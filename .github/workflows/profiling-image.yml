@@ -13,7 +13,7 @@
 #   IMAGE_REGISTRY=<account>.dkr.ecr.us-east-1.amazonaws.com \
 #   IMAGE_TAG=siglake:prof-<sha> \
 #   SIGLAKE_REPO=/path/to/siglake \
-#     bash bench/siglake_aws_run.sh --skip-build
+#     bash quickwit-testing/bench/siglake_aws_run.sh --skip-build
 #
 # Two things a caller has to know:
 #
@@ -135,5 +135,5 @@ jobs:
           echo "PROFILE_ROUND=1 \\" >> "$GITHUB_STEP_SUMMARY"
           echo "IMAGE_REGISTRY=${{ steps.login-ecr.outputs.registry }} \\" >> "$GITHUB_STEP_SUMMARY"
           echo "IMAGE_TAG=siglake:prof-${TAG} \\" >> "$GITHUB_STEP_SUMMARY"
-          echo "  bash bench/siglake_aws_run.sh --skip-build" >> "$GITHUB_STEP_SUMMARY"
+          echo "  bash quickwit-testing/bench/siglake_aws_run.sh --skip-build" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
