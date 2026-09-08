@@ -27,7 +27,12 @@
 //!   because the bench node and its bucket are destroyed at the end of a round.
 //! - `/debug/pprof/heap` — a jemalloc heap profile in `jeprof` text format.
 //!   Needs the binary to symbolize, which is why a profiling round records its
-//!   image digest.
+//!   image digest. The process must be started with
+//!   `_RJEM_MALLOC_CONF=prof:true,prof_active:true` — **prefixed**, because
+//!   `tikv-jemalloc-sys` builds jemalloc with a prefixed symbol namespace and
+//!   ignores the plain `MALLOC_CONF` entirely. Get that wrong and this route
+//!   answers 412 while the other two look perfectly healthy, which is exactly
+//!   how it went unnoticed until the image was run locally (2026-09-08).
 //! - `/debug/pprof/runtime` — tokio runtime counters as JSON. A CPU profile
 //!   samples only threads that are *running*, so an await-blocked query looks
 //!   free in it; the derived `worker_idle_duration_ns` / `busy_ratio` here are
@@ -221,7 +226,7 @@ fn gzip(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
 ///
 /// Requires BOTH that the binary linked a `tikv-jemallocator` built with
 /// `--enable-prof` (its `profiling` feature) and that the process started with
-/// `MALLOC_CONF=prof:true,prof_active:true` — jemalloc reads that once, at
+/// `_RJEM_MALLOC_CONF=prof:true,prof_active:true` — jemalloc reads that once, at
 /// startup, so profiling cannot be turned on later, and only allocations made
 /// while sampling was active appear in a dump. Either missing and this answers
 /// 412 rather than a misleading near-empty profile.
@@ -247,7 +252,7 @@ async fn heap_profile() -> Response {
                     "heap profile unavailable: {e}\n\
                      Needs a binary built with `--features profiling` (so \
                      tikv-jemallocator gets --enable-prof) AND \
-                     MALLOC_CONF=prof:true,prof_active:true at process start.\n"
+                     _RJEM_MALLOC_CONF=prof:true,prof_active:true at process start.\n"
                 ),
             )
                 .into_response()
@@ -265,14 +270,14 @@ fn collect_heap_profile() -> anyhow::Result<Vec<u8>> {
 
     use tikv_jemalloc_ctl::raw;
 
-    // `opt.prof` reflects the MALLOC_CONF the process actually started with.
+    // `opt.prof` reflects the _RJEM_MALLOC_CONF the process actually started with.
     // Checking it first turns "profiling was never enabled" into a precise
     // message instead of an opaque mallctl failure further down.
     let prof_built: bool = unsafe { raw::read(b"opt.prof\0") }
         .map_err(|e| anyhow::anyhow!("read opt.prof (jemalloc built without profiling?): {e}"))?;
     anyhow::ensure!(
         prof_built,
-        "jemalloc reports opt.prof=false (MALLOC_CONF is missing prof:true)"
+        "jemalloc reports opt.prof=false (_RJEM_MALLOC_CONF is missing prof:true)"
     );
 
     // Sampling must ALREADY have been running. A jemalloc heap profile is a
@@ -289,7 +294,7 @@ fn collect_heap_profile() -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
         active,
         "jemalloc sampling is inactive (prof.active=false), so a dump would be empty; \
-         start the process with MALLOC_CONF=prof:true,prof_active:true"
+         start the process with _RJEM_MALLOC_CONF=prof:true,prof_active:true"
     );
 
     let dump = tempfile::Builder::new()
