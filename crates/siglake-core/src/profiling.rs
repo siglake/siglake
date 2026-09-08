@@ -110,9 +110,33 @@ pub fn clamp_seconds(requested: Option<u64>) -> u64 {
         .clamp(MIN_SECONDS, MAX_SECONDS)
 }
 
+/// Bounds on the runtime route's `?seconds=`. Far smaller than the CPU
+/// profiler's: this is a metrics delta, not a sample set, and the harness takes
+/// it at the END of a stage window, so a long wait here only delays the round.
+const RUNTIME_MIN_SECONDS: u64 = 1;
+const RUNTIME_MAX_SECONDS: u64 = 60;
+const RUNTIME_DEFAULT_SECONDS: u64 = 2;
+
+// The runtime window must stay well under the CPU profiler's, since the
+// harness reads it at the END of a stage window and a long wait here only
+// delays the round. Compile-time, so the two ceilings cannot drift together.
+const _: () = assert!(RUNTIME_MAX_SECONDS < MAX_SECONDS);
+const _: () = assert!(RUNTIME_MIN_SECONDS >= 1);
+
 #[derive(Debug, Deserialize)]
 pub struct ProfileParams {
     seconds: Option<u64>,
+}
+
+/// Clamp the runtime sampling window to `1..=60` seconds, defaulting to 2.
+///
+/// Separate from [`clamp_seconds`] on purpose: sharing the CPU profiler's
+/// 600-second ceiling would let one `?seconds=` value mean two very different
+/// things depending on the route.
+pub fn clamp_runtime_window(requested: Option<u64>) -> u64 {
+    requested
+        .unwrap_or(RUNTIME_DEFAULT_SECONDS)
+        .clamp(RUNTIME_MIN_SECONDS, RUNTIME_MAX_SECONDS)
 }
 
 /// The `/debug/pprof/*` routes, or an empty router when the env gate is off.
@@ -348,12 +372,29 @@ pub fn worker_idle(elapsed: Duration, workers: usize, total_busy: Duration) -> (
 /// than fail, the response reports which set it is via `tokio_unstable`, so a
 /// reader is never left guessing whether a missing key means "zero" or "not
 /// compiled in".
-async fn runtime_stats() -> Response {
+///
+/// Blocks for `?seconds=` (default 2, clamped to 1..=60) because everything
+/// here except the point-in-time gauges is a DELTA over a sampling interval;
+/// see the comment in the body.
+async fn runtime_stats(Query(params): Query<ProfileParams>) -> Response {
+    let seconds = clamp_runtime_window(params.seconds);
     let handle = tokio::runtime::Handle::current();
     let monitor = tokio_metrics::RuntimeMonitor::new(&handle);
-    // `intervals()` yields cumulative-since-last-poll; the first item covers
-    // since-runtime-start, which is what a per-stage delta wants.
-    let Some(m) = monitor.intervals().next() else {
+    let mut intervals = monitor.intervals();
+
+    // MEASURE OVER A REAL WINDOW. Every duration and count in `RuntimeMetrics`
+    // is a DELTA over the sampling interval, and `intervals()` starts that
+    // interval when it is called -- so taking the first item immediately
+    // yields a window of a few microseconds in which nothing happened. The
+    // 2026-09-08 profiling round shipped exactly that: `elapsed_ns: 5527`,
+    // every counter 0, and `busy_ratio: 0.0` on an ingester that was running
+    // flat out. It reads as "completely idle", which is worse than useless.
+    //
+    // So: burn the first item to establish the baseline, sleep, then take a
+    // genuine `seconds`-long interval.
+    let _ = intervals.next();
+    tokio::time::sleep(Duration::from_secs(seconds)).await;
+    let Some(m) = intervals.next() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             "runtime monitor produced no sample\n",
@@ -461,6 +502,109 @@ mod tests {
         assert_eq!(clamp_seconds(Some(120)), 120);
         assert_eq!(clamp_seconds(Some(0)), MIN_SECONDS);
         assert_eq!(clamp_seconds(Some(MAX_SECONDS + 1)), MAX_SECONDS);
+    }
+
+    #[test]
+    fn runtime_window_defaults_and_clamps() {
+        assert_eq!(clamp_runtime_window(None), RUNTIME_DEFAULT_SECONDS);
+        assert_eq!(clamp_runtime_window(Some(10)), 10);
+        assert_eq!(clamp_runtime_window(Some(0)), RUNTIME_MIN_SECONDS);
+        assert_eq!(
+            clamp_runtime_window(Some(RUNTIME_MAX_SECONDS + 1)),
+            RUNTIME_MAX_SECONDS
+        );
+    }
+
+    /// The runtime window must never be zero. A zero-length interval is what
+    /// produced the 2026-09-08 round's useless snapshots: every delta counter
+    /// 0 and busy_ratio 0.0 on a fully loaded ingester.
+    #[test]
+    fn runtime_window_is_never_zero() {
+        for requested in [None, Some(0), Some(1), Some(u64::MAX)] {
+            assert!(clamp_runtime_window(requested) >= 1, "{requested:?}");
+        }
+    }
+
+    /// The two routes' windows are bounded independently: one `?seconds=600`
+    /// is a valid CPU profile and an absurd metrics delta.
+    #[test]
+    fn the_two_windows_have_separate_ceilings() {
+        assert_eq!(clamp_seconds(Some(600)), 600);
+        assert_eq!(clamp_runtime_window(Some(600)), RUNTIME_MAX_SECONDS);
+    }
+
+    /// THE REGRESSION THIS FILE EXISTS TO PREVENT.
+    ///
+    /// Every duration and count in `RuntimeMetrics` is a delta over the
+    /// sampling interval, and `intervals()` starts that interval when it is
+    /// called. Taking the first item immediately therefore measures a window
+    /// of microseconds in which nothing happened — which is what the
+    /// 2026-09-08 profiling round shipped for all seven stages:
+    /// `elapsed_ns: 5527`, every counter 0, `busy_ratio: 0.0` on an ingester
+    /// running flat out.
+    ///
+    /// Asserts the shape of the fix rather than the handler (which needs an
+    /// HTTP server): burn the first interval, do real work, then take a
+    /// second interval and require it to have observed that work.
+    #[test]
+    fn a_real_window_observes_work_where_an_immediate_sample_sees_none() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let monitor = tokio_metrics::RuntimeMonitor::new(runtime.handle());
+        let mut intervals = monitor.intervals();
+
+        // The old behaviour: sample immediately, before anything can run.
+        let immediate = intervals.next().expect("first interval");
+
+        // Now do work the runtime must account for.
+        runtime.block_on(async {
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                handles.push(tokio::spawn(async {
+                    let mut acc = 0u64;
+                    for i in 0..2_000_000u64 {
+                        acc = acc.wrapping_add(i);
+                    }
+                    acc
+                }));
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
+        });
+
+        let measured = intervals.next().expect("second interval");
+
+        assert!(
+            measured.elapsed > immediate.elapsed,
+            "the measured window must be longer than the microsecond one \
+             (immediate={:?}, measured={:?})",
+            immediate.elapsed,
+            measured.elapsed
+        );
+        assert!(
+            measured.total_busy_duration > Duration::ZERO,
+            "a window containing 8 CPU-bound tasks must report busy time, got {:?}",
+            measured.total_busy_duration
+        );
+
+        // And the derived ratio must now be a real number rather than the
+        // 0.0-over-nothing the round reported.
+        let (idle, ratio) = worker_idle(
+            measured.elapsed,
+            measured.workers_count,
+            measured.total_busy_duration,
+        );
+        let ratio = ratio.expect("a non-empty window has a defined busy ratio");
+        assert!(ratio > 0.0, "busy_ratio must be above zero, got {ratio}");
+        assert!(
+            idle > 0 || ratio >= 1.0,
+            "idle and ratio must be consistent (idle={idle}, ratio={ratio})"
+        );
     }
 
     /// A gzip payload has to be what `pprof` will accept, so assert the magic
