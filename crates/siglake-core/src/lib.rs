@@ -8,6 +8,11 @@ pub mod index_config;
 pub mod mapping;
 pub mod metrics;
 pub mod oidc;
+/// On-demand CPU/heap/runtime profiling routes. Compiled only under the
+/// off-by-default `profiling` feature, and armed only by
+/// `SIGLAKE_PPROF_ENABLED=1`.
+#[cfg(feature = "profiling")]
+pub mod profiling;
 pub mod promote;
 pub mod tenant;
 

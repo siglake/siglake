@@ -9,6 +9,14 @@ description = "siglake CLI: smoke-test ingest and query for the siglake storage 
 name = "siglake"
 path = "src/main.rs"
 
+[features]
+# Passthrough for a profiling build (`deploy/Dockerfile` with `PROFILING=1`).
+# Two halves, and BOTH have to be here rather than in siglake-core: the routes
+# come from siglake-core, but `--enable-prof` is a property of the jemalloc that
+# *this* crate's `#[global_allocator]` links, so siglake-core cannot turn it on.
+# Without the second half the heap route answers 412.
+profiling = ["siglake-core/profiling", "tikv-jemallocator/profiling"]
+
 [dependencies]
 reqwest = { workspace = true }
 rustyline = { workspace = true }

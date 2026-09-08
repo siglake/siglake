@@ -406,6 +406,18 @@ jobs:
       - name: Install mold linker
         run: sudo apt-get install -y mold
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `--workspace` above builds every member with DEFAULT features, so it
+      # never compiles `siglake-core/profiling` at all. Without these two the
+      # profiling endpoint rots silently and the next profiling round discovers
+      # it at image-build time. Both configurations are needed because
+      # tokio-metrics gates most of its counters behind `--cfg tokio_unstable`
+      # and the module compiles a different field set for each.
+      - name: clippy the profiling feature
+        run: cargo clippy -p siglake-core --features profiling --all-targets -- -D warnings
+      - name: clippy the profiling feature with tokio_unstable
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold --cfg tokio_unstable"
+        run: cargo clippy -p siglake-core --features profiling --all-targets -- -D warnings
 
   # Both gates here are `cargo run` of a workspace binary, so they share one
   # job (and one warm target dir) rather than one runner each.
