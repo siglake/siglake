@@ -352,6 +352,22 @@ compactor:
   # row) outgrows the query pod's index caches. Set true to render
   # SIGLAKE_INDEX_REBUILD=1 and opt in — existing indexes are read either way.
   indexRebuild: false
+  # #3000 short-aggregate repair. Every 15 minutes the maintenance pass
+  # censuses each maintained table for a group-count aggregate short of
+  # `total-records` with every commit's contribution accounted for — the state a
+  # commit killed between its commit and its delta PUT leaves, and the state a
+  # table upgraded across #2919 starts in. It always reports
+  # (`siglake_group_count_short_aggregates_total`,
+  # `SiglakeGroupCountAggregateShort`); answers stay exact either way and
+  # `GROUP BY` on the affected columns runs on the exact per-file path.
+  #
+  # OFF by default, because the repair is one Tier-2 query per maintained
+  # column — measured ~9 minutes per column per 250M rows on a local
+  # filesystem, so a wide table is hours and the compactor's 600s watchdog
+  # would cut it. Set true to render SIGLAKE_AGG_SHORT_REPAIR=1 and have one
+  # table per census rebuilt from the committed files; on a very large table
+  # `siglake rebuild-group-counts --table <t>` remains the tool.
+  shortAggregateRepair: false
   # QW-7 delete-task execution in the compactor's idle cycle. ON by
   # default: tasks created via the query server's /api/v1/delete-tasks are
   # acknowledged with a 201, so something has to run them. Set to `false`

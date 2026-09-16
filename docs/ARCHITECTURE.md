@@ -329,6 +329,43 @@ Each maintenance pass also adds the number of deltas folded into the base to
 `siglake_group_count_deltas_absorbed_total` and the number of already-absorbed
 delta objects removed to `siglake_group_count_deltas_deleted_total`.
 
+**The deficit census.** A marker covers one cause. A process killed between its
+commit and its delta PUT writes neither, and a table upgraded across the
+per-incarnation prefix starts a fresh aggregate at its first commit after the
+upgrade; both leave an aggregate that is merely SHORT, which no later delta
+heals. Every 15 minutes
+(`SIGLAKE_AGG_SHORT_SCAN_INTERVAL_SECS`; `0`, `off`, `disabled` or `never`
+switch it off) the same maintenance pass censuses each maintained table for
+exactly that: a maintained column whose total falls short of `total-records`
+where the FOLDED view — outstanding deltas included — already carries the
+current generation's own contribution. It reads one number per column straight
+out of the compact base, so a healthy warehouse costs milliseconds per table.
+
+Two rules keep it from firing on work that is merely in flight or hopeless.
+A commit publishes its delta after the commit, so the census waits until the
+newest generation's contribution has landed in the artifact — counting the
+coverage links still waiting on a missing predecessor, and admitting a
+row-conserving re-cluster on top through the same bridging rule the read guard
+uses. And a column the rebuild could not restore (over the cardinality cap,
+unreadable in some live file) is recorded in the base object by the rebuild that
+tried, then skipped until another rebuild clears the record — that column is
+dropped from the base by the rebuild and re-added short by the next delta, so
+without the record one unreadable column would cost a full Tier-2 rebuild every
+pass.
+
+Every verdict lands on
+`siglake_group_count_short_aggregates_total{table="<table>",outcome="detected|repaired|incomplete|failed"}`
+and a WARN line naming the columns, and `SiglakeGroupCountAggregateShort` fires
+on all but `repaired`. Rebuilding automatically is **opt-in**
+(`SIGLAKE_AGG_SHORT_REPAIR=1`, `compactor.shortAggregateRepair` in the chart):
+the repair is one Tier-2 query per maintained column — measured ~9 minutes per
+column per 250M rows on a local filesystem, so a wide table is hours and the
+compactor's 600 s watchdog cuts it (a cut repair publishes nothing and the next
+pass retries). With it on, one table per pass is rebuilt
+(`SIGLAKE_AGG_SHORT_REPAIR_MAX_TABLES`), because every table upgraded across the
+prefix change is short at once. On a table that size the operator's
+`rebuild-group-counts` remains the tool.
+
 If the LOST log says the marker itself could not be written, or automatic
 rebuild keeps failing, the operator fallback remains:
 

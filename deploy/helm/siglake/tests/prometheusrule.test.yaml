@@ -561,3 +561,46 @@ tests:
       - eval_time: 14m
         alertname: SiglakeIngestLanesRefused
         exp_alerts: []
+
+  # #3000: a short aggregate needs no lost write to exist, so the census's
+  # `detected` outcome is the series a default install fires on — automatic
+  # repair is opt-in. `repaired` is the healthy outcome and must stay silent,
+  # or every successful repair would page.
+  - name: a census that finds a short aggregate raises its warning
+    interval: 1m
+    input_series:
+      - series: 'siglake_group_count_short_aggregates_total{namespace="logs",pod="compactor-0",table="events",outcome="detected"}'
+        values: '0 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: SiglakeGroupCountAggregateShort
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              table: events
+              outcome: detected
+              severity: warning
+            exp_annotations:
+              summary: The group-count aggregate for events is short of its row count
+              description: >-
+                The maintenance census found table events short of
+                `total-records` in at least one maintained column, with every
+                commit's contribution present — outcome detected. Answers stay
+                exact; `GROUP BY` on those columns runs on the exact per-file
+                path and will keep doing so, because no later commit closes the
+                gap. The compactor's WARN line names the columns. Run `siglake
+                rebuild-group-counts --table events`, which recomputes the
+                aggregate from the committed files and is safe to re-run, or set
+                `compactor.shortAggregateRepair=true` to have the maintenance
+                pass rebuild one table per census.
+
+  - name: a census whose repairs all succeed stays silent
+    interval: 1m
+    input_series:
+      - series: 'siglake_group_count_short_aggregates_total{namespace="logs",pod="compactor-0",table="events",outcome="repaired"}'
+        values: '0 1 2 3 4 5'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SiglakeGroupCountAggregateShort
+        exp_alerts: []
