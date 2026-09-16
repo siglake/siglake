@@ -27,8 +27,13 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   visible rather than inferred: every acquisition is a `miss` on
   `siglake_iceberg_parsed_index_cache_lookups_total` with no eviction beside it,
   which is the shape the "Text-index startup" panels were added for (#3969). The caps above 16Gi are policy
-  rather than measurement: nothing has sized a working set larger than the
-  three or four compacted files 1 GiB of parsed indexes holds. Whether the
+  rather than measurement, but the working set below them has now been sized,
+  and it is larger than the caps assume: one 7.34M-row compacted file's parsed
+  index is 526.0 MiB, so 1 GiB holds **one** of them, and a 14-file text plan
+  wants 7.19 GiB (#4376, `DESIGN_segmented_inverted_index.md`). At the 1 GiB
+  budget that plan takes zero cache hits and 41 evictions. Sizing cannot close
+  that gap at any cap a query pod can afford, which is why the format itself is
+  the open item rather than the budget. Whether the
   serialized copy earns its share at all is a separate open question: since a
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no

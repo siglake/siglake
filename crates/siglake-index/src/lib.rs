@@ -24,6 +24,8 @@ use std::collections::BTreeMap;
 
 use siglake_bloom::{normalize_query_term, Tokenizer};
 
+pub mod segmented;
+
 /// Magic prefixing a serialized index blob.
 const INDEX_MAGIC: &[u8; 4] = b"KIDX";
 /// Serialization version.
@@ -151,6 +153,17 @@ impl InvertedIndex {
                     ENTRY_OVERHEAD + term.len() + rows.len() * std::mem::size_of::<u32>()
                 })
                 .sum::<usize>()
+    }
+
+    /// The dictionary in term order, each term with its ascending postings. The
+    /// serializers walk this; so does the experimental segmented encoder
+    /// ([`segmented::SegmentedWriter::push_group_index`]), which is what lets a
+    /// segmented sidecar be built from an index that already exists without
+    /// re-tokenizing its rows.
+    pub fn terms(&self) -> impl ExactSizeIterator<Item = (&str, &[u32])> {
+        self.postings
+            .iter()
+            .map(|(term, rows)| (term.as_str(), rows.as_slice()))
     }
 
     /// Ascending row ordinals containing `term` (normalized as the blooms do),
