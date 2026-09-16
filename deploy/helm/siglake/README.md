@@ -496,8 +496,9 @@ Five of the silent-loss alerts are about the aggregates rather than rows. A per-
 four attempts leaves a durable marker; the maintenance compactor normally
 rebuilds the aggregate on its next fold, while `GROUP BY` stays exact on the
 per-file path. `SiglakeGroupCountDeltaLost` (warning) fires only when that
-automatic rebuild fails or remains incomplete and names the table; use
-`siglake rebuild-group-counts --table <table>` as the operator fallback.
+automatic rebuild fails or remains incomplete and names the Iceberg
+namespace and table; use `siglake rebuild-group-counts --namespace <ns> --table
+<table>` as the operator fallback.
 `SiglakeGroupCountDeltaRetrying` (warning) fires once delta writes for a table
 have needed retries for half an hour and names both the table and pod, warning
 that an exhausted write and automatic rebuild are becoming more likely.
@@ -536,7 +537,8 @@ upgrade; both leave a shortfall no later commit closes. Repairing it
 automatically is opt-in (`compactor.shortAggregateRepair`, which renders
 `SIGLAKE_AGG_SHORT_REPAIR=1`) because it costs one Tier-2 query per maintained
 column; with it off the alert and the compactor's WARN line — which names the
-columns — point at `siglake rebuild-group-counts --table <table>`.
+columns — point at
+`siglake rebuild-group-counts --namespace <ns> --table <table>`.
 
 The starter Grafana dashboard `deploy/grafana/siglake-overview.json`
 groups panels the same way and filters on `namespace` (the label

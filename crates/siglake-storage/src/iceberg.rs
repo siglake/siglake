@@ -262,6 +262,13 @@ mod format_version_tests {
 #[cfg(test)]
 mod alerted_counter_catalog_tests {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::CompositeKey;
+
+    fn has_label(key: &CompositeKey, name: &str, value: &str) -> bool {
+        key.key()
+            .labels()
+            .any(|label| label.key() == name && label.value() == value)
+    }
 
     #[test]
     fn consumed_proof_cap_refusals_are_preregistered() {
@@ -273,16 +280,20 @@ mod alerted_counter_catalog_tests {
     }
 
     /// The compactor pre-registers `siglake_group_count_delta_write_failures_total`
-    /// for the events table so the first failed delta PUT is a delta
-    /// `increase()` can see. siglake-core cannot name this crate, so the label
-    /// value there is a literal; this holds it to [`super::TABLE_NAME`].
+    /// for the default namespace's events table so the first failed delta PUT
+    /// is a delta `increase()` can see. siglake-core cannot name this crate, so
+    /// the label values there are literals; this holds them to
+    /// [`super::NAMESPACE`] and [`super::TABLE_NAME`].
     #[test]
     fn group_count_delta_write_failures_is_preregistered_for_the_events_table() {
         let registered = siglake_core::metrics::COMPACTOR_ALERTED_COUNTERS
             .iter()
             .find(|c| c.name == "siglake_group_count_delta_write_failures_total")
             .expect("compactor catalog lists the delta write-failure counter");
-        let events: &[(&str, &str)] = &[("table", super::TABLE_NAME)];
+        let events: &[(&str, &str)] = &[
+            ("iceberg_namespace", super::NAMESPACE),
+            ("table", super::TABLE_NAME),
+        ];
         assert!(registered.series.contains(&events), "{registered:?}");
     }
 
@@ -296,18 +307,22 @@ mod alerted_counter_catalog_tests {
             .find(|c| c.name == "siglake_group_count_auto_rebuilds_total")
             .expect("compactor catalog lists the auto-rebuild counter");
         for outcome in ["success", "incomplete", "failed"] {
-            let events: &[(&str, &str)] = &[("table", super::TABLE_NAME), ("outcome", outcome)];
+            let events: &[(&str, &str)] = &[
+                ("iceberg_namespace", super::NAMESPACE),
+                ("table", super::TABLE_NAME),
+                ("outcome", outcome),
+            ];
             assert!(registered.series.contains(&events), "{registered:?}");
         }
     }
 
     #[test]
-    fn group_count_auto_rebuilds_are_labelled_by_table_and_outcome() {
+    fn group_count_auto_rebuilds_are_labelled_by_namespace_table_and_outcome() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
             for outcome in ["success", "incomplete", "failed"] {
-                super::record_group_count_auto_rebuild("logs-index", outcome);
+                super::record_group_count_auto_rebuild(super::NAMESPACE, "logs-index", outcome);
             }
         });
 
@@ -317,17 +332,42 @@ mod alerted_counter_catalog_tests {
                 .iter()
                 .find(|(key, _, _, _)| {
                     key.key().name() == "siglake_group_count_auto_rebuilds_total"
-                        && key
-                            .key()
-                            .labels()
-                            .any(|label| label.key() == "table" && label.value() == "logs-index")
-                        && key
-                            .key()
-                            .labels()
-                            .any(|label| label.key() == "outcome" && label.value() == outcome)
+                        && has_label(key, "iceberg_namespace", super::NAMESPACE)
+                        && has_label(key, "table", "logs-index")
+                        && has_label(key, "outcome", outcome)
                 })
                 .unwrap_or_else(|| panic!("missing {outcome} auto-rebuild sample: {samples:?}"));
             assert!(matches!(sample.3, DebugValue::Counter(1)), "{sample:?}");
+        }
+    }
+
+    /// #4737's acceptance for the rebuild counter: one compactor rebuilds for
+    /// the base namespace and every `tenant_*` namespace, so the two `events`
+    /// tables must not land on one series.
+    #[test]
+    fn a_rebuild_in_each_namespace_is_two_series() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            super::record_group_count_auto_rebuild(super::NAMESPACE, super::TABLE_NAME, "failed");
+            super::record_group_count_auto_rebuild("tenant_acme", super::TABLE_NAME, "failed");
+        });
+
+        let samples = snapshotter.snapshot().into_vec();
+        for namespace in [super::NAMESPACE, "tenant_acme"] {
+            let sample = samples
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == "siglake_group_count_auto_rebuilds_total"
+                        && has_label(key, "iceberg_namespace", namespace)
+                        && has_label(key, "table", super::TABLE_NAME)
+                        && has_label(key, "outcome", "failed")
+                })
+                .unwrap_or_else(|| panic!("no rebuild series for {namespace}: {samples:?}"));
+            assert!(
+                matches!(sample.3, DebugValue::Counter(1)),
+                "{namespace} carries another namespace's rebuilds: {sample:?}"
+            );
         }
     }
 
@@ -341,18 +381,22 @@ mod alerted_counter_catalog_tests {
             .find(|c| c.name == "siglake_group_count_short_aggregates_total")
             .expect("compactor catalog lists the short-aggregate counter");
         for outcome in ["detected", "repaired", "incomplete", "failed"] {
-            let events: &[(&str, &str)] = &[("table", super::TABLE_NAME), ("outcome", outcome)];
+            let events: &[(&str, &str)] = &[
+                ("iceberg_namespace", super::NAMESPACE),
+                ("table", super::TABLE_NAME),
+                ("outcome", outcome),
+            ];
             assert!(registered.series.contains(&events), "{registered:?}");
         }
     }
 
     #[test]
-    fn short_aggregate_outcomes_are_labelled_by_table_and_outcome() {
+    fn short_aggregate_outcomes_are_labelled_by_namespace_table_and_outcome() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
             for outcome in ["detected", "repaired", "incomplete", "failed"] {
-                super::record_group_count_short_aggregate("logs-index", outcome);
+                super::record_group_count_short_aggregate(super::NAMESPACE, "logs-index", outcome);
             }
         });
 
@@ -362,14 +406,9 @@ mod alerted_counter_catalog_tests {
                 .iter()
                 .find(|(key, _, _, _)| {
                     key.key().name() == "siglake_group_count_short_aggregates_total"
-                        && key
-                            .key()
-                            .labels()
-                            .any(|label| label.key() == "table" && label.value() == "logs-index")
-                        && key
-                            .key()
-                            .labels()
-                            .any(|label| label.key() == "outcome" && label.value() == outcome)
+                        && has_label(key, "iceberg_namespace", super::NAMESPACE)
+                        && has_label(key, "table", "logs-index")
+                        && has_label(key, "outcome", outcome)
                 })
                 .unwrap_or_else(|| panic!("missing {outcome} short-aggregate sample: {samples:?}"));
             assert!(matches!(sample.3, DebugValue::Counter(1)), "{sample:?}");
@@ -6528,11 +6567,16 @@ async fn publish_side_deltas(
 /// inline time aggregates stay short — the message says so rather than
 /// promising a repair that is not coming.
 ///
+/// Labelled by `iceberg_namespace` as well as `table` for the reason given on
+/// [`record_group_count_short_aggregate`]: one compactor publishes for the base
+/// namespace and every `tenant_*` namespace, each with its own `events`.
+///
 /// `marker_cap` is the TABLE's cardinality, not the inline object's base cap:
 /// the marker drives a rebuild of the wide object, whose fold uses the table
 /// cap, and repairing at the smaller base cap would report every column above
 /// it as an incomplete rebuild.
 async fn record_lost_side_publication(
+    namespace: &str,
     table: &str,
     op: Option<&opendal::Operator>,
     deltas: &PendingSideAggDeltas,
@@ -6542,6 +6586,7 @@ async fn record_lost_side_publication(
 ) {
     metrics::counter!(
         "siglake_side_aggregate_publish_failures_total",
+        "iceberg_namespace" => namespace.to_owned(),
         "table" => table.to_owned()
     )
     .increment(1);
@@ -6846,9 +6891,12 @@ fn record_group_count_delta_write_retries(table: &str, retries: u64) {
     .increment(retries);
 }
 
-fn record_group_count_auto_rebuild(table: &str, outcome: &'static str) {
+/// Labelled by `iceberg_namespace` as well as `table` for the reason given on
+/// [`record_group_count_short_aggregate`].
+fn record_group_count_auto_rebuild(namespace: &str, table: &str, outcome: &'static str) {
     metrics::counter!(
         "siglake_group_count_auto_rebuilds_total",
+        "iceberg_namespace" => namespace.to_owned(),
         "table" => table.to_owned(),
         "outcome" => outcome
     )
@@ -6860,9 +6908,19 @@ fn record_group_count_auto_rebuild(table: &str, outcome: &'static str) {
 /// one names a commit whose delta PUT was spent, this one names a table whose
 /// aggregate is short with every contribution accounted for — an upgrade across
 /// #2919, a delta lost with its marker, a foreign overwrite.
-fn record_group_count_short_aggregate(table: &str, outcome: &'static str) {
+///
+/// Labelled by namespace as well as table (#4737): one compactor censuses the
+/// base namespace plus every `tenant_*` namespace, so a bare `events` merges
+/// every tenant's table into one series and the alert names a table an
+/// operator cannot locate or pass to `--namespace`.
+///
+/// `iceberg_namespace`, not `namespace`, for the reason given on
+/// [`report_inline_coverage`]: Prometheus renames a colliding metric label to
+/// `exported_namespace`.
+fn record_group_count_short_aggregate(namespace: &str, table: &str, outcome: &'static str) {
     metrics::counter!(
         "siglake_group_count_short_aggregates_total",
+        "iceberg_namespace" => namespace.to_owned(),
         "table" => table.to_owned(),
         "outcome" => outcome
     )
@@ -11287,7 +11345,11 @@ impl IcebergContext {
                 Ok(result) => result,
                 Err(error) => {
                     if rebuild_requested {
-                        record_group_count_auto_rebuild(ident.name(), "failed");
+                        record_group_count_auto_rebuild(
+                            &ident.namespace().to_string(),
+                            ident.name(),
+                            "failed",
+                        );
                     }
                     return Err(error)
                         .with_context(|| format!("automatic group-count rebuild for {ident}"));
@@ -11430,9 +11492,17 @@ impl IcebergContext {
                 "automatic group-count rebuild completed, but these marker columns cannot \
                  cover the table and remain on the per-file path"
             );
-            record_group_count_auto_rebuild(ident.name(), "incomplete");
+            record_group_count_auto_rebuild(
+                &ident.namespace().to_string(),
+                ident.name(),
+                "incomplete",
+            );
         } else {
-            record_group_count_auto_rebuild(ident.name(), "success");
+            record_group_count_auto_rebuild(
+                &ident.namespace().to_string(),
+                ident.name(),
+                "success",
+            );
         }
         let deleted =
             delete_group_count_rebuild_markers(op, &marker_paths, report.sequence_number).await;
@@ -11497,6 +11567,10 @@ impl IcebergContext {
         let mut out = Vec::new();
         let mut repairs = 0usize;
         for ident in self.aggregate_table_idents().await {
+            // The counter's namespace label. Taken from the ident rather than
+            // from `self` so it can never name a different namespace than the
+            // `table` beside it.
+            let namespace = ident.namespace().to_string();
             // One table's transient read error must not skip the rest: this is
             // a whole-warehouse sweep on a timer, and the events table is
             // usually last in nobody's interest.
@@ -11531,7 +11605,7 @@ impl IcebergContext {
                      rebuild could not restore; not rebuilding again"
                 ),
                 ShortAggregateOutcome::Detected { columns } => {
-                    record_group_count_short_aggregate(ident.name(), "detected");
+                    record_group_count_short_aggregate(&namespace, ident.name(), "detected");
                     tracing::warn!(
                         table = %ident,
                         columns = %columns.join(","),
@@ -11539,8 +11613,8 @@ impl IcebergContext {
                          contribution accounted for; GROUP BY on these columns stays \
                          on the exact per-file path. Automatic repair is off or its \
                          per-pass budget is spent — run \
-                         `siglake rebuild-group-counts --table <t>` or set \
-                         SIGLAKE_AGG_SHORT_REPAIR=1"
+                         `siglake rebuild-group-counts --namespace <ns> --table <t>` \
+                         or set SIGLAKE_AGG_SHORT_REPAIR=1"
                     );
                 }
                 ShortAggregateOutcome::Repaired {
@@ -11548,14 +11622,14 @@ impl IcebergContext {
                     unrestored,
                 } => {
                     if unrestored.is_empty() {
-                        record_group_count_short_aggregate(ident.name(), "repaired");
+                        record_group_count_short_aggregate(&namespace, ident.name(), "repaired");
                         tracing::info!(
                             table = %ident,
                             columns = %columns.join(","),
                             "rebuilt a short group-count aggregate from committed files"
                         );
                     } else {
-                        record_group_count_short_aggregate(ident.name(), "incomplete");
+                        record_group_count_short_aggregate(&namespace, ident.name(), "incomplete");
                         tracing::warn!(
                             table = %ident,
                             columns = %unrestored.join(","),
@@ -11567,7 +11641,7 @@ impl IcebergContext {
                     }
                 }
                 ShortAggregateOutcome::Failed => {
-                    record_group_count_short_aggregate(ident.name(), "failed");
+                    record_group_count_short_aggregate(&namespace, ident.name(), "failed");
                 }
                 ShortAggregateOutcome::Covered => {}
             }
@@ -12730,6 +12804,7 @@ impl IcebergContext {
                 let path = side_path.to_string();
                 let location = side_location.to_string();
                 let incarnation = incarnation.to_string();
+                let namespace = table_ident.namespace().to_string();
                 let table = table_ident.name().to_string();
                 let group_count_deltas_enabled = self.group_count_deltas_enabled();
                 let marker_cap = self.table_group_count_cardinality();
@@ -12785,6 +12860,7 @@ impl IcebergContext {
                             Ok((SidePublication::Written, _)) => {}
                             Err(err) => {
                                 record_lost_side_publication(
+                                    &namespace,
                                     &table,
                                     cas_op.as_ref(),
                                     &deltas,
@@ -12831,6 +12907,7 @@ impl IcebergContext {
                 Ok((SidePublication::Written, _)) => {}
                 Err(err) => {
                     record_lost_side_publication(
+                        &table_ident.namespace().to_string(),
                         table_ident.name(),
                         cas_op.as_ref(),
                         &deltas,
@@ -13136,8 +13213,12 @@ impl IcebergContext {
                         // line nothing reads is how the 2026-09-02 regression
                         // took a bisect to explain. The count is the alarm; the
                         // message is the remedy.
+                        // Labelled by namespace as well as table (#4737): one
+                        // compactor writes for every `tenant_*` namespace, and
+                        // a bare `events` merges them into one series.
                         metrics::counter!(
                             "siglake_group_count_delta_write_failures_total",
+                            "iceberg_namespace" => table_ident.namespace().to_string(),
                             "table" => table_ident.name().to_string()
                         )
                         .increment(1);
@@ -29689,6 +29770,7 @@ mod side_publication_retry_tests {
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
             rt.block_on(record_lost_side_publication(
+                NAMESPACE,
                 "events",
                 Some(&op),
                 &deltas,
@@ -29704,6 +29786,10 @@ mod side_publication_retry_tests {
             .into_iter()
             .filter(|(key, _, _, _)| {
                 key.key().name() == "siglake_side_aggregate_publish_failures_total"
+                    && key
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "iceberg_namespace" && l.value() == NAMESPACE)
                     && key
                         .key()
                         .labels()
@@ -29739,6 +29825,7 @@ mod side_publication_retry_tests {
         .unwrap()
         .finish();
         record_lost_side_publication(
+            NAMESPACE,
             "events",
             Some(&op),
             &deltas_for(Some(10), 11, 7, 20),

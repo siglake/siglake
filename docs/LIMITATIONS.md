@@ -256,8 +256,9 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   (`siglake_group_count_short_aggregates_total`,
   `SiglakeGroupCountAggregateShort`), but repairing it automatically is opt-in
   (`SIGLAKE_AGG_SHORT_REPAIR=1`, one table per pass) because the rebuild is one
-  Tier-2 query per maintained column; `siglake rebuild-group-counts --table
-  <table>` recomputes the columns from committed files either way. And a table
+  Tier-2 query per maintained column; `siglake rebuild-group-counts
+  --namespace <ns> --table <table>` recomputes the columns from committed files
+  either way. And a table
   whose metadata carries no UUID publishes and reads no aggregate at all, on the
   same reasoning — so it is also invisible to the census, which has nothing to
   measure a shortfall against.
@@ -881,8 +882,9 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   be pre-registered is a series whose label value is only known at the
   increment: `siglake_storage_schema_drift_total{column=...}` (the alert fires
   on the second refusal, which the next drain cycle produces) and
-  `siglake_group_count_delta_write_failures_total` for index tables (the
-  events table is pre-registered).
+  `siglake_group_count_delta_write_failures_total` for index tables and for
+  `tenant_*` namespaces (the default namespace's events table is
+  pre-registered; the four namespaced aggregate counters share that limit).
 - **Mixed-version claim-reclaim rollout needs temporary snapshot headroom.**
   New writers atomically maintain the bounded `siglake.consumed_proof.v1`
   table property, so committed-claim evidence survives snapshot expiry and
@@ -942,7 +944,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   before typed columns joined the side aggregate is the common case — is
   permanently short and every `GROUP BY` on it falls to the exact per-file
   Tier-2 path: correct answers, no speedup, `served_by: "materialized"` for the
-  life of the table. `siglake rebuild-group-counts --table <t>` (with
+  life of the table. `siglake rebuild-group-counts --namespace <ns> --table <t>` (with
   `--admit-typed-columns` for the older-table case) backfills the total from
   the committed files. Nothing automatically admits a pre-existing typed
   column: the maintenance census measures a shortfall only against the columns
@@ -966,7 +968,8 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   rebuild to exceed the compactor's watchdog (600 s) has it cut, publishes
   nothing, and retries on the next pass with no durable backoff, so a
   persistently trippable table needs the knob off and
-  `siglake rebuild-group-counts --table <t>` run once by hand;
+  `siglake rebuild-group-counts --namespace <ns> --table <t>` run once by
+  hand;
   `siglake_compactor_watchdog_trips_total{stage="agg_short_repair"}` is the
   signal. A shortfall the coverage rules cannot bridge to the current snapshot —
   a foreign overwrite or a delete task as the newest commit — is never censused,

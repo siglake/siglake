@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- **Metrics (series identity changes)**: the four aggregate-maintenance
+  counters now carry `iceberg_namespace` alongside `table`:
+  `siglake_group_count_short_aggregates_total`,
+  `siglake_group_count_delta_write_failures_total`,
+  `siglake_side_aggregate_publish_failures_total` and
+  `siglake_group_count_auto_rebuilds_total`. One compactor maintains the base
+  namespace and every `tenant_*` namespace, each with its own `events`, so a
+  bare `table="events"` merged every tenant into one series and
+  `SiglakeGroupCountAggregateShort` named a table an operator could not
+  locate. The three alerts that read these counters now name
+  `<namespace>.<table>` and pass `--namespace` to the `rebuild-group-counts`
+  they suggest, and the dashboard's three panels group by the pair. The label
+  is `iceberg_namespace`, not `namespace`, because Prometheus attaches the
+  Kubernetes namespace under that name and renames a colliding metric label to
+  `exported_namespace`. Existing recording rules, dashboards and silences that
+  match these four counters by `table` alone keep working; anything that
+  matches an exact label set does not. Pre-registration still lists the
+  default namespace's `events` alone — a tenant namespace, an index table and
+  a base namespace moved by `SIGLAKE_TENANT_NAMESPACE` are known only at the
+  increment. (#4737)
+
 ## 0.1.1
 
 Twelve changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
