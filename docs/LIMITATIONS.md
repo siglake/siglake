@@ -490,6 +490,26 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   ("Decoded-file cache populations") in `deploy/grafana/siglake-overview.json`
   charts them; on a default install, where the cache is off, every arm stays at
   zero.
+  **An operator who turns the cache on also pays for the populate path stripping
+  the query's predicate**, which is what makes an entry reusable: the read then
+  decodes the whole projection instead of the pages the predicate would have
+  selected. Measured 2026-09-16 on a local two-row-group fixture (#4847), a
+  `LIMIT 100` browse whose `host` predicate converts to an Iceberg predicate ran
+  at 2.3 ms warm with the cache off and 6.4 ms with it on — **2.6x slower for a
+  cache that then inserted nothing**. This cost is independent of what the
+  entries are keyed on.
+  #4847 qualified the row-group-granular alternative locally and the disposition
+  is REVISE, with the shipped policy kept: per-row-group population does insert
+  from a clipped browse and cuts its repeat from 6.7 ms to 2.0 ms, and it drops
+  the off-pool population peak per stream from a whole file to one row group
+  (20.8 MiB to 5.2 MiB of extent on a drained four-group file) — but only when
+  the clip decodes a WHOLE row group, which at the 131,072-row floor needs a
+  residual predicate matching fewer than ~1 row in 1,300, and whether the
+  rounds' label shapes do is not in their export. See
+  `docs/DESIGN_row_group_decoded_cache_qualification.md`; the prototype is
+  reachable only in-process
+  (`QueryScanTuning::file_cache_row_group_prototype`), with no environment, CLI,
+  chart or operator surface.
 - **Query scales by REPLICATION, not by fan-out, for ordinary log search.**
   Adding query replicas multiplies throughput — measured 705 QPS on one
   replica and 2,269 on three (3.22x), with browse p50 flat at 13–21ms through

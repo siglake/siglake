@@ -20,9 +20,12 @@ pub mod schema_version;
 pub mod subscribe;
 
 pub use query_provider::{
-    settle_scan_partitions, CancelOnDrop, ClippedScanLimit, OrderedMergeGlobalBudget,
-    OrderedResidualHint, OrderedScanLimit, OrderedScanTuning, PreferredScanOrder, QueryCancel,
-    ScanPartitionTracker, ScanSettle, ScanShard, SiglakeIcebergTableScan,
+    clear_decoded_file_cache, clear_row_group_layout_cache, decoded_file_cache_footprint,
+    decoded_file_cache_population_stats, reset_decoded_file_cache_population_peaks,
+    settle_scan_partitions, CancelOnDrop, ClippedScanLimit, DecodedFileCacheFootprint,
+    DecodedFileCachePopulationStats, OrderedMergeGlobalBudget, OrderedResidualHint,
+    OrderedScanLimit, OrderedScanTuning, PreferredScanOrder, QueryCancel, ScanPartitionTracker,
+    ScanSettle, ScanShard, SiglakeIcebergTableScan,
 };
 
 /// Arrow field-metadata key carrying the configured text tokenizer name for a
@@ -66,6 +69,15 @@ pub struct QueryScanTuning {
     pub file_cache_max_bytes: Option<u64>,
     pub file_cache_max_entries: Option<usize>,
     pub ordered_drain_buffer_bytes: Option<u64>,
+    /// #4847 LOCAL QUALIFICATION PROTOTYPE: populate the decoded cache per ROW
+    /// GROUP instead of per drained file, so a read that stops early still
+    /// leaves whole units behind.
+    ///
+    /// Deliberately has no environment variable, CLI flag, chart value or
+    /// operator field: only an in-process caller can set it, which is the
+    /// measurement fixture. Shipped policy stays drained-scan-only — see
+    /// `docs/DESIGN_row_group_decoded_cache_qualification.md`.
+    pub file_cache_row_group_prototype: bool,
 }
 
 /// Effective process-wide read-cache configuration.

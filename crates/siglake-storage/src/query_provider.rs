@@ -129,6 +129,8 @@ impl EffectiveReaderTuning {
 struct EffectiveFileCacheTuning {
     max_bytes: Option<u64>,
     max_entries: Option<usize>,
+    /// #4847 prototype gate; see [`crate::QueryScanTuning::file_cache_row_group_prototype`].
+    row_group_prototype: bool,
 }
 
 /// Selectivity-aware ordered-policy override, injected through
@@ -342,6 +344,231 @@ impl QueryFileBatchCache {
 fn query_file_batch_cache() -> &'static std::sync::Mutex<QueryFileBatchCache> {
     static CACHE: OnceLock<std::sync::Mutex<QueryFileBatchCache>> = OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(QueryFileBatchCache::default()))
+}
+
+/// Drop every decoded-cache entry. Measurement hook: the cache is process-wide,
+/// so an arm that must start cold needs this between arms.
+pub fn clear_decoded_file_cache() {
+    let mut cache = query_file_batch_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cache = QueryFileBatchCache::default();
+    metrics::gauge!("siglake_query_scan_file_cache_bytes").set(0.0);
+    metrics::gauge!("siglake_query_scan_file_cache_entries").set(0.0);
+}
+
+/// What the installed decoded cache costs, in three currencies.
+///
+/// `priced_bytes` is what the cache charges against its own budget
+/// (`get_array_memory_size`, whole buffer allocations, summed per batch and
+/// therefore double-counting an allocation two batches share). `extent_bytes`
+/// prices the rows the entries actually span (`get_slice_memory_size`).
+/// `retained_bytes` sums the DISTINCT backing allocations the entries keep
+/// alive, deduplicated across the whole cache by allocation base pointer — the
+/// number that says what the process cannot give back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodedFileCacheFootprint {
+    pub entries: usize,
+    pub batches: usize,
+    pub rows: usize,
+    pub priced_bytes: u64,
+    pub extent_bytes: u64,
+    pub retained_bytes: u64,
+}
+
+/// [`DecodedFileCacheFootprint`] for the installed cache. Walks every cached
+/// batch, so it is a measurement hook, not something to call per request.
+pub fn decoded_file_cache_footprint() -> DecodedFileCacheFootprint {
+    let cache = query_file_batch_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut footprint = DecodedFileCacheFootprint {
+        entries: cache.entries.len(),
+        priced_bytes: cache.bytes,
+        ..Default::default()
+    };
+    let mut allocations: Vec<(usize, usize)> = Vec::new();
+    for entry in cache.entries.values() {
+        for batch in entry.batches.iter() {
+            footprint.batches += 1;
+            footprint.rows += batch.num_rows();
+            footprint.extent_bytes = footprint
+                .extent_bytes
+                .saturating_add(batch_extent_bytes(batch));
+            for column in batch.columns() {
+                collect_backing_allocations(&column.to_data(), &mut allocations);
+            }
+        }
+    }
+    footprint.retained_bytes = allocations
+        .iter()
+        .map(|(_, capacity)| *capacity as u64)
+        .sum();
+    footprint
+}
+
+/// Bytes a batch's rows span, by the measure the write paths use for a slice
+/// (`ArrayData::get_slice_memory_size`) rather than the whole-buffer measure.
+fn batch_extent_bytes(batch: &RecordBatch) -> u64 {
+    batch
+        .columns()
+        .iter()
+        .map(|column| column.to_data().get_slice_memory_size().unwrap_or(0) as u64)
+        .sum()
+}
+
+/// Distinct backing allocations one batch keeps alive, by allocation base
+/// pointer and capacity, so two columns sharing a buffer (or a sliced view of
+/// one) are counted once.
+fn batch_retained_bytes(batch: &RecordBatch) -> u64 {
+    let mut allocations: Vec<(usize, usize)> = Vec::new();
+    for column in batch.columns() {
+        collect_backing_allocations(&column.to_data(), &mut allocations);
+    }
+    allocations
+        .iter()
+        .map(|(_, capacity)| *capacity as u64)
+        .sum()
+}
+
+/// Accumulate `(allocation base pointer, capacity)` for every buffer under
+/// `data`, deduplicated. `Buffer::data_ptr` is the allocation, not the slice
+/// start, so two slices of one allocation collapse to one entry; `capacity` is
+/// the allocation's, which is why the pair identifies it.
+fn collect_backing_allocations(
+    data: &datafusion::arrow::array::ArrayData,
+    out: &mut Vec<(usize, usize)>,
+) {
+    let push = |buffer: &datafusion::arrow::buffer::Buffer, out: &mut Vec<(usize, usize)>| {
+        let entry = (buffer.data_ptr().as_ptr() as usize, buffer.capacity());
+        if !out.contains(&entry) {
+            out.push(entry);
+        }
+    };
+    for buffer in data.buffers() {
+        push(buffer, out);
+    }
+    if let Some(nulls) = data.nulls() {
+        push(nulls.inner().inner(), out);
+    }
+    for child in data.child_data() {
+        collect_backing_allocations(child, out);
+    }
+}
+
+/// Off-pool bytes the populate streams hold, now and at their peak.
+///
+/// #4494 recorded the population memory risk as a bound — "up to budget/4 per
+/// stream, concurrently per partition" — with nothing measuring it: the
+/// `siglake_query_scan_file_cache_bytes` gauge is written from the INSERT, so a
+/// population that never inserts is invisible in it, which is every population
+/// on a clipped browse. These counters are charged as batches are buffered and
+/// released when the stream inserts or drops, so a run can read the aggregate
+/// across concurrent partitions and its peak. Both currencies of
+/// [`DecodedFileCacheFootprint`] are tracked: the rows' extent and the distinct
+/// backing allocations (deduplicated per batch — sharing ACROSS batches is not,
+/// so retained is an upper bound there).
+#[derive(Debug, Default)]
+struct PopulationMeter {
+    extent_bytes: std::sync::atomic::AtomicU64,
+    retained_bytes: std::sync::atomic::AtomicU64,
+    streams: std::sync::atomic::AtomicU64,
+    peak_extent_bytes: std::sync::atomic::AtomicU64,
+    peak_retained_bytes: std::sync::atomic::AtomicU64,
+    peak_streams: std::sync::atomic::AtomicU64,
+}
+
+fn population_meter() -> &'static PopulationMeter {
+    static METER: OnceLock<PopulationMeter> = OnceLock::new();
+    METER.get_or_init(PopulationMeter::default)
+}
+
+/// Aggregate population memory across every live populate stream in the
+/// process, and the peak since the last
+/// [`reset_decoded_file_cache_population_peaks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodedFileCachePopulationStats {
+    pub inflight_extent_bytes: u64,
+    pub inflight_retained_bytes: u64,
+    pub inflight_streams: u64,
+    pub peak_extent_bytes: u64,
+    pub peak_retained_bytes: u64,
+    pub peak_streams: u64,
+}
+
+pub fn decoded_file_cache_population_stats() -> DecodedFileCachePopulationStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    let meter = population_meter();
+    DecodedFileCachePopulationStats {
+        inflight_extent_bytes: meter.extent_bytes.load(Relaxed),
+        inflight_retained_bytes: meter.retained_bytes.load(Relaxed),
+        inflight_streams: meter.streams.load(Relaxed),
+        peak_extent_bytes: meter.peak_extent_bytes.load(Relaxed),
+        peak_retained_bytes: meter.peak_retained_bytes.load(Relaxed),
+        peak_streams: meter.peak_streams.load(Relaxed),
+    }
+}
+
+/// Reset the peaks (not the in-flight totals, which belong to live streams) so
+/// one arm's peak is not another's.
+pub fn reset_decoded_file_cache_population_peaks() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let meter = population_meter();
+    meter.peak_extent_bytes.store(0, Relaxed);
+    meter.peak_retained_bytes.store(0, Relaxed);
+    meter.peak_streams.store(0, Relaxed);
+}
+
+/// One populate stream's charge against [`PopulationMeter`]. Releases exactly
+/// what it charged on drop, so a cancelled population cannot leak the gauge.
+#[derive(Debug, Default)]
+struct PopulationCharge {
+    extent_bytes: u64,
+    retained_bytes: u64,
+}
+
+impl PopulationCharge {
+    fn open() -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let meter = population_meter();
+        let streams = meter.streams.fetch_add(1, Relaxed) + 1;
+        meter.peak_streams.fetch_max(streams, Relaxed);
+        Self::default()
+    }
+
+    fn charge(&mut self, batch: &RecordBatch) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let extent = batch_extent_bytes(batch);
+        let retained = batch_retained_bytes(batch);
+        self.extent_bytes = self.extent_bytes.saturating_add(extent);
+        self.retained_bytes = self.retained_bytes.saturating_add(retained);
+        let meter = population_meter();
+        let extent_total = meter.extent_bytes.fetch_add(extent, Relaxed) + extent;
+        let retained_total = meter.retained_bytes.fetch_add(retained, Relaxed) + retained;
+        meter.peak_extent_bytes.fetch_max(extent_total, Relaxed);
+        meter.peak_retained_bytes.fetch_max(retained_total, Relaxed);
+    }
+
+    /// Give back what this stream holds, keeping its stream slot (it is still
+    /// live — it just handed its batches to the cache, or dropped them).
+    fn release_buffered(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let meter = population_meter();
+        meter
+            .extent_bytes
+            .fetch_sub(std::mem::take(&mut self.extent_bytes), Relaxed);
+        meter
+            .retained_bytes
+            .fetch_sub(std::mem::take(&mut self.retained_bytes), Relaxed);
+    }
+}
+
+impl Drop for PopulationCharge {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.release_buffered();
+        population_meter().streams.fetch_sub(1, Relaxed);
+    }
 }
 
 type TaskBatchStream = Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>;
@@ -653,10 +880,13 @@ struct CachePopulateStream {
     buffered_bytes: u64,
     oversized: bool,
     insert_done: bool,
+    /// Off-pool population memory this stream holds — see [`PopulationMeter`].
+    charge: PopulationCharge,
 }
 
 impl CachePopulateStream {
     fn insert_buffered(&mut self, cache: &mut QueryFileBatchCache) {
+        self.charge.release_buffered();
         if cache.get(&self.key).is_none() {
             cache.insert(
                 self.key.clone(),
@@ -727,6 +957,7 @@ impl Stream for CachePopulateStream {
                     if this.tuning.entry_is_oversized(buffered_bytes) {
                         this.buffered.clear();
                         this.buffered_bytes = 0;
+                        this.charge.release_buffered();
                         this.oversized = true;
                         metrics::counter!(
                             "siglake_query_scan_file_cache_requests_total",
@@ -735,6 +966,7 @@ impl Stream for CachePopulateStream {
                         .increment(1);
                     } else {
                         this.buffered_bytes = buffered_bytes;
+                        this.charge.charge(&batch);
                         this.buffered.push(batch.clone());
                     }
                 }
@@ -783,6 +1015,417 @@ impl Stream for CachePopulateStream {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #4847: row-group-granular population, LOCAL QUALIFICATION PROTOTYPE.
+//
+// Shipped policy is unchanged and stays drained-scan-only: the gate is
+// `QueryScanTuning::file_cache_row_group_prototype`, which has no environment
+// variable, no CLI flag, no chart value and no operator field, so nothing
+// outside this process can turn it on. The packaged cache is still off (0/0)
+// and the operator's 4Gi clamp is untouched. The evidence this exists to
+// produce is in `docs/DESIGN_row_group_decoded_cache_qualification.md`.
+//
+// The idea under test (option (c) on #4494): make the cache unit a ROW GROUP,
+// so a read that stops early still leaves whole units behind — no prefix
+// contract, no "this entry covers n rows" key. Two facts make it implementable
+// without touching the fork:
+//
+//   * parquet-rs never lets a record batch straddle a row group, so a decoded
+//     prefix that reaches a group boundary is exactly a set of whole batches
+//     (asserted per batch below rather than assumed: a batch that overshoots a
+//     boundary stops population for the task and is counted);
+//   * the reader's ONLY row-group selector from outside is the task's byte
+//     range (`filter_row_groups_by_byte_range`), and it accumulates synthetic
+//     offsets from 4 over `compressed_size()`. Recomputing those offsets from
+//     the footer therefore addresses any contiguous span of groups exactly.
+// ---------------------------------------------------------------------------
+
+/// Per-file row-group layout: rows and compressed bytes per group, in file
+/// order, read once from the footer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RowGroupLayout {
+    rows: Vec<u64>,
+    compressed: Vec<u64>,
+}
+
+impl RowGroupLayout {
+    fn from_footer(groups: Vec<(u64, u64)>) -> Self {
+        Self {
+            rows: groups.iter().map(|(rows, _)| *rows).collect(),
+            compressed: groups.iter().map(|(_, bytes)| *bytes).collect(),
+        }
+    }
+
+    /// The groups a task's byte range selects, under the reader's own rule: a
+    /// group is selected when it overlaps `[start, start + length)`, offsets
+    /// accumulated from 4 over the compressed sizes. `(0, 0)` is the whole file,
+    /// which is how the reader reads it too (it skips byte-range filtering
+    /// entirely for that case).
+    fn selected(&self, start: u64, length: u64) -> Vec<usize> {
+        if start == 0 && length == 0 {
+            return (0..self.rows.len()).collect();
+        }
+        let end = start.saturating_add(length);
+        let mut offset = 4u64;
+        let mut selected = Vec::new();
+        for (idx, size) in self.compressed.iter().enumerate() {
+            let group_end = offset.saturating_add(*size);
+            if offset < end && start < group_end {
+                selected.push(idx);
+            }
+            offset = group_end;
+        }
+        selected
+    }
+
+    /// A byte range selecting exactly groups `first..=last` under that rule.
+    /// `None` when the span is empty or out of range, or when a group reports
+    /// zero compressed bytes — the range would then be ambiguous and the task
+    /// takes the whole-file path instead.
+    fn byte_range(&self, first: usize, last: usize) -> Option<(u64, u64)> {
+        if first > last || last >= self.compressed.len() {
+            return None;
+        }
+        if self.compressed[first..=last].contains(&0) {
+            return None;
+        }
+        let start = 4 + self.compressed[..first].iter().sum::<u64>();
+        let length = self.compressed[first..=last].iter().sum::<u64>();
+        Some((start, length))
+    }
+}
+
+/// Footer layouts already read, keyed by data-file path. Data files are
+/// immutable, so an entry never goes stale. Capped and cleared wholesale when
+/// full: this is a prototype, and a layout is two small vectors per file.
+const ROW_GROUP_LAYOUT_CACHE_MAX_ENTRIES: usize = 8192;
+
+fn row_group_layout_cache() -> &'static std::sync::Mutex<HashMap<String, Arc<RowGroupLayout>>> {
+    static LAYOUTS: OnceLock<std::sync::Mutex<HashMap<String, Arc<RowGroupLayout>>>> =
+        OnceLock::new();
+    LAYOUTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Drop every cached footer layout. Measurement hook, like
+/// [`clear_decoded_file_cache`]: an arm that must pay its own footer reads
+/// needs the layouts cold.
+pub fn clear_row_group_layout_cache() {
+    row_group_layout_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+fn row_group_prototype_outcome(outcome: &'static str) {
+    metrics::counter!(
+        "siglake_query_scan_file_cache_row_group_total",
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+async fn row_group_layout(
+    file_io: &iceberg::io::FileIO,
+    path: &str,
+) -> Option<Arc<RowGroupLayout>> {
+    if let Some(layout) = row_group_layout_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .cloned()
+    {
+        row_group_prototype_outcome("layout_hit");
+        return Some(layout);
+    }
+    match crate::iceberg::row_group_layout_from_footer(file_io, path).await {
+        Ok(groups) => {
+            row_group_prototype_outcome("layout_read");
+            let layout = Arc::new(RowGroupLayout::from_footer(groups));
+            let mut cache = row_group_layout_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if cache.len() >= ROW_GROUP_LAYOUT_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+            cache.insert(path.to_string(), layout.clone());
+            Some(layout)
+        }
+        Err(err) => {
+            row_group_prototype_outcome("layout_error");
+            tracing::debug!(path, error = %err, "row-group layout read failed");
+            None
+        }
+    }
+}
+
+/// Cache identity of one row group: the file, the group's index in it, and the
+/// same projection/deletes/direction the whole-file key carries. The task's
+/// byte range is deliberately NOT part of it — the group's own index pins the
+/// bytes, so two different splits of one file address the same group. Nothing
+/// else about identity changes, which is what keeps a segment answer equal to
+/// the read it replaces.
+fn row_group_segment_key(task: &FileScanTask, group: usize, reverse: bool) -> String {
+    format!(
+        "{}:rg={group}:{}:reverse={reverse}",
+        task.data_file_path(),
+        task_projection_delete_key(task)
+    )
+}
+
+/// Populate one entry per completed row group, as the read passes each boundary.
+///
+/// The whole-file stream inserts in its end-of-stream arm and therefore inserts
+/// nothing when a `LIMIT` is satisfied first (#4494). This one inserts at every
+/// boundary it reaches, so a read that covers g whole groups leaves g entries
+/// behind whether or not it ever finishes.
+struct RowGroupPopulateStream {
+    inner: TaskBatchStream,
+    tuning: EffectiveFileCacheTuning,
+    /// Segment keys and row counts for the groups this stream reads, in the
+    /// order the reader emits them.
+    keys: Vec<String>,
+    group_rows: Vec<u64>,
+    /// The group being filled.
+    at: usize,
+    filled_rows: u64,
+    buffered: Vec<RecordBatch>,
+    buffered_bytes: u64,
+    /// This group will not be inserted (it crossed the entry bound), but its
+    /// rows are still counted so the next boundary is found.
+    group_skipped: bool,
+    /// A batch crossed a group boundary — the alignment this rests on does not
+    /// hold for this read, so stop populating rather than guess.
+    misaligned: bool,
+    charge: PopulationCharge,
+}
+
+impl RowGroupPopulateStream {
+    fn discard_buffered(&mut self) {
+        self.buffered.clear();
+        self.buffered_bytes = 0;
+        self.charge.release_buffered();
+    }
+
+    fn insert_group(&mut self) {
+        let key = self.keys[self.at].clone();
+        let entry = CachedFileBatches {
+            bytes: self.buffered_bytes,
+            batches: Arc::new(std::mem::take(&mut self.buffered)),
+        };
+        self.buffered_bytes = 0;
+        self.charge.release_buffered();
+        // Same non-blocking discipline as the whole-file path: the insert is an
+        // optimization and the entry is rebuildable, so a contended lock is
+        // counted and skipped, never waited on.
+        match query_file_batch_cache().try_lock() {
+            Ok(mut cache) => {
+                if cache.get(&key).is_none() {
+                    cache.insert(key, entry, self.tuning);
+                    metrics::counter!(
+                        "siglake_query_scan_file_cache_requests_total",
+                        "outcome" => "insert"
+                    )
+                    .increment(1);
+                    row_group_prototype_outcome("group_inserted");
+                }
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut cache = poisoned.into_inner();
+                if cache.get(&key).is_none() {
+                    cache.insert(key, entry, self.tuning);
+                    metrics::counter!(
+                        "siglake_query_scan_file_cache_requests_total",
+                        "outcome" => "insert"
+                    )
+                    .increment(1);
+                    row_group_prototype_outcome("group_inserted");
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                metrics::counter!(
+                    "siglake_query_scan_file_cache_requests_total",
+                    "outcome" => "insert_skipped_contended"
+                )
+                .increment(1);
+            }
+        }
+    }
+}
+
+/// A population dropped with a partial group buffered is abandoned in exactly
+/// #4846's sense: it decoded batches, kept them, and never reached an insert.
+/// It charges the same outcome, so the counter keeps one meaning across both
+/// granularities. The difference the prototype is meant to show is that the
+/// groups it DID complete are already in the cache by then.
+impl Drop for RowGroupPopulateStream {
+    fn drop(&mut self) {
+        if !self.buffered.is_empty() {
+            metrics::counter!(
+                "siglake_query_scan_file_cache_requests_total",
+                "outcome" => "abandoned"
+            )
+            .increment(1);
+        }
+    }
+}
+
+impl Stream for RowGroupPopulateStream {
+    type Item = DFResult<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                if !this.misaligned && this.at < this.keys.len() {
+                    let rows = batch.num_rows() as u64;
+                    let group_rows = this.group_rows[this.at];
+                    let filled = this.filled_rows + rows;
+                    if filled > group_rows {
+                        // parquet-rs does not produce such a batch; a row
+                        // selection or a delete file would. Count it and stop
+                        // populating — a segment must be a whole group or
+                        // nothing.
+                        this.misaligned = true;
+                        this.discard_buffered();
+                        row_group_prototype_outcome("misaligned");
+                    } else {
+                        if !this.group_skipped {
+                            let buffered_bytes = this
+                                .buffered_bytes
+                                .saturating_add(batch.get_array_memory_size() as u64);
+                            if this.tuning.entry_is_oversized(buffered_bytes) {
+                                this.discard_buffered();
+                                this.group_skipped = true;
+                                metrics::counter!(
+                                    "siglake_query_scan_file_cache_requests_total",
+                                    "outcome" => "skip_oversized"
+                                )
+                                .increment(1);
+                            } else {
+                                this.buffered_bytes = buffered_bytes;
+                                this.charge.charge(&batch);
+                                this.buffered.push(batch.clone());
+                            }
+                        }
+                        this.filled_rows = filled;
+                        if this.filled_rows == group_rows {
+                            if !this.group_skipped {
+                                this.insert_group();
+                            }
+                            this.at += 1;
+                            this.filled_rows = 0;
+                            this.group_skipped = false;
+                        }
+                    }
+                }
+                Poll::Ready(Some(Ok(batch)))
+            }
+            Poll::Ready(Some(Err(err))) => {
+                this.discard_buffered();
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Ready(None) => {
+                // Nothing to flush: a group that did not reach its boundary is
+                // not a group. The partial buffer is released by Drop, which
+                // also charges `abandoned`.
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// What the prototype can do with one task.
+enum RowGroupPlan {
+    /// Every group is cached: the task is served without a reader.
+    Served(Vec<RecordBatch>),
+    /// `served` groups are cached; the rest are read from `range` and
+    /// populated.
+    Partial {
+        served: Vec<RecordBatch>,
+        served_groups: usize,
+        range: (u64, u64),
+        keys: Vec<String>,
+        group_rows: Vec<u64>,
+    },
+    /// Nothing is cached: read the whole task and populate per group.
+    Populate {
+        keys: Vec<String>,
+        group_rows: Vec<u64>,
+    },
+}
+
+/// Decide what the prototype does with `task`, or `None` to leave it to the
+/// shipped whole-file path.
+///
+/// Refusals are deliberate and narrow: a reversed read (the ordered path, which
+/// does not use this cache at all today), a task with delete files (its row
+/// counts no longer match the footer's, so no group could ever close), and a
+/// file whose footer would not read.
+async fn row_group_plan(
+    file_io: &iceberg::io::FileIO,
+    task: &FileScanTask,
+    reverse: bool,
+) -> Option<RowGroupPlan> {
+    if reverse || !task.deletes.is_empty() {
+        row_group_prototype_outcome("refused");
+        return None;
+    }
+    let layout = row_group_layout(file_io, task.data_file_path()).await?;
+    let groups = layout.selected(task.start, task.length);
+    if groups.is_empty() {
+        row_group_prototype_outcome("refused");
+        return None;
+    }
+    let keys: Vec<String> = groups
+        .iter()
+        .map(|group| row_group_segment_key(task, *group, reverse))
+        .collect();
+    let group_rows: Vec<u64> = groups.iter().map(|group| layout.rows[*group]).collect();
+
+    let mut served = Vec::new();
+    let mut served_groups = 0usize;
+    {
+        let cache = query_file_batch_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in &keys {
+            match cache.get(key) {
+                Some(entry) => {
+                    served.extend(entry.batches.iter().cloned());
+                    served_groups += 1;
+                }
+                None => break,
+            }
+        }
+    }
+
+    if served_groups == keys.len() {
+        return Some(RowGroupPlan::Served(served));
+    }
+    let remaining_keys = keys[served_groups..].to_vec();
+    let remaining_rows = group_rows[served_groups..].to_vec();
+    if served_groups == 0 {
+        return Some(RowGroupPlan::Populate {
+            keys: remaining_keys,
+            group_rows: remaining_rows,
+        });
+    }
+    // A partial serve needs a reader over the groups that are NOT cached, which
+    // only the byte range can express. If it cannot be expressed, read the whole
+    // task and re-populate rather than serve a wrong prefix.
+    match layout.byte_range(groups[served_groups], *groups.last().unwrap()) {
+        Some(range) => Some(RowGroupPlan::Partial {
+            served,
+            served_groups,
+            range,
+            keys: remaining_keys,
+            group_rows: remaining_rows,
+        }),
+        None => Some(RowGroupPlan::Populate { keys, group_rows }),
     }
 }
 
@@ -3258,6 +3901,19 @@ impl datafusion::physical_plan::RecordBatchStream for SourceMetricsStream {
 }
 
 fn task_cache_key(task: &FileScanTask) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        task.data_file_path(),
+        task.start,
+        task.length,
+        task_projection_delete_key(task)
+    )
+}
+
+/// The projection-and-deletes half of a cache key: everything about identity
+/// that is not the file, the byte range or the direction. Shared by the
+/// whole-file key and #4847's per-row-group key so the two cannot drift.
+fn task_projection_delete_key(task: &FileScanTask) -> String {
     let fields = task
         .project_field_ids()
         .iter()
@@ -3284,14 +3940,7 @@ fn task_cache_key(task: &FileScanTask) -> String {
         })
         .collect::<Vec<_>>()
         .join("|");
-    format!(
-        "{}:{}:{}:{}:{}",
-        task.data_file_path(),
-        task.start,
-        task.length,
-        fields,
-        deletes
-    )
+    format!("{fields}:{deletes}")
 }
 
 fn task_cache_key_with_direction(task: &FileScanTask, reverse: bool) -> String {
@@ -3423,6 +4072,26 @@ async fn open_task_batch_stream_cached(
         );
     }
 
+    // #4847 prototype (off unless an in-process caller set it): per-row-group
+    // entries. Placed after the prune bypass so filtering semantics are
+    // untouched — a task with a raw or promoted prune still bypasses the cache
+    // entirely, at either granularity.
+    if cache_tuning.row_group_prototype {
+        if let Some(plan) = row_group_plan(&file_io, &task, reverse).await {
+            return row_group_task_stream(
+                plan,
+                file_io,
+                task,
+                reader_tuning,
+                cache_tuning,
+                byte_counter,
+                scan_counters,
+                cache_counters,
+                reverse,
+            );
+        }
+    }
+
     metrics::counter!(
         "siglake_query_scan_file_cache_requests_total",
         "outcome" => "miss"
@@ -3449,7 +4118,122 @@ async fn open_task_batch_stream_cached(
         buffered_bytes: 0,
         oversized: false,
         insert_done: false,
+        charge: PopulationCharge::open(),
     }))
+}
+
+/// Build the task stream for a [`RowGroupPlan`].
+///
+/// Counter discipline, chosen so the shipped series keep one meaning: `hit`
+/// when the task needed no reader at all, `miss` when one was opened — which is
+/// exactly what those two say today. The prototype's own detail (a task partly
+/// served from cache, how many groups) goes to
+/// `siglake_query_scan_file_cache_row_group_total`, which no dashboard or
+/// pre-registration depends on.
+#[allow(clippy::too_many_arguments)]
+fn row_group_task_stream(
+    plan: RowGroupPlan,
+    file_io: iceberg::io::FileIO,
+    task: FileScanTask,
+    reader_tuning: EffectiveReaderTuning,
+    cache_tuning: EffectiveFileCacheTuning,
+    byte_counter: Arc<std::sync::atomic::AtomicU64>,
+    scan_counters: Arc<ScanCounters>,
+    cache_counters: Arc<FileCacheCounters>,
+    reverse: bool,
+) -> DFResult<TaskBatchStream> {
+    let populate =
+        |inner: TaskBatchStream, keys: Vec<String>, group_rows: Vec<u64>| -> TaskBatchStream {
+            Box::pin(RowGroupPopulateStream {
+                inner,
+                tuning: cache_tuning,
+                keys,
+                group_rows,
+                at: 0,
+                filled_rows: 0,
+                buffered: Vec::new(),
+                buffered_bytes: 0,
+                group_skipped: false,
+                misaligned: false,
+                charge: PopulationCharge::open(),
+            })
+        };
+    match plan {
+        RowGroupPlan::Served(batches) => {
+            metrics::counter!(
+                "siglake_query_scan_file_cache_requests_total",
+                "outcome" => "hit"
+            )
+            .increment(1);
+            cache_counters
+                .hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            row_group_prototype_outcome("served_whole_task");
+            Ok(futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)).boxed())
+        }
+        RowGroupPlan::Partial {
+            served,
+            served_groups,
+            range,
+            keys,
+            group_rows,
+        } => {
+            metrics::counter!(
+                "siglake_query_scan_file_cache_requests_total",
+                "outcome" => "miss"
+            )
+            .increment(1);
+            cache_counters
+                .misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            row_group_prototype_outcome("partial_serve");
+            metrics::histogram!("siglake_query_scan_file_cache_row_group_served")
+                .record(served_groups as f64);
+            // The derived task addresses exactly the groups that were not
+            // served. Its rows, in order, are the ones the served batches do
+            // not carry, so cached-then-read is the same row sequence the
+            // whole-task read produces.
+            let mut remainder = cacheable_task(&task);
+            remainder.start = range.0;
+            remainder.length = range.1;
+            let inner = open_task_batch_stream_uncached(
+                file_io,
+                remainder,
+                reader_tuning,
+                byte_counter,
+                scan_counters,
+                None,
+                Vec::new(),
+                reverse,
+            )?;
+            Ok(
+                futures::stream::iter(served.into_iter().map(Ok::<_, DataFusionError>))
+                    .chain(populate(inner, keys, group_rows))
+                    .boxed(),
+            )
+        }
+        RowGroupPlan::Populate { keys, group_rows } => {
+            metrics::counter!(
+                "siglake_query_scan_file_cache_requests_total",
+                "outcome" => "miss"
+            )
+            .increment(1);
+            cache_counters
+                .misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let inner = open_task_batch_stream_uncached(
+                file_io,
+                cacheable_task(&task),
+                reader_tuning,
+                byte_counter,
+                scan_counters,
+                None,
+                Vec::new(),
+                reverse,
+            )?;
+            Ok(populate(inner, keys, group_rows))
+        }
+    }
 }
 
 impl ExecutionPlan for SiglakeIcebergTableScan {
@@ -4683,6 +5467,7 @@ fn effective_file_cache_tuning(tuning: crate::QueryScanTuning) -> EffectiveFileC
     EffectiveFileCacheTuning {
         max_bytes: tuning.file_cache_max_bytes.filter(|n| *n > 0),
         max_entries: tuning.file_cache_max_entries.filter(|n| *n > 0),
+        row_group_prototype: tuning.file_cache_row_group_prototype,
     }
 }
 
@@ -5881,6 +6666,7 @@ mod tests {
             // entry limit while a third batch remains unread.
             max_bytes: Some(batch_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)),
             max_entries: Some(1),
+            row_group_prototype: false,
         };
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -5901,6 +6687,7 @@ mod tests {
                     buffered_bytes: 0,
                     oversized: false,
                     insert_done: false,
+                    charge: PopulationCharge::open(),
                 };
 
                 assert!(stream.next().await.unwrap().is_ok());
@@ -5942,11 +6729,13 @@ mod tests {
         let roomy = EffectiveFileCacheTuning {
             max_bytes: Some(batch_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION * 8)),
             max_entries: Some(8),
+            row_group_prototype: false,
         };
         // One batch fits; the second crosses the quarter-budget entry bound.
         let tight = EffectiveFileCacheTuning {
             max_bytes: Some(batch_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)),
             max_entries: Some(8),
+            row_group_prototype: false,
         };
         let source = |batches: usize| -> TaskBatchStream {
             futures::stream::iter(
@@ -5962,6 +6751,7 @@ mod tests {
             buffered_bytes: 0,
             oversized: false,
             insert_done: false,
+            charge: PopulationCharge::open(),
         };
 
         let recorder = DebuggingRecorder::new();
