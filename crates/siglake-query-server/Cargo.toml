@@ -65,6 +65,14 @@ siglake-ingest = { workspace = true }
 # raced. Dev-only under resolver 2, so the shipped binaries keep the real clock.
 tokio = { workspace = true, features = ["test-util"] }
 metrics-util = "0.20"
+# The trace-propagation test drives the real SDK: it installs a tracer provider
+# with a recording exporter and the tracing bridge, so both halves of the hop
+# land in one exporter.
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+# Only the OTel-off cost measurement still needs tower-http: it compares the new
+# middleware against the `TraceLayer` it replaced on this router.
+tower-http = { workspace = true }
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "gen-tonic-messages", "trace", "with-serde"] }
 rcgen = "0.13"
 tempfile = "3"

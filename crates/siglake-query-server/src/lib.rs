@@ -1539,3 +1539,90 @@ mod warm_probe_timeout_tests {
         assert_eq!(warm_probe_timeout_from(Some("invalid")).as_secs(), 30);
     }
 }
+
+#[cfg(test)]
+mod otel_disabled_cost_tests {
+    use std::time::Instant;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::util::ServiceExt;
+
+    use super::otel_http_trace;
+
+    /// What the OTel-off path costs per request, measured rather than asserted.
+    ///
+    /// The claim on PR #7 was that telemetry costs nothing when it is off. It
+    /// does not cost nothing: `otel_http_trace` runs on every request whatever
+    /// the configuration — it clones the method, allocates the path `String`,
+    /// asks the global propagator to extract (a no-op propagator when
+    /// `telemetry::init` installed none), and creates a `tracing` span that no
+    /// subscriber is listening to. This measures that residue against the same
+    /// handler without the layer, arms interleaved because a single pass on a
+    /// loaded box varies several-fold between minutes.
+    ///
+    /// `#[ignore]`d: it is a measurement, not a bound. A wall-clock ratio
+    /// asserted in CI measures the scheduler.
+    ///
+    /// Run with:
+    ///   cargo test -p siglake-query-server --lib otel_disabled_path_cost \
+    ///     -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "measurement, not a bound"]
+    async fn otel_disabled_path_cost() {
+        const REQUESTS: usize = 2_000;
+        const PAIRS: usize = 5;
+
+        let bare = Router::new().route("/healthz", get(|| async { StatusCode::OK }));
+        // What this router carried before PR #7: tower-http's per-request span.
+        let previous = Router::new()
+            .route("/healthz", get(|| async { StatusCode::OK }))
+            .layer(tower_http::trace::TraceLayer::new_for_http());
+        let layered = Router::new()
+            .route("/healthz", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn(otel_http_trace));
+
+        async fn hammer(app: &Router, n: usize) -> f64 {
+            let start = Instant::now();
+            for _ in 0..n {
+                let req = Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .expect("request");
+                let resp = app.clone().oneshot(req).await.expect("response");
+                assert_eq!(resp.status(), StatusCode::OK);
+            }
+            start.elapsed().as_secs_f64() * 1e9 / n as f64
+        }
+
+        // Warm every arm; the first pass pays for lazy initialization.
+        hammer(&bare, REQUESTS).await;
+        hammer(&previous, REQUESTS).await;
+        hammer(&layered, REQUESTS).await;
+
+        let mut vs_bare = Vec::new();
+        let mut vs_previous = Vec::new();
+        for pair in 0..PAIRS {
+            let bare_ns = hammer(&bare, REQUESTS).await;
+            let previous_ns = hammer(&previous, REQUESTS).await;
+            let layered_ns = hammer(&layered, REQUESTS).await;
+            println!(
+                "pair {pair}: bare {bare_ns:.0}, TraceLayer {previous_ns:.0}, \
+                 otel_http_trace {layered_ns:.0} ns/req"
+            );
+            vs_bare.push(layered_ns - bare_ns);
+            vs_previous.push(layered_ns - previous_ns);
+        }
+        vs_bare.sort_by(f64::total_cmp);
+        vs_previous.sort_by(f64::total_cmp);
+        println!(
+            "otel-off cost over {PAIRS} pairs of {REQUESTS} requests: \
+             median {:+.0} ns/req vs no layer, {:+.0} ns/req vs the TraceLayer \
+             this replaced",
+            vs_bare[PAIRS / 2],
+            vs_previous[PAIRS / 2]
+        );
+    }
+}
