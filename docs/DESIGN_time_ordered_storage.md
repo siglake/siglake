@@ -140,7 +140,7 @@ tables remain open.
   ingest) is still healed by BIG-1 re-clustering — this change makes re-clustering
   *consistent* with the initial write, not redundant.
 - **Time-ordered query *results*** still require the coordinator/scan merge (the
-  deferred `ORDER BY` follow-on / Splunk reverse-time default). This is the
+  deferred `ORDER BY` follow-on / reverse-time default). This is the
   storage foundation that makes an ordered scan cheap (sorted files + tight
   row-group bounds + declared `SortingColumn`), but parallel scans still need a
   merge to present globally-ordered output.

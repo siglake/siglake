@@ -1,10 +1,11 @@
 //! `Bearer` is the only accepted authorization scheme.
 //!
-//! `Splunk <token>` used to be accepted alongside it — a leftover from the HEC
-//! ingest surface removed in 2026-06. Once the protocol was OTLP it bought
-//! nothing (no OTLP client sends it) while widening the credential shapes the
-//! ingest path accepts, and it was covered by no test at all: the acceptance
-//! was untested, so the removal would have been too.
+//! A second, vendor-specific `<Scheme> <token>` form used to be accepted
+//! alongside it — left over from the HTTP event-collector compatibility
+//! surface removed in 2026-06. Once the protocol was OTLP it bought nothing
+//! (no OTLP client sends it) while widening the credential shapes the ingest
+//! path accepts, and it was covered by no test at all: the acceptance was
+//! untested, so the removal would have been too.
 //!
 //! The removal breaks nothing that shipped — 0.1.0 is unreleased, with no tag
 //! and no published image.
@@ -83,14 +84,16 @@ async fn bearer_is_accepted() {
     );
 }
 
-/// Against the old code this test FAILS with 200: the same token under a
-/// `Splunk` scheme authenticated just as well as under `Bearer`.
+/// `Bearer` is the whole of the accepted scheme set: a valid token under any
+/// other scheme is refused. The removed second scheme is one instance of this
+/// rule; the case below uses a neutral scheme name so the test states the rule
+/// rather than re-litigating the one scheme that carried it.
 #[tokio::test]
-async fn the_splunk_scheme_is_refused_even_with_a_valid_token() {
+async fn a_non_bearer_scheme_is_refused_even_with_a_valid_token() {
     let tmp = tempfile::tempdir().unwrap();
     let app = app(&tmp.path().join("wal"));
     assert_eq!(
-        post_with_auth(&app, &format!("Splunk {TOKEN}")).await,
+        post_with_auth(&app, &format!("Token {TOKEN}")).await,
         StatusCode::UNAUTHORIZED,
         "only Bearer is an accepted scheme; a valid token under any other must not authenticate"
     );

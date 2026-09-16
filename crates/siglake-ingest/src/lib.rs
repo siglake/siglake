@@ -117,15 +117,14 @@ impl Drop for InFlightGuard {
 /// stalls (network blips, GC pauses) without bloating ingester memory.
 pub const STREAM_BROADCAST_CAPACITY: usize = 1024;
 
-/// Tenant identifier carried alongside accepted HEC tokens. The
+/// Tenant identifier carried alongside accepted ingest tokens. The
 /// ingester routes each accepted request to a per-tenant
 /// [`WalWriter`] under `<wal-root>/<tenant>/`; the compactor then
 /// commits each tenant's segments to its own Iceberg namespace.
 ///
 /// `DEFAULT_TENANT` is the fallback for token configurations that
-/// don't set a tenant (e.g. legacy `--hec-tokens t1,t2,t3` syntax)
-/// and for open-mode (no auth) deployments. Matches the historical
-/// single-tenant behavior.
+/// don't set a tenant and for open-mode (no auth) deployments.
+/// Matches the historical single-tenant behavior.
 pub const DEFAULT_TENANT: &str = "default";
 
 /// Where an ingester takes the tenant from when no verified claim supplies it.
@@ -731,7 +730,7 @@ impl TenantAdmission {
     }
 }
 
-/// State shared across HEC handlers.
+/// State shared across the ingest handlers.
 #[derive(Clone)]
 pub struct AppState {
     /// Default (single-tenant fallback) writer. Always used when
@@ -775,7 +774,7 @@ pub struct AppState {
     /// concurrent request decide against one count.
     pub tenant_admission: TenantAdmission,
     /// Optional mpsc-fed per-tenant writer router (Phase 4.12.14).
-    /// When `Some`, HEC handlers route through here instead of
+    /// When `Some`, the ingest handlers route through here instead of
     /// `tenants` / `writer`. The handler `try_send`s into a bounded
     /// channel and returns 503 + `Retry-After` on backpressure
     /// rather than blocking on a per-tenant `Mutex<WalWriter>`. Opt-in;
@@ -784,7 +783,7 @@ pub struct AppState {
     /// Broadcast channel used by SSE subscribers. Optional so callers
     /// (notably unit tests) can opt out of the streaming machinery.
     pub events_tx: Option<broadcast::Sender<StreamedEvent>>,
-    /// HEC token allow-list. `None` ⇒ no auth (the v0 default).
+    /// Ingest token allow-list. `None` ⇒ no auth (the v0 default).
     pub tokens: Option<Arc<AuthTokens>>,
     /// OIDC verifier. When `Some`, every request must carry a valid JWT
     /// signed by the configured issuer. Takes precedence over `tokens`.
@@ -855,7 +854,7 @@ impl AppState {
     }
 
     /// Enable the mpsc-fed backpressure-aware writer path. When set,
-    /// HEC handlers route every accepted batch through this
+    /// the ingest handlers route every accepted batch through this
     /// [`backpressure::BackpressureRouter`] instead of locking
     /// `Mutex<WalWriter>`. A full lane returns 503 + `Retry-After`,
     /// rather than queueing behind the mutex until memory pressure
@@ -911,7 +910,7 @@ impl AppState {
     }
 
     /// Resolve a request to its writer + tenant identifier. Used by
-    /// the HEC handlers: per-tenant mode looks the tenant up in
+    /// the ingest handlers: per-tenant mode looks the tenant up in
     /// [`TenantWalRouter`]; single-tenant mode returns the default
     /// writer.
     pub async fn writer_for_request(
@@ -951,7 +950,7 @@ impl AppState {
 }
 
 /// Set on each request's `axum::Extension` by the auth middleware.
-/// The HEC handlers read it back to pick the right tenant writer.
+/// The ingest handlers read it back to pick the right tenant writer.
 #[derive(Clone, Debug)]
 pub struct ResolvedTenant(pub String);
 
@@ -1142,7 +1141,7 @@ pub fn router(state: AppState) -> Router {
         // `route_layer` here runs first per request.
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            hec_rate_limit_middleware,
+            ingest_rate_limit_middleware,
         ));
 
     // Body cap: axum's 2 MB default rejects normal shipper batches with 413
@@ -1162,11 +1161,11 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Token-bucket rate-limit middleware. Keys by the `Authorization`
-/// token if present (so each HEC token gets its own budget); otherwise
+/// token if present (so each ingest token gets its own budget); otherwise
 /// keys by `X-Forwarded-For` (most ingester deployments sit behind an
 /// LB); otherwise lumps anonymous callers into a single bucket. On
 /// throttle returns `429` with a `Retry-After` header.
-async fn hec_rate_limit_middleware(
+async fn ingest_rate_limit_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
@@ -1516,7 +1515,7 @@ async fn ingest_auth_middleware(
 /// to complete, then returns. The caller (CLI) is responsible for
 /// draining any `BackpressureRouter` *after* this returns — the
 /// router owns per-tenant writer tasks whose mpsc senders must
-/// drop *only* once every HEC handler has finished handing off
+/// drop *only* once every ingest handler has finished handing off
 /// its batch.
 pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
@@ -2769,10 +2768,11 @@ fn resolve_traces_index_value(raw: Option<&str>, source: &str) -> Result<String,
 
 /// `Bearer <token>` only.
 ///
-/// `Splunk <token>` used to be accepted alongside it, a leftover from the HEC
-/// ingest surface that was removed in 2026-06. It bought nothing once the
-/// protocol was OTLP — no OTLP client sends it — while widening the accepted
-/// credential shapes on the ingest path, and it was covered by no test at all.
+/// A second, vendor-specific `<Scheme> <token>` form used to be accepted
+/// alongside it, left over from the HTTP event-collector compatibility surface
+/// removed in 2026-06. It bought nothing once the protocol was OTLP — no OTLP
+/// client sends it — while widening the accepted credential shapes on the
+/// ingest path, and it was covered by no test at all.
 /// Nothing has shipped that accepted it: 0.1.0 is unreleased.
 fn extract_bearer_token(raw: &str) -> Option<&str> {
     raw.strip_prefix("Bearer ")
@@ -3476,7 +3476,7 @@ async fn get_es_root() -> Json<EsRootInfo> {
             claim, a resolved tenant outside `--allowed-tenants`, or a novel tenant \
             past `--max-tenants` — even though this \
             route ignores which tenant is named. No body."),
-        (status = 429, description = "Rate limited. `hec_rate_limit_middleware` wraps \
+        (status = 429, description = "Rate limited. `ingest_rate_limit_middleware` wraps \
             every ingest route and runs ahead of even the auth check, so this probe \
             is throttled like any other request. No body — `retry-after` carries the \
             only part a `HEAD` caller could have read anyway.",
@@ -3510,7 +3510,7 @@ async fn head_es_root() -> StatusCode {
             past `--max-tenants` — even though this \
             route ignores which tenant is named. Body is the siglake `{text, code}` \
             envelope, not an ES-shaped body.", body = SiglakeErrorBody),
-        (status = 429, description = "Rate limited. `hec_rate_limit_middleware` wraps \
+        (status = 429, description = "Rate limited. `ingest_rate_limit_middleware` wraps \
             every ingest route, this readiness gate included, and runs ahead of even \
             the auth check — so a shipper that polls health hard enough is throttled \
             here, before it has sent a single event.", body = RateLimitBody,
@@ -3545,7 +3545,7 @@ async fn get_es_cluster_health() -> Json<EsClusterHealth> {
             past `--max-tenants` — even though this \
             route ignores which tenant is named. Body is the siglake `{text, code}` \
             envelope, not an ES-shaped body.", body = SiglakeErrorBody),
-        (status = 429, description = "Rate limited. `hec_rate_limit_middleware` wraps \
+        (status = 429, description = "Rate limited. `ingest_rate_limit_middleware` wraps \
             every ingest route, this readiness gate included, and runs ahead of even \
             the auth check — so a shipper that polls health hard enough is throttled \
             here, before it has sent a single event.", body = RateLimitBody,
@@ -3566,7 +3566,7 @@ async fn get_es_cluster_health_compat() -> Json<EsClusterHealth> {
 // `501` is not the only answer these can give. They sit behind the same two
 // layers as every other ingest route, so `400` for a bad `X-Scope-OrgID`, `403`
 // for a refused tenant, `401` for missing credentials (`ingest_auth_middleware`)
-// and `429` when throttled (`hec_rate_limit_middleware`, which runs first of
+// and `429` when throttled (`ingest_rate_limit_middleware`, which runs first of
 // all) all land before the stub runs, in the siglake envelope rather than the ES
 // one. That used to be spelled out per operation in the spec; the routes are now
 // undocumented (see `es_read_stubs`), so it is stated here instead.

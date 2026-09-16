@@ -775,7 +775,7 @@ ingester:
   replicas: 3
   auth:
     existingSecret: acme-ingest-tokens
-    secretKey: hec
+    secretKey: ingest-tokens
 compactor:
   replicas: 2
   resources:
@@ -814,7 +814,7 @@ query:
             .as_ref()
             .expect("ingester auth secret must survive adoption");
         assert_eq!(auth.name, "acme-ingest-tokens");
-        assert_eq!(auth.key, "hec");
+        assert_eq!(auth.key, "ingest-tokens");
 
         // The PVC applies FIRST and a shrink is rejected, failing the whole
         // reconcile — so these must match the chart, not the CR defaults.
@@ -1626,7 +1626,7 @@ query:
     #[test]
     fn the_supported_ingest_secret_reference_still_maps() {
         let report = adopt(&values_with(
-            "ingester:\n  auth:\n    existingSecret: acme-ingest-tokens\n    secretKey: hec\n    list: [ignored-by-the-chart]\n",
+            "ingester:\n  auth:\n    existingSecret: acme-ingest-tokens\n    secretKey: ingest-tokens\n    list: [ignored-by-the-chart]\n",
         ));
         let auth = report
             .cluster
@@ -1635,7 +1635,7 @@ query:
             .as_ref()
             .expect("the reference must survive adoption");
         assert_eq!(auth.name, "acme-ingest-tokens");
-        assert_eq!(auth.key, "hec");
+        assert_eq!(auth.key, "ingest-tokens");
         assert!(
             !report
                 .findings

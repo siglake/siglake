@@ -10,7 +10,7 @@
 //! the whole record: a stub that answers `501` to everyone still answers `401`
 //! to a caller without credentials.
 //!
-//! The layer ORDER is part of it. `hec_rate_limit_middleware` is applied after
+//! The layer ORDER is part of it. `ingest_rate_limit_middleware` is applied after
 //! `ingest_auth_middleware` in `router()` and axum runs `route_layer`s
 //! bottom-up, so the rate limiter sees the request first — a throttled caller
 //! gets `429` even when it sent no credentials at all, which is what the `429`

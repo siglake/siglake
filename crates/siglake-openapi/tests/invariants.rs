@@ -281,7 +281,7 @@ fn tenant_header_declaration_is_exact() {
 ///
 /// `ingest_auth_middleware` validates credentials, `X-Scope-OrgID` and the JWT
 /// tenant claim ahead of *every* route in `ingest_routes()`, not just the
-/// tenant-consuming ones, and `hec_rate_limit_middleware` is a `route_layer`
+/// tenant-consuming ones, and `ingest_rate_limit_middleware` is a `route_layer`
 /// over the same router that runs ahead of even the auth check. So a shipper
 /// that only ever calls `GET /` or `/_cluster/health` can be answered `400` over
 /// a header it never knew was inspected, `401` on a path that looks anonymous,
