@@ -117,6 +117,15 @@ HISTOGRAM_QUANTILE = "histogram_quantile("
 # `metrics::histogram!` as a Prometheus summary unless the recorder was handed
 # buckets for its name; `builder()` here is the one place that hands them out.
 METRICS_RS = pathlib.Path("crates/siglake-core/src/metrics.rs")
+# The owned forks emit `siglake_*` metrics that ship in the same binaries as
+# `crates/`: the Iceberg fork's reader owns the text-index and object-store read
+# families. Read alongside `crates/` so a panel over one of them is not
+# mistaken for a rename.
+METRIC_FORK_ROOTS = (
+    pathlib.Path("third_party/iceberg/src"),
+    pathlib.Path("third_party/iceberg-catalog-sql/src"),
+    pathlib.Path("third_party/iceberg-storage-opendal/src"),
+)
 MACRO = re.compile(r'metrics::(gauge|counter|histogram)!\(\s*"([a-z0-9_]+)"', re.S)
 COUNT_HISTOGRAMS = re.compile(
     r"pub const COUNT_HISTOGRAMS:\s*&\[&str\]\s*=\s*&\[(.*?)\];", re.S
@@ -1850,7 +1859,8 @@ def metric_problems(expr: str, exported: "Exported") -> list[str]:
             suffix = name[len(base) + 1 :] or None
             if base not in exported.kinds:
                 problems.append(
-                    f"references '{name}', which no metrics:: macro in crates/ emits"
+                    f"references '{name}', which no metrics:: macro in crates/ or the owned "
+                    f"forks emits"
                 )
                 continue
         form = exported.form(base)
@@ -1980,10 +1990,61 @@ def check_dashboard(path: pathlib.Path, exported: "Exported") -> list[str]:
                 f"{path}: {where} reads siglake_query_breaker_trips_total without "
                 f"grouping by `breaker`, so the panel cannot say WHICH limit refused"
             )
+
+    # The same rule for the text-index startup families (#3969): each one exists
+    # to say WHICH stage, outcome or bound is responsible, and a panel that
+    # matched on the dimension instead of grouping by it would answer a question
+    # the operator already knew the answer to — and would go silent when the
+    # reader's vocabulary grows.
+    for metric, dimension in TEXT_INDEX_GROUPINGS.items():
+        for where, expr in dashboard_exprs(dashboard):
+            if metric not in expr:
+                continue
+            if re.search(rf"{metric}[a-z_]*\s*\{{[^}}]*\b{dimension}\s*(=|=~|!=|!~)", expr):
+                problems.append(
+                    f"{path}: {where} filters {metric} on `{dimension}`, so a new "
+                    f"`{dimension}` value is invisible until someone edits the "
+                    f"dashboard; group `by ({dimension})` instead"
+                )
+            elif not re.search(rf"by\s*\(\s*[^)]*\b{dimension}\b[^)]*\)", expr):
+                problems.append(
+                    f"{path}: {where} reads {metric} without grouping by "
+                    f"`{dimension}`, so the panel cannot say WHICH `{dimension}` the "
+                    f"number belongs to"
+                )
     return problems
 
 
 OVERVIEW_DASHBOARD = DASHBOARD_DIR / "siglake-overview.json"
+# #3969's text-index families and the dimension each panel must GROUP BY rather
+# than match on: the stage of a per-file index load, the parsed-index cache's
+# lookup outcome, and which bound dropped an entry. The vocabularies are the
+# reader's, exported from the Iceberg fork
+# (`TEXT_INDEX_STARTUP_STAGES`, `PARSED_INDEX_CACHE_OUTCOMES`,
+# `PARSED_INDEX_CACHE_DROP_REASONS`) and held to these panels by
+# `text_index_startup_series_are_preregistered` in siglake-storage.
+TEXT_INDEX_GROUPINGS = {
+    "siglake_iceberg_text_index_startup_seconds": "stage",
+    "siglake_iceberg_parsed_index_cache_lookups_total": "outcome",
+    "siglake_iceberg_parsed_index_cache_evictions_total": "reason",
+}
+# "Text-index startup by stage (p50 / p99)".
+TEXT_INDEX_STARTUP_PANEL = 159
+# A two-stage classic histogram, one stage recorded under both storage forms.
+# `(stage, storage) -> [(le, observations)]`, cumulative as Prometheus expects.
+# The quantiles below are the linear interpolation within the bucket that holds
+# them (`lower + (upper - lower) * q`, with the lowest bucket's lower bound at
+# 0), which is what `histogram_quantile` computes for a classic histogram:
+# `decode` sits in (0.05, 0.5] and `permit_wait` in (0, 0.0025].
+TEXT_INDEX_STARTUP_SERIES = {
+    ("decode", "puffin"): [("0.05", 0), ("0.5", 20), ("+Inf", 20)],
+    ("decode", "footer_kv"): [("0.05", 0), ("0.5", 10), ("+Inf", 10)],
+    ("permit_wait", "puffin"): [("0.0025", 30), ("0.05", 30), ("+Inf", 30)],
+}
+TEXT_INDEX_STARTUP_EXPECTED = {
+    "0.50": {"decode": 0.05 + (0.5 - 0.05) * 0.5, "permit_wait": 0.0025 * 0.5},
+    "0.99": {"decode": 0.05 + (0.5 - 0.05) * 0.99, "permit_wait": 0.0025 * 0.99},
+}
 # "Drain backlog (segments + bytes)".
 DRAIN_BACKLOG_PANEL = 111
 # Two clusters' worth of `siglake_compactor_sealed_pending*` series, as
@@ -2155,6 +2216,121 @@ def check_drain_backlog_panel(require_promtool: bool = False) -> tuple[list[str]
     return [], False
 
 
+def text_index_startup_exprs(dashboard: dict) -> dict[str, str]:
+    """Panel 159's expressions, keyed by the quantile each one takes.
+
+    Read from the shipped panel rather than copied, so the fixture below
+    evaluates what an operator imports.
+    """
+    out: dict[str, str] = {}
+    for panel in dashboard_panels(dashboard):
+        if panel.get("id") != TEXT_INDEX_STARTUP_PANEL:
+            continue
+        for target in panel.get("targets") or []:
+            expr = target.get("expr")
+            if not isinstance(expr, str):
+                continue
+            if "siglake_iceberg_text_index_startup_seconds_bucket" not in expr:
+                continue
+            found = re.search(r"histogram_quantile\(\s*([0-9.]+)", expr)
+            if found:
+                out.setdefault(f"{float(found.group(1)):.2f}", expr)
+    return out
+
+
+def text_index_startup_fixture(exprs: dict[str, str]) -> str:
+    """A `promtool test rules` file over panel 159's quantile expressions.
+
+    The fixture records `decode` under both storage forms and `permit_wait`
+    under one, in different buckets. One sample per STAGE with the storage forms
+    summed is the reading the panel is for: an expression that dropped `le` from
+    the grouping returns nothing, one that kept `storage` returns three samples
+    with a `storage` label, and one that grouped by neither collapses two very
+    different stages into one line.
+    """
+    out = "evaluation_interval: 1m\ntests:\n"
+    for quantile, expr in sorted(exprs.items()):
+        out += f"  - name: text-index startup p{quantile}\n    interval: 1m\n"
+        out += "    input_series:\n"
+        for (stage, storage), buckets in sorted(TEXT_INDEX_STARTUP_SERIES.items()):
+            for le, observations in buckets:
+                out += (
+                    f"      - series: 'siglake_iceberg_text_index_startup_seconds_bucket"
+                    f'{{namespace="logs",app_kubernetes_io_instance="siglake",'
+                    f'app_kubernetes_io_component="query-server",pod="query-server-0",'
+                    f'stage="{stage}",storage="{storage}",le="{le}"}}\'\n'
+                    f"        values: '0+{observations}x6'\n"
+                )
+        out += "    promql_expr_test:\n"
+        out += f"      - expr: '{expr.replace('$namespace', '.*')}'\n"
+        out += "        eval_time: 6m\n        exp_samples:\n"
+        for stage, value in sorted(TEXT_INDEX_STARTUP_EXPECTED[quantile].items()):
+            out += (
+                f"          - labels: '{{stage=\"{stage}\"}}'\n"
+                f"            value: {value}\n"
+            )
+    return out
+
+
+def check_text_index_startup_panel(require_promtool: bool = False) -> tuple[list[str], bool]:
+    """Evaluate panel 159's quantile expressions with Prometheus' own engine.
+
+    `check_dashboard` holds the panel to a metric the source emits and to
+    grouping by `stage`; this one says the quantile arithmetic reads one number
+    per stage out of a fleet's buckets. It is the half of #3969's acceptance
+    that a structural check cannot cover: the whole point of the panel is to
+    separate `decode` from `permit_wait`, and an expression that quietly folds
+    them together looks like a working chart.
+
+    Returns (problems, skipped); a box without promtool skips unless
+    `require_promtool`.
+    """
+    try:
+        dashboard = json.loads(OVERVIEW_DASHBOARD.read_text())
+    except (OSError, ValueError) as e:
+        return [f"{OVERVIEW_DASHBOARD}: not readable as JSON ({e})"], False
+    exprs = text_index_startup_exprs(dashboard)
+    missing = sorted(set(TEXT_INDEX_STARTUP_EXPECTED) - set(exprs))
+    if missing:
+        return [
+            f"{OVERVIEW_DASHBOARD}: panel {TEXT_INDEX_STARTUP_PANEL} no longer takes "
+            f"quantile(s) {', '.join(missing)} over "
+            f"siglake_iceberg_text_index_startup_seconds_bucket; re-point "
+            f"TEXT_INDEX_STARTUP_EXPECTED rather than leaving this check evaluating "
+            f"nothing"
+        ], False
+    for quantile, expr in exprs.items():
+        if "'" in expr:
+            return [
+                f"{OVERVIEW_DASHBOARD}: the p{quantile} expression needs YAML escaping"
+            ], False
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = pathlib.Path(tmp_dir)
+        name = "text-index-startup.test.yaml"
+        (tmp_path / name).write_text(text_index_startup_fixture(exprs))
+        try:
+            subprocess.run(
+                ["promtool", "test", "rules", name],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=tmp_path,
+            )
+        except FileNotFoundError:
+            problem = (
+                "promtool not installed; the text-index startup panel expressions "
+                "were not evaluated"
+            )
+            return ([problem] if require_promtool else []), True
+        except subprocess.CalledProcessError as e:
+            output = "\n".join(s for s in (e.stdout.strip(), e.stderr.strip()) if s)
+            return [
+                f"{OVERVIEW_DASHBOARD}: panel {TEXT_INDEX_STARTUP_PANEL} does not read "
+                f"one latency per stage:" + (f"\n{output}" if output else "")
+            ], False
+    return [], False
+
+
 def check_dashboards(exported: "Exported | None" = None) -> tuple[int, list[str]]:
     """Check every dashboard under deploy/grafana; returns (count, problems)."""
     if exported is None:
@@ -2224,7 +2400,8 @@ class PreregistrationRuleError(Exception):
 
 @dataclasses.dataclass(frozen=True)
 class Exported:
-    """Every metric crates/ emits, and the form the exporter renders it in.
+    """Every metric the shipped Rust source emits, and the form the exporter
+    renders it in.
 
     `kinds` maps a name to the macro(s) that record it. A `metrics::histogram!`
     renders as a true Prometheus histogram (`_bucket` / `_sum` / `_count`, no
@@ -2277,20 +2454,32 @@ class Exported:
         return out
 
     @classmethod
-    def load(cls, root: pathlib.Path = pathlib.Path("crates")) -> "Exported":
+    def load(
+        cls,
+        root: pathlib.Path = pathlib.Path("crates"),
+        extra_roots: tuple[pathlib.Path, ...] = METRIC_FORK_ROOTS,
+    ) -> "Exported":
         """Read the macros under `root` and the bucket rule from metrics.rs.
 
         No `root` at all (run from another directory) yields an empty catalog
         and the metric checks skip, as they always have. A `root` whose
         metrics.rs cannot be read the way this script reads it raises
         ExpositionRuleError instead.
+
+        `extra_roots` are the owned forks under `third_party/`, which emit
+        `siglake_*` metrics of their own — the whole text-index and
+        object-store read families live in the Iceberg fork's reader. They ship
+        in the same binaries as `crates/`, so a dashboard may read them and a
+        binary may pre-register them; leaving them out made every one of those
+        series look like a rename to `check_dashboard` (#3969).
         """
         if not root.is_dir():
             return cls({})
         kinds: dict[str, set[str]] = {}
         series: dict[str, set[frozenset[tuple[str, str]]]] = {}
         dynamic: set[str] = set()
-        for path in root.rglob("*.rs"):
+        sources = [root, *(extra for extra in extra_roots if extra.is_dir())]
+        for path in [p for source in sources for p in source.rglob("*.rs")]:
             if "/tests/" in str(path):
                 continue
             try:
@@ -2490,7 +2679,7 @@ def check_preregistered(exported: "Exported", catalog: Preregistered) -> list[st
         if "counter" not in exported.kinds.get(name, ()):
             problems.append(
                 f"{METRICS_RS} lists '{name}' for pre-registration, but no "
-                f"metrics::counter! in crates/ emits it"
+                f"metrics::counter! in crates/ or the owned forks emits it"
             )
     for name in sorted(catalog.unregisterable):
         if name in exported.kinds and name not in exported.counter_dynamic:
@@ -2504,7 +2693,7 @@ def check_preregistered(exported: "Exported", catalog: Preregistered) -> list[st
                 continue
             shown = ",".join(f'{k}="{v}"' for k, v in sorted(labels))
             problems.append(
-                f"crates/ records {name}{{{shown}}}, a series {METRICS_RS} does not "
+                f"the source records {name}{{{shown}}}, a series {METRICS_RS} does not "
                 f"pre-register: add that label set to its AlertedCounter entry"
             )
     return problems
@@ -2580,7 +2769,8 @@ def source_checks(
         if exported:
             forms = exported.histograms()
             print(
-                f"ok   [metrics] {len(exported.kinds)} names emitted under crates/; "
+                f"ok   [metrics] {len(exported.kinds)} names emitted under crates/ and "
+                f"the owned forks; "
                 f"{len(forms['histogram'])} histograms bucketed, "
                 f"{len(forms['summary'])} rendered as summaries, per {METRICS_RS}",
                 flush=True,
@@ -2654,15 +2844,19 @@ def source_checks(
     count, problems = check_dashboards(exported)
     panel_problems, panel_skipped = check_drain_backlog_panel(require_promtool)
     problems.extend(panel_problems)
+    startup_problems, startup_skipped = check_text_index_startup_panel(require_promtool)
+    problems.extend(startup_problems)
+    panel_skipped = panel_skipped or startup_skipped
     if problems:
         failed = True
         for p in problems:
             print(f"FAIL [dashboard] {p}", file=sys.stderr)
     else:
         panel_result = (
-            "; drain-backlog panel skipped (promtool not installed)"
+            "; panel expressions skipped (promtool not installed)"
             if panel_skipped
-            else f"; panel {DRAIN_BACKLOG_PANEL} passed promtool"
+            else f"; panels {DRAIN_BACKLOG_PANEL} and {TEXT_INDEX_STARTUP_PANEL} "
+            f"passed promtool"
         )
         print(
             f"ok   [dashboard] {count} dashboard(s) under {DASHBOARD_DIR}{panel_result}",

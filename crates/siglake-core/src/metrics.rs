@@ -506,6 +506,38 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
         name: "siglake_wal_partial_tail_dropped_total",
         series: UNLABELLED,
     },
+    // #3969's "Text-index startup" panels. Neither counter is alerted on; they
+    // are here for the other half of the pre-registration argument — a panel
+    // over a series that does not exist yet renders "No data", which reads the
+    // same as a healthy pod. A query tier serving no text query yet has to
+    // chart a flat zero, because the reading these panels exist for is a
+    // CHANGE: run #78's `keyword_and_label` plan held 4.1 GB of parsed index
+    // against the 1 GiB default and 91 of 156 partitions started cold, which
+    // shows up here as an eviction rate that climbs away from zero.
+    //
+    // Both are recorded from the Iceberg fork with variable label values
+    // (`iceberg::arrow`'s `PARSED_INDEX_CACHE_OUTCOMES`,
+    // `TEXT_INDEX_STORAGE_FORMS` and `PARSED_INDEX_CACHE_DROP_REASONS`), so
+    // check-chart.py sees dynamic sites and cannot hold this catalog to them;
+    // `text_index_startup_series_are_preregistered` in siglake-storage does,
+    // against those exported vocabularies.
+    AlertedCounter {
+        name: "siglake_iceberg_parsed_index_cache_lookups_total",
+        series: &[
+            &[("outcome", "hit"), ("storage", "puffin")],
+            &[("outcome", "miss"), ("storage", "puffin")],
+            &[("outcome", "hit"), ("storage", "footer_kv")],
+            &[("outcome", "miss"), ("storage", "footer_kv")],
+        ],
+    },
+    AlertedCounter {
+        name: "siglake_iceberg_parsed_index_cache_evictions_total",
+        series: &[
+            &[("reason", "byte_bound")],
+            &[("reason", "entry_bound")],
+            &[("reason", "oversized")],
+        ],
+    },
 ];
 
 /// Counters an `increase()` alert reads that no binary can pre-register,

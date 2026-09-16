@@ -219,13 +219,20 @@ remains a no-op.
 
 `Reader::inverted_index_row_selection` (in the vendored `arrow/reader.rs`):
 for a normalizable `raw LIKE '%substr%'`, loads the blob, `rows_containing`, and
-builds a `RowSelection` of the candidate rows by **reusing
-`build_deletes_row_selection` with the complement** as the delete set — so the
-file-physical ordinals map onto the surviving row groups with no bespoke
-arithmetic. The selection is a superset (the engine's `FilterExec` re-checks the
-exact `LIKE` above the scan), intersected with any predicate/delete selection.
+builds a `RowSelection` over the matching file-physical ordinals — one run per
+matching stretch within each selected row group (`row_selection_runs`), in the
+same shape `build_deletes_row_selection` produces for a delete vector, which is
+what this reused with the complement until #3896. The selection is a superset
+(the engine's `FilterExec` re-checks the exact `LIKE` above the scan),
+intersected with any predicate/delete selection.
 Metric `siglake_iceberg_inverted_index_used_total` + selected/file-row
-histograms. Differential storage test
+histograms, and — since #3969 —
+`siglake_iceberg_text_index_startup_seconds{stage,storage}` around the four
+sections of that work separately (`permit_wait`, `blob_fetch`, `decode`,
+`selection`), with the parsed-index cache's lookup outcomes and eviction
+reasons beside it. One total could not say which section a regression was in:
+run #73 measured about 30 ns per file row before a first batch and the round's
+artifacts could not attribute it. Differential storage test
 (`tests/inverted_index.rs`) asserts ground-truth-correct counts across
 answerable substrings, fragments, absent terms, a delimiter-bearing fallback,
 and a dimensional-predicate intersection, with many row groups + bloom-skip

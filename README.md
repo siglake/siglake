@@ -139,7 +139,11 @@ written down.
   predicate under a `LIMIT` — ordered or bare — reads a sliver of the first
   file and would pay a whole file's postings to do it, so it stays on the scan
   path, while an unclipped text scan keeps the index. A missing or declined
-  index costs pruning, never correctness
+  index costs pruning, never correctness. What a text query spends before its
+  first batch is attributable per stage rather than as one number:
+  `siglake_iceberg_text_index_startup_seconds{stage}` separates the load queue
+  from the blob read, the decode and the selection, and the parsed-index
+  cache reports its lookup outcomes beside the bound that dropped an entry
   ([`docs/DESIGN_inverted_index.md`](docs/DESIGN_inverted_index.md),
   [`docs/DESIGN_raw_content_index.md`](docs/DESIGN_raw_content_index.md)).
 - **Exact aggregates without scans, or the exact scan.** Whole-table and
