@@ -2,7 +2,7 @@
 
 ## 0.1.1
 
-Ten changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
+Eleven changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
 surface moves, and a 0.1.0 warehouse is read and written unchanged: one values
 key and five environment knobs are added, and no flag or values key is removed.
 Two defaults move. The audit worker now gives each append 30 s instead of
@@ -157,6 +157,22 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   `siglake_compactor_segments_poisoned{tenant}` levels them, and
   `SiglakeSegmentsQuarantined` now fires on either drain's held-back segments
   (still 34 alerts). (#3143)
+- **Drain**: a pass that keeps failing no longer re-claims the same segments
+  until its cycle budget runs out. Each drain pass now spends at most three
+  claims on a segment and then leaves it in `sealed/` for the next cycle; the
+  segments a pass has not tried, including ones sealed while it ran, are
+  claimed as before. A failed batch was released back to `sealed/` and handed
+  straight back by the re-list, so a cause that fails fast and names no
+  segment — a recurring catalog conflict, a store refusing writes, an
+  unreadable segment on a build with `SIGLAKE_COMPACTOR_POISON_ATTEMPTS=0` —
+  cost a rename and two fsyncs per segment each way, as fast as the failure
+  returned, for the whole 30 s default budget: 17,502 claims over two segments
+  in one measured pass, against the 3 it now makes. Same-cycle retry of a
+  transient failure is unchanged, and so is the cross-cycle accounting behind
+  the `poison/` set-aside — the per-pass bound is not a verdict on a segment
+  and is forgotten at the end of the pass. A withheld segment is counted by
+  `siglake_compactor_pass_claim_attempts_exhausted_total{tenant}`. No setting,
+  default or durability boundary moves. (#4651)
 - **Query audit**: an audit append now has 30 s to finish
   (`SIGLAKE_QUERY_AUDIT_APPEND_DEADLINE_SECS`; `0` restores the unbounded
   await). Query responses never waited on the audit worker and 0.1.0 bounded
