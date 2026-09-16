@@ -15695,12 +15695,14 @@ impl IcebergContext {
         let partition = if spec.is_unpartitioned() {
             None
         } else {
-            // All input files share a partition value — `recluster_files_with`
-            // refuses a mixed bin before reaching here (see
-            // `first_cross_partition_file`) — so one partition key drives the
-            // whole merged output. Stamping it from `files[0]` is only sound
-            // under that precondition: a mixed bin would land the other
-            // partition's rows behind a wrong manifest partition value.
+            // All input files share a partition value: `recluster_files_with`
+            // refuses a mixed bin before dispatching to either streaming
+            // executor (see `first_cross_partition_file`), and the delete-task
+            // survivor rewrite passes a single file. So one partition key drives
+            // the whole output. Stamping it from `files[0]` is only sound under
+            // that precondition — a mixed bin would land the other partition's
+            // rows behind a wrong manifest partition value, where a predicated
+            // query prunes them away.
             Some(iceberg::spec::PartitionKey::new(
                 spec.as_ref().clone(),
                 table.metadata().current_schema().clone(),
