@@ -531,10 +531,23 @@ near 1 is every call decoding raw pages), Tier-2 files per call, the
 live-file-list cache hit ratio, and a second line for the Tier-1
 aggregate itself: outstanding deltas folded per read (p50 / p99, near
 zero when the compactor fold keeps up) and columns demoted from exact
-counts to sketches (should sit at zero). `scripts/check-chart.py` verifies
+counts to sketches (should sit at zero). The row ends with the
+text-index panels: a text query's per-file startup split by stage
+(`permit_wait` / `blob_fetch` / `decode` / `selection` — which one moved
+says whether a slowdown is the load queue, object storage, the decode or
+the postings work), the parsed-index cache's lookup outcomes beside the
+bound that dropped an entry, and its resident bytes against that bound.
+`scripts/check-chart.py` verifies
 that every `siglake_*` series a panel or template variable names is one
-the code emits, the same check it applies to the alert rules and the KEDA
+the code emits — `crates/` and the owned forks under `third_party/`,
+which is where the text-index and object-store read families live — the
+same check it applies to the alert rules and the KEDA
 trigger queries, so a renamed metric fails CI instead of blanking a panel.
+It evaluates the arithmetic of two panels with promtool rather than only
+their names: the drain backlog, which has to read one queue depth per
+namespace under two different drain shapes, and the text-index startup
+quantiles, which have to read one number per stage out of a fleet's
+buckets.
 It also holds each reference to the form the exporter renders: `_bucket`
 and `histogram_quantile()` only on the histograms `builder()` in
 `crates/siglake-core/src/metrics.rs` hands buckets (names ending in
