@@ -445,6 +445,36 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   coverage signal, not a latency one — in that sweep the fastest arm had the
   highest unreserved rate. Local storage only; overlapping S3 first-byte
   latency is untested.
+- **The experimental decoded-file cache fills only from a scan that reads a
+  file to its end, which the shapes a log UI issues never do.** The cache is off
+  in the chart, the compose file and the operator
+  (`SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_{BYTES,ENTRIES}` default to 0), and when
+  an operator turns it on it inserts at end-of-stream only: a `LIMIT` satisfied
+  from the first batches drops the populate stream before it gets there
+  (`CachePopulateStream::poll_next`, `crates/siglake-storage/src/query_provider.rs`).
+  Two 50G bench rounds on 2026-09-15 ran it at 8 GiB / 16,384 entries and
+  exported 712 `bypass` + 448 `miss` and 663 + 402 — no `hit` series, and no
+  `insert`, `skip_oversized`, `insert_skipped_contended` or `evict` series, nor
+  the `siglake_query_scan_file_cache_{bytes,entries}` gauges. All five are
+  written from the insert path, so across 1,160 and 1,065 requests the cache
+  never built a single entry; eviction and keying never came into it. A `miss`
+  counts a task OPENED, not a population attempted: it is charged once per
+  partition that opens its first task, which is where the 448 comes from (12
+  executions × 16 partitions for `label_filter`, 12 × 8 for
+  `label_filter_last25`, 10 × 16 for `multi_label_and` — the three shapes whose
+  label predicate reaches neither the raw-text nor the promoted-column prune
+  path, and whose residual `FilterExec` keeps their `LIMIT 100` off the scan).
+  The `bypass` count is the text and promoted-label shapes, which take the
+  pruning reader by design. So an entry needs a scan that is
+  non-order-preserving, has no raw or promoted prune, and drains one task —
+  plus decoded batches for that task under a quarter of the budget (2 GiB at
+  8 GiB), which at 50G scale is ~615 MB for a `timestamp, raw` projection
+  (98.47M rows over 16 files at ~100 decoded bytes/row), so ~13 of that
+  round's 16 files would fit the whole 8 GiB before eviction starts. Until a
+  populate path survives cancellation, the budget is subtracted from the query
+  pool for no return on this workload — the sizing question #3053 and #2956
+  carry. `crates/siglake-storage/tests/file_cache_population_shape.rs` pins the
+  four readings hermetically.
 - **Query scales by REPLICATION, not by fan-out, for ordinary log search.**
   Adding query replicas multiplies throughput — measured 705 QPS on one
   replica and 2,269 on three (3.22x), with browse p50 flat at 13–21ms through
