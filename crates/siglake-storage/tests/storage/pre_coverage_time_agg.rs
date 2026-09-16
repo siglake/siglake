@@ -519,3 +519,302 @@ async fn the_fallback_cost_report() {
         }
     }
 }
+
+/// THE REPAIR. After `rebuild_inline_time_aggregates` the same queries serve
+/// from Tier-1 again with byte-identical answers, and the object carries a
+/// coverage edge naming the snapshot the pass read.
+#[tokio::test]
+async fn the_rebuild_restores_tier_1_without_changing_an_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = seed(tmp.path(), 6, 400).await;
+    let window = last25(6, 400);
+
+    let before_groups = ice
+        .grouped_counts_with_summary(INDEX, "sourcetype", None, Some(window))
+        .await
+        .unwrap()
+        .expect("windowed group counts");
+    assert_eq!(before_groups.source_label(), "tier1_windowed_agg");
+    let before_hist = ice
+        .date_histogram_counts(INDEX, SNAPSHOT_TIME_BUCKET_BASE_NS, 0, None, Some(window))
+        .await
+        .unwrap()
+        .expect("windowed histogram");
+    let before_count = ice.windowed_count(INDEX, window, None).await.unwrap();
+    let before_side = read_side(tmp.path());
+    drop(ice);
+
+    strip_coverage(tmp.path());
+    let ice = open(tmp.path()).await;
+    let report = ice.rebuild_inline_time_aggregates(INDEX).await.unwrap();
+
+    assert!(
+        report.published,
+        "the rebuild published nothing: {report:?}"
+    );
+    assert!(!report.already_covered);
+    assert!(
+        report.time_buckets_restored,
+        "time buckets short of {} rows: {:?}",
+        report.record_count, report.time_buckets_rows
+    );
+    assert!(
+        report.columns.iter().any(|c| c.column == "sourcetype"),
+        "the pass must take its column set from the object it repairs: {report:?}"
+    );
+    assert!(
+        report.columns.iter().all(|c| c.covers_table),
+        "every maintained column should be readable from the files here: {report:?}"
+    );
+
+    let side = read_side(tmp.path());
+    assert_eq!(
+        side.coverage.map(|c| c.snapshot_id),
+        Some(report.coverage.snapshot_id),
+        "the published edge must name the snapshot the pass read"
+    );
+    assert!(side.coverage_links.is_empty());
+    assert_eq!(
+        side.group_counts, None,
+        "the inline group counts are dropped, not certified (decision 2026-09-16)"
+    );
+
+    // The counts themselves are unchanged: this is a proof-of-provenance
+    // repair, not a recount. A drifting map here would be the failure mode the
+    // whole coverage mechanism exists to prevent.
+    assert_eq!(
+        side.time_buckets, before_side.time_buckets,
+        "the rebuilt time buckets differ from what maintenance had accumulated"
+    );
+    assert_eq!(
+        side.time_group_counts, before_side.time_group_counts,
+        "the rebuilt 2-D rollup differs from what maintenance had accumulated"
+    );
+
+    let after_groups = ice
+        .grouped_counts_with_summary(INDEX, "sourcetype", None, Some(window))
+        .await
+        .unwrap()
+        .expect("windowed group counts");
+    assert_eq!(
+        after_groups.source_label(),
+        "tier1_windowed_agg",
+        "the windowed GROUP BY is still on the per-file tier after the repair"
+    );
+    let mut want = before_groups.to_rows();
+    want.sort();
+    let mut got = after_groups.to_rows();
+    got.sort();
+    assert_eq!(got, want, "the repair changed the answer");
+    assert_eq!(
+        ice.date_histogram_counts(INDEX, SNAPSHOT_TIME_BUCKET_BASE_NS, 0, None, Some(window))
+            .await
+            .unwrap(),
+        Some(before_hist)
+    );
+    assert_eq!(
+        ice.windowed_count(INDEX, window, None).await.unwrap(),
+        before_count
+    );
+}
+
+/// THE POINT OF RE-ROOTING THE CHAIN, and the property that makes this a repair
+/// rather than a one-off: after the rebuild, the NEXT append's edge has the
+/// published snapshot as its parent, so it joins and ordinary commit-path
+/// maintenance carries coverage forward on its own. Without this the command
+/// would buy one query's worth of Tier-1 and lose it at the next commit.
+#[tokio::test]
+async fn ordinary_maintenance_carries_coverage_forward_after_the_rebuild() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = seed(tmp.path(), 4, 200).await;
+    drop(ice);
+    strip_coverage(tmp.path());
+
+    let ice = open(tmp.path()).await;
+    let report = ice.rebuild_inline_time_aggregates(INDEX).await.unwrap();
+    assert!(report.published);
+
+    let config = index_config();
+    for a in 4..7 {
+        append(&ice, &config, a * 200, 200, step_secs(800)).await;
+    }
+
+    let side = read_side(tmp.path());
+    assert!(
+        side.coverage_links.is_empty(),
+        "three appends after the repair left edges stranded: {:?}",
+        side.coverage_links
+    );
+    let window = last25_of(1400, step_secs(800));
+    assert_eq!(
+        ice.grouped_counts_with_summary(INDEX, "sourcetype", None, Some(window))
+            .await
+            .unwrap()
+            .expect("windowed group counts")
+            .source_label(),
+        "tier1_windowed_agg",
+        "coverage did not advance with the appends that followed the repair"
+    );
+}
+
+/// Re-running is free of consequence: the maps are replaced rather than merged,
+/// so a second pass over an already-covered object reports that and writes
+/// nothing. A merge-based repair would double every count here.
+#[tokio::test]
+async fn a_second_rebuild_is_a_reported_no_op() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = seed(tmp.path(), 4, 200).await;
+    drop(ice);
+    strip_coverage(tmp.path());
+
+    let ice = open(tmp.path()).await;
+    assert!(
+        ice.rebuild_inline_time_aggregates(INDEX)
+            .await
+            .unwrap()
+            .published
+    );
+    let after_first = read_side(tmp.path());
+
+    let again = ice.rebuild_inline_time_aggregates(INDEX).await.unwrap();
+    assert!(
+        again.already_covered && !again.published,
+        "a second pass must recognise its own work: {again:?}"
+    );
+    let after_second = read_side(tmp.path());
+    assert_eq!(
+        after_second.time_buckets, after_first.time_buckets,
+        "the second pass changed the time buckets"
+    );
+    assert_eq!(
+        after_second.time_group_counts, after_first.time_group_counts,
+        "the second pass changed the 2-D rollup"
+    );
+}
+
+/// The pass refuses to rebuild an object it cannot bind to a column set, rather
+/// than inventing one. Same rule as the wide rebuild: a repair restores what a
+/// table was maintaining.
+#[tokio::test]
+async fn a_table_with_no_inline_object_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = seed(tmp.path(), 2, 100).await;
+    drop(ice);
+    std::fs::remove_file(side_object_path(tmp.path())).unwrap();
+
+    let ice = open(tmp.path()).await;
+    let err = ice
+        .rebuild_inline_time_aggregates(INDEX)
+        .await
+        .expect_err("a missing object must be refused, not created");
+    assert!(
+        err.to_string().contains("no inline aggregate object"),
+        "unexpected refusal: {err}"
+    );
+}
+
+/// THE FOOTER SHORTCUT. A file whose manifest `[min, max]` fits inside one
+/// aggregate bucket contributes its group-count footer to that bucket instead
+/// of being decoded. Worth its own test because it is a SECOND way to compute
+/// the same map, and a shortcut that disagrees with the decode would publish a
+/// wrong answer as proven.
+#[tokio::test]
+async fn bucket_contained_files_are_rebuilt_from_footers_and_agree() {
+    let tmp = tempfile::tempdir().unwrap();
+    // One second apart: every append's file lands inside the first hour, so
+    // every file is provably contained in one bucket.
+    let ice = open(tmp.path()).await;
+    let config = index_config();
+    ice.create_index(&config).await.unwrap();
+    for a in 0..5 {
+        append(&ice, &config, a * 300, 300, 1).await;
+    }
+    let window = TimeBounds {
+        start: Some(base_time()),
+        end: Some(base_time() + Duration::hours(1)),
+    };
+    let before = read_side(tmp.path());
+    drop(ice);
+
+    strip_coverage(tmp.path());
+    let ice = open(tmp.path()).await;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let guard = metrics::set_default_local_recorder(&recorder);
+    let report = ice.rebuild_inline_time_aggregates(INDEX).await.unwrap();
+    let snap = snapshotter.snapshot().into_vec();
+    drop(guard);
+
+    let by_source = |want: &str| -> u64 {
+        snap.iter()
+            .filter(|(k, _, _, _)| {
+                k.key().name() == "siglake_inline_time_group_rebuild_files_total"
+                    && k.key()
+                        .labels()
+                        .any(|l| l.key() == "source" && l.value() == want)
+            })
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .sum()
+    };
+    assert!(
+        by_source("footer") > 0,
+        "no file took the footer shortcut, so this test exercises the decode \
+         path the other tests already cover"
+    );
+    assert_eq!(
+        by_source("decode"),
+        0,
+        "a bucket-contained file fell to the decode"
+    );
+
+    assert!(report.published, "{report:?}");
+    let after = read_side(tmp.path());
+    // Per covering column, not map-for-map. `group_count_columns_for` admits
+    // every Int64 field, so `timestamp_ns` is in the rollup's column set and
+    // thrashes the value cap: the accumulated object holds whichever commit's
+    // 300 distinct values landed last, 300 of 1,500 rows. That column is short
+    // and the read guard refuses it either way, so the rebuild drops it —
+    // comparing whole maps would assert the leftover instead of the repair.
+    let before_tg = before.time_group_counts.expect("maintained rollup");
+    let after_tg = after.time_group_counts.expect("rebuilt rollup");
+    let covering: Vec<&str> = report
+        .columns
+        .iter()
+        .filter(|c| c.covers_table)
+        .map(|c| c.column.as_str())
+        .collect();
+    assert!(
+        covering.contains(&"sourcetype"),
+        "no covering column to compare: {report:?}"
+    );
+    for column in &covering {
+        assert_eq!(
+            after_tg.columns.get(*column),
+            before_tg.columns.get(*column),
+            "the footer shortcut disagrees with maintenance on `{column}`"
+        );
+    }
+    assert!(
+        report
+            .columns
+            .iter()
+            .any(|c| c.column == "timestamp_ns" && !c.covers_table),
+        "the short timestamp column must be reported as not covering, not \
+         silently dropped: {report:?}"
+    );
+    assert!(
+        !after_tg.columns.contains_key("timestamp_ns"),
+        "a column short of the row count must not be published"
+    );
+    assert_eq!(
+        ice.grouped_counts_with_summary(INDEX, "sourcetype", None, Some(window))
+            .await
+            .unwrap()
+            .expect("windowed group counts")
+            .source_label(),
+        "tier1_windowed_agg"
+    );
+}
