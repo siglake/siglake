@@ -200,6 +200,15 @@ written down.
   you) and a `PrometheusRule` with 33 alerts grouped by what an operator
   should do, rendered when `prometheusRule.enabled` is set
   ([Monitoring](https://docs.siglake.dev/operations/monitoring/)).
+- **Metrics are Prometheus; logs and traces are OTLP, and off until you point
+  them somewhere.** The `/metrics` endpoint the alerts, the KEDA scalers and
+  the dashboard read does not change. Setting
+  `OTEL_EXPORTER_OTLP_ENDPOINT` also exports the existing log lines as OTLP log
+  records and the request/cycle spans as OTLP spans, with W3C `traceparent`
+  carried across the query fan-out so a distributed query is one trace. Unset,
+  the exporters and their batch processors are never constructed, and the
+  per-request residue is +104 ns against the span layer that was already
+  there ([Observability](docs/ARCHITECTURE.md#observability-opentelemetry-emission)).
 - **Iceberg is vendored, not waited for.** `third_party/iceberg` and
   `third_party/iceberg-catalog-sql` are first-class forks carrying the atomic
   `rewrite_files` action, count- and age-based snapshot expiry, commit-reload

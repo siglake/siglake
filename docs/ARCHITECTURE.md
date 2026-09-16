@@ -1087,6 +1087,66 @@ per process: it starts empty on restart, and each pod holds its own, so a
 cap was inert until #4240** — parsed, passed to the ingester and never read, so
 an operator whose only bound was `maxTenants` had none.
 
+## Observability (OpenTelemetry emission)
+
+Metrics and emission are separate paths, on purpose.
+
+**Metrics stay on Prometheus.** Every binary exports its counters, gauges and
+histograms through the `metrics` crate to a `/metrics` endpoint
+(`siglake_core::metrics::init`), which is what the chart's `ServiceMonitor`,
+the `PrometheusRule` alerts, the KEDA scalers and the Grafana dashboard read.
+No call site changed when OTel arrived. A collector with a Prometheus receiver
+is how these reach an OTLP backend.
+
+**Logs and traces leave as OTLP/HTTP, when configured.** `siglake_core::
+telemetry::init` installs the process's `tracing` subscriber: the console
+layer always, plus — when an endpoint is configured — an OTel logs bridge and
+an OTel traces layer. The logs bridge forwards existing `tracing::info!` and
+friends as OTLP log records, so no logging call site changed either. The
+traces layer forwards the spans placed at the boundaries that cost something:
+the ingest handlers and `ingest_batch`, the compactor drain, the query
+server's per-request middleware and `distributed_inner`.
+
+**A distributed query is one trace.** The coordinator injects W3C
+`traceparent` into each shard request and the worker's middleware extracts it,
+so a fan-out's worker spans are children of the coordinator's span rather than
+unrelated roots. `crates/siglake-query-server/tests/otel_traceparent_propagation.rs`
+pins that over a real socket.
+
+**Configuration is the standard OTel environment, and it is off by default.**
+
+| Variable | Effect |
+| --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | The switch. Unset or empty ⇒ no OTel emission at all: console logs only, exactly as before. Set (e.g. `http://otel-collector:4318`) ⇒ logs and traces export over OTLP/HTTP. |
+| `SIGLAKE_OTEL_DISABLED` | `1`/`true` turns emission off without removing the endpoint. |
+| `OTEL_TRACES_EXPORTER`, `OTEL_LOGS_EXPORTER` | `none`/`off` drops that one signal; the other keeps exporting. |
+| `OTEL_SERVICE_NAME` | Defaults to `siglake-<component>` (`ingest`, `compactor`, `query`, `operator`, `cli`), derived from the binary and its subcommand. |
+| `OTEL_SERVICE_NAMESPACE`, `OTEL_RESOURCE_ATTRIBUTES`, `HOSTNAME`/`HOST`, `POD_NAME` | Resource attributes: `service.namespace`, free-form `k=v,k=v`, `host.name`, `service.instance.id`. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | `k=v,k=v` exporter headers (an API key for a hosted backend). |
+| `RUST_LOG` | Unchanged: it drives the console layer and the log bridge alike. |
+
+Every one of these is read once, at startup, through pure resolvers that the
+tests drive directly; nothing mutates the process environment.
+
+**Console output stays on stderr.** stdout belongs to the reports:
+`siglake-operator --print-crd` (which CI diffs), `migrate-schema --dry-run`,
+`gc-orphans`, the SQL client's rows.
+
+**Shutdown is explicit, because nothing else flushes.** The batch processors
+buffer, and the providers live in a `OnceLock` that never drops, so a
+drop-at-exit guard would ship nothing. Each binary's `main` initializes
+telemetry and then wraps a `run()`, so one `telemetry::shutdown()` covers the
+graceful SIGTERM return, a startup error and a rejected flag alike.
+
+**The disabled path is cheap, not free.** The per-request middleware runs
+whatever the configuration: it allocates the request path, asks the global
+propagator to extract, and creates a span no subscriber is listening to.
+Measured in a release build with `cargo test -p siglake-query-server --lib
+otel_disabled_path_cost -- --ignored --nocapture` (5 interleaved pairs of 2000
+`/healthz`-shaped requests): **+393 ns/request against no layer at all, and
++104 ns/request against the `TraceLayer` it replaced**. Against a SQL query's
+milliseconds that is noise; against an empty request it is most of the cost.
+
 ## Deployment
 
 - **Helm** (`deploy/helm/siglake`): all roles; query as a headless-service

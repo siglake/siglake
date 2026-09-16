@@ -942,3 +942,21 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   what an operator should do (data-loss, stalled, refusing, saturation),
   rendered when `prometheusRule.enabled` is set (default off). No metrics
   downsampling; retention is file/day-granular (no row-level retention).
+- **The chart and the operator do not render the OTel environment.** Logs and
+  traces export only when `OTEL_EXPORTER_OTLP_ENDPOINT` reaches the process, and
+  the Helm chart has no `otel:` block for it: set it per tier through the
+  existing `<tier>.extraEnv` (alongside `OTEL_RESOURCE_ATTRIBUTES`,
+  `OTEL_EXPORTER_OTLP_HEADERS` and the per-signal switches — see
+  [Observability](ARCHITECTURE.md#observability-opentelemetry-emission)). The
+  operator has no equivalent escape hatch, so a `SiglakeCluster` cannot turn
+  emission on at all; it joins the list of chart-only settings under
+  [Deployment](ARCHITECTURE.md#deployment). A first-class block was left out
+  until a deployment has run with emission on and shown which knobs an operator
+  actually reaches for.
+- **Metrics do not leave as OTLP from the process.** `siglake_*` metrics are
+  Prometheus, scraped from `/metrics`; the OTel metrics SDK is not wired, so an
+  OTLP-only backend needs a collector with a Prometheus receiver. Moving the
+  ~340 `metrics::` call sites onto the OTel API would change the names the
+  alerts, the KEDA scalers and the dashboard are written against, which is a
+  migration and not a feature; the collector costs one deployment and nothing
+  in the code.
