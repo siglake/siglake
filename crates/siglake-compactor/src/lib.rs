@@ -1873,6 +1873,7 @@ impl Compactor {
     /// Drain all currently-sealed segments into a single Iceberg commit.
     /// Returns the number of segments included in that commit (0 if there
     /// were none to process).
+    #[tracing::instrument(skip_all)]
     pub async fn run_once(&self) -> Result<usize> {
         if self.catalog.is_some() {
             return self.run_once_catalog().await;

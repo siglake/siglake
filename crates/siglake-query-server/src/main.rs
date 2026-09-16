@@ -355,16 +355,10 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Log lines go to stderr, matching the siglake CLI and the rest of the
-    // workspace's binaries. The container runtime captures both streams, so
-    // the server loses nothing.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,siglake=debug".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // Logs + traces via OTel (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT); the fmt
+    // console layer always stays on. Providers flush via `telemetry::shutdown()`
+    // on the SIGTERM path and via static-drop on normal exit.
+    siglake_core::telemetry::init(siglake_core::telemetry::TelemetryConfig::from_env("query"))?;
 
     let cli = Cli::parse();
 
@@ -582,7 +576,7 @@ async fn main() -> Result<()> {
     )
     .set(1.0);
 
-    match (cli.tls_cert.as_deref(), cli.tls_key.as_deref()) {
+    let result = match (cli.tls_cert.as_deref(), cli.tls_key.as_deref()) {
         (Some(cert), Some(key)) => {
             let tls = TlsConfig {
                 cert_path: cert.into(),
@@ -594,7 +588,12 @@ async fn main() -> Result<()> {
             anyhow::bail!("--tls-cert and --tls-key must both be set (or both unset)")
         }
         (None, None) => serve(cli.bind, state).await,
-    }
+    };
+    // Flush buffered OTel logs/traces (the graceful-shutdown signal future
+    // returned above; flush deterministically rather than relying on static
+    // Drop ordering). No-op when OTel is off.
+    siglake_core::telemetry::shutdown();
+    result
 }
 
 /// Open an [`IcebergContext`] from CLI flag/env-var inputs. Same logic

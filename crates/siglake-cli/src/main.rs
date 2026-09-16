@@ -742,6 +742,31 @@ enum Command {
     },
 }
 
+/// Map the CLI subcommand to the OTel `service.name` component suffix used by
+/// [`siglake_core::telemetry::TelemetryConfig::from_env`] (which prepends
+/// `siglake-`). Deployed long-lived components map to their data-plane role;
+/// one-shot/admin subcommands fall back to `"cli"`.
+fn component_name(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::IngestServer { .. } => "ingest",
+        Command::Compactor { .. } => "compactor",
+        Command::Sql { .. } => "query",
+        Command::SqlDirect { .. } => "query",
+        Command::Ingest { .. } => "ingest",
+        Command::Query { .. } => "query",
+        Command::Gen { .. }
+        | Command::IcebergDemo { .. }
+        | Command::WalRecover { .. }
+        | Command::AuditRotate { .. }
+        | Command::GcOrphans { .. }
+        | Command::RetentionSweep { .. }
+        | Command::DeleteSweep { .. }
+        | Command::RebuildGroupCounts { .. }
+        | Command::MigrateSchema { .. }
+        | Command::Subscribe { .. } => "cli",
+    }
+}
+
 /// jemalloc as the global allocator: the drain's large transient allocations
 /// (256 MiB batch -> concat -> sort -> split -> encode copies) fragment glibc
 /// malloc arenas, which retain freed memory indefinitely — a 200G round crept
@@ -753,19 +778,17 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Log lines go to stderr so the `println!` reports of the maintenance
-    // subcommands (rebuild-group-counts, migrate-schema --dry-run, gc-orphans,
-    // ...) stay pipe-clean on stdout under the default filter. Container
-    // runtimes capture both streams, so the servers lose nothing.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,siglake=debug".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+
+    // Logs + traces via OTel (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT); the fmt
+    // console layer always stays on. The service name is seeded from the
+    // subcommand so each deployed component (ingest/compactor/query) is
+    // distinguishable in the backend. Providers flush via
+    // `telemetry::shutdown()` on the SIGTERM path and via static-drop on exit.
+    siglake_core::telemetry::init(siglake_core::telemetry::TelemetryConfig::from_env(
+        component_name(&cli.command),
+    ))?;
+
     std::fs::create_dir_all(&cli.data_dir)?;
 
     match cli.command {
@@ -2258,6 +2281,10 @@ async fn run_ingest_server(
     if let Some(h) = active_mirror_task {
         h.abort();
     }
+    // Flush buffered OTel logs/traces before exit (the SIGTERM that got us
+    // here killed the signal future; the process-wide static Drop would not
+    // run if something later calls process::exit). No-op when OTel is off.
+    siglake_core::telemetry::shutdown();
     serve_result
 }
 

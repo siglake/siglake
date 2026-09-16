@@ -37,6 +37,8 @@ futures = { workspace = true }
 hickory-resolver = "0.26"
 jsonwebtoken = "9"
 metrics = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-http = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -46,7 +48,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 tower = { workspace = true }
-tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tikv-jemallocator = "0.7.0"

@@ -42,6 +42,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# OpenTelemetry emission (logs + traces via OTLP/HTTP; metrics stay Prometheus
+# and are unified into OTLP by a collector with a prometheus receiver — see
+# crates/siglake-core/src/telemetry.rs and docs/ARCHITECTURE.md).
+# 0.32 family: tracing-opentelemetry 0.33 pairs with opentelemetry 0.32, and
+# opentelemetry-proto 0.32 is already the OTLP decode path on the ingest side.
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-http = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls", "trace", "logs", "internal-logs"] }
+opentelemetry-appender-tracing = "0.32"
+tracing-opentelemetry = "0.33"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 bytes = "1"

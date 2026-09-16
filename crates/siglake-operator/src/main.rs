@@ -107,18 +107,13 @@ async fn main() -> Result<()> {
     // process-level CryptoProvider from Rustls crate features".
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    // Log lines go to stderr, matching the rest of the workspace's binaries,
-    // so the `--print-crd` and `--adopt-values` reports below stay pipe-clean
-    // on stdout (ci-local.sh diffs the CRD against the checked-in copies).
-    // The container runtime captures both streams, so the controller loses
-    // nothing.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,siglake_operator=debug".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // Logs + traces via OTel (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT). Providers
+    // flush via `telemetry::shutdown()` on the SIGTERM path and via static-drop
+    // on normal exit.
+    siglake_core::telemetry::init(siglake_core::telemetry::TelemetryConfig::from_env(
+        "operator",
+    ))?;
+
     let cli = Cli::parse();
 
     if cli.print_crd {
@@ -245,8 +240,8 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!("siglake-operator stopping");
-    // Reserved for future graceful-shutdown work.
-    let _ = Duration::from_secs(0);
+    // Flush buffered OTel logs/traces before exit. No-op when OTel is off.
+    siglake_core::telemetry::shutdown();
     Ok(())
 }
 

@@ -1158,6 +1158,10 @@ pub fn router(state: AppState) -> Router {
         .0
         .merge(ingest)
         .layer(axum::extract::DefaultBodyLimit::max(body_limit))
+        // Per-request `tracing` span (http.method, http.uri, http.status).
+        // With the OTel traces layer installed (`siglake_core::telemetry`), these
+        // spans are forwarded as OTel spans automatically; no-op when OTel is off.
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
 
@@ -2158,6 +2162,10 @@ async fn ingest_events(
     ingest_batch(state, tenant_id, index_id, batch, commit_mode, endpoint).await
 }
 
+#[tracing::instrument(
+    skip_all,
+    fields(endpoint = %endpoint, tenant = %tenant_id, index = %index_id, event_count = batch.num_rows())
+)]
 async fn ingest_batch(
     state: &AppState,
     tenant_id: &str,
@@ -2491,6 +2499,10 @@ fn mem_breaker_response(endpoint: &'static str) -> Response {
         (status = 500, description = "Internal error.", body = SiglakeErrorBody),
     ),
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(endpoint = "otlp_logs", event_count = tracing::field::Empty)
+)]
 async fn post_otlp_logs(
     State(state): State<AppState>,
     Query(commit): Query<CommitQuery>,
@@ -2541,6 +2553,7 @@ async fn post_otlp_logs(
         }
     };
     let n = batch.num_rows();
+    tracing::Span::current().record("event_count", n);
     metrics::histogram!("siglake_ingest_request_events", "endpoint" => "otlp").record(n as f64);
     metrics::counter!("siglake_ingest_commit_total", "mode" => commit_mode.as_label()).increment(1);
     let tenant_id = tenant
@@ -2625,6 +2638,10 @@ async fn post_otlp_logs(
         (status = 500, description = "Internal error.", body = SiglakeErrorBody),
     ),
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(endpoint = "otlp_traces", event_count = tracing::field::Empty)
+)]
 async fn post_otlp_traces(
     State(state): State<AppState>,
     Query(commit): Query<CommitQuery>,
@@ -2672,6 +2689,7 @@ async fn post_otlp_traces(
         }
     };
     let n = events.len();
+    tracing::Span::current().record("event_count", n);
     metrics::histogram!(
         "siglake_ingest_request_events",
         "endpoint" => "otlp_traces",

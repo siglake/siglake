@@ -250,6 +250,19 @@ impl ShardRunner for HttpShardRunner {
         if let Some(t) = &self.auth {
             rb = rb.bearer_auth(t);
         }
+        // W3C trace-context injection: propagate the current OTel context (the
+        // coordinator's request span) as `traceparent` so the worker's shard
+        // span becomes a child. No-op when OTel is off (no propagator set).
+        let mut trace_headers = reqwest::header::HeaderMap::new();
+        opentelemetry::global::get_text_map_propagator(|p| {
+            p.inject_context(
+                &opentelemetry::Context::current(),
+                &mut opentelemetry_http::HeaderInjector(&mut trace_headers),
+            );
+        });
+        if !trace_headers.is_empty() {
+            rb = rb.headers(trace_headers);
+        }
         let resp = rb.send().await.with_context(|| format!("POST {url}"))?;
         // A shard worker's own refusal (413 row-ceiling breaker, 400 bad query,
         // 429 budget, 503 memory pool) is a statement ABOUT THE QUERY or its

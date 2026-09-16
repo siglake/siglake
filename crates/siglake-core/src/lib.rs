@@ -9,6 +9,7 @@ pub mod mapping;
 pub mod metrics;
 pub mod oidc;
 pub mod promote;
+pub mod telemetry;
 pub mod tenant;
 
 pub use build_info::{build_info, BuildInfo, BUILD_VERSION};

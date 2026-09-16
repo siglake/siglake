@@ -14983,6 +14983,7 @@ pub async fn distributed(
     distributed_inner(state, identity, req, None, None, peers).await
 }
 
+#[tracing::instrument(skip_all, fields(otel.kind = "internal", query = %req.query))]
 async fn distributed_inner(
     state: AppState,
     identity: CallerIdentity,
