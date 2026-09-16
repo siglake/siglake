@@ -269,7 +269,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   the `orphans/` disposition that runs every cycle, survives restarts, and is
   never deleted or rewritten: requeueing is an operator running `siglake
   wal-requeue --wal <wal-root>` once the cause is fixed, and a segment requeued
-  unchanged simply spends its attempts again. Until then its rows are acknowledged,
+  unchanged simply spends its attempts again. Where the corruption is local and
+  the WAL mirror holds a good copy, `siglake wal-recover` is the other way back
+  — the set-aside left no file under `sealed/`, so recovery pulls that segment
+  again and the drain commits it, with the unreadable bytes still under
+  `poison/` to look at. Until then its rows are acknowledged,
   durable on the volume, and not queryable — which is the trade the set-aside
   makes, against a queue behind it that never drains.
   `siglake_compactor_segments_poisoned_total` counts the set-asides,
