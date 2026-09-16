@@ -82,6 +82,15 @@ pub const DEFAULT_FS_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// Consecutive failed reads a local segment gets before the drain sets it
 /// aside under `poison/` — see [`poison_attempts`].
 pub const DEFAULT_POISON_ATTEMPTS: u32 = 3;
+/// #4651: claim attempts one drain pass will spend on one segment before
+/// leaving it in `sealed/` for the next cycle. Not a knob: the setting an
+/// operator has for how many times a segment is tried is
+/// `SIGLAKE_COMPACTOR_POISON_ATTEMPTS`, which counts across cycles and decides
+/// whether the segment is set aside for good. This bound only stops one pass
+/// from spending its whole cycle budget re-claiming a set that keeps failing,
+/// and it has to be at least 2 for the same-cycle retry a transient commit
+/// error gets (`a_transient_commit_error_is_retried_in_the_same_cycle`).
+const MAX_PASS_CLAIM_ATTEMPTS: u32 = 3;
 
 #[derive(Clone, Copy)]
 struct FsBatchConfig {
@@ -2619,7 +2628,18 @@ impl Compactor {
         let mut inflight_bytes = 0u64;
         let mut queue: Vec<PathBuf> = sealed;
         let mut offset = 0usize;
-        let mut relisted = false;
+        // #4651: claim attempts this pass has spent on each segment, keyed by
+        // segment NAME. A failed batch goes back to `sealed/` and the re-list
+        // below hands it straight to the next selection, so without a bound the
+        // pass re-claims and re-fails the same set — a rename and two fsyncs
+        // per segment each way — for the whole cycle budget, as fast as the
+        // failure returns. The bound is per segment rather than per batch so
+        // re-grouping a failing segment with fresh siblings cannot buy it
+        // another run of attempts, and it is pass-local: the next cycle starts
+        // every segment at zero, which keeps recovery from a transient cause
+        // one poll away and leaves #3143's `poison/` ledger the only accounting
+        // that survives a cycle.
+        let mut pass_attempts: HashMap<String, u32> = HashMap::new();
         let mut inflight = FuturesUnordered::new();
         let mut committed_segments = 0usize;
         let mut first_err: Option<anyhow::Error> = None;
@@ -2640,6 +2660,17 @@ impl Compactor {
                         tenant_label,
                         target.index_label(),
                     );
+                    // #4651: withhold the segments this pass has already tried
+                    // MAX_PASS_CLAIM_ATTEMPTS times. They stay in `sealed/`
+                    // untouched for the next cycle; everything else in the
+                    // fresh list — healthy siblings, segments sealed while this
+                    // pass ran — is still claimable, so one failing segment
+                    // does not stop the drain. The old length-comparison guard
+                    // here could not fire: this block only runs with the
+                    // snapshot exhausted, so the length it compared against was
+                    // always 0 and an empty fresh list had already broken out.
+                    let mut fresh = fresh;
+                    fresh.retain(|p| !withhold_spent_segment(&mut pass_attempts, p, tenant_label));
                     if fresh.is_empty() {
                         break;
                     }
@@ -2649,14 +2680,8 @@ impl Compactor {
                             break;
                         }
                     }
-                    // Guard against a pathological same-list spin: if nothing was
-                    // claimable from an identical fresh list, stop this pass.
-                    if relisted && fresh.len() == queue.len().saturating_sub(offset) {
-                        break;
-                    }
                     queue = fresh;
                     offset = 0;
-                    relisted = true;
                 }
                 let selected = self
                     .select_sealed_for_cycle(&queue[offset..])
@@ -2685,6 +2710,13 @@ impl Compactor {
                     break;
                 }
                 offset += selected.len();
+                // #4651: charge the attempt before the claim, so a claim that
+                // fails half-way through the batch is counted too — that path
+                // releases its partial claims and resumes topping up, which is
+                // its own spin.
+                for s in &selected {
+                    charge_pass_attempt(&mut pass_attempts, s);
+                }
                 metrics::histogram!(
                     "siglake_compactor_claimed_segments",
                     "tenant" => tenant_label.to_string()
@@ -2803,6 +2835,21 @@ impl Compactor {
                     // and segments with attempts left.
                     let (claimed, set_aside) = self.set_aside_unreadable(claimed, &e, tenant_label);
                     backlog.observe_poisoned(tenant_label, set_aside);
+                    // #4651: a set-aside is progress — the segment that failed
+                    // this batch has left `sealed/` for good, so what is left of
+                    // the batch faces a different queue and gets its pass
+                    // attempts back. Without this, #3143's siblings would be
+                    // charged for the batches the poisoned segment took down
+                    // and wait a cycle at the default attempt budget. Every
+                    // forgiveness costs a segment out of the directory, so the
+                    // claims one pass can make stay finite.
+                    if set_aside > 0 {
+                        for c in &claimed {
+                            if let Some(name) = c.file_name().and_then(|n| n.to_str()) {
+                                pass_attempts.remove(name);
+                            }
+                        }
+                    }
                     // A failed batch releases its own segments back to sealed/ for
                     // retry; in-flight siblings are unaffected (their claims are
                     // disjoint and their commits independent).
@@ -4399,6 +4446,57 @@ fn admit_batch(
         return true;
     }
     inflight_bytes.saturating_add(batch_bytes) <= budget_bytes
+}
+
+/// #4651: should this pass leave `segment` in `sealed/` because it has already
+/// spent [`MAX_PASS_CLAIM_ATTEMPTS`] claims on it? A path with no readable file
+/// name is never withheld — it cannot be charged either, and refusing to claim
+/// it would strand it.
+///
+/// Says so once per segment per pass, when the pass first declines to re-claim
+/// it rather than when the last attempt was charged: the attempt that reaches
+/// the bound may still be the one that commits. Whether the cause is a one-off
+/// or recurs every cycle is only visible in the rate.
+fn withhold_spent_segment(
+    attempts: &mut HashMap<String, u32>,
+    segment: &Path,
+    tenant_label: &str,
+) -> bool {
+    let Some(name) = segment.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(spent) = attempts.get_mut(name) else {
+        return false;
+    };
+    if *spent < MAX_PASS_CLAIM_ATTEMPTS {
+        return false;
+    }
+    if *spent == MAX_PASS_CLAIM_ATTEMPTS {
+        // One past the bound marks it reported, so a later re-list in the same
+        // pass withholds it silently.
+        *spent += 1;
+        tracing::warn!(
+            path = %segment.display(),
+            attempts = MAX_PASS_CLAIM_ATTEMPTS,
+            tenant = tenant_label,
+            "segment failed every claim this drain pass made on it; it stays in sealed/ for the \
+             next cycle instead of being re-claimed for the rest of this one"
+        );
+        metrics::counter!(
+            "siglake_compactor_pass_claim_attempts_exhausted_total",
+            "tenant" => tenant_label.to_string()
+        )
+        .increment(1);
+    }
+    true
+}
+
+/// Charge one claim attempt to `segment` for the rest of this pass.
+fn charge_pass_attempt(attempts: &mut HashMap<String, u32>, segment: &Path) {
+    if let Some(name) = segment.file_name().and_then(|n| n.to_str()) {
+        let entry = attempts.entry(name.to_string()).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
 }
 
 fn utf8_bloom_columns(config: &IndexConfig) -> Vec<String> {

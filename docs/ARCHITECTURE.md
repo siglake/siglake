@@ -173,6 +173,16 @@ first) once the cause is fixed. The set-asides are counted by
 alongside the catalog-claim path's own quarantine. The rows in a set-aside
 segment are acknowledged and not queryable, which is the point: the alternative
 is a queue that never drains.
+Every other failure is retried inside the pass, bounded per segment: a pass
+makes at most three claims on the same segment and then leaves it in `sealed/`
+for the next cycle, counting it under
+`siglake_compactor_pass_claim_attempts_exhausted_total`. That bound is what
+stops a cause which fails fast and names no file — a recurring catalog
+conflict, a store refusing writes — from spending a whole cycle budget on
+claim/release renames of one set. It is per segment name rather than per batch,
+so regrouping buys no further attempts; it is pass-local, so recovery from a
+transient cause is one poll away; and the segments a pass has not tried,
+including ones sealed while it ran, stay claimable throughout.
 Cumulative per-table aggregates are maintained in a **side object** (see
 Storage), with an optional write-behind mode
 (`SIGLAKE_SIDE_AGG_WRITE_BEHIND=1`) that moves its serialized S3
