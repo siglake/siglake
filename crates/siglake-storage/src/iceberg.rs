@@ -8020,6 +8020,22 @@ fn recluster_should_stream(files: &[DataFile], merge: &ReclusterMergeOptions) ->
     )
 }
 
+/// Index of the first file whose partition value disagrees with `files[0]`, or
+/// `None` when the whole bin shares one partition value (including the
+/// unpartitioned case, where every value is the empty struct).
+///
+/// This is the precondition [`IcebergContext::recluster_files_with`] enforces on
+/// its streaming dispatches: they write their output through one writer stamped
+/// with `files[0].partition()` (see `build_merge_output_writer`), so a bin
+/// spanning two day partitions would commit rows under the wrong partition value
+/// and a query whose timestamp predicate resolves against the other day prunes
+/// the file. The row-count guard cannot see it — the rows are all there, just
+/// unreachable.
+fn first_cross_partition_file(files: &[DataFile]) -> Option<usize> {
+    let first = files.first()?.partition();
+    files.iter().position(|f| f.partition() != first)
+}
+
 /// A bin is too large for the in-RAM concat (so must stream) when *either* its
 /// compressed bytes or its row count exceeds the in-RAM safety cap. Pure so the
 /// boundary is unit-tested without constructing `DataFile`s or touching env.
@@ -15679,8 +15695,14 @@ impl IcebergContext {
         let partition = if spec.is_unpartitioned() {
             None
         } else {
-            // All input files share a partition (caller groups by it), so one
-            // partition key drives the whole merged output.
+            // All input files share a partition value: `recluster_files_with`
+            // refuses a mixed bin before dispatching to either streaming
+            // executor (see `first_cross_partition_file`), and the delete-task
+            // survivor rewrite passes a single file. So one partition key drives
+            // the whole output. Stamping it from `files[0]` is only sound under
+            // that precondition — a mixed bin would land the other partition's
+            // rows behind a wrong manifest partition value, where a predicated
+            // query prunes them away.
             Some(iceberg::spec::PartitionKey::new(
                 spec.as_ref().clone(),
                 table.metadata().current_schema().clone(),
@@ -16190,6 +16212,13 @@ impl IcebergContext {
             .map_err(|e| anyhow::anyhow!("repromote batch: {e}"))
     }
 
+    /// Re-cluster one bin of data files into time-sorted replacement output and
+    /// commit the rewrite.
+    ///
+    /// Group `files` by partition value and call once per group. Only the in-RAM
+    /// merge can honour a bin spanning several partition values, and whether a
+    /// bin takes that path is decided by its size — see
+    /// [`Self::recluster_files_with`] for the full precondition.
     pub async fn recluster_files(
         &self,
         table_ident: &TableIdent,
@@ -16208,6 +16237,22 @@ impl IcebergContext {
     /// [`Self::recluster_files`] with the merge dispatch steered by `merge`
     /// instead of the `SIGLAKE_RECLUSTER_*` environment (each `None` field still
     /// reads the environment). See [`ReclusterMergeOptions`] for why this exists.
+    ///
+    /// Partitioning precondition: a bin should hold one partition value, and a
+    /// caller that bins its own files groups by partition value first — both
+    /// shipped planners do ([`Self::recluster_pass`] and
+    /// [`Self::recluster_all_indexes`]).
+    ///
+    /// A mixed bin is honoured only by the in-RAM merge, which splits its output
+    /// by partition value (`write_batch_to_data_files`) and so writes one
+    /// correctly-stamped file per partition. The streaming executors cannot:
+    /// they write through a single writer stamped with one partition value, so a
+    /// mixed bin routed to them is REFUSED before any output is written (#4200 —
+    /// it used to commit rows under the wrong partition value, where a
+    /// timestamp-predicated query prunes them away while `count(*)` still counts
+    /// them). Dispatch is decided by bin size and the `SIGLAKE_RECLUSTER_*`
+    /// knobs, so a caller that cannot bound its bins must group by partition;
+    /// see `docs/LIMITATIONS.md`.
     pub async fn recluster_files_with(
         &self,
         table_ident: &TableIdent,
@@ -16253,6 +16298,33 @@ impl IcebergContext {
         // Both re-sort into the table's declared (time-ascending) order; the
         // streaming path bounds decoded memory so an oversized bin can't OOM.
         let (added, rows, merge_path) = if recluster_should_stream(&files, merge) {
+            // Every streaming executor writes the whole merge through one
+            // writer stamped with `files[0].partition()`, so a bin straddling
+            // two day partitions would commit the second day's rows under the
+            // first day's partition value: rows conserved (the row-count guard
+            // below still passes), rows invisible, because a predicate that
+            // resolves to the real day prunes the file at the partition filter.
+            // Refuse here — before the first output byte is written and before
+            // the rewrite commit — rather than regroup: the caller's bin budgets
+            // (`max_pass_bytes`, the generation cap) are stated per output file,
+            // and silently turning one bin into N would break them.
+            if let Some(other) = first_cross_partition_file(&files) {
+                anyhow::bail!(
+                    "streaming re-cluster of {table_ident} was handed a bin spanning {} \
+                     partitions: {} is in partition {:?} but {} is in {:?}. The streaming \
+                     merge writes one output partition per call — group the files by \
+                     partition value and call once per group.",
+                    files
+                        .iter()
+                        .map(|f| format!("{:?}", f.partition()))
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len(),
+                    files[0].file_path(),
+                    files[0].partition(),
+                    files[other].file_path(),
+                    files[other].partition(),
+                );
+            }
             let fanin = merge
                 .merge_fanin
                 .map(|n| n.max(2))
