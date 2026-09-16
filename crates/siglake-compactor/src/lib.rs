@@ -24,6 +24,14 @@
 //! optimistic concurrency means we never split a logical batch across
 //! commits.
 //!
+//! One exception, and only for step 2 (#3143): a segment whose bytes do not
+//! decode fails every batch it is ever claimed into, so after
+//! `SIGLAKE_COMPACTOR_POISON_ATTEMPTS` consecutive read failures the drain
+//! moves that file — and only that file — to `{wal}/poison/` with a note
+//! saying why. Its batch siblings are released and commit on the next cycle.
+//! Nothing there is deleted or automatically requeued; an operator moves the
+//! file back into `sealed/` once its cause is fixed.
+//!
 //! Phase 4 will introduce target-row-group-byte sizing (multi-file
 //! splitting when a batch exceeds ~256 MB compressed) and a partition
 //! spec (`day(timestamp)`) so multi-day batches fan out correctly.
@@ -48,9 +56,10 @@ use siglake_storage::iceberg::{
     ProofMaintenanceIncarnationMismatch, ReclusterPolicy, ShortAggregateOutcome,
 };
 use siglake_wal::{
-    claim_segment, finish_segment, list_index_dirs, list_orphaned, list_sealed, list_tenant_dirs,
-    list_visible, read_segment, read_segment_from_bytes, recover_orphaned_processing,
-    release_segment, sweep_committed_coordinated,
+    claim_segment, finish_segment, list_index_dirs, list_orphaned, list_poisoned, list_sealed,
+    list_tenant_dirs, list_visible, quarantine_poison_segment, read_segment,
+    read_segment_from_bytes, recover_orphaned_processing, release_segment,
+    sweep_committed_coordinated,
 };
 
 /// How long to retain `committed/` segments before sweep deletes them.
@@ -70,6 +79,9 @@ pub const CONSUMER_STALE_AFTER: Duration = Duration::from_secs(300);
 /// the corresponding limit.
 pub const DEFAULT_FS_MAX_SEGMENTS: usize = 64;
 pub const DEFAULT_FS_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Consecutive failed reads a local segment gets before the drain sets it
+/// aside under `poison/` — see [`poison_attempts`].
+pub const DEFAULT_POISON_ATTEMPTS: u32 = 3;
 
 #[derive(Clone, Copy)]
 struct FsBatchConfig {
@@ -98,22 +110,48 @@ struct CommitOutcome {
 /// last one visited — often a small, quiet index — describing the tenant and
 /// hiding whatever was queued ahead of it.
 ///
-/// Each visited directory calls [`Self::observe`], including the ones the
+/// Each visited directory calls [`Self::observe_dir`], including the ones the
 /// sweep skips and the ones that are empty, and the caller publishes once at
 /// the end. An observation that is cut short publishes nothing: a partial
 /// total reads as a drop in backlog, which is the one reading an autoscaler
 /// must not be given on no evidence.
+///
+/// `siglake_compactor_segments_poisoned{tenant}` rides along (#3143): it is
+/// per-tenant, summed over the same directories, and clobberable in exactly
+/// the same way, so it is counted and published here rather than `set` by each
+/// directory in turn.
 #[derive(Default)]
 struct SealedBacklog {
     by_tenant: BTreeMap<String, usize>,
+    poisoned_by_tenant: BTreeMap<String, usize>,
 }
 
 impl SealedBacklog {
-    /// Add one directory's sealed count to its tenant's total. Zero still
-    /// registers the label, so a tenant that drains to empty reports zero
-    /// instead of keeping its last non-zero reading.
-    fn observe(&mut self, tenant_label: &str, sealed: usize) {
+    /// Add one directory's sealed count, and the segments set aside under its
+    /// `poison/`, to its tenant's totals. Zero still registers the label, so a
+    /// tenant that drains to empty reports zero instead of keeping its last
+    /// non-zero reading.
+    ///
+    /// A `poison/` that cannot be listed counts zero for this sweep: the
+    /// reading is an operator's cue, and the drain has better ways to report a
+    /// directory it cannot read than to refuse the backlog gauge over it.
+    fn observe_dir(&mut self, tenant_label: &str, dir: &Path, sealed: usize) {
         *self.by_tenant.entry(tenant_label.to_string()).or_default() += sealed;
+        let poisoned = list_poisoned(dir).map(|v| v.len()).unwrap_or(0);
+        *self
+            .poisoned_by_tenant
+            .entry(tenant_label.to_string())
+            .or_default() += poisoned;
+    }
+
+    /// Add segments this sweep set aside itself. The directory listing that
+    /// opened the cycle predates them, and a level an operator alerts on
+    /// should not wait for the next sweep to move.
+    fn observe_poisoned(&mut self, tenant_label: &str, poisoned: usize) {
+        *self
+            .poisoned_by_tenant
+            .entry(tenant_label.to_string())
+            .or_default() += poisoned;
     }
 
     /// Publish one reading per tenant label seen this sweep, plus zero for
@@ -126,6 +164,11 @@ impl SealedBacklog {
                 "tenant" => tenant.clone()
             )
             .set(0.0);
+            metrics::gauge!(
+                "siglake_compactor_segments_poisoned",
+                "tenant" => tenant.clone()
+            )
+            .set(0.0);
         }
         for (tenant, sealed) in &self.by_tenant {
             metrics::gauge!(
@@ -133,6 +176,11 @@ impl SealedBacklog {
                 "tenant" => tenant.clone()
             )
             .set(*sealed as f64);
+            metrics::gauge!(
+                "siglake_compactor_segments_poisoned",
+                "tenant" => tenant.clone()
+            )
+            .set(self.poisoned_by_tenant.get(tenant).copied().unwrap_or(0) as f64);
         }
         *previously_published = published_this_sweep;
     }
@@ -530,6 +578,18 @@ pub struct Compactor {
     commit_batch: Option<CommitBatchPolicy>,
     drain_concurrency: Option<usize>,
     drain_cycle_budget: Option<Duration>,
+    /// See [`Self::with_poison_attempts`]; `None` reads the environment.
+    poison_attempts: Option<u32>,
+    /// #3143: consecutive read failures charged to each local segment, by file
+    /// name. A name is unique across the whole WAL (uuidv7-derived, minted by
+    /// the writer), so one map covers every tenant and index directory.
+    ///
+    /// Entries appear only for a segment a drain could not read, and leave on
+    /// its next successful commit or on its set-aside, so the map is bounded
+    /// by the failing part of the backlog. Shared across clones; emptied by a
+    /// restart, which costs a poisoned segment one more round of attempts and
+    /// cannot lose its bytes.
+    segment_read_failures: Arc<std::sync::Mutex<HashMap<String, u32>>>,
     /// See [`Self::with_verified_owner_for_test`].
     verified_owner_for_test: Option<String>,
     /// See [`Self::with_transient_fs_commit_failures_for_test`].
@@ -564,6 +624,8 @@ impl Compactor {
             commit_batch: None,
             drain_concurrency: None,
             drain_cycle_budget: None,
+            poison_attempts: None,
+            segment_read_failures: Default::default(),
             verified_owner_for_test: None,
             transient_fs_commit_failures_for_test: None,
         };
@@ -597,6 +659,18 @@ impl Compactor {
     /// failure scenarios without changing the process environment.
     pub fn with_drain_cycle_budget(mut self, budget: Duration) -> Self {
         self.drain_cycle_budget = Some(budget.max(Duration::from_millis(100)));
+        self
+    }
+
+    /// Pin how many consecutive failed reads a local segment gets before the
+    /// drain sets it aside under `poison/`, bypassing
+    /// `SIGLAKE_COMPACTOR_POISON_ATTEMPTS`. `0` disables the set-aside.
+    ///
+    /// Same use as [`Self::with_drain_concurrency`]: a caller that wants a
+    /// different containment budget — or a test driving the set-aside — sets
+    /// it here rather than in the process environment.
+    pub fn with_poison_attempts(mut self, attempts: u32) -> Self {
+        self.poison_attempts = Some(attempts);
         self
     }
 
@@ -791,6 +865,115 @@ impl Compactor {
             );
         }
         Ok(())
+    }
+
+    /// #3143: charge a failed drain batch to the individual segments that
+    /// could not be read, and set aside the ones that have now failed
+    /// [`poison_attempts`] consecutive reads. Returns what stays in the batch,
+    /// for the caller to release back to `sealed/`, and how many segments this
+    /// call set aside.
+    ///
+    /// A failure that names no segment — a catalog conflict, an append
+    /// refusal, a store timeout — charges nothing and the whole batch is
+    /// released, exactly as before. So does a segment that simply shared a
+    /// batch with an unreadable one.
+    ///
+    /// A set-aside that itself fails leaves the segment in the batch: it goes
+    /// back to `sealed/` and the next cycle tries again, which is the
+    /// pre-#3143 behaviour and the right one while the volume is the thing
+    /// that is unwell.
+    fn set_aside_unreadable(
+        &self,
+        claimed: Vec<PathBuf>,
+        err: &anyhow::Error,
+        tenant_label: &str,
+    ) -> (Vec<PathBuf>, usize) {
+        let Some(unreadable) = err.downcast_ref::<UnreadableSegments>() else {
+            return (claimed, 0);
+        };
+        let limit = self.poison_attempts.unwrap_or_else(poison_attempts);
+        let mut set_aside: HashSet<PathBuf> = HashSet::new();
+        for segment in &unreadable.segments {
+            let Some(name) = segment.path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let attempts = {
+                let mut ledger = self
+                    .segment_read_failures
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let entry = ledger.entry(name.to_string()).or_insert(0);
+                *entry = entry.saturating_add(1);
+                *entry
+            };
+            if limit == 0 || attempts < limit {
+                tracing::warn!(
+                    path = %segment.path.display(),
+                    error = %segment.reason,
+                    attempts,
+                    limit,
+                    tenant = tenant_label,
+                    "could not read a claimed WAL segment; releasing it for retry"
+                );
+                continue;
+            }
+            match quarantine_poison_segment(&segment.path, &segment.reason, attempts) {
+                Ok(dest) => {
+                    tracing::error!(
+                        path = %segment.path.display(),
+                        held = %dest.display(),
+                        error = %segment.reason,
+                        attempts,
+                        tenant = tenant_label,
+                        "segment SET ASIDE: it failed to read on every attempt, so it is held \
+                         under poison/ instead of failing every batch it joins. Its rows are \
+                         durable and unqueryable; move the file back into sealed/ to retry it"
+                    );
+                    metrics::counter!(
+                        "siglake_compactor_segments_poisoned_total",
+                        "tenant" => tenant_label.to_string()
+                    )
+                    .increment(1);
+                    self.segment_read_failures
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(name);
+                    set_aside.insert(segment.path.clone());
+                }
+                Err(e) => tracing::error!(
+                    path = %segment.path.display(),
+                    error = %e,
+                    tenant = tenant_label,
+                    "could not set an unreadable segment aside; releasing it for retry"
+                ),
+            }
+        }
+        if set_aside.is_empty() {
+            return (claimed, 0);
+        }
+        let kept = claimed
+            .into_iter()
+            .filter(|c| !set_aside.contains(c))
+            .collect();
+        (kept, set_aside.len())
+    }
+
+    /// Drop a committed batch's read-failure charges. The ledger counts
+    /// CONSECUTIVE failures, so a segment that reads once is owed nothing for
+    /// the cycles it failed before.
+    fn forget_read_failures(&self, claimed: &[PathBuf]) {
+        let mut ledger = self
+            .segment_read_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if ledger.is_empty() {
+            return;
+        }
+        for path in claimed {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                ledger.remove(name);
+            }
+        }
     }
 
     /// Requeue abandoned claims, but only those PROVEN not to have committed.
@@ -1972,7 +2155,7 @@ impl Compactor {
             // zero, not an absence of one. Without it a deployment whose only
             // tenant subdir is named something other than `default` would keep
             // exporting whatever the legacy root last held.
-            backlog.observe("default", 0);
+            backlog.observe_dir("default", &self.wal_dir, 0);
             // Same toggle as above, seen from retention's side: a deployment
             // that drained at the top level and then moved to tenant subdirs
             // leaves a `committed/` tail here that no later cycle would reach,
@@ -1999,7 +2182,7 @@ impl Compactor {
                 // quarantined — disposition may requeue them for commit.
                 let orphaned = list_orphaned(&index_dir).map(|v| v.len()).unwrap_or(0);
                 if pending.is_empty() && orphaned == 0 {
-                    backlog.observe(&tenant, 0);
+                    backlog.observe_dir(&tenant, &index_dir, 0);
                     // Skipping the drain must not skip retention: an index that
                     // stops receiving writes still has a `committed/` tail from
                     // its last drain, and this branch is the only one it will
@@ -2023,7 +2206,7 @@ impl Compactor {
                     // segments are waiting, and every later cycle stops here
                     // too, so leaving them out of the tenant's total is how a
                     // stuck index becomes invisible to the HPA.
-                    backlog.observe(&tenant, pending.len());
+                    backlog.observe_dir(&tenant, &index_dir, pending.len());
                     // The fifth exit, and the one the sweep-on-every-cycle
                     // change missed. Lower stakes than the other four — this
                     // path has pending work and means an index that cannot be
@@ -2064,7 +2247,7 @@ impl Compactor {
                         // `sealed/`. What the sweep KEPT is the backlog the
                         // next cycle drains.
                         let kept = list_sealed(&index_dir).map(|v| v.len()).unwrap_or(0);
-                        backlog.observe(&tenant, kept);
+                        backlog.observe_dir(&tenant, &index_dir, kept);
                         self.sweep_retention_at(&index_dir, &tenant);
                         continue;
                     }
@@ -2384,7 +2567,7 @@ impl Compactor {
             tenant_label,
             target.index_label(),
         );
-        backlog.observe(tenant_label, sealed.len());
+        backlog.observe_dir(tenant_label, dir, sealed.len());
         if sealed.is_empty() {
             metrics::counter!("siglake_compactor_cycles_total",
                 "outcome" => "empty", "tenant" => tenant_label.to_string())
@@ -2607,8 +2790,19 @@ impl Compactor {
                         .increment(outcome.strict_residual_rows);
                     }
                     committed_segments += outcome.segments;
+                    // #3143: a segment that committed owes nothing for the
+                    // cycles it failed before — the ledger counts CONSECUTIVE
+                    // failures, so a storage hiccup never accumulates toward a
+                    // set-aside.
+                    self.forget_read_failures(&claimed);
                 }
                 Err(e) => {
+                    // #3143: charge the failure to the segments it names, and
+                    // set aside the ones that have spent their attempts. What
+                    // comes back is the rest of the batch — healthy siblings,
+                    // and segments with attempts left.
+                    let (claimed, set_aside) = self.set_aside_unreadable(claimed, &e, tenant_label);
+                    backlog.observe_poisoned(tenant_label, set_aside);
                     // A failed batch releases its own segments back to sealed/ for
                     // retry; in-flight siblings are unaffected (their claims are
                     // disjoint and their commits independent).
@@ -4095,6 +4289,30 @@ fn drain_concurrency() -> usize {
         .unwrap_or(1)
 }
 
+/// How many consecutive cycles may fail to read one local segment before the
+/// drain sets it aside under `poison/` (#3143). `0` disables the set-aside and
+/// restores the retry-forever behaviour.
+///
+/// Three, not one: a read can fail for reasons that are not the segment's (a
+/// storage hiccup, a momentarily unreachable volume), and the cost of a wrong
+/// verdict is an operator requeue. Three cycles of an otherwise healthy drain
+/// is seconds, so a genuinely unreadable segment is contained long before the
+/// backlog behind it matters.
+fn poison_attempts() -> u32 {
+    poison_attempts_from(
+        std::env::var("SIGLAKE_COMPACTOR_POISON_ATTEMPTS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure resolver for [`poison_attempts`]: unset or unparseable is the default.
+fn poison_attempts_from(configured: Option<&str>) -> u32 {
+    configured
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_POISON_ATTEMPTS)
+}
+
 /// This drain's shard of the index keyspace, from
 /// `SIGLAKE_DRAIN_SHARD_INDEX` / `SIGLAKE_DRAIN_SHARD_COUNT`.
 ///
@@ -4275,6 +4493,44 @@ fn align_batch_to(
     RecordBatch::try_new(target.clone(), cols).context("align WAL batch to the widest schema")
 }
 
+/// One claimed segment the drain could not read, and the error it got.
+#[derive(Debug)]
+struct UnreadableSegment {
+    path: PathBuf,
+    reason: String,
+}
+
+/// A filesystem drain batch that failed because specific segments could not be
+/// read (#3143).
+///
+/// The point of the type is attribution: the drain charges the failure to
+/// exactly these segments, and every other segment in the batch is released
+/// untouched. An error of any other kind is the batch's — a catalog conflict,
+/// a store timeout — and is charged to nothing.
+#[derive(Debug)]
+struct UnreadableSegments {
+    segments: Vec<UnreadableSegment>,
+}
+
+impl std::fmt::Display for UnreadableSegments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} claimed segment(s) could not be read: ",
+            self.segments.len()
+        )?;
+        for (i, s) in self.segments.iter().enumerate() {
+            if i > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "{}: {}", s.path.display(), s.reason)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UnreadableSegments {}
+
 async fn commit_claimed(
     ice: &Arc<IcebergContext>,
     wal_dir: &Path,
@@ -4305,9 +4561,25 @@ async fn commit_claimed(
     let read_results = futures::future::try_join_all(read_futures)
         .await
         .context("joining read_segment tasks")?;
+    // #3143: name the segments that failed rather than returning the first
+    // error for the whole batch. One unreadable file used to fail every batch
+    // it landed in with nothing to say which file it was, and the drain
+    // released the batch and re-claimed the same set forever.
     let mut batches: Vec<RecordBatch> = Vec::new();
-    for r in read_results {
-        batches.extend(r?);
+    let mut unreadable: Vec<UnreadableSegment> = Vec::new();
+    for (path, r) in claimed.iter().zip(read_results) {
+        match r {
+            Ok(b) => batches.extend(b),
+            Err(e) => unreadable.push(UnreadableSegment {
+                path: path.clone(),
+                reason: format!("{e:#}"),
+            }),
+        }
+    }
+    if !unreadable.is_empty() {
+        return Err(anyhow::Error::new(UnreadableSegments {
+            segments: unreadable,
+        }));
     }
     metrics::histogram!("siglake_compactor_segment_read_duration_seconds")
         .record(read_start.elapsed().as_secs_f64());
@@ -4388,7 +4660,14 @@ async fn filesystem_terminal_consumed_proof_entries(
             }
         }
     }
-    for path in list_orphaned(wal_dir).context("listing quarantined WAL segments")? {
+    for path in list_orphaned(wal_dir)
+        .context("listing quarantined WAL segments")?
+        .into_iter()
+        // #3143: a segment set aside under `poison/` is also awaiting
+        // adjudication — an operator can move it back into `sealed/` — so its
+        // proof entry stays for the same reason an orphan's does.
+        .chain(list_poisoned(wal_dir).context("listing WAL segments set aside")?)
+    {
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             protected.insert(name.to_string());
         }
@@ -5761,6 +6040,141 @@ mod watchdog_tests {
             watchdog_ceiling_from(Some("nope"), 1800),
             Some(Duration::from_secs(1800))
         );
+    }
+
+    /// #3143: the attempt budget a local segment gets before the set-aside.
+    #[test]
+    fn poison_attempts_parse_default_and_disable() {
+        assert_eq!(poison_attempts_from(None), DEFAULT_POISON_ATTEMPTS);
+        assert_eq!(poison_attempts_from(Some("1")), 1);
+        assert_eq!(poison_attempts_from(Some(" 5 ")), 5);
+        // 0 keeps the pre-#3143 behaviour: retry forever, set nothing aside.
+        assert_eq!(poison_attempts_from(Some("0")), 0);
+        // Garbage and negatives → default, never an accidental disable.
+        assert_eq!(poison_attempts_from(Some("nope")), DEFAULT_POISON_ATTEMPTS);
+        assert_eq!(poison_attempts_from(Some("-1")), DEFAULT_POISON_ATTEMPTS);
+        assert_eq!(poison_attempts_from(Some("")), DEFAULT_POISON_ATTEMPTS);
+    }
+}
+
+/// #3143: the attempt ledger behind the `poison/` set-aside, driven directly
+/// so each charge is one "cycle". The drain's own pass retries within a cycle,
+/// which makes the same accounting hard to step through end to end.
+#[cfg(test)]
+mod poison_ledger_tests {
+    use super::*;
+    use siglake_core::Event;
+
+    fn seal(dir: &Path, n: usize) -> Vec<PathBuf> {
+        let mut w =
+            siglake_wal::WalWriter::with_thresholds(dir, "ing-1", 1, Duration::from_secs(60))
+                .unwrap();
+        for i in 0..n {
+            w.append_events(&[Event::now(format!("row-{i}"))])
+                .unwrap()
+                .expect("one row seals the segment");
+        }
+        list_sealed(dir).unwrap()
+    }
+
+    fn unreadable(path: &Path) -> anyhow::Error {
+        anyhow::Error::new(UnreadableSegments {
+            segments: vec![UnreadableSegment {
+                path: path.to_path_buf(),
+                reason: "CRC mismatch".to_string(),
+            }],
+        })
+    }
+
+    async fn compactor_at(wal: &Path, warehouse: &Path, attempts: u32) -> Compactor {
+        let ice = Arc::new(IcebergContext::open(warehouse).await.unwrap());
+        Compactor::new(wal, ice).with_poison_attempts(attempts)
+    }
+
+    #[tokio::test]
+    async fn only_the_segments_a_failure_names_are_charged_for_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let sealed = seal(&wal, 2);
+        // The constructor sweeps `processing/`, so the compactor exists before
+        // anything is claimed — as it does in the drain.
+        let c = compactor_at(&wal, &tmp.path().join("warehouse"), 2).await;
+        let claimed: Vec<PathBuf> = sealed.iter().map(|p| claim_segment(p).unwrap()).collect();
+
+        // A failure that names no segment is the batch's, not any file's: a
+        // catalog conflict or a store timeout charges nothing, however often
+        // it repeats.
+        for _ in 0..5 {
+            let (kept, aside) = c.set_aside_unreadable(
+                claimed.clone(),
+                &anyhow::anyhow!("catalog commit conflict"),
+                "default",
+            );
+            assert_eq!(kept, claimed);
+            assert_eq!(aside, 0);
+        }
+
+        // The first charge is under the budget: the whole batch comes back.
+        let (kept, aside) = c.set_aside_unreadable(claimed.clone(), &unreadable(&claimed[0]), "t");
+        assert_eq!(kept, claimed, "nothing is set aside on one failed read");
+        assert_eq!(aside, 0);
+        assert!(list_poisoned(&wal).unwrap().is_empty());
+
+        // The second spends it. Only the named segment moves; its sibling was
+        // never charged for sharing a batch with it.
+        let (kept, aside) = c.set_aside_unreadable(claimed.clone(), &unreadable(&claimed[0]), "t");
+        assert_eq!(aside, 1);
+        assert_eq!(kept, vec![claimed[1].clone()]);
+        let held = list_poisoned(&wal).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].file_name(), claimed[0].file_name());
+        assert_eq!(siglake_wal::read_poison_note(&held[0]).unwrap().attempts, 2);
+
+        // And the sibling still has its full budget.
+        let (_, aside) =
+            c.set_aside_unreadable(vec![claimed[1].clone()], &unreadable(&claimed[1]), "t");
+        assert_eq!(aside, 0, "the sibling starts from zero");
+    }
+
+    #[tokio::test]
+    async fn a_segment_that_commits_owes_nothing_for_its_earlier_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let sealed = seal(&wal, 1);
+        // The constructor sweeps `processing/`, so the compactor exists before
+        // anything is claimed — as it does in the drain.
+        let c = compactor_at(&wal, &tmp.path().join("warehouse"), 2).await;
+        let claimed: Vec<PathBuf> = sealed.iter().map(|p| claim_segment(p).unwrap()).collect();
+
+        let (_, aside) = c.set_aside_unreadable(claimed.clone(), &unreadable(&claimed[0]), "t");
+        assert_eq!(aside, 0);
+        // A cycle later it reads fine and commits.
+        c.forget_read_failures(&claimed);
+        // So the next failure is its first, not its last.
+        let (kept, aside) = c.set_aside_unreadable(claimed.clone(), &unreadable(&claimed[0]), "t");
+        assert_eq!(aside, 0, "the ledger counts CONSECUTIVE failures");
+        assert_eq!(kept, claimed);
+        assert!(list_poisoned(&wal).unwrap().is_empty());
+    }
+
+    /// `0` keeps the pre-#3143 behaviour for a deployment that wants it: the
+    /// segment is released for retry however many times it fails.
+    #[tokio::test]
+    async fn a_zero_budget_never_sets_anything_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let sealed = seal(&wal, 1);
+        // The constructor sweeps `processing/`, so the compactor exists before
+        // anything is claimed — as it does in the drain.
+        let c = compactor_at(&wal, &tmp.path().join("warehouse"), 0).await;
+        let claimed: Vec<PathBuf> = sealed.iter().map(|p| claim_segment(p).unwrap()).collect();
+        for _ in 0..10 {
+            let (kept, aside) =
+                c.set_aside_unreadable(claimed.clone(), &unreadable(&claimed[0]), "t");
+            assert_eq!(kept, claimed);
+            assert_eq!(aside, 0);
+        }
+        assert!(list_poisoned(&wal).unwrap().is_empty());
     }
 }
 
