@@ -4207,8 +4207,10 @@ const DEFAULT_PUFFIN_BLOB_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// query memory pool — which subtracts the caches it knows about — had never
 /// heard of them. The cgroup read lives in `siglake_storage`, which depends on
 /// this crate, so the limit cannot be read from here. It arrives instead the way
-/// the byte-range object cache's budget does: the query server resolves it once
-/// at startup (`siglake_storage::resolve_text_index_cache_config`) and calls
+/// the byte-range object cache's budget does: the host process resolves it once
+/// at startup (`siglake_storage::resolve_text_index_cache_config`, or
+/// `resolve_role_cache_config` for the `siglake` binary's roles, where a
+/// maintenance process budgets zero because it reads no text index) and calls
 /// [`set_text_index_cache_max_bytes`] before the warehouse opens.
 static CONFIGURED_PARSED_INDEX_CACHE_MAX_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(TEXT_INDEX_CACHE_UNCONFIGURED);
