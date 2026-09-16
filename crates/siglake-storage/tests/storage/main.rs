@@ -40,6 +40,7 @@ mod pre_coverage_time_agg;
 mod puffin_gc;
 mod query_cancel;
 mod rebuild_admits_typed_columns;
+mod recluster_cross_partition;
 mod recluster_page_bounded_merge;
 mod recluster_tiered_merge;
 mod retention_delete_tasks;

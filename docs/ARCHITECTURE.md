@@ -600,7 +600,13 @@ through 200 GB and 1 TB sustained-ingest rounds
   reads against cached metadata), so decoded memory is bounded by the chunk —
   independent of fan-in — with zero intermediate write amplification, and
   near-disjoint inputs collapse to zero-copy slices (merges get cheaper as
-  data ages). Merged output is where deferred indexes materialize, in one of
+  data ages). A streamed merge writes ONE output partition per call — its
+  writer stamps the bin's first partition value on everything it writes — so a
+  bin spanning two partitions is refused rather than committed under a partition
+  value that hides its rows from a predicated query; the planners bin per
+  partition, and an in-RAM merge splits its output by partition value and takes
+  a mixed bin (see [`LIMITATIONS.md`](LIMITATIONS.md)).
+  Merged output is where deferred indexes materialize, in one of
   two shapes: an in-RAM merge writes the full inline set, including the footer
   inverted indexes (with Puffin overflow) and the whole-file raw trigram
   bloom, while a streamed merge writes neither of those and leaves its output
