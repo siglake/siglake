@@ -49,9 +49,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 0.32 family: tracing-opentelemetry 0.33 pairs with opentelemetry 0.32, and
 # opentelemetry-proto 0.32 is already the OTLP decode path on the ingest side.
 opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+# No `rt-tokio`: with the blocking OTLP client below, the batch processors run
+# on their own threads and the exporter retries without a runtime, so the
+# experimental async-runtime machinery that feature pulls in is dead weight.
+opentelemetry_sdk = "0.32"
 opentelemetry-http = "0.32"
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls", "trace", "logs", "internal-logs"] }
+# `reqwest-blocking-client`, NOT `reqwest-client`: the SDK's batch processors
+# export from their own OS threads, which have no tokio reactor, and the async
+# client panics there ("there is no reactor running") so nothing ever ships.
+# With this feature the exporter builds a blocking client on a thread of its
+# own and retries without tokio. crates/siglake-cli/tests/cli/otel_shutdown_flush.rs
+# is the regression.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "logs", "internal-logs"] }
 opentelemetry-appender-tracing = "0.32"
 tracing-opentelemetry = "0.33"
 chrono = { version = "0.4", features = ["serde"] }
