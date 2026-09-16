@@ -162,6 +162,8 @@ jobs:
           exit "$rc"
       - name: compose smoke formats host counts and propagates pipeline failures
         run: scripts/check-smoke.sh
+      - name: aws up binds every cluster write to its private kubeconfig
+        run: scripts/check-aws-up-kubeconfig.sh
       - name: loadgen reports its missing local-binary prerequisite before preflight
         run: scripts/check-loadgen.sh
       - name: compose preflight rejects an occupied published port
