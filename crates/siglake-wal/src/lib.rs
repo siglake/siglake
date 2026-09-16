@@ -2916,7 +2916,8 @@ pub fn read_poison_note(segment: &Path) -> Option<PoisonNote> {
 /// Call this after fixing what made the segment unreadable — restoring the
 /// file from a backup, or upgrading to a build that knows its frame version.
 /// Requeueing an unchanged segment simply spends the attempt budget again and
-/// sets it aside once more.
+/// sets it aside once more. `siglake wal-requeue` is the operator-facing
+/// wrapper: it walks the tenant/index layout and reports each note.
 pub fn requeue_poisoned_segment(path: &Path) -> Result<PathBuf> {
     let root = path
         .parent()

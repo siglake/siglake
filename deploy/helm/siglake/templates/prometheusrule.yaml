@@ -366,7 +366,8 @@ spec:
               `requeue_quarantined`. On the local filesystem drain, the segment failed to
               read on every attempt it was given and sits under `<wal>/poison/` with a
               `.poison.json` note saying why; the `segment SET ASIDE` log line names the
-              file. Fix what made it unreadable, then move it back into `<wal>/sealed/`.
+              file. Fix what made it unreadable, then `siglake wal-requeue --wal
+              <wal-root>`.
         - alert: SiglakeMirrorReconciliationErrors
           # The bounded-page activity counter advances before reconciliation
           # lists the mirror. A listing or registration failure can therefore

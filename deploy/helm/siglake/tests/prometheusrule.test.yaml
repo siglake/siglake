@@ -637,7 +637,7 @@ tests:
                 the segment failed to read on every attempt it was given and sits
                 under `<wal>/poison/` with a `.poison.json` note saying why; the
                 `segment SET ASIDE` log line names the file. Fix what made it
-                unreadable, then move it back into `<wal>/sealed/`.
+                unreadable, then `siglake wal-requeue --wal <wal-root>`.
       # Requeued by an operator at 12m: the alert clears on the next sweep's
       # reading, without anyone restarting a pod.
       - eval_time: 13m

@@ -83,8 +83,8 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   the whole batch, and a segment that commits has its charges dropped, so the
   budget counts consecutive failures of one file. `poison/` is excluded from the
   automatic `orphans/` disposition, survives restarts, and is never deleted or
-  rewritten: an operator moves the file back into `<wal>/sealed/` once the cause
-  is fixed. `siglake_compactor_segments_poisoned_total` counts the set-asides,
+  rewritten: the new `siglake wal-requeue --wal <wal-root>` command
+  (`--segment`, `--dry-run`) is the way back, once the cause is fixed. `siglake_compactor_segments_poisoned_total` counts the set-asides,
   `siglake_compactor_segments_poisoned{tenant}` levels them, and
   `SiglakeSegmentsQuarantined` now fires on either drain's held-back segments
   (still 34 alerts). (#3143)

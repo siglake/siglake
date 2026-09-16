@@ -267,9 +267,9 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   read error and the attempts spent, and its batch siblings commit on the next
   pass. What is left out is any automatic way back. `poison/` is excluded from
   the `orphans/` disposition that runs every cycle, survives restarts, and is
-  never deleted or rewritten: requeueing is an operator moving the file into
-  `<wal>/sealed/` once the cause is fixed, and a segment requeued unchanged
-  simply spends its attempts again. Until then its rows are acknowledged,
+  never deleted or rewritten: requeueing is an operator running `siglake
+  wal-requeue --wal <wal-root>` once the cause is fixed, and a segment requeued
+  unchanged simply spends its attempts again. Until then its rows are acknowledged,
   durable on the volume, and not queryable — which is the trade the set-aside
   makes, against a queue behind it that never drains.
   `siglake_compactor_segments_poisoned_total` counts the set-asides,

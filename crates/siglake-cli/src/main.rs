@@ -366,6 +366,33 @@ enum Command {
         to: PathBuf,
     },
 
+    /// Return segments the drain set aside under `<wal>/poison/` to `sealed/`,
+    /// so the next drain cycle claims them again.
+    ///
+    /// A segment lands there after failing to read on every attempt the drain
+    /// gave it (`SIGLAKE_COMPACTOR_POISON_ATTEMPTS`), which is why nothing
+    /// requeues it automatically: the retry that would change the answer is
+    /// the one an operator does first — restoring the file from the mirror or
+    /// a backup, or upgrading to a build that knows its frame version.
+    /// Requeueing a segment unchanged simply spends the attempts again.
+    ///
+    /// Prints one line per set-aside segment with the recorded reason. Refuses
+    /// to move a segment whose name is already back in `sealed/`.
+    WalRequeue {
+        /// The WAL ROOT (e.g. `/var/lib/siglake/wal`), not a `poison/`
+        /// directory. Its own `poison/`, every tenant's and every index's are
+        /// all visited.
+        #[arg(long)]
+        wal: PathBuf,
+        /// Requeue only this segment file name. Default: every set-aside
+        /// segment under the root.
+        #[arg(long)]
+        segment: Option<String>,
+        /// Report what would move without moving anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Bound the `query_audit` Iceberg table's growth.
     ///
     /// Two modes:
@@ -864,6 +891,11 @@ async fn main() -> Result<()> {
             .await
         }
         Command::WalRecover { from, to } => run_wal_recover(&from, &to).await,
+        Command::WalRequeue {
+            wal,
+            segment,
+            dry_run,
+        } => run_wal_requeue(&wal, segment.as_deref(), dry_run),
         Command::AuditRotate {
             warehouse_url,
             catalog_uri,
@@ -2282,6 +2314,79 @@ async fn run_wal_recover(from: &str, to: &std::path::Path) -> Result<()> {
     tracing::info!(from, to = %to.display(), prefix, "wal-recover starting");
     let pulled = siglake_wal::mirror::recover_from_object_store(store, prefix, to).await?;
     println!("pulled {pulled} segments into {}", to.display());
+    Ok(())
+}
+
+/// Every WAL directory under `root` that can hold a `poison/`: the root
+/// itself (legacy single-tenant layout), each tenant, and each tenant's
+/// per-index directories. The same walk the drain does each cycle.
+fn wal_dirs_under(root: &std::path::Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = vec![root.to_path_buf()];
+    for (_tenant, dir) in siglake_wal::list_tenant_dirs(root)? {
+        for (_index, index_dir) in siglake_wal::list_index_dirs(&dir)? {
+            dirs.push(index_dir);
+        }
+        dirs.push(dir);
+    }
+    dirs.sort();
+    Ok(dirs)
+}
+
+/// Implementation of the `siglake wal-requeue` subcommand. See
+/// `Command::WalRequeue` docs for the user-facing semantics.
+fn run_wal_requeue(wal: &std::path::Path, segment: Option<&str>, dry_run: bool) -> Result<()> {
+    if wal.file_name().and_then(|n| n.to_str()) == Some(siglake_wal::POISON_DIR) {
+        anyhow::bail!(
+            "--wal must be the WAL ROOT, not a `{}` directory: the requeue visits every \
+             tenant and index directory beneath it. Pass {} instead.",
+            siglake_wal::POISON_DIR,
+            wal.parent().unwrap_or(wal).display()
+        );
+    }
+    let mut seen = 0usize;
+    let mut moved = 0usize;
+    for dir in wal_dirs_under(wal)? {
+        for held in siglake_wal::list_poisoned(&dir)? {
+            let name = held
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if segment.is_some_and(|wanted| wanted != name) {
+                continue;
+            }
+            seen += 1;
+            let reason = siglake_wal::read_poison_note(&held)
+                .map(|note| format!("{} after {} attempt(s)", note.reason, note.attempts))
+                .unwrap_or_else(|| "no note recorded".to_string());
+            if dry_run {
+                println!("WOULD REQUEUE {} — {reason}", held.display());
+                continue;
+            }
+            let back = siglake_wal::requeue_poisoned_segment(&held)?;
+            moved += 1;
+            println!(
+                "REQUEUED {} -> {} — {reason}",
+                held.display(),
+                back.display()
+            );
+        }
+    }
+    if seen == 0 {
+        match segment {
+            Some(name) => println!(
+                "no segment named {name} is set aside under {}",
+                wal.display()
+            ),
+            None => println!("nothing is set aside under {}", wal.display()),
+        }
+        return Ok(());
+    }
+    if dry_run {
+        println!("{seen} segment(s) would be requeued; nothing was moved");
+    } else {
+        println!("requeued {moved} of {seen} segment(s) into sealed/");
+    }
     Ok(())
 }
 

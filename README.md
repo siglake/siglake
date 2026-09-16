@@ -244,7 +244,8 @@ crates/
   siglake-bloom        trigram/token blooms
   siglake-cli          the `siglake` binary (all roles + ops commands:
                        audit-rotate, gc-orphans, retention-sweep,
-                       delete-sweep, migrate-schema, wal-recover, …)
+                       delete-sweep, migrate-schema, wal-recover,
+                       wal-requeue, …)
   siglake-operator     Kubernetes operator
   siglake-openapi      emits the committed OpenAPI 3.1 specs (docs/api/)
   siglake-bench (private, not in the public tree) / -loadgen   tooling

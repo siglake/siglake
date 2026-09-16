@@ -165,8 +165,9 @@ the drain moves that file, and only that file, to `<wal>/poison/` with a
 `.poison.json` note recording the error and the attempts spent; its batch
 siblings commit on the next pass. Nothing under `poison/` is deleted, rewritten
 or automatically requeued — unlike `orphans/`, whose residents are disposed of
-every cycle — so requeueing is an operator moving the file back into
-`sealed/` once the cause is fixed. The set-asides are counted by
+every cycle — so requeueing is an operator running `siglake wal-requeue
+--wal <wal-root>` (`--segment` for one file, `--dry-run` to read the verdicts
+first) once the cause is fixed. The set-asides are counted by
 `siglake_compactor_segments_poisoned_total` and levelled per tenant by
 `siglake_compactor_segments_poisoned`, which fires `SiglakeSegmentsQuarantined`
 alongside the catalog-claim path's own quarantine. The rows in a set-aside
