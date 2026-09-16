@@ -733,3 +733,182 @@ async fn unresolvable_index_still_sweeps_its_committed_tail() {
         "and its pending segment must be left alone, not silently dropped"
     );
 }
+
+/// #3143: one segment whose bytes never decode used to fail every batch it was
+/// claimed into, forever, with nothing naming the file. It is now charged for
+/// its own failures, set aside under `poison/` once it has spent them, and its
+/// batch siblings commit on the next cycle.
+///
+/// Drives the whole containment: repeated cycles, a restart, the automatic
+/// orphan disposition that must not touch it, the consumed proof that must not
+/// claim it, and the operator's deliberate way back.
+#[tokio::test]
+async fn an_undecodable_segment_is_set_aside_and_its_siblings_commit() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use siglake_wal::{list_poisoned, read_poison_note, requeue_poisoned_segment, POISON_DIR};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_dir = tmp.path().join("wal");
+    let warehouse = tmp.path().join("warehouse");
+    let ice = Arc::new(IcebergContext::open(&warehouse).await.unwrap());
+
+    // Three sealed segments, one row each, all claimable into one batch.
+    {
+        let mut w =
+            WalWriter::with_thresholds(&wal_dir, "ing-poison", 1, Duration::from_secs(60)).unwrap();
+        for i in 0..3 {
+            w.append_events(&[Event::now(format!("row-{i}"))])
+                .unwrap()
+                .expect("one row seals the segment");
+        }
+    }
+    let sealed = list_sealed(&wal_dir).unwrap();
+    assert_eq!(sealed.len(), 3);
+
+    // The middle one is truncated in place — a torn restore, a bad sector and
+    // an unknown frame version all arrive at the same read error.
+    let poisoned_name = sealed[1].file_name().unwrap().to_str().unwrap().to_string();
+    let intact_bytes = std::fs::read(&sealed[1]).unwrap();
+    std::fs::write(&sealed[1], &intact_bytes[..8]).unwrap();
+    let corrupt_bytes = std::fs::read(&sealed[1]).unwrap();
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let compactor = Compactor::new(&wal_dir, ice.clone()).with_poison_attempts(2);
+    {
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        // A pass re-lists and re-claims whatever it released until its budget
+        // runs out, so the two attempts and the commit of what is left happen
+        // inside one cycle: batch of three fails, batch of three fails again
+        // and sets the segment aside, batch of two commits.
+        assert_eq!(compactor.run_once().await.unwrap(), 2);
+    }
+    assert_eq!(
+        count_events(&ice).await,
+        2,
+        "the healthy siblings must not be held hostage"
+    );
+    assert!(list_sealed(&wal_dir).unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_dir(wal_dir.join(PROCESSING_DIR))
+            .unwrap()
+            .count(),
+        0
+    );
+
+    let held = wal_dir.join(POISON_DIR).join(&poisoned_name);
+    assert_eq!(list_poisoned(&wal_dir).unwrap(), vec![held.clone()]);
+    assert_eq!(
+        std::fs::read(&held).unwrap(),
+        corrupt_bytes,
+        "the original bytes are preserved, not repaired and not deleted"
+    );
+    let note = read_poison_note(&held).expect("a set-aside segment carries its verdict");
+    assert_eq!(note.segment, poisoned_name);
+    assert_eq!(note.attempts, 2);
+    assert!(!note.reason.is_empty(), "the read error is recorded");
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    let counter: u64 = snapshot
+        .iter()
+        .filter(|(key, _, _, _)| key.key().name() == "siglake_compactor_segments_poisoned_total")
+        .map(|(_, _, _, value)| match value {
+            DebugValue::Counter(n) => *n,
+            other => panic!("segments_poisoned_total must be a counter, got {other:?}"),
+        })
+        .sum();
+    assert_eq!(counter, 1, "one set-aside, counted once");
+    let gauge: f64 = snapshot
+        .iter()
+        .filter(|(key, _, _, _)| key.key().name() == "siglake_compactor_segments_poisoned")
+        .map(|(_, _, _, value)| match value {
+            DebugValue::Gauge(n) => n.into_inner(),
+            other => panic!("segments_poisoned must be a gauge, got {other:?}"),
+        })
+        .fold(0.0, f64::max);
+    assert_eq!(
+        gauge, 1.0,
+        "and reported as a level an operator can alert on"
+    );
+
+    // The consumed proof speaks only for what committed: a set-aside segment
+    // is not claimed as consumed, so a requeue of it is still a fresh commit.
+    let (consumed, _floor) = ice
+        .consumed_segments_and_history_floor("events")
+        .await
+        .unwrap();
+    assert!(
+        !consumed.contains(&poisoned_name),
+        "a segment that never committed must not be proven consumed"
+    );
+    for path in [&sealed[0], &sealed[2]] {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            consumed.contains(name),
+            "{name} committed and must be proven"
+        );
+    }
+
+    // A restart re-runs startup recovery and every cycle re-runs the orphan
+    // disposition. Neither may requeue or delete the set-aside.
+    let restarted = Compactor::new(&wal_dir, ice.clone()).with_poison_attempts(2);
+    assert_eq!(restarted.run_once().await.unwrap(), 0);
+    assert_eq!(list_poisoned(&wal_dir).unwrap(), vec![held.clone()]);
+    assert_eq!(std::fs::read(&held).unwrap(), corrupt_bytes);
+    assert!(
+        list_sealed(&wal_dir).unwrap().is_empty(),
+        "never auto-requeued"
+    );
+    assert_eq!(count_events(&ice).await, 2);
+
+    // The operator's way back: fix the file, then requeue it deliberately.
+    std::fs::write(&held, &intact_bytes).unwrap();
+    let back = requeue_poisoned_segment(&held).unwrap();
+    assert_eq!(back, wal_dir.join("sealed").join(&poisoned_name));
+    assert!(list_poisoned(&wal_dir).unwrap().is_empty());
+    assert_eq!(restarted.run_once().await.unwrap(), 1);
+    assert_eq!(
+        count_events(&ice).await,
+        3,
+        "a repaired segment commits like any other"
+    );
+}
+
+/// The negative control for the set-aside. With the attempt budget disabled
+/// the queue behaves exactly as it did before #3143: the unreadable segment
+/// takes every batch it joins down with it, cycle after cycle, and the rows of
+/// its healthy siblings never become queryable.
+#[tokio::test]
+async fn without_the_set_aside_one_unreadable_segment_blocks_its_siblings() {
+    use siglake_wal::list_poisoned;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_dir = tmp.path().join("wal");
+    let warehouse = tmp.path().join("warehouse");
+    let ice = Arc::new(IcebergContext::open(&warehouse).await.unwrap());
+    {
+        let mut w = WalWriter::with_thresholds(&wal_dir, "ing-control", 1, Duration::from_secs(60))
+            .unwrap();
+        for i in 0..3 {
+            w.append_events(&[Event::now(format!("row-{i}"))])
+                .unwrap()
+                .expect("one row seals the segment");
+        }
+    }
+    let sealed = list_sealed(&wal_dir).unwrap();
+    let intact = std::fs::read(&sealed[1]).unwrap();
+    std::fs::write(&sealed[1], &intact[..8]).unwrap();
+
+    let compactor = Compactor::new(&wal_dir, ice.clone())
+        .with_poison_attempts(0)
+        .with_drain_cycle_budget(Duration::from_millis(100));
+    for cycle in 0..3 {
+        assert!(
+            compactor.run_once().await.is_err(),
+            "cycle {cycle} commits nothing"
+        );
+        assert_eq!(list_sealed(&wal_dir).unwrap().len(), 3);
+        assert!(list_poisoned(&wal_dir).unwrap().is_empty());
+        assert_eq!(count_events(&ice).await, 0);
+    }
+}

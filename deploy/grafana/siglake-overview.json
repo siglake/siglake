@@ -551,11 +551,16 @@
    "targets": [
     {
      "expr": "sum(siglake_catalog_claim_quarantined{namespace=~\"$namespace\"})",
-     "legendFormat": "quarantined",
+     "legendFormat": "claim quarantine",
      "refId": "A"
+    },
+    {
+     "expr": "sum(siglake_compactor_segments_poisoned{namespace=~\"$namespace\"})",
+     "legendFormat": "poison/ set-aside",
+     "refId": "B"
     }
    ],
-   "description": "Set aside and not draining without intervention: repeated drain failures (usually an index that does not exist), or a mirrored segment refused because it cannot be placed in the table its index resolves to now, which is set aside on the first cycle. Durable and unqueryable until requeued."
+   "description": "Set aside and not draining without intervention: repeated drain failures (usually an index that does not exist), or a mirrored segment refused because it cannot be placed in the table its index resolves to now, which is set aside on the first cycle. Durable and unqueryable until requeued. The second line is the local filesystem drain's equivalent (#3143): a segment that failed to read on every attempt is held under `<wal>/poison/` with a note saying why, and `siglake wal-requeue --wal <wal-root>` is the way back once its cause is fixed. `siglake_compactor_segments_poisoned_total` is the event arm — a set-aside that is requeued and set aside again counts twice there and once here."
   },
   {
    "id": 117,

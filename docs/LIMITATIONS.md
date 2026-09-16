@@ -257,6 +257,33 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `maintenance_does_not_acknowledge_a_replacement_for_the_dropped_incarnation`,
   `maintenance_refuses_a_recreation_between_the_watermark_read_and_the_commit`
   and `a_new_incarnation_replaces_the_boundary_rather_than_inheriting_it`.
+- **A WAL segment that never decodes is set aside, and only an operator gets
+  it back.** The local filesystem drain reads a claimed batch as a unit, so one
+  unreadable segment — a torn restore, a bad sector, a frame version this build
+  does not know — failed the batch, went back to `sealed/`, and failed the next
+  batch it joined, forever. After `SIGLAKE_COMPACTOR_POISON_ATTEMPTS`
+  consecutive failed reads (3; `0` restores the old behaviour) the drain now
+  moves that one file to `<wal>/poison/` with a `.poison.json` note holding the
+  read error and the attempts spent, and its batch siblings commit on the next
+  pass. What is left out is any automatic way back. `poison/` is excluded from
+  the `orphans/` disposition that runs every cycle, survives restarts, and is
+  never deleted or rewritten: requeueing is an operator running `siglake
+  wal-requeue --wal <wal-root>` once the cause is fixed, and a segment requeued
+  unchanged simply spends its attempts again. Where the corruption is local and
+  the WAL mirror holds a good copy, `siglake wal-recover` is the other way back
+  — the set-aside left no file under `sealed/`, so recovery pulls that segment
+  again and the drain commits it, with the unreadable bytes still under
+  `poison/` to look at. Until then its rows are acknowledged,
+  durable on the volume, and not queryable — which is the trade the set-aside
+  makes, against a queue behind it that never drains.
+  `siglake_compactor_segments_poisoned_total` counts the set-asides,
+  `siglake_compactor_segments_poisoned` levels them per tenant, and
+  `SiglakeSegmentsQuarantined` pages on either drain's held-back segments. The
+  attempt counter itself is per-process, so a restart gives a segment its
+  budget again; the bytes and the verdict are what survive. Regressions:
+  `an_undecodable_segment_is_set_aside_and_its_siblings_commit`,
+  `without_the_set_aside_one_unreadable_segment_blocks_its_siblings` and
+  `only_the_segments_a_failure_names_are_charged_for_it`.
 - **A concurrent index-mapping update is refused, not merged.** Two writers
   appending different fields to the same index are not combined: the loser's
   `field_mappings` are no longer an extension of what is stored, and only the
@@ -807,7 +834,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   watermark. The filesystem drain applies the same bound from its owned WAL
   directory: entries under `committed/`, or absent after quarantine disposition
   and retention sweeps, are removed on the next append; entries still under
-  `sealed/`, `processing/` or `orphans/` remain. The v1 property format is
+  `sealed/`, `processing/`, `orphans/` or `poison/` remain. The v1 property format is
   unchanged. Old writers know only the retained snapshot summaries. Before a
   rolling upgrade, set `compactor.snapshotExpire.retainLast >= 400`; keep it
   there until every old drain/maintenance writer is gone and for another 1,025

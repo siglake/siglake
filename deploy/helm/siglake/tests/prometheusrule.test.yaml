@@ -604,3 +604,54 @@ tests:
       - eval_time: 5m
         alertname: SiglakeGroupCountAggregateShort
         exp_alerts: []
+
+  # #3143: the local filesystem drain's `poison/` set-aside is the same
+  # operator situation as the claim table's quarantine, so it fires the same
+  # alert — and a cluster with neither must stay silent.
+  - name: a segment set aside by the filesystem drain raises the quarantine warning
+    interval: 1m
+    input_series:
+      - series: 'siglake_compactor_segments_poisoned{namespace="logs-staging",pod="compactor-0",tenant="acme"}'
+        values: '0 1 1 1 1 1 1 1 1 1 1 1 0 0 0'
+      - series: 'siglake_catalog_claim_quarantined{namespace="logs",pod="compactor-0"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: SiglakeSegmentsQuarantined
+        exp_alerts:
+          - exp_labels:
+              namespace: logs-staging
+              pod: compactor-0
+              tenant: acme
+              severity: warning
+            exp_annotations:
+              summary: WAL segments have been set aside and will not drain without intervention
+              description: >-
+                1 segment(s) are quarantined. Their rows are durable and
+                unqueryable. On the claim path, either the drain failed on them
+                repeatedly — usually an index that does not exist — or a mirrored
+                segment could not be placed in the table its index resolves to now,
+                which is set aside on the first cycle because no retry can change it.
+                The `reason` field on the `segment QUARANTINED` log line says which.
+                Resolve, then `requeue_quarantined`. On the local filesystem drain,
+                the segment failed to read on every attempt it was given and sits
+                under `<wal>/poison/` with a `.poison.json` note saying why; the
+                `segment SET ASIDE` log line names the file. Fix what made it
+                unreadable, then `siglake wal-requeue --wal <wal-root>`.
+      # Requeued by an operator at 12m: the alert clears on the next sweep's
+      # reading, without anyone restarting a pod.
+      - eval_time: 13m
+        alertname: SiglakeSegmentsQuarantined
+        exp_alerts: []
+
+  - name: a drain with nothing set aside on either path stays silent
+    interval: 1m
+    input_series:
+      - series: 'siglake_compactor_segments_poisoned{namespace="logs",pod="compactor-0",tenant="default"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'siglake_catalog_claim_quarantined{namespace="logs",pod="compactor-1"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: SiglakeSegmentsQuarantined
+        exp_alerts: []

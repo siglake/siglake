@@ -292,6 +292,17 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
         name: "siglake_compactor_mirror_sync_total",
         series: UNLABELLED,
     },
+    // #3143: the local drain setting a segment aside under `poison/`. The
+    // level an operator alerts on is the gauge beside it (gauges are not
+    // pre-registered), and this is the event arm a dashboard reads to tell one
+    // long-held segment apart from a directory that keeps producing them. Its
+    // only label is the tenant, which is known at the increment and cannot be
+    // listed here — the unlabelled series exists so the counter is on a fresh
+    // compactor's first scrape at 0, as `siglake_compactor_cycles_total` is.
+    AlertedCounter {
+        name: "siglake_compactor_segments_poisoned_total",
+        series: UNLABELLED,
+    },
     AlertedCounter {
         name: "siglake_compactor_delete_tasks_stalled_total",
         series: &[&[("state", "running")], &[("state", "pending_claimed")]],
