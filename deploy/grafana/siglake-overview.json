@@ -1608,6 +1608,35 @@
    "description": "The parsed working set against the bound that evicts it. Both are published where the bounds are enforced — on admission to the cache — so neither exists before the pod's first indexed text query and both hold their last value while no text query runs; read them with the eviction arms beside them, not on their own. Resident pinned at the budget with byte_bound drops beside it is the case for raising SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES (or the query pod's memory limit, which the resolved budget follows when it is set)."
   },
   {
+   "id": 162,
+   "type": "timeseries",
+   "title": "Decoded-file cache populations (abandoned = decoded, then dropped)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 138
+   },
+   "targets": [
+    {
+     "expr": "sum by (outcome) (rate(siglake_query_scan_file_cache_requests_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{outcome}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "min": 0
+    }
+   },
+   "description": "Decoded-file cache populations, by what happened to each one. The cache is experimental and OFF by default (SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_BYTES and _MAX_ENTRIES are 0 in the chart, the compose file and the operator), so a flat zero on every arm is the expected reading for most deployments; all eight arms are pre-registered on the query server, so zero charts as zero rather than No data. abandoned is the arm to read when it IS on (#4846): a population that decoded batches, buffered them and was dropped before the end-of-stream arm could insert them — a LIMIT satisfied from the first batches, or a cancelled query. It cannot be read off miss, which is charged when a partition OPENS its first task, once per partition: the 2026-09-15 50G rounds exported 448 miss and no insert at 8 GiB, and #4494 had to establish from four ABSENT series that those were opens rather than populations that failed to stick. abandoned at the miss rate with insert at zero is that same shape, stated directly: the budget is subtracted from the query memory pool and nothing is ever kept. insert against abandoned is therefore the readout of whether the cache is earning its bytes on this workload. The other arms: bypass is a scan with a raw-text or promoted-column predicate, which reads through the pruning reader by design and never populates; skip_oversized is one file's decoded batches crossing a quarter of the budget; insert_skipped_contended is the deliberate degrade when a finished population loses the cache lock — one skip costs one future miss, and its rate against insert is #3086; evict is the LRU bound biting. The arms do not partition miss: miss is charged before the populate stream is built, and hit and bypass never build one."
+  },
+  {
    "id": 137,
    "type": "row",
    "title": "Cache warmer",
@@ -1615,7 +1644,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 138
+    "y": 146
    },
    "collapsed": false
   },
@@ -1631,7 +1660,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 139
+    "y": 147
    },
    "targets": [
     {
@@ -1678,7 +1707,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 139
+    "y": 147
    },
    "targets": [
     {
@@ -1709,7 +1738,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 139
+    "y": 147
    },
    "targets": [
     {
@@ -1743,7 +1772,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 147
+    "y": 155
    },
    "collapsed": false
   },
@@ -1759,7 +1788,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 148
+    "y": 156
    },
    "targets": [
     {
@@ -1787,7 +1816,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 148
+    "y": 156
    },
    "targets": [
     {
@@ -1820,7 +1849,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 156
+    "y": 164
    },
    "targets": [
     {
@@ -1854,7 +1883,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 164
+    "y": 172
    },
    "targets": [
     {

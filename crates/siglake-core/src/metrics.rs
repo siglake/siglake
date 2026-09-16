@@ -583,6 +583,31 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
             &[("reason", "oversized")],
         ],
     },
+    // #4846's "Decoded-file cache populations" panel. No alert reads these
+    // either; they are here for the same reason as the two above, and with one
+    // more edge — the cache is OFF by default, so on most deployments every
+    // series stays at 0 and that is the correct reading. The one an operator who
+    // turned it on is looking for is `abandoned`: a population that decoded
+    // batches and was dropped before its insert. Charting it against `insert`
+    // needs both arms to exist, and a query tier serving nothing but clipped
+    // scans emits `insert` never.
+    //
+    // Every outcome the code records is listed; `scripts/check-chart.py` holds
+    // this entry to the call sites in `siglake-storage`'s query provider, which
+    // all pass a literal.
+    AlertedCounter {
+        name: "siglake_query_scan_file_cache_requests_total",
+        series: &[
+            &[("outcome", "hit")],
+            &[("outcome", "miss")],
+            &[("outcome", "bypass")],
+            &[("outcome", "insert")],
+            &[("outcome", "insert_skipped_contended")],
+            &[("outcome", "skip_oversized")],
+            &[("outcome", "abandoned")],
+            &[("outcome", "evict")],
+        ],
+    },
 ];
 
 /// Counters an `increase()` alert reads that no binary can pre-register,
