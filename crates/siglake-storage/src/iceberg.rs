@@ -15068,8 +15068,18 @@ impl IcebergContext {
     /// matches (and returns early when there are none, so a nonmatching
     /// candidate never creates an output file); the second streams the
     /// survivors into a rolling writer. Peak decoded memory is one batch plus
-    /// the Parquet reader's row-group buffer plus the writer's open row group,
-    /// independent of how large the candidate is.
+    /// the Parquet reader's row-group buffer plus the writer's open row group.
+    ///
+    /// THE INPUT IS NEVER HELD; THE OUTPUT IS. The writer's open row group is
+    /// `build_merge_output_writer`'s 1,048,576 rows, buffered decoded, so a
+    /// rewrite whose survivors fit in one row group holds all of them.
+    /// Measured 2026-09-16 (#4703,
+    /// `tests/delete_task_size_gate.rs::measure_peak_allocation_per_arm`):
+    /// peak ≈ 0.96 × the survivors' decoded bytes + ~18 MB, and flat in the
+    /// candidate's own size — an eighth of a 78.7 MB candidate's rows costs
+    /// what half of a 19.7 MB one does. Against the in-RAM arm's four copies
+    /// of the whole file that is still the gate's win, and it is not a bound
+    /// that holds at any candidate size.
     ///
     /// The extra read is the price of not materializing: the alternative —
     /// writing survivors on the way through the counting pass — would create
