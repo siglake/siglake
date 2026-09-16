@@ -98,8 +98,11 @@ free to decline it, exactly as #4375's policy declines clipped shapes.
 The block target trades the resident directory against the bytes one lookup
 fetches, and both directions are pinned by a test
 (`block_size_trades_resident_directory_against_bytes_per_lookup`). At the 4 KiB
-default, one 7.34M-row file's directory is 474.9 KiB — against 526.0 MiB parsed
-for the same index.
+default, one 7.34M-row file's directory is 474.9 KiB on disk and 1.0 MiB once
+parsed — against 526.0 MiB parsed for the same index. Those two directory
+figures are the same structure at rest and in RAM; the resident comparison
+throughout this document uses the 1.0 MiB one, and the fetched-bytes columns use
+the 474.9 KiB one, because that is what a cold open reads.
 
 ## Versioning and discovery
 
