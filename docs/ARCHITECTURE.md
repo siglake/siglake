@@ -157,6 +157,21 @@ segments arrive — bounded by a per-pass budget so compaction and gauges keep
 their cadence under backlog. Commit-accumulation batching (default on, 64 MiB
 target / 10 s age floor) amortizes the fixed per-commit catalog cost; the
 vendored `update_table_with_base` elides redundant metadata re-reads.
+A claimed segment whose bytes do not decode — a torn restore, a bad sector, a
+frame version this build does not know — fails the whole batch it is in, and
+releasing it back to `sealed/` only hands it to the next batch. After
+`SIGLAKE_COMPACTOR_POISON_ATTEMPTS` consecutive failed reads (3; `0` disables)
+the drain moves that file, and only that file, to `<wal>/poison/` with a
+`.poison.json` note recording the error and the attempts spent; its batch
+siblings commit on the next pass. Nothing under `poison/` is deleted, rewritten
+or automatically requeued — unlike `orphans/`, whose residents are disposed of
+every cycle — so requeueing is an operator moving the file back into
+`sealed/` once the cause is fixed. The set-asides are counted by
+`siglake_compactor_segments_poisoned_total` and levelled per tenant by
+`siglake_compactor_segments_poisoned`, which fires `SiglakeSegmentsQuarantined`
+alongside the catalog-claim path's own quarantine. The rows in a set-aside
+segment are acknowledged and not queryable, which is the point: the alternative
+is a queue that never drains.
 Cumulative per-table aggregates are maintained in a **side object** (see
 Storage), with an optional write-behind mode
 (`SIGLAKE_SIDE_AGG_WRITE_BEHIND=1`) that moves its serialized S3

@@ -2,9 +2,9 @@
 
 ## 0.1.1
 
-Five changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
+Six changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
 surface moves, and a 0.1.0 warehouse is read and written unchanged: one values
-key and three environment knobs are added, every existing default holds, and no
+key and four environment knobs are added, every existing default holds, and no
 flag or values key is removed. The
 workspace version, both chart `version`/`appVersion` pairs, the pinned image
 tags under `deploy/` and the two OpenAPI documents' `info.version` all read
@@ -69,6 +69,25 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   still the operator's to rebuild by hand. A rebuild records the columns it
   could not restore, so one unreadable column does not buy a full rebuild every
   pass. (#3000)
+- **Drain**: a WAL segment the local filesystem drain cannot read no longer
+  takes every batch it joins down with it. The read phase now names the
+  segments that failed instead of returning one error for the whole batch, and
+  after three consecutive failed reads
+  (`SIGLAKE_COMPACTOR_POISON_ATTEMPTS`; `0` restores the old behaviour) that
+  file — and only that file — moves to `<wal>/poison/` with a `.poison.json`
+  note holding the read error and the attempts spent. Its batch siblings commit
+  on the next pass. Before this, a truncated restore, a bad sector or a frame
+  version the build did not know left the segment cycling between `sealed/` and
+  `processing/` with nothing naming the file, and the healthy segments behind it
+  never became queryable. A transient failure still charges nothing and retries
+  the whole batch, and a segment that commits has its charges dropped, so the
+  budget counts consecutive failures of one file. `poison/` is excluded from the
+  automatic `orphans/` disposition, survives restarts, and is never deleted or
+  rewritten: an operator moves the file back into `<wal>/sealed/` once the cause
+  is fixed. `siglake_compactor_segments_poisoned_total` counts the set-asides,
+  `siglake_compactor_segments_poisoned{tenant}` levels them, and
+  `SiglakeSegmentsQuarantined` now fires on either drain's held-back segments
+  (still 34 alerts). (#3143)
 - **Naming**: the ingest handlers, their rate-limit middleware and the prose
   around ingest tokens no longer carry the name of the HTTP event-collector
   compatibility surface that was removed in 2026-06. The middleware is named in
