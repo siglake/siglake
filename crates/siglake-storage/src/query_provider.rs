@@ -206,6 +206,21 @@ pub struct OrderedScanLimit {
     pub limit: usize,
 }
 
+/// The query's explicit `LIMIT n` where that limit clips THIS scan's output
+/// row for row: an unordered, unaggregated select whose rows leave the plan as
+/// they are produced. Injected through `SessionConfig` because DataFusion
+/// cannot push a limit through the residual `FilterExec` that every text
+/// predicate keeps above the scan, so the scan would otherwise never learn
+/// that it only owes `n` rows.
+///
+/// Only consumer today: the text-index decline (see
+/// [`text_index_decline_reason`]). It carries the value rather than a bare
+/// flag so a later per-execution cost rule has the number to work with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClippedScanLimit {
+    pub limit: usize,
+}
+
 /// Per-request preferred output direction for a `timestamp`-ordered scan.
 /// Injected through `SessionConfig` so the scan can serve the opposite of the
 /// declared on-disk direction when it can still prove correctness.
@@ -931,6 +946,11 @@ pub struct SiglakeIcebergTableScan {
     /// residual predicate evaluated above the scan may need more than LIMIT
     /// source rows to produce LIMIT matches and therefore cannot be capped.
     ordered_source_limit_safe: bool,
+    /// Why this scan's text predicate will not load a per-file inverted index
+    /// ([`text_index_decline_reason`]), `None` when it may. Displayed in the
+    /// plan so an EXPLAIN says which path the shape takes without reading a
+    /// process-wide counter.
+    text_index_decline: Option<&'static str>,
 }
 
 /// The Iceberg field-id stamped in an Arrow field's Parquet metadata, if any.
@@ -988,6 +1008,55 @@ async fn global_timestamp_bounds(
     }
 }
 
+/// Whether this scan may load a per-file inverted index for its text
+/// predicate, and if not, the reason to attribute the refusal to.
+///
+/// The index is a WHOLE-FILE structure: touching it at all costs a
+/// deserialization proportional to the file's rows (~40 bytes of parsed index
+/// per indexed row), independent of how many rows the query ends up wanting.
+/// Both declines below are the same argument from opposite ends of the plan —
+/// the query wants a handful of rows and the index charges for all of them:
+///
+/// - `ordered_limit`: an index RowSelection batches by SELECTED rows, so sparse
+///   postings span most of a large file before the first batch is emitted,
+///   defeating the contiguous tail/head read that lets an ordered browse
+///   short-circuit.
+/// - `clipped_limit`: a bare `LIMIT n` over a text predicate stops the scan
+///   after `n` matches, which for anything but a very rare term is a sliver of
+///   the first file. #4329 measured the two against each other on 14 × 7.34M
+///   rows with every index resident: `keyword` 20.3 ms indexed against 6.1 ms
+///   scanned, `substring_scan` 813.1 ms against 4.5 ms
+///   (`docs/DESIGN_inverted_index.md`).
+///
+/// Neither is a selectivity estimate, because the planner has none: a term's
+/// document frequency lives inside the index it is deciding whether to load.
+/// The cost of being wrong is bounded and asymmetric — a declined rare term
+/// pays a scan it would have skipped, an accepted common term pays a
+/// whole-file decode per planned file. Reaching sparse postings without
+/// materializing a whole file's index is #4376's segmented format, not a
+/// threshold to guess here.
+///
+/// Correctness does not turn on this: the index only ever produces a
+/// superset RowSelection, and the engine re-evaluates the exact predicate
+/// above the scan either way. File and row-group blooms stay active when the
+/// index is declined.
+fn text_index_decline_reason(
+    has_text_spec: bool,
+    ordered_limit: bool,
+    clipped_limit: bool,
+) -> Option<&'static str> {
+    if !has_text_spec {
+        return None;
+    }
+    if ordered_limit {
+        Some("ordered_limit")
+    } else if clipped_limit {
+        Some("clipped_limit")
+    } else {
+        None
+    }
+}
+
 impl SiglakeIcebergTableScan {
     async fn try_new(
         table: Table,
@@ -1011,27 +1080,23 @@ impl SiglakeIcebergTableScan {
             .map(|config| text_field_tokenizers(&config))
             .unwrap_or_default();
         let mut raw_prune_spec = extract_raw_prune_spec(filters, &text_tokenizers)?;
-        // An inverted-index RowSelection batches by selected rows. For an
-        // ordered LIMIT, sparse postings can therefore span most of a large
-        // file before the first batch is emitted, defeating the contiguous
-        // tail/head read that makes the scan short-circuit. The planner has no
-        // trustworthy per-file selectivity/cost estimate here, so decline the
-        // row index for this query shape instead of guessing a threshold.
-        // Raw file/row-group blooms and exact predicate evaluation remain on.
-        let ordered_text_limit = raw_prune_spec.is_some()
-            && state
+        let text_index_decline = text_index_decline_reason(
+            raw_prune_spec.is_some(),
+            state
                 .config()
                 .get_extension::<PreferredScanOrder>()
                 .is_some()
-            && state.config().get_extension::<OrderedScanLimit>().is_some();
-        if ordered_text_limit {
+                && state.config().get_extension::<OrderedScanLimit>().is_some(),
+            limit.is_some() || state.config().get_extension::<ClippedScanLimit>().is_some(),
+        );
+        if let Some(reason) = text_index_decline {
             raw_prune_spec
                 .as_mut()
-                .expect("checked as present")
+                .expect("a reason is only returned for a text spec")
                 .inverted_index_row_selection = false;
             metrics::counter!(
                 "siglake_query_inverted_index_declined_total",
-                "reason" => "ordered_limit"
+                "reason" => reason
             )
             .increment(1);
         }
@@ -1366,6 +1431,7 @@ impl SiglakeIcebergTableScan {
                 .filter(|&l| l > 0),
             ordered_source_limit_safe: preserve_task_order
                 && (!has_pushed_filters || time_only_filters(filters)),
+            text_index_decline,
         })
     }
 
@@ -3825,6 +3891,16 @@ impl DisplayAs for SiglakeIcebergTableScan {
         if let Some(limit) = self.limit {
             write!(f, " limit:[{limit}]")?;
         }
+        // Only for a scan that HAS a text predicate: on every other plan the
+        // field would be noise, and "no text index" would read as a refusal
+        // rather than as nothing to refuse.
+        if let Some(spec) = self.raw_prune_spec.as_ref() {
+            match self.text_index_decline {
+                Some(reason) => write!(f, " text_index:[declined:{reason}]")?,
+                None if spec.inverted_index_row_selection => write!(f, " text_index:[allowed]")?,
+                None => {}
+            }
+        }
         Ok(())
     }
 }
@@ -5279,6 +5355,37 @@ mod tests {
                 _ => 0,
             })
             .sum()
+    }
+
+    /// The decline is a three-input decision and the scan that consumes it
+    /// needs a warehouse, a text corpus and a plan to reach. Driving the
+    /// resolver directly is what makes each arm — including the two that must
+    /// NOT decline — cost nothing to state.
+    #[test]
+    fn text_index_declines_clipped_and_ordered_limits_only() {
+        // No text predicate: nothing to decline, whatever the limits say.
+        assert_eq!(text_index_decline_reason(false, true, true), None);
+        assert_eq!(text_index_decline_reason(false, false, true), None);
+
+        // An unclipped text scan is the regime the index wins in (#4329:
+        // 129.3 ms indexed against 1,733.5 ms scanned for a 0.001%-density
+        // term over 102.76M rows). It keeps the index.
+        assert_eq!(text_index_decline_reason(true, false, false), None);
+
+        assert_eq!(
+            text_index_decline_reason(true, false, true),
+            Some("clipped_limit")
+        );
+        assert_eq!(
+            text_index_decline_reason(true, true, false),
+            Some("ordered_limit")
+        );
+        // Both hold only if a caller sets both extensions; the reason is the
+        // ordered one, which is the older and more specific finding.
+        assert_eq!(
+            text_index_decline_reason(true, true, true),
+            Some("ordered_limit")
+        );
     }
 
     struct GatedBatchStream {

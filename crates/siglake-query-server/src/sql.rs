@@ -1792,6 +1792,12 @@ struct RewrittenQuery {
     /// Literal `LIMIT n` of a timestamp-ordered query — rides into the
     /// session as `OrderedScanLimit` so the gate can coalesce partitions.
     ordered_limit: Option<usize>,
+    /// Literal `LIMIT n` of an UNordered query whose limit clips the scan row
+    /// for row (see [`clipping_scan_limit`]) — rides into the session as
+    /// `ClippedScanLimit`. Disjoint from `ordered_limit` by construction: the
+    /// shape test refuses a query carrying an ORDER BY, including the one the
+    /// newest-first rewrite injects.
+    clipped_limit: Option<usize>,
 }
 
 /// Inject the implicit newest-first ordering into a qualifying bare SELECT.
@@ -1815,6 +1821,7 @@ fn apply_default_order_if_needed(
                 sql: query.to_string(),
                 preferred_scan_order: None,
                 ordered_limit: None,
+                clipped_limit: None,
             };
         }
     };
@@ -1828,13 +1835,20 @@ fn apply_default_order_if_needed(
             return RewrittenQuery {
                 sql: query.to_string(),
                 preferred_scan_order: preferred_scan_order_from_query(inner),
+                // The hints an EXPLAIN carries are the ones that decide the
+                // PLAN the caller asked to see. `clipping_scan_limit` decides
+                // the text-index path and prints in the scan's display; a
+                // missing hint here would show an index the real query
+                // declines (#91's argument for the scan-order hint).
                 ordered_limit: None,
+                clipped_limit: clipping_scan_limit(inner),
             };
         }
         return RewrittenQuery {
             sql: query.to_string(),
             preferred_scan_order: None,
             ordered_limit: None,
+            clipped_limit: None,
         };
     }
     let Statement::Query(sql_query) = &mut stmts[0] else {
@@ -1842,6 +1856,7 @@ fn apply_default_order_if_needed(
             sql: query.to_string(),
             preferred_scan_order: None,
             ordered_limit: None,
+            clipped_limit: None,
         };
     };
     let table_has_timestamp = |table: &str| {
@@ -1864,6 +1879,10 @@ fn apply_default_order_if_needed(
             sql,
             preferred_scan_order,
             ordered_limit,
+            // The rewrite injected an ORDER BY, so the shape test refuses:
+            // this browse is the ordered decline's business, not the clipped
+            // one's.
+            clipped_limit: clipping_scan_limit(sql_query),
         };
     }
     let preferred_scan_order = preferred_scan_order_from_query(sql_query);
@@ -1871,6 +1890,7 @@ fn apply_default_order_if_needed(
         sql: query.to_string(),
         preferred_scan_order,
         ordered_limit: preferred_scan_order.and_then(|_| explicit_limit_value(sql_query)),
+        clipped_limit: clipping_scan_limit(sql_query),
     }
 }
 
@@ -2633,6 +2653,32 @@ fn explicit_limit_value(query: &SqlQuery) -> Option<usize> {
         _ => return None,
     };
     Some(limit.saturating_add(offset))
+}
+
+/// The literal `LIMIT n [OFFSET m]` of a query whose limit clips its SCAN row
+/// for row, so the scan only ever owes `n + m` rows. Rides into the session as
+/// [`siglake_storage::ClippedScanLimit`], which is what lets the provider
+/// decline a whole-file inverted index for a shape that reads a sliver of the
+/// first file (#4375; the ordered form of the same decline travels as
+/// `OrderedScanLimit`).
+///
+/// `None` unless every operator between the scan and the limit passes rows
+/// through unchanged. [`default_order_target_table`] already spells that shape
+/// out — one plain table, no CTE/join/GROUP BY/DISTINCT/aggregate/window — for
+/// the newest-first rewrite, and the two want the same thing for the same
+/// reason. It also requires no ORDER BY, which is what keeps this disjoint
+/// from the ordered path rather than double-counting it.
+///
+/// Subqueries disqualify the whole statement: the hint is per SESSION, and an
+/// inner scan feeding an aggregate is not clipped by the outer limit at all.
+/// `SELECT count(*) … LIMIT 100` is the shape that would otherwise lose its
+/// index for no reason, and it is excluded by the aggregate test above.
+fn clipping_scan_limit(query: &SqlQuery) -> Option<usize> {
+    if query_contains_subquery(query) {
+        return None;
+    }
+    default_order_target_table(query)?;
+    explicit_limit_value(query)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4265,6 +4311,11 @@ async fn handle_local_inner(
     } else {
         None
     };
+    // No shard guard, unlike the ordered hint above: that one drives the
+    // coordinator's partition coalesce, while this one only says how many rows
+    // THIS scan owes — and a shard executing `… LIMIT n` is as clipped as the
+    // whole-table request that fanned it out.
+    let clipped_limit_hint = effective_query.clipped_limit;
     // Per-request cancellation. The guard lives to the end of this function, so
     // it fires on EVERY exit -- including the one that leaked: the request future
     // being dropped by the 60s timeout or a client hanging up. Dropping that
@@ -4300,6 +4351,11 @@ async fn handle_local_inner(
         if let Some(limit) = ordered_limit_hint {
             hinted.config_mut().set_extension(std::sync::Arc::new(
                 siglake_storage::OrderedScanLimit { limit },
+            ));
+        }
+        if let Some(limit) = clipped_limit_hint {
+            hinted.config_mut().set_extension(std::sync::Arc::new(
+                siglake_storage::ClippedScanLimit { limit },
             ));
         }
         datafusion::prelude::SessionContext::new_with_state(hinted)
@@ -10440,6 +10496,62 @@ mod tests {
         }
     }
 
+    /// #4375. The four shapes the 50G text gate runs are all clipped, and the
+    /// two rare-term shapes #4329 added are not — which is the whole boundary
+    /// the storage-side decline is built on, stated here against the AST.
+    #[test]
+    fn clipping_scan_limit_reads_the_shapes_the_text_gate_runs() {
+        let limit_of = |sql: &str| {
+            let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+            let Statement::Query(query) = &stmts[0] else {
+                panic!("not a query: {sql}");
+            };
+            clipping_scan_limit(query)
+        };
+
+        for sql in [
+            // keyword
+            "SELECT timestamp, raw FROM events WHERE match_terms(raw, 'queen') LIMIT 100",
+            // substring_scan
+            "SELECT timestamp, raw FROM events WHERE raw LIKE '%checkout%' LIMIT 100",
+            // keyword_last25 / keyword_last5: the time window sits in the same
+            // WHERE and changes nothing about who clips whom.
+            "SELECT timestamp, raw FROM events WHERE match_terms(raw, 'queen') \
+             AND timestamp >= TIMESTAMP '2026-09-01T00:00:00Z' LIMIT 100",
+        ] {
+            assert_eq!(limit_of(sql), Some(100), "{sql}");
+        }
+        // OFFSET is rows the scan still has to produce.
+        assert_eq!(
+            limit_of("SELECT raw FROM events WHERE raw LIKE '%x%' LIMIT 10 OFFSET 40"),
+            Some(50)
+        );
+
+        for sql in [
+            // rare_scan / rare_scan_last25: no LIMIT at all.
+            "SELECT timestamp, raw FROM events WHERE match_terms(raw, 'rareneedle')",
+            "SELECT timestamp, raw FROM events WHERE match_terms(raw, 'rareneedle') \
+             AND timestamp >= TIMESTAMP '2026-09-01T00:00:00Z'",
+            // The limit clips the aggregate's ONE row, not the scan under it.
+            "SELECT count(*) FROM events WHERE match_terms(raw, 'rareneedle') LIMIT 100",
+            "SELECT host, count(*) FROM events WHERE raw LIKE '%x%' GROUP BY host LIMIT 100",
+            "SELECT DISTINCT host FROM events WHERE raw LIKE '%x%' LIMIT 100",
+            // A sort consumes the whole scan before the limit applies.
+            "SELECT raw FROM events WHERE raw LIKE '%x%' ORDER BY host LIMIT 100",
+            "SELECT raw FROM events WHERE raw LIKE '%x%' ORDER BY timestamp DESC LIMIT 100",
+            // The inner scan is not the one being clipped.
+            "SELECT raw FROM events WHERE raw LIKE '%x%' AND host IN \
+             (SELECT host FROM events WHERE raw LIKE '%y%') LIMIT 100",
+            "WITH m AS (SELECT raw FROM events WHERE raw LIKE '%x%') SELECT * FROM m LIMIT 100",
+            // A join makes the scan's row count and the output's unrelated.
+            "SELECT a.raw FROM events a JOIN events b ON a.host = b.host LIMIT 100",
+            // Not a literal: nothing to carry.
+            "SELECT raw FROM events WHERE raw LIKE '%x%' LIMIT ALL",
+        ] {
+            assert_eq!(limit_of(sql), None, "{sql}");
+        }
+    }
+
     #[test]
     fn default_order_rewrite_respects_opt_out_and_batch() {
         let sql = "SELECT host FROM events";
@@ -10462,6 +10574,9 @@ mod tests {
         assert_eq!(unresolved.sql, sql);
         assert_eq!(unresolved.preferred_scan_order, None);
         assert_eq!(unresolved.ordered_limit, None);
+        // Un-rewritten it is a bare `LIMIT 100` over a text predicate: the
+        // clipped decline is what keeps it off the whole-file index (#4375).
+        assert_eq!(unresolved.clipped_limit, Some(100));
 
         let resolved =
             apply_default_order_if_needed(sql, true, Priority::Interactive, 25, Some("logs-bench"));
@@ -10477,6 +10592,10 @@ mod tests {
             Some(siglake_storage::PreferredScanOrder { descending: true })
         );
         assert_eq!(resolved.ordered_limit, Some(100));
+        // Once the implicit newest-first ordering is injected the SAME query
+        // is the ordered decline's, not the clipped one's — the two hints are
+        // never both set, so the refusal has one attribution.
+        assert_eq!(resolved.clipped_limit, None);
 
         // A different index in the same request is not the resolved one.
         assert_eq!(
@@ -16496,6 +16615,7 @@ mod batch_run_deadline_tests {
             sql: "SELECT count(*) AS n FROM events".to_string(),
             preferred_scan_order: None,
             ordered_limit: None,
+            clipped_limit: None,
         }
     }
 
@@ -16899,6 +17019,7 @@ mod batch_lifecycle_tests {
             sql: LIFECYCLE_SQL.to_string(),
             preferred_scan_order: None,
             ordered_limit: None,
+            clipped_limit: None,
         }
     }
 
