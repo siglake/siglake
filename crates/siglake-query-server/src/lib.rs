@@ -1566,9 +1566,12 @@ mod otel_disabled_cost_tests {
     /// `#[ignore]`d: it is a measurement, not a bound. A wall-clock ratio
     /// asserted in CI measures the scheduler.
     ///
-    /// Run with:
-    ///   cargo test -p siglake-query-server --lib otel_disabled_path_cost \
-    ///     -- --ignored --nocapture
+    /// Run with — `--release`, because the recorded numbers are a release
+    /// build's. The default test profile puts all three arms an order of
+    /// magnitude higher (bare ~6.7 us/req against ~0.48 us) and reports the
+    /// residue as +6.6 us/+2.6 us, which is the profile, not the layer:
+    ///   cargo test --release -p siglake-query-server --lib \
+    ///     otel_disabled_path_cost -- --ignored --nocapture
     #[tokio::test]
     #[ignore = "measurement, not a bound"]
     async fn otel_disabled_path_cost() {

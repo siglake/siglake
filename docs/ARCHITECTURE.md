@@ -1383,11 +1383,13 @@ graceful SIGTERM return, one-shot commands and errors after initialization.
 **The disabled path is cheap, not free.** The per-request middleware runs
 whatever the configuration: it allocates the request path, asks the global
 propagator to extract, and creates a span no subscriber is listening to.
-Measured in a release build with `cargo test -p siglake-query-server --lib
+Measured with `cargo test --release -p siglake-query-server --lib
 otel_disabled_path_cost -- --ignored --nocapture` (5 interleaved pairs of 2000
 `/healthz`-shaped requests): **+393 ns/request against no layer at all, and
-+104 ns/request against the `TraceLayer` it replaced**. Against a SQL query's
-milliseconds that is noise; against an empty request it is most of the cost.
++104 ns/request against the `TraceLayer` it replaced**. `--release` is part of
+the recipe — the default test profile reports the same residue as +6.6 us and
++2.6 us, which measures the profile. Against a SQL query's milliseconds this is
+noise; against an empty request it is most of the cost.
 
 ## Deployment
 
