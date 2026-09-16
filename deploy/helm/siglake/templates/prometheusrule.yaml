@@ -295,6 +295,51 @@ spec:
               `siglake rebuild-group-counts --table {{ "{{ $labels.table }}" }}`
               to restore the group-count aggregate, which does not rebuild the
               inline time aggregates.
+        - alert: SiglakeInlineCoverageUnproven
+          # The end state every remaining orphaning trigger shares (#3800): a
+          # delete task, retention, a foreign overwrite, or one of the two
+          # residual windows at expiry leaves an object the read guard refuses.
+          # The counts are not wrong, they are unprovable — and after a row
+          # removal they are not even correct on their own terms — so every
+          # windowed GROUP BY, date histogram and windowed count on the table
+          # answers EXACTLY from the per-file tiers. Nothing on the commit path
+          # republishes a chain the reader cannot walk, so the state persists
+          # for the life of the table until an operator rebuilds. Critical, not
+          # warning: it does not heal, and it is a manual repair.
+          #
+          # Two arms. The gauge is a last observation, set by the compactor's
+          # census for every table it visits, so a repaired table clears at the
+          # next pass — but a pod that STOPS censusing (it lost the `agg_fold`
+          # lease, `SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS` was set to
+          # `off`, its watchdog cut the stage) keeps serving its last reading,
+          # which for a `> 0` rule is stale-BAD. The census counter beside it is
+          # the liveness arm: a pod that stopped looking leaves the alert within
+          # the hour instead of paging from a reading nobody is refreshing.
+          #
+          # `for: 30m` is two consecutive censuses at the default cadence. The
+          # census already excludes a publication in flight (it reports those as
+          # `Publishing` and writes 0); the window is what keeps a slow
+          # multi-commit republication from paging on one sample.
+          expr: >-
+            siglake_inline_coverage_unproven > 0
+            and on (namespace, pod)
+            increase(siglake_inline_coverage_census_total[1h]) > 0
+          for: 30m
+          labels:
+            severity: critical
+          annotations:
+            summary: The inline aggregate for {{ "{{ $labels.table }}" }} cannot prove coverage
+            description: >-
+              The maintenance census found that table
+              {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }}
+              has an inline aggregate object whose coverage edge does not reach
+              the current snapshot, with no publication in flight. ANSWERS STAY
+              EXACT — the guard refuses the object — but windowed GROUP BY, date
+              histograms and windowed counts run on the per-file tiers and will
+              keep doing so: no commit repairs this. Run
+              `siglake rebuild-time-aggregates --namespace {{ "{{ $labels.iceberg_namespace }}" }} --table {{ "{{ $labels.table }}" }}`,
+              which recomputes the object from the committed files and is safe
+              to re-run. The compactor's WARN line names the same table.
         - alert: SiglakeGroupCountDeltaRetrying
           # The precursor to the alert above. A delta write that succeeds on a
           # retry is fine in isolation — a credential refresh or one slow PUT —

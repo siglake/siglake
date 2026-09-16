@@ -599,6 +599,12 @@ pub struct Compactor {
     /// restart, which costs a poisoned segment one more round of attempts and
     /// cannot lose its bytes.
     segment_read_failures: Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    /// #4674: the `(iceberg namespace, table)` readings the previous complete
+    /// inline-coverage census published. Shared across clones for the reason
+    /// `published_fs_backlog_tenants` is: a series is never removed from a live
+    /// process, so an index dropped while its object was unprovable would page
+    /// until a restart unless a later pass explicitly zeroes it.
+    published_inline_coverage: Arc<std::sync::Mutex<BTreeSet<(String, String)>>>,
     /// See [`Self::with_verified_owner_for_test`].
     verified_owner_for_test: Option<String>,
     /// See [`Self::with_transient_fs_commit_failures_for_test`].
@@ -630,6 +636,7 @@ impl Compactor {
             delete_tasks_enabled: false,
             delete_task_stall_logged: Default::default(),
             published_fs_backlog_tenants: Default::default(),
+            published_inline_coverage: Default::default(),
             commit_batch: None,
             drain_concurrency: None,
             drain_cycle_budget: None,
@@ -1954,6 +1961,58 @@ impl Compactor {
         }
     }
 
+    /// Name every maintained table whose inline aggregate object cannot prove
+    /// coverage of its current snapshot (#4674), across every namespace this
+    /// compactor maintains.
+    ///
+    /// Read-only and metadata-only: one HEAD and one GET of
+    /// `siglake-aggregates.json` per table, no rebuild. The rebuild is an
+    /// operator's `siglake rebuild-time-aggregates`, and automating it is
+    /// #4675 — so unlike the short-aggregate pass beside it, this one has no
+    /// budget to spend and nothing to opt into.
+    ///
+    /// A table the pass no longer reaches has its reading zeroed. The gauge is
+    /// per `(iceberg namespace, table)` and a series is never removed from a
+    /// live process, so an index dropped while its object was unprovable would
+    /// otherwise page until a restart.
+    ///
+    /// The pass counter is the alert's liveness arm. `siglake_inline_coverage_unproven`
+    /// is a last-observation gauge: a pod that stops censusing — it lost the
+    /// `agg_fold` lease, the census was switched off, the watchdog cut it —
+    /// keeps serving its last reading forever, and for a `> 0` alert that is
+    /// stale-BAD, a page for a table somebody else already repaired.
+    /// `SiglakeInlineCoverageUnproven` pairs the gauge with
+    /// `increase(siglake_inline_coverage_census_total[1h]) > 0` on the same pod,
+    /// so a pod that stopped looking drops out of the alert instead of paging
+    /// from a stale reading.
+    async fn run_inline_coverage_census_once(&self) {
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        for ice in self.aggregate_contexts("inline-coverage census").await {
+            let namespace = ice.namespace().to_string();
+            for (table, outcome) in ice.census_inline_coverage().await {
+                tracing::debug!(
+                    namespace,
+                    table,
+                    outcome = ?outcome,
+                    "inline-coverage census"
+                );
+                seen.insert((namespace.clone(), table));
+            }
+        }
+        // A namespace this pass could not open is missing from `seen` entirely,
+        // and zeroing its tables would read as "repaired" when the truth is
+        // "unvisited". `aggregate_contexts` warns and skips such a namespace,
+        // so hold the previous set when the pass reached nothing at all.
+        if !seen.is_empty() {
+            let mut published = self.published_inline_coverage.lock().unwrap();
+            for (namespace, table) in vanished_inline_coverage(&published, &seen) {
+                siglake_storage::iceberg::report_inline_coverage(&namespace, &table, false);
+            }
+            *published = seen;
+        }
+        metrics::counter!("siglake_inline_coverage_census_total").increment(1);
+    }
+
     /// Run a single snapshot-metadata expiry pass over the events table,
     /// retaining the configured number of recent snapshots. Non-destructive
     /// (metadata only) and idempotent — a second pass at the same retention
@@ -3219,6 +3278,26 @@ impl Compactor {
                             .increment(1);
                         }
                     }
+                }
+                // The inline object's coverage census (#4674), on the same
+                // lease and its own interval. Separate from the census above
+                // because it measures a different thing: that one is an
+                // aggregate with a provable chain and too few rows, this one is
+                // an object with the rows and no chain to prove them through.
+                // After the fold for the same reason too — the fold is what
+                // turns an outstanding delta into coverage.
+                if inline_coverage_scan_interval().is_some_and(inline_coverage_scan_due)
+                    && bounded(drain_watchdog, self.run_inline_coverage_census_once())
+                        .await
+                        .is_none()
+                {
+                    // Safe to cut: the census writes nothing anywhere. What a
+                    // cut costs is the gauges it had not reached yet, which
+                    // keep their previous reading until the next pass.
+                    tracing::error!("inline-coverage census exceeded the watchdog ceiling");
+                    metrics::counter!("siglake_compactor_watchdog_trips_total",
+                        "stage" => "inline_coverage_census")
+                    .increment(1);
                 }
             }
             let mut throttled = false;
@@ -5682,6 +5761,73 @@ fn agg_short_repair_max_tables_from(configured: Option<&str>) -> usize {
         .unwrap_or(1)
 }
 
+/// How often to census the maintained tables for an inline aggregate object
+/// that cannot prove coverage (`SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS`,
+/// default 900s; `0`, `off`, `disabled` or `never` switch the census off).
+///
+/// Fifteen minutes for the same reason the short-aggregate census runs at it:
+/// the condition, once true, is true until an operator rebuilds, so the cadence
+/// bounds how long a table serves windowed `GROUP BY` from the per-file tiers
+/// before anything says which table it is. It is also what `for:` on
+/// `SiglakeInlineCoverageUnproven` is sized against — 30 minutes is two
+/// consecutive censuses agreeing, which is what makes the alert's condition
+/// "persistent" rather than "seen once".
+///
+/// Default ON: the pass reads table metadata the compactor has cached and one
+/// object per maintained table, with no rebuild behind it. The expensive half
+/// of #3000 — a Tier-2 query per column — has no counterpart here, so there is
+/// nothing to make opt-in.
+fn inline_coverage_scan_interval() -> Option<Duration> {
+    inline_coverage_scan_interval_from(
+        std::env::var("SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Resolve the inline-coverage census cadence from its raw environment value.
+/// Pure so the disable words and the zero case are tested without `set_var`.
+fn inline_coverage_scan_interval_from(configured: Option<&str>) -> Option<Duration> {
+    let Some(raw) = configured else {
+        return Some(Duration::from_secs(900));
+    };
+    let raw = raw.trim().to_ascii_lowercase();
+    if matches!(raw.as_str(), "off" | "disabled" | "never" | "0") {
+        return None;
+    }
+    Some(Duration::from_secs(raw.parse().unwrap_or(900).max(1)))
+}
+
+/// Which `(iceberg namespace, table)` readings a completed inline-coverage
+/// census must zero: the ones the previous pass published and this one no
+/// longer reaches.
+///
+/// A table this pass could not read is still in `seen` — the census returns
+/// `Undetermined` for it rather than dropping it — so only a table that has
+/// genuinely stopped being maintained is cleared. Pure, so the set arithmetic
+/// is tested without a warehouse.
+fn vanished_inline_coverage(
+    published: &BTreeSet<(String, String)>,
+    seen: &BTreeSet<(String, String)>,
+) -> Vec<(String, String)> {
+    published.difference(seen).cloned().collect()
+}
+
+/// Whether the inline-coverage census interval has elapsed since the last pass.
+/// Its own stamp, not the short-aggregate census's: the two run on independent
+/// intervals and sharing one would make whichever ran first suppress the other.
+fn inline_coverage_scan_due(interval: Duration) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+    let last = LAST.get_or_init(|| Mutex::new(None));
+    let mut last = last.lock().unwrap();
+    let due = last.is_none_or(|t| t.elapsed() >= interval);
+    if due {
+        *last = Some(std::time::Instant::now());
+    }
+    due
+}
+
 /// Whether the census interval has elapsed since the last pass.
 fn agg_short_scan_due(interval: Duration) -> bool {
     use std::sync::{Mutex, OnceLock};
@@ -7589,6 +7735,72 @@ mod agg_short_repair_knob_tests {
         // switching the repair off is what the enable knob is for.
         assert_eq!(agg_short_repair_max_tables_from(Some("0")), 1);
         assert_eq!(agg_short_repair_max_tables_from(Some("nonsense")), 1);
+    }
+
+    /// #4674's census reads the same vocabulary. Its default cadence is also
+    /// what `SiglakeInlineCoverageUnproven`'s `for: 30m` is sized against —
+    /// two consecutive passes — so a change here is a change to the alert.
+    #[test]
+    fn the_inline_coverage_cadence_reads_its_disable_words_and_zero() {
+        for word in ["off", "OFF", "disabled", "never", "0", " off "] {
+            assert!(
+                super::inline_coverage_scan_interval_from(Some(word)).is_none(),
+                "{word:?} must disable the census"
+            );
+        }
+        assert_eq!(
+            super::inline_coverage_scan_interval_from(Some("300")),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            super::inline_coverage_scan_interval_from(None),
+            Some(Duration::from_secs(900)),
+            "the default cadence, and half of the alert's 30-minute window"
+        );
+        assert_eq!(
+            super::inline_coverage_scan_interval_from(Some("nonsense")),
+            Some(Duration::from_secs(900))
+        );
+    }
+
+    /// A dropped index must not page until the process restarts: the gauge has
+    /// no delete, so the pass that stops reaching a table has to zero it. A
+    /// table the pass merely could not READ stays in the seen set
+    /// (`InlineCoverageOutcome::Undetermined`) and keeps its reading.
+    #[test]
+    fn a_table_the_census_no_longer_reaches_is_zeroed() {
+        let entry = |ns: &str, t: &str| (ns.to_string(), t.to_string());
+        let published = std::collections::BTreeSet::from([
+            entry("siglake", "events"),
+            entry("siglake", "logs-archive"),
+            entry("tenant_acme", "events"),
+        ]);
+        let seen = std::collections::BTreeSet::from([
+            entry("siglake", "events"),
+            entry("tenant_acme", "events"),
+        ]);
+        assert_eq!(
+            super::vanished_inline_coverage(&published, &seen),
+            vec![entry("siglake", "logs-archive")]
+        );
+        // A table seen for the first time is not something to clear, and a
+        // pass that reaches everything clears nothing.
+        assert!(super::vanished_inline_coverage(&seen, &published).is_empty());
+        assert!(super::vanished_inline_coverage(&published, &published).is_empty());
+    }
+
+    /// The liveness arm of `SiglakeInlineCoverageUnproven`. Without the series
+    /// at 0, the FIRST census on a fresh compactor raises the gauge while the
+    /// `increase()` beside it still reads nothing, and the alert never fires.
+    #[test]
+    fn the_census_pass_counter_is_preregistered() {
+        assert!(
+            siglake_core::metrics::COMPACTOR_ALERTED_COUNTERS
+                .iter()
+                .any(|c| c.name == "siglake_inline_coverage_census_total"
+                    && c.series == siglake_core::metrics::UNLABELLED),
+            "the compactor catalog must create the census counter at 0"
+        );
     }
 }
 

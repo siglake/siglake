@@ -1001,7 +1001,18 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   correctness story for every side-object write.
   `crates/siglake-storage/tests/storage/orphaned_coverage_repair.rs` pins the
   repair after a delete task, the re-root across an expiry, and the refusal to
-  certify an object whose rows a delete task removed.
+  certify an object whose rows a delete task removed. The state is reported by
+  name: the maintenance compactor's 15-minute inline-coverage census sets
+  `siglake_inline_coverage_unproven{iceberg_namespace,table}` for every table it
+  reaches a verdict on, and `SiglakeInlineCoverageUnproven` (critical) names the
+  table and renders the `rebuild-time-aggregates` line for it. Three limits on
+  the census: it reports, it never rebuilds (automating the repair is separate
+  work); it says nothing about a table whose object it could not read, leaving
+  the previous reading standing rather than writing one it did not observe
+  (a table it stops reaching altogether, a dropped index, is zeroed instead);
+  and the gauge is a last observation, so the alert carries
+  `increase(siglake_inline_coverage_census_total[1h]) > 0` as a liveness arm to
+  keep a compactor that stopped censusing from paging off a stale reading.
 - **Streamed rewrite output carries no inline inverted index.** Every rewrite
   past the in-RAM caps — a leveled compaction merge, a re-clustering pass, or
   a delete task's large candidates (16 MiB compressed / 128 Ki rows) — is

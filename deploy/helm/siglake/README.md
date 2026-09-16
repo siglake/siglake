@@ -492,7 +492,7 @@ and a zero cadence and holds the alert's `for:` to three times the
 container's value (or to the alert's absence at 0), so the two cannot
 drift apart unnoticed.
 
-Four of the silent-loss alerts are about the aggregates rather than rows. A per-commit delta write that exhausts its
+Five of the silent-loss alerts are about the aggregates rather than rows. A per-commit delta write that exhausts its
 four attempts leaves a durable marker; the maintenance compactor normally
 rebuilds the aggregate on its next fold, while `GROUP BY` stays exact on the
 per-file path. `SiglakeGroupCountDeltaLost` (warning) fires only when that
@@ -504,9 +504,28 @@ that an exhausted write and automatic rebuild are becoming more likely.
 `SiglakeSideAggregatePublicationLost` (warning) covers the inline aggregate
 object: a publication that exhausts the same four attempts loses the commit's
 contribution outright, so it fires on the failure itself. The compactor's
-rebuild restores the wide group counts; the inline time aggregates have no
-rebuild, so windowed `GROUP BY` on that table answers from the per-file path
-until the object is rebuilt.
+rebuild restores the wide group counts; the inline time aggregates are restored
+by `siglake rebuild-time-aggregates --table <table>`, and until one of those
+runs, windowed `GROUP BY` on that table answers from the per-file path.
+`SiglakeInlineCoverageUnproven` (critical) is the state, rather than the event
+that produced it. Every 15 minutes the maintenance pass reads each maintained
+table's inline aggregate object and asks the read guard's own question: does its
+coverage edge reach the current snapshot? A delete task, retention, a foreign
+overwrite and the two residual windows at snapshot expiry all leave an object
+where the answer is no, and no commit republishes a chain the reader cannot
+walk — so the table serves windowed `GROUP BY`, date histograms and windowed
+counts from the exact per-file tiers for the rest of its life. Answers stay
+exact; the alert is critical because the state is permanent and the repair is
+manual: `siglake rebuild-time-aggregates --namespace <ns> --table <table>`,
+which the alert renders with both labels filled in. It reads the current-state
+gauge `siglake_inline_coverage_unproven{iceberg_namespace,table}` — set to 0 or
+1 for every table on every pass, so a repaired table clears at the next census —
+paired with `increase(siglake_inline_coverage_census_total[1h]) > 0` on the same
+pod, so a compactor that has stopped censusing drops out of the alert instead of
+paging from a reading nobody is refreshing. There is no values key for it and
+nothing to opt into, because the pass only reads: a
+`compactor.extraEnv` entry setting `SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS`
+changes the cadence, and `off` switches the census off.
 `SiglakeGroupCountAggregateShort` (warning) is the one that needs no lost write
 at all: every 15 minutes the maintenance pass censuses each maintained table
 and fires this when one is short of `total-records` with every commit's

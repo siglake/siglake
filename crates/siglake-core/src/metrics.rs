@@ -248,6 +248,7 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
             &[("stage", "drain")],
             &[("stage", "agg_fold")],
             &[("stage", "agg_short_repair")],
+            &[("stage", "inline_coverage_census")],
             &[("stage", "recluster")],
             &[("stage", "delete_tasks")],
         ],
@@ -287,6 +288,18 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
             &[("table", "events"), ("outcome", "incomplete")],
             &[("table", "events"), ("outcome", "failed")],
         ],
+    },
+    // #4674: one increment per completed inline-coverage census pass. It is the
+    // liveness arm of `SiglakeInlineCoverageUnproven`, whose other arm is a
+    // last-observation gauge — a pod that stops censusing keeps serving its last
+    // reading, and for a `> 0` alert that is stale-BAD. A fresh compactor that
+    // finds an unproven table on its FIRST pass has to pass the liveness arm on
+    // that same pass, so the series must exist at 0 before it: without this
+    // entry the very first census would raise the gauge and the `increase()`
+    // beside it would still read nothing.
+    AlertedCounter {
+        name: "siglake_inline_coverage_census_total",
+        series: UNLABELLED,
     },
     AlertedCounter {
         name: "siglake_compactor_mirror_sync_total",

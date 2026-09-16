@@ -205,7 +205,7 @@ written down.
 - **No built-in UI.** The query tier is reached through SQL over HTTP and the
   Jaeger-compatible shim; Grafana is the front end. What ships for operations
   is a starter dashboard (`deploy/grafana/siglake-overview.json`, imported by
-  you) and a `PrometheusRule` with 34 alerts grouped by what an operator
+  you) and a `PrometheusRule` with 35 alerts grouped by what an operator
   should do, rendered when `prometheusRule.enabled` is set
   ([Monitoring](https://docs.siglake.dev/operations/monitoring/)).
 - **Iceberg is vendored, not waited for.** `third_party/iceberg` and
