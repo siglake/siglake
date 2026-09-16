@@ -220,10 +220,16 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   what proves nothing; nothing deletes them either — the orphan GC still counts
   them as siglake's. So an upgraded table starts a fresh aggregate at its first
   commit, which is short of `record_count` for every row that predates the
-  upgrade: `GROUP BY` answers stay exact and fall to the per-file tiers until
-  `siglake rebuild-group-counts --table <table>` recomputes the columns from
-  committed files. And a table whose metadata carries no UUID publishes and
-  reads no aggregate at all, on the same reasoning.
+  upgrade: `GROUP BY` answers stay exact and fall to the per-file tiers. The
+  maintenance census finds that state within 15 minutes and reports it
+  (`siglake_group_count_short_aggregates_total`,
+  `SiglakeGroupCountAggregateShort`), but repairing it automatically is opt-in
+  (`SIGLAKE_AGG_SHORT_REPAIR=1`, one table per pass) because the rebuild is one
+  Tier-2 query per maintained column; `siglake rebuild-group-counts --table
+  <table>` recomputes the columns from committed files either way. And a table
+  whose metadata carries no UUID publishes and reads no aggregate at all, on the
+  same reasoning — so it is also invisible to the census, which has nothing to
+  measure a shortfall against.
   The catalog-claim **acknowledgement watermark** is the third artefact keyed by
   a name. It is the boundary the maintenance compaction writes onto a table so
   one that receives no later append still retires its terminal consumed-proof
@@ -855,13 +861,34 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   life of the table. `siglake rebuild-group-counts --table <t>` (with
   `--admit-typed-columns` for the older-table case) backfills the total from
   the committed files. Nothing automatically admits a pre-existing typed
-  column; lost-delta auto-repair only restores columns named by that failed
-  commit. A benchmark that recreates its table every round never sees the
+  column: the maintenance census measures a shortfall only against the columns
+  the aggregate already carries, and neither it nor the lost-delta repair widens
+  what a table maintains — that is an operator decision. A benchmark that
+  recreates its table every round never sees the
   older-table case; a long-lived table does, so do not read a Tier-2 result on
   an old table as the fast path failing. Rebuilds repair only the wide Tier-1
   object: they do not backfill the inline object, so repaired columns remain
   `tier1_wide` even below its 4096-entry cap and may pay a wide-object fold on a
   cold metadata cache.
+- **The short-aggregate census reports more than it repairs.** Every 15 minutes
+  the maintenance pass finds a maintained column short of `total-records` with
+  every commit's contribution accounted for and fires
+  `siglake_group_count_short_aggregates_total` /
+  `SiglakeGroupCountAggregateShort`; rebuilding it is opt-in
+  (`SIGLAKE_AGG_SHORT_REPAIR=1`, `compactor.shortAggregateRepair`) and budgeted
+  at one table per pass, because the rebuild is one Tier-2 query per maintained
+  column — ~9 minutes per column per 250M rows measured on a local filesystem.
+  Three gaps follow from that shape. A table wide or large enough for the
+  rebuild to exceed the compactor's watchdog (600 s) has it cut, publishes
+  nothing, and retries on the next pass with no durable backoff, so a
+  persistently trippable table needs the knob off and
+  `siglake rebuild-group-counts --table <t>` run once by hand;
+  `siglake_compactor_watchdog_trips_total{stage="agg_short_repair"}` is the
+  signal. A shortfall the coverage rules cannot bridge to the current snapshot —
+  a foreign overwrite or a delete task as the newest commit — is never censused,
+  because that state is indistinguishable from a contribution still in flight.
+  And a table with no exact map at all (every column sketched, or no aggregate
+  object yet) has nothing to measure a shortfall against.
 - **Pre-coverage side aggregates are not adopted.** Inline group counts, time
   buckets and 2-D time×group counts written without a snapshot-coverage chain
   remain readable but cannot prove which equal-row-count snapshot they
@@ -938,7 +965,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   query tier is reached through SQL over HTTP and the Elasticsearch- and
   Jaeger-compatible shims. What does ship for operations: a starter Grafana
   dashboard (`deploy/grafana/siglake-overview.json` — import it yourself, the
-  chart does not render it) and a `PrometheusRule` with 33 alerts grouped by
+  chart does not render it) and a `PrometheusRule` with 34 alerts grouped by
   what an operator should do (data-loss, stalled, refusing, saturation),
   rendered when `prometheusRule.enabled` is set (default off). No metrics
   downsampling; retention is file/day-granular (no row-level retention).

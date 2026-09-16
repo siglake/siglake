@@ -492,7 +492,7 @@ and a zero cadence and holds the alert's `for:` to three times the
 container's value (or to the alert's absence at 0), so the two cannot
 drift apart unnoticed.
 
-Three of the silent-loss alerts are about the aggregates rather than rows. A per-commit delta write that exhausts its
+Four of the silent-loss alerts are about the aggregates rather than rows. A per-commit delta write that exhausts its
 four attempts leaves a durable marker; the maintenance compactor normally
 rebuilds the aggregate on its next fold, while `GROUP BY` stays exact on the
 per-file path. `SiglakeGroupCountDeltaLost` (warning) fires only when that
@@ -507,6 +507,17 @@ contribution outright, so it fires on the failure itself. The compactor's
 rebuild restores the wide group counts; the inline time aggregates have no
 rebuild, so windowed `GROUP BY` on that table answers from the per-file path
 until the object is rebuilt.
+`SiglakeGroupCountAggregateShort` (warning) is the one that needs no lost write
+at all: every 15 minutes the maintenance pass censuses each maintained table
+and fires this when one is short of `total-records` with every commit's
+contribution present. A process killed between its commit and its delta PUT
+writes neither delta nor marker, and a table upgraded across the per-incarnation
+aggregate prefix starts a fresh aggregate at its first commit after the
+upgrade; both leave a shortfall no later commit closes. Repairing it
+automatically is opt-in (`compactor.shortAggregateRepair`, which renders
+`SIGLAKE_AGG_SHORT_REPAIR=1`) because it costs one Tier-2 query per maintained
+column; with it off the alert and the compactor's WARN line — which names the
+columns — point at `siglake rebuild-group-counts --table <table>`.
 
 The starter Grafana dashboard `deploy/grafana/siglake-overview.json`
 groups panels the same way and filters on `namespace` (the label

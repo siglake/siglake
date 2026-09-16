@@ -2,9 +2,10 @@
 
 ## 0.1.1
 
-Four changes on top of 0.1.0. Nothing about the on-disk format, the HTTP
-surface or the configuration moves: a 0.1.0 warehouse is read and written
-unchanged, every default holds, and no flag or values key is removed. The
+Five changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
+surface moves, and a 0.1.0 warehouse is read and written unchanged: one values
+key and three environment knobs are added, every existing default holds, and no
+flag or values key is removed. The
 workspace version, both chart `version`/`appVersion` pairs, the pinned image
 tags under `deploy/` and the two OpenAPI documents' `info.version` all read
 `0.1.1`, and git tag `v0.1.1` publishes image tag `0.1.1`.
@@ -47,6 +48,27 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   the file on failure. `deploy/terraform/aws/README.md` documents the same
   by-hand recipe. `scripts/check-aws-up-kubeconfig.sh` holds the script to this
   in the `shell` job. (#4545)
+- **Maintenance**: the compactor now censuses every maintained table for a
+  group-count aggregate short of its row count with every commit's contribution
+  accounted for, and reports it on
+  `siglake_group_count_short_aggregates_total{table,outcome}` and the new
+  `SiglakeGroupCountAggregateShort` alert (34 alerts in the chart, was 33). That
+  state does not heal on its own — a commit killed between its commit and its
+  delta PUT leaves it, a table whose aggregate prefix started empty mid-life
+  starts in it, and a later delta adds its own rows while the total stays short
+  — so until now it lasted until an operator ran `siglake rebuild-group-counts`.
+  Answers were and remain exact: a short aggregate sends `GROUP BY` to the exact
+  per-file path. The census runs every 15 minutes
+  (`SIGLAKE_AGG_SHORT_SCAN_INTERVAL_SECS`), from the maintenance compactor only,
+  and costs one number per column out of the base — 15 ms at 40k rows, 141 ms at
+  400k. Rebuilding automatically is opt-in
+  (`SIGLAKE_AGG_SHORT_REPAIR=1`, `compactor.shortAggregateRepair`, one table per
+  pass via `SIGLAKE_AGG_SHORT_REPAIR_MAX_TABLES`), because it is one Tier-2
+  query per maintained column: ~217 ms per 100k rows per column measured on a
+  local filesystem, so a 250M-row column is ~9 minutes and a table that size is
+  still the operator's to rebuild by hand. A rebuild records the columns it
+  could not restore, so one unreadable column does not buy a full rebuild every
+  pass. (#3000)
 - **Naming**: the ingest handlers, their rate-limit middleware and the prose
   around ingest tokens no longer carry the name of the HTTP event-collector
   compatibility surface that was removed in 2026-06. The middleware is named in

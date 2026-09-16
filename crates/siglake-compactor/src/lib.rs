@@ -45,7 +45,7 @@ use siglake_storage::consumed_proof::{ConsumedProofEntry, ConsumedProofRead, Rec
 use siglake_storage::iceberg::{
     AppendIncarnationMismatch, DeleteTaskState, IcebergContext, LevelPolicy, LeveledPassOptions,
     NonTerminalDeleteTask, NonTerminalDeleteTaskObservation, ObservedDeleteTaskClaim,
-    ProofMaintenanceIncarnationMismatch, ReclusterPolicy,
+    ProofMaintenanceIncarnationMismatch, ReclusterPolicy, ShortAggregateOutcome,
 };
 use siglake_wal::{
     claim_segment, finish_segment, list_index_dirs, list_orphaned, list_sealed, list_tenant_dirs,
@@ -1643,38 +1643,7 @@ impl Compactor {
     /// failure costs read amplification until the next cycle and nothing else.
     /// Inert unless the cardinality knob is raised above the inline ceiling.
     async fn run_agg_fold_once(&self, min_backlog: usize) {
-        let mut contexts = vec![self.ice.clone()];
-        match self.ice.catalog().list_namespaces(None).await {
-            Ok(namespaces) => {
-                for namespace in namespaces {
-                    let Some(name) = namespace
-                        .as_ref()
-                        .as_slice()
-                        .first()
-                        .filter(|_| namespace.len() == 1)
-                    else {
-                        continue;
-                    };
-                    if !name.starts_with("tenant_") || &namespace == self.ice.namespace() {
-                        continue;
-                    }
-                    match self.ice.for_namespace(name).await {
-                        Ok(ice) => contexts.push(Arc::new(ice)),
-                        Err(e) => tracing::warn!(
-                            namespace = %namespace,
-                            error = ?e,
-                            "group-count delta fold could not open tenant namespace"
-                        ),
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(
-                error = ?e,
-                "group-count delta fold could not enumerate tenant namespaces; folding the base namespace only"
-            ),
-        }
-
-        for ice in contexts {
+        for ice in self.aggregate_contexts("group-count delta fold").await {
             let namespace = ice.namespace().to_string();
             match ice.fold_group_count_deltas(min_backlog).await {
                 Ok(outcomes) => {
@@ -1699,6 +1668,95 @@ impl Compactor {
                     namespace,
                     error = ?e,
                     "group-count delta fold failed"
+                ),
+            }
+        }
+    }
+
+    /// Every namespace whose aggregate artifacts this compactor maintains: the
+    /// base one plus each `tenant_*` namespace the catalog reports.
+    ///
+    /// `stage` names the caller in the warning, because a namespace that cannot
+    /// be opened costs a different thing to each sweep and an operator reading
+    /// the line needs to know which one skipped it.
+    async fn aggregate_contexts(&self, stage: &str) -> Vec<Arc<IcebergContext>> {
+        let mut contexts = vec![self.ice.clone()];
+        match self.ice.catalog().list_namespaces(None).await {
+            Ok(namespaces) => {
+                for namespace in namespaces {
+                    let Some(name) = namespace
+                        .as_ref()
+                        .as_slice()
+                        .first()
+                        .filter(|_| namespace.len() == 1)
+                    else {
+                        continue;
+                    };
+                    if !name.starts_with("tenant_") || &namespace == self.ice.namespace() {
+                        continue;
+                    }
+                    match self.ice.for_namespace(name).await {
+                        Ok(ice) => contexts.push(Arc::new(ice)),
+                        Err(e) => tracing::warn!(
+                            namespace = %namespace,
+                            error = ?e,
+                            stage,
+                            "aggregate maintenance could not open tenant namespace"
+                        ),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = ?e,
+                stage,
+                "aggregate maintenance could not enumerate tenant namespaces; \
+                 visiting the base namespace only"
+            ),
+        }
+        contexts
+    }
+
+    /// Census every maintained table's group-count aggregate for a shortfall
+    /// `record_count` says is real, and rebuild at most `max_repairs` of them
+    /// (#3000).
+    ///
+    /// Its own step for the same reason the fold is: only a durable lost-delta
+    /// marker used to make anything rebuild, so an aggregate that is merely
+    /// short — a table upgraded across #2919, a commit killed between its
+    /// commit and its delta PUT — stayed short for the life of the table and
+    /// every `GROUP BY` on it paid the exact per-file tiers. The census is
+    /// cheap; the rebuild is one Tier-2 query per maintained column, which is
+    /// why it is budgeted per pass and off unless asked for.
+    ///
+    /// `max_repairs == 0` is the census alone: the counter and the log still
+    /// name the table, nothing reads the files. The budget is global across
+    /// namespaces, so a fleet-wide first enable cannot turn one pass into a
+    /// whole-warehouse Tier-2 scan.
+    async fn run_agg_short_repair_once(&self, max_repairs: usize) {
+        let mut budget = max_repairs;
+        for ice in self.aggregate_contexts("short group-count repair").await {
+            let namespace = ice.namespace().to_string();
+            match ice.repair_short_group_count_aggregates(budget).await {
+                Ok(outcomes) => {
+                    for (table, outcome) in outcomes {
+                        if matches!(
+                            outcome,
+                            ShortAggregateOutcome::Repaired { .. } | ShortAggregateOutcome::Failed
+                        ) {
+                            budget = budget.saturating_sub(1);
+                        }
+                        tracing::debug!(
+                            namespace,
+                            table,
+                            outcome = ?outcome,
+                            "short group-count aggregate census"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    namespace,
+                    error = ?e,
+                    "short group-count aggregate census failed"
                 ),
             }
         }
@@ -2891,6 +2949,35 @@ impl Compactor {
                     metrics::counter!("siglake_compactor_watchdog_trips_total",
                         "stage" => "agg_fold")
                     .increment(1);
+                }
+                // The deficit census (#3000), inside the fold's lease and on its
+                // own much slower interval. It runs AFTER the fold so it reads
+                // the freshly folded base: the fold is what turns an outstanding
+                // delta into coverage, and a census in front of it would read
+                // every just-committed table as short.
+                if let Some(interval) = agg_short_scan_interval() {
+                    if agg_short_scan_due(interval) {
+                        let budget = if agg_short_repair_enabled() {
+                            agg_short_repair_max_tables()
+                        } else {
+                            0
+                        };
+                        if bounded(drain_watchdog, self.run_agg_short_repair_once(budget))
+                            .await
+                            .is_none()
+                        {
+                            // Safe to cut: the rebuild publishes in one CAS at
+                            // the end, so a cancelled one leaves the aggregate
+                            // exactly as short as it was and the next pass
+                            // retries. What it costs is the reads it had done.
+                            tracing::error!(
+                                "short group-count aggregate repair exceeded the watchdog ceiling"
+                            );
+                            metrics::counter!("siglake_compactor_watchdog_trips_total",
+                                "stage" => "agg_short_repair")
+                            .increment(1);
+                        }
+                    }
                 }
             }
             let mut throttled = false;
@@ -5141,6 +5228,96 @@ fn agg_fold_due() -> bool {
     due
 }
 
+/// How often to census the maintained tables for a group-count aggregate that
+/// is short of `record_count` (`SIGLAKE_AGG_SHORT_SCAN_INTERVAL_SECS`, default
+/// 900s; `0`, `off`, `disabled` or `never` switch the census off).
+///
+/// Much slower than the fold because it answers a different question. The fold
+/// paces read amplification and a lagging one costs a reader small GETs; the
+/// census looks for a condition that, once true, is true until something
+/// rebuilds — an upgraded prefix, a delta lost with its marker. Fifteen minutes
+/// bounds how long a table serves `GROUP BY` from the per-file tiers before an
+/// operator is told, and keeps one whole-warehouse pass (one folded-wide view
+/// and one inline object per table) off the minute cadence the fold runs at.
+fn agg_short_scan_interval() -> Option<Duration> {
+    agg_short_scan_interval_from(
+        std::env::var("SIGLAKE_AGG_SHORT_SCAN_INTERVAL_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Resolve the census cadence from its raw environment value. Pure so the
+/// disable words and the zero case are tested without `set_var`.
+fn agg_short_scan_interval_from(configured: Option<&str>) -> Option<Duration> {
+    let Some(raw) = configured else {
+        return Some(Duration::from_secs(900));
+    };
+    let raw = raw.trim().to_ascii_lowercase();
+    if matches!(raw.as_str(), "off" | "disabled" | "never" | "0") {
+        return None;
+    }
+    Some(Duration::from_secs(raw.parse().unwrap_or(900).max(1)))
+}
+
+/// Whether a census that finds a real shortfall may REBUILD it
+/// (`SIGLAKE_AGG_SHORT_REPAIR`, default off).
+///
+/// Off by default for the reason the post-rewrite index rebuild is (#4162): the
+/// repair is the most expensive read the system has — one Tier-2 query per
+/// maintained column, and on a table whose columns exceed the per-file footer
+/// cap that is a raw-page decode of every live file — and turning it on for
+/// every install would spend it on the first pass after an upgrade, unasked.
+/// Off, the census still fires `siglake_group_count_short_aggregates_total`
+/// and `SiglakeGroupCountAggregateShort` pages, and
+/// `siglake rebuild-group-counts --table <t>` remains the operator's move.
+fn agg_short_repair_enabled() -> bool {
+    agg_short_repair_enabled_from(std::env::var("SIGLAKE_AGG_SHORT_REPAIR").ok().as_deref())
+}
+
+fn agg_short_repair_enabled_from(configured: Option<&str>) -> bool {
+    matches!(
+        configured.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// How many tables one census pass may rebuild
+/// (`SIGLAKE_AGG_SHORT_REPAIR_MAX_TABLES`, default 1).
+///
+/// The budget is what keeps a first enable from turning into a whole-warehouse
+/// Tier-2 scan: every table upgraded across #2919 is short at once, and a
+/// warehouse's indexes are all short together. One per pass at the default
+/// cadence drains a hundred-table warehouse in a day and leaves the compactor's
+/// other stages their time.
+fn agg_short_repair_max_tables() -> usize {
+    agg_short_repair_max_tables_from(
+        std::env::var("SIGLAKE_AGG_SHORT_REPAIR_MAX_TABLES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn agg_short_repair_max_tables_from(configured: Option<&str>) -> usize {
+    configured
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
+/// Whether the census interval has elapsed since the last pass.
+fn agg_short_scan_due(interval: Duration) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+    let last = LAST.get_or_init(|| Mutex::new(None));
+    let mut last = last.lock().unwrap();
+    let due = last.is_none_or(|t| t.elapsed() >= interval);
+    if due {
+        *last = Some(std::time::Instant::now());
+    }
+    due
+}
+
 /// Default for `SIGLAKE_CLAIM_RECLAIM_MAX_AGE_SECS`, and what `0` and an
 /// unparseable value resolve to.
 const DEFAULT_CLAIM_RECLAIM_MAX_AGE_SECS: u64 = 900;
@@ -5684,6 +5861,94 @@ mod agg_fold_tests {
                 .source_label(),
             "tier1_wide",
             "the base compactor must discover and repair the tenant namespace"
+        );
+    }
+
+    /// #3000 through the compactor's own plumbing: a tenant table short with no
+    /// marker anywhere. The storage tests cover the census's rules; what this
+    /// covers is that the pass reaches a `tenant_*` namespace at all, and that
+    /// its budget is what decides whether any file is read.
+    ///
+    /// The cardinality here (8,192 against 8,200 distinct hosts over the two
+    /// commits) also puts a DEMOTED sketch column in the folded base, which is
+    /// the state the repair must survive — see the `None` sketch argument in
+    /// `repair_short_group_count_aggregate`.
+    #[tokio::test]
+    async fn the_short_aggregate_census_reaches_tenant_namespaces_under_its_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("warehouse");
+        let base = Arc::new(IcebergContext::open(&warehouse).await.unwrap().with_tuning(
+            IcebergTuning {
+                table_group_count_cardinality: Some(8_192),
+                result_caches: Some(false),
+                ..Default::default()
+            },
+        ));
+        let tenant = base.for_namespace("tenant_acme").await.unwrap();
+        let commit = |nth: usize| -> Vec<Event> {
+            (0..4_100)
+                .map(|i| {
+                    let mut event = Event::now(format!("row {nth}-{i}"));
+                    event.host = format!("host-{nth}-{i:04}");
+                    event
+                })
+                .collect()
+        };
+        tenant.append_events(&commit(0)).await.unwrap();
+        // No marker: the first commit's contribution simply vanishes, the way a
+        // process killed between its commit and its delta PUT leaves it. The
+        // second commit's delta lands, so nothing outstanding explains the gap.
+        let mut deltas: Vec<_> = walk_files(&warehouse)
+            .into_iter()
+            .filter(|path| {
+                path.to_string_lossy().contains("tenant_acme")
+                    && path.to_string_lossy().contains("siglake-agg-deltas")
+            })
+            .collect();
+        assert_eq!(deltas.len(), 1, "precondition: one commit, one delta");
+        std::fs::remove_file(deltas.pop().unwrap()).unwrap();
+        tenant.append_events(&commit(1)).await.unwrap();
+        tenant
+            .invalidate_cached_table(tenant.events_table_ident())
+            .await;
+        assert_eq!(
+            tenant
+                .grouped_counts_with_summary("events", "host", None, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .source_label(),
+            "materialized",
+            "precondition: short, and no marker to explain it"
+        );
+
+        let compactor = Compactor::new(tmp.path().join("wal"), base);
+        // A census with no budget reports and reads nothing — the default
+        // install, where the counter and the alert are the whole output.
+        compactor.run_agg_short_repair_once(0).await;
+        assert!(
+            !walk_files(&warehouse).iter().any(|path| path
+                .file_name()
+                .is_some_and(|name| name == "siglake-agg-wide.json")),
+            "a census with no repair budget must not write a base object"
+        );
+
+        compactor.run_agg_short_repair_once(1).await;
+        // This handle is a different `IcebergContext` from the one the pass
+        // opened for the namespace, and holds its own memo of the folded base —
+        // as a query pod in another process would.
+        tenant
+            .invalidate_cached_table(tenant.events_table_ident())
+            .await;
+        assert_eq!(
+            tenant
+                .grouped_counts_with_summary("events", "host", None, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .source_label(),
+            "tier1_wide",
+            "with a budget, the tenant namespace's short aggregate is rebuilt"
         );
     }
 }
@@ -6745,6 +7010,73 @@ mod mirror_sync_gate_tests {
             mirror_sync_interval_from(None),
             Some(std::time::Duration::from_secs(60))
         );
+    }
+}
+
+#[cfg(test)]
+mod agg_short_repair_knob_tests {
+    use super::{
+        agg_short_repair_enabled_from, agg_short_repair_max_tables_from,
+        agg_short_scan_interval_from,
+    };
+    use std::time::Duration;
+
+    /// Unlike the mirror sweep, `0` here IS off: a census on every compactor
+    /// loop would re-read every table's folded base once a second to answer a
+    /// question whose answer changes only when something commits or rebuilds.
+    #[test]
+    fn the_census_cadence_reads_its_disable_words_and_zero() {
+        for word in ["off", "OFF", "disabled", "never", "0", " off "] {
+            assert!(
+                agg_short_scan_interval_from(Some(word)).is_none(),
+                "{word:?} must disable the census"
+            );
+        }
+        assert_eq!(
+            agg_short_scan_interval_from(Some("300")),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            agg_short_scan_interval_from(None),
+            Some(Duration::from_secs(900)),
+            "the default cadence"
+        );
+        assert_eq!(
+            agg_short_scan_interval_from(Some("nonsense")),
+            Some(Duration::from_secs(900)),
+            "an unparseable value falls back to the default rather than to \
+             every loop"
+        );
+    }
+
+    /// The repair is one Tier-2 query per maintained column, so only an
+    /// explicit opt-in may turn it on — anything else leaves the census
+    /// reporting and the operator's rebuild the remedy.
+    #[test]
+    fn only_an_explicit_opt_in_enables_the_repair() {
+        for word in ["1", "true", "TRUE", "yes", "on", " on "] {
+            assert!(
+                agg_short_repair_enabled_from(Some(word)),
+                "{word:?} must enable the repair"
+            );
+        }
+        for word in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(
+                !agg_short_repair_enabled_from(Some(word)),
+                "{word:?} must not enable the repair"
+            );
+        }
+        assert!(!agg_short_repair_enabled_from(None), "default is off");
+    }
+
+    #[test]
+    fn the_per_pass_repair_budget_is_at_least_one_table() {
+        assert_eq!(agg_short_repair_max_tables_from(None), 1);
+        assert_eq!(agg_short_repair_max_tables_from(Some("4")), 4);
+        // 0 would make the interval gate a no-op that silently never repairs;
+        // switching the repair off is what the enable knob is for.
+        assert_eq!(agg_short_repair_max_tables_from(Some("0")), 1);
+        assert_eq!(agg_short_repair_max_tables_from(Some("nonsense")), 1);
     }
 }
 

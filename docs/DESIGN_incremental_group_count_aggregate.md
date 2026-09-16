@@ -134,6 +134,52 @@ twice. If the marker write or automatic rebuild fails, the LOST log names the
 operator fallback: `siglake rebuild-group-counts --table <table>`. It is safe
 to re-run.
 
+**A shortfall with no marker at all (#3000).** A marker is written by the
+committer, so a committer that dies between its commit and its delta PUT leaves
+none, and neither does the per-incarnation prefix change (#2919), which starts
+every upgraded table's aggregate fresh at its first commit after the upgrade.
+That state is stable: a later delta adds its own rows and the total stays short.
+The maintenance pass therefore also censuses each maintained table on a slow
+interval (`SIGLAKE_AGG_SHORT_SCAN_INTERVAL_SECS`, default 900s) for a maintained
+column short of `total-records`, reading one total per column out of the compact
+base (`decode_column_totals`) rather than decoding each column's values.
+
+Two rules decide when it may rebuild rather than report, and both exist because
+the alternative is worse than the deficit. **Landed, not merely absent:** a
+commit publishes its delta after its commit, so "short" and "short for another
+second" read identically in the totals; the census requires the current
+generation's own contribution to be in the folded artifact, counting coverage
+links still waiting on a missing predecessor and bridging a row-conserving
+re-cluster the way the read guard does. **One attempt per condition:** a column
+the rebuild cannot cover is dropped from the base by that rebuild and re-added
+short by the next delta, so the rebuild records the columns it failed to restore
+(`short_repair` in the base object, written in the same CAS that publishes the
+rebuild) and the census skips them until another rebuild — a marker repair, or
+the CLI — clears the record.
+
+A census rebuild recomputes the **exact** columns from the files and leaves the
+sketches alone: recomputing them costs a second Tier-2 query per sketched column
+and fails the whole rebuild on the first column the files cannot serve, which on
+the events table is `timestamp_ns` the moment its per-row-unique values demote
+it. That leaves one edge to close. `rebuilt_through` makes every delta at or
+below it redundant, and both folds then delete rather than fold it — sketch half
+included, which no later commit re-adds. So the rebuild merges the sketch half of
+exactly those deltas into the base in the same write, under the same predicate
+the fold uses, and drops from the carry any column it just restored exactly: a
+column represented both ways is reconciled by demoting the exact side, which
+would undo the repair. The marker path, which does recompute sketches from the
+files, is unchanged.
+
+Measured 2026-09-16 (release, local filesystem, one dimension column): census
+12.3ms / repair 64.4ms at 40k rows, 139.3ms / 849.4ms at 400k. Both are linear
+in the column's distinct values and the repair is ~6× the census per column, so
+the census is unconditional and the repair is opt-in
+(`SIGLAKE_AGG_SHORT_REPAIR=1`) and budgeted at one table per pass
+(`SIGLAKE_AGG_SHORT_REPAIR_MAX_TABLES`). At the 1TB shape the extrapolation is
+~9 minutes per column per 250M rows, which the compactor's 600s watchdog cuts —
+safely, since the rebuild publishes in one write at the end — and that is why a
+table that size stays the operator's to rebuild.
+
 The rebuild takes its column set from the aggregate, not the schema: it repairs
 what a table was maintaining, and inventing columns would change what the table
 serves. The one opt-in exception is `--admit-typed-columns`, for a table

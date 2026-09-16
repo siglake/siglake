@@ -344,6 +344,9 @@ fn the_wide_object_round_trips() {
     // "never rebuilt", not as "rebuilt through sequence 0" — which would make
     // the fold discard every delta at or below 0.
     assert!(empty.rebuilt_through.is_none());
+    // Nor as "a repair already tried and failed on every column", which would
+    // suppress the deficit census (#3000) on every pre-existing object.
+    assert!(empty.short_repair.is_none());
 
     let mut wide = WideGroupCounts {
         group_counts: counts("host", &[("a", 3), ("b", 5)], 1).to_compact(),
@@ -352,6 +355,7 @@ fn the_wide_object_round_trips() {
         rebuilt_through: None,
         coverage: None,
         coverage_links: Vec::new(),
+        short_repair: None,
     };
     let back: WideGroupCounts =
         serde_json::from_str(&serde_json::to_string(&wide).unwrap()).unwrap();
