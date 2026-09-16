@@ -19,6 +19,7 @@ quickest path to validate a siglake build against real AWS.
 ```bash
 # 1. Stand it all up.
 deploy/aws/up.sh
+# Run the printed `export KUBECONFIG=...` before the remaining commands.
 
 # 2. Run the smoke test (OTLP POST → query-server SQL → assert).
 deploy/aws/smoke.sh
@@ -28,7 +29,7 @@ deploy/aws/smoke.sh
 helm install siglake-op deploy/helm/siglake-operator \
   --namespace siglake-system --create-namespace \
   --set image.repository="$(terraform -chdir=deploy/terraform/aws output -raw ecr_repository_url)" \
-  --set image.tag=operator-0.1.0
+  --set image.tag=operator-0.1.1
 deploy/aws/operator-smoke.sh
 
 # 4. Tear it down.
@@ -41,7 +42,7 @@ SIGLAKE_DOWN_MODE=all EMPTY_WAREHOUSE=1 deploy/aws/down.sh
 
 | Script              | What it does                                                                                                                                          |
 |---------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `up.sh`             | `terraform apply` → `aws eks update-kubeconfig` → create namespace + Postgres Secret from Secrets Manager → `helm upgrade --install` → wait-ready.    |
+| `up.sh`             | `terraform apply` → write and verify a private kubeconfig → create namespace + Postgres Secret from Secrets Manager → `helm upgrade --install` → wait-ready. It prints the `KUBECONFIG` export used by the follow-on scripts. |
 | `smoke.sh`          | `kubectl port-forward` to ingester + query-server, POST N events, poll `/api/v1/sql` until the row count matches, then run an SPL stats-by-host.      |
 | `query-bench.sh`    | Creates a temporary in-cluster runner pod, executes tab-separated SQL timing cases against `siglake-query`, writes serial/concurrency TSVs, and captures query pod stats, metrics, and logs. |
 | `operator-smoke.sh` | Templates `deploy/operator/sample-cluster.smoke.yaml` against `terraform output -raw {ecr_repository_url, warehouse_bucket, rds_endpoint, rds_secret_arn}` + the postgres password from Secrets Manager. Creates the ingest token Secrets + applies the CR. Waits for the operator-rendered `example-{ingester,compactor,query}` Deployments to roll out. Run *after* `up.sh` *and* `helm install siglake-op deploy/helm/siglake-operator …`. |
@@ -55,7 +56,7 @@ All three scripts honor the same set of vars:
 |----------------------|------------------------------------------------|-------------------------------------------------------------|
 | `SIGLAKE_RELEASE`     | `siglake`                                       | Helm release name.                                          |
 | `SIGLAKE_NAMESPACE`   | `siglake`                                       | Target namespace.                                           |
-| `SIGLAKE_IMAGE_TAG`   | `0.1.0`                                        | Image tag to deploy.                                        |
+| `SIGLAKE_IMAGE_TAG`   | `0.1.1`                                        | Image tag to deploy.                                        |
 | `SIGLAKE_VALUES_EXTRA`| `deploy/aws/config/values.smoke.yaml`          | Extra values file layered onto Terraform's emitted values.  |
 | `SIGLAKE_QUERY_TOKEN` | _empty_                                        | Bearer token for `smoke.sh` if the chart's `query.tokens` is set. |
 | `SIGLAKE_QUERY_CASES_FILE` | _empty_                                   | TSV input file for `query-bench.sh` (`label<TAB>expected<TAB>sql<TAB>tags`). |
@@ -68,9 +69,11 @@ All three scripts honor the same set of vars:
 ## Failure recovery
 
 - **`up.sh` fails mid-apply**: `terraform apply` is idempotent — rerun
-  the script and it'll pick up where it left off.
+  the script and it'll pick up where it left off. Its private kubeconfig is
+  removed on failure.
 - **Helm release stuck pending-install**: `helm uninstall $RELEASE -n
-  $NAMESPACE` and re-run.
+  $NAMESPACE --kubeconfig <path printed by up.sh> --kube-context <cluster>`
+  and re-run.
 - **`down.sh` fails on S3**: `EMPTY_WAREHOUSE=1` empties the bucket
   first. In the default keep-EKS mode the script already turns this
   on unless you override it. For very large buckets this can take

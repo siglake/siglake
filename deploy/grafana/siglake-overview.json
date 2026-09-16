@@ -344,8 +344,8 @@
    },
    "targets": [
     {
-     "expr": "sum by (table) (increase(siglake_group_count_delta_write_failures_total{namespace=~\"$namespace\"}[5m]))",
-     "legendFormat": "lost {{table}}",
+     "expr": "sum by (iceberg_namespace, table) (increase(siglake_group_count_delta_write_failures_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "lost {{iceberg_namespace}}.{{table}}",
      "refId": "A"
     },
     {
@@ -354,12 +354,12 @@
      "refId": "B"
     },
     {
-     "expr": "sum by (table) (increase(siglake_side_aggregate_publish_failures_total{namespace=~\"$namespace\"}[5m]))",
-     "legendFormat": "side publication lost {{table}}",
+     "expr": "sum by (iceberg_namespace, table) (increase(siglake_side_aggregate_publish_failures_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "side publication lost {{iceberg_namespace}}.{{table}}",
      "refId": "C"
     }
    ],
-   "description": "Lost and retried delta writes are grouped by table. A lost delta leaves the aggregate short, but writes a durable marker that the maintenance compactor normally repairs on its next aggregate fold; a sustained retry rate means the object store or credentials are flaky and a loss is likely. The third series is the inline side object's own publication: it retries on the same budget, and a loss there leaves that object short of total-records with only its group counts repairable."
+   "description": "Lost delta writes are grouped by Iceberg namespace and table, retried ones by table alone. A lost delta leaves the aggregate short, but writes a durable marker that the maintenance compactor normally repairs on its next aggregate fold; a sustained retry rate means the object store or credentials are flaky and a loss is likely. The third series is the inline side object's own publication: it retries on the same budget, and a loss there leaves that object short of total-records with only its group counts repairable."
   },
   {
    "id": 143,
@@ -377,12 +377,12 @@
    },
    "targets": [
     {
-     "expr": "sum by (table, outcome) (increase(siglake_group_count_auto_rebuilds_total{namespace=~\"$namespace\"}[5m]))",
-     "legendFormat": "{{outcome}} {{table}}",
+     "expr": "sum by (iceberg_namespace, table, outcome) (increase(siglake_group_count_auto_rebuilds_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{outcome}} {{iceberg_namespace}}.{{table}}",
      "refId": "A"
     }
    ],
-   "description": "success means the compactor restored the aggregate from committed files after a lost delta. incomplete or failed means GROUP BY remains on the exact per-file path and fires SiglakeGroupCountDeltaLost; use siglake rebuild-group-counts --table <table> as the operator fallback."
+   "description": "success means the compactor restored the aggregate from committed files after a lost delta. incomplete or failed means GROUP BY remains on the exact per-file path and fires SiglakeGroupCountDeltaLost; use siglake rebuild-group-counts --namespace <iceberg_namespace> --table <table> as the operator fallback."
   },
   {
    "id": 110,
@@ -551,11 +551,16 @@
    "targets": [
     {
      "expr": "sum(siglake_catalog_claim_quarantined{namespace=~\"$namespace\"})",
-     "legendFormat": "quarantined",
+     "legendFormat": "claim quarantine",
      "refId": "A"
+    },
+    {
+     "expr": "sum(siglake_compactor_segments_poisoned{namespace=~\"$namespace\"})",
+     "legendFormat": "poison/ set-aside",
+     "refId": "B"
     }
    ],
-   "description": "Set aside and not draining without intervention: repeated drain failures (usually an index that does not exist), or a mirrored segment refused because it cannot be placed in the table its index resolves to now, which is set aside on the first cycle. Durable and unqueryable until requeued."
+   "description": "Set aside and not draining without intervention: repeated drain failures (usually an index that does not exist), or a mirrored segment refused because it cannot be placed in the table its index resolves to now, which is set aside on the first cycle. Durable and unqueryable until requeued. The second line is the local filesystem drain's equivalent (#3143): a segment that failed to read on every attempt is held under `<wal>/poison/` with a note saying why, and `siglake wal-requeue --wal <wal-root>` is the way back once its cause is fixed. `siglake_compactor_segments_poisoned_total` is the event arm — a set-aside that is requeued and set aside again counts twice there and once here."
   },
   {
    "id": 117,
@@ -1501,6 +1506,108 @@
    "description": "Every decision the snapshot-keyed SQL result cache takes. hit/miss/insert/wait are the working cache. Not only /api/v1/sql since #2268: the two Jaeger name-list routes (services, operations) share this store and this counter rather than owning a second one, so a Jaeger UI polling in the background shows up here as hits it did not used to produce. Their misses carry none of the skip_ arms below — the routes serve two fixed SELECT DISTINCTs over the committed snapshot, so there is no statement to classify and no WAL union to prove empty. The skip_ arms say why a request was refused one: skip_buffer_* is the WAL proof (rows in flight, a refused decode, a failed load, a witnessed segment set that moved) and is expected while a backlog drains; skip_time_dependent is a query calling a registered STABLE or VOLATILE function (now(), random()) and is ordinary dashboard traffic; skip_unclassifiable is a function name the planner's registry does not hold — the conservative classifier costing this deployment its cache on queries that may plan and succeed anyway; skip_unparseable is a statement the cache classifier's own parser rejected and should sit at ~zero (#1481). Uncacheable SHAPES — bare unordered scans — are not counted here at all. No arm is pre-registered at 0 (no alert reads them), so a missing series here means that outcome has not happened on this pod — not a broken panel: scripts/check-chart.py holds this metric name to the source, so a rename fails CI instead of blanking the chart."
   },
   {
+   "id": 159,
+   "type": "timeseries",
+   "title": "Text-index startup by stage (p50 / p99)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 130
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.50, sum by (le, stage) (rate(siglake_iceberg_text_index_startup_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p50 {{stage}}",
+     "refId": "A"
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le, stage) (rate(siglake_iceberg_text_index_startup_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p99 {{stage}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "min": 0
+    }
+   },
+   "description": "What a text query spends before a planned indexed file produces its first batch, split into the four stages that make the number actionable: permit_wait is the global index-load semaphore (SIGLAKE_INDEX_LOAD_CONCURRENCY, 4 by default) making a plan's files queue; blob_fetch is the Puffin blob read from object storage; decode is InvertedIndex::from_bytes, which costs about 30 ns per indexed row and is paid only when the parsed-index cache missed; selection is the postings lookup plus the row-selection runs, paid on every file the index prunes. A first-batch regression is one of those four, and run #73 could not say which from the round's artifacts. Read against the cache panel beside it: decode's sample COUNT is the number of cold loads, selection's is the number of index-pruned files, so decode climbing toward selection means the cache is not holding the plan's indexes. The stage is a grouping, not a filter, so a stage added later appears here without editing the dashboard."
+  },
+  {
+   "id": 160,
+   "type": "timeseries",
+   "title": "Parsed text-index cache outcomes / evictions",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 130
+   },
+   "targets": [
+    {
+     "expr": "sum by (outcome) (rate(siglake_iceberg_parsed_index_cache_lookups_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "lookup {{outcome}}",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (reason) (rate(siglake_iceberg_parsed_index_cache_evictions_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "dropped {{reason}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "min": 0
+    }
+   },
+   "description": "Whether the plan's parsed indexes stay warm. One lookup outcome per file a text query acquires an index for: hit means the parsed form was reused, miss means this query deserialized the blob. Both arms are pre-registered at 0 on the query server, so a tier serving no text query charts a flat zero rather than No data. The dropped arms are why a miss happened and they are the reading a hit ratio cannot give: byte_bound is the working set over SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES (1 GiB by default, about 40 bytes per indexed row, so five compacted 7M-row files need about 1.5 GB), entry_bound is the shared SIGLAKE_PUFFIN_BLOB_CACHE_MAX_ENTRIES count, and oversized is one index alone exceeding the whole budget, which leaves that file decoding on every query. Misses with no drops are first reads; misses beside a steady byte_bound rate are thrash, which is what run #78's keyword_and_label plan was doing with 4.1 GB of parsed index against the default."
+  },
+  {
+   "id": 161,
+   "type": "timeseries",
+   "title": "Parsed text-index cache resident / budget",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 130
+   },
+   "targets": [
+    {
+     "expr": "max(siglake_iceberg_parsed_index_cache_bytes{namespace=~\"$namespace\"})",
+     "legendFormat": "resident",
+     "refId": "A"
+    },
+    {
+     "expr": "max(siglake_iceberg_parsed_index_cache_max_bytes{namespace=~\"$namespace\"})",
+     "legendFormat": "budget",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "min": 0
+    }
+   },
+   "description": "The parsed working set against the bound that evicts it. Both are published where the bounds are enforced — on admission to the cache — so neither exists before the pod's first indexed text query and both hold their last value while no text query runs; read them with the eviction arms beside them, not on their own. Resident pinned at the budget with byte_bound drops beside it is the case for raising SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES (or the query pod's memory limit, which the resolved budget follows when it is set)."
+  },
+  {
    "id": 137,
    "type": "row",
    "title": "Cache warmer",
@@ -1508,7 +1615,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 130
+    "y": 138
    },
    "collapsed": false
   },
@@ -1524,7 +1631,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 131
+    "y": 139
    },
    "targets": [
     {
@@ -1571,7 +1678,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 131
+    "y": 139
    },
    "targets": [
     {
@@ -1602,7 +1709,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 131
+    "y": 139
    },
    "targets": [
     {
@@ -1636,7 +1743,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 139
+    "y": 147
    },
    "collapsed": false
   },
@@ -1652,7 +1759,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 140
+    "y": 148
    },
    "targets": [
     {
@@ -1680,7 +1787,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 140
+    "y": 148
    },
    "targets": [
     {
@@ -1713,7 +1820,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 148
+    "y": 156
    },
    "targets": [
     {
@@ -1747,7 +1854,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 156
+    "y": 164
    },
    "targets": [
     {
@@ -1762,7 +1869,7 @@
     },
     "overrides": []
    },
-   "description": "Whole audit rows refused without changing query responses. Oversized is a single row above the byte ceiling; row_limit and byte_limit are retained-budget saturation; channel_full is a transient sender/worker race; worker_shutdown means no audit receiver remains."
+   "description": "Whole audit rows lost without changing query responses. Oversized is a single row above the byte ceiling; row_limit and byte_limit are retained-budget saturation; channel_full is a transient sender/worker race; worker_shutdown means no audit receiver remains. Those five are refusals at submit. append_deadline is the other kind: a storage append outlived its service deadline and the batch it held was abandoned, so it counts one per row already accepted, and its commit may or may not have landed."
   }
  ]
 }

@@ -1,60 +1,380 @@
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "generated_at": "2026-09-07T12:02:00Z",
   "revisions": {
     "repository_commit": "0123456789abcdef",
     "query_pods": [
-      {"pod": "siglake-query-0", "image": "siglake:kind", "image_id": "sha256:query0"},
-      {"pod": "siglake-query-1", "image": "siglake:kind", "image_id": "sha256:query1"}
+      {
+        "pod": "siglake-query-0",
+        "image": "siglake:kind",
+        "image_id": "sha256:query0"
+      },
+      {
+        "pod": "siglake-query-1",
+        "image": "siglake:kind",
+        "image_id": "sha256:query1"
+      }
     ],
-    "postgres": {"pod": "postgres-0", "image": "postgres:16-alpine", "image_id": "sha256:postgres"}
+    "postgres": {
+      "pod": "postgres-0",
+      "image": "postgres:16-alpine",
+      "image_id": "sha256:postgres"
+    }
   },
   "settings": {
     "persistent_job_store": true,
     "reconcile_interval_seconds": 5,
     "reconcile_write_timeout_seconds": 10,
     "max_unreconciled_per_pod": 1024,
+    "terminal_write_attempts": 3,
+    "terminal_write_deadline_seconds": 30,
     "sample_interval_seconds": 5,
     "outage_seconds": 45,
-    "drain_timeout_seconds": 120
+    "drain_timeout_seconds": 120,
+    "write_probe_timeout_seconds": 5
   },
-  "expected_pods": ["siglake-query-0", "siglake-query-1"],
+  "expected_pods": [
+    "siglake-query-0",
+    "siglake-query-1"
+  ],
+  "postgres_container": {
+    "pod": "postgres-0",
+    "before": {
+      "uid": "3f1b",
+      "restart_count": 0,
+      "started_at": "2026-09-07T11:58:00Z"
+    },
+    "after": {
+      "uid": "3f1b",
+      "restart_count": 0,
+      "started_at": "2026-09-07T11:58:00Z"
+    }
+  },
+  "write_probes": [
+    {
+      "at": "2026-09-07T12:00:00Z",
+      "phase": "baseline",
+      "timeout_seconds": 5,
+      "exec_status": 0,
+      "outcome": "completed",
+      "exit_status": 0,
+      "seconds": 0.0,
+      "detail": ""
+    },
+    {
+      "at": "2026-09-07T12:00:25Z",
+      "phase": "outage",
+      "timeout_seconds": 5,
+      "exec_status": 0,
+      "outcome": "blocked",
+      "exit_status": 137,
+      "seconds": 5.0,
+      "detail": ""
+    },
+    {
+      "at": "2026-09-07T12:00:51Z",
+      "phase": "recovery",
+      "timeout_seconds": 5,
+      "exec_status": 0,
+      "outcome": "completed",
+      "exit_status": 0,
+      "seconds": 0.0,
+      "detail": ""
+    }
+  ],
+  "job_commit_times": {
+    "at": "2026-09-07T12:01:06Z",
+    "exec_status": 0,
+    "setting_status": 0,
+    "query_status": 0,
+    "track_commit_timestamp": "on",
+    "rows": [
+      {
+        "job_id": "job-a",
+        "status": "succeeded",
+        "submitted_at": "2026-09-07 12:00:01.204817+00",
+        "ended_at": "2026-09-07 12:00:51.771902+00",
+        "recovered_at": null,
+        "committed_at": "2026-09-07 12:00:51.884113+00"
+      },
+      {
+        "job_id": "job-b",
+        "status": "succeeded",
+        "submitted_at": "2026-09-07 12:00:02.118440+00",
+        "ended_at": "2026-09-07 12:00:52.004551+00",
+        "recovered_at": null,
+        "committed_at": "2026-09-07 12:00:52.131288+00"
+      }
+    ],
+    "detail": ""
+  },
   "timestamps": {
     "submission_started_at": "2026-09-07T12:00:01Z",
     "submission_finished_at": "2026-09-07T12:00:02Z",
     "outage_started_at": "2026-09-07T12:00:03Z",
+    "pause_applied_at": "2026-09-07T12:00:04Z",
     "restoration_started_at": "2026-09-07T12:00:48Z",
+    "restoration_applied_at": "2026-09-07T12:00:49Z",
     "postgres_ready_at": "2026-09-07T12:00:50Z",
     "sampling_ended_at": "2026-09-07T12:01:05Z"
   },
   "submissions": [
-    {"submitted_at": "2026-09-07T12:00:01Z", "http_status": 202, "job_id": "job-a"},
-    {"submitted_at": "2026-09-07T12:00:02Z", "http_status": 202, "job_id": "job-b"}
+    {
+      "submitted_at": "2026-09-07T12:00:01Z",
+      "http_status": 202,
+      "job_id": "job-a"
+    },
+    {
+      "submitted_at": "2026-09-07T12:00:02Z",
+      "http_status": 202,
+      "job_id": "job-b"
+    }
   ],
   "samples": [
     {
       "at": "2026-09-07T12:00:00Z",
       "phase": "baseline",
-      "backlog": [{"pod": "siglake-query-0", "value": 0}, {"pod": "siglake-query-1", "value": 0}],
-      "completions": [{"pod": "siglake-query-0", "value": 10}, {"pod": "siglake-query-1", "value": 12}]
+      "evaluated_at": 1788782400.0,
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0,
+          "sample_time": 1788782398.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0,
+          "sample_time": 1788782398.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 10,
+          "sample_time": 1788782398.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 12,
+          "sample_time": 1788782398.0
+        }
+      ],
+      "postgres": {
+        "exec_status": 0,
+        "processes": [
+          {
+            "pid": "1",
+            "state": "S",
+            "starttime": "311"
+          },
+          {
+            "pid": "42",
+            "state": "S",
+            "starttime": "742"
+          },
+          {
+            "pid": "43",
+            "state": "S",
+            "starttime": "743"
+          }
+        ]
+      }
     },
     {
       "at": "2026-09-07T12:00:30Z",
       "phase": "outage",
-      "backlog": [{"pod": "siglake-query-0", "value": 2}, {"pod": "siglake-query-1", "value": 1}],
-      "completions": [{"pod": "siglake-query-0", "value": 10}, {"pod": "siglake-query-1", "value": 12}]
+      "evaluated_at": 1788782430.0,
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 2,
+          "sample_time": 1788782428.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 1,
+          "sample_time": 1788782428.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 10,
+          "sample_time": 1788782428.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 12,
+          "sample_time": 1788782428.0
+        }
+      ],
+      "postgres": {
+        "exec_status": 0,
+        "processes": [
+          {
+            "pid": "1",
+            "state": "T",
+            "starttime": "311"
+          },
+          {
+            "pid": "42",
+            "state": "T",
+            "starttime": "742"
+          },
+          {
+            "pid": "43",
+            "state": "T",
+            "starttime": "743"
+          }
+        ]
+      }
+    },
+    {
+      "at": "2026-09-07T12:00:40Z",
+      "phase": "outage",
+      "evaluated_at": 1788782440.0,
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 2,
+          "sample_time": 1788782438.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 1,
+          "sample_time": 1788782438.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 10,
+          "sample_time": 1788782438.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 12,
+          "sample_time": 1788782438.0
+        }
+      ],
+      "postgres": {
+        "exec_status": 0,
+        "processes": [
+          {
+            "pid": "1",
+            "state": "T",
+            "starttime": "311"
+          },
+          {
+            "pid": "42",
+            "state": "T",
+            "starttime": "742"
+          },
+          {
+            "pid": "43",
+            "state": "T",
+            "starttime": "743"
+          }
+        ]
+      }
     },
     {
       "at": "2026-09-07T12:00:52Z",
       "phase": "recovery",
-      "backlog": [{"pod": "siglake-query-0", "value": 1}, {"pod": "siglake-query-1", "value": 0}],
-      "completions": [{"pod": "siglake-query-0", "value": 11}, {"pod": "siglake-query-1", "value": 13}]
+      "evaluated_at": 1788782452.0,
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 1,
+          "sample_time": 1788782450.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0,
+          "sample_time": 1788782450.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 11,
+          "sample_time": 1788782450.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 13,
+          "sample_time": 1788782450.0
+        }
+      ],
+      "postgres": {
+        "exec_status": 0,
+        "processes": [
+          {
+            "pid": "1",
+            "state": "S",
+            "starttime": "311"
+          },
+          {
+            "pid": "42",
+            "state": "S",
+            "starttime": "742"
+          },
+          {
+            "pid": "43",
+            "state": "S",
+            "starttime": "743"
+          }
+        ]
+      }
     },
     {
       "at": "2026-09-07T12:01:02Z",
       "phase": "recovery",
-      "backlog": [{"pod": "siglake-query-0", "value": 0}, {"pod": "siglake-query-1", "value": 0}],
-      "completions": [{"pod": "siglake-query-0", "value": 12}, {"pod": "siglake-query-1", "value": 13}]
+      "evaluated_at": 1788782462.0,
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0,
+          "sample_time": 1788782460.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0,
+          "sample_time": 1788782460.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 12,
+          "sample_time": 1788782460.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 13,
+          "sample_time": 1788782460.0
+        }
+      ],
+      "postgres": {
+        "exec_status": 0,
+        "processes": [
+          {
+            "pid": "1",
+            "state": "S",
+            "starttime": "311"
+          },
+          {
+            "pid": "42",
+            "state": "S",
+            "starttime": "742"
+          },
+          {
+            "pid": "43",
+            "state": "S",
+            "starttime": "743"
+          }
+        ]
+      }
     }
   ]
 }

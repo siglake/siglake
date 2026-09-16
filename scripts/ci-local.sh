@@ -9,7 +9,7 @@
 # public-tree checker found fourteen — but only when someone looks at them. The
 # cheap fix is to make the whole suite runnable in one command before pushing.
 #
-#   scripts/ci-local.sh              # build-env, fmt, shell, claude-md, set-var, dashboard, test, clippy, helm, public-tree, generated, deny, fork-tests
+#   scripts/ci-local.sh              # build-env, fmt, shell, claude-md, set-var, dashboard, test, clippy, profiling, helm, public-tree, generated, deny, fork-tests
 #   scripts/ci-local.sh --all        # + operator-cluster (kind), docker, external-readers
 #   scripts/ci-local.sh --strict     # a job this box cannot run (no mold, helm, promtool, cargo-deny, kind, docker, external reader) is FAIL, not skipped
 #   scripts/ci-local.sh --log-dir D  # keep this run's job logs in D (also CI_LOCAL_LOG_DIR)
@@ -199,6 +199,7 @@ else
     bash -n "$f" 2>>"$LOG_DIR/shell.log" || sh_rc=1
   done < <(git ls-files '*.sh' '*.sh.tpl' '*.bash')
   scripts/check-smoke.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  scripts/check-aws-up-kubeconfig.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-loadgen.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-compose-preflight.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-ci-local-test-guard.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
@@ -282,8 +283,8 @@ fi
 job_started=$SECONDS
 # check-chart.py's checks that need no render: every deployed SIGLAKE_* env name
 # in compose and the operator is named by non-test Rust source; every
-# `siglake_*` series a deploy/grafana panel queries is one crates/ emits, in the
-# form the exporter renders it; the README's alert count matches the
+# `siglake_*` series a deploy/grafana panel queries is one crates/ or an owned
+# fork emits, in the form the exporter renders it; the README's alert count matches the
 # PrometheusRule template source; and every counter the template reads through
 # `increase()` is in a pre-registration list in siglake-core's metrics.rs. CI
 # runs them inside the helm job's full check-chart.py; here they are
@@ -293,10 +294,11 @@ job_started=$SECONDS
 # four-minute test job for the same reason set-var does: a wrong answer here is
 # red in a second.
 #
-# One of these checks evaluates the drain-backlog panel's PromQL with promtool,
-# which the helm job installs in CI but which is also worth using here whenever
-# it happens to be on PATH: the panel's arithmetic is what the check is about,
-# and skipping it silently on a box that could have run it is the worse default.
+# Two of these checks evaluate a panel's PromQL with promtool (the drain backlog
+# and the text-index startup stages), which the helm job installs in CI but
+# which is also worth using here whenever it happens to be on PATH: the panels'
+# arithmetic is what those checks are about, and skipping it silently on a box
+# that could have run it is the worse default.
 dashboard_args=(--source-only)
 if command -v promtool >/dev/null 2>&1; then
   dashboard_args+=(--require-promtool)
@@ -430,6 +432,27 @@ if cargo clippy --workspace --all-targets -- -D warnings >"$LOG_DIR/clippy.log" 
   report clippy ok
 else
   report clippy FAIL; grep -E '^error' "$LOG_DIR/clippy.log" | head -5 | sed 's/^/  /' >&2
+fi
+
+# --- profiling ---------------------------------------------------------------
+job_started=$SECONDS
+# A step of ci.yml's `clippy` job, reported as its own line because it answers a
+# different question: the clippy above builds every member with DEFAULT
+# features, so `siglake-core`'s off-by-default `profiling` feature -- the
+# `/debug/pprof/*` endpoints, and the only thing a PROFILING=1 image adds to the
+# code -- is compiled by neither it nor the test job. The script runs clippy and
+# the crate's tests in both `tokio_unstable` configurations and is the same one
+# ci.yml and .github/workflows/profiling-image.yml run.
+#
+# Two extra dependency builds, since each RUSTFLAGS change invalidates the
+# graph; they cache separately after the first run. That is the price of the
+# gate building what the diagnostic image ships.
+if scripts/check-profiling-feature.sh >"$LOG_DIR/profiling.log" 2>&1; then
+  report profiling "ok ($(awk '/^test result: ok\./ {s+=$4} END {print s+0}' \
+    "$LOG_DIR/profiling.log") tests, both cfgs)"
+else
+  report profiling FAIL
+  grep -E '^(error|test result: FAILED)' "$LOG_DIR/profiling.log" | head -5 | sed 's/^/  /' >&2
 fi
 
 # --- helm --------------------------------------------------------------------

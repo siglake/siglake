@@ -34,8 +34,8 @@ use iceberg::puffin::{
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
     BlobMetadata as StatisticsBlobMetadata, DataFile, DataFileFormat, FormatVersion, NullOrder,
-    Operation, PartitionSpec, PrimitiveType, SortDirection, SortField, SortOrder, StatisticsFile,
-    Summary, Transform, Type,
+    Operation, PartitionSpec, PrimitiveType, Snapshot, SortDirection, SortField, SortOrder,
+    StatisticsFile, Summary, Transform, Type,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{
@@ -262,6 +262,13 @@ mod format_version_tests {
 #[cfg(test)]
 mod alerted_counter_catalog_tests {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::CompositeKey;
+
+    fn has_label(key: &CompositeKey, name: &str, value: &str) -> bool {
+        key.key()
+            .labels()
+            .any(|label| label.key() == name && label.value() == value)
+    }
 
     #[test]
     fn consumed_proof_cap_refusals_are_preregistered() {
@@ -273,16 +280,20 @@ mod alerted_counter_catalog_tests {
     }
 
     /// The compactor pre-registers `siglake_group_count_delta_write_failures_total`
-    /// for the events table so the first failed delta PUT is a delta
-    /// `increase()` can see. siglake-core cannot name this crate, so the label
-    /// value there is a literal; this holds it to [`super::TABLE_NAME`].
+    /// for the default namespace's events table so the first failed delta PUT
+    /// is a delta `increase()` can see. siglake-core cannot name this crate, so
+    /// the label values there are literals; this holds them to
+    /// [`super::NAMESPACE`] and [`super::TABLE_NAME`].
     #[test]
     fn group_count_delta_write_failures_is_preregistered_for_the_events_table() {
         let registered = siglake_core::metrics::COMPACTOR_ALERTED_COUNTERS
             .iter()
             .find(|c| c.name == "siglake_group_count_delta_write_failures_total")
             .expect("compactor catalog lists the delta write-failure counter");
-        let events: &[(&str, &str)] = &[("table", super::TABLE_NAME)];
+        let events: &[(&str, &str)] = &[
+            ("iceberg_namespace", super::NAMESPACE),
+            ("table", super::TABLE_NAME),
+        ];
         assert!(registered.series.contains(&events), "{registered:?}");
     }
 
@@ -296,18 +307,22 @@ mod alerted_counter_catalog_tests {
             .find(|c| c.name == "siglake_group_count_auto_rebuilds_total")
             .expect("compactor catalog lists the auto-rebuild counter");
         for outcome in ["success", "incomplete", "failed"] {
-            let events: &[(&str, &str)] = &[("table", super::TABLE_NAME), ("outcome", outcome)];
+            let events: &[(&str, &str)] = &[
+                ("iceberg_namespace", super::NAMESPACE),
+                ("table", super::TABLE_NAME),
+                ("outcome", outcome),
+            ];
             assert!(registered.series.contains(&events), "{registered:?}");
         }
     }
 
     #[test]
-    fn group_count_auto_rebuilds_are_labelled_by_table_and_outcome() {
+    fn group_count_auto_rebuilds_are_labelled_by_namespace_table_and_outcome() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
             for outcome in ["success", "incomplete", "failed"] {
-                super::record_group_count_auto_rebuild("logs-index", outcome);
+                super::record_group_count_auto_rebuild(super::NAMESPACE, "logs-index", outcome);
             }
         });
 
@@ -317,16 +332,85 @@ mod alerted_counter_catalog_tests {
                 .iter()
                 .find(|(key, _, _, _)| {
                     key.key().name() == "siglake_group_count_auto_rebuilds_total"
-                        && key
-                            .key()
-                            .labels()
-                            .any(|label| label.key() == "table" && label.value() == "logs-index")
-                        && key
-                            .key()
-                            .labels()
-                            .any(|label| label.key() == "outcome" && label.value() == outcome)
+                        && has_label(key, "iceberg_namespace", super::NAMESPACE)
+                        && has_label(key, "table", "logs-index")
+                        && has_label(key, "outcome", outcome)
                 })
                 .unwrap_or_else(|| panic!("missing {outcome} auto-rebuild sample: {samples:?}"));
+            assert!(matches!(sample.3, DebugValue::Counter(1)), "{sample:?}");
+        }
+    }
+
+    /// #4737's acceptance for the rebuild counter: one compactor rebuilds for
+    /// the base namespace and every `tenant_*` namespace, so the two `events`
+    /// tables must not land on one series.
+    #[test]
+    fn a_rebuild_in_each_namespace_is_two_series() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            super::record_group_count_auto_rebuild(super::NAMESPACE, super::TABLE_NAME, "failed");
+            super::record_group_count_auto_rebuild("tenant_acme", super::TABLE_NAME, "failed");
+        });
+
+        let samples = snapshotter.snapshot().into_vec();
+        for namespace in [super::NAMESPACE, "tenant_acme"] {
+            let sample = samples
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == "siglake_group_count_auto_rebuilds_total"
+                        && has_label(key, "iceberg_namespace", namespace)
+                        && has_label(key, "table", super::TABLE_NAME)
+                        && has_label(key, "outcome", "failed")
+                })
+                .unwrap_or_else(|| panic!("no rebuild series for {namespace}: {samples:?}"));
+            assert!(
+                matches!(sample.3, DebugValue::Counter(1)),
+                "{namespace} carries another namespace's rebuilds: {sample:?}"
+            );
+        }
+    }
+
+    /// #3000's census counter. `detected` is what a default install records —
+    /// automatic repair is opt-in — so it must be preregistered too, or the
+    /// first short table a fresh compactor finds is invisible to `increase()`.
+    #[test]
+    fn short_aggregate_outcomes_are_preregistered_for_the_events_table() {
+        let registered = siglake_core::metrics::COMPACTOR_ALERTED_COUNTERS
+            .iter()
+            .find(|c| c.name == "siglake_group_count_short_aggregates_total")
+            .expect("compactor catalog lists the short-aggregate counter");
+        for outcome in ["detected", "repaired", "incomplete", "failed"] {
+            let events: &[(&str, &str)] = &[
+                ("iceberg_namespace", super::NAMESPACE),
+                ("table", super::TABLE_NAME),
+                ("outcome", outcome),
+            ];
+            assert!(registered.series.contains(&events), "{registered:?}");
+        }
+    }
+
+    #[test]
+    fn short_aggregate_outcomes_are_labelled_by_namespace_table_and_outcome() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            for outcome in ["detected", "repaired", "incomplete", "failed"] {
+                super::record_group_count_short_aggregate(super::NAMESPACE, "logs-index", outcome);
+            }
+        });
+
+        let samples = snapshotter.snapshot().into_vec();
+        for outcome in ["detected", "repaired", "incomplete", "failed"] {
+            let sample = samples
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == "siglake_group_count_short_aggregates_total"
+                        && has_label(key, "iceberg_namespace", super::NAMESPACE)
+                        && has_label(key, "table", "logs-index")
+                        && has_label(key, "outcome", outcome)
+                })
+                .unwrap_or_else(|| panic!("missing {outcome} short-aggregate sample: {samples:?}"));
             assert!(matches!(sample.3, DebugValue::Counter(1)), "{sample:?}");
         }
     }
@@ -842,6 +926,68 @@ impl MergePathKind {
             Self::SliceStreaming => "slice_streaming",
             Self::PageBounded => "page_bounded",
             Self::Tiered => "tiered",
+        }
+    }
+}
+
+/// A merge output writer built on the FIRST batch written through it, so its
+/// row group can be sized from that batch against the configured byte target
+/// (`SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` /
+/// [`IcebergTuning::target_row_group_bytes`]).
+///
+/// Rows are the unit parquet takes and the target is bytes, so converting one
+/// to the other needs an observed row size. The flush path has its whole batch
+/// in hand before it builds a writer; a merge's rows do not exist until the
+/// merge runs, and building the writer up front is what made the target
+/// unreachable on every merge path — leveled compaction, re-clustering and the
+/// streaming delete-task survivor rewrite all passed no sample, which returns
+/// the 1,048,576-row fallback WITHOUT reading the target (see
+/// [`target_row_group_rows_with_target`]). That matters because the open row
+/// group is buffered decoded whenever a row-group bloom column is set (which
+/// `with_footers` always sets): below one row group the buffer is the whole
+/// output, so 1 Mi rows of a 1.2 KB-per-row table is ~1.2 GB held.
+///
+/// Deferring also means a writer that is never written is never built, so no
+/// empty output file is created. `close` on an unwritten writer returns no data
+/// files, which is what the eager writer's `close` returned for the same case.
+struct LazyMergeOutputWriter<'a> {
+    ctx: &'a IcebergContext,
+    table: &'a Table,
+    files: &'a [DataFile],
+    bloom_columns: &'a [&'a str],
+    with_footers: bool,
+    rewrite_gen: u32,
+    inner: Option<Box<dyn IcebergWriter>>,
+}
+
+impl LazyMergeOutputWriter<'_> {
+    async fn write(&mut self, batch: RecordBatch) -> Result<()> {
+        if self.inner.is_none() {
+            self.inner = Some(
+                self.ctx
+                    .build_merge_output_writer(
+                        self.table,
+                        self.files,
+                        self.bloom_columns,
+                        self.with_footers,
+                        self.rewrite_gen,
+                        Some(&batch),
+                    )
+                    .await?,
+            );
+        }
+        self.inner
+            .as_mut()
+            .expect("writer built above")
+            .write(batch)
+            .await
+            .context("DataFileWriter::write")
+    }
+
+    async fn close(&mut self) -> Result<Vec<DataFile>> {
+        match self.inner.as_mut() {
+            Some(writer) => writer.close().await.context("DataFileWriter::close"),
+            None => Ok(Vec::new()),
         }
     }
 }
@@ -1659,9 +1805,8 @@ fn warehouse_operator(location: &str) -> Result<opendal::Operator> {
 pub const DEFAULT_CATALOG_FILE: &str = "_catalog.db";
 
 /// Columns that get a per-row-group Parquet bloom filter. These are the
-/// high-cardinality dimensional fields — equivalent to Splunk's primary
-/// indexed fields — and they're where our `WHERE` clauses spend most of
-/// their selectivity.
+/// high-cardinality dimensional fields, and they're where our `WHERE`
+/// clauses spend most of their selectivity.
 pub const BLOOM_FILTER_COLUMNS: &[&str] = &["host", "source", "sourcetype", "index"];
 
 /// Snapshot-summary property (Iceberg `additional_properties`) holding the
@@ -1765,9 +1910,48 @@ fn target_row_group_rows_with_target(sample: Option<&RecordBatch>, target_bytes:
         _ => return 1_048_576,
     };
     let bytes = sample.unwrap().get_array_memory_size();
-    let avg = (bytes / rows).max(1);
-    let target = target_bytes / avg;
+    row_group_rows_for_avg((bytes / rows).max(1), target_bytes)
+}
+
+/// Turn an observed average decoded row size into a row-group row count for
+/// `target_bytes`, under the [`MIN_ROW_GROUP_ROWS`]/[`MAX_ROW_GROUP_ROWS`]
+/// clamps. Split out of [`target_row_group_rows_with_target`] because the merge
+/// paths measure their sample differently (see [`sampled_row_bytes`]).
+fn row_group_rows_for_avg(avg_row_bytes: usize, target_bytes: usize) -> usize {
+    let target = target_bytes / avg_row_bytes.max(1);
     target.clamp(MIN_ROW_GROUP_ROWS, MAX_ROW_GROUP_ROWS)
+}
+
+/// Average decoded bytes per row of `batch`, measured over the rows the batch
+/// actually spans.
+///
+/// NOT `get_array_memory_size`, which the flush path uses on a batch it
+/// assembled itself: that reports whole buffer allocations, and the merge paths
+/// write zero-copy SLICES of a decoded input part (the page-bounded merge emits
+/// a whole run as slices; `RecordBatch::slice` shares the part's buffers). On a
+/// 2,000-row slice of an 8,192-row part it would report the part's bytes and
+/// size the row group as if every row were four times its weight — the sizing
+/// would then follow how the plan happened to cut its first run rather than the
+/// data. `ArrayData::get_slice_memory_size` prices the slice's own extent,
+/// including the variable-width bytes its offsets span.
+///
+/// The extent is not all the writer holds: a buffered batch keeps whole
+/// buffers, and a batch built by the ingest path carries ~2x its extent in
+/// allocation slack (measured 2026-09-16 on the delete fixture: 432 B/row by
+/// `get_array_memory_size` against 216 B/row here). So the byte target is a
+/// target for the rows, and the resident bytes can run over it by that slack.
+/// Pricing the slack instead is what cannot be done here — on a slice it is the
+/// whole part behind it, shared with every other slice of that part.
+fn sampled_row_bytes(batch: &RecordBatch) -> Option<usize> {
+    let rows = batch.num_rows();
+    if rows == 0 {
+        return None;
+    }
+    let mut bytes = 0usize;
+    for col in batch.columns() {
+        bytes = bytes.saturating_add(col.to_data().get_slice_memory_size().ok()?);
+    }
+    Some((bytes / rows).max(1))
 }
 
 fn target_row_group_uncompressed_bytes() -> usize {
@@ -4593,6 +4777,11 @@ impl SnapshotAggregates {
         }
         self.coverage_links
             .sort_unstable_by_key(|pending| pending.sequence_number);
+        self.join_pending_links();
+    }
+
+    /// Collapse every pending link that now chains onto the edge.
+    fn join_pending_links(&mut self) {
         loop {
             let parent = self.coverage.map(|coverage| coverage.snapshot_id);
             let Some(pos) = self
@@ -4608,6 +4797,22 @@ impl SnapshotAggregates {
                 sequence_number: next.sequence_number,
             });
         }
+    }
+
+    /// Move the edge to `edge` without touching a count, for a caller that has
+    /// PROVEN the object already describes that snapshot's rows — the expiry
+    /// path, whose commit is about to drop the ancestry the current edge is
+    /// read through (#3800).
+    ///
+    /// The proof is the caller's whole contribution: nothing here can check it,
+    /// and matching row totals are not evidence. A link that was waiting on the
+    /// new edge joins in the same call, which is what makes an append that lands
+    /// between the expiry commit and this write recover instead of stranding.
+    fn reroot_coverage(&mut self, edge: AggregateCoverage) {
+        self.coverage = Some(edge);
+        self.coverage_links
+            .retain(|pending| pending.snapshot_id != edge.snapshot_id);
+        self.join_pending_links();
     }
 
     /// Does this object already carry `link`'s publication?
@@ -4664,6 +4869,47 @@ mod aggregate_coverage_link_tests {
 
         aggs.add_coverage_link(link(None, 11, 1));
         assert_eq!(aggs.coverage.map(|coverage| coverage.snapshot_id), Some(12));
+        assert!(aggs.coverage_links.is_empty());
+    }
+
+    /// The expiry path's window, closed (#3800): the expire commit lands, the
+    /// append that follows builds its edge against the shrunken metadata — so
+    /// its parent is the snapshot the expiry left as the deepest survivor, not
+    /// the one the edge still names — and the re-root that follows joins it
+    /// instead of leaving it pending forever.
+    #[test]
+    fn a_re_root_joins_the_link_that_was_waiting_on_the_new_edge() {
+        let mut aggs = SnapshotAggregates::default();
+        aggs.add_coverage_link(link(None, 11, 1));
+        aggs.add_coverage_link(link(Some(20), 21, 5));
+        assert_eq!(aggs.coverage.map(|coverage| coverage.snapshot_id), Some(11));
+
+        aggs.reroot_coverage(AggregateCoverage {
+            snapshot_id: 20,
+            sequence_number: 4,
+        });
+        assert_eq!(
+            aggs.coverage.map(|coverage| coverage.snapshot_id),
+            Some(21),
+            "the append waiting on the re-rooted edge did not join it"
+        );
+        assert!(aggs.coverage_links.is_empty());
+    }
+
+    /// Re-rooting onto a snapshot a pending link already names leaves one edge,
+    /// not an entry that can never join — the same guard
+    /// [`SnapshotAggregates::add_coverage_link`] opens with.
+    #[test]
+    fn a_re_root_onto_a_pending_snapshot_does_not_keep_it_pending() {
+        let mut aggs = SnapshotAggregates::default();
+        aggs.add_coverage_link(link(Some(19), 20, 4));
+        assert_eq!(aggs.coverage_links, vec![link(Some(19), 20, 4)]);
+
+        aggs.reroot_coverage(AggregateCoverage {
+            snapshot_id: 20,
+            sequence_number: 4,
+        });
+        assert_eq!(aggs.coverage.map(|coverage| coverage.snapshot_id), Some(20));
         assert!(aggs.coverage_links.is_empty());
     }
 
@@ -5316,6 +5562,34 @@ pub struct WideGroupCounts {
     /// both or neither, so they can never disagree about what has been counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sketches: Option<GroupCountSketches>,
+    /// What the last automatic SHORT-AGGREGATE repair could not restore.
+    ///
+    /// The suppression state for #3000's maintenance repair, and the reason it
+    /// is durable rather than a process memo: a column the rebuild cannot cover
+    /// is dropped from `group_counts` by that very rebuild, so the next commit's
+    /// delta re-adds it short and the census finds a fresh deficit every cycle.
+    /// Without a record of "already tried, still short", one unreadable column
+    /// buys a full Tier-2 rebuild per repair interval for the life of the table.
+    ///
+    /// Written only by the deficit repair. Any other rebuild — a lost-delta
+    /// marker, `siglake rebuild-group-counts` — CLEARS it, because it has just
+    /// re-read the same files and its report is the newer evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_repair: Option<ShortAggregateRepair>,
+}
+
+/// The outcome of one automatic short-aggregate repair, kept so a later
+/// maintenance pass can tell a deficit worth rebuilding for from the residue of
+/// one it has already rebuilt for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ShortAggregateRepair {
+    /// The snapshot sequence number the repair rebuilt from.
+    pub sequence_number: i64,
+    /// Columns that were short before the rebuild and are still not covering
+    /// the table after it: over the cardinality cap, or unreadable in some live
+    /// file. A later pass skips these until another rebuild clears the record.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub unrestored: BTreeSet<String>,
 }
 
 impl WideGroupCounts {
@@ -6394,11 +6668,16 @@ async fn publish_side_deltas(
 /// inline time aggregates stay short — the message says so rather than
 /// promising a repair that is not coming.
 ///
+/// Labelled by `iceberg_namespace` as well as `table` for the reason given on
+/// [`record_group_count_short_aggregate`]: one compactor publishes for the base
+/// namespace and every `tenant_*` namespace, each with its own `events`.
+///
 /// `marker_cap` is the TABLE's cardinality, not the inline object's base cap:
 /// the marker drives a rebuild of the wide object, whose fold uses the table
 /// cap, and repairing at the smaller base cap would report every column above
 /// it as an incomplete rebuild.
 async fn record_lost_side_publication(
+    namespace: &str,
     table: &str,
     op: Option<&opendal::Operator>,
     deltas: &PendingSideAggDeltas,
@@ -6408,6 +6687,7 @@ async fn record_lost_side_publication(
 ) {
     metrics::counter!(
         "siglake_side_aggregate_publish_failures_total",
+        "iceberg_namespace" => namespace.to_owned(),
         "table" => table.to_owned()
     )
     .increment(1);
@@ -6712,13 +6992,67 @@ fn record_group_count_delta_write_retries(table: &str, retries: u64) {
     .increment(retries);
 }
 
-fn record_group_count_auto_rebuild(table: &str, outcome: &'static str) {
+/// Labelled by `iceberg_namespace` as well as `table` for the reason given on
+/// [`record_group_count_short_aggregate`].
+fn record_group_count_auto_rebuild(namespace: &str, table: &str, outcome: &'static str) {
     metrics::counter!(
         "siglake_group_count_auto_rebuilds_total",
+        "iceberg_namespace" => namespace.to_owned(),
         "table" => table.to_owned(),
         "outcome" => outcome
     )
     .increment(1);
+}
+
+/// The maintenance census's verdict on one table (#3000). Separate from the
+/// lost-delta counter above because the causes and the remedies differ: that
+/// one names a commit whose delta PUT was spent, this one names a table whose
+/// aggregate is short with every contribution accounted for — an upgrade across
+/// #2919, a delta lost with its marker, a foreign overwrite.
+///
+/// Labelled by namespace as well as table (#4737): one compactor censuses the
+/// base namespace plus every `tenant_*` namespace, so a bare `events` merges
+/// every tenant's table into one series and the alert names a table an
+/// operator cannot locate or pass to `--namespace`.
+///
+/// `iceberg_namespace`, not `namespace`, for the reason given on
+/// [`report_inline_coverage`]: Prometheus renames a colliding metric label to
+/// `exported_namespace`.
+fn record_group_count_short_aggregate(namespace: &str, table: &str, outcome: &'static str) {
+    metrics::counter!(
+        "siglake_group_count_short_aggregates_total",
+        "iceberg_namespace" => namespace.to_owned(),
+        "table" => table.to_owned(),
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+/// The maintenance census's current-state reading for one table's inline
+/// aggregate object (#4674).
+///
+/// A gauge, not a counter, because the condition is a STATE: it is true from
+/// the commit that orphaned the chain until an operator rebuilds, and an
+/// operator needs to know which tables are in it right now, not how many times
+/// a census noticed. Labelled by namespace as well as table because a
+/// warehouse's tenant namespaces each hold an `events` table, and a bare table
+/// name cannot say which one to repair.
+///
+/// `iceberg_namespace`, not `namespace`: Prometheus attaches the Kubernetes
+/// namespace to every scraped series under that name, and a colliding metric
+/// label is silently renamed to `exported_namespace`.
+///
+/// The one writer of this gauge, and `pub` so the compactor can zero a reading
+/// for a table its census no longer reaches: a series is never removed from a
+/// live process, so an index dropped while its object was unprovable would page
+/// until a restart.
+pub fn report_inline_coverage(namespace: &str, table: &str, unproven: bool) {
+    metrics::gauge!(
+        "siglake_inline_coverage_unproven",
+        "iceberg_namespace" => namespace.to_owned(),
+        "table" => table.to_owned()
+    )
+    .set(if unproven { 1.0 } else { 0.0 });
 }
 
 /// Test-only view of [`retry_delta_write`].
@@ -6946,6 +7280,10 @@ async fn fold_wide_group_counts(
         let mut folded = WideGroupCounts {
             coverage: wide.coverage,
             coverage_links: wide.coverage_links.clone(),
+            // Carried so the maintenance census reads its own suppression
+            // record off the memoised folded view instead of GETting the base
+            // object (26.5 MB at the measured extreme) a second time.
+            short_repair: wide.short_repair.clone(),
             ..WideGroupCounts::default()
         };
         let present = list_group_count_deltas(op).await?;
@@ -7028,6 +7366,80 @@ pub struct GroupCountFoldOutcome {
     pub rebuilt: bool,
     /// Durable lost-delta markers removed after their sequences were covered.
     pub repair_markers_deleted: usize,
+}
+
+/// What the short-aggregate census made of one table (#3000).
+///
+/// The cases are separated because they call for different things from an
+/// operator, and collapsing them is how a maintenance pass ends up either
+/// paging on a one-second race or hiding a table that will never recover on its
+/// own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShortAggregateOutcome {
+    /// Every maintained column covers `record_count` at Tier-1.
+    Covered,
+    /// Short, but the newest generation's own contribution has not landed yet —
+    /// a commit between its commit and its delta PUT looks exactly like a lost
+    /// one, by totals alone. The next pass decides.
+    Pending { columns: Vec<String> },
+    /// Short only in columns a previous rebuild already proved it cannot
+    /// restore. Nothing to do but tell an operator.
+    Suppressed { columns: Vec<String> },
+    /// Short with every contribution accounted for, and no rebuild ran:
+    /// automatic repair is off, or this pass's budget is spent.
+    Detected { columns: Vec<String> },
+    /// A rebuild ran. `unrestored` is empty when every short column now covers
+    /// the table.
+    Repaired {
+        columns: Vec<String>,
+        unrestored: Vec<String>,
+    },
+    /// The rebuild errored. The deficit is unchanged and a later pass retries.
+    Failed,
+}
+
+/// What the inline-coverage census made of one table (#4674).
+///
+/// Separated the way [`ShortAggregateOutcome`]'s cases are, and for the same
+/// reason: only one of these is a state an operator has to act on, and the two
+/// that look like it from the outside — a publication still in flight, a GET
+/// that failed — are transient. Collapsing them would page on every busy table
+/// and on every object-store blip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineCoverageOutcome {
+    /// Nothing claims coverage here: no provable incarnation (#2919), no rows
+    /// yet, or no object. Not a repair target — `rebuild-time-aggregates`
+    /// refuses a table with no object to rebuild from.
+    NotApplicable,
+    /// The object's coverage edge reaches the current snapshot through
+    /// row-conserving re-clusters. Tier-1 serves this table.
+    Covered,
+    /// The edge does not reach current, but one of the object's pending links
+    /// does. A commit is mid-publication; the next one settles it.
+    Publishing,
+    /// The object is there, its edge does not reach the current snapshot, and
+    /// no pending link bridges the gap. PERSISTENT: answers stay exact on the
+    /// per-file tiers, and only `siglake rebuild-time-aggregates` clears it.
+    Unproven,
+    /// This pass could not read what it needed — the table would not load, or
+    /// the object is there and could not be read or parsed. Says nothing about
+    /// coverage in either direction, so the census leaves the last reading
+    /// standing rather than reporting a state it did not observe. The table is
+    /// still maintained: a caller clearing readings for tables that have gone
+    /// away must not clear this one.
+    Undetermined,
+}
+
+impl InlineCoverageOutcome {
+    /// What this pass should write to `siglake_inline_coverage_unproven`, or
+    /// `None` when it observed nothing worth writing.
+    fn gauge_value(&self) -> Option<bool> {
+        match self {
+            Self::Unproven => Some(true),
+            Self::Covered | Self::Publishing | Self::NotApplicable => Some(false),
+            Self::Undetermined => None,
+        }
+    }
 }
 
 /// Fold every unabsorbed delta into the wide base, then GC.
@@ -7838,6 +8250,22 @@ fn recluster_should_stream(files: &[DataFile], merge: &ReclusterMergeOptions) ->
     )
 }
 
+/// Index of the first file whose partition value disagrees with `files[0]`, or
+/// `None` when the whole bin shares one partition value (including the
+/// unpartitioned case, where every value is the empty struct).
+///
+/// This is the precondition [`IcebergContext::recluster_files_with`] enforces on
+/// its streaming dispatches: they write their output through one writer stamped
+/// with `files[0].partition()` (see `build_merge_output_writer`), so a bin
+/// spanning two day partitions would commit rows under the wrong partition value
+/// and a query whose timestamp predicate resolves against the other day prunes
+/// the file. The row-count guard cannot see it — the rows are all there, just
+/// unreachable.
+fn first_cross_partition_file(files: &[DataFile]) -> Option<usize> {
+    let first = files.first()?.partition();
+    files.iter().position(|f| f.partition() != first)
+}
+
 /// A bin is too large for the in-RAM concat (so must stream) when *either* its
 /// compressed bytes or its row count exceeds the in-RAM safety cap. Pure so the
 /// boundary is unit-tested without constructing `DataFile`s or touching env.
@@ -7959,22 +8387,83 @@ fn row_conserving_recluster(summary: &Summary) -> bool {
 /// The data-changing snapshot `snapshot_id` extends. Re-clustering changes file
 /// identity but preserves every row, so provenance may bridge across it.
 ///
-/// `None` when the walk runs off the start of the table — or off the end of
-/// retained metadata, because `expire_snapshots` dropped the ancestor. Both
-/// read as "no provable predecessor", which costs a republication and never a
-/// wrong answer.
+/// `None` only when there is nothing to name: no snapshot, or one that is not
+/// in the metadata at all.
 fn aggregate_coverage_ancestor(table: &Table, snapshot_id: Option<i64>) -> Option<i64> {
+    aggregate_coverage_root(table, snapshot_id, &HashSet::new())
+}
+
+/// THE NORMAL FORM EVERY COVERAGE EDGE IS PUBLISHED AT, and the parent every
+/// append's link names: the deepest ancestor of `snapshot_id` reachable through
+/// nothing but row-conserving re-clusters, skipping the ids in `expiring`
+/// (empty outside the expiry path, which has to reason about the metadata it is
+/// about to shrink).
+///
+/// Both sides of the chain have to agree on it. `add_coverage_link` advances
+/// `coverage` only when a link's parent is exactly the edge, so an edge
+/// published at a re-cluster whose parent survives is an edge the next append
+/// cannot join: its link walks past the re-cluster to the append below. That is
+/// what made a republication on a compacted table buy one query's worth of
+/// Tier-1 and lose it at the next commit (#3800).
+///
+/// When the walk runs off the end of retained metadata — `expire_snapshots`
+/// dropped the ancestor — the deepest re-cluster it did reach is the root
+/// instead. Everything above that snapshot is verified row-conserving against
+/// the metadata in hand, so it names the same row set; what is NOT there is
+/// never bridged, and a walk that reaches nothing still returns `None`.
+fn aggregate_coverage_root(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    expiring: &HashSet<i64>,
+) -> Option<i64> {
     let mut snapshot_id = snapshot_id?;
+    let mut deepest_bridged = None;
     loop {
-        let snapshot = table
+        if expiring.contains(&snapshot_id) {
+            return deepest_bridged;
+        }
+        let Some(snapshot) = table
             .metadata()
             .snapshots()
-            .find(|snapshot| snapshot.snapshot_id() == snapshot_id)?;
+            .find(|snapshot| snapshot.snapshot_id() == snapshot_id)
+        else {
+            return deepest_bridged;
+        };
         if !row_conserving_recluster(snapshot.summary()) {
             return Some(snapshot_id);
         }
-        snapshot_id = snapshot.parent_snapshot_id()?;
+        deepest_bridged = Some(snapshot_id);
+        let Some(parent) = snapshot.parent_snapshot_id() else {
+            return deepest_bridged;
+        };
+        snapshot_id = parent;
     }
+}
+
+/// The `(snapshot_id, sequence_number)` pair a coverage edge is, read from the
+/// metadata rather than assembled by a caller: the read guard checks both, so an
+/// edge carrying a sequence number that is not that snapshot's proves nothing.
+fn coverage_edge_at(table: &Table, snapshot_id: i64) -> Option<AggregateCoverage> {
+    table
+        .metadata()
+        .snapshots()
+        .find(|snapshot| snapshot.snapshot_id() == snapshot_id)
+        .map(|snapshot| AggregateCoverage {
+            snapshot_id,
+            sequence_number: snapshot.sequence_number(),
+        })
+}
+
+/// The edge a pass that read the files of `snapshot` should publish: that
+/// snapshot's own edge when it is a data-changing commit, else the root the
+/// re-cluster run above it sits on ([`aggregate_coverage_root`]).
+fn published_coverage_edge(table: &Table, snapshot: &Snapshot) -> AggregateCoverage {
+    aggregate_coverage_root(table, Some(snapshot.snapshot_id()), &HashSet::new())
+        .and_then(|root| coverage_edge_at(table, root))
+        .unwrap_or(AggregateCoverage {
+            snapshot_id: snapshot.snapshot_id(),
+            sequence_number: snapshot.sequence_number(),
+        })
 }
 
 /// The edge an append contributes to the side object's coverage chain.
@@ -8002,6 +8491,18 @@ fn append_coverage_link(committed: &Table) -> Option<AggregateCoverageLink> {
 /// gap; retention, delete tasks, foreign overwrites and appends all require a
 /// fresh aggregate publication.
 fn aggregate_covers_current_snapshot(table: &Table, coverage: Option<AggregateCoverage>) -> bool {
+    aggregate_covers_current_snapshot_excluding(table, coverage, &HashSet::new())
+}
+
+/// [`aggregate_covers_current_snapshot`] against the metadata an expiry is
+/// about to leave behind: an id in `expiring` reads as already gone, which is
+/// how the expiry path tells a chain that survives it from one it has to
+/// re-root before committing (#3800).
+fn aggregate_covers_current_snapshot_excluding(
+    table: &Table,
+    coverage: Option<AggregateCoverage>,
+    expiring: &HashSet<i64>,
+) -> bool {
     let Some(coverage) = coverage else {
         return false;
     };
@@ -8009,6 +8510,9 @@ fn aggregate_covers_current_snapshot(table: &Table, coverage: Option<AggregateCo
         return false;
     };
     loop {
+        if expiring.contains(&snapshot_id) {
+            return false;
+        }
         if snapshot_id == coverage.snapshot_id {
             return table
                 .metadata()
@@ -8031,6 +8535,42 @@ fn aggregate_covers_current_snapshot(table: &Table, coverage: Option<AggregateCo
         };
         snapshot_id = parent;
     }
+}
+
+/// Whether every Siglake contribution up to the table's current generation has
+/// LANDED in this artifact — counting the links still waiting on a missing
+/// predecessor, which `coverage` alone does not.
+///
+/// This is what tells a contribution that is lost from one that is merely in
+/// flight, and the deficit repair (#3000) cannot run without the distinction.
+/// A commit publishes its delta AFTER the commit, so for the second or so
+/// between them the newest snapshot has no contribution anywhere and every
+/// column is short of `record_count` — indistinguishable, by totals, from a
+/// delta whose writer was killed. The pending link is the discriminator: if the
+/// newest generation's own contribution is in the artifact and a column is
+/// still short, nothing outstanding can close that gap.
+///
+/// Pending links are admitted through the same bridging rule as `coverage`
+/// (#2920), so a row-conserving re-cluster on top of the newest append does not
+/// read as an unlanded contribution — on a table under compaction that would be
+/// most cycles.
+fn aggregate_evidence_reaches_current_snapshot(
+    table: &Table,
+    coverage: Option<AggregateCoverage>,
+    pending: &[AggregateCoverageLink],
+) -> bool {
+    if aggregate_covers_current_snapshot(table, coverage) {
+        return true;
+    }
+    pending.iter().any(|link| {
+        aggregate_covers_current_snapshot(
+            table,
+            Some(AggregateCoverage {
+                snapshot_id: link.snapshot_id,
+                sequence_number: link.sequence_number,
+            }),
+        )
+    })
 }
 
 fn metadata_dir_for_table(table: &Table) -> Result<String> {
@@ -10875,17 +11415,7 @@ impl IcebergContext {
         if !self.group_count_deltas_enabled() {
             return Ok(Vec::new());
         }
-        // DEDUPED: `list_indexes` reports `events` as a built-in index, so the
-        // naive concatenation visits it twice — and a second pass in the same
-        // call would delete the deltas the first pass just absorbed, collapsing
-        // the one-cycle gap that keeps concurrent readers off the retry path.
-        let mut idents = vec![self.table_ident.clone()];
-        for config in self.list_indexes().await.unwrap_or_default() {
-            let ident = self.index_table_ident(&config.index_id);
-            if !idents.contains(&ident) {
-                idents.push(ident);
-            }
-        }
+        let idents = self.aggregate_table_idents().await;
         let mut out = Vec::new();
         for ident in idents {
             let table = match self.catalog.load_table(&ident).await {
@@ -10916,7 +11446,11 @@ impl IcebergContext {
                 Ok(result) => result,
                 Err(error) => {
                     if rebuild_requested {
-                        record_group_count_auto_rebuild(ident.name(), "failed");
+                        record_group_count_auto_rebuild(
+                            &ident.namespace().to_string(),
+                            ident.name(),
+                            "failed",
+                        );
                     }
                     return Err(error)
                         .with_context(|| format!("automatic group-count rebuild for {ident}"));
@@ -11032,6 +11566,7 @@ impl IcebergContext {
                 GroupCountRebuildOptions::default(),
                 &repair_columns,
                 Some(&repair_sketch_columns),
+                None,
             )
             .await?;
         anyhow::ensure!(
@@ -11058,9 +11593,17 @@ impl IcebergContext {
                 "automatic group-count rebuild completed, but these marker columns cannot \
                  cover the table and remain on the per-file path"
             );
-            record_group_count_auto_rebuild(ident.name(), "incomplete");
+            record_group_count_auto_rebuild(
+                &ident.namespace().to_string(),
+                ident.name(),
+                "incomplete",
+            );
         } else {
-            record_group_count_auto_rebuild(ident.name(), "success");
+            record_group_count_auto_rebuild(
+                &ident.namespace().to_string(),
+                ident.name(),
+                "success",
+            );
         }
         let deleted =
             delete_group_count_rebuild_markers(op, &marker_paths, report.sequence_number).await;
@@ -11072,6 +11615,436 @@ impl IcebergContext {
             "automatically rebuilt group-count aggregate after a lost delta"
         );
         Ok((true, deleted))
+    }
+
+    /// Every table whose aggregate artifacts this context maintains.
+    ///
+    /// DEDUPED: `list_indexes` reports `events` as a built-in index, so the
+    /// naive concatenation visits it twice — and for the fold a second pass in
+    /// the same call would delete the deltas the first pass just absorbed,
+    /// collapsing the one-cycle gap that keeps concurrent readers off the retry
+    /// path.
+    async fn aggregate_table_idents(&self) -> Vec<TableIdent> {
+        let mut idents = vec![self.table_ident.clone()];
+        for config in self.list_indexes().await.unwrap_or_default() {
+            let ident = self.index_table_ident(&config.index_id);
+            if !idents.contains(&ident) {
+                idents.push(ident);
+            }
+        }
+        idents
+    }
+
+    /// Find the tables whose group-count aggregate is SHORT of `record_count`
+    /// with nothing outstanding to explain it, and rebuild up to `max_repairs`
+    /// of them from the committed files (#3000).
+    ///
+    /// Only a durable lost-delta marker used to make anything rebuild. A commit
+    /// that never wrote a marker — its process was killed between the commit and
+    /// the delta PUT, or its aggregate prefix was moved out from under it by the
+    /// #2919 upgrade, which starts every table's new
+    /// `metadata/siglake-agg/<table-uuid>/` empty at the first commit after the
+    /// upgrade — leaves an aggregate that is merely short. The read guard
+    /// refuses it, correctly and permanently: a later delta adds its own rows
+    /// and the total stays short, so `GROUP BY` pays the exact per-file tiers
+    /// for the life of the table until an operator runs
+    /// `siglake rebuild-group-counts`.
+    ///
+    /// Maintenance only. One Tier-2 query per maintained column is the most
+    /// expensive read the system has, so this runs from the compactor's
+    /// aggregate pass behind its lease and its own interval, never from a query
+    /// or an ingest path, and `max_repairs` bounds how many tables one pass may
+    /// rebuild. `max_repairs == 0` is the census alone: the counter still fires
+    /// and the log still names the columns, and nothing reads the files.
+    ///
+    /// Returns one entry per table that is not fully covered.
+    pub async fn repair_short_group_count_aggregates(
+        &self,
+        max_repairs: usize,
+    ) -> Result<Vec<(String, ShortAggregateOutcome)>> {
+        if !self.group_count_deltas_enabled() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut repairs = 0usize;
+        for ident in self.aggregate_table_idents().await {
+            // The counter's namespace label. Taken from the ident rather than
+            // from `self` so it can never name a different namespace than the
+            // `table` beside it.
+            let namespace = ident.namespace().to_string();
+            // One table's transient read error must not skip the rest: this is
+            // a whole-warehouse sweep on a timer, and the events table is
+            // usually last in nobody's interest.
+            let census = match self.short_group_count_census(&ident).await {
+                Ok(census) => census,
+                Err(error) => {
+                    tracing::warn!(error = ?error, table = %ident,
+                        "short group-count census failed");
+                    continue;
+                }
+            };
+            let outcome = match census {
+                ShortAggregateOutcome::Covered => continue,
+                ShortAggregateOutcome::Detected { columns } if repairs < max_repairs => {
+                    repairs += 1;
+                    self.repair_short_group_count_aggregate(&ident, columns)
+                        .await
+                }
+                other => other,
+            };
+            match &outcome {
+                ShortAggregateOutcome::Pending { columns } => tracing::debug!(
+                    table = %ident,
+                    columns = %columns.join(","),
+                    "group-count aggregate is short, but the newest generation's \
+                     contribution has not landed yet; leaving it to the fold"
+                ),
+                ShortAggregateOutcome::Suppressed { columns } => tracing::debug!(
+                    table = %ident,
+                    columns = %columns.join(","),
+                    "group-count aggregate is short only in columns a previous \
+                     rebuild could not restore; not rebuilding again"
+                ),
+                ShortAggregateOutcome::Detected { columns } => {
+                    record_group_count_short_aggregate(&namespace, ident.name(), "detected");
+                    tracing::warn!(
+                        table = %ident,
+                        columns = %columns.join(","),
+                        "group-count aggregate is SHORT of record_count with every \
+                         contribution accounted for; GROUP BY on these columns stays \
+                         on the exact per-file path. Automatic repair is off or its \
+                         per-pass budget is spent — run \
+                         `siglake rebuild-group-counts --namespace <ns> --table <t>` \
+                         or set SIGLAKE_AGG_SHORT_REPAIR=1"
+                    );
+                }
+                ShortAggregateOutcome::Repaired {
+                    columns,
+                    unrestored,
+                } => {
+                    if unrestored.is_empty() {
+                        record_group_count_short_aggregate(&namespace, ident.name(), "repaired");
+                        tracing::info!(
+                            table = %ident,
+                            columns = %columns.join(","),
+                            "rebuilt a short group-count aggregate from committed files"
+                        );
+                    } else {
+                        record_group_count_short_aggregate(&namespace, ident.name(), "incomplete");
+                        tracing::warn!(
+                            table = %ident,
+                            columns = %unrestored.join(","),
+                            "rebuilt a short group-count aggregate, but these columns \
+                             still cannot cover the table and remain on the per-file \
+                             path; they are recorded so later passes do not rebuild \
+                             for them again"
+                        );
+                    }
+                }
+                ShortAggregateOutcome::Failed => {
+                    record_group_count_short_aggregate(&namespace, ident.name(), "failed");
+                }
+                ShortAggregateOutcome::Covered => {}
+            }
+            out.push((ident.name().to_string(), outcome));
+        }
+        Ok(out)
+    }
+
+    /// Which maintained columns the Tier-1 read guard cannot serve, and whether
+    /// a rebuild is the right answer for them.
+    ///
+    /// Mirrors [`Self::tier1_group_count_rows`] — the same two arms in the same
+    /// order, checked against the same `record_count` — because a census that
+    /// disagreed with the guard would either rebuild for a column that is
+    /// already served or leave one that is not. It does not CALL the guard:
+    /// that decodes one column's values per call, and asking it for 22 columns
+    /// walks a 26.5 MB blob 22 times to compare 22 integers.
+    async fn short_group_count_census(&self, ident: &TableIdent) -> Result<ShortAggregateOutcome> {
+        let cached = self.cached_table_entry(ident).await?;
+        // Incarnation fence (#2919): a table with no UUID publishes and reads no
+        // aggregate at all, so it has nothing to be short of, and the artifacts
+        // at the shared path are somebody else's.
+        if aggregate_operator(&cached.table)?.is_none() {
+            return Ok(ShortAggregateOutcome::Covered);
+        }
+        let Some(record_count) = cached
+            .table
+            .metadata()
+            .current_snapshot()
+            .and_then(|s| s.summary().additional_properties.get("total-records"))
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|rc| *rc > 0)
+        else {
+            return Ok(ShortAggregateOutcome::Covered);
+        };
+        // The FOLDED view, so an outstanding delta explains its own rows before
+        // anything calls the aggregate short — the fold defers persisting until
+        // a backlog is worth the write, and a reader folds what is outstanding
+        // itself.
+        let Some(wide) = self.cached_wide_group_counts(&cached).await? else {
+            return Ok(ShortAggregateOutcome::Covered);
+        };
+        let Some(totals) = wide
+            .group_counts
+            .as_deref()
+            .and_then(siglake_bloom::group_counts::decode_column_totals)
+        else {
+            // No exact map at all: nothing declares which columns this table
+            // maintains, so there is no deficit to measure. A table whose
+            // columns are all sketched lands here too, and a sketch is short of
+            // `record_count` by design.
+            return Ok(ShortAggregateOutcome::Covered);
+        };
+        let wide_covers = aggregate_covers_current_snapshot(&cached.table, wide.coverage);
+        let mut short: Vec<String> = totals
+            .into_iter()
+            .filter(|(_, total)| !wide_covers || *total != record_count)
+            .map(|(column, _)| column)
+            .collect();
+        if short.is_empty() {
+            return Ok(ShortAggregateOutcome::Covered);
+        }
+        // The guard's first arm, for the columns the wide one leaves short. On a
+        // table where the incremental path was switched on mid-life the inline
+        // object holds a column's whole history while the wide one holds only
+        // the delta era, so a column short HERE can still be served there — and
+        // a complete wide repair is not owed to a column Tier-1 already
+        // answers. Read straight from the object rather than through the query
+        // path's memo: this runs on the compactor, and the memo is pinned to a
+        // snapshot for readers.
+        if let Some(path) = side_aggregates_path(&cached.table) {
+            if let Some(inline) = load_side_aggregates(cached.table.file_io(), &path).await? {
+                if aggregate_covers_current_snapshot(&cached.table, inline.coverage) {
+                    if let Some(counts) = inline.group_counts.as_ref() {
+                        short.retain(|column| counts.column_total(column) != Some(record_count));
+                    }
+                }
+            }
+        }
+        if short.is_empty() {
+            return Ok(ShortAggregateOutcome::Covered);
+        }
+        // Residue of an earlier repair: a column over the cardinality cap, or
+        // unreadable in some live file, comes back short on the next commit's
+        // delta however often it is rebuilt.
+        if let Some(residue) = wide.short_repair.as_ref() {
+            let (suppressed, remaining): (Vec<String>, Vec<String>) = short
+                .into_iter()
+                .partition(|column| residue.unrestored.contains(column));
+            if remaining.is_empty() {
+                return Ok(ShortAggregateOutcome::Suppressed {
+                    columns: suppressed,
+                });
+            }
+            short = remaining;
+        }
+        short.sort();
+        if !aggregate_evidence_reaches_current_snapshot(
+            &cached.table,
+            wide.coverage,
+            &wide.coverage_links,
+        ) {
+            return Ok(ShortAggregateOutcome::Pending { columns: short });
+        }
+        Ok(ShortAggregateOutcome::Detected { columns: short })
+    }
+
+    /// Rebuild one table's short aggregate and record what the rebuild could
+    /// not restore.
+    async fn repair_short_group_count_aggregate(
+        &self,
+        ident: &TableIdent,
+        columns: Vec<String>,
+    ) -> ShortAggregateOutcome {
+        let short: BTreeSet<String> = columns.iter().cloned().collect();
+        // The census read a memoised folded view; the rebuild must take its
+        // maintained column set from a fresh load, or it would omit a column a
+        // concurrent fold has since added.
+        self.invalidate_cached_table(ident).await;
+        let report = match self
+            .rebuild_group_count_aggregate_for(
+                ident,
+                // Never admits a column the table was not already maintaining:
+                // that is an operator decision (`--admit-typed-columns`), and
+                // one a repair must not make on its own.
+                GroupCountRebuildOptions::default(),
+                &BTreeMap::new(),
+                // NOT the sketches. Asking for them recomputes every sketched
+                // column from the files and fails the WHOLE rebuild on the
+                // first one the files cannot serve — which on the events table
+                // is `timestamp_ns` the moment its per-row-unique values get it
+                // demoted, so the repair would never complete on the table that
+                // needs it most. What the rebuild does instead is carry the
+                // sketch half of every delta its watermark is about to make
+                // deletable, so an approximate column keeps its rows without
+                // costing a second Tier-2 query per sketched column. The exact
+                // columns are the ones Tier-1 serves, and they are rebuilt from
+                // the files.
+                None,
+                Some(&short),
+            )
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::warn!(error = ?error, table = %ident,
+                    "rebuild of a short group-count aggregate failed");
+                return ShortAggregateOutcome::Failed;
+            }
+        };
+        if report.skipped_no_columns {
+            // The object changed under us and nothing is maintained any more.
+            // Nothing was written, including the suppression record.
+            tracing::debug!(table = %ident,
+                "short group-count rebuild found no maintained columns");
+            return ShortAggregateOutcome::Covered;
+        }
+        let unrestored: Vec<String> = report
+            .columns
+            .iter()
+            .filter(|column| short.contains(&column.column) && !column.covers_table)
+            .map(|column| column.column.clone())
+            .collect();
+        ShortAggregateOutcome::Repaired {
+            columns,
+            unrestored,
+        }
+    }
+
+    /// Name every maintained table whose inline aggregate object cannot prove
+    /// coverage of the current snapshot (#4674).
+    ///
+    /// After #3800 the orphaning triggers that remain — a delete task,
+    /// retention, a foreign overwrite, and the two residual windows at expiry —
+    /// all end in one state: an object the read guard refuses, so windowed
+    /// `GROUP BY`, date histograms and windowed counts answer from the exact
+    /// per-file tiers until `siglake rebuild-time-aggregates --table <t>` runs.
+    /// Answers stay exact throughout; what is lost is the fast path, and it
+    /// does not come back on its own — no commit republishes a chain the reader
+    /// cannot walk.
+    ///
+    /// Nothing named the table before this. `siglake_query_side_aggs_cache_total{result="unproven_coverage"}`
+    /// needs a query to arrive and carries no table label, and the expiry
+    /// path's warn fires only in the window where its own re-root failed. The
+    /// census reports the CURRENT state instead: one gauge per visited table,
+    /// set every pass, so a repaired table clears itself at the next one.
+    ///
+    /// Metadata only — it never rebuilds. Automatic repair is #4675.
+    ///
+    /// Returns one entry per maintained table, in `aggregate_table_idents`
+    /// order — including the ones this pass could not reach a verdict on, so a
+    /// caller can tell "no longer maintained" from "not determined this pass".
+    pub async fn census_inline_coverage(&self) -> Vec<(String, InlineCoverageOutcome)> {
+        let mut out = Vec::new();
+        for ident in self.aggregate_table_idents().await {
+            // One table's transient read error must not skip the rest: this is
+            // a whole-warehouse sweep on a timer, and a namespace whose base
+            // `events` table was never created is the ordinary case on an
+            // index-only warehouse.
+            let outcome = match self.inline_coverage_census(&ident).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::warn!(error = ?error, table = %ident,
+                        "inline-coverage census failed");
+                    InlineCoverageOutcome::Undetermined
+                }
+            };
+            match &outcome {
+                InlineCoverageOutcome::Unproven => tracing::warn!(
+                    table = %ident,
+                    "the inline aggregate object cannot prove coverage of the current \
+                     snapshot; windowed GROUP BY, date histograms and windowed counts \
+                     on this table answer EXACTLY from the per-file path and will keep \
+                     doing so — no commit repairs this. Run \
+                     `siglake rebuild-time-aggregates --namespace <ns> --table <t>`"
+                ),
+                InlineCoverageOutcome::Publishing => tracing::debug!(
+                    table = %ident,
+                    "the inline aggregate's edge does not reach the current snapshot \
+                     yet, but a pending link does; leaving it to the commit path"
+                ),
+                // The per-table warn above this loop names what failed; this
+                // one says what the failure costs.
+                InlineCoverageOutcome::Undetermined => tracing::warn!(
+                    table = %ident,
+                    "the inline-coverage census could not read this table or its \
+                     aggregate object; this pass has no evidence about its coverage \
+                     either way and leaves the last reading standing"
+                ),
+                InlineCoverageOutcome::Covered | InlineCoverageOutcome::NotApplicable => {}
+            }
+            // Set every pass, for every table the census reached a verdict on.
+            // That is what clears a repaired table, and what puts a healthy
+            // table on the board at 0 rather than leaving it absent. An
+            // `Undetermined` pass deliberately writes nothing: it is not evidence,
+            // and overwriting a standing 1 with a 0 on a failed GET would hide
+            // exactly the state this exists to report.
+            if let Some(unproven) = outcome.gauge_value() {
+                report_inline_coverage(&self.namespace().to_string(), ident.name(), unproven);
+            }
+            out.push((ident.name().to_string(), outcome));
+        }
+        out
+    }
+
+    /// Whether one table's inline aggregate object proves coverage now.
+    ///
+    /// The predicate is the read guard's, called on the same object the guard
+    /// reads: `aggregate_covers_current_snapshot` walks table metadata only, so
+    /// what this costs is the object — one HEAD and, when it is there, one GET.
+    /// Read straight from storage rather than through
+    /// [`Self::cached_side_aggregates`], which collapses every refusal into
+    /// `None` and so cannot say WHY a table is off Tier-1.
+    async fn inline_coverage_census(&self, ident: &TableIdent) -> Result<InlineCoverageOutcome> {
+        let cached = self.cached_table_entry(ident).await?;
+        // Incarnation fence (#2919): a table with no provable incarnation reads
+        // no aggregate at all, so it has no coverage claim to refuse, and the
+        // object at the shared path is somebody else's.
+        let Some(path) = side_aggregates_path(&cached.table) else {
+            return Ok(InlineCoverageOutcome::NotApplicable);
+        };
+        if cached
+            .table
+            .metadata()
+            .current_snapshot()
+            .and_then(|s| s.summary().additional_properties.get("total-records"))
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|rc| *rc > 0)
+            .is_none()
+        {
+            return Ok(InlineCoverageOutcome::NotApplicable);
+        }
+        // `load_side_aggregates` returns `Ok(None)` for absent, unreadable and
+        // unparseable alike — the distinction the census exists to draw. Probe
+        // existence first so an `Ok(None)` after this point can only mean the
+        // object is there and was lost.
+        let input = cached.table.file_io().new_input(&path)?;
+        match input.exists().await {
+            Ok(true) => {}
+            // No object: nothing claims coverage, and `rebuild-time-aggregates`
+            // refuses a table with no object to rebuild from. A table that
+            // should have one and does not is
+            // `SiglakeSideAggregatePublicationLost`, not this.
+            Ok(false) => return Ok(InlineCoverageOutcome::NotApplicable),
+            Err(_) => return Ok(InlineCoverageOutcome::Undetermined),
+        }
+        let Some(side) = load_side_aggregates(cached.table.file_io(), &path).await? else {
+            return Ok(InlineCoverageOutcome::Undetermined);
+        };
+        if aggregate_covers_current_snapshot(&cached.table, side.coverage) {
+            return Ok(InlineCoverageOutcome::Covered);
+        }
+        // A commit whose link is written but not yet folded into the edge is a
+        // second old, not broken. Reporting it would page on every busy table.
+        if aggregate_evidence_reaches_current_snapshot(
+            &cached.table,
+            side.coverage,
+            &side.coverage_links,
+        ) {
+            return Ok(InlineCoverageOutcome::Publishing);
+        }
+        Ok(InlineCoverageOutcome::Unproven)
     }
 
     /// WS-7 auto-promotion: sample the newest live files' `attributes` JSON,
@@ -11932,6 +12905,7 @@ impl IcebergContext {
                 let path = side_path.to_string();
                 let location = side_location.to_string();
                 let incarnation = incarnation.to_string();
+                let namespace = table_ident.namespace().to_string();
                 let table = table_ident.name().to_string();
                 let group_count_deltas_enabled = self.group_count_deltas_enabled();
                 let marker_cap = self.table_group_count_cardinality();
@@ -11987,6 +12961,7 @@ impl IcebergContext {
                             Ok((SidePublication::Written, _)) => {}
                             Err(err) => {
                                 record_lost_side_publication(
+                                    &namespace,
                                     &table,
                                     cas_op.as_ref(),
                                     &deltas,
@@ -12033,6 +13008,7 @@ impl IcebergContext {
                 Ok((SidePublication::Written, _)) => {}
                 Err(err) => {
                     record_lost_side_publication(
+                        &table_ident.namespace().to_string(),
                         table_ident.name(),
                         cas_op.as_ref(),
                         &deltas,
@@ -12338,8 +13314,12 @@ impl IcebergContext {
                         // line nothing reads is how the 2026-09-02 regression
                         // took a bisect to explain. The count is the alarm; the
                         // message is the remedy.
+                        // Labelled by namespace as well as table (#4737): one
+                        // compactor writes for every `tenant_*` namespace, and
+                        // a bare `events` merges them into one series.
                         metrics::counter!(
                             "siglake_group_count_delta_write_failures_total",
+                            "iceberg_namespace" => table_ident.namespace().to_string(),
                             "table" => table_ident.name().to_string()
                         )
                         .increment(1);
@@ -12640,6 +13620,10 @@ impl IcebergContext {
             return Ok(0);
         }
         let n = expired.len();
+        // Decided against the metadata this commit is about to shrink, because
+        // that is the only place the current edge is still provable.
+        let expiring: HashSet<i64> = expired.iter().copied().collect();
+        let reroot = self.coverage_reroot_for_expiry(&table, &expiring).await;
         let tx = Transaction::new(&table);
         let mut action = tx.expire_snapshots().retain_last(retain_last);
         if let Some(cutoff) = older_than_ms {
@@ -12651,7 +13635,150 @@ impl IcebergContext {
             .context("expire_snapshots commit")?;
         self.invalidate_cached_table(table_ident).await;
         metrics::counter!("siglake_iceberg_snapshots_expired_total").increment(n as u64);
+        if let Some((proven, target)) = reroot {
+            // After the commit, not before: an append that lands in this window
+            // builds its link against the shrunken metadata, so its parent is
+            // `target` and the re-root's own join collapses it. Publishing
+            // first would leave that append's link naming ancestry that no
+            // longer roots anything.
+            if let Err(err) = self
+                .publish_coverage_reroot(table_ident, &table, proven, target)
+                .await
+                .with_context(|| format!("re-root side-aggregate coverage on {table_ident}"))
+            {
+                // The counts are intact; only the proof is. A rebuild is the
+                // remedy, and it is an operator's call because it re-reads every
+                // live file.
+                tracing::warn!(
+                    error = ?err,
+                    table = %table_ident,
+                    "snapshot expiry dropped the ancestry the inline aggregate's coverage edge \
+                     is read through and the edge could not be re-rooted; windowed GROUP BY, \
+                     date histograms and windowed counts on this table answer from the exact \
+                     per-file path until `siglake rebuild-time-aggregates --table <table>` runs"
+                );
+            }
+        }
         Ok(n)
+    }
+
+    /// Whether this expiry has to move the inline object's coverage edge, and
+    /// where to (#3800).
+    ///
+    /// `Some((proven, target))` when the edge is provable NOW and would not be
+    /// after the commit: the reader's walk needs every snapshot between the edge
+    /// and current, and a re-cluster run longer than `retain_last` takes the
+    /// edge's own snapshot with it. `target` is the deepest snapshot the commit
+    /// leaves in place that the walk still reaches, so the object describes the
+    /// same rows — [`aggregate_coverage_root`] over the surviving metadata, which
+    /// is also the parent the next append's link will name.
+    ///
+    /// `None` is the common case (the chain survives) and every case where there
+    /// is nothing to prove: no object, no edge, or an edge the current metadata
+    /// already refuses. An expiry never certifies what it cannot walk.
+    async fn coverage_reroot_for_expiry(
+        &self,
+        table: &Table,
+        expiring: &HashSet<i64>,
+    ) -> Option<(AggregateCoverage, AggregateCoverage)> {
+        let current = table.metadata().current_snapshot()?;
+        // Read through the incarnation-scoped operator, not the memoized entry:
+        // a cached object can be a generation behind, and this decides what to
+        // certify. A table with no incarnation has no object of its own to
+        // repair, exactly as the rebuild command refuses one.
+        let op = aggregate_operator(table).ok().flatten()?;
+        // A read that fails is not an absent object. The expiry goes ahead
+        // either way — snapshot bloat is the more expensive problem, and it is
+        // what `retain_last` exists for — so say that the edge may not survive
+        // it rather than skipping in silence.
+        let existing = match OpendalSideCas(&op).load(SIDE_AGGREGATES_REL_PATH).await {
+            Ok((existing, _)) => existing,
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    table = %table.identifier(),
+                    "could not read the inline aggregate before expiring snapshots; if this \
+                     commit drops the ancestry its coverage edge is read through, the table \
+                     answers from the exact per-file path until `siglake \
+                     rebuild-time-aggregates` runs"
+                );
+                return None;
+            }
+        };
+        let proven = existing?.coverage?;
+        if !aggregate_covers_current_snapshot(table, Some(proven)) {
+            return None;
+        }
+        if aggregate_covers_current_snapshot_excluding(table, Some(proven), expiring) {
+            return None;
+        }
+        let target = aggregate_coverage_root(table, Some(current.snapshot_id()), expiring)
+            .and_then(|root| coverage_edge_at(table, root))?;
+        (target != proven).then_some((proven, target))
+    }
+
+    /// Write the re-rooted edge, fenced on the object still carrying the one
+    /// that was proven.
+    ///
+    /// The fence is the whole safety argument. A publication that landed since
+    /// [`Self::coverage_reroot_for_expiry`] read the object merged an append's
+    /// rows into it and moved the edge to that append; writing `target` over
+    /// that would claim coverage of a generation the object has since grown past
+    /// — an over-claim, where leaving it alone costs nothing (the append's own
+    /// edge is current and provable).
+    async fn publish_coverage_reroot(
+        &self,
+        table_ident: &TableIdent,
+        table: &Table,
+        proven: AggregateCoverage,
+        target: AggregateCoverage,
+    ) -> Result<()> {
+        let op = aggregate_operator(table)?.ok_or_else(|| {
+            anyhow::anyhow!("{table_ident} has no UUID; its aggregate has no incarnation to bind")
+        })?;
+        let store = OpendalSideCas(&op);
+        let (existing, version) = store.load(SIDE_AGGREGATES_REL_PATH).await?;
+        let Some(mut side) = existing else {
+            anyhow::bail!("{table_ident} has no inline aggregate object to re-root");
+        };
+        if side.coverage != Some(proven) {
+            metrics::counter!("siglake_inline_coverage_reroot_conflicts_total").increment(1);
+            return Ok(());
+        }
+        side.reroot_coverage(target);
+        let body = serde_json::to_vec(&side).context("serialize re-rooted side aggregates")?;
+        if store.conditional() {
+            match store
+                .store_if(SIDE_AGGREGATES_REL_PATH, body, version.as_deref())
+                .await?
+            {
+                CasWrite::Written => {}
+                CasWrite::Conflict => {
+                    metrics::counter!("siglake_inline_coverage_reroot_conflicts_total")
+                        .increment(1);
+                    return Ok(());
+                }
+                CasWrite::Unsupported => {
+                    CONDITIONAL_UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let body =
+                        serde_json::to_vec(&side).context("serialize re-rooted side aggregates")?;
+                    store.store(SIDE_AGGREGATES_REL_PATH, body).await?;
+                }
+            }
+        } else {
+            store.store(SIDE_AGGREGATES_REL_PATH, body).await?;
+        }
+        // Readers memoize the object on the cached table entry, so without this
+        // they keep the edge the expiry just invalidated.
+        self.invalidate_cached_table(table_ident).await;
+        metrics::counter!("siglake_inline_coverage_reroots_total").increment(1);
+        tracing::info!(
+            table = %table_ident,
+            from = proven.snapshot_id,
+            to = target.snapshot_id,
+            "snapshot expiry re-rooted the inline aggregate's coverage edge off expiring ancestry"
+        );
+        Ok(())
     }
 
     /// Additively reconcile a table's stored schema toward `desired_arrow`,
@@ -14123,8 +15250,22 @@ impl IcebergContext {
     /// matches (and returns early when there are none, so a nonmatching
     /// candidate never creates an output file); the second streams the
     /// survivors into a rolling writer. Peak decoded memory is one batch plus
-    /// the Parquet reader's row-group buffer plus the writer's open row group,
-    /// independent of how large the candidate is.
+    /// the Parquet reader's row-group buffer plus the writer's open row group.
+    ///
+    /// THE INPUT IS NEVER HELD; THE OUTPUT IS. The writer's open row group is
+    /// buffered decoded, so a rewrite whose survivors fit in one row group
+    /// holds all of them. That row group was a flat 1,048,576 rows until #4754;
+    /// it is now the byte target divided by the first survivor batch's row size
+    /// (see [`LazyMergeOutputWriter`]), clamped at [`MIN_ROW_GROUP_ROWS`], so
+    /// lowering `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` lowers what a rewrite
+    /// holds — down to that floor's worth of survivors and no further.
+    /// Measured 2026-09-16 (#4703,
+    /// `tests/delete_task_size_gate.rs::measure_peak_allocation_per_arm`):
+    /// peak ≈ 0.96 × the survivors' decoded bytes + ~18 MB, and flat in the
+    /// candidate's own size — an eighth of a 78.7 MB candidate's rows costs
+    /// what half of a 19.7 MB one does. Against the in-RAM arm's four copies
+    /// of the whole file that is still the gate's win, and it is not a bound
+    /// that holds at any candidate size.
     ///
     /// The extra read is the price of not materializing: the alternative —
     /// writing survivors on the way through the counting pass — would create
@@ -14188,21 +15329,9 @@ impl IcebergContext {
         // A preview (`apply == false`) runs the same pass with no writer, so
         // it still answers the question the guard below asks: would this
         // rewrite conserve the file's rows?
-        let mut writer = if apply {
-            Some(
-                self.build_merge_output_writer(
-                    table,
-                    std::slice::from_ref(file),
-                    bloom_columns,
-                    true,
-                    0,
-                )
-                .await
-                .context("build delete-task survivor writer")?,
-            )
-        } else {
-            None
-        };
+        let mut writer = apply.then(|| {
+            self.lazy_merge_output_writer(table, std::slice::from_ref(file), bloom_columns, true, 0)
+        });
         let mut survivor_rows = 0u64;
         while let Some(batch) = survivors.next().await {
             let batch = batch
@@ -14886,6 +16015,28 @@ impl IcebergContext {
         Ok((arrow_schema, ts_col, merge_col, descending))
     }
 
+    /// The merge output writer every merge path writes through, held unbuilt
+    /// until its first batch so the row group is sized from a real row size
+    /// against the configured byte target. See [`LazyMergeOutputWriter`].
+    fn lazy_merge_output_writer<'a>(
+        &'a self,
+        table: &'a Table,
+        files: &'a [DataFile],
+        bloom_columns: &'a [&'a str],
+        with_footers: bool,
+        rewrite_gen: u32,
+    ) -> LazyMergeOutputWriter<'a> {
+        LazyMergeOutputWriter {
+            ctx: self,
+            table,
+            files,
+            bloom_columns,
+            with_footers,
+            rewrite_gen,
+            inner: None,
+        }
+    }
+
     /// Build the rolling data-file writer both merge executors write through:
     /// row-group blooms incremental, a `SortingColumn` footer claiming ONLY the
     /// `timestamp` order the merge actually guarantees (in the declared
@@ -14902,6 +16053,13 @@ impl IcebergContext {
         bloom_columns: &[&str],
         with_footers: bool,
         rewrite_gen: u32,
+        // The first batch the caller is about to write, as the row-size sample
+        // the byte target is divided by. `None` — no output batch exists yet —
+        // is what every merge path used to pass, and it reaches the
+        // 1,048,576-row fallback that reads no target at all. Callers go
+        // through `lazy_merge_output_writer`, which holds the build until it
+        // has a batch.
+        sample: Option<&RecordBatch>,
         // Boxed rather than `impl IcebergWriter`: an opaque return here makes
         // every future up the compactor call chain trip rustc's
         // higher-ranked-lifetime `Send` limitation at `tokio::spawn`.
@@ -14913,7 +16071,19 @@ impl IcebergContext {
             descending,
             nulls_first: false,
         }];
-        let row_group_rows = target_row_group_rows_with_target(None, self.target_row_group_bytes());
+        let target_bytes = self.target_row_group_bytes();
+        let sample_row_bytes = sample.and_then(sampled_row_bytes);
+        let row_group_rows = match sample_row_bytes {
+            Some(avg) => row_group_rows_for_avg(avg, target_bytes),
+            None => target_row_group_rows_with_target(None, target_bytes),
+        };
+        tracing::debug!(
+            row_group_rows,
+            sample_row_bytes,
+            target_bytes,
+            with_footers,
+            "merge output row group sized"
+        );
         let mut parquet_builder = ParquetWriterBuilder::new(
             siglake_writer_properties(
                 bloom_columns,
@@ -14956,8 +16126,14 @@ impl IcebergContext {
         let partition = if spec.is_unpartitioned() {
             None
         } else {
-            // All input files share a partition (caller groups by it), so one
-            // partition key drives the whole merged output.
+            // All input files share a partition value: `recluster_files_with`
+            // refuses a mixed bin before dispatching to either streaming
+            // executor (see `first_cross_partition_file`), and the delete-task
+            // survivor rewrite passes a single file. So one partition key drives
+            // the whole output. Stamping it from `files[0]` is only sound under
+            // that precondition — a mixed bin would land the other partition's
+            // rows behind a wrong manifest partition value, where a predicated
+            // query prunes them away.
             Some(iceberg::spec::PartitionKey::new(
                 spec.as_ref().clone(),
                 table.metadata().current_schema().clone(),
@@ -15019,9 +16195,8 @@ impl IcebergContext {
             sources.push(stream);
         }
 
-        let mut writer = self
-            .build_merge_output_writer(table, files, bloom_columns, with_footers, rewrite_gen)
-            .await?;
+        let mut writer =
+            self.lazy_merge_output_writer(table, files, bloom_columns, with_footers, rewrite_gen);
 
         let mut merge =
             crate::merge::TimestampKwayMerge::new(sources, merge_col, MERGE_BATCH_ROWS, descending);
@@ -15033,11 +16208,11 @@ impl IcebergContext {
             stages.assemble += t_assemble.elapsed().as_nanos() as u64;
             rows += batch.num_rows();
             let t_write = std::time::Instant::now();
-            writer.write(batch).await.context("DataFileWriter::write")?;
+            writer.write(batch).await?;
             stages.write += t_write.elapsed().as_nanos() as u64;
         }
         let t_close = std::time::Instant::now();
-        let added = writer.close().await.context("DataFileWriter::close")?;
+        let added = writer.close().await?;
         stages.write += t_close.elapsed().as_nanos() as u64;
         // Fold in the merger's own input/assemble split.
         let inner = merge.stages();
@@ -15263,9 +16438,8 @@ impl IcebergContext {
             inflight.push_back(spawn_fetch(ci, args));
         }
 
-        let mut writer = self
-            .build_merge_output_writer(table, files, bloom_columns, true, rewrite_gen)
-            .await?;
+        let mut writer =
+            self.lazy_merge_output_writer(table, files, bloom_columns, true, rewrite_gen);
         let mut rows_written = 0usize;
         let mut fetch_total_nanos = 0u64;
         loop {
@@ -15362,7 +16536,7 @@ impl IcebergContext {
                         let b = self.maybe_repromote(table, b)?;
                         rows_written += b.num_rows();
                         let t = std::time::Instant::now();
-                        writer.write(b).await.context("DataFileWriter::write")?;
+                        writer.write(b).await?;
                         chunk_write_nanos += t.elapsed().as_nanos() as u64;
                         indices.clear();
                     }
@@ -15393,7 +16567,7 @@ impl IcebergContext {
                         let b = self.maybe_repromote(table, b)?;
                         rows_written += b.num_rows();
                         let t = std::time::Instant::now();
-                        writer.write(b).await.context("DataFileWriter::write")?;
+                        writer.write(b).await?;
                         chunk_write_nanos += t.elapsed().as_nanos() as u64;
                         emitted += take;
                     }
@@ -15406,7 +16580,7 @@ impl IcebergContext {
                             let b = self.maybe_repromote(table, b)?;
                             rows_written += b.num_rows();
                             let t = std::time::Instant::now();
-                            writer.write(b).await.context("DataFileWriter::write")?;
+                            writer.write(b).await?;
                             chunk_write_nanos += t.elapsed().as_nanos() as u64;
                             indices.clear();
                         }
@@ -15419,7 +16593,7 @@ impl IcebergContext {
                 let b = self.maybe_repromote(table, b)?;
                 rows_written += b.num_rows();
                 let t = std::time::Instant::now();
-                writer.write(b).await.context("DataFileWriter::write")?;
+                writer.write(b).await?;
                 chunk_write_nanos += t.elapsed().as_nanos() as u64;
             }
             stages.write += chunk_write_nanos;
@@ -15432,7 +16606,7 @@ impl IcebergContext {
             "page-bounded merge wrote {rows_written} rows, planned {total_rows}"
         );
         let t_close = std::time::Instant::now();
-        let added = writer.close().await.context("DataFileWriter::close")?;
+        let added = writer.close().await?;
         stages.write += t_close.elapsed().as_nanos() as u64;
         // Gross fetch time vs the part that actually stalled the merge. The
         // difference is what chunk pipelining hid behind encode, and it is the
@@ -15467,6 +16641,13 @@ impl IcebergContext {
             .map_err(|e| anyhow::anyhow!("repromote batch: {e}"))
     }
 
+    /// Re-cluster one bin of data files into time-sorted replacement output and
+    /// commit the rewrite.
+    ///
+    /// Group `files` by partition value and call once per group. Only the in-RAM
+    /// merge can honour a bin spanning several partition values, and whether a
+    /// bin takes that path is decided by its size — see
+    /// [`Self::recluster_files_with`] for the full precondition.
     pub async fn recluster_files(
         &self,
         table_ident: &TableIdent,
@@ -15485,6 +16666,22 @@ impl IcebergContext {
     /// [`Self::recluster_files`] with the merge dispatch steered by `merge`
     /// instead of the `SIGLAKE_RECLUSTER_*` environment (each `None` field still
     /// reads the environment). See [`ReclusterMergeOptions`] for why this exists.
+    ///
+    /// Partitioning precondition: a bin should hold one partition value, and a
+    /// caller that bins its own files groups by partition value first — both
+    /// shipped planners do ([`Self::recluster_pass`] and
+    /// [`Self::recluster_all_indexes`]).
+    ///
+    /// A mixed bin is honoured only by the in-RAM merge, which splits its output
+    /// by partition value (`write_batch_to_data_files`) and so writes one
+    /// correctly-stamped file per partition. The streaming executors cannot:
+    /// they write through a single writer stamped with one partition value, so a
+    /// mixed bin routed to them is REFUSED before any output is written (#4200 —
+    /// it used to commit rows under the wrong partition value, where a
+    /// timestamp-predicated query prunes them away while `count(*)` still counts
+    /// them). Dispatch is decided by bin size and the `SIGLAKE_RECLUSTER_*`
+    /// knobs, so a caller that cannot bound its bins must group by partition;
+    /// see `docs/LIMITATIONS.md`.
     pub async fn recluster_files_with(
         &self,
         table_ident: &TableIdent,
@@ -15530,6 +16727,33 @@ impl IcebergContext {
         // Both re-sort into the table's declared (time-ascending) order; the
         // streaming path bounds decoded memory so an oversized bin can't OOM.
         let (added, rows, merge_path) = if recluster_should_stream(&files, merge) {
+            // Every streaming executor writes the whole merge through one
+            // writer stamped with `files[0].partition()`, so a bin straddling
+            // two day partitions would commit the second day's rows under the
+            // first day's partition value: rows conserved (the row-count guard
+            // below still passes), rows invisible, because a predicate that
+            // resolves to the real day prunes the file at the partition filter.
+            // Refuse here — before the first output byte is written and before
+            // the rewrite commit — rather than regroup: the caller's bin budgets
+            // (`max_pass_bytes`, the generation cap) are stated per output file,
+            // and silently turning one bin into N would break them.
+            if let Some(other) = first_cross_partition_file(&files) {
+                anyhow::bail!(
+                    "streaming re-cluster of {table_ident} was handed a bin spanning {} \
+                     partitions: {} is in partition {:?} but {} is in {:?}. The streaming \
+                     merge writes one output partition per call — group the files by \
+                     partition value and call once per group.",
+                    files
+                        .iter()
+                        .map(|f| format!("{:?}", f.partition()))
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len(),
+                    files[0].file_path(),
+                    files[0].partition(),
+                    files[other].file_path(),
+                    files[other].partition(),
+                );
+            }
             let fanin = merge
                 .merge_fanin
                 .map(|n| n.max(2))
@@ -18728,7 +19952,7 @@ impl IcebergContext {
         options: GroupCountRebuildOptions,
     ) -> Result<GroupCountRebuild> {
         let ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
-        self.rebuild_group_count_aggregate_for(&ident, options, &BTreeMap::new(), None)
+        self.rebuild_group_count_aggregate_for(&ident, options, &BTreeMap::new(), None, None)
             .await
     }
 
@@ -18736,12 +19960,20 @@ impl IcebergContext {
     /// name columns that do not exist in the folded object yet (when the first
     /// delta was lost); their stored caps keep that recovery from admitting an
     /// unbounded column by accident.
+    ///
+    /// `short_columns` marks this as the deficit repair (#3000) and carries the
+    /// columns the census found short, so the CAS write that publishes the
+    /// rebuild also records which of them it failed to restore. Any other
+    /// caller passes `None`, which CLEARS that record: a marker rebuild or a CLI
+    /// rebuild has just re-read the same files, and its outcome is the newer
+    /// evidence.
     async fn rebuild_group_count_aggregate_for(
         &self,
         ident: &TableIdent,
         options: GroupCountRebuildOptions,
         repair_columns: &BTreeMap<String, usize>,
         repair_sketch_columns: Option<&BTreeSet<String>>,
+        short_columns: Option<&BTreeSet<String>>,
     ) -> Result<GroupCountRebuild> {
         let table_name = ident.name();
         let cached = self.cached_table_entry(ident).await?;
@@ -18941,7 +20173,49 @@ impl IcebergContext {
             }
             Some(sketches)
         } else {
-            None
+            // Not recomputing the sketches, but they must not silently LOSE
+            // rows either. `rebuilt_through` makes every delta at or below it
+            // redundant, and both folds then DELETE rather than fold it —
+            // correct for the exact half, which this rebuild read out of the
+            // files, and wrong for the sketch half, which it did not touch. So
+            // merge the sketch half of exactly those deltas first, under the
+            // same predicate the fold's `redundant` uses, and let the watermark
+            // delete them afterwards.
+            //
+            // Columns this rebuild restored exactly are dropped from the carry:
+            // a column represented both ways is reconciled by demoting the
+            // exact side, which would undo the repair and leave the next census
+            // rebuilding the same column every pass.
+            let mut carried = existing
+                .as_ref()
+                .and_then(|w| w.sketches.clone())
+                .unwrap_or_else(|| GroupCountSketches {
+                    version: GROUP_COUNT_SKETCH_VERSION,
+                    columns: BTreeMap::new(),
+                });
+            let absorbed: BTreeSet<i64> = existing
+                .as_ref()
+                .map(|w| w.absorbed.iter().copied().collect())
+                .unwrap_or_default();
+            for (seq, path) in list_group_count_deltas(&op).await? {
+                if seq > sequence_number || absorbed.contains(&seq) {
+                    continue;
+                }
+                let Some(delta) = read_group_count_delta(&op, &path).await? else {
+                    continue;
+                };
+                let Some(mut sketches) = delta.sketches else {
+                    continue;
+                };
+                sketches
+                    .columns
+                    .retain(|column, _| !rebuilt.columns.contains_key(column));
+                if sketches.is_empty() {
+                    continue;
+                }
+                carried.merge(&sketches);
+            }
+            Some(carried)
         };
 
         // CAS the object. On conflict the whole rebuild is redone rather than
@@ -18953,10 +20227,21 @@ impl IcebergContext {
             wide.sketches = (!sketches.is_empty()).then_some(sketches);
         }
         wide.rebuilt_through = Some(sequence_number);
-        wide.coverage = Some(AggregateCoverage {
-            snapshot_id: snapshot.snapshot_id(),
+        // Recorded in the SAME write that publishes the rebuild: knowing which
+        // columns a repair could not restore is only worth having if it costs
+        // nothing, and a second CAS to say so would rewrite the whole base.
+        wide.short_repair = short_columns.map(|short| ShortAggregateRepair {
             sequence_number,
+            unrestored: report
+                .iter()
+                .filter(|column| short.contains(&column.column) && !column.covers_table)
+                .map(|column| column.column.clone())
+                .collect(),
         });
+        // Normalized for the same reason the inline rebuild's edge is: an edge
+        // at a re-cluster is one the next append's link cannot join, so the
+        // repair would last exactly until the next commit (#3800).
+        wide.coverage = Some(published_coverage_edge(&cached.table, snapshot));
         wide.coverage_links.clear();
         // Deltas at or below the watermark are now redundant; the fold deletes
         // them. Their ids must not linger in `absorbed`, which the fold prunes
@@ -18985,6 +20270,471 @@ impl IcebergContext {
             skipped_no_columns: false,
             admissible_typed_columns,
         })
+    }
+
+    /// Recompute the inline object's time aggregates from committed files and
+    /// republish them with a provable coverage edge (#3082).
+    ///
+    /// The failure this repairs: an inline object written before #2920 carries
+    /// no coverage chain, so `aggregate_covers_current_snapshot` refuses it and
+    /// `time_buckets` and `time_group_counts` serve nothing. It does not heal —
+    /// the first append edge after the gap has a parent nothing matches, so it
+    /// stays pending and every later edge chains onto it (asserted in
+    /// `tests/storage/pre_coverage_time_agg.rs`). Only a deliberate
+    /// republication re-roots the chain, after which ordinary commit-path
+    /// maintenance takes over again.
+    ///
+    /// The protocol and the two decisions behind it are
+    /// `docs/DESIGN_inline_time_aggregate_rebuild.md`; the short form:
+    ///
+    /// - Fenced by incarnation (the operator is UUID-scoped), by snapshot (the
+    ///   published edge is exactly the snapshot whose files were read) and by
+    ///   the object's CAS version where the store has one.
+    /// - The maps are REPLACED, never merged. A rebuild carries the whole table,
+    ///   so merging it onto a base that already holds some of those rows is the
+    ///   one way this could over-count — and an over-count is permanent where
+    ///   an under-count self-heals. Replacement also makes the pass a pure
+    ///   function of `(incarnation, snapshot, column set)`, so re-running is
+    ///   free of consequence.
+    /// - `group_counts` is DROPPED rather than certified. One coverage edge
+    ///   governs the whole object, so granting it to maps computed at an unknown
+    ///   earlier snapshot is exactly the unmarked N-for-N overwrite the edge
+    ///   exists to catch. Nothing readable is lost: a pre-coverage object's
+    ///   group counts were already refused by every consult (decision
+    ///   2026-09-16).
+    /// - An append landing under the pass makes it retry the whole thing, a
+    ///   bounded number of times, and then give up asking for a quiet window.
+    ///   Reconciling by hand is how a repair becomes a corruption, and the
+    ///   measured urgency sits on cold tables that are not ingesting (decision
+    ///   2026-09-16).
+    ///
+    /// A component that cannot be read to the table's full row count is left
+    /// ABSENT, never published short: short is what the read guard rejects
+    /// anyway, and writing it would trade a provable gap for an unprovable one.
+    pub async fn rebuild_inline_time_aggregates(
+        &self,
+        table_name: &str,
+    ) -> Result<InlineTimeAggregateRebuild> {
+        let ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
+        let mut moved = 0u32;
+        loop {
+            match self.rebuild_inline_time_aggregates_once(&ident).await? {
+                Some(report) => return Ok(report),
+                None => {
+                    moved += 1;
+                    metrics::counter!("siglake_inline_time_aggregate_rebuild_conflicts_total")
+                        .increment(1);
+                    if moved >= INLINE_TIME_REBUILD_ATTEMPTS {
+                        anyhow::bail!(
+                            "{table_name} committed under the inline time-aggregate rebuild \
+                             {moved} times; nothing was written. The pass reads the files of one \
+                             snapshot and cannot merge a commit that lands under it, so run it \
+                             in a window with no ingest to this table."
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// One attempt. `Ok(None)` means the table committed under the pass and the
+    /// caller should start over; every other outcome is a report.
+    async fn rebuild_inline_time_aggregates_once(
+        &self,
+        ident: &TableIdent,
+    ) -> Result<Option<InlineTimeAggregateRebuild>> {
+        let table_name = ident.name().to_string();
+        // A fresh handle, not the memoized entry: the pass must read the files
+        // of the snapshot it is about to name, and a cached entry can be a
+        // generation behind.
+        self.invalidate_cached_table(ident).await;
+        let cached = self.cached_table_entry(ident).await?;
+        let snapshot = cached
+            .table
+            .metadata()
+            .current_snapshot()
+            .ok_or_else(|| anyhow::anyhow!("{table_name} has no current snapshot to rebuild from"))?
+            .clone();
+        // The edge is published at the root of the re-cluster run above it, not
+        // at the snapshot whose files were read: on a compacted table the newest
+        // snapshot is a re-cluster, and an edge there is one no later append's
+        // link can join (#3800, `aggregate_coverage_root`). Same rows either
+        // way — that is what row-conserving means.
+        let coverage = published_coverage_edge(&cached.table, &snapshot);
+        // The fence below is about the generation this pass READ, which is the
+        // current snapshot whatever the published edge normalizes to.
+        let read_sequence_number = snapshot.sequence_number();
+        let record_count = snapshot
+            .summary()
+            .additional_properties
+            .get("total-records")
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{table_name}'s snapshot summary carries no `total-records`, so a rebuilt \
+                     aggregate could not be proven complete"
+                )
+            })?;
+        let op = aggregate_operator(&cached.table)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{table_name} has no UUID; its aggregate cannot be bound to an incarnation, \
+                 so there is nothing safe to rebuild into"
+            )
+        })?;
+        let store = OpendalSideCas(&op);
+        let (existing, version) = store.load(SIDE_AGGREGATES_REL_PATH).await?;
+        let existing = existing.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{table_name} has no inline aggregate object to rebuild. This command repairs \
+                 an object whose coverage cannot be proven; it does not create one, because \
+                 the column set it would rebuild is recorded nowhere else."
+            )
+        })?;
+        if aggregate_covers_current_snapshot(&cached.table, existing.coverage) {
+            return Ok(Some(InlineTimeAggregateRebuild {
+                table: table_name,
+                coverage,
+                record_count,
+                time_buckets_rows: None,
+                time_buckets_restored: false,
+                columns: Vec::new(),
+                published: false,
+                already_covered: true,
+            }));
+        }
+
+        // The column set comes from the EXISTING object, as the wide rebuild's
+        // does: a repair restores what the table was maintaining, and inventing
+        // columns here would change what it serves.
+        let columns: Vec<String> = existing
+            .time_group_counts
+            .as_ref()
+            .map(|tg| tg.columns.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let buckets = self.rebuilt_time_buckets(ident, &cached).await?;
+        let groups = if columns.is_empty() {
+            None
+        } else {
+            Some(
+                self.rebuilt_time_group_counts(ident, &cached, &columns)
+                    .await?,
+            )
+        };
+
+        // Publish only what accounts for every row. `total-records` is net of
+        // deletes, so a table with delete files (or NULL timestamps, which no
+        // tier buckets) lands short here and keeps the exact per-file path —
+        // the same guard the read side applies, applied before the write.
+        let buckets_total = buckets.total();
+        let buckets_ok = buckets_total == record_count;
+        let mut column_reports = Vec::with_capacity(columns.len());
+        for column in &columns {
+            let rows = groups.as_ref().and_then(|g| g.column_total(column));
+            column_reports.push(InlineTimeRebuiltColumn {
+                column: column.clone(),
+                rows,
+                covers_table: rows == Some(record_count),
+            });
+        }
+        // A column short of the row count is dropped, not published partial:
+        // the read guard would refuse it anyway, and an absent column at least
+        // says so plainly in the report.
+        let covering: BTreeSet<&str> = column_reports
+            .iter()
+            .filter(|c| c.covers_table)
+            .map(|c| c.column.as_str())
+            .collect();
+        let groups = groups
+            .map(|mut g| {
+                g.columns
+                    .retain(|column, _| covering.contains(column.as_str()));
+                g
+            })
+            .filter(|g| !g.columns.is_empty());
+
+        if !buckets_ok && groups.is_none() {
+            // Nothing provable to write. Not writing matters here: the
+            // publication drops `group_counts`, so a write would destroy the
+            // legacy maps in exchange for nothing.
+            return Ok(Some(InlineTimeAggregateRebuild {
+                table: table_name,
+                coverage,
+                record_count,
+                time_buckets_rows: Some(buckets_total),
+                time_buckets_restored: false,
+                columns: column_reports,
+                published: false,
+                already_covered: false,
+            }));
+        }
+
+        // Re-read under the same fence before writing. A publication that
+        // landed since the load has merged rows into the object we are
+        // replacing, and its pending edge would claim coverage over rows this
+        // pass never read.
+        let (fresh, fresh_version) = store.load(SIDE_AGGREGATES_REL_PATH).await?;
+        if fresh_version != version
+            || fresh.as_ref().is_some_and(|side| {
+                side.coverage_links
+                    .iter()
+                    .any(|link| link.sequence_number > read_sequence_number)
+            })
+        {
+            return Ok(None);
+        }
+
+        let mut side = existing;
+        side.time_buckets = buckets_ok.then_some(buckets);
+        side.time_group_counts = groups;
+        side.group_counts = None;
+        side.coverage = Some(coverage);
+        side.coverage_links.clear();
+        let body = serde_json::to_vec(&side).context("serialize rebuilt side aggregates")?;
+        if store.conditional() {
+            match store
+                .store_if(SIDE_AGGREGATES_REL_PATH, body, version.as_deref())
+                .await?
+            {
+                CasWrite::Written => {}
+                CasWrite::Conflict => return Ok(None),
+                CasWrite::Unsupported => {
+                    CONDITIONAL_UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let body =
+                        serde_json::to_vec(&side).context("serialize rebuilt side aggregates")?;
+                    store.store(SIDE_AGGREGATES_REL_PATH, body).await?;
+                }
+            }
+        } else {
+            store.store(SIDE_AGGREGATES_REL_PATH, body).await?;
+        }
+
+        // The object is memoized on the cached table entry, so without this
+        // every reader keeps serving the refusal this just repaired.
+        self.invalidate_cached_table(ident).await;
+        metrics::counter!("siglake_inline_time_aggregate_rebuilds_total").increment(1);
+        Ok(Some(InlineTimeAggregateRebuild {
+            table: table_name,
+            coverage,
+            record_count,
+            time_buckets_rows: Some(buckets_total),
+            time_buckets_restored: buckets_ok,
+            columns: column_reports,
+            published: true,
+            already_covered: false,
+        }))
+    }
+
+    /// Whole-table hourly time buckets from committed files: each file's minute
+    /// footer histogram rolled up (60s divides the hour exactly, so a minute
+    /// bucket nests in one hourly bucket), and a timestamp decode for a file
+    /// whose footer is absent or fails its own validity guard.
+    async fn rebuilt_time_buckets(
+        &self,
+        ident: &TableIdent,
+        cached: &CachedTableEntry,
+    ) -> Result<TimeBucketCounts> {
+        let files = self.live_data_files_cached(ident).await?;
+        let file_io = cached.table.file_io().clone();
+        let footer_cache = self.footer_cache.clone();
+        let concurrency = rebuild_concurrency();
+        let probes: Vec<TimeBucketProbe> = futures::stream::iter(files.iter().map(|file| {
+            let path = file.file_path().to_string();
+            let file_io = file_io.clone();
+            let footer_cache = footer_cache.clone();
+            async move {
+                let buckets = cached_read_file_time_buckets(&footer_cache, &file_io, &path).await?;
+                Ok::<_, anyhow::Error>((path, buckets))
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await?;
+
+        let width = SNAPSHOT_TIME_BUCKET_BASE_NS;
+        let mut out: BTreeMap<i64, u64> = BTreeMap::new();
+        let mut decode: Vec<String> = Vec::new();
+        for (path, buckets) in probes {
+            match buckets {
+                Some(buckets) => {
+                    for (start, count) in buckets {
+                        *out.entry(start.div_euclid(width) * width).or_insert(0) += count;
+                    }
+                }
+                None => decode.push(path),
+            }
+        }
+        metrics::counter!("siglake_inline_time_rebuild_files_total", "source" => "footer")
+            .increment((files.len() - decode.len()) as u64);
+        metrics::counter!("siglake_inline_time_rebuild_files_total", "source" => "decode")
+            .increment(decode.len() as u64);
+        let scanned: Vec<BTreeMap<i64, i64>> =
+            futures::stream::iter(decode.into_iter().map(|path| {
+                let file_io = file_io.clone();
+                async move {
+                    let mut m = BTreeMap::new();
+                    scan_file_timestamp_buckets_windowed(
+                        &file_io, &path, width, 0, None, None, &mut m,
+                    )
+                    .await?;
+                    Ok::<_, anyhow::Error>(m)
+                }
+            }))
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
+        for partial in scanned {
+            for (start, count) in partial {
+                if let Ok(count) = u64::try_from(count) {
+                    *out.entry(start).or_insert(0) += count;
+                }
+            }
+        }
+        let mut rebuilt = TimeBucketCounts {
+            width_ns: width,
+            buckets: out,
+        };
+        // The cap is enforced by coarsening, exactly as the merge path does, so
+        // a long-lived table's rebuild lands at the width its maintenance would
+        // have reached.
+        while rebuilt.buckets.len() > TIME_BUCKET_CAP {
+            rebuilt.coarsen_to(rebuilt.width_ns.saturating_mul(2));
+        }
+        Ok(rebuilt)
+    }
+
+    /// Whole-table 2-D time×group counts from committed files.
+    ///
+    /// There is no footer to read: the 2-D map is built from the in-memory
+    /// batch at commit time and never stamped into the file, and a file's
+    /// group-count footer carries whole-file totals with no time dimension. So
+    /// the general case is a two-column decode per live file, through the same
+    /// `file_time_group_counts` the commit path uses — one implementation, so a
+    /// repair cannot disagree with what maintenance would have written.
+    ///
+    /// The one shortcut: a file whose manifest `[min, max]` timestamps fall
+    /// inside a single bucket contributes its whole group-count footer to that
+    /// bucket. Taken only when EVERY requested column has a readable footer for
+    /// that file — a mixed file is decoded in full rather than half-read from
+    /// each source, which keeps one rule instead of two.
+    async fn rebuilt_time_group_counts(
+        &self,
+        ident: &TableIdent,
+        cached: &CachedTableEntry,
+        columns: &[String],
+    ) -> Result<TimeGroupCounts> {
+        let files = self.live_data_files_cached(ident).await?;
+        let file_io = cached.table.file_io().clone();
+        let footer_cache = self.footer_cache.clone();
+        let concurrency = rebuild_concurrency();
+        let width = SNAPSHOT_TIME_BUCKET_BASE_NS;
+        let ts_field =
+            TimeBoundField::resolve(cached.table.metadata().current_schema(), "timestamp");
+
+        // Which files a single bucket provably contains, and which of those can
+        // serve every column from its footer.
+        let mut contained: Vec<(String, i64)> = Vec::new();
+        let mut decode: Vec<String> = Vec::new();
+        for file in files.iter() {
+            let path = file.file_path().to_string();
+            let bucket = match (
+                file.file_format() == DataFileFormat::Parquet,
+                ts_field.and_then(|f| data_file_timestamp_lower_ns(file, f)),
+                ts_field.and_then(|f| data_file_timestamp_upper_ns(file, f)),
+            ) {
+                (true, Some(lo), Some(hi)) if lo.div_euclid(width) == hi.div_euclid(width) => {
+                    Some(lo.div_euclid(width) * width)
+                }
+                _ => None,
+            };
+            match bucket {
+                Some(bucket) => contained.push((path, bucket)),
+                None => decode.push(path),
+            }
+        }
+
+        let mut from_footers = TimeGroupCounts {
+            width_ns: width,
+            columns: BTreeMap::new(),
+        };
+        let footer_probes: Vec<TimeGroupFooterProbe> =
+            futures::stream::iter(contained.drain(..).map(|(path, bucket)| {
+                let file_io = file_io.clone();
+                let footer_cache = footer_cache.clone();
+                let columns = columns.to_vec();
+                async move {
+                    let mut per_column = Vec::with_capacity(columns.len());
+                    for column in columns {
+                        let Some(rows) = cached_read_file_group_counts_for_path(
+                            &footer_cache,
+                            &file_io,
+                            &path,
+                            &column,
+                        )
+                        .await?
+                        else {
+                            return Ok::<_, anyhow::Error>((path, bucket, None));
+                        };
+                        per_column.push((column, rows));
+                    }
+                    Ok((path, bucket, Some(per_column)))
+                }
+            }))
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
+        let mut footer_files = 0usize;
+        for (path, bucket, per_column) in footer_probes {
+            let Some(per_column) = per_column else {
+                decode.push(path);
+                continue;
+            };
+            footer_files += 1;
+            for (column, rows) in per_column {
+                let entry = from_footers
+                    .columns
+                    .entry(column)
+                    .or_default()
+                    .entry(bucket)
+                    .or_insert_with(|| ColumnGroupCounts {
+                        values: BTreeMap::new(),
+                        nulls: 0,
+                    });
+                for (value, count) in rows {
+                    match value {
+                        Some(value) => *entry.values.entry(value).or_insert(0) += count,
+                        None => entry.nulls += count,
+                    }
+                }
+            }
+        }
+        metrics::counter!("siglake_inline_time_group_rebuild_files_total", "source" => "footer")
+            .increment(footer_files as u64);
+        metrics::counter!("siglake_inline_time_group_rebuild_files_total", "source" => "decode")
+            .increment(decode.len() as u64);
+
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let decoded: Vec<TimeGroupCounts> = futures::stream::iter(decode.into_iter().map(|path| {
+            let file_io = file_io.clone();
+            let refs = refs.clone();
+            async move { decode_file_time_group_counts(&file_io, &path, &refs, width).await }
+        }))
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await?;
+        // Everything lands through `merge`, including the footer part, so the
+        // value/total caps and the bucket coarsening are enforced by the same
+        // code that enforces them at commit time. The merges only ever add, so
+        // an intermediate state cannot be over a cap the final one is under.
+        let mut rebuilt = TimeGroupCounts {
+            width_ns: width,
+            columns: BTreeMap::new(),
+        };
+        rebuilt.merge(&from_footers);
+        for partial in &decoded {
+            rebuilt.merge(partial);
+        }
+        Ok(rebuilt)
     }
 
     /// The TRUE per-value counts for `column`, read from the committed files:
@@ -19713,6 +21463,11 @@ impl<'a> Iterator for GroupCountsIter<'a> {
 /// One file's concurrent time-bucket footer probe: `(file_path, Some(buckets))`
 /// when the footer was readable, `(file_path, None)` when it must fall to a scan.
 type TimeBucketProbe = (String, Option<Vec<(i64, u64)>>);
+
+/// One bucket-contained file's group-count footer probe for the 2-D rebuild:
+/// `(file_path, bucket_start_ns, Some(per-column rows))` when every requested
+/// column was readable, `None` in the third slot when the file must be decoded.
+type TimeGroupFooterProbe = (String, i64, Option<Vec<(String, GroupCountRows)>>);
 
 /// The column names carried by one file's group-count footer (empty when
 /// the file has none) — the warm cycle uses the newest file as the census
@@ -20850,6 +22605,44 @@ mod row_group_tests {
             (MIN_ROW_GROUP_ROWS..=MAX_ROW_GROUP_ROWS).contains(&n),
             "expected in-band, got {n}"
         );
+    }
+
+    /// The knob has to move the answer ABOVE the floor, where the clamp is not
+    /// the one deciding. Doubling the target doubles the rows; halving it
+    /// halves them; and both land between the clamps, so this fails if the
+    /// target is ignored (either fallback would be a constant).
+    #[test]
+    fn row_group_rows_track_the_byte_target_above_the_floor() {
+        let avg = 600; // decoded bytes per row, mid-range for a log event
+        let base = row_group_rows_for_avg(avg, 256 * 1024 * 1024);
+        assert_eq!(base, 256 * 1024 * 1024 / avg);
+        assert!((MIN_ROW_GROUP_ROWS..MAX_ROW_GROUP_ROWS).contains(&base));
+        assert_eq!(row_group_rows_for_avg(avg, 512 * 1024 * 1024), base * 2);
+        let half = row_group_rows_for_avg(avg, 128 * 1024 * 1024);
+        assert_eq!(half, base / 2);
+        assert!(half > MIN_ROW_GROUP_ROWS, "{half} is at the floor");
+    }
+
+    /// A merge writes zero-copy slices of decoded input parts, and the
+    /// row-group size must not depend on how wide the slice happens to be.
+    /// `get_array_memory_size` — what the flush path measures — reports the
+    /// whole part for every slice of it, which is the trap this avoids.
+    #[test]
+    fn sampled_row_bytes_prices_a_slice_not_the_part_behind_it() {
+        let part = make_batch(8192, 256);
+        let whole = sampled_row_bytes(&part).expect("non-empty");
+        let slice = part.slice(0, 64);
+        let sliced = sampled_row_bytes(&slice).expect("non-empty");
+        assert!(
+            sliced.abs_diff(whole) * 20 < whole,
+            "a 64-row slice priced {sliced} B/row against the part's {whole} B/row"
+        );
+        assert!(
+            slice.get_array_memory_size() / 64 > whole * 10,
+            "the trap this test exists for is gone: get_array_memory_size no \
+             longer inflates a slice"
+        );
+        assert_eq!(sampled_row_bytes(&make_batch(0, 0)), None);
     }
 
     #[test]
@@ -26367,6 +28160,90 @@ mod side_agg_freshness_tests {
     }
 }
 
+/// Attempts [`IcebergContext::rebuild_inline_time_aggregates`] gets before it
+/// declares the table too busy.
+///
+/// Bounded rather than convergent, deliberately (decision 2026-09-16). The
+/// convergent shape — fold in only the files the intervening snapshots added —
+/// is a second code path over the same maps, and the measurement that justifies
+/// the command puts its cost on cold, rarely-queried tables, which are the ones
+/// a retry wins against. A warm table's per-file fallback measured ~2ms.
+const INLINE_TIME_REBUILD_ATTEMPTS: u32 = 3;
+
+/// Per-file concurrency for a rebuild pass, matching what the query path's
+/// per-file tiers use.
+fn rebuild_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .clamp(1, 16)
+}
+
+/// One file's 2-D time×group contribution, decoded. Streams `timestamp` plus
+/// the requested columns and folds each batch through the commit path's
+/// [`file_time_group_counts`], so a rebuild cannot compute something
+/// maintenance would not have.
+async fn decode_file_time_group_counts(
+    file_io: &FileIO,
+    path: &str,
+    columns: &[&str],
+    width_ns: i64,
+) -> Result<TimeGroupCounts> {
+    use futures::StreamExt;
+
+    let (mut reader, _) = pruned_window_batch_stream(file_io, path, columns, None, None).await?;
+    let mut out = TimeGroupCounts {
+        width_ns,
+        columns: BTreeMap::new(),
+    };
+    while let Some(batch) = reader.next().await {
+        let batch = batch.with_context(|| format!("decode parquet batch {path}"))?;
+        if let Some(partial) = file_time_group_counts(&batch, columns, width_ns) {
+            out.merge(&partial);
+        }
+    }
+    Ok(out)
+}
+
+/// What one [`IcebergContext::rebuild_inline_time_aggregates`] did.
+#[derive(Debug, Clone)]
+pub struct InlineTimeAggregateRebuild {
+    pub table: String,
+    /// The snapshot the pass read and published as the object's coverage edge.
+    pub coverage: AggregateCoverage,
+    /// The table's row count at that snapshot — the bar every component had to
+    /// clear to be published.
+    pub record_count: u64,
+    /// Rows the rebuilt time buckets accounted for, `None` when the pass did
+    /// not get as far as reading them.
+    pub time_buckets_rows: Option<u64>,
+    /// Whether the time buckets were published, i.e. accounted for every row.
+    pub time_buckets_restored: bool,
+    /// One entry per column the object was maintaining in its 2-D rollup.
+    pub columns: Vec<InlineTimeRebuiltColumn>,
+    /// Whether anything was written. `false` with `already_covered` false means
+    /// no component could be proven complete, so the object was left alone
+    /// rather than rewritten with less than it had.
+    pub published: bool,
+    /// The object's coverage already reached this snapshot, so there was
+    /// nothing to repair. Reported rather than counted as a repair.
+    pub already_covered: bool,
+}
+
+/// One 2-D rollup column's rebuild outcome.
+#[derive(Debug, Clone)]
+pub struct InlineTimeRebuiltColumn {
+    pub column: String,
+    /// Rows the rebuilt column accounts for, `None` when no tier could read it.
+    pub rows: Option<u64>,
+    /// Whether `rows` equals the table's row count — i.e. whether a windowed
+    /// `GROUP BY` on this column serves from the rollup again. `false` is
+    /// information, not a failure: a column can be legitimately short (over a
+    /// cardinality cap, or absent from older files) and a rebuild cannot invent
+    /// history the files do not carry.
+    pub covers_table: bool,
+}
+
 /// Options for [`IcebergContext::rebuild_group_count_aggregate_with`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GroupCountRebuildOptions {
@@ -28063,6 +29940,7 @@ mod side_publication_retry_tests {
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
             rt.block_on(record_lost_side_publication(
+                NAMESPACE,
                 "events",
                 Some(&op),
                 &deltas,
@@ -28078,6 +29956,10 @@ mod side_publication_retry_tests {
             .into_iter()
             .filter(|(key, _, _, _)| {
                 key.key().name() == "siglake_side_aggregate_publish_failures_total"
+                    && key
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "iceberg_namespace" && l.value() == NAMESPACE)
                     && key
                         .key()
                         .labels()
@@ -28113,6 +29995,7 @@ mod side_publication_retry_tests {
         .unwrap()
         .finish();
         record_lost_side_publication(
+            NAMESPACE,
             "events",
             Some(&op),
             &deltas_for(Some(10), 11, 7, 20),

@@ -183,6 +183,38 @@ pub fn decode_column(s: &str, column: &str) -> Option<(Vec<(String, u64)>, u64)>
     None
 }
 
+/// Every column's name and ROW TOTAL (`Σ counts + nulls`), in one forward pass
+/// and without materializing a single value string.
+///
+/// The shape a maintenance census wants. "Is this column short of
+/// `record_count`?" is a question about one number per column, and asking it
+/// through [`decode_column`] once per column walks the blob once per column and
+/// allocates every value of the one it stops at — at the measured extreme
+/// (26.5 MB, ~20M keys, 22 columns) that is the whole blob decoded 22 times
+/// over to compare 22 integers.
+///
+/// Counts saturate rather than wrap: a corrupt or hostile blob claiming
+/// `u64::MAX` rows must not fold around into a plausible total that compares
+/// equal to `record_count`.
+pub fn decode_column_totals(s: &str) -> Option<Vec<(String, u64)>> {
+    let body = blob_body(s)?;
+    let mut cur = Cursor { buf: &body, pos: 0 };
+    let n_columns = cur.uvarint()?;
+    let mut totals = Vec::with_capacity(prealloc(n_columns));
+    for _ in 0..n_columns {
+        let name = std::str::from_utf8(cur.bytes()?).ok()?.to_string();
+        let mut total = cur.uvarint()?; // nulls are rows too
+        let n_values = cur.uvarint()?;
+        for _ in 0..n_values {
+            cur.uvarint()?; // shared prefix length
+            cur.bytes()?; // suffix
+            total = total.saturating_add(cur.uvarint()?);
+        }
+        totals.push((name, total));
+    }
+    Some(totals)
+}
+
 /// The column names a footer covers, without decoding any values — the warm
 /// cycle's census of which columns are footer-aggregated for a table.
 pub fn decode_column_names(s: &str) -> Option<Vec<String>> {
@@ -455,6 +487,35 @@ mod tests {
         assert_eq!(
             decode_column_names(&blob),
             Some(gc.columns.keys().cloned().collect::<Vec<_>>())
+        );
+    }
+
+    #[test]
+    fn column_totals_match_a_full_decode() {
+        let gc = sample();
+        let blob = gc.encode().unwrap();
+        let want: Vec<(String, u64)> = gc
+            .columns
+            .iter()
+            .map(|(name, col)| (name.clone(), col.values.values().sum::<u64>() + col.nulls))
+            .collect();
+        assert_eq!(decode_column_totals(&blob), Some(want));
+        for bad in ["", "not base64 !!!", r#"{"columns":{}}"#] {
+            assert_eq!(decode_column_totals(bad), None);
+        }
+    }
+
+    #[test]
+    fn column_totals_saturate_instead_of_wrapping() {
+        // A total that overflows must not land on a small plausible number: the
+        // census compares it against `record_count` to decide a column is
+        // short, and a wrapped total is how a corrupt blob would read healthy.
+        let mut columns = BTreeMap::new();
+        columns.insert("wide".to_string(), col(&[("a", u64::MAX), ("b", 7)], 3));
+        let blob = GroupCounts { columns }.encode().unwrap();
+        assert_eq!(
+            decode_column_totals(&blob),
+            Some(vec![("wide".to_string(), u64::MAX)])
         );
     }
 

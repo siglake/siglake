@@ -30,7 +30,7 @@ plug straight into `--values`.
 helm install siglake ./deploy/helm/siglake \
   --namespace siglake --create-namespace \
   --set image.repository=ghcr.io/siglake/siglake \
-  --set image.tag=0.1.0 \
+  --set image.tag=0.1.1 \
   --set s3.bucket=my-customer-warehouse \
   --set s3.region=us-east-1 \
   --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::123456789012:role/siglake-warehouse-rw \
@@ -38,8 +38,8 @@ helm install siglake ./deploy/helm/siglake \
 ```
 
 Image tags are numeric, matching the chart's `appVersion`: the release
-is tagged `v0.1.0` in git but published as
-`ghcr.io/siglake/siglake:0.1.0`. Leaving `image.tag` unset picks the
+is tagged `v0.1.1` in git but published as
+`ghcr.io/siglake/siglake:0.1.1`. Leaving `image.tag` unset picks the
 `appVersion` of the chart you installed, which is the paired image.
 
 For non-trivial deployments, write a `values.yaml` and pass `-f`
@@ -492,21 +492,53 @@ and a zero cadence and holds the alert's `for:` to three times the
 container's value (or to the alert's absence at 0), so the two cannot
 drift apart unnoticed.
 
-Three of the silent-loss alerts are about the aggregates rather than rows. A per-commit delta write that exhausts its
+Five of the silent-loss alerts are about the aggregates rather than rows. A per-commit delta write that exhausts its
 four attempts leaves a durable marker; the maintenance compactor normally
 rebuilds the aggregate on its next fold, while `GROUP BY` stays exact on the
 per-file path. `SiglakeGroupCountDeltaLost` (warning) fires only when that
-automatic rebuild fails or remains incomplete and names the table; use
-`siglake rebuild-group-counts --table <table>` as the operator fallback.
+automatic rebuild fails or remains incomplete and names the Iceberg
+namespace and table; use `siglake rebuild-group-counts --namespace <ns> --table
+<table>` as the operator fallback.
 `SiglakeGroupCountDeltaRetrying` (warning) fires once delta writes for a table
 have needed retries for half an hour and names both the table and pod, warning
 that an exhausted write and automatic rebuild are becoming more likely.
 `SiglakeSideAggregatePublicationLost` (warning) covers the inline aggregate
 object: a publication that exhausts the same four attempts loses the commit's
 contribution outright, so it fires on the failure itself. The compactor's
-rebuild restores the wide group counts; the inline time aggregates have no
-rebuild, so windowed `GROUP BY` on that table answers from the per-file path
-until the object is rebuilt.
+rebuild restores the wide group counts; the inline time aggregates are restored
+by `siglake rebuild-time-aggregates --table <table>`, and until one of those
+runs, windowed `GROUP BY` on that table answers from the per-file path.
+`SiglakeInlineCoverageUnproven` (critical) is the state, rather than the event
+that produced it. Every 15 minutes the maintenance pass reads each maintained
+table's inline aggregate object and asks the read guard's own question: does its
+coverage edge reach the current snapshot? A delete task, retention, a foreign
+overwrite and the two residual windows at snapshot expiry all leave an object
+where the answer is no, and no commit republishes a chain the reader cannot
+walk — so the table serves windowed `GROUP BY`, date histograms and windowed
+counts from the exact per-file tiers for the rest of its life. Answers stay
+exact; the alert is critical because the state is permanent and the repair is
+manual: `siglake rebuild-time-aggregates --namespace <ns> --table <table>`,
+which the alert renders with both labels filled in. It reads the current-state
+gauge `siglake_inline_coverage_unproven{iceberg_namespace,table}` — set to 0 or
+1 for every table on every pass, so a repaired table clears at the next census —
+paired with `increase(siglake_inline_coverage_census_total[1h]) > 0` on the same
+pod, so a compactor that has stopped censusing drops out of the alert instead of
+paging from a reading nobody is refreshing. There is no values key for it and
+nothing to opt into, because the pass only reads: a
+`compactor.extraEnv` entry setting `SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS`
+changes the cadence, and `off` switches the census off.
+`SiglakeGroupCountAggregateShort` (warning) is the one that needs no lost write
+at all: every 15 minutes the maintenance pass censuses each maintained table
+and fires this when one is short of `total-records` with every commit's
+contribution present. A process killed between its commit and its delta PUT
+writes neither delta nor marker, and a table upgraded across the per-incarnation
+aggregate prefix starts a fresh aggregate at its first commit after the
+upgrade; both leave a shortfall no later commit closes. Repairing it
+automatically is opt-in (`compactor.shortAggregateRepair`, which renders
+`SIGLAKE_AGG_SHORT_REPAIR=1`) because it costs one Tier-2 query per maintained
+column; with it off the alert and the compactor's WARN line — which names the
+columns — point at
+`siglake rebuild-group-counts --namespace <ns> --table <table>`.
 
 The starter Grafana dashboard `deploy/grafana/siglake-overview.json`
 groups panels the same way and filters on `namespace` (the label
@@ -520,10 +552,23 @@ near 1 is every call decoding raw pages), Tier-2 files per call, the
 live-file-list cache hit ratio, and a second line for the Tier-1
 aggregate itself: outstanding deltas folded per read (p50 / p99, near
 zero when the compactor fold keeps up) and columns demoted from exact
-counts to sketches (should sit at zero). `scripts/check-chart.py` verifies
+counts to sketches (should sit at zero). The row ends with the
+text-index panels: a text query's per-file startup split by stage
+(`permit_wait` / `blob_fetch` / `decode` / `selection` — which one moved
+says whether a slowdown is the load queue, object storage, the decode or
+the postings work), the parsed-index cache's lookup outcomes beside the
+bound that dropped an entry, and its resident bytes against that bound.
+`scripts/check-chart.py` verifies
 that every `siglake_*` series a panel or template variable names is one
-the code emits, the same check it applies to the alert rules and the KEDA
+the code emits — `crates/` and the owned forks under `third_party/`,
+which is where the text-index and object-store read families live — the
+same check it applies to the alert rules and the KEDA
 trigger queries, so a renamed metric fails CI instead of blanking a panel.
+It evaluates the arithmetic of two panels with promtool rather than only
+their names: the drain backlog, which has to read one queue depth per
+namespace under two different drain shapes, and the text-index startup
+quantiles, which have to read one number per stage out of a fleet's
+buckets.
 It also holds each reference to the form the exporter renders: `_bucket`
 and `histogram_quantile()` only on the histograms `builder()` in
 `crates/siglake-core/src/metrics.rs` hands buckets (names ending in

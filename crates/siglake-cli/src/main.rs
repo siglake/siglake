@@ -16,7 +16,9 @@ use siglake_core::{events_schema, events_to_record_batch, Event};
 use siglake_ingest::{AppState, TenantRouting};
 use siglake_storage::iceberg::{GroupCountRebuildOptions, IcebergContext};
 use siglake_storage::subscribe::IcebergSubscription;
-use siglake_storage::{local_store, register_parquet_dir, session_context, write_batch_as_parquet};
+use siglake_storage::{
+    local_store, register_parquet_dir, session_context, write_batch_as_parquet, WarehouseRole,
+};
 use siglake_wal::WalWriter;
 
 mod sql_client;
@@ -366,6 +368,33 @@ enum Command {
         to: PathBuf,
     },
 
+    /// Return segments the drain set aside under `<wal>/poison/` to `sealed/`,
+    /// so the next drain cycle claims them again.
+    ///
+    /// A segment lands there after failing to read on every attempt the drain
+    /// gave it (`SIGLAKE_COMPACTOR_POISON_ATTEMPTS`), which is why nothing
+    /// requeues it automatically: the retry that would change the answer is
+    /// the one an operator does first — restoring the file from the mirror or
+    /// a backup, or upgrading to a build that knows its frame version.
+    /// Requeueing a segment unchanged simply spends the attempts again.
+    ///
+    /// Prints one line per set-aside segment with the recorded reason. Refuses
+    /// to move a segment whose name is already back in `sealed/`.
+    WalRequeue {
+        /// The WAL ROOT (e.g. `/var/lib/siglake/wal`), not a `poison/`
+        /// directory. Its own `poison/`, every tenant's and every index's are
+        /// all visited.
+        #[arg(long)]
+        wal: PathBuf,
+        /// Requeue only this segment file name. Default: every set-aside
+        /// segment under the root.
+        #[arg(long)]
+        segment: Option<String>,
+        /// Report what would move without moving anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Bound the `query_audit` Iceberg table's growth.
     ///
     /// Two modes:
@@ -544,6 +573,51 @@ enum Command {
         /// the columns it would add.
         #[arg(long)]
         admit_typed_columns: bool,
+    },
+    /// Republish a table's inline time aggregates with a provable coverage
+    /// chain, recomputing them from committed files.
+    ///
+    /// For a table whose inline aggregate object predates the snapshot-coverage
+    /// chain. Such an object cannot prove which equal-row-count snapshot it
+    /// describes, so every query refuses it and takes the exact per-file tier:
+    /// answers stay right, `date_histogram` and windowed `GROUP BY` stop being
+    /// served from warm metadata. Symptom:
+    /// `siglake_query_side_aggs_cache_total{result="unproven_coverage"}` climbing
+    /// on a table whose windowed shapes report `served_by: "materialized"`.
+    ///
+    /// Nothing repairs this on its own — a coverage chain with no head cannot be
+    /// rejoined by later appends, and a compaction has no edge to walk back to —
+    /// so this command is the only way back. After it runs, the appends that
+    /// follow join the chain normally.
+    ///
+    /// What it costs: the time buckets are one footer read per live file, but
+    /// the 2-D time x group rollup has no footer to read and decodes two columns
+    /// of every live file whose time range spans more than one bucket. On a
+    /// large table that is a full pass, once.
+    ///
+    /// NOT safe to run against a table being ingested: the pass reads the files
+    /// of one snapshot and cannot merge a commit that lands under it, so it
+    /// retries and then gives up without writing. Run it in a window with no
+    /// ingest to the table. Re-running after success is a reported no-op.
+    ///
+    /// The inline whole-table group counts are dropped rather than republished:
+    /// one coverage edge governs the object, and they cannot be proven. They
+    /// were already refused before this ran, so nothing readable is lost;
+    /// `GROUP BY` without a time window is served by the wide aggregate or the
+    /// per-file tier, exactly as it was.
+    RebuildTimeAggregates {
+        /// Iceberg warehouse URL. Reads `SIGLAKE_WAREHOUSE_URL` if not given.
+        #[arg(long, env = "SIGLAKE_WAREHOUSE_URL")]
+        warehouse_url: Option<String>,
+        /// Iceberg catalog URI. Reads `SIGLAKE_CATALOG_URI` if not given.
+        #[arg(long, env = "SIGLAKE_CATALOG_URI")]
+        catalog_uri: Option<String>,
+        /// Per-deployment Iceberg namespace.
+        #[arg(long, env = "SIGLAKE_TENANT_NAMESPACE", default_value = "siglake")]
+        namespace: String,
+        /// Table whose time aggregates to rebuild (`events`, or a managed index id).
+        #[arg(long, default_value = "events")]
+        table: String,
     },
     /// Additively reconcile a table's stored schema toward the schema the
     /// running build declares for it.
@@ -757,13 +831,202 @@ fn component_name(cmd: &Command) -> &'static str {
         Command::Gen { .. }
         | Command::IcebergDemo { .. }
         | Command::WalRecover { .. }
+        | Command::WalRequeue { .. }
         | Command::AuditRotate { .. }
         | Command::GcOrphans { .. }
         | Command::RetentionSweep { .. }
         | Command::DeleteSweep { .. }
         | Command::RebuildGroupCounts { .. }
+        | Command::RebuildTimeAggregates { .. }
         | Command::MigrateSchema { .. }
         | Command::Subscribe { .. } => "cli",
+    }
+}
+
+/// Which cache budgets this invocation earns.
+///
+/// One binary, two roles: `siglake compactor` is the packaged compactor pod and
+/// `siglake sql-direct` is a query engine, and they were sharing the fork's flat
+/// text-index ceilings — 1.25 GiB of them inside the compactor's 1Gi limit
+/// (#4082). Exhaustive on purpose, so a new subcommand has to say which role it
+/// runs in rather than inherit one.
+///
+/// [`WarehouseRole::InProcessQuery`] is the subcommands that register the
+/// Iceberg tables with DataFusion and execute SQL here: a `LIKE` or an FTS
+/// predicate among them reaches the scan's index-pruning path, which is the
+/// only thing that fills the text-index caches. `subscribe` is in for the same
+/// reason even though it cursors on time — it plans against the same provider
+/// and its budgets are derived, so being wrong about it costs nothing.
+///
+/// Everything else is maintenance, including `query` (a listing table over a
+/// local Parquet directory — no Iceberg provider and no index sidecars to read)
+/// and the subcommands that never open a warehouse at all (`sql` talks to a
+/// running server over HTTP, `gen` writes to stdout).
+fn warehouse_role(command: &Command) -> WarehouseRole {
+    match command {
+        Command::SqlDirect { .. } | Command::IcebergDemo { .. } | Command::Subscribe { .. } => {
+            WarehouseRole::InProcessQuery
+        }
+        Command::Compactor { .. }
+        | Command::IngestServer { .. }
+        | Command::Sql { .. }
+        | Command::Ingest { .. }
+        | Command::Query { .. }
+        | Command::Gen { .. }
+        | Command::WalRecover { .. }
+        | Command::WalRequeue { .. }
+        | Command::AuditRotate { .. }
+        | Command::GcOrphans { .. }
+        | Command::RetentionSweep { .. }
+        | Command::DeleteSweep { .. }
+        | Command::RebuildGroupCounts { .. }
+        | Command::RebuildTimeAggregates { .. }
+        | Command::MigrateSchema { .. } => WarehouseRole::Maintenance,
+    }
+}
+
+/// Resolve this role's cache budgets and push them into the caches, the way
+/// `siglake-query-server`'s startup does for its own role.
+///
+/// Both configurations, because both were being answered by a fallback rather
+/// than by this process: the text-index caches took the fork's env-or-constant
+/// pair, and `reserved_cache_bytes_in_force` — what the query memory pool
+/// subtracts — re-derived the query server's object cache for a process whose
+/// object cache is off. The resolver
+/// ([`siglake_storage::resolve_role_cache_config`]) carries which budget a role
+/// gets and why.
+fn configure_role_caches(role: WarehouseRole) {
+    let object_cache = std::env::var("SIGLAKE_OBJECT_CACHE_BYTES").ok();
+    let parsed_index = std::env::var("SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES").ok();
+    let puffin_blob = std::env::var("SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES").ok();
+    let config = siglake_storage::role_cache_config_from(
+        role,
+        siglake_storage::iceberg::cgroup_memory_limit_bytes(),
+        object_cache.as_deref(),
+        parsed_index.as_deref(),
+        puffin_blob.as_deref(),
+    );
+    siglake_storage::configure_query_read_caches(config.read);
+    siglake_storage::configure_text_index_caches(config.text_index);
+    tracing::debug!(
+        ?role,
+        object_cache_bytes = config.read.object_cache_max_bytes,
+        parsed_index_cache_bytes = config.text_index.parsed_index_max_bytes,
+        puffin_blob_cache_bytes = config.text_index.puffin_blob_max_bytes,
+        "cache budgets resolved for this role"
+    );
+}
+
+#[cfg(test)]
+mod warehouse_role_tests {
+    use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn role_of(argv: &[&str]) -> WarehouseRole {
+        warehouse_role(&Cli::try_parse_from(argv).expect("argv parses").command)
+    }
+
+    /// The packaged compactor pod (`deploy/helm/siglake/values.yaml`: 1Gi) and
+    /// the query subcommands of the same binary get different ceilings, which is
+    /// the whole of #4082: the compactor was holding the fork's flat 1 GiB +
+    /// 256 MiB inside a 1Gi limit.
+    #[test]
+    fn the_compactor_is_maintenance_and_takes_no_text_index_ceilings() {
+        assert_eq!(
+            role_of(&["siglake", "compactor"]),
+            WarehouseRole::Maintenance
+        );
+
+        let config = siglake_storage::role_cache_config_from(
+            WarehouseRole::Maintenance,
+            Some(GIB),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(config.text_index.reserved_bytes(), 0);
+        // And the read caches are what an unconfigured process actually holds:
+        // the byte-range object cache stays off until an operator sets it.
+        assert_eq!(config.read.reserved_bytes(), 0);
+    }
+
+    /// `sql-direct` executes SQL against the Iceberg tables in this process, so
+    /// a text predicate can fill the caches and the budgets are derived — the
+    /// query server's answer, at this process's limit.
+    #[test]
+    fn sql_direct_is_a_query_role_and_derives_its_budgets() {
+        assert_eq!(
+            role_of(&["siglake", "sql-direct", "--query", "SELECT 1"]),
+            WarehouseRole::InProcessQuery
+        );
+
+        let derived = siglake_storage::role_cache_config_from(
+            WarehouseRole::InProcessQuery,
+            Some(8 * GIB),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            derived.text_index,
+            siglake_storage::resolve_text_index_cache_config(Some(8 * GIB), None, None),
+            "an in-process query role resolves what the query server would"
+        );
+        assert!(derived.text_index.reserved_bytes() > 0, "8Gi has the room");
+    }
+
+    /// Roles, one per subcommand that opens a warehouse. `query` reads a local
+    /// Parquet directory through a listing table — no Iceberg provider, no index
+    /// sidecar — so it is maintenance however much SQL it runs.
+    #[test]
+    fn every_subcommand_has_a_role() {
+        for argv in [
+            ["siglake", "iceberg-demo"].as_slice(),
+            ["siglake", "subscribe", "--table", "events"].as_slice(),
+        ] {
+            assert_eq!(role_of(argv), WarehouseRole::InProcessQuery, "{argv:?}");
+        }
+        for argv in [
+            ["siglake", "ingest-server"].as_slice(),
+            ["siglake", "query", "--sql", "SELECT 1"].as_slice(),
+            ["siglake", "delete-sweep", "--index", "events"].as_slice(),
+            ["siglake", "gc-orphans"].as_slice(),
+            ["siglake", "retention-sweep"].as_slice(),
+            ["siglake", "rebuild-group-counts"].as_slice(),
+            ["siglake", "rebuild-time-aggregates"].as_slice(),
+            ["siglake", "migrate-schema"].as_slice(),
+            ["siglake", "gen"].as_slice(),
+            ["siglake", "sql"].as_slice(),
+        ] {
+            assert_eq!(role_of(argv), WarehouseRole::Maintenance, "{argv:?}");
+        }
+    }
+
+    /// A fleet-wide override survives the role. An operator who has sized these
+    /// caches by hand keeps what they set, in either role.
+    #[test]
+    fn an_operator_override_survives_both_roles() {
+        for role in [WarehouseRole::Maintenance, WarehouseRole::InProcessQuery] {
+            let config = siglake_storage::role_cache_config_from(
+                role,
+                Some(GIB),
+                Some("134217728"),
+                Some("268435456"),
+                Some("0"),
+            );
+            assert_eq!(
+                config.read.object_cache_max_bytes,
+                128 * 1024 * 1024,
+                "{role:?}"
+            );
+            assert_eq!(
+                config.text_index.parsed_index_max_bytes,
+                256 * 1024 * 1024,
+                "{role:?}"
+            );
+            assert_eq!(config.text_index.puffin_blob_max_bytes, 0, "{role:?}");
+        }
     }
 }
 
@@ -801,6 +1064,9 @@ async fn main() -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     std::fs::create_dir_all(&cli.data_dir)?;
+    // Before anything opens a warehouse or builds the query memory pool, which
+    // subtracts what the caches hold.
+    configure_role_caches(warehouse_role(&cli.command));
 
     match cli.command {
         Command::Ingest { input } => ingest(&cli.data_dir, input).await,
@@ -898,6 +1164,11 @@ async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Command::WalRecover { from, to } => run_wal_recover(&from, &to).await,
+        Command::WalRequeue {
+            wal,
+            segment,
+            dry_run,
+        } => run_wal_requeue(&wal, segment.as_deref(), dry_run),
         Command::AuditRotate {
             warehouse_url,
             catalog_uri,
@@ -1007,6 +1278,21 @@ async fn run(cli: Cli) -> Result<()> {
                 &namespace,
                 &table,
                 admit_typed_columns,
+            )
+            .await
+        }
+        Command::RebuildTimeAggregates {
+            warehouse_url,
+            catalog_uri,
+            namespace,
+            table,
+        } => {
+            run_rebuild_time_aggregates(
+                &cli.data_dir,
+                warehouse_url.as_deref(),
+                catalog_uri.as_deref(),
+                &namespace,
+                &table,
             )
             .await
         }
@@ -2317,6 +2603,79 @@ async fn run_wal_recover(from: &str, to: &std::path::Path) -> Result<()> {
     tracing::info!(from, to = %to.display(), prefix, "wal-recover starting");
     let pulled = siglake_wal::mirror::recover_from_object_store(store, prefix, to).await?;
     println!("pulled {pulled} segments into {}", to.display());
+    Ok(())
+}
+
+/// Every WAL directory under `root` that can hold a `poison/`: the root
+/// itself (legacy single-tenant layout), each tenant, and each tenant's
+/// per-index directories. The same walk the drain does each cycle.
+fn wal_dirs_under(root: &std::path::Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = vec![root.to_path_buf()];
+    for (_tenant, dir) in siglake_wal::list_tenant_dirs(root)? {
+        for (_index, index_dir) in siglake_wal::list_index_dirs(&dir)? {
+            dirs.push(index_dir);
+        }
+        dirs.push(dir);
+    }
+    dirs.sort();
+    Ok(dirs)
+}
+
+/// Implementation of the `siglake wal-requeue` subcommand. See
+/// `Command::WalRequeue` docs for the user-facing semantics.
+fn run_wal_requeue(wal: &std::path::Path, segment: Option<&str>, dry_run: bool) -> Result<()> {
+    if wal.file_name().and_then(|n| n.to_str()) == Some(siglake_wal::POISON_DIR) {
+        anyhow::bail!(
+            "--wal must be the WAL ROOT, not a `{}` directory: the requeue visits every \
+             tenant and index directory beneath it. Pass {} instead.",
+            siglake_wal::POISON_DIR,
+            wal.parent().unwrap_or(wal).display()
+        );
+    }
+    let mut seen = 0usize;
+    let mut moved = 0usize;
+    for dir in wal_dirs_under(wal)? {
+        for held in siglake_wal::list_poisoned(&dir)? {
+            let name = held
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if segment.is_some_and(|wanted| wanted != name) {
+                continue;
+            }
+            seen += 1;
+            let reason = siglake_wal::read_poison_note(&held)
+                .map(|note| format!("{} after {} attempt(s)", note.reason, note.attempts))
+                .unwrap_or_else(|| "no note recorded".to_string());
+            if dry_run {
+                println!("WOULD REQUEUE {} — {reason}", held.display());
+                continue;
+            }
+            let back = siglake_wal::requeue_poisoned_segment(&held)?;
+            moved += 1;
+            println!(
+                "REQUEUED {} -> {} — {reason}",
+                held.display(),
+                back.display()
+            );
+        }
+    }
+    if seen == 0 {
+        match segment {
+            Some(name) => println!(
+                "no segment named {name} is set aside under {}",
+                wal.display()
+            ),
+            None => println!("nothing is set aside under {}", wal.display()),
+        }
+        return Ok(());
+    }
+    if dry_run {
+        println!("{seen} segment(s) would be requeued; nothing was moved");
+    } else {
+        println!("requeued {moved} of {seen} segment(s) into sealed/");
+    }
     Ok(())
 }
 
@@ -4930,5 +5289,108 @@ async fn run_rebuild_group_counts(
         );
     }
     admissible_hint();
+    Ok(())
+}
+
+/// `siglake rebuild-time-aggregates` — republish the inline time aggregates of
+/// a table whose coverage chain cannot be proven (#3082).
+///
+/// Prints per component whether it was restored, because "exited 0" is not the
+/// same as "the fast path is back": a component short of the table's row count
+/// is deliberately left absent, and a table with delete files or NULL
+/// timestamps lands short for reasons no rebuild can change. Saying which
+/// component came back beats implying both did.
+async fn run_rebuild_time_aggregates(
+    data_dir: &std::path::Path,
+    warehouse_url: Option<&str>,
+    catalog_uri: Option<&str>,
+    namespace: &str,
+    table: &str,
+) -> Result<()> {
+    let ice = open_iceberg(
+        data_dir,
+        "warehouse",
+        warehouse_url,
+        catalog_uri,
+        Some(namespace),
+    )
+    .await?;
+    let report = ice.rebuild_inline_time_aggregates(table).await?;
+
+    if report.already_covered {
+        println!(
+            "{namespace}.{table}: the inline aggregate already proves coverage of snapshot {} \
+             (sequence {}); nothing to rebuild",
+            report.coverage.snapshot_id, report.coverage.sequence_number
+        );
+        return Ok(());
+    }
+    println!(
+        "{namespace}.{table}: read snapshot {} (sequence {}, table rows: {})",
+        report.coverage.snapshot_id, report.coverage.sequence_number, report.record_count
+    );
+    println!(
+        "  {:<24} {}",
+        "time_buckets",
+        match (report.time_buckets_restored, report.time_buckets_rows) {
+            (true, Some(rows)) =>
+                format!("rows={rows:<14} restored (date_histogram, windowed count)"),
+            (false, Some(rows)) => format!(
+                "rows={rows:<14} NOT written: short of the table row count, so the read guard \
+                 would refuse it"
+            ),
+            (_, None) => "not read".to_string(),
+        }
+    );
+    let mut short = Vec::new();
+    for column in &report.columns {
+        match column.rows {
+            Some(rows) if column.covers_table => println!(
+                "  {:<24} rows={rows:<14} restored (windowed GROUP BY)",
+                format!("time_group_counts.{}", column.column)
+            ),
+            Some(rows) => {
+                println!(
+                    "  {:<24} rows={rows:<14} NOT written: short of the table row count",
+                    format!("time_group_counts.{}", column.column)
+                );
+                short.push(column.column.clone());
+            }
+            None => {
+                println!(
+                    "  {:<24} NOT READABLE from any tier — left absent rather than written wrong",
+                    format!("time_group_counts.{}", column.column)
+                );
+                short.push(column.column.clone());
+            }
+        }
+    }
+    if report.columns.is_empty() {
+        println!("  {:<24} the object maintained none", "time_group_counts");
+    }
+    if !report.published {
+        println!(
+            "\nNOTHING WAS WRITTEN. No component could be proven complete against the table's \
+             {} rows, and the publication drops the inline group counts — so writing here would \
+             have destroyed what the object still holds in exchange for nothing. The table keeps \
+             answering exactly from the per-file tiers.",
+            report.record_count
+        );
+        return Ok(());
+    }
+    if !short.is_empty() {
+        println!(
+            "\nleft absent: {}. Counted from every live file and still short of the table row \
+             count — the column exceeds a rollup cap, or is missing from files older than it. A \
+             windowed GROUP BY on these keeps using the exact per-file tier.",
+            short.join(", ")
+        );
+    }
+    println!(
+        "\nThe inline whole-table group counts were dropped: one coverage edge governs the \
+         object and they could not be proven. They were already refused before this ran, so \
+         `GROUP BY` without a time window is served exactly as it was. Commits after this one \
+         extend the coverage chain normally."
+    );
     Ok(())
 }

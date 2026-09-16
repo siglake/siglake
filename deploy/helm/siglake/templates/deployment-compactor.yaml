@@ -104,6 +104,13 @@ spec:
             # and `indexRebuild: true` is the explicit opt-in.
             - name: SIGLAKE_INDEX_REBUILD
               value: {{ ternary "1" "0" .Values.compactor.indexRebuild | quote }}
+            # #3000: rebuild a group-count aggregate the maintenance census
+            # finds short of its row count. The census itself always runs and
+            # always reports; this is the opt-in that lets it spend one Tier-2
+            # query per maintained column to fix what it finds. Rendered either
+            # way so the pod states what it runs.
+            - name: SIGLAKE_AGG_SHORT_REPAIR
+              value: {{ ternary "1" "0" .Values.compactor.shortAggregateRepair | quote }}
             # QW-7: execute pending delete tasks in the idle cycle. Default-on,
             # and rendered either way: the binary defaults ON since 2026-09-11,
             # so `deleteTasks: false` has to say "0" out loud — omitting the

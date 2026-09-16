@@ -78,22 +78,56 @@ COPY third_party ./third_party
 # its own BUILD_CACHE_ID: the target cache is not keyed by feature set, so
 # reusing `default` would leave feature-built objects in the cache the release
 # image links from.
+#
+# PROFILING=1 builds the image a profiling round needs, and is the escape hatch
+# the paragraph above refers to. Three differences from the shipped build, all
+# of them reasons this cannot just be the default:
+#   1. `--features profiling` on the two binaries that own a jemalloc global
+#      allocator, which adds the `/debug/pprof/*` routes to the metrics port
+#      (`crates/siglake-core/src/profiling.rs`) and rebuilds jemalloc with
+#      `--enable-prof`. Those routes still need SIGLAKE_PPROF_ENABLED=1 to arm.
+#   2. `--cfg tokio_unstable`, without which tokio-metrics reports only its
+#      always-available subset (no poll counts, no queue depths), and
+#      `-C force-frame-pointers=yes`, because a release build omits frame
+#      pointers and pprof's SIGPROF handler then walks a call graph that
+#      collapses to `0x1` -- the exact failure recorded in the header of the
+#      harness's siglake-benchmarks/bench/wedge_capture.sh.
+#   3. NO `strip --strip-debug`, restoring the file:line resolution and
+#      DWARF-unwound call graphs the shipped build gives up. This is what makes
+#      the image ~1.95 GB again, so it stays opt-in.
+# It composes with SIGLAKE_CARGO_FEATURES above rather than replacing it, and
+# like that knob it must be paired with its own BUILD_CACHE_ID: the RUSTFLAGS
+# below invalidate every object, and the cache mount is shared across builds on
+# a host (see the 2026-08-16 note). CI uses a separate buildx cache scope for
+# the same reason -- .github/workflows/profiling-image.yml.
 ARG BUILD_CACHE_ID=default
 ARG SIGLAKE_GIT_SHA
 ARG SIGLAKE_CARGO_FEATURES=""
+ARG PROFILING=0
 ENV SIGLAKE_GIT_SHA=${SIGLAKE_GIT_SHA}
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target,id=siglake-target-${BUILD_CACHE_ID} \
-    cargo build --release --locked \
-        ${SIGLAKE_CARGO_FEATURES:+--features ${SIGLAKE_CARGO_FEATURES}} \
+    set -eu; \
+    FEATURES="${SIGLAKE_CARGO_FEATURES}"; \
+    if [ "${PROFILING}" = "1" ]; then \
+        FEATURES="${FEATURES:+${FEATURES},}siglake-cli/profiling,siglake-query-server/profiling"; \
+        export RUSTFLAGS="${RUSTFLAGS:-} --cfg tokio_unstable -C force-frame-pointers=yes"; \
+    fi; \
+    cargo build --release --locked ${FEATURES:+--features ${FEATURES}} \
         --bin siglake --bin siglake-query-server --bin siglake-loadgen \
  && cp target/release/siglake /usr/local/bin/siglake \
  && cp target/release/siglake-query-server /usr/local/bin/siglake-query-server \
  && cp target/release/siglake-loadgen /usr/local/bin/siglake-loadgen \
- && strip --strip-debug \
-        /usr/local/bin/siglake \
-        /usr/local/bin/siglake-query-server \
-        /usr/local/bin/siglake-loadgen
+ && if [ "${PROFILING}" = "1" ]; then \
+        echo "PROFILING=1: keeping DWARF (image will be ~1.95 GB)"; \
+        readelf -S /usr/local/bin/siglake-query-server | grep -q '\.debug_info' \
+          || { echo "FATAL: PROFILING=1 but .debug_info is absent" >&2; exit 1; }; \
+    else \
+        strip --strip-debug \
+            /usr/local/bin/siglake \
+            /usr/local/bin/siglake-query-server \
+            /usr/local/bin/siglake-loadgen; \
+    fi
 
 # ---------- runtime ----------
 FROM debian:trixie-slim AS runtime
@@ -105,6 +139,24 @@ RUN apt-get update \
         hostname \
         curl \
  && rm -rf /var/lib/apt/lists/*
+
+# ARGs do not cross stages, so PROFILING is re-declared for the runtime stage.
+# `/debug/pprof/heap` returns a jeprof-format text dump that needs the binary to
+# symbolize; a profiling image keeps its DWARF, so `jeprof` in the image can
+# resolve a dump on the node instead of waiting to pull the 1.95 GB image back
+# down. `libjemalloc-dev` is what ships /usr/bin/jeprof on Debian, and jeprof is
+# a Perl script. Some version skew against the jemalloc `tikv-jemalloc-sys`
+# builds is expected and harmless: jeprof parses the dump and shells out to
+# binutils. Adds nothing to a default build.
+ARG PROFILING=0
+RUN if [ "${PROFILING}" = "1" ]; then \
+        apt-get update \
+     && apt-get install -y --no-install-recommends \
+            perl \
+            binutils \
+            libjemalloc-dev \
+     && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Non-root user. UID 65532 matches Google Distroless's `nonroot` so we're
 # compatible with downstream pod-security policies that expect that UID.

@@ -1,6 +1,6 @@
 //! Mpsc-fed per-tenant writer with bounded backpressure.
 //!
-//! The default HEC ingest path serializes writes to each tenant's WAL
+//! The default OTLP/bulk ingest path serializes writes to each tenant's WAL
 //! by holding `Arc<Mutex<WalWriter>>` across an `.append_events`
 //! call. That's correct under any single-replica load (the mutex is
 //! held for one fsync), but two things bite at scale:
@@ -17,7 +17,7 @@
 //! bounded mpsc channel + a dedicated writer task that drains it in
 //! order. HTTP handlers `try_send` into the channel and immediately
 //! return — they never block on disk. When the channel is full the
-//! handler gets [`SubmitOutcome::Backpressure`], which the HEC
+//! handler gets [`SubmitOutcome::Backpressure`], which the ingest
 //! handlers surface as `503 Service Unavailable` + `Retry-After`.
 //! The writer task batches whatever's queued in one
 //! `WalWriter::append_events` call, amortizing the fsync cost.
@@ -363,7 +363,7 @@ impl Lane {
     }
 }
 
-/// Per-tenant submission outcome. Maps to the HEC handler's HTTP
+/// Per-tenant submission outcome. Maps to the ingest handler's HTTP
 /// status code.
 #[derive(Debug)]
 pub enum SubmitOutcome {
@@ -378,7 +378,7 @@ pub enum SubmitOutcome {
 }
 
 /// Mpsc-fed router. One [`Lane`] per active tenant. Created with
-/// `new()` and used through `submit()` from the HEC handlers.
+/// `new()` and used through `submit()` from the ingest handlers.
 /// Group of shard lanes for one tenant. Round-robin across shards
 /// via the `next` counter.
 struct LaneGroup {

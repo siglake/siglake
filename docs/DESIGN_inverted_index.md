@@ -159,6 +159,57 @@ Three 0.2.0 slices carry those two requirements and the build cost behind them:
 and #4377 builds the postings during the streaming merge so the post-commit
 decode pass disappears. None of them changes a 0.1.0 or 0.1.x default.
 
+#4376's format decision, its prototype codec and its measurements live in
+[`DESIGN_segmented_inverted_index.md`](DESIGN_segmented_inverted_index.md):
+per-row-group postings and dictionary blocks addressed by byte range, with the
+directory and trailer written last so a merge can emit the blob in one forward
+pass. Nothing is wired — the format has its own magic, footer-KV key and Puffin
+blob type, so this reader does not see one. Measured on one 7,340,000-row file
+from the same corpus: 526.0 MiB parsed for the whole-file index against
+474.9 KiB of resident directory, and a rare term answered from 14 range reads
+of 9.8 KiB rather than a 3.27 s whole-file decode. The remaining slices are
+#4560 (codec and fixtures), #4561 (reader integration and bounded partial
+reads) and #4562 (the six-shape comparison that decides #4377).
+
+#### The per-execution policy arm (2026-09-16, #4375)
+
+The same completed 14-file fixture was reopened with an 8 GiB parsed-index
+budget and a 2 GiB blob budget. A third `policy` arm queried the indexed
+warehouse through the per-execution session hint: the four clipped shapes
+declined the whole-file index, while the two unclipped rare scans kept it.
+Nine executions per shape and arm, interleaved, produced:
+
+| shape | OFF p50 | indexed p50 | policy p50 | registered 50G ceiling | policy path |
+|---|---:|---:|---:|---:|---|
+| keyword | 6.0 ms | 24.4 ms | **7.5 ms** | 10 ms | declined |
+| keyword_last25 | 9.4 ms | 13.6 ms | **10.1 ms** | 25 ms | declined |
+| keyword_last5 | 11.3 ms | 50.3 ms | **10.8 ms** | 30 ms | declined |
+| substring_scan | 4.9 ms | 869.2 ms | **5.4 ms** | 10 ms | declined |
+| rare_scan | 1,757.2 ms | 134.8 ms | **126.3 ms** | — | allowed |
+| rare_scan_last25 | 535.2 ms | 38.6 ms | **39.4 ms** | — | allowed |
+| rare_keyword | 532.5 ms | 45.8 ms | **531.2 ms** | — | declined |
+
+The ceiling column states the AWS guardrails registered in the benchmark
+project at `docs/predictions/50g-regression.json`; it is separate from the
+four-file local OFF medians above. All four clipped policy results are below
+those guardrails, but this local-filesystem run does not qualify an AWS result.
+
+All 14 parsed indexes occupied 7,830,305,508 bytes with no eviction. The
+unclipped `rare_scan` policy arm recorded 126 parsed-cache hits and returned all
+1,028 matches, row for row equal to the OFF arm. The isolated policy test also
+checks each clipped `match_terms`, `LIKE`, and time-window plan for
+`text_index:[declined:clipped_limit]`, then proves that the indexed warehouse
+performs neither a lookup nor a decode and returns the same rows as its
+unindexed control. The query-server request test covers the implicit
+newest-first rewrite separately: it takes the existing `ordered_limit` refusal
+and records one reason rather than both.
+
+`rare_keyword` states the conservative rule's cost. Its limit clips the scan,
+so the policy declines it even though this fixture's 0.001%-density term would
+have won from a resident index. Document frequency lives inside the whole-file
+index being declined; choosing by it would first pay the load this policy
+avoids. #4376's segmented reader is the planned way to reduce that cost.
+
 Reproduce the deployed pass with the command above plus
 `SIGLAKE_REBUILD_AB_FILES=14`, `SIGLAKE_REBUILD_AB_ROWS_PER_FILE=7340000`,
 `SIGLAKE_REBUILD_AB_RARE_EVERY=100000`,
@@ -180,13 +231,20 @@ remains a no-op.
 
 `Reader::inverted_index_row_selection` (in the vendored `arrow/reader.rs`):
 for a normalizable `raw LIKE '%substr%'`, loads the blob, `rows_containing`, and
-builds a `RowSelection` of the candidate rows by **reusing
-`build_deletes_row_selection` with the complement** as the delete set — so the
-file-physical ordinals map onto the surviving row groups with no bespoke
-arithmetic. The selection is a superset (the engine's `FilterExec` re-checks the
-exact `LIKE` above the scan), intersected with any predicate/delete selection.
+builds a `RowSelection` over the matching file-physical ordinals — one run per
+matching stretch within each selected row group (`row_selection_runs`), in the
+same shape `build_deletes_row_selection` produces for a delete vector, which is
+what this reused with the complement until #3896. The selection is a superset
+(the engine's `FilterExec` re-checks the exact `LIKE` above the scan),
+intersected with any predicate/delete selection.
 Metric `siglake_iceberg_inverted_index_used_total` + selected/file-row
-histograms. Differential storage test
+histograms, and — since #3969 —
+`siglake_iceberg_text_index_startup_seconds{stage,storage}` around the four
+sections of that work separately (`permit_wait`, `blob_fetch`, `decode`,
+`selection`), with the parsed-index cache's lookup outcomes and eviction
+reasons beside it. One total could not say which section a regression was in:
+run #73 measured about 30 ns per file row before a first batch and the round's
+artifacts could not attribute it. Differential storage test
 (`tests/inverted_index.rs`) asserts ground-truth-correct counts across
 answerable substrings, fragments, absent terms, a delimiter-bearing fallback,
 and a dimensional-predicate intersection, with many row groups + bloom-skip

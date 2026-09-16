@@ -49,6 +49,8 @@ use siglake_core::index_config::{FieldType, IndexConfig};
 use siglake_core::{events_to_record_batch, Event};
 use siglake_storage::iceberg::{DeleteTaskState, IcebergContext};
 
+use crate::fixture_clock::fixture_base;
+
 fn logs_index(index_id: &str) -> IndexConfig {
     let mut config = IndexConfig::builtin_events();
     config.index_id = index_id.to_string();
@@ -297,7 +299,7 @@ async fn a_persisted_non_read_predicate_is_refused_with_nothing_written() {
     let config = logs_index("logs");
     let ice = IcebergContext::open(&warehouse).await.unwrap();
     ice.create_index(&config).await.unwrap();
-    let now = Utc::now();
+    let now = fixture_base();
     append_index_events(
         &ice,
         &config,
@@ -384,7 +386,7 @@ async fn an_ordinary_delete_task_still_rewrites_the_file() {
     let config = logs_index("logs");
     let ice = IcebergContext::open(&warehouse).await.unwrap();
     ice.create_index(&config).await.unwrap();
-    let now = Utc::now();
+    let now = fixture_base();
     append_index_events(
         &ice,
         &config,

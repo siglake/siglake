@@ -35,7 +35,7 @@ fn events_for(file: usize, n: usize, base_ns: i64) -> Vec<Event> {
             ));
             // Disjoint, ascending time ranges per file so the merged output is
             // contiguous per file and row-group boundaries are predictable —
-            // and spaced in NANOSECONDS so all 1.2M rows land in ONE day
+            // and spaced in NANOSECONDS so every row lands in ONE day
             // partition. At one row per second they spread over 14 days, the
             // table partitions by day, and every file came out at exactly
             // 86,400 rows: one row group each, and the test could not see what
@@ -47,40 +47,33 @@ fn events_for(file: usize, n: usize, base_ns: i64) -> Vec<Event> {
         .collect()
 }
 
-fn find_parquet(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                out.extend(find_parquet(&p));
-            } else if p.extension().and_then(|s| s.to_str()) == Some("parquet") {
-                out.push(p);
-            }
-        }
-    }
-    out
-}
-
 #[tokio::test]
 async fn rowgroup_blooms_stay_aligned_when_a_row_group_spans_many_batches() {
-    // The merge path sizes row groups with `target_row_group_rows(None)`, which
-    // is a FIXED 1,048,576 rows — `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` only
-    // applies where a sample batch is available, which the merge writer has no
-    // reason to have. So the fixture has to clear 1,048,576 rows for real; there
-    // is no knob that makes this cheaper, and the assertion below refuses to
-    // pass if it ever stops clearing it.
+    // The merge path used to size row groups with `target_row_group_rows(None)`
+    // — a FIXED 1,048,576 rows, with `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES`
+    // reaching only the flush path, which has a sample batch. So this fixture
+    // had to clear 1,048,576 rows for real. Since #4754 the merge writer is
+    // built on its first output batch and divides the byte target by that
+    // batch's row size, so a 1-byte target clamps the row group to
+    // `MIN_ROW_GROUP_ROWS` (131,072) and the fixture only has to clear THAT.
+    // The assertion below still refuses to pass if it ever stops producing more
+    // than one row group.
     // Force the STREAMING merge path, which is the one that buffers batches and
-    // forms row groups itself. Left to itself a 1.2M-row bin takes the in-RAM
-    // path, whose writer sizes row groups from a sample batch and produced a
-    // single row group covering everything — so the fixture silently tested a
-    // path this change does not touch.
+    // forms row groups itself. Left to itself this bin takes the in-RAM path,
+    // whose writer sizes row groups from a sample batch and produced a single
+    // row group covering everything — so the fixture silently tested a path
+    // this change does not touch.
     const FILES: usize = 4;
-    const PER_FILE: usize = 300_000; // 1.2M total => 2 row groups (1,048,576 + 151,424)
+    const PER_FILE: usize = 50_000; // 200k total => 2 row groups (131,072 + 68,928)
 
     let tmp = tempfile::tempdir().unwrap();
     let warehouse = tmp.path().join("warehouse");
-    let ice = IcebergContext::open(&warehouse).await.unwrap();
+    let ice = IcebergContext::open(&warehouse).await.unwrap().with_tuning(
+        siglake_storage::iceberg::IcebergTuning {
+            target_row_group_bytes: Some(1),
+            ..Default::default()
+        },
+    );
 
     let base_ns = Utc
         .timestamp_opt(1_767_225_600, 0)
@@ -108,13 +101,24 @@ async fn rowgroup_blooms_stay_aligned_when_a_row_group_spans_many_batches() {
         .await
         .expect("slice-streaming recluster");
 
-    // The merged output: the largest parquet file in the warehouse.
-    let mut files = find_parquet(&warehouse);
-    files.sort_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0));
-    let merged = files.last().expect("a merged parquet file");
+    // The merged output: the table's live file after the merge, not the biggest
+    // object on disk — the inputs are still there, GC-pending, and picking by
+    // size guesses at which one the merge wrote.
+    let after = ice.live_data_files(ident).await.unwrap();
+    assert_eq!(
+        after.len(),
+        1,
+        "the bin must merge into one file for the row groups below to be of one \
+         output: {:?}",
+        after
+            .iter()
+            .map(|f| (f.file_path().to_string(), f.record_count()))
+            .collect::<Vec<_>>()
+    );
+    let merged = std::path::PathBuf::from(after[0].file_path().trim_start_matches("file://"));
 
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    let bytes = std::fs::read(merged).unwrap();
+    let bytes = std::fs::read(&merged).unwrap();
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes)).unwrap();
     let meta = builder.metadata().clone();
     let rg_count = meta.num_row_groups();
@@ -152,7 +156,7 @@ async fn rowgroup_blooms_stay_aligned_when_a_row_group_spans_many_batches() {
     let mut rejections = 0;
     for (rg, bloom) in blooms.iter().enumerate() {
         let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(
-            std::fs::read(merged).unwrap(),
+            std::fs::read(&merged).unwrap(),
         ))
         .unwrap()
         .with_row_groups(vec![rg])

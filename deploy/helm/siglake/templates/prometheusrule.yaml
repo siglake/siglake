@@ -225,17 +225,52 @@ spec:
           labels:
             severity: warning
           annotations:
-            summary: Automatic group-count repair for {{ "{{ $labels.table }}" }} was {{ "{{ $labels.outcome }}" }}
+            summary: Automatic group-count repair for {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }} was {{ "{{ $labels.outcome }}" }}
             description: >-
               {{ "{{ $value }}" }} automatic group-count rebuild(s) for table
-              {{ "{{ $labels.table }}" }} were {{ "{{ $labels.outcome }}" }} in
+              {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }}
+              were {{ "{{ $labels.outcome }}" }} in
               the last hour. Answers stay exact, but GROUP BY on the affected
               columns remains on the per-file path. The compactor retries a
               failed rebuild while its durable marker remains; as the operator
               fallback, run
-              `siglake rebuild-group-counts --table {{ "{{ $labels.table }}" }}`,
+              `siglake rebuild-group-counts --namespace {{ "{{ $labels.iceberg_namespace }}" }} --table {{ "{{ $labels.table }}" }}`,
               which recomputes the aggregate from the committed files and is
               safe to re-run.
+        - alert: SiglakeGroupCountAggregateShort
+          # The condition the lost-delta alert above cannot see: an aggregate
+          # short of `record_count` with every contribution accounted for, and
+          # no marker anywhere to say so. A commit killed between its commit and
+          # its delta PUT leaves this, and so does a table whose aggregate prefix
+          # started empty mid-life (#2919's upgrade). It does not heal: a later
+          # delta adds its own rows and the total stays short, so `GROUP BY` on
+          # the named columns pays the exact per-file tiers until something
+          # rebuilds.
+          #
+          # `repaired` is deliberately absent from the selector. The compactor's
+          # automatic repair is opt-in (`compactor.shortAggregateRepair`), so
+          # `detected` is what a default install records — one series per
+          # census, every 15 minutes, until an operator acts — and `incomplete`
+          # means the rebuild ran and the column still cannot cover the table.
+          expr: increase(siglake_group_count_short_aggregates_total{outcome=~"detected|incomplete|failed"}[1h]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: The group-count aggregate for {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }} is short of its row count
+            description: >-
+              The maintenance census found table
+              {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }}
+              short of `total-records` in at least one maintained column, with
+              every commit's contribution present — outcome
+              {{ "{{ $labels.outcome }}" }}. Answers stay exact; `GROUP BY` on
+              those columns runs on the exact per-file path and will keep doing
+              so, because no later commit closes the gap. The compactor's WARN
+              line names the columns. Run
+              `siglake rebuild-group-counts --namespace {{ "{{ $labels.iceberg_namespace }}" }} --table {{ "{{ $labels.table }}" }}`,
+              which recomputes the aggregate from the committed files and is
+              safe to re-run, or set `compactor.shortAggregateRepair=true` to
+              have the maintenance pass rebuild one table per census.
         - alert: SiglakeSideAggregatePublicationLost
           # The inline aggregate object's counterpart to the delta loss above,
           # and the reason it pages on the failure counter rather than on a
@@ -250,18 +285,64 @@ spec:
           labels:
             severity: warning
           annotations:
-            summary: A side-aggregate publication for {{ "{{ $labels.table }}" }} was lost
+            summary: A side-aggregate publication for {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }} was lost
             description: >-
               {{ "{{ $value }}" }} side-aggregate publication(s) for table
-              {{ "{{ $labels.table }}" }} on {{ "{{ $labels.pod }}" }} spent all
+              {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }}
+              on {{ "{{ $labels.pod }}" }} spent all
               four attempts in the last hour. Each one was carrying a commit's
               group counts and time aggregates that exist nowhere else, so the
               object now stays short of total-records and no later commit closes
               the gap. Check warehouse object-store health and credential
               refresh (IMDS) on that pod; run
-              `siglake rebuild-group-counts --table {{ "{{ $labels.table }}" }}`
+              `siglake rebuild-group-counts --namespace {{ "{{ $labels.iceberg_namespace }}" }} --table {{ "{{ $labels.table }}" }}`
               to restore the group-count aggregate, which does not rebuild the
               inline time aggregates.
+        - alert: SiglakeInlineCoverageUnproven
+          # The end state every remaining orphaning trigger shares (#3800): a
+          # delete task, retention, a foreign overwrite, or one of the two
+          # residual windows at expiry leaves an object the read guard refuses.
+          # The counts are not wrong, they are unprovable — and after a row
+          # removal they are not even correct on their own terms — so every
+          # windowed GROUP BY, date histogram and windowed count on the table
+          # answers EXACTLY from the per-file tiers. Nothing on the commit path
+          # republishes a chain the reader cannot walk, so the state persists
+          # for the life of the table until an operator rebuilds. Critical, not
+          # warning: it does not heal, and it is a manual repair.
+          #
+          # Two arms. The gauge is a last observation, set by the compactor's
+          # census for every table it visits, so a repaired table clears at the
+          # next pass — but a pod that STOPS censusing (it lost the `agg_fold`
+          # lease, `SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS` was set to
+          # `off`, its watchdog cut the stage) keeps serving its last reading,
+          # which for a `> 0` rule is stale-BAD. The census counter beside it is
+          # the liveness arm: a pod that stopped looking leaves the alert within
+          # the hour instead of paging from a reading nobody is refreshing.
+          #
+          # `for: 30m` is two consecutive censuses at the default cadence. The
+          # census already excludes a publication in flight (it reports those as
+          # `Publishing` and writes 0); the window is what keeps a slow
+          # multi-commit republication from paging on one sample.
+          expr: >-
+            siglake_inline_coverage_unproven > 0
+            and on (namespace, pod)
+            increase(siglake_inline_coverage_census_total[1h]) > 0
+          for: 30m
+          labels:
+            severity: critical
+          annotations:
+            summary: The inline aggregate for {{ "{{ $labels.table }}" }} cannot prove coverage
+            description: >-
+              The maintenance census found that table
+              {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }}
+              has an inline aggregate object whose coverage edge does not reach
+              the current snapshot, with no publication in flight. ANSWERS STAY
+              EXACT — the guard refuses the object — but windowed GROUP BY, date
+              histograms and windowed counts run on the per-file tiers and will
+              keep doing so: no commit repairs this. Run
+              `siglake rebuild-time-aggregates --namespace {{ "{{ $labels.iceberg_namespace }}" }} --table {{ "{{ $labels.table }}" }}`,
+              which recomputes the object from the committed files and is safe
+              to re-run. The compactor's WARN line names the same table.
         - alert: SiglakeGroupCountDeltaRetrying
           # The precursor to the alert above. A delta write that succeeds on a
           # retry is fine in isolation — a credential refresh or one slow PUT —
@@ -314,7 +395,10 @@ spec:
               The drain is not keeping up with ingest. Rows are durable but not
               yet queryable, and the WAL volume is filling. Add drain capacity.
         - alert: SiglakeSegmentsQuarantined
-          expr: siglake_catalog_claim_quarantined > 0
+          # Both drains, one alert: the claim table's quarantine and the local
+          # filesystem's `poison/` set-aside (#3143) are the same operator
+          # situation — rows acknowledged, held back, and waiting on a person.
+          expr: siglake_catalog_claim_quarantined > 0 or siglake_compactor_segments_poisoned > 0
           for: 10m
           labels:
             severity: warning
@@ -322,12 +406,16 @@ spec:
             summary: WAL segments have been set aside and will not drain without intervention
             description: >-
               {{ "{{ $value }}" }} segment(s) are quarantined. Their rows are durable and
-              unqueryable. Either the drain failed on them repeatedly — usually an
-              index that does not exist — or a mirrored segment could not be placed in
-              the table its index resolves to now, which is set aside on the first
-              cycle because no retry can change it. The `reason` field on the
+              unqueryable. On the claim path, either the drain failed on them repeatedly
+              — usually an index that does not exist — or a mirrored segment could not be
+              placed in the table its index resolves to now, which is set aside on the
+              first cycle because no retry can change it. The `reason` field on the
               `segment QUARANTINED` log line says which. Resolve, then
-              `requeue_quarantined`.
+              `requeue_quarantined`. On the local filesystem drain, the segment failed to
+              read on every attempt it was given and sits under `<wal>/poison/` with a
+              `.poison.json` note saying why; the `segment SET ASIDE` log line names the
+              file. Fix what made it unreadable, then `siglake wal-requeue --wal
+              <wal-root>`.
         - alert: SiglakeMirrorReconciliationErrors
           # The bounded-page activity counter advances before reconciliation
           # lists the mirror. A listing or registration failure can therefore

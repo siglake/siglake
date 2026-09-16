@@ -209,11 +209,13 @@ pub const INGESTER_ALERTED_COUNTERS: &[AlertedCounter] = &[
 /// Counters the compactor (`siglake compactor`, not `--once`, which serves no
 /// metrics) pre-registers. `siglake_wal_crc_mismatch_total` is here too: the
 /// drain reads sealed segments through the same CRC check as ingest replay.
-/// The two group-count counters are labelled by table (and rebuild outcome)
-/// and are listed for the events table only
-/// (`siglake_storage::iceberg::TABLE_NAME`, held equal by tests there); an
-/// event on an index table is a series this cannot know ahead, and its first
-/// increment stays invisible to `increase()`.
+/// The two group-count counters are labelled by Iceberg namespace and table
+/// (and rebuild outcome) and are listed for the default namespace's events
+/// table only (`siglake_storage::iceberg::NAMESPACE` and `TABLE_NAME`, held
+/// equal by tests there); an event on an index table, in a `tenant_*`
+/// namespace, or under a base namespace moved off the default by
+/// `SIGLAKE_TENANT_NAMESPACE` is a series this cannot know ahead, and its
+/// first increment stays invisible to `increase()`.
 /// `siglake_compactor_mirror_sync_total` is the activity arm of
 /// `SiglakeMirrorReconciliationStalled`: without the series at 0, a compactor
 /// whose very first reconciliation pass never wraps around looks idle to
@@ -247,33 +249,103 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
             &[("stage", "expire")],
             &[("stage", "drain")],
             &[("stage", "agg_fold")],
+            &[("stage", "agg_short_repair")],
+            &[("stage", "inline_coverage_census")],
             &[("stage", "recluster")],
             &[("stage", "delete_tasks")],
         ],
     },
     AlertedCounter {
         name: "siglake_group_count_delta_write_failures_total",
-        series: &[&[("table", "events")]],
+        series: &[&[("iceberg_namespace", "siglake"), ("table", "events")]],
     },
     // #3799: an append's contribution to the inline aggregate object exists
     // nowhere else, so a publication that spends its four attempts leaves the
-    // object short of `total-records` for good. Listed with `events` alone for
-    // the same reason as the delta counter above: an index table's name is
-    // known only at the increment.
+    // object short of `total-records` for good. Listed with the default
+    // namespace's `events` alone for the same reason as the delta counter
+    // above: an index table's name, and a tenant namespace's, are known only
+    // at the increment.
     AlertedCounter {
         name: "siglake_side_aggregate_publish_failures_total",
-        series: &[&[("table", "events")]],
+        series: &[&[("iceberg_namespace", "siglake"), ("table", "events")]],
     },
     AlertedCounter {
         name: "siglake_group_count_auto_rebuilds_total",
         series: &[
-            &[("table", "events"), ("outcome", "success")],
-            &[("table", "events"), ("outcome", "incomplete")],
-            &[("table", "events"), ("outcome", "failed")],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "success"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "incomplete"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "failed"),
+            ],
         ],
+    },
+    // #3000: the maintenance census's verdict on an aggregate that is short of
+    // `record_count` with every contribution accounted for. `detected` is the
+    // default-install series — automatic repair is opt-in — so it has to exist
+    // at 0 from the compactor's first scrape or the first find is invisible to
+    // `increase()`. Listed with the default namespace's `events` alone for the
+    // same reason as the counters above: an index table's name, and a tenant
+    // namespace's, are known only at the increment.
+    AlertedCounter {
+        name: "siglake_group_count_short_aggregates_total",
+        series: &[
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "detected"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "repaired"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "incomplete"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "failed"),
+            ],
+        ],
+    },
+    // #4674: one increment per completed inline-coverage census pass. It is the
+    // liveness arm of `SiglakeInlineCoverageUnproven`, whose other arm is a
+    // last-observation gauge — a pod that stops censusing keeps serving its last
+    // reading, and for a `> 0` alert that is stale-BAD. A fresh compactor that
+    // finds an unproven table on its FIRST pass has to pass the liveness arm on
+    // that same pass, so the series must exist at 0 before it: without this
+    // entry the very first census would raise the gauge and the `increase()`
+    // beside it would still read nothing.
+    AlertedCounter {
+        name: "siglake_inline_coverage_census_total",
+        series: UNLABELLED,
     },
     AlertedCounter {
         name: "siglake_compactor_mirror_sync_total",
+        series: UNLABELLED,
+    },
+    // #3143: the local drain setting a segment aside under `poison/`. The
+    // level an operator alerts on is the gauge beside it (gauges are not
+    // pre-registered), and this is the event arm a dashboard reads to tell one
+    // long-held segment apart from a directory that keeps producing them. Its
+    // only label is the tenant, which is known at the increment and cannot be
+    // listed here — the unlabelled series exists so the counter is on a fresh
+    // compactor's first scrape at 0, as `siglake_compactor_cycles_total` is.
+    AlertedCounter {
+        name: "siglake_compactor_segments_poisoned_total",
         series: UNLABELLED,
     },
     AlertedCounter {
@@ -308,6 +380,9 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
     // Query responses stay non-blocking when the best-effort audit path is
     // saturated or stopped. Pre-register every bounded reason so the first
     // whole-row refusal is visible to the dashboard's increase() reader.
+    // `append_deadline` is the one that is charged per row of an abandoned
+    // batch rather than per refused submit: the storage append outlived its
+    // service deadline and those rows are gone (#3438).
     AlertedCounter {
         name: "siglake_query_audit_dropped_total",
         series: &[
@@ -316,6 +391,7 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
             &[("reason", "byte_limit")],
             &[("reason", "channel_full")],
             &[("reason", "worker_shutdown")],
+            &[("reason", "append_deadline")],
         ],
     },
     // Recovery refusing a start means no query was executed; recovery rejecting
@@ -475,6 +551,38 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
         name: "siglake_wal_partial_tail_dropped_total",
         series: UNLABELLED,
     },
+    // #3969's "Text-index startup" panels. Neither counter is alerted on; they
+    // are here for the other half of the pre-registration argument — a panel
+    // over a series that does not exist yet renders "No data", which reads the
+    // same as a healthy pod. A query tier serving no text query yet has to
+    // chart a flat zero, because the reading these panels exist for is a
+    // CHANGE: run #78's `keyword_and_label` plan held 4.1 GB of parsed index
+    // against the 1 GiB default and 91 of 156 partitions started cold, which
+    // shows up here as an eviction rate that climbs away from zero.
+    //
+    // Both are recorded from the Iceberg fork with variable label values
+    // (`iceberg::arrow`'s `PARSED_INDEX_CACHE_OUTCOMES`,
+    // `TEXT_INDEX_STORAGE_FORMS` and `PARSED_INDEX_CACHE_DROP_REASONS`), so
+    // check-chart.py sees dynamic sites and cannot hold this catalog to them;
+    // `text_index_startup_series_are_preregistered` in siglake-storage does,
+    // against those exported vocabularies.
+    AlertedCounter {
+        name: "siglake_iceberg_parsed_index_cache_lookups_total",
+        series: &[
+            &[("outcome", "hit"), ("storage", "puffin")],
+            &[("outcome", "miss"), ("storage", "puffin")],
+            &[("outcome", "hit"), ("storage", "footer_kv")],
+            &[("outcome", "miss"), ("storage", "footer_kv")],
+        ],
+    },
+    AlertedCounter {
+        name: "siglake_iceberg_parsed_index_cache_evictions_total",
+        series: &[
+            &[("reason", "byte_bound")],
+            &[("reason", "entry_bound")],
+            &[("reason", "oversized")],
+        ],
+    },
 ];
 
 /// Counters an `increase()` alert reads that no binary can pre-register,
@@ -520,6 +628,14 @@ pub async fn init(bind: SocketAddr) -> Result<tokio::task::JoinHandle<()>> {
         .route("/metrics", get(metrics_handler))
         .route("/", get(root_handler))
         .with_state(handle);
+
+    // Profiling rides this server rather than the public API port because this
+    // is the one HTTP surface every role shares, so a single mount covers the
+    // ingester, the compactor and the query tier. Under a default build the
+    // module does not exist; under a profiling build it still returns an empty
+    // router unless `SIGLAKE_PPROF_ENABLED=1`. See `crate::profiling`.
+    #[cfg(feature = "profiling")]
+    let app = app.merge(crate::profiling::routes());
 
     Ok(tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {

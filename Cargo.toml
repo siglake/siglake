@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/siglake/siglake"
@@ -32,6 +32,15 @@ repository = "https://github.com/siglake/siglake"
 # path must not make; each entry's reason names the operation to use instead.
 [workspace.lints.clippy]
 await_holding_lock = "deny"
+
+# `tokio_unstable` is set via RUSTFLAGS by the `PROFILING=1` arm of
+# `deploy/Dockerfile`, not by any Cargo feature, so rustc's `unexpected_cfgs`
+# check has no way to learn it exists. Declaring it here keeps
+# `crates/siglake-core/src/profiling.rs` warning-clean in BOTH builds: the
+# profiling endpoint reports the richer tokio-metrics counters when the flag is
+# set and the always-available subset when it is not.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [workspace.dependencies]
 # Async / utilities
@@ -129,6 +138,27 @@ siglake-query-server = { path = "crates/siglake-query-server" }
 # Metrics
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
+
+# Profiling. Reached only through siglake-core's OFF-BY-DEFAULT `profiling`
+# feature, so none of this is in a shipped build; see
+# `crates/siglake-core/src/profiling.rs` and the `PROFILING=1` arm of
+# `deploy/Dockerfile`.
+#
+# `pprof` default features are dropped deliberately: `default = ["cpp"]` only
+# turns on symbolic-demangle's C++ demangler, and every symbol we sample is
+# Rust. `frame-pointer` picks frame-pointer unwinding over backtrace-rs inside
+# the SIGPROF handler, which is why the profiling build also passes
+# `-C force-frame-pointers=yes` -- a release build omits them otherwise, and
+# that is exactly the collapsed-to-`0x1` call graph
+# `siglake-benchmarks/bench/wedge_capture.sh` was written to work around. The
+# `flamegraph` feature (and its `inferno` dep) is NOT enabled: the handler
+# returns pprof protobuf and `pprof -http` renders the flame graph itself.
+pprof = { version = "0.15", default-features = false, features = ["protobuf-codec", "frame-pointer"] }
+# Version-locked to the `tikv-jemallocator` the two binaries already declare a
+# global allocator with; the ctl crate talks to that same embedded jemalloc.
+tikv-jemalloc-ctl = { version = "0.7.0", features = ["profiling"] }
+# `default = ["rt"]`, which is the RuntimeMonitor we want.
+tokio-metrics = "0.5"
 
 # Loadgen
 hdrhistogram = "7"

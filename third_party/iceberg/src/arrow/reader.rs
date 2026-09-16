@@ -2398,10 +2398,16 @@ impl ArrowReader {
             // scan fans out across many files (the round-76 OOM note on
             // `file_might_match_prune_spec`). The permit covers the blob fetch
             // and the decode, nothing else.
+            let waited = std::time::Instant::now();
             let _permit = Self::index_load_semaphore()
                 .acquire()
                 .await
                 .expect("index-load semaphore is never closed");
+            record_text_index_stage(
+                TEXT_INDEX_STAGE_PERMIT_WAIT,
+                TEXT_INDEX_STORAGE_PUFFIN,
+                waited.elapsed(),
+            );
             // Another task may have decoded this blob while we waited.
             if !cache_bypass && let Some(index) = parsed_index_cache_get(&key) {
                 return Ok(Some(index));
@@ -2409,9 +2415,15 @@ impl ArrowReader {
             if !cache_bypass && let Some(bytes) = puffin_blob_cache_get(path, offset) {
                 return Ok(Self::decode_and_cache_index(key, bytes.as_ref(), cache_bypass));
             }
+            let fetched = std::time::Instant::now();
             let input = file_io.new_input(path)?;
             let reader = PuffinReader::new(input);
             let blob = reader.blob(&blob_metadata).await?;
+            record_text_index_stage(
+                TEXT_INDEX_STAGE_BLOB_FETCH,
+                TEXT_INDEX_STORAGE_PUFFIN,
+                fetched.elapsed(),
+            );
             if !cache_bypass {
                 puffin_blob_cache_put(path, offset, blob.data());
             }
@@ -2429,7 +2441,10 @@ impl ArrowReader {
         cache_bypass: bool,
     ) -> Option<Arc<siglake_index::InvertedIndex>> {
         INVERTED_INDEX_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        record_parsed_index_lookup(PARSED_INDEX_CACHE_MISS, key.storage());
+        let decoded = std::time::Instant::now();
         let index = Arc::new(siglake_index::InvertedIndex::from_bytes(bytes)?);
+        record_text_index_stage(TEXT_INDEX_STAGE_DECODE, key.storage(), decoded.elapsed());
         if !cache_bypass {
             parsed_index_cache_put(key, Arc::clone(&index));
         }
@@ -2470,16 +2485,32 @@ impl ArrowReader {
             }
             // Same bound as the Puffin decode below — a footer-KV index is
             // parsed from memory, but into the same hundreds of MB.
+            let waited = std::time::Instant::now();
             let _permit = Self::index_load_semaphore()
                 .acquire()
                 .await
                 .expect("index-load semaphore is never closed");
+            record_text_index_stage(
+                TEXT_INDEX_STAGE_PERMIT_WAIT,
+                TEXT_INDEX_STORAGE_FOOTER_KV,
+                waited.elapsed(),
+            );
             // Another task may have decoded this footer while we waited.
             if !cache_bypass && let Some(index) = parsed_index_cache_get(&key) {
                 return Ok(Some((index, "footer_kv")));
             }
+            // No blob-fetch stage here: the footer bytes came with the Parquet
+            // metadata this scan already read, which is why only the Puffin
+            // path can be slow at `blob_fetch`.
+            let decoded = std::time::Instant::now();
             if let Some(index) = siglake_index::InvertedIndex::from_hex(hex) {
+                record_text_index_stage(
+                    TEXT_INDEX_STAGE_DECODE,
+                    TEXT_INDEX_STORAGE_FOOTER_KV,
+                    decoded.elapsed(),
+                );
                 INVERTED_INDEX_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                record_parsed_index_lookup(PARSED_INDEX_CACHE_MISS, TEXT_INDEX_STORAGE_FOOTER_KV);
                 let index = Arc::new(index);
                 if !cache_bypass {
                     parsed_index_cache_put(key, Arc::clone(&index));
@@ -2638,6 +2669,13 @@ impl ArrowReader {
         let Some((index, storage)) = index_and_storage else {
             return Ok(None);
         };
+        // Everything below is the `selection` stage: the term lookups plus the
+        // run construction, timed together because the round reads them as one
+        // post-load cost (#3969). It is charged whether the index was decoded
+        // for this query or handed over warm, which is what makes the stage
+        // histogram's `selection` count the number of index-pruned files while
+        // `decode` counts only the cold ones.
+        let selected = std::time::Instant::now();
         let source = Self::prune_source_label(spec);
         let mut matching: Option<Vec<u32>> = None;
 
@@ -2697,11 +2735,13 @@ impl ArrowReader {
             "storage" => storage
         )
         .record(total_rows as f64);
-        Ok(Some(Self::index_matches_row_selection(
+        let selection = Self::index_matches_row_selection(
             metadata.row_groups(),
             selected_row_groups,
             &matching,
-        )))
+        );
+        record_text_index_stage(TEXT_INDEX_STAGE_SELECTION, storage, selected.elapsed());
+        Ok(Some(selection))
     }
 
     /// Select exactly `matching` (ascending, file-physical row ordinals) across
@@ -4167,8 +4207,10 @@ const DEFAULT_PUFFIN_BLOB_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// query memory pool — which subtracts the caches it knows about — had never
 /// heard of them. The cgroup read lives in `siglake_storage`, which depends on
 /// this crate, so the limit cannot be read from here. It arrives instead the way
-/// the byte-range object cache's budget does: the query server resolves it once
-/// at startup (`siglake_storage::resolve_text_index_cache_config`) and calls
+/// the byte-range object cache's budget does: the host process resolves it once
+/// at startup (`siglake_storage::resolve_text_index_cache_config`, or
+/// `resolve_role_cache_config` for the `siglake` binary's roles, where a
+/// maintenance process budgets zero because it reads no text index) and calls
 /// [`set_text_index_cache_max_bytes`] before the warehouse opens.
 static CONFIGURED_PARSED_INDEX_CACHE_MAX_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(TEXT_INDEX_CACHE_UNCONFIGURED);
@@ -4348,6 +4390,89 @@ impl ParsedIndexKey {
             Self::Puffin { path, .. } | Self::FooterKv { path, .. } => path,
         }
     }
+
+    /// The `storage` label the index metrics carry, so a cache outcome can be
+    /// read against the stage timings of the same form.
+    fn storage(&self) -> &'static str {
+        match self {
+            Self::Puffin { .. } => TEXT_INDEX_STORAGE_PUFFIN,
+            Self::FooterKv { .. } => TEXT_INDEX_STORAGE_FOOTER_KV,
+        }
+    }
+}
+
+pub(crate) const TEXT_INDEX_STORAGE_PUFFIN: &str = "puffin";
+pub(crate) const TEXT_INDEX_STORAGE_FOOTER_KV: &str = "footer_kv";
+
+/// Both `storage` values every index metric carries: a Puffin blob beside the
+/// data file, or the index inlined in the Parquet footer.
+pub const TEXT_INDEX_STORAGE_FORMS: &[&str] =
+    &[TEXT_INDEX_STORAGE_PUFFIN, TEXT_INDEX_STORAGE_FOOTER_KV];
+
+/// The `stage` values of `siglake_iceberg_text_index_startup_seconds` — the
+/// four sections a text query's per-file startup splits into, which run #73
+/// could not tell apart from the round's artifacts (#3969). A regression is
+/// queueing (`permit_wait`), object storage (`blob_fetch`), deserialization
+/// (`decode`) or the postings-and-runs work above the index (`selection`), and
+/// no single total can say which. The vocabulary is closed: these four and
+/// `storage` ("puffin" / "footer_kv") are every label value emitted, eight
+/// series at most.
+const TEXT_INDEX_STAGE_PERMIT_WAIT: &str = "permit_wait";
+const TEXT_INDEX_STAGE_BLOB_FETCH: &str = "blob_fetch";
+const TEXT_INDEX_STAGE_DECODE: &str = "decode";
+const TEXT_INDEX_STAGE_SELECTION: &str = "selection";
+
+/// Every `stage` value the reader records, for the tests that hold the
+/// dashboard's grouping to this vocabulary.
+pub const TEXT_INDEX_STARTUP_STAGES: &[&str] = &[
+    TEXT_INDEX_STAGE_PERMIT_WAIT,
+    TEXT_INDEX_STAGE_BLOB_FETCH,
+    TEXT_INDEX_STAGE_DECODE,
+    TEXT_INDEX_STAGE_SELECTION,
+];
+
+/// One section of a text query's per-file index startup. `_seconds`, so
+/// siglake-core's exporter gives it real histogram buckets and a round can
+/// take a fleet-wide quantile per stage.
+fn record_text_index_stage(stage: &'static str, storage: &'static str, took: std::time::Duration) {
+    metrics::histogram!(
+        "siglake_iceberg_text_index_startup_seconds",
+        "stage" => stage,
+        "storage" => storage
+    )
+    .record(took.as_secs_f64());
+}
+
+const PARSED_INDEX_CACHE_HIT: &str = "hit";
+const PARSED_INDEX_CACHE_MISS: &str = "miss";
+
+/// Both `outcome` values of `siglake_iceberg_parsed_index_cache_lookups_total`.
+pub const PARSED_INDEX_CACHE_OUTCOMES: &[&str] = &[PARSED_INDEX_CACHE_HIT, PARSED_INDEX_CACHE_MISS];
+
+const PARSED_INDEX_DROP_BYTE_BOUND: &str = "byte_bound";
+const PARSED_INDEX_DROP_ENTRY_BOUND: &str = "entry_bound";
+const PARSED_INDEX_DROP_OVERSIZED: &str = "oversized";
+
+/// Every `reason` value of
+/// `siglake_iceberg_parsed_index_cache_evictions_total`.
+pub const PARSED_INDEX_CACHE_DROP_REASONS: &[&str] = &[
+    PARSED_INDEX_DROP_BYTE_BOUND,
+    PARSED_INDEX_DROP_ENTRY_BOUND,
+    PARSED_INDEX_DROP_OVERSIZED,
+];
+
+/// Whether a query found the parsed index already decoded. Exactly one outcome
+/// is recorded per acquisition that finds an index at all: the repeated
+/// lookups a single cold load makes (before the permit, after it, and against
+/// the blob-bytes cache) are one `miss`, recorded where the decode happens, so
+/// the two arms sum to acquisitions and the hit ratio reads directly.
+fn record_parsed_index_lookup(outcome: &'static str, storage: &'static str) {
+    metrics::counter!(
+        "siglake_iceberg_parsed_index_cache_lookups_total",
+        "outcome" => outcome,
+        "storage" => storage
+    )
+    .increment(1);
 }
 
 /// Parsed per-file inverted indexes, keyed by the write-once identity of the
@@ -4411,6 +4536,7 @@ impl ParsedIndexCacheInner {
         // then be evicted itself: leave it to decode per query.
         if size > max_bytes {
             self.oversized_skips += 1;
+            record_parsed_index_dropped(PARSED_INDEX_DROP_OVERSIZED);
             return;
         }
         if self.map.contains_key(&key) {
@@ -4424,15 +4550,41 @@ impl ParsedIndexCacheInner {
         self.order.push_back(key);
         self.bytes += size;
         while self.order.len() > max_entries || self.bytes > max_bytes {
+            // Which bound bit, so a round can tell a working set over the byte
+            // budget (raise `SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES`) from a plan
+            // over the entry bound (raise
+            // `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_ENTRIES`).
+            let reason = if self.order.len() > max_entries {
+                PARSED_INDEX_DROP_ENTRY_BOUND
+            } else {
+                PARSED_INDEX_DROP_BYTE_BOUND
+            };
             let Some(evicted) = self.order.pop_front() else {
                 break;
             };
             if let Some(entry) = self.map.remove(&evicted) {
                 self.bytes -= entry.size;
                 self.evictions += 1;
+                record_parsed_index_dropped(reason);
             }
         }
+        // Resident against budget, published wherever the bounds are enforced.
+        // Hit and miss rates alone cannot say whether a miss is a first read or
+        // an entry this cache decoded and threw away (#3969).
+        metrics::gauge!("siglake_iceberg_parsed_index_cache_bytes").set(self.bytes as f64);
+        metrics::gauge!("siglake_iceberg_parsed_index_cache_max_bytes").set(max_bytes as f64);
     }
+}
+
+/// A parsed index the cache would not keep: evicted by one of the two bounds,
+/// or never admitted because it alone exceeds the byte budget. `reason` is one
+/// of three literals — the dashboard groups by it rather than matching on it.
+fn record_parsed_index_dropped(reason: &'static str) {
+    metrics::counter!(
+        "siglake_iceberg_parsed_index_cache_evictions_total",
+        "reason" => reason
+    )
+    .increment(1);
 }
 
 static PARSED_INDEX_CACHE: std::sync::OnceLock<std::sync::Mutex<ParsedIndexCacheInner>> =
@@ -4551,6 +4703,7 @@ fn parsed_index_cache_get(key: &ParsedIndexKey) -> Option<Arc<siglake_index::Inv
     let hit = parsed_index_cache().lock().unwrap().get(key);
     if hit.is_some() {
         INVERTED_INDEX_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        record_parsed_index_lookup(PARSED_INDEX_CACHE_HIT, key.storage());
     }
     hit
 }

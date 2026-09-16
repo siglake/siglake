@@ -202,7 +202,7 @@ async fn load_command(
 
     for line in reader.lines() {
         let line = line.context("read events.ndjson")?;
-        // Transform each HEC-shaped corpus line into an OTLP resourceLogs entry.
+        // Transform each corpus line into an OTLP resourceLogs entry.
         batch.push(line_to_resource_log(&line)?);
         if batch.len() >= batch_size {
             let body = otlp_envelope(&batch);
@@ -321,8 +321,8 @@ async fn send_batch(
     Ok(())
 }
 
-/// One HEC-shaped corpus line (`events.ndjson` is a neutral on-disk format;
-/// the wire protocol is OTLP).
+/// One corpus line (`events.ndjson` is a neutral on-disk format; the wire
+/// protocol is OTLP).
 #[derive(serde::Deserialize)]
 struct CorpusLine {
     #[serde(default)]

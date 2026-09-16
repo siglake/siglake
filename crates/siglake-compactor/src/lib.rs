@@ -24,6 +24,14 @@
 //! optimistic concurrency means we never split a logical batch across
 //! commits.
 //!
+//! One exception, and only for step 2 (#3143): a segment whose bytes do not
+//! decode fails every batch it is ever claimed into, so after
+//! `SIGLAKE_COMPACTOR_POISON_ATTEMPTS` consecutive read failures the drain
+//! moves that file — and only that file — to `{wal}/poison/` with a note
+//! saying why. Its batch siblings are released and commit on the next cycle.
+//! Nothing there is deleted or automatically requeued; an operator moves the
+//! file back into `sealed/` once its cause is fixed.
+//!
 //! Phase 4 will introduce target-row-group-byte sizing (multi-file
 //! splitting when a batch exceeds ~256 MB compressed) and a partition
 //! spec (`day(timestamp)`) so multi-day batches fan out correctly.
@@ -45,12 +53,13 @@ use siglake_storage::consumed_proof::{ConsumedProofEntry, ConsumedProofRead, Rec
 use siglake_storage::iceberg::{
     AppendIncarnationMismatch, DeleteTaskState, IcebergContext, LevelPolicy, LeveledPassOptions,
     NonTerminalDeleteTask, NonTerminalDeleteTaskObservation, ObservedDeleteTaskClaim,
-    ProofMaintenanceIncarnationMismatch, ReclusterPolicy,
+    ProofMaintenanceIncarnationMismatch, ReclusterPolicy, ShortAggregateOutcome,
 };
 use siglake_wal::{
-    claim_segment, finish_segment, list_index_dirs, list_orphaned, list_sealed, list_tenant_dirs,
-    list_visible, read_segment, read_segment_from_bytes, recover_orphaned_processing,
-    release_segment, sweep_committed_coordinated,
+    claim_segment, finish_segment, list_index_dirs, list_orphaned, list_poisoned, list_sealed,
+    list_tenant_dirs, list_visible, quarantine_poison_segment, read_segment,
+    read_segment_from_bytes, recover_orphaned_processing, release_segment,
+    sweep_committed_coordinated,
 };
 
 /// How long to retain `committed/` segments before sweep deletes them.
@@ -70,6 +79,18 @@ pub const CONSUMER_STALE_AFTER: Duration = Duration::from_secs(300);
 /// the corresponding limit.
 pub const DEFAULT_FS_MAX_SEGMENTS: usize = 64;
 pub const DEFAULT_FS_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Consecutive failed reads a local segment gets before the drain sets it
+/// aside under `poison/` — see [`poison_attempts`].
+pub const DEFAULT_POISON_ATTEMPTS: u32 = 3;
+/// #4651: claim attempts one drain pass will spend on one segment before
+/// leaving it in `sealed/` for the next cycle. Not a knob: the setting an
+/// operator has for how many times a segment is tried is
+/// `SIGLAKE_COMPACTOR_POISON_ATTEMPTS`, which counts across cycles and decides
+/// whether the segment is set aside for good. This bound only stops one pass
+/// from spending its whole cycle budget re-claiming a set that keeps failing,
+/// and it has to be at least 2 for the same-cycle retry a transient commit
+/// error gets (`a_transient_commit_error_is_retried_in_the_same_cycle`).
+const MAX_PASS_CLAIM_ATTEMPTS: u32 = 3;
 
 #[derive(Clone, Copy)]
 struct FsBatchConfig {
@@ -98,22 +119,48 @@ struct CommitOutcome {
 /// last one visited — often a small, quiet index — describing the tenant and
 /// hiding whatever was queued ahead of it.
 ///
-/// Each visited directory calls [`Self::observe`], including the ones the
+/// Each visited directory calls [`Self::observe_dir`], including the ones the
 /// sweep skips and the ones that are empty, and the caller publishes once at
 /// the end. An observation that is cut short publishes nothing: a partial
 /// total reads as a drop in backlog, which is the one reading an autoscaler
 /// must not be given on no evidence.
+///
+/// `siglake_compactor_segments_poisoned{tenant}` rides along (#3143): it is
+/// per-tenant, summed over the same directories, and clobberable in exactly
+/// the same way, so it is counted and published here rather than `set` by each
+/// directory in turn.
 #[derive(Default)]
 struct SealedBacklog {
     by_tenant: BTreeMap<String, usize>,
+    poisoned_by_tenant: BTreeMap<String, usize>,
 }
 
 impl SealedBacklog {
-    /// Add one directory's sealed count to its tenant's total. Zero still
-    /// registers the label, so a tenant that drains to empty reports zero
-    /// instead of keeping its last non-zero reading.
-    fn observe(&mut self, tenant_label: &str, sealed: usize) {
+    /// Add one directory's sealed count, and the segments set aside under its
+    /// `poison/`, to its tenant's totals. Zero still registers the label, so a
+    /// tenant that drains to empty reports zero instead of keeping its last
+    /// non-zero reading.
+    ///
+    /// A `poison/` that cannot be listed counts zero for this sweep: the
+    /// reading is an operator's cue, and the drain has better ways to report a
+    /// directory it cannot read than to refuse the backlog gauge over it.
+    fn observe_dir(&mut self, tenant_label: &str, dir: &Path, sealed: usize) {
         *self.by_tenant.entry(tenant_label.to_string()).or_default() += sealed;
+        let poisoned = list_poisoned(dir).map(|v| v.len()).unwrap_or(0);
+        *self
+            .poisoned_by_tenant
+            .entry(tenant_label.to_string())
+            .or_default() += poisoned;
+    }
+
+    /// Add segments this sweep set aside itself. The directory listing that
+    /// opened the cycle predates them, and a level an operator alerts on
+    /// should not wait for the next sweep to move.
+    fn observe_poisoned(&mut self, tenant_label: &str, poisoned: usize) {
+        *self
+            .poisoned_by_tenant
+            .entry(tenant_label.to_string())
+            .or_default() += poisoned;
     }
 
     /// Publish one reading per tenant label seen this sweep, plus zero for
@@ -126,6 +173,11 @@ impl SealedBacklog {
                 "tenant" => tenant.clone()
             )
             .set(0.0);
+            metrics::gauge!(
+                "siglake_compactor_segments_poisoned",
+                "tenant" => tenant.clone()
+            )
+            .set(0.0);
         }
         for (tenant, sealed) in &self.by_tenant {
             metrics::gauge!(
@@ -133,6 +185,11 @@ impl SealedBacklog {
                 "tenant" => tenant.clone()
             )
             .set(*sealed as f64);
+            metrics::gauge!(
+                "siglake_compactor_segments_poisoned",
+                "tenant" => tenant.clone()
+            )
+            .set(self.poisoned_by_tenant.get(tenant).copied().unwrap_or(0) as f64);
         }
         *previously_published = published_this_sweep;
     }
@@ -530,6 +587,24 @@ pub struct Compactor {
     commit_batch: Option<CommitBatchPolicy>,
     drain_concurrency: Option<usize>,
     drain_cycle_budget: Option<Duration>,
+    /// See [`Self::with_poison_attempts`]; `None` reads the environment.
+    poison_attempts: Option<u32>,
+    /// #3143: consecutive read failures charged to each local segment, by file
+    /// name. A name is unique across the whole WAL (uuidv7-derived, minted by
+    /// the writer), so one map covers every tenant and index directory.
+    ///
+    /// Entries appear only for a segment a drain could not read, and leave on
+    /// its next successful commit or on its set-aside, so the map is bounded
+    /// by the failing part of the backlog. Shared across clones; emptied by a
+    /// restart, which costs a poisoned segment one more round of attempts and
+    /// cannot lose its bytes.
+    segment_read_failures: Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    /// #4674: the `(iceberg namespace, table)` readings the previous complete
+    /// inline-coverage census published. Shared across clones for the reason
+    /// `published_fs_backlog_tenants` is: a series is never removed from a live
+    /// process, so an index dropped while its object was unprovable would page
+    /// until a restart unless a later pass explicitly zeroes it.
+    published_inline_coverage: Arc<std::sync::Mutex<BTreeSet<(String, String)>>>,
     /// See [`Self::with_verified_owner_for_test`].
     verified_owner_for_test: Option<String>,
     /// See [`Self::with_transient_fs_commit_failures_for_test`].
@@ -561,9 +636,12 @@ impl Compactor {
             delete_tasks_enabled: false,
             delete_task_stall_logged: Default::default(),
             published_fs_backlog_tenants: Default::default(),
+            published_inline_coverage: Default::default(),
             commit_batch: None,
             drain_concurrency: None,
             drain_cycle_budget: None,
+            poison_attempts: None,
+            segment_read_failures: Default::default(),
             verified_owner_for_test: None,
             transient_fs_commit_failures_for_test: None,
         };
@@ -597,6 +675,18 @@ impl Compactor {
     /// failure scenarios without changing the process environment.
     pub fn with_drain_cycle_budget(mut self, budget: Duration) -> Self {
         self.drain_cycle_budget = Some(budget.max(Duration::from_millis(100)));
+        self
+    }
+
+    /// Pin how many consecutive failed reads a local segment gets before the
+    /// drain sets it aside under `poison/`, bypassing
+    /// `SIGLAKE_COMPACTOR_POISON_ATTEMPTS`. `0` disables the set-aside.
+    ///
+    /// Same use as [`Self::with_drain_concurrency`]: a caller that wants a
+    /// different containment budget — or a test driving the set-aside — sets
+    /// it here rather than in the process environment.
+    pub fn with_poison_attempts(mut self, attempts: u32) -> Self {
+        self.poison_attempts = Some(attempts);
         self
     }
 
@@ -791,6 +881,115 @@ impl Compactor {
             );
         }
         Ok(())
+    }
+
+    /// #3143: charge a failed drain batch to the individual segments that
+    /// could not be read, and set aside the ones that have now failed
+    /// [`poison_attempts`] consecutive reads. Returns what stays in the batch,
+    /// for the caller to release back to `sealed/`, and how many segments this
+    /// call set aside.
+    ///
+    /// A failure that names no segment — a catalog conflict, an append
+    /// refusal, a store timeout — charges nothing and the whole batch is
+    /// released, exactly as before. So does a segment that simply shared a
+    /// batch with an unreadable one.
+    ///
+    /// A set-aside that itself fails leaves the segment in the batch: it goes
+    /// back to `sealed/` and the next cycle tries again, which is the
+    /// pre-#3143 behaviour and the right one while the volume is the thing
+    /// that is unwell.
+    fn set_aside_unreadable(
+        &self,
+        claimed: Vec<PathBuf>,
+        err: &anyhow::Error,
+        tenant_label: &str,
+    ) -> (Vec<PathBuf>, usize) {
+        let Some(unreadable) = err.downcast_ref::<UnreadableSegments>() else {
+            return (claimed, 0);
+        };
+        let limit = self.poison_attempts.unwrap_or_else(poison_attempts);
+        let mut set_aside: HashSet<PathBuf> = HashSet::new();
+        for segment in &unreadable.segments {
+            let Some(name) = segment.path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let attempts = {
+                let mut ledger = self
+                    .segment_read_failures
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let entry = ledger.entry(name.to_string()).or_insert(0);
+                *entry = entry.saturating_add(1);
+                *entry
+            };
+            if limit == 0 || attempts < limit {
+                tracing::warn!(
+                    path = %segment.path.display(),
+                    error = %segment.reason,
+                    attempts,
+                    limit,
+                    tenant = tenant_label,
+                    "could not read a claimed WAL segment; releasing it for retry"
+                );
+                continue;
+            }
+            match quarantine_poison_segment(&segment.path, &segment.reason, attempts) {
+                Ok(dest) => {
+                    tracing::error!(
+                        path = %segment.path.display(),
+                        held = %dest.display(),
+                        error = %segment.reason,
+                        attempts,
+                        tenant = tenant_label,
+                        "segment SET ASIDE: it failed to read on every attempt, so it is held \
+                         under poison/ instead of failing every batch it joins. Its rows are \
+                         durable and unqueryable; move the file back into sealed/ to retry it"
+                    );
+                    metrics::counter!(
+                        "siglake_compactor_segments_poisoned_total",
+                        "tenant" => tenant_label.to_string()
+                    )
+                    .increment(1);
+                    self.segment_read_failures
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(name);
+                    set_aside.insert(segment.path.clone());
+                }
+                Err(e) => tracing::error!(
+                    path = %segment.path.display(),
+                    error = %e,
+                    tenant = tenant_label,
+                    "could not set an unreadable segment aside; releasing it for retry"
+                ),
+            }
+        }
+        if set_aside.is_empty() {
+            return (claimed, 0);
+        }
+        let kept = claimed
+            .into_iter()
+            .filter(|c| !set_aside.contains(c))
+            .collect();
+        (kept, set_aside.len())
+    }
+
+    /// Drop a committed batch's read-failure charges. The ledger counts
+    /// CONSECUTIVE failures, so a segment that reads once is owed nothing for
+    /// the cycles it failed before.
+    fn forget_read_failures(&self, claimed: &[PathBuf]) {
+        let mut ledger = self
+            .segment_read_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if ledger.is_empty() {
+            return;
+        }
+        for path in claimed {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                ledger.remove(name);
+            }
+        }
     }
 
     /// Requeue abandoned claims, but only those PROVEN not to have committed.
@@ -1643,38 +1842,7 @@ impl Compactor {
     /// failure costs read amplification until the next cycle and nothing else.
     /// Inert unless the cardinality knob is raised above the inline ceiling.
     async fn run_agg_fold_once(&self, min_backlog: usize) {
-        let mut contexts = vec![self.ice.clone()];
-        match self.ice.catalog().list_namespaces(None).await {
-            Ok(namespaces) => {
-                for namespace in namespaces {
-                    let Some(name) = namespace
-                        .as_ref()
-                        .as_slice()
-                        .first()
-                        .filter(|_| namespace.len() == 1)
-                    else {
-                        continue;
-                    };
-                    if !name.starts_with("tenant_") || &namespace == self.ice.namespace() {
-                        continue;
-                    }
-                    match self.ice.for_namespace(name).await {
-                        Ok(ice) => contexts.push(Arc::new(ice)),
-                        Err(e) => tracing::warn!(
-                            namespace = %namespace,
-                            error = ?e,
-                            "group-count delta fold could not open tenant namespace"
-                        ),
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(
-                error = ?e,
-                "group-count delta fold could not enumerate tenant namespaces; folding the base namespace only"
-            ),
-        }
-
-        for ice in contexts {
+        for ice in self.aggregate_contexts("group-count delta fold").await {
             let namespace = ice.namespace().to_string();
             match ice.fold_group_count_deltas(min_backlog).await {
                 Ok(outcomes) => {
@@ -1702,6 +1870,147 @@ impl Compactor {
                 ),
             }
         }
+    }
+
+    /// Every namespace whose aggregate artifacts this compactor maintains: the
+    /// base one plus each `tenant_*` namespace the catalog reports.
+    ///
+    /// `stage` names the caller in the warning, because a namespace that cannot
+    /// be opened costs a different thing to each sweep and an operator reading
+    /// the line needs to know which one skipped it.
+    async fn aggregate_contexts(&self, stage: &str) -> Vec<Arc<IcebergContext>> {
+        let mut contexts = vec![self.ice.clone()];
+        match self.ice.catalog().list_namespaces(None).await {
+            Ok(namespaces) => {
+                for namespace in namespaces {
+                    let Some(name) = namespace
+                        .as_ref()
+                        .as_slice()
+                        .first()
+                        .filter(|_| namespace.len() == 1)
+                    else {
+                        continue;
+                    };
+                    if !name.starts_with("tenant_") || &namespace == self.ice.namespace() {
+                        continue;
+                    }
+                    match self.ice.for_namespace(name).await {
+                        Ok(ice) => contexts.push(Arc::new(ice)),
+                        Err(e) => tracing::warn!(
+                            namespace = %namespace,
+                            error = ?e,
+                            stage,
+                            "aggregate maintenance could not open tenant namespace"
+                        ),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = ?e,
+                stage,
+                "aggregate maintenance could not enumerate tenant namespaces; \
+                 visiting the base namespace only"
+            ),
+        }
+        contexts
+    }
+
+    /// Census every maintained table's group-count aggregate for a shortfall
+    /// `record_count` says is real, and rebuild at most `max_repairs` of them
+    /// (#3000).
+    ///
+    /// Its own step for the same reason the fold is: only a durable lost-delta
+    /// marker used to make anything rebuild, so an aggregate that is merely
+    /// short — a table upgraded across #2919, a commit killed between its
+    /// commit and its delta PUT — stayed short for the life of the table and
+    /// every `GROUP BY` on it paid the exact per-file tiers. The census is
+    /// cheap; the rebuild is one Tier-2 query per maintained column, which is
+    /// why it is budgeted per pass and off unless asked for.
+    ///
+    /// `max_repairs == 0` is the census alone: the counter and the log still
+    /// name the table, nothing reads the files. The budget is global across
+    /// namespaces, so a fleet-wide first enable cannot turn one pass into a
+    /// whole-warehouse Tier-2 scan.
+    async fn run_agg_short_repair_once(&self, max_repairs: usize) {
+        let mut budget = max_repairs;
+        for ice in self.aggregate_contexts("short group-count repair").await {
+            let namespace = ice.namespace().to_string();
+            match ice.repair_short_group_count_aggregates(budget).await {
+                Ok(outcomes) => {
+                    for (table, outcome) in outcomes {
+                        if matches!(
+                            outcome,
+                            ShortAggregateOutcome::Repaired { .. } | ShortAggregateOutcome::Failed
+                        ) {
+                            budget = budget.saturating_sub(1);
+                        }
+                        tracing::debug!(
+                            namespace,
+                            table,
+                            outcome = ?outcome,
+                            "short group-count aggregate census"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    namespace,
+                    error = ?e,
+                    "short group-count aggregate census failed"
+                ),
+            }
+        }
+    }
+
+    /// Name every maintained table whose inline aggregate object cannot prove
+    /// coverage of its current snapshot (#4674), across every namespace this
+    /// compactor maintains.
+    ///
+    /// Read-only and metadata-only: one HEAD and one GET of
+    /// `siglake-aggregates.json` per table, no rebuild. The rebuild is an
+    /// operator's `siglake rebuild-time-aggregates`, and automating it is
+    /// #4675 — so unlike the short-aggregate pass beside it, this one has no
+    /// budget to spend and nothing to opt into.
+    ///
+    /// A table the pass no longer reaches has its reading zeroed. The gauge is
+    /// per `(iceberg namespace, table)` and a series is never removed from a
+    /// live process, so an index dropped while its object was unprovable would
+    /// otherwise page until a restart.
+    ///
+    /// The pass counter is the alert's liveness arm. `siglake_inline_coverage_unproven`
+    /// is a last-observation gauge: a pod that stops censusing — it lost the
+    /// `agg_fold` lease, the census was switched off, the watchdog cut it —
+    /// keeps serving its last reading forever, and for a `> 0` alert that is
+    /// stale-BAD, a page for a table somebody else already repaired.
+    /// `SiglakeInlineCoverageUnproven` pairs the gauge with
+    /// `increase(siglake_inline_coverage_census_total[1h]) > 0` on the same pod,
+    /// so a pod that stopped looking drops out of the alert instead of paging
+    /// from a stale reading.
+    async fn run_inline_coverage_census_once(&self) {
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        for ice in self.aggregate_contexts("inline-coverage census").await {
+            let namespace = ice.namespace().to_string();
+            for (table, outcome) in ice.census_inline_coverage().await {
+                tracing::debug!(
+                    namespace,
+                    table,
+                    outcome = ?outcome,
+                    "inline-coverage census"
+                );
+                seen.insert((namespace.clone(), table));
+            }
+        }
+        // A namespace this pass could not open is missing from `seen` entirely,
+        // and zeroing its tables would read as "repaired" when the truth is
+        // "unvisited". `aggregate_contexts` warns and skips such a namespace,
+        // so hold the previous set when the pass reached nothing at all.
+        if !seen.is_empty() {
+            let mut published = self.published_inline_coverage.lock().unwrap();
+            for (namespace, table) in vanished_inline_coverage(&published, &seen) {
+                siglake_storage::iceberg::report_inline_coverage(&namespace, &table, false);
+            }
+            *published = seen;
+        }
+        metrics::counter!("siglake_inline_coverage_census_total").increment(1);
     }
 
     /// Run a single snapshot-metadata expiry pass over the events table,
@@ -1915,7 +2224,7 @@ impl Compactor {
             // zero, not an absence of one. Without it a deployment whose only
             // tenant subdir is named something other than `default` would keep
             // exporting whatever the legacy root last held.
-            backlog.observe("default", 0);
+            backlog.observe_dir("default", &self.wal_dir, 0);
             // Same toggle as above, seen from retention's side: a deployment
             // that drained at the top level and then moved to tenant subdirs
             // leaves a `committed/` tail here that no later cycle would reach,
@@ -1942,7 +2251,7 @@ impl Compactor {
                 // quarantined — disposition may requeue them for commit.
                 let orphaned = list_orphaned(&index_dir).map(|v| v.len()).unwrap_or(0);
                 if pending.is_empty() && orphaned == 0 {
-                    backlog.observe(&tenant, 0);
+                    backlog.observe_dir(&tenant, &index_dir, 0);
                     // Skipping the drain must not skip retention: an index that
                     // stops receiving writes still has a `committed/` tail from
                     // its last drain, and this branch is the only one it will
@@ -1966,7 +2275,7 @@ impl Compactor {
                     // segments are waiting, and every later cycle stops here
                     // too, so leaving them out of the tenant's total is how a
                     // stuck index becomes invisible to the HPA.
-                    backlog.observe(&tenant, pending.len());
+                    backlog.observe_dir(&tenant, &index_dir, pending.len());
                     // The fifth exit, and the one the sweep-on-every-cycle
                     // change missed. Lower stakes than the other four — this
                     // path has pending work and means an index that cannot be
@@ -2007,7 +2316,7 @@ impl Compactor {
                         // `sealed/`. What the sweep KEPT is the backlog the
                         // next cycle drains.
                         let kept = list_sealed(&index_dir).map(|v| v.len()).unwrap_or(0);
-                        backlog.observe(&tenant, kept);
+                        backlog.observe_dir(&tenant, &index_dir, kept);
                         self.sweep_retention_at(&index_dir, &tenant);
                         continue;
                     }
@@ -2327,7 +2636,7 @@ impl Compactor {
             tenant_label,
             target.index_label(),
         );
-        backlog.observe(tenant_label, sealed.len());
+        backlog.observe_dir(tenant_label, dir, sealed.len());
         if sealed.is_empty() {
             metrics::counter!("siglake_compactor_cycles_total",
                 "outcome" => "empty", "tenant" => tenant_label.to_string())
@@ -2379,7 +2688,18 @@ impl Compactor {
         let mut inflight_bytes = 0u64;
         let mut queue: Vec<PathBuf> = sealed;
         let mut offset = 0usize;
-        let mut relisted = false;
+        // #4651: claim attempts this pass has spent on each segment, keyed by
+        // segment NAME. A failed batch goes back to `sealed/` and the re-list
+        // below hands it straight to the next selection, so without a bound the
+        // pass re-claims and re-fails the same set — a rename and two fsyncs
+        // per segment each way — for the whole cycle budget, as fast as the
+        // failure returns. The bound is per segment rather than per batch so
+        // re-grouping a failing segment with fresh siblings cannot buy it
+        // another run of attempts, and it is pass-local: the next cycle starts
+        // every segment at zero, which keeps recovery from a transient cause
+        // one poll away and leaves #3143's `poison/` ledger the only accounting
+        // that survives a cycle.
+        let mut pass_attempts: HashMap<String, u32> = HashMap::new();
         let mut inflight = FuturesUnordered::new();
         let mut committed_segments = 0usize;
         let mut first_err: Option<anyhow::Error> = None;
@@ -2400,6 +2720,17 @@ impl Compactor {
                         tenant_label,
                         target.index_label(),
                     );
+                    // #4651: withhold the segments this pass has already tried
+                    // MAX_PASS_CLAIM_ATTEMPTS times. They stay in `sealed/`
+                    // untouched for the next cycle; everything else in the
+                    // fresh list — healthy siblings, segments sealed while this
+                    // pass ran — is still claimable, so one failing segment
+                    // does not stop the drain. The old length-comparison guard
+                    // here could not fire: this block only runs with the
+                    // snapshot exhausted, so the length it compared against was
+                    // always 0 and an empty fresh list had already broken out.
+                    let mut fresh = fresh;
+                    fresh.retain(|p| !withhold_spent_segment(&mut pass_attempts, p, tenant_label));
                     if fresh.is_empty() {
                         break;
                     }
@@ -2409,14 +2740,8 @@ impl Compactor {
                             break;
                         }
                     }
-                    // Guard against a pathological same-list spin: if nothing was
-                    // claimable from an identical fresh list, stop this pass.
-                    if relisted && fresh.len() == queue.len().saturating_sub(offset) {
-                        break;
-                    }
                     queue = fresh;
                     offset = 0;
-                    relisted = true;
                 }
                 let selected = self
                     .select_sealed_for_cycle(&queue[offset..])
@@ -2445,6 +2770,13 @@ impl Compactor {
                     break;
                 }
                 offset += selected.len();
+                // #4651: charge the attempt before the claim, so a claim that
+                // fails half-way through the batch is counted too — that path
+                // releases its partial claims and resumes topping up, which is
+                // its own spin.
+                for s in &selected {
+                    charge_pass_attempt(&mut pass_attempts, s);
+                }
                 metrics::histogram!(
                     "siglake_compactor_claimed_segments",
                     "tenant" => tenant_label.to_string()
@@ -2550,8 +2882,34 @@ impl Compactor {
                         .increment(outcome.strict_residual_rows);
                     }
                     committed_segments += outcome.segments;
+                    // #3143: a segment that committed owes nothing for the
+                    // cycles it failed before — the ledger counts CONSECUTIVE
+                    // failures, so a storage hiccup never accumulates toward a
+                    // set-aside.
+                    self.forget_read_failures(&claimed);
                 }
                 Err(e) => {
+                    // #3143: charge the failure to the segments it names, and
+                    // set aside the ones that have spent their attempts. What
+                    // comes back is the rest of the batch — healthy siblings,
+                    // and segments with attempts left.
+                    let (claimed, set_aside) = self.set_aside_unreadable(claimed, &e, tenant_label);
+                    backlog.observe_poisoned(tenant_label, set_aside);
+                    // #4651: a set-aside is progress — the segment that failed
+                    // this batch has left `sealed/` for good, so what is left of
+                    // the batch faces a different queue and gets its pass
+                    // attempts back. Without this, #3143's siblings would be
+                    // charged for the batches the poisoned segment took down
+                    // and wait a cycle at the default attempt budget. Every
+                    // forgiveness costs a segment out of the directory, so the
+                    // claims one pass can make stay finite.
+                    if set_aside > 0 {
+                        for c in &claimed {
+                            if let Some(name) = c.file_name().and_then(|n| n.to_str()) {
+                                pass_attempts.remove(name);
+                            }
+                        }
+                    }
                     // A failed batch releases its own segments back to sealed/ for
                     // retry; in-flight siblings are unaffected (their claims are
                     // disjoint and their commits independent).
@@ -2891,6 +3249,55 @@ impl Compactor {
                     tracing::error!("group-count delta fold exceeded the watchdog ceiling");
                     metrics::counter!("siglake_compactor_watchdog_trips_total",
                         "stage" => "agg_fold")
+                    .increment(1);
+                }
+                // The deficit census (#3000), inside the fold's lease and on its
+                // own much slower interval. It runs AFTER the fold so it reads
+                // the freshly folded base: the fold is what turns an outstanding
+                // delta into coverage, and a census in front of it would read
+                // every just-committed table as short.
+                if let Some(interval) = agg_short_scan_interval() {
+                    if agg_short_scan_due(interval) {
+                        let budget = if agg_short_repair_enabled() {
+                            agg_short_repair_max_tables()
+                        } else {
+                            0
+                        };
+                        if bounded(drain_watchdog, self.run_agg_short_repair_once(budget))
+                            .await
+                            .is_none()
+                        {
+                            // Safe to cut: the rebuild publishes in one CAS at
+                            // the end, so a cancelled one leaves the aggregate
+                            // exactly as short as it was and the next pass
+                            // retries. What it costs is the reads it had done.
+                            tracing::error!(
+                                "short group-count aggregate repair exceeded the watchdog ceiling"
+                            );
+                            metrics::counter!("siglake_compactor_watchdog_trips_total",
+                                "stage" => "agg_short_repair")
+                            .increment(1);
+                        }
+                    }
+                }
+                // The inline object's coverage census (#4674), on the same
+                // lease and its own interval. Separate from the census above
+                // because it measures a different thing: that one is an
+                // aggregate with a provable chain and too few rows, this one is
+                // an object with the rows and no chain to prove them through.
+                // After the fold for the same reason too — the fold is what
+                // turns an outstanding delta into coverage.
+                if inline_coverage_scan_interval().is_some_and(inline_coverage_scan_due)
+                    && bounded(drain_watchdog, self.run_inline_coverage_census_once())
+                        .await
+                        .is_none()
+                {
+                    // Safe to cut: the census writes nothing anywhere. What a
+                    // cut costs is the gauges it had not reached yet, which
+                    // keep their previous reading until the next pass.
+                    tracing::error!("inline-coverage census exceeded the watchdog ceiling");
+                    metrics::counter!("siglake_compactor_watchdog_trips_total",
+                        "stage" => "inline_coverage_census")
                     .increment(1);
                 }
             }
@@ -4009,6 +4416,30 @@ fn drain_concurrency() -> usize {
         .unwrap_or(1)
 }
 
+/// How many consecutive cycles may fail to read one local segment before the
+/// drain sets it aside under `poison/` (#3143). `0` disables the set-aside and
+/// restores the retry-forever behaviour.
+///
+/// Three, not one: a read can fail for reasons that are not the segment's (a
+/// storage hiccup, a momentarily unreachable volume), and the cost of a wrong
+/// verdict is an operator requeue. Three cycles of an otherwise healthy drain
+/// is seconds, so a genuinely unreadable segment is contained long before the
+/// backlog behind it matters.
+fn poison_attempts() -> u32 {
+    poison_attempts_from(
+        std::env::var("SIGLAKE_COMPACTOR_POISON_ATTEMPTS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure resolver for [`poison_attempts`]: unset or unparseable is the default.
+fn poison_attempts_from(configured: Option<&str>) -> u32 {
+    configured
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_POISON_ATTEMPTS)
+}
+
 /// This drain's shard of the index keyspace, from
 /// `SIGLAKE_DRAIN_SHARD_INDEX` / `SIGLAKE_DRAIN_SHARD_COUNT`.
 ///
@@ -4095,6 +4526,57 @@ fn admit_batch(
         return true;
     }
     inflight_bytes.saturating_add(batch_bytes) <= budget_bytes
+}
+
+/// #4651: should this pass leave `segment` in `sealed/` because it has already
+/// spent [`MAX_PASS_CLAIM_ATTEMPTS`] claims on it? A path with no readable file
+/// name is never withheld — it cannot be charged either, and refusing to claim
+/// it would strand it.
+///
+/// Says so once per segment per pass, when the pass first declines to re-claim
+/// it rather than when the last attempt was charged: the attempt that reaches
+/// the bound may still be the one that commits. Whether the cause is a one-off
+/// or recurs every cycle is only visible in the rate.
+fn withhold_spent_segment(
+    attempts: &mut HashMap<String, u32>,
+    segment: &Path,
+    tenant_label: &str,
+) -> bool {
+    let Some(name) = segment.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(spent) = attempts.get_mut(name) else {
+        return false;
+    };
+    if *spent < MAX_PASS_CLAIM_ATTEMPTS {
+        return false;
+    }
+    if *spent == MAX_PASS_CLAIM_ATTEMPTS {
+        // One past the bound marks it reported, so a later re-list in the same
+        // pass withholds it silently.
+        *spent += 1;
+        tracing::warn!(
+            path = %segment.display(),
+            attempts = MAX_PASS_CLAIM_ATTEMPTS,
+            tenant = tenant_label,
+            "segment failed every claim this drain pass made on it; it stays in sealed/ for the \
+             next cycle instead of being re-claimed for the rest of this one"
+        );
+        metrics::counter!(
+            "siglake_compactor_pass_claim_attempts_exhausted_total",
+            "tenant" => tenant_label.to_string()
+        )
+        .increment(1);
+    }
+    true
+}
+
+/// Charge one claim attempt to `segment` for the rest of this pass.
+fn charge_pass_attempt(attempts: &mut HashMap<String, u32>, segment: &Path) {
+    if let Some(name) = segment.file_name().and_then(|n| n.to_str()) {
+        let entry = attempts.entry(name.to_string()).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
 }
 
 fn utf8_bloom_columns(config: &IndexConfig) -> Vec<String> {
@@ -4189,6 +4671,44 @@ fn align_batch_to(
     RecordBatch::try_new(target.clone(), cols).context("align WAL batch to the widest schema")
 }
 
+/// One claimed segment the drain could not read, and the error it got.
+#[derive(Debug)]
+struct UnreadableSegment {
+    path: PathBuf,
+    reason: String,
+}
+
+/// A filesystem drain batch that failed because specific segments could not be
+/// read (#3143).
+///
+/// The point of the type is attribution: the drain charges the failure to
+/// exactly these segments, and every other segment in the batch is released
+/// untouched. An error of any other kind is the batch's — a catalog conflict,
+/// a store timeout — and is charged to nothing.
+#[derive(Debug)]
+struct UnreadableSegments {
+    segments: Vec<UnreadableSegment>,
+}
+
+impl std::fmt::Display for UnreadableSegments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} claimed segment(s) could not be read: ",
+            self.segments.len()
+        )?;
+        for (i, s) in self.segments.iter().enumerate() {
+            if i > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "{}: {}", s.path.display(), s.reason)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UnreadableSegments {}
+
 async fn commit_claimed(
     ice: &Arc<IcebergContext>,
     wal_dir: &Path,
@@ -4219,9 +4739,25 @@ async fn commit_claimed(
     let read_results = futures::future::try_join_all(read_futures)
         .await
         .context("joining read_segment tasks")?;
+    // #3143: name the segments that failed rather than returning the first
+    // error for the whole batch. One unreadable file used to fail every batch
+    // it landed in with nothing to say which file it was, and the drain
+    // released the batch and re-claimed the same set forever.
     let mut batches: Vec<RecordBatch> = Vec::new();
-    for r in read_results {
-        batches.extend(r?);
+    let mut unreadable: Vec<UnreadableSegment> = Vec::new();
+    for (path, r) in claimed.iter().zip(read_results) {
+        match r {
+            Ok(b) => batches.extend(b),
+            Err(e) => unreadable.push(UnreadableSegment {
+                path: path.clone(),
+                reason: format!("{e:#}"),
+            }),
+        }
+    }
+    if !unreadable.is_empty() {
+        return Err(anyhow::Error::new(UnreadableSegments {
+            segments: unreadable,
+        }));
     }
     metrics::histogram!("siglake_compactor_segment_read_duration_seconds")
         .record(read_start.elapsed().as_secs_f64());
@@ -4302,7 +4838,14 @@ async fn filesystem_terminal_consumed_proof_entries(
             }
         }
     }
-    for path in list_orphaned(wal_dir).context("listing quarantined WAL segments")? {
+    for path in list_orphaned(wal_dir)
+        .context("listing quarantined WAL segments")?
+        .into_iter()
+        // #3143: a segment set aside under `poison/` is also awaiting
+        // adjudication — an operator can move it back into `sealed/` — so its
+        // proof entry stays for the same reason an orphan's does.
+        .chain(list_poisoned(wal_dir).context("listing WAL segments set aside")?)
+    {
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             protected.insert(name.to_string());
         }
@@ -5142,6 +5685,163 @@ fn agg_fold_due() -> bool {
     due
 }
 
+/// How often to census the maintained tables for a group-count aggregate that
+/// is short of `record_count` (`SIGLAKE_AGG_SHORT_SCAN_INTERVAL_SECS`, default
+/// 900s; `0`, `off`, `disabled` or `never` switch the census off).
+///
+/// Much slower than the fold because it answers a different question. The fold
+/// paces read amplification and a lagging one costs a reader small GETs; the
+/// census looks for a condition that, once true, is true until something
+/// rebuilds — an upgraded prefix, a delta lost with its marker. Fifteen minutes
+/// bounds how long a table serves `GROUP BY` from the per-file tiers before an
+/// operator is told, and keeps one whole-warehouse pass (one folded-wide view
+/// and one inline object per table) off the minute cadence the fold runs at.
+fn agg_short_scan_interval() -> Option<Duration> {
+    agg_short_scan_interval_from(
+        std::env::var("SIGLAKE_AGG_SHORT_SCAN_INTERVAL_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Resolve the census cadence from its raw environment value. Pure so the
+/// disable words and the zero case are tested without `set_var`.
+fn agg_short_scan_interval_from(configured: Option<&str>) -> Option<Duration> {
+    let Some(raw) = configured else {
+        return Some(Duration::from_secs(900));
+    };
+    let raw = raw.trim().to_ascii_lowercase();
+    if matches!(raw.as_str(), "off" | "disabled" | "never" | "0") {
+        return None;
+    }
+    Some(Duration::from_secs(raw.parse().unwrap_or(900).max(1)))
+}
+
+/// Whether a census that finds a real shortfall may REBUILD it
+/// (`SIGLAKE_AGG_SHORT_REPAIR`, default off).
+///
+/// Off by default for the reason the post-rewrite index rebuild is (#4162): the
+/// repair is the most expensive read the system has — one Tier-2 query per
+/// maintained column, and on a table whose columns exceed the per-file footer
+/// cap that is a raw-page decode of every live file — and turning it on for
+/// every install would spend it on the first pass after an upgrade, unasked.
+/// Off, the census still fires `siglake_group_count_short_aggregates_total`
+/// and `SiglakeGroupCountAggregateShort` pages, and
+/// `siglake rebuild-group-counts --table <t>` remains the operator's move.
+fn agg_short_repair_enabled() -> bool {
+    agg_short_repair_enabled_from(std::env::var("SIGLAKE_AGG_SHORT_REPAIR").ok().as_deref())
+}
+
+fn agg_short_repair_enabled_from(configured: Option<&str>) -> bool {
+    matches!(
+        configured.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// How many tables one census pass may rebuild
+/// (`SIGLAKE_AGG_SHORT_REPAIR_MAX_TABLES`, default 1).
+///
+/// The budget is what keeps a first enable from turning into a whole-warehouse
+/// Tier-2 scan: every table upgraded across #2919 is short at once, and a
+/// warehouse's indexes are all short together. One per pass at the default
+/// cadence drains a hundred-table warehouse in a day and leaves the compactor's
+/// other stages their time.
+fn agg_short_repair_max_tables() -> usize {
+    agg_short_repair_max_tables_from(
+        std::env::var("SIGLAKE_AGG_SHORT_REPAIR_MAX_TABLES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn agg_short_repair_max_tables_from(configured: Option<&str>) -> usize {
+    configured
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
+/// How often to census the maintained tables for an inline aggregate object
+/// that cannot prove coverage (`SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS`,
+/// default 900s; `0`, `off`, `disabled` or `never` switch the census off).
+///
+/// Fifteen minutes for the same reason the short-aggregate census runs at it:
+/// the condition, once true, is true until an operator rebuilds, so the cadence
+/// bounds how long a table serves windowed `GROUP BY` from the per-file tiers
+/// before anything says which table it is. It is also what `for:` on
+/// `SiglakeInlineCoverageUnproven` is sized against — 30 minutes is two
+/// consecutive censuses agreeing, which is what makes the alert's condition
+/// "persistent" rather than "seen once".
+///
+/// Default ON: the pass reads table metadata the compactor has cached and one
+/// object per maintained table, with no rebuild behind it. The expensive half
+/// of #3000 — a Tier-2 query per column — has no counterpart here, so there is
+/// nothing to make opt-in.
+fn inline_coverage_scan_interval() -> Option<Duration> {
+    inline_coverage_scan_interval_from(
+        std::env::var("SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Resolve the inline-coverage census cadence from its raw environment value.
+/// Pure so the disable words and the zero case are tested without `set_var`.
+fn inline_coverage_scan_interval_from(configured: Option<&str>) -> Option<Duration> {
+    let Some(raw) = configured else {
+        return Some(Duration::from_secs(900));
+    };
+    let raw = raw.trim().to_ascii_lowercase();
+    if matches!(raw.as_str(), "off" | "disabled" | "never" | "0") {
+        return None;
+    }
+    Some(Duration::from_secs(raw.parse().unwrap_or(900).max(1)))
+}
+
+/// Which `(iceberg namespace, table)` readings a completed inline-coverage
+/// census must zero: the ones the previous pass published and this one no
+/// longer reaches.
+///
+/// A table this pass could not read is still in `seen` — the census returns
+/// `Undetermined` for it rather than dropping it — so only a table that has
+/// genuinely stopped being maintained is cleared. Pure, so the set arithmetic
+/// is tested without a warehouse.
+fn vanished_inline_coverage(
+    published: &BTreeSet<(String, String)>,
+    seen: &BTreeSet<(String, String)>,
+) -> Vec<(String, String)> {
+    published.difference(seen).cloned().collect()
+}
+
+/// Whether the inline-coverage census interval has elapsed since the last pass.
+/// Its own stamp, not the short-aggregate census's: the two run on independent
+/// intervals and sharing one would make whichever ran first suppress the other.
+fn inline_coverage_scan_due(interval: Duration) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+    let last = LAST.get_or_init(|| Mutex::new(None));
+    let mut last = last.lock().unwrap();
+    let due = last.is_none_or(|t| t.elapsed() >= interval);
+    if due {
+        *last = Some(std::time::Instant::now());
+    }
+    due
+}
+
+/// Whether the census interval has elapsed since the last pass.
+fn agg_short_scan_due(interval: Duration) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+    let last = LAST.get_or_init(|| Mutex::new(None));
+    let mut last = last.lock().unwrap();
+    let due = last.is_none_or(|t| t.elapsed() >= interval);
+    if due {
+        *last = Some(std::time::Instant::now());
+    }
+    due
+}
+
 /// Default for `SIGLAKE_CLAIM_RECLAIM_MAX_AGE_SECS`, and what `0` and an
 /// unparseable value resolve to.
 const DEFAULT_CLAIM_RECLAIM_MAX_AGE_SECS: u64 = 900;
@@ -5586,6 +6286,141 @@ mod watchdog_tests {
             Some(Duration::from_secs(1800))
         );
     }
+
+    /// #3143: the attempt budget a local segment gets before the set-aside.
+    #[test]
+    fn poison_attempts_parse_default_and_disable() {
+        assert_eq!(poison_attempts_from(None), DEFAULT_POISON_ATTEMPTS);
+        assert_eq!(poison_attempts_from(Some("1")), 1);
+        assert_eq!(poison_attempts_from(Some(" 5 ")), 5);
+        // 0 keeps the pre-#3143 behaviour: retry forever, set nothing aside.
+        assert_eq!(poison_attempts_from(Some("0")), 0);
+        // Garbage and negatives → default, never an accidental disable.
+        assert_eq!(poison_attempts_from(Some("nope")), DEFAULT_POISON_ATTEMPTS);
+        assert_eq!(poison_attempts_from(Some("-1")), DEFAULT_POISON_ATTEMPTS);
+        assert_eq!(poison_attempts_from(Some("")), DEFAULT_POISON_ATTEMPTS);
+    }
+}
+
+/// #3143: the attempt ledger behind the `poison/` set-aside, driven directly
+/// so each charge is one "cycle". The drain's own pass retries within a cycle,
+/// which makes the same accounting hard to step through end to end.
+#[cfg(test)]
+mod poison_ledger_tests {
+    use super::*;
+    use siglake_core::Event;
+
+    fn seal(dir: &Path, n: usize) -> Vec<PathBuf> {
+        let mut w =
+            siglake_wal::WalWriter::with_thresholds(dir, "ing-1", 1, Duration::from_secs(60))
+                .unwrap();
+        for i in 0..n {
+            w.append_events(&[Event::now(format!("row-{i}"))])
+                .unwrap()
+                .expect("one row seals the segment");
+        }
+        list_sealed(dir).unwrap()
+    }
+
+    fn unreadable(path: &Path) -> anyhow::Error {
+        anyhow::Error::new(UnreadableSegments {
+            segments: vec![UnreadableSegment {
+                path: path.to_path_buf(),
+                reason: "CRC mismatch".to_string(),
+            }],
+        })
+    }
+
+    async fn compactor_at(wal: &Path, warehouse: &Path, attempts: u32) -> Compactor {
+        let ice = Arc::new(IcebergContext::open(warehouse).await.unwrap());
+        Compactor::new(wal, ice).with_poison_attempts(attempts)
+    }
+
+    #[tokio::test]
+    async fn only_the_segments_a_failure_names_are_charged_for_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let sealed = seal(&wal, 2);
+        // The constructor sweeps `processing/`, so the compactor exists before
+        // anything is claimed — as it does in the drain.
+        let c = compactor_at(&wal, &tmp.path().join("warehouse"), 2).await;
+        let claimed: Vec<PathBuf> = sealed.iter().map(|p| claim_segment(p).unwrap()).collect();
+
+        // A failure that names no segment is the batch's, not any file's: a
+        // catalog conflict or a store timeout charges nothing, however often
+        // it repeats.
+        for _ in 0..5 {
+            let (kept, aside) = c.set_aside_unreadable(
+                claimed.clone(),
+                &anyhow::anyhow!("catalog commit conflict"),
+                "default",
+            );
+            assert_eq!(kept, claimed);
+            assert_eq!(aside, 0);
+        }
+
+        // The first charge is under the budget: the whole batch comes back.
+        let (kept, aside) = c.set_aside_unreadable(claimed.clone(), &unreadable(&claimed[0]), "t");
+        assert_eq!(kept, claimed, "nothing is set aside on one failed read");
+        assert_eq!(aside, 0);
+        assert!(list_poisoned(&wal).unwrap().is_empty());
+
+        // The second spends it. Only the named segment moves; its sibling was
+        // never charged for sharing a batch with it.
+        let (kept, aside) = c.set_aside_unreadable(claimed.clone(), &unreadable(&claimed[0]), "t");
+        assert_eq!(aside, 1);
+        assert_eq!(kept, vec![claimed[1].clone()]);
+        let held = list_poisoned(&wal).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].file_name(), claimed[0].file_name());
+        assert_eq!(siglake_wal::read_poison_note(&held[0]).unwrap().attempts, 2);
+
+        // And the sibling still has its full budget.
+        let (_, aside) =
+            c.set_aside_unreadable(vec![claimed[1].clone()], &unreadable(&claimed[1]), "t");
+        assert_eq!(aside, 0, "the sibling starts from zero");
+    }
+
+    #[tokio::test]
+    async fn a_segment_that_commits_owes_nothing_for_its_earlier_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let sealed = seal(&wal, 1);
+        // The constructor sweeps `processing/`, so the compactor exists before
+        // anything is claimed — as it does in the drain.
+        let c = compactor_at(&wal, &tmp.path().join("warehouse"), 2).await;
+        let claimed: Vec<PathBuf> = sealed.iter().map(|p| claim_segment(p).unwrap()).collect();
+
+        let (_, aside) = c.set_aside_unreadable(claimed.clone(), &unreadable(&claimed[0]), "t");
+        assert_eq!(aside, 0);
+        // A cycle later it reads fine and commits.
+        c.forget_read_failures(&claimed);
+        // So the next failure is its first, not its last.
+        let (kept, aside) = c.set_aside_unreadable(claimed.clone(), &unreadable(&claimed[0]), "t");
+        assert_eq!(aside, 0, "the ledger counts CONSECUTIVE failures");
+        assert_eq!(kept, claimed);
+        assert!(list_poisoned(&wal).unwrap().is_empty());
+    }
+
+    /// `0` keeps the pre-#3143 behaviour for a deployment that wants it: the
+    /// segment is released for retry however many times it fails.
+    #[tokio::test]
+    async fn a_zero_budget_never_sets_anything_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let sealed = seal(&wal, 1);
+        // The constructor sweeps `processing/`, so the compactor exists before
+        // anything is claimed — as it does in the drain.
+        let c = compactor_at(&wal, &tmp.path().join("warehouse"), 0).await;
+        let claimed: Vec<PathBuf> = sealed.iter().map(|p| claim_segment(p).unwrap()).collect();
+        for _ in 0..10 {
+            let (kept, aside) =
+                c.set_aside_unreadable(claimed.clone(), &unreadable(&claimed[0]), "t");
+            assert_eq!(kept, claimed);
+            assert_eq!(aside, 0);
+        }
+        assert!(list_poisoned(&wal).unwrap().is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -5685,6 +6520,94 @@ mod agg_fold_tests {
                 .source_label(),
             "tier1_wide",
             "the base compactor must discover and repair the tenant namespace"
+        );
+    }
+
+    /// #3000 through the compactor's own plumbing: a tenant table short with no
+    /// marker anywhere. The storage tests cover the census's rules; what this
+    /// covers is that the pass reaches a `tenant_*` namespace at all, and that
+    /// its budget is what decides whether any file is read.
+    ///
+    /// The cardinality here (8,192 against 8,200 distinct hosts over the two
+    /// commits) also puts a DEMOTED sketch column in the folded base, which is
+    /// the state the repair must survive — see the `None` sketch argument in
+    /// `repair_short_group_count_aggregate`.
+    #[tokio::test]
+    async fn the_short_aggregate_census_reaches_tenant_namespaces_under_its_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("warehouse");
+        let base = Arc::new(IcebergContext::open(&warehouse).await.unwrap().with_tuning(
+            IcebergTuning {
+                table_group_count_cardinality: Some(8_192),
+                result_caches: Some(false),
+                ..Default::default()
+            },
+        ));
+        let tenant = base.for_namespace("tenant_acme").await.unwrap();
+        let commit = |nth: usize| -> Vec<Event> {
+            (0..4_100)
+                .map(|i| {
+                    let mut event = Event::now(format!("row {nth}-{i}"));
+                    event.host = format!("host-{nth}-{i:04}");
+                    event
+                })
+                .collect()
+        };
+        tenant.append_events(&commit(0)).await.unwrap();
+        // No marker: the first commit's contribution simply vanishes, the way a
+        // process killed between its commit and its delta PUT leaves it. The
+        // second commit's delta lands, so nothing outstanding explains the gap.
+        let mut deltas: Vec<_> = walk_files(&warehouse)
+            .into_iter()
+            .filter(|path| {
+                path.to_string_lossy().contains("tenant_acme")
+                    && path.to_string_lossy().contains("siglake-agg-deltas")
+            })
+            .collect();
+        assert_eq!(deltas.len(), 1, "precondition: one commit, one delta");
+        std::fs::remove_file(deltas.pop().unwrap()).unwrap();
+        tenant.append_events(&commit(1)).await.unwrap();
+        tenant
+            .invalidate_cached_table(tenant.events_table_ident())
+            .await;
+        assert_eq!(
+            tenant
+                .grouped_counts_with_summary("events", "host", None, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .source_label(),
+            "materialized",
+            "precondition: short, and no marker to explain it"
+        );
+
+        let compactor = Compactor::new(tmp.path().join("wal"), base);
+        // A census with no budget reports and reads nothing — the default
+        // install, where the counter and the alert are the whole output.
+        compactor.run_agg_short_repair_once(0).await;
+        assert!(
+            !walk_files(&warehouse).iter().any(|path| path
+                .file_name()
+                .is_some_and(|name| name == "siglake-agg-wide.json")),
+            "a census with no repair budget must not write a base object"
+        );
+
+        compactor.run_agg_short_repair_once(1).await;
+        // This handle is a different `IcebergContext` from the one the pass
+        // opened for the namespace, and holds its own memo of the folded base —
+        // as a query pod in another process would.
+        tenant
+            .invalidate_cached_table(tenant.events_table_ident())
+            .await;
+        assert_eq!(
+            tenant
+                .grouped_counts_with_summary("events", "host", None, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .source_label(),
+            "tier1_wide",
+            "with a budget, the tenant namespace's short aggregate is rebuilt"
         );
     }
 }
@@ -6745,6 +7668,139 @@ mod mirror_sync_gate_tests {
         assert_eq!(
             mirror_sync_interval_from(None),
             Some(std::time::Duration::from_secs(60))
+        );
+    }
+}
+
+#[cfg(test)]
+mod agg_short_repair_knob_tests {
+    use super::{
+        agg_short_repair_enabled_from, agg_short_repair_max_tables_from,
+        agg_short_scan_interval_from,
+    };
+    use std::time::Duration;
+
+    /// Unlike the mirror sweep, `0` here IS off: a census on every compactor
+    /// loop would re-read every table's folded base once a second to answer a
+    /// question whose answer changes only when something commits or rebuilds.
+    #[test]
+    fn the_census_cadence_reads_its_disable_words_and_zero() {
+        for word in ["off", "OFF", "disabled", "never", "0", " off "] {
+            assert!(
+                agg_short_scan_interval_from(Some(word)).is_none(),
+                "{word:?} must disable the census"
+            );
+        }
+        assert_eq!(
+            agg_short_scan_interval_from(Some("300")),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            agg_short_scan_interval_from(None),
+            Some(Duration::from_secs(900)),
+            "the default cadence"
+        );
+        assert_eq!(
+            agg_short_scan_interval_from(Some("nonsense")),
+            Some(Duration::from_secs(900)),
+            "an unparseable value falls back to the default rather than to \
+             every loop"
+        );
+    }
+
+    /// The repair is one Tier-2 query per maintained column, so only an
+    /// explicit opt-in may turn it on — anything else leaves the census
+    /// reporting and the operator's rebuild the remedy.
+    #[test]
+    fn only_an_explicit_opt_in_enables_the_repair() {
+        for word in ["1", "true", "TRUE", "yes", "on", " on "] {
+            assert!(
+                agg_short_repair_enabled_from(Some(word)),
+                "{word:?} must enable the repair"
+            );
+        }
+        for word in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(
+                !agg_short_repair_enabled_from(Some(word)),
+                "{word:?} must not enable the repair"
+            );
+        }
+        assert!(!agg_short_repair_enabled_from(None), "default is off");
+    }
+
+    #[test]
+    fn the_per_pass_repair_budget_is_at_least_one_table() {
+        assert_eq!(agg_short_repair_max_tables_from(None), 1);
+        assert_eq!(agg_short_repair_max_tables_from(Some("4")), 4);
+        // 0 would make the interval gate a no-op that silently never repairs;
+        // switching the repair off is what the enable knob is for.
+        assert_eq!(agg_short_repair_max_tables_from(Some("0")), 1);
+        assert_eq!(agg_short_repair_max_tables_from(Some("nonsense")), 1);
+    }
+
+    /// #4674's census reads the same vocabulary. Its default cadence is also
+    /// what `SiglakeInlineCoverageUnproven`'s `for: 30m` is sized against —
+    /// two consecutive passes — so a change here is a change to the alert.
+    #[test]
+    fn the_inline_coverage_cadence_reads_its_disable_words_and_zero() {
+        for word in ["off", "OFF", "disabled", "never", "0", " off "] {
+            assert!(
+                super::inline_coverage_scan_interval_from(Some(word)).is_none(),
+                "{word:?} must disable the census"
+            );
+        }
+        assert_eq!(
+            super::inline_coverage_scan_interval_from(Some("300")),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            super::inline_coverage_scan_interval_from(None),
+            Some(Duration::from_secs(900)),
+            "the default cadence, and half of the alert's 30-minute window"
+        );
+        assert_eq!(
+            super::inline_coverage_scan_interval_from(Some("nonsense")),
+            Some(Duration::from_secs(900))
+        );
+    }
+
+    /// A dropped index must not page until the process restarts: the gauge has
+    /// no delete, so the pass that stops reaching a table has to zero it. A
+    /// table the pass merely could not READ stays in the seen set
+    /// (`InlineCoverageOutcome::Undetermined`) and keeps its reading.
+    #[test]
+    fn a_table_the_census_no_longer_reaches_is_zeroed() {
+        let entry = |ns: &str, t: &str| (ns.to_string(), t.to_string());
+        let published = std::collections::BTreeSet::from([
+            entry("siglake", "events"),
+            entry("siglake", "logs-archive"),
+            entry("tenant_acme", "events"),
+        ]);
+        let seen = std::collections::BTreeSet::from([
+            entry("siglake", "events"),
+            entry("tenant_acme", "events"),
+        ]);
+        assert_eq!(
+            super::vanished_inline_coverage(&published, &seen),
+            vec![entry("siglake", "logs-archive")]
+        );
+        // A table seen for the first time is not something to clear, and a
+        // pass that reaches everything clears nothing.
+        assert!(super::vanished_inline_coverage(&seen, &published).is_empty());
+        assert!(super::vanished_inline_coverage(&published, &published).is_empty());
+    }
+
+    /// The liveness arm of `SiglakeInlineCoverageUnproven`. Without the series
+    /// at 0, the FIRST census on a fresh compactor raises the gauge while the
+    /// `increase()` beside it still reads nothing, and the alert never fires.
+    #[test]
+    fn the_census_pass_counter_is_preregistered() {
+        assert!(
+            siglake_core::metrics::COMPACTOR_ALERTED_COUNTERS
+                .iter()
+                .any(|c| c.name == "siglake_inline_coverage_census_total"
+                    && c.series == siglake_core::metrics::UNLABELLED),
+            "the compactor catalog must create the census counter at 0"
         );
     }
 }

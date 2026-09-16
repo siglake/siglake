@@ -20,18 +20,20 @@ SQL, we remove it entirely, sequenced so nothing breaks:
    convenience).
 3. **Crate** — delete `siglake-spl` and its workspace/dep references.
 
-## 2. HEC → OTel — OTel-only ingest (transport swap first)
+## 2. OTel-only ingest (transport swap first)
 
-OTLP logs (`POST /v1/logs`) is already live but HEC is the hardened primary
-(tenancy keyed off HEC tokens; rate-limit + backpressure router are HEC-fronted).
-We make OTLP the **sole** ingest path:
+OTLP logs (`POST /v1/logs`) is already live, but the HTTP event collector
+compatibility surface is the hardened primary: tenancy is keyed off its tokens
+and the rate-limiter + backpressure router sit in front of it. We make OTLP the
+**sole** ingest path:
 
 - **Tenancy: `X-Scope-OrgID` header** (Grafana/Mimir/Loki convention) replaces
-  HEC-token→tenant routing. Absent ⇒ the default tenant (single-tenant mode).
+  token→tenant routing. Absent ⇒ the default tenant (single-tenant mode).
 - **Reuse, don't delete, the hardening** — the rate-limiter + backpressure router
-  are generic; rename `hec`→`ingest` and front the OTLP path with them.
-- **Remove** the HEC routes (`/services/collector/*`), `HecTokens`, and HEC token
-  Secrets in the operator/Helm.
+  are generic; rename their collector-specific names to `ingest` and front the
+  OTLP path with them.
+- **Remove** the collector routes (`/services/collector/*`), the collector token
+  type, and the collector token Secrets in the operator/Helm.
 - **Event mapping unchanged for now** — keep host/source/sourcetype/index +
   body→raw; dense-attribute extraction / dynamic schema is the later WS-7 phase.
 - Update smoke tests + loadgen to OTLP.

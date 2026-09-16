@@ -7,14 +7,14 @@
 # Assumes you've already run:
 #   - `deploy/aws/up.sh`         (terraform + main chart)
 #   - `helm install siglake-op deploy/helm/siglake-operator` (operator chart)
-#   - pushed `<ECR>:operator-0.1.0` and `<ECR>:0.1.0`
+#   - pushed `<ECR>:operator-0.1.1` and `<ECR>:0.1.1`
 #
 # What this script does:
 #   1. Read the necessary terraform outputs (ECR URL, warehouse URL,
 #      RDS endpoint, region).
 #   2. Resolve the postgres password from Secrets Manager and build a
 #      `catalogUri` of the form `postgres://siglake:<pw>@<host>/siglake`.
-#   3. Create the two HEC token Secrets the sample CR references.
+#   3. Create the two ingest token Secrets the sample CR references.
 #   4. Substitute every `__PLACEHOLDER__` in
 #      `deploy/operator/sample-cluster.smoke.yaml` and kubectl apply it.
 #   5. Wait for the operator-rendered `example-ingester`,

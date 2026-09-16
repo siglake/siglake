@@ -269,6 +269,71 @@ async fn stalled_append_bounds_retention_without_changing_query_responses() {
     await_released(&shutdown_writer).await;
 }
 
+/// The same stall, with nobody to release it: the append deadline is what
+/// returns the charged row and lets the worker write the next one, and the
+/// query responses either side of it are the ones they always were.
+#[tokio::test]
+async fn an_append_past_its_deadline_frees_the_audit_path_without_changing_responses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = Arc::new(
+        IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap(),
+    );
+    let appender = Arc::new(HeldFailingAppender::default());
+    let limits = AuditLimits {
+        max_rows: 2,
+        max_bytes: 4 * 1024,
+    };
+    let (service, writer) =
+        AuditService::with_limits(appender.clone(), 1, Duration::from_secs(60), limits);
+    let app = router(AppState::new(ice, AuthConfig::open()).with_audit(writer.clone()));
+    let handle = tokio::spawn(
+        service
+            .with_append_deadline(Duration::from_millis(200))
+            .run(),
+    );
+
+    let (status, _) = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/sql",
+        Some(serde_json::json!({"query": ""})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    appender.first_started.notified().await;
+    assert_eq!(writer.retained_usage().rows, 1);
+
+    // `release_first` is never notified: the deadline, and nothing else,
+    // returns this capacity.
+    await_released(&writer).await;
+
+    let (status, _) = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/sql",
+        Some(serde_json::json!({"query": ""})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while appender.appended_rows.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the worker never appended after the deadline");
+    assert_eq!(
+        appender.appended_rows.load(Ordering::Acquire),
+        1,
+        "the abandoned batch was re-appended"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
 #[tokio::test]
 async fn successful_sql_query_lands_audit_row() {
     let srv = spawn().await;

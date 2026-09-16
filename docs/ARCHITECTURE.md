@@ -157,6 +157,32 @@ segments arrive — bounded by a per-pass budget so compaction and gauges keep
 their cadence under backlog. Commit-accumulation batching (default on, 64 MiB
 target / 10 s age floor) amortizes the fixed per-commit catalog cost; the
 vendored `update_table_with_base` elides redundant metadata re-reads.
+A claimed segment whose bytes do not decode — a torn restore, a bad sector, a
+frame version this build does not know — fails the whole batch it is in, and
+releasing it back to `sealed/` only hands it to the next batch. After
+`SIGLAKE_COMPACTOR_POISON_ATTEMPTS` consecutive failed reads (3; `0` disables)
+the drain moves that file, and only that file, to `<wal>/poison/` with a
+`.poison.json` note recording the error and the attempts spent; its batch
+siblings commit on the next pass. Nothing under `poison/` is deleted, rewritten
+or automatically requeued — unlike `orphans/`, whose residents are disposed of
+every cycle — so requeueing is an operator running `siglake wal-requeue
+--wal <wal-root>` (`--segment` for one file, `--dry-run` to read the verdicts
+first) once the cause is fixed. The set-asides are counted by
+`siglake_compactor_segments_poisoned_total` and levelled per tenant by
+`siglake_compactor_segments_poisoned`, which fires `SiglakeSegmentsQuarantined`
+alongside the catalog-claim path's own quarantine. The rows in a set-aside
+segment are acknowledged and not queryable, which is the point: the alternative
+is a queue that never drains.
+Every other failure is retried inside the pass, bounded per segment: a pass
+makes at most three claims on the same segment and then leaves it in `sealed/`
+for the next cycle, counting it under
+`siglake_compactor_pass_claim_attempts_exhausted_total`. That bound is what
+stops a cause which fails fast and names no file — a recurring catalog
+conflict, a store refusing writes — from spending a whole cycle budget on
+claim/release renames of one set. It is per segment name rather than per batch,
+so regrouping buys no further attempts; it is pass-local, so recovery from a
+transient cause is one poll away; and the segments a pass has not tried,
+including ones sealed while it ran, stay claimable throughout.
 Cumulative per-table aggregates are maintained in a **side object** (see
 Storage), with an optional write-behind mode
 (`SIGLAKE_SIDE_AGG_WRITE_BEHIND=1`) that moves its serialized S3
@@ -196,7 +222,26 @@ bytes per indexed row — roughly 294 MB parsed for a 7.3M-row file — so a
 50G-class layout's text plan needs several gigabytes of parsed index against a
 query pod's 1 GiB parsed-index cache, and the shapes that take the sidecar path
 land above the ceilings measured on the scan path. Enable it where the working
-set fits, or where pruning is worth more than the decode.
+set fits, or where pruning is worth more than the decode. That whole-file cost
+is a property of the sidecar format, not of its sizing: a row-group-addressable
+replacement a reader can touch in part is specified and measured in
+`docs/DESIGN_segmented_inverted_index.md`. It is a prototype behind its own
+magic, footer-KV key and Puffin blob type, so nothing in this section changes
+until it is wired (#4561).
+
+**Whether to USE an index is decided per execution.** Loading one is a
+whole-file cost, so a query that wants a handful of rows cannot pay it: a text
+predicate under a `LIMIT` stops the scan after a sliver of the first file,
+while the index charges for every row in every planned file. Both forms are
+declined — a `LIMIT` under an `ORDER BY timestamp` (including the implicit
+newest-first one) because an index row selection defeats the ordered drain's
+contiguous tail read, and a bare `LIMIT` because the scan short-circuits
+first. An unclipped text scan keeps the index, which is the regime it wins in.
+The refusal is attributed by
+`siglake_query_inverted_index_declined_total{reason}` and named in the scan's
+`EXPLAIN` line (`text_index:[declined:clipped_limit]`), and it never changes a
+result: the index only ever produced a superset row selection, blooms stay
+active, and the exact predicate is re-evaluated above the scan either way.
 
 **Freshness.** The query tier's WAL buffer serves *uncommitted* sealed +
 processing segments for the events table, unioned with Iceberg under the same
@@ -267,9 +312,35 @@ coverage even when it replaces N rows with N different rows. The query then
 uses the exact per-file path. The same rule covers the inline object, folded
 wide counts, time buckets and 2-D time×group counts.
 Artifacts written before coverage links existed deserialize without claiming
-coverage and remain on the exact per-file path. `rebuild-group-counts` can
-restore the wide group-count object from committed files; it does not rebuild
-the inline time aggregates.
+coverage and remain on the exact per-file path, and nothing repairs that on its
+own: a chain with no head cannot be rejoined, because the first append edge
+after the gap names a parent nothing matches and every later edge chains onto
+that stranded run. `rebuild-group-counts` restores the wide group-count object
+from committed files; `rebuild-time-aggregates` restores the inline object's
+time buckets and 2-D time×group counts and republishes a coverage edge, after
+which ordinary commit-path maintenance carries the chain forward again.
+
+Every edge is published at one normal form: the deepest ancestor reachable
+through nothing but re-clusters, which is the parent an append's link names.
+An edge at a re-cluster is an edge the next append cannot join — its link
+walks past the re-cluster to the append below — so a republication that named
+the snapshot it scanned would last exactly until the next commit on a
+compacted table, where the newest snapshot is usually a re-cluster. Both
+rebuilds normalize.
+
+Snapshot expiry is the other way the chain was lost. The reader's walk needs
+every snapshot between the edge and current, so a re-cluster run longer than
+`retain_last` dropped the edge's own snapshot and stranded the object for the
+life of the table. `expire_snapshots` now decides, against the metadata it is
+about to shrink, whether the edge it can still prove survives the commit; when
+it would not, it re-roots the edge onto the deepest snapshot the commit leaves
+in place — the same rows, no recompute, one object write — and counts
+`siglake_inline_coverage_reroots_total`. The write is fenced on the object
+still carrying the edge that was proven, since a publication landing in the
+window has moved the edge to its own append and nothing here improves on that
+(`siglake_inline_coverage_reroot_conflicts_total`). An expiry that cannot walk
+to the edge leaves it alone: ancestry that is gone is never bridged, and equal
+row totals are not evidence.
 
 A publication carries counts that exist nowhere else, so a failed one is
 retried with the same deltas on the delta write's budget — four attempts, 250,
@@ -278,12 +349,14 @@ is replay-safe: the merge reads the object first and skips a publication whose
 coverage links are already there, which is how a write that landed and lost its
 response is told from one that never landed. A publication that spends all four
 attempts increments
-`siglake_side_aggregate_publish_failures_total{table="<table>"}` and, where the
+`siglake_side_aggregate_publish_failures_total{iceberg_namespace="<ns>",table="<table>"}`
+and, where the
 incremental delta path is active, writes the same `*.rebuild.json` marker a lost
 delta does, so the maintenance compactor rebuilds the wide group counts. Nothing
-rebuilds the inline object itself: its time aggregates stay short of
+rebuilds the inline object automatically: its time aggregates stay short of
 `total-records`, and windowed `GROUP BY` on that table answers from the per-file
-path until it is rebuilt. `SiglakeSideAggregatePublicationLost` fires on the
+path until an operator runs `rebuild-time-aggregates`, which recomputes them
+from committed files. `SiglakeSideAggregatePublicationLost` fires on the
 counter.
 The `<table-uuid>` component is what keeps that guard honest across a recreated
 index: every aggregate artifact — this object, the folded wide base, the
@@ -296,7 +369,8 @@ four attempts, waiting 250, 500 and 750 ms between attempts. A write that
 eventually succeeds after retry increments
 `siglake_group_count_delta_write_retries_total{table="<table>"}` by the retries
 it used; a write that exhausts all four attempts increments
-`siglake_group_count_delta_write_failures_total{table="<table>"}`. The Helm
+`siglake_group_count_delta_write_failures_total{iceberg_namespace="<ns>",table="<table>"}`.
+The Helm
 chart's `SiglakeGroupCountDeltaRetrying` alert warns on a sustained retry rate,
 the precursor. An exhausted write records a per-sequence `*.rebuild.json`
 marker alongside the deltas under
@@ -305,26 +379,78 @@ no additional listing). The maintenance compactor consumes that
 marker on its next aggregate fold, rebuilds the affected table's exact maps and
 bounded sketches from committed files, and deletes every marker covered by the
 rebuild watermark. It increments
-`siglake_group_count_auto_rebuilds_total{table="<table>",outcome="success|incomplete|failed"}`;
+`siglake_group_count_auto_rebuilds_total{iceberg_namespace="<ns>",table="<table>",outcome="success|incomplete|failed"}`;
 `SiglakeGroupCountDeltaLost` fires only when that automatic repair fails or
-completes without restoring full coverage. Both alerts name the affected table;
-the retry alert also names the pod. A later delta does not heal the gap; the
+completes without restoring full coverage. Both alerts name the affected namespace and
+table; the retry alert names the pod and, because its counter is not
+namespaced, the table alone. A later delta does not heal the gap; the
 marker-driven rebuild does.
 
 Each maintenance pass also adds the number of deltas folded into the base to
 `siglake_group_count_deltas_absorbed_total` and the number of already-absorbed
 delta objects removed to `siglake_group_count_deltas_deleted_total`.
 
+**The deficit census.** A marker covers one cause. A process killed between its
+commit and its delta PUT writes neither, and a table upgraded across the
+per-incarnation prefix starts a fresh aggregate at its first commit after the
+upgrade; both leave an aggregate that is merely SHORT, which no later delta
+heals. Every 15 minutes
+(`SIGLAKE_AGG_SHORT_SCAN_INTERVAL_SECS`; `0`, `off`, `disabled` or `never`
+switch it off) the same maintenance pass censuses each maintained table for
+exactly that: a maintained column whose total falls short of `total-records`
+where the FOLDED view — outstanding deltas included — already carries the
+current generation's own contribution. It reads one number per column straight
+out of the compact base, so a healthy warehouse costs milliseconds per table.
+
+Two rules keep it from firing on work that is merely in flight or hopeless.
+A commit publishes its delta after the commit, so the census waits until the
+newest generation's contribution has landed in the artifact — counting the
+coverage links still waiting on a missing predecessor, and admitting a
+row-conserving re-cluster on top through the same bridging rule the read guard
+uses. And a column the rebuild could not restore (over the cardinality cap,
+unreadable in some live file) is recorded in the base object by the rebuild that
+tried, then skipped until another rebuild clears the record — that column is
+dropped from the base by the rebuild and re-added short by the next delta, so
+without the record one unreadable column would cost a full Tier-2 rebuild every
+pass.
+
+Every verdict lands on
+`siglake_group_count_short_aggregates_total{iceberg_namespace="<ns>",table="<table>",outcome="detected|repaired|incomplete|failed"}`
+and a WARN line naming the columns, and `SiglakeGroupCountAggregateShort` fires
+on all but `repaired`. One compactor censuses the base namespace and every
+`tenant_*` namespace, each with its own `events`, so this counter and the three
+beside it (`siglake_group_count_delta_write_failures_total`,
+`siglake_side_aggregate_publish_failures_total`,
+`siglake_group_count_auto_rebuilds_total`) carry `iceberg_namespace` as well as
+`table` — the name the alert passes to `rebuild-group-counts --namespace`. It
+is `iceberg_namespace` rather than `namespace` because Prometheus attaches the
+Kubernetes namespace under that name and renames a colliding metric label to
+`exported_namespace`. Only the default namespace's `events` series is
+pre-registered at 0: a tenant namespace, an index table and a base namespace
+moved off the default by `SIGLAKE_TENANT_NAMESPACE` are known only at the
+increment. Rebuilding automatically is **opt-in**
+(`SIGLAKE_AGG_SHORT_REPAIR=1`, `compactor.shortAggregateRepair` in the chart):
+the repair is one Tier-2 query per maintained column — measured ~9 minutes per
+column per 250M rows on a local filesystem, so a wide table is hours and the
+compactor's 600 s watchdog cuts it (a cut repair publishes nothing and the next
+pass retries). With it on, one table per pass is rebuilt
+(`SIGLAKE_AGG_SHORT_REPAIR_MAX_TABLES`), because every table upgraded across the
+prefix change is short at once. On a table that size the operator's
+`rebuild-group-counts` remains the tool.
+
 If the LOST log says the marker itself could not be written, or automatic
 rebuild keeps failing, the operator fallback remains:
 
 ```
-siglake rebuild-group-counts --table <table>
+siglake rebuild-group-counts --namespace <ns> --table <table>
 ```
 
 Both automatic and operator-triggered rebuilds use the same exact per-file
 Tier-2 path as a query, record a `rebuilt_through` watermark so an old or late
-delta is not folded twice, and are safe to re-run. They deliberately repair
+delta is not folded twice, and are safe to re-run. A census rebuild rebuilds the
+exact columns only, so it merges the sketch half of every delta that watermark
+retires into the base first — the fold deletes those deltas rather than folding
+them, and an approximate column's rows are not re-added by any later commit. They deliberately repair
 only the incarnation's `siglake-agg-wide.json`, not the inline
 `siglake-aggregates.json` object maintained by the commit path. A
 repaired column therefore reports `served_by: "tier1_wide"` even when it is
@@ -350,6 +476,56 @@ distinct count and is reported, not written, when over it. The same knob caps
 the exact group-count cardinality of typed columns admitted by inference at
 write time; declared dimensions retain the table-level cap. Raising it admits
 wider typed columns but also increases per-commit delta size and counting work.
+
+The inline object's own repair is a separate command, for a separate failure —
+an object whose coverage chain cannot be proven at all:
+
+```
+siglake rebuild-time-aggregates --table <table>
+```
+
+It recomputes the time buckets (one footer read per live file) and the 2-D
+time×group rollup (a two-column decode of every live file whose time range
+spans more than one bucket; a file contained in one bucket contributes its
+group-count footer instead), replaces both, and publishes the scanned
+snapshot's coverage edge at its normal form — the root of the re-cluster run
+it sits on, so the next append's link joins it. A component short of
+`total-records` is left absent
+rather than written short, and the inline whole-table group counts are dropped
+rather than certified — one coverage edge governs the object, and granting it to
+maps from an unknown earlier snapshot is the unmarked overwrite the edge exists
+to catch. Nothing readable is lost by that: those counts were already refused.
+Re-running is a reported no-op. Unlike the wide rebuild it is NOT safe to run
+against a table being ingested: a commit landing under the pass cannot be
+merged, so the command retries and then exits without writing, asking for a
+window with no ingest. Details in
+`docs/DESIGN_inline_time_aggregate_rebuild.md`.
+
+**Which table needs it.** The state that command repairs is reported by name.
+Every 15 minutes (`SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS`, `off` to
+disable) the maintenance compactor reads each maintained table's inline object
+under the `agg_fold` lease and asks the read guard's own question — does its
+coverage edge reach the current snapshot? — and sets
+`siglake_inline_coverage_unproven{iceberg_namespace,table}` to 1 or 0 for every
+table it reaches a verdict on. A repaired table clears on the next pass. The
+census never rebuilds: it reads table metadata and one object per table, and
+automating the repair is separate work. An object it cannot READ writes no
+sample at all — a failed GET is not evidence about coverage in either direction
+— and a publication still in flight (the edge does not reach current, but one of
+the object's pending links does) is reported as covered, because the next commit
+settles it. A table the pass no longer reaches at all — a dropped index — has its
+reading zeroed, since a metric series is never removed from a live process and a
+standing 1 would otherwise page until a restart.
+
+The counter beside it, `siglake_inline_coverage_census_total`, is one increment
+per completed pass. The gauge is a last observation, so a compactor that stops
+censusing keeps serving its last reading; `SiglakeInlineCoverageUnproven` pairs
+the two, and a pod that stopped looking leaves the alert rather than paging from
+a reading nobody is refreshing. It is the one alert in this area at `critical`
+severity: the two beside it name events that automatic maintenance or an
+operator's `rebuild-group-counts` repairs, and this one names a state that
+persists for the life of the table until a human runs a command. Answers stay
+exact throughout — what is lost is Tier-1, not correctness.
 
 **Residual attributes (WS-7).** OTLP resource/log attributes that aren't
 promoted columns are preserved losslessly in a JSON-string `attributes`
@@ -479,7 +655,13 @@ through 200 GB and 1 TB sustained-ingest rounds
   reads against cached metadata), so decoded memory is bounded by the chunk —
   independent of fan-in — with zero intermediate write amplification, and
   near-disjoint inputs collapse to zero-copy slices (merges get cheaper as
-  data ages). Merged output is where deferred indexes materialize, in one of
+  data ages). A streamed merge writes ONE output partition per call — its
+  writer stamps the bin's first partition value on everything it writes — so a
+  bin spanning two partitions is refused rather than committed under a partition
+  value that hides its rows from a predicated query; the planners bin per
+  partition, and an in-RAM merge splits its output by partition value and takes
+  a mixed bin (see [`LIMITATIONS.md`](LIMITATIONS.md)).
+  Merged output is where deferred indexes materialize, in one of
   two shapes: an in-RAM merge writes the full inline set, including the footer
   inverted indexes (with Puffin overflow) and the whole-file raw trigram
   bloom, while a streamed merge writes neither of those and leaves its output
@@ -487,6 +669,15 @@ through 200 GB and 1 TB sustained-ingest rounds
   (`SIGLAKE_INDEX_REBUILD=1`) registers Puffin sidecars for it.
   Group-count, time-bucket and row-group-bloom footers are written
   either way (see [`LIMITATIONS.md`](LIMITATIONS.md)).
+  Row groups on merged output are sized in BYTES: the writer is built on the
+  merge's first output batch and takes
+  `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` (or
+  `IcebergTuning::target_row_group_bytes`, 256 MB uncompressed by default)
+  divided by that batch's decoded row size, clamped to 128 Ki–4 Mi rows — the
+  same sizing the flush path makes from the batch it is handed. The open row
+  group is buffered decoded while its bloom accumulates, so that target is also
+  what bounds a merge's, a re-cluster's and a delete rewrite's writer-side
+  memory (see [`LIMITATIONS.md`](LIMITATIONS.md)).
 - **Metadata hygiene on the same loop:** snapshot expiry (count + age),
   orphan-file GC with its own safety age (deliberately not the retention
   window — a file younger than the longest write-then-commit gap may be about
@@ -581,7 +772,15 @@ submitted whole to a best-effort `query_audit` Iceberg writer. The process
 retains at most 10,000 submitted rows and 64 MiB charged across the channel,
 flush buffer, owned strings and overlapping Arrow conversion; an oversized or
 over-budget row is dropped without changing the query response and increments
-`siglake_query_audit_dropped_total{reason}`. For batch jobs,
+`siglake_query_audit_dropped_total{reason}`. Each append the worker awaits is
+bounded by a service deadline (30 s;
+`SIGLAKE_QUERY_AUDIT_APPEND_DEADLINE_SECS`, `0` awaits without a bound), so a
+storage append that stops answering costs its own batch instead of the audit
+service: the deadline releases that batch's retained budget, counts its rows
+under `reason="append_deadline"`, and the worker takes the rows behind it. The
+abandoned batch is never re-appended — the deadline cuts the await, not the
+commit that may already have landed — which is the `query_audit` table's one
+source of silent row loss under a healthy process. For batch jobs,
 `query_audit.duration_ms` measures the bounded run lifecycle from the moment the
 queued future starts on the dedicated batch runtime; it excludes both
 batch-runtime queue time and the HTTP `202` handoff. The jobs API exposes
@@ -837,7 +1036,50 @@ count alone allowed. Setting the entry count to `0` turns both caches off and
 returns to fetching and deserializing per query; setting the blob byte bound to
 `0` drops only the serialized copy. Both budgets are subtracted from the query
 memory pool like every other read cache and published on
-`siglake_cache_budget_bytes{kind="text_index"}`. They are also the last claim
+`siglake_cache_budget_bytes{kind="text_index"}`.
+
+**Which budget a process gets is its role.** The query server derives both from
+its pod's limit. The `siglake` binary resolves its own at startup, and for the
+maintenance roles — the compactor pod, the ingest server, the sweeps and the
+rebuilds — that is an explicit zero: the only site that fills either cache is
+the scan's index-pruning path, reached from a plan carrying a text predicate
+through the Iceberg table provider, and maintenance plans none. A Tier-2
+aggregate rebuild counts from manifest stats, Parquet footers and raw pages; a
+delete task evaluates its predicate over a `MemTable` of the candidate file's
+decoded rows. The flat 1 GiB + 256 MiB pair those processes used to inherit from
+the fork was 1.25 GiB of ceilings on caches that never take an entry, inside the
+1Gi the chart gives the compactor. The subcommands that do run SQL in process —
+`sql-direct`, `iceberg-demo`, `subscribe` — derive what the query server would.
+The byte-range object cache stays the opt-in it has always been
+(`SIGLAKE_OBJECT_CACHE_BYTES`) in every role, and is now recorded rather than
+re-derived: a process that configured nothing left the pool subtracting a
+quarter of the pod for a cache that process had switched off. Every override
+survives the role, in both directions.
+
+What the parsed side is doing
+under those budgets is readable per query rather than inferred from latency:
+`siglake_iceberg_parsed_index_cache_lookups_total{outcome,storage}` records one
+`hit` or `miss` per file a text query acquires an index for, and
+`siglake_iceberg_parsed_index_cache_evictions_total{reason}` names the bound
+that dropped an entry — `byte_bound`, `entry_bound`, or `oversized` for an index
+that alone exceeds the budget and is therefore never admitted at all. A hit
+ratio cannot separate a first read from an entry this cache decoded and threw
+away, which is the difference between a cold plan and a thrashing one; the
+resident set is charted against its bound on
+`siglake_iceberg_parsed_index_cache_bytes` and
+`siglake_iceberg_parsed_index_cache_max_bytes`, both published where the bounds
+are enforced and therefore absent until the pod's first indexed text query.
+The startup cost itself is split by stage on
+`siglake_iceberg_text_index_startup_seconds{stage,storage}`: `permit_wait` for
+the load semaphore, `blob_fetch` for the Puffin read, `decode` for
+`InvertedIndex::from_bytes` and `selection` for the postings lookup plus the
+row-selection runs. `decode` is recorded only on a miss and `selection` on
+every file the index prunes, so the two sample counts together say how much of
+a plan started warm — run #73 could not tell those four apart from a round's
+artifacts, which is what the split is for. The "Text-index startup" panels of
+`deploy/grafana/siglake-overview.json` read all of it, and the two counters are
+pre-registered at 0 on the query server so a tier serving no text query charts
+zero rather than no data. They are also the last claim
 on the limit: the derivation gives them only what is left once the pool can
 still reserve one compacted file's decode working set, so the packaged 4Gi pod
 — where that reservation is the whole remainder — caches no text indexes unless
@@ -1180,6 +1422,10 @@ milliseconds that is noise; against an empty request it is most of the cost.
   anything not yet committed to Iceberg stays on the release's claim), and
   each configured authentication or tenant control above, with the tier it
   belongs to and how to keep it (`deploy/helm/siglake-operator/README.md`).
+  The report is a single applicable manifest — findings and runbook are
+  comments — and `--adopt-namespace` (default: the release name) sets both
+  `metadata.namespace` and the `-n` on every runbook command, so a release
+  installed into a namespace that is not its name adopts into the right one.
 - **Terraform/EKS BYOC** (`deploy/terraform`): EKS + EFS (RWX WAL) + RDS
   (catalog) + S3 (warehouse), validated across the AWS smoke rounds; Grafana
   overview dashboard in `deploy/grafana/`.
@@ -1189,6 +1435,78 @@ milliseconds that is noise; against an empty request it is most of the cost.
   `scripts/smoke.sh` validates correctness; `scripts/kind-*.sh` runs
   the chart in kind. Single-process demo: `siglake ingest-server
   --with-compactor`, POST OTLP to `/v1/logs`, then `siglake sql`.
+
+## Diagnostics
+
+### The metrics port is node-local, and nothing on it is authenticated
+
+Every role serves `--metrics-bind` (9100 for the ingester, 9101 for the
+compactor, 9105 for the query tier): `/metrics` for Prometheus, `/` as a
+one-line pointer to it, and nothing else in a release build. The compactor's
+liveness probe is a `tcpSocket` against it. None of it checks a token — the
+query tier's bearer tokens and OIDC guard 8089, not this — so **treat the
+metrics port as an internal control surface and do not route it through an
+Ingress or a LoadBalancer.**
+
+The chart's `networkPolicy.enabled` writes an **egress** policy only; there is
+no shipped ingress restriction on the metrics port, so the reachability you get
+is whatever your cluster's default is. A cluster that allows pod-to-pod traffic
+allows scrapes from anywhere in it. Restricting it further is an operator
+decision: your own `NetworkPolicy` admitting only the Prometheus
+ServiceAccount's pods, or no policy and `kubectl port-forward` for ad-hoc
+reads. On the AWS bench stack the security group opens 8088, 8089 and 22 only,
+which is why the port is reachable from the node and its peers and nowhere
+else.
+
+### On-demand profiling and the `PROFILING=1` image
+
+`/debug/pprof/{profile,heap,runtime}` serve a CPU profile (gzipped pprof
+protobuf, 99 Hz, `?seconds=` clamped to 1..=600), a jemalloc heap profile in
+`jeprof` text, and tokio runtime counters as JSON measured over a real window
+(`?seconds=` clamped to 1..=60). They mount on the metrics port because it is
+the one HTTP surface every role shares, so one mount point profiles the
+ingester, the compactor and the query tier. **They are never mounted on the
+public API port:** a CPU profile is a stack-trace oracle and the heap route
+names allocation sites, and neither should be reachable by a caller who is
+merely authorized to query. Everything in the paragraph above about restricting
+the metrics port applies with more force once these are armed.
+
+A released image cannot serve them at all. Reaching them takes both opt-ins,
+which are not redundant:
+
+1. **A build.** `siglake-core`'s `profiling` cargo feature is off by default
+   and no published image sets it, so the code is absent rather than disabled.
+   `deploy/Dockerfile` with `--build-arg PROFILING=1` is the only build that
+   turns it on; it also passes `--cfg tokio_unstable` (without which
+   tokio-metrics reports a much smaller counter set) and
+   `-C force-frame-pointers=yes`, and skips `strip --strip-debug` so profiles
+   resolve to file:line. That DWARF is most of why the image is ~1.95 GB
+   against ~115–123 MB per stripped binary, so it is built on request
+   (`.github/workflows/profiling-image.yml`, `workflow_dispatch`) and tagged
+   `prof-<sha>`, never published as a release image.
+2. **An operator.** Even that image mounts nothing until
+   `SIGLAKE_PPROF_ENABLED=1` is set in the process environment; any other
+   value, including a misspelling, leaves the routes absent. A disarmed
+   profiler answers `404`, which is what lets a profiling round refuse at its
+   readback gate instead of capturing nothing.
+
+A feature flag alone would be too easy to ship by accident; an env var alone
+could not remove the code. The pair is the contract, and neither half is
+scheduled to become a default.
+
+One capture runs at a time, CPU or heap: a heap dump walks allocator state
+while the CPU profiler's `SIGPROF` handler interrupts threads, so a second
+request of either kind is refused with `409` rather than interleaved. The
+admission ticket releases on drop, so a client that hangs up mid-window leaves
+the endpoint usable.
+
+The heap route needs one more thing the image cannot give it: the process must
+have **started** with `_RJEM_MALLOC_CONF=prof:true,prof_active:true` — prefixed,
+because `tikv-jemalloc-sys` builds jemalloc with a prefixed symbol namespace and
+ignores the plain `MALLOC_CONF`. jemalloc samples only while `prof.active` is
+true and a dump reports live sampled allocations, so arming it at dump time
+would report a near-empty heap; the handler therefore only dumps, and answers
+`412` naming what is missing when sampling was never on.
 
 ## Performance (measured on AWS, 3-node clusters)
 

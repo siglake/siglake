@@ -135,7 +135,15 @@ written down.
   Puffin rebuild ships **off** in 0.1.0: a compacted file's parsed index costs
   about 40 bytes per indexed row, and at 50 GB-class layouts the sidecar path
   landed above the text-search ceilings that were measured on the scan path.
-  A missing index costs pruning, never correctness
+  Whether a query uses an index it finds is decided per execution: a text
+  predicate under a `LIMIT` — ordered or bare — reads a sliver of the first
+  file and would pay a whole file's postings to do it, so it stays on the scan
+  path, while an unclipped text scan keeps the index. A missing or declined
+  index costs pruning, never correctness. What a text query spends before its
+  first batch is attributable per stage rather than as one number:
+  `siglake_iceberg_text_index_startup_seconds{stage}` separates the load queue
+  from the blob read, the decode and the selection, and the parsed-index
+  cache reports its lookup outcomes beside the bound that dropped an entry
   ([`docs/DESIGN_inverted_index.md`](docs/DESIGN_inverted_index.md),
   [`docs/DESIGN_raw_content_index.md`](docs/DESIGN_raw_content_index.md)).
 - **Exact aggregates without scans, or the exact scan.** Whole-table and
@@ -197,7 +205,7 @@ written down.
 - **No built-in UI.** The query tier is reached through SQL over HTTP and the
   Jaeger-compatible shim; Grafana is the front end. What ships for operations
   is a starter dashboard (`deploy/grafana/siglake-overview.json`, imported by
-  you) and a `PrometheusRule` with 33 alerts grouped by what an operator
+  you) and a `PrometheusRule` with 35 alerts grouped by what an operator
   should do, rendered when `prometheusRule.enabled` is set
   ([Monitoring](https://docs.siglake.dev/operations/monitoring/)).
 - **Metrics are Prometheus; logs and traces are OTLP, and off until you point
@@ -215,6 +223,19 @@ written down.
   elision, S3 conditional puts and the incremental append scan that table
   subscriptions need; they are rebased against upstream periodically
   ([`third_party/README.md`](third_party/README.md)).
+- **The metrics port is an internal surface, and profiling is off in every
+  released binary.** `--metrics-bind` (9100/9101/9105) serves `/metrics` and
+  nothing else in a release build, with no token check of its own — the query
+  tier's auth guards 8089 — so it belongs behind your cluster's network policy
+  and never behind an Ingress. The chart's `networkPolicy` writes egress rules
+  only; restricting who may scrape is an operator decision. On-demand CPU, heap
+  and tokio-runtime profiles (`/debug/pprof/*`) ride that same port, for the
+  same reason `/metrics` does — it is the one surface every role shares — and
+  reaching them takes two opt-ins that will not become defaults: a
+  `--build-arg PROFILING=1` image, which no release is, and
+  `SIGLAKE_PPROF_ENABLED=1` in the process. A stack-trace oracle is not a thing
+  a query-authorized caller should be able to ask for
+  ([Diagnostics](docs/ARCHITECTURE.md#diagnostics)).
 - **Omissions are recorded, not hidden.** Everything left out on purpose, with
   the reason and what would change it, is one entry in
   [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md), kept current with the code.
@@ -249,7 +270,8 @@ crates/
   siglake-bloom        trigram/token blooms
   siglake-cli          the `siglake` binary (all roles + ops commands:
                        audit-rotate, gc-orphans, retention-sweep,
-                       delete-sweep, migrate-schema, wal-recover, …)
+                       delete-sweep, migrate-schema, wal-recover,
+                       wal-requeue, …)
   siglake-operator     Kubernetes operator
   siglake-openapi      emits the committed OpenAPI 3.1 specs (docs/api/)
   siglake-bench (private, not in the public tree) / -loadgen   tooling

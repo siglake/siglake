@@ -444,8 +444,9 @@ fn pick_shape(per_100: u32) -> Shape {
     Shape::AuthSyslog
 }
 
-/// In-memory shape of one corpus event. The legacy profile maps 1:1 to a HEC
-/// `/event` payload. The `otel-rich` profile reuses the same file shape for
+/// In-memory shape of one corpus event. The legacy profile is the flat
+/// `{time, host, source, sourcetype, index, event}` record the corpus has
+/// always carried. The `otel-rich` profile reuses the same file shape for
 /// compatibility and fills `attributes` with a deterministic JSON object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorpusEvent {

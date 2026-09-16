@@ -74,9 +74,46 @@ restoration timestamps, accepted submissions, per-query-pod backlog and
 completion-counter series; and derives submission/completion rates, peak
 backlog, and restoration-to-drain time. The probe is off by default and its
 durations and burst size are bounded by `POSTGRES_OUTAGE_*` environment knobs.
+
+The first three rounds to run it could not show that the pause held. Each sample
+now also carries the state and start time of every postgres process in the
+paused container and the Prometheus scrape timestamp behind each value, one
+bounded write is attempted before, during and after the pause, and the
+container's identity and restart count are recorded across the window. Counters
+say what was counted, not when the row was written, so the scrape timestamp is
+what separates a write that landed during the pause from the delayed
+observation of work that finished before it.
+
+Postgres can date the write itself. The kind StatefulSet starts with
+`track_commit_timestamp=on` — postmaster-only, defaulted off by Postgres, and
+set for this throwaway install alone; the chart and every other deployment keep
+the default. After the bounded recovery window, not at readiness, the probe
+reads `pg_xact_commit_timestamp(xmin)` for every job row along with the
+effective setting, and retains them as `job_commit_times`. The grader
+correlates those rows with the accepted submissions and reports how many
+committed inside the pause window. A commit inside it means the pause did not
+block writes. Every accepted job dated outside it resolves the
+zero-backlog-with-rising-completions observation instead of leaving it as a
+problem: the completion was observed work, not landed work.
+
+That reading has limits the grader keeps rather than papers over.
+`pg_xact_commit_timestamp(xmin)` dates the row version that is visible at
+collection time, not every status transition, and a recovered row can be
+amended after it went terminal, so a recovered row cannot clear anything. A
+missing row, a NULL timestamp, a job still short of a terminal status, and a
+commit inside the second the probe's own stamps are truncated to are all held
+as gaps, and a gap leaves the observation unexplained.
+
 `scripts/check-kind-postgres-outage-evidence.sh` grades offline fixtures in CI;
-missing series, a backlog that never rises, or one that never drains are
-`unverified`, not passing evidence.
+missing series, a backlog that never rises, one that never drains, a missing or
+running process observation, a bounded write that completed during the pause, a
+container restart, an undated or in-pause job-row commit, and an outage sample
+with zero backlog and rising completions before restoration are all
+`unverified`, not passing evidence. A drain whose accepted job rows are all
+dated outside the pause is graded `verified` with the resolution recorded. The
+same check runs the probe's three remote readers against a synthetic `/proc`
+and psql stand-ins, and drives the probe end to end against recording stand-ins
+for `kubectl` and `curl`. No cluster is involved.
 
 After every other observation, and before the panel and ScaledObject evidence,
 the round raises the ingester ScaledObject's `minReplicaCount` to 2, drives OTLP

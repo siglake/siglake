@@ -29,6 +29,48 @@ pub struct AdoptionReport {
     pub runbook: String,
 }
 
+impl AdoptionReport {
+    /// The complete `--adopt-values` output, as ONE YAML document: the
+    /// synthesized resource, then the preflight findings and the handover
+    /// runbook as comments.
+    ///
+    /// The runbook's own step 5 is `kubectl apply -f cluster.yaml`, so the
+    /// file the user saves has to still parse after the resource ends. That
+    /// is the whole contract here — nothing below the resource may be
+    /// anything but a comment, and a finding carrying a newline would break
+    /// it, so they are flattened to one line each.
+    pub fn to_yaml(&self) -> Result<String> {
+        let mut out = String::new();
+        out.push_str("# --- synthesized SiglakeCluster: this whole output is one manifest ---\n");
+        out.push_str("# Save it (cluster.yaml) and apply it at step 5; every line below the\n");
+        out.push_str("# resource is a comment, so `kubectl apply -f` reads only the resource.\n");
+        out.push_str(&serde_yaml::to_string(&self.cluster).context("serialize SiglakeCluster")?);
+        if self.findings.is_empty() {
+            out.push_str("# preflight: no findings — proceed to the runbook\n");
+        } else {
+            out.push_str("# preflight FINDINGS (resolve before handover):\n");
+            for finding in &self.findings {
+                let flat = finding.split_whitespace().collect::<Vec<_>>().join(" ");
+                out.push_str(&format!("#  - {flat}\n"));
+            }
+        }
+        out.push_str(&self.runbook);
+        out.push('\n');
+        Ok(out)
+    }
+}
+
+/// The namespace the handover targets: `--adopt-namespace` when it carries
+/// one, otherwise the release name. The fallback is what every runbook step
+/// assumed before the flag existed (`-n {name}`), so a release whose
+/// namespace matches its name keeps the output it had.
+pub fn adoption_namespace_from<'a>(flag: Option<&'a str>, cluster_name: &'a str) -> &'a str {
+    match flag.map(str::trim) {
+        Some(ns) if !ns.is_empty() => ns,
+        _ => cluster_name,
+    }
+}
+
 fn yaml_str(v: &serde_yaml::Value, path: &[&str]) -> Option<String> {
     let mut cur = v;
     for key in path {
@@ -340,9 +382,15 @@ fn auth_and_tenancy_findings(
 /// Synthesize a `SiglakeCluster` from chart values. `catalog_uri` must be
 /// supplied by the caller: the chart wires Postgres through a Secret and
 /// never materializes a URI, so it cannot be inferred from values.
+///
+/// `namespace` is the release's namespace (`adoption_namespace_from`). It
+/// lands on `metadata.namespace` and in every runbook command: the CRD is
+/// namespaced, so a resource without it is applied wherever the current
+/// kubecontext points, which is not necessarily where the release runs.
 pub fn synthesize_from_values(
     values: &serde_yaml::Value,
     cluster_name: &str,
+    namespace: &str,
     catalog_uri: Option<&str>,
 ) -> Result<AdoptionReport> {
     let mut findings = Vec::new();
@@ -636,8 +684,9 @@ pub fn synthesize_from_values(
         }
     }
 
-    let cluster = SiglakeCluster::new(cluster_name, spec);
-    let runbook = runbook_for(cluster_name);
+    let mut cluster = SiglakeCluster::new(cluster_name, spec);
+    cluster.metadata.namespace = Some(namespace.to_string());
+    let runbook = runbook_for(cluster_name, namespace);
     Ok(AdoptionReport {
         cluster,
         findings,
@@ -645,28 +694,32 @@ pub fn synthesize_from_values(
     })
 }
 
-fn runbook_for(name: &str) -> String {
+fn runbook_for(name: &str, namespace: &str) -> String {
     format!(
         r#"# Adoption handover runbook (manual commit point — see DESIGN_operator_adoption.md)
+# Release {name} in namespace {namespace}. Every command is a comment: step 5
+# applies THIS file, so nothing below the resource may be YAML.
 # 0. Preconditions: findings list above is EMPTY; operator deployed + CRD installed;
-#    the CR below saved to cluster.yaml. Nothing before step 3 mutates the cluster.
+#    this output saved to cluster.yaml. Nothing before step 3 mutates the cluster.
 # 1. Verify name parity (all objects must already exist with these names):
-kubectl get deploy/{name}-ingester deploy/{name}-compactor sts/{name}-query -n {name}
+#   kubectl get deploy/{name}-ingester deploy/{name}-compactor sts/{name}-query -n {namespace}
 # 2. Back up the helm release secrets BEFORE step 4 deletes them. This file is the
 #    only way to give helm its release history back; without it an abort can only
 #    re-install the release at revision 1.
-kubectl get secret -n {name} -l owner=helm,name={name} -o yaml > helm-release-{name}.yaml
+#   kubectl get secret -n {namespace} -l owner=helm,name={name} -o yaml > helm-release-{name}.yaml
 # 3. Flip ownership metadata (helm forgets WITHOUT cascading deletes):
-for kind in deploy/{name}-ingester deploy/{name}-compactor sts/{name}-query; do
-  kubectl annotate $kind -n {name} meta.helm.sh/release-name- meta.helm.sh/release-namespace-
-  kubectl label $kind -n {name} app.kubernetes.io/managed-by=siglake-operator --overwrite
-done
+#   for kind in deploy/{name}-ingester deploy/{name}-compactor sts/{name}-query; do
+#     kubectl annotate $kind -n {namespace} meta.helm.sh/release-name- meta.helm.sh/release-namespace-
+#     kubectl label $kind -n {namespace} app.kubernetes.io/managed-by=siglake-operator --overwrite
+#   done
 # 4. Delete the helm release secret (helm's memory of the release):
-kubectl delete secret -n {name} -l owner=helm,name={name}
-# 5. Apply the CR; the operator's first reconcile should be a NO-OP apply:
-kubectl apply -f cluster.yaml
+#   kubectl delete secret -n {namespace} -l owner=helm,name={name}
+# 5. Apply the CR; the operator's first reconcile should be a NO-OP apply. The
+#    resource carries metadata.namespace, so this lands in {namespace} whatever the
+#    current context selects:
+#   kubectl apply -f cluster.yaml
 # 6. Watch: status must reach Ready WITHOUT pod restarts when specs match.
-kubectl get siglakecluster {name} -n {name} -w
+#   kubectl get siglakecluster {name} -n {namespace} -w
 #
 # Abort path, by the last step you ran:
 # - through step 2: nothing changed; delete helm-release-{name}.yaml and stop.
@@ -675,14 +728,14 @@ kubectl get siglakecluster {name} -n {name} -w
 #   annotations and the managed-by label — helm refuses to adopt an object that
 #   carries only one of them:
 #     for kind in deploy/{name}-ingester deploy/{name}-compactor sts/{name}-query; do
-#       kubectl annotate $kind -n {name} --overwrite \
-#         meta.helm.sh/release-name={name} meta.helm.sh/release-namespace={name}
-#       kubectl label $kind -n {name} app.kubernetes.io/managed-by=Helm --overwrite
+#       kubectl annotate $kind -n {namespace} --overwrite \
+#         meta.helm.sh/release-name={name} meta.helm.sh/release-namespace={namespace}
+#       kubectl label $kind -n {namespace} app.kubernetes.io/managed-by=Helm --overwrite
 #     done
 # - after step 4: do the same re-annotation, then put the release record back, or
 #   `helm list` stays empty and upgrade/rollback/uninstall have nothing to act on:
 #     kubectl apply -f helm-release-{name}.yaml
-#   With no backup the fallback is `helm install {name} <chart> -n {name} -f <the
+#   With no backup the fallback is `helm install {name} <chart> -n {namespace} -f <the
 #   effective values you saved>` over the re-annotated objects: it takes ownership
 #   again but starts history at revision 1, so every earlier revision is gone."#
     )
@@ -692,6 +745,7 @@ kubectl get siglakecluster {name} -n {name} -w
 mod tests {
     use super::*;
     use crate::render::name_of;
+    use serde::Deserialize;
 
     /// A release that CUSTOMIZED the keys the converter has to read.
     ///
@@ -721,7 +775,7 @@ ingester:
   replicas: 3
   auth:
     existingSecret: acme-ingest-tokens
-    secretKey: hec
+    secretKey: ingest-tokens
 compactor:
   replicas: 2
   resources:
@@ -742,8 +796,13 @@ query:
 
     #[test]
     fn adoption_carries_the_customized_keys_across() {
-        let report =
-            synthesize_from_values(&customized_values(), "acme", Some("postgres://x@y/z")).unwrap();
+        let report = synthesize_from_values(
+            &customized_values(),
+            "acme",
+            "acme",
+            Some("postgres://x@y/z"),
+        )
+        .unwrap();
         let spec = &report.cluster.spec;
 
         // The warehouse path decides which table the adopted cluster reads.
@@ -755,7 +814,7 @@ query:
             .as_ref()
             .expect("ingester auth secret must survive adoption");
         assert_eq!(auth.name, "acme-ingest-tokens");
-        assert_eq!(auth.key, "hec");
+        assert_eq!(auth.key, "ingest-tokens");
 
         // The PVC applies FIRST and a shrink is rejected, failing the whole
         // reconcile — so these must match the chart, not the CR defaults.
@@ -855,6 +914,7 @@ dispatcher:
         let report = synthesize_from_values(
             &standing_values(),
             "siglake",
+            "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
         .unwrap();
@@ -897,6 +957,7 @@ dispatcher:
         let report = synthesize_from_values(
             &values,
             "siglake",
+            "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
         .unwrap();
@@ -912,6 +973,7 @@ dispatcher:
         values["image"]["tag"] = serde_yaml::Value::String(String::new());
         let report = synthesize_from_values(
             &values,
+            "siglake",
             "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
@@ -932,9 +994,13 @@ dispatcher:
 
     #[test]
     fn name_parity_holds_when_cr_named_after_release() {
-        let report =
-            synthesize_from_values(&standing_values(), "siglake", Some("postgres://x@y/z"))
-                .unwrap();
+        let report = synthesize_from_values(
+            &standing_values(),
+            "siglake",
+            "siglake",
+            Some("postgres://x@y/z"),
+        )
+        .unwrap();
         // Chart convention: {release}-{role}. Operator: name_of(cr, role).
         for role in ["ingester", "compactor", "query"] {
             assert_eq!(name_of(&report.cluster, role), format!("siglake-{role}"));
@@ -951,6 +1017,7 @@ dispatcher:
         values["compactor"]["deleteTasks"] = serde_yaml::Value::Bool(false);
         let report = synthesize_from_values(
             &values,
+            "siglake",
             "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
@@ -969,6 +1036,7 @@ dispatcher:
         values["compactor"]["deleteTasks"] = serde_yaml::Value::Bool(true);
         let report = synthesize_from_values(
             &values,
+            "siglake",
             "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
@@ -990,6 +1058,7 @@ dispatcher:
         let report = synthesize_from_values(
             &values,
             "siglake",
+            "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
         .unwrap();
@@ -1004,6 +1073,7 @@ dispatcher:
         values["compactor"]["invertedIndex"]["enabled"] = serde_yaml::Value::Bool(true);
         let report = synthesize_from_values(
             &values,
+            "siglake",
             "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
@@ -1028,6 +1098,7 @@ dispatcher:
         let report = synthesize_from_values(
             &values,
             "siglake",
+            "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
         .unwrap();
@@ -1044,6 +1115,7 @@ dispatcher:
         values["compactor"]["indexRebuild"] = serde_yaml::Value::Bool(false);
         let report = synthesize_from_values(
             &values,
+            "siglake",
             "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
@@ -1068,6 +1140,7 @@ dispatcher:
         let report = synthesize_from_values(
             &values,
             "siglake",
+            "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
         .unwrap();
@@ -1086,6 +1159,7 @@ dispatcher:
         values["query"]["jobs"]["persistent"] = serde_yaml::Value::Bool(true);
         let report = synthesize_from_values(
             &values,
+            "siglake",
             "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
@@ -1111,6 +1185,7 @@ dispatcher:
         let report = synthesize_from_values(
             &values,
             "siglake",
+            "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
         .unwrap();
@@ -1126,6 +1201,7 @@ dispatcher:
         values["wal"]["mirror"]["enabled"] = serde_yaml::Value::Bool(true);
         let report = synthesize_from_values(
             &values,
+            "siglake",
             "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
@@ -1148,7 +1224,7 @@ dispatcher:
     fn a_chart_wal_existing_claim_is_reported_at_adoption() {
         let uri = Some("postgres://siglake:pw@host:5432/db");
         let finding_of = |values: &serde_yaml::Value| {
-            synthesize_from_values(values, "siglake", uri)
+            synthesize_from_values(values, "siglake", "siglake", uri)
                 .unwrap()
                 .findings
                 .into_iter()
@@ -1182,7 +1258,7 @@ dispatcher:
 
         // The claim it names is the one the operator actually renders and
         // mounts, not a string the preflight guesses at.
-        let report = synthesize_from_values(&values, "siglake", uri).unwrap();
+        let report = synthesize_from_values(&values, "siglake", "siglake", uri).unwrap();
         assert_eq!(
             crate::render::wal_pvc(&report.cluster)
                 .metadata
@@ -1193,7 +1269,7 @@ dispatcher:
 
         // Carrying the geometry across is unchanged by any of it.
         values["wal"]["size"] = serde_yaml::Value::String("50Gi".into());
-        let report = synthesize_from_values(&values, "siglake", uri).unwrap();
+        let report = synthesize_from_values(&values, "siglake", "siglake", uri).unwrap();
         assert_eq!(report.cluster.spec.storage.wal_size, "50Gi");
     }
 
@@ -1256,6 +1332,7 @@ query:
     fn adopt(values: &serde_yaml::Value) -> AdoptionReport {
         synthesize_from_values(
             values,
+            "siglake",
             "siglake",
             Some("postgres://siglake:pw@host:5432/db"),
         )
@@ -1549,7 +1626,7 @@ query:
     #[test]
     fn the_supported_ingest_secret_reference_still_maps() {
         let report = adopt(&values_with(
-            "ingester:\n  auth:\n    existingSecret: acme-ingest-tokens\n    secretKey: hec\n    list: [ignored-by-the-chart]\n",
+            "ingester:\n  auth:\n    existingSecret: acme-ingest-tokens\n    secretKey: ingest-tokens\n    list: [ignored-by-the-chart]\n",
         ));
         let auth = report
             .cluster
@@ -1558,7 +1635,7 @@ query:
             .as_ref()
             .expect("the reference must survive adoption");
         assert_eq!(auth.name, "acme-ingest-tokens");
-        assert_eq!(auth.key, "hec");
+        assert_eq!(auth.key, "ingest-tokens");
         assert!(
             !report
                 .findings
@@ -1592,11 +1669,136 @@ query:
 
     #[test]
     fn missing_catalog_uri_is_a_blocking_finding() {
-        let report = synthesize_from_values(&standing_values(), "siglake", None).unwrap();
+        let report =
+            synthesize_from_values(&standing_values(), "siglake", "siglake", None).unwrap();
         assert!(report
             .findings
             .iter()
             .any(|f| f.contains("--adopt-catalog-uri")));
+    }
+
+    /// The report's own step 5 is `kubectl apply -f cluster.yaml`, so the whole
+    /// thing has to parse as the one resource it prescribes — findings,
+    /// runbook and all. Before #4544 the runbook's command lines were bare, and
+    /// the saved file stopped being YAML right after the resource.
+    #[test]
+    fn the_whole_report_is_the_manifest_its_runbook_applies() {
+        let report = adopt(&values_with("{}"));
+        let printed = report.to_yaml().unwrap();
+
+        // What kubectl parses: one document, and it is the CR.
+        let docs: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(&printed)
+            .map(|d| serde_yaml::Value::deserialize(d).expect("the report must parse as YAML"))
+            .collect();
+        assert_eq!(docs.len(), 1, "one resource per report:\n{printed}");
+        assert_eq!(docs[0]["kind"].as_str(), Some("SiglakeCluster"));
+        assert_eq!(
+            docs[0]["apiVersion"].as_str(),
+            Some("siglake.limnion.ai/v1alpha1")
+        );
+        assert_eq!(docs[0]["metadata"]["name"].as_str(), Some("siglake"));
+        assert_eq!(docs[0]["metadata"]["namespace"].as_str(), Some("siglake"));
+        let parsed: SiglakeCluster =
+            serde_yaml::from_str(&printed).expect("the report must deserialize into the CR");
+        assert_eq!(parsed.spec, report.cluster.spec);
+
+        // And the reason it parses: nothing below the resource is anything but
+        // a comment. This is the line the docs' extraction leans on.
+        for line in printed
+            .lines()
+            .skip_while(|l| !l.starts_with("# preflight"))
+        {
+            assert!(
+                line.is_empty() || line.starts_with('#'),
+                "a non-comment line below the resource breaks the apply: {line:?}\n{printed}"
+            );
+        }
+
+        // The findings are comments too, one line each whatever they carry.
+        let report = adopt(&values_with(
+            "ingester:\n  trustScopeHeader: true\n  allowedTenants: [acme]\n",
+        ));
+        let printed = report.to_yaml().unwrap();
+        assert!(printed.contains("# preflight FINDINGS"));
+        assert_eq!(
+            printed.matches("#  - ").count(),
+            report.findings.len(),
+            "one comment line per finding:\n{printed}"
+        );
+        serde_yaml::from_str::<SiglakeCluster>(&printed)
+            .expect("findings must not break the manifest");
+    }
+
+    /// A release installed into a namespace that is not its name. Every command
+    /// has to name the namespace the release runs in, and the resource has to
+    /// carry it too — an apply without one lands wherever the current context
+    /// points, and the CRD is namespaced.
+    #[test]
+    fn a_release_whose_namespace_differs_from_its_name_adopts_into_that_namespace() {
+        let report = synthesize_from_values(
+            &standing_values(),
+            "acme",
+            "obs-prod",
+            Some("postgres://x@y/z"),
+        )
+        .unwrap();
+        assert_eq!(
+            report.cluster.metadata.namespace.as_deref(),
+            Some("obs-prod")
+        );
+        assert_eq!(report.cluster.metadata.name.as_deref(), Some("acme"));
+        assert_eq!(
+            serde_yaml::from_str::<serde_yaml::Value>(&report.to_yaml().unwrap()).unwrap()
+                ["metadata"]["namespace"]
+                .as_str(),
+            Some("obs-prod")
+        );
+
+        // Workload names still follow the RELEASE name; only -n moves.
+        let runbook = &report.runbook;
+        for command in [
+            "kubectl get deploy/acme-ingester deploy/acme-compactor sts/acme-query -n obs-prod",
+            "kubectl get secret -n obs-prod -l owner=helm,name=acme -o yaml > helm-release-acme.yaml",
+            "kubectl delete secret -n obs-prod -l owner=helm,name=acme",
+            "kubectl apply -f cluster.yaml",
+            "kubectl get siglakecluster acme -n obs-prod -w",
+        ] {
+            assert!(runbook.contains(command), "missing {command:?}:\n{runbook}");
+        }
+        // ...including the abort path, which puts helm's own namespace
+        // annotation back.
+        let abort = runbook.split_once("# Abort path").unwrap().1;
+        assert!(
+            abort.contains("meta.helm.sh/release-name=acme")
+                && abort.contains("meta.helm.sh/release-namespace=obs-prod"),
+            "the abort path must restore the release's real namespace:\n{abort}"
+        );
+        assert!(
+            abort.contains("kubectl label $kind -n obs-prod")
+                && abort.contains("helm install acme <chart> -n obs-prod"),
+            "every abort command must name the release namespace:\n{abort}"
+        );
+        assert!(
+            !runbook.contains("-n acme"),
+            "no command may fall back to the release name as a namespace:\n{runbook}"
+        );
+    }
+
+    /// The flag's compatibility default: a release whose namespace was never
+    /// given keeps the `-n {name}` the runbook always assumed.
+    #[test]
+    fn the_adoption_namespace_defaults_to_the_release_name() {
+        assert_eq!(adoption_namespace_from(None, "acme"), "acme");
+        assert_eq!(adoption_namespace_from(Some(""), "acme"), "acme");
+        assert_eq!(adoption_namespace_from(Some("   "), "acme"), "acme");
+        assert_eq!(
+            adoption_namespace_from(Some("obs-prod"), "acme"),
+            "obs-prod"
+        );
+        assert_eq!(
+            adoption_namespace_from(Some(" obs-prod "), "acme"),
+            "obs-prod"
+        );
     }
 
     /// Step 4 deletes the helm release secret, which is helm's whole record of
@@ -1606,9 +1808,10 @@ query:
     /// step, and the backup that makes it right has to be taken BEFORE it.
     #[test]
     fn the_runbook_backs_up_the_release_history_before_deleting_it() {
-        let runbook = synthesize_from_values(&standing_values(), "acme", Some("postgres://x@y/z"))
-            .unwrap()
-            .runbook;
+        let runbook =
+            synthesize_from_values(&standing_values(), "acme", "acme", Some("postgres://x@y/z"))
+                .unwrap()
+                .runbook;
 
         let backup = runbook
             .find("-o yaml > helm-release-acme.yaml")

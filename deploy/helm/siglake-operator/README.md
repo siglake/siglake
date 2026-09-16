@@ -106,9 +106,9 @@ this section is reasoned from `render.rs` and `reconciler.rs`.
 **No Secrets access.** The ClusterRole deliberately grants none — the
 operator never reads a Secret, it only references one by name in a
 container's `valueFrom`, which the kubelet resolves. An earlier version
-of this list claimed "`secrets`: read-only (HEC token Secret lookups)";
-that was never true of the shipped ClusterRole, and HEC itself no longer
-exists.
+of this list claimed "`secrets`: read-only (ingest token Secret lookups)";
+that was never true of the shipped ClusterRole, and the operator never
+reads those Secrets.
 
 Operator runs as a non-root, read-only-rootfs ServiceAccount.
 
@@ -150,12 +150,22 @@ can hold.
 
 ```bash
 siglake-operator --adopt-values values.yaml \
-  --adopt-cluster-name <release> --adopt-catalog-uri postgres://...
+  --adopt-cluster-name <release> --adopt-namespace <ns> \
+  --adopt-catalog-uri postgres://... > cluster.yaml
 ```
 
 synthesizes a `SiglakeCluster` from chart values and prints the handover
 runbook (design: `docs/DESIGN_operator_adoption.md`; experimental, no
-live test coverage). Feed it the release's *effective* values
+live test coverage).
+
+The whole output is one manifest: the resource, then the preflight findings
+and the runbook as comments. `cluster.yaml` above is the file the runbook's
+own step 5 applies — no extraction step. `--adopt-namespace` is the
+namespace the release runs in; it lands on `metadata.namespace` and in every
+runbook command, and defaults to the release name, so a release whose
+namespace matches its name renders as before.
+
+Feed it the release's *effective* values
 (`helm get values <release> -n <ns> --all -o yaml`), not only the
 override file: `<tier>.resources`, `<tier>.extraEnv`, `wal.*`,
 `ingester.auth.existingSecret` (with its `secretKey`) and the replica

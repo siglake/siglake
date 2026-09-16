@@ -13,7 +13,7 @@
 # Environment overrides:
 #   SIGLAKE_RELEASE       Helm release name (default: siglake)
 #   SIGLAKE_NAMESPACE     k8s namespace     (default: siglake)
-#   SIGLAKE_IMAGE_TAG     image tag to deploy (default: 0.1.0)
+#   SIGLAKE_IMAGE_TAG     image tag to deploy (default: 0.1.1)
 #   SIGLAKE_VALUES_EXTRA  path to additional values file (default: ./config/values.smoke.yaml)
 #   TF_DIR               terraform working dir (default: deploy/terraform/aws)
 #
@@ -29,7 +29,7 @@ CHART_DIR="$ROOT/deploy/helm/siglake"
 
 RELEASE="${SIGLAKE_RELEASE:-siglake}"
 NAMESPACE="${SIGLAKE_NAMESPACE:-siglake}"
-IMAGE_TAG="${SIGLAKE_IMAGE_TAG:-0.1.0}"
+IMAGE_TAG="${SIGLAKE_IMAGE_TAG:-0.1.1}"
 VALUES_EXTRA="${SIGLAKE_VALUES_EXTRA:-$HERE/config/values.smoke.yaml}"
 case "$VALUES_EXTRA" in
   /*) ;;
@@ -38,6 +38,20 @@ esac
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+HELM_VALUES_FILE=""
+TMP_SECRET=""
+KUBECONFIG_PATH=""
+RETAIN_KUBECONFIG=0
+
+cleanup() {
+  [[ -z "$HELM_VALUES_FILE" ]] || rm -f "$HELM_VALUES_FILE"
+  [[ -z "$TMP_SECRET" ]] || rm -f "$TMP_SECRET"
+  if [[ "$RETAIN_KUBECONFIG" != 1 && -n "$KUBECONFIG_PATH" ]]; then
+    rm -f "$KUBECONFIG_PATH"
+  fi
+}
+trap cleanup EXIT
 
 preserve_warm_node_shape() {
   [[ -n "${TF_VAR_node_instance_types:-}" ]] && return 0
@@ -108,10 +122,23 @@ terraform output -raw helm_values > "$HELM_VALUES_FILE"
 # 3. kubeconfig + namespace
 # ---------------------------------------------------------------------------
 log "kubeconfig: $CLUSTER in $REGION"
-aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER" >/dev/null
+KUBECONFIG_PATH="$(mktemp -t siglake-kubeconfig.XXXXXX)"
+chmod 600 "$KUBECONFIG_PATH"
+aws eks update-kubeconfig \
+  --region "$REGION" \
+  --name "$CLUSTER" \
+  --alias "$CLUSTER" \
+  --kubeconfig "$KUBECONFIG_PATH" >/dev/null
 
-kubectl get ns "$NAMESPACE" >/dev/null 2>&1 \
-  || kubectl create namespace "$NAMESPACE"
+CURRENT_CONTEXT=$(kubectl --kubeconfig "$KUBECONFIG_PATH" config current-context)
+[[ "$CURRENT_CONTEXT" == "$CLUSTER" ]] \
+  || die "configured kube context is '$CURRENT_CONTEXT', expected '$CLUSTER'"
+
+KUBECTL=(kubectl --kubeconfig "$KUBECONFIG_PATH" --context "$CLUSTER")
+HELM=(helm --kubeconfig "$KUBECONFIG_PATH" --kube-context "$CLUSTER")
+
+"${KUBECTL[@]}" get ns "$NAMESPACE" >/dev/null 2>&1 \
+  || "${KUBECTL[@]}" create namespace "$NAMESPACE"
 
 # ---------------------------------------------------------------------------
 # 4. Materialize the Postgres Secret
@@ -140,8 +167,9 @@ data:""")
 for k, v in data.items():
     print(f"  {k}: {base64.b64encode(str(v).encode()).decode()}")
 PY
-kubectl apply -f "$TMP_SECRET" >/dev/null
+"${KUBECTL[@]}" apply -f "$TMP_SECRET" >/dev/null
 rm -f "$TMP_SECRET"
+TMP_SECRET=""
 
 # ---------------------------------------------------------------------------
 # 4b. EFS StorageClass install
@@ -154,7 +182,7 @@ rm -f "$TMP_SECRET"
 # need EFS pay nothing — the StorageClass is just available.
 EFS_ID=$(cd "$TF_DIR" && terraform output -raw efs_file_system_id)
 log "storageclass: install efs-sc pointing at $EFS_ID"
-cat <<YAML | kubectl apply -f - >/dev/null
+cat <<YAML | "${KUBECTL[@]}" apply -f - >/dev/null
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -187,7 +215,7 @@ YAML
 # provision with `Iops to volume size ratio of 1200 is too high;
 # maximum is 500`. Set `wal.size: 16Gi` when using gp3-wal at 6000 IOPS.
 log "storageclass: install gp3-wal (6000 IOPS, 250 MBps)"
-cat <<'YAML' | kubectl apply -f - >/dev/null
+cat <<'YAML' | "${KUBECTL[@]}" apply -f - >/dev/null
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -216,7 +244,7 @@ log "helm: install/upgrade $RELEASE"
 # stand-up). Derive the zone from the live region instead; `<region>a`
 # exists in every commercial region. Override with SIGLAKE_WAL_ZONE.
 WAL_ZONE="${SIGLAKE_WAL_ZONE:-${REGION}a}"
-helm upgrade --install "$RELEASE" "$CHART_DIR" \
+"${HELM[@]}" upgrade --install "$RELEASE" "$CHART_DIR" \
   --namespace "$NAMESPACE" \
   --values "$HELM_VALUES_FILE" \
   --values "$VALUES_EXTRA" \
@@ -226,8 +254,8 @@ helm upgrade --install "$RELEASE" "$CHART_DIR" \
   --set "ingester.nodeSelector.topology\.kubernetes\.io/zone=$WAL_ZONE" \
   --set "compactor.nodeSelector.topology\.kubernetes\.io/zone=$WAL_ZONE" \
   --wait --timeout 10m
-
 rm -f "$HELM_VALUES_FILE"
+HELM_VALUES_FILE=""
 
 # ---------------------------------------------------------------------------
 # 6. Wait for readiness
@@ -237,10 +265,15 @@ log "rollout: wait for ingester + query-server"
 # name already contains the chart name, so the actual Deployment
 # names are `${RELEASE}-ingester` / `${RELEASE}-query` (not
 # `${RELEASE}-siglake-${role}`) for the default RELEASE=siglake.
-kubectl -n "$NAMESPACE" rollout status \
+"${KUBECTL[@]}" -n "$NAMESPACE" rollout status \
   "deployment/${RELEASE}-ingester" --timeout=5m
-kubectl -n "$NAMESPACE" rollout status \
+"${KUBECTL[@]}" -n "$NAMESPACE" rollout status \
   "deployment/${RELEASE}-query"    --timeout=5m
+
+WAREHOUSE_BUCKET=$(cd "$TF_DIR" && terraform output -raw warehouse_bucket)
+RDS_ENDPOINT=$(cd "$TF_DIR" && terraform output -raw rds_endpoint)
+printf -v KUBECONFIG_SHELL '%q' "$KUBECONFIG_PATH"
+RETAIN_KUBECONFIG=1
 
 cat <<EOF
 
@@ -249,12 +282,14 @@ siglake is up.
   namespace:        $NAMESPACE
   release:          $RELEASE
   cluster:          $CLUSTER
-  warehouse bucket: $(cd "$TF_DIR" && terraform output -raw warehouse_bucket)
-  rds endpoint:     $(cd "$TF_DIR" && terraform output -raw rds_endpoint)
+  warehouse bucket: $WAREHOUSE_BUCKET
+  rds endpoint:     $RDS_ENDPOINT
 
 Next:
+  export KUBECONFIG=$KUBECONFIG_SHELL
   deploy/aws/smoke.sh                 # run the smoke test
   deploy/aws/down.sh                  # remove workload, keep EKS warm
   SIGLAKE_DOWN_MODE=all deploy/aws/down.sh
                                      # fully tear down AWS resources
+  rm -f $KUBECONFIG_SHELL             # after the final command above
 EOF

@@ -561,3 +561,262 @@ tests:
       - eval_time: 14m
         alertname: SiglakeIngestLanesRefused
         exp_alerts: []
+
+  # #3000: a short aggregate needs no lost write to exist, so the census's
+  # `detected` outcome is the series a default install fires on — automatic
+  # repair is opt-in. `repaired` is the healthy outcome and must stay silent,
+  # or every successful repair would page.
+  - name: a census that finds a short aggregate raises its warning
+    interval: 1m
+    input_series:
+      - series: 'siglake_group_count_short_aggregates_total{namespace="logs",pod="compactor-0",iceberg_namespace="siglake",table="events",outcome="detected"}'
+        values: '0 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: SiglakeGroupCountAggregateShort
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              iceberg_namespace: siglake
+              table: events
+              outcome: detected
+              severity: warning
+            exp_annotations:
+              summary: The group-count aggregate for siglake.events is short of its row count
+              description: >-
+                The maintenance census found table siglake.events short of
+                `total-records` in at least one maintained column, with every
+                commit's contribution present — outcome detected. Answers stay
+                exact; `GROUP BY` on those columns runs on the exact per-file
+                path and will keep doing so, because no later commit closes the
+                gap. The compactor's WARN line names the columns. Run `siglake
+                rebuild-group-counts --namespace siglake --table events`, which
+                recomputes the aggregate from the committed files and is safe to
+                re-run, or set `compactor.shortAggregateRepair=true` to have the
+                maintenance pass rebuild one table per census.
+
+  # #4737: one compactor censuses the base namespace and every `tenant_*` one,
+  # so the two `events` tables must reach the operator as two alerts naming the
+  # namespace each would be repaired in. A bare `table` label merged them.
+  - name: a short events table in two namespaces raises one alert each
+    interval: 1m
+    input_series:
+      - series: 'siglake_group_count_short_aggregates_total{namespace="logs",pod="compactor-0",iceberg_namespace="siglake",table="events",outcome="detected"}'
+        values: '0 1 1'
+      - series: 'siglake_group_count_short_aggregates_total{namespace="logs",pod="compactor-0",iceberg_namespace="tenant_acme",table="events",outcome="detected"}'
+        values: '0 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: SiglakeGroupCountAggregateShort
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              iceberg_namespace: siglake
+              table: events
+              outcome: detected
+              severity: warning
+            exp_annotations:
+              summary: The group-count aggregate for siglake.events is short of its row count
+              description: >-
+                The maintenance census found table siglake.events short of
+                `total-records` in at least one maintained column, with every
+                commit's contribution present — outcome detected. Answers stay
+                exact; `GROUP BY` on those columns runs on the exact per-file
+                path and will keep doing so, because no later commit closes the
+                gap. The compactor's WARN line names the columns. Run `siglake
+                rebuild-group-counts --namespace siglake --table events`, which
+                recomputes the aggregate from the committed files and is safe to
+                re-run, or set `compactor.shortAggregateRepair=true` to have the
+                maintenance pass rebuild one table per census.
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              iceberg_namespace: tenant_acme
+              table: events
+              outcome: detected
+              severity: warning
+            exp_annotations:
+              summary: The group-count aggregate for tenant_acme.events is short of its row count
+              description: >-
+                The maintenance census found table tenant_acme.events short of
+                `total-records` in at least one maintained column, with every
+                commit's contribution present — outcome detected. Answers stay
+                exact; `GROUP BY` on those columns runs on the exact per-file
+                path and will keep doing so, because no later commit closes the
+                gap. The compactor's WARN line names the columns. Run `siglake
+                rebuild-group-counts --namespace tenant_acme --table events`,
+                which recomputes the aggregate from the committed files and is
+                safe to re-run, or set `compactor.shortAggregateRepair=true` to
+                have the maintenance pass rebuild one table per census.
+
+  - name: a census whose repairs all succeed stays silent
+    interval: 1m
+    input_series:
+      - series: 'siglake_group_count_short_aggregates_total{namespace="logs",pod="compactor-0",iceberg_namespace="siglake",table="events",outcome="repaired"}'
+        values: '0 1 2 3 4 5'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SiglakeGroupCountAggregateShort
+        exp_alerts: []
+
+  # The rebuild and publication alerts carry the same pair, and their repair
+  # commands have to name the namespace they would run against.
+  - name: an incomplete rebuild and a lost publication name their namespace
+    interval: 1m
+    input_series:
+      - series: 'siglake_group_count_auto_rebuilds_total{namespace="logs",pod="compactor-0",iceberg_namespace="tenant_acme",table="events",outcome="incomplete"}'
+        values: '0 1 1'
+      - series: 'siglake_side_aggregate_publish_failures_total{namespace="logs",pod="compactor-0",iceberg_namespace="tenant_acme",table="events"}'
+        values: '0 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: SiglakeGroupCountDeltaLost
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              iceberg_namespace: tenant_acme
+              table: events
+              outcome: incomplete
+              severity: warning
+            exp_annotations:
+              summary: Automatic group-count repair for tenant_acme.events was incomplete
+              description: >-
+                1 automatic group-count rebuild(s) for table tenant_acme.events
+                were incomplete in the last hour. Answers stay exact, but GROUP
+                BY on the affected columns remains on the per-file path. The
+                compactor retries a failed rebuild while its durable marker
+                remains; as the operator fallback, run `siglake
+                rebuild-group-counts --namespace tenant_acme --table events`,
+                which recomputes the aggregate from the committed files and is
+                safe to re-run.
+      - eval_time: 2m
+        alertname: SiglakeSideAggregatePublicationLost
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              iceberg_namespace: tenant_acme
+              table: events
+              severity: warning
+            exp_annotations:
+              summary: A side-aggregate publication for tenant_acme.events was lost
+              description: >-
+                1 side-aggregate publication(s) for table tenant_acme.events on
+                compactor-0 spent all four attempts in the last hour. Each one
+                was carrying a commit's group counts and time aggregates that
+                exist nowhere else, so the object now stays short of
+                total-records and no later commit closes the gap. Check
+                warehouse object-store health and credential refresh (IMDS) on
+                that pod; run `siglake rebuild-group-counts --namespace
+                tenant_acme --table events` to restore the group-count
+                aggregate, which does not rebuild the inline time aggregates.
+
+  # #4674: the gauge is a current state, so the alert has to fire while it
+  # stands and clear on the census pass after the repair — without a query
+  # ever arriving. `for: 30m` is two censuses at the default cadence.
+  - name: a table whose inline aggregate cannot prove coverage is named and pages
+    interval: 1m
+    input_series:
+      - series: 'siglake_inline_coverage_unproven{namespace="logs",pod="compactor-0",iceberg_namespace="tenant_acme",table="events"}'
+        values: '1+0x40 0+0x15'
+      - series: 'siglake_inline_coverage_census_total{namespace="logs",pod="compactor-0"}'
+        values: '0+1x60'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: SiglakeInlineCoverageUnproven
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: SiglakeInlineCoverageUnproven
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              iceberg_namespace: tenant_acme
+              table: events
+              severity: critical
+            exp_annotations:
+              summary: The inline aggregate for events cannot prove coverage
+              description: >-
+                The maintenance census found that table tenant_acme.events has
+                an inline aggregate object whose coverage edge does not reach
+                the current snapshot, with no publication in flight. ANSWERS
+                STAY EXACT — the guard refuses the object — but windowed GROUP
+                BY, date histograms and windowed counts run on the per-file
+                tiers and will keep doing so: no commit repairs this. Run
+                `siglake rebuild-time-aggregates --namespace tenant_acme --table
+                events`, which recomputes the object from the committed files
+                and is safe to re-run. The compactor's WARN line names the same
+                table.
+      # The census after `rebuild-time-aggregates` wrote 0 over the same series.
+      - eval_time: 50m
+        alertname: SiglakeInlineCoverageUnproven
+        exp_alerts: []
+
+  # The liveness arm. A compactor that stopped censusing keeps serving its last
+  # reading forever, so without the second arm this gauge would page for a table
+  # another pod may already have repaired.
+  - name: a stale unproven gauge on a pod that stopped censusing stays silent
+    interval: 1m
+    input_series:
+      - series: 'siglake_inline_coverage_unproven{namespace="logs",pod="compactor-1",iceberg_namespace="siglake",table="events"}'
+        values: '1+0x120'
+      - series: 'siglake_inline_coverage_census_total{namespace="logs",pod="compactor-1"}'
+        values: '7+0x120'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SiglakeInlineCoverageUnproven
+        exp_alerts: []
+
+  # #3143: the local filesystem drain's `poison/` set-aside is the same
+  # operator situation as the claim table's quarantine, so it fires the same
+  # alert — and a cluster with neither must stay silent.
+  - name: a segment set aside by the filesystem drain raises the quarantine warning
+    interval: 1m
+    input_series:
+      - series: 'siglake_compactor_segments_poisoned{namespace="logs-staging",pod="compactor-0",tenant="acme"}'
+        values: '0 1 1 1 1 1 1 1 1 1 1 1 0 0 0'
+      - series: 'siglake_catalog_claim_quarantined{namespace="logs",pod="compactor-0"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: SiglakeSegmentsQuarantined
+        exp_alerts:
+          - exp_labels:
+              namespace: logs-staging
+              pod: compactor-0
+              tenant: acme
+              severity: warning
+            exp_annotations:
+              summary: WAL segments have been set aside and will not drain without intervention
+              description: >-
+                1 segment(s) are quarantined. Their rows are durable and
+                unqueryable. On the claim path, either the drain failed on them
+                repeatedly — usually an index that does not exist — or a mirrored
+                segment could not be placed in the table its index resolves to now,
+                which is set aside on the first cycle because no retry can change it.
+                The `reason` field on the `segment QUARANTINED` log line says which.
+                Resolve, then `requeue_quarantined`. On the local filesystem drain,
+                the segment failed to read on every attempt it was given and sits
+                under `<wal>/poison/` with a `.poison.json` note saying why; the
+                `segment SET ASIDE` log line names the file. Fix what made it
+                unreadable, then `siglake wal-requeue --wal <wal-root>`.
+      # Requeued by an operator at 12m: the alert clears on the next sweep's
+      # reading, without anyone restarting a pod.
+      - eval_time: 13m
+        alertname: SiglakeSegmentsQuarantined
+        exp_alerts: []
+
+  - name: a drain with nothing set aside on either path stays silent
+    interval: 1m
+    input_series:
+      - series: 'siglake_compactor_segments_poisoned{namespace="logs",pod="compactor-0",tenant="default"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'siglake_catalog_claim_quarantined{namespace="logs",pod="compactor-1"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: SiglakeSegmentsQuarantined
+        exp_alerts: []

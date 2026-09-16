@@ -43,20 +43,34 @@ control plane is the long pole; RDS comes up in 5–7 min).
 When the apply completes, fetch credentials and assemble Helm values:
 
 ```bash
-aws eks update-kubeconfig --region "$(terraform output -raw region)" \
-                          --name "$(terraform output -raw cluster_name)"
+REGION=$(terraform output -raw region)
+CLUSTER=$(terraform output -raw cluster_name)
+KUBE_CONTEXT=$CLUSTER
+KUBECONFIG=$(mktemp -t siglake-kubeconfig.XXXXXX)
+chmod 600 "$KUBECONFIG"
+aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER" \
+  --alias "$KUBE_CONTEXT" --kubeconfig "$KUBECONFIG"
+export KUBECONFIG
+
+CURRENT_CONTEXT=$(kubectl config current-context)
+[ "$CURRENT_CONTEXT" = "$KUBE_CONTEXT" ] || {
+  printf 'wrong kube context: got %s, expected %s\n' \
+    "$CURRENT_CONTEXT" "$KUBE_CONTEXT" >&2
+  exit 1
+}
 
 # Materialize the chart-shaped Postgres Secret in the siglake namespace.
 # (The orchestration script in deploy/aws/up.sh does this automatically.)
-kubectl create ns siglake
+kubectl --context "$KUBE_CONTEXT" create ns siglake
 SECRET_ARN=$(terraform output -raw rds_secret_arn)
-aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" \
+aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_ARN" \
   --query SecretString --output text \
-  | python3 -c '
-import json, sys, subprocess
+  | KUBE_CONTEXT="$KUBE_CONTEXT" python3 -c '
+import json, os, sys, subprocess
 d = json.loads(sys.stdin.read())
 subprocess.check_call([
-  "kubectl", "create", "secret", "generic", "siglake-postgres",
+  "kubectl", "--context", os.environ["KUBE_CONTEXT"],
+  "create", "secret", "generic", "siglake-postgres",
   "-n", "siglake",
   *[f"--from-literal={k}={v}" for k, v in d.items()],
 ])'
@@ -64,8 +78,9 @@ subprocess.check_call([
 # Install the chart with the values snippet Terraform built.
 terraform output -raw helm_values > /tmp/siglake.values.yaml
 helm install siglake ../../helm/siglake \
+  --kube-context "$KUBE_CONTEXT" \
   -n siglake -f /tmp/siglake.values.yaml \
-  --set image.tag=0.1.0 \
+  --set image.tag=0.1.1 \
   --set wal.storageClassName=efs-sc
 ```
 
@@ -80,7 +95,7 @@ to choose themselves. Standard recipe:
 ```bash
 helm repo add aws-efs-csi-driver https://kubernetes-sigs.github.io/aws-efs-csi-driver
 helm install aws-efs-csi-driver aws-efs-csi-driver/aws-efs-csi-driver \
-  -n kube-system
+  --kube-context "$KUBE_CONTEXT" -n kube-system
 
 aws efs create-file-system --tags Key=Name,Value=siglake-wal
 # … add mount targets in each private subnet …
@@ -88,6 +103,9 @@ aws efs create-file-system --tags Key=Name,Value=siglake-wal
 ```
 
 Then pass `--set wal.storageClassName=efs-sc` to the chart.
+Keep the private kubeconfig for smoke and teardown commands, then remove it
+with `rm -f "$KUBECONFIG"` when the environment no longer needs Kubernetes
+access.
 
 ## Destroy
 

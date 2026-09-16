@@ -17,32 +17,16 @@
 //! The complement is now `({predicate}) IS NOT TRUE`, which is exact under the
 //! same three-valued logic. The guard and the read-only planner stay.
 
-use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+use chrono::{Duration as ChronoDuration, Utc};
 
 use siglake_core::index_config::{FieldType, IndexConfig};
 use siglake_core::{events_to_record_batch, Event};
 use siglake_storage::iceberg::{DeleteTaskState, IcebergContext};
 
+use crate::fixture_clock::fixture_base;
+
 const GONE: &str = r#"{"tenant":"gone"}"#;
 const STAY: &str = r#"{"tenant":"stay"}"#;
-
-/// A fixed base for the fixtures below, where `Utc::now()` used to be.
-///
-/// The index table is partitioned by day (`Transform::Day`), and these tests
-/// assert how many files an append produced. A window reaching a few minutes
-/// back off `Utc::now()` straddles UTC midnight for the first few minutes of
-/// each day, writing two day partitions instead of one — so `files_rewritten`
-/// came back one higher and the test failed. It is a clock-dependent fixture,
-/// not a delete-path defect: the nightly gate caught
-/// `an_explicit_is_null_predicate_deletes_exactly_the_null_rows` at 00:01 UTC
-/// with `rows_deleted` correct and only the file count off.
-///
-/// 22:13:20Z leaves room for the nine minutes the longest fixture reaches
-/// back, and these tests pass no time bounds to `create_delete_task`, so
-/// nothing here depends on the data being recent.
-fn fixture_base() -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(1_700_000_000, 0).unwrap()
-}
 
 fn logs_index(index_id: &str) -> IndexConfig {
     let mut config = IndexConfig::builtin_events();

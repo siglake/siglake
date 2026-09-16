@@ -1,0 +1,134 @@
+# Builds the profiling image a profiling round consumes, and pushes it as
+# `siglake:prof-<short-sha>`.
+#
+# Deliberately `workflow_dispatch` and NOT `push`. `PROFILING=1` builds with
+# `--features profiling` under `codegen-units = 1`, keeps DWARF, and produces a
+# ~1.95 GB push (versus ~115-123 MB per stripped binary). That roughly doubles
+# an already-slow job, and profiling rounds are occasional — paying it on every
+# merge to main is waste.
+#
+# The round consumes the result WITHOUT building anything locally:
+#
+#   PROFILE_ROUND=1 \
+#   IMAGE_REGISTRY=<account>.dkr.ecr.us-east-1.amazonaws.com \
+#   IMAGE_TAG=siglake:prof-<sha> \
+#   SIGLAKE_REPO=/path/to/siglake \
+#     bash siglake-benchmarks/bench/siglake_aws_run.sh --skip-build
+#
+# Two things a caller has to know:
+#
+#   * This pushes to us-east-1 (matching ci.yml's `docker` job), while rounds
+#     run in us-west-2 next to the corpus. The bench driver parses the registry
+#     region out of IMAGE_REGISTRY, so pass it explicitly.
+#   * `prof-*` tags do NOT expire on the 24-hour clock that `ci-*` tags do.
+#     The siglake repo's lifecycle policy expires untagged images after a day
+#     and tagged images after a day only under the `ci-` prefix, then keeps the
+#     last 50 of any tag status -- so a prof- image lives until 50 newer
+#     images displace it (checked 2026-09-08). Re-check if the policy changes.
+#
+# Mirrors ci.yml's `docker` job for runner selection and the ECR_PUSH secret
+# test, so this file behaves the same way in a repo with no AWS role (build
+# only, never push) as that one does.
+name: profiling-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (default: the branch this is run from)"
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Cheap gates first: a 1.95 GB image build is not the place to discover that
+  # the profiling feature does not compile. These are the two configurations
+  # the endpoint has to support — with and without `--cfg tokio_unstable`,
+  # since tokio-metrics gates most of its counters on it and the module reports
+  # which set it got.
+  check:
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # The same script ci.yml's `clippy` job and scripts/ci-local.sh's
+      # `profiling` job run: clippy plus the crate's tests, in both
+      # configurations.
+      - name: Profiling feature, both tokio_unstable configurations
+        run: scripts/check-profiling-feature.sh
+
+  image:
+    needs: check
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ECR_PUSH: ${{ secrets.AWS_ROLE_ARN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Set image tag
+        run: echo "TAG=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        if: env.ECR_PUSH == 'true'
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Login to ECR
+        id: login-ecr
+        if: env.ECR_PUSH == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # The cache scope MUST differ from the shipped image's `scope=siglake`.
+      # The RUSTFLAGS above invalidate every object, so a shared scope would
+      # cross-contaminate the normal image's cache with tokio_unstable and
+      # frame-pointer builds — the same hazard the Dockerfile's BUILD_CACHE_ID
+      # comment records for the local target-dir mount.
+      - name: Build and push the profiling image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: ${{ env.ECR_PUSH == 'true' }}
+          build-args: |
+            SIGLAKE_GIT_SHA=${{ env.TAG }}
+            PROFILING=1
+            BUILD_CACHE_ID=profiling
+          tags: ${{ env.ECR_PUSH == 'true' && format('{0}/siglake:prof-{1}', steps.login-ecr.outputs.registry, env.TAG) || format('siglake:prof-{0}', env.TAG) }}
+          cache-from: type=gha,scope=siglake-profiling
+          cache-to: type=gha,scope=siglake-profiling,mode=max
+
+      # The Dockerfile already fails the build if `.debug_info` is missing under
+      # PROFILING=1, so this only reports what a caller needs next: the exact
+      # IMAGE_TAG to pass, and the fact that it is unstripped.
+      - name: Report the tag to launch with
+        if: env.ECR_PUSH == 'true'
+        run: |
+          echo "### Profiling image pushed" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Launch a round with:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "PROFILE_ROUND=1 \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "IMAGE_REGISTRY=${{ steps.login-ecr.outputs.registry }} \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "IMAGE_TAG=siglake:prof-${TAG} \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "  bash siglake-benchmarks/bench/siglake_aws_run.sh --skip-build" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

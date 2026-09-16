@@ -14,6 +14,24 @@ default = []
 # image: `deploy/Dockerfile` builds with no `--features` and the chart defaults
 # do not name it. This is not a production column and not a format surface.
 experimental-schema-rollback-probe = []
+# OFF by default: a shipped image must not carry the profiler. Enabling it adds
+# the `/debug/pprof/*` routes to the `--metrics-bind` server (see
+# `src/profiling.rs`), and those routes ALSO require `SIGLAKE_PPROF_ENABLED=1`
+# at runtime -- a feature flag alone is too easy to ship by accident.
+#
+# The two binaries that declare a jemalloc global allocator (`siglake-cli`,
+# `siglake-query-server`) each have a `profiling` feature of their own that
+# turns this on AND enables `tikv-jemallocator/profiling`. Enabling this
+# feature alone leaves the heap route reporting 412: the ctl crate can only
+# read a jemalloc that was BUILT with `--enable-prof`, and that is a property
+# of the allocator the binary links, not of this crate.
+profiling = [
+    "dep:pprof",
+    "dep:tikv-jemalloc-ctl",
+    "dep:tokio-metrics",
+    "dep:flate2",
+    "dep:tempfile",
+]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -39,6 +57,16 @@ tracing-opentelemetry = { workspace = true }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
+
+# Optional, and reached only under the `profiling` feature above.
+pprof = { workspace = true, optional = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }
+tokio-metrics = { workspace = true, optional = true }
+# gzip framing for the pprof payload, and the scratch file jemalloc's
+# `prof.dump` writes to before it is read back over HTTP. Both already resolve
+# in the lockfile; `tempfile = "3"` is a direct dep of eight other members.
+flate2 = { version = "1", optional = true }
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
