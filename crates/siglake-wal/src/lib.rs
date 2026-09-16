@@ -638,7 +638,7 @@ impl WalWriter {
     /// the flush, accepted-but-not-yet-sealed batches sit in memory
     /// until either the buffer fills (~8 KB default) or `seal()`
     /// runs — which means a SIGKILL or pod rollover between seals
-    /// drops events the HEC handler already 200'd to the client.
+    /// drops events the ingest handler already 200'd to the client.
     /// The trade-off is one extra `write(2)` per batch boundary;
     /// in practice that's amortized over the typical multi-event
     /// batch the BackpressureRouter feeds in. fsync still only
@@ -2090,7 +2090,7 @@ fn list_layout_dirs(root: &Path) -> Result<Vec<(String, PathBuf)>> {
 /// is treated as a tenant. Returns `[(tenant_name, tenant_dir)]`.
 ///
 /// Used by the per-tenant compactor sweep to enumerate tenants
-/// without needing the HEC configuration on hand.
+/// without needing the ingest configuration on hand.
 pub fn list_tenant_dirs(root: &Path) -> Result<Vec<(String, PathBuf)>> {
     list_layout_dirs(root)
 }

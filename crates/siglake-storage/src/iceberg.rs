@@ -1659,9 +1659,8 @@ fn warehouse_operator(location: &str) -> Result<opendal::Operator> {
 pub const DEFAULT_CATALOG_FILE: &str = "_catalog.db";
 
 /// Columns that get a per-row-group Parquet bloom filter. These are the
-/// high-cardinality dimensional fields — equivalent to Splunk's primary
-/// indexed fields — and they're where our `WHERE` clauses spend most of
-/// their selectivity.
+/// high-cardinality dimensional fields, and they're where our `WHERE`
+/// clauses spend most of their selectivity.
 pub const BLOOM_FILTER_COLUMNS: &[&str] = &["host", "source", "sourcetype", "index"];
 
 /// Snapshot-summary property (Iceberg `additional_properties`) holding the

@@ -800,8 +800,8 @@ fn selector_labels_from(labels: &BTreeMap<String, String>) -> BTreeMap<String, S
 ///
 /// ONE DEFINITION, used to build the container's ports AND the Service that
 /// targets them. They used to be written out separately in two files, and a
-/// rename landed in one of them: the operator's ingester Service targeted a
-/// port named `hec` while the container declared `ingest`. A named `targetPort`
+/// rename landed in one of them: the operator's ingester Service targeted the
+/// port's old name while the container declared `ingest`. A named `targetPort`
 /// matching no container port is silently dropped by the endpoints controller,
 /// so the EndpointSlice carried no port for 8088 and every connection to
 /// `<cr>-ingester:8088` was refused — while the pods stayed Ready, because the
@@ -3016,9 +3016,9 @@ mod tests {
 
     /// Every Service's named `targetPort` must exist on the workload it selects.
     ///
-    /// THE DEFECT THIS GUARDS. The ingester Service targeted a port named `hec`
-    /// while the container declared `ingest` — residue of the HEC-to-OTLP
-    /// rename landing in one of two copies. A named `targetPort` matching no
+    /// THE DEFECT THIS GUARDS. The ingester Service targeted the ingest port's
+    /// old name while the container declared `ingest` — residue of the
+    /// OTLP rename landing in one of two copies. A named `targetPort` matching no
     /// container port is silently DROPPED by the endpoints controller: the
     /// EndpointSlice carries no port for 8088 and every connection to
     /// `<cr>-ingester:8088` is refused, while the pods stay Ready because the

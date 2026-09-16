@@ -84,7 +84,7 @@ paths:
         '403':
           description: Tenant refused by the ingest middleware before the handler runs — a tenant header this single-tenant ingester will not route, a header that disagrees with (or a token that lacks) the JWT tenant claim, a resolved tenant outside `--allowed-tenants`, or a novel tenant past `--max-tenants` — even though this route ignores which tenant is named. No body.
         '429':
-          description: Rate limited. `hec_rate_limit_middleware` wraps every ingest route and runs ahead of even the auth check, so this probe is throttled like any other request. No body — `retry-after` carries the only part a `HEAD` caller could have read anyway.
+          description: Rate limited. `ingest_rate_limit_middleware` wraps every ingest route and runs ahead of even the auth check, so this probe is throttled like any other request. No body — `retry-after` carries the only part a `HEAD` caller could have read anyway.
           headers:
             retry-after:
               schema:
@@ -127,7 +127,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/SiglakeErrorBody'
         '429':
-          description: Rate limited. `hec_rate_limit_middleware` wraps every ingest route, this readiness gate included, and runs ahead of even the auth check — so a shipper that polls health hard enough is throttled here, before it has sent a single event.
+          description: Rate limited. `ingest_rate_limit_middleware` wraps every ingest route, this readiness gate included, and runs ahead of even the auth check — so a shipper that polls health hard enough is throttled here, before it has sent a single event.
           headers:
             retry-after:
               schema:
@@ -294,7 +294,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/SiglakeErrorBody'
         '429':
-          description: Rate limited. `hec_rate_limit_middleware` wraps every ingest route, this readiness gate included, and runs ahead of even the auth check — so a shipper that polls health hard enough is throttled here, before it has sent a single event.
+          description: Rate limited. `ingest_rate_limit_middleware` wraps every ingest route, this readiness gate included, and runs ahead of even the auth check — so a shipper that polls health hard enough is throttled here, before it has sent a single event.
           headers:
             retry-after:
               schema:

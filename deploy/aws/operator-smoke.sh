@@ -14,7 +14,7 @@
 #      RDS endpoint, region).
 #   2. Resolve the postgres password from Secrets Manager and build a
 #      `catalogUri` of the form `postgres://siglake:<pw>@<host>/siglake`.
-#   3. Create the two HEC token Secrets the sample CR references.
+#   3. Create the two ingest token Secrets the sample CR references.
 #   4. Substitute every `__PLACEHOLDER__` in
 #      `deploy/operator/sample-cluster.smoke.yaml` and kubectl apply it.
 #   5. Wait for the operator-rendered `example-ingester`,

@@ -106,9 +106,9 @@ this section is reasoned from `render.rs` and `reconciler.rs`.
 **No Secrets access.** The ClusterRole deliberately grants none — the
 operator never reads a Secret, it only references one by name in a
 container's `valueFrom`, which the kubelet resolves. An earlier version
-of this list claimed "`secrets`: read-only (HEC token Secret lookups)";
-that was never true of the shipped ClusterRole, and HEC itself no longer
-exists.
+of this list claimed "`secrets`: read-only (ingest token Secret lookups)";
+that was never true of the shipped ClusterRole, and the operator never
+reads those Secrets.
 
 Operator runs as a non-root, read-only-rootfs ServiceAccount.
 
