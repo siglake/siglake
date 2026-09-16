@@ -82,6 +82,30 @@ fn batch(cfg: &IndexConfig, nth: i64) -> RecordBatch {
     .unwrap()
 }
 
+/// [`batch`] with a chosen row count, for the cost measurement: the repair
+/// reads the FILES, so its cost is set by rows and distinct values per file.
+fn wide_batch(cfg: &IndexConfig, nth: i64, rows: i64) -> RecordBatch {
+    let base = 1_700_000_000_000_000i64 + nth * 100_000_000_000;
+    RecordBatch::try_new(
+        cfg.to_arrow_schema(),
+        vec![
+            std::sync::Arc::new(
+                TimestampMicrosecondArray::from(
+                    (0..rows).map(|i| Some(base + i)).collect::<Vec<_>>(),
+                )
+                .with_timezone("+00:00"),
+            ),
+            std::sync::Arc::new(StringArray::from(
+                (0..rows)
+                    .map(|i| format!("h-{:08}", nth * rows + i))
+                    .collect::<Vec<_>>(),
+            )),
+            std::sync::Arc::new(StringArray::from(vec![None::<&str>; rows as usize])),
+        ],
+    )
+    .unwrap()
+}
+
 async fn open(root: &std::path::Path) -> IcebergContext {
     IcebergContext::open(root).await.unwrap().with_tuning(
         // Above the inline ceiling, which is what switches the incremental
@@ -486,6 +510,98 @@ async fn a_recorded_column_is_skipped_without_reading_any_file() {
         )]
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// What the two halves cost, which is what the cadence and the per-pass budget
+/// are set from. Run it:
+///
+/// ```text
+/// cargo test --release -p siglake-storage --test storage \
+///     agg_short_repair::measure -- --ignored --nocapture
+/// ```
+///
+/// The census must be cheap enough to run on a timer over every table, and the
+/// repair must be expensive enough to justify budgeting it. Recorded 2026-09-16
+/// on the dev box (release, local filesystem warehouse, 8 commits, one
+/// dimension column, one distinct value per row):
+///
+/// ```text
+/// rows=40000  census=12.3ms  repair=64.4ms   5x  161ms/100k rows
+/// rows=400000 census=139.3ms repair=849.4ms  6x  212ms/100k rows
+/// ```
+///
+/// Both halves are linear in the column's distinct values — the census walks
+/// the base object, the repair reads the files — and the repair is ~6× the
+/// census per column. That sets both defaults. The census at 900 s costs
+/// milliseconds per table, so it can be unconditional. The repair extrapolates
+/// to ~9 minutes per column at 250M rows on a local filesystem, so a 22-column
+/// table is hours: it is opt-in, budgeted at one table per pass, and on a table
+/// that size the operator's `rebuild-group-counts` is still the tool (the
+/// compactor's 600 s watchdog would cut a repair that long and its trip counter
+/// is what says so).
+#[tokio::test]
+#[ignore = "measurement, not an assertion"]
+async fn measure_census_and_repair_cost() {
+    for rows_per_commit in [5_000i64, 50_000] {
+        measure_one(rows_per_commit).await;
+    }
+}
+
+async fn measure_one(rows_per_commit: i64) {
+    const COMMITS: i64 = 8;
+    let tmp = tempfile::tempdir().unwrap();
+    let wh = tmp.path().join("warehouse");
+    let ice = open(&wh).await;
+    let cfg = index_config("cost");
+    ice.create_index(&cfg).await.unwrap();
+    let ident = ice.index_table_ident("cost");
+
+    for n in 0..COMMITS {
+        ice.append_to_table(&ident, wide_batch(&cfg, n, rows_per_commit), &["host"])
+            .await
+            .unwrap();
+    }
+    // Lose the first commit's contribution, then fold: the base is short and
+    // the census has something to find.
+    let mut deltas: Vec<std::path::PathBuf> = aggregate_artifacts(&wh)
+        .into_iter()
+        .filter(|p| p.to_string_lossy().contains("siglake-agg-deltas"))
+        .collect();
+    deltas.sort();
+    std::fs::remove_file(&deltas[0]).unwrap();
+    ice.fold_group_count_deltas(1).await.unwrap();
+    ice.invalidate_cached_table(&ident).await;
+
+    let started = std::time::Instant::now();
+    let census = ice.repair_short_group_count_aggregates(0).await.unwrap();
+    let census_ms = started.elapsed().as_secs_f64() * 1e3;
+    assert!(
+        matches!(
+            census.first().map(|(_, o)| o),
+            Some(ShortAggregateOutcome::Detected { .. })
+        ),
+        "{census:?}"
+    );
+
+    ice.invalidate_cached_table(&ident).await;
+    let started = std::time::Instant::now();
+    let repair = ice.repair_short_group_count_aggregates(1).await.unwrap();
+    let repair_ms = started.elapsed().as_secs_f64() * 1e3;
+    assert!(
+        matches!(
+            repair.first().map(|(_, o)| o),
+            Some(ShortAggregateOutcome::Repaired { .. })
+        ),
+        "{repair:?}"
+    );
+
+    let rows = (COMMITS * rows_per_commit) as f64;
+    println!(
+        "rows={rows:.0} commits={COMMITS} census={census_ms:.1}ms \
+         repair={repair_ms:.1}ms ratio={:.0}x repair_per_100k_rows={:.0}ms",
+        repair_ms / census_ms.max(f64::MIN_POSITIVE),
+        repair_ms / rows * 100_000.0
+    );
 }
 
 /// The per-pass budget. Every table upgraded across #2919 is short at once, and

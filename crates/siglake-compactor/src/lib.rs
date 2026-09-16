@@ -6926,6 +6926,73 @@ mod mirror_sync_gate_tests {
 }
 
 #[cfg(test)]
+mod agg_short_repair_knob_tests {
+    use super::{
+        agg_short_repair_enabled_from, agg_short_repair_max_tables_from,
+        agg_short_scan_interval_from,
+    };
+    use std::time::Duration;
+
+    /// Unlike the mirror sweep, `0` here IS off: a census on every compactor
+    /// loop would re-read every table's folded base once a second to answer a
+    /// question whose answer changes only when something commits or rebuilds.
+    #[test]
+    fn the_census_cadence_reads_its_disable_words_and_zero() {
+        for word in ["off", "OFF", "disabled", "never", "0", " off "] {
+            assert!(
+                agg_short_scan_interval_from(Some(word)).is_none(),
+                "{word:?} must disable the census"
+            );
+        }
+        assert_eq!(
+            agg_short_scan_interval_from(Some("300")),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            agg_short_scan_interval_from(None),
+            Some(Duration::from_secs(900)),
+            "the default cadence"
+        );
+        assert_eq!(
+            agg_short_scan_interval_from(Some("nonsense")),
+            Some(Duration::from_secs(900)),
+            "an unparseable value falls back to the default rather than to \
+             every loop"
+        );
+    }
+
+    /// The repair is one Tier-2 query per maintained column, so only an
+    /// explicit opt-in may turn it on — anything else leaves the census
+    /// reporting and the operator's rebuild the remedy.
+    #[test]
+    fn only_an_explicit_opt_in_enables_the_repair() {
+        for word in ["1", "true", "TRUE", "yes", "on", " on "] {
+            assert!(
+                agg_short_repair_enabled_from(Some(word)),
+                "{word:?} must enable the repair"
+            );
+        }
+        for word in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(
+                !agg_short_repair_enabled_from(Some(word)),
+                "{word:?} must not enable the repair"
+            );
+        }
+        assert!(!agg_short_repair_enabled_from(None), "default is off");
+    }
+
+    #[test]
+    fn the_per_pass_repair_budget_is_at_least_one_table() {
+        assert_eq!(agg_short_repair_max_tables_from(None), 1);
+        assert_eq!(agg_short_repair_max_tables_from(Some("4")), 4);
+        // 0 would make the interval gate a no-op that silently never repairs;
+        // switching the repair off is what the enable knob is for.
+        assert_eq!(agg_short_repair_max_tables_from(Some("0")), 1);
+        assert_eq!(agg_short_repair_max_tables_from(Some("nonsense")), 1);
+    }
+}
+
+#[cfg(test)]
 mod mirror_sync_cursor_tests {
     use std::collections::BTreeSet;
 
