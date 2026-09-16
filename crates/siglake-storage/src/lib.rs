@@ -194,6 +194,116 @@ pub fn text_index_cache_config_from(
     )
 }
 
+/// What a process does with the warehouse, for cache sizing.
+///
+/// The query server is not in here: it resolves its own budgets from its flags
+/// ([`resolve_query_read_cache_config`], [`resolve_text_index_cache_config`]).
+/// These are the roles of the `siglake` binary, which is every OTHER process
+/// that opens a warehouse — the compactor pod, the ingest server, the sweeps
+/// and rebuilds, and the two subcommands that run SQL in process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarehouseRole {
+    /// Runs DataFusion SQL over the Iceberg tables in this process
+    /// (`sql-direct`, `iceberg-demo`, `subscribe`), so a `LIKE` or an FTS
+    /// predicate can reach the scan's index-pruning path and fill the
+    /// text-index caches.
+    InProcessQuery,
+    /// Drains, compacts, sweeps, rebuilds. Never plans a text predicate.
+    Maintenance,
+}
+
+/// Both cache configurations one role resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleCacheConfig {
+    pub read: QueryReadCacheConfig,
+    pub text_index: TextIndexCacheConfig,
+}
+
+/// Pure resolver for the `siglake` binary's cache budgets, by role.
+///
+/// WHY A ROLE AND NOT THE QUERY SERVER'S ANSWER. #4056 sized both text-index
+/// caches from the pod's memory limit at the query server's startup; every
+/// other process kept the fork's env-or-constant fallback, a flat 1 GiB of
+/// parsed indexes plus 256 MiB of blobs whatever its limit — 1.25 GiB of
+/// ceilings inside the 1Gi the chart packages for the compactor.
+///
+/// A maintenance process takes an explicit ZERO rather than a derivation,
+/// because nothing it does can fill either cache. The only sites that insert
+/// are the fork reader's index-pruning path (`inverted_index_row_selection`),
+/// reached only from a plan carrying a `RawPruneSpec` — a text predicate
+/// through the Iceberg table provider. Maintenance plans none: a Tier-2
+/// aggregate rebuild counts from manifest stats, Parquet footers and raw pages,
+/// and a delete task evaluates its predicate over a `MemTable` of the candidate
+/// file's decoded rows. So the flat pair bounded caches that never take an
+/// entry, and the zero costs a maintenance process nothing. (It is a budget,
+/// not a refusal: were a maintenance read to reach that path after all, a zero
+/// parsed budget means it re-parses per file, which is the documented
+/// `SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES=0` behaviour.)
+///
+/// The READ caches are the same answer for both roles, and deliberately not the
+/// query server's: the byte-range object cache stays the opt-in it has always
+/// been (`SIGLAKE_OBJECT_CACHE_BYTES`, `0`/unset disabling it — exactly what the
+/// fork holds when nothing configures it), and the decoded-file cache is off
+/// because only the query server applies its limits
+/// ([`configure_query_scan_tuning`]). Resolving them here is about honesty, not
+/// enablement: a process that configures nothing leaves
+/// [`reserved_cache_bytes_in_force`] to fall back on the query server's
+/// resolver, which answers with a DERIVED object cache — a quarter of the pod —
+/// for a process whose object cache is empty by construction.
+///
+/// Every override survives in both roles: an operator with
+/// `SIGLAKE_OBJECT_CACHE_BYTES` or either text-index bound set fleet-wide keeps
+/// what they set.
+pub fn resolve_role_cache_config(
+    role: WarehouseRole,
+    memory_limit_bytes: Option<u64>,
+    object_cache_max_bytes: Option<u64>,
+    parsed_index_max_bytes: Option<u64>,
+    puffin_blob_max_bytes: Option<u64>,
+) -> RoleCacheConfig {
+    let text_index = match role {
+        WarehouseRole::InProcessQuery => resolve_text_index_cache_config(
+            memory_limit_bytes,
+            parsed_index_max_bytes,
+            puffin_blob_max_bytes,
+        ),
+        WarehouseRole::Maintenance => TextIndexCacheConfig {
+            parsed_index_max_bytes: parsed_index_max_bytes.unwrap_or(0),
+            puffin_blob_max_bytes: puffin_blob_max_bytes.unwrap_or(0),
+        },
+    };
+    RoleCacheConfig {
+        read: QueryReadCacheConfig {
+            object_cache_max_bytes: object_cache_max_bytes.unwrap_or(0),
+            file_cache_max_bytes: None,
+            file_cache_max_entries: None,
+        },
+        text_index,
+    }
+}
+
+/// [`resolve_role_cache_config`] for raw environment values, so the parsing is
+/// covered without mutating the process environment.
+///
+/// `SIGLAKE_OBJECT_CACHE_BYTES` is parsed the way the fork parses it — no trim,
+/// unparseable means off — so recording the budget cannot disagree with the
+/// cache that would have read the variable itself.
+pub fn role_cache_config_from(
+    role: WarehouseRole,
+    memory_limit_bytes: Option<u64>,
+    object_cache_max_bytes: Option<&str>,
+    parsed_index_max_bytes: Option<&str>,
+    puffin_blob_max_bytes: Option<&str>,
+) -> RoleCacheConfig {
+    resolve_role_cache_config(
+        role,
+        memory_limit_bytes,
+        object_cache_max_bytes.and_then(|value| value.parse::<u64>().ok()),
+        parsed_index_max_bytes.and_then(|value| value.trim().parse::<u64>().ok()),
+        puffin_blob_max_bytes.and_then(|value| value.trim().parse::<u64>().ok()),
+    )
+}
+
 /// Apply the resolved text-index cache budgets to the fork's caches. Must run
 /// before the shared query memory pool is built, which subtracts what they
 /// hold.

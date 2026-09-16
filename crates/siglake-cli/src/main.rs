@@ -16,7 +16,9 @@ use siglake_core::{events_schema, events_to_record_batch, Event};
 use siglake_ingest::{AppState, TenantRouting};
 use siglake_storage::iceberg::{GroupCountRebuildOptions, IcebergContext};
 use siglake_storage::subscribe::IcebergSubscription;
-use siglake_storage::{local_store, register_parquet_dir, session_context, write_batch_as_parquet};
+use siglake_storage::{
+    local_store, register_parquet_dir, session_context, write_batch_as_parquet, WarehouseRole,
+};
 use siglake_wal::WalWriter;
 
 mod sql_client;
@@ -814,6 +816,193 @@ enum Command {
     },
 }
 
+/// Which cache budgets this invocation earns.
+///
+/// One binary, two roles: `siglake compactor` is the packaged compactor pod and
+/// `siglake sql-direct` is a query engine, and they were sharing the fork's flat
+/// text-index ceilings — 1.25 GiB of them inside the compactor's 1Gi limit
+/// (#4082). Exhaustive on purpose, so a new subcommand has to say which role it
+/// runs in rather than inherit one.
+///
+/// [`WarehouseRole::InProcessQuery`] is the subcommands that register the
+/// Iceberg tables with DataFusion and execute SQL here: a `LIKE` or an FTS
+/// predicate among them reaches the scan's index-pruning path, which is the
+/// only thing that fills the text-index caches. `subscribe` is in for the same
+/// reason even though it cursors on time — it plans against the same provider
+/// and its budgets are derived, so being wrong about it costs nothing.
+///
+/// Everything else is maintenance, including `query` (a listing table over a
+/// local Parquet directory — no Iceberg provider and no index sidecars to read)
+/// and the subcommands that never open a warehouse at all (`sql` talks to a
+/// running server over HTTP, `gen` writes to stdout).
+fn warehouse_role(command: &Command) -> WarehouseRole {
+    match command {
+        Command::SqlDirect { .. } | Command::IcebergDemo { .. } | Command::Subscribe { .. } => {
+            WarehouseRole::InProcessQuery
+        }
+        Command::Compactor { .. }
+        | Command::IngestServer { .. }
+        | Command::Sql { .. }
+        | Command::Ingest { .. }
+        | Command::Query { .. }
+        | Command::Gen { .. }
+        | Command::WalRecover { .. }
+        | Command::WalRequeue { .. }
+        | Command::AuditRotate { .. }
+        | Command::GcOrphans { .. }
+        | Command::RetentionSweep { .. }
+        | Command::DeleteSweep { .. }
+        | Command::RebuildGroupCounts { .. }
+        | Command::RebuildTimeAggregates { .. }
+        | Command::MigrateSchema { .. } => WarehouseRole::Maintenance,
+    }
+}
+
+/// Resolve this role's cache budgets and push them into the caches, the way
+/// `siglake-query-server`'s startup does for its own role.
+///
+/// Both configurations, because both were being answered by a fallback rather
+/// than by this process: the text-index caches took the fork's env-or-constant
+/// pair, and `reserved_cache_bytes_in_force` — what the query memory pool
+/// subtracts — re-derived the query server's object cache for a process whose
+/// object cache is off. The resolver
+/// ([`siglake_storage::resolve_role_cache_config`]) carries which budget a role
+/// gets and why.
+fn configure_role_caches(role: WarehouseRole) {
+    let object_cache = std::env::var("SIGLAKE_OBJECT_CACHE_BYTES").ok();
+    let parsed_index = std::env::var("SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES").ok();
+    let puffin_blob = std::env::var("SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES").ok();
+    let config = siglake_storage::role_cache_config_from(
+        role,
+        siglake_storage::iceberg::cgroup_memory_limit_bytes(),
+        object_cache.as_deref(),
+        parsed_index.as_deref(),
+        puffin_blob.as_deref(),
+    );
+    siglake_storage::configure_query_read_caches(config.read);
+    siglake_storage::configure_text_index_caches(config.text_index);
+    tracing::debug!(
+        ?role,
+        object_cache_bytes = config.read.object_cache_max_bytes,
+        parsed_index_cache_bytes = config.text_index.parsed_index_max_bytes,
+        puffin_blob_cache_bytes = config.text_index.puffin_blob_max_bytes,
+        "cache budgets resolved for this role"
+    );
+}
+
+#[cfg(test)]
+mod warehouse_role_tests {
+    use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn role_of(argv: &[&str]) -> WarehouseRole {
+        warehouse_role(&Cli::try_parse_from(argv).expect("argv parses").command)
+    }
+
+    /// The packaged compactor pod (`deploy/helm/siglake/values.yaml`: 1Gi) and
+    /// the query subcommands of the same binary get different ceilings, which is
+    /// the whole of #4082: the compactor was holding the fork's flat 1 GiB +
+    /// 256 MiB inside a 1Gi limit.
+    #[test]
+    fn the_compactor_is_maintenance_and_takes_no_text_index_ceilings() {
+        assert_eq!(
+            role_of(&["siglake", "compactor"]),
+            WarehouseRole::Maintenance
+        );
+
+        let config = siglake_storage::role_cache_config_from(
+            WarehouseRole::Maintenance,
+            Some(GIB),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(config.text_index.reserved_bytes(), 0);
+        // And the read caches are what an unconfigured process actually holds:
+        // the byte-range object cache stays off until an operator sets it.
+        assert_eq!(config.read.reserved_bytes(), 0);
+    }
+
+    /// `sql-direct` executes SQL against the Iceberg tables in this process, so
+    /// a text predicate can fill the caches and the budgets are derived — the
+    /// query server's answer, at this process's limit.
+    #[test]
+    fn sql_direct_is_a_query_role_and_derives_its_budgets() {
+        assert_eq!(
+            role_of(&["siglake", "sql-direct", "--query", "SELECT 1"]),
+            WarehouseRole::InProcessQuery
+        );
+
+        let derived = siglake_storage::role_cache_config_from(
+            WarehouseRole::InProcessQuery,
+            Some(8 * GIB),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            derived.text_index,
+            siglake_storage::resolve_text_index_cache_config(Some(8 * GIB), None, None),
+            "an in-process query role resolves what the query server would"
+        );
+        assert!(derived.text_index.reserved_bytes() > 0, "8Gi has the room");
+    }
+
+    /// Roles, one per subcommand that opens a warehouse. `query` reads a local
+    /// Parquet directory through a listing table — no Iceberg provider, no index
+    /// sidecar — so it is maintenance however much SQL it runs.
+    #[test]
+    fn every_subcommand_has_a_role() {
+        for argv in [
+            ["siglake", "iceberg-demo"].as_slice(),
+            ["siglake", "subscribe", "--table", "events"].as_slice(),
+        ] {
+            assert_eq!(role_of(argv), WarehouseRole::InProcessQuery, "{argv:?}");
+        }
+        for argv in [
+            ["siglake", "ingest-server"].as_slice(),
+            ["siglake", "query", "--sql", "SELECT 1"].as_slice(),
+            ["siglake", "delete-sweep", "--index", "events"].as_slice(),
+            ["siglake", "gc-orphans"].as_slice(),
+            ["siglake", "retention-sweep"].as_slice(),
+            ["siglake", "rebuild-group-counts"].as_slice(),
+            ["siglake", "rebuild-time-aggregates"].as_slice(),
+            ["siglake", "migrate-schema"].as_slice(),
+            ["siglake", "gen"].as_slice(),
+            ["siglake", "sql"].as_slice(),
+        ] {
+            assert_eq!(role_of(argv), WarehouseRole::Maintenance, "{argv:?}");
+        }
+    }
+
+    /// A fleet-wide override survives the role. An operator who has sized these
+    /// caches by hand keeps what they set, in either role.
+    #[test]
+    fn an_operator_override_survives_both_roles() {
+        for role in [WarehouseRole::Maintenance, WarehouseRole::InProcessQuery] {
+            let config = siglake_storage::role_cache_config_from(
+                role,
+                Some(GIB),
+                Some("134217728"),
+                Some("268435456"),
+                Some("0"),
+            );
+            assert_eq!(
+                config.read.object_cache_max_bytes,
+                128 * 1024 * 1024,
+                "{role:?}"
+            );
+            assert_eq!(
+                config.text_index.parsed_index_max_bytes,
+                256 * 1024 * 1024,
+                "{role:?}"
+            );
+            assert_eq!(config.text_index.puffin_blob_max_bytes, 0, "{role:?}");
+        }
+    }
+}
+
 /// jemalloc as the global allocator: the drain's large transient allocations
 /// (256 MiB batch -> concat -> sort -> split -> encode copies) fragment glibc
 /// malloc arenas, which retain freed memory indefinitely — a 200G round crept
@@ -839,6 +1028,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     std::fs::create_dir_all(&cli.data_dir)?;
+    // Before anything opens a warehouse or builds the query memory pool, which
+    // subtracts what the caches hold.
+    configure_role_caches(warehouse_role(&cli.command));
 
     match cli.command {
         Command::Ingest { input } => ingest(&cli.data_dir, input).await,
