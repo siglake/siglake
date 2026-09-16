@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **Diagnostics (new, off in every released binary)**: on-demand CPU, heap and
+  tokio-runtime profiles at `/debug/pprof/{profile,heap,runtime}` on the
+  `--metrics-bind` router, so one mount point covers the ingester, the
+  compactor and the query tier. Reaching them takes two opt-ins, neither of
+  which a release carries: `siglake-core`'s off-by-default `profiling` cargo
+  feature, and `SIGLAKE_PPROF_ENABLED=1` in the process (any other value,
+  including a misspelling, leaves the routes absent and answering `404`). The
+  build that carries the feature is `deploy/Dockerfile --build-arg
+  PROFILING=1`, which also sets `--cfg tokio_unstable` and frame pointers and
+  keeps DWARF — ~1.95 GB against ~115–123 MB per stripped binary, so it is
+  built on request by `.github/workflows/profiling-image.yml` and tagged
+  `prof-<sha>`, never published. Nothing on the metrics port is authenticated
+  and the chart restricts only egress, so the exposure model is now written
+  down where an operator will find it (`docs/ARCHITECTURE.md` "Diagnostics").
+  One capture runs at a time, CPU or heap — a heap dump walks allocator state
+  while the CPU profiler's `SIGPROF` handler interrupts threads — and the
+  ticket releases on drop, so a client that hangs up mid-window leaves the
+  endpoint usable. The heap route needs the process STARTED with
+  `_RJEM_MALLOC_CONF=prof:true,prof_active:true`, prefixed, and answers `412`
+  naming what is missing otherwise. The runtime route measures over a real
+  `?seconds=` window (default 2): tokio-metrics counters are deltas over a
+  sampling interval, and sampling immediately reported a fully loaded ingester
+  as idle. No release binary, HTTP surface, values key or default changes.
+  Imported from Gianluca Arbezzano's PR #11. (#4547)
+
 - **Metrics (series identity changes)**: the four aggregate-maintenance
   counters now carry `iceberg_namespace` alongside `table`:
   `siglake_group_count_short_aggregates_total`,
