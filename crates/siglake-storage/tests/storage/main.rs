@@ -34,6 +34,7 @@ mod native_bloom_opt_in;
 mod page_bounded_multipart_runs;
 mod phase2_agg_cache_invalidation;
 mod phase4_agg_result_cache_invalidation;
+mod pre_coverage_time_agg;
 mod puffin_gc;
 mod query_cancel;
 mod rebuild_admits_typed_columns;

@@ -297,9 +297,13 @@ coverage even when it replaces N rows with N different rows. The query then
 uses the exact per-file path. The same rule covers the inline object, folded
 wide counts, time buckets and 2-D time×group counts.
 Artifacts written before coverage links existed deserialize without claiming
-coverage and remain on the exact per-file path. `rebuild-group-counts` can
-restore the wide group-count object from committed files; it does not rebuild
-the inline time aggregates.
+coverage and remain on the exact per-file path, and nothing repairs that on its
+own: a chain with no head cannot be rejoined, because the first append edge
+after the gap names a parent nothing matches and every later edge chains onto
+that stranded run. `rebuild-group-counts` restores the wide group-count object
+from committed files; `rebuild-time-aggregates` restores the inline object's
+time buckets and 2-D time×group counts and republishes a coverage edge, after
+which ordinary commit-path maintenance carries the chain forward again.
 
 A publication carries counts that exist nowhere else, so a failed one is
 retried with the same deltas on the delta write's budget — four attempts, 250,
@@ -311,9 +315,10 @@ attempts increments
 `siglake_side_aggregate_publish_failures_total{table="<table>"}` and, where the
 incremental delta path is active, writes the same `*.rebuild.json` marker a lost
 delta does, so the maintenance compactor rebuilds the wide group counts. Nothing
-rebuilds the inline object itself: its time aggregates stay short of
+rebuilds the inline object automatically: its time aggregates stay short of
 `total-records`, and windowed `GROUP BY` on that table answers from the per-file
-path until it is rebuilt. `SiglakeSideAggregatePublicationLost` fires on the
+path until an operator runs `rebuild-time-aggregates`, which recomputes them
+from committed files. `SiglakeSideAggregatePublicationLost` fires on the
 counter.
 The `<table-uuid>` component is what keeps that guard honest across a recreated
 index: every aggregate artifact — this object, the folded wide base, the
@@ -420,6 +425,28 @@ distinct count and is reported, not written, when over it. The same knob caps
 the exact group-count cardinality of typed columns admitted by inference at
 write time; declared dimensions retain the table-level cap. Raising it admits
 wider typed columns but also increases per-commit delta size and counting work.
+
+The inline object's own repair is a separate command, for a separate failure —
+an object whose coverage chain cannot be proven at all:
+
+```
+siglake rebuild-time-aggregates --table <table>
+```
+
+It recomputes the time buckets (one footer read per live file) and the 2-D
+time×group rollup (a two-column decode of every live file whose time range
+spans more than one bucket; a file contained in one bucket contributes its
+group-count footer instead), replaces both, and publishes the scanned
+snapshot's coverage edge. A component short of `total-records` is left absent
+rather than written short, and the inline whole-table group counts are dropped
+rather than certified — one coverage edge governs the object, and granting it to
+maps from an unknown earlier snapshot is the unmarked overwrite the edge exists
+to catch. Nothing readable is lost by that: those counts were already refused.
+Re-running is a reported no-op. Unlike the wide rebuild it is NOT safe to run
+against a table being ingested: a commit landing under the pass cannot be
+merged, so the command retries and then exits without writing, asking for a
+window with no ingest. Details in
+`docs/DESIGN_inline_time_aggregate_rebuild.md`.
 
 **Residual attributes (WS-7).** OTLP resource/log attributes that aren't
 promoted columns are preserved losslessly in a JSON-string `attributes`

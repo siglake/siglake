@@ -572,6 +572,51 @@ enum Command {
         #[arg(long)]
         admit_typed_columns: bool,
     },
+    /// Republish a table's inline time aggregates with a provable coverage
+    /// chain, recomputing them from committed files.
+    ///
+    /// For a table whose inline aggregate object predates the snapshot-coverage
+    /// chain. Such an object cannot prove which equal-row-count snapshot it
+    /// describes, so every query refuses it and takes the exact per-file tier:
+    /// answers stay right, `date_histogram` and windowed `GROUP BY` stop being
+    /// served from warm metadata. Symptom:
+    /// `siglake_query_side_aggs_cache_total{result="unproven_coverage"}` climbing
+    /// on a table whose windowed shapes report `served_by: "materialized"`.
+    ///
+    /// Nothing repairs this on its own — a coverage chain with no head cannot be
+    /// rejoined by later appends, and a compaction has no edge to walk back to —
+    /// so this command is the only way back. After it runs, the appends that
+    /// follow join the chain normally.
+    ///
+    /// What it costs: the time buckets are one footer read per live file, but
+    /// the 2-D time x group rollup has no footer to read and decodes two columns
+    /// of every live file whose time range spans more than one bucket. On a
+    /// large table that is a full pass, once.
+    ///
+    /// NOT safe to run against a table being ingested: the pass reads the files
+    /// of one snapshot and cannot merge a commit that lands under it, so it
+    /// retries and then gives up without writing. Run it in a window with no
+    /// ingest to the table. Re-running after success is a reported no-op.
+    ///
+    /// The inline whole-table group counts are dropped rather than republished:
+    /// one coverage edge governs the object, and they cannot be proven. They
+    /// were already refused before this ran, so nothing readable is lost;
+    /// `GROUP BY` without a time window is served by the wide aggregate or the
+    /// per-file tier, exactly as it was.
+    RebuildTimeAggregates {
+        /// Iceberg warehouse URL. Reads `SIGLAKE_WAREHOUSE_URL` if not given.
+        #[arg(long, env = "SIGLAKE_WAREHOUSE_URL")]
+        warehouse_url: Option<String>,
+        /// Iceberg catalog URI. Reads `SIGLAKE_CATALOG_URI` if not given.
+        #[arg(long, env = "SIGLAKE_CATALOG_URI")]
+        catalog_uri: Option<String>,
+        /// Per-deployment Iceberg namespace.
+        #[arg(long, env = "SIGLAKE_TENANT_NAMESPACE", default_value = "siglake")]
+        namespace: String,
+        /// Table whose time aggregates to rebuild (`events`, or a managed index id).
+        #[arg(long, default_value = "events")]
+        table: String,
+    },
     /// Additively reconcile a table's stored schema toward the schema the
     /// running build declares for it.
     ///
@@ -1005,6 +1050,21 @@ async fn main() -> Result<()> {
                 &namespace,
                 &table,
                 admit_typed_columns,
+            )
+            .await
+        }
+        Command::RebuildTimeAggregates {
+            warehouse_url,
+            catalog_uri,
+            namespace,
+            table,
+        } => {
+            run_rebuild_time_aggregates(
+                &cli.data_dir,
+                warehouse_url.as_deref(),
+                catalog_uri.as_deref(),
+                &namespace,
+                &table,
             )
             .await
         }
@@ -5000,5 +5060,108 @@ async fn run_rebuild_group_counts(
         );
     }
     admissible_hint();
+    Ok(())
+}
+
+/// `siglake rebuild-time-aggregates` — republish the inline time aggregates of
+/// a table whose coverage chain cannot be proven (#3082).
+///
+/// Prints per component whether it was restored, because "exited 0" is not the
+/// same as "the fast path is back": a component short of the table's row count
+/// is deliberately left absent, and a table with delete files or NULL
+/// timestamps lands short for reasons no rebuild can change. Saying which
+/// component came back beats implying both did.
+async fn run_rebuild_time_aggregates(
+    data_dir: &std::path::Path,
+    warehouse_url: Option<&str>,
+    catalog_uri: Option<&str>,
+    namespace: &str,
+    table: &str,
+) -> Result<()> {
+    let ice = open_iceberg(
+        data_dir,
+        "warehouse",
+        warehouse_url,
+        catalog_uri,
+        Some(namespace),
+    )
+    .await?;
+    let report = ice.rebuild_inline_time_aggregates(table).await?;
+
+    if report.already_covered {
+        println!(
+            "{namespace}.{table}: the inline aggregate already proves coverage of snapshot {} \
+             (sequence {}); nothing to rebuild",
+            report.coverage.snapshot_id, report.coverage.sequence_number
+        );
+        return Ok(());
+    }
+    println!(
+        "{namespace}.{table}: read snapshot {} (sequence {}, table rows: {})",
+        report.coverage.snapshot_id, report.coverage.sequence_number, report.record_count
+    );
+    println!(
+        "  {:<24} {}",
+        "time_buckets",
+        match (report.time_buckets_restored, report.time_buckets_rows) {
+            (true, Some(rows)) =>
+                format!("rows={rows:<14} restored (date_histogram, windowed count)"),
+            (false, Some(rows)) => format!(
+                "rows={rows:<14} NOT written: short of the table row count, so the read guard \
+                 would refuse it"
+            ),
+            (_, None) => "not read".to_string(),
+        }
+    );
+    let mut short = Vec::new();
+    for column in &report.columns {
+        match column.rows {
+            Some(rows) if column.covers_table => println!(
+                "  {:<24} rows={rows:<14} restored (windowed GROUP BY)",
+                format!("time_group_counts.{}", column.column)
+            ),
+            Some(rows) => {
+                println!(
+                    "  {:<24} rows={rows:<14} NOT written: short of the table row count",
+                    format!("time_group_counts.{}", column.column)
+                );
+                short.push(column.column.clone());
+            }
+            None => {
+                println!(
+                    "  {:<24} NOT READABLE from any tier — left absent rather than written wrong",
+                    format!("time_group_counts.{}", column.column)
+                );
+                short.push(column.column.clone());
+            }
+        }
+    }
+    if report.columns.is_empty() {
+        println!("  {:<24} the object maintained none", "time_group_counts");
+    }
+    if !report.published {
+        println!(
+            "\nNOTHING WAS WRITTEN. No component could be proven complete against the table's \
+             {} rows, and the publication drops the inline group counts — so writing here would \
+             have destroyed what the object still holds in exchange for nothing. The table keeps \
+             answering exactly from the per-file tiers.",
+            report.record_count
+        );
+        return Ok(());
+    }
+    if !short.is_empty() {
+        println!(
+            "\nleft absent: {}. Counted from every live file and still short of the table row \
+             count — the column exceeds a rollup cap, or is missing from files older than it. A \
+             windowed GROUP BY on these keeps using the exact per-file tier.",
+            short.join(", ")
+        );
+    }
+    println!(
+        "\nThe inline whole-table group counts were dropped: one coverage edge governs the \
+         object and they could not be proven. They were already refused before this ran, so \
+         `GROUP BY` without a time window is served exactly as it was. Commits after this one \
+         extend the coverage chain normally."
+    );
     Ok(())
 }

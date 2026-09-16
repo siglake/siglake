@@ -19486,6 +19486,466 @@ impl IcebergContext {
         })
     }
 
+    /// Recompute the inline object's time aggregates from committed files and
+    /// republish them with a provable coverage edge (#3082).
+    ///
+    /// The failure this repairs: an inline object written before #2920 carries
+    /// no coverage chain, so `aggregate_covers_current_snapshot` refuses it and
+    /// `time_buckets` and `time_group_counts` serve nothing. It does not heal —
+    /// the first append edge after the gap has a parent nothing matches, so it
+    /// stays pending and every later edge chains onto it (asserted in
+    /// `tests/storage/pre_coverage_time_agg.rs`). Only a deliberate
+    /// republication re-roots the chain, after which ordinary commit-path
+    /// maintenance takes over again.
+    ///
+    /// The protocol and the two decisions behind it are
+    /// `docs/DESIGN_inline_time_aggregate_rebuild.md`; the short form:
+    ///
+    /// - Fenced by incarnation (the operator is UUID-scoped), by snapshot (the
+    ///   published edge is exactly the snapshot whose files were read) and by
+    ///   the object's CAS version where the store has one.
+    /// - The maps are REPLACED, never merged. A rebuild carries the whole table,
+    ///   so merging it onto a base that already holds some of those rows is the
+    ///   one way this could over-count — and an over-count is permanent where
+    ///   an under-count self-heals. Replacement also makes the pass a pure
+    ///   function of `(incarnation, snapshot, column set)`, so re-running is
+    ///   free of consequence.
+    /// - `group_counts` is DROPPED rather than certified. One coverage edge
+    ///   governs the whole object, so granting it to maps computed at an unknown
+    ///   earlier snapshot is exactly the unmarked N-for-N overwrite the edge
+    ///   exists to catch. Nothing readable is lost: a pre-coverage object's
+    ///   group counts were already refused by every consult (decision
+    ///   2026-09-16).
+    /// - An append landing under the pass makes it retry the whole thing, a
+    ///   bounded number of times, and then give up asking for a quiet window.
+    ///   Reconciling by hand is how a repair becomes a corruption, and the
+    ///   measured urgency sits on cold tables that are not ingesting (decision
+    ///   2026-09-16).
+    ///
+    /// A component that cannot be read to the table's full row count is left
+    /// ABSENT, never published short: short is what the read guard rejects
+    /// anyway, and writing it would trade a provable gap for an unprovable one.
+    pub async fn rebuild_inline_time_aggregates(
+        &self,
+        table_name: &str,
+    ) -> Result<InlineTimeAggregateRebuild> {
+        let ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
+        let mut moved = 0u32;
+        loop {
+            match self.rebuild_inline_time_aggregates_once(&ident).await? {
+                Some(report) => return Ok(report),
+                None => {
+                    moved += 1;
+                    metrics::counter!("siglake_inline_time_aggregate_rebuild_conflicts_total")
+                        .increment(1);
+                    if moved >= INLINE_TIME_REBUILD_ATTEMPTS {
+                        anyhow::bail!(
+                            "{table_name} committed under the inline time-aggregate rebuild \
+                             {moved} times; nothing was written. The pass reads the files of one \
+                             snapshot and cannot merge a commit that lands under it, so run it \
+                             in a window with no ingest to this table."
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// One attempt. `Ok(None)` means the table committed under the pass and the
+    /// caller should start over; every other outcome is a report.
+    async fn rebuild_inline_time_aggregates_once(
+        &self,
+        ident: &TableIdent,
+    ) -> Result<Option<InlineTimeAggregateRebuild>> {
+        let table_name = ident.name().to_string();
+        // A fresh handle, not the memoized entry: the pass must read the files
+        // of the snapshot it is about to name, and a cached entry can be a
+        // generation behind.
+        self.invalidate_cached_table(ident).await;
+        let cached = self.cached_table_entry(ident).await?;
+        let snapshot = cached
+            .table
+            .metadata()
+            .current_snapshot()
+            .ok_or_else(|| anyhow::anyhow!("{table_name} has no current snapshot to rebuild from"))?
+            .clone();
+        let coverage = AggregateCoverage {
+            snapshot_id: snapshot.snapshot_id(),
+            sequence_number: snapshot.sequence_number(),
+        };
+        let record_count = snapshot
+            .summary()
+            .additional_properties
+            .get("total-records")
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{table_name}'s snapshot summary carries no `total-records`, so a rebuilt \
+                     aggregate could not be proven complete"
+                )
+            })?;
+        let op = aggregate_operator(&cached.table)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{table_name} has no UUID; its aggregate cannot be bound to an incarnation, \
+                 so there is nothing safe to rebuild into"
+            )
+        })?;
+        let store = OpendalSideCas(&op);
+        let (existing, version) = store.load(SIDE_AGGREGATES_REL_PATH).await?;
+        let existing = existing.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{table_name} has no inline aggregate object to rebuild. This command repairs \
+                 an object whose coverage cannot be proven; it does not create one, because \
+                 the column set it would rebuild is recorded nowhere else."
+            )
+        })?;
+        if aggregate_covers_current_snapshot(&cached.table, existing.coverage) {
+            return Ok(Some(InlineTimeAggregateRebuild {
+                table: table_name,
+                coverage,
+                record_count,
+                time_buckets_rows: None,
+                time_buckets_restored: false,
+                columns: Vec::new(),
+                published: false,
+                already_covered: true,
+            }));
+        }
+
+        // The column set comes from the EXISTING object, as the wide rebuild's
+        // does: a repair restores what the table was maintaining, and inventing
+        // columns here would change what it serves.
+        let columns: Vec<String> = existing
+            .time_group_counts
+            .as_ref()
+            .map(|tg| tg.columns.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let buckets = self.rebuilt_time_buckets(ident, &cached).await?;
+        let groups = if columns.is_empty() {
+            None
+        } else {
+            Some(
+                self.rebuilt_time_group_counts(ident, &cached, &columns)
+                    .await?,
+            )
+        };
+
+        // Publish only what accounts for every row. `total-records` is net of
+        // deletes, so a table with delete files (or NULL timestamps, which no
+        // tier buckets) lands short here and keeps the exact per-file path —
+        // the same guard the read side applies, applied before the write.
+        let buckets_total = buckets.total();
+        let buckets_ok = buckets_total == record_count;
+        let mut column_reports = Vec::with_capacity(columns.len());
+        for column in &columns {
+            let rows = groups.as_ref().and_then(|g| g.column_total(column));
+            column_reports.push(InlineTimeRebuiltColumn {
+                column: column.clone(),
+                rows,
+                covers_table: rows == Some(record_count),
+            });
+        }
+        // A column short of the row count is dropped, not published partial:
+        // the read guard would refuse it anyway, and an absent column at least
+        // says so plainly in the report.
+        let covering: BTreeSet<&str> = column_reports
+            .iter()
+            .filter(|c| c.covers_table)
+            .map(|c| c.column.as_str())
+            .collect();
+        let groups = groups
+            .map(|mut g| {
+                g.columns
+                    .retain(|column, _| covering.contains(column.as_str()));
+                g
+            })
+            .filter(|g| !g.columns.is_empty());
+
+        if !buckets_ok && groups.is_none() {
+            // Nothing provable to write. Not writing matters here: the
+            // publication drops `group_counts`, so a write would destroy the
+            // legacy maps in exchange for nothing.
+            return Ok(Some(InlineTimeAggregateRebuild {
+                table: table_name,
+                coverage,
+                record_count,
+                time_buckets_rows: Some(buckets_total),
+                time_buckets_restored: false,
+                columns: column_reports,
+                published: false,
+                already_covered: false,
+            }));
+        }
+
+        // Re-read under the same fence before writing. A publication that
+        // landed since the load has merged rows into the object we are
+        // replacing, and its pending edge would claim coverage over rows this
+        // pass never read.
+        let (fresh, fresh_version) = store.load(SIDE_AGGREGATES_REL_PATH).await?;
+        if fresh_version != version
+            || fresh.as_ref().is_some_and(|side| {
+                side.coverage_links
+                    .iter()
+                    .any(|link| link.sequence_number > coverage.sequence_number)
+            })
+        {
+            return Ok(None);
+        }
+
+        let mut side = existing;
+        side.time_buckets = buckets_ok.then_some(buckets);
+        side.time_group_counts = groups;
+        side.group_counts = None;
+        side.coverage = Some(coverage);
+        side.coverage_links.clear();
+        let body = serde_json::to_vec(&side).context("serialize rebuilt side aggregates")?;
+        if store.conditional() {
+            match store
+                .store_if(SIDE_AGGREGATES_REL_PATH, body, version.as_deref())
+                .await?
+            {
+                CasWrite::Written => {}
+                CasWrite::Conflict => return Ok(None),
+                CasWrite::Unsupported => {
+                    CONDITIONAL_UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let body =
+                        serde_json::to_vec(&side).context("serialize rebuilt side aggregates")?;
+                    store.store(SIDE_AGGREGATES_REL_PATH, body).await?;
+                }
+            }
+        } else {
+            store.store(SIDE_AGGREGATES_REL_PATH, body).await?;
+        }
+
+        // The object is memoized on the cached table entry, so without this
+        // every reader keeps serving the refusal this just repaired.
+        self.invalidate_cached_table(ident).await;
+        metrics::counter!("siglake_inline_time_aggregate_rebuilds_total").increment(1);
+        Ok(Some(InlineTimeAggregateRebuild {
+            table: table_name,
+            coverage,
+            record_count,
+            time_buckets_rows: Some(buckets_total),
+            time_buckets_restored: buckets_ok,
+            columns: column_reports,
+            published: true,
+            already_covered: false,
+        }))
+    }
+
+    /// Whole-table hourly time buckets from committed files: each file's minute
+    /// footer histogram rolled up (60s divides the hour exactly, so a minute
+    /// bucket nests in one hourly bucket), and a timestamp decode for a file
+    /// whose footer is absent or fails its own validity guard.
+    async fn rebuilt_time_buckets(
+        &self,
+        ident: &TableIdent,
+        cached: &CachedTableEntry,
+    ) -> Result<TimeBucketCounts> {
+        let files = self.live_data_files_cached(ident).await?;
+        let file_io = cached.table.file_io().clone();
+        let footer_cache = self.footer_cache.clone();
+        let concurrency = rebuild_concurrency();
+        let probes: Vec<TimeBucketProbe> = futures::stream::iter(files.iter().map(|file| {
+            let path = file.file_path().to_string();
+            let file_io = file_io.clone();
+            let footer_cache = footer_cache.clone();
+            async move {
+                let buckets = cached_read_file_time_buckets(&footer_cache, &file_io, &path).await?;
+                Ok::<_, anyhow::Error>((path, buckets))
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await?;
+
+        let width = SNAPSHOT_TIME_BUCKET_BASE_NS;
+        let mut out: BTreeMap<i64, u64> = BTreeMap::new();
+        let mut decode: Vec<String> = Vec::new();
+        for (path, buckets) in probes {
+            match buckets {
+                Some(buckets) => {
+                    for (start, count) in buckets {
+                        *out.entry(start.div_euclid(width) * width).or_insert(0) += count;
+                    }
+                }
+                None => decode.push(path),
+            }
+        }
+        metrics::counter!("siglake_inline_time_rebuild_files_total", "source" => "footer")
+            .increment((files.len() - decode.len()) as u64);
+        metrics::counter!("siglake_inline_time_rebuild_files_total", "source" => "decode")
+            .increment(decode.len() as u64);
+        let scanned: Vec<BTreeMap<i64, i64>> =
+            futures::stream::iter(decode.into_iter().map(|path| {
+                let file_io = file_io.clone();
+                async move {
+                    let mut m = BTreeMap::new();
+                    scan_file_timestamp_buckets_windowed(
+                        &file_io, &path, width, 0, None, None, &mut m,
+                    )
+                    .await?;
+                    Ok::<_, anyhow::Error>(m)
+                }
+            }))
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
+        for partial in scanned {
+            for (start, count) in partial {
+                if let Ok(count) = u64::try_from(count) {
+                    *out.entry(start).or_insert(0) += count;
+                }
+            }
+        }
+        let mut rebuilt = TimeBucketCounts {
+            width_ns: width,
+            buckets: out,
+        };
+        // The cap is enforced by coarsening, exactly as the merge path does, so
+        // a long-lived table's rebuild lands at the width its maintenance would
+        // have reached.
+        while rebuilt.buckets.len() > TIME_BUCKET_CAP {
+            rebuilt.coarsen_to(rebuilt.width_ns.saturating_mul(2));
+        }
+        Ok(rebuilt)
+    }
+
+    /// Whole-table 2-D time×group counts from committed files.
+    ///
+    /// There is no footer to read: the 2-D map is built from the in-memory
+    /// batch at commit time and never stamped into the file, and a file's
+    /// group-count footer carries whole-file totals with no time dimension. So
+    /// the general case is a two-column decode per live file, through the same
+    /// `file_time_group_counts` the commit path uses — one implementation, so a
+    /// repair cannot disagree with what maintenance would have written.
+    ///
+    /// The one shortcut: a file whose manifest `[min, max]` timestamps fall
+    /// inside a single bucket contributes its whole group-count footer to that
+    /// bucket. Taken only when EVERY requested column has a readable footer for
+    /// that file — a mixed file is decoded in full rather than half-read from
+    /// each source, which keeps one rule instead of two.
+    async fn rebuilt_time_group_counts(
+        &self,
+        ident: &TableIdent,
+        cached: &CachedTableEntry,
+        columns: &[String],
+    ) -> Result<TimeGroupCounts> {
+        let files = self.live_data_files_cached(ident).await?;
+        let file_io = cached.table.file_io().clone();
+        let footer_cache = self.footer_cache.clone();
+        let concurrency = rebuild_concurrency();
+        let width = SNAPSHOT_TIME_BUCKET_BASE_NS;
+        let ts_field =
+            TimeBoundField::resolve(cached.table.metadata().current_schema(), "timestamp");
+
+        // Which files a single bucket provably contains, and which of those can
+        // serve every column from its footer.
+        let mut contained: Vec<(String, i64)> = Vec::new();
+        let mut decode: Vec<String> = Vec::new();
+        for file in files.iter() {
+            let path = file.file_path().to_string();
+            let bucket = match (
+                file.file_format() == DataFileFormat::Parquet,
+                ts_field.and_then(|f| data_file_timestamp_lower_ns(file, f)),
+                ts_field.and_then(|f| data_file_timestamp_upper_ns(file, f)),
+            ) {
+                (true, Some(lo), Some(hi)) if lo.div_euclid(width) == hi.div_euclid(width) => {
+                    Some(lo.div_euclid(width) * width)
+                }
+                _ => None,
+            };
+            match bucket {
+                Some(bucket) => contained.push((path, bucket)),
+                None => decode.push(path),
+            }
+        }
+
+        let mut from_footers = TimeGroupCounts {
+            width_ns: width,
+            columns: BTreeMap::new(),
+        };
+        let footer_probes: Vec<TimeGroupFooterProbe> =
+            futures::stream::iter(contained.drain(..).map(|(path, bucket)| {
+                let file_io = file_io.clone();
+                let footer_cache = footer_cache.clone();
+                let columns = columns.to_vec();
+                async move {
+                    let mut per_column = Vec::with_capacity(columns.len());
+                    for column in columns {
+                        let Some(rows) = cached_read_file_group_counts_for_path(
+                            &footer_cache,
+                            &file_io,
+                            &path,
+                            &column,
+                        )
+                        .await?
+                        else {
+                            return Ok::<_, anyhow::Error>((path, bucket, None));
+                        };
+                        per_column.push((column, rows));
+                    }
+                    Ok((path, bucket, Some(per_column)))
+                }
+            }))
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
+        let mut footer_files = 0usize;
+        for (path, bucket, per_column) in footer_probes {
+            let Some(per_column) = per_column else {
+                decode.push(path);
+                continue;
+            };
+            footer_files += 1;
+            for (column, rows) in per_column {
+                let entry = from_footers
+                    .columns
+                    .entry(column)
+                    .or_default()
+                    .entry(bucket)
+                    .or_insert_with(|| ColumnGroupCounts {
+                        values: BTreeMap::new(),
+                        nulls: 0,
+                    });
+                for (value, count) in rows {
+                    match value {
+                        Some(value) => *entry.values.entry(value).or_insert(0) += count,
+                        None => entry.nulls += count,
+                    }
+                }
+            }
+        }
+        metrics::counter!("siglake_inline_time_group_rebuild_files_total", "source" => "footer")
+            .increment(footer_files as u64);
+        metrics::counter!("siglake_inline_time_group_rebuild_files_total", "source" => "decode")
+            .increment(decode.len() as u64);
+
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let decoded: Vec<TimeGroupCounts> = futures::stream::iter(decode.into_iter().map(|path| {
+            let file_io = file_io.clone();
+            let refs = refs.clone();
+            async move { decode_file_time_group_counts(&file_io, &path, &refs, width).await }
+        }))
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await?;
+        // Everything lands through `merge`, including the footer part, so the
+        // value/total caps and the bucket coarsening are enforced by the same
+        // code that enforces them at commit time. The merges only ever add, so
+        // an intermediate state cannot be over a cap the final one is under.
+        let mut rebuilt = TimeGroupCounts {
+            width_ns: width,
+            columns: BTreeMap::new(),
+        };
+        rebuilt.merge(&from_footers);
+        for partial in &decoded {
+            rebuilt.merge(partial);
+        }
+        Ok(rebuilt)
+    }
+
     /// The TRUE per-value counts for `column`, read from the committed files:
     /// each file's group-count footer where it has one, a raw-page decode where
     /// it does not. This is Tier-2, and it is the source of truth the
@@ -20212,6 +20672,11 @@ impl<'a> Iterator for GroupCountsIter<'a> {
 /// One file's concurrent time-bucket footer probe: `(file_path, Some(buckets))`
 /// when the footer was readable, `(file_path, None)` when it must fall to a scan.
 type TimeBucketProbe = (String, Option<Vec<(i64, u64)>>);
+
+/// One bucket-contained file's group-count footer probe for the 2-D rebuild:
+/// `(file_path, bucket_start_ns, Some(per-column rows))` when every requested
+/// column was readable, `None` in the third slot when the file must be decoded.
+type TimeGroupFooterProbe = (String, i64, Option<Vec<(String, GroupCountRows)>>);
 
 /// The column names carried by one file's group-count footer (empty when
 /// the file has none) — the warm cycle uses the newest file as the census
@@ -26864,6 +27329,90 @@ mod side_agg_freshness_tests {
         assert!(!empty.covers(AggNeed::TimeBuckets));
         assert!(!empty.covers(AggNeed::TimeGroupColumn("level")));
     }
+}
+
+/// Attempts [`IcebergContext::rebuild_inline_time_aggregates`] gets before it
+/// declares the table too busy.
+///
+/// Bounded rather than convergent, deliberately (decision 2026-09-16). The
+/// convergent shape — fold in only the files the intervening snapshots added —
+/// is a second code path over the same maps, and the measurement that justifies
+/// the command puts its cost on cold, rarely-queried tables, which are the ones
+/// a retry wins against. A warm table's per-file fallback measured ~2ms.
+const INLINE_TIME_REBUILD_ATTEMPTS: u32 = 3;
+
+/// Per-file concurrency for a rebuild pass, matching what the query path's
+/// per-file tiers use.
+fn rebuild_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .clamp(1, 16)
+}
+
+/// One file's 2-D time×group contribution, decoded. Streams `timestamp` plus
+/// the requested columns and folds each batch through the commit path's
+/// [`file_time_group_counts`], so a rebuild cannot compute something
+/// maintenance would not have.
+async fn decode_file_time_group_counts(
+    file_io: &FileIO,
+    path: &str,
+    columns: &[&str],
+    width_ns: i64,
+) -> Result<TimeGroupCounts> {
+    use futures::StreamExt;
+
+    let (mut reader, _) = pruned_window_batch_stream(file_io, path, columns, None, None).await?;
+    let mut out = TimeGroupCounts {
+        width_ns,
+        columns: BTreeMap::new(),
+    };
+    while let Some(batch) = reader.next().await {
+        let batch = batch.with_context(|| format!("decode parquet batch {path}"))?;
+        if let Some(partial) = file_time_group_counts(&batch, columns, width_ns) {
+            out.merge(&partial);
+        }
+    }
+    Ok(out)
+}
+
+/// What one [`IcebergContext::rebuild_inline_time_aggregates`] did.
+#[derive(Debug, Clone)]
+pub struct InlineTimeAggregateRebuild {
+    pub table: String,
+    /// The snapshot the pass read and published as the object's coverage edge.
+    pub coverage: AggregateCoverage,
+    /// The table's row count at that snapshot — the bar every component had to
+    /// clear to be published.
+    pub record_count: u64,
+    /// Rows the rebuilt time buckets accounted for, `None` when the pass did
+    /// not get as far as reading them.
+    pub time_buckets_rows: Option<u64>,
+    /// Whether the time buckets were published, i.e. accounted for every row.
+    pub time_buckets_restored: bool,
+    /// One entry per column the object was maintaining in its 2-D rollup.
+    pub columns: Vec<InlineTimeRebuiltColumn>,
+    /// Whether anything was written. `false` with `already_covered` false means
+    /// no component could be proven complete, so the object was left alone
+    /// rather than rewritten with less than it had.
+    pub published: bool,
+    /// The object's coverage already reached this snapshot, so there was
+    /// nothing to repair. Reported rather than counted as a repair.
+    pub already_covered: bool,
+}
+
+/// One 2-D rollup column's rebuild outcome.
+#[derive(Debug, Clone)]
+pub struct InlineTimeRebuiltColumn {
+    pub column: String,
+    /// Rows the rebuilt column accounts for, `None` when no tier could read it.
+    pub rows: Option<u64>,
+    /// Whether `rows` equals the table's row count — i.e. whether a windowed
+    /// `GROUP BY` on this column serves from the rollup again. `false` is
+    /// information, not a failure: a column can be legitimately short (over a
+    /// cardinality cap, or absent from older files) and a rebuild cannot invent
+    /// history the files do not carry.
+    pub covers_table: bool,
 }
 
 /// Options for [`IcebergContext::rebuild_group_count_aggregate_with`].
