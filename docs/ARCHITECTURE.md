@@ -1249,7 +1249,20 @@ the parsed budget — `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES` (1/64 of the limit,
 capped at 256 MiB, a blob being roughly a quarter of its parsed size) and
 `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_ENTRIES` (128), whichever binds first, with a
 blob larger than the whole budget left uncached rather than evicting the
-entries that fit. Both bounds apply to every entry, so a per-file index sized
+entries that fit. Which blob it drops follows from what the blob side is for. A
+warm query never reads it, so a blob whose parsed twin is resident cannot be
+read at all: eviction drops one of those first — the one whose twin sits
+furthest from the parsed cache's eviction end — and only then a blob the parsed
+cache has already dropped. Evicting in arrival order instead cost the whole
+budget: a blob reaches the front of that queue at the moment its twin leaves
+the parsed cache, so a plan larger than either cache re-fetched every index
+blob on every execution (4.60 GB over 183 index-phase reads for a 14-file plan
+that had read 0.50 GB over 73). A blob keeps that protection for a bounded
+number of the cache's own turnovers and then becomes an ordinary candidate,
+because nothing here can see that a file has been compacted away and its blob
+would otherwise be retained for the life of the process. What survives is
+arithmetic and measured: a repeat suite re-fetches the indexed files the blob
+budget cannot cover, and nothing more. Both bounds apply to every entry, so a per-file index sized
 by its row count cannot push the cache past the byte ceiling the way the entry
 count alone allowed. Setting the entry count to `0` turns both caches off and
 returns to fetching and deserializing per query; setting the blob byte bound to

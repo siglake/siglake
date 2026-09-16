@@ -89,6 +89,25 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no
   measurement against a real store has settled. Both are kept for now.
+- **A text plan larger than both caches still re-fetches its excess index
+  blobs, once per execution.** Eviction no longer drops the blobs the pair does
+  hold — that was #4182, where a 14-file plan against caches for about seven
+  re-read every blob on every execution — but the residue is arithmetic: a
+  repeat suite fetches the indexed files the blob budget cannot cover, measured
+  as exactly `files - blobs held` per pass over plans from 8 to 28 files
+  (`a_plan_larger_than_both_caches_stops_refetching_every_blob` in the fork).
+  Removing the fetches means covering the plan, and the budgets stay where they
+  are: #4102 timed the parsed side against eight times its budget and kept the
+  1 GiB cap, leaving the paired hand-set override above as the deployment-level
+  answer, and blob retention against a real store is still #4054's. What the
+  split between the two forms costs is measurable locally: on the six-file
+  fixture of `crates/siglake-storage/tests/text_index_blob_refetch.rs`, holding
+  all six as serialized blobs cost 65 kB against 188 kB for the parsed form,
+  for the same zero fetches and a decode per file per query. A blob also keeps
+  its protection from eviction for a bounded number of the cache's own
+  turnovers rather than for as long as its file is planned, which is the
+  approximation that keeps a compacted-away file's blob from being retained
+  forever; the plan-level signal that would replace it does not exist.
 - **A v1 inverted-index blob in a Parquet footer has no checksum; the Puffin
   sidecar's Zstd frame has one.** #4558 made the decoder validate everything
   the format can check itself — the serialized lengths against the bytes behind
