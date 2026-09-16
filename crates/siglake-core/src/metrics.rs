@@ -629,6 +629,14 @@ pub async fn init(bind: SocketAddr) -> Result<tokio::task::JoinHandle<()>> {
         .route("/", get(root_handler))
         .with_state(handle);
 
+    // Profiling rides this server rather than the public API port because this
+    // is the one HTTP surface every role shares, so a single mount covers the
+    // ingester, the compactor and the query tier. Under a default build the
+    // module does not exist; under a profiling build it still returns an empty
+    // router unless `SIGLAKE_PPROF_ENABLED=1`. See `crate::profiling`.
+    #[cfg(feature = "profiling")]
+    let app = app.merge(crate::profiling::routes());
+
     Ok(tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(error = %e, "metrics server crashed");

@@ -214,6 +214,19 @@ written down.
   elision, S3 conditional puts and the incremental append scan that table
   subscriptions need; they are rebased against upstream periodically
   ([`third_party/README.md`](third_party/README.md)).
+- **The metrics port is an internal surface, and profiling is off in every
+  released binary.** `--metrics-bind` (9100/9101/9105) serves `/metrics` and
+  nothing else in a release build, with no token check of its own — the query
+  tier's auth guards 8089 — so it belongs behind your cluster's network policy
+  and never behind an Ingress. The chart's `networkPolicy` writes egress rules
+  only; restricting who may scrape is an operator decision. On-demand CPU, heap
+  and tokio-runtime profiles (`/debug/pprof/*`) ride that same port, for the
+  same reason `/metrics` does — it is the one surface every role shares — and
+  reaching them takes two opt-ins that will not become defaults: a
+  `--build-arg PROFILING=1` image, which no release is, and
+  `SIGLAKE_PPROF_ENABLED=1` in the process. A stack-trace oracle is not a thing
+  a query-authorized caller should be able to ask for
+  ([Diagnostics](docs/ARCHITECTURE.md#diagnostics)).
 - **Omissions are recorded, not hidden.** Everything left out on purpose, with
   the reason and what would change it, is one entry in
   [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md), kept current with the code.

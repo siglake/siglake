@@ -9,6 +9,12 @@ description = "HTTP query server: SPL/SQL JSON endpoints over the siglake Iceber
 name = "siglake-query-server"
 path = "src/main.rs"
 
+[features]
+# See the identical feature on `siglake-cli`: the routes come from
+# siglake-core, but `--enable-prof` is a property of the jemalloc that this
+# crate's `#[global_allocator]` links, so both halves belong here.
+profiling = ["siglake-core/profiling", "tikv-jemallocator/profiling"]
+
 [dependencies]
 siglake-bloom = { workspace = true }
 siglake-core = { workspace = true }

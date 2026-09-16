@@ -9,7 +9,7 @@
 # public-tree checker found fourteen — but only when someone looks at them. The
 # cheap fix is to make the whole suite runnable in one command before pushing.
 #
-#   scripts/ci-local.sh              # build-env, fmt, shell, claude-md, set-var, dashboard, test, clippy, helm, public-tree, generated, deny, fork-tests
+#   scripts/ci-local.sh              # build-env, fmt, shell, claude-md, set-var, dashboard, test, clippy, profiling, helm, public-tree, generated, deny, fork-tests
 #   scripts/ci-local.sh --all        # + operator-cluster (kind), docker, external-readers
 #   scripts/ci-local.sh --strict     # a job this box cannot run (no mold, helm, promtool, cargo-deny, kind, docker, external reader) is FAIL, not skipped
 #   scripts/ci-local.sh --log-dir D  # keep this run's job logs in D (also CI_LOCAL_LOG_DIR)
@@ -432,6 +432,27 @@ if cargo clippy --workspace --all-targets -- -D warnings >"$LOG_DIR/clippy.log" 
   report clippy ok
 else
   report clippy FAIL; grep -E '^error' "$LOG_DIR/clippy.log" | head -5 | sed 's/^/  /' >&2
+fi
+
+# --- profiling ---------------------------------------------------------------
+job_started=$SECONDS
+# A step of ci.yml's `clippy` job, reported as its own line because it answers a
+# different question: the clippy above builds every member with DEFAULT
+# features, so `siglake-core`'s off-by-default `profiling` feature -- the
+# `/debug/pprof/*` endpoints, and the only thing a PROFILING=1 image adds to the
+# code -- is compiled by neither it nor the test job. The script runs clippy and
+# the crate's tests in both `tokio_unstable` configurations and is the same one
+# ci.yml and .github/workflows/profiling-image.yml run.
+#
+# Two extra dependency builds, since each RUSTFLAGS change invalidates the
+# graph; they cache separately after the first run. That is the price of the
+# gate building what the diagnostic image ships.
+if scripts/check-profiling-feature.sh >"$LOG_DIR/profiling.log" 2>&1; then
+  report profiling "ok ($(awk '/^test result: ok\./ {s+=$4} END {print s+0}' \
+    "$LOG_DIR/profiling.log") tests, both cfgs)"
+else
+  report profiling FAIL
+  grep -E '^(error|test result: FAILED)' "$LOG_DIR/profiling.log" | head -5 | sed 's/^/  /' >&2
 fi
 
 # --- helm --------------------------------------------------------------------
