@@ -1506,6 +1506,108 @@
    "description": "Every decision the snapshot-keyed SQL result cache takes. hit/miss/insert/wait are the working cache. Not only /api/v1/sql since #2268: the two Jaeger name-list routes (services, operations) share this store and this counter rather than owning a second one, so a Jaeger UI polling in the background shows up here as hits it did not used to produce. Their misses carry none of the skip_ arms below — the routes serve two fixed SELECT DISTINCTs over the committed snapshot, so there is no statement to classify and no WAL union to prove empty. The skip_ arms say why a request was refused one: skip_buffer_* is the WAL proof (rows in flight, a refused decode, a failed load, a witnessed segment set that moved) and is expected while a backlog drains; skip_time_dependent is a query calling a registered STABLE or VOLATILE function (now(), random()) and is ordinary dashboard traffic; skip_unclassifiable is a function name the planner's registry does not hold — the conservative classifier costing this deployment its cache on queries that may plan and succeed anyway; skip_unparseable is a statement the cache classifier's own parser rejected and should sit at ~zero (#1481). Uncacheable SHAPES — bare unordered scans — are not counted here at all. No arm is pre-registered at 0 (no alert reads them), so a missing series here means that outcome has not happened on this pod — not a broken panel: scripts/check-chart.py holds this metric name to the source, so a rename fails CI instead of blanking the chart."
   },
   {
+   "id": 159,
+   "type": "timeseries",
+   "title": "Text-index startup by stage (p50 / p99)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 130
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.50, sum by (le, stage) (rate(siglake_iceberg_text_index_startup_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p50 {{stage}}",
+     "refId": "A"
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le, stage) (rate(siglake_iceberg_text_index_startup_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p99 {{stage}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "min": 0
+    }
+   },
+   "description": "What a text query spends before a planned indexed file produces its first batch, split into the four stages that make the number actionable: permit_wait is the global index-load semaphore (SIGLAKE_INDEX_LOAD_CONCURRENCY, 4 by default) making a plan's files queue; blob_fetch is the Puffin blob read from object storage; decode is InvertedIndex::from_bytes, which costs about 30 ns per indexed row and is paid only when the parsed-index cache missed; selection is the postings lookup plus the row-selection runs, paid on every file the index prunes. A first-batch regression is one of those four, and run #73 could not say which from the round's artifacts. Read against the cache panel beside it: decode's sample COUNT is the number of cold loads, selection's is the number of index-pruned files, so decode climbing toward selection means the cache is not holding the plan's indexes. The stage is a grouping, not a filter, so a stage added later appears here without editing the dashboard."
+  },
+  {
+   "id": 160,
+   "type": "timeseries",
+   "title": "Parsed text-index cache outcomes / evictions",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 130
+   },
+   "targets": [
+    {
+     "expr": "sum by (outcome) (rate(siglake_iceberg_parsed_index_cache_lookups_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "lookup {{outcome}}",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (reason) (rate(siglake_iceberg_parsed_index_cache_evictions_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "dropped {{reason}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "min": 0
+    }
+   },
+   "description": "Whether the plan's parsed indexes stay warm. One lookup outcome per file a text query acquires an index for: hit means the parsed form was reused, miss means this query deserialized the blob. Both arms are pre-registered at 0 on the query server, so a tier serving no text query charts a flat zero rather than No data. The dropped arms are why a miss happened and they are the reading a hit ratio cannot give: byte_bound is the working set over SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES (1 GiB by default, about 40 bytes per indexed row, so five compacted 7M-row files need about 1.5 GB), entry_bound is the shared SIGLAKE_PUFFIN_BLOB_CACHE_MAX_ENTRIES count, and oversized is one index alone exceeding the whole budget, which leaves that file decoding on every query. Misses with no drops are first reads; misses beside a steady byte_bound rate are thrash, which is what run #78's keyword_and_label plan was doing with 4.1 GB of parsed index against the default."
+  },
+  {
+   "id": 161,
+   "type": "timeseries",
+   "title": "Parsed text-index cache resident / budget",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 130
+   },
+   "targets": [
+    {
+     "expr": "max(siglake_iceberg_parsed_index_cache_bytes{namespace=~\"$namespace\"})",
+     "legendFormat": "resident",
+     "refId": "A"
+    },
+    {
+     "expr": "max(siglake_iceberg_parsed_index_cache_max_bytes{namespace=~\"$namespace\"})",
+     "legendFormat": "budget",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "min": 0
+    }
+   },
+   "description": "The parsed working set against the bound that evicts it. Both are published where the bounds are enforced — on admission to the cache — so neither exists before the pod's first indexed text query and both hold their last value while no text query runs; read them with the eviction arms beside them, not on their own. Resident pinned at the budget with byte_bound drops beside it is the case for raising SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES (or the query pod's memory limit, which the resolved budget follows when it is set)."
+  },
+  {
    "id": 137,
    "type": "row",
    "title": "Cache warmer",
@@ -1513,7 +1615,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 130
+    "y": 138
    },
    "collapsed": false
   },
@@ -1529,7 +1631,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 131
+    "y": 139
    },
    "targets": [
     {
@@ -1576,7 +1678,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 131
+    "y": 139
    },
    "targets": [
     {
@@ -1607,7 +1709,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 131
+    "y": 139
    },
    "targets": [
     {
@@ -1641,7 +1743,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 139
+    "y": 147
    },
    "collapsed": false
   },
@@ -1657,7 +1759,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 140
+    "y": 148
    },
    "targets": [
     {
@@ -1685,7 +1787,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 140
+    "y": 148
    },
    "targets": [
     {
@@ -1718,7 +1820,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 148
+    "y": 156
    },
    "targets": [
     {
@@ -1752,7 +1854,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 156
+    "y": 164
    },
    "targets": [
     {
