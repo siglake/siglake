@@ -647,16 +647,46 @@ fn a_guard_failure_mid_write_commits_no_partial_deletion() {
     });
 }
 
+/// What one sweep of [`sweep_peak`] measured.
+#[derive(Debug, Clone, Copy)]
+struct SweepPeak {
+    /// Peak live heap between the start and the end of the delete sweep.
+    peak: usize,
+    /// `get_array_memory_size` of the appended batch — the decoded size of the
+    /// one candidate the sweep rewrites.
+    decoded: usize,
+    /// The committed candidate's compressed size on the store.
+    file_bytes: u64,
+    /// Rows the predicate did NOT match, out of [`Self::rows`] — the rows the
+    /// rewrite has to write back out.
+    survivors: usize,
+    rows: usize,
+}
+
+impl SweepPeak {
+    /// The decoded bytes of the survivors alone: what a rewrite that holds its
+    /// output, and only its output, would be holding.
+    fn survivor_decoded(&self) -> usize {
+        self.decoded / self.rows * self.survivors
+    }
+}
+
 /// Peak live heap across one delete sweep over a fixture of `rows` rows of
-/// `raw_len`-byte raw text, plus the decoded size of that fixture.
+/// `raw_len`-byte raw text, with the candidate's decoded and compressed sizes.
+/// One row in `survivor_in_n` survives the predicate; the rest are deleted.
 ///
-/// One row per second, so the 64 Ki fixture spans 18 hours and the
-/// `day(timestamp)` partition splits it into two candidate files, while 16 Ki
-/// and 32 Ki fit inside one. Off `Utc::now()` which of the three split depended
-/// on the hour the measurement ran; off [`fixture_base`] the split is the same
-/// on every run. [`measure_peak_allocation_per_arm`] records what that costs
-/// the reading.
-async fn sweep_peak(rows: usize, raw_len: usize, tuning: IcebergTuning) -> (usize, usize) {
+/// ONE CANDIDATE AT EVERY SIZE, asserted below. Rows are one MILLISECOND apart,
+/// so even the largest fixture here spans a minute and the `day(timestamp)`
+/// partition delivers it as a single data file. The second-apart spacing this
+/// replaces put 64 Ki rows across 18 hours and so across two day partitions
+/// (#3999), which measured the split rather than the arm: half a candidate
+/// costs half a peak, so the arm looked flatter than it is (#4703).
+async fn sweep_peak(
+    rows: usize,
+    raw_len: usize,
+    survivor_in_n: usize,
+    tuning: IcebergTuning,
+) -> SweepPeak {
     let raw: String = "x".repeat(raw_len);
     let tmp = tempfile::tempdir().unwrap();
     let warehouse = tmp.path().join("warehouse");
@@ -670,9 +700,13 @@ async fn sweep_peak(rows: usize, raw_len: usize, tuning: IcebergTuning) -> (usiz
     let now = fixture_base();
     let events: Vec<Event> = (0..rows)
         .map(|i| {
-            let host = if i % 2 == 0 { "victim" } else { "keep" };
+            let host = if i % survivor_in_n == 0 {
+                "keep"
+            } else {
+                "victim"
+            };
             event(
-                now - ChronoDuration::seconds((rows - i) as i64),
+                now - ChronoDuration::milliseconds((rows - i) as i64),
                 host,
                 raw.as_str(),
                 None,
@@ -681,6 +715,20 @@ async fn sweep_peak(rows: usize, raw_len: usize, tuning: IcebergTuning) -> (usiz
         .collect();
     let decoded = append_index_events(&ice, &config, &events).await;
     drop(events);
+
+    let files = ice
+        .live_data_files(&ice.index_table_ident("logs"))
+        .await
+        .unwrap();
+    assert_eq!(
+        files.len(),
+        1,
+        "{rows} rows must arrive as ONE delete candidate, or the peak below is \
+         the peak of a fraction of the file"
+    );
+    let file_bytes = files[0].file_size_in_bytes();
+    drop(files);
+
     ice.create_delete_task("logs", "host = 'victim'", None, None)
         .await
         .unwrap();
@@ -689,14 +737,27 @@ async fn sweep_peak(rows: usize, raw_len: usize, tuning: IcebergTuning) -> (usiz
     let outcome = ice.execute_delete_tasks("logs").await.unwrap();
     let peak = peak_tracked();
 
+    let survivors = rows.div_ceil(survivor_in_n);
     assert_eq!(outcome.tasks_completed, 1, "{outcome:?}");
-    assert_eq!(outcome.rows_deleted, rows as u64 / 2, "{outcome:?}");
-    assert_eq!(count_index_rows(&ice, "logs", None).await, rows as i64 / 2);
-    (peak, decoded)
+    assert_eq!(outcome.files_rewritten, 1, "{outcome:?}");
+    assert_eq!(
+        outcome.rows_deleted,
+        (rows - survivors) as u64,
+        "{outcome:?}"
+    );
+    assert_eq!(count_index_rows(&ice, "logs", None).await, survivors as i64);
+    SweepPeak {
+        peak,
+        decoded,
+        file_bytes,
+        survivors,
+        rows,
+    }
 }
 
 /// THE DEFECT, MEASURED — by hand, because each sweep below writes and
-/// rewrites a multi-megabyte fixture in a debug build (~40 s apiece):
+/// rewrites a multi-megabyte fixture in a debug build (~40 s apiece, seven of
+/// them):
 ///
 /// ```text
 /// cargo test -p siglake-storage --test delete_task_size_gate \
@@ -704,63 +765,160 @@ async fn sweep_peak(rows: usize, raw_len: usize, tuning: IcebergTuning) -> (usiz
 /// ```
 ///
 /// What it records is net heap growth across one delete sweep, per arm, over
-/// the same fixture. Measured 2026-09-16 (debug build, 1 KiB of raw text per
-/// row, half the rows deleted), off the fixed [`fixture_base`] and so
-/// repeatable, which the 2026-09-11 numbers it replaces were not — those were
-/// taken off `Utc::now()`, where the hour of the run decided how the day
-/// partition split the fixture:
+/// ONE candidate file — [`sweep_peak`] asserts the fixture is one, which is
+/// the correction #4703 made. Measured 2026-09-16, debug build, 1 KiB of raw
+/// text per row (~1,200 B decoded), half the rows deleted:
 ///
 /// ```text
-/// rows    decoded    in-RAM peak   streaming peak
-/// 16 Ki   19.7 MB    54.2 MB       27.4 MB
-/// 32 Ki   39.3 MB    95.1 MB       36.9 MB
-/// 64 Ki   78.7 MB   125.4 MB       41.6 MB
+/// rows    file     decoded   survivors   in-RAM peak   streaming peak
+/// 16 Ki   113 KB   19.7 MB     9.8 MB       54.2 MB          27.4 MB
+/// 32 Ki   222 KB   39.3 MB    19.7 MB       95.1 MB          36.9 MB
+/// 64 Ki   443 KB   78.7 MB    39.3 MB      187.8 MB          55.7 MB
+/// 64 Ki   443 KB   78.7 MB     9.8 MB            —           28.1 MB   (⅛ survive)
 /// ```
 ///
-/// The shape is the point, not the absolute bytes (freeing memory allocated
-/// before the sweep started biases every number down): the fixture doubles
-/// from 32 Ki to 64 Ki rows and the streaming arm's peak moves 13% while the
-/// in-RAM arm's tracks the candidate. That near-flat line is what keeps a
-/// cold-target candidate inside a 1Gi compactor.
+/// WHAT THE STREAMING ARM HOLDS, per decoded byte: **0.96 of its OUTPUT, plus
+/// a fixed ~18 MB**, and nothing per decoded byte of its input. The fit is
+/// `peak ≈ 0.96 × survivor_decoded + 18.0 MB` — 0.05% off at 32 Ki, 2.7% at
+/// the fourth row. The fourth row is the one that separates input from output:
+/// it rewrites the SAME 78.7 MB candidate as the third but keeps an eighth of
+/// the rows, and lands at 28.1 MB, within 2.7% of the 16 Ki sweep's 27.4 MB
+/// over the same 9.8 MB of survivors off a candidate a quarter the size. Per
+/// decoded byte of the candidate the streaming arm therefore reads at
+/// 1.39 / 0.94 / 0.71 / 0.36 — a ratio that says nothing on its own, which is
+/// why it is not what the assertions use.
 ///
-/// HOW MUCH OF IT IS THE FIXTURE (#3999). [`sweep_peak`] spaces its rows one
-/// second apart, so the 64 Ki fixture spans 18 hours and arrives as TWO
-/// day-partitioned candidate files where 32 Ki arrives as one. Spacing the
-/// same 64 Ki rows a millisecond apart to make one candidate of them, measured
-/// 2026-09-16, puts the streaming arm at 55.7 MB against 36.9 MB at 32 Ki: it
-/// grows with the candidate, sublinearly (2x the rows, 1.5x the peak), and the
-/// first assertion below fails. So part of the near-flat line is the split,
-/// and nothing here yet says what one whole cold-target candidate costs the
-/// streaming arm. Left as recorded rather than redefined: what the gate should
-/// measure is a design question, not a fixture-hardening one (#4703).
+/// 0.96 of the output is one whole decoded copy, and the code says where:
+/// `build_merge_output_writer` sizes its row group with
+/// `target_row_group_rows_with_target(None, …)`, which with no sample returns
+/// the 1,048,576-row fallback and ignores the byte target it was passed; the
+/// fork's `ParquetWriter` buffers the open row group as decoded Arrow batches
+/// in `pending` whenever a row-group bloom column is set, which
+/// `with_footers` always sets here. So every output under 1 Mi rows is held
+/// entire. The answer to #4703's question is yes: the rolling writer buffers a
+/// row group proportional to the output, and below 1 Mi rows the row group IS
+/// the output.
+///
+/// WHAT THIS DOES NOT ESTABLISH. Not that a 256 MiB cold-target candidate fits
+/// a compactor packaged at `memory: 1Gi` (`deploy/helm/siglake/values.yaml`).
+/// The model above says the opposite is the thing to check — 1 Mi rows at this
+/// fixture's 1,200 decoded bytes per row is ~1.2 GB of buffered survivors
+/// before the cap engages at all — but these numbers cannot carry that
+/// extrapolation: they are net heap growth, biased down by pre-sweep
+/// allocations freed during the sweep, taken in a debug build on fixtures
+/// three orders of magnitude smaller, over uniform `xxx…` raw text that
+/// compresses 174:1 and so has no representative relationship between file
+/// bytes and decoded bytes. What the gate below pins is the shape.
+///
+/// SUPERSEDED. #3999's reading, taken the same day, recorded 125.4 MB in-RAM
+/// and 41.6 MB streaming at 64 Ki, and read the arm as near-flat (13% for a
+/// doubled fixture). Its rows were one second apart, so 64 Ki spanned 18 hours
+/// and the `day(timestamp)` partition delivered it as TWO candidates: half a
+/// candidate, half a peak. Before that, rows placed off `Utc::now()` made the
+/// hour of the run decide which sizes split (#3999). Neither reading was of
+/// what it claimed to measure.
 #[ignore]
 #[test]
 fn measure_peak_allocation_per_arm() {
     serialized(|_snapshotter| async move {
-        let mut streaming_peaks = Vec::new();
-        let mut in_ram_peaks = Vec::new();
+        let mut streaming = Vec::new();
+        let mut in_ram = Vec::new();
         for rows in [16 * 1024usize, 32 * 1024, 64 * 1024] {
-            let (in_ram, decoded) = sweep_peak(rows, 1024, IcebergTuning::default()).await;
-            let (streaming, _) = sweep_peak(rows, 1024, force_streaming()).await;
+            let ram = sweep_peak(rows, 1024, 2, IcebergTuning::default()).await;
+            let stream = sweep_peak(rows, 1024, 2, force_streaming()).await;
             println!(
-                "rows={rows} decoded={decoded} in_ram_peak={in_ram} streaming_peak={streaming}"
+                "rows={rows} file_bytes={} decoded={} survivor_decoded={} in_ram_peak={} \
+                 streaming_peak={} streaming_per_decoded={:.2} streaming_per_survivor={:.2}",
+                stream.file_bytes,
+                stream.decoded,
+                stream.survivor_decoded(),
+                ram.peak,
+                stream.peak,
+                stream.peak as f64 / stream.decoded as f64,
+                stream.peak as f64 / stream.survivor_decoded() as f64,
             );
-            streaming_peaks.push(streaming);
-            in_ram_peaks.push(in_ram);
+            streaming.push(stream);
+            in_ram.push(ram);
         }
-        let (small, large) = (streaming_peaks[1], streaming_peaks[2]);
-        assert!(
-            large * 4 < small * 5,
-            "the streaming arm grew with the candidate: {small} B at 32 Ki rows, \
-             {large} B at 64 Ki — it is materializing something proportional to \
-             the file"
+
+        // THE SAME CANDIDATE, AN EIGHTH OF THE SURVIVORS. If the streaming
+        // arm's growth term is the output it buffers rather than the input it
+        // reads, this sweep reads the largest candidate above and peaks near
+        // the smallest.
+        let narrow = sweep_peak(64 * 1024, 1024, 8, force_streaming()).await;
+        println!(
+            "rows={} survivors={} decoded={} survivor_decoded={} streaming_peak={} \
+             streaming_per_decoded={:.2} streaming_per_survivor={:.2}",
+            narrow.rows,
+            narrow.survivors,
+            narrow.decoded,
+            narrow.survivor_decoded(),
+            narrow.peak,
+            narrow.peak as f64 / narrow.decoded as f64,
+            narrow.peak as f64 / narrow.survivor_decoded() as f64,
+        );
+
+        // WHAT THE GATE EXISTS FOR, at every size: under 0.6 of the arm it
+        // replaced, over the same candidate. Measured at 0.51 / 0.39 / 0.30 —
+        // the margin is widest where it matters, on the largest candidate.
+        for (stream, ram) in streaming.iter().zip(in_ram.iter()) {
+            assert!(
+                stream.peak * 5 < ram.peak * 3,
+                "the streaming arm peaked at {} B against the in-RAM arm's {} B over the \
+                 same {}-byte candidate; the gate is not buying what it exists for",
+                stream.peak,
+                ram.peak,
+                stream.decoded,
+            );
+        }
+
+        // THE GROWTH TERM IS THE OUTPUT, NOT THE INPUT. Doubling the candidate
+        // at a fixed survivor fraction costs a fixed share of the added decoded
+        // bytes; measured at 0.48 (see the table above), so 0.7 leaves room for
+        // allocator noise while still failing if the arm starts holding the
+        // whole input. The in-RAM arm fails this by construction.
+        for pair in streaming.windows(2) {
+            let (small, large) = (pair[0], pair[1]);
+            let marginal_peak = large.peak - small.peak;
+            let marginal_decoded = large.decoded - small.decoded;
+            assert!(
+                marginal_peak * 10 < marginal_decoded * 7,
+                "the streaming arm took {marginal_peak} B of peak for {marginal_decoded} \
+                 added decoded bytes ({} B over {} at {} rows, {} B over {} at {}); above \
+                 half the input it is holding more than the survivors it writes",
+                small.peak,
+                small.decoded,
+                small.rows,
+                large.peak,
+                large.decoded,
+                large.rows,
+            );
+        }
+
+        // ... and that share is the SURVIVORS. `narrow` and the 16 Ki sweep
+        // write the same 9.8 MB of survivors off candidates 4x apart in size,
+        // and must therefore peak at the same place: measured 2.7% apart, so
+        // 15% is noise margin, not slack. This is the assertion that fails if
+        // the arm ever starts holding the input.
+        let same_output = streaming[0];
+        assert_eq!(
+            narrow.survivor_decoded(),
+            same_output.survivor_decoded(),
+            "the two sweeps must write the same survivor bytes to be comparable"
+        );
+        let (lo, hi) = (
+            narrow.peak.min(same_output.peak),
+            narrow.peak.max(same_output.peak),
         );
         assert!(
-            streaming_peaks[2] * 2 < in_ram_peaks[2],
-            "at 64 Ki rows the streaming arm peaked at {} B against the in-RAM \
-             arm's {} B; the gate is not buying what it exists for",
-            streaming_peaks[2],
-            in_ram_peaks[2]
+            hi * 100 < lo * 115,
+            "the same {} survivor bytes peaked at {} B off a {}-byte candidate and {} B \
+             off a {}-byte one; the arm is holding the input, not the output",
+            narrow.survivor_decoded(),
+            same_output.peak,
+            same_output.decoded,
+            narrow.peak,
+            narrow.decoded,
         );
     });
 }
