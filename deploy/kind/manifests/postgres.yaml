@@ -47,6 +47,13 @@ spec:
       containers:
         - name: postgres
           image: postgres:16-alpine
+          # Commit timestamps date a row version's write, which is what the
+          # opt-in outage probe needs to say whether a job row landed while
+          # Postgres was paused. Postgres defaults it off and it is
+          # postmaster-only, so it has to be set at start-up; this throwaway
+          # install is the only place siglake turns it on. The chart and every
+          # other deployment keep the default.
+          args: ["-c", "track_commit_timestamp=on"]
           ports:
             - containerPort: 5432
           env:

@@ -149,7 +149,41 @@ printf "outcome=%s\tstatus=%s\tseconds=%s\tdetail=%s\n" "$outcome" "$status" \
 '
 # write-probe-snippet-end
 
-# Both remote readers are advisory: a failed exec is retained as evidence that
+# Date each job row's visible version by its commit timestamp, which is the one
+# reading that says whether a write landed while Postgres was stopped:
+# `ended_at` is application-supplied and `submitted_at` predates the fault. The
+# effective `track_commit_timestamp` comes back in the same output, because
+# `pg_xact_commit_timestamp` raises rather than returning NULL when the setting
+# is off, and a failed query must not read as "no rows committed in the pause".
+# No SQL string literal and no single quote appears here, so the offline
+# fixtures can run this exact text through a psql stand-in.
+# commit-times-snippet-begin
+POSTGRES_COMMIT_TIMES_SNIPPET='
+errors=${COMMIT_TIMES_ERRORS:-/tmp/siglake-outage-commit-times.err}
+rows=${COMMIT_TIMES_ROWS:-/tmp/siglake-outage-commit-times.rows}
+: >"$errors"
+: >"$rows"
+tab=$(printf "\t")
+psql_bin=${COMMIT_TIMES_PSQL:-psql}
+user=${PGUSER:-${POSTGRES_USER:-postgres}}
+database=${PGDATABASE:-${POSTGRES_DB:-postgres}}
+setting_status=0
+setting=$("$psql_bin" -qtAX -v ON_ERROR_STOP=1 -U "$user" -d "$database" \
+  -c "SHOW track_commit_timestamp" 2>>"$errors") || setting_status=$?
+query_status=0
+"$psql_bin" -qtAX -F"$tab" -v ON_ERROR_STOP=1 -U "$user" -d "$database" \
+  -c "SELECT job_id, status, submitted_at, ended_at, recovered_at, pg_xact_commit_timestamp(xmin) FROM siglake_query_jobs ORDER BY 6" \
+  >"$rows" 2>>"$errors" || query_status=$?
+printf "status\t%s\t%s\n" "$setting_status" "$query_status"
+printf "setting\t%s\n" "$setting"
+while IFS= read -r line; do
+  printf "row\t%s\n" "$line"
+done <"$rows"
+printf "detail\t%s\n" "$(tr "\n\t" "  " <"$errors" | cut -c1-200)"
+'
+# commit-times-snippet-end
+
+# The pause-window readers are advisory: a failed exec is retained as evidence that
 # the pause window went unobserved, never as a reason to leave Postgres stopped.
 # Their request timeouts are short for the same reason — an exec that cannot be
 # served against a stopped PID 1 costs one sample, not the window.
@@ -189,6 +223,17 @@ with open(output, "a", encoding="utf-8") as handle:
     handle.write(json.dumps(probe) + "\n")
 PY
   log "write probe ($phase): $line"
+}
+
+# Advisory in the same way as the two pause-window readers: a failed exec is
+# retained as evidence that the job rows could not be dated, never as a reason
+# to leave the run without a verdict.
+postgres_commit_times() {
+  local output=$1 status=0
+  kubectl --context "$KUBE_CONTEXT" --request-timeout=30s -n "$NAMESPACE" \
+    exec "$POSTGRES_POD" -- sh -eu -c "$POSTGRES_COMMIT_TIMES_SNIPPET" \
+    commit-times >"$output" 2>"$output.err" || status=$?
+  printf '%s' "$status"
 }
 
 postgres_container_status() {
@@ -373,6 +418,12 @@ OUTAGE_STARTED_AT=$(iso_now)
 log "pause only $POSTGRES_POD for ${OUTAGE_SECONDS}s"
 POSTGRES_PAUSED=1
 pause_postgres_processes >/dev/null
+# The signal lands somewhere between these two stamps, both truncated to the
+# second, so a commit timestamp is only inside the pause once it is past
+# `pause_applied_at` by more than that truncation. The grader holds anything
+# closer to the edge as unplaceable rather than calling it a write during the
+# pause.
+PAUSE_APPLIED_AT=$(iso_now)
 
 observed_positive=0
 write_probed=0
@@ -395,6 +446,7 @@ done
 RESTORATION_STARTED_AT=$(iso_now)
 log "continue $POSTGRES_POD and wait for readiness"
 continue_postgres_processes >/dev/null
+RESTORATION_APPLIED_AT=$(iso_now)
 POSTGRES_PAUSED=0
 kubectl --context "$KUBE_CONTEXT" --request-timeout=125s -n "$NAMESPACE" wait \
   --for=condition=Ready "pod/$POSTGRES_POD" --timeout=120s >/dev/null
@@ -413,22 +465,76 @@ while ((SECONDS < recovery_deadline)); do
 done
 SAMPLING_ENDED_AT=$(iso_now)
 
+# After the bounded recovery window, not at readiness: a ready postmaster says
+# connections are served, not that reconciliation has finished writing the rows
+# this reading is about.
+log "read job-row commit timestamps"
+COMMIT_TIMES_AT=$(iso_now)
+COMMIT_TIMES_STATUS=$(postgres_commit_times "$TMP_DIR/commit-times")
+
 python3 - "$ROOT" "$TMP_DIR" "$SAMPLES_FILE" "$SUBMISSIONS_DIR" \
   "$SUBMISSION_STARTED_AT" "$SUBMISSION_FINISHED_AT" "$OUTAGE_STARTED_AT" \
   "$RESTORATION_STARTED_AT" "$POSTGRES_READY_AT" "$SAMPLING_ENDED_AT" \
   "$REQUESTED_JOBS" "$OUTAGE_SECONDS" "$DRAIN_TIMEOUT_SECONDS" \
   "$SAMPLE_INTERVAL_SECONDS" "$QUERY_TIMEOUT_SECONDS" "$QUERY" \
   "$WRITE_PROBE_SECONDS" "$WRITE_PROBES_FILE" "$CONTAINER_BEFORE" \
-  "$CONTAINER_AFTER" "$TMP_DIR/raw.json" <<'PY'
+  "$CONTAINER_AFTER" "$PAUSE_APPLIED_AT" "$RESTORATION_APPLIED_AT" \
+  "$COMMIT_TIMES_AT" "$COMMIT_TIMES_STATUS" "$TMP_DIR/commit-times" \
+  "$TMP_DIR/raw.json" <<'PY'
 import datetime, json, pathlib, subprocess, sys
 (
     root, tmp, samples_path, submissions_dir, submission_started, submission_finished,
     outage_started, restoration_started, postgres_ready, sampling_ended,
     requested_jobs, outage_seconds, drain_timeout, sample_interval, query_timeout,
     query, write_probe_seconds, write_probes_path, container_before, container_after,
-    output,
+    pause_applied, restoration_applied, commit_times_at, commit_times_status,
+    commit_times_path, output,
 ) = sys.argv[1:]
 tmp = pathlib.Path(tmp)
+
+# `status`, `setting`, `row` and `detail` lines, in the shape the remote snippet
+# prints them. A row keeps every field as text, including the empty strings a
+# NULL `ended_at`, `recovered_at` or commit timestamp comes back as: the grader
+# reads a missing commit timestamp as evidence it cannot date, so this must not
+# quietly turn one into a value.
+def commit_times(path, at, exec_status):
+    reading = {
+        "at": at,
+        "exec_status": int(exec_status) if exec_status.isdigit() else 1,
+        "setting_status": None,
+        "query_status": None,
+        "track_commit_timestamp": None,
+        "rows": [],
+        "detail": "",
+    }
+    fields = ("job_id", "status", "submitted_at", "ended_at", "recovered_at", "committed_at")
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return reading
+    for line in lines:
+        parts = line.split("\t")
+        if parts[0] == "status" and len(parts) == 3:
+            reading["setting_status"] = int(parts[1]) if parts[1].isdigit() else None
+            reading["query_status"] = int(parts[2]) if parts[2].isdigit() else None
+        elif parts[0] == "setting" and len(parts) == 2:
+            reading["track_commit_timestamp"] = parts[1] or None
+        elif parts[0] == "row" and len(parts) == len(fields) + 1:
+            reading["rows"].append(
+                {name: (parts[index + 1] or None) for index, name in enumerate(fields)}
+            )
+        elif parts[0] == "detail" and len(parts) == 2:
+            reading["detail"] = parts[1]
+    if not reading["detail"]:
+        # An exec that never reached the snippet leaves its complaint here, and
+        # that is the only thing that would say why the rows are missing.
+        try:
+            reading["detail"] = (
+                open(path + ".err", encoding="utf-8").read().replace("\n", " ").strip()[:200]
+            )
+        except OSError:
+            pass
+    return reading
 
 def container_identity(raw):
     parts = raw.split("\t")
@@ -465,7 +571,7 @@ write_probes = [
     json.loads(line) for line in open(write_probes_path, encoding="utf-8") if line.strip()
 ]
 document = {
-    "schema_version": 2,
+    "schema_version": 3,
     "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
     "revisions": {
         "repository_commit": subprocess.check_output(
@@ -496,11 +602,14 @@ document = {
         "after": container_identity(container_after),
     },
     "write_probes": write_probes,
+    "job_commit_times": commit_times(commit_times_path, commit_times_at, commit_times_status),
     "timestamps": {
         "submission_started_at": submission_started,
         "submission_finished_at": submission_finished,
         "outage_started_at": outage_started,
+        "pause_applied_at": pause_applied,
         "restoration_started_at": restoration_started,
+        "restoration_applied_at": restoration_applied,
         "postgres_ready_at": postgres_ready,
         "sampling_ended_at": sampling_ended,
     },

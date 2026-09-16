@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "generated_at": "2026-09-07T12:02:00Z",
   "revisions": {
     "repository_commit": "0123456789abcdef",
@@ -82,11 +82,39 @@
       "detail": ""
     }
   ],
+  "job_commit_times": {
+    "at": "2026-09-07T12:01:06Z",
+    "exec_status": 0,
+    "setting_status": 0,
+    "query_status": 0,
+    "track_commit_timestamp": "on",
+    "rows": [
+      {
+        "job_id": "job-a",
+        "status": "succeeded",
+        "submitted_at": "2026-09-07 12:00:01.204817+00",
+        "ended_at": "2026-09-07 12:00:51.771902+00",
+        "recovered_at": null,
+        "committed_at": "2026-09-07 12:00:51.884113+00"
+      },
+      {
+        "job_id": "job-b",
+        "status": "succeeded",
+        "submitted_at": "2026-09-07 12:00:02.118440+00",
+        "ended_at": "2026-09-07 12:00:52.004551+00",
+        "recovered_at": null,
+        "committed_at": "2026-09-07 12:00:52.131288+00"
+      }
+    ],
+    "detail": ""
+  },
   "timestamps": {
     "submission_started_at": "2026-09-07T12:00:01Z",
     "submission_finished_at": "2026-09-07T12:00:02Z",
     "outage_started_at": "2026-09-07T12:00:03Z",
+    "pause_applied_at": "2026-09-07T12:00:04Z",
     "restoration_started_at": "2026-09-07T12:00:48Z",
+    "restoration_applied_at": "2026-09-07T12:00:49Z",
     "postgres_ready_at": "2026-09-07T12:00:50Z",
     "sampling_ended_at": "2026-09-07T12:01:05Z"
   },

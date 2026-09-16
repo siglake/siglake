@@ -28,6 +28,13 @@ def parse_stamp(value: Any, field: str, problems: list[str]) -> dt.datetime | No
 
 
 STOPPED_STATES = {"T", "t"}
+TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "timeout"}
+# The probe's own stamps are truncated to the second and are read around the
+# exec that carries the pause or continuation signal, so the signal landed
+# somewhere inside a one-second band on either side of them. A commit timestamp
+# inside that band cannot be placed against the pause at all; only one past it
+# is a write that happened while the processes were stopped.
+EDGE_SLACK = dt.timedelta(seconds=1)
 
 
 def numeric_series(sample: dict[str, Any], field: str) -> dict[str, float] | None:
@@ -223,9 +230,175 @@ def grade_container(document: dict[str, Any], problems: list[str]) -> None:
         )
 
 
+def parse_pg_stamp(value: Any) -> dt.datetime | None:
+    """A `timestamptz` as psql prints it, or None for a NULL or unusable one."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace(" ", "T")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    elif len(text) > 3 and text[-3] in "+-":
+        text += ":00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def grade_commit_times(
+    document: dict[str, Any],
+    accepted: list[dict[str, Any]],
+    outage_at: dt.datetime | None,
+    pause_applied_at: dt.datetime | None,
+    restoration_at: dt.datetime | None,
+    problems: list[str],
+) -> dict[str, Any]:
+    """Date each accepted job's row version by its Postgres commit timestamp.
+
+    `pg_xact_commit_timestamp(xmin)` dates the row version that is visible now,
+    which is not the same thing as every status transition the job made: the
+    amendment at `crates/siglake-query-server/src/jobs.rs:2313` rewrites an
+    already-terminal row, so a recovered job's latest commit can postdate a
+    terminal write that landed earlier. Anything the reading cannot place -- a
+    missing row, a NULL timestamp, a job still short of a terminal status, a
+    recovered row, a commit inside the second-resolution band around the pause
+    edges -- is kept as a gap, and a gap is what stops this reading from
+    settling the pause question either way.
+    """
+    reading: dict[str, Any] = {
+        "collected_at": None,
+        "track_commit_timestamp": None,
+        "rows_returned": None,
+        "correlated_jobs": 0,
+        "uncorrelated_rows": None,
+        "committed_before_pause": 0,
+        "committed_in_pause": [],
+        "committed_after_restoration": 0,
+        "unplaceable_commits": [],
+        "gaps": [],
+        "settles_pause": False,
+    }
+    observation = document.get("job_commit_times")
+    if not isinstance(observation, dict):
+        problems.append("missing job-row commit-time observations")
+        return reading
+    rows = observation.get("rows")
+    if not isinstance(rows, list):
+        rows = []
+    reading["collected_at"] = observation.get("at")
+    reading["track_commit_timestamp"] = observation.get("track_commit_timestamp")
+    reading["rows_returned"] = len(rows)
+    gaps: list[str] = reading["gaps"]
+
+    if observation.get("exec_status") != 0 or observation.get("query_status") != 0:
+        problems.append(
+            "the job-row commit-time query did not run: "
+            f"{str(observation.get('detail', ''))[:160]!r}"
+        )
+        gaps.append("the commit-time query did not run")
+    if reading["track_commit_timestamp"] != "on":
+        problems.append(
+            "Postgres did not track commit timestamps "
+            f"(track_commit_timestamp={reading['track_commit_timestamp']!r}), so no job row can be dated"
+        )
+        gaps.append("commit timestamps were not tracked")
+
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("job_id"), str) or not row["job_id"]:
+            gaps.append("a retained commit-time row has no job id")
+            continue
+        by_id.setdefault(row["job_id"], []).append(row)
+
+    if pause_applied_at is None or restoration_at is None:
+        gaps.append("the trace has no pause and restoration stamps to place commit timestamps against")
+
+    seen: set[str] = set()
+    for index, submission in enumerate(accepted):
+        job_id = submission.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            gaps.append(f"accepted submission {index} has no job id to correlate")
+            continue
+        seen.add(job_id)
+        matches = by_id.get(job_id, [])
+        if not matches:
+            gaps.append(f"no job row for accepted job {job_id}")
+            continue
+        if len(matches) > 1:
+            gaps.append(f"job {job_id} has {len(matches)} rows")
+            continue
+        row = matches[0]
+        reading["correlated_jobs"] += 1
+        status = row.get("status")
+        if status not in TERMINAL_STATUSES:
+            gaps.append(
+                f"job {job_id} is {status!r} after the recovery window, so its row is not the "
+                "terminal write"
+            )
+        if row.get("recovered_at"):
+            gaps.append(
+                f"job {job_id} was recovered at {row['recovered_at']}, so its visible row version "
+                "may be an amendment of an earlier terminal write"
+            )
+        if parse_pg_stamp(row.get("committed_at")) is None:
+            gaps.append(f"job {job_id} has no usable commit timestamp")
+
+    reading["uncorrelated_rows"] = len([job_id for job_id in by_id if job_id not in seen])
+    # Every row in the table is dated, not only the ones this burst submitted: a
+    # job row from earlier in the round that committed while the processes were
+    # stopped is the same finding, and the completion counter the samples read
+    # does not distinguish them either.
+    for job_id, matches in sorted(by_id.items()):
+        for row in matches:
+            committed = parse_pg_stamp(row.get("committed_at"))
+            if committed is None or pause_applied_at is None or restoration_at is None:
+                continue
+            stamp = committed.isoformat()
+            if outage_at is not None and committed < outage_at:
+                reading["committed_before_pause"] += 1
+            elif committed < pause_applied_at + EDGE_SLACK:
+                reading["unplaceable_commits"].append(job_id)
+                problems.append(
+                    f"job {job_id} committed at {stamp}, within {EDGE_SLACK.total_seconds():g}s of "
+                    f"the pause applied at {pause_applied_at.isoformat()}: the probe's stamps are "
+                    "truncated to the second, so this commit cannot be placed inside or outside "
+                    "the pause"
+                )
+            elif committed < restoration_at:
+                reading["committed_in_pause"].append(job_id)
+                problems.append(
+                    f"job {job_id} committed at {stamp}, inside the pause window that was applied "
+                    f"at {pause_applied_at.isoformat()} and lifted at "
+                    f"{restoration_at.isoformat()}, so the pause did not block writes"
+                )
+            elif committed < restoration_at + EDGE_SLACK:
+                reading["unplaceable_commits"].append(job_id)
+                problems.append(
+                    f"job {job_id} committed at {stamp}, within {EDGE_SLACK.total_seconds():g}s of "
+                    f"restoration at {restoration_at.isoformat()}: the probe's stamps are "
+                    "truncated to the second, so this commit cannot be placed inside or outside "
+                    "the pause"
+                )
+            else:
+                reading["committed_after_restoration"] += 1
+
+    if not accepted:
+        gaps.append("no accepted submission to correlate commit times with")
+    reading["settles_pause"] = (
+        not gaps
+        and not reading["committed_in_pause"]
+        and not reading["unplaceable_commits"]
+        and reading["correlated_jobs"] > 0
+    )
+    if gaps:
+        problems.append("job-row commit times are incomplete: " + "; ".join(gaps))
+    return reading
+
+
 def grade(document: dict[str, Any]) -> dict[str, Any]:
     problems: list[str] = []
-    if document.get("schema_version") not in {1, 2}:
+    if document.get("schema_version") not in {1, 2, 3}:
         problems.append("unsupported or missing schema_version")
     revisions = document.get("revisions")
     if not isinstance(revisions, dict) or not revisions.get("repository_commit"):
@@ -292,10 +465,25 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
         timestamps.get("restoration_started_at"), "restoration_started_at", problems
     )
     ready_at = parse_stamp(timestamps.get("postgres_ready_at"), "postgres_ready_at", problems)
+    # Read after the exec that carries each signal, so they bound the interval a
+    # commit timestamp has to fall in to be a write taken while the processes
+    # were stopped.
+    pause_applied_at = parse_stamp(
+        timestamps.get("pause_applied_at"), "pause_applied_at", problems
+    )
+    restoration_applied_at = parse_stamp(
+        timestamps.get("restoration_applied_at"), "restoration_applied_at", problems
+    )
     if outage_at and restored_at and restored_at <= outage_at:
         problems.append("restoration did not follow the outage")
     if restored_at and ready_at and ready_at < restored_at:
         problems.append("Postgres-ready timestamp precedes restoration")
+    if outage_at and pause_applied_at and pause_applied_at < outage_at:
+        problems.append("the pause was applied before the outage window opened")
+    if restored_at and pause_applied_at and pause_applied_at > restored_at:
+        problems.append("the pause was applied after restoration")
+    if restored_at and restoration_applied_at and restoration_applied_at < restored_at:
+        problems.append("restoration completed before it started")
 
     submissions = document.get("submissions")
     if not isinstance(submissions, list):
@@ -389,6 +577,9 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
     stopped_processes, observed_outage_states = grade_pause(parsed_samples, problems)
     write_probe_outcomes = grade_write_probes(document, problems)
     grade_container(document, problems)
+    commit_times = grade_commit_times(
+        document, accepted, outage_at, pause_applied_at, restored_at, problems
+    )
 
     totals = [(row.at, row.phase, sum(row.backlog.values())) for row in parsed_samples]
     positive = [(at, total) for at, _, total in totals if total > 0]
@@ -402,7 +593,11 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
     # counted, not when the row was written, so this is reported as an
     # unexplained observation, and separately when the scrape it came from
     # predates the pause, which makes it delayed observation of earlier work.
+    # The commit-time reading is what can answer it: the messages collected here
+    # are only raised when that reading cannot place every accepted job's write
+    # outside the pause.
     pre_restoration_drain: dict[str, Any] | None = None
+    drain_problems: list[str] = []
     previous_completions: float | None = None
     for observation in parsed_samples:
         total_completions = sum(observation.completions.values())
@@ -421,13 +616,13 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
         stamp = observation.at.isoformat()
         scraped = observation.scraped_at
         if scraped is not None and outage_at and scraped < outage_at:
-            problems.append(
+            drain_problems.append(
                 f"outage sample at {stamp} shows zero backlog with completions up by {delta:g}, "
                 f"from a Prometheus scrape at {scraped.isoformat()} taken before the pause: "
                 "delayed observation of pre-pause work, not a write during the pause"
             )
         else:
-            problems.append(
+            drain_problems.append(
                 f"outage sample at {stamp} shows zero backlog with completions up by {delta:g} "
                 f"before restoration at {restored_at.isoformat() if restored_at else 'unknown'}"
                 + (f", scraped at {scraped.isoformat()}" if scraped else "")
@@ -443,7 +638,51 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
                 "scrape_precedes_pause": bool(
                     scraped is not None and outage_at and scraped < outage_at
                 ),
+                "resolution": None,
             }
+
+    if pre_restoration_drain is not None:
+        if commit_times["settles_pause"]:
+            # Every accepted job's row version is dated, terminal, unamended and
+            # committed outside the pause, so the completion the counter showed
+            # was observed work rather than a write that landed while Postgres
+            # was stopped. This is the only reading that clears the observation;
+            # a counter cannot.
+            pre_restoration_drain["resolution"] = {
+                "state": "resolved",
+                "by": "job_commit_times",
+                "detail": (
+                    f"{commit_times['correlated_jobs']} accepted job rows are dated by commit "
+                    f"timestamp, {commit_times['committed_after_restoration']} after restoration "
+                    f"and {commit_times['committed_before_pause']} before the pause, none inside "
+                    "it: the completion was observed work, not a write that landed during the pause"
+                ),
+            }
+        else:
+            pre_restoration_drain["resolution"] = {
+                "state": "unresolved",
+                "by": "job_commit_times",
+                "detail": (
+                    "the commit-time reading cannot place every accepted job's write outside the "
+                    "pause"
+                    + (
+                        "; commits inside the pause: " + ", ".join(commit_times["committed_in_pause"])
+                        if commit_times["committed_in_pause"]
+                        else ""
+                    )
+                    + (
+                        "; gaps: " + "; ".join(commit_times["gaps"])
+                        if commit_times["gaps"]
+                        else ""
+                    )
+                    + (
+                        "; unplaceable commits: " + ", ".join(commit_times["unplaceable_commits"])
+                        if commit_times["unplaceable_commits"]
+                        else ""
+                    )
+                ),
+            }
+            problems.extend(drain_problems)
 
     drained_at: dt.datetime | None = None
     if positive and restored_at:
@@ -508,6 +747,7 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
         "pre_restoration_drain": pre_restoration_drain,
+        "job_commit_times": commit_times,
         "outage_samples_with_process_state": observed_outage_states,
         "stopped_postgres_processes": stopped_processes,
         "write_probe_outcomes": write_probe_outcomes,
@@ -542,10 +782,16 @@ def main() -> int:
         args.output.write_text(rendered, encoding="utf-8")
     else:
         sys.stdout.write(rendered)
+    commits = result["summary"]["job_commit_times"]
+    drain = result["summary"]["pre_restoration_drain"]
     print(
         "POSTGRES_OUTAGE_EVIDENCE "
         f"grade={result['grade']} peak={result['summary']['peak_backlog_total']} "
-        f"drain_seconds={result['summary']['time_to_drain_seconds']}",
+        f"drain_seconds={result['summary']['time_to_drain_seconds']} "
+        f"job_rows_committed_in_pause={len(commits['committed_in_pause'])} "
+        f"job_rows_dated={commits['correlated_jobs']} "
+        f"pre_restoration_drain="
+        f"{(drain['resolution'] or {}).get('state', 'unresolved') if drain else 'none'}",
         file=sys.stderr,
     )
     for problem in result["problems"]:
