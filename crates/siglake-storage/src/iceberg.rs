@@ -34,8 +34,8 @@ use iceberg::puffin::{
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
     BlobMetadata as StatisticsBlobMetadata, DataFile, DataFileFormat, FormatVersion, NullOrder,
-    Operation, PartitionSpec, PrimitiveType, SortDirection, SortField, SortOrder, StatisticsFile,
-    Summary, Transform, Type,
+    Operation, PartitionSpec, PrimitiveType, Snapshot, SortDirection, SortField, SortOrder,
+    StatisticsFile, Summary, Transform, Type,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{
@@ -4637,6 +4637,11 @@ impl SnapshotAggregates {
         }
         self.coverage_links
             .sort_unstable_by_key(|pending| pending.sequence_number);
+        self.join_pending_links();
+    }
+
+    /// Collapse every pending link that now chains onto the edge.
+    fn join_pending_links(&mut self) {
         loop {
             let parent = self.coverage.map(|coverage| coverage.snapshot_id);
             let Some(pos) = self
@@ -4652,6 +4657,22 @@ impl SnapshotAggregates {
                 sequence_number: next.sequence_number,
             });
         }
+    }
+
+    /// Move the edge to `edge` without touching a count, for a caller that has
+    /// PROVEN the object already describes that snapshot's rows — the expiry
+    /// path, whose commit is about to drop the ancestry the current edge is
+    /// read through (#3800).
+    ///
+    /// The proof is the caller's whole contribution: nothing here can check it,
+    /// and matching row totals are not evidence. A link that was waiting on the
+    /// new edge joins in the same call, which is what makes an append that lands
+    /// between the expiry commit and this write recover instead of stranding.
+    fn reroot_coverage(&mut self, edge: AggregateCoverage) {
+        self.coverage = Some(edge);
+        self.coverage_links
+            .retain(|pending| pending.snapshot_id != edge.snapshot_id);
+        self.join_pending_links();
     }
 
     /// Does this object already carry `link`'s publication?
@@ -4708,6 +4729,47 @@ mod aggregate_coverage_link_tests {
 
         aggs.add_coverage_link(link(None, 11, 1));
         assert_eq!(aggs.coverage.map(|coverage| coverage.snapshot_id), Some(12));
+        assert!(aggs.coverage_links.is_empty());
+    }
+
+    /// The expiry path's window, closed (#3800): the expire commit lands, the
+    /// append that follows builds its edge against the shrunken metadata — so
+    /// its parent is the snapshot the expiry left as the deepest survivor, not
+    /// the one the edge still names — and the re-root that follows joins it
+    /// instead of leaving it pending forever.
+    #[test]
+    fn a_re_root_joins_the_link_that_was_waiting_on_the_new_edge() {
+        let mut aggs = SnapshotAggregates::default();
+        aggs.add_coverage_link(link(None, 11, 1));
+        aggs.add_coverage_link(link(Some(20), 21, 5));
+        assert_eq!(aggs.coverage.map(|coverage| coverage.snapshot_id), Some(11));
+
+        aggs.reroot_coverage(AggregateCoverage {
+            snapshot_id: 20,
+            sequence_number: 4,
+        });
+        assert_eq!(
+            aggs.coverage.map(|coverage| coverage.snapshot_id),
+            Some(21),
+            "the append waiting on the re-rooted edge did not join it"
+        );
+        assert!(aggs.coverage_links.is_empty());
+    }
+
+    /// Re-rooting onto a snapshot a pending link already names leaves one edge,
+    /// not an entry that can never join — the same guard
+    /// [`SnapshotAggregates::add_coverage_link`] opens with.
+    #[test]
+    fn a_re_root_onto_a_pending_snapshot_does_not_keep_it_pending() {
+        let mut aggs = SnapshotAggregates::default();
+        aggs.add_coverage_link(link(Some(19), 20, 4));
+        assert_eq!(aggs.coverage_links, vec![link(Some(19), 20, 4)]);
+
+        aggs.reroot_coverage(AggregateCoverage {
+            snapshot_id: 20,
+            sequence_number: 4,
+        });
+        assert_eq!(aggs.coverage.map(|coverage| coverage.snapshot_id), Some(20));
         assert!(aggs.coverage_links.is_empty());
     }
 
@@ -8079,22 +8141,83 @@ fn row_conserving_recluster(summary: &Summary) -> bool {
 /// The data-changing snapshot `snapshot_id` extends. Re-clustering changes file
 /// identity but preserves every row, so provenance may bridge across it.
 ///
-/// `None` when the walk runs off the start of the table — or off the end of
-/// retained metadata, because `expire_snapshots` dropped the ancestor. Both
-/// read as "no provable predecessor", which costs a republication and never a
-/// wrong answer.
+/// `None` only when there is nothing to name: no snapshot, or one that is not
+/// in the metadata at all.
 fn aggregate_coverage_ancestor(table: &Table, snapshot_id: Option<i64>) -> Option<i64> {
+    aggregate_coverage_root(table, snapshot_id, &HashSet::new())
+}
+
+/// THE NORMAL FORM EVERY COVERAGE EDGE IS PUBLISHED AT, and the parent every
+/// append's link names: the deepest ancestor of `snapshot_id` reachable through
+/// nothing but row-conserving re-clusters, skipping the ids in `expiring`
+/// (empty outside the expiry path, which has to reason about the metadata it is
+/// about to shrink).
+///
+/// Both sides of the chain have to agree on it. `add_coverage_link` advances
+/// `coverage` only when a link's parent is exactly the edge, so an edge
+/// published at a re-cluster whose parent survives is an edge the next append
+/// cannot join: its link walks past the re-cluster to the append below. That is
+/// what made a republication on a compacted table buy one query's worth of
+/// Tier-1 and lose it at the next commit (#3800).
+///
+/// When the walk runs off the end of retained metadata — `expire_snapshots`
+/// dropped the ancestor — the deepest re-cluster it did reach is the root
+/// instead. Everything above that snapshot is verified row-conserving against
+/// the metadata in hand, so it names the same row set; what is NOT there is
+/// never bridged, and a walk that reaches nothing still returns `None`.
+fn aggregate_coverage_root(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    expiring: &HashSet<i64>,
+) -> Option<i64> {
     let mut snapshot_id = snapshot_id?;
+    let mut deepest_bridged = None;
     loop {
-        let snapshot = table
+        if expiring.contains(&snapshot_id) {
+            return deepest_bridged;
+        }
+        let Some(snapshot) = table
             .metadata()
             .snapshots()
-            .find(|snapshot| snapshot.snapshot_id() == snapshot_id)?;
+            .find(|snapshot| snapshot.snapshot_id() == snapshot_id)
+        else {
+            return deepest_bridged;
+        };
         if !row_conserving_recluster(snapshot.summary()) {
             return Some(snapshot_id);
         }
-        snapshot_id = snapshot.parent_snapshot_id()?;
+        deepest_bridged = Some(snapshot_id);
+        let Some(parent) = snapshot.parent_snapshot_id() else {
+            return deepest_bridged;
+        };
+        snapshot_id = parent;
     }
+}
+
+/// The `(snapshot_id, sequence_number)` pair a coverage edge is, read from the
+/// metadata rather than assembled by a caller: the read guard checks both, so an
+/// edge carrying a sequence number that is not that snapshot's proves nothing.
+fn coverage_edge_at(table: &Table, snapshot_id: i64) -> Option<AggregateCoverage> {
+    table
+        .metadata()
+        .snapshots()
+        .find(|snapshot| snapshot.snapshot_id() == snapshot_id)
+        .map(|snapshot| AggregateCoverage {
+            snapshot_id,
+            sequence_number: snapshot.sequence_number(),
+        })
+}
+
+/// The edge a pass that read the files of `snapshot` should publish: that
+/// snapshot's own edge when it is a data-changing commit, else the root the
+/// re-cluster run above it sits on ([`aggregate_coverage_root`]).
+fn published_coverage_edge(table: &Table, snapshot: &Snapshot) -> AggregateCoverage {
+    aggregate_coverage_root(table, Some(snapshot.snapshot_id()), &HashSet::new())
+        .and_then(|root| coverage_edge_at(table, root))
+        .unwrap_or(AggregateCoverage {
+            snapshot_id: snapshot.snapshot_id(),
+            sequence_number: snapshot.sequence_number(),
+        })
 }
 
 /// The edge an append contributes to the side object's coverage chain.
@@ -8122,6 +8245,18 @@ fn append_coverage_link(committed: &Table) -> Option<AggregateCoverageLink> {
 /// gap; retention, delete tasks, foreign overwrites and appends all require a
 /// fresh aggregate publication.
 fn aggregate_covers_current_snapshot(table: &Table, coverage: Option<AggregateCoverage>) -> bool {
+    aggregate_covers_current_snapshot_excluding(table, coverage, &HashSet::new())
+}
+
+/// [`aggregate_covers_current_snapshot`] against the metadata an expiry is
+/// about to leave behind: an id in `expiring` reads as already gone, which is
+/// how the expiry path tells a chain that survives it from one it has to
+/// re-root before committing (#3800).
+fn aggregate_covers_current_snapshot_excluding(
+    table: &Table,
+    coverage: Option<AggregateCoverage>,
+    expiring: &HashSet<i64>,
+) -> bool {
     let Some(coverage) = coverage else {
         return false;
     };
@@ -8129,6 +8264,9 @@ fn aggregate_covers_current_snapshot(table: &Table, coverage: Option<AggregateCo
         return false;
     };
     loop {
+        if expiring.contains(&snapshot_id) {
+            return false;
+        }
         if snapshot_id == coverage.snapshot_id {
             return table
                 .metadata()
@@ -13078,6 +13216,10 @@ impl IcebergContext {
             return Ok(0);
         }
         let n = expired.len();
+        // Decided against the metadata this commit is about to shrink, because
+        // that is the only place the current edge is still provable.
+        let expiring: HashSet<i64> = expired.iter().copied().collect();
+        let reroot = self.coverage_reroot_for_expiry(&table, &expiring).await;
         let tx = Transaction::new(&table);
         let mut action = tx.expire_snapshots().retain_last(retain_last);
         if let Some(cutoff) = older_than_ms {
@@ -13089,7 +13231,150 @@ impl IcebergContext {
             .context("expire_snapshots commit")?;
         self.invalidate_cached_table(table_ident).await;
         metrics::counter!("siglake_iceberg_snapshots_expired_total").increment(n as u64);
+        if let Some((proven, target)) = reroot {
+            // After the commit, not before: an append that lands in this window
+            // builds its link against the shrunken metadata, so its parent is
+            // `target` and the re-root's own join collapses it. Publishing
+            // first would leave that append's link naming ancestry that no
+            // longer roots anything.
+            if let Err(err) = self
+                .publish_coverage_reroot(table_ident, &table, proven, target)
+                .await
+                .with_context(|| format!("re-root side-aggregate coverage on {table_ident}"))
+            {
+                // The counts are intact; only the proof is. A rebuild is the
+                // remedy, and it is an operator's call because it re-reads every
+                // live file.
+                tracing::warn!(
+                    error = ?err,
+                    table = %table_ident,
+                    "snapshot expiry dropped the ancestry the inline aggregate's coverage edge \
+                     is read through and the edge could not be re-rooted; windowed GROUP BY, \
+                     date histograms and windowed counts on this table answer from the exact \
+                     per-file path until `siglake rebuild-time-aggregates --table <table>` runs"
+                );
+            }
+        }
         Ok(n)
+    }
+
+    /// Whether this expiry has to move the inline object's coverage edge, and
+    /// where to (#3800).
+    ///
+    /// `Some((proven, target))` when the edge is provable NOW and would not be
+    /// after the commit: the reader's walk needs every snapshot between the edge
+    /// and current, and a re-cluster run longer than `retain_last` takes the
+    /// edge's own snapshot with it. `target` is the deepest snapshot the commit
+    /// leaves in place that the walk still reaches, so the object describes the
+    /// same rows — [`aggregate_coverage_root`] over the surviving metadata, which
+    /// is also the parent the next append's link will name.
+    ///
+    /// `None` is the common case (the chain survives) and every case where there
+    /// is nothing to prove: no object, no edge, or an edge the current metadata
+    /// already refuses. An expiry never certifies what it cannot walk.
+    async fn coverage_reroot_for_expiry(
+        &self,
+        table: &Table,
+        expiring: &HashSet<i64>,
+    ) -> Option<(AggregateCoverage, AggregateCoverage)> {
+        let current = table.metadata().current_snapshot()?;
+        // Read through the incarnation-scoped operator, not the memoized entry:
+        // a cached object can be a generation behind, and this decides what to
+        // certify. A table with no incarnation has no object of its own to
+        // repair, exactly as the rebuild command refuses one.
+        let op = aggregate_operator(table).ok().flatten()?;
+        // A read that fails is not an absent object. The expiry goes ahead
+        // either way — snapshot bloat is the more expensive problem, and it is
+        // what `retain_last` exists for — so say that the edge may not survive
+        // it rather than skipping in silence.
+        let existing = match OpendalSideCas(&op).load(SIDE_AGGREGATES_REL_PATH).await {
+            Ok((existing, _)) => existing,
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    table = %table.identifier(),
+                    "could not read the inline aggregate before expiring snapshots; if this \
+                     commit drops the ancestry its coverage edge is read through, the table \
+                     answers from the exact per-file path until `siglake \
+                     rebuild-time-aggregates` runs"
+                );
+                return None;
+            }
+        };
+        let proven = existing?.coverage?;
+        if !aggregate_covers_current_snapshot(table, Some(proven)) {
+            return None;
+        }
+        if aggregate_covers_current_snapshot_excluding(table, Some(proven), expiring) {
+            return None;
+        }
+        let target = aggregate_coverage_root(table, Some(current.snapshot_id()), expiring)
+            .and_then(|root| coverage_edge_at(table, root))?;
+        (target != proven).then_some((proven, target))
+    }
+
+    /// Write the re-rooted edge, fenced on the object still carrying the one
+    /// that was proven.
+    ///
+    /// The fence is the whole safety argument. A publication that landed since
+    /// [`Self::coverage_reroot_for_expiry`] read the object merged an append's
+    /// rows into it and moved the edge to that append; writing `target` over
+    /// that would claim coverage of a generation the object has since grown past
+    /// — an over-claim, where leaving it alone costs nothing (the append's own
+    /// edge is current and provable).
+    async fn publish_coverage_reroot(
+        &self,
+        table_ident: &TableIdent,
+        table: &Table,
+        proven: AggregateCoverage,
+        target: AggregateCoverage,
+    ) -> Result<()> {
+        let op = aggregate_operator(table)?.ok_or_else(|| {
+            anyhow::anyhow!("{table_ident} has no UUID; its aggregate has no incarnation to bind")
+        })?;
+        let store = OpendalSideCas(&op);
+        let (existing, version) = store.load(SIDE_AGGREGATES_REL_PATH).await?;
+        let Some(mut side) = existing else {
+            anyhow::bail!("{table_ident} has no inline aggregate object to re-root");
+        };
+        if side.coverage != Some(proven) {
+            metrics::counter!("siglake_inline_coverage_reroot_conflicts_total").increment(1);
+            return Ok(());
+        }
+        side.reroot_coverage(target);
+        let body = serde_json::to_vec(&side).context("serialize re-rooted side aggregates")?;
+        if store.conditional() {
+            match store
+                .store_if(SIDE_AGGREGATES_REL_PATH, body, version.as_deref())
+                .await?
+            {
+                CasWrite::Written => {}
+                CasWrite::Conflict => {
+                    metrics::counter!("siglake_inline_coverage_reroot_conflicts_total")
+                        .increment(1);
+                    return Ok(());
+                }
+                CasWrite::Unsupported => {
+                    CONDITIONAL_UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let body =
+                        serde_json::to_vec(&side).context("serialize re-rooted side aggregates")?;
+                    store.store(SIDE_AGGREGATES_REL_PATH, body).await?;
+                }
+            }
+        } else {
+            store.store(SIDE_AGGREGATES_REL_PATH, body).await?;
+        }
+        // Readers memoize the object on the cached table entry, so without this
+        // they keep the edge the expiry just invalidated.
+        self.invalidate_cached_table(table_ident).await;
+        metrics::counter!("siglake_inline_coverage_reroots_total").increment(1);
+        tracing::info!(
+            table = %table_ident,
+            from = proven.snapshot_id,
+            to = target.snapshot_id,
+            "snapshot expiry re-rooted the inline aggregate's coverage edge off expiring ancestry"
+        );
+        Ok(())
     }
 
     /// Additively reconcile a table's stored schema toward `desired_arrow`,
@@ -19452,10 +19737,10 @@ impl IcebergContext {
                 .map(|column| column.column.clone())
                 .collect(),
         });
-        wide.coverage = Some(AggregateCoverage {
-            snapshot_id: snapshot.snapshot_id(),
-            sequence_number,
-        });
+        // Normalized for the same reason the inline rebuild's edge is: an edge
+        // at a re-cluster is one the next append's link cannot join, so the
+        // repair would last exactly until the next commit (#3800).
+        wide.coverage = Some(published_coverage_edge(&cached.table, snapshot));
         wide.coverage_links.clear();
         // Deltas at or below the watermark are now redundant; the fold deletes
         // them. Their ids must not linger in `absorbed`, which the fold prunes
@@ -19569,10 +19854,15 @@ impl IcebergContext {
             .current_snapshot()
             .ok_or_else(|| anyhow::anyhow!("{table_name} has no current snapshot to rebuild from"))?
             .clone();
-        let coverage = AggregateCoverage {
-            snapshot_id: snapshot.snapshot_id(),
-            sequence_number: snapshot.sequence_number(),
-        };
+        // The edge is published at the root of the re-cluster run above it, not
+        // at the snapshot whose files were read: on a compacted table the newest
+        // snapshot is a re-cluster, and an edge there is one no later append's
+        // link can join (#3800, `aggregate_coverage_root`). Same rows either
+        // way — that is what row-conserving means.
+        let coverage = published_coverage_edge(&cached.table, &snapshot);
+        // The fence below is about the generation this pass READ, which is the
+        // current snapshot whatever the published edge normalizes to.
+        let read_sequence_number = snapshot.sequence_number();
         let record_count = snapshot
             .summary()
             .additional_properties
@@ -19687,7 +19977,7 @@ impl IcebergContext {
             || fresh.as_ref().is_some_and(|side| {
                 side.coverage_links
                     .iter()
-                    .any(|link| link.sequence_number > coverage.sequence_number)
+                    .any(|link| link.sequence_number > read_sequence_number)
             })
         {
             return Ok(None);

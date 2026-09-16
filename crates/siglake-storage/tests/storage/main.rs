@@ -31,6 +31,7 @@ mod mg_sketch;
 mod multi_tenant;
 mod native_bloom_cost;
 mod native_bloom_opt_in;
+mod orphaned_coverage_repair;
 mod page_bounded_multipart_runs;
 mod phase2_agg_cache_invalidation;
 mod phase4_agg_result_cache_invalidation;

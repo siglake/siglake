@@ -305,6 +305,28 @@ from committed files; `rebuild-time-aggregates` restores the inline object's
 time buckets and 2-D time×group counts and republishes a coverage edge, after
 which ordinary commit-path maintenance carries the chain forward again.
 
+Every edge is published at one normal form: the deepest ancestor reachable
+through nothing but re-clusters, which is the parent an append's link names.
+An edge at a re-cluster is an edge the next append cannot join — its link
+walks past the re-cluster to the append below — so a republication that named
+the snapshot it scanned would last exactly until the next commit on a
+compacted table, where the newest snapshot is usually a re-cluster. Both
+rebuilds normalize.
+
+Snapshot expiry is the other way the chain was lost. The reader's walk needs
+every snapshot between the edge and current, so a re-cluster run longer than
+`retain_last` dropped the edge's own snapshot and stranded the object for the
+life of the table. `expire_snapshots` now decides, against the metadata it is
+about to shrink, whether the edge it can still prove survives the commit; when
+it would not, it re-roots the edge onto the deepest snapshot the commit leaves
+in place — the same rows, no recompute, one object write — and counts
+`siglake_inline_coverage_reroots_total`. The write is fenced on the object
+still carrying the edge that was proven, since a publication landing in the
+window has moved the edge to its own append and nothing here improves on that
+(`siglake_inline_coverage_reroot_conflicts_total`). An expiry that cannot walk
+to the edge leaves it alone: ancestry that is gone is never bridged, and equal
+row totals are not evidence.
+
 A publication carries counts that exist nowhere else, so a failed one is
 retried with the same deltas on the delta write's budget — four attempts, 250,
 500 and 750 ms apart — in both the inline and the write-behind arm. The retry
@@ -437,7 +459,9 @@ It recomputes the time buckets (one footer read per live file) and the 2-D
 time×group rollup (a two-column decode of every live file whose time range
 spans more than one bucket; a file contained in one bucket contributes its
 group-count footer instead), replaces both, and publishes the scanned
-snapshot's coverage edge. A component short of `total-records` is left absent
+snapshot's coverage edge at its normal form — the root of the re-cluster run
+it sits on, so the next append's link joins it. A component short of
+`total-records` is left absent
 rather than written short, and the inline whole-table group counts are dropped
 rather than certified — one coverage edge governs the object, and granting it to
 maps from an unknown earlier snapshot is the unmarked overwrite the edge exists
