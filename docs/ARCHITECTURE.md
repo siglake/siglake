@@ -198,6 +198,20 @@ query pod's 1 GiB parsed-index cache, and the shapes that take the sidecar path
 land above the ceilings measured on the scan path. Enable it where the working
 set fits, or where pruning is worth more than the decode.
 
+**Whether to USE an index is decided per execution.** Loading one is a
+whole-file cost, so a query that wants a handful of rows cannot pay it: a text
+predicate under a `LIMIT` stops the scan after a sliver of the first file,
+while the index charges for every row in every planned file. Both forms are
+declined — a `LIMIT` under an `ORDER BY timestamp` (including the implicit
+newest-first one) because an index row selection defeats the ordered drain's
+contiguous tail read, and a bare `LIMIT` because the scan short-circuits
+first. An unclipped text scan keeps the index, which is the regime it wins in.
+The refusal is attributed by
+`siglake_query_inverted_index_declined_total{reason}` and named in the scan's
+`EXPLAIN` line (`text_index:[declined:clipped_limit]`), and it never changes a
+result: the index only ever produced a superset row selection, blooms stay
+active, and the exact predicate is re-evaluated above the scan either way.
+
 **Freshness.** The query tier's WAL buffer serves *uncommitted* sealed +
 processing segments for the events table, unioned with Iceberg under the same
 name and de-overlapped via commit-stamped consumed-segment lists — measured

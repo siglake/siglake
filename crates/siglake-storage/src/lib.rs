@@ -20,9 +20,9 @@ pub mod schema_version;
 pub mod subscribe;
 
 pub use query_provider::{
-    settle_scan_partitions, CancelOnDrop, OrderedMergeGlobalBudget, OrderedResidualHint,
-    OrderedScanLimit, OrderedScanTuning, PreferredScanOrder, QueryCancel, ScanPartitionTracker,
-    ScanSettle, ScanShard, SiglakeIcebergTableScan,
+    settle_scan_partitions, CancelOnDrop, ClippedScanLimit, OrderedMergeGlobalBudget,
+    OrderedResidualHint, OrderedScanLimit, OrderedScanTuning, PreferredScanOrder, QueryCancel,
+    ScanPartitionTracker, ScanSettle, ScanShard, SiglakeIcebergTableScan,
 };
 
 /// Arrow field-metadata key carrying the configured text tokenizer name for a

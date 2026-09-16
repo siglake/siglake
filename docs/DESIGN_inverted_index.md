@@ -159,6 +159,45 @@ Three 0.2.0 slices carry those two requirements and the build cost behind them:
 and #4377 builds the postings during the streaming merge so the post-commit
 decode pass disappears. None of them changes a 0.1.0 or 0.1.x default.
 
+#### The per-execution policy arm (2026-09-16, #4375)
+
+The same completed 14-file fixture was reopened with an 8 GiB parsed-index
+budget and a 2 GiB blob budget. A third `policy` arm queried the indexed
+warehouse through the per-execution session hint: the four clipped shapes
+declined the whole-file index, while the two unclipped rare scans kept it.
+Nine executions per shape and arm, interleaved, produced:
+
+| shape | OFF p50 | indexed p50 | policy p50 | registered 50G ceiling | policy path |
+|---|---:|---:|---:|---:|---|
+| keyword | 6.0 ms | 24.4 ms | **7.5 ms** | 10 ms | declined |
+| keyword_last25 | 9.4 ms | 13.6 ms | **10.1 ms** | 25 ms | declined |
+| keyword_last5 | 11.3 ms | 50.3 ms | **10.8 ms** | 30 ms | declined |
+| substring_scan | 4.9 ms | 869.2 ms | **5.4 ms** | 10 ms | declined |
+| rare_scan | 1,757.2 ms | 134.8 ms | **126.3 ms** | — | allowed |
+| rare_scan_last25 | 535.2 ms | 38.6 ms | **39.4 ms** | — | allowed |
+| rare_keyword | 532.5 ms | 45.8 ms | **531.2 ms** | — | declined |
+
+The ceiling column states the AWS guardrails registered in the benchmark
+project at `docs/predictions/50g-regression.json`; it is separate from the
+four-file local OFF medians above. All four clipped policy results are below
+those guardrails, but this local-filesystem run does not qualify an AWS result.
+
+All 14 parsed indexes occupied 7,830,305,508 bytes with no eviction. The
+unclipped `rare_scan` policy arm recorded 126 parsed-cache hits and returned all
+1,028 matches, row for row equal to the OFF arm. The isolated policy test also
+checks each clipped `match_terms`, `LIKE`, and time-window plan for
+`text_index:[declined:clipped_limit]`, then proves that the indexed warehouse
+performs neither a lookup nor a decode and returns the same rows as its
+unindexed control. The query-server request test covers the implicit
+newest-first rewrite separately: it takes the existing `ordered_limit` refusal
+and records one reason rather than both.
+
+`rare_keyword` states the conservative rule's cost. Its limit clips the scan,
+so the policy declines it even though this fixture's 0.001%-density term would
+have won from a resident index. Document frequency lives inside the whole-file
+index being declined; choosing by it would first pay the load this policy
+avoids. #4376's segmented reader is the planned way to reduce that cost.
+
 Reproduce the deployed pass with the command above plus
 `SIGLAKE_REBUILD_AB_FILES=14`, `SIGLAKE_REBUILD_AB_ROWS_PER_FILE=7340000`,
 `SIGLAKE_REBUILD_AB_RARE_EVERY=100000`,
