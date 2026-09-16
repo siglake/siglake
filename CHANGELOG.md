@@ -2,11 +2,13 @@
 
 ## 0.1.1
 
-Nine changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
+Ten changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
 surface moves, and a 0.1.0 warehouse is read and written unchanged: one values
 key and five environment knobs are added, and no flag or values key is removed.
-The one default that moves is the audit worker's, which now gives each append
-30 s instead of awaiting it forever. The
+Two defaults move. The audit worker now gives each append 30 s instead of
+awaiting it forever, and every process except the query server budgets zero for
+the two text-index caches — a ceiling rather than a behaviour, since those
+processes were already holding nothing in them. The
 workspace version, both chart `version`/`appVersion` pairs, the pinned image
 tags under `deploy/` and the two OpenAPI documents' `info.version` all read
 `0.1.1`, and git tag `v0.1.1` publishes image tag `0.1.1`.
@@ -119,6 +121,23 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   Retention, a delete task and a foreign overwrite still retire the object
   until `rebuild-time-aggregates` runs, which is
   `docs/LIMITATIONS.md`. (#3800)
+- **Maintenance**: the compactor, the ingest server and the `siglake`
+  maintenance subcommands resolve their own cache budgets at startup instead of
+  inheriting the vendored reader's constants. The two text-index caches are an
+  explicit zero there: the only site that fills either is the scan's
+  index-pruning path, and maintenance plans no text predicate — a Tier-2
+  aggregate rebuild counts from manifest stats, Parquet footers and raw pages,
+  and a delete task evaluates its predicate over the candidate file's decoded
+  rows — so what the packaged 1Gi compactor pod used to carry was 1.25 GiB of
+  ceilings on caches that never take an entry. `sql-direct`, `iceberg-demo` and
+  `subscribe` do run SQL in process, and derive what the query server derives at
+  their own memory limit. Nothing is switched on to make the accounting agree:
+  the byte-range object cache stays off until `SIGLAKE_OBJECT_CACHE_BYTES` is
+  set, and what a process holds is now recorded rather than re-derived, so a
+  process no longer subtracts a quarter of its pod from the query memory pool
+  for a cache it has switched off. `SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES`,
+  `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES` and `SIGLAKE_OBJECT_CACHE_BYTES`
+  override the role in either direction. (#4082)
 - **Drain**: a WAL segment the local filesystem drain cannot read no longer
   takes every batch it joins down with it. The read phase now names the
   segments that failed instead of returning one error for the whole batch, and

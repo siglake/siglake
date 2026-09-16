@@ -309,6 +309,13 @@ compactor:
   # Above 1 requires `catalogClaim.enabled` below; the render is refused
   # otherwise, and so is an `autoscaling.compactor.maxReplicas` above 1.
   replicas: 1
+  # WHAT THIS LIMIT COVERS. Unlike the query tier's, a compactor's caches are
+  # the metadata ones (footers, aggregates, file lists: limit/8) and nothing
+  # else: the byte-range object cache stays off unless SIGLAKE_OBJECT_CACHE_BYTES
+  # is set, and the two text-index caches are an explicit ZERO because nothing a
+  # compactor does reads a text index — a Tier-2 aggregate rebuild counts from
+  # manifest stats, footers and raw pages. The rest of the limit is the drain and
+  # the merge (see binConcurrency below), which is what actually needs it.
   resources:
     requests:
       cpu: 200m
