@@ -347,7 +347,10 @@ spec:
               The drain is not keeping up with ingest. Rows are durable but not
               yet queryable, and the WAL volume is filling. Add drain capacity.
         - alert: SiglakeSegmentsQuarantined
-          expr: siglake_catalog_claim_quarantined > 0
+          # Both drains, one alert: the claim table's quarantine and the local
+          # filesystem's `poison/` set-aside (#3143) are the same operator
+          # situation — rows acknowledged, held back, and waiting on a person.
+          expr: siglake_catalog_claim_quarantined > 0 or siglake_compactor_segments_poisoned > 0
           for: 10m
           labels:
             severity: warning
@@ -355,12 +358,15 @@ spec:
             summary: WAL segments have been set aside and will not drain without intervention
             description: >-
               {{ "{{ $value }}" }} segment(s) are quarantined. Their rows are durable and
-              unqueryable. Either the drain failed on them repeatedly — usually an
-              index that does not exist — or a mirrored segment could not be placed in
-              the table its index resolves to now, which is set aside on the first
-              cycle because no retry can change it. The `reason` field on the
+              unqueryable. On the claim path, either the drain failed on them repeatedly
+              — usually an index that does not exist — or a mirrored segment could not be
+              placed in the table its index resolves to now, which is set aside on the
+              first cycle because no retry can change it. The `reason` field on the
               `segment QUARANTINED` log line says which. Resolve, then
-              `requeue_quarantined`.
+              `requeue_quarantined`. On the local filesystem drain, the segment failed to
+              read on every attempt it was given and sits under `<wal>/poison/` with a
+              `.poison.json` note saying why; the `segment SET ASIDE` log line names the
+              file. Fix what made it unreadable, then move it back into `<wal>/sealed/`.
         - alert: SiglakeMirrorReconciliationErrors
           # The bounded-page activity counter advances before reconciliation
           # lists the mirror. A listing or registration failure can therefore
