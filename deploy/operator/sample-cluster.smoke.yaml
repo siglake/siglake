@@ -5,7 +5,7 @@
 # overrides), this one is what the AWS smoke runbook applies
 # against a freshly-`up.sh`-provisioned EKS cluster:
 #
-# - **`image`**: placeholder `__ECR_REPO_URL__:0.1.0` — substituted
+# - **`image`**: placeholder `__ECR_REPO_URL__:0.1.1` — substituted
 #   by `deploy/aws/operator-smoke.sh` from `terraform output -raw
 #   ecr_repository_url`. The smoke pushes a fresh build to the
 #   per-account ECR; the canonical sample's `ghcr.io/siglake/siglake`
@@ -32,7 +32,7 @@ metadata:
   name: example
   namespace: __NAMESPACE__
 spec:
-  image: __ECR_REPO_URL__:0.1.0
+  image: __ECR_REPO_URL__:0.1.1
   warehouseUrl: __WAREHOUSE_URL__
   catalogUri: __CATALOG_URI__
   # operator-smoke.sh substitutes these placeholders from terraform
