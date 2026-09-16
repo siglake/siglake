@@ -14,10 +14,12 @@ DRAIN_TIMEOUT_SECONDS=${POSTGRES_OUTAGE_DRAIN_TIMEOUT_SECONDS:-120}
 SAMPLE_INTERVAL_SECONDS=${POSTGRES_OUTAGE_SAMPLE_INTERVAL_SECONDS:-5}
 QUERY=${POSTGRES_OUTAGE_QUERY:-"SELECT sum(length(a.raw) + length(b.raw)) AS n FROM events a CROSS JOIN events b"}
 QUERY_TIMEOUT_SECONDS=${POSTGRES_OUTAGE_QUERY_TIMEOUT_SECONDS:-5}
+WRITE_PROBE_SECONDS=${POSTGRES_OUTAGE_WRITE_PROBE_SECONDS:-5}
 EVIDENCE_JSON="$RESULTS_DIR/postgres-outage-reconnect.json"
 
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/siglake-postgres-outage.XXXXXX")
 SAMPLES_FILE="$TMP_DIR/samples.jsonl"
+WRITE_PROBES_FILE="$TMP_DIR/write-probes.jsonl"
 SUBMISSIONS_DIR="$TMP_DIR/submissions"
 POSTGRES_PAUSED=0
 POSTGRES_POD=
@@ -84,6 +86,118 @@ continue_postgres_processes() {
     '
 }
 
+# Read the exact process set the pause selected, one `pid<TAB>state<TAB>starttime`
+# line per postgres process. `state` is field 3 of /proc/<pid>/stat and is `T`
+# while a process is stopped; `starttime` is field 22 and changes only when the
+# process is replaced, so a restart cannot hide behind a matching pid. Held in a
+# variable, and reading ${PROC_ROOT:-/proc}, so the offline fixtures can run this
+# exact text against a synthetic process tree.
+# state-snippet-begin
+POSTGRES_STATE_SNIPPET='
+proc=${PROC_ROOT:-/proc}
+[ "$(cat "$proc/1/comm" 2>/dev/null || true)" = postgres ] || {
+  echo "PID 1 is not postgres; refusing to report container state" >&2
+  exit 1
+}
+for comm_path in "$proc"/[0-9]*/comm; do
+  pid=${comm_path#"$proc"/}
+  pid=${pid%/comm}
+  [ "$(cat "$comm_path" 2>/dev/null || true)" = postgres ] || continue
+  line=$(cat "$proc/$pid/stat" 2>/dev/null || true)
+  [ -n "$line" ] || continue
+  rest=${line##*") "}
+  state=${rest%% *}
+  starttime=$(printf %s "$rest" | cut -d" " -f20)
+  printf "%s\t%s\t%s\n" "$pid" "$state" "$starttime"
+done
+'
+# state-snippet-end
+
+# One bounded write against the paused database, run three times: before the
+# pause, inside it, and after restoration. The postmaster is stopped, so the
+# connection sits in the listen backlog and psql never returns; the watchdog
+# kills it and `blocked` is that timeout, distinguished from a write that
+# actually completed. Emits a single `key=value` TSV line.
+# write-probe-snippet-begin
+POSTGRES_WRITE_PROBE_SNIPPET='
+timeout_seconds=$1
+errors=${WRITE_PROBE_ERRORS:-/tmp/siglake-outage-write-probe.err}
+: >"$errors"
+started=$(date +%s)
+${WRITE_PROBE_PSQL:-psql} -qtAX -v ON_ERROR_STOP=1 \
+  -U "${PGUSER:-${POSTGRES_USER:-postgres}}" \
+  -d "${PGDATABASE:-${POSTGRES_DB:-postgres}}" \
+  -c "CREATE TABLE IF NOT EXISTS siglake_outage_write_probe (observed_at timestamptz NOT NULL DEFAULT now())" \
+  -c "INSERT INTO siglake_outage_write_probe DEFAULT VALUES" \
+  >/dev/null 2>"$errors" &
+probe_pid=$!
+( sleep "$timeout_seconds"; kill -KILL "$probe_pid" 2>/dev/null || true ) >/dev/null 2>&1 &
+watchdog_pid=$!
+status=0
+wait "$probe_pid" || status=$?
+kill "$watchdog_pid" 2>/dev/null || true
+elapsed=$(( $(date +%s) - started ))
+if [ "$status" -eq 0 ]; then
+  outcome=completed
+elif [ "$status" -ge 128 ] && [ "$((elapsed + 1))" -ge "$timeout_seconds" ]; then
+  outcome=blocked
+else
+  outcome=error
+fi
+printf "outcome=%s\tstatus=%s\tseconds=%s\tdetail=%s\n" "$outcome" "$status" \
+  "$elapsed" "$(tr "\n\t" "  " <"$errors" | cut -c1-200)"
+'
+# write-probe-snippet-end
+
+# Both remote readers are advisory: a failed exec is retained as evidence that
+# the pause window went unobserved, never as a reason to leave Postgres stopped.
+# Their request timeouts are short for the same reason — an exec that cannot be
+# served against a stopped PID 1 costs one sample, not the window.
+postgres_process_state() {
+  local output=$1 status=0
+  kubectl --context "$KUBE_CONTEXT" --request-timeout=10s -n "$NAMESPACE" \
+    exec "$POSTGRES_POD" -- sh -eu -c "$POSTGRES_STATE_SNIPPET" \
+    >"$output" 2>"$output.err" || status=$?
+  printf '%s' "$status"
+}
+
+postgres_write_probe() {
+  local phase=$1 at status=0 line=
+  at=$(iso_now)
+  line=$(kubectl --context "$KUBE_CONTEXT" \
+    --request-timeout="$((WRITE_PROBE_SECONDS + 15))s" -n "$NAMESPACE" \
+    exec "$POSTGRES_POD" -- sh -eu -c "$POSTGRES_WRITE_PROBE_SNIPPET" \
+    write-probe "$WRITE_PROBE_SECONDS" 2>"$TMP_DIR/write-probe.err") || status=$?
+  python3 - "$phase" "$at" "$WRITE_PROBE_SECONDS" "$status" "$line" \
+    "$WRITE_PROBES_FILE" <<'PY'
+import json, sys
+phase, at, timeout_seconds, exec_status, line, output = sys.argv[1:]
+fields = dict(
+    part.split("=", 1) for part in line.split("\t") if "=" in part
+)
+probe = {
+    "at": at,
+    "phase": phase,
+    "timeout_seconds": int(timeout_seconds),
+    "exec_status": int(exec_status),
+    "outcome": fields.get("outcome", "error"),
+    "exit_status": int(fields["status"]) if fields.get("status", "").isdigit() else None,
+    "seconds": float(fields["seconds"]) if fields.get("seconds", "").isdigit() else None,
+    "detail": fields.get("detail", ""),
+}
+with open(output, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(probe) + "\n")
+PY
+  log "write probe ($phase): $line"
+}
+
+postgres_container_status() {
+  kubectl --context "$KUBE_CONTEXT" --request-timeout=30s -n "$NAMESPACE" \
+    get pod "$POSTGRES_POD" -o \
+    jsonpath='{.metadata.uid}{"\t"}{.status.containerStatuses[0].restartCount}{"\t"}{.status.containerStatuses[0].state.running.startedAt}' \
+    2>/dev/null || true
+}
+
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
@@ -97,7 +211,7 @@ for tool in curl git kubectl python3; do
   command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
 for value in "$REQUESTED_JOBS" "$OUTAGE_SECONDS" "$DRAIN_TIMEOUT_SECONDS" \
-  "$SAMPLE_INTERVAL_SECONDS" "$QUERY_TIMEOUT_SECONDS"; do
+  "$SAMPLE_INTERVAL_SECONDS" "$QUERY_TIMEOUT_SECONDS" "$WRITE_PROBE_SECONDS"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "probe durations and counts must be positive integers: $value"
 done
 ((REQUESTED_JOBS <= 64)) || die "POSTGRES_OUTAGE_JOBS exceeds the 64-job safety cap"
@@ -105,9 +219,12 @@ done
 ((DRAIN_TIMEOUT_SECONDS <= 600)) || die "POSTGRES_OUTAGE_DRAIN_TIMEOUT_SECONDS exceeds the 600s safety cap"
 ((SAMPLE_INTERVAL_SECONDS <= 60)) || die "POSTGRES_OUTAGE_SAMPLE_INTERVAL_SECONDS exceeds the 60s safety cap"
 ((QUERY_TIMEOUT_SECONDS <= 60)) || die "POSTGRES_OUTAGE_QUERY_TIMEOUT_SECONDS exceeds the 60s safety cap"
+((WRITE_PROBE_SECONDS <= 30)) || die "POSTGRES_OUTAGE_WRITE_PROBE_SECONDS exceeds the 30s safety cap"
+((WRITE_PROBE_SECONDS < OUTAGE_SECONDS)) || die "POSTGRES_OUTAGE_WRITE_PROBE_SECONDS must be shorter than the outage window"
 
 mkdir -p "$RESULTS_DIR" "$SUBMISSIONS_DIR"
 : >"$SAMPLES_FILE"
+: >"$WRITE_PROBES_FILE"
 
 POSTGRES_POD=$(kubectl --context "$KUBE_CONTEXT" --request-timeout=30s \
   -n "$NAMESPACE" get pods \
@@ -142,45 +259,81 @@ prometheus_vector() {
 
 # Append one instant sample and print its total backlog, or `missing`. The
 # completion expression uses the always-present backlog gauge as the observed
-# zero for pods that have not completed a batch job yet.
+# zero for pods that have not completed a batch job yet. `timestamp()` on that
+# same gauge carries the scrape each value came from, which is the only thing
+# that separates a counter moving during the pause from the delayed observation
+# of work that finished before it: the instant query's own `value[0]` is the
+# evaluation time and says nothing about sample age.
 sample_metrics() {
-  local phase=$1 at backlog_expr completion_expr
+  local phase=$1 at backlog_expr completion_expr scrape_expr state_status
   at=$(iso_now)
   backlog_expr="siglake_query_jobs_unreconciled{namespace=\"$NAMESPACE\"}"
   completion_expr="sum by (pod) (siglake_query_jobs_total{namespace=\"$NAMESPACE\",priority=\"batch\"}) or on (pod) (0 * siglake_query_jobs_unreconciled{namespace=\"$NAMESPACE\"})"
+  scrape_expr="timestamp(siglake_query_jobs_unreconciled{namespace=\"$NAMESPACE\"})"
   prometheus_vector "$backlog_expr" "$TMP_DIR/backlog.json"
   prometheus_vector "$completion_expr" "$TMP_DIR/completions.json"
+  prometheus_vector "$scrape_expr" "$TMP_DIR/scrape-times.json"
+  state_status=$(postgres_process_state "$TMP_DIR/postgres-state")
   python3 - "$phase" "$at" "$TMP_DIR/backlog.json" "$TMP_DIR/completions.json" \
-    "$TMP_DIR/expected-pods" "$SAMPLES_FILE" <<'PY'
+    "$TMP_DIR/scrape-times.json" "$TMP_DIR/expected-pods" \
+    "$TMP_DIR/postgres-state" "$state_status" "$SAMPLES_FILE" <<'PY'
 import json, sys
-phase, at, backlog_path, completion_path, expected_path, output = sys.argv[1:]
+(
+    phase, at, backlog_path, completion_path, scrape_path, expected_path,
+    state_path, state_status, output,
+) = sys.argv[1:]
 expected = {line.strip() for line in open(expected_path, encoding="utf-8") if line.strip()}
 
 def vector(path):
     try:
         document = json.load(open(path, encoding="utf-8"))
         if document.get("status") != "success":
-            return []
-        rows = []
+            return {}
+        rows = {}
         for item in document.get("data", {}).get("result", []):
             pod = item.get("metric", {}).get("pod")
-            value = item.get("value", [None, None])[1]
+            evaluated, value = item.get("value", [None, None])
             if pod in expected and value is not None:
-                rows.append({"pod": pod, "value": float(value)})
-        return sorted(rows, key=lambda row: row["pod"])
+                rows[pod] = (float(value), float(evaluated) if evaluated is not None else None)
+        return rows
     except (OSError, ValueError, TypeError, IndexError):
+        return {}
+
+def series(rows, scrapes):
+    return [
+        {"pod": pod, "value": value, "sample_time": scrapes.get(pod, (None, None))[0]}
+        for pod, (value, _) in sorted(rows.items())
+    ]
+
+def processes(path):
+    rows = []
+    try:
+        for line in open(path, encoding="utf-8"):
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) == 3 and all(parts):
+                rows.append({"pid": parts[0], "state": parts[1], "starttime": parts[2]})
+    except OSError:
         return []
+    return rows
 
 backlog = vector(backlog_path)
+completions = vector(completion_path)
+scrapes = vector(scrape_path)
+evaluated = next((stamp for _, stamp in backlog.values() if stamp is not None), None)
 sample = {
     "at": at,
     "phase": phase,
-    "backlog": backlog,
-    "completions": vector(completion_path),
+    "evaluated_at": evaluated,
+    "backlog": series(backlog, scrapes),
+    "completions": series(completions, scrapes),
+    "postgres": {
+        "exec_status": int(state_status) if state_status.isdigit() else 1,
+        "processes": processes(state_path),
+    },
 }
 with open(output, "a", encoding="utf-8") as handle:
     handle.write(json.dumps(sample) + "\n")
-print(sum(row["value"] for row in backlog) if backlog else "missing")
+print(sum(value for value, _ in backlog.values()) if backlog else "missing")
 PY
 }
 
@@ -206,6 +359,8 @@ PY
 
 log "record baseline from Prometheus"
 sample_metrics baseline >/dev/null
+postgres_write_probe baseline
+CONTAINER_BEFORE=$(postgres_container_status)
 SUBMISSION_STARTED_AT=$(iso_now)
 log "submit a burst of $REQUESTED_JOBS bounded batch jobs before the fault"
 for index in $(seq 1 "$REQUESTED_JOBS"); do
@@ -220,11 +375,19 @@ POSTGRES_PAUSED=1
 pause_postgres_processes >/dev/null
 
 observed_positive=0
+write_probed=0
 outage_deadline=$((SECONDS + OUTAGE_SECONDS))
+write_probe_at=$((SECONDS + OUTAGE_SECONDS / 2))
 while ((SECONDS < outage_deadline)); do
   total=$(sample_metrics outage)
   if [[ "$total" != missing ]] && python3 -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) > 0 else 1)' "$total"; then
     observed_positive=1
+  fi
+  # Once, in the middle of the window, so the pause is proven by a write that
+  # could not land rather than only by the process states around it.
+  if ((write_probed == 0 && SECONDS >= write_probe_at)); then
+    postgres_write_probe outage
+    write_probed=1
   fi
   sleep "$SAMPLE_INTERVAL_SECONDS"
 done
@@ -236,6 +399,8 @@ POSTGRES_PAUSED=0
 kubectl --context "$KUBE_CONTEXT" --request-timeout=125s -n "$NAMESPACE" wait \
   --for=condition=Ready "pod/$POSTGRES_POD" --timeout=120s >/dev/null
 POSTGRES_READY_AT=$(iso_now)
+postgres_write_probe recovery
+CONTAINER_AFTER=$(postgres_container_status)
 
 recovery_deadline=$((SECONDS + DRAIN_TIMEOUT_SECONDS))
 while ((SECONDS < recovery_deadline)); do
@@ -253,15 +418,23 @@ python3 - "$ROOT" "$TMP_DIR" "$SAMPLES_FILE" "$SUBMISSIONS_DIR" \
   "$RESTORATION_STARTED_AT" "$POSTGRES_READY_AT" "$SAMPLING_ENDED_AT" \
   "$REQUESTED_JOBS" "$OUTAGE_SECONDS" "$DRAIN_TIMEOUT_SECONDS" \
   "$SAMPLE_INTERVAL_SECONDS" "$QUERY_TIMEOUT_SECONDS" "$QUERY" \
-  "$TMP_DIR/raw.json" <<'PY'
+  "$WRITE_PROBE_SECONDS" "$WRITE_PROBES_FILE" "$CONTAINER_BEFORE" \
+  "$CONTAINER_AFTER" "$TMP_DIR/raw.json" <<'PY'
 import datetime, json, pathlib, subprocess, sys
 (
     root, tmp, samples_path, submissions_dir, submission_started, submission_finished,
     outage_started, restoration_started, postgres_ready, sampling_ended,
     requested_jobs, outage_seconds, drain_timeout, sample_interval, query_timeout,
-    query, output,
+    query, write_probe_seconds, write_probes_path, container_before, container_after,
+    output,
 ) = sys.argv[1:]
 tmp = pathlib.Path(tmp)
+
+def container_identity(raw):
+    parts = raw.split("\t")
+    if len(parts) != 3 or not parts[0] or not parts[1].isdigit():
+        return None
+    return {"uid": parts[0], "restart_count": int(parts[1]), "started_at": parts[2] or None}
 
 def container_revision(item):
     spec = item.get("spec", {}).get("containers", [{}])[0]
@@ -288,8 +461,11 @@ for meta in sorted(pathlib.Path(submissions_dir).glob("*.meta"), key=lambda p: i
         "http_status": int(status),
         "job_id": response.get("job_id"),
     })
+write_probes = [
+    json.loads(line) for line in open(write_probes_path, encoding="utf-8") if line.strip()
+]
 document = {
-    "schema_version": 1,
+    "schema_version": 2,
     "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
     "revisions": {
         "repository_commit": subprocess.check_output(
@@ -310,9 +486,16 @@ document = {
         "drain_timeout_seconds": int(drain_timeout),
         "requested_jobs": int(requested_jobs),
         "query_timeout_seconds": int(query_timeout),
+        "write_probe_timeout_seconds": int(write_probe_seconds),
         "query": query,
     },
     "expected_pods": expected,
+    "postgres_container": {
+        "pod": postgres_item["metadata"]["name"],
+        "before": container_identity(container_before),
+        "after": container_identity(container_after),
+    },
+    "write_probes": write_probes,
     "timestamps": {
         "submission_started_at": submission_started,
         "submission_finished_at": submission_finished,

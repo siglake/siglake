@@ -546,7 +546,22 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   opt-in, bounded local-kind probe now retains the per-pod outage/reconnect
   trace in `results/postgres-outage-reconnect.json` and grades missing or
   non-draining observations `unverified`; no live round has supplied the first
-  measured trace yet (`POSTGRES_OUTAGE_PROBE=1 scripts/kind-round.sh`).
+  measured trace yet (`POSTGRES_OUTAGE_PROBE=1 scripts/kind-round.sh`). Three
+  rounds have run it, and none of them measured what it claimed: the retained
+  traces carried no evidence that the paused process set stayed stopped, and no
+  Prometheus scrape timestamp, so a counter that moved could not be placed
+  against the pause. Run #76's trace is kept under `scripts/testdata/` as a
+  fixture that has to stay red: its backlog emptied ten seconds before
+  restoration while the samples were still labelled `outage`, and the grader
+  called it `verified` with a 0.0s drain. The probe now reads every postgres
+  process's state and start time on each sample, attempts one bounded write
+  before, during and after the pause, and records the container's identity and
+  restart count across the window; the grader rejects a trace missing any of
+  that, and flags an outage sample with zero backlog and rising completions —
+  separately when its scrape predates the pause, which makes it delayed
+  observation of pre-pause work rather than a write that landed during it. What
+  happened in run #76 is still unexplained; nothing here establishes a
+  persistence failure.
 - **The query server's `/healthz` is a constant 200, so no probe acts on the
   one known query degradation.** `/healthz` answers `ok` for as long as the
   process is serving and `/readyz` only round-trips the catalog. The still-open

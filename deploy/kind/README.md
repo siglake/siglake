@@ -74,9 +74,24 @@ restoration timestamps, accepted submissions, per-query-pod backlog and
 completion-counter series; and derives submission/completion rates, peak
 backlog, and restoration-to-drain time. The probe is off by default and its
 durations and burst size are bounded by `POSTGRES_OUTAGE_*` environment knobs.
+
+The first three rounds to run it could not show that the pause held. Each sample
+now also carries the state and start time of every postgres process in the
+paused container and the Prometheus scrape timestamp behind each value, one
+bounded write is attempted before, during and after the pause, and the
+container's identity and restart count are recorded across the window. Counters
+say what was counted, not when the row was written, so the scrape timestamp is
+what separates a write that landed during the pause from the delayed
+observation of work that finished before it.
+
 `scripts/check-kind-postgres-outage-evidence.sh` grades offline fixtures in CI;
-missing series, a backlog that never rises, or one that never drains are
-`unverified`, not passing evidence.
+missing series, a backlog that never rises, one that never drains, a missing or
+running process observation, a bounded write that completed during the pause, a
+container restart, and an outage sample with zero backlog and rising
+completions before restoration are all `unverified`, not passing evidence. The
+same check runs the probe's two remote readers against a synthetic `/proc` and
+psql stand-ins, and drives the probe end to end against recording stand-ins for
+`kubectl` and `curl`. No cluster is involved.
 
 After every other observation, and before the panel and ScaledObject evidence,
 the round raises the ingester ScaledObject's `minReplicaCount` to 2, drives OTLP

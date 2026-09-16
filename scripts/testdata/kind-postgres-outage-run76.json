@@ -1,0 +1,450 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-13T22:54:11.846169Z",
+  "revisions": {
+    "repository_commit": "c1776ef59a3fb76176ddd8998f28f4b008dba931",
+    "query_pods": [
+      {
+        "pod": "siglake-query-0",
+        "image": "siglake:kind",
+        "image_id": "docker.io/library/import-2026-09-13@sha256:ffe101f5bcc70632c48f65309efe3358c1b1d2800b0bb8a4726121450c548713"
+      },
+      {
+        "pod": "siglake-query-1",
+        "image": "siglake:kind",
+        "image_id": "docker.io/library/import-2026-09-13@sha256:ffe101f5bcc70632c48f65309efe3358c1b1d2800b0bb8a4726121450c548713"
+      }
+    ],
+    "postgres": {
+      "pod": "postgres-0",
+      "image": "postgres:16-alpine",
+      "image_id": "docker.io/library/postgres@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685"
+    }
+  },
+  "settings": {
+    "persistent_job_store": true,
+    "reconcile_interval_seconds": 5,
+    "reconcile_write_timeout_seconds": 10,
+    "max_unreconciled_per_pod": 1024,
+    "terminal_write_attempts": 3,
+    "terminal_write_deadline_seconds": 30,
+    "sample_interval_seconds": 5,
+    "outage_seconds": 60,
+    "drain_timeout_seconds": 120,
+    "requested_jobs": 8,
+    "query_timeout_seconds": 5,
+    "query": "SELECT sum(length(a.raw) + length(b.raw)) AS n FROM events a CROSS JOIN events b"
+  },
+  "expected_pods": [
+    "siglake-query-0",
+    "siglake-query-1"
+  ],
+  "timestamps": {
+    "submission_started_at": "2026-09-13T22:53:08Z",
+    "submission_finished_at": "2026-09-13T22:53:10Z",
+    "outage_started_at": "2026-09-13T22:53:10Z",
+    "restoration_started_at": "2026-09-13T22:54:11Z",
+    "postgres_ready_at": "2026-09-13T22:54:11Z",
+    "sampling_ended_at": "2026-09-13T22:54:11Z"
+  },
+  "submissions": [
+    {
+      "submitted_at": "2026-09-13T22:53:08Z",
+      "http_status": 202,
+      "job_id": "01a09cf9-72da-78e0-8a68-5305ff75a931"
+    },
+    {
+      "submitted_at": "2026-09-13T22:53:08Z",
+      "http_status": 202,
+      "job_id": "01a09cf9-72da-78e0-8a68-5313bc5eb336"
+    },
+    {
+      "submitted_at": "2026-09-13T22:53:08Z",
+      "http_status": 202,
+      "job_id": "01a09cf9-72da-78c2-8197-0b3c9b2f1a43"
+    },
+    {
+      "submitted_at": "2026-09-13T22:53:08Z",
+      "http_status": 202,
+      "job_id": "01a09cf9-72da-78e0-8a68-52f1281c16f6"
+    },
+    {
+      "submitted_at": "2026-09-13T22:53:08Z",
+      "http_status": 202,
+      "job_id": "01a09cf9-72da-78c2-8197-0b4e1fbf5cd2"
+    },
+    {
+      "submitted_at": "2026-09-13T22:53:08Z",
+      "http_status": 429,
+      "job_id": null
+    },
+    {
+      "submitted_at": "2026-09-13T22:53:08Z",
+      "http_status": 429,
+      "job_id": null
+    },
+    {
+      "submitted_at": "2026-09-13T22:53:08Z",
+      "http_status": 202,
+      "job_id": "01a09cf9-72da-78e0-8a68-52e7c4869c95"
+    }
+  ],
+  "samples": [
+    {
+      "at": "2026-09-13T22:53:08Z",
+      "phase": "baseline",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "at": "2026-09-13T22:53:10Z",
+      "phase": "outage",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "at": "2026-09-13T22:53:15Z",
+      "phase": "outage",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "at": "2026-09-13T22:53:20Z",
+      "phase": "outage",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "at": "2026-09-13T22:53:25Z",
+      "phase": "outage",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "at": "2026-09-13T22:53:31Z",
+      "phase": "outage",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "at": "2026-09-13T22:53:36Z",
+      "phase": "outage",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "at": "2026-09-13T22:53:41Z",
+      "phase": "outage",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "at": "2026-09-13T22:53:46Z",
+      "phase": "outage",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 1.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 1.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "at": "2026-09-13T22:53:51Z",
+      "phase": "outage",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 1.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 1.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "at": "2026-09-13T22:53:56Z",
+      "phase": "outage",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 1.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 1.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "at": "2026-09-13T22:54:01Z",
+      "phase": "outage",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 4.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 2.0
+        }
+      ]
+    },
+    {
+      "at": "2026-09-13T22:54:06Z",
+      "phase": "outage",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 4.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 2.0
+        }
+      ]
+    },
+    {
+      "at": "2026-09-13T22:54:11Z",
+      "phase": "recovery",
+      "backlog": [
+        {
+          "pod": "siglake-query-0",
+          "value": 0.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 0.0
+        }
+      ],
+      "completions": [
+        {
+          "pod": "siglake-query-0",
+          "value": 4.0
+        },
+        {
+          "pod": "siglake-query-1",
+          "value": 2.0
+        }
+      ]
+    }
+  ],
+  "evidence": {
+    "grade": "verified",
+    "problems": [],
+    "summary": {
+      "accepted_jobs": 6,
+      "submission_window_seconds": 0.0,
+      "submission_rate_per_second": 6.0,
+      "completion_delta": 6.0,
+      "completion_observation_seconds": 63.0,
+      "completion_rate_per_second": 0.09523809523809523,
+      "peak_backlog_total": 2.0,
+      "peak_backlog_by_pod": {
+        "siglake-query-0": 1.0,
+        "siglake-query-1": 1.0
+      },
+      "first_backlog_at": "2026-09-13T22:53:46Z",
+      "drained_at": "2026-09-13T22:54:11Z",
+      "time_to_drain_seconds": 0.0
+    }
+  }
+}
