@@ -18,14 +18,16 @@ token per row is unique to that row — the row ordinal in the text, which stand
 for the request ids, trace ids and timestamps real logs carry — so the
 dictionary has as many entries as the file has rows. Measured on one 7,340,000
 row file (see [Measurements](#measurements)): 116.5 MiB serialized, **526.0 MiB
-parsed**, 3.31 s to parse.
+parsed**, 3.27 s to parse.
 
-A 14-file text plan therefore wants 7.83 GB of parsed index. #4329 measured what
-a 1 GiB budget does with that: one resident index, 388 evictions, and the
+A 14-file text plan therefore wants **7.19 GiB** of parsed index on this corpus
+— #4329 measured 7,830,305,508 bytes on its own fourteen files, and the figure
+below is the same quantity re-derived from this one. #4329 measured what a 1 GiB
+budget does with that: one resident index, 388 evictions, and the
 0.001%-density rare scan the index exists for running 19x slower than the scan
-it was supposed to beat. With the whole 7.83 GB resident it wins by 13x. Both
-facts are the same fact — the win needs residency, and residency needs a 4 GiB
-query pod to hold 7.83 GB.
+it was supposed to beat. With the whole working set resident it wins by 13x.
+Both facts are the same fact — the win needs residency, and residency needs a
+query pod sized to hold gigabytes of index.
 
 Cache sizing cannot settle that. Reading in part can.
 
@@ -206,7 +208,8 @@ The whole layout is arranged so a merge can write it in **one forward pass**:
   exactly one group's rows, which is what a merge already has in hand when it
   flushes a row group.
 - The blob is complete only once the trailer lands, so a partial upload is not
-  mistakable for an index: no trailer, no magic, no reader.
+  mistakable for an index: the reader looks for the trailer's magic at a fixed
+  offset from the end, and a truncated blob does not have it.
 
 For registration, a segmented sidecar should carry the properties the v1 one
 does (`data_file`, `column`, `tokenizer`) plus `format: seg1`, and should **not**
@@ -243,7 +246,27 @@ to the row groups the shape kept, before any timing is reported.
 
 ### One file
 
-MEASUREMENT_ONE_FILE
+7,340,000 rows, 7,340,011 distinct terms, 7 row groups of 1,048,576.
+
+| format | build | serialized | parse/open | resident |
+|---|---:|---:|---:|---:|
+| whole-file v1 | 13.55 s | 116.5 MiB | 3.27 s | **526.0 MiB** |
+| segmented | 11.87 s | 85.8 MiB | 3.65 ms | **1.0 MiB** |
+
+Resident bytes fall **510x**; the blob is 0.74x the size of the v1 one, split
+35.9 MiB dictionary, 49.4 MiB postings, 474.9 KiB directory. The blob shrinking
+while gaining a directory and a per-term document frequency is the dictionary
+blocks: v1 writes every term in full (`lib.rs:250`), and on this corpus almost
+every term is `row-NNNNNN`, so a block's shared prefix covers most of it.
+
+"parse/open" is the asymmetry the format exists for. v1 must decode 116.5 MiB
+into a `BTreeMap` before answering anything; the segmented reader reads a
+trailer and a directory and is ready in 3.65 ms, ~900x sooner.
+
+Every byte count in this document reproduced exactly across two full runs. The
+timings are one run's, and they jitter a few percent between runs on this box
+(the v1 parse measured 3.27 s and 3.54 s); nothing here turns on a difference
+that small.
 
 ### Per shape, one file, index work only
 
@@ -253,7 +276,28 @@ against *when the cache wins*, and it is where v1 is better: a `BTreeMap` hit is
 hundreds of nanoseconds, a block read plus a posting read is tens of
 microseconds.
 
-MEASUREMENT_SHAPES
+| shape | rows | v1 warm | seg warm | seg reads | seg fetched | ÷ blob |
+|---|---:|---:|---:|---:|---:|---:|
+| rare_scan | 74 | 380 ns | 66.2 µs | 14 | 9.8 KiB | 0.011% |
+| rare_scan_last25 | 21 | 330 ns | 17.7 µs | 4 | 2.7 KiB | 0.003% |
+| keyword | 146,800 | 12.8 µs | 522.2 µs | 14 | 152.9 KiB | 0.174% |
+| keyword_last25 | 41,942 | 12.4 µs | 148.1 µs | 4 | 43.6 KiB | 0.050% |
+| unique_token | 1 | 100 ns | 4.6 µs | 2 | 1.7 KiB | 0.002% |
+| substring_scan | 367,000 | 289.9 ms | 328.2 ms | 23,059 | 36.3 MiB | 42.3% |
+
+Read the first five rows as the partial-read case and the last as its limit. A
+point lookup touches two to fourteen ranges and thousandths of a percent of the
+blob, at tens of microseconds against v1's hundreds of nanoseconds — a real
+100x on an operation that is already negligible beside the 3.27 s decode that
+has to precede it. Pruning compounds: keeping the last quarter of the row groups
+takes `rare_scan` from 14 reads to 4, because a rejected group costs no read.
+
+`substring_scan` is the regime where the format buys nothing: 23,059 reads and
+42.3% of the blob, because finding the dictionary terms that *contain* a
+substring means reading every block. Its cost is the dictionary (35.9 MiB), and
+it lands within 15% of v1's warm sweep while giving up the residency win. This
+is the shape a reader should decline, and #4375's per-execution policy is where
+that decision belongs.
 
 ### A 14-file plan under the deployed 1 GiB parsed-index budget
 
@@ -263,11 +307,11 @@ logical file carries the same blob bytes and differs only in its cache key: this
 sizes the cache pressure without building fourteen distinct corpora, and the
 parse on every miss is real work.
 
-The first execution of each shape opens fourteen readers — a trailer and a
-directory read each — and the two after it reuse them, so the `seg fetched`
-column is a three-execution average with the cold directory reads amortized
-into it. The 474.9 KiB directory dominates it for every shape except the
-substring sweep.
+Cold and warm are reported apart rather than medianed together, because the
+first execution is the one that opens fourteen readers — a trailer and a
+directory read each — and the two after it reuse them. For the v1 arm the
+distinction is empty, which is the point: it never hits, so its warm column is
+its cold one.
 
 Only one of the two deployed budgets appears here. The 1 GiB parsed-index cache
 is what holds a decoded index, and the 256 MiB Puffin-blob cache holds the
@@ -276,7 +320,37 @@ it holds a directory and range-reads the rest, so the blob budget has no role on
 this path. That is a difference in kind between the arms and #4562's
 configuration should say so rather than applying both budgets to all three.
 
-MEASUREMENT_PLAN
+| shape | v1 cold | v1 warm | v1 h/m/e | seg cold | seg warm | seg h/m/e | seg cold fetched | seg warm fetched |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| rare_scan | 44.93 s | 44.13 s | 0/42/41 | 35.6 ms | 1.07 ms | 28/14/0 | 6.6 MiB | 137.2 KiB |
+| rare_scan_last25 | 43.58 s | 44.05 s | 0/42/41 | 30.5 ms | 273 µs | 28/14/0 | 6.5 MiB | 37.2 KiB |
+| keyword | 43.00 s | 43.68 s | 0/42/41 | 37.3 ms | 6.75 ms | 28/14/0 | 8.6 MiB | 2.1 MiB |
+| keyword_last25 | 43.30 s | 43.80 s | 0/42/41 | 32.7 ms | 1.97 ms | 28/14/0 | 7.1 MiB | 609.8 KiB |
+| unique_token | 43.01 s | 43.47 s | 0/42/41 | 33.1 ms | 215 µs | 28/14/0 | 6.5 MiB | 24.0 KiB |
+| substring_scan | 47.28 s | 48.26 s | 0/42/41 | 4.68 s | 4.83 s | 28/14/0 | 514.6 MiB | 508.1 MiB |
+
+v1 resident working set for 14 files: **7.19 GiB**. Segmented: **14.4 MiB**.
+
+The v1 arm is #4329's result reproduced at the codec level, and the cache
+counters are why: **0 hits, 42 misses, 41 evictions.** Two 526.0 MiB indexes do
+not fit 1 GiB, so every file in the plan evicts the previous one and every
+execution re-decodes all fourteen — which is why warming changes nothing. That
+is ~43 s of index work for a plan whose OFF control (#4329) is 1.67 s cold /
+1.80 s p50: a 24x loss on the index term alone, at a layer where nothing but the
+format is varying. Sizing cannot reach it, because the working set is 7.19 GiB
+against a 1 GiB budget.
+
+The segmented arm never evicts, because fourteen directories are 14.4 MiB. Its
+cold column is the honest cost of the format's one bulk read: ~6.5 MiB of
+directory over fourteen files, 30-37 ms. Warm, the four point shapes answer the
+whole plan in 215 µs to 6.75 ms, fetching 24 KiB to 2.1 MiB. Both columns sit
+far under the 1.67 s OFF control, and the cold one does not need a cache to get
+there — which is the property the whole-file format cannot have.
+
+`substring_scan` marks the boundary again: 4.68 s cold, 4.83 s warm, and over
+500 MiB fetched either way. It is the one shape where partial reads buy nothing,
+and warming does not help it because the sweep re-reads every dictionary block
+regardless.
 
 ### What these numbers are, and are not
 
@@ -287,9 +361,10 @@ MEASUREMENT_PLAN
   decoding the selected rows, `FilterExec` above it) is absent, and so is the
   query server, distribution and object storage. #4329's OFF column is the
   comparison those need: 1,671.8 ms cold / 1,801.2 ms p50 for the 14-file
-  `rare_scan`. This harness says the shipped index spends **far more than that
-  budget on the index alone**, and that the segmented reader spends a fraction
-  of a millisecond; it does not say what the whole query costs.
+  `rare_scan`. What this measures is that the shipped index spends 44 s on the
+  index term alone — 24x the entire OFF budget — where the segmented reader
+  spends 35.6 ms cold and 1.07 ms warm. That makes the acceptance plausible and
+  does not establish it: the scan-side term could dominate both.
 - **Are not** an object-store measurement. `SliceSource` counts what the reader
   *asks for* — 14 reads of 9.8 KiB is 14 GETs against S3, where the shipped path
   issues one GET of ~16 MiB and decompresses it. Whether many small ranges beat
@@ -334,9 +409,18 @@ cargo test -p siglake-index --release --test segmented_measure \
 Sized by `SIGLAKE_SEG_ROWS_PER_FILE` (7,340,000 above), `SIGLAKE_SEG_GROUP_ROWS`
 (1,048,576), `SIGLAKE_SEG_FILES` (14), `SIGLAKE_SEG_RUNS` (9),
 `SIGLAKE_SEG_PLAN_RUNS` (3), `SIGLAKE_SEG_RARE_EVERY` (100,000),
-`SIGLAKE_SEG_PARSED_BYTES` (1 GiB) and `SIGLAKE_SEG_BLOCK_BYTES` (4,096). The
-defaults in the file are a tenth of the size, so an unparameterized run finishes
-in a minute.
+`SIGLAKE_SEG_PARSED_BYTES` (1 GiB) and `SIGLAKE_SEG_BLOCK_BYTES` (4,096). Those
+are the values every table above was taken at; the run takes 14 minutes, almost
+all of it the v1 arm's 42 re-decodes per shape.
+
+The file's default `ROWS_PER_FILE` is 1,000,000, which finishes in about a
+minute and is a useful negative control rather than a smaller version of the
+result: a 70.8 MiB index means all fourteen fit the 1 GiB budget (28/14/0, zero
+evictions) and **v1 wins every point shape** — 66 µs against the segmented
+arm's 160 µs for the 14-file `rare_scan`, because a warm `BTreeMap` hit beats a
+pair of range reads. One million rows is also a single row group, so it does not
+exercise the reject path either. The measured claim is specifically about a
+working set that exceeds the budget; where residency is free, this format costs.
 
 The codec's own fixtures run in the crate's normal test pass
 (`cargo test -p siglake-index`): v1 equivalence term by term, group-straddling

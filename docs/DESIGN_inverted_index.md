@@ -167,7 +167,7 @@ pass. Nothing is wired — the format has its own magic, footer-KV key and Puffi
 blob type, so this reader does not see one. Measured on one 7,340,000-row file
 from the same corpus: 526.0 MiB parsed for the whole-file index against
 474.9 KiB of resident directory, and a rare term answered from 14 range reads
-of 9.8 KiB rather than a 3.31 s whole-file decode. The remaining slices are
+of 9.8 KiB rather than a 3.27 s whole-file decode. The remaining slices are
 #4560 (codec and fixtures), #4561 (reader integration and bounded partial
 reads) and #4562 (the six-shape comparison that decides #4377).
 
