@@ -16,6 +16,8 @@ use siglake_core::index_config::{FieldType, IndexConfig};
 use siglake_core::{events_to_record_batch, Event};
 use siglake_storage::iceberg::{DeleteTaskState, IcebergContext};
 
+use crate::fixture_clock::fixture_base;
+
 fn logs_index(index_id: &str) -> IndexConfig {
     let mut config = IndexConfig::builtin_events();
     config.index_id = index_id.to_string();
@@ -122,7 +124,7 @@ async fn an_executor_status_update_cannot_erase_a_task_submitted_meanwhile() {
     let executor = Arc::new(IcebergContext::open(&warehouse).await.unwrap());
     executor.create_index(&config).await.unwrap();
 
-    let now = Utc::now();
+    let now = fixture_base();
     for batch in 0..3 {
         append_index_events(
             &executor,
@@ -213,7 +215,7 @@ async fn concurrent_executors_do_not_erase_each_others_index_updates() {
         append_index_events(
             &bootstrap,
             &config,
-            &[event_at(Utc::now(), "victim", "victim row")],
+            &[event_at(fixture_base(), "victim", "victim row")],
         )
         .await;
         tasks.push((
@@ -276,7 +278,7 @@ async fn legacy_ledger_stays_readable_and_is_never_rewritten() {
     append_index_events(
         &ice,
         &config,
-        &[event_at(Utc::now(), "victim", "victim row")],
+        &[event_at(fixture_base(), "victim", "victim row")],
     )
     .await;
 

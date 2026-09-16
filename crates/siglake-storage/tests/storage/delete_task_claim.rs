@@ -34,6 +34,8 @@ use siglake_core::index_config::{FieldType, IndexConfig};
 use siglake_core::{events_to_record_batch, Event};
 use siglake_storage::iceberg::{DeleteTaskState, IcebergContext};
 
+use crate::fixture_clock::fixture_base;
+
 fn logs_index(index_id: &str) -> IndexConfig {
     let mut config = IndexConfig::builtin_events();
     config.index_id = index_id.to_string();
@@ -82,6 +84,10 @@ async fn append_index_events(ice: &IcebergContext, config: &IndexConfig, events:
 
 /// Seed a warehouse with an index holding `victim`/`keep` rows spread over
 /// several data files, and one pending delete task for the victim.
+///
+/// Four appends, four files: the events sit inside one day partition
+/// ([`fixture_base`]), so the count is the number of appends and not a function
+/// of what time the test ran.
 async fn seed(warehouse: &std::path::Path) -> uuid::Uuid {
     seed_with_predicate(warehouse, "host = 'victim'").await
 }
@@ -92,7 +98,7 @@ async fn seed_with_predicate(warehouse: &std::path::Path, predicate: &str) -> uu
     let config = logs_index("logs");
     let ice = IcebergContext::open(warehouse).await.unwrap();
     ice.create_index(&config).await.unwrap();
-    let now = Utc::now();
+    let now = fixture_base();
     for batch in 0..4 {
         append_index_events(
             &ice,

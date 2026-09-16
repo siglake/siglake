@@ -25,6 +25,8 @@ use siglake_core::index_config::{FieldType, IndexConfig};
 use siglake_core::{events_to_record_batch, Event};
 use siglake_storage::iceberg::{DeleteTaskState, IcebergContext};
 
+use crate::fixture_clock::fixture_base;
+
 fn logs_index(index_id: &str) -> IndexConfig {
     let mut config = IndexConfig::builtin_events();
     config.index_id = index_id.to_string();
@@ -129,7 +131,7 @@ async fn a_task_accepted_against_the_dropped_index_cannot_delete_the_replacement
     let ice = IcebergContext::open(&warehouse).await.unwrap();
 
     ice.create_index(&config).await.unwrap();
-    let now = Utc::now();
+    let now = fixture_base();
     append_index_events(
         &ice,
         &config,
@@ -244,7 +246,7 @@ async fn a_dry_run_reports_the_refusal_without_touching_the_record() {
     let config = logs_index("logs");
     let ice = IcebergContext::open(&warehouse).await.unwrap();
     ice.create_index(&config).await.unwrap();
-    append_index_events(&ice, &config, &[event_at(Utc::now(), "victim", "row")]).await;
+    append_index_events(&ice, &config, &[event_at(fixture_base(), "victim", "row")]).await;
     let stale = ice
         .create_delete_task("logs", "host = 'victim'", None, None)
         .await
@@ -252,7 +254,7 @@ async fn a_dry_run_reports_the_refusal_without_touching_the_record() {
 
     assert!(ice.delete_index("logs").await.unwrap());
     ice.create_index(&config).await.unwrap();
-    append_index_events(&ice, &config, &[event_at(Utc::now(), "victim", "row")]).await;
+    append_index_events(&ice, &config, &[event_at(fixture_base(), "victim", "row")]).await;
 
     let outcome = ice.preview_delete_tasks("logs").await.unwrap();
     assert_eq!(
@@ -283,7 +285,7 @@ async fn a_uuid_less_record_is_refused_and_never_backfilled() {
     let config = logs_index("logs");
     let ice = IcebergContext::open(&warehouse).await.unwrap();
     ice.create_index(&config).await.unwrap();
-    append_index_events(&ice, &config, &[event_at(Utc::now(), "victim", "row")]).await;
+    append_index_events(&ice, &config, &[event_at(fixture_base(), "victim", "row")]).await;
 
     // Exactly the JSON a pre-#2837 build wrote: no `table_uuid` key at all.
     let legacy_id = uuid::Uuid::now_v7();
@@ -352,7 +354,7 @@ async fn a_refused_task_keeps_its_claim_against_a_stale_executor() {
     let config = logs_index("logs");
     let ice = IcebergContext::open(&warehouse).await.unwrap();
     ice.create_index(&config).await.unwrap();
-    append_index_events(&ice, &config, &[event_at(Utc::now(), "victim", "row")]).await;
+    append_index_events(&ice, &config, &[event_at(fixture_base(), "victim", "row")]).await;
     let stale = ice
         .create_delete_task("logs", "host = 'victim'", None, None)
         .await
@@ -367,7 +369,7 @@ async fn a_refused_task_keeps_its_claim_against_a_stale_executor() {
 
     assert!(ice.delete_index("logs").await.unwrap());
     ice.create_index(&config).await.unwrap();
-    append_index_events(&ice, &config, &[event_at(Utc::now(), "victim", "row")]).await;
+    append_index_events(&ice, &config, &[event_at(fixture_base(), "victim", "row")]).await;
 
     let outcome = ice.execute_delete_tasks("logs").await.unwrap();
     assert_eq!(outcome.tasks_failed, 1, "{outcome:?}");
