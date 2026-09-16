@@ -135,7 +135,11 @@ written down.
   Puffin rebuild ships **off** in 0.1.0: a compacted file's parsed index costs
   about 40 bytes per indexed row, and at 50 GB-class layouts the sidecar path
   landed above the text-search ceilings that were measured on the scan path.
-  A missing index costs pruning, never correctness
+  Whether a query uses an index it finds is decided per execution: a text
+  predicate under a `LIMIT` — ordered or bare — reads a sliver of the first
+  file and would pay a whole file's postings to do it, so it stays on the scan
+  path, while an unclipped text scan keeps the index. A missing or declined
+  index costs pruning, never correctness
   ([`docs/DESIGN_inverted_index.md`](docs/DESIGN_inverted_index.md),
   [`docs/DESIGN_raw_content_index.md`](docs/DESIGN_raw_content_index.md)).
 - **Exact aggregates without scans, or the exact scan.** Whole-table and

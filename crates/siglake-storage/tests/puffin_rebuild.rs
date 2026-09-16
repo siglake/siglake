@@ -2164,6 +2164,10 @@ struct AbShape {
     /// thousands of matches promises no order, so those are compared on count
     /// and membership instead.
     exact: bool,
+    /// The shape's literal `LIMIT`, when it has one that clips the scan — so
+    /// the `policy` arm can set the same `ClippedScanLimit` the query server
+    /// derives from the statement (`sql.rs::clipping_scan_limit`).
+    clip: Option<usize>,
 }
 
 /// #4162's local on/off comparison, extended by #4329 with the rare-term
@@ -2176,6 +2180,14 @@ struct AbShape {
 /// Parquet layout; the only difference is whether the outputs carry sidecars,
 /// which is what disabling the rebuild on an already-indexed table would NOT
 /// have shown.
+///
+/// #4375 adds a third arm, `policy`: the indexed warehouse queried the way the
+/// query server now queries it — `ClippedScanLimit` set for a shape whose
+/// literal `LIMIT` clips the scan, absent for one nothing clips. Two arms
+/// could only ever say whether the index helps; three say whether the rule
+/// that decides per execution picks the better one, which is the claim. Its
+/// `rare_keyword` shape is there to price the rule's one known loss: a
+/// clipped query over a term rare enough that the index would have won.
 ///
 /// Why the two regimes belong in one run: the gate shapes stop at 100 rows, so
 /// the scan they race against reads a sliver of the file and the index's
@@ -2321,6 +2333,7 @@ async fn report_rebuild_on_off_text_shapes() {
             window_floor: 0,
             corpus_matches: matches(50, 1.0),
             exact: false,
+            clip: Some(100),
         },
         AbShape {
             name: "keyword_last25",
@@ -2329,6 +2342,7 @@ async fn report_rebuild_on_off_text_shapes() {
             window_floor: floor(0.25),
             corpus_matches: matches(50, 0.25),
             exact: false,
+            clip: Some(100),
         },
         AbShape {
             name: "keyword_last5",
@@ -2337,6 +2351,7 @@ async fn report_rebuild_on_off_text_shapes() {
             window_floor: floor(0.05),
             corpus_matches: matches(50, 0.05),
             exact: false,
+            clip: Some(100),
         },
         AbShape {
             name: "substring_scan",
@@ -2346,6 +2361,7 @@ async fn report_rebuild_on_off_text_shapes() {
             window_floor: 0,
             corpus_matches: matches(20, 1.0),
             exact: false,
+            clip: Some(100),
         },
         // The rare-term regime (#4329): no `LIMIT`, so the scan arm reads every
         // row of every file and the index arm reads the rows it selected.
@@ -2356,6 +2372,7 @@ async fn report_rebuild_on_off_text_shapes() {
             window_floor: 0,
             corpus_matches: matches(rare_every, 1.0),
             exact: true,
+            clip: None,
         },
         AbShape {
             name: "rare_scan_last25",
@@ -2364,6 +2381,23 @@ async fn report_rebuild_on_off_text_shapes() {
             window_floor: floor(0.25),
             corpus_matches: matches(rare_every, 0.25),
             exact: true,
+            clip: None,
+        },
+        // What the conservative decline COSTS, stated rather than left to be
+        // discovered: the one shape where a clipped query would have wanted
+        // the index. The scan has to read until it finds 100 matches of a
+        // 0.001%-density term, which is most of the corpus.
+        AbShape {
+            name: "rare_keyword",
+            sql: format!(
+                "SELECT timestamp, raw FROM events WHERE \
+                 match_terms(raw, '{AB_RARE_TERM}') LIMIT 100"
+            ),
+            term: AB_RARE_TERM,
+            window_floor: 0,
+            corpus_matches: matches(rare_every, 1.0),
+            exact: false,
+            clip: Some(100),
         },
     ];
 
@@ -2414,12 +2448,21 @@ async fn report_rebuild_on_off_text_shapes() {
         }
         let ctx = unordered_text_context();
         ice.register_with_datafusion(&ctx).await.unwrap();
-        contexts.push((
-            label,
-            ctx,
-            file_rows,
-            warehouse.to_string_lossy().to_string(),
-        ));
+        let path = warehouse.to_string_lossy().to_string();
+        // #4375's arm: the SAME indexed warehouse, queried through the session
+        // the query server now builds for a clipped statement. It is a third
+        // ARM rather than a replacement for `on` because the question is what
+        // the policy is worth against the index it declines, and `off` alone
+        // cannot answer that — it has no index to decline.
+        let policy = if rebuild {
+            let clipped = clipped_text_context(100);
+            ice.register_with_datafusion(&clipped).await.unwrap();
+            Some(("policy", clipped, file_rows.clone(), path.clone()))
+        } else {
+            None
+        };
+        contexts.push((label, ctx, file_rows, path));
+        contexts.extend(policy);
     }
     assert_eq!(
         contexts[0].2, contexts[1].2,
@@ -2434,6 +2477,13 @@ async fn report_rebuild_on_off_text_shapes() {
     for run in 0..runs {
         for shape in &shapes {
             for (label, ctx, _, _) in &contexts {
+                // The policy arm decides per EXECUTION, which is the whole
+                // claim: a shape nothing clips runs in the unhinted session
+                // and keeps the index it would have used.
+                let ctx = match (*label, shape.clip) {
+                    ("policy", None) => &contexts[1].1,
+                    _ => ctx,
+                };
                 let (elapsed, found, delta) = time_ab_shape(shape, label, ctx, run == 0).await;
                 samples
                     .entry((shape.name, label))
@@ -2452,19 +2502,26 @@ async fn report_rebuild_on_off_text_shapes() {
     for shape in &shapes {
         let name = shape.name;
         let off = &results[&(name, "off")];
-        let on = &results[&(name, "on")];
-        assert_eq!(
-            off.len(),
-            on.len(),
-            "{name}: the arms must return the same number of rows"
-        );
-        if shape.exact {
-            // `raw_column` sorts, so an unclipped shape compares row for row.
-            assert_eq!(off, on, "{name}: the arms must return the same rows");
+        for arm in ["on", "policy"] {
+            let found = &results[&(name, arm)];
+            assert_eq!(
+                off.len(),
+                found.len(),
+                "{name}/{arm}: the arms must return the same number of rows"
+            );
+            if shape.exact {
+                // `raw_column` sorts, so an unclipped shape compares row for row.
+                assert_eq!(
+                    off, found,
+                    "{name}/{arm}: the arms must return the same rows"
+                );
+            }
         }
     }
 
-    for (label, _, _, warehouse) in &contexts {
+    // `policy` shares the indexed warehouse with `on`, so it has no cache
+    // statistics of its own; its decodes are attributed per execution below.
+    for (label, _, _, warehouse) in contexts.iter().filter(|(label, ..)| *label != "policy") {
         let (entries, lookups) = iceberg::arrow::parsed_inverted_index_cache_stats(warehouse);
         println!("arm={label} cached_indexes={entries} cache_lookups={lookups}");
     }
@@ -2473,9 +2530,12 @@ async fn report_rebuild_on_off_text_shapes() {
         "parsed_cache entries={} bytes={} evictions={} oversized_skips={}",
         footprint.entries, footprint.bytes, footprint.evictions, footprint.oversized_skips
     );
+    // One row per (shape, arm) since #4375 added the third arm: a fixed
+    // column per arm stops being readable at three and would have to change
+    // again at four.
     println!(
-        "shape,corpus_matches,selectivity,rows_returned,off_cold_ms,off_p50_ms,on_cold_ms,\
-         on_p50_ms,on_over_off,on_decodes,on_cache_hits,off_all_ms,on_all_ms"
+        "shape,arm,clip,corpus_matches,selectivity,rows_returned,cold_ms,p50_ms,over_off,\
+         decodes,cache_hits,all_ms"
     );
     let format_all = |values: &[f64]| {
         values
@@ -2485,25 +2545,26 @@ async fn report_rebuild_on_off_text_shapes() {
     };
     for shape in &shapes {
         let name = shape.name;
-        let off = &samples[&(name, "off")];
-        let on = &samples[&(name, "on")];
         // The first execution of each arm is its cold one; the p50 is over the
         // rest, which is what the benchmark's repeated iterations report.
-        let off_p50 = median(&off[1..]);
-        let on_p50 = median(&on[1..]);
-        let (on_decodes, on_hits) = decodes[&(name, "on")];
-        println!(
-            "{name},{},{:.6},{},{:.1},{off_p50:.1},{:.1},{on_p50:.1},{:.2}x,{on_decodes},\
-             {on_hits},{:?},{:?}",
-            shape.corpus_matches,
-            shape.corpus_matches as f64 / corpus_rows as f64,
-            results[&(name, "off")].len(),
-            off[0],
-            on[0],
-            on_p50 / off_p50,
-            format_all(off),
-            format_all(on),
-        );
+        let off_p50 = median(&samples[&(name, "off")][1..]);
+        for arm in ["off", "on", "policy"] {
+            let arm_samples = &samples[&(name, arm)];
+            let p50 = median(&arm_samples[1..]);
+            let (arm_decodes, arm_hits) = decodes[&(name, arm)];
+            println!(
+                "{name},{arm},{},{},{:.6},{},{:.1},{p50:.1},{:.2}x,{arm_decodes},{arm_hits},{:?}",
+                shape
+                    .clip
+                    .map_or_else(|| "none".to_string(), |n| n.to_string()),
+                shape.corpus_matches,
+                shape.corpus_matches as f64 / corpus_rows as f64,
+                results[&(name, arm)].len(),
+                arm_samples[0],
+                p50 / off_p50,
+                format_all(arm_samples),
+            );
+        }
     }
     // Further passes over the SAME indexed arm at other cache budgets. Each one
     // prints as it finishes: the last is the largest, and a box that cannot

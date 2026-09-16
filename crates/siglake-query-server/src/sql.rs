@@ -2636,11 +2636,15 @@ fn explicit_limit_value(query: &SqlQuery) -> Option<usize> {
         _ => None,
     };
     let (limit, offset) = match &query.limit_clause {
+        // `LIMIT n BY expr` is n rows PER GROUP, so `n` is not the row count
+        // the query needs and a hint built from it would be wrong in the
+        // direction that truncates. Nothing in siglake's SQL surface documents
+        // the form; a dialect that parses it gets no hint.
         Some(LimitClause::LimitOffset {
             limit: Some(limit),
             offset,
-            ..
-        }) => (
+            limit_by,
+        }) if limit_by.is_empty() => (
             literal(limit)?,
             match offset {
                 Some(offset) => literal(&offset.value)?,
@@ -10547,6 +10551,9 @@ mod tests {
             "SELECT a.raw FROM events a JOIN events b ON a.host = b.host LIMIT 100",
             // Not a literal: nothing to carry.
             "SELECT raw FROM events WHERE raw LIKE '%x%' LIMIT ALL",
+            // `LIMIT n BY expr` is n rows per group, so n is not the row count
+            // the scan owes. `explicit_limit_value` refuses it for both hints.
+            "SELECT raw FROM events WHERE raw LIKE '%x%' LIMIT 5 BY host",
         ] {
             assert_eq!(limit_of(sql), None, "{sql}");
         }
