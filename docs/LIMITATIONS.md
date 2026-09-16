@@ -464,8 +464,9 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `label_filter_last25`, 10 × 16 for `multi_label_and` — the three shapes whose
   label predicate reaches neither the raw-text nor the promoted-column prune
   path, and whose residual `FilterExec` keeps their `LIMIT 100` off the scan).
-  The `bypass` count is the text and promoted-label shapes, which take the
-  pruning reader by design. So an entry needs a scan that is
+  The `bypass` count is the text shapes, whose `raw_prune_spec` sends them to
+  the pruning reader by design, as a promoted-column predicate would. So an
+  entry needs a scan that is
   non-order-preserving, has no raw or promoted prune, and drains one task —
   plus decoded batches for that task under a quarter of the budget (2 GiB at
   8 GiB), which at 50G scale is ~615 MB for a `timestamp, raw` projection
