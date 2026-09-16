@@ -119,8 +119,8 @@ ENGINE_REPO_URL = re.compile(
 )
 
 # deploy/helm/siglake-operator/Chart.yaml carries the same `home`/`sources`
-# defect. Correcting it belongs to the operator chart's own metadata task, so it
-# is exempt here rather than silently fixed under a data-plane-chart card. The
+# defect. Correcting it belongs to the operator chart's own metadata task
+# (#4856), so it is exempt here rather than fixed under a data-plane card. The
 # exemption is checked for being still necessary: once that chart names the
 # published repository, this set has to shrink, so the hole cannot outlive the
 # defect it was opened for.
