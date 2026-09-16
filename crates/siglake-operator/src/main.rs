@@ -91,6 +91,13 @@ struct Cli {
     #[arg(long = "adopt-cluster-name", default_value = "siglake")]
     adopt_cluster_name: String,
 
+    /// Namespace the helm release runs in. Lands on the synthesized
+    /// resource's `metadata.namespace` and in every runbook command.
+    /// Defaults to the release name, which is what the runbook assumed
+    /// before this flag existed.
+    #[arg(long = "adopt-namespace", value_name = "NS")]
+    adopt_namespace: Option<String>,
+
     /// Catalog URI for adoption (cannot be inferred from chart values —
     /// the chart wires Postgres through a Secret).
     #[arg(long = "adopt-catalog-uri")]
@@ -129,22 +136,19 @@ async fn main() -> Result<()> {
         let raw = std::fs::read_to_string(values_path)
             .with_context(|| format!("read {}", values_path.display()))?;
         let values: serde_yaml::Value = serde_yaml::from_str(&raw).context("parse values yaml")?;
+        let namespace = siglake_operator::adopt::adoption_namespace_from(
+            cli.adopt_namespace.as_deref(),
+            &cli.adopt_cluster_name,
+        );
         let report = siglake_operator::adopt::synthesize_from_values(
             &values,
             &cli.adopt_cluster_name,
+            namespace,
             cli.adopt_catalog_uri.as_deref(),
         )?;
-        println!("# --- synthesized SiglakeCluster (save as cluster.yaml) ---");
-        println!("{}", serde_yaml::to_string(&report.cluster)?);
-        if report.findings.is_empty() {
-            println!("# preflight: no findings — proceed to the runbook");
-        } else {
-            println!("# preflight FINDINGS (resolve before handover):");
-            for f in &report.findings {
-                println!("#  - {f}");
-            }
-        }
-        println!("{}", report.runbook);
+        // One YAML document, comments and all: the runbook's own step 5
+        // applies this file.
+        print!("{}", report.to_yaml()?);
         return Ok(());
     }
 
