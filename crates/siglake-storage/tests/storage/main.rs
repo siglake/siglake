@@ -4,6 +4,7 @@ mod agg_delta_fold;
 mod agg_delta_writer;
 mod agg_incarnation_fence;
 mod agg_orphan_gc;
+mod agg_short_repair;
 mod agg_sketch_fallback;
 mod consumed_proof_maintenance_incarnation;
 mod date_histogram;

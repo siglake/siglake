@@ -331,6 +331,51 @@ mod alerted_counter_catalog_tests {
         }
     }
 
+    /// #3000's census counter. `detected` is what a default install records —
+    /// automatic repair is opt-in — so it must be preregistered too, or the
+    /// first short table a fresh compactor finds is invisible to `increase()`.
+    #[test]
+    fn short_aggregate_outcomes_are_preregistered_for_the_events_table() {
+        let registered = siglake_core::metrics::COMPACTOR_ALERTED_COUNTERS
+            .iter()
+            .find(|c| c.name == "siglake_group_count_short_aggregates_total")
+            .expect("compactor catalog lists the short-aggregate counter");
+        for outcome in ["detected", "repaired", "incomplete", "failed"] {
+            let events: &[(&str, &str)] = &[("table", super::TABLE_NAME), ("outcome", outcome)];
+            assert!(registered.series.contains(&events), "{registered:?}");
+        }
+    }
+
+    #[test]
+    fn short_aggregate_outcomes_are_labelled_by_table_and_outcome() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            for outcome in ["detected", "repaired", "incomplete", "failed"] {
+                super::record_group_count_short_aggregate("logs-index", outcome);
+            }
+        });
+
+        let samples = snapshotter.snapshot().into_vec();
+        for outcome in ["detected", "repaired", "incomplete", "failed"] {
+            let sample = samples
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == "siglake_group_count_short_aggregates_total"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "table" && label.value() == "logs-index")
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "outcome" && label.value() == outcome)
+                })
+                .unwrap_or_else(|| panic!("missing {outcome} short-aggregate sample: {samples:?}"));
+            assert!(matches!(sample.3, DebugValue::Counter(1)), "{sample:?}");
+        }
+    }
+
     #[test]
     fn group_count_delta_write_retries_are_labelled_by_table() {
         let recorder = DebuggingRecorder::new();
@@ -5315,6 +5360,34 @@ pub struct WideGroupCounts {
     /// both or neither, so they can never disagree about what has been counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sketches: Option<GroupCountSketches>,
+    /// What the last automatic SHORT-AGGREGATE repair could not restore.
+    ///
+    /// The suppression state for #3000's maintenance repair, and the reason it
+    /// is durable rather than a process memo: a column the rebuild cannot cover
+    /// is dropped from `group_counts` by that very rebuild, so the next commit's
+    /// delta re-adds it short and the census finds a fresh deficit every cycle.
+    /// Without a record of "already tried, still short", one unreadable column
+    /// buys a full Tier-2 rebuild per repair interval for the life of the table.
+    ///
+    /// Written only by the deficit repair. Any other rebuild — a lost-delta
+    /// marker, `siglake rebuild-group-counts` — CLEARS it, because it has just
+    /// re-read the same files and its report is the newer evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_repair: Option<ShortAggregateRepair>,
+}
+
+/// The outcome of one automatic short-aggregate repair, kept so a later
+/// maintenance pass can tell a deficit worth rebuilding for from the residue of
+/// one it has already rebuilt for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ShortAggregateRepair {
+    /// The snapshot sequence number the repair rebuilt from.
+    pub sequence_number: i64,
+    /// Columns that were short before the rebuild and are still not covering
+    /// the table after it: over the cardinality cap, or unreadable in some live
+    /// file. A later pass skips these until another rebuild clears the record.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub unrestored: BTreeSet<String>,
 }
 
 impl WideGroupCounts {
@@ -6720,6 +6793,20 @@ fn record_group_count_auto_rebuild(table: &str, outcome: &'static str) {
     .increment(1);
 }
 
+/// The maintenance census's verdict on one table (#3000). Separate from the
+/// lost-delta counter above because the causes and the remedies differ: that
+/// one names a commit whose delta PUT was spent, this one names a table whose
+/// aggregate is short with every contribution accounted for — an upgrade across
+/// #2919, a delta lost with its marker, a foreign overwrite.
+fn record_group_count_short_aggregate(table: &str, outcome: &'static str) {
+    metrics::counter!(
+        "siglake_group_count_short_aggregates_total",
+        "table" => table.to_owned(),
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
 /// Test-only view of [`retry_delta_write`].
 #[doc(hidden)]
 pub async fn retry_delta_write_for_test<F, Fut>(
@@ -6945,6 +7032,10 @@ async fn fold_wide_group_counts(
         let mut folded = WideGroupCounts {
             coverage: wide.coverage,
             coverage_links: wide.coverage_links.clone(),
+            // Carried so the maintenance census reads its own suppression
+            // record off the memoised folded view instead of GETting the base
+            // object (26.5 MB at the measured extreme) a second time.
+            short_repair: wide.short_repair.clone(),
             ..WideGroupCounts::default()
         };
         let present = list_group_count_deltas(op).await?;
@@ -7027,6 +7118,36 @@ pub struct GroupCountFoldOutcome {
     pub rebuilt: bool,
     /// Durable lost-delta markers removed after their sequences were covered.
     pub repair_markers_deleted: usize,
+}
+
+/// What the short-aggregate census made of one table (#3000).
+///
+/// The cases are separated because they call for different things from an
+/// operator, and collapsing them is how a maintenance pass ends up either
+/// paging on a one-second race or hiding a table that will never recover on its
+/// own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShortAggregateOutcome {
+    /// Every maintained column covers `record_count` at Tier-1.
+    Covered,
+    /// Short, but the newest generation's own contribution has not landed yet —
+    /// a commit between its commit and its delta PUT looks exactly like a lost
+    /// one, by totals alone. The next pass decides.
+    Pending { columns: Vec<String> },
+    /// Short only in columns a previous rebuild already proved it cannot
+    /// restore. Nothing to do but tell an operator.
+    Suppressed { columns: Vec<String> },
+    /// Short with every contribution accounted for, and no rebuild ran:
+    /// automatic repair is off, or this pass's budget is spent.
+    Detected { columns: Vec<String> },
+    /// A rebuild ran. `unrestored` is empty when every short column now covers
+    /// the table.
+    Repaired {
+        columns: Vec<String>,
+        unrestored: Vec<String>,
+    },
+    /// The rebuild errored. The deficit is unchanged and a later pass retries.
+    Failed,
 }
 
 /// Fold every unabsorbed delta into the wide base, then GC.
@@ -8030,6 +8151,42 @@ fn aggregate_covers_current_snapshot(table: &Table, coverage: Option<AggregateCo
         };
         snapshot_id = parent;
     }
+}
+
+/// Whether every Siglake contribution up to the table's current generation has
+/// LANDED in this artifact — counting the links still waiting on a missing
+/// predecessor, which `coverage` alone does not.
+///
+/// This is what tells a contribution that is lost from one that is merely in
+/// flight, and the deficit repair (#3000) cannot run without the distinction.
+/// A commit publishes its delta AFTER the commit, so for the second or so
+/// between them the newest snapshot has no contribution anywhere and every
+/// column is short of `record_count` — indistinguishable, by totals, from a
+/// delta whose writer was killed. The pending link is the discriminator: if the
+/// newest generation's own contribution is in the artifact and a column is
+/// still short, nothing outstanding can close that gap.
+///
+/// Pending links are admitted through the same bridging rule as `coverage`
+/// (#2920), so a row-conserving re-cluster on top of the newest append does not
+/// read as an unlanded contribution — on a table under compaction that would be
+/// most cycles.
+fn aggregate_evidence_reaches_current_snapshot(
+    table: &Table,
+    coverage: Option<AggregateCoverage>,
+    pending: &[AggregateCoverageLink],
+) -> bool {
+    if aggregate_covers_current_snapshot(table, coverage) {
+        return true;
+    }
+    pending.iter().any(|link| {
+        aggregate_covers_current_snapshot(
+            table,
+            Some(AggregateCoverage {
+                snapshot_id: link.snapshot_id,
+                sequence_number: link.sequence_number,
+            }),
+        )
+    })
 }
 
 fn metadata_dir_for_table(table: &Table) -> Result<String> {
@@ -10874,17 +11031,7 @@ impl IcebergContext {
         if !self.group_count_deltas_enabled() {
             return Ok(Vec::new());
         }
-        // DEDUPED: `list_indexes` reports `events` as a built-in index, so the
-        // naive concatenation visits it twice — and a second pass in the same
-        // call would delete the deltas the first pass just absorbed, collapsing
-        // the one-cycle gap that keeps concurrent readers off the retry path.
-        let mut idents = vec![self.table_ident.clone()];
-        for config in self.list_indexes().await.unwrap_or_default() {
-            let ident = self.index_table_ident(&config.index_id);
-            if !idents.contains(&ident) {
-                idents.push(ident);
-            }
-        }
+        let idents = self.aggregate_table_idents().await;
         let mut out = Vec::new();
         for ident in idents {
             let table = match self.catalog.load_table(&ident).await {
@@ -11031,6 +11178,7 @@ impl IcebergContext {
                 GroupCountRebuildOptions::default(),
                 &repair_columns,
                 Some(&repair_sketch_columns),
+                None,
             )
             .await?;
         anyhow::ensure!(
@@ -11071,6 +11219,290 @@ impl IcebergContext {
             "automatically rebuilt group-count aggregate after a lost delta"
         );
         Ok((true, deleted))
+    }
+
+    /// Every table whose aggregate artifacts this context maintains.
+    ///
+    /// DEDUPED: `list_indexes` reports `events` as a built-in index, so the
+    /// naive concatenation visits it twice — and for the fold a second pass in
+    /// the same call would delete the deltas the first pass just absorbed,
+    /// collapsing the one-cycle gap that keeps concurrent readers off the retry
+    /// path.
+    async fn aggregate_table_idents(&self) -> Vec<TableIdent> {
+        let mut idents = vec![self.table_ident.clone()];
+        for config in self.list_indexes().await.unwrap_or_default() {
+            let ident = self.index_table_ident(&config.index_id);
+            if !idents.contains(&ident) {
+                idents.push(ident);
+            }
+        }
+        idents
+    }
+
+    /// Find the tables whose group-count aggregate is SHORT of `record_count`
+    /// with nothing outstanding to explain it, and rebuild up to `max_repairs`
+    /// of them from the committed files (#3000).
+    ///
+    /// Only a durable lost-delta marker used to make anything rebuild. A commit
+    /// that never wrote a marker — its process was killed between the commit and
+    /// the delta PUT, or its aggregate prefix was moved out from under it by the
+    /// #2919 upgrade, which starts every table's new
+    /// `metadata/siglake-agg/<table-uuid>/` empty at the first commit after the
+    /// upgrade — leaves an aggregate that is merely short. The read guard
+    /// refuses it, correctly and permanently: a later delta adds its own rows
+    /// and the total stays short, so `GROUP BY` pays the exact per-file tiers
+    /// for the life of the table until an operator runs
+    /// `siglake rebuild-group-counts`.
+    ///
+    /// Maintenance only. One Tier-2 query per maintained column is the most
+    /// expensive read the system has, so this runs from the compactor's
+    /// aggregate pass behind its lease and its own interval, never from a query
+    /// or an ingest path, and `max_repairs` bounds how many tables one pass may
+    /// rebuild. `max_repairs == 0` is the census alone: the counter still fires
+    /// and the log still names the columns, and nothing reads the files.
+    ///
+    /// Returns one entry per table that is not fully covered.
+    pub async fn repair_short_group_count_aggregates(
+        &self,
+        max_repairs: usize,
+    ) -> Result<Vec<(String, ShortAggregateOutcome)>> {
+        if !self.group_count_deltas_enabled() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut repairs = 0usize;
+        for ident in self.aggregate_table_idents().await {
+            // One table's transient read error must not skip the rest: this is
+            // a whole-warehouse sweep on a timer, and the events table is
+            // usually last in nobody's interest.
+            let census = match self.short_group_count_census(&ident).await {
+                Ok(census) => census,
+                Err(error) => {
+                    tracing::warn!(error = ?error, table = %ident,
+                        "short group-count census failed");
+                    continue;
+                }
+            };
+            let outcome = match census {
+                ShortAggregateOutcome::Covered => continue,
+                ShortAggregateOutcome::Detected { columns } if repairs < max_repairs => {
+                    repairs += 1;
+                    self.repair_short_group_count_aggregate(&ident, columns)
+                        .await
+                }
+                other => other,
+            };
+            match &outcome {
+                ShortAggregateOutcome::Pending { columns } => tracing::debug!(
+                    table = %ident,
+                    columns = %columns.join(","),
+                    "group-count aggregate is short, but the newest generation's \
+                     contribution has not landed yet; leaving it to the fold"
+                ),
+                ShortAggregateOutcome::Suppressed { columns } => tracing::debug!(
+                    table = %ident,
+                    columns = %columns.join(","),
+                    "group-count aggregate is short only in columns a previous \
+                     rebuild could not restore; not rebuilding again"
+                ),
+                ShortAggregateOutcome::Detected { columns } => {
+                    record_group_count_short_aggregate(ident.name(), "detected");
+                    tracing::warn!(
+                        table = %ident,
+                        columns = %columns.join(","),
+                        "group-count aggregate is SHORT of record_count with every \
+                         contribution accounted for; GROUP BY on these columns stays \
+                         on the exact per-file path. Automatic repair is off or its \
+                         per-pass budget is spent — run \
+                         `siglake rebuild-group-counts --table <t>` or set \
+                         SIGLAKE_AGG_SHORT_REPAIR=1"
+                    );
+                }
+                ShortAggregateOutcome::Repaired {
+                    columns,
+                    unrestored,
+                } => {
+                    if unrestored.is_empty() {
+                        record_group_count_short_aggregate(ident.name(), "repaired");
+                        tracing::info!(
+                            table = %ident,
+                            columns = %columns.join(","),
+                            "rebuilt a short group-count aggregate from committed files"
+                        );
+                    } else {
+                        record_group_count_short_aggregate(ident.name(), "incomplete");
+                        tracing::warn!(
+                            table = %ident,
+                            columns = %unrestored.join(","),
+                            "rebuilt a short group-count aggregate, but these columns \
+                             still cannot cover the table and remain on the per-file \
+                             path; they are recorded so later passes do not rebuild \
+                             for them again"
+                        );
+                    }
+                }
+                ShortAggregateOutcome::Failed => {
+                    record_group_count_short_aggregate(ident.name(), "failed");
+                }
+                ShortAggregateOutcome::Covered => {}
+            }
+            out.push((ident.name().to_string(), outcome));
+        }
+        Ok(out)
+    }
+
+    /// Which maintained columns the Tier-1 read guard cannot serve, and whether
+    /// a rebuild is the right answer for them.
+    ///
+    /// Mirrors [`Self::tier1_group_count_rows`] — the same two arms in the same
+    /// order, checked against the same `record_count` — because a census that
+    /// disagreed with the guard would either rebuild for a column that is
+    /// already served or leave one that is not. It does not CALL the guard:
+    /// that decodes one column's values per call, and asking it for 22 columns
+    /// walks a 26.5 MB blob 22 times to compare 22 integers.
+    async fn short_group_count_census(&self, ident: &TableIdent) -> Result<ShortAggregateOutcome> {
+        let cached = self.cached_table_entry(ident).await?;
+        // Incarnation fence (#2919): a table with no UUID publishes and reads no
+        // aggregate at all, so it has nothing to be short of, and the artifacts
+        // at the shared path are somebody else's.
+        if aggregate_operator(&cached.table)?.is_none() {
+            return Ok(ShortAggregateOutcome::Covered);
+        }
+        let Some(record_count) = cached
+            .table
+            .metadata()
+            .current_snapshot()
+            .and_then(|s| s.summary().additional_properties.get("total-records"))
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|rc| *rc > 0)
+        else {
+            return Ok(ShortAggregateOutcome::Covered);
+        };
+        // The FOLDED view, so an outstanding delta explains its own rows before
+        // anything calls the aggregate short — the fold defers persisting until
+        // a backlog is worth the write, and a reader folds what is outstanding
+        // itself.
+        let Some(wide) = self.cached_wide_group_counts(&cached).await? else {
+            return Ok(ShortAggregateOutcome::Covered);
+        };
+        let Some(totals) = wide
+            .group_counts
+            .as_deref()
+            .and_then(siglake_bloom::group_counts::decode_column_totals)
+        else {
+            // No exact map at all: nothing declares which columns this table
+            // maintains, so there is no deficit to measure. A table whose
+            // columns are all sketched lands here too, and a sketch is short of
+            // `record_count` by design.
+            return Ok(ShortAggregateOutcome::Covered);
+        };
+        let wide_covers = aggregate_covers_current_snapshot(&cached.table, wide.coverage);
+        let mut short: Vec<String> = totals
+            .into_iter()
+            .filter(|(_, total)| !wide_covers || *total != record_count)
+            .map(|(column, _)| column)
+            .collect();
+        if short.is_empty() {
+            return Ok(ShortAggregateOutcome::Covered);
+        }
+        // The guard's first arm, for the columns the wide one leaves short. On a
+        // table where the incremental path was switched on mid-life the inline
+        // object holds a column's whole history while the wide one holds only
+        // the delta era, so a column short HERE can still be served there — and
+        // a complete wide repair is not owed to a column Tier-1 already
+        // answers. Read straight from the object rather than through the query
+        // path's memo: this runs on the compactor, and the memo is pinned to a
+        // snapshot for readers.
+        if let Some(path) = side_aggregates_path(&cached.table) {
+            if let Some(inline) = load_side_aggregates(cached.table.file_io(), &path).await? {
+                if aggregate_covers_current_snapshot(&cached.table, inline.coverage) {
+                    if let Some(counts) = inline.group_counts.as_ref() {
+                        short.retain(|column| counts.column_total(column) != Some(record_count));
+                    }
+                }
+            }
+        }
+        if short.is_empty() {
+            return Ok(ShortAggregateOutcome::Covered);
+        }
+        // Residue of an earlier repair: a column over the cardinality cap, or
+        // unreadable in some live file, comes back short on the next commit's
+        // delta however often it is rebuilt.
+        if let Some(residue) = wide.short_repair.as_ref() {
+            let (suppressed, remaining): (Vec<String>, Vec<String>) = short
+                .into_iter()
+                .partition(|column| residue.unrestored.contains(column));
+            if remaining.is_empty() {
+                return Ok(ShortAggregateOutcome::Suppressed {
+                    columns: suppressed,
+                });
+            }
+            short = remaining;
+        }
+        short.sort();
+        if !aggregate_evidence_reaches_current_snapshot(
+            &cached.table,
+            wide.coverage,
+            &wide.coverage_links,
+        ) {
+            return Ok(ShortAggregateOutcome::Pending { columns: short });
+        }
+        Ok(ShortAggregateOutcome::Detected { columns: short })
+    }
+
+    /// Rebuild one table's short aggregate and record what the rebuild could
+    /// not restore.
+    async fn repair_short_group_count_aggregate(
+        &self,
+        ident: &TableIdent,
+        columns: Vec<String>,
+    ) -> ShortAggregateOutcome {
+        let short: BTreeSet<String> = columns.iter().cloned().collect();
+        // The census read a memoised folded view; the rebuild must take its
+        // maintained column set from a fresh load, or it would omit a column a
+        // concurrent fold has since added.
+        self.invalidate_cached_table(ident).await;
+        let report = match self
+            .rebuild_group_count_aggregate_for(
+                ident,
+                // Never admits a column the table was not already maintaining:
+                // that is an operator decision (`--admit-typed-columns`), and
+                // one a repair must not make on its own.
+                GroupCountRebuildOptions::default(),
+                &BTreeMap::new(),
+                // Recompute the sketches too. The rebuild's watermark makes
+                // every delta at or below it redundant and the fold deletes
+                // them, so a sketch left at its last stored state would be
+                // permanently short by whatever was outstanding.
+                Some(&BTreeSet::new()),
+                Some(&short),
+            )
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::warn!(error = ?error, table = %ident,
+                    "rebuild of a short group-count aggregate failed");
+                return ShortAggregateOutcome::Failed;
+            }
+        };
+        if report.skipped_no_columns {
+            // The object changed under us and nothing is maintained any more.
+            // Nothing was written, including the suppression record.
+            tracing::debug!(table = %ident,
+                "short group-count rebuild found no maintained columns");
+            return ShortAggregateOutcome::Covered;
+        }
+        let unrestored: Vec<String> = report
+            .columns
+            .iter()
+            .filter(|column| short.contains(&column.column) && !column.covers_table)
+            .map(|column| column.column.clone())
+            .collect();
+        ShortAggregateOutcome::Repaired {
+            columns,
+            unrestored,
+        }
     }
 
     /// WS-7 auto-promotion: sample the newest live files' `attributes` JSON,
@@ -18727,7 +19159,7 @@ impl IcebergContext {
         options: GroupCountRebuildOptions,
     ) -> Result<GroupCountRebuild> {
         let ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
-        self.rebuild_group_count_aggregate_for(&ident, options, &BTreeMap::new(), None)
+        self.rebuild_group_count_aggregate_for(&ident, options, &BTreeMap::new(), None, None)
             .await
     }
 
@@ -18735,12 +19167,20 @@ impl IcebergContext {
     /// name columns that do not exist in the folded object yet (when the first
     /// delta was lost); their stored caps keep that recovery from admitting an
     /// unbounded column by accident.
+    ///
+    /// `short_columns` marks this as the deficit repair (#3000) and carries the
+    /// columns the census found short, so the CAS write that publishes the
+    /// rebuild also records which of them it failed to restore. Any other
+    /// caller passes `None`, which CLEARS that record: a marker rebuild or a CLI
+    /// rebuild has just re-read the same files, and its outcome is the newer
+    /// evidence.
     async fn rebuild_group_count_aggregate_for(
         &self,
         ident: &TableIdent,
         options: GroupCountRebuildOptions,
         repair_columns: &BTreeMap<String, usize>,
         repair_sketch_columns: Option<&BTreeSet<String>>,
+        short_columns: Option<&BTreeSet<String>>,
     ) -> Result<GroupCountRebuild> {
         let table_name = ident.name();
         let cached = self.cached_table_entry(ident).await?;
@@ -18952,6 +19392,17 @@ impl IcebergContext {
             wide.sketches = (!sketches.is_empty()).then_some(sketches);
         }
         wide.rebuilt_through = Some(sequence_number);
+        // Recorded in the SAME write that publishes the rebuild: knowing which
+        // columns a repair could not restore is only worth having if it costs
+        // nothing, and a second CAS to say so would rewrite the whole base.
+        wide.short_repair = short_columns.map(|short| ShortAggregateRepair {
+            sequence_number,
+            unrestored: report
+                .iter()
+                .filter(|column| short.contains(&column.column) && !column.covers_table)
+                .map(|column| column.column.clone())
+                .collect(),
+        });
         wide.coverage = Some(AggregateCoverage {
             snapshot_id: snapshot.snapshot_id(),
             sequence_number,

@@ -247,6 +247,7 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
             &[("stage", "expire")],
             &[("stage", "drain")],
             &[("stage", "agg_fold")],
+            &[("stage", "agg_short_repair")],
             &[("stage", "recluster")],
             &[("stage", "delete_tasks")],
         ],
@@ -268,6 +269,21 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
         name: "siglake_group_count_auto_rebuilds_total",
         series: &[
             &[("table", "events"), ("outcome", "success")],
+            &[("table", "events"), ("outcome", "incomplete")],
+            &[("table", "events"), ("outcome", "failed")],
+        ],
+    },
+    // #3000: the maintenance census's verdict on an aggregate that is short of
+    // `record_count` with every contribution accounted for. `detected` is the
+    // default-install series — automatic repair is opt-in — so it has to exist
+    // at 0 from the compactor's first scrape or the first find is invisible to
+    // `increase()`. Listed with `events` alone for the same reason as the
+    // counters above: an index table's name is known only at the increment.
+    AlertedCounter {
+        name: "siglake_group_count_short_aggregates_total",
+        series: &[
+            &[("table", "events"), ("outcome", "detected")],
+            &[("table", "events"), ("outcome", "repaired")],
             &[("table", "events"), ("outcome", "incomplete")],
             &[("table", "events"), ("outcome", "failed")],
         ],
