@@ -218,6 +218,16 @@ being maintained normally reports "already covered" rather than looking broken.
   of `record_count` and schedules a Tier-2 rebuild. A pre-coverage object is not
   short; it is unprovable. Keeping them separate is deliberate.
 
+  Worth checking once, because both landed in 0.1.1 and this pass drops
+  `group_counts`: the census is unaffected. `short_group_count_census` takes its
+  column set from the WIDE object and consults the inline one only to excuse a
+  column the wide map leaves short, and that arm requires the inline object to
+  prove coverage. Before a repair it never applied (no coverage edge); after
+  one it still does not (coverage edge, no `group_counts`). So dropping the map
+  can neither add a column to the census's verdict nor remove an exculpation
+  that was in force. The same holds for the object the next commit rebuilds
+  from empty: covered but short, which the arm already declines.
+
 ## The same machinery serves #3800
 
 #3082 is one way an inline object ends up with an unprovable chain: it never
