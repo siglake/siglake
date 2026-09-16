@@ -678,7 +678,15 @@ submitted whole to a best-effort `query_audit` Iceberg writer. The process
 retains at most 10,000 submitted rows and 64 MiB charged across the channel,
 flush buffer, owned strings and overlapping Arrow conversion; an oversized or
 over-budget row is dropped without changing the query response and increments
-`siglake_query_audit_dropped_total{reason}`. For batch jobs,
+`siglake_query_audit_dropped_total{reason}`. Each append the worker awaits is
+bounded by a service deadline (30 s;
+`SIGLAKE_QUERY_AUDIT_APPEND_DEADLINE_SECS`, `0` awaits without a bound), so a
+storage append that stops answering costs its own batch instead of the audit
+service: the deadline releases that batch's retained budget, counts its rows
+under `reason="append_deadline"`, and the worker takes the rows behind it. The
+abandoned batch is never re-appended — the deadline cuts the await, not the
+commit that may already have landed — which is the `query_audit` table's one
+source of silent row loss under a healthy process. For batch jobs,
 `query_audit.duration_ms` measures the bounded run lifecycle from the moment the
 queued future starts on the dedicated batch runtime; it excludes both
 batch-runtime queue time and the HTTP `202` handoff. The jobs API exposes
