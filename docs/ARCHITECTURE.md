@@ -966,7 +966,27 @@ count alone allowed. Setting the entry count to `0` turns both caches off and
 returns to fetching and deserializing per query; setting the blob byte bound to
 `0` drops only the serialized copy. Both budgets are subtracted from the query
 memory pool like every other read cache and published on
-`siglake_cache_budget_bytes{kind="text_index"}`. What the parsed side is doing
+`siglake_cache_budget_bytes{kind="text_index"}`.
+
+**Which budget a process gets is its role.** The query server derives both from
+its pod's limit. The `siglake` binary resolves its own at startup, and for the
+maintenance roles — the compactor pod, the ingest server, the sweeps and the
+rebuilds — that is an explicit zero: the only site that fills either cache is
+the scan's index-pruning path, reached from a plan carrying a text predicate
+through the Iceberg table provider, and maintenance plans none. A Tier-2
+aggregate rebuild counts from manifest stats, Parquet footers and raw pages; a
+delete task evaluates its predicate over a `MemTable` of the candidate file's
+decoded rows. The flat 1 GiB + 256 MiB pair those processes used to inherit from
+the fork was 1.25 GiB of ceilings on caches that never take an entry, inside the
+1Gi the chart gives the compactor. The subcommands that do run SQL in process —
+`sql-direct`, `iceberg-demo`, `subscribe` — derive what the query server would.
+The byte-range object cache stays the opt-in it has always been
+(`SIGLAKE_OBJECT_CACHE_BYTES`) in every role, and is now recorded rather than
+re-derived: a process that configured nothing left the pool subtracting a
+quarter of the pod for a cache that process had switched off. Every override
+survives the role, in both directions.
+
+What the parsed side is doing
 under those budgets is readable per query rather than inferred from latency:
 `siglake_iceberg_parsed_index_cache_lookups_total{outcome,storage}` records one
 `hit` or `miss` per file a text query acquires an index for, and
