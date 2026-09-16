@@ -19,7 +19,9 @@
 //! restore, or one unreadable column buys a full Tier-2 rebuild every pass.
 
 use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
+use chrono::{TimeZone, Utc};
 use siglake_core::index_config::{DocMapping, FieldMapping, FieldType, IndexConfig, MappingMode};
+use siglake_core::Event;
 use siglake_storage::iceberg::{
     ColumnGroupCounts, ColumnSketch, FileGroupCounts, GroupCountDelta, GroupCountSketches,
     IcebergContext, IcebergTuning, ShortAggregateOutcome, ShortAggregateRepair, WideGroupCounts,
@@ -794,4 +796,101 @@ async fn one_pass_repairs_at_most_its_budget() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// #4737: one compactor censuses the base namespace and every `tenant_*`
+/// namespace, and each holds its own `events`. The counter used to carry the
+/// bare table name, so both short tables incremented `table="events"` and
+/// `SiglakeGroupCountAggregateShort` named a table an operator could not
+/// locate — let alone pass to `rebuild-group-counts --namespace`.
+#[tokio::test]
+async fn a_short_events_table_in_two_namespaces_is_two_series() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    /// One commit of events with distinct hosts, above the inline ceiling so
+    /// the wide object is `host`'s only Tier-1 carrier.
+    async fn commit(ice: &IcebergContext, nth: i64) {
+        let base = 1_700_000_000i64 + nth * 100_000;
+        let events: Vec<Event> = (0..ROWS)
+            .map(|i| Event {
+                timestamp: Utc.timestamp_opt(base + i, 0).single().unwrap(),
+                host: format!("h-{:06}", nth * ROWS + i),
+                source: "src".into(),
+                sourcetype: "app:json".into(),
+                index: "main".into(),
+                raw: "request".into(),
+                attributes: None,
+            })
+            .collect();
+        ice.append_events(&events).await.unwrap();
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let wh = tmp.path().join("warehouse");
+    let base = open(&wh).await;
+    let tenant = base.for_namespace("tenant_acme").await.unwrap();
+
+    for ice in [&base, &tenant] {
+        for nth in 0..2 {
+            commit(ice, nth).await;
+        }
+        ice.fold_group_count_deltas(1).await.unwrap();
+    }
+
+    // #2919's upgrade, in both namespaces at once: the artifacts each
+    // incarnation had been reading sit at a path nothing adopts any more, so
+    // the next commit starts a fresh aggregate that is short of every row
+    // before it — with no marker anywhere to say so.
+    for artifact in aggregate_artifacts(&wh) {
+        std::fs::remove_file(&artifact).unwrap();
+    }
+    for ice in [&base, &tenant] {
+        commit(ice, 2).await;
+        ice.fold_group_count_deltas(1).await.unwrap();
+    }
+
+    // Census only, no repair budget: the counter is what a default install
+    // records, and it must not depend on a rebuild having run.
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let guard = metrics::set_default_local_recorder(&recorder);
+    for ice in [&base, &tenant] {
+        let outcomes = ice.repair_short_group_count_aggregates(0).await.unwrap();
+        assert!(
+            outcomes.iter().any(|(table, outcome)| table == "events"
+                && matches!(outcome, ShortAggregateOutcome::Detected { .. })),
+            "{} censused nothing short: {outcomes:?}",
+            ice.namespace()
+        );
+    }
+    drop(guard);
+
+    let mut series: Vec<(String, u64)> = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, _, _, _)| key.key().name() == "siglake_group_count_short_aggregates_total")
+        .map(|(key, _, _, value)| {
+            let label = |name: &str| {
+                key.key()
+                    .labels()
+                    .find(|l| l.key() == name)
+                    .map(|l| l.value().to_string())
+                    .unwrap_or_else(|| panic!("no {name} label on {key:?}"))
+            };
+            assert_eq!(label("table"), "events", "{key:?}");
+            assert_eq!(label("outcome"), "detected", "{key:?}");
+            let DebugValue::Counter(count) = value else {
+                panic!("{value:?} is not a counter");
+            };
+            (label("iceberg_namespace"), count)
+        })
+        .collect();
+    series.sort();
+    assert_eq!(
+        series,
+        vec![("siglake".to_string(), 1), ("tenant_acme".to_string(), 1),],
+        "two namespaces' events tables must reach the alert as two series, \
+         each at its own count"
+    );
 }

@@ -225,15 +225,16 @@ spec:
           labels:
             severity: warning
           annotations:
-            summary: Automatic group-count repair for {{ "{{ $labels.table }}" }} was {{ "{{ $labels.outcome }}" }}
+            summary: Automatic group-count repair for {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }} was {{ "{{ $labels.outcome }}" }}
             description: >-
               {{ "{{ $value }}" }} automatic group-count rebuild(s) for table
-              {{ "{{ $labels.table }}" }} were {{ "{{ $labels.outcome }}" }} in
+              {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }}
+              were {{ "{{ $labels.outcome }}" }} in
               the last hour. Answers stay exact, but GROUP BY on the affected
               columns remains on the per-file path. The compactor retries a
               failed rebuild while its durable marker remains; as the operator
               fallback, run
-              `siglake rebuild-group-counts --table {{ "{{ $labels.table }}" }}`,
+              `siglake rebuild-group-counts --namespace {{ "{{ $labels.iceberg_namespace }}" }} --table {{ "{{ $labels.table }}" }}`,
               which recomputes the aggregate from the committed files and is
               safe to re-run.
         - alert: SiglakeGroupCountAggregateShort
@@ -256,16 +257,17 @@ spec:
           labels:
             severity: warning
           annotations:
-            summary: The group-count aggregate for {{ "{{ $labels.table }}" }} is short of its row count
+            summary: The group-count aggregate for {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }} is short of its row count
             description: >-
-              The maintenance census found table {{ "{{ $labels.table }}" }}
+              The maintenance census found table
+              {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }}
               short of `total-records` in at least one maintained column, with
               every commit's contribution present — outcome
               {{ "{{ $labels.outcome }}" }}. Answers stay exact; `GROUP BY` on
               those columns runs on the exact per-file path and will keep doing
               so, because no later commit closes the gap. The compactor's WARN
               line names the columns. Run
-              `siglake rebuild-group-counts --table {{ "{{ $labels.table }}" }}`,
+              `siglake rebuild-group-counts --namespace {{ "{{ $labels.iceberg_namespace }}" }} --table {{ "{{ $labels.table }}" }}`,
               which recomputes the aggregate from the committed files and is
               safe to re-run, or set `compactor.shortAggregateRepair=true` to
               have the maintenance pass rebuild one table per census.
@@ -283,16 +285,17 @@ spec:
           labels:
             severity: warning
           annotations:
-            summary: A side-aggregate publication for {{ "{{ $labels.table }}" }} was lost
+            summary: A side-aggregate publication for {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }} was lost
             description: >-
               {{ "{{ $value }}" }} side-aggregate publication(s) for table
-              {{ "{{ $labels.table }}" }} on {{ "{{ $labels.pod }}" }} spent all
+              {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }}
+              on {{ "{{ $labels.pod }}" }} spent all
               four attempts in the last hour. Each one was carrying a commit's
               group counts and time aggregates that exist nowhere else, so the
               object now stays short of total-records and no later commit closes
               the gap. Check warehouse object-store health and credential
               refresh (IMDS) on that pod; run
-              `siglake rebuild-group-counts --table {{ "{{ $labels.table }}" }}`
+              `siglake rebuild-group-counts --namespace {{ "{{ $labels.iceberg_namespace }}" }} --table {{ "{{ $labels.table }}" }}`
               to restore the group-count aggregate, which does not rebuild the
               inline time aggregates.
         - alert: SiglakeInlineCoverageUnproven

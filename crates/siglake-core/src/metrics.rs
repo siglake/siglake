@@ -209,11 +209,13 @@ pub const INGESTER_ALERTED_COUNTERS: &[AlertedCounter] = &[
 /// Counters the compactor (`siglake compactor`, not `--once`, which serves no
 /// metrics) pre-registers. `siglake_wal_crc_mismatch_total` is here too: the
 /// drain reads sealed segments through the same CRC check as ingest replay.
-/// The two group-count counters are labelled by table (and rebuild outcome)
-/// and are listed for the events table only
-/// (`siglake_storage::iceberg::TABLE_NAME`, held equal by tests there); an
-/// event on an index table is a series this cannot know ahead, and its first
-/// increment stays invisible to `increase()`.
+/// The two group-count counters are labelled by Iceberg namespace and table
+/// (and rebuild outcome) and are listed for the default namespace's events
+/// table only (`siglake_storage::iceberg::NAMESPACE` and `TABLE_NAME`, held
+/// equal by tests there); an event on an index table, in a `tenant_*`
+/// namespace, or under a base namespace moved off the default by
+/// `SIGLAKE_TENANT_NAMESPACE` is a series this cannot know ahead, and its
+/// first increment stays invisible to `increase()`.
 /// `siglake_compactor_mirror_sync_total` is the activity arm of
 /// `SiglakeMirrorReconciliationStalled`: without the series at 0, a compactor
 /// whose very first reconciliation pass never wraps around looks idle to
@@ -255,38 +257,68 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
     },
     AlertedCounter {
         name: "siglake_group_count_delta_write_failures_total",
-        series: &[&[("table", "events")]],
+        series: &[&[("iceberg_namespace", "siglake"), ("table", "events")]],
     },
     // #3799: an append's contribution to the inline aggregate object exists
     // nowhere else, so a publication that spends its four attempts leaves the
-    // object short of `total-records` for good. Listed with `events` alone for
-    // the same reason as the delta counter above: an index table's name is
-    // known only at the increment.
+    // object short of `total-records` for good. Listed with the default
+    // namespace's `events` alone for the same reason as the delta counter
+    // above: an index table's name, and a tenant namespace's, are known only
+    // at the increment.
     AlertedCounter {
         name: "siglake_side_aggregate_publish_failures_total",
-        series: &[&[("table", "events")]],
+        series: &[&[("iceberg_namespace", "siglake"), ("table", "events")]],
     },
     AlertedCounter {
         name: "siglake_group_count_auto_rebuilds_total",
         series: &[
-            &[("table", "events"), ("outcome", "success")],
-            &[("table", "events"), ("outcome", "incomplete")],
-            &[("table", "events"), ("outcome", "failed")],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "success"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "incomplete"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "failed"),
+            ],
         ],
     },
     // #3000: the maintenance census's verdict on an aggregate that is short of
     // `record_count` with every contribution accounted for. `detected` is the
     // default-install series — automatic repair is opt-in — so it has to exist
     // at 0 from the compactor's first scrape or the first find is invisible to
-    // `increase()`. Listed with `events` alone for the same reason as the
-    // counters above: an index table's name is known only at the increment.
+    // `increase()`. Listed with the default namespace's `events` alone for the
+    // same reason as the counters above: an index table's name, and a tenant
+    // namespace's, are known only at the increment.
     AlertedCounter {
         name: "siglake_group_count_short_aggregates_total",
         series: &[
-            &[("table", "events"), ("outcome", "detected")],
-            &[("table", "events"), ("outcome", "repaired")],
-            &[("table", "events"), ("outcome", "incomplete")],
-            &[("table", "events"), ("outcome", "failed")],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "detected"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "repaired"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "incomplete"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "failed"),
+            ],
         ],
     },
     // #4674: one increment per completed inline-coverage census pass. It is the

@@ -125,13 +125,14 @@ up and fall back to the per-file path.
 A delta PUT gets four total attempts, with 250/500/750ms delays between them.
 `siglake_group_count_delta_write_retries_total{table="<table>"}` counts the
 retries used when a later attempt succeeds;
-`siglake_group_count_delta_write_failures_total{table="<table>"}` counts a PUT
-that exhausted all four. The committer then writes a durable rebuild marker;
+`siglake_group_count_delta_write_failures_total{iceberg_namespace="<ns>",table="<table>"}`
+counts a PUT that exhausted all four. The committer then writes a durable rebuild marker;
 the maintenance compactor recomputes through the exact Tier-2 path — footer
 where one exists, raw-page decode where it does not — and records
 `rebuilt_through` so a late delta from the scanned prefix cannot be folded
 twice. If the marker write or automatic rebuild fails, the LOST log names the
-operator fallback: `siglake rebuild-group-counts --table <table>`. It is safe
+operator fallback:
+`siglake rebuild-group-counts --namespace <ns> --table <table>`. It is safe
 to re-run.
 
 **A shortfall with no marker at all (#3000).** A marker is written by the

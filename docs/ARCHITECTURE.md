@@ -349,7 +349,8 @@ is replay-safe: the merge reads the object first and skips a publication whose
 coverage links are already there, which is how a write that landed and lost its
 response is told from one that never landed. A publication that spends all four
 attempts increments
-`siglake_side_aggregate_publish_failures_total{table="<table>"}` and, where the
+`siglake_side_aggregate_publish_failures_total{iceberg_namespace="<ns>",table="<table>"}`
+and, where the
 incremental delta path is active, writes the same `*.rebuild.json` marker a lost
 delta does, so the maintenance compactor rebuilds the wide group counts. Nothing
 rebuilds the inline object automatically: its time aggregates stay short of
@@ -368,7 +369,8 @@ four attempts, waiting 250, 500 and 750 ms between attempts. A write that
 eventually succeeds after retry increments
 `siglake_group_count_delta_write_retries_total{table="<table>"}` by the retries
 it used; a write that exhausts all four attempts increments
-`siglake_group_count_delta_write_failures_total{table="<table>"}`. The Helm
+`siglake_group_count_delta_write_failures_total{iceberg_namespace="<ns>",table="<table>"}`.
+The Helm
 chart's `SiglakeGroupCountDeltaRetrying` alert warns on a sustained retry rate,
 the precursor. An exhausted write records a per-sequence `*.rebuild.json`
 marker alongside the deltas under
@@ -377,10 +379,11 @@ no additional listing). The maintenance compactor consumes that
 marker on its next aggregate fold, rebuilds the affected table's exact maps and
 bounded sketches from committed files, and deletes every marker covered by the
 rebuild watermark. It increments
-`siglake_group_count_auto_rebuilds_total{table="<table>",outcome="success|incomplete|failed"}`;
+`siglake_group_count_auto_rebuilds_total{iceberg_namespace="<ns>",table="<table>",outcome="success|incomplete|failed"}`;
 `SiglakeGroupCountDeltaLost` fires only when that automatic repair fails or
-completes without restoring full coverage. Both alerts name the affected table;
-the retry alert also names the pod. A later delta does not heal the gap; the
+completes without restoring full coverage. Both alerts name the affected namespace and
+table; the retry alert names the pod and, because its counter is not
+namespaced, the table alone. A later delta does not heal the gap; the
 marker-driven rebuild does.
 
 Each maintenance pass also adds the number of deltas folded into the base to
@@ -412,9 +415,20 @@ without the record one unreadable column would cost a full Tier-2 rebuild every
 pass.
 
 Every verdict lands on
-`siglake_group_count_short_aggregates_total{table="<table>",outcome="detected|repaired|incomplete|failed"}`
+`siglake_group_count_short_aggregates_total{iceberg_namespace="<ns>",table="<table>",outcome="detected|repaired|incomplete|failed"}`
 and a WARN line naming the columns, and `SiglakeGroupCountAggregateShort` fires
-on all but `repaired`. Rebuilding automatically is **opt-in**
+on all but `repaired`. One compactor censuses the base namespace and every
+`tenant_*` namespace, each with its own `events`, so this counter and the three
+beside it (`siglake_group_count_delta_write_failures_total`,
+`siglake_side_aggregate_publish_failures_total`,
+`siglake_group_count_auto_rebuilds_total`) carry `iceberg_namespace` as well as
+`table` — the name the alert passes to `rebuild-group-counts --namespace`. It
+is `iceberg_namespace` rather than `namespace` because Prometheus attaches the
+Kubernetes namespace under that name and renames a colliding metric label to
+`exported_namespace`. Only the default namespace's `events` series is
+pre-registered at 0: a tenant namespace, an index table and a base namespace
+moved off the default by `SIGLAKE_TENANT_NAMESPACE` are known only at the
+increment. Rebuilding automatically is **opt-in**
 (`SIGLAKE_AGG_SHORT_REPAIR=1`, `compactor.shortAggregateRepair` in the chart):
 the repair is one Tier-2 query per maintained column — measured ~9 minutes per
 column per 250M rows on a local filesystem, so a wide table is hours and the
@@ -428,7 +442,7 @@ If the LOST log says the marker itself could not be written, or automatic
 rebuild keeps failing, the operator fallback remains:
 
 ```
-siglake rebuild-group-counts --table <table>
+siglake rebuild-group-counts --namespace <ns> --table <table>
 ```
 
 Both automatic and operator-triggered rebuilds use the same exact per-file

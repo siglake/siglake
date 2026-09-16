@@ -344,8 +344,8 @@
    },
    "targets": [
     {
-     "expr": "sum by (table) (increase(siglake_group_count_delta_write_failures_total{namespace=~\"$namespace\"}[5m]))",
-     "legendFormat": "lost {{table}}",
+     "expr": "sum by (iceberg_namespace, table) (increase(siglake_group_count_delta_write_failures_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "lost {{iceberg_namespace}}.{{table}}",
      "refId": "A"
     },
     {
@@ -354,12 +354,12 @@
      "refId": "B"
     },
     {
-     "expr": "sum by (table) (increase(siglake_side_aggregate_publish_failures_total{namespace=~\"$namespace\"}[5m]))",
-     "legendFormat": "side publication lost {{table}}",
+     "expr": "sum by (iceberg_namespace, table) (increase(siglake_side_aggregate_publish_failures_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "side publication lost {{iceberg_namespace}}.{{table}}",
      "refId": "C"
     }
    ],
-   "description": "Lost and retried delta writes are grouped by table. A lost delta leaves the aggregate short, but writes a durable marker that the maintenance compactor normally repairs on its next aggregate fold; a sustained retry rate means the object store or credentials are flaky and a loss is likely. The third series is the inline side object's own publication: it retries on the same budget, and a loss there leaves that object short of total-records with only its group counts repairable."
+   "description": "Lost delta writes are grouped by Iceberg namespace and table, retried ones by table alone. A lost delta leaves the aggregate short, but writes a durable marker that the maintenance compactor normally repairs on its next aggregate fold; a sustained retry rate means the object store or credentials are flaky and a loss is likely. The third series is the inline side object's own publication: it retries on the same budget, and a loss there leaves that object short of total-records with only its group counts repairable."
   },
   {
    "id": 143,
@@ -377,12 +377,12 @@
    },
    "targets": [
     {
-     "expr": "sum by (table, outcome) (increase(siglake_group_count_auto_rebuilds_total{namespace=~\"$namespace\"}[5m]))",
-     "legendFormat": "{{outcome}} {{table}}",
+     "expr": "sum by (iceberg_namespace, table, outcome) (increase(siglake_group_count_auto_rebuilds_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{outcome}} {{iceberg_namespace}}.{{table}}",
      "refId": "A"
     }
    ],
-   "description": "success means the compactor restored the aggregate from committed files after a lost delta. incomplete or failed means GROUP BY remains on the exact per-file path and fires SiglakeGroupCountDeltaLost; use siglake rebuild-group-counts --table <table> as the operator fallback."
+   "description": "success means the compactor restored the aggregate from committed files after a lost delta. incomplete or failed means GROUP BY remains on the exact per-file path and fires SiglakeGroupCountDeltaLost; use siglake rebuild-group-counts --namespace <iceberg_namespace> --table <table> as the operator fallback."
   },
   {
    "id": 110,

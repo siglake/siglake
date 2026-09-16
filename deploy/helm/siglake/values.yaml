@@ -373,7 +373,8 @@ compactor:
   # filesystem, so a wide table is hours and the compactor's 600s watchdog
   # would cut it. Set true to render SIGLAKE_AGG_SHORT_REPAIR=1 and have one
   # table per census rebuilt from the committed files; on a very large table
-  # `siglake rebuild-group-counts --table <t>` remains the tool.
+  # `siglake rebuild-group-counts --namespace <ns> --table <t>` remains the
+  # tool.
   shortAggregateRepair: false
   # QW-7 delete-task execution in the compactor's idle cycle. ON by
   # default: tasks created via the query server's /api/v1/delete-tasks are
