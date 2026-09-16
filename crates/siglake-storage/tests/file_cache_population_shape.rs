@@ -23,6 +23,11 @@
 //!    population, so the rounds' 448 misses measure the tasks partitions
 //!    opened, not population attempts.
 //!
+//! Since #4846 each of those clipped populations also charges
+//! `outcome="abandoned"` from `CachePopulateStream`'s `Drop`, so phases 2 and 4
+//! read as one abandonment per miss directly instead of by the absence of the
+//! four insert-path series. The drained phases must charge none.
+//!
 //! Isolated in its own test binary: the query-scan tuning, the file batch
 //! cache and the global metrics recorder are all process-wide.
 
@@ -48,6 +53,7 @@ struct Outcomes {
     insert: u64,
     insert_skipped_contended: u64,
     skip_oversized: u64,
+    abandoned: u64,
     evict: u64,
 }
 
@@ -76,7 +82,38 @@ fn outcomes(snapshotter: &Snapshotter) -> Outcomes {
         insert: sum("insert"),
         insert_skipped_contended: sum("insert_skipped_contended"),
         skip_oversized: sum("skip_oversized"),
+        abandoned: sum("abandoned"),
         evict: sum("evict"),
+    }
+}
+
+/// Accumulate outcome deltas until `settled` holds or the deadline passes.
+///
+/// `abandoned` is charged from `CachePopulateStream::Drop`, and a clipped plan's
+/// scan streams are dropped by whatever task last held them — for a multi-
+/// partition plan that is a `CoalescePartitionsExec` worker, not the `collect()`
+/// this test awaits. So the count can arrive a scheduler tick after the rows do.
+/// Every snapshot drains the registry, hence the accumulation.
+async fn outcomes_settling(
+    snapshotter: &Snapshotter,
+    settled: impl Fn(&Outcomes) -> bool,
+) -> Outcomes {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut total = Outcomes::default();
+    loop {
+        let delta = outcomes(snapshotter);
+        total.hit += delta.hit;
+        total.miss += delta.miss;
+        total.bypass += delta.bypass;
+        total.insert += delta.insert;
+        total.insert_skipped_contended += delta.insert_skipped_contended;
+        total.skip_oversized += delta.skip_oversized;
+        total.abandoned += delta.abandoned;
+        total.evict += delta.evict;
+        if settled(&total) || std::time::Instant::now() >= deadline {
+            return total;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 
@@ -134,17 +171,25 @@ async fn limit_clipped_scans_never_populate_the_decoded_file_cache() {
     assert_eq!(rows(&ctx, scan_sql).await, file_rows);
     let cold = outcomes(&snapshotter);
     assert_eq!(
-        (cold.miss, cold.insert, cold.hit),
-        (1, 1, 0),
-        "a drained scan must miss once and insert once: {cold:?}"
+        cold,
+        Outcomes {
+            miss: 1,
+            insert: 1,
+            ..Default::default()
+        },
+        "a drained scan must miss once, insert once and abandon nothing: {cold:?}"
     );
 
     assert_eq!(rows(&ctx, scan_sql).await, file_rows);
     let warm = outcomes(&snapshotter);
     assert_eq!(
-        (warm.hit, warm.miss, warm.insert),
-        (1, 0, 0),
-        "the identical repeat of a drained scan must hit: {warm:?}"
+        warm,
+        Outcomes {
+            hit: 1,
+            ..Default::default()
+        },
+        "the identical repeat of a drained scan must hit, and builds no populate \
+         stream to abandon: {warm:?}"
     );
 
     // Phase 2: the same scan under a clipping LIMIT, on its own table so the
@@ -163,16 +208,21 @@ async fn limit_clipped_scans_never_populate_the_decoded_file_cache() {
         .unwrap();
     let limited_sql = "SELECT raw FROM events LIMIT 10";
 
+    // Each attempt's one population is now attributed rather than inferred:
+    // `abandoned` says the stream decoded batches and was dropped before its
+    // insert, which is the reading #4494 had to take from four absent series.
     for attempt in 1..=2 {
         assert_eq!(rows(&clipped_ctx, limited_sql).await, 10);
-        let limited = outcomes(&snapshotter);
+        let limited = outcomes_settling(&snapshotter, |o| o.abandoned >= 1).await;
         assert_eq!(
             limited,
             Outcomes {
                 miss: 1,
+                abandoned: 1,
                 ..Default::default()
             },
-            "attempt {attempt}: a limit-clipped scan must miss and populate nothing"
+            "attempt {attempt}: a limit-clipped scan must miss, populate nothing \
+             and count one abandoned population"
         );
     }
 
@@ -181,15 +231,22 @@ async fn limit_clipped_scans_never_populate_the_decoded_file_cache() {
     assert_eq!(rows(&clipped_ctx, scan_sql).await, file_rows);
     let drain_pass = outcomes(&snapshotter);
     assert_eq!(
-        (drain_pass.miss, drain_pass.insert),
-        (1, 1),
-        "the drained pass must populate: {drain_pass:?}"
+        drain_pass,
+        Outcomes {
+            miss: 1,
+            insert: 1,
+            ..Default::default()
+        },
+        "the drained pass must populate and abandon nothing: {drain_pass:?}"
     );
     assert_eq!(rows(&clipped_ctx, limited_sql).await, 10);
     let after_drain = outcomes(&snapshotter);
     assert_eq!(
-        (after_drain.hit, after_drain.miss),
-        (1, 0),
+        after_drain,
+        Outcomes {
+            hit: 1,
+            ..Default::default()
+        },
         "after one drained pass the limited repeat hits: {after_drain:?}"
     );
 
@@ -236,14 +293,16 @@ async fn limit_clipped_scans_never_populate_the_decoded_file_cache() {
         .await,
         1
     );
-    let partitioned = outcomes(&snapshotter);
+    let partitioned = outcomes_settling(&snapshotter, |o| o.abandoned >= 4).await;
     assert_eq!(
         partitioned,
         Outcomes {
             miss: 4,
+            abandoned: 4,
             ..Default::default()
         },
-        "one miss per partition that opened its first task, and no population"
+        "one miss per partition that opened its first task, no population, and \
+         one abandoned population per miss"
     );
 
     siglake_storage::configure_query_scan_tuning(QueryScanTuning::default());

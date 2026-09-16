@@ -675,6 +675,41 @@ impl CachePopulateStream {
     }
 }
 
+/// #4846: one increment per population that decoded batches, kept them, and was
+/// dropped before its end-of-stream arm could insert them — a `LIMIT` satisfied
+/// from the first batches, or a cancelled query, above a file that was never
+/// read to its end.
+///
+/// Without it a round reads the miss counter and cannot tell "448 populations
+/// that did not stick" from "448 task streams opened, none drained": a `miss` is
+/// charged when the stream is OPENED (once per partition), so #4494 had to
+/// establish which of the two it was by hand, from the ABSENCE of the four
+/// sibling series the insert path writes.
+///
+/// Scope is abandonment of an ELIGIBLE population, not a new taxonomy:
+///
+/// - `oversized` is excluded because the `poll_next` arm that set it already
+///   charged `skip_oversized`; counting the drop as well would bill one
+///   abandoned population twice;
+/// - a stream that failed sets `insert_done` in its error arm, and a key another
+///   partition populated first leaves `insert_buffered` with nothing to do but
+///   still sets `insert_done` — both are finished, not abandoned.
+///
+/// The outcomes still do not partition `miss`. `miss` is charged before the
+/// inner stream is constructed, so a construction error leaves a miss with no
+/// outcome at all, and `hit` and `bypass` never build one of these.
+impl Drop for CachePopulateStream {
+    fn drop(&mut self) {
+        if !self.insert_done && !self.oversized {
+            metrics::counter!(
+                "siglake_query_scan_file_cache_requests_total",
+                "outcome" => "abandoned"
+            )
+            .increment(1);
+        }
+    }
+}
+
 impl Stream for CachePopulateStream {
     type Item = DFResult<RecordBatch>;
 
@@ -5893,6 +5928,122 @@ mod tests {
             ),
             1,
             "an oversized candidate is abandoned exactly once"
+        );
+    }
+
+    /// #4846's counter and the three ways a population finishes without one.
+    /// One test because all four arms read the same counter and the
+    /// already-populated arm needs the process-wide cache, which parallel
+    /// `#[test]` functions in this binary would otherwise interleave with.
+    #[test]
+    fn unfinished_eligible_populations_are_counted_once() {
+        let batch = string_batch(64);
+        let batch_bytes = batch.get_array_memory_size() as u64;
+        let roomy = EffectiveFileCacheTuning {
+            max_bytes: Some(batch_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION * 8)),
+            max_entries: Some(8),
+        };
+        // One batch fits; the second crosses the quarter-budget entry bound.
+        let tight = EffectiveFileCacheTuning {
+            max_bytes: Some(batch_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)),
+            max_entries: Some(8),
+        };
+        let source = |batches: usize| -> TaskBatchStream {
+            futures::stream::iter(
+                std::iter::repeat_n(batch.clone(), batches).map(Ok::<_, DataFusionError>),
+            )
+            .boxed()
+        };
+        let populate = |key: &str, tuning, inner| CachePopulateStream {
+            key: key.to_string(),
+            tuning,
+            inner,
+            buffered: Vec::new(),
+            buffered_bytes: 0,
+            oversized: false,
+            insert_done: false,
+        };
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let outcome = |snapshot: &SnapshotVec, name: &str| {
+            counter_sum(
+                snapshot,
+                "siglake_query_scan_file_cache_requests_total",
+                Some(("outcome", name)),
+            )
+        };
+
+        // Every drop happens inside the local recorder's scope: a
+        // `CachePopulateStream` counts from `Drop`, so a stream that outlived
+        // the closure would charge the global recorder instead.
+        metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(async {
+                // A clipped read: one batch taken of three, then dropped. The
+                // buffered batch and the decode behind it are thrown away.
+                let mut clipped = populate("abandoned-clipped", roomy, source(3));
+                assert!(clipped.next().await.unwrap().is_ok());
+                assert_eq!(clipped.buffered.len(), 1);
+                drop(clipped);
+
+                // Dropped before the first poll — the partition's task opened
+                // (its `miss` is already charged) and the plan finished
+                // elsewhere. Still an eligible population that kept nothing.
+                drop(populate("abandoned-unpolled", roomy, source(3)));
+
+                // Oversized, then dropped before end-of-stream: `poll_next`
+                // charged `skip_oversized` when it crossed the bound, so this
+                // must NOT be charged again.
+                let mut oversized = populate("oversized-then-dropped", tight, source(3));
+                assert!(oversized.next().await.unwrap().is_ok());
+                assert!(oversized.next().await.unwrap().is_ok());
+                assert!(oversized.oversized);
+                assert!(!oversized.insert_done, "a third batch is still unread");
+                drop(oversized);
+
+                // An error finishes the population: nothing more will be read,
+                // so there is nothing to abandon.
+                let failing: TaskBatchStream = futures::stream::iter([
+                    Ok(batch.clone()),
+                    Err(DataFusionError::External("decode failed".into())),
+                    Ok(batch.clone()),
+                ])
+                .boxed();
+                let mut errored = populate("errored", roomy, failing);
+                assert!(errored.next().await.unwrap().is_ok());
+                assert!(errored.next().await.unwrap().is_err());
+                assert!(errored.insert_done);
+                drop(errored);
+
+                // A key some other partition populated first: `insert_buffered`
+                // has nothing to do and charges no `insert`, but the stream ran
+                // to end-of-stream and is finished. Both passes over the same
+                // key go through the process-wide cache.
+                for pass in 1..=2 {
+                    let mut drained = populate("already-populated", roomy, source(1));
+                    assert!(drained.next().await.unwrap().is_ok());
+                    assert!(drained.next().await.is_none());
+                    assert!(drained.insert_done, "pass {pass} reached end-of-stream");
+                    drop(drained);
+                }
+            })
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            outcome(&snapshot, "abandoned"),
+            2,
+            "the clipped and the unpolled population, and nothing else: {snapshot:?}"
+        );
+        assert_eq!(
+            outcome(&snapshot, "skip_oversized"),
+            1,
+            "the oversized stream keeps its one charge from poll_next"
+        );
+        assert_eq!(
+            outcome(&snapshot, "insert"),
+            1,
+            "only the first pass over `already-populated` inserts"
         );
     }
 

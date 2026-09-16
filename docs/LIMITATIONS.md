@@ -476,6 +476,20 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   pool for no return on this workload — the sizing question #3053 and #2956
   carry. `crates/siglake-storage/tests/file_cache_population_shape.rs` pins the
   four readings hermetically.
+  Since #4846 the drop is counted rather than inferred:
+  `outcome="abandoned"` is charged from `CachePopulateStream`'s `Drop` for a
+  population that buffered decoded batches and never reached its insert, so a
+  round showing `abandoned` at the `miss` rate with no `insert` reports this
+  shape directly instead of through the absence of four series. It counts
+  ELIGIBLE abandonment only: a stream that crossed the entry bound already
+  charged `skip_oversized`, and one that errored or found its key populated by
+  another partition is finished, not abandoned. The outcomes still do not
+  partition `miss` — `miss` is charged before the populate stream is built, so a
+  construction error leaves a miss with no outcome, and `hit` and `bypass` never
+  build one. The query server pre-registers all eight arms at 0 and panel 162
+  ("Decoded-file cache populations") in `deploy/grafana/siglake-overview.json`
+  charts them; on a default install, where the cache is off, every arm stays at
+  zero.
 - **Query scales by REPLICATION, not by fan-out, for ordinary log search.**
   Adding query replicas multiplies throughput — measured 705 QPS on one
   replica and 2,269 on three (3.22x), with browse p50 flat at 13–21ms through
