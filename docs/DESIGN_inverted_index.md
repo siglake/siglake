@@ -159,6 +159,18 @@ Three 0.2.0 slices carry those two requirements and the build cost behind them:
 and #4377 builds the postings during the streaming merge so the post-commit
 decode pass disappears. None of them changes a 0.1.0 or 0.1.x default.
 
+#4376's format decision, its prototype codec and its measurements live in
+[`DESIGN_segmented_inverted_index.md`](DESIGN_segmented_inverted_index.md):
+per-row-group postings and dictionary blocks addressed by byte range, with the
+directory and trailer written last so a merge can emit the blob in one forward
+pass. Nothing is wired — the format has its own magic, footer-KV key and Puffin
+blob type, so this reader does not see one. Measured on one 7,340,000-row file
+from the same corpus: 526.0 MiB parsed for the whole-file index against
+474.9 KiB of resident directory, and a rare term answered from 14 range reads
+of 9.8 KiB rather than a 3.31 s whole-file decode. The remaining slices are
+#4560 (codec and fixtures), #4561 (reader integration and bounded partial
+reads) and #4562 (the six-shape comparison that decides #4377).
+
 #### The per-execution policy arm (2026-09-16, #4375)
 
 The same completed 14-file fixture was reopened with an 8 GiB parsed-index

@@ -222,7 +222,12 @@ bytes per indexed row — roughly 294 MB parsed for a 7.3M-row file — so a
 50G-class layout's text plan needs several gigabytes of parsed index against a
 query pod's 1 GiB parsed-index cache, and the shapes that take the sidecar path
 land above the ceilings measured on the scan path. Enable it where the working
-set fits, or where pruning is worth more than the decode.
+set fits, or where pruning is worth more than the decode. That whole-file cost
+is a property of the sidecar format, not of its sizing: a row-group-addressable
+replacement a reader can touch in part is specified and measured in
+`docs/DESIGN_segmented_inverted_index.md`. It is a prototype behind its own
+magic, footer-KV key and Puffin blob type, so nothing in this section changes
+until it is wired (#4561).
 
 **Whether to USE an index is decided per execution.** Loading one is a
 whole-file cost, so a query that wants a handful of rows cannot pay it: a text
