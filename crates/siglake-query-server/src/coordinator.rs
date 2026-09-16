@@ -254,9 +254,11 @@ impl ShardRunner for HttpShardRunner {
         // coordinator's request span) as `traceparent` so the worker's shard
         // span becomes a child. No-op when OTel is off (no propagator set).
         let mut trace_headers = reqwest::header::HeaderMap::new();
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let current_context = tracing::Span::current().context();
         opentelemetry::global::get_text_map_propagator(|p| {
             p.inject_context(
-                &opentelemetry::Context::current(),
+                &current_context,
                 &mut opentelemetry_http::HeaderInjector(&mut trace_headers),
             );
         });

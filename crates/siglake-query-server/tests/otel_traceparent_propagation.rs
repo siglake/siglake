@@ -10,8 +10,8 @@
 //! context, `TraceContextPropagator` then writes no header at all, and every
 //! signal that the plumbing is wrong is silence: the worker's span is still
 //! recorded, still exported, still looks fine on its own, and just belongs to a
-//! different trace. Only a test that watches both spans leave one exporter
-//! catches it.
+//! different trace. This test captures the coordinator's tracing span context,
+//! then compares the worker export against it after the real HTTP hop.
 //!
 //! The whole test runs with OTel ON, which is the only configuration in which
 //! propagation is observable at all.
@@ -19,7 +19,7 @@
 use std::sync::{Arc, Mutex};
 
 use opentelemetry::global;
-use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
@@ -27,6 +27,7 @@ use siglake_query_server::coordinator::{HttpShardRunner, ShardRunner};
 use siglake_query_server::{router, AppState, AuthConfig};
 use siglake_storage::iceberg::IcebergContext;
 use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -73,14 +74,24 @@ async fn shard_request_carries_the_coordinator_trace() {
 
     let runner = HttpShardRunner::new(vec![worker_url], None);
     // `SELECT 1` needs no table, so the answer depends on nothing but the hop.
-    let rows = async {
-        runner
-            .run("SELECT 1 AS n", None)
-            .await
-            .expect("shard query")
-    }
-    .instrument(tracing::info_span!("coordinator.fanout"))
-    .await;
+    let coordinator_span = tracing::info_span!("coordinator.fanout");
+    let coordinator_context = coordinator_span.context();
+    let expected = coordinator_context.span().span_context().clone();
+    assert!(expected.is_valid(), "coordinator span has no OTel context");
+
+    // Own the instrumented future and drop it before `force_flush`, so the
+    // exporter holds every completed span when the assertions run.
+    let mut request = Box::pin(
+        async {
+            runner
+                .run("SELECT 1 AS n", None)
+                .await
+                .expect("shard query")
+        }
+        .instrument(coordinator_span),
+    );
+    let rows = request.as_mut().await;
+    drop(request);
     assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 
     server.abort();
@@ -88,10 +99,6 @@ async fn shard_request_carries_the_coordinator_trace() {
 
     let spans = exporter.spans.lock().expect("spans").clone();
     let names: Vec<&str> = spans.iter().map(|s| s.name.as_ref()).collect();
-    let coordinator = spans
-        .iter()
-        .find(|s| s.name == "coordinator.fanout")
-        .unwrap_or_else(|| panic!("no coordinator span; exported: {names:?}"));
     let server_span = spans
         .iter()
         .find(|s| s.name == "http.server")
@@ -99,13 +106,13 @@ async fn shard_request_carries_the_coordinator_trace() {
 
     assert_eq!(
         server_span.span_context.trace_id(),
-        coordinator.span_context.trace_id(),
+        expected.trace_id(),
         "the worker joined a different trace: the traceparent did not survive \
          the hop (exported: {names:?})"
     );
     assert_eq!(
         server_span.parent_span_id,
-        coordinator.span_context.span_id(),
+        expected.span_id(),
         "the worker's span is not a child of the fan-out span"
     );
     assert_eq!(

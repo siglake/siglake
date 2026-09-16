@@ -790,9 +790,9 @@ async fn main() -> Result<()> {
         component_name(&cli.command),
     ))?;
 
-    // `run` owns every exit from this process — a server's graceful shutdown, a
-    // one-shot subcommand's return, any error — so the flush happens once, here,
-    // on all of them. The providers live in a `OnceLock` that never drops, so
+    // `run` owns every exit after initialization — a server's graceful shutdown,
+    // a one-shot subcommand's return, any error — so the flush happens once,
+    // here, on all of them. The providers live in a `OnceLock` that never drops, so
     // nothing else would flush them. No-op when OTel is off.
     let result = run(cli).await;
     siglake_core::telemetry::shutdown();

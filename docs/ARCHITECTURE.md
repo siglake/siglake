@@ -1136,7 +1136,7 @@ tests drive directly; nothing mutates the process environment.
 buffer, and the providers live in a `OnceLock` that never drops, so a
 drop-at-exit guard would ship nothing. Each binary's `main` initializes
 telemetry and then wraps a `run()`, so one `telemetry::shutdown()` covers the
-graceful SIGTERM return, a startup error and a rejected flag alike.
+graceful SIGTERM return, one-shot commands and errors after initialization.
 
 **The disabled path is cheap, not free.** The per-request middleware runs
 whatever the configuration: it allocates the request path, asks the global

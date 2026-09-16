@@ -49,6 +49,7 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 tikv-jemallocator = "0.7.0"
 utoipa = { workspace = true }
@@ -69,7 +70,6 @@ metrics-util = "0.20"
 # with a recording exporter and the tracing bridge, so both halves of the hop
 # land in one exporter.
 opentelemetry_sdk = { workspace = true }
-tracing-opentelemetry = { workspace = true }
 # Only the OTel-off cost measurement still needs tower-http: it compares the new
 # middleware against the `TraceLayer` it replaced on this router.
 tower-http = { workspace = true }

@@ -12,6 +12,7 @@
 //! to arrive before the exit status does.
 
 use std::net::SocketAddr;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::http::StatusCode;
 use axum::Router;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 /// A stand-in OTLP/HTTP collector: counts request bodies and answers 200. The
 /// exporter's own decode of that empty answer is not what is under test.
@@ -134,5 +136,93 @@ async fn a_succeeding_subcommand_flushes_before_it_exits() {
         n > 0,
         "the process returned normally without flushing: the collector saw {n} \
          exports (stderr: {stderr})"
+    );
+}
+
+/// The long-running exit: SIGTERM resolves the ingest server's graceful
+/// shutdown future, `run()` drains its writers, and `main` flushes telemetry.
+/// This covers the deployed server path separately from the one-shot returns
+/// above.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graceful_server_shutdown_flushes_before_it_exits() {
+    let (addr, exports, collector) = collector().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_siglake"))
+        .arg("--data-dir")
+        .arg(tmp.path())
+        .arg("ingest-server")
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--metrics-bind")
+        .arg("127.0.0.1:0")
+        .arg("--disable-otlp-grpc")
+        .env_remove("SIGLAKE_OTEL_DISABLED")
+        .env_remove("SIGLAKE_WAREHOUSE_URL")
+        .env_remove("SIGLAKE_CATALOG_URI")
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", format!("http://{addr}"))
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ingest server");
+    let pid = child.id().expect("child pid");
+    let mut stderr = BufReader::new(child.stderr.take().expect("child stderr"));
+    let mut captured = String::new();
+    let mut server_addr = None;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                stderr.read_line(&mut line).await.expect("read stderr"),
+                0,
+                "ingest server exited before listening: {captured}"
+            );
+            captured.push_str(&line);
+            if line.contains("siglake-ingest HTTP server listening") {
+                server_addr = line
+                    .split_whitespace()
+                    .find_map(|field| field.strip_prefix("addr="))
+                    .map(str::to_string);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("ingest server started");
+    let health_url = format!(
+        "http://{}/healthz",
+        server_addr.expect("server address in log")
+    );
+    let response = tokio::time::timeout(Duration::from_secs(10), reqwest::get(health_url))
+        .await
+        .expect("health request finished")
+        .expect("health request succeeded");
+    assert!(response.status().is_success(), "ingest server became ready");
+
+    // SAFETY: `pid` came from this live child, and SIGTERM neither dereferences
+    // memory nor outlives the process handle retained below.
+    let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(sent, 0, "send SIGTERM to ingest server");
+    let status = tokio::time::timeout(Duration::from_secs(60), child.wait())
+        .await
+        .expect("ingest server stopped")
+        .expect("wait for ingest server");
+    stderr
+        .read_to_string(&mut captured)
+        .await
+        .expect("read remaining stderr");
+    assert!(status.success(), "graceful shutdown failed: {captured}");
+    assert!(
+        captured.contains("shutdown signal received"),
+        "server did not take the graceful signal path: {captured}"
+    );
+
+    collector.abort();
+    let n = exports.load(Ordering::SeqCst);
+    assert!(
+        n > 0,
+        "the graceful server return did not flush: the collector saw {n} \
+         exports (stderr: {captured})"
     );
 }

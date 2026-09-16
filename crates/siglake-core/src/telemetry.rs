@@ -36,8 +36,8 @@
 //! The providers live in the [`TELEMETRY`] `OnceLock`, which never drops, so
 //! nothing flushes them by itself — a `Drop` guard on a process-lifetime static
 //! is not a flush. Every binary calls [`shutdown`] explicitly on the one path
-//! all of its exits funnel through (`main` wrapping a `run()`), which covers the
-//! graceful-shutdown return, a startup error and a bad flag alike.
+//! all post-initialization exits funnel through (`main` wrapping a `run()`),
+//! which covers graceful shutdown, one-shot returns and errors.
 //!
 //! ## Environment reads
 //!
@@ -214,7 +214,7 @@ impl TelemetryGuard {
 
 /// Flush the OTel providers and shut their exporters down. Call this from the
 /// single path every exit of the process funnels through — `main` wrapping a
-/// `run()` — so a graceful shutdown, a startup error and a bad flag all flush.
+/// `run()` — so a graceful shutdown, a one-shot return and errors all flush.
 /// Nothing else flushes: [`TELEMETRY`] is a `OnceLock` that never drops. Safe to
 /// call when OTel is off, before [`init`], or twice (no-op).
 pub fn shutdown() {
