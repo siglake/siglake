@@ -33,6 +33,18 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no
   measurement against a real store has settled. Both are kept for now.
+- **A maintenance process's cache budgets are readable at startup, not on
+  `/metrics`.** The compactor, the ingest server and the `siglake` maintenance
+  subcommands resolve their own budgets now — zero for the two text-index
+  caches, whatever `SIGLAKE_OBJECT_CACHE_BYTES` says for the byte-range cache —
+  and log the resolved numbers once. `siglake_cache_budget_bytes` and
+  `siglake_query_memory_*` are sampled by the query server alone, so a
+  compactor's budget is not scrapeable. Publishing them from the compactor's
+  metrics loop is the extension, and it was left out because the one sampler
+  that exists reads the query memory pool, and reading that pool BUILDS it: a
+  process with no query engine would start publishing a pool it never uses. A
+  cache-only sampler is the change; nothing measured yet needs it, since what a
+  maintenance process holds is a derivation of its limit and its environment.
 - **The operator does not convert WAL between filesystem and catalog-claim
   drains.** Changing `spec.autoscaling.compactor.max` across one changes the
   ownership protocol. If either existing workload template names the other
