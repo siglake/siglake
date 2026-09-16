@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- **Observability (new, off by default)**: setting
+  `OTEL_EXPORTER_OTLP_ENDPOINT` exports the log lines every binary already
+  writes as OTLP log records, and the spans at the boundaries that cost
+  something — the ingest handlers and `ingest_batch`, the compactor drain, the
+  query server's per-request middleware and `distributed_inner` — as OTLP
+  traces over HTTP. The coordinator injects W3C `traceparent` into each shard
+  request and the worker's middleware extracts it, so a distributed query is
+  one trace rather than a root span per replica. `/metrics` does not move:
+  `siglake_*` stays Prometheus, which is what the alerts, the KEDA scalers and
+  the dashboard read, so an OTLP-only backend still needs a collector with a
+  Prometheus receiver (`docs/LIMITATIONS.md`). Unset or empty endpoint and no
+  exporter, batch processor or OTel layer is constructed; what remains is the
+  per-request middleware asking the global propagator to extract and creating a
+  span nothing listens to, measured at +104 ns/request against the `TraceLayer`
+  it replaced and +393 ns against no layer at all. Configuration is the
+  standard OTel environment, read once at startup through pure resolvers —
+  `OTEL_SERVICE_NAME` defaults to `siglake-<component>`,
+  `SIGLAKE_OTEL_DISABLED=1` stops emission without unsetting the endpoint,
+  `OTEL_TRACES_EXPORTER`/`OTEL_LOGS_EXPORTER=none` drops one signal. Neither
+  the chart nor the operator renders any of it, so it reaches a pod through
+  `<tier>.extraEnv`. Console output stays on stderr, where the CRD print and
+  the `--dry-run` reports need it. Each binary's `main` flushes the providers
+  explicitly on a graceful SIGTERM return, a one-shot subcommand's return and
+  any error after initialization: the providers live in a `OnceLock` that never
+  drops, so a drop-at-exit guard shipped nothing. The OTLP exporter uses the
+  blocking `reqwest` client, because the SDK's batch processors export from
+  their own threads and the async client panics with no reactor there. No HTTP
+  surface, values key or default changes. Imported from Gianluca Arbezzano's
+  PR #7. (#4546)
+
 - **Diagnostics (new, off in every released binary)**: on-demand CPU, heap and
   tokio-runtime profiles at `/debug/pprof/{profile,heap,runtime}` on the
   `--metrics-bind` router, so one mount point covers the ingester, the

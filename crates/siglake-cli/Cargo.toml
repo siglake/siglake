@@ -46,6 +46,7 @@ tikv-jemallocator = "0.7.0"
 [dev-dependencies]
 arrow-array = { workspace = true }
 axum = { workspace = true }
+libc = "0.2"
 serde_json = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }

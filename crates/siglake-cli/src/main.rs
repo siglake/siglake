@@ -816,6 +816,33 @@ enum Command {
     },
 }
 
+/// Map the CLI subcommand to the OTel `service.name` component suffix used by
+/// [`siglake_core::telemetry::TelemetryConfig::from_env`] (which prepends
+/// `siglake-`). Deployed long-lived components map to their data-plane role;
+/// one-shot/admin subcommands fall back to `"cli"`.
+fn component_name(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::IngestServer { .. } => "ingest",
+        Command::Compactor { .. } => "compactor",
+        Command::Sql { .. } => "query",
+        Command::SqlDirect { .. } => "query",
+        Command::Ingest { .. } => "ingest",
+        Command::Query { .. } => "query",
+        Command::Gen { .. }
+        | Command::IcebergDemo { .. }
+        | Command::WalRecover { .. }
+        | Command::WalRequeue { .. }
+        | Command::AuditRotate { .. }
+        | Command::GcOrphans { .. }
+        | Command::RetentionSweep { .. }
+        | Command::DeleteSweep { .. }
+        | Command::RebuildGroupCounts { .. }
+        | Command::RebuildTimeAggregates { .. }
+        | Command::MigrateSchema { .. }
+        | Command::Subscribe { .. } => "cli",
+    }
+}
+
 /// Which cache budgets this invocation earns.
 ///
 /// One binary, two roles: `siglake compactor` is the packaged compactor pod and
@@ -888,6 +915,47 @@ fn configure_role_caches(role: WarehouseRole) {
         puffin_blob_cache_bytes = config.text_index.puffin_blob_max_bytes,
         "cache budgets resolved for this role"
     );
+}
+
+#[cfg(test)]
+mod component_name_tests {
+    use super::*;
+
+    fn component_of(argv: &[&str]) -> &'static str {
+        component_name(&Cli::try_parse_from(argv).expect("argv parses").command)
+    }
+
+    /// The three deployed long-lived roles of this binary get three names, so a
+    /// backend's `service.name` separates the ingester's spans from the
+    /// compactor's from a query's. `siglake sql` is the HTTP client, not the
+    /// server, and takes `query` on purpose: its spans belong to the query it
+    /// issued.
+    #[test]
+    fn the_deployed_roles_are_named_apart() {
+        assert_eq!(component_of(&["siglake", "ingest-server"]), "ingest");
+        assert_eq!(component_of(&["siglake", "compactor"]), "compactor");
+        assert_eq!(
+            component_of(&["siglake", "sql-direct", "--query", "select 1"]),
+            "query"
+        );
+    }
+
+    /// A one-shot admin subcommand is not a component, so it takes `cli` rather
+    /// than borrowing a data-plane name and mixing its spans into that tier's.
+    /// Both matches over `Command` are exhaustive, so a new subcommand cannot
+    /// compile without choosing — this pins the choice the merge of #4082's
+    /// `role-cache` work and #4737's `rebuild-time-aggregates` made.
+    #[test]
+    fn one_shot_subcommands_are_cli() {
+        for argv in [
+            vec!["siglake", "gen", "--n", "1"],
+            vec!["siglake", "wal-requeue", "--wal", "/var/lib/siglake/wal"],
+            vec!["siglake", "rebuild-time-aggregates"],
+            vec!["siglake", "migrate-schema"],
+        ] {
+            assert_eq!(component_of(&argv), "cli", "{argv:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1014,19 +1082,28 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Log lines go to stderr so the `println!` reports of the maintenance
-    // subcommands (rebuild-group-counts, migrate-schema --dry-run, gc-orphans,
-    // ...) stay pipe-clean on stdout under the default filter. Container
-    // runtimes capture both streams, so the servers lose nothing.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,siglake=debug".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+
+    // Logs + traces via OTel (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT); the fmt
+    // console layer always stays on. It stays on stderr, so the `println!`
+    // reports of the maintenance subcommands (rebuild-group-counts,
+    // migrate-schema --dry-run, gc-orphans, ...) stay pipe-clean on stdout.
+    // The service name is seeded from the subcommand so each deployed component
+    // (ingest/compactor/query) is distinguishable in the backend.
+    siglake_core::telemetry::init(siglake_core::telemetry::TelemetryConfig::from_env(
+        component_name(&cli.command),
+    ))?;
+
+    // `run` owns every exit after initialization — a server's graceful shutdown,
+    // a one-shot subcommand's return, any error — so the flush happens once,
+    // here, on all of them. The providers live in a `OnceLock` that never drops, so
+    // nothing else would flush them. No-op when OTel is off.
+    let result = run(cli).await;
+    siglake_core::telemetry::shutdown();
+    result
+}
+
+async fn run(cli: Cli) -> Result<()> {
     std::fs::create_dir_all(&cli.data_dir)?;
     // Before anything opens a warehouse or builds the query memory pool, which
     // subtracts what the caches hold.
@@ -2542,6 +2619,7 @@ async fn run_ingest_server(
     if let Some(h) = active_mirror_task {
         h.abort();
     }
+    // `main` flushes the OTel providers once this returns.
     serve_result
 }
 

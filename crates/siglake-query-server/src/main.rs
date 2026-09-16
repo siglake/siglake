@@ -355,17 +355,20 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Log lines go to stderr, matching the siglake CLI and the rest of the
-    // workspace's binaries. The container runtime captures both streams, so
-    // the server loses nothing.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,siglake=debug".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // Logs + traces via OTel (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT); the fmt
+    // console layer always stays on, and stays on stderr, matching the siglake
+    // CLI and the rest of the workspace's binaries.
+    siglake_core::telemetry::init(siglake_core::telemetry::TelemetryConfig::from_env("query"))?;
+    // `run` owns every other exit from this process — graceful shutdown, a
+    // startup error, a bad flag — so the flush happens once, here, on all of
+    // them. The providers live in a `OnceLock` that never drops, so nothing
+    // else would flush them. No-op when OTel is off.
+    let result = run().await;
+    siglake_core::telemetry::shutdown();
+    result
+}
 
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     let read_caches = siglake_storage::resolve_query_read_cache_config(

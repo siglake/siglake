@@ -14,6 +14,7 @@ pub mod oidc;
 #[cfg(feature = "profiling")]
 pub mod profiling;
 pub mod promote;
+pub mod telemetry;
 pub mod tenant;
 
 pub use build_info::{build_info, BuildInfo, BUILD_VERSION};
