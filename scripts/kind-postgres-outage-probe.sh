@@ -151,9 +151,11 @@ printf "outcome=%s\tstatus=%s\tseconds=%s\tdetail=%s\n" "$outcome" "$status" \
 
 # Both remote readers are advisory: a failed exec is retained as evidence that
 # the pause window went unobserved, never as a reason to leave Postgres stopped.
+# Their request timeouts are short for the same reason — an exec that cannot be
+# served against a stopped PID 1 costs one sample, not the window.
 postgres_process_state() {
   local output=$1 status=0
-  kubectl --context "$KUBE_CONTEXT" --request-timeout=30s -n "$NAMESPACE" \
+  kubectl --context "$KUBE_CONTEXT" --request-timeout=10s -n "$NAMESPACE" \
     exec "$POSTGRES_POD" -- sh -eu -c "$POSTGRES_STATE_SNIPPET" \
     >"$output" 2>"$output.err" || status=$?
   printf '%s' "$status"
@@ -163,7 +165,7 @@ postgres_write_probe() {
   local phase=$1 at status=0 line=
   at=$(iso_now)
   line=$(kubectl --context "$KUBE_CONTEXT" \
-    --request-timeout="$((WRITE_PROBE_SECONDS + 30))s" -n "$NAMESPACE" \
+    --request-timeout="$((WRITE_PROBE_SECONDS + 15))s" -n "$NAMESPACE" \
     exec "$POSTGRES_POD" -- sh -eu -c "$POSTGRES_WRITE_PROBE_SNIPPET" \
     write-probe "$WRITE_PROBE_SECONDS" 2>"$TMP_DIR/write-probe.err") || status=$?
   python3 - "$phase" "$at" "$WRITE_PROBE_SECONDS" "$status" "$line" \
