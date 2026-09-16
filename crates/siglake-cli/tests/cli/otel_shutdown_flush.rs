@@ -44,6 +44,35 @@ async fn collector() -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<(
     (addr, exports, handle)
 }
 
+fn server_addr_from_log(line: &str) -> Option<String> {
+    let mut plain = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.next_if_eq(&'[').is_some() {
+            for escape_ch in chars.by_ref() {
+                if ('@'..='~').contains(&escape_ch) {
+                    break;
+                }
+            }
+        } else {
+            plain.push(ch);
+        }
+    }
+    plain
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("addr=").map(str::to_string))
+}
+
+#[test]
+fn server_address_parser_ignores_tracing_ansi_codes() {
+    let colored = "siglake-ingest HTTP server listening \
+        \x1b[3maddr\x1b[0m\x1b[2m=\x1b[0m127.0.0.1:43123\x1b[0m";
+    assert_eq!(
+        server_addr_from_log(colored).as_deref(),
+        Some("127.0.0.1:43123")
+    );
+}
+
 /// Run the real binary, either on a path that returns `Err` (`wal-recover`
 /// with an unparseable `--from`, which touches no storage and returns in
 /// milliseconds) or on one that returns `Ok` (`gen`, which prints events).
@@ -180,10 +209,7 @@ async fn a_graceful_server_shutdown_flushes_before_it_exits() {
             );
             captured.push_str(&line);
             if line.contains("siglake-ingest HTTP server listening") {
-                server_addr = line
-                    .split_whitespace()
-                    .find_map(|field| field.strip_prefix("addr="))
-                    .map(str::to_string);
+                server_addr = server_addr_from_log(&line);
                 break;
             }
         }
