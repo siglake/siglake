@@ -781,14 +781,25 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Logs + traces via OTel (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT); the fmt
-    // console layer always stays on. The service name is seeded from the
-    // subcommand so each deployed component (ingest/compactor/query) is
-    // distinguishable in the backend. Providers flush via
-    // `telemetry::shutdown()` on the SIGTERM path and via static-drop on exit.
+    // console layer always stays on. It stays on stderr, so the `println!`
+    // reports of the maintenance subcommands (rebuild-group-counts,
+    // migrate-schema --dry-run, gc-orphans, ...) stay pipe-clean on stdout.
+    // The service name is seeded from the subcommand so each deployed component
+    // (ingest/compactor/query) is distinguishable in the backend.
     siglake_core::telemetry::init(siglake_core::telemetry::TelemetryConfig::from_env(
         component_name(&cli.command),
     ))?;
 
+    // `run` owns every exit from this process — a server's graceful shutdown, a
+    // one-shot subcommand's return, any error — so the flush happens once, here,
+    // on all of them. The providers live in a `OnceLock` that never drops, so
+    // nothing else would flush them. No-op when OTel is off.
+    let result = run(cli).await;
+    siglake_core::telemetry::shutdown();
+    result
+}
+
+async fn run(cli: Cli) -> Result<()> {
     std::fs::create_dir_all(&cli.data_dir)?;
 
     match cli.command {
@@ -2281,10 +2292,7 @@ async fn run_ingest_server(
     if let Some(h) = active_mirror_task {
         h.abort();
     }
-    // Flush buffered OTel logs/traces before exit (the SIGTERM that got us
-    // here killed the signal future; the process-wide static Drop would not
-    // run if something later calls process::exit). No-op when OTel is off.
-    siglake_core::telemetry::shutdown();
+    // `main` flushes the OTel providers once this returns.
     serve_result
 }
 

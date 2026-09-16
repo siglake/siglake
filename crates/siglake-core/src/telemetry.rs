@@ -18,23 +18,33 @@
 //! - **Metrics** — *not* handled here. The `metrics` crate + Prometheus exporter
 //!   ([`crate::metrics::init`]) stays the metrics path on the app side; an OTel
 //!   Collector with a Prometheus receiver unifies them into OTLP downstream. None
-//!   of the 334 `metrics::` call sites change.
+//!   of the `metrics::` call sites change.
 //!
 //! ## Opt-in
 //!
 //! OTel emission is **off by default**. It turns on iff
 //! `OTEL_EXPORTER_OTLP_ENDPOINT` is set (and `SIGLAKE_OTEL_DISABLED=1` is not).
-//! Deployments that don't set it get a fmt-only subscriber byte-identical to the
-//! previous inlined `tracing_subscriber::fmt()…init()` — protecting existing
-//! smoke rounds. Standard OTel env vars drive behavior:
-//! `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_HEADERS`,
-//! `OTEL_TRACES_EXPORTER`, `OTEL_LOGS_EXPORTER`, `OTEL_BSP_*`/`OTEL_BLRP_*`.
+//! Deployments that don't set it get a fmt-only subscriber equivalent to the
+//! previous inlined `tracing_subscriber::fmt()…init()`, on stderr, which is where
+//! every siglake binary's console output goes. Standard OTel env vars drive
+//! behavior: `OTEL_SERVICE_NAME`, `OTEL_SERVICE_NAMESPACE`,
+//! `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_HEADERS`,
+//! `OTEL_TRACES_EXPORTER`, `OTEL_LOGS_EXPORTER`.
 //!
 //! ## Shutdown
 //!
-//! [`TelemetryGuard`] owns the OTel providers. Hold it for the process lifetime
-//! and call [`TelemetryGuard::shutdown`] on the SIGTERM path before exit so the
-//! batch processors flush buffered OTLP. `Drop` also shuts down as a safety net.
+//! The providers live in the [`TELEMETRY`] `OnceLock`, which never drops, so
+//! nothing flushes them by itself — a `Drop` guard on a process-lifetime static
+//! is not a flush. Every binary calls [`shutdown`] explicitly on the one path
+//! all of its exits funnel through (`main` wrapping a `run()`), which covers the
+//! graceful-shutdown return, a startup error and a bad flag alike.
+//!
+//! ## Environment reads
+//!
+//! Every env read happens once, in [`TelemetryConfig::from_env`], which is a thin
+//! wrapper over the pure [`TelemetryConfig::resolve`] (plus the per-knob
+//! `*_from` twins). Tests drive the pure functions; nothing here mutates the
+//! process environment.
 
 use std::collections::HashMap;
 use std::env;
@@ -59,6 +69,7 @@ use tracing_subscriber::{EnvFilter, Registry};
 /// Configuration for [`init`]. Build with [`TelemetryConfig::from_env`] so the
 /// standard `OTEL_*` env vars drive behavior and the `service.name` defaults to
 /// `siglake-<component>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetryConfig {
     /// OTLP/HTTP endpoint, e.g. `http://otel-collector:4318`. `None` ⇒ OTel
     /// emission off (fmt-only subscriber, identical to pre-OTel behavior).
@@ -66,13 +77,18 @@ pub struct TelemetryConfig {
     /// `OTEL_EXPORTER_OTLP_HEADERS` ("k=v,k=v"), forwarded as exporter headers.
     pub otlp_headers: Option<String>,
     pub service_name: String,
-    pub service_namespace: Option<String>,
     pub enable_traces: bool,
     pub enable_logs: bool,
+    /// Resource attributes beyond `service.name`, already resolved from the
+    /// environment (`service.namespace`, `host.name`, `service.instance.id`,
+    /// `OTEL_RESOURCE_ATTRIBUTES`), so building the `Resource` reads no env.
+    pub resource_attributes: Vec<(String, String)>,
     /// Fallback `RUST_LOG`-style filter when `RUST_LOG` is unset, e.g.
     /// `info,siglake=debug`.
     pub default_log_filter: String,
-    /// Route the fmt (console) layer to stderr instead of stdout.
+    /// Route the fmt (console) layer to stderr. Defaults to `true`: every
+    /// siglake binary keeps stdout free for its reports (`--print-crd`,
+    /// `migrate-schema --dry-run`, the SQL client's rows).
     pub fmt_to_stderr: bool,
 }
 
@@ -80,37 +96,94 @@ impl TelemetryConfig {
     /// Read the standard `OTEL_*` env vars. `component` (e.g. `"ingest"`,
     /// `"query"`) seeds the default `OTEL_SERVICE_NAME` (`siglake-<component>`).
     pub fn from_env(component: &str) -> Self {
-        let otlp_endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let disabled = env::var("SIGLAKE_OTEL_DISABLED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let otel_on = otlp_endpoint.is_some() && !disabled;
+        Self::resolve(component, &|key| env::var(key).ok())
+    }
 
-        let exporter_on = |name: &str| {
-            env::var(name)
-                .map(|v| !v.eq_ignore_ascii_case("none") && !v.eq_ignore_ascii_case("off"))
-                .unwrap_or(true)
-        };
+    /// The pure twin of [`TelemetryConfig::from_env`]: every env read goes
+    /// through `get`, so tests pass a fixed lookup instead of mutating the
+    /// process environment.
+    pub fn resolve(component: &str, get: &dyn Fn(&str) -> Option<String>) -> Self {
+        let otlp_endpoint = otlp_endpoint_from(get("OTEL_EXPORTER_OTLP_ENDPOINT").as_deref());
+        let otel_on =
+            otlp_endpoint.is_some() && !otel_disabled_from(get("SIGLAKE_OTEL_DISABLED").as_deref());
 
         Self {
             otlp_endpoint,
-            otlp_headers: env::var("OTEL_EXPORTER_OTLP_HEADERS").ok(),
-            service_name: env::var("OTEL_SERVICE_NAME")
-                .unwrap_or_else(|_| format!("siglake-{component}")),
-            service_namespace: env::var("OTEL_SERVICE_NAMESPACE").ok(),
-            enable_traces: otel_on && exporter_on("OTEL_TRACES_EXPORTER"),
-            enable_logs: otel_on && exporter_on("OTEL_LOGS_EXPORTER"),
+            otlp_headers: get("OTEL_EXPORTER_OTLP_HEADERS"),
+            service_name: service_name_from(get("OTEL_SERVICE_NAME").as_deref(), component),
+            enable_traces: otel_on && exporter_enabled_from(get("OTEL_TRACES_EXPORTER").as_deref()),
+            enable_logs: otel_on && exporter_enabled_from(get("OTEL_LOGS_EXPORTER").as_deref()),
+            resource_attributes: resource_attributes_from(
+                get("OTEL_SERVICE_NAMESPACE").as_deref(),
+                get("HOSTNAME").or_else(|| get("HOST")).as_deref(),
+                get("POD_NAME").as_deref(),
+                get("OTEL_RESOURCE_ATTRIBUTES").as_deref(),
+            ),
             default_log_filter: format!("info,siglake=debug,siglake_{component}=debug"),
-            fmt_to_stderr: false,
+            fmt_to_stderr: true,
         }
     }
 }
 
+/// An empty `OTEL_EXPORTER_OTLP_ENDPOINT` is "unset": a chart that renders the
+/// variable with no value must not turn emission on.
+fn otlp_endpoint_from(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// `SIGLAKE_OTEL_DISABLED=1|true` is the kill switch that overrides a set
+/// endpoint (a deployment can turn emission off without editing the endpoint).
+fn otel_disabled_from(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// `OTEL_{TRACES,LOGS}_EXPORTER`: `none`/`off` turns that signal off, anything
+/// else (including unset) leaves it on, per the OTel env-var spec.
+fn exporter_enabled_from(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        Some(v) => !v.eq_ignore_ascii_case("none") && !v.eq_ignore_ascii_case("off"),
+        None => true,
+    }
+}
+
+fn service_name_from(raw: Option<&str>, component: &str) -> String {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("siglake-{component}"))
+}
+
+/// Resource attributes beyond `service.name`, in precedence order: the explicit
+/// `OTEL_SERVICE_NAMESPACE`, the pod/host identity a Kubernetes deployment
+/// injects, then the operator's free-form `OTEL_RESOURCE_ATTRIBUTES`.
+fn resource_attributes_from(
+    namespace: Option<&str>,
+    host: Option<&str>,
+    pod: Option<&str>,
+    extra: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut push = |key: &str, value: Option<&str>| {
+        if let Some(v) = value.map(str::trim).filter(|s| !s.is_empty()) {
+            out.push((key.to_string(), v.to_string()));
+        }
+    };
+    push("service.namespace", namespace);
+    push("host.name", host);
+    push("service.instance.id", pod);
+    if let Some(extra) = extra {
+        let mut pairs: Vec<(String, String)> = parse_kv_pairs(extra).into_iter().collect();
+        pairs.sort();
+        out.extend(pairs);
+    }
+    out
+}
+
 /// Owns the OTel providers for the process lifetime. Stored in the process-wide
-/// [`TELEMETRY`] static so [`shutdown`] can flush from the SIGTERM path; `Drop`
-/// flushes as a safety net on normal exit (static drop). Not returned to callers.
+/// [`TELEMETRY`] static so [`shutdown`] can flush from the binaries' single exit
+/// path. The static never drops, so `Drop` is not a flush — see [`shutdown`].
 struct TelemetryGuard {
     tracer_provider: Option<SdkTracerProvider>,
     logger_provider: Option<SdkLoggerProvider>,
@@ -139,16 +212,11 @@ impl TelemetryGuard {
     }
 }
 
-impl Drop for TelemetryGuard {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
 /// Flush the OTel providers and shut their exporters down. Call this from the
-/// SIGTERM/shutdown path before `process::exit` so buffered OTLP ships. Safe to
-/// call when OTel is off or already shut down (no-op). On normal return from
-/// `main` the [`TELEMETRY`] static's `Drop` does this automatically.
+/// single path every exit of the process funnels through — `main` wrapping a
+/// `run()` — so a graceful shutdown, a startup error and a bad flag all flush.
+/// Nothing else flushes: [`TELEMETRY`] is a `OnceLock` that never drops. Safe to
+/// call when OTel is off, before [`init`], or twice (no-op).
 pub fn shutdown() {
     if let Some(g) = TELEMETRY.get() {
         g.shutdown();
@@ -160,9 +228,10 @@ pub fn shutdown() {
 /// the W3C `TraceContextPropagator` globally so `opentelemetry_http`
 /// `HeaderInjector`/`HeaderExtractor` carry `traceparent` across HTTP hops.
 ///
-/// Stores the providers in a process-wide static; call [`shutdown`] on the
-/// SIGTERM path to flush. When OTel is off (`otlp_endpoint` is `None`) this is
-/// equivalent to the old `tracing_subscriber::fmt().with_env_filter(...).init()`.
+/// Stores the providers in a process-wide static; call [`shutdown`] before the
+/// process exits to flush. When OTel is off (`otlp_endpoint` is `None`) this is
+/// equivalent to the old `tracing_subscriber::fmt().with_env_filter(...)
+/// .with_writer(std::io::stderr).init()`.
 pub fn init(cfg: TelemetryConfig) -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&cfg.default_log_filter));
@@ -296,28 +365,13 @@ pub fn init(cfg: TelemetryConfig) -> Result<()> {
 
 fn build_resource(cfg: &TelemetryConfig) -> Resource {
     let mut builder = Resource::builder().with_service_name(cfg.service_name.clone());
-    if let Some(ns) = &cfg.service_namespace {
-        builder = builder.with_attributes([KeyValue::new("service.namespace", ns.clone())]);
-    }
-    if let Ok(host) = env::var("HOSTNAME").or_else(|_| env::var("HOST")) {
-        if !host.is_empty() {
-            builder = builder.with_attributes([KeyValue::new("host.name", host)]);
-        }
-    }
-    if let Ok(pod) = env::var("POD_NAME") {
-        if !pod.is_empty() {
-            builder = builder.with_attributes([KeyValue::new("service.instance.id", pod)]);
-        }
-    }
-    // Merge user-supplied OTEL_RESOURCE_ATTRIBUTES (k=v,k=v).
-    if let Ok(attrs) = env::var("OTEL_RESOURCE_ATTRIBUTES") {
-        let kvs: Vec<KeyValue> = parse_kv_pairs(&attrs)
-            .into_iter()
-            .map(|(k, v)| KeyValue::new(k, v))
-            .collect();
-        if !kvs.is_empty() {
-            builder = builder.with_attributes(kvs);
-        }
+    let attrs: Vec<KeyValue> = cfg
+        .resource_attributes
+        .iter()
+        .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+        .collect();
+    if !attrs.is_empty() {
+        builder = builder.with_attributes(attrs);
     }
     builder.build()
 }
@@ -339,6 +393,48 @@ fn parse_kv_pairs(s: &str) -> HashMap<String, String> {
 mod tests {
     use super::*;
 
+    use std::sync::{Arc, Mutex};
+
+    use opentelemetry::trace::Tracer;
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+
+    /// Records what the batch processor hands the exporter, and how many times
+    /// the provider shuts it down. The SDK's own `InMemorySpanExporter` clears
+    /// its store on shutdown, which is exactly the moment under test here.
+    #[derive(Debug, Default, Clone)]
+    struct RecordingExporter {
+        exported: Arc<Mutex<Vec<String>>>,
+        shutdowns: Arc<Mutex<usize>>,
+    }
+
+    impl SpanExporter for RecordingExporter {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            let mut exported = self.exported.lock().expect("exported");
+            exported.extend(batch.into_iter().map(|s| s.name.to_string()));
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+            *self.shutdowns.lock().expect("shutdowns") += 1;
+            Ok(())
+        }
+    }
+
+    /// A lookup over a fixed table, standing in for the process environment.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
     #[test]
     fn parse_kv_pairs_basic() {
         let m = parse_kv_pairs("a=1, b=two ,c=,=x");
@@ -349,13 +445,144 @@ mod tests {
     }
 
     #[test]
-    fn from_env_defaults_service_name() {
-        env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
-        env::remove_var("OTEL_SERVICE_NAME");
-        let cfg = TelemetryConfig::from_env("query");
+    fn resolve_defaults_service_name_and_leaves_otel_off() {
+        let cfg = TelemetryConfig::resolve("query", &env_of(&[]));
         assert_eq!(cfg.service_name, "siglake-query");
         assert!(cfg.otlp_endpoint.is_none());
         assert!(!cfg.enable_traces);
         assert!(!cfg.enable_logs);
+        assert!(cfg.fmt_to_stderr, "console output stays on stderr");
+        assert!(cfg.resource_attributes.is_empty());
+    }
+
+    #[test]
+    fn resolve_turns_both_signals_on_for_an_endpoint() {
+        let cfg = TelemetryConfig::resolve(
+            "ingest",
+            &env_of(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")]),
+        );
+        assert_eq!(cfg.otlp_endpoint.as_deref(), Some("http://collector:4318"));
+        assert!(cfg.enable_traces);
+        assert!(cfg.enable_logs);
+    }
+
+    #[test]
+    fn endpoint_and_disable_switch() {
+        assert_eq!(otlp_endpoint_from(None), None);
+        assert_eq!(otlp_endpoint_from(Some("")), None);
+        assert_eq!(otlp_endpoint_from(Some("  ")), None);
+        assert_eq!(
+            otlp_endpoint_from(Some(" http://c:4318 ")).as_deref(),
+            Some("http://c:4318")
+        );
+
+        assert!(!otel_disabled_from(None));
+        assert!(!otel_disabled_from(Some("0")));
+        assert!(otel_disabled_from(Some("1")));
+        assert!(otel_disabled_from(Some("TRUE")));
+
+        // The kill switch beats a set endpoint.
+        let cfg = TelemetryConfig::resolve(
+            "compactor",
+            &env_of(&[
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
+                ("SIGLAKE_OTEL_DISABLED", "1"),
+            ]),
+        );
+        assert!(!cfg.enable_traces);
+        assert!(!cfg.enable_logs);
+    }
+
+    #[test]
+    fn per_signal_exporter_switch() {
+        assert!(exporter_enabled_from(None));
+        assert!(exporter_enabled_from(Some("otlp")));
+        assert!(!exporter_enabled_from(Some("none")));
+        assert!(!exporter_enabled_from(Some("OFF")));
+
+        let cfg = TelemetryConfig::resolve(
+            "query",
+            &env_of(&[
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
+                ("OTEL_LOGS_EXPORTER", "none"),
+            ]),
+        );
+        assert!(cfg.enable_traces);
+        assert!(!cfg.enable_logs, "logs off, traces still on");
+    }
+
+    #[test]
+    fn service_name_override_wins() {
+        assert_eq!(service_name_from(None, "query"), "siglake-query");
+        assert_eq!(service_name_from(Some(""), "query"), "siglake-query");
+        assert_eq!(service_name_from(Some("shard-a"), "query"), "shard-a");
+    }
+
+    #[test]
+    fn resource_attributes_carry_pod_identity_and_extras() {
+        let attrs = resource_attributes_from(
+            Some("prod"),
+            Some("node-7"),
+            Some("siglake-query-1"),
+            Some("region=eu-central-1,team=platform"),
+        );
+        assert_eq!(
+            attrs,
+            vec![
+                ("service.namespace".to_string(), "prod".to_string()),
+                ("host.name".to_string(), "node-7".to_string()),
+                (
+                    "service.instance.id".to_string(),
+                    "siglake-query-1".to_string()
+                ),
+                ("region".to_string(), "eu-central-1".to_string()),
+                ("team".to_string(), "platform".to_string()),
+            ]
+        );
+        assert!(resource_attributes_from(None, Some(""), None, None).is_empty());
+    }
+
+    /// The claim [`shutdown`] makes: buffered spans reach the exporter because
+    /// the provider is shut down explicitly, not because anything drops. The
+    /// `OnceLock` in production never drops, so this is the whole flush.
+    #[test]
+    fn provider_shutdown_flushes_and_is_idempotent() {
+        let exporter = RecordingExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("test");
+        tracer.in_span("buffered", |_| {});
+
+        let guard = TelemetryGuard {
+            tracer_provider: Some(provider),
+            logger_provider: None,
+            shutdown: AtomicBool::new(false),
+        };
+        assert!(
+            exporter.exported.lock().unwrap().is_empty(),
+            "batch processor holds the span until shutdown"
+        );
+
+        guard.shutdown();
+        assert_eq!(
+            *exporter.exported.lock().unwrap(),
+            vec!["buffered".to_string()],
+            "shutdown flushed the batch processor"
+        );
+        assert_eq!(*exporter.shutdowns.lock().unwrap(), 1);
+
+        // A second call must not export or shut down again: a binary may call
+        // `shutdown` after a path that already did.
+        guard.shutdown();
+        assert_eq!(exporter.exported.lock().unwrap().len(), 1);
+        assert_eq!(*exporter.shutdowns.lock().unwrap(), 1);
+    }
+
+    /// `shutdown()` before `init()` — the path a binary takes when clap rejects
+    /// a flag — must not panic.
+    #[test]
+    fn shutdown_before_init_is_a_no_op() {
+        super::shutdown();
     }
 }
