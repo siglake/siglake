@@ -918,6 +918,47 @@ fn configure_role_caches(role: WarehouseRole) {
 }
 
 #[cfg(test)]
+mod component_name_tests {
+    use super::*;
+
+    fn component_of(argv: &[&str]) -> &'static str {
+        component_name(&Cli::try_parse_from(argv).expect("argv parses").command)
+    }
+
+    /// The three deployed long-lived roles of this binary get three names, so a
+    /// backend's `service.name` separates the ingester's spans from the
+    /// compactor's from a query's. `siglake sql` is the HTTP client, not the
+    /// server, and takes `query` on purpose: its spans belong to the query it
+    /// issued.
+    #[test]
+    fn the_deployed_roles_are_named_apart() {
+        assert_eq!(component_of(&["siglake", "ingest-server"]), "ingest");
+        assert_eq!(component_of(&["siglake", "compactor"]), "compactor");
+        assert_eq!(
+            component_of(&["siglake", "sql-direct", "--query", "select 1"]),
+            "query"
+        );
+    }
+
+    /// A one-shot admin subcommand is not a component, so it takes `cli` rather
+    /// than borrowing a data-plane name and mixing its spans into that tier's.
+    /// Both matches over `Command` are exhaustive, so a new subcommand cannot
+    /// compile without choosing — this pins the choice the merge of #4082's
+    /// `role-cache` work and #4737's `rebuild-time-aggregates` made.
+    #[test]
+    fn one_shot_subcommands_are_cli() {
+        for argv in [
+            vec!["siglake", "gen", "--n", "1"],
+            vec!["siglake", "wal-requeue", "--wal", "/var/lib/siglake/wal"],
+            vec!["siglake", "rebuild-time-aggregates"],
+            vec!["siglake", "migrate-schema"],
+        ] {
+            assert_eq!(component_of(&argv), "cli", "{argv:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod warehouse_role_tests {
     use super::*;
 
