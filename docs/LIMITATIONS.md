@@ -83,12 +83,23 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   stopped tier's missing series also holds the two healthy ones at their
   current size. An activation signal that outlives the stopped pods (a
   catalog-side backlog probe, a request-driven wake-up) is not implemented.
-- **Audit appends have no service deadline.** Query responses never wait for
-  the best-effort audit worker, and its retained rows and conversion working set
-  are bounded by count and charged bytes. A storage append can still hold that
-  bounded capacity indefinitely; later audit rows are dropped whole and exposed
-  by `siglake_query_audit_dropped_total{reason}` until the append returns or the
-  process restarts.
+- **An audit batch can be lost at its append deadline.** Query responses never
+  wait for the best-effort audit worker, its retained rows and conversion
+  working set are bounded by count and charged bytes, and each append is
+  bounded by a service deadline (30 s;
+  `SIGLAKE_QUERY_AUDIT_APPEND_DEADLINE_SECS`, `0` restores an unbounded await).
+  A storage append that outlives the deadline is abandoned so the worker can
+  serve the rows behind it, and the abandoned batch's rows are gone: they are
+  counted by `siglake_query_audit_dropped_total{reason="append_deadline"}`
+  beside one `siglake_query_audit_failures_total{reason="append_deadline"}`,
+  and nothing re-submits them. They are not retried on purpose. The deadline
+  cuts the worker's await, not the append's effects — a commit whose catalog
+  write had already gone out can land unseen — so a retry would duplicate the
+  rows it did persist rather than recover the ones it did not. Rows submitted
+  while an append is still running are dropped whole once the bounded capacity
+  is full, as before. Per-row delivery is therefore best-effort in both
+  directions: the `query_audit` table is an operational record, not an
+  accounting one.
 - **Dropping an index does not reclaim its committed storage.** `DELETE
   /api/v1/indexes/{id}` removes the catalog entry only. The retention and
   orphan-GC paths both need to load that entry, so neither can reclaim the

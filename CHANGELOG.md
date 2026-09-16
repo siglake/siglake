@@ -2,10 +2,11 @@
 
 ## 0.1.1
 
-Seven changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
+Eight changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
 surface moves, and a 0.1.0 warehouse is read and written unchanged: one values
-key and four environment knobs are added, every existing default holds, and no
-flag or values key is removed. The
+key and five environment knobs are added, and no flag or values key is removed.
+The one default that moves is the audit worker's, which now gives each append
+30 s instead of awaiting it forever. The
 workspace version, both chart `version`/`appVersion` pairs, the pinned image
 tags under `deploy/` and the two OpenAPI documents' `info.version` all read
 `0.1.1`, and git tag `v0.1.1` publishes image tag `0.1.1`.
@@ -112,6 +113,22 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   `siglake_compactor_segments_poisoned{tenant}` levels them, and
   `SiglakeSegmentsQuarantined` now fires on either drain's held-back segments
   (still 34 alerts). (#3143)
+- **Query audit**: an audit append now has 30 s to finish
+  (`SIGLAKE_QUERY_AUDIT_APPEND_DEADLINE_SECS`; `0` restores the unbounded
+  await). Query responses never waited on the audit worker and 0.1.0 bounded
+  what it retains, but a single append that stopped answering still held that
+  whole bounded budget: every later row was refused as `row_limit` or
+  `byte_limit`, and nothing reached the `query_audit` table again until the
+  process restarted. A batch that outlives the deadline is abandoned, which
+  releases its rows and lets the worker take the ones behind it; the rows are
+  counted by `siglake_query_audit_dropped_total{reason="append_deadline"}`
+  beside one `siglake_query_audit_failures_total{reason="append_deadline"}`,
+  and the dashboard's drop panel names them. Shutdown of a finite queue is
+  bounded by the same deadline. The abandoned batch is never re-appended: the
+  deadline cuts the worker's await rather than the append, so a catalog commit
+  that had already gone out can land unseen, and a retry would duplicate the
+  rows it did persist. Audit rows can therefore be lost whole at the deadline,
+  which `docs/LIMITATIONS.md` now records. (#3438)
 - **Naming**: the ingest handlers, their rate-limit middleware and the prose
   around ingest tokens no longer carry the name of the HTTP event-collector
   compatibility surface that was removed in 2026-06. The middleware is named in

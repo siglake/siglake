@@ -58,7 +58,7 @@ use siglake_storage::iceberg::IcebergContext;
 
 pub use audit::{
     AuditAppender, AuditLimits, AuditRow, AuditService, AuditStatus, AuditUsage, AuditWriter,
-    DEFAULT_AUDIT_LIMITS,
+    DEFAULT_AUDIT_APPEND_DEADLINE, DEFAULT_AUDIT_LIMITS,
 };
 pub use auth::{AuthConfig, CallerIdentity};
 pub use error::ApiError;
