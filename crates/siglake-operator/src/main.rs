@@ -303,4 +303,41 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["siglake-operator", "print-crd"]).is_err());
     }
+
+    /// The adoption namespace is optional on the command line and resolves to
+    /// the release name when it is absent — the `-n {name}` every runbook step
+    /// assumed before the flag existed.
+    #[test]
+    fn the_adoption_namespace_is_optional_and_falls_back_to_the_release_name() {
+        use siglake_operator::adopt::adoption_namespace_from;
+
+        let cli = Cli::try_parse_from([
+            "siglake-operator",
+            "--adopt-values",
+            "values.yaml",
+            "--adopt-cluster-name",
+            "acme",
+        ])
+        .unwrap();
+        assert_eq!(cli.adopt_namespace, None);
+        assert_eq!(
+            adoption_namespace_from(cli.adopt_namespace.as_deref(), &cli.adopt_cluster_name),
+            "acme"
+        );
+
+        let cli = Cli::try_parse_from([
+            "siglake-operator",
+            "--adopt-values",
+            "values.yaml",
+            "--adopt-cluster-name",
+            "acme",
+            "--adopt-namespace",
+            "obs-prod",
+        ])
+        .unwrap();
+        assert_eq!(
+            adoption_namespace_from(cli.adopt_namespace.as_deref(), &cli.adopt_cluster_name),
+            "obs-prod"
+        );
+    }
 }
