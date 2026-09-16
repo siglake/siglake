@@ -174,6 +174,20 @@ pub const PROCESSING_DIR: &str = "processing";
 /// failed on EFS), we quarantine the orphans for ops to inspect.
 pub const ORPHANS_DIR: &str = "orphans";
 
+/// `poison/` holds segments the local drain set aside because reading them
+/// failed on every attempt it gave them — a truncated restore, a bad sector,
+/// or a frame this build cannot decode (#3143). Distinct from `orphans/` on
+/// purpose: orphan disposition deletes or requeues its residents on every
+/// cycle, and a segment that can never be read has to stay put instead of
+/// taking the next batch down with it.
+///
+/// Layout is `poison/<segment>.arrow` beside
+/// `poison/<segment>.arrow.poison.json`, a [`PoisonNote`] recording why and
+/// after how many attempts. The segment bytes are never rewritten and never
+/// deleted; [`requeue_poisoned_segment`] is the deliberate way back into
+/// `sealed/`.
+pub const POISON_DIR: &str = "poison";
+
 /// `committed/` is where the compactor moves segments after a successful
 /// Iceberg commit, *instead of deleting them*. A retention sweep
 /// eventually removes them. This gives secondary consumers (notably the
@@ -1856,6 +1870,106 @@ mod lifecycle_durability_tests {
         assert_eq!(rows_in(&committed), 1);
     }
 
+    /// #3143: the note is durable before the segment carries its name, and
+    /// the set-aside is durable before `processing/` forgets it. Anything
+    /// weaker leaves a restart with a segment it cannot explain.
+    #[test]
+    fn setting_a_segment_aside_publishes_the_note_before_the_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sealed = sealed_segment(tmp.path());
+        let name = name_of(&sealed);
+        let claimed = claim_segment(&sealed).unwrap();
+        let before = fs::read(&claimed).unwrap();
+
+        probe::record();
+        let dest = quarantine_poison_segment(&claimed, "reading it failed", 3).unwrap();
+        let ops = probe::taken();
+        let at = |op: &str| {
+            ops.iter()
+                .position(|o| o == op)
+                .unwrap_or_else(|| panic!("{op} missing from {ops:?}"))
+        };
+        assert!(
+            at(&format!("rename {name}.poison.json")) < at(&format!("rename {name}")),
+            "a poisoned segment is never without its verdict: {ops:?}"
+        );
+        assert_eq!(
+            ops.last().map(String::as_str),
+            Some("sync_dir processing"),
+            "the set-aside is durable before the claim is forgotten: {ops:?}"
+        );
+
+        assert_eq!(dest, tmp.path().join(POISON_DIR).join(&name));
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            before,
+            "the original bytes are preserved verbatim"
+        );
+        assert!(list_segments(tmp.path(), PROCESSING_DIR)
+            .unwrap()
+            .is_empty());
+        assert!(list_sealed(tmp.path()).unwrap().is_empty());
+        assert_eq!(list_poisoned(tmp.path()).unwrap(), vec![dest.clone()]);
+
+        let note = read_poison_note(&dest).expect("the note is readable");
+        assert_eq!(note.segment, name);
+        assert_eq!(note.reason, "reading it failed");
+        assert_eq!(note.attempts, 3);
+        assert!(note.quarantined_at_ms > 0);
+    }
+
+    /// The set-aside never clobbers: a second verdict on a name already held
+    /// is refused, which leaves the caller holding the segment it started
+    /// with rather than silently losing one of the two.
+    #[test]
+    fn setting_aside_refuses_a_name_already_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = sealed_segment(tmp.path());
+        let name = name_of(&first);
+        quarantine_poison_segment(&first, "first", 3).unwrap();
+
+        let impostor = tmp.path().join(SEALED_DIR).join(&name);
+        fs::write(&impostor, b"not the same bytes").unwrap();
+        let err = quarantine_poison_segment(&impostor, "second", 3).unwrap_err();
+        assert!(format!("{err:#}").contains("already set aside"), "{err:#}");
+        assert!(impostor.exists(), "the refused segment stays where it was");
+        assert_eq!(
+            read_poison_note(&tmp.path().join(POISON_DIR).join(&name))
+                .unwrap()
+                .reason,
+            "first"
+        );
+    }
+
+    /// The deliberate way back: `poison/` → `sealed/`, note dropped, and the
+    /// next drain claims it like any other segment.
+    #[test]
+    fn requeueing_a_poisoned_segment_returns_it_to_sealed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sealed = sealed_segment(tmp.path());
+        let name = name_of(&sealed);
+        let held = quarantine_poison_segment(&sealed, "reading it failed", 3).unwrap();
+
+        // A name already back in `sealed/` is a refusal, not a clobber.
+        fs::write(tmp.path().join(SEALED_DIR).join(&name), b"live").unwrap();
+        let err = requeue_poisoned_segment(&held).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not requeueing over it"),
+            "{err:#}"
+        );
+        fs::remove_file(tmp.path().join(SEALED_DIR).join(&name)).unwrap();
+
+        let back = requeue_poisoned_segment(&held).unwrap();
+        assert_eq!(back, tmp.path().join(SEALED_DIR).join(&name));
+        assert_eq!(rows_in(&back), 1);
+        assert!(list_poisoned(tmp.path()).unwrap().is_empty());
+        assert!(
+            !poison_note_path(&held).exists(),
+            "a requeued segment leaves no verdict behind"
+        );
+        assert_eq!(list_sealed(tmp.path()).unwrap(), vec![back]);
+    }
+
     #[test]
     fn a_claim_that_cannot_be_made_durable_leaves_the_segment_claimable() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2687,6 +2801,154 @@ pub fn quarantine_stale_segment(path: &Path, owner: &str) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("segment {} has no parent directory", path.display()))?;
     durability::persist_move(&quarantine, from)
         .with_context(|| format!("persisting quarantine of {}", path.display()))?;
+    Ok(dest)
+}
+
+/// Why one segment sits under [`POISON_DIR`], written beside it as
+/// `<segment>.poison.json`.
+///
+/// The verdict has to outlive the process that made it: the attempt counter
+/// behind it is per-process, so without a durable note a restart would hand
+/// the same segment back to the drain and re-derive the same answer, one
+/// failed batch at a time. Self-describing on purpose — a file copied out of
+/// `poison/` for inspection carries its own reason.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PoisonNote {
+    /// Segment file name, as it was under `sealed/`.
+    pub segment: String,
+    /// The last read error, verbatim.
+    pub reason: String,
+    /// Consecutive failed drain attempts before the set-aside.
+    pub attempts: u32,
+    /// When the set-aside happened, ms since the epoch.
+    pub quarantined_at_ms: i64,
+}
+
+/// Where a poisoned segment's [`PoisonNote`] lives: the segment path with
+/// `.poison.json` appended, so the pair sorts together and nothing that lists
+/// `*.arrow` picks the note up as a segment.
+pub fn poison_note_path(segment: &Path) -> PathBuf {
+    let mut s = segment.as_os_str().to_owned();
+    s.push(".poison.json");
+    PathBuf::from(s)
+}
+
+/// Set a segment aside under [`POISON_DIR`] because the drain could not read
+/// it, and record why.
+///
+/// `path` is the segment wherever the drain holds it — `processing/` for a
+/// claimed one, `sealed/` for one it never claimed. The note is published
+/// first so a segment under `poison/` always has one; the rename is the
+/// commit point and both directories are fsynced before this returns.
+///
+/// Nothing is deleted and nothing is rewritten. Unlike the `orphans/`
+/// disposition this is terminal until an operator runs
+/// [`requeue_poisoned_segment`]: a segment whose bytes do not decode has no
+/// retry that can change the verdict, and leaving it in `sealed/` fails every
+/// batch it lands in.
+pub fn quarantine_poison_segment(path: &Path, reason: &str, attempts: u32) -> Result<PathBuf> {
+    // `<dir>/<lifecycle>/<segment>` ⇒ the WAL directory is two levels up.
+    let root = path
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow!("segment {} has no WAL directory", path.display()))?;
+    let quarantine = root.join(POISON_DIR);
+    durability::create_dir_all(&quarantine)
+        .with_context(|| format!("creating {}", quarantine.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("segment {} has no filename", path.display()))?
+        .to_string();
+    let dest = quarantine.join(&name);
+    if dest.exists() {
+        return Err(anyhow!(
+            "{} is already set aside under {}",
+            name,
+            quarantine.display()
+        ));
+    }
+    let note = PoisonNote {
+        segment: name.clone(),
+        reason: reason.to_string(),
+        attempts,
+        quarantined_at_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    let note_path = poison_note_path(&dest);
+    let tmp = quarantine.join(format!(".{name}.poison.{}.tmp", std::process::id()));
+    let body = serde_json::to_vec_pretty(&note)
+        .with_context(|| format!("serializing the poison note for {name}"))?;
+    durability::publish_file(&note_path, &tmp, &body)
+        .with_context(|| format!("publishing {}", note_path.display()))?;
+    durability::rename(path, &dest)
+        .with_context(|| format!("setting aside {} -> {}", path.display(), dest.display()))?;
+    move_sidecar(path, &dest);
+    let from = path
+        .parent()
+        .ok_or_else(|| anyhow!("segment {} has no parent directory", path.display()))?;
+    durability::persist_move(&quarantine, from)
+        .with_context(|| format!("persisting the set-aside of {}", path.display()))?;
+    Ok(dest)
+}
+
+/// List segments set aside under `<dir>/poison/`, sorted. Empty when the
+/// directory is missing, which is the ordinary case.
+pub fn list_poisoned(dir: &Path) -> Result<Vec<PathBuf>> {
+    list_segments(dir, POISON_DIR)
+}
+
+/// Read a poisoned segment's note. `None` when it is missing or unparseable —
+/// the segment itself is the thing being preserved, and a note that cannot be
+/// read must not stop an operator from listing or requeueing it.
+pub fn read_poison_note(segment: &Path) -> Option<PoisonNote> {
+    let raw = fs::read(poison_note_path(segment)).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// The operator's deliberate way out of [`POISON_DIR`]: move one segment back
+/// into `sealed/` so the next drain cycle claims it again.
+///
+/// Refuses rather than clobbers when `sealed/` already holds that name. The
+/// note is removed only after the segment's new name is durable, so a crash
+/// mid-requeue leaves a note without a segment (cosmetic) rather than a
+/// segment without its verdict.
+///
+/// Call this after fixing what made the segment unreadable — restoring the
+/// file from a backup, or upgrading to a build that knows its frame version.
+/// Requeueing an unchanged segment simply spends the attempt budget again and
+/// sets it aside once more.
+pub fn requeue_poisoned_segment(path: &Path) -> Result<PathBuf> {
+    let root = path
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow!("segment {} has no WAL directory", path.display()))?;
+    let sealed = root.join(SEALED_DIR);
+    durability::create_dir_all(&sealed)
+        .with_context(|| format!("creating {}", sealed.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("segment {} has no filename", path.display()))?;
+    let dest = sealed.join(name);
+    if dest.exists() {
+        return Err(anyhow!(
+            "{} already exists; not requeueing over it",
+            dest.display()
+        ));
+    }
+    durability::rename(path, &dest)
+        .with_context(|| format!("requeueing {} -> {}", path.display(), dest.display()))?;
+    move_sidecar(path, &dest);
+    let from = path
+        .parent()
+        .ok_or_else(|| anyhow!("segment {} has no parent directory", path.display()))?;
+    durability::persist_move(&sealed, from)
+        .with_context(|| format!("persisting the requeue of {}", path.display()))?;
+    let note = poison_note_path(path);
+    if note.exists() {
+        durability::remove_file(&note).with_context(|| format!("removing {}", note.display()))?;
+        durability::sync_dir(from)
+            .with_context(|| format!("persisting the note removal in {}", from.display()))?;
+    }
     Ok(dest)
 }
 

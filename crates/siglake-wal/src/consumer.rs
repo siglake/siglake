@@ -67,7 +67,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     list_visible, publish_consumer_watermark, read_segment, ACTIVE_DIR, COMMITTED_DIR,
-    CONSUMERS_DIR, ORPHANS_DIR, PROCESSING_DIR, SEALED_DIR,
+    CONSUMERS_DIR, ORPHANS_DIR, POISON_DIR, PROCESSING_DIR, SEALED_DIR,
 };
 
 /// WAL directories that actually hold segments, at or below `root`.
@@ -117,6 +117,7 @@ pub fn consumable_dirs(root: &Path) -> Result<Vec<PathBuf>> {
                         | PROCESSING_DIR
                         | COMMITTED_DIR
                         | ORPHANS_DIR
+                        | POISON_DIR
                         | CONSUMERS_DIR
                 )
             }) {
