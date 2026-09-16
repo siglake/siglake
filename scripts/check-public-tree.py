@@ -27,6 +27,11 @@ locally:
      can otherwise leave a plausible-looking path which is a 404 in the public
      tree.
 
+  6. Source metadata naming a repository other than the published one. The
+     manifest's `repository` and the charts' `home`/`sources` shipped with the
+     pre-launch organization, which sends crates.io and Artifact Hub readers to
+     an archived repo (and, for the full-history mirror, a private one).
+
 Competitor NAMES are deliberately not checked. This project publishes
 head-to-head benchmarks on purpose — an eight-engine board, an intentional
 CHANGELOG reference — so a named engine is normal. What is not publishable is a
@@ -92,6 +97,35 @@ DATED_MD_STEM = re.compile(r"_20\d\d-\d\d-\d\d")
 # about to become correct is a guard people delete.
 CLOSED_SOURCE = re.compile(r"siglake-detection")
 
+# The engine's own repository, settled by the public push to
+# github.com/siglake/siglake. Source metadata that names any other owner of a
+# repo called `siglake` points at the pre-launch organization's archived copy or
+# at the private full-history mirror.
+#
+# Narrow on purpose, because the pre-launch organization legitimately owns plenty
+# of other things this must not touch:
+#
+#   * `github.com/<org>/siglake-benchmarks`, `.../siglake.dev` — different
+#     repositories, public under the old owner. The closing boundary below stops
+#     the match at `siglake`, so a longer repo name never matches.
+#   * `ghcr.io/<org>/siglake` — package publication authority, not source. Only
+#     `github.com` host matches, so image references are untouched.
+#   * `github.com/<org>` with no repo path — a maintainer's profile, which is an
+#     identity and not an engine-source link.
+#   * `siglake.limnion.ai` — the CRD API group. Not a URL, never matched.
+CANONICAL_ENGINE_REPO = "siglake/siglake"
+ENGINE_REPO_URL = re.compile(
+    r"github\.com[/:]([A-Za-z0-9][A-Za-z0-9._-]*/siglake)(?:\.git)?(?![\w.-])"
+)
+
+# deploy/helm/siglake-operator/Chart.yaml carries the same `home`/`sources`
+# defect. Correcting it belongs to the operator chart's own metadata task, so it
+# is exempt here rather than silently fixed under a data-plane-chart card. The
+# exemption is checked for being still necessary: once that chart names the
+# published repository, this set has to shrink, so the hole cannot outlive the
+# defect it was opened for.
+ENGINE_REPO_EXEMPT = {"deploy/helm/siglake-operator/Chart.yaml"}
+
 # The squash deletes crates/siglake-bench AND `sed -i`s its workspace-members
 # line out of Cargo.toml, so that one reference is handled by construction.
 #
@@ -143,6 +177,48 @@ TEXTUAL = {
     ".tpl",
     ".txt",
 }
+
+
+def foreign_engine_repos(line: str) -> list[str]:
+    """Owners other than the published one for a repository called `siglake`."""
+    return [
+        m.group(1)
+        for m in ENGINE_REPO_URL.finditer(line)
+        if m.group(1) != CANONICAL_ENGINE_REPO
+    ]
+
+
+# Negative fixtures for rule 6, kept to engine source metadata: the three field
+# shapes that shipped wrong, and the neighbouring URLs which are correct as they
+# stand and must not be swept up with them.
+ENGINE_REPO_RED = [
+    'repository = "https://github.com/example-invalid/siglake"',
+    "home: https://github.com/example-invalid/siglake",
+    "  - git@github.com:example-invalid/siglake.git",
+]
+ENGINE_REPO_GREEN = [
+    'repository = "https://github.com/siglake/siglake"',
+    "  - https://github.com/siglake/siglake",
+    "benchmarks live at https://github.com/limnion-ai/siglake-benchmarks",
+    "the site is https://github.com/limnion-ai/siglake.dev",
+    "  - name: limnion-ai",
+    "    url: https://github.com/limnion-ai",
+    "  repository: ghcr.io/example-invalid/siglake",
+    'image: "ghcr.io/example-invalid/siglake:0.1.0"',
+    '    group = "siglake.limnion.ai",',
+    "2026-07-24: chose the limnion-ai organization; the launch superseded it",
+]
+
+
+def run_fixtures() -> int:
+    """Prove rule 6 goes red on the fields that shipped wrong, and only those."""
+    for line in ENGINE_REPO_RED:
+        if not foreign_engine_repos(line):
+            raise AssertionError(f"fixture: source metadata passed: {line!r}")
+    for line in ENGINE_REPO_GREEN:
+        if found := foreign_engine_repos(line):
+            raise AssertionError(f"fixture: reported {found} in: {line!r}")
+    return len(ENGINE_REPO_RED) + len(ENGINE_REPO_GREEN)
 
 
 def shipping_files(root: pathlib.Path) -> list[pathlib.PurePath]:
@@ -228,9 +304,11 @@ def main() -> int:
     root = pathlib.Path(__file__).resolve().parent.parent
     problems: list[str] = []
     checked = 0
+    fixtures = run_fixtures()
     shipping = shipping_files(root)
     shipping_names = {rel.as_posix() for rel in shipping}
     excluded_md_ref = excluded_markdown_names(root, shipping)
+    engine_repo_exempt_used: set[str] = set()
 
     for rel in shipping:
         path = root / rel
@@ -253,6 +331,15 @@ def main() -> int:
                 problems.append(
                     f"{rel}:{lineno} names `{m.group(0)}`, a closed-source repository — "
                     f"the open tree must not link or name it: {line.strip()[:110]}"
+                )
+            for owner in foreign_engine_repos(line):
+                if rel.as_posix() in ENGINE_REPO_EXEMPT:
+                    engine_repo_exempt_used.add(rel.as_posix())
+                    continue
+                problems.append(
+                    f"{rel}:{lineno} source metadata names `{owner}`, not the "
+                    f"published repository `{CANONICAL_ENGINE_REPO}` — crates.io "
+                    f"and Artifact Hub readers follow this: {line.strip()[:110]}"
                 )
             dead_ref_reported = False
             for m in DEAD_REF.finditer(line):
@@ -293,6 +380,12 @@ def main() -> int:
                     )
                     break
 
+    for stale in sorted(ENGINE_REPO_EXEMPT - engine_repo_exempt_used):
+        problems.append(
+            f"{stale} no longer names another owner of `siglake`, so its entry in "
+            f"ENGINE_REPO_EXEMPT is a hole with nothing behind it — drop it"
+        )
+
     if problems:
         for p in problems:
             print(f"FAIL {p}", file=sys.stderr)
@@ -302,7 +395,10 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"ok   {checked} shipping files carry no local paths or dead references")
+    print(
+        f"ok   {checked} shipping files carry no local paths, dead references or "
+        f"foreign source metadata; {fixtures} fixtures"
+    )
     return 0
 
 
