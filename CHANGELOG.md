@@ -2,7 +2,7 @@
 
 ## 0.1.1
 
-Eight changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
+Nine changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
 surface moves, and a 0.1.0 warehouse is read and written unchanged: one values
 key and five environment knobs are added, and no flag or values key is removed.
 The one default that moves is the audit worker's, which now gives each append
@@ -79,8 +79,9 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   recomputes the time buckets (one footer read per live file) and the 2-D
   time×group rollup (a two-column decode per live file, or that file's
   group-count footer where its whole time range sits inside one bucket),
-  replaces both, and publishes the scanned snapshot's coverage edge, after
-  which ordinary commit-path maintenance carries the chain forward. Measured on
+  replaces both, and publishes that snapshot's coverage edge at the root of the
+  re-cluster run it sits on, after which ordinary commit-path maintenance
+  carries the chain forward. Measured on
   a local fixture, the fallback it removes costs 23–59× the Tier-1 path warm
   (though under ~2ms) and 3.8–35× cold across 49–168 live files, growing with
   the file count. Three limits, all reported by the command: the inline
@@ -94,6 +95,30 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   rows, and `rebuild-group-counts` (or the opt-in automatic repair) is its
   remedy; this one has the rows and cannot prove which snapshot they belong
   to. No existing behaviour, default or format changes. (#3082)
+- **Maintenance**: a side-object aggregate's coverage chain now survives
+  snapshot expiry. A reader walks from the current snapshot back to the
+  object's coverage edge over row-conserving re-clusters, so it needs every
+  snapshot in between: a compaction-only stretch longer than `retain_last`
+  (default 100, swept every 60 s) dropped the edge's own snapshot and stranded
+  the object for the life of the table, with every later append's edge
+  stranded behind it. `expire_snapshots` now decides, against the metadata it
+  is about to shrink, whether the edge it can still prove survives the commit,
+  and re-roots it onto the deepest surviving snapshot when it would not: the
+  same rows, no recompute, one object write, counted on
+  `siglake_inline_coverage_reroots_total`. The write is fenced on the object
+  still carrying the edge that was proven, so an append publishing in the
+  window keeps its own edge
+  (`siglake_inline_coverage_reroot_conflicts_total`), and an expiry that
+  cannot walk to the edge leaves it alone — ancestry that is gone is never
+  bridged and equal row totals are not evidence. Both rebuild commands had a
+  related defect: they published the scanned snapshot's own edge, which on a
+  compacted table is a re-cluster, and an append's link names the
+  data-changing snapshot below the run — so a repair there lasted until the
+  next commit. Every edge is now published at that normal form. Answers were
+  exact throughout, by the per-file tiers; what was lost was the fast path.
+  Retention, a delete task and a foreign overwrite still retire the object
+  until `rebuild-time-aggregates` runs, which is
+  `docs/LIMITATIONS.md`. (#3800)
 - **Drain**: a WAL segment the local filesystem drain cannot read no longer
   takes every batch it joins down with it. The read phase now names the
   segments that failed instead of returning one error for the whole batch, and

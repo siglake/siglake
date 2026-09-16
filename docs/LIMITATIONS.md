@@ -948,6 +948,25 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   commit that lands under it, so on a table under live ingest it retries three
   times and exits without writing. See
   `docs/DESIGN_inline_time_aggregate_rebuild.md`.
+- **A row-removing commit retires the side object until it is rebuilt.**
+  Retention and a delete task rewrite files without conserving rows, so the
+  object's counts describe a generation that no longer exists: they exceed
+  `total-records`, the read guard refuses them, and the chain cannot bridge the
+  commit either. Nothing on the commit path recomputes them — the counts are
+  cumulative, and a commit knows only its own delta — so the table answers from
+  the exact per-file tiers until `rebuild-time-aggregates` runs. A foreign
+  overwrite (a writer that is not Siglake) is the same state and deliberately
+  unbridgeable, because an unmarked N-for-N overwrite preserves the row total
+  while changing every answer. Snapshot expiry no longer joins this list: it
+  re-roots the edge onto surviving ancestry rather than orphaning it. Two
+  residual windows there, both costing acceleration and never an answer, and
+  both repaired by the same command: a process that dies between the expire
+  commit and the re-root write, and an append that publishes in that window on
+  a store with no conditional write, where single-writer-per-table is the
+  correctness story for every side-object write.
+  `crates/siglake-storage/tests/storage/orphaned_coverage_repair.rs` pins the
+  repair after a delete task, the re-root across an expiry, and the refusal to
+  certify an object whose rows a delete task removed.
 - **Streamed rewrite output carries no inline inverted index.** Every rewrite
   past the in-RAM caps — a leveled compaction merge, a re-clustering pass, or
   a delete task's large candidates (16 MiB compressed / 128 Ki rows) — is

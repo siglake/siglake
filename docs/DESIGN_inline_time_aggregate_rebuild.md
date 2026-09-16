@@ -228,6 +228,33 @@ being maintained normally reports "already covered" rather than looking broken.
   that was in force. The same holds for the object the next commit rebuilds
   from empty: covered but short, which the arm already declines.
 
+## #3800, and the correction it made to step 7
+
+#3800 ran the other set of triggers through this and found step 7's published
+edge wrong for one of them. The edge has to be the snapshot's NORMAL FORM — the
+deepest ancestor reachable through nothing but re-clusters — and not the
+snapshot the pass read. `add_coverage_link` advances `coverage` only when a
+link's parent is exactly the edge, and an append's link names the data-changing
+snapshot below the re-cluster run it lands on. So an edge published at a
+re-cluster is one no later append can join: on a compacted table, where the
+newest snapshot is usually a re-cluster, this command bought one query's worth
+of Tier-1 and lost it at the next commit. The rows are the same either way,
+which is what row-conserving means;
+`orphaned_coverage_repair::a_rebuild_on_a_recluster_survives_the_next_append`
+is the property, and the wide rebuild's edge had the same defect and the same
+fix. Step 6's fence still reads the sequence number of the snapshot the pass
+READ, which is not the published edge's any more.
+
+The expiry trigger is repaired on the commit path rather than here. The edge is
+provable right up to the expire commit, so `expire_snapshots` re-roots it onto
+the deepest surviving snapshot instead of letting the commit strand it — no
+decode, one object write, fenced on the object still carrying the edge that was
+proven (`siglake_inline_coverage_reroots_total`,
+`..._reroot_conflicts_total`). That leaves this command for the two triggers
+that remove rows
+(retention, a delete task) and for a pre-coverage object, which is what the
+cost argument below was written about.
+
 ## The same machinery serves #3800
 
 #3082 is one way an inline object ends up with an unprovable chain: it never

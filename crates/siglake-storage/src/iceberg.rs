@@ -13283,10 +13283,24 @@ impl IcebergContext {
         // certify. A table with no incarnation has no object of its own to
         // repair, exactly as the rebuild command refuses one.
         let op = aggregate_operator(table).ok().flatten()?;
-        let (existing, _) = OpendalSideCas(&op)
-            .load(SIDE_AGGREGATES_REL_PATH)
-            .await
-            .ok()?;
+        // A read that fails is not an absent object. The expiry goes ahead
+        // either way — snapshot bloat is the more expensive problem, and it is
+        // what `retain_last` exists for — so say that the edge may not survive
+        // it rather than skipping in silence.
+        let existing = match OpendalSideCas(&op).load(SIDE_AGGREGATES_REL_PATH).await {
+            Ok((existing, _)) => existing,
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    table = %table.identifier(),
+                    "could not read the inline aggregate before expiring snapshots; if this \
+                     commit drops the ancestry its coverage edge is read through, the table \
+                     answers from the exact per-file path until `siglake \
+                     rebuild-time-aggregates` runs"
+                );
+                return None;
+            }
+        };
         let proven = existing?.coverage?;
         if !aggregate_covers_current_snapshot(table, Some(proven)) {
             return None;
@@ -19726,7 +19740,7 @@ impl IcebergContext {
         // Normalized for the same reason the inline rebuild's edge is: an edge
         // at a re-cluster is one the next append's link cannot join, so the
         // repair would last exactly until the next commit (#3800).
-        wide.coverage = Some(published_coverage_edge(&cached.table, &snapshot));
+        wide.coverage = Some(published_coverage_edge(&cached.table, snapshot));
         wide.coverage_links.clear();
         // Deltas at or below the watermark are now redundant; the fold deletes
         // them. Their ids must not linger in `absorbed`, which the fold prunes
