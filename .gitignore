@@ -1,0 +1,31 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local data dirs used by smoke tests
+/data
+/.siglake
+
+# Evidence a round writes for the manager to collect (scripts/kind-round.sh)
+/results
+
+# Local reference clones for study (not part of siglake)
+/compare
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+__pycache__/
+*.py[cod]
+
+# Terraform working state
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+crash.log
+crash.*.log
+.aws-env

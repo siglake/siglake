@@ -1,0 +1,16 @@
+mod auth_scheme;
+mod commit_force;
+mod elastic_bulk;
+mod fake_idp;
+mod mem_breaker_accounting;
+mod middleware_refusals;
+mod otlp_round_trip;
+mod readiness;
+mod redis_rate_budget;
+mod stream_lag;
+mod stream_tenancy;
+mod tenant_bounds;
+mod tenant_cap;
+mod tenant_identity;
+mod tenant_transport_parity;
+mod wal_table_identity;

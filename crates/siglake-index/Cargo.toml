@@ -1,0 +1,12 @@
+[package]
+name = "siglake-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-file inverted index (term → row-ordinal postings) for exact term search + row-level pruning."
+
+[dependencies]
+siglake-bloom = { workspace = true }
+
+[lints]
+workspace = true

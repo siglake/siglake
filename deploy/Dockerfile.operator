@@ -1,0 +1,80 @@
+# Multi-stage build for the siglake-operator binary.
+#
+# Separate from the main `Dockerfile` because the operator has a
+# substantially smaller dependency surface than the data plane (no
+# datafusion, parquet, opendal, etc.) — building a focused image
+# keeps the controller's pull / cold-start time tight in a
+# production cluster.
+#
+# Final image is debian-slim rather than distroless because we
+# need /etc/ssl/certs/ca-certificates.crt to verify the K8s API
+# server's TLS chain (the in-cluster bundle is mounted in, but
+# OIDC issuers + Prometheus targets resolved via the operator's
+# /metrics scrape configuration both want a system trust store).
+
+# ---------- builder ----------
+FROM rust:1.95-slim AS builder
+
+# binutils: `strip` for the debug-info strip below (see the main Dockerfile).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libssl-dev \
+        clang \
+        cmake \
+        make \
+        binutils \
+        ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY rust-toolchain.toml ./
+COPY crates ./crates
+COPY third_party ./third_party
+
+# Cargo caches accelerate iterative builds. We intentionally do NOT
+# share the target dir cache across operator + main image builds —
+# previous smoke builds saw the cargo cache serve a stale operator
+# .rlib that pre-dated the `rename_all` → field-level rename refactor,
+# masking the bug #17 fix. Keeping this mount
+# scoped to the operator Dockerfile (and including a `cargo clean
+# -p siglake-operator` belt-and-braces) avoids that class of issue.
+#
+# Same debug-info strip as the main Dockerfile: the release profile's
+# `debug = 1` DWARF is dropped from the shipped copy, .symtab is kept.
+ARG SIGLAKE_GIT_SHA
+ENV SIGLAKE_GIT_SHA=${SIGLAKE_GIT_SHA}
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target,id=siglake-operator-target \
+    cargo clean -p siglake-operator \
+ && cargo build --release --locked --bin siglake-operator \
+ && cp target/release/siglake-operator /usr/local/bin/siglake-operator \
+ && strip --strip-debug /usr/local/bin/siglake-operator
+
+# ---------- runtime ----------
+FROM debian:trixie-slim AS runtime
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Match the upstream `nonroot` UID from Google Distroless so any
+# downstream PodSecurityPolicy / restricted PSS profile that
+# expects UID 65532 still binds cleanly.
+RUN groupadd -r -g 65532 siglake \
+ && useradd -r -u 65532 -g siglake -m -d /home/siglake -s /usr/sbin/nologin siglake
+
+COPY --from=builder /usr/local/bin/siglake-operator /usr/local/bin/siglake-operator
+
+USER siglake
+WORKDIR /home/siglake
+
+ENTRYPOINT ["/usr/local/bin/siglake-operator"]
+CMD ["--help"]
+
+# Operator `/metrics` endpoint (siglake-operator.metricsService.port
+# in the chart). Documentation-only — the Service is what makes
+# the port reachable in-cluster.
+EXPOSE 9190

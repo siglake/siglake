@@ -1,0 +1,17 @@
+apiVersion: v2
+name: siglake-operator
+description: |
+  Kubernetes operator for siglake: reconciles SiglakeCluster CRs into
+  ingester / compactor / query-server Deployments and drives
+  per-tenant lifecycle + autoscaling.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/siglake/siglake
+sources:
+  - https://github.com/siglake/siglake
+keywords:
+  - siglake
+  - operator
+  - logs
+  - observability

@@ -1,0 +1,36 @@
+{{- if not .Values.wal.existingClaim -}}
+{{- $needsWal := or .Values.ingester.enabled .Values.compactor.enabled -}}
+{{- if $needsWal -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "siglake.componentName" (list . "wal") }}
+  {{- if .Values.wal.retainOnDelete }}
+  annotations:
+    # KEEP THE WAL WHEN THE RELEASE GOES.
+    #
+    # Acks are WAL-append-based: a segment is durable here and NOT yet in
+    # Iceberg until the compactor commits it — minutes under load, longer with
+    # commit batching and a backlog. `wal.mirror.enabled` is true by default,
+    # but the upload is asynchronous and the mirror is a DR copy, not a
+    # replacement for the volume. Without this annotation `helm uninstall`
+    # deletes the claim and takes every acknowledged-but-uncommitted event
+    # whose upload had not landed with it.
+    #
+    # The cost is an orphaned PVC after uninstall, which an operator can see
+    # and delete deliberately. That is the right way round.
+    "helm.sh/resource-policy": keep
+  {{- end }}
+  labels:
+    {{- include "siglake.componentLabels" (list . "wal") | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.wal.accessMode | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.wal.size | quote }}
+  {{- with .Values.wal.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}
+{{- end }}

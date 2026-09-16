@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "synthetic",
+  "revisions": {
+    "repository_commit": "synthetic-siglake-revision",
+    "benchmark_commit": "synthetic-benchmark-revision"
+  },
+  "status": "complete",
+  "truncated": false,
+  "error": null,
+  "resource_limited": false,
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "exported_pair_rows": 4,
+  "row_count": 98466115,
+  "verdict": "complete"
+}

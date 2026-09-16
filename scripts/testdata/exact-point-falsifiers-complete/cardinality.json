@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "synthetic",
+  "revisions": {
+    "repository_commit": "synthetic-siglake-revision",
+    "benchmark_commit": "synthetic-benchmark-revision"
+  },
+  "row_count": 98466115,
+  "distinct_ts_ns": 3,
+  "distinct_ts_us": 3,
+  "distinct_ts_ns_level": 4,
+  "queries": {
+    "transparent": {
+      "status": "complete",
+      "eligible": true,
+      "counter_reset": false,
+      "cache_hits_delta": 0,
+      "cache_misses_delta": 0,
+      "row_count": 98466115,
+      "distinct_ts_ns": 3,
+      "distinct_ts_us": 3,
+      "distinct_ts_ns_level": 4
+    },
+    "local": {
+      "status": "complete",
+      "eligible": true,
+      "counter_reset": false,
+      "cache_hits_delta": 0,
+      "cache_misses_delta": 0,
+      "row_count": 98466115,
+      "distinct_ts_ns": 3,
+      "distinct_ts_us": 3,
+      "distinct_ts_ns_level": 4
+    }
+  },
+  "verdict": "passed"
+}

@@ -1,0 +1,1768 @@
+{
+ "uid": "siglake-overview",
+ "title": "siglake overview",
+ "tags": [
+  "siglake",
+  "logs",
+  "iceberg"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 38,
+ "version": 2,
+ "refresh": "30s",
+ "time": {
+  "from": "now-30m",
+  "to": "now"
+ },
+ "templating": {
+  "list": [
+   {
+    "name": "datasource",
+    "type": "datasource",
+    "query": "prometheus",
+    "current": {
+     "selected": false,
+     "text": "Prometheus",
+     "value": "Prometheus"
+    },
+    "hide": 0
+   },
+   {
+    "name": "namespace",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "${datasource}"
+    },
+    "query": "label_values(siglake_ingest_requests_total, namespace)",
+    "refresh": 2,
+    "includeAll": true,
+    "allValue": ".*",
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    }
+   }
+  ]
+ },
+ "panels": [
+  {
+   "id": 133,
+   "type": "stat",
+   "title": "Build provenance",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   },
+   "targets": [
+    {
+     "expr": "max by (pod, version, commit) (siglake_build_info{namespace=~\"$namespace\"})",
+     "instant": true,
+     "legendFormat": "{{pod}} · {{version}} ({{commit}})",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "decimals": 0
+    }
+   },
+   "options": {
+    "reduceOptions": {
+     "values": false,
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": ""
+    },
+    "orientation": "horizontal",
+    "textMode": "name",
+    "colorMode": "none",
+    "graphMode": "none",
+    "justifyMode": "auto"
+   },
+   "description": "Build version and commit reported by each scraped siglake server process."
+  },
+  {
+   "id": 100,
+   "type": "row",
+   "title": "Ingest",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 4
+   },
+   "collapsed": false
+  },
+  {
+   "id": 101,
+   "type": "timeseries",
+   "title": "Events accepted (per-sec)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 0,
+    "y": 5
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(siglake_events_accepted_total{namespace=~\"$namespace\"}[1m]))",
+     "legendFormat": "EPS",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "rps"
+    }
+   }
+  },
+  {
+   "id": 102,
+   "type": "timeseries",
+   "title": "Ingest requests by status",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 6,
+    "y": 5
+   },
+   "targets": [
+    {
+     "expr": "sum by (status) (rate(siglake_ingest_requests_total{namespace=~\"$namespace\"}[1m]))",
+     "legendFormat": "{{status}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "rps"
+    }
+   }
+  },
+  {
+   "id": 103,
+   "type": "timeseries",
+   "title": "Ingest request p99 latency",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 12,
+    "y": 5
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.99, sum by (le, endpoint) (rate(siglake_ingest_request_duration_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "{{endpoint}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    }
+   }
+  },
+  {
+   "id": 104,
+   "type": "timeseries",
+   "title": "WAL throughput (bytes + seals)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 18,
+    "y": 5
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(siglake_wal_bytes_written_total{namespace=~\"$namespace\"}[1m]))",
+     "legendFormat": "bytes/s",
+     "refId": "A"
+    },
+    {
+     "expr": "sum(rate(siglake_wal_segments_sealed_total{namespace=~\"$namespace\"}[1m])) * 60",
+     "legendFormat": "seals/min",
+     "refId": "B"
+    }
+   ]
+  },
+  {
+   "id": 105,
+   "type": "row",
+   "title": "Durability (silent-loss signals — these should sit at zero)",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 13
+   },
+   "collapsed": false
+  },
+  {
+   "id": 106,
+   "type": "timeseries",
+   "title": "Mirror registrations abandoned",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 0,
+    "y": 14
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(siglake_wal_mirror_register_abandoned_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "abandoned",
+     "refId": "A"
+    }
+   ],
+   "description": "Rows acked and uploaded, with no catalog row: durable and permanently unqueryable. The 2026-08-15 incident. Any non-zero value is data loss."
+  },
+  {
+   "id": 107,
+   "type": "timeseries",
+   "title": "Mirror uploads abandoned / failing",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 6,
+    "y": 14
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(siglake_wal_mirror_upload_abandoned_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "abandoned",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (reason) (rate(siglake_wal_mirror_failures_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "fail {{reason}}",
+     "refId": "B"
+    }
+   ],
+   "description": "Abandoned means the PVC is now the only copy of those rows."
+  },
+  {
+   "id": 108,
+   "type": "timeseries",
+   "title": "WAL recovery / integrity",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 12,
+    "y": 14
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(siglake_wal_crc_mismatch_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "crc mismatch",
+     "refId": "A"
+    },
+    {
+     "expr": "sum(increase(siglake_wal_partials_adopted_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "partials adopted",
+     "refId": "B"
+    },
+    {
+     "expr": "sum(increase(siglake_wal_partial_tail_dropped_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "partial tails dropped",
+     "refId": "C"
+    }
+   ],
+   "description": "Adoption is expected after a pod dies mid-write. A dropped tail means the recovered partial ended during an IPC message; its complete fsynced prefix remains readable and the original bytes remain on disk."
+  },
+  {
+   "id": 109,
+   "type": "timeseries",
+   "title": "Schema drift",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 18,
+    "y": 14
+   },
+   "targets": [
+    {
+     "expr": "sum by (disposition) (increase(siglake_storage_schema_drift_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{disposition}}",
+     "refId": "A"
+    }
+   ],
+   "description": "disposition=refused means writes are being rejected because a table is behind the running binary. Run migrate-schema --all-tables --all-namespaces."
+  },
+  {
+   "id": 127,
+   "type": "timeseries",
+   "title": "Group-count delta writes lost / retried",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 22
+   },
+   "targets": [
+    {
+     "expr": "sum by (table) (increase(siglake_group_count_delta_write_failures_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "lost {{table}}",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (table) (increase(siglake_group_count_delta_write_retries_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "retried {{table}}",
+     "refId": "B"
+    },
+    {
+     "expr": "sum by (table) (increase(siglake_side_aggregate_publish_failures_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "side publication lost {{table}}",
+     "refId": "C"
+    }
+   ],
+   "description": "Lost and retried delta writes are grouped by table. A lost delta leaves the aggregate short, but writes a durable marker that the maintenance compactor normally repairs on its next aggregate fold; a sustained retry rate means the object store or credentials are flaky and a loss is likely. The third series is the inline side object's own publication: it retries on the same budget, and a loss there leaves that object short of total-records with only its group counts repairable."
+  },
+  {
+   "id": 143,
+   "type": "timeseries",
+   "title": "Group-count automatic rebuilds",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 22
+   },
+   "targets": [
+    {
+     "expr": "sum by (table, outcome) (increase(siglake_group_count_auto_rebuilds_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{outcome}} {{table}}",
+     "refId": "A"
+    }
+   ],
+   "description": "success means the compactor restored the aggregate from committed files after a lost delta. incomplete or failed means GROUP BY remains on the exact per-file path and fires SiglakeGroupCountDeltaLost; use siglake rebuild-group-counts --table <table> as the operator fallback."
+  },
+  {
+   "id": 110,
+   "type": "row",
+   "title": "Drain and compaction",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 30
+   },
+   "collapsed": false
+  },
+  {
+   "id": 111,
+   "type": "timeseries",
+   "title": "Drain backlog (segments + bytes)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 0,
+    "y": 31
+   },
+   "targets": [
+    {
+     "expr": "sum by (namespace) (max by (namespace, tenant) (siglake_compactor_sealed_pending{namespace=~\"$namespace\"}))",
+     "legendFormat": "{{namespace}} segments",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (namespace) (max by (namespace, tenant) (siglake_compactor_sealed_pending_bytes{namespace=~\"$namespace\"}))",
+     "legendFormat": "{{namespace}} bytes",
+     "refId": "B"
+    }
+   ],
+   "description": "The real queue depth, from peek_pending. Read WITH the oldest-age panel: a deep queue draining fast is healthy. Under the catalog claim peek_pending counts the whole sealed table with no worker filter, so every compactor replica publishes the same total: the inner max takes each tenant's queue once however many workers report it, and a bare sum would multiply the backlog by the replica count. One line per namespace, so two clusters keep two totals."
+  },
+  {
+   "id": 112,
+   "type": "timeseries",
+   "title": "Oldest unclaimed segment age",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 6,
+    "y": 31
+   },
+   "targets": [
+    {
+     "expr": "max(siglake_compactor_sealed_pending_oldest_age_seconds{namespace=~\"$namespace\"})",
+     "legendFormat": "oldest age",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    }
+   },
+   "description": "The growth signal a depth count cannot give. Steady depth with a rising age is a drain that is not keeping up."
+  },
+  {
+   "id": 113,
+   "type": "timeseries",
+   "title": "Rows + segments committed",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 12,
+    "y": 31
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(siglake_compactor_rows_committed_total{namespace=~\"$namespace\"}[1m]))",
+     "legendFormat": "rows/s",
+     "refId": "A"
+    },
+    {
+     "expr": "sum(rate(siglake_compactor_segments_committed_total{namespace=~\"$namespace\"}[5m])) * 60",
+     "legendFormat": "segments/min",
+     "refId": "B"
+    },
+    {
+     "expr": "sum(rate(siglake_compactor_segments_swept_total{namespace=~\"$namespace\"}[5m])) * 60",
+     "legendFormat": "swept/min",
+     "refId": "C"
+    }
+   ]
+  },
+  {
+   "id": 114,
+   "type": "timeseries",
+   "title": "Cycles by outcome",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 18,
+    "y": 31
+   },
+   "targets": [
+    {
+     "expr": "sum by (outcome) (rate(siglake_compactor_cycles_total{namespace=~\"$namespace\"}[1m]))",
+     "legendFormat": "{{outcome}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "rps"
+    }
+   }
+  },
+  {
+   "id": 115,
+   "type": "timeseries",
+   "title": "Watchdog trips",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 0,
+    "y": 39
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(siglake_compactor_watchdog_trips_total{namespace=~\"$namespace\"}[15m]))",
+     "legendFormat": "trips",
+     "refId": "A"
+    }
+   ],
+   "description": "Compaction being killed by its own deadline. Tripped 52 times on 2026-08-15 with nothing watching it."
+  },
+  {
+   "id": 116,
+   "type": "timeseries",
+   "title": "Segments quarantined",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 6,
+    "y": 39
+   },
+   "targets": [
+    {
+     "expr": "sum(siglake_catalog_claim_quarantined{namespace=~\"$namespace\"})",
+     "legendFormat": "quarantined",
+     "refId": "A"
+    }
+   ],
+   "description": "Set aside and not draining without intervention: repeated drain failures (usually an index that does not exist), or a mirrored segment refused because it cannot be placed in the table its index resolves to now, which is set aside on the first cycle. Durable and unqueryable until requeued."
+  },
+  {
+   "id": 117,
+   "type": "timeseries",
+   "title": "Reclaims without proof",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 12,
+    "y": 39
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(siglake_compactor_reclaim_unprovable_total{namespace=~\"$namespace\"}[30m]))",
+     "legendFormat": "unprovable",
+     "refId": "A"
+    }
+   ],
+   "description": "The snapshots proving whether a segment was already committed had expired, so requeueing it may duplicate rows. Widen snapshot retention."
+  },
+  {
+   "id": 118,
+   "type": "timeseries",
+   "title": "Commit p99 latency",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 18,
+    "y": 39
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(siglake_compactor_commit_duration_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p99",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    }
+   }
+  },
+  {
+   "id": 134,
+   "type": "timeseries",
+   "title": "Mirror sync duration (avg / p99)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 47
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(siglake_compactor_mirror_sync_duration_seconds_sum{namespace=~\"$namespace\"}[15m])) / sum(rate(siglake_compactor_mirror_sync_duration_seconds_count{namespace=~\"$namespace\"}[15m]))",
+     "legendFormat": "average",
+     "refId": "A"
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(siglake_compactor_mirror_sync_duration_seconds_bucket{namespace=~\"$namespace\"}[15m])))",
+     "legendFormat": "p99",
+     "refId": "B"
+    },
+    {
+     "expr": "sum(siglake_compactor_mirror_sync_rotation_duration_seconds_sum{namespace=~\"$namespace\"}) / sum(siglake_compactor_mirror_sync_rotation_duration_seconds_count{namespace=~\"$namespace\"})",
+     "legendFormat": "completed rotation avg",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    }
+   },
+   "description": "Average wall time per completed or failed bounded page and the fleet-wide page p99 over 15m. Completed rotation avg is the whole durable wraparound scan, including cadence gaps and owner handoff, averaged since the current pods started. Read with page and rotation object counts to separate storage/catalog latency from retained-prefix growth."
+  },
+  {
+   "id": 135,
+   "type": "timeseries",
+   "title": "Mirror sync objects per pass",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 47
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(siglake_compactor_mirror_sync_objects_sum{namespace=~\"$namespace\"}[15m])) / sum(rate(siglake_compactor_mirror_sync_objects_count{namespace=~\"$namespace\"}[15m]))",
+     "legendFormat": "objects/page avg",
+     "refId": "A"
+    },
+    {
+     "expr": "sum(siglake_compactor_mirror_sync_rotation_objects_sum{namespace=~\"$namespace\"}) / sum(siglake_compactor_mirror_sync_rotation_objects_count{namespace=~\"$namespace\"})",
+     "legendFormat": "retained/rotation avg",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    }
+   },
+   "description": "Objects/page preserves the bounded-pass meaning of siglake_compactor_mirror_sync_objects and should plateau at 1,024 while a rotation is in progress. Retained/rotation is the sealed .arrow population examined by each completed wraparound rotation, averaged since the current pods started; it can move slightly during a rotation because retention runs between pages. A rising retained count with proportional rotation duration means retention backlog, while a flat page count alone does not prove recovery is converging."
+  },
+  {
+   "id": 136,
+   "type": "timeseries",
+   "title": "Mirror repairs / rotation completion",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 47
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(siglake_compactor_mirror_sync_registered_total{namespace=~\"$namespace\"}[15m])) * 60",
+     "legendFormat": "registered/min",
+     "refId": "A"
+    },
+    {
+     "expr": "time() - max(siglake_compactor_mirror_sync_last_completed_timestamp_seconds{namespace=~\"$namespace\"})",
+     "legendFormat": "completion age",
+     "refId": "B"
+    },
+    {
+     "expr": "max(siglake_compactor_mirror_sync_rotations_completed{namespace=~\"$namespace\"})",
+     "legendFormat": "rotations completed",
+     "refId": "C"
+    },
+    {
+     "expr": "siglake_compactor_mirror_sync_rotation_objects_examined{namespace=~\"$namespace\"} and on(namespace, pod) increase(siglake_compactor_mirror_sync_total{namespace=~\"$namespace\"}[5m]) > 0",
+     "legendFormat": "examined {{pod}}",
+     "refId": "F"
+    },
+    {
+     "expr": "sum(rate(siglake_compactor_mirror_sync_total{namespace=~\"$namespace\"}[15m])) * 60",
+     "legendFormat": "pages/min",
+     "refId": "D"
+    },
+    {
+     "expr": "sum(rate(siglake_compactor_mirror_sync_rotation_objects_count{namespace=~\"$namespace\"}[6h])) * 3600",
+     "legendFormat": "rotations completed/h",
+     "refId": "E"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byFrameRefID",
+       "options": "B"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "s"
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "right"
+       }
+      ]
+     }
+    ]
+   },
+   "description": "Registered/min counts catalog rows actually inserted by reconciliation, excluding idempotent conflicts. Completion age is seconds since the durable cursor last wrapped; it survives owner handoff and is the backlog/stall reader when every bounded page remains full. Examined by pod is durable examined-to-date progress, published after every successful page; it rises within a rotation and resets to the first page's count after a wrap, so it is not a remaining-work gauge. The five-minute page-activity filter hides the retained gauge of a live former owner after lease handoff. Rotations completed is the durable cursor generation, not a per-pod event counter. The two stall readers SiglakeMirrorReconciliationStalled ANDs are pages/min (bounded reconciliation passes are running at all — 0 means reconciliation is off, unelected, or the compactor is gone, none of which that alert pages for) and rotations completed/h, which is the wraparound rate the alert requires to be nonzero over prometheusRule.mirrorRotationStallSecs. Pages/min above zero with rotations completed/h pinned at zero is the stall: the prefix is being walked and never finished."
+  },
+  {
+   "id": 155,
+   "type": "timeseries",
+   "title": "Delete tasks left non-terminal (last observation)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 55
+   },
+   "targets": [
+    {
+     "expr": "sum by (state) (siglake_compactor_delete_tasks_nonterminal{namespace=~\"$namespace\"})",
+     "legendFormat": "non-terminal {{state}}",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (state) (increase(siglake_compactor_delete_tasks_stalled_total{namespace=~\"$namespace\"}[1h]))",
+     "legendFormat": "stalled observations/h {{state}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "description": "LAST OBSERVATION, not live state. The compactor's delete sweep publishes these counts once per cycle, before it executes anything, and only when it could see every non-terminal task in every namespace; a live pod therefore RETAINS the last full number when delete-task execution is switched off, when it loses the delete_tasks lease, when the stage's watchdog trips or when a listing fails. That is why the alert (SiglakeDeleteTaskStalled) reads the stalled counter and not this gauge, and why check-chart.py refuses a rule that reads it. running is a task claimed and started that never reached done or failed; pending_claimed is one claimed by an executor that died before writing running. Both are aged from the claim OBJECT, which bounds execution duration from above and keeps growing after the task strands — it is not a running duration, and a stalled observation proves neither that the executor is gone nor whether its rewrite committed. Non-terminal counts above zero are normal while a delete task is executing; the stalled arm is what says one has outlived every execution window this compactor allows. Recovery is an explicit resubmission under a new task id."
+  },
+  {
+   "id": 156,
+   "type": "timeseries",
+   "title": "WAL owner mismatches (dropped incarnation held back)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 55
+   },
+   "targets": [
+    {
+     "expr": "sum by (tenant, index) (increase(siglake_compactor_wal_owner_mismatch_total{namespace=~\"$namespace\"}[1h]))",
+     "legendFormat": "owner mismatch/h {{tenant}} {{index}}",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (tenant, index) (increase(siglake_compactor_wal_stale_segments_total{namespace=~\"$namespace\"}[1h]))",
+     "legendFormat": "segment refusals/h {{tenant}} {{index}}",
+     "refId": "B"
+    },
+    {
+     "expr": "sum(siglake_compactor_wal_owner_mismatch_total{namespace=~\"$namespace\"})",
+     "legendFormat": "owner mismatch (cumulative)",
+     "refId": "C"
+    },
+    {
+     "expr": "sum(siglake_compactor_wal_stale_segments_total{namespace=~\"$namespace\"})",
+     "legendFormat": "segment refusals (cumulative)",
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "description": "Both counters count refusal EVENTS, which is not a count of distinct objects held back: a mirrored object requeued out of quarantine and refused again counts again, and a filesystem segment whose move under stale/ fails stays in sealed/ and is counted on every cycle that re-examines it. Owner mismatch is the prefix-level finding — a WAL directory or a mirror key prefix stamped for a dropped incarnation of the index. On the filesystem it counts the segments that move under stale/; on the mirror there is nothing to move, so it counts the re-stamp, once. Segment refusals are per object: a frame header naming a table the index no longer resolves to, or (under a prefix that has itself named a dropped table) an object carrying no identity at all. Filesystem segments go under stale/; mirrored objects stay where they are and their claim is quarantined on the cycle that refuses it, since no retry can change a verdict a never-reused table uuid makes terminal — which Segments quarantined and SiglakeSegmentsQuarantined already read. The cumulative arms are here because both series are labelled by tenant and appear only with their first increment, so a single filesystem event has no rate to read but does move the total. Above zero with the drain otherwise healthy is the narrow case #2729 left behind: the index commits normally while individual objects are held back, and requeue_quarantined is the deliberate way back."
+  },
+  {
+   "id": 119,
+   "type": "row",
+   "title": "Layout (query latency tracks depth)",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 63
+   },
+   "collapsed": false
+  },
+  {
+   "id": 120,
+   "type": "timeseries",
+   "title": "Overlap depth",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 64
+   },
+   "targets": [
+    {
+     "expr": "max by (table) (siglake_table_overlap_depth{namespace=~\"$namespace\"})",
+     "legendFormat": "{{table}}",
+     "refId": "A"
+    }
+   ],
+   "description": "Scanning queries degrade with depth: the 2026-08-27 round measured a windowed browse at 40.9s against 0.13s converged. Target <= 12."
+  },
+  {
+   "id": 121,
+   "type": "timeseries",
+   "title": "Live data files",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 64
+   },
+   "targets": [
+    {
+     "expr": "max by (table) (siglake_table_live_data_files{namespace=~\"$namespace\"})",
+     "legendFormat": "{{table}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "id": 122,
+   "type": "row",
+   "title": "Query",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 72
+   },
+   "collapsed": false
+  },
+  {
+   "id": 123,
+   "type": "timeseries",
+   "title": "Request rate by endpoint+status",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 0,
+    "y": 73
+   },
+   "targets": [
+    {
+     "expr": "sum by (endpoint, status) (rate(siglake_query_requests_total{namespace=~\"$namespace\"}[1m]))",
+     "legendFormat": "{{endpoint}} {{status}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "rps"
+    }
+   }
+  },
+  {
+   "id": 124,
+   "type": "timeseries",
+   "title": "Request latency by endpoint (p50 / p99)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 6,
+    "y": 73
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.50, sum by (le, endpoint) (rate(siglake_query_request_duration_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p50 {{endpoint}}",
+     "refId": "A"
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le, endpoint) (rate(siglake_query_request_duration_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p99 {{endpoint}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    }
+   }
+  },
+  {
+   "id": 125,
+   "type": "timeseries",
+   "title": "Memory pool reserved / limit",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 12,
+    "y": 73
+   },
+   "targets": [
+    {
+     "expr": "max(siglake_query_memory_pool_reserved_bytes{namespace=~\"$namespace\"})",
+     "legendFormat": "reserved",
+     "refId": "A"
+    },
+    {
+     "expr": "max(siglake_query_memory_pool_bytes{namespace=~\"$namespace\"})",
+     "legendFormat": "limit",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes"
+    }
+   },
+   "description": "Every memory-related outage this project has had lived in the query pod. A limit of 0 means the pool is unbounded, which is the defect state."
+  },
+  {
+   "id": 126,
+   "type": "timeseries",
+   "title": "Exec pool in-flight / abandoned",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 18,
+    "y": 73
+   },
+   "targets": [
+    {
+     "expr": "sum(siglake_query_exec_pool_in_flight{namespace=~\"$namespace\"})",
+     "legendFormat": "in flight",
+     "refId": "A"
+    },
+    {
+     "expr": "sum(increase(siglake_query_exec_pool_abandoned_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "abandoned",
+     "refId": "B"
+    }
+   ],
+   "description": "Accumulated abandonments preceded the degradation that only a restart cured. In-flight that never returns to zero is the leak shape."
+  },
+  {
+   "id": 144,
+   "type": "timeseries",
+   "title": "Breaker trips by kind",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 81
+   },
+   "targets": [
+    {
+     "expr": "sum by (breaker, priority) (increase(siglake_query_breaker_trips_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{breaker}} {{priority}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "decimals": 0,
+     "min": 0
+    }
+   },
+   "description": "Breaker trips in the last five minutes, split by breaker kind and request priority. pool_exhausted means the query memory pool or spill cap refused work; admission and the remaining kinds identify the governing limit instead. The jaeger_* kinds (jaeger_trace_limit, jaeger_span_rows, jaeger_render_bytes, jaeger_name_rows) are the Jaeger read API's own render ceilings, derived from that pod's admission reservation: a request they refuse FITS the pod, so the fix is a narrower request or a larger admission budget, not memory pressure. Nothing filters this panel on breaker, so a kind added later appears here on its own. A batch timeout also appears as a timeout outcome in the separate batch-job panel; the two series describe the same run from breaker and job-lifecycle perspectives and must not be added."
+  },
+  {
+   "id": 150,
+   "type": "timeseries",
+   "title": "Distributed-query shard pins",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 81
+   },
+   "targets": [
+    {
+     "expr": "sum by (outcome) (rate(siglake_query_shard_pin_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{outcome}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "min": 0
+    }
+   },
+   "description": "Shard snapshot-pin outcomes per second. A miss refuses the distributed query with 503 rather than mixing snapshots. Sustained misses fire SiglakeQueryShardPinUnresolved; raise compactor.snapshotExpire.retainLast or lower SIGLAKE_ICEBERG_METADATA_CACHE_TTL_SECS."
+  },
+  {
+   "id": 148,
+   "type": "timeseries",
+   "title": "Incomplete scan attribution rate",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 89
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(siglake_query_scan_attribution_incomplete_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "incomplete responses",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "min": 0
+    }
+   },
+   "description": "Rate of responses whose scan attribution was incomplete because at least one scan partition was still unwinding after the two-second settle deadline. Correlate with stats.scan.unsettled_partitions and the settle p99."
+  },
+  {
+   "id": 149,
+   "type": "timeseries",
+   "title": "Scan settle p99 latency",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 89
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(siglake_query_scan_settle_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p99",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "min": 0
+    }
+   },
+   "description": "Fleet-wide p99 time spent waiting for scan-partition pumps to finish after the root stream ends. The wait is bounded at two seconds; deadline hits increment the adjacent incomplete-attribution counter."
+  },
+  {
+   "id": 153,
+   "type": "timeseries",
+   "title": "Batch job cancellation across replicas",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 97
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(siglake_query_jobs_cancel_propagated_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "aborted by a peer's cancellation",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (attempted, actual, cause) (rate(siglake_query_job_terminal_conflict_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "lifecycle conflict: {{attempted}} / {{actual}} ({{cause}})",
+     "refId": "B"
+    },
+    {
+     "expr": "sum by (outcome) (rate(siglake_query_jobs_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "job outcome: {{outcome}}",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "min": 0
+    }
+   },
+   "description": "The two halves of cancelling a batch job in a tier that shares one job store. The abort handle that releases a job's admission reservation and cancels its storage scans is process-local, so a DELETE served by a replica that is not executing the job can only persist `cancelled`; the executor picks that up on its own poll (--jobs-cancel-poll-secs, default 2s) and the propagated-abort series counts it. A healthy multi-replica tier shows that series tracking client cancellations; it sitting at zero while jobs are being cancelled means either every DELETE happened to land on the executor or the poll is not running. The lifecycle-conflict series names attempted and observed states with a bounded cause: attempted=running means the store refused the start and the query was never polled; succeeded, failed or timeout mean a completion was refused. Cancellation and gone are expected races, recovery pages for either a prevented start or discarded completion, write_deferred and write_abandoned are terminal writes that never landed (the panel to the right), and result_too_large is an applied failed completion. The job-outcome series reports only terminal states the executor actually INSTALLED, so an aborted or refused job appears in neither series; an oversized body appears as failed, never succeeded. The four cause=recovery series and the three cause=write_abandoned ones are pre-registered because alerts read them; other causes appear on first occurrence. scripts/check-chart.py holds these metric names to the source, so a rename fails CI instead of blanking the chart."
+  },
+  {
+   "id": 154,
+   "type": "timeseries",
+   "title": "Batch jobs finished but not persisted",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 97
+   },
+   "targets": [
+    {
+     "expr": "sum(siglake_query_jobs_unreconciled{namespace=~\"$namespace\"})",
+     "legendFormat": "parked, awaiting reconciliation",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (computed, outcome) (rate(siglake_query_jobs_reconciled_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "reconciled: {{computed}} -> {{outcome}}",
+     "refId": "B"
+    },
+    {
+     "expr": "sum(rate(siglake_query_jobs_unreconciled_dropped_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "refused, bookkeeping full (pages)",
+     "refId": "C"
+    },
+    {
+     "expr": "sum(rate(siglake_query_job_terminal_conflict_total{namespace=~\"$namespace\",cause=\"write_abandoned\"}[5m]))",
+     "legendFormat": "stranded: write abandoned (pages)",
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "min": 0
+    }
+   },
+   "description": "Batch runs whose execution ENDED without a terminal state being installed, because the job store was unreachable for every attempt the run could afford. The executor keeps a bounded, body-free note of those ids and retries the same conditional write every 5s: the parked gauge is that backlog and the reconciled rate is it draining, so a store outage shows as the gauge rising and then falling to zero with no operator action. It is deliberately diagnostic only — no alert reads it. The bottom two series are the failure of that mechanism and both fire SiglakeBatchRowStrandedNonTerminal: bookkeeping full at 1024 ids per replica, and a run reporting that its write could not even be tracked. They move together by construction, and either one means a client polls `running` until this pod exits and lease-expiry recovery on a peer condemns the row. Note the mixed units: the parked series is a count of ids, the other three are per-second rates."
+  },
+  {
+   "id": 128,
+   "type": "row",
+   "title": "Fast paths (healthy is hits, footer_only and a high hit ratio)",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 105
+   },
+   "collapsed": false
+  },
+  {
+   "id": 129,
+   "type": "timeseries",
+   "title": "Side-aggregate cache by outcome",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 0,
+    "y": 106
+   },
+   "targets": [
+    {
+     "expr": "sum by (result) (rate(siglake_query_side_aggs_cache_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{result}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops"
+    }
+   },
+   "description": "hit = pinned aggregate served; miss = nothing pinned; stale = pinned for an older snapshot; uncovered = pinned, but not for the component asked about. The 2026-09-01 regression was 0 hits / 168 misses with stale ABSENT — the pin was never taken — and cost 11-242x per query. It sat there for two months because no panel showed this."
+  },
+  {
+   "id": 130,
+   "type": "timeseries",
+   "title": "Tier-2 group-count calls by outcome",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 6,
+    "y": 106
+   },
+   "targets": [
+    {
+     "expr": "sum by (outcome) (rate(siglake_group_count_tier2_calls_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{outcome}}",
+     "refId": "A"
+    },
+    {
+     "expr": "(sum(rate(siglake_group_count_tier2_files_total{namespace=~\"$namespace\", outcome=~\"raw_page|boundary_scan\"}[5m])) or vector(0)) / sum(rate(siglake_group_count_tier2_files_total{namespace=~\"$namespace\", outcome=~\"footer|raw_page|boundary_scan\"}[5m]))",
+     "legendFormat": "fallback share",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byFrameRefID",
+       "options": "B"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percentunit"
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "right"
+       },
+       {
+        "id": "min",
+        "value": 0
+       },
+       {
+        "id": "max",
+        "value": 1
+       }
+      ]
+     }
+    ]
+   },
+   "description": "Tier 2 reports rows_scanned: 0 whether it read one footer per file (µs) or decoded raw pages per file (orders of magnitude slower); this is the only place the two differ. The 5-minute fallback share (right axis) is (raw_page + boundary_scan) / (footer + raw_page + boundary_scan), matching rollup_report.py: HEALTHY below 1%, MIXED from 1% to below 50%, and DEGENERATE at 50% or above."
+  },
+  {
+   "id": 131,
+   "type": "timeseries",
+   "title": "Tier-2 files per call (p50 / p99)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 12,
+    "y": 106
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.50, sum by (le) (rate(siglake_group_count_tier2_files_per_call_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(siglake_group_count_tier2_files_per_call_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p99",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    }
+   },
+   "description": "Tier 2 walks the manifest and touches a footer per LIVE FILE on every call, so its cost tracks this number and the Layout row's live-file count. Rising with a flat query mix means compaction is not keeping the file count down."
+  },
+  {
+   "id": 132,
+   "type": "timeseries",
+   "title": "File-list cache hit ratio",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 18,
+    "y": 106
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(siglake_file_list_cache_hits_total{namespace=~\"$namespace\"}[5m])) / (sum(rate(siglake_file_list_cache_hits_total{namespace=~\"$namespace\"}[5m])) + sum(rate(siglake_file_list_cache_misses_total{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "hit ratio",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "min": 0,
+     "max": 1
+    }
+   },
+   "description": "Share of scans served from the snapshot-keyed live-file list instead of a fresh manifest walk. It invalidates on commit, so a ratio that falls with a steady query rate means the commit cadence outran the queries between them. Empty when no scan ran in the window."
+  },
+  {
+   "id": 141,
+   "type": "timeseries",
+   "title": "Group-count deltas folded per read (p50 / p99)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 114
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.50, sum by (le) (rate(siglake_group_count_deltas_folded_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(siglake_group_count_deltas_folded_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p99",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "decimals": 0,
+     "min": 0
+    }
+   },
+   "description": "Per-commit group-count deltas still outstanding, folded on top of the wide aggregate by each Tier-1 read. The compactor's fold absorbs them into the wide file, so a healthy fleet sits near zero; a rising p99 means that fold is behind or stopped and every read is re-folding the backlog. Quantiles are fleet-wide over the last 5m of Tier-1 reads. The histogram has a 0 bucket, so a healthy fleet reads exactly 0 rather than the bottom of the first bucket; a window with no Tier-1 read shows a gap, not zero."
+  },
+  {
+   "id": 142,
+   "type": "timeseries",
+   "title": "Group-count columns demoted to sketches",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 114
+   },
+   "targets": [
+    {
+     "expr": "sum by (column) (increase(siglake_group_count_column_demoted_total{namespace=~\"$namespace\"}[15m]))",
+     "legendFormat": "{{column}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "decimals": 0,
+     "min": 0
+    }
+   },
+   "description": "Times a fold found a column's exact group-count aggregate above SIGLAKE_TABLE_GROUP_COUNT_CARDINALITY and converted it to a bounded sketch, by column. The first crossing is the one that matters: from then on GROUP BY on that column is approximate, and only the response's approximation field says so. Raise the cap above the column's distinct count to keep it exact. Should sit at zero."
+  },
+  {
+   "id": 151,
+   "type": "timeseries",
+   "title": "Table-metadata cache fences by action",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 122
+   },
+   "targets": [
+    {
+     "expr": "sum by (pod, action) (rate(siglake_iceberg_table_cache_fenced_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{pod}} {{action}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "min": 0
+    }
+   },
+   "description": "Reloads of a table's Iceberg metadata that lost their publication race (#1561), per pod. superseded (served the entry that beat it) and reload (re-loaded because the entry was invalidated) are healthy contention under a commit storm. unpublished is not: those reloads ran out of attempts, so the table's metadata cache stays empty and every read pays a full load_table. All three arms are pre-registered at 0, so a flat zero line is a working cache, not a missing series; a sustained unpublished rate fires SiglakeTableCacheUnpublished."
+  },
+  {
+   "id": 152,
+   "type": "timeseries",
+   "title": "SQL result cache by outcome",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 122
+   },
+   "targets": [
+    {
+     "expr": "sum by (outcome) (rate(siglake_query_sql_result_cache_requests_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{outcome}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "min": 0
+    }
+   },
+   "description": "Every decision the snapshot-keyed SQL result cache takes. hit/miss/insert/wait are the working cache. Not only /api/v1/sql since #2268: the two Jaeger name-list routes (services, operations) share this store and this counter rather than owning a second one, so a Jaeger UI polling in the background shows up here as hits it did not used to produce. Their misses carry none of the skip_ arms below — the routes serve two fixed SELECT DISTINCTs over the committed snapshot, so there is no statement to classify and no WAL union to prove empty. The skip_ arms say why a request was refused one: skip_buffer_* is the WAL proof (rows in flight, a refused decode, a failed load, a witnessed segment set that moved) and is expected while a backlog drains; skip_time_dependent is a query calling a registered STABLE or VOLATILE function (now(), random()) and is ordinary dashboard traffic; skip_unclassifiable is a function name the planner's registry does not hold — the conservative classifier costing this deployment its cache on queries that may plan and succeed anyway; skip_unparseable is a statement the cache classifier's own parser rejected and should sit at ~zero (#1481). Uncacheable SHAPES — bare unordered scans — are not counted here at all. No arm is pre-registered at 0 (no alert reads them), so a missing series here means that outcome has not happened on this pod — not a broken panel: scripts/check-chart.py holds this metric name to the source, so a rename fails CI instead of blanking the chart."
+  },
+  {
+   "id": 137,
+   "type": "row",
+   "title": "Cache warmer",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 130
+   },
+   "collapsed": false
+  },
+  {
+   "id": 138,
+   "type": "timeseries",
+   "title": "Age since last completed warm cycle",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 131
+   },
+   "targets": [
+    {
+     "expr": "time() - siglake_query_warm_last_completed_seconds{namespace=~\"$namespace\"}",
+     "legendFormat": "{{pod}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "min": 0,
+     "custom": {
+      "thresholdsStyle": {
+       "mode": "line"
+      }
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 90
+       }
+      ]
+     }
+    }
+   },
+   "description": "Seconds since each query pod last completed a cache-warm cycle. The red line is three times the chart's default 30s interval, matching SiglakeQueryWarmCycleStalled; keep it aligned if the deployment overrides the interval. A new pod has no series until its first cycle completes, so consult the in-progress panel beside it during startup."
+  },
+  {
+   "id": 139,
+   "type": "timeseries",
+   "title": "Warm cycle in progress",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 131
+   },
+   "targets": [
+    {
+     "expr": "siglake_query_warm_cycle_in_progress{namespace=~\"$namespace\"}",
+     "legendFormat": "{{pod}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "decimals": 0,
+     "min": 0,
+     "max": 1
+    }
+   },
+   "description": "One while a query pod is warming caches, zero between cycles. A pod pinned at one is wedged mid-cycle; a stale last-completed age while pinned at zero means the periodic warm loop may have stopped."
+  },
+  {
+   "id": 140,
+   "type": "timeseries",
+   "title": "Warm-cycle failure rate",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 131
+   },
+   "targets": [
+    {
+     "expr": "sum by (pod) (rate(siglake_query_warm_cycles_abandoned_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{pod}} abandoned",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (pod) (rate(siglake_query_warm_cycle_timeouts_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{pod}} cycle timeout",
+     "refId": "B"
+    },
+    {
+     "expr": "sum by (pod) (rate(siglake_query_warm_probe_timeouts_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{pod}} probe timeout",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops"
+    }
+   },
+   "description": "Per-pod rates over five minutes. Every cycle timeout is also an abandonment; abandonment without a cycle timeout is cancellation or panic. Probe timeouts are best-effort failures within a cycle and do not by themselves abandon it."
+  },
+  {
+   "id": 145,
+   "type": "row",
+   "title": "Durable reclaim proof",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 139
+   },
+   "collapsed": false
+  },
+  {
+   "id": 146,
+   "type": "timeseries",
+   "title": "Consumed-proof size",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 140
+   },
+   "targets": [
+    {
+     "expr": "sum by (table) (siglake_consumed_proof_entries{namespace=~\"$namespace\"})",
+     "legendFormat": "entries {{table}}",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (table) (siglake_consumed_proof_bytes{namespace=~\"$namespace\"})",
+     "legendFormat": "bytes {{table}}",
+     "refId": "B"
+    }
+   ],
+   "description": "Unacknowledged committed segment IDs and their encoded table-property bytes. Both should return to a small steady state after catalog marks are acknowledged."
+  },
+  {
+   "id": 147,
+   "type": "timeseries",
+   "title": "Consumed-proof watermark lag / cap refusals",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 140
+   },
+   "targets": [
+    {
+     "expr": "max by (table) (siglake_consumed_proof_watermark_lag_seconds{namespace=~\"$namespace\"})",
+     "legendFormat": "last successful update {{table}}",
+     "refId": "A"
+    },
+    {
+     "expr": "max by (table) (siglake_consumed_proof_current_watermark_lag_seconds{namespace=~\"$namespace\"})",
+     "legendFormat": "current attempt {{table}}",
+     "refId": "C"
+    },
+    {
+     "expr": "sum(increase(siglake_consumed_proof_cap_refusals_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "cap refusals",
+     "refId": "B"
+    }
+   ],
+   "description": "Current-attempt lag keeps moving during refused commits; last-successful lag shows when the property stopped updating. Exact terminal IDs compact independently of a pinned time watermark. Any cap refusal fails writes closed and fires SiglakeConsumedProofAtCapacity."
+  },
+  {
+   "id": 157,
+   "type": "timeseries",
+   "title": "Consumed-proof watermark refusals",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 148
+   },
+   "targets": [
+    {
+     "expr": "sum by (reason, index) (increase(siglake_compactor_proof_watermark_skipped_total{namespace=~\"$namespace\"}[1h]))",
+     "legendFormat": "refusals/h {{reason}} {{index}}",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (reason, index) (siglake_compactor_proof_watermark_skipped_total{namespace=~\"$namespace\"})",
+     "legendFormat": "refusals (cumulative) {{reason}} {{index}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "description": "Counts refused consumed-proof boundaries by index and reason. A refusal leaves that boundary uncompacted; it does not prove that all proof compaction for the index has stopped. The next terminal claim can establish a verified boundary and restore progress. The cumulative arm preserves a first event whose series did not exist at the preceding Prometheus scrape."
+  },
+  {
+   "id": 158,
+   "type": "timeseries",
+   "title": "Query audit whole-row drops",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 156
+   },
+   "targets": [
+    {
+     "expr": "sum by (reason) (increase(siglake_query_audit_dropped_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{reason}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "description": "Whole audit rows refused without changing query responses. Oversized is a single row above the byte ceiling; row_limit and byte_limit are retained-budget saturation; channel_full is a transient sender/worker race; worker_shutdown means no audit receiver remains."
+  }
+ ]
+}

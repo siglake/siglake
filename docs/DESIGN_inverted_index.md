@@ -1,0 +1,266 @@
+# Design — per-file inverted index (WS-5 search arc)
+
+Status (2026-09-14): **slices A + B shipped + tested** (build at write time,
+consume at query time). Footer indexes now default on after a bounded local
+write-cost and byte-size qualification. Post-rewrite Puffin rebuild ships
+**off** for 0.1.0; turned on, it skips files that already carry a footer or
+Puffin index. **Slice C = AWS validation** remains: run
+`scripts/ws5-validate.sh` against a cluster with the defaults enabled.
+
+## What exists (shipped)
+
+`siglake-index::InvertedIndex` — per-file `term → ascending row-ordinal postings`,
+`doc_id == file-local row ordinal`:
+
+- **Build:** `IndexBuilder::push_row(raw)` / `InvertedIndex::from_rows(..)`.
+  Tokenization is shared with the blooms (`siglake_bloom::tokenize` /
+  `normalize_query_term`), so a term a bloom admits is looked up here under the
+  same normalization — no index/bloom skew.
+- **Query:** `postings(term)`, `matching_rows_all(terms)` (AND = sorted-merge
+  intersection; any absent term ⇒ definitive no-match).
+- **RowSelection bridge:** `matching_row_selection(terms) -> Vec<(bool, u32)>` —
+  `(selected, length)` runs over the whole file, a Parquet-agnostic
+  `RowSelection`.
+- **Serialization:** `to_bytes`/`from_bytes` — magic/version + delta-varint
+  postings, for a Puffin-style side blob.
+
+## Integration (shipped)
+
+### Slice A — build at write time ✅
+
+The writer builds the index unless `SIGLAKE_INVERTED_INDEX=0` (Helm
+`compactor.invertedIndex.enabled: false`; operator
+`spec.extraEnv` with the same env opt-out). It indexes the events table's `raw`
+column and stamps the hex blob into the footer KV
+(`siglake_index::INVERTED_INDEX_KV_KEY`) at the single-writer + partition-split
+commit paths. Metrics `siglake_index_build_{seconds,bytes}`. The streaming
+re-cluster writer rebuilds the index for its committed output files, so both
+flush and re-cluster paths retain exact query results and indexed output.
+
+### Post-rewrite Puffin rebuild ✅
+
+`SIGLAKE_INDEX_REBUILD` defaults **off** (2026-09-14, #4162). The Helm opt-in
+is `compactor.indexRebuild: true`; operator-managed clusters use
+`spec.extraEnv: [{name: SIGLAKE_INDEX_REBUILD, value: "1"}]`. Chart and
+operator render the variable in both states, so a pod's env says which way it
+runs rather than leaving the reader to know the binary's default.
+
+Why off: a parsed index costs about 40 bytes per indexed row (≈294 MB for a
+7.3M-row compacted file, `third_party/iceberg/src/arrow/reader.rs`), so a
+50G-class text plan over 14 such files needs ~4 GB of parsed index against a
+1 GiB cache and a 256 MiB blob cache. AWS rounds 78, 80 and 81 put `keyword`,
+`keyword_last25`, `keyword_last5` and `substring_scan` 2-45x over ceilings that
+were measured on the scan path on 2026-09-03. Nothing about reads changes:
+indexes already registered are still discovered and used, and the flush path's
+footer index is still written. Only new sidecars after a rewrite stop.
+Index-path performance is 0.1.1 work.
+
+Streaming rewrite outputs carry row-group blooms and aggregate footers but no
+whole-file inverted index, so they require a Puffin sidecar. In-memory rewrite
+outputs use the normal writer: an index at or below
+`SIGLAKE_INDEX_FOOTER_MAX_BYTES` is already in the Parquet footer, while a
+larger one still requires Puffin registration. Before decoding a file, the
+rebuild checks each configured column against registered Puffin blobs and the
+file footer. A second pass therefore registers no duplicate statistics file.
+
+#### The local on/off measurement (2026-09-14)
+
+`report_rebuild_on_off_text_shapes` in `tests/puffin_rebuild.rs` writes the
+same corpus twice — once with the rebuild on, once off — and times the four
+shapes the 50G gate fails. Both arms are freshly written and end with the same
+Parquet layout (4 files × 7,340,000 rows, 39,825,917 bytes, one day partition
+per file); the only difference is the sidecars. Release build, this box, nine
+executions per shape per arm, arms interleaved, text-index caches at their
+deployed defaults:
+
+| shape | rows | off cold | off p50 | on cold | on p50 | on ÷ off |
+|---|---|---|---|---|---|---|
+| keyword | 100 | 27.9 ms | **3.7 ms** | 4365.0 ms | 9.2 ms | 2.5x |
+| keyword_last25 | 100 | 14.6 ms | **10.2 ms** | 5575.1 ms | 69.4 ms | 6.8x |
+| keyword_last5 | 100 | 10.5 ms | **8.6 ms** | 47.8 ms | 57.6 ms | 6.7x |
+| substring_scan | 100 | 2.2 ms | **3.4 ms** | 284.5 ms | 271.7 ms | 79x |
+
+The indexed arm's cold executions are the whole-index decode: 4.4 s and 5.6 s
+for the first two shapes. Its warm p50 is not stable either — the run ends with
+one 913 ms `keyword` and one 4186 ms `keyword_last25` sample, and the process
+finishes holding **one** cached parsed index for four files. That is the
+deployed 1 GiB budget against four ~294 MB indexes, which is the same eviction
+the 50G rounds hit at 14 files. Reproduce with:
+
+```
+cargo test -p siglake-storage --release --test puffin_rebuild \
+  report_rebuild_on_off_text_shapes -- --ignored --nocapture
+```
+
+`SIGLAKE_REBUILD_AB_{FILES,ROWS_PER_FILE,RUNS}` size it (defaults 4 /
+1,000,000 / 9); `SIGLAKE_REBUILD_AB_{PARSED,BLOB}_BYTES` scale the caches down
+with the corpus when a smaller one has to stand in for a deployed
+working-set-to-cache ratio. What this does NOT measure: the HTTP query server,
+object storage (the warehouse is local files), distribution across shards, and
+a corpus of the round's width — 29.4M rows here against the round's ~98M.
+
+#### The 0.2.0 regime-boundary measurement (2026-09-15, #4329)
+
+The extended comparison adds `rareneedle` to one row in 100,000 and times two
+unclipped `match_terms` shapes beside the four release shapes. The full-width
+run used 14 files × 7,340,000 rows = 102,760,000 rows per arm. Both arms had
+the same 14-file Parquet layout and 138,704,723 Parquet bytes. The OFF fixture
+built in 574.7 s; the ON fixture built in 729.0 s and registered all 14
+sidecars. The statistics files occupied 224,473,769 bytes OFF and 453,404,387
+bytes ON. Build times are observations from sequential local fixture creation,
+not a controlled writer-cost benchmark.
+
+Release build, nine executions per shape, arms interleaved. The first pass used
+the deployed 1 GiB parsed-index and 256 MiB Puffin-blob budgets:
+
+| shape | corpus matches | selectivity | OFF cold | OFF p50 | ON cold | ON p50 | ON ÷ OFF | ON decodes / hits |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| keyword | 2,055,200 | 2% | 33.9 ms | 5.9 ms | 11,222.6 ms | 16,509.8 ms | 2783x | 100 / 1 |
+| keyword_last25 | 513,799 | 0.5% | 8.2 ms | 9.0 ms | 6,118.8 ms | 4,345.2 ms | 480x | 19 / 4 |
+| keyword_last5 | 102,759 | 0.1% | 12.4 ms | 14.0 ms | 1,536.1 ms | 8,568.8 ms | 613x | 21 / 2 |
+| substring_scan | 5,138,000 | 5% | 7.6 ms | 6.8 ms | 16,640.3 ms | 14,710.5 ms | 2172x | 84 / 1 |
+| rare_scan | 1,028 | 0.001% | 1,671.8 ms | 1,801.2 ms | 50,486.7 ms | 34,211.1 ms | 19.0x | 121 / 10 |
+| rare_scan_last25 | 257 | 0.00025% of corpus | 583.9 ms | 583.1 ms | 6,547.6 ms | 4,826.1 ms | 8.28x | 31 / 5 |
+
+The pass ended with one 559,896,106-byte parsed index resident, 388 evictions,
+and no oversized-entry skips. Its optional 12 GiB follow-on pass was killed by
+the local memory limit before printing a sample. The completed fixture was
+then reopened in a fresh process with an 8 GiB parsed budget and a 2 GiB blob
+budget. All 14 parsed indexes occupied 7,830,305,508 bytes; there were zero
+evictions:
+
+| shape | OFF cold | OFF p50 | ON cold | ON p50 | ON ÷ OFF |
+|---|---:|---:|---:|---:|---:|
+| keyword | 38.8 ms | 6.1 ms | 9,016.1 ms | 20.3 ms | 3.31x |
+| keyword_last25 | 8.2 ms | 9.7 ms | 4,303.9 ms | 13.1 ms | 1.36x |
+| keyword_last5 | 12.1 ms | 11.6 ms | 4,057.6 ms | 50.1 ms | 4.33x |
+| substring_scan | 4.4 ms | 4.5 ms | 868.0 ms | 813.1 ms | 182x |
+| rare_scan | 1,659.8 ms | 1,733.5 ms | 3,637.6 ms | **129.3 ms** | **0.075x** |
+| rare_scan_last25 | 581.9 ms | 529.3 ms | 37.9 ms | **38.1 ms** | **0.072x** |
+
+The current format therefore has a measured winning regime: after its entire
+7.83 GiB parsed working set is warm, a 0.001%-density term over an unclipped
+scan is 13.4-13.9x faster than the scan path. Its first full-corpus execution
+still loses because it decodes the indexes. Under the deployed cap, eviction
+removes the win and makes the same rare shapes 8.3-19.0x slower.
+
+Residency does not protect the release shapes. Their resident ON p50 values
+(20.3, 13.1, 50.1 and 813.1 ms) all exceed the 0.1.0 ceilings (3.7, 10.2, 8.6
+and 3.4 ms). `substring_scan` is especially expensive because selecting 5% of
+the rows costs more than its early `LIMIT 100` scan. A redesign needs both a
+per-execution decline for clipped/high-document-frequency shapes and a layout
+that can reach sparse postings without materializing every file's index. Cache
+sizing alone asks a 4 GiB query pod to retain a 7.83 GiB parsed set and cannot
+be the long-term fix.
+
+Three 0.2.0 slices carry those two requirements and the build cost behind them:
+#4375 declines the whole-file index for a clipped `LIMIT` shape per execution,
+#4376 prototypes a row-group-addressable sidecar the reader can touch in part,
+and #4377 builds the postings during the streaming merge so the post-commit
+decode pass disappears. None of them changes a 0.1.0 or 0.1.x default.
+
+Reproduce the deployed pass with the command above plus
+`SIGLAKE_REBUILD_AB_FILES=14`, `SIGLAKE_REBUILD_AB_ROWS_PER_FILE=7340000`,
+`SIGLAKE_REBUILD_AB_RARE_EVERY=100000`,
+`SIGLAKE_REBUILD_AB_PARSED_BYTES=1073741824`, and
+`SIGLAKE_REBUILD_AB_BLOB_BYTES=268435456`. A completed fixture can be re-timed
+by setting `SIGLAKE_REBUILD_AB_REUSE_DIR` to its root containing `off/` and
+`on/`. This remains local evidence: it does not cover HTTP, object storage,
+distributed execution or AWS, and it does not qualify a new default.
+
+`tests/puffin_rebuild.rs` covers both rewrite paths under the opt-in, the
+default-off path (a rewrite leaves its output unindexed, and a table indexed
+before the rewrite still serves index reads), exact filtered and unfiltered
+counts, and snapshot expiry. Iceberg
+snapshot expiry retains the registered statistics metadata in the current
+implementation, so the Puffin sidecar stays discoverable and a later rebuild
+remains a no-op.
+
+### Slice B — consume at query time ✅
+
+`Reader::inverted_index_row_selection` (in the vendored `arrow/reader.rs`):
+for a normalizable `raw LIKE '%substr%'`, loads the blob, `rows_containing`, and
+builds a `RowSelection` of the candidate rows by **reusing
+`build_deletes_row_selection` with the complement** as the delete set — so the
+file-physical ordinals map onto the surviving row groups with no bespoke
+arithmetic. The selection is a superset (the engine's `FilterExec` re-checks the
+exact `LIKE` above the scan), intersected with any predicate/delete selection.
+Metric `siglake_iceberg_inverted_index_used_total` + selected/file-row
+histograms. Differential storage test
+(`tests/inverted_index.rs`) asserts ground-truth-correct counts across
+answerable substrings, fragments, absent terms, a delimiter-bearing fallback,
+and a dimensional-predicate intersection, with many row groups + bloom-skip
+active.
+
+### Slice C — AWS validation (remaining)
+
+`scripts/ws5-validate.sh`: with `compactor.invertedIndex.enabled=true`, ingest a
+rare-token batch, confirm `siglake_index_build_bytes` advanced (built), the
+`LIKE '%token%'` count is exact (correct), and
+`siglake_iceberg_inverted_index_used_total` advanced (pruned at scan time).
+
+## Default qualification (2026-09-11)
+
+`inverted_index_default::report_footer_inverted_index_write_cost` writes the
+same 20,000 corpus-shaped events five times per arm on local storage, with arm
+order alternating, and reports medians from a release build. This run measured
+77.02 ms with indexes off and 79.73 ms with them on (**+3.51%**). The serialized
+index was 96,103 bytes; hex footer storage raised the Parquet file from 123,467
+to 315,705 bytes (**+192,238 bytes**). The fixture is small and compressible, so
+the byte ratio is not a production-storage projection; it bounds and attributes
+the default's local write work while the AWS validation remains separate. The
+post-rewrite qualification establishes that this cost is not repeated for
+files the default writer already indexed: only streaming outputs and indexes
+above the footer threshold enter the Puffin builder.
+
+## Original plan (for reference)
+
+### Slice A — build at write time
+
+In `iceberg.rs::write_batch_to_data_files`, alongside `raw_trigram_bloom_hex`,
+build the index from the batch's `raw` column and stash the `to_bytes()` blob in
+the Parquet **footer KV** under a new `SIGLAKE_INVERTED_INDEX_KV_KEY` (mirror the
+raw-bloom KV path through `siglake_writer_properties`). The ordinal space is the
+**file's physical row order** — which, post time-ordering, is `timestamp ASC`, so
+ordinals line up with the SortingColumn footer.
+
+- **Gate it.** A full inverted index is heavier than a bloom (CPU + blob bytes).
+  This original default-off gate was superseded after local qualification; the
+  opt-out is `SIGLAKE_INVERTED_INDEX=0` or Helm
+  `compactor.invertedIndex.enabled: false`. Emit `siglake_index_build_bytes` /
+  `_build_seconds` so the cost remains observable.
+- **Per-file vs per-row-group.** Start per-file (one blob/file). The query bridge
+  maps file-local ordinals to row-group-relative `RowSelection` using the
+  Parquet metadata's per-row-group row counts.
+
+### Slice B — consume at query time (the WS-3 RowSelection bridge)
+
+When a query has an indexable predicate (`raw LIKE '%term%'` with a term of
+length ≥ the tokenizer minimum, or a token-equality), and the file carries the
+index blob:
+
+1. Load the blob from footer KV, `from_bytes`.
+2. `matching_row_selection(terms)`; if all-skip ⇒ skip the file (stronger than
+   the bloom's maybe-contains).
+3. Otherwise translate the `(selected,len)` runs to `parquet::arrow::arrow_reader::RowSelection`
+   (`RowSelector::select/skip`) and hand it to the `ParquetRecordBatchReaderBuilder`
+   `.with_row_selection(..)` so non-matching rows are never decoded.
+
+This composes with the existing trigram blooms (bloom prunes the file/row-group;
+the index prunes rows within a surviving block) and with the WS-3
+`output_ordering` (selection preserves row order, so the ASC ordering still
+holds).
+
+### Slice C — validation
+
+AWS round: write a warehouse with the index enabled, run `raw LIKE '%rare-term%'`
+and confirm (a) correctness vs the un-indexed result, (b) `rows_decoded`
+drops via the selection, (c) blob-size + build-time overhead are acceptable.
+
+## Why bespoke postings (not Tantivy yet)
+
+The first slice needs exact term→row matching + a RowSelection, which a sorted
+postings list does in ~250 dependency-free lines with full test control. Tantivy
+(BM25, phrase, fuzzy) is a later evolution if richer relevance/phrase search
+becomes a product requirement; the `InvertedIndex` API (postings + selection)
+can be re-backed by it without changing the query bridge.

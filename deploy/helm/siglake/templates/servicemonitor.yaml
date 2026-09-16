@@ -1,0 +1,45 @@
+{{- if .Values.serviceMonitor.enabled -}}
+{{- range $role := list "ingester" "compactor" "query" }}
+{{- $enabled := index $.Values $role "enabled" }}
+{{- if $enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "siglake.componentName" (list $ $role) }}
+  labels:
+    {{- include "siglake.componentLabels" (list $ $role) | nindent 4 }}
+    {{- with $.Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "siglake.componentSelectorLabels" (list $ $role) | nindent 6 }}
+      # Component labels alone are not a unique selector: a tier can render
+      # more than one Service (query renders a ClusterIP one and a headless one
+      # for per-pod DNS), and matching both makes Prometheus scrape every pod
+      # once per Endpoints object. This label marks the ONE Service per tier
+      # that is the scrape target, so adding another Service cannot silently
+      # double every metric on that tier.
+      siglake.limnion.ai/scrape: "true"
+  # The operator's default autoscaling PromQL also selects on the `namespace`
+  # scrape label that Prometheus Operator attaches from the ServiceMonitor's
+  # target namespace. Prometheus Operator does NOT copy the instance and
+  # component Service labels onto series unless they are named here, so without
+  # this the queries match nothing — and an empty result on a saturation signal
+  # used to read as an idle fleet. The ingester query also groups by `pod`, to
+  # sum a pod's request rate across the counter's endpoint/status/tenant/index
+  # series before averaging across pods; that label comes from Prometheus
+  # Operator's own target relabeling, not from this list.
+  targetLabels:
+    - app.kubernetes.io/instance
+    - app.kubernetes.io/component
+  endpoints:
+    - port: metrics
+      interval: {{ $.Values.serviceMonitor.interval | quote }}
+      scrapeTimeout: {{ $.Values.serviceMonitor.scrapeTimeout | quote }}
+      path: /metrics
+{{- end }}
+{{- end }}
+{{- end }}

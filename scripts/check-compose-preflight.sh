@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# Verify that the compose preflight rejects a live host port without Docker.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+check_dir=$(mktemp -d "${TMPDIR:-/tmp}/siglake-compose-preflight.XXXXXX")
+listener_pid=
+cleanup() {
+  if [ -n "$listener_pid" ]; then
+    kill "$listener_pid" 2>/dev/null || true
+    wait "$listener_pid" 2>/dev/null || true
+  fi
+  rm -rf -- "$check_dir"
+}
+trap cleanup EXIT
+
+mkdir "$check_dir/bin"
+cat >"$check_dir/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+# The regression test must not inspect or modify the machine's Docker state.
+case "$*" in
+  *label=com.docker.compose.project=*) exit 0 ;;
+  *'{{.Names}}|{{.Ports}}'*)
+    printf 'foreign-postgres|127.0.0.1:%s->5432/tcp\n' "${TEST_PORT:?}"
+    ;;
+esac
+EOF
+chmod +x "$check_dir/bin/docker"
+
+python3 - <<'PY' >"$check_dir/port" &
+import socket
+
+with socket.socket() as listener:
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    print(listener.getsockname()[1], flush=True)
+    while True:
+        connection, _ = listener.accept()
+        connection.close()
+PY
+listener_pid=$!
+
+for _ in $(seq 1 50); do
+  [ ! -s "$check_dir/port" ] || break
+  kill -0 "$listener_pid" 2>/dev/null || {
+    echo "FAIL throwaway listener exited before reporting its port" >&2
+    exit 1
+  }
+  sleep 0.1
+done
+[ -s "$check_dir/port" ] || {
+  echo "FAIL throwaway listener did not report its port" >&2
+  exit 1
+}
+port=$(<"$check_dir/port")
+
+if output=$(PATH="$check_dir/bin:$PATH" TEST_PORT="$port" SIGLAKE_PG_HOST_PORT="$port" \
+    scripts/up.sh --preflight-only 2>&1); then
+  echo "FAIL compose preflight accepted listening host port $port" >&2
+  exit 1
+fi
+
+expected="compose port preflight failed: host port $port (SIGLAKE_PG_HOST_PORT) is already in use by container foreign-postgres"
+if [[ $output != *"$expected"* ]]; then
+  echo "FAIL compose preflight did not name the occupied port and variable" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+
+echo "ok (occupied host port $port rejected before compose)"
+
+# The object-store selector (task #2958) decides which credentials and endpoint
+# the whole stack gets, so a typo in it must stop at the preflight rather than
+# silently leaving the MinIO defaults in place.
+if output=$(PATH="$check_dir/bin:$PATH" SIGLAKE_OBJECT_STORE=minioo \
+    scripts/up.sh --preflight-only 2>&1); then
+  echo "FAIL compose preflight accepted SIGLAKE_OBJECT_STORE=minioo" >&2
+  exit 1
+fi
+expected="compose port preflight failed: SIGLAKE_OBJECT_STORE must be 'minio' or 'garage' (got 'minioo')"
+if [[ $output != *"$expected"* ]]; then
+  echo "FAIL compose preflight did not name the unknown object store" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+
+# And the garage arm's own published ports join the checked set only when that
+# arm is selected: they are not published in the default stack, so checking
+# them there would reject a host that has something unrelated on 3900. Both
+# arms are driven with an out-of-range value, which the number pass catches
+# before anything is probed — so the assertion holds on a box where some other
+# default port is already taken.
+if output=$(PATH="$check_dir/bin:$PATH" \
+    SIGLAKE_OBJECT_STORE=garage SIGLAKE_GARAGE_HOST_PORT=99999 \
+    scripts/up.sh --preflight-only 2>&1); then
+  echo "FAIL compose preflight accepted an out-of-range garage S3 port" >&2
+  exit 1
+fi
+expected="compose port preflight failed: SIGLAKE_GARAGE_HOST_PORT must be a port from 1 to 65535 (got '99999')"
+if [[ $output != *"$expected"* ]]; then
+  echo "FAIL compose preflight did not name the out-of-range garage port" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+output=$(PATH="$check_dir/bin:$PATH" SIGLAKE_GARAGE_HOST_PORT=99999 \
+  scripts/up.sh --preflight-only 2>&1) || true
+if [[ $output == *SIGLAKE_GARAGE_HOST_PORT* ]]; then
+  echo "FAIL compose preflight checked the garage ports in the default minio arm" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+
+echo "ok (object-store selector validated; garage ports checked only in the garage arm)"
+
+# ci-local's Docker job must not inherit the developer port or pin the old
+# 18088 assignment. Drive its selector directly, then stand in the preflight's
+# listener probe so the old port is occupied and every candidate port is free.
+# No container or machine Docker state is reached.
+# shellcheck source=scripts/ci-local-compose-port.sh
+source scripts/ci-local-compose-port.sh
+# shellcheck source=scripts/compose-common.bash
+source scripts/compose-common.bash
+selection_log="$check_dir/selection.log"
+SIGLAKE_PG_HOST_PORT=15433
+SIGLAKE_MINIO_HOST_PORT=19000
+SIGLAKE_MINIO_CONSOLE_HOST_PORT=19001
+SIGLAKE_OTLP_GRPC_HOST_PORT=14317
+SIGLAKE_INGEST_METRICS_HOST_PORT=19100
+SIGLAKE_COMPACTOR_METRICS_HOST_PORT=19101
+SIGLAKE_QUERY_HOST_PORT=18089
+SIGLAKE_QUERY_METRICS_HOST_PORT=19105
+SIGLAKE_PROMETHEUS_HOST_PORT=19090
+SIGLAKE_GARAGE_HOST_PORT=13900
+SIGLAKE_GARAGE_ADMIN_HOST_PORT=13903
+export SIGLAKE_PG_HOST_PORT SIGLAKE_MINIO_HOST_PORT SIGLAKE_MINIO_CONSOLE_HOST_PORT
+export SIGLAKE_OTLP_GRPC_HOST_PORT SIGLAKE_INGEST_METRICS_HOST_PORT
+export SIGLAKE_COMPACTOR_METRICS_HOST_PORT SIGLAKE_QUERY_HOST_PORT
+export SIGLAKE_QUERY_METRICS_HOST_PORT SIGLAKE_PROMETHEUS_HOST_PORT
+export SIGLAKE_GARAGE_HOST_PORT SIGLAKE_GARAGE_ADMIN_HOST_PORT
+ci_local_choose_compose_ingest_port "$selection_log"
+selected_port=$SIGLAKE_INGEST_HOST_PORT
+
+if [ "$selected_port" = 18088 ]; then
+  echo "FAIL ci-local selected its old fixed ingest port" >&2
+  exit 1
+fi
+ephemeral_low=$(awk '{print $1}' /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null) \
+  || ephemeral_low=32768
+if [ "$selected_port" -ge "$ephemeral_low" ]; then
+  echo "FAIL ci-local selected ephemeral-range host port $selected_port" >&2
+  exit 1
+fi
+case " 15433 19000 19001 14317 19100 19101 18089 19105 19090 13900 13903 " in
+  *" $selected_port "*)
+    echo "FAIL ci-local selected another compose service's host port $selected_port" >&2
+    exit 1
+    ;;
+esac
+if ! grep -Fxq "==> docker compose selected SIGLAKE_INGEST_HOST_PORT=$selected_port" \
+    "$selection_log"; then
+  echo "FAIL ci-local did not log its selected ingest port" >&2
+  exit 1
+fi
+if siglake_compose_port_is_listening "$selected_port"; then
+  echo "FAIL ci-local selected listening host port $selected_port" >&2
+  exit 1
+fi
+
+siglake_compose_port_is_listening() {
+  [ "$1" = 18088 ]
+}
+if ! output=$(siglake_compose_preflight 2>&1); then
+  echo "FAIL compose preflight rejected selected port $selected_port while 18088 was occupied" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+
+if ! grep -Fq 'ci_local_choose_compose_ingest_port "$dlog"' scripts/ci-local.sh; then
+  echo "FAIL ci-local Docker job does not call the tested port selector" >&2
+  exit 1
+fi
+
+echo "ok (ci-local selected and logged free ingest host port $selected_port; occupied 18088 ignored)"

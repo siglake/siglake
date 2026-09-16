@@ -1,0 +1,60 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "siglake-operator.fullname" . }}
+  labels:
+    {{- include "siglake-operator.labels" . | nindent 4 }}
+rules:
+  # The CR the operator owns.
+  - apiGroups: ["siglake.limnion.ai"]
+    resources: ["siglakeclusters", "siglakeclusters/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # The Deployments the operator renders from the CR. Includes
+  # `deployments/scale` so future replica-only patches stay narrow.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale", "statefulsets", "statefulsets/scale"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Services (headless + ClusterIP per tier). This RBAC was caught lagging
+  # the rendered resources by the GA operator-managed round: reconcile died at
+  # `server-side-apply Service/<cluster>-ingester`).
+  - apiGroups: [""]
+    resources: ["services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # (No Secrets access: tenancy is header-based and the optional
+  # cluster auth Secret is wired into the ingester via a `valueFrom`
+  # secretKeyRef — the kubelet resolves it, the operator never reads it.)
+  # PVCs rendered for the shared WAL volume. The operator creates
+  # one `<release>-wal` PVC per managed cluster and
+  # patches it with server-side apply each reconcile.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Events for tracing reconcile decisions.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # Leases keep reconciliation single-active across operator replicas.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # CronJobs implement retention policies. The operator renders one
+  # `<release>-audit-rotate` CronJob per managed
+  # cluster when `spec.retention.queryAuditRotateIntervalDays` is set.
+  - apiGroups: ["batch"]
+    resources: ["cronjobs", "jobs", "jobs/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "siglake-operator.fullname" . }}
+  labels:
+    {{- include "siglake-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "siglake-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "siglake-operator.fullname" . }}
+    namespace: {{ .Release.Namespace }}

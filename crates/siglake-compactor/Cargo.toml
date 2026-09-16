@@ -1,0 +1,37 @@
+[package]
+name = "siglake-compactor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compactor daemon: drains WAL segments into Iceberg fast_append commits."
+
+[dependencies]
+siglake-core = { workspace = true }
+siglake-storage = { workspace = true }
+siglake-wal = { workspace = true }
+
+anyhow = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+metrics = { workspace = true }
+opendal = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+metrics-util = "0.20"
+metrics = { workspace = true }
+arrow-array = { workspace = true }
+bytes = { workspace = true }
+datafusion = { workspace = true }
+iceberg = { workspace = true }
+opendal = { workspace = true }
+parquet = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
+
+[lints]
+workspace = true

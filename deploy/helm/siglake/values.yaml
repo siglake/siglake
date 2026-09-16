@@ -1,0 +1,1105 @@
+# Default values for the siglake chart.
+#
+# BYOC framing: this chart references customer-owned secrets/network/IAM
+# rather than trying to provision them. The required wiring is:
+#   1. An RDS Postgres instance reachable from the cluster.
+#   2. A Secret with Postgres connection details (see `postgres` below).
+#   3. An S3 bucket for the Iceberg warehouse.
+#   4. An IAM role with R/W on that bucket, trusted by the cluster's
+#      OIDC provider, ARN annotated on the ServiceAccount.
+#
+# The companion Terraform in `deploy/terraform/aws/` provisions all of
+# the above and emits Helm values that match this schema. See the
+# chart README for end-to-end install instructions.
+
+# -----------------------------------------------------------------------
+# Tenant
+# -----------------------------------------------------------------------
+# Each Helm release pins itself to a single Iceberg namespace. Run
+# multiple releases (one per tenant) against the same catalog + S3
+# warehouse to get schema-level isolation between customer
+# environments. The default `siglake` namespace matches the
+# pre-multi-tenancy behavior.
+tenant:
+  namespace: siglake
+
+# -----------------------------------------------------------------------
+# Image
+# -----------------------------------------------------------------------
+image:
+  repository: ghcr.io/siglake/siglake
+  # Empty = Chart.appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# -----------------------------------------------------------------------
+# ServiceAccount
+# -----------------------------------------------------------------------
+# IRSA: annotate the ServiceAccount with
+# `eks.amazonaws.com/role-arn: arn:aws:iam::...:role/siglake-warehouse-rw`
+# (Terraform output `serviceaccount_role_arn`).
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# -----------------------------------------------------------------------
+# Postgres (Iceberg catalog)
+# -----------------------------------------------------------------------
+# The chart consumes a customer-provided Secret. Required keys:
+#   host, port, user, password, database
+# Each binary builds `SIGLAKE_CATALOG_URI` from those via K8s env
+# variable substitution (no shell wrapper needed).
+postgres:
+  existingSecret: "siglake-postgres"
+  # Override the secret-key names if the customer Secret uses different
+  # conventions (e.g. AWS Secrets Manager exports `host` as `endpoint`).
+  secretKeys:
+    host: host
+    port: port
+    user: user
+    password: password
+    database: database
+
+# -----------------------------------------------------------------------
+# S3 warehouse
+# -----------------------------------------------------------------------
+s3:
+  bucket: ""
+  region: ""
+  # Folder under the bucket root. Final URL: s3://<bucket>/<prefix>/
+  warehousePrefix: warehouse
+  # Set when targeting a non-AWS S3 (minio, R2, etc.). Leave blank for
+  # real AWS — IRSA + STS handles credentials and endpoint resolution.
+  endpoint: ""
+
+# -----------------------------------------------------------------------
+# Per-service toggles
+# -----------------------------------------------------------------------
+# Common shape (all services accept the same keys):
+#   enabled:           bring this pod up at all
+#   replicas:          replica count (1 for stateful binaries)
+#   resources:         k8s resource requests/limits
+#   nodeSelector:      pod scheduling constraints
+#   tolerations:       pod scheduling constraints
+#   affinity:          pod scheduling constraints
+#   extraEnv:          additional env vars (list of {name, value} or
+#                      {name, valueFrom})
+#   extraArgs:         additional CLI args appended to the entrypoint
+
+ingester:
+  enabled: true
+  replicas: 1
+  # The 2026-05-19 sustained-load run on EKS measured a
+  # single ingester pod at the `limits.cpu: 1` shape sustaining
+  # ~55 000 EPS on log-line events before latency-feedback throttled
+  # its callers.
+  # Rough sizing rule: budget ~50 000 EPS per pod-CPU at the
+  # default `walSegmentMax{Events,AgeSecs}` thresholds. Customers
+  # running >50 k EPS should scale ingester replicas + use an
+  # RWX (EFS) WAL volume; scaling vertically past `limits.cpu: 2`
+  # gives sub-linear returns past the writer-task per-tenant
+  # serialization point.
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 2
+      memory: 1Gi
+  walSegmentMaxEvents: 4096
+  walSegmentMaxAgeSecs: 5
+  # OTLP/gRPC logs+traces listener. On by default on the standard port used by
+  # OpenTelemetry Collector exporters. Set enabled=false to pass the binary's
+  # explicit opt-out; omitting --otlp-grpc-listen no longer disables it.
+  # HTTP OTLP (`POST /v1/logs`, `/v1/traces`) is always on.
+  otlpGrpc:
+    enabled: true
+    port: 4317
+  # Graceful scale-down (autoscaling primitive). On SIGTERM the ingester
+  # drains in-flight requests then force-seals the active WAL segment so
+  # buffered events land in `sealed/` (the compactor only reads sealed
+  # segments) instead of stranding in `active/` when KEDA/HPA scales a pod
+  # away.
+  #   preStopSleepSeconds — pause before SIGTERM so the Service stops routing
+  #     new requests (endpoint deregistration propagates). 0 disables the hook.
+  #   terminationGracePeriodSeconds — kubelet's SIGTERM→SIGKILL window; must
+  #     exceed preStop + in-flight-drain + seal time, or a seal gets killed.
+  preStopSleepSeconds: 5
+  terminationGracePeriodSeconds: 60
+  # Bearer-token auth allow-list. Empty list = no auth (only safe
+  # inside a trusted network). When set, every request must carry
+  # `Authorization: Bearer <token>`. These tokens say who may write, not
+  # what they may write as: binding tenancy to the caller is
+  # `ingester.oidc.tenantClaim`.
+  auth:
+    # Reference a customer-managed Secret with a comma-separated
+    # `tokens` key. Takes precedence over `list`.
+    existingSecret: ""
+    secretKey: tokens
+    # Or define inline (chart will create a Secret).
+    list: []
+  # MULTI-TENANT ROUTING IS EXPLICIT. This ingester is single-tenant unless
+  # you say otherwise: every request routes to the `default` tenant, and an
+  # `X-Scope-OrgID` naming any other one is refused with 403.
+  #
+  # `X-Scope-OrgID` is a client header that nothing authenticates, and it
+  # picks both the WAL subtree a write lands in and the Iceberg namespace it
+  # is committed to. Trusting it by default meant any accepted credential
+  # could write as, and be read as, any tenant. Default flipped 2026-09-11.
+  #
+  # Two ways to turn routing on. `ingester.oidc.tenantClaim` takes the tenant
+  # from a verified JWT and is the right answer on a shared cluster.
+  # `trustScopeHeader` takes the client's word, and is defensible only where a
+  # gateway in front of the ingester sets the header itself and strips the
+  # client's.
+  trustScopeHeader: false
+  # BOUND WHAT A CLIENT HEADER CAN MINT.
+  #
+  # The index (`x-siglake-index`) is an unauthenticated client header, and so
+  # is the tenant wherever `trustScopeHeader` is on. Each novel value creates
+  # a backpressure lane holding an open file, a set of metric label values,
+  # and — downstream — an Iceberg namespace with seven tables. Nothing
+  # capped or evicted any of that.
+  #
+  # `allowedTenants` is the bound when the tenant set is known — checked
+  # against the tenant actually resolved, so it bounds a JWT claim too.
+  # `maxTenants` and `maxLanes` are the backstop when it is not: refusing an
+  # unexpected tenant is a bad day, exhausting file descriptors is an outage
+  # for every tenant that was real. All default to unbounded, which is the
+  # historical behaviour.
+  #
+  # `maxTenants` counts distinct tenants, `maxLanes` counts (tenant, index)
+  # lanes, so one tenant on twelve indexes is one tenant and twelve lanes. At
+  # the cap the tenants already writing are unaffected and a novel one gets a
+  # 403 (gRPC PermissionDenied), counted under
+  # siglake_ingest_tenant_denied_total{reason="at_capacity"}. Both are per
+  # pod and per process: a 2-replica ingester with maxTenants: 100 admits up
+  # to 100 tenants on each, and a restarted pod starts its count over.
+  allowedTenants: []
+  maxTenants: 0
+  maxLanes: 0
+  # OIDC bearer-token verification on INGEST. Takes precedence over
+  # `ingester.auth` tokens when both `issuer` and `audience` are set.
+  #
+  # THREE VALID COMBINATIONS, and the chart refuses everything else while the
+  # tier is enabled:
+  #   - all three empty: no OIDC, and `ingester.auth` (or nothing) decides.
+  #   - `issuer` + `audience`: bearer tokens are verified JWTs; the tenant
+  #     still comes from `trustScopeHeader` or stays `default`.
+  #   - `issuer` + `audience` + `tenantClaim`: verified JWTs, and the tenant
+  #     comes from the claim.
+  # An issuer without an audience, an audience without an issuer, or a
+  # `tenantClaim` without both used to render NO OIDC variables at all, so the
+  # ingester came up on static tokens or open with nothing reporting that the
+  # requested verification was missing. Bearer tokens beside an incomplete
+  # block do not make it valid: they say who may write, not that the JWT was
+  # checked. `siglake ingest-server` refuses the same combinations at startup.
+  oidc:
+    issuer: ""
+    audience: ""
+    # JWT claim carrying the tenant. When set, the tenant comes from the
+    # VERIFIED token — on HTTP and on OTLP/gRPC alike — and a header naming a
+    # different tenant is refused.
+    #
+    # SET THIS ON ANY SHARED CLUSTER. It is the only way to route tenants that
+    # does not take a client header at its word; without it the ingester is
+    # single-tenant unless `trustScopeHeader` says otherwise.
+    tenantClaim: ""
+  # Token-bucket rate limiter on ingest requests. ratePerSec: 0 disables
+  # the limiter. Helps protect ingester memory from burst sources while
+  # leaving steady-state legitimate traffic untouched.
+  #
+  # WHAT THE BUDGET IS PER. The tenant (`X-Scope-OrgID`) is the key only
+  # where `trustScopeHeader` is on. The limiter runs ahead of
+  # authentication — that is what protects the auth path — so it reads
+  # the header before anything has verified it: with `oidc.tenantClaim`
+  # alone the claim is read after the limiter and the budget is per
+  # bearer token, then per first `X-Forwarded-For` address, then one
+  # `anonymous` bucket shared by every caller. Size a shared OIDC
+  # cluster per token, not per tenant.
+  #
+  # `redis.url` opts into the cross-replica shared budget (Phase
+  # 4.12.17). When set, every replica enforces a single shared
+  # `ratePerSec` budget via the named Redis. Empty/unset = each
+  # replica enforces its own in-memory budget (defaults: N×
+  # the configured ratePerSec on an N-replica deployment).
+  rateLimit:
+    ratePerSec: 0
+    burst: 0
+    redis:
+      # Direct URL: `redis://[:password@]host:port/db`. Pass through
+      # `existingSecret` instead for production deployments — never
+      # check inline passwords into values.yaml.
+      url: ""
+      existingSecret: ""
+      existingSecretKey: "url"
+      # Hash-key prefix to namespace this deployment's keys when
+      # sharing a Redis with other siglake installs. Defaults to
+      # `siglake:rb` in-binary.
+      prefix: ""
+  # Mpsc-fed per-tenant writer queue. When `capacity > 0`, every ingest handler
+  # routes through a bounded per-tenant mpsc channel + dedicated writer
+  # task. A full lane returns 503 + `Retry-After` rather than
+  # blocking on `Mutex<WalWriter>`. Maps to
+  # `--ingest-backpressure-capacity` / `SIGLAKE_INGEST_BACKPRESSURE_CAPACITY`.
+  #
+  # 1024 (default) enables the BackpressureRouter path. Set 0 to opt
+  # out to the historical mutex-serialized path. Tune up for higher
+  # per-tenant burst tolerance, down for tighter HTTP-tail-latency SLOs.
+  backpressure:
+    capacity: 1024
+    # Group commit: writer task waits up to this many ms
+    # for more commands to accumulate before flushing. Trades p50 ack
+    # latency for amortized fsync cost. 0 (default) preserves the
+    # immediate-flush behavior. Only effective when `capacity > 0`.
+    groupCommitMs: 0
+    # Per-tenant write parallelism. N writer tasks per
+    # tenant; ingest handlers round-robin across them. 1 (default)
+    # preserves the single-writer-per-tenant behavior. Only effective
+    # when `capacity > 0`. Each shard owns its own WalWriter writing
+    # to distinct segment filenames (the ingester_id gets a `-s{i}`
+    # suffix).
+    shards: 1
+  # RSS memory circuit breaker. When `limitMib > 0`, a background
+  # task samples the ingester's resident set every `sampleSecs` and
+  # ingest handlers shed load with 503 + `Retry-After` while RSS is at
+  # or above the ceiling — a clean backpressure signal instead of the
+  # OOM killer. Maps to `--ingest-mem-limit-mib` /
+  # `SIGLAKE_INGEST_MEM_LIMIT_MIB`. 0 (default) disables it; set it a
+  # comfortable margin below the container memory limit (e.g. ~80%).
+  memBreaker:
+    limitMib: 0
+    sampleSecs: 60
+  # Each request routes to a per-tenant WAL writer under `<wal>/<tenant>/`
+  # — `default` unless `oidc.tenantClaim` or `trustScopeHeader` routes it
+  # elsewhere. The compactor's per-tenant sweep commits each tenant's
+  # segments to the `tenant_<tenant>` namespace.
+  extraEnv: []
+  # `--with-compactor` is refused here at render time: the embedded compactor
+  # takes no catalog claim and this chart renders none for it, so two ingester
+  # pods — including the pair a rollout overlaps — would contend on every
+  # Iceberg commit. Compact with the `compactor` tier below.
+  extraArgs: []
+
+# Additive schema migration, run as a pre-upgrade hook before the new pods
+# roll. A binary newer than its table cannot write the columns the table lacks
+# — storage REFUSES such a write rather than dropping the column silently — so
+# an upgrade whose migration has not run is an ingest outage. Leave this on.
+#
+# `siglake migrate-schema` is additive-only and idempotent: it only ever ADDS
+# columns, never drops, retypes or rewrites, and a run with nothing to do
+# prints "up to date" and exits 0. Only rendered on `helm upgrade`; a fresh
+# install provisions tables at the current schema.
+schemaMigration:
+  enabled: true
+  backoffLimit: 4
+  ttlSecondsAfterFinished: 86400
+  resources:
+    requests:
+      memory: 64Mi
+      cpu: 50m
+    limits:
+      memory: 256Mi
+      cpu: 500m
+
+compactor:
+  enabled: true
+  # Above 1 requires `catalogClaim.enabled` below; the render is refused
+  # otherwise, and so is an `autoscaling.compactor.maxReplicas` above 1.
+  replicas: 1
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 2
+      memory: 1Gi
+  intervalSecs: 1
+  # How many re-cluster bins a leveled compaction pass merges concurrently
+  # (SIGLAKE_COMPACTOR_BIN_CONCURRENCY). Bins are file-disjoint and each
+  # commits its own rewrite, so they are independent work.
+  #
+  # MEMORY IS THE BINDING CONSTRAINT, NOT CPU. Each in-flight bin holds its
+  # own decoded working set — roughly SIGLAKE_MERGE_CHUNK_ROWS rows times
+  # SIGLAKE_MERGE_CHUNK_PREFETCH, plus its open row-group decoders.
+  #
+  # MEASURED, not extrapolated: a 200G AWS round with binConcurrency: 4 peaked
+  # at 12.03 GB of compaction-only RSS — about 3 GB PER BIN. An earlier estimate
+  # of ~650 MB/bin came from a local bench whose bins were far smaller than a
+  # production leading edge produces, and it was 4x too low. Budget ~3 GB per
+  # concurrent bin, and treat that as a floor for 200G-class bins: 1TB bins are
+  # bigger still.
+  #
+  # The default resources above (1Gi limit, 2 CPU) support binConcurrency: 1
+  # and nothing more. Raising this without raising compactor.resources.limits
+  # .memory proportionally gives an OOMKill loop, not throughput. Raise both
+  # together, and give the pod at least as many CPUs as bins — ~52% of a merge
+  # is CPU-bound Parquet encode against S3 (~87% on local storage, which is what
+  # made the local bench misleading here too).
+  #
+  # Default 1 = the historical sequential pass. Measured 3.72x of 4 (93%
+  # efficient) on a pass that had bins to spread across; see
+  # the 2026-08-05 compaction attribution round.
+  binConcurrency: 1
+  # QW-3b post-rewrite index rebuild: after a re-clustering pass, build
+  # missing Puffin-sidecar inverted indexes and register them on the recluster
+  # snapshot. Files with footer or registered Puffin indexes are skipped.
+  # OFF by default since 2026-09-14: on a 50G-class layout the text shapes that
+  # take the sidecar path cost several times what the same shapes cost on the
+  # scan path, because a compacted file's parsed index (~40 bytes per indexed
+  # row) outgrows the query pod's index caches. Set true to render
+  # SIGLAKE_INDEX_REBUILD=1 and opt in — existing indexes are read either way.
+  indexRebuild: false
+  # QW-7 delete-task execution in the compactor's idle cycle. ON by
+  # default: tasks created via the query server's /api/v1/delete-tasks are
+  # acknowledged with a 201, so something has to run them. Set to `false`
+  # to render SIGLAKE_DELETE_TASKS=0 — submissions are still accepted and
+  # recorded, and then only `siglake delete-sweep --apply` executes them.
+  deleteTasks: true
+  # Bound the local-FS compactor's in-memory working set. The
+  # compactor reads, concatenates, sorts, and parquet-writes the
+  # claimed segments as one batch, so leaving the filesystem path
+  # unbounded can OOM on backlog. `0` disables the corresponding
+  # limit.
+  fsBatch:
+    maxSegments: 64
+    maxBytes: 67108864
+  # Commit-accumulation batching (default-on; round-60 soak
+  # validated). The compactor defers an Iceberg commit until the sealed
+  # queue reaches `targetMb` OR its oldest segment hits `maxAgeSecs`,
+  # amortizing the fixed ~1.6s commit cost over many more rows (~30x fewer
+  # commits). TRADEOFF: ingest-to-queryable latency lags by up to
+  # `maxAgeSecs`. Set `targetMb: 0` to opt out to commit-per-segment.
+  commitBatch:
+    targetMb: 32
+    maxAgeSecs: 10
+  # Snapshot-metadata expiry (default-on; round-60 soak
+  # validated). Every `intervalSecs` the compactor drops all but the most-
+  # recent `retainLast` events-table snapshots (always keeping the current
+  # snapshot + ref targets), bounding the metadata.json that is otherwise
+  # read + rewritten on every commit. Non-destructive (metadata only;
+  # expired-snapshot files remain as orphans until the orphan-file sweep).
+  # TRADEOFF: no Iceberg time-travel beyond the retained N. Set
+  # `intervalSecs: 0` to opt out (snapshots never trimmed).
+  snapshotExpire:
+    intervalSecs: 60
+    retainLast: 100
+  # Search: build a per-file inverted index (term → row ordinals) into each
+  # events data file's footer KV at write time. On by default; set `enabled:
+  # false` to render SIGLAKE_INVERTED_INDEX=0 and opt out. The query-side
+  # row-selection slice consumes the index.
+  #
+  # SCOPE: compactor-only by design, and under this chart that is every Parquet
+  # write. The ingester Deployment runs `ingest-server` with no
+  # `--with-compactor` (see templates/deployment-ingester.yaml), so it appends
+  # to the WAL and nothing else; the compactor performs both the gen-0 flush
+  # (WAL → Parquet) and the leveled rewrites. There is deliberately no
+  # `ingester.invertedIndex` value — setting SIGLAKE_INVERTED_INDEX through
+  # `ingester.extraEnv` changes nothing, because this chart never gives the
+  # ingester a compactor to configure: `ingester.extraArgs: [--with-compactor]`
+  # is REFUSED AT RENDER TIME (`siglake.embeddedCompactorGuard`). An embedded
+  # compactor takes no catalog claim and the chart renders no claim arguments
+  # on the ingester, so concurrent copies would coordinate on the drain only by
+  # atomic rename on a shared RWX WAL volume, and on their maintenance passes
+  # not at all. One replica is not exclusivity either — the ingester rollout
+  # overlaps the outgoing and incoming pod — so the refusal has no replica
+  # threshold and `compactor.catalogClaim.enabled` does not waive it.
+  #
+  # The flush-vs-compaction lever is compactor-scoped for the same reason:
+  # SIGLAKE_INDEX_AT_FLUSH (inline unless set to "0", overridden per table by
+  # the index config's `index_at_flush`) belongs in `compactor.extraEnv`, where
+  # it defers the ~30 % inline index cost of gen-0 writes to the L1 rewrite —
+  # rewrites always build, whatever this setting is.
+  invertedIndex:
+    enabled: true
+  # Catalog-claim coordination. When `true` the compactor reads the
+  # `wal_segments` SQL table (Postgres / SQLite — same catalog URI
+  # as Iceberg) instead of the local-FS `<wal>/sealed/` directory.
+  # Multi-pod-safe: set `replicas > 1` once this is on.
+  #
+  # BOTH DIRECTIONS ARE ENFORCED AT RENDER TIME (the chart fails the install
+  # rather than accepting a compactor tier that cannot work):
+  #  - More than one compactor pod — `compactor.replicas` above 1, or
+  #    `autoscaling.compactor.maxReplicas` above 1 — requires this on.
+  #    Without it the replicas share no claim table: each runs the whole
+  #    drain and maintenance loop against the same tables and they lose
+  #    optimistic-concurrency commits to each other.
+  #  - This requires `wal.mirror.enabled = true` (the default), because the
+  #    claim path reads only rows an ingester's mirror wrote, never local
+  #    `sealed/`. Unmirrored, it claims nothing, and the backlog gauge
+  #    reports zero because it counts local sealed segments.
+  catalogClaim:
+    enabled: false
+    batch: 16
+  # Delete committed mirror objects and their catalog rows after this many
+  # seconds. Defaults to 86400 (24h) so the mirror prefix does not grow without
+  # bound; 0 opts out and never purges. Any non-zero value is floored at 901s:
+  # the default 600s local-WAL settle delay plus one 300s local-WAL sweep
+  # cadence, and one second so retention strictly outlives the sum. Raise this
+  # beyond the sum if either local-WAL window is increased. Set it to 0 if the
+  # local-WAL sweep is disabled but mirror catch-up remains on.
+  committedRetentionSecs: 86400
+  # Dense extraction: promote declared OTLP attributes out of the
+  # `attributes` JSON into their own typed columns (Parquet stats/bloom pruning
+  # + clean typed SQL, vs `attr_get()` over the JSON). Each entry is
+  # `attr_key:type[:column]`, type ∈ string|int|float|bool; the column name
+  # defaults to the attr key with `.`/`-` → `_`. The compactor widens the events
+  # table additively at startup. Run `siglake migrate-schema --table events
+  # --promote-attr ...` with the same set to widen an existing warehouse first.
+  # Empty = no promotion (the long tail stays queryable via `attr_get`).
+  #   promoteAttrs:
+  #     - http.status_code:int
+  #     - k8s.namespace:string
+  promoteAttrs: []
+  extraEnv: []
+  extraArgs: []
+
+query:
+  enabled: true
+  # Query pods run as a StatefulSet with a headless Service (stable per-pod DNS)
+  # so distributed query can address each shard's pod. With `distributed.enabled`
+  # (default), every pod coordinates an incoming query by fanning the scan
+  # across the READY replicas (shard i -> membership[i]) and merging the
+  # partials. `/api/v1/sql` coordinates transparently; `/api/v1/sql/local`
+  # forces single-pod. Set distributed.enabled: false for the classic
+  # single-pod path.
+  #
+  # The starting replica count, and the fixed count when KEDA is off. It is NOT
+  # a fan-out ceiling any more (#967): membership comes from the headless
+  # Service's SRV record at runtime, so keda.query.maxReplicas may exceed this.
+  replicas: 2
+  distributed:
+    enabled: true
+    # Shared secret the coordinator presents to peer pods on
+    # `/api/v1/sql/shard`. REQUIRED whenever query auth is on and the tier can
+    # ever hold more than one pod (query.replicas or keda.query.maxReplicas):
+    # a shard request carries the coordinator's credential, not the caller's, so
+    # without it every peer answers 401 and 401 is deliberately non-retryable.
+    # The chart FAILS the install on that combination rather than rendering a
+    # cluster whose scanning queries are all broken.
+    #
+    # It is also what lets a peer trust the tenant the coordinator forwards; a
+    # request that cannot present this token is treated as an ordinary caller,
+    # so `/shard` grants nothing extra to whoever can reach it.
+    #
+    # Set `existingSecret` to source it from your own Secret, or `value` to have
+    # the chart create one. Must be IDENTICAL across the peer set.
+    coordinatorToken:
+      existingSecret: ""
+      secretKey: coordinatorToken
+      value: ""
+  # Real-time WAL queryability. When enabled, query pods mount the shared
+  # RWX WAL claim (read-only) and union the un-committed WAL segments
+  # (sealed/ + processing/) into `events`, so just-ingested rows are queryable
+  # before the compaction commit. REQUIRES `wal.persistence` to be a
+  # ReadWriteMany claim (EFS) shared with the ingester — the default RWO/EBS
+  # claim cannot be mounted by both. Off by default.
+  walBuffer:
+    enabled: false
+  # Query-tier hot caches: the `last_values()` and `distinct_values(<dim>)`
+  # UDTFs, served from a WAL-tail last-value + distinct cache (<10/<30 ms). Tails
+  # the same shared RWX WAL mount as walBuffer — enable walBuffer too. Off by
+  # default.
+  hotCaches:
+    enabled: false
+  # #79 continuous pre-warm cadence, in seconds. Rendered on every query pod as
+  # SIGLAKE_QUERY_WARM_INTERVAL_SECS: table entries, live-file lists and footers
+  # for `events` and every managed index are warmed at startup and then on this
+  # cadence, so an unqueried pod never ages past the staleness ceiling. 0 =
+  # warm once at startup only. SiglakeQueryWarmCycleStalled derives its
+  # threshold (three intervals) from this same value, so the alert cannot drift
+  # from what the pods run; with 0 the alert is not rendered, since there is no
+  # cycle to miss. See prometheusRule.queryWarmIntervalSecs for the override.
+  warmIntervalSecs: 30
+  # QW-4 interactive-query admission control. 0 = binary defaults
+  # (4 GiB budget, 4x decompression factor, 2000 ms wait). Reservation per
+  # query = clamp(estimated_bytes_scanned * factor, 16 MiB, budget/2). A
+  # whole-table scan should reserve the cap and serialize; overflow queries
+  # should get 429 + Retry-After rather than OOM. Gauges
+  # siglake_query_admission_{reserved_bytes,waiting} feed KEDA.
+  admission:
+    budgetBytes: 0
+    waitMs: 0
+  # Mid-flight interactive circuit breakers. 0 = binary defaults (100M rows /
+  # 100 GB scanned). The row ceiling aborts a query that pulls more rows out of
+  # the scan than expected; the 100M default suits ~50G datasets, but a
+  # legitimately large windowed scan at scale (e.g. a 25% time-window aggregate
+  # over 400M rows ≈ 98M) trips it → 413 rather than degrading to slow. Size it
+  # to a few × your largest expected windowed scan; the wall-clock timeout +
+  # admission budget still bound runaway work, and the batch priority keeps its
+  # much higher ceilings. See QW-200G.
+  breaker:
+    rowsScannedCeiling: 0
+    bytesScannedCeilingGb: 0
+  # Graceful scale-down (autoscaling primitive). The query pod is stateless,
+  # so on SIGTERM it just drains in-flight queries (graceful HTTP shutdown) and
+  # exits — nothing to flush.
+  #   preStopSleepSeconds — pause before SIGTERM so the Service stops routing
+  #     new queries first. 0 disables the hook.
+  #   terminationGracePeriodSeconds — must exceed preStop + the longest query
+  #     you want to let finish before SIGKILL.
+  preStopSleepSeconds: 5
+  terminationGracePeriodSeconds: 60
+  # Per-component image override — blank fields inherit the global `image.*`.
+  # Lets the query pods roll to a new build independently of ingester/compactor.
+  image:
+    repository: ""
+    tag: ""
+  # Query spill is node-local scratch space. Keep the three capacity ceilings
+  # ordered: DataFusion's 8Gi byte cap < the 10Gi emptyDir sizeLimit < the
+  # pod's 12Gi ephemeral-storage limit. That makes DataFusion return
+  # ResourcesExhausted before kubelet eviction and leaves 2Gi for the writable
+  # layer. The 10Gi request reserves enough node storage for a full emptyDir.
+  spill:
+    directory: /var/lib/siglake/spill
+    # Keep this quoted: Helm/YAML otherwise rounds large integers through
+    # scientific notation before they reach the byte-count env parser.
+    maxBytes: "8589934592"
+    sizeLimit: 10Gi
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+      ephemeral-storage: 10Gi
+    limits:
+      cpu: 2
+      ephemeral-storage: 12Gi
+      # EVERYTHING the query server sizes comes off this number, so read it as a
+      # budget rather than a ceiling:
+      #
+      #   read caches  25%  (object cache; the file-batch cache defaults off)
+      #   metadata     12.5% (footers, file lists, and aggregate results)
+      #   text indexes 6.25% parsed inverted indexes + 1.5625% Puffin blobs,
+      #                capped at 1Gi and 256Mi and taken only from what is left
+      #                ABOVE the pool's first-file decode reservation -- which
+      #                at this floor is nothing, so a 4Gi pod caches no text
+      #                indexes and a 5Gi pod holds 400Mi of them
+      #   memory pool  50% of what is LEFT after those caches (~31% of the
+      #                limit at the floor)
+      #   remainder    the process, in-flight Arrow batches, decode buffers,
+      #                allocator slack
+      #
+      # At 4Gi that is 1Gi read cache + 512Mi metadata caches + ~1.25Gi pool,
+      # leaving ~1.25Gi. The text-index caches were flat constants (1Gi + 256Mi
+      # on every pod) outside this arithmetic entirely, which spent that whole
+      # remainder a second time; they are inside it now, and at the floor they
+      # yield to the pool rather than the other way round. A pod that would
+      # rather have warm text indexes than the reservation sets
+      # SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES and
+      # SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES explicitly; either way both are
+      # subtracted from the pool and published on
+      # siglake_cache_budget_bytes{kind="text_index"}.
+      # Enabling the file-batch cache subtracts its configured
+      # bytes before the 50% pool share is calculated. The pool is a real bound
+      # as of 2026-08: DataFusion sorts and aggregates SPILL at it rather than
+      # growing until the kernel intervenes, which is what used to happen
+      # (measured 31.6 GB anon-rss on a 32 GB node before the bound existed). A
+      # pod that is too small now degrades in speed, not availability.
+      #
+      # DO NOT LOWER THIS. 4Gi is the floor, not just a default: the ~1.25Gi
+      # pool it derives is exactly one compacted file's decode estimate (256Mi
+      # cold target x5 decompression), which is what a scan must reserve to
+      # open its FIRST file. Below 4Gi every scan runs one file at a time and
+      # holds that file's decode buffers OUTSIDE the pool, so the number that
+      # is supposed to bound this container stops seeing them. That is the
+      # reason to stay at or above 4Gi. The operator logs a warning when a
+      # rendered `spec.resources.query` limit falls below it
+      # (`query_memory_warning`, crates/siglake-operator/src/render.rs).
+      #
+      # It is NOT a speed floor. Measured 2026-09-06 on a decode-bound scan
+      # (9.87 GB decoded/query): sweeping the pool 80x around one file's
+      # estimate moved the median from 1.78s to 1.95s, with the STARVED side
+      # faster, and pinning per-partition file concurrency to 1 under an
+      # unconstrained pool cost nothing. What did cost 3.6x was dropping
+      # partition fan-out from 4 to 1 -- and the pool does not govern partition
+      # fan-out. Local storage only; overlapping S3 first-byte latency is
+      # untested.
+      #
+      # RAISE THIS for scan-heavy or high-concurrency workloads -- 4Gi is a
+      # starting point, not a recommendation for billions of rows. Tune the pool
+      # share with SIGLAKE_QUERY_MEMORY_FRACTION (default 0.5) and watch
+      # `siglake_query_memory_pool_bytes`.
+      # `siglake_query_scan_decode_reservation_total{outcome="unreserved"}` is a
+      # coverage signal, NOT a slowness one: it says decode memory is going
+      # unaccounted. In the same sweep the fastest arm (16 scan partitions) also
+      # had the highest unreserved rate, because wider fan-out asks the pool for
+      # more. Do not alert on it as a latency proxy.
+      #
+      # See the 2026-08-06 defaults review (F7), the 2026-08-20 four-fix
+      # validation round, and the 2026-09-06 decode-cliff measurement.
+      memory: 4Gi
+  tokens:
+    # If `existingSecret` is set, SIGLAKE_QUERY_TOKENS is sourced from
+    # `<existingSecret>.<secretKey>`. Otherwise, if `list` is non-empty
+    # the chart creates a Secret with those tokens (comma-joined), and if
+    # `externalSecrets.queryTokens.remoteKey` is set under
+    # `externalSecrets.enabled` the ExternalSecret materializes the same
+    # Secret. The chart refuses both sources together when `existingSecret`
+    # is empty; otherwise, either source makes the query pods read
+    # `<release>-siglake-query-tokens` under `secretKey`. All three empty AND
+    # no complete `oidc` block below = the query API runs open (the install
+    # notes and the pods both say so at start).
+    existingSecret: ""
+    secretKey: tokens
+    list: []
+  # OIDC bearer-token verification. Takes precedence over `tokens`
+  # when both `issuer` and `audience` are non-empty.
+  #
+  # THREE VALID COMBINATIONS, and the chart refuses everything else while the
+  # query tier is enabled: all three empty; `issuer` + `audience`; or
+  # `issuer` + `audience` + `tenantClaim`. A half-pair, or a claim without the
+  # pair, used to render NO OIDC variables at all and leave `/api/v1/sql` on
+  # `query.tokens` — or open — with nothing reporting the missing
+  # verification. A token allow-list beside an incomplete block does not make
+  # it valid. `siglake-query-server` refuses the same combinations at startup.
+  #
+  # A complete block is authentication, so it reaches
+  # `query.distributed.coordinatorToken` the same way `tokens` does: with
+  # fan-out reachable (`query.replicas` or `keda.query.maxReplicas` above one)
+  # and no coordinator token, the install is refused rather than shipped with
+  # peers that 401 every shard request.
+  oidc:
+    issuer: ""
+    audience: ""
+    # When set, the query-server enables per-request multi-tenancy:
+    # each verified JWT must carry this claim, and the claim value
+    # selects an Iceberg namespace (`tenant_<value>`) for that query.
+    # The claim is then MANDATORY and validated, not repaired: a token
+    # whose claim is missing, blank, non-string, over 128 chars or
+    # outside [A-Za-z0-9_-] is refused with 403 rather than routed to
+    # the default namespace. Empty = single-tenant mode (every caller
+    # routes to the `tenant.namespace` default).
+    tenantClaim: ""
+  # Persistent batch-job store. When true the query-server stores its
+  # batch-job state in the same Postgres instance as the Iceberg
+  # catalog, so pod restart surfaces in-flight jobs as `failed`
+  # instead of 404. When false, batch state is in-memory, per pod, and
+  # evaporates on restart.
+  #
+  # ON by default since 2026-09-11. The store this chart needs is the
+  # catalog Postgres the query pods already connect to, and a per-pod
+  # store is wrong for the shape the chart installs: `query.replicas`
+  # is 2 behind one Service with no session affinity, so with this off
+  # a `GET /api/v1/jobs/{id}` that lands on the pod that did not run
+  # the job answers 404 with no restart involved at all, and every
+  # in-flight job is lost on a rolling upgrade. Setting it false is a
+  # supported opt-out only for a tier that can hold one pod. The chart
+  # refuses this setting when `query.replicas` or an enabled
+  # `keda.query.maxReplicas` exceeds 1, because job reads would otherwise
+  # return false 404s when the Service routes them to another pod.
+  #
+  # Every replica shares that one store, so restart recovery is scoped to
+  # execution ownership: each job row records the replica incarnation
+  # executing it, owners heartbeat, and a job is failed only once its
+  # owner's lease has expired. Scaling the tier out, or rolling one pod,
+  # therefore leaves the other replicas' in-flight jobs -- and their
+  # results -- alone. The flip side: a dead replica's jobs reach `failed`
+  # within one lease period rather than the instant a pod starts. Tune
+  # with SIGLAKE_JOBS_OWNER_LEASE_SECS (default 120) and, for rows written
+  # before ownership existed, SIGLAKE_JOBS_OWNERLESS_GRACE_SECS
+  # (default 86400).
+  #
+  # Sharing the store also means a DELETE is usually served by a replica
+  # that is not executing the job, and the abort handle that releases the
+  # admission reservation and cancels the storage scans is process-local.
+  # The executing replica re-reads its own in-flight rows every
+  # SIGLAKE_JOBS_CANCEL_POLL_SECS (default 2) and aborts the ones that
+  # read `cancelled`, which is the bound the 202 promises.
+  jobs:
+    persistent: true
+  scan:
+    # 0 = DataFusion default. Raise this to expose more source
+    # partitions from the custom Iceberg scan for large pruned reads.
+    targetPartitions: 0
+    # 0 = no aggregate reader budget. When set, derive the per-source-
+    # partition object-store reader concurrency from the planned
+    # partition count so total per-query fan-out stays bounded.
+    readerBudget: 0
+    # 0 = derive automatically from available parallelism and the
+    # chosen partition count.
+    fileConcurrency: 0
+    # 0 = keep the iceberg reader default batch size.
+    batchSize: 0
+    # 0 = keep the iceberg reader default merged-range threshold.
+    rangeCoalesceBytes: 0
+    # 0 = keep the iceberg reader default merged-range concurrency.
+    rangeFetchConcurrency: 0
+    # 0 = apply the merged-range settings to every scan. Set these to
+    # restrict range coalescing to larger planned scans.
+    rangeAdaptiveMinBytes: 0
+    rangeAdaptiveMinFiles: 0
+    # 0 = keep the fixed `targetPartitions` ceiling for every scan.
+    # Set these to let smaller planned scans expose fewer source
+    # partitions while larger scans can still fan out up to the
+    # target-partitions ceiling.
+    adaptivePartitionMinBytes: 0
+    adaptivePartitionMinFiles: 0
+    # Experimental per-query-pod source-file batch cache. Disabled unless both
+    # limits are explicitly set to positive values.
+    fileCacheMaxBytes: 0
+    fileCacheMaxEntries: 0
+  # In-binary TLS. Default off — customers typically front the
+  # query-server with an Ingress that terminates TLS, which is the
+  # path the chart's `ingress.tls` block supports. Enable this when
+  # the query-server is exposed directly (Service LB / NodePort)
+  # without an Ingress in front.
+  tls:
+    enabled: false
+    # Existing TLS Secret (kubernetes.io/tls) with `tls.crt` + `tls.key`
+    # keys. The chart mounts it at /etc/siglake/tls and passes the
+    # paths to the binary via env.
+    existingSecret: ""
+  extraEnv: []
+  extraArgs: []
+
+# -----------------------------------------------------------------------
+# WAL volume (shared between ingester and compactor; also readable by any
+# external WAL consumer — see docs/CONSUMING_SEGMENTS.md)
+# -----------------------------------------------------------------------
+# Requires a ReadWriteMany-capable StorageClass. On EKS the recommended
+# path is the AWS EFS CSI driver. The Terraform module provisions the file
+# system, mount targets, NFS security group, CSI controller IRSA role and
+# managed EKS add-on. `deploy/aws/up.sh` creates the StorageClass post-apply
+# because the module has no Kubernetes provider.
+wal:
+  # Keep the WAL claim when the release is uninstalled.
+  #
+  # Acks are WAL-append-based: a segment is durable in the WAL and not yet in
+  # Iceberg until the compactor commits it. `wal.mirror.enabled` is on by
+  # default, so what an uninstall with this false discards is the segments
+  # whose upload had not finished — seconds of acknowledged data, not all of
+  # it. Set it false only if you are certain the WAL is empty.
+  retainOnDelete: true
+  size: 50Gi
+  accessMode: ReadWriteMany
+  # Empty = cluster default. Set to e.g. `efs-sc`.
+  storageClassName: ""
+  # If true the chart leaves the PVC alone (customer pre-creates it).
+  existingClaim: ""
+  # WAL → object-store mirror. Each sealed WAL segment is uploaded to
+  # `s3://<s3.bucket>/<wal.mirror.prefix>/` on a best-effort background
+  # task. DR recipe: `siglake wal-recover --from
+  # s3://<bucket>/<prefix> --to <wal-root>` — `--to` is the WAL ROOT, and
+  # recovery rebuilds the <tenant>[/<index>]/sealed/ layout beneath it so each
+  # segment is committed to the namespace and table it came from.
+  #
+  # ON by default since 2026-09-11: without it the WAL volume is the only copy
+  # of everything acknowledged but not yet committed, and losing it loses that
+  # data. The upload is asynchronous, so it does NOT make an acknowledgement
+  # remotely durable — the window between the ack and the upload stays.
+  #
+  # What it costs, measured on a local (filesystem-backed) object store — see
+  # README "Ingest path": the saturation ceiling moved -0.8%, inside the spread
+  # between repeats, and ack p50 rose 0.27ms at 20k EPS (1.53 -> 1.80ms) and
+  # 0.08ms at saturation. Uploads stayed within one sealed segment of the
+  # writer at 61 seals/s. PUT volume is one object per sealed segment (plus one
+  # per `activeIntervalSecs` tick), which is what an S3 bill sees; on S3 the
+  # backlog follows remote PUT latency, and no AWS measurement has been taken.
+  #
+  # Two things to set alongside it:
+  #  - Nothing deletes mirror objects unless `compactor.catalogClaim.enabled`
+  #    is on: that drain claims from the mirror and purges what it committed.
+  #    With the default single-replica FS drain the prefix grows forever —
+  #    give `<wal.mirror.prefix>/` an object-store lifecycle expiry (the
+  #    Terraform module does not add one yet).
+  #  - `?commit=force` is refused with a 400 when the catalog-claim drain is on. Use
+  #    `?commit=wait_for` (the default) and query for visibility.
+  #
+  # `enabled: false` renders an EMPTY SIGLAKE_WAL_MIRROR_PREFIX, which is the
+  # binary's opt-out; omitting the variable would leave the mirror running.
+  mirror:
+    enabled: true
+    # Bucket-root-relative path. Lives as a sibling to `s3.warehousePrefix`,
+    # not underneath it.
+    prefix: wal-mirror
+    # Also snapshot the in-flight (active) segment every N seconds to
+    # `<prefix>/_active/<filename>`. N is the upload window for that
+    # segment. After PVC loss a successful upload becomes rows only when
+    # an operator runs `siglake wal-recover` onto the WAL root and the
+    # filesystem drain commits what it finds; nothing recovers an active
+    # snapshot on a restart. The catalog-claim drain
+    # (`compactor.catalogClaim.enabled`) reconciles sealed objects only and
+    # never reads `_active/`, so it gets no N-second target.
+    # 0 disables.
+    activeIntervalSecs: 0
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    # Hosts to expose. The default rule maps to the query-server; OTLP
+    # ingest is typically a separate Ingress (different auth model).
+    - host: siglake.example.com
+      paths:
+        - path: /api
+          pathType: Prefix
+          service: query
+        - path: /healthz
+          pathType: Exact
+          service: query
+        - path: /readyz
+          pathType: Exact
+          service: query
+  tls: []
+
+# -----------------------------------------------------------------------
+# Prometheus operator integration
+# -----------------------------------------------------------------------
+# Prometheus alert rules for the failure modes siglake has actually hit —
+# silent-data-loss counters, a stalled drain, a non-converging layout, refused
+# writes, a stalled query-cache warmer. Requires the Prometheus Operator (same
+# as serviceMonitor).
+#
+# Every rule fires on a metric this build actually exports; there is a CI check
+# asserting that, because an alert on a metric nobody emits is indistinguishable
+# from a healthy system.
+prometheusRule:
+  enabled: false
+  # Extra labels, e.g. `release: kube-prometheus-stack` for rule discovery.
+  labels: {}
+  # Optional override for the warm cadence SiglakeQueryWarmCycleStalled assumes.
+  # The alert fires once no warm cycle has completed for THREE of these intervals,
+  # and its `for:` is the same span, so the value must match what the pods run.
+  # Unset (or 0), it follows `query.warmIntervalSecs`, which is what the chart
+  # renders into the pods as SIGLAKE_QUERY_WARM_INTERVAL_SECS, so the two cannot
+  # drift. Set it only when the pods' cadence comes from somewhere else (a
+  # query.extraEnv entry wins over the rendered value) and differs from
+  # query.warmIntervalSecs; otherwise the alert is either late or noisy.
+  queryWarmIntervalSecs: null
+  # How long SiglakeMirrorReconciliationStalled lets bounded mirror-to-catalog
+  # pages run without one full wraparound rotation completing. This is a whole
+  # walk of the mirror prefix, not one page: at the 1,024-object page budget and
+  # the compactor's default 60s page cadence, the 218,569-object prefix of the
+  # 2026-08-15 incident takes ~3.5h, so the default leaves headroom above it.
+  # Raise it if `compactor.committedRetentionSecs` keeps a larger prefix than one
+  # rotation can walk in this window (the dashboard's retained/rotation target
+  # is the population being walked); 0 does not render the alert at all.
+  mirrorRotationStallSecs: 21600
+
+serviceMonitor:
+  enabled: false
+  labels: {}
+  interval: 15s
+  scrapeTimeout: 10s
+
+# -----------------------------------------------------------------------
+# K8s hardening (opt-in — default off so single-node clusters work)
+# -----------------------------------------------------------------------
+# PodDisruptionBudgets keep at least N replicas of each enabled service
+# available during voluntary disruptions (node drains, upgrades). v0
+# only applies PDBs to services with replicas > 1.
+podDisruptionBudget:
+  enabled: false
+  # `minAvailable` is applied as `replicas - 1` per service unless
+  # overridden below.
+  minAvailable: {}   # e.g. { query: 1, ingester: 1 }
+
+# Pod anti-affinity for the WAL-sharing stateful trio
+# (ingester/compactor) and for the query-server. Default
+# topologyKey is `kubernetes.io/hostname` (one-per-node spreading).
+# Set this to `topology.kubernetes.io/zone` for AZ-aware spreading on
+# EKS multi-AZ clusters.
+antiAffinity:
+  enabled: false
+  topologyKey: kubernetes.io/hostname
+  # "preferred" = soft (schedulable on single-node clusters too)
+  # "required" = hard (scheduling fails if no available node)
+  mode: preferred
+
+# NetworkPolicies lock down egress to S3 + RDS + (for query-server)
+# the OIDC issuer. Customer is responsible for the CIDRs.
+networkPolicy:
+  enabled: false
+  # Egress CIDRs the binaries are allowed to reach. The chart adds
+  # DNS (kube-dns) on top automatically.
+  egress:
+    s3:
+      # AWS S3 in the cluster region — narrow with a VPC endpoint or
+      # the regional S3 prefix list in production.
+      cidrs: ["0.0.0.0/0"]
+      ports: [443]
+    postgres:
+      cidrs: []     # e.g. ["10.0.0.0/16"]
+      ports: [5432]
+    oidc:
+      # OIDC issuer egress; only consumed where an OIDC block is complete
+      # (`query.oidc` / `ingester.oidc` issuer + audience). There is no
+      # `query.auth.mode`, which this line used to name.
+      cidrs: ["0.0.0.0/0"]
+      ports: [443]
+
+# External Secrets Operator integration. When enabled the chart
+# creates `ExternalSecret` resources that pull from a customer-provided
+# `SecretStore` / `ClusterSecretStore`. The chart does *not* create the
+# SecretStore — the customer wires that up with their preferred backend
+# (AWS Secrets Manager, Vault, etc.).
+externalSecrets:
+  enabled: false
+  refreshInterval: "1h"
+  secretStore:
+    # Name of the SecretStore or ClusterSecretStore to pull from.
+    name: siglake
+    kind: ClusterSecretStore
+  postgres:
+    # Remote key in the SecretStore that holds the Postgres creds
+    # as a JSON object with host/port/user/password/database fields.
+    remoteKey: siglake/postgres
+  queryTokens:
+    # When set, creates an ExternalSecret that materializes the
+    # query-server bearer-token Secret. Useful only in `tokens` auth
+    # mode. The chart refuses this together with a non-empty
+    # `query.tokens.list` when `query.tokens.existingSecret` is empty.
+    remoteKey: ""
+
+# -----------------------------------------------------------------------
+# Pod-level defaults applied to every Deployment
+# -----------------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+# Global log level applied as `RUST_LOG` env on every binary.
+logLevel: "info,siglake=info"
+
+# Additional env vars applied to every pod (useful for proxy settings,
+# AWS_ENDPOINT_URL for minio dev, etc.).
+extraEnv: []
+
+# -----------------------------------------------------------------------
+# Autoscaling — KEDA (recommended; change 3)
+# -----------------------------------------------------------------------
+# KEDA ScaledObjects scale the ingester (Deployment) + query (StatefulSet)
+# pools on Prometheus *saturation* signals instead of CPU. Pair with the
+# graceful scale-down primitives (preStop + terminationGracePeriodSeconds +
+# WAL seal-on-shutdown) so scale-down is safe. Requires the KEDA operator
+# (keda.sh) installed in-cluster; off by default because the CRDs must exist.
+#
+# Metric names are siglake-unique, so the default empty `metricLabelSelector`
+# aggregates this release's pods. Running multiple siglake releases against one
+# Prometheus? Scope it, e.g. `metricLabelSelector: 'namespace="siglake"'`.
+keda:
+  enabled: false
+  # Prometheus KEDA reads the trigger metrics from (in-cluster URL).
+  prometheusServerAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+  # Appended inside each query's `{...}` label matcher. Empty = all series for
+  # the (siglake-unique) metric name.
+  metricLabelSelector: ""
+  # How often KEDA evaluates the triggers.
+  pollingIntervalSeconds: 15
+  # Idle-to-min cooldown before scaling down after the last active trigger.
+  cooldownPeriodSeconds: 300
+  # Anti-flap: HPA stabilization windows. Scale-down is slow (avoid thrash on
+  # bursty load); scale-up is immediate (absorb spikes fast).
+  scaleDownStabilizationSeconds: 300
+  scaleUpStabilizationSeconds: 0
+  ingester:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 10
+    # Accept rate: total requests/sec ÷ this = desired pods.
+    requestsPerSecondTarget: "800"
+    # Backpressure queue depth: total queued events ÷ this = desired pods.
+    # Empty string disables this trigger.
+    backpressureQueueTarget: "256"
+  query:
+    enabled: true
+    # Keep >= 2 so distributed fan-out always has peers (and never 0).
+    minReplicas: 2
+    # #967: this may now exceed query.replicas. Query pods discover each other
+    # from the headless Service's SRV record, so every READY replica joins the
+    # membership and receives shard work; query.replicas is only the starting
+    # (and non-KEDA) count. The chart's former refusal of
+    # maxReplicas > query.replicas is gone.
+    #
+    # Two convergence properties to expect when you raise this: a new pod
+    # becomes eligible one readiness probe plus one DNS refresh after it
+    # starts, and a query already running keeps the membership it captured, so
+    # scale-out shows up on the NEXT query, not the one in flight.
+    maxReplicas: 2
+    # Concurrency: total in-flight queries ÷ this = desired pods.
+    inFlightTarget: "8"
+    # Contention: p95 seconds spent WAITING for a query exec-pool slot ÷ this
+    # = desired pods. Empty disables.
+    #
+    # NOT request duration. KEDA divides by replica count, so the signal has to
+    # FALL as pods are added — and total duration does not: a shape that
+    # legitimately takes 20s pins the tier to maxReplicas at any load level,
+    # which is what the old p95-request-latency trigger did. Queue wait is near
+    # zero whenever a slot is free however slow the query, rises with
+    # contention, and falls with replicas.
+    p95QueueWaitSecondsTarget: "0.5"
+
+# -----------------------------------------------------------------------
+# Autoscaling (HorizontalPodAutoscaler) — legacy/CPU fallback
+# -----------------------------------------------------------------------
+# Ingester and compactor HPA manifests, opt-in. CPU-based scaling works
+# anywhere metrics-server is installed (every managed Kubernetes
+# cluster ships it). Custom-metric scaling — request rate on the
+# ingester and sealed-segment backlog on the compactor — requires
+# `prometheus-adapter` or KEDA in front of the cluster's metrics API, and
+# the compactor's is refused under the catalog claim (see below).
+#
+# KEDA is the recommended chart autoscaler and the only chart autoscaler for
+# query. These HPAs remain as a legacy fallback for ingester and compactor;
+# `siglake-operator` replaces them with its own controller-driven decisions.
+autoscaling:
+  ingester:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 8
+    # CPU utilization target. 70 means "scale up when avg CPU > 70%".
+    targetCPUUtilizationPercentage: 70
+    # Optional custom metric: ingest requests-per-second per pod.
+    # Requires prometheus-adapter wiring the metric
+    # `siglake_ingest_requests_per_second` into the external/object
+    # metrics API.
+    customMetric:
+      enabled: false
+      name: siglake_ingest_requests_per_second
+      targetAverageValue: "100"
+  compactor:
+    enabled: false
+    minReplicas: 1
+    # A ceiling above 1 requires `compactor.catalogClaim.enabled`, the same
+    # refusal `compactor.replicas` gets: an HPA reaches the uncoordinated
+    # multi-pod state a few minutes after install instead of at install.
+    maxReplicas: 4
+    # CPU is what this HPA scales on. Most compactor work is zstd plus
+    # Iceberg metadata, so it is a coarse signal, but the backlog metric
+    # below is not an alternative under the claim — see there.
+    targetCPUUtilizationPercentage: 80
+    # Scale on the count of sealed WAL segments waiting to compact. See the
+    # `siglake_compactor_sealed_pending` gauge.
+    #
+    # REFUSED together with `compactor.catalogClaim.enabled`: in claim mode
+    # every compactor publishes the whole shared sealed, unclaimed queue
+    # (`peek_pending`, a COUNT(*) with no worker filter), not the segments it
+    # claimed. The HPA renders this as `type: Pods` with an averageValue
+    # target, and that algorithm averages the reading over the running pods,
+    # so a fixed backlog asks for a count that grows with the count already
+    # running. Dividing the target into the queue once needs one aggregated
+    # series behind an Object or External metric plus the adapter rule that
+    # exposes it; `siglake-operator` does that division itself.
+    #
+    # In filesystem mode the reading IS one pod's own: one value per tenant
+    # covering that tenant's events directory and every managed index under
+    # it, published once the sweep has visited them all; a cycle that fails
+    # partway leaves the previous reading standing rather than reporting a
+    # short total. That mode is held at one pod by the refusal above, so the
+    # metric renders at `maxReplicas: 1` and scales nothing.
+    customMetric:
+      enabled: false
+      name: siglake_compactor_sealed_pending
+      targetAverageValue: "5"

@@ -1,0 +1,241 @@
+{{- if .Values.ingester.enabled -}}
+{{- /*
+  `ingester.extraArgs: [--with-compactor]` is refused here, and only here: this
+  is the template that puts the flag on a pod, and a render with
+  `ingester.enabled: false` puts it on none. See siglake.embeddedCompactorGuard
+  in _helpers.tpl for what the uncoordinated copies do to each other.
+*/ -}}
+{{- include "siglake.embeddedCompactorGuard" . -}}
+{{- $oidc := default dict .Values.ingester.oidc -}}
+{{- $oidcIssuer := trim (toString (default "" $oidc.issuer)) -}}
+{{- $oidcAudience := trim (toString (default "" $oidc.audience)) -}}
+{{- $oidcClaim := trim (toString (default "" $oidc.tenantClaim)) -}}
+{{- /*
+  Trimmed before anything reads them: the binary treats a whitespace-only
+  tenant claim as unset (`oidc_tenant_claim_from`, crates/siglake-cli), so a
+  value the chart called "set" and the binary called "empty" would be the same
+  silent gap the guard below exists to close.
+*/ -}}
+{{- include "siglake.oidcGuard" (list "ingester" $oidcIssuer $oidcAudience $oidcClaim) -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "siglake.componentName" (list . "ingester") }}
+  labels:
+    {{- include "siglake.componentLabels" (list . "ingester") | nindent 4 }}
+spec:
+  {{- if and .Values.keda.enabled .Values.keda.ingester.enabled }}
+  # replicas deliberately OMITTED: KEDA owns spec.replicas on this tier. See the
+  # query StatefulSet for why rendering it caused a replica cliff on upgrade.
+  {{- else }}
+  replicas: {{ .Values.ingester.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "siglake.componentSelectorLabels" (list . "ingester") | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "siglake.componentLabels" (list . "ingester") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "siglake.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ingester
+          image: {{ include "siglake.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - ingest-server
+            - --bind
+            - 0.0.0.0:8088
+            - --metrics-bind
+            - 0.0.0.0:9100
+            - --wal
+            - /var/lib/siglake/wal
+            - --warehouse
+            - {{ .Values.s3.warehousePrefix | quote }}
+            - --wal-max-events
+            - {{ .Values.ingester.walSegmentMaxEvents | quote }}
+            - --wal-max-age-secs
+            - {{ .Values.ingester.walSegmentMaxAgeSecs | quote }}
+            {{- if .Values.ingester.otlpGrpc.enabled }}
+            - --otlp-grpc-listen
+            - 0.0.0.0:{{ .Values.ingester.otlpGrpc.port }}
+            {{- else }}
+            - --disable-otlp-grpc
+            {{- end }}
+            {{- with .Values.ingester.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            {{- include "siglake.commonEnv" . | nindent 12 }}
+            {{- if $oidcIssuer }}
+            # The guard at the top of this file already refused every partial
+            # block, so an issuer here means an audience with it.
+            - name: SIGLAKE_OIDC_ISSUER
+              value: {{ $oidcIssuer | quote }}
+            - name: SIGLAKE_OIDC_AUDIENCE
+              value: {{ $oidcAudience | quote }}
+            {{- if $oidcClaim }}
+            - name: SIGLAKE_OIDC_TENANT_CLAIM
+              value: {{ $oidcClaim | quote }}
+            {{- end }}
+            {{- end }}
+            # Tenant routing. Rendered either way, like the WAL mirror below:
+            # the binary is single-tenant unless told otherwise, so the value
+            # says which one this release is rather than leaving it to be
+            # inferred from an absent variable. `ingester.extraEnv` is spliced
+            # after this, so it still wins.
+            - name: SIGLAKE_TRUST_SCOPE_HEADER
+              value: {{ ternary "1" "0" .Values.ingester.trustScopeHeader | quote }}
+            {{- with .Values.ingester.allowedTenants }}
+            - name: SIGLAKE_ALLOWED_TENANTS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if gt (int .Values.ingester.maxTenants) 0 }}
+            - name: SIGLAKE_MAX_TENANTS
+              value: {{ .Values.ingester.maxTenants | quote }}
+            {{- end }}
+            {{- if gt (int .Values.ingester.maxLanes) 0 }}
+            - name: SIGLAKE_INGEST_MAX_LANES
+              value: {{ .Values.ingester.maxLanes | quote }}
+            {{- end }}
+            # WAL → object-store mirror. Default-on, and rendered either way:
+            # the binary mirrors to `wal-mirror/` whenever a warehouse URL is
+            # set (and one always is here), so `wal.mirror.enabled: false` has
+            # to say so with an EMPTY value — omitting the variable would leave
+            # the mirror running. `ingester.extraEnv` is spliced after this, so
+            # it still wins.
+            - name: SIGLAKE_WAL_MIRROR_PREFIX
+              value: {{ ternary .Values.wal.mirror.prefix "" .Values.wal.mirror.enabled | quote }}
+            - name: SIGLAKE_REMOTE_WAL_DRAIN
+              value: {{ ternary "1" "0" .Values.compactor.catalogClaim.enabled | quote }}
+            {{- if and .Values.wal.mirror.enabled (gt (int .Values.wal.mirror.activeIntervalSecs) 0) }}
+            - name: SIGLAKE_WAL_ACTIVE_MIRROR_INTERVAL_SECS
+              value: {{ .Values.wal.mirror.activeIntervalSecs | quote }}
+            {{- end }}
+            {{- $authSecret := .Values.ingester.auth.existingSecret -}}
+            {{- if and (not $authSecret) .Values.ingester.auth.list -}}
+            {{- $authSecret = include "siglake.componentName" (list . "auth-tokens") -}}
+            {{- end }}
+            {{- if $authSecret }}
+            - name: SIGLAKE_AUTH_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $authSecret | quote }}
+                  key: {{ .Values.ingester.auth.secretKey | quote }}
+            {{- end }}
+            {{- with .Values.ingester.rateLimit }}
+            {{- if gt (.ratePerSec | float64) 0.0 }}
+            - name: SIGLAKE_INGEST_RATE_PER_SEC
+              value: {{ .ratePerSec | quote }}
+            - name: SIGLAKE_INGEST_RATE_BURST
+              value: {{ .burst | quote }}
+            {{- if .redis.url }}
+            - name: SIGLAKE_INGEST_RATE_REDIS_URL
+              {{- if .redis.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .redis.existingSecret | quote }}
+                  key: {{ .redis.existingSecretKey | default "url" | quote }}
+              {{- else }}
+              value: {{ .redis.url | quote }}
+              {{- end }}
+            {{- if .redis.prefix }}
+            - name: SIGLAKE_INGEST_RATE_REDIS_PREFIX
+              value: {{ .redis.prefix | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if gt (int .Values.ingester.backpressure.capacity) 0 }}
+            - name: SIGLAKE_INGEST_BACKPRESSURE_CAPACITY
+              value: {{ .Values.ingester.backpressure.capacity | quote }}
+            {{- if gt (int .Values.ingester.backpressure.groupCommitMs) 0 }}
+            - name: SIGLAKE_INGEST_GROUP_COMMIT_MS
+              value: {{ .Values.ingester.backpressure.groupCommitMs | quote }}
+            {{- end }}
+            {{- if gt (int .Values.ingester.backpressure.shards) 1 }}
+            - name: SIGLAKE_INGEST_BACKPRESSURE_SHARDS
+              value: {{ .Values.ingester.backpressure.shards | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if gt (int .Values.ingester.memBreaker.limitMib) 0 }}
+            - name: SIGLAKE_INGEST_MEM_LIMIT_MIB
+              value: {{ .Values.ingester.memBreaker.limitMib | quote }}
+            - name: SIGLAKE_INGEST_MEM_SAMPLE_SECS
+              value: {{ .Values.ingester.memBreaker.sampleSecs | quote }}
+            {{- end }}
+            {{- with .Values.ingester.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: ingest
+              containerPort: 8088
+              protocol: TCP
+            {{- if .Values.ingester.otlpGrpc.enabled }}
+            - name: otlp-grpc
+              containerPort: {{ .Values.ingester.otlpGrpc.port }}
+              protocol: TCP
+            {{- end }}
+            - name: metrics
+              containerPort: 9100
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ingest
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          # /readyz, not /healthz: readiness must be able to FAIL, and /healthz
+          # is a constant 200 built from a string literal. Wiring it as both
+          # probes meant an ingester whose WAL volume was full or remounted
+          # read-only stayed in Service rotation, accepting traffic it could not
+          # durably ack. /readyz probes the WAL for writability, which is what
+          # an ack actually promises.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: ingest
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            # Two consecutive failures, so a single slow fsync under load does
+            # not evict a healthy pod.
+            failureThreshold: 2
+          {{- if gt (int .Values.ingester.preStopSleepSeconds) 0 }}
+          # Graceful scale-down: pause before SIGTERM so the Service/LB stops
+          # routing new requests (endpoint deregistration propagates) before the
+          # process shuts down. On SIGTERM the ingester drains in-flight requests
+          # + force-seals the active WAL segment so buffered events land in
+          # `sealed/` for the compactor instead of stranding in `active/`.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep {{ .Values.ingester.preStopSleepSeconds }}"]
+          {{- end }}
+          volumeMounts:
+            - name: wal
+              mountPath: /var/lib/siglake/wal
+          resources:
+            {{- toYaml .Values.ingester.resources | nindent 12 }}
+      # Must exceed preStopSleepSeconds + the in-flight-drain + WAL-seal time,
+      # or the kubelet SIGKILLs mid-seal and strands the active segment.
+      terminationGracePeriodSeconds: {{ .Values.ingester.terminationGracePeriodSeconds }}
+      volumes:
+        - name: wal
+          persistentVolumeClaim:
+            claimName: {{ include "siglake.walClaimName" . }}
+      {{- include "siglake.scheduling" (list . .Values.ingester "ingester") | nindent 6 }}
+{{- end }}

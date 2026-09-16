@@ -1,0 +1,75 @@
+{{/*
+HorizontalPodAutoscaler manifests for ingester / compactor.
+Each component renders only when `.Values.autoscaling.<component>.enabled`
+is true. CPU target always renders; the custom-metric block is opt-in
+on top.
+
+The compactor's `replicas` value is overridden by the HPA's
+`minReplicas` when autoscaling is enabled, and a `maxReplicas` above 1
+requires `compactor.catalogClaim.enabled = true` so the multi-pod claim
+coordination is in effect: `siglake.compactorScaleGuard` refuses the render
+otherwise. It is included below rather than only from the compactor
+Deployment, so an HPA that scales a compactor this chart does not render
+(`compactor.enabled: false`) is checked too.
+
+The same guard refuses the compactor's custom metric under the claim. The
+block below can only express a metric as `type: Pods`, which the autoscaler
+averages over the running pods, and in claim mode every compactor publishes
+the whole shared sealed queue — so the request would carry the current replica
+count (#3718). Claim-mode scaling here is CPU-only. The ingester's custom
+metric is a per-pod request rate and is unaffected.
+*/}}
+{{- define "siglake.hpaMetrics" -}}
+metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: {{ .targetCPUUtilizationPercentage }}
+  {{- if and .customMetric .customMetric.enabled }}
+  - type: Pods
+    pods:
+      metric:
+        name: {{ .customMetric.name | quote }}
+      target:
+        type: AverageValue
+        averageValue: {{ .customMetric.targetAverageValue | quote }}
+  {{- end }}
+{{- end -}}
+
+{{- if .Values.autoscaling.ingester.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "siglake.componentName" (list . "ingester") }}
+  labels:
+    {{- include "siglake.componentLabels" (list . "ingester") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "siglake.componentName" (list . "ingester") }}
+  minReplicas: {{ .Values.autoscaling.ingester.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.ingester.maxReplicas }}
+  {{- include "siglake.hpaMetrics" .Values.autoscaling.ingester | nindent 2 }}
+---
+{{- end }}
+{{- if .Values.autoscaling.compactor.enabled }}
+{{- include "siglake.compactorScaleGuard" . }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "siglake.componentName" (list . "compactor") }}
+  labels:
+    {{- include "siglake.componentLabels" (list . "compactor") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "siglake.componentName" (list . "compactor") }}
+  minReplicas: {{ .Values.autoscaling.compactor.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.compactor.maxReplicas }}
+  {{- include "siglake.hpaMetrics" .Values.autoscaling.compactor | nindent 2 }}
+---
+{{- end }}

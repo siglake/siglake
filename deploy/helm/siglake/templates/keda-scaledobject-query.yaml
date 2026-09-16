@@ -1,0 +1,66 @@
+{{- /*
+KEDA ScaledObject for the query pool (change 3 — autoscaling).
+
+Scales the query StatefulSet on Prometheus saturation signals. Triggers — KEDA
+takes the max desired across them:
+  - concurrency: total in-flight queries ÷ per-pod target.
+  - contention: p95 seconds spent WAITING for a query exec-pool slot ÷ target.
+
+The second trigger measures queue WAIT, not request duration, and that
+distinction is the whole point. KEDA external metrics use AverageValue
+semantics, so desired = ceil(signal / target) — which only converges if the
+signal FALLS as replicas are added. Total request duration does not: a shape
+that legitimately takes 20s (a full scan at depth, or the measured 40.9s
+windowed browse under compaction lag) yields desired = 10 at any load level,
+and scaleDownStabilizationSeconds holds it there — so the tier sat at
+maxReplicas at 5% CPU on a signal replicas could not move. The old
+p95-request-latency trigger did exactly that, and it also aggregated across
+every `endpoint` value, mixing coordinator requests with `/api/v1/sql/shard`
+sub-queries.
+
+Time spent waiting for an exec-pool slot is a genuine saturation signal: near
+zero whenever a slot is free however slow the query is, rising with contention,
+and falling when replicas are added because each replica has its own pool.
+
+Anti-flap via the HPA behavior block + cooldownPeriod. Requires the KEDA
+operator. Note the query pool is a distributed-query StatefulSet — keep
+`minReplicaCount >= 2` so cross-shard fan-out still has peers (and never 0, or
+the API goes dark). See the ingester ScaledObject for the label-selector note.
+*/ -}}
+{{- if and .Values.keda.enabled .Values.keda.query.enabled .Values.query.enabled }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "siglake.componentName" (list . "query") }}
+  labels:
+    {{- include "siglake.componentLabels" (list . "query") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: {{ include "siglake.componentName" (list . "query") }}
+  minReplicaCount: {{ .Values.keda.query.minReplicas }}
+  maxReplicaCount: {{ .Values.keda.query.maxReplicas }}
+  pollingInterval: {{ .Values.keda.pollingIntervalSeconds }}
+  cooldownPeriod: {{ .Values.keda.cooldownPeriodSeconds }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: {{ .Values.keda.scaleDownStabilizationSeconds }}
+        scaleUp:
+          stabilizationWindowSeconds: {{ .Values.keda.scaleUpStabilizationSeconds }}
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.keda.prometheusServerAddress | quote }}
+        query: sum(siglake_query_in_flight{ {{- .Values.keda.metricLabelSelector }} })
+        threshold: {{ .Values.keda.query.inFlightTarget | quote }}
+    {{- if .Values.keda.query.p95QueueWaitSecondsTarget }}
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.keda.prometheusServerAddress | quote }}
+        query: histogram_quantile(0.95, sum(rate(siglake_query_exec_pool_queue_seconds_bucket{ {{- .Values.keda.metricLabelSelector }} }[5m])) by (le))
+        threshold: {{ .Values.keda.query.p95QueueWaitSecondsTarget | quote }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,563 @@
+rule_files:
+  - prometheusrule.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  - name: a torn recovered WAL tail raises its warning
+    interval: 1m
+    input_series:
+      - series: 'siglake_wal_partial_tail_dropped_total{namespace="logs",pod="compactor-0"}'
+        values: '0 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: SiglakeWalPartialTailDropped
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              severity: warning
+            exp_annotations:
+              summary: A recovered WAL partial ended in a torn IPC message
+              description: >-
+                Siglake committed or served the complete fsynced prefix and left
+                the torn source bytes intact. Correlate this warning with an
+                ingester restart or storage failure; repeated events indicate
+                an unstable WAL volume or process.
+
+  - name: recovery rejecting a batch completion alerts and recovers
+    interval: 1m
+    input_series:
+      - series: 'siglake_query_job_terminal_conflict_total{namespace="logs",pod="query-0",attempted="succeeded",actual="failed",cause="recovery"}'
+        values: '0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SiglakeBatchCompletionRejectedByRecovery
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: query-0
+              attempted: succeeded
+              actual: failed
+              cause: recovery
+              severity: warning
+            exp_annotations:
+              summary: Batch recovery refused executor work
+              description: >-
+                1 batch lifecycle transition(s) were refused after recovery
+                declared their executor gone. A refused running publication
+                prevents execution; a refused completion discards its computed
+                output. The failed job remains terminal and tells the client to
+                resubmit; inspect the query-server WARN line for the job id,
+                owner, attempted transition and disposition. Client
+                cancellations, TTL expiry, oversized results and terminal-write
+                errors do not fire this alert.
+      - eval_time: 15m
+        alertname: SiglakeBatchCompletionRejectedByRecovery
+        exp_alerts: []
+
+  - name: recovery refusing a pre-registered batch start alerts and recovers
+    interval: 1m
+    input_series:
+      - series: 'siglake_query_job_terminal_conflict_total{namespace="logs",pod="query-1",attempted="running",actual="failed",cause="recovery"}'
+        values: '0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SiglakeBatchCompletionRejectedByRecovery
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: query-1
+              attempted: running
+              actual: failed
+              cause: recovery
+              severity: warning
+            exp_annotations:
+              summary: Batch recovery refused executor work
+              description: >-
+                1 batch lifecycle transition(s) were refused after recovery
+                declared their executor gone. A refused running publication
+                prevents execution; a refused completion discards its computed
+                output. The failed job remains terminal and tells the client to
+                resubmit; inspect the query-server WARN line for the job id,
+                owner, attempted transition and disposition. Client
+                cancellations, TTL expiry, oversized results and terminal-write
+                errors do not fire this alert.
+      - eval_time: 15m
+        alertname: SiglakeBatchCompletionRejectedByRecovery
+        exp_alerts: []
+
+  - name: expected batch completion conflicts do not page
+    interval: 1m
+    input_series:
+      - series: 'siglake_query_job_terminal_conflict_total{namespace="logs",pod="query-0",attempted="succeeded",actual="cancelled",cause="cancellation"}'
+        values: '0+1x15'
+      - series: 'siglake_query_job_terminal_conflict_total{namespace="logs",pod="query-0",attempted="succeeded",actual="gone",cause="gone"}'
+        values: '0+1x15'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SiglakeBatchCompletionRejectedByRecovery
+        exp_alerts: []
+
+  # #1951. A run that finished, could not persist its verdict, and could not be
+  # tracked for reconciliation either. Nothing on this pod will retry, so the
+  # row reads `running` until the process exits — the whole point of the page.
+  - name: an abandoned terminal write pages from its pre-registered zero
+    interval: 1m
+    input_series:
+      - series: 'siglake_query_job_terminal_conflict_total{namespace="logs",pod="query-0",attempted="succeeded",actual="unknown",cause="write_abandoned"}'
+        values: '0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'siglake_query_jobs_unreconciled_dropped_total{namespace="logs",pod="query-0"}'
+        values: '0+0x17'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SiglakeBatchRowStrandedNonTerminal
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: query-0
+              severity: critical
+            exp_annotations:
+              summary: A finished batch job's row is stranded non-terminal until its executor restarts
+              description: >-
+                1 batch run(s) on query-0 finished without persisting a verdict
+                and are not being retried by anything: their clients read
+                `running` until this pod exits and a peer condemns the rows on
+                lease expiry. Read the query-server ERROR lines "batch terminal
+                state could not be persisted and could not be tracked" and
+                "job-store outage outlasted this replica's reconciliation
+                bookkeeping" for the job ids and owner. The cause is a job-store
+                outage that outlasted this replica's 1024-id bookkeeping;
+                restore the store, then restart the pod to release the stranded
+                rows. Rows whose executor is still reconciling them
+                (cause="write_deferred", siglake_query_jobs_unreconciled) do not
+                fire this alert.
+      - eval_time: 15m
+        alertname: SiglakeBatchRowStrandedNonTerminal
+        exp_alerts: []
+
+  # The overflow half alone: bookkeeping refused an id. Same page, and it must
+  # fire when only this counter moves.
+  - name: reconciliation bookkeeping overflowing pages on its own
+    interval: 1m
+    input_series:
+      - series: 'siglake_query_jobs_unreconciled_dropped_total{namespace="logs",pod="query-1"}'
+        values: '0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SiglakeBatchRowStrandedNonTerminal
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: query-1
+              severity: critical
+            exp_annotations:
+              summary: A finished batch job's row is stranded non-terminal until its executor restarts
+              description: >-
+                1 batch run(s) on query-1 finished without persisting a verdict
+                and are not being retried by anything: their clients read
+                `running` until this pod exits and a peer condemns the rows on
+                lease expiry. Read the query-server ERROR lines "batch terminal
+                state could not be persisted and could not be tracked" and
+                "job-store outage outlasted this replica's reconciliation
+                bookkeeping" for the job ids and owner. The cause is a job-store
+                outage that outlasted this replica's 1024-id bookkeeping;
+                restore the store, then restart the pod to release the stranded
+                rows. Rows whose executor is still reconciling them
+                (cause="write_deferred", siglake_query_jobs_unreconciled) do not
+                fire this alert.
+
+  # Both series move together, which is what production does: one event
+  # increments the dropped counter and then reports the conflict. That must be
+  # ONE page for the pod, not one per series — the reason both sides of the
+  # `or` are reduced to (namespace, pod).
+  - name: the two stranded-row series page once per pod
+    interval: 1m
+    input_series:
+      - series: 'siglake_query_job_terminal_conflict_total{namespace="logs",pod="query-0",attempted="succeeded",actual="unknown",cause="write_abandoned"}'
+        values: '0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'siglake_query_job_terminal_conflict_total{namespace="logs",pod="query-0",attempted="timeout",actual="unknown",cause="write_abandoned"}'
+        values: '0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'siglake_query_jobs_unreconciled_dropped_total{namespace="logs",pod="query-0"}'
+        values: '0 0 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SiglakeBatchRowStrandedNonTerminal
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: query-0
+              severity: critical
+            exp_annotations:
+              summary: A finished batch job's row is stranded non-terminal until its executor restarts
+              description: >-
+                2 batch run(s) on query-0 finished without persisting a verdict
+                and are not being retried by anything: their clients read
+                `running` until this pod exits and a peer condemns the rows on
+                lease expiry. Read the query-server ERROR lines "batch terminal
+                state could not be persisted and could not be tracked" and
+                "job-store outage outlasted this replica's reconciliation
+                bookkeeping" for the job ids and owner. The cause is a job-store
+                outage that outlasted this replica's 1024-id bookkeeping;
+                restore the store, then restart the pod to release the stranded
+                rows. Rows whose executor is still reconciling them
+                (cause="write_deferred", siglake_query_jobs_unreconciled) do not
+                fire this alert.
+
+  # A store outage the executor IS reconciling through: rows are parked, the
+  # same conditional write is retried every 5s, and the gauge tracks the
+  # backlog. No operator action, so no page.
+  - name: a deferred terminal write being reconciled does not page
+    interval: 1m
+    input_series:
+      - series: 'siglake_query_job_terminal_conflict_total{namespace="logs",pod="query-0",attempted="succeeded",actual="unknown",cause="write_deferred"}'
+        values: '0+2x20'
+      - series: 'siglake_query_jobs_unreconciled{namespace="logs",pod="query-0"}'
+        values: '0+2x20'
+      - series: 'siglake_query_jobs_unreconciled_dropped_total{namespace="logs",pod="query-0"}'
+        values: '0+0x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SiglakeBatchRowStrandedNonTerminal
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: SiglakeBatchCompletionRejectedByRecovery
+        exp_alerts: []
+
+  - name: shard pin misses start from the pre-registered zero baseline
+    interval: 1m
+    input_series:
+      - series: 'siglake_query_shard_pin_total{namespace="logs",pod="query-0",outcome="miss"}'
+        values: '0 0 0 0 0 1 2 3 4 5 6'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: SiglakeQueryShardPinUnresolved
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: SiglakeQueryShardPinUnresolved
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: query-0
+              severity: warning
+            exp_annotations:
+              summary: Query workers cannot resolve the coordinator's generation
+              description: >-
+                Distributed queries are being refused with 503
+                reason="shard_pin_unresolved" rather than mixing generations.
+                The worker log names which half of the pin it refused. For a
+                snapshot, raise compactor.snapshotExpire.retainLast, or lower
+                SIGLAKE_ICEBERG_METADATA_CACHE_TTL_SECS so coordinators stop
+                serving snapshots before the catalog expires them. For a
+                schema, the pinned schema id is in no generation the worker's
+                catalog read retains: check the workers read the same warehouse
+                and that their metadata refreshes are succeeding.
+
+  # #967. The pod answers every query and looks healthy; the ONLY signal that
+  # it never joined a membership is that its discovery refreshes all fail.
+  - name: a query pod whose peer discovery never succeeds is reported
+    interval: 1m
+    input_series:
+      - series: 'siglake_query_peer_discovery_refresh_total{namespace="logs",pod="query-0",outcome="error"}'
+        values: '0+1x30'
+      - series: 'siglake_query_peer_discovery_refresh_total{namespace="logs",pod="query-0",outcome="changed"}'
+        values: '0+0x30'
+      - series: 'siglake_query_peer_discovery_refresh_total{namespace="logs",pod="query-0",outcome="unchanged"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SiglakeQueryPeerDiscoveryStalled
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: SiglakeQueryPeerDiscoveryStalled
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: query-0
+              severity: warning
+            exp_annotations:
+              summary: A query pod has not resolved a usable peer membership
+              description: >-
+                This pod is serving every query single-pod because it has no
+                published membership. Check the outcome label: error is the SRV
+                lookup itself (CoreDNS, NetworkPolicy, or a
+                --query-peer-discovery-srv that does not name the headless
+                Service's http port); empty is a Service with no Ready
+                endpoints; unmatched is a pod that cannot find its OWN name in
+                the answer, which also leaves it without a failover target
+                (check SIGLAKE_QUERY_PEER_SELF_NAME against the SRV targets).
+
+  # A pod that keeps failing AND keeps succeeding is a cluster in churn or a
+  # partially-answering resolver, not a pod cut off from its membership. It has
+  # a membership, so it is not this alert.
+  - name: failing refreshes alongside succeeding ones do not alert
+    interval: 1m
+    input_series:
+      - series: 'siglake_query_peer_discovery_refresh_total{namespace="logs",pod="query-0",outcome="error"}'
+        values: '0+1x30'
+      - series: 'siglake_query_peer_discovery_refresh_total{namespace="logs",pod="query-0",outcome="changed"}'
+        values: '0+1x30'
+      - series: 'siglake_query_peer_discovery_refresh_total{namespace="logs",pod="query-0",outcome="unchanged"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: SiglakeQueryPeerDiscoveryStalled
+        exp_alerts: []
+
+  # #1561/#1625. Healthy publication contention: reloads lose the race, serve
+  # what beat them or re-load, and the cache keeps being published. The
+  # unpublished arm exists at 0 (pre-registered) and never moves.
+  - name: superseded and reload fences are contention, not an alert
+    interval: 1m
+    input_series:
+      - series: 'siglake_iceberg_table_cache_fenced_total{namespace="logs",pod="query-0",action="superseded"}'
+        values: '0+3x40'
+      - series: 'siglake_iceberg_table_cache_fenced_total{namespace="logs",pod="query-0",action="reload"}'
+        values: '0+1x40'
+      - series: 'siglake_iceberg_table_cache_fenced_total{namespace="logs",pod="query-0",action="unpublished"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: SiglakeTableCacheUnpublished
+        exp_alerts: []
+
+  # One burst of fenced-out reloads (a single commit storm) is inside the 10m
+  # rate window for less than the 15m `for:`, so it stays quiet.
+  - name: a single fenced-out burst does not alert
+    interval: 1m
+    input_series:
+      - series: 'siglake_iceberg_table_cache_fenced_total{namespace="logs",pod="query-0",action="unpublished"}'
+        values: '0 0 0 1 2 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SiglakeTableCacheUnpublished
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: SiglakeTableCacheUnpublished
+        exp_alerts: []
+
+  # Sustained: reloads for this table are fenced out for good, so its metadata
+  # cache never gets published and every read pays load_table.
+  - name: a table whose reloads never publish is reported
+    interval: 1m
+    input_series:
+      - series: 'siglake_iceberg_table_cache_fenced_total{namespace="logs",pod="query-0",action="unpublished"}'
+        values: '0+2x40'
+      - series: 'siglake_iceberg_table_cache_fenced_total{namespace="logs",pod="query-0",action="superseded"}'
+        values: '0+0x40'
+      - series: 'siglake_iceberg_table_cache_fenced_total{namespace="logs",pod="query-0",action="reload"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SiglakeTableCacheUnpublished
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SiglakeTableCacheUnpublished
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: query-0
+              severity: warning
+            exp_annotations:
+              summary: Table-metadata cache reloads keep being fenced out unpublished
+              description: >-
+                Reloads have exhausted their attempts against concurrent
+                invalidations for over 15 minutes, so this pod's table-metadata
+                cache stays empty and every read pays a full load_table. The
+                counter cannot name the table (index-table names are only known
+                at the increment, so a table label would not be
+                pre-registerable); grep this pod's log for the WARN line
+                "table-cache refresh fenced out" — it carries table= and
+                attempts=. The healthy arms (action="superseded",
+                action="reload") are on the dashboard's fence panel; if they are
+                moving too, the table is simply committing faster than its
+                metadata loads. Lower the commit rate (raise
+                compactor.commitBatch.targetMb / maxAgeSecs) or shrink the
+                metadata.json being loaded (lower
+                compactor.snapshotExpire.retainLast, or its intervalSecs).
+
+  # A stranded delete task is an acknowledged GDPR deletion request nothing
+  # will retry. The counter counts OBSERVATIONS of the stall, so the series
+  # sits at a constant value between sweeps that see it; only `increase()`
+  # over the window says whether the stall was seen recently, which is why the
+  # alert is independent of the sweep cadence and of the watchdog ceiling the
+  # bound derives from.
+  - name: a delete task left running past the sweep bound pages from its pre-registered zero
+    interval: 1m
+    input_series:
+      - series: 'siglake_compactor_delete_tasks_stalled_total{namespace="logs",pod="compactor-0",state="running"}'
+        values: '0 0 1x75'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SiglakeDeleteTaskStalled
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              state: running
+              severity: critical
+            exp_annotations:
+              summary: An acknowledged deletion request has been left unexecuted
+              description: >-
+                A delete task has been non-terminal (running) for longer than
+                twice the delete sweep's own watchdog ceiling, so no execution
+                this compactor allows could still hold it. It does NOT prove
+                the executor is dead, and it does not say whether the rewrite
+                committed: the age is the claim object's, which bounds
+                execution duration from above and keeps growing after the task
+                strands. Nothing will retry it. Find the task id and index in
+                the compactor's WARN line, read GET
+                /api/v1/delete-tasks/{id} for the record and its claim, decide
+                from your audit trail whether the original rewrite landed, and
+                resubmit the request under a new task id.
+      # The task is still stranded, but no sweep has observed it inside the
+      # window: the alert reports observations, and a compactor whose delete
+      # stage stopped running altogether is the case the dashboard gauge (not
+      # this rule) is for.
+      - eval_time: 75m
+        alertname: SiglakeDeleteTaskStalled
+        exp_alerts: []
+
+  # The claimed-`pending` stranding — a process that died between taking the
+  # claim and writing `running` — is the same signal under its own state, not a
+  # second detector with its own threshold.
+  - name: a delete task stranded pending under its claim pages under its own state
+    interval: 1m
+    input_series:
+      - series: 'siglake_compactor_delete_tasks_stalled_total{namespace="logs",pod="compactor-0",state="pending_claimed"}'
+        values: '0 0 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SiglakeDeleteTaskStalled
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              state: pending_claimed
+              severity: critical
+            exp_annotations:
+              summary: An acknowledged deletion request has been left unexecuted
+              description: >-
+                A delete task has been non-terminal (pending_claimed) for
+                longer than twice the delete sweep's own watchdog ceiling, so
+                no execution this compactor allows could still hold it. It does
+                NOT prove the executor is dead, and it does not say whether the
+                rewrite committed: the age is the claim object's, which bounds
+                execution duration from above and keeps growing after the task
+                strands. Nothing will retry it. Find the task id and index in
+                the compactor's WARN line, read GET
+                /api/v1/delete-tasks/{id} for the record and its claim, decide
+                from your audit trail whether the original rewrite landed, and
+                resubmit the request under a new task id.
+
+  # The pre-registered zero baseline itself must not page. Both series exist
+  # from the compactor's first scrape so that the FIRST stranded task is
+  # visible to increase(); a fleet with nothing stranded therefore reports a
+  # flat zero, not an absent series.
+  - name: the pre-registered delete-task zero baseline does not page
+    interval: 1m
+    input_series:
+      - series: 'siglake_compactor_delete_tasks_stalled_total{namespace="logs",pod="compactor-0",state="running"}'
+        values: '0x90'
+      - series: 'siglake_compactor_delete_tasks_stalled_total{namespace="logs",pod="compactor-0",state="pending_claimed"}'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SiglakeDeleteTaskStalled
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: SiglakeDeleteTaskStalled
+        exp_alerts: []
+
+  # `--max-tenants` is read through the same alert as every other tenancy
+  # refusal (#4240): the cap was inert, so `reason="at_capacity"` had never
+  # existed and nothing had ever fired SiglakeTenantsDenied from it. The
+  # ingester pre-registers all six reasons, so the arms an ingester is not
+  # refusing under sit at a flat zero and the sum is the one an operator reads.
+  - name: an ingester at its tenant cap raises the tenancy alert
+    interval: 1m
+    input_series:
+      - series: 'siglake_ingest_tenant_denied_total{namespace="logs",pod="ingester-0",reason="at_capacity"}'
+        values: '0 0 3 6 9 12 15 18 21 24 27 30 33 36 39'
+      - series: 'siglake_ingest_tenant_denied_total{namespace="logs",pod="ingester-0",reason="not_allowed"}'
+        values: '0x14'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: SiglakeTenantsDenied
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: ingester-0
+              reason: at_capacity
+              severity: warning
+            exp_annotations:
+              summary: Ingest is denying tenants
+              description: >-
+                Sustained denials mean a misconfigured client, a tenant missing
+                from ingester.allowedTenants, or an ingester at
+                ingester.maxTenants turning novel tenants away. The reason
+                label says which: at_capacity is the cap, not_allowed the
+                allow-list, header_not_trusted a client selecting a tenant on a
+                single-tenant ingester, and the claim_* reasons a token whose
+                tenant claim is missing or unusable.
+
+  # And the pre-registered zeros themselves do not page: an ingester below its
+  # cap publishes every reason at 0 from its first scrape, which is what makes
+  # the FIRST capacity refusal an increase() can see.
+  - name: the pre-registered tenant-denial zero baseline does not page
+    interval: 1m
+    input_series:
+      - series: 'siglake_ingest_tenant_denied_total{namespace="logs",pod="ingester-0",reason="at_capacity"}'
+        values: '0x30'
+      - series: 'siglake_ingest_tenant_denied_total{namespace="logs",pod="ingester-0",reason="not_allowed"}'
+        values: '0x30'
+      - series: 'siglake_ingest_tenant_denied_total{namespace="logs",pod="ingester-0",reason="header_not_trusted"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SiglakeTenantsDenied
+        exp_alerts: []
+
+  # The lane cap is the only writer of siglake_ingest_lane_refused_total
+  # (crates/siglake-ingest/src/backpressure.rs, guarded by max_lanes), so the
+  # description must send the operator to ingester.maxLanes and say where a
+  # tenant-cap refusal shows up instead. Before #4256 it named both caps and
+  # an operator raising ingester.maxTenants changed nothing.
+  - name: an ingester at its lane cap raises the lane alert
+    interval: 1m
+    input_series:
+      - series: 'siglake_ingest_lane_refused_total{namespace="logs",pod="ingester-0"}'
+        values: '0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SiglakeIngestLanesRefused
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: ingester-0
+              severity: warning
+            exp_annotations:
+              summary: Ingest is refusing new tenant/index lanes at its cap
+              description: >-
+                Either a legitimate tenant is being turned away, or a client is
+                varying X-Scope-OrgID / x-siglake-index. Only the lane cap
+                increments this counter, so check ingester.maxLanes. A refusal
+                at ingester.maxTenants lands on SiglakeTenantsDenied with
+                reason at_capacity instead.
+      - eval_time: 25m
+        alertname: SiglakeIngestLanesRefused
+        exp_alerts: []
+
+  # And a tenant-cap refusal leaves the lane counter flat: it fires the
+  # tenancy alert alone, which is what the corrected description promises.
+  - name: a tenant-cap refusal does not raise the lane alert
+    interval: 1m
+    input_series:
+      - series: 'siglake_ingest_lane_refused_total{namespace="logs",pod="ingester-0"}'
+        values: '0x20'
+      - series: 'siglake_ingest_tenant_denied_total{namespace="logs",pod="ingester-0",reason="at_capacity"}'
+        values: '0 0 3 6 9 12 15 18 21 24 27 30 33 36 39 42 45 48 51 54 57'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: SiglakeIngestLanesRefused
+        exp_alerts: []

@@ -1,0 +1,23 @@
+# kind cluster config for the siglake inner-dev smoke loop.
+#
+# Single-node, port-mapped so smoke.sh can reach the ingest + query API
+# from the host without a kubectl port-forward.
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: siglake
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # Ingester OTLP ingest.
+      - containerPort: 30088
+        hostPort: 8088
+        protocol: TCP
+      # Query-server HTTP.
+      - containerPort: 30089
+        hostPort: 8089
+        protocol: TCP
+      # Minio console (handy for debugging).
+      - containerPort: 30901
+        hostPort: 9001
+        protocol: TCP

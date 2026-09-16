@@ -1,0 +1,76 @@
+# Helm values overrides for AWS query/perf rounds.
+#
+# Starts from the same single-tenant smoke topology, but restores the
+# heavier ingest/compaction shape needed to quickly rebuild a warehouse
+# large enough for the query-side sweeps.
+
+tenant:
+  namespace: tenant_default
+
+ingester:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 4
+      memory: 2Gi
+  walSegmentMaxEvents: 4096
+  walSegmentMaxAgeSecs: 5
+  backpressure:
+    capacity: 1024
+    groupCommitMs: 10
+    shards: 1
+  nodeSelector:
+    topology.kubernetes.io/zone: us-east-1a
+
+compactor:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 2
+      memory: 4Gi
+    limits:
+      cpu: 6
+      memory: 8Gi
+  intervalSecs: 1
+  fsBatch:
+    maxSegments: 2048
+    maxBytes: 2147483648
+  extraEnv:
+    - name: SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES
+      value: "67108864"
+  nodeSelector:
+    topology.kubernetes.io/zone: us-east-1a
+
+query:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 6
+      memory: 6Gi
+    limits:
+      cpu: 8
+      memory: 12Gi
+  scan:
+    targetPartitions: 8
+    fileConcurrency: 4
+    batchSize: 65536
+    rangeCoalesceBytes: "4194304"
+    rangeFetchConcurrency: 32
+    rangeAdaptiveMinBytes: "700000000"
+    rangeAdaptiveMinFiles: 500
+    adaptivePartitionMinBytes: "134217728"
+    adaptivePartitionMinFiles: 48
+    fileCacheMaxBytes: "536870912"
+    fileCacheMaxEntries: 512
+  tokens:
+    existingSecret: ""
+    list: []
+
+wal:
+  size: 64Gi
+  accessMode: ReadWriteOnce
+  storageClassName: gp3-wal
+

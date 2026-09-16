@@ -1,0 +1,53 @@
+apiVersion: siglake.limnion.ai/v1alpha1
+kind: SiglakeCluster
+metadata:
+  name: example
+  namespace: default
+spec:
+  image: ghcr.io/siglake/siglake:0.1.0
+  warehouseUrl: s3://acme-prod/warehouse
+  catalogUri: postgres://siglake:secret@postgres.siglake-system:5432/siglake
+  autoscaling:
+    ingester:
+      min: 2
+      max: 8
+      target: 1000.0   # ingest requests / sec / pod
+    compactor:
+      min: 1
+      max: 4
+      target: 5.0      # sealed segments waiting / pod
+    query:
+      min: 2
+      # Since #967 a real range is supported here: the pods discover each other
+      # from the headless Service's SRV record, so a replica the operator adds
+      # joins the shard membership once it is Ready. This sample stays at 2/2
+      # as a conservative default — raise max to let the query tier scale out.
+      max: 2
+      target: 4.0      # in-flight queries / pod
+  # Tenancy is resolved by the ingester (single-tenant unless configured
+  # otherwise); declared tenants are advisory
+  # (namespaces are created lazily on first write).
+  tenants:
+    - name: acme
+    - name: widgets
+  # Optional cluster-wide bearer-token auth (decoupled from tenancy). The
+  # ingester reads the comma-separated tokens from this Secret's key via a
+  # valueFrom ref. Omit for open ingest (only safe in a trusted network).
+  authTokensSecretRef:
+    name: siglake-auth
+    key: tokens
+  retention:
+    # The operator renders a daily/weekly/monthly `siglake audit-rotate`
+    # CronJob when this is set. 30 = first
+    # of each month; 7 = every Sunday; 1 = every day at 00:00.
+    queryAuditRotateIntervalDays: 30
+  # Per-tier container resources, merged key by key over the packaged
+  # defaults (the chart's values.yaml `<tier>.resources`: a 4Gi memory limit
+  # for query, 1Gi for ingester and compactor, 2 CPU and 256Mi/200m requests
+  # everywhere). The query server sizes its read caches and memory pool from
+  # its limit, so raise `query.limits.memory` for scan-heavy or concurrent
+  # query workloads; the other keys keep their defaults.
+  # resources:
+  #   query:
+  #     limits:
+  #       memory: 8Gi

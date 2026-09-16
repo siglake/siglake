@@ -1,0 +1,125 @@
+name: ci-authorize
+
+# THE LABEL CONTROLLER. It decides; ci.yml runs. Nothing here checks out,
+# builds or executes the pull request.
+#
+# A fork's pull request queues a `ci` run that GitHub holds at "waiting for
+# approval" and does not start (repository setting: Actions > General > Fork
+# pull request workflows from outside collaborators > "Require approval for
+# all outside collaborators"). THAT SETTING IS THE ENFORCEMENT: without it
+# GitHub starts a first-time contributor's run before anyone has read it, and
+# CONTRIBUTING.md's account of how a contributor's CI starts is wrong. A
+# maintainer reads the diff and adds the `ci:run` label; this workflow reads it
+# from base-branch code, re-reads the pull request's head, and approves the
+# ONE queued run whose head commit is the commit that was reviewed.
+#
+# The approval therefore belongs to a run id, and a run id belongs to a
+# commit. A later push produces a different queued run that no earlier
+# approval touches, and the `synchronize` arm removes the label so that
+# releasing the new head is a deliberate act by a trusted login again. A
+# retained label authorizes nothing by itself.
+#
+# The rejected alternative -- `pull_request_target` with
+# `ref: github.event.pull_request.head.sha` and the jobs gated on the label --
+# is what GitHub's own hardening guidance tells you not to build: those runs
+# "share the same cache of the main branch with other privileged workflow
+# triggers, and may have repository write access and access to referenced
+# secrets". Approving a queued `pull_request` run keeps the contributor's code
+# inside the restricted context GitHub built for it: read-only token, no
+# secrets, an Actions cache scoped to `refs/pull/N/merge`. The rule and its
+# fixtures are in scripts/check-ci-authorization.py, which also fails the
+# build if ci.yml ever becomes reachable from a privileged trigger.
+on:
+  pull_request_target:
+    types: [labeled, synchronize]
+
+# One controller run per pull request. A `synchronize` that revokes the label
+# must not race the `labeled` run that is still releasing the head it replaced.
+concurrency:
+  group: ci-authorize-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  authorize:
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    permissions:
+      # `actions: write` releases one queued run and `pull-requests: write`
+      # removes a label a new commit invalidated. No `contents: write`, no
+      # `id-token`, and no secret is read below.
+      actions: write
+      contents: read
+      pull-requests: write
+    steps:
+      # The base branch, which is the only tree this job ever sees. A
+      # pull_request_target checkout with no `ref:` is the base; naming a ref
+      # here is the pwn-request shape and the checker refuses it.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Decide what this event authorizes
+        id: decide
+        env:
+          # The logins allowed to release a run. A repository variable so a
+          # new maintainer is a settings change, not a commit; unset means
+          # only the default below. GitHub also treats an empty value as false,
+          # so unset and empty both fall back to the confirmed login gianarb.
+          CI_TRUSTED_LOGINS: ${{ vars.SIGLAKE_CI_TRUSTED_LOGINS || 'gianarb' }}
+        run: python3 scripts/check-ci-authorization.py --decide >>"$GITHUB_OUTPUT"
+
+      # A new commit is not the reviewed commit. Dropping the label is what
+      # makes the next release a deliberate act rather than an inheritance.
+      - name: A new commit revokes the reviewed authorization
+        if: steps.decide.outputs.revoke == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          if err="$(gh api -X DELETE "repos/$GH_REPO/issues/$PR_NUMBER/labels/ci:run" 2>&1)"; then
+            echo "removed ci:run from #$PR_NUMBER"
+            exit 0
+          fi
+          # Someone removed it between the event and this call. The state this
+          # step wants is the state the repository is in; anything else is a
+          # real failure and stays red.
+          case "$err" in
+            *"Label does not exist"* | *"Not Found"*)
+              echo "ci:run was already gone from #$PR_NUMBER"
+              ;;
+            *)
+              echo "::error::could not remove the ci:run label from #$PR_NUMBER: $err"
+              exit 1
+              ;;
+          esac
+
+      - name: Release the queued run for the reviewed commit
+        if: steps.decide.outputs.approve == 'true'
+        env:
+          # github.token carries the permissions above. If this organization
+          # refuses run approval to GITHUB_TOKEN, set the CI_AUTHORIZE_TOKEN
+          # secret to an app installation token or PAT with `actions: write`
+          # and nothing changes below -- the failure is loud either way, and
+          # a maintainer can always approve from the Actions tab.
+          GH_TOKEN: ${{ secrets.CI_AUTHORIZE_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.decide.outputs.pr }}
+          AUTHORIZED_SHA: ${{ steps.decide.outputs.sha }}
+          HEAD_REPO: ${{ steps.decide.outputs.head_repo }}
+        run: scripts/ci-approve-run.sh
+
+      - name: What this run decided
+        if: always()
+        env:
+          REASON: ${{ steps.decide.outputs.reason }}
+          LEVEL: ${{ steps.decide.outputs.level }}
+        run: |
+          set -uo pipefail
+          reason="${REASON:-the decision step did not run}"
+          printf '%s\n' "$reason" >>"$GITHUB_STEP_SUMMARY"
+          # A ci:run label that released nothing is annotated, not buried: it
+          # is the one outcome a maintainer is waiting on.
+          printf '::%s::%s\n' "${LEVEL:-notice}" "$reason"

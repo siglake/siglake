@@ -1,0 +1,55 @@
+{{- /*
+KEDA ScaledObject for the ingester pool (change 3 — autoscaling).
+
+Scales the ingester Deployment on Prometheus saturation signals rather than CPU
+(CPU is a poor proxy for ingest load). Triggers — KEDA takes the max desired
+across them:
+  - accept rate: total requests/sec ÷ per-pod target.
+  - backpressure queue depth: total queued events ÷ per-pod target (a sustained
+    nonzero queue means writers can't keep up — the leading saturation signal).
+
+Anti-flap is the HPA behavior block (scaleDown/scaleUp stabilization windows) +
+cooldownPeriod. Requires the KEDA operator (keda.sh) installed in-cluster.
+
+`siglake_*` metric names are unique, so the default empty label selector
+aggregates across this release's ingester pods. In a cluster running multiple
+siglake releases, set `keda.metricLabelSelector` to scope (e.g.
+`namespace="siglake"`).
+*/ -}}
+{{- if and .Values.keda.enabled .Values.keda.ingester.enabled .Values.ingester.enabled }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "siglake.componentName" (list . "ingester") }}
+  labels:
+    {{- include "siglake.componentLabels" (list . "ingester") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "siglake.componentName" (list . "ingester") }}
+  minReplicaCount: {{ .Values.keda.ingester.minReplicas }}
+  maxReplicaCount: {{ .Values.keda.ingester.maxReplicas }}
+  pollingInterval: {{ .Values.keda.pollingIntervalSeconds }}
+  cooldownPeriod: {{ .Values.keda.cooldownPeriodSeconds }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: {{ .Values.keda.scaleDownStabilizationSeconds }}
+        scaleUp:
+          stabilizationWindowSeconds: {{ .Values.keda.scaleUpStabilizationSeconds }}
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.keda.prometheusServerAddress | quote }}
+        query: sum(rate(siglake_ingest_requests_total{ {{- .Values.keda.metricLabelSelector }} }[1m]))
+        threshold: {{ .Values.keda.ingester.requestsPerSecondTarget | quote }}
+    {{- if .Values.keda.ingester.backpressureQueueTarget }}
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.keda.prometheusServerAddress | quote }}
+        query: sum(siglake_ingest_backpressure_queue_events{ {{- .Values.keda.metricLabelSelector }} })
+        threshold: {{ .Values.keda.ingester.backpressureQueueTarget | quote }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,55 @@
+siglake {{ .Chart.AppVersion }} has been installed as release {{ .Release.Name }}.
+
+Components:
+{{- if .Values.ingester.enabled }}
+  ingester     — OTLP ingest on Service {{ include "siglake.componentName" (list . "ingester") }}:8088
+{{- end }}
+{{- if .Values.compactor.enabled }}
+  compactor    — sealed-WAL → Iceberg, metrics :9101
+{{- end }}
+{{- if .Values.query.enabled }}
+  query-server — SQL HTTP API on Service {{ include "siglake.componentName" (list . "query") }}:8089
+{{- end }}
+
+Quick checks:
+{{- if .Values.query.enabled }}
+
+  # query-server readiness (in-cluster):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "siglake.componentName" (list . "query") }} 8089:8089
+  curl http://localhost:8089/readyz
+{{- end }}
+{{- if .Values.ingester.enabled }}
+
+  # OTLP ingest smoke. The ingester is single-tenant unless
+  # ingester.oidc.tenantClaim or ingester.trustScopeHeader says otherwise, so
+  # X-Scope-OrgID may name `default` and nothing else here:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "siglake.componentName" (list . "ingester") }} 8088:8088
+  curl -X POST http://localhost:8088/v1/logs \
+    -H 'Content-Type: application/json' \
+    -H 'X-Scope-OrgID: default' \
+    -d '{"resourceLogs":[{"resource":{"attributes":[{"key":"host.name","value":{"stringValue":"h1"}}]},"scopeLogs":[{"logRecords":[{"body":{"stringValue":"hello"}}]}]}]}'
+{{- end }}
+
+{{- if not .Values.serviceAccount.annotations }}
+
+WARNING: serviceAccount.annotations is empty. For IRSA on EKS, set
+  serviceAccount.annotations.eks\.amazonaws\.com/role-arn=<role-arn>
+or the binaries will fail to authenticate to S3.
+{{- end }}
+
+{{- /*
+  #4317: the same predicate the query StatefulSet runs on, so this note
+  describes the authentication the pods actually enforce. It used to read the
+  three token values by hand, which called an OIDC-only install open and told
+  its operator to add the allow-list OIDC takes precedence over.
+*/ -}}
+{{- if and .Values.query.enabled (not (include "siglake.queryAuthOn" .)) }}
+
+WARNING: the query API is running open. query.tokens.{existingSecret,list} are
+empty, no externalSecrets.queryTokens.remoteKey is set, and query.oidc has no
+issuer/audience pair. Set a token source, or query.oidc.issuer together with
+query.oidc.audience, before exposing this cluster.
+{{- end }}
+
+Tear down with:
+  helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}

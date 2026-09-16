@@ -1,0 +1,300 @@
+# Local stress-test environment for siglake.
+#
+# Stack:
+#  - postgres:    Iceberg catalog (sqlx connects via SqlCatalog).
+#  - minio:       S3-compatible object storage for the Iceberg warehouse.
+#  - minio-init:  one-shot job that creates the warehouse bucket on first run.
+#  - garage:      opt-in alternative warehouse store, compose profile `garage`
+#                 (task #2958). Off unless SIGLAKE_OBJECT_STORE=garage.
+#  - garage-init: one-shot readiness probe for garage's default bucket.
+#  - ingester:    OTLP HTTP + gRPC server, writes WAL segments to /var/lib/siglake/wal.
+#  - compactor:   drains WAL segments → Iceberg fast_append commits in S3.
+#  - query-server: DataFusion SQL over the warehouse.
+#  - prometheus:  scrapes every tier's /metrics.
+#
+# Detection is NOT in this stack. The tiered detectors moved out of siglake and
+# siglake retains only the consumption interface,
+# `siglake_wal::consumer::SegmentConsumer` — see docs/CONSUMING_SEGMENTS.md.
+# This file used to run `siglake detector` and `siglake correlator`, subcommands
+# that no longer exist, so both containers failed at startup on the public
+# quickstart path. To run detection locally, point the detection repo's
+# binaries at this stack's WAL volume and catalog.
+#
+# Usage (from repo root):
+#   ./scripts/up.sh           # docker compose up -d
+#   ./scripts/loadgen.sh ...  # drive load (phase 4c — comes next)
+#   ./scripts/down.sh         # tear down + remove volumes
+#
+# Single host, single replica per service: this is *not* an HA topology.
+# It's the smallest stack that exercises the real S3 + Postgres ingest path.
+
+name: siglake-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    # Publish on 5433 to avoid clashing with a macOS-native postgres on
+    # the default 5432. Inside the network postgres still listens on 5432.
+    ports:
+      - "${SIGLAKE_PG_HOST_PORT:-5433}:5432"
+    environment:
+      POSTGRES_USER: siglake
+      POSTGRES_PASSWORD: siglake
+      POSTGRES_DB: siglake
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U siglake -d siglake"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # quay.io, not Docker Hub: on 2026-09-11 docker.io/minio/minio and
+  # docker.io/minio/mc began answering 401 to anonymous pulls, and the `docker`
+  # CI job died at `pull access denied` before either integration test started.
+  # quay.io is MinIO's own registry and still serves both anonymously. Pinned
+  # to a release tag rather than :latest so the next move is a deliberate one.
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "${SIGLAKE_MINIO_HOST_PORT:-9000}:9000"  # S3 API (native pagination integration test)
+      - "${SIGLAKE_MINIO_CONSOLE_HOST_PORT:-9001}:9001"  # console (web UI)
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # One-shot bucket creation. Exits after the bucket exists.
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/siglake-warehouse &&
+        echo 'bucket siglake-warehouse ready'
+      "
+
+  # Opt-in comparison arm (task #2958). `--single-node` applies a one-node
+  # layout without replication and `--default-bucket` creates the bucket and
+  # access key named by the GARAGE_DEFAULT_* variables, so this needs no
+  # `garage layout assign` / `garage key create` round trip. Garage has no web
+  # console; port 3903 is the admin/metrics API.
+  garage:
+    image: dxflrs/garage:v2.4.1
+    profiles: ["garage"]
+    command: ["/garage", "server", "--single-node", "--default-bucket"]
+    environment:
+      GARAGE_DEFAULT_ACCESS_KEY: "${SIGLAKE_GARAGE_ACCESS_KEY:-GK0123456789abcdef0123456789abcdef}"
+      GARAGE_DEFAULT_SECRET_KEY: "${SIGLAKE_GARAGE_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
+      GARAGE_DEFAULT_BUCKET: siglake-warehouse
+    ports:
+      - "${SIGLAKE_GARAGE_HOST_PORT:-3900}:3900"  # S3 API
+      - "${SIGLAKE_GARAGE_ADMIN_HOST_PORT:-3903}:3903"  # admin + /metrics
+    volumes:
+      - ./garage/garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    healthcheck:
+      # The image ships the static `garage` binary and nothing else — no shell,
+      # no curl — so the probe is the binary's own status call over RPC.
+      test: ["CMD", "/garage", "status"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # One-shot readiness probe. `--default-bucket` creates the bucket, so this
+  # only waits for it to answer over S3; it never creates anything, because the
+  # default key has no CreateBucket permission. Run by scripts/up.sh via
+  # `compose run --rm` before the siglake services start.
+  garage-init:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    profiles: ["garage"]
+    depends_on:
+      garage:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set garage http://garage:3900 $$GARAGE_DEFAULT_ACCESS_KEY $$GARAGE_DEFAULT_SECRET_KEY &&
+      for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+      mc ls garage/siglake-warehouse >/dev/null 2>&1 && echo 'bucket siglake-warehouse ready' && exit 0;
+      sleep 1;
+      done;
+      echo 'garage bucket siglake-warehouse never became listable' >&2;
+      exit 1
+      "
+    environment:
+      GARAGE_DEFAULT_ACCESS_KEY: "${SIGLAKE_GARAGE_ACCESS_KEY:-GK0123456789abcdef0123456789abcdef}"
+      GARAGE_DEFAULT_SECRET_KEY: "${SIGLAKE_GARAGE_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
+
+  ingester:
+    image: siglake:dev
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    command:
+      - ingest-server
+      - --bind
+      - 0.0.0.0:8088
+      - --wal
+      - /var/lib/siglake/wal
+      - --warehouse
+      - s3-warehouse  # placeholder; the real warehouse URL goes via env (see below)
+    environment:
+      RUST_LOG: info,siglake=debug
+      SIGLAKE_INGESTER_ID: ingester-0
+      # Iceberg catalog (Postgres):
+      SIGLAKE_CATALOG_URI: postgres://siglake:siglake@postgres:5432/siglake
+      SIGLAKE_WAREHOUSE_URL: s3://siglake-warehouse/
+      # AWS env vars consumed by OpenDAL (S3 backend) — the selected store's
+      # creds + endpoint, resolved by scripts/compose-common.bash. The defaults
+      # here are minio's, so a bare `docker compose -f deploy/docker-compose.yml
+      # up` behaves exactly as it did before the garage profile existed.
+      # OpenDAL defaults to path-style, which both stores accept.
+      AWS_ACCESS_KEY_ID: "${SIGLAKE_S3_ACCESS_KEY:-minioadmin}"
+      AWS_SECRET_ACCESS_KEY: "${SIGLAKE_S3_SECRET_KEY:-minioadmin}"
+      AWS_REGION: "${SIGLAKE_S3_REGION:-us-east-1}"
+      AWS_ENDPOINT_URL: "${SIGLAKE_S3_ENDPOINT:-http://minio:9000}"
+      # The WAL mirror needs no variable here: a warehouse URL is set, so the
+      # ingester mirrors each sealed segment to s3://siglake-warehouse/wal-mirror/
+      # by default (2026-09-11). The compactor below drains the local WAL rather
+      # than claiming from the mirror, so nothing reclaims those objects — in
+      # this dev stack they accumulate in the minio volume until `down.sh`
+      # removes it.
+      # Set SIGLAKE_WAL_MIRROR_PREFIX to an empty string to run without it.
+    ports:
+      - "${SIGLAKE_INGEST_HOST_PORT:-8088}:8088"   # OTLP/HTTP ingest
+      - "${SIGLAKE_OTLP_GRPC_HOST_PORT:-4317}:4317"   # OTLP/gRPC ingest
+      - "${SIGLAKE_INGEST_METRICS_HOST_PORT:-9100}:9100"   # /metrics
+    volumes:
+      - ingester-wal:/var/lib/siglake/wal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  compactor:
+    image: siglake:dev
+    depends_on:
+      ingester:
+        # Wait until ingester is healthy. Ingester opens the Iceberg
+        # catalog on startup, which serializes first-time DDL so we
+        # don't race postgres `CREATE TABLE IF NOT EXISTS`.
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    command:
+      - compactor
+      - --wal
+      - /var/lib/siglake/wal
+      - --warehouse
+      - s3-warehouse  # placeholder, see SIGLAKE_WAREHOUSE_URL
+      - --interval-secs
+      - "1"
+    ports:
+      - "${SIGLAKE_COMPACTOR_METRICS_HOST_PORT:-9101}:9101"   # /metrics
+    environment:
+      RUST_LOG: info,siglake=debug
+      SIGLAKE_CATALOG_URI: postgres://siglake:siglake@postgres:5432/siglake
+      SIGLAKE_WAREHOUSE_URL: s3://siglake-warehouse/
+      AWS_ACCESS_KEY_ID: "${SIGLAKE_S3_ACCESS_KEY:-minioadmin}"
+      AWS_SECRET_ACCESS_KEY: "${SIGLAKE_S3_SECRET_KEY:-minioadmin}"
+      AWS_REGION: "${SIGLAKE_S3_REGION:-us-east-1}"
+      AWS_ENDPOINT_URL: "${SIGLAKE_S3_ENDPOINT:-http://minio:9000}"
+    volumes:
+      # Compactor reads from the same WAL volume as the ingester. In K8s this
+      # would be a ReadWriteMany PVC; here a named volume mounted into both.
+      - ingester-wal:/var/lib/siglake/wal
+
+  query-server:
+    image: siglake:dev
+    entrypoint: ["/usr/local/bin/siglake-query-server"]
+    depends_on:
+      ingester:
+        # Wait for the ingester to bring up the Iceberg catalog tables.
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    command:
+      - --bind
+      - 0.0.0.0:8089
+      - --metrics-bind
+      - 0.0.0.0:9105
+      # Serve sealed-but-uncommitted WAL rows (the quickstart's "queryable
+      # in seconds" freshness path) — shares the ingester's WAL volume.
+      - --query-wal-buffer-dir
+      - /var/lib/siglake/wal
+    environment:
+      RUST_LOG: info,siglake=debug
+      SIGLAKE_CATALOG_URI: postgres://siglake:siglake@postgres:5432/siglake
+      SIGLAKE_WAREHOUSE_URL: s3://siglake-warehouse/
+      # Batch-job state in the catalog database, as the chart ships it: a
+      # `docker compose restart query` then reports in-flight jobs as failed
+      # instead of answering 404 for ids it handed out.
+      SIGLAKE_JOBS_POSTGRES_URI: postgres://siglake:siglake@postgres:5432/siglake
+      # Experimental source-file batch cache: disabled unless explicitly sized.
+      SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_BYTES: "0"
+      SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_ENTRIES: "0"
+      # Open access in local dev. Set SIGLAKE_QUERY_TOKENS to require auth.
+      AWS_ACCESS_KEY_ID: "${SIGLAKE_S3_ACCESS_KEY:-minioadmin}"
+      AWS_SECRET_ACCESS_KEY: "${SIGLAKE_S3_SECRET_KEY:-minioadmin}"
+      AWS_REGION: "${SIGLAKE_S3_REGION:-us-east-1}"
+      AWS_ENDPOINT_URL: "${SIGLAKE_S3_ENDPOINT:-http://minio:9000}"
+    ports:
+      - "${SIGLAKE_QUERY_HOST_PORT:-8089}:8089"   # query API
+      - "${SIGLAKE_QUERY_METRICS_HOST_PORT:-9105}:9105"   # /metrics
+    volumes:
+      - ingester-wal:/var/lib/siglake/wal:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8089/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=1h
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${SIGLAKE_PROMETHEUS_HOST_PORT:-9090}:9090"
+    depends_on:
+      ingester:
+        condition: service_healthy
+
+volumes:
+  pg-data:
+  minio-data:
+  garage-meta:
+  garage-data:
+  ingester-wal:
+  prometheus-data:

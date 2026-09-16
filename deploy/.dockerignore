@@ -1,0 +1,10 @@
+target/
+data/
+.git/
+.github/
+.idea/
+.vscode/
+**/*.swp
+**/.DS_Store
+deploy/helm/**/charts/*.tgz
+deploy/helm/**/Chart.lock

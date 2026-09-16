@@ -1,0 +1,369 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: siglakeclusters.siglake.limnion.ai
+spec:
+  group: siglake.limnion.ai
+  names:
+    categories: []
+    kind: SiglakeCluster
+    plural: siglakeclusters
+    shortNames:
+    - kcluster
+    singular: siglakecluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SiglakeClusterSpec via `CustomResource`
+        properties:
+          spec:
+            description: '`SiglakeCluster` spec — what the user declares.'
+            properties:
+              authTokensSecretRef:
+                description: Optional cluster-wide bearer-token auth. References a Kubernetes Secret whose `<key>` holds a comma-separated allow-list; it's surfaced to the ingester as `SIGLAKE_AUTH_TOKENS` (valueFrom, so the operator never reads the token bytes). Omitted ⇒ open ingest (only safe inside a trusted network). Decoupled from tenancy.
+                nullable: true
+                properties:
+                  key:
+                    type: string
+                  name:
+                    type: string
+                required:
+                - key
+                - name
+                type: object
+              autoscaling:
+                default:
+                  compactor:
+                    max: 4
+                    min: 1
+                    target: 1.0
+                  ewmaHalfLifeSecs: 0.0
+                  ingester:
+                    max: 4
+                    min: 1
+                    target: 1.0
+                  query:
+                    max: 1
+                    min: 1
+                    target: 1.0
+                description: Per-component autoscaling policy.
+                properties:
+                  compactor:
+                    default:
+                      max: 4
+                      min: 1
+                      target: 1.0
+                    properties:
+                      max:
+                        description: Ceiling on the replica count. Protects shared-cluster neighbors from runaway scaling.
+                        format: int32
+                        type: integer
+                      min:
+                        description: 'Floor on the replica count. The operator never scales below this even when the workload signal goes to zero. Must be 1 or more: each component''s load signal is exported by the component''s own pods, so a tier stopped at zero has nothing left to ask for it back, and its missing reading also holds the other two tiers at their current size. `0` is refused with `InvalidSpec` / `AutoscalingZeroFloorUnsupported` before any workload changes.'
+                        format: int32
+                        type: integer
+                      target:
+                        description: 'Target value for the component''s primary load signal, per replica: - ingester: ingest requests/sec/pod. - compactor: sealed segments pending per worker. Above a `max` of 1 the drain is the catalog claim and the backlog is ONE shared queue every worker publishes in full, so the operator divides it by this target once: a backlog of 8 at a target of 4 asks for 2 workers whatever the current replica count. - query: in-flight queries per replica.'
+                        format: double
+                        type: number
+                    required:
+                    - max
+                    - min
+                    - target
+                    type: object
+                  ewmaHalfLifeSecs:
+                    default: 0.0
+                    description: 'EWMA half-life (seconds) for smoothing the per-pod saturation signals before the scaling decision. `0` (default) ⇒ no smoothing (react to the raw sample). A non-zero value damps flapping: a tier resizes on the blended signal rather than on a single busy or quiet sample, and a monitoring outage leaves the blend untouched instead of decaying it. Scaling a tier to zero is not supported — every component floor must be 1 or more — so this setting never decides whether a last replica goes away, only how quickly a tier moves within its range.'
+                    format: double
+                    type: number
+                  ingester:
+                    default:
+                      max: 4
+                      min: 1
+                      target: 1.0
+                    properties:
+                      max:
+                        description: Ceiling on the replica count. Protects shared-cluster neighbors from runaway scaling.
+                        format: int32
+                        type: integer
+                      min:
+                        description: 'Floor on the replica count. The operator never scales below this even when the workload signal goes to zero. Must be 1 or more: each component''s load signal is exported by the component''s own pods, so a tier stopped at zero has nothing left to ask for it back, and its missing reading also holds the other two tiers at their current size. `0` is refused with `InvalidSpec` / `AutoscalingZeroFloorUnsupported` before any workload changes.'
+                        format: int32
+                        type: integer
+                      target:
+                        description: 'Target value for the component''s primary load signal, per replica: - ingester: ingest requests/sec/pod. - compactor: sealed segments pending per worker. Above a `max` of 1 the drain is the catalog claim and the backlog is ONE shared queue every worker publishes in full, so the operator divides it by this target once: a backlog of 8 at a target of 4 asks for 2 workers whatever the current replica count. - query: in-flight queries per replica.'
+                        format: double
+                        type: number
+                    required:
+                    - max
+                    - min
+                    - target
+                    type: object
+                  query:
+                    default:
+                      max: 1
+                      min: 1
+                      target: 1.0
+                    description: 'Query scales on in-flight queries per pod like the other components. A `max` above `min` is supported since #967: the pods discover each other through the headless Service''s SRV record, so a replica the decision adds receives shard work once it is Ready, and each query pins the membership it captured. The packaged `max: 1` remains a deliberate conservative pin until 2→4→2 scaling has been validated in kind; raise `max` explicitly to enable query-tier scale-out.'
+                    properties:
+                      max:
+                        description: Ceiling on the replica count. Protects shared-cluster neighbors from runaway scaling.
+                        format: int32
+                        type: integer
+                      min:
+                        description: 'Floor on the replica count. The operator never scales below this even when the workload signal goes to zero. Must be 1 or more: each component''s load signal is exported by the component''s own pods, so a tier stopped at zero has nothing left to ask for it back, and its missing reading also holds the other two tiers at their current size. `0` is refused with `InvalidSpec` / `AutoscalingZeroFloorUnsupported` before any workload changes.'
+                        format: int32
+                        type: integer
+                      target:
+                        description: 'Target value for the component''s primary load signal, per replica: - ingester: ingest requests/sec/pod. - compactor: sealed segments pending per worker. Above a `max` of 1 the drain is the catalog claim and the backlog is ONE shared queue every worker publishes in full, so the operator divides it by this target once: a backlog of 8 at a target of 4 asks for 2 workers whatever the current replica count. - query: in-flight queries per replica.'
+                        format: double
+                        type: number
+                    required:
+                    - max
+                    - min
+                    - target
+                    type: object
+                type: object
+              awsRegion:
+                default: ''
+                description: |-
+                  AWS region for the warehouse / RDS / Secrets-Manager calls the rendered Pods make. Operator-rendered pods (including the retention CronJob) need this in their env or opendal's S3 client fails with `region is missing`. Chart-managed Deployments receive it through the terraform-emitted helm_values; the operator path bypasses that entirely.
+
+                  Empty string = unset; the operator omits the env var and relies on whatever defaults the binary picks up (`AWS_REGION` / `AWS_DEFAULT_REGION` / IMDS).
+                type: string
+              catalogUri:
+                description: Iceberg catalog URI (e.g. `postgres://user:pass@host/db`).
+                type: string
+              extraEnv:
+                description: Extra environment variables appended to EVERY siglake container the operator renders — the escape hatch for the long tail of tuning knobs (watchdog ceilings, warm interval, overlap-depth bound, ordered-merge fan-in caps, buffer-delta budget, claim batch, mirror sync interval, …) without a CRD field per knob. Plain name/value only; anything needing `valueFrom` deserves a first-class field.
+                items:
+                  description: A plain name/value environment variable for [`SiglakeClusterSpec::extra_env`].
+                  properties:
+                    name:
+                      type: string
+                    value:
+                      type: string
+                  required:
+                  - name
+                  - value
+                  type: object
+                type: array
+              image:
+                description: Container image to roll across every managed component.
+                type: string
+              resources:
+                default: {}
+                description: |-
+                  Per-tier container resources. Every tier left unset renders the operator's packaged requests/limits, which are the chart's (`deploy/helm/siglake/values.yaml`: `ingester.resources`, `compactor.resources`, `query.resources`). A tier that IS set merges its keys over those defaults — `query: {limits: {memory: 8Gi}}` raises the query memory limit and keeps the packaged CPU limit and requests — the same way a `--set query.resources.limits.memory=8Gi` behaves against the chart's values.
+
+                  The query server sizes its read caches and its memory pool from the container's memory limit, so this is THE knob for scan-heavy or high-concurrency query workloads; see the sizing note above `query.resources.limits.memory` in values.yaml.
+                properties:
+                  compactor:
+                    description: 'Compactor Deployment container resources. Raise `limits.memory` together with `SIGLAKE_COMPACTOR_BIN_CONCURRENCY` in `extraEnv`: the operator reports `InvalidSpec` when the effective limit cannot hold the requested concurrency.'
+                    nullable: true
+                    properties:
+                      limits:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      requests:
+                        additionalProperties:
+                          type: string
+                        type: object
+                    type: object
+                  ingester:
+                    description: Ingester Deployment container resources.
+                    nullable: true
+                    properties:
+                      limits:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      requests:
+                        additionalProperties:
+                          type: string
+                        type: object
+                    type: object
+                  query:
+                    description: Query StatefulSet container resources.
+                    nullable: true
+                    properties:
+                      limits:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      requests:
+                        additionalProperties:
+                          type: string
+                        type: object
+                    type: object
+                type: object
+              retention:
+                default:
+                  queryAuditRotateIntervalDays: null
+                description: Optional retention policy for managed Iceberg tables. Today the only supported knob is `queryAuditRotateIntervalDays` — when set, the operator renders a Kubernetes `CronJob` that runs `siglake audit-rotate` on that cadence. iceberg-rust 0.9 doesn't expose `expire_snapshots` through its public Transaction API, so drop-and-recreate is the working retention escape hatch; when iceberg-rust ships the public action we'll swap behind the same CronJob.
+                properties:
+                  queryAuditRotateIntervalDays:
+                    description: |-
+                      Days between `siglake audit-rotate` runs. The operator renders a CronJob with a schedule of `@every Nd`-equivalent crontab expression. Supported values:
+
+                      - `30` for production deployments (monthly rotation, on the first). - `7` for high-cardinality audit logging (weekly). - `1` for daily rotation.
+
+                      `None` (default) disables the CronJob entirely.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
+              schemaVersion:
+                description: 'Monotonic schema-generation counter. Bump it to run a one-shot, additive schema migration (`siglake migrate-schema --all-tables`) before the rolled-out pods write under the new schema. The operator renders an immutable Job named `<cluster>-migrate-schema-v<N>-<digest>`, where the digest covers the image, warehouse/catalog URIs, region and extraEnv — everything that shapes the (immutable) pod template. Re-reconciling the same version with the same template is a no-op; a bump, or an image change, creates a fresh Job. Additive-only + idempotent, so it is safe to leave set across restarts. Unset (or 0) renders no Job. Reverting the image runs one more Job on the OLD binary: additive migration is diffed by name, so it adds nothing and does not narrow the table — leave this field where it is rather than lowering it.'
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              serviceAccountName:
+                default: ''
+                description: |-
+                  Name of an existing Kubernetes ServiceAccount to bind to every rendered Pod (including the retention CronJob). Operator-rendered pods need an IRSA-bound SA to write to the warehouse S3 bucket, or the node IAM role's missing s3:PutObject lands them on 403 AccessDenied.
+
+                  Empty string (default) → use the namespace's `default` SA, which is fine for clusters where the node IAM role already has the bucket-level permissions but is the wrong default for the standard EKS+IRSA pattern. The chart's terraform module creates a `siglake` SA with the warehouse-rw IRSA annotation; deployments using that chart + this operator should set `serviceAccountName: siglake`.
+                type: string
+              storage:
+                default:
+                  walAccessMode: ReadWriteMany
+                  walRetainOnDelete: true
+                  walSize: 5Gi
+                  walStorageClassName: ''
+                description: Persistent storage knobs for the WAL. Optional — sensible defaults work for any cluster with an RWX StorageClass available (e.g. AWS EFS).
+                properties:
+                  walAccessMode:
+                    default: ReadWriteMany
+                    description: WAL PVC access mode. Defaults to `ReadWriteMany` because the ingester and compactor both mount the WAL, and an external consumer may too all share the WAL. Customers running single-pod deployments + EBS can override to `ReadWriteOnce`.
+                    type: string
+                  walRetainOnDelete:
+                    default: true
+                    description: |-
+                      Keep the WAL claim when the `SiglakeCluster` is deleted. Default true.
+
+                      Acks are WAL-append-based: a segment is durable in the WAL and not yet in Iceberg until the compactor commits it. With an ownerReference the CR's deletion cascaded into the claim and took acknowledged data with it. The operator mirrors the WAL by default, but asynchronously, so a deleted claim still takes the segments whose upload had not landed. Set false only if the WAL is known empty.
+                    type: boolean
+                  walSize:
+                    default: 5Gi
+                    description: WAL PVC size. Defaults to 5Gi for smoke + small-tenant deployments. Real customer deployments will want >100Gi.
+                    type: string
+                  walStorageClassName:
+                    default: ''
+                    description: StorageClass to use for the WAL PVC. Empty string = the cluster default (which EKS doesn't set; you'll want to override this to e.g. `efs-sc`).
+                    type: string
+                type: object
+              tenants:
+                default: []
+                description: 'Tenants this cluster serves, for documentation/provisioning. Tenancy itself is resolved by the ingester — single-tenant unless a verified JWT claim or a trusted `X-Scope-OrgID` routes it — and namespaces are created lazily on first write, so this list is advisory: empty means the cluster simply serves whatever tenants arrive (the `default` namespace for untenanted traffic).'
+                items:
+                  description: One row of `SiglakeClusterSpec::tenants`. A declared tenant the cluster expects to serve; tenancy is resolved at ingest, so this is advisory (no per-tenant secret).
+                  properties:
+                    name:
+                      description: Tenant identifier — used verbatim as the Iceberg namespace (`tenant_<name>`) and as the per-tenant WAL subdirectory.
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              warehouseUrl:
+                description: Iceberg warehouse URL (e.g. `s3://acme-prod/warehouse`).
+                type: string
+            required:
+            - catalogUri
+            - image
+            - warehouseUrl
+            type: object
+          status:
+            description: Status the reconciler writes back.
+            nullable: true
+            properties:
+              conditions:
+                description: |-
+                  Standard Kubernetes-style condition list. Condition types emitted by the operator include:
+
+                  - `Ready` — the managed Deployments are in their desired replica counts and the most recent reconcile succeeded. - `Progressing` — a reconcile changed at least one Deployment's `.spec.replicas` (true during scale events). - `InvalidSpec` — the requested spec cannot be honoured; `reason` identifies the rule that rejected it and `Ready=False` accompanies it. - `QueryMemoryUndersized` — the query memory limit is below the decode accounting floor. This is advisory and does not change `Ready`.
+
+                  Drives kubectl's `wait --for=condition=ready` workflows.
+                items:
+                  description: Subset of the upstream `metav1.Condition` we actually populate.
+                  properties:
+                    lastTransitionTime:
+                      description: Last time the status flipped.
+                      type: string
+                    message:
+                      description: Human-readable detail.
+                      type: string
+                    reason:
+                      description: Short PascalCase identifier — e.g. `Scaled` / `NoOp`.
+                      type: string
+                    status:
+                      description: '`True`, `False`, or `Unknown`.'
+                      type: string
+                    type:
+                      description: Condition type — e.g. `Ready` or `Progressing`.
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              lastReconciled:
+                nullable: true
+                type: string
+              message:
+                description: Free-form human-readable reason for the latest reconcile — e.g. "scaled compactor 1 → 2 on backlog".
+                nullable: true
+                type: string
+              observedGeneration:
+                default: 0
+                format: int64
+                type: integer
+              replicas:
+                default:
+                  compactor: 0
+                  ingester: 0
+                  query: 0
+                properties:
+                  compactor:
+                    format: int32
+                    type: integer
+                  ingester:
+                    format: int32
+                    type: integer
+                  query:
+                    format: int32
+                    type: integer
+                required:
+                - compactor
+                - ingester
+                - query
+                type: object
+              schemaVersion:
+                description: |-
+                  Iceberg schema version the operator has provisioned for the `siglake.events` table (and per-tenant analogues). Today the operator doesn't manage schema migrations, but recording the version on status lets a future reconciler detect when the desired version moves and apply an `update_schema` Transaction.
+
+                  `None` unless the operator has actually OBSERVED a migration — that is, `spec.schemaVersion` was set and its Job ran to completion. The operator does not read the warehouse, so it cannot report the version of a table it never looked at; absent means "not observed", never "up to date". To read a table's recorded version, run `siglake migrate-schema --dry-run --all-namespaces`, which prints it per table from the table's own `siglake.schema_version.v1` property. Serialized even when `None` (explicit null): status updates go out as merge-patches, and omitting the field would LEAVE a stale prior value — observed live in the GA round: a schemaVersion bump kept reporting the old version while its migration Job was still running.
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+            type: object
+        required:
+        - spec
+        title: SiglakeCluster
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+

@@ -1,0 +1,553 @@
+# siglake Helm chart
+
+Installs the siglake data plane (ingester, compactor, and query-server)
+backed by a customer-provided RDS Postgres + S3 warehouse.
+
+This chart is intentionally light on managed infrastructure: it
+references existing Secrets, an existing OIDC-trusted IAM role, and an
+existing S3 bucket. The companion Terraform module in
+`deploy/terraform/aws/` provisions all three and prints values that
+plug straight into `--values`.
+
+## Prerequisites
+
+- Kubernetes 1.27+ with the AWS EBS and EFS CSI drivers installed.
+- A StorageClass for the shared WAL volume. Use `ReadWriteMany` (for
+  example, EFS) when ingester and compactor may run on different nodes;
+  `ReadWriteOnce` requires them to be co-located on one node.
+- An RDS Postgres instance reachable from the cluster.
+- A Kubernetes Secret holding Postgres credentials (default name
+  `siglake-postgres`, override via `--set postgres.existingSecret=...`).
+  Required keys: `host`, `port`, `user`, `password`, `database`.
+- An S3 bucket for the Iceberg warehouse.
+- An IAM role with read/write on the bucket, trusted by the cluster's
+  OIDC provider. The role ARN goes onto the ServiceAccount via
+  `serviceAccount.annotations.eks\.amazonaws\.com/role-arn`.
+
+## Install
+
+```bash
+helm install siglake ./deploy/helm/siglake \
+  --namespace siglake --create-namespace \
+  --set image.repository=ghcr.io/siglake/siglake \
+  --set image.tag=0.1.0 \
+  --set s3.bucket=my-customer-warehouse \
+  --set s3.region=us-east-1 \
+  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::123456789012:role/siglake-warehouse-rw \
+  --set wal.storageClassName=efs-sc
+```
+
+Image tags are numeric, matching the chart's `appVersion`: the release
+is tagged `v0.1.0` in git but published as
+`ghcr.io/siglake/siglake:0.1.0`. Leaving `image.tag` unset picks the
+`appVersion` of the chart you installed, which is the paired image.
+
+For non-trivial deployments, write a `values.yaml` and pass `-f`
+instead of stacking `--set` flags. The Terraform module emits a
+ready-to-use `values.aws.yaml` snippet.
+
+## Upgrade
+
+```bash
+helm upgrade siglake ./deploy/helm/siglake -n siglake -f values.aws.yaml
+```
+
+The ingester Deployment and query-server StatefulSet use `RollingUpdate`;
+the compactor Deployment uses `Recreate`. With `schemaMigration.enabled`
+(the default), the chart runs the `migrate-schema` Job from
+`job-migrate-schema.yaml` as a `pre-upgrade` hook and waits for it to
+succeed before rolling the workloads. The migration is additive and
+idempotent. If a newer binary reaches an older table that lacks a column,
+it refuses the affected write and names the migration remedy rather than
+silently dropping the column.
+
+## Rollback
+
+```bash
+helm rollback siglake <revision> -n siglake
+```
+
+The migration Job does **not** re-run. It is a `pre-upgrade` hook, and a
+rollback runs only `pre-rollback`/`post-rollback` hooks — the chart
+declares neither. So the rolled-back pods meet the table the migration
+already widened, which is the supported direction: the older binary
+writes the columns it declares and the storage layer fills the rest with
+nulls, leaving existing values intact (regression:
+`crates/siglake-storage/tests/storage/schema_rollback.rs`). **A rollback
+rolls back the image, never the schema** — the columns the migration
+added stay, and re-running `migrate-schema` on the old image adds and
+removes nothing.
+
+Rolling forward again renders a *fresh* Job: the name carries
+`.Release.Revision`, and a rollback increments the revision, so the next
+`helm upgrade` never reuses a name (a Job's `spec.template` is immutable,
+and reuse would 422 the moment the image tag changed). Hook Jobs are not
+part of the release manifest, so a rollback neither deletes nor recreates
+the ones already there; `schemaMigration.ttlSecondsAfterFinished`
+(default `86400`) reaps them.
+
+A migration that FAILS needs no rollback. Helm blocks on the pre-upgrade
+hook, so the release fails before any workload is applied and the previous
+revision is still the live one. Read the Job's logs
+(`kubectl logs -n siglake -l app.kubernetes.io/component=migrate-schema`)
+before deleting it; the next attempt's Job has a different name either
+way.
+
+Two limits on the above. It covers *additive* differences only — a
+rollback across the pre-0.1.0 nanosecond `timestamp` contract has no path
+(`migrate-schema` refuses such tables; see the root README's "Things
+deliberately not yet done"). And no rollback has been qualified against an
+actual older image: the regression runs one binary against a
+widened table, and this section is reasoned from the templates.
+
+## Per-service configuration
+
+Each of the three services has its own values block with `enabled`,
+`replicas`, `resources`, `nodeSelector`, `tolerations`, `affinity`,
+`extraEnv`, and `extraArgs`. Disable a workload with
+`--set <service>.enabled=false`.
+
+Service-specific knobs:
+
+| Service     | Knobs                                                                  |
+|-------------|-------------------------------------------------------------------------|
+| ingester    | `walSegmentMaxEvents`, `walSegmentMaxAgeSecs`                           |
+| compactor   | `intervalSecs`, `binConcurrency`, `committedRetentionSecs`              |
+| query       | `tokens.existingSecret` or `tokens.list`; `jobs.persistent`; `scan.fileCacheMaxBytes`, `scan.fileCacheMaxEntries` |
+
+### The batch-job store
+
+`query.jobs.persistent` is **on by default**. The query pods store batch-job
+state (`priority: "batch"` submissions, their status and their result rows) in
+the Postgres instance that already holds the Iceberg catalog — the chart
+renders `SIGLAKE_JOBS_POSTGRES_URI` from the same Secret, there is no second
+connection to configure, and the query-server creates its own tables on start.
+
+One store for the tier is what makes a `job_id` usable: `query.replicas`
+defaults to 2 behind a Service with no session affinity, so a status, result
+or cancel request lands on either pod. A restart is then bounded rather than
+lossy — an in-flight job is failed once its owner's lease expires
+(`SIGLAKE_JOBS_OWNER_LEASE_SECS`, default 120 s), and jobs owned by a sibling
+that is still heartbeating are untouched.
+
+`--set query.jobs.persistent=false` drops the variable and gives each pod its
+own in-memory store. That is a single-pod configuration: the chart refuses the
+render if `query.replicas` or an enabled `keda.query.maxReplicas` exceeds 1,
+because job reads routed to another pod would answer `404` for a job that is
+running normally. Keep the shared store on to scale the query tier.
+
+### Query source-file cache limits
+
+`query.scan.fileCacheMaxBytes` and `query.scan.fileCacheMaxEntries` bound the
+per-query-pod source-file batch cache. Set either value to `0` to disable the
+cache. Both default to `0`; set both to positive limits to enable it.
+
+### Scaling the compactor past one pod
+
+A compactor tier that can hold more than one pod requires
+`compactor.catalogClaim.enabled: true`, and the chart refuses to render
+without it:
+
+```yaml
+compactor:
+  replicas: 2
+  catalogClaim:
+    enabled: true    # wal.mirror.enabled is already the default
+```
+
+The claim is the only thing that divides the work. Without it each replica
+lists the same sealed segments and runs the same maintenance loop — leveled
+rewrites, snapshot expiry, retention and orphan GC — against the same tables,
+on optimistic-concurrency commits, so the pods spend their budget losing
+commit races to each other. Nothing in the metrics says "misconfigured"; the
+layout just stops converging. `autoscaling.compactor.maxReplicas` above `1`
+is refused the same way: an HPA reaches that state a few minutes after
+install rather than at install.
+
+The claim needs the mirror, and that direction is refused too. In claim mode
+the drain reads the `wal_segments` catalog table and never the local
+`sealed/` directory, and rows land there only from an ingester that mirrors
+its segments. With `wal.mirror.enabled: false` it claims nothing, and
+`siglake_compactor_sealed_pending` reads zero while the backlog grows, because
+in claim mode that gauge counts the sealed rows in `wal_segments` that no
+worker has claimed, and the local `sealed/` directory is not what it looks at.
+
+Two consequences of turning the claim on, both already in the templates: the
+compactor mounts an `emptyDir` instead of the WAL PVC (it no longer reads the
+ingester's filesystem), and the drain purges the mirror objects it commits,
+which is the only thing that bounds the mirror prefix.
+
+A third: `autoscaling.compactor.customMetric.enabled: true` is refused with the
+claim on. That gauge is the whole shared queue — every compactor publishes the
+same total — while the HPA renders it as a `type: Pods` metric, whose algorithm
+averages the reading over the running pods and multiplies the ratio by that
+count. A fixed backlog of 8 against a target of 5 then asks for 2 pods from 1
+and 4 from 2, climbing to `maxReplicas` on a backlog that never moved. Dividing
+the target into the queue once needs one aggregated series behind an `Object`
+or `External` metric and the adapter rule that publishes it, which this chart
+does not render. Claim-mode HPA scaling is therefore CPU-only here; the
+backlog signal is `siglake-operator`'s, which does that division itself. The
+metric still renders in filesystem mode, where each pod's sealed count is its
+own — but the refusal above holds that mode at `maxReplicas: 1`, so it scales
+nothing there either.
+
+### The ingester does not compact
+
+`ingest-server --with-compactor` gives one process an in-process compactor.
+It is a single-process shape — the dev quickstart, the bench scripts — and
+this chart refuses it: `ingester.extraArgs: [--with-compactor]` fails the
+render, whatever the replica count.
+
+The embedded compactor is built without a catalog claim, and the chart renders
+no claim arguments on the ingester, so there is no setting that divides the
+work between two of them. They coordinate on the drain only by atomic rename
+on the shared WAL volume, and on the maintenance loop — leveled rewrites,
+snapshot expiry, retention, orphan GC — not at all: the same contention the
+compactor tier refuses above, reached through a different value.
+`compactor.catalogClaim.enabled: true` does not waive it, because the claim it
+turns on is rendered on the compactor Deployment and nowhere else.
+
+`ingester.replicas: 1` does not waive it either. The ingester rolls with
+`maxSurge: 1` and `maxUnavailable: 0`, so the outgoing and incoming pod overlap
+on every upgrade — long enough for two embedded compactors to run maintenance
+against one table. Narrowing the rollout instead would trade ingest
+availability for a configuration the chart still could not coordinate.
+
+Compact with `compactor.enabled: true` (the default). What that costs, next to
+an embedded compactor, is one more Deployment; what it buys is the claim, the
+scale guard above, and a memory limit that is not the ingester's.
+
+### `compactor.committedRetentionSecs`
+
+`committedRetentionSecs` bounds how long successfully drained WAL mirror
+objects and their catalog rows remain available. It defaults to `86400` seconds
+(24 hours) so the mirror prefix and catalog do not grow monotonically; set it to
+`0` to opt out and never purge. The compactor floors a non-zero value at
+`MIN_COMMITTED_RETENTION_SECS` (901 seconds): it must outlive the default
+600-second `SIGLAKE_WAL_LOCAL_SWEEP_SETTLE_SECS` delay plus one 300-second
+`SIGLAKE_WAL_LOCAL_SWEEP_SECS` cadence. That gives an ingester time to observe
+the committed catalog row and remove its local sealed copy before the mirror
+object and row disappear; otherwise its catch-up sweep can re-upload and
+re-register the drained segment. If either local-sweep window is increased,
+increase `committedRetentionSecs` beyond their sum as well.
+If `SIGLAKE_WAL_LOCAL_SWEEP_SECS=0` disables that sweep, keep committed
+retention disabled too unless mirror catch-up is also disabled.
+
+The claim-reclaim age is not part of this floor. A claim remains `processing`
+and cannot be purged while it awaits disposition; if reclaim proves it already
+committed, the retention clock starts from that later disposition.
+
+### Consumed-proof rolling upgrades
+
+Versions that write `siglake.consumed_proof.v1` can reclaim committed claims
+after their source snapshots expire. Older writers update only the legacy
+snapshot summary, so a mixed-version rollout needs a temporary retention
+guard. Before starting the first new binary, set:
+
+```yaml
+compactor:
+  snapshotExpire:
+    retainLast: 400
+```
+
+Keep `retainLast >= 400` throughout the rollout and for at least 1,025 seconds
+after the last old drain or maintenance writer exits. The new reader consults
+both sources during that interval. After the wait, `retainLast` may return to
+the metadata/time-travel value appropriate for the deployment (the packaged
+default is 100); no data-file rewrite is required.
+
+### `compactor.binConcurrency` and memory
+
+Bins in a leveled compaction pass are file-disjoint and independent, so they can
+merge concurrently. **Memory, not CPU, is the binding constraint**: each in-flight
+bin holds its own decoded working set (roughly `SIGLAKE_MERGE_CHUNK_ROWS` x
+`SIGLAKE_MERGE_CHUNK_PREFETCH` rows, plus its open row-group decoders).
+
+**Measured: `binConcurrency: 4` peaked at 12.03 GiB (200G) and 14.44 GiB (1TB)
+of compaction-only RSS — roughly 3-3.4 GiB per bin, GROWING with corpus size.** An earlier ~650Mi/bin figure came
+from a local bench with much smaller bins and was 4x too low; treat 3 GB/bin as a
+floor, since 1TB-class bins are larger.
+
+The packaged `compactor.resources` (1Gi limit, 2 CPU) supports
+`binConcurrency: 1` and nothing more. **Raise `resources.limits.memory` and
+`resources.limits.cpu` together with this knob** — under-provisioned, the
+compactor OOMKills instead of compacting faster, and compaction silently stops.
+The chart refuses to render `binConcurrency > 1` while the memory limit is still
+the packaged default; the operator (which renders the same defaults) logs a
+warning when `spec.extraEnv` raises it past what the limit can hold.
+
+Rough guide: budget `1Gi + 4Gi x binConcurrency` and at least one CPU per
+bin. Measured 3.72x of 4 (93% efficient) on a pass with bins to spread across.
+
+## Autoscaling
+
+`keda.enabled=true` renders KEDA `ScaledObject`s for the ingester and the
+query tier, scaling on saturation signals (`keda.ingester.*`,
+`keda.query.*`) rather than CPU. The KEDA operator must be installed first,
+because its CRDs have to exist. The `autoscaling.*` blocks are the legacy
+CPU-HPA fallback for the ingester and compactor only; the compactor's ceiling
+is bound to the catalog claim (see "Scaling the compactor past one pod"). The legacy query CPU HPA
+was removed because the peer list of the day capped useful shard workers at
+`query.replicas`; use `keda.query.*` for query-tier autoscaling.
+
+### The query tier scales past `query.replicas`
+
+The chart used to refuse `keda.query.maxReplicas > query.replicas`, because
+`--query-peers` was built from `query.replicas` **at render time** and a pod
+KEDA added beyond that count coordinated but received no shard work. Since
+#967 the pods discover each other instead: each resolves
+`_http._tcp.<release>-query-headless.<namespace>.svc.cluster.local`, the
+headless Service's SRV record, and publishes the Ready endpoints as its
+membership. `query.replicas` is now only the starting count (and the fixed
+count when KEDA is off); `keda.query.minReplicas`/`maxReplicas` own the range:
+
+```yaml
+query:
+  replicas: 2
+keda:
+  enabled: true
+  query:
+    minReplicas: 2
+    maxReplicas: 8
+```
+
+Two convergence properties to expect. A pod becomes eligible one readiness
+probe plus one DNS refresh (`SIGLAKE_QUERY_PEER_DISCOVERY_INTERVAL_SECS`,
+default 5) after it starts. And a query already running keeps the membership
+it captured, so scale-out shows up on the *next* query, not the one in
+flight — which is also why a pod that joins or leaves mid-query cannot change
+that query's answer.
+
+Scaling *down* is safe but not free: a shard whose peer has left fails over,
+with its original shard index and snapshot pin, to the coordinator's own
+runner, and counts on `siglake_query_coordinator_failover_total`. Before its
+first usable SRV answer a pod answers every query single-pod — correct, merely
+not distributed; a pod stuck there is
+`SiglakeQueryPeerDiscoveryStalled`, from
+`siglake_query_peer_discovery_refresh_total{outcome=~"error|empty|unmatched"}`.
+With `query.distributed.enabled: false` no discovery is rendered at all, every
+pod runs single-pod, and extra replicas are plain replication.
+
+Non-Kubernetes deployments keep the static `--query-peers` list
+(`SIGLAKE_QUERY_PEERS`), whose contract is that the coordinator is peer zero.
+Setting both it and discovery is refused at startup rather than resolved by a
+precedence rule.
+
+## Auth
+
+The query-server takes a static bearer-token allow-list via
+`SIGLAKE_QUERY_TOKENS`. Three ways to wire it:
+
+1. **Customer-managed Secret** (recommended for SOC2 setups):
+   ```yaml
+   query:
+     tokens:
+       existingSecret: siglake-query-tokens   # has key `tokens` = "abc,def"
+   ```
+
+2. **Chart-managed Secret** (good for dev):
+   ```yaml
+   query:
+     tokens:
+       list:
+         - dev-token-1
+         - dev-token-2
+   ```
+
+3. **External Secrets Operator**, pulling the allow-list from your secret
+   backend:
+   ```yaml
+   externalSecrets:
+     enabled: true
+     secretStore:
+       name: siglake
+       kind: ClusterSecretStore
+     queryTokens:
+       remoteKey: siglake/query-tokens
+   ```
+   The chart renders an `ExternalSecret` whose target is
+   `<release>-siglake-query-tokens` with key `query.tokens.secretKey`, and the
+   query pods read `SIGLAKE_QUERY_TOKENS` from it. Leave
+   `query.tokens.existingSecret` and `query.tokens.list` empty on this path:
+   `existingSecret` renames the ExternalSecret's target to the Secret you
+   already own. The chart refuses `query.tokens.list` together with
+   `externalSecrets.queryTokens.remoteKey` when `existingSecret` is empty,
+   because both sources would manage the same Secret name.
+
+OIDC bearer-token verification uses `query.oidc.issuer`,
+`query.oidc.audience`, and `query.oidc.tenantClaim`. When issuer and audience
+are non-empty, OIDC takes precedence over `query.tokens`.
+
+An OIDC block has to be complete. On each enabled tier — `query.oidc` and
+`ingester.oidc` alike — the chart accepts three shapes and refuses the rest:
+
+| `issuer` | `audience` | `tenantClaim` | |
+|---|---|---|---|
+| empty | empty | empty | no OIDC; `tokens`/`auth`, or open |
+| set | set | empty | verified JWTs, single-tenant routing |
+| set | set | set | verified JWTs, tenant from the claim |
+
+An issuer without an audience, an audience without an issuer, or a
+`tenantClaim` without both fails the render. The variables were emitted only as
+a complete set, so an incomplete block used to disappear during rendering: the
+tier came up on its token allow-list, or open, and the omission also skipped
+the binaries' own startup checks, which see only variables that were rendered.
+Bearer tokens beside an incomplete block do not make it valid — they say who
+may call, not that the JWT the values asked for was verified.
+
+A complete `query.oidc` block is authentication, so it needs
+`query.distributed.coordinatorToken` wherever fan-out is reachable, exactly as
+a token allow-list does.
+
+## Ingress
+
+ClusterIP only by default. Customers typically expose the query-server
+via an Ingress they already own:
+
+```yaml
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:...
+  hosts:
+    - host: siglake.example.com
+      paths:
+        - path: /api
+          pathType: Prefix
+          service: query
+  tls:
+    - hosts: [siglake.example.com]
+```
+
+OTLP ingest usually sits behind a separate Ingress with a different
+auth model — point it at the `<release>-siglake-ingester` Service on
+port 8088 for OTLP/HTTP (`POST /v1/logs`, `POST /v1/traces`) or 4317 for
+OTLP/gRPC logs and traces. Both are enabled by default. Set
+`ingester.otlpGrpc.enabled=false` to remove the gRPC container and Service
+ports and pass the binary's explicit `--disable-otlp-grpc` opt-out.
+
+## Ingest tenancy
+
+The ingester is **single-tenant by default**: every request routes to the
+`default` tenant, and an `X-Scope-OrgID` naming any other one is refused with
+`403` on both HTTP and OTLP/gRPC. Two values turn multi-tenant routing on:
+
+- `ingester.oidc.tenantClaim` — the tenant comes from the verified JWT, on
+  both transports. A header may only agree with the claim, and a token that
+  carries no usable claim is refused rather than routed to `default`. This is
+  the setting for a shared cluster. It needs `ingester.oidc.issuer` and
+  `ingester.oidc.audience` with it: there is no verified token to read a claim
+  from without them, and the chart refuses the claim on its own.
+- `ingester.trustScopeHeader: true` — the header selects the tenant, on the
+  client's word. Only safe where a gateway in front of the ingester sets the
+  header itself and strips the client's.
+
+`ingester.allowedTenants` bounds whichever of the two is in use: it is checked
+against the tenant actually resolved.
+
+## Observability
+
+Set `serviceMonitor.enabled=true` if you run `kube-prometheus-stack`.
+Each pod's `/metrics` endpoint is scraped at `serviceMonitor.interval`.
+Exactly one Service per tier carries `siglake.limnion.ai/scrape: "true"`
+and the ServiceMonitor requires it — without that, the two Services the
+query tier renders would each become a scrape target and every query
+metric would read double.
+
+`serviceMonitor.targetLabels` copies `app.kubernetes.io/instance` and
+`app.kubernetes.io/component` onto the series, which the operator's
+autoscaling PromQL selects on.
+
+Set `prometheusRule.enabled=true` for alerts on the failure modes
+siglake has hit or pins with a deterministic loss regression: silent-loss counters (abandoned mirror
+registrations, CRC mismatches, refused writes, lost group-count
+deltas), a stalled drain, a non-converging layout, query-pool
+saturation, sustained pool refusals (`SiglakeQueryPoolRefusing`), incomplete
+scan attribution (`SiglakeQueryScanAttributionIncomplete`), sustained shard
+pin failures (`SiglakeQueryShardPinUnresolved`), table-metadata cache
+reloads that keep being fenced out unpublished
+(`SiglakeTableCacheUnpublished` — the `superseded` and `reload` fences are
+healthy contention and do not alert; the counter has no `table` label, so the
+alert points at the pod's WARN line `table-cache refresh fenced out`, which
+carries `table=`, and it is above the default `logLevel`), batch execution
+prevented or completed output discarded after recovery
+(`SiglakeBatchCompletionRejectedByRecovery`; client cancellations and TTL
+expiry do not alert), and a stalled
+query-cache
+warmer. That last one is the
+earliest known signal for the query degradation that only a pod
+restart cures; it fires once no warm cycle has completed for three
+intervals. The interval is `query.warmIntervalSecs` (default 30), which
+the chart renders as `SIGLAKE_QUERY_WARM_INTERVAL_SECS` on every query
+pod, so changing the cadence moves the alert threshold with it. Set
+`prometheusRule.queryWarmIntervalSecs` only when the pods' cadence comes
+from somewhere else (a `query.extraEnv` entry wins over the rendered
+value); it overrides what the alert assumes, nothing more. A cadence of
+0 means a startup-only warm, and the alert is then not rendered.
+`scripts/check-chart.py` renders the chart at the default, a non-default
+and a zero cadence and holds the alert's `for:` to three times the
+container's value (or to the alert's absence at 0), so the two cannot
+drift apart unnoticed.
+
+Three of the silent-loss alerts are about the aggregates rather than rows. A per-commit delta write that exhausts its
+four attempts leaves a durable marker; the maintenance compactor normally
+rebuilds the aggregate on its next fold, while `GROUP BY` stays exact on the
+per-file path. `SiglakeGroupCountDeltaLost` (warning) fires only when that
+automatic rebuild fails or remains incomplete and names the table; use
+`siglake rebuild-group-counts --table <table>` as the operator fallback.
+`SiglakeGroupCountDeltaRetrying` (warning) fires once delta writes for a table
+have needed retries for half an hour and names both the table and pod, warning
+that an exhausted write and automatic rebuild are becoming more likely.
+`SiglakeSideAggregatePublicationLost` (warning) covers the inline aggregate
+object: a publication that exhausts the same four attempts loses the commit's
+contribution outright, so it fires on the failure itself. The compactor's
+rebuild restores the wide group counts; the inline time aggregates have no
+rebuild, so windowed `GROUP BY` on that table answers from the per-file path
+until the object is rebuilt.
+
+The starter Grafana dashboard `deploy/grafana/siglake-overview.json`
+groups panels the same way and filters on `namespace` (the label
+Prometheus Operator sets on every target). It does *not* need a `role`
+label — an earlier version of this README said it did, and no
+ServiceMonitor has ever set one. Its "Fast paths" row is the
+query tier's cheap-answer machinery: side-aggregate cache outcomes
+(`hit` / `miss` / `stale` / `uncovered`), Tier-2 group-count calls by
+outcome with the fallback share on the right axis (near 0 is healthy,
+near 1 is every call decoding raw pages), Tier-2 files per call, the
+live-file-list cache hit ratio, and a second line for the Tier-1
+aggregate itself: outstanding deltas folded per read (p50 / p99, near
+zero when the compactor fold keeps up) and columns demoted from exact
+counts to sketches (should sit at zero). `scripts/check-chart.py` verifies
+that every `siglake_*` series a panel or template variable names is one
+the code emits, the same check it applies to the alert rules and the KEDA
+trigger queries, so a renamed metric fails CI instead of blanking a panel.
+It also holds each reference to the form the exporter renders: `_bucket`
+and `histogram_quantile()` only on the histograms `builder()` in
+`crates/siglake-core/src/metrics.rs` hands buckets (names ending in
+`_seconds` and the `COUNT_HISTOGRAMS` list), a `quantile` label only on
+the ones it leaves as summaries. The rule is parsed from that file, so a
+new `_bucket` panel on a summary-form histogram fails until the histogram
+is bucketed there, and nothing in the script needs updating when it is.
+
+## Storage
+
+- `wal/`: ReadWriteMany PVC, shared by ingester (writer) + compactor
+  (reader, archiver), plus any external segment consumer. Defaults to
+  50Gi.
+
+For EFS, set `wal.storageClassName` to the name of your EFS
+StorageClass. The chart never recreates the PVC implicitly — if you
+need to resize, follow the standard k8s PVC expand procedure.
+
+## Uninstall
+
+```bash
+helm uninstall siglake -n siglake
+kubectl delete pvc -n siglake -l app.kubernetes.io/instance=siglake
+```
+
+PVCs are deliberately not deleted by `helm uninstall` so a reinstall
+keeps the WAL. Delete them explicitly when you mean it.

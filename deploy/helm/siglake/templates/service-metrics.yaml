@@ -1,0 +1,27 @@
+{{/*
+Headless metrics-only Services for the binaries that don't expose any
+other HTTP. Used by the ServiceMonitor and for ad-hoc port-forward.
+*/}}
+{{- range $role := list "compactor" }}
+{{- $enabled := index $.Values $role "enabled" }}
+{{- if $enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "siglake.componentName" (list $ $role) }}
+  labels:
+    {{- include "siglake.componentLabels" (list $ $role) | nindent 4 }}
+    siglake.limnion.ai/scrape: "true"
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "siglake.componentSelectorLabels" (list $ $role) | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9101
+      targetPort: metrics
+      protocol: TCP
+{{- end }}
+{{- end }}

@@ -1,0 +1,61 @@
+# siglake chart values for the kind inner-dev loop.
+#
+# Tiny resources, single-node anti-affinity off, RWO emptyDir-backed
+# PVC for the WAL (acceptable because kind is single-node anyway).
+
+image:
+  repository: siglake
+  tag: kind
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  annotations: {}    # No IRSA in kind.
+
+postgres:
+  existingSecret: siglake-postgres
+
+s3:
+  bucket: siglake-warehouse
+  region: us-east-1
+  endpoint: http://minio:9000
+  warehousePrefix: warehouse
+
+# Shared so the pre-upgrade schema-migration hook can reach MinIO too.
+extraEnv:
+  - name: AWS_ACCESS_KEY_ID
+    value: minioadmin
+  - name: AWS_SECRET_ACCESS_KEY
+    value: minioadmin
+
+ingester:
+  replicas: 1
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: 1,    memory: 512Mi }
+
+compactor:
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 500m, memory: 256Mi }
+
+query:
+  replicas: 1
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: 1,    memory: 512Mi }
+
+wal:
+  size: 1Gi
+  accessMode: ReadWriteOnce
+
+# All hardening off in kind — single node, no need.
+podDisruptionBudget:
+  enabled: false
+antiAffinity:
+  enabled: false
+networkPolicy:
+  enabled: false
+externalSecrets:
+  enabled: false

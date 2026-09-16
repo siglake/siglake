@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "synthetic",
+  "revisions": {
+    "repository_commit": "synthetic-siglake-revision",
+    "benchmark_commit": "synthetic-benchmark-revision"
+  },
+  "points": 3,
+  "exported_pair_rows": 4,
+  "row_count": 98466115,
+  "dictionary_values": 4,
+  "encoded_bytes": 100,
+  "bytes_per_point": 33.333333333333336,
+  "serde_json_bytes": 180,
+  "decode_round_trip": true,
+  "verdict": "passed"
+}

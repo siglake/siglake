@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "synthetic",
+  "revisions": {
+    "repository_commit": "synthetic-siglake-revision",
+    "benchmark_commit": "synthetic-benchmark-revision"
+  },
+  "sql_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "control": {
+    "status": "complete",
+    "query_path": "local_full_table",
+    "counter_reset": false,
+    "execution_count": 2,
+    "max_rows_returned": [10, 9],
+    "counts": {"debug": 2, "error": 3, "info": 5, "warn": 7},
+    "boundary_scan_delta": 8,
+    "physical_read_delta": 8,
+    "files_per_call": [4, 4],
+    "cache_hits_delta": 0,
+    "cache_misses_delta": 0
+  },
+  "candidate": {
+    "status": "complete",
+    "query_path": "local_full_table",
+    "counter_reset": false,
+    "execution_count": 2,
+    "max_rows_returned": [10, 9],
+    "counts": {"debug": 2, "error": 3, "info": 5, "warn": 7},
+    "boundary_scan_delta": 0,
+    "physical_read_delta": 0,
+    "candidate_served_delta": 2,
+    "cache_hits_delta": 0,
+    "cache_misses_delta": 0
+  },
+  "distributed_correctness": {
+    "label": "correctness_only",
+    "query_path": "transparent",
+    "control_counts": {"debug": 2, "error": 3, "info": 5, "warn": 7},
+    "candidate_counts": {"debug": 2, "error": 3, "info": 5, "warn": 7}
+  },
+  "verdict": "passed"
+}

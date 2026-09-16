@@ -1,0 +1,765 @@
+{{- if .Values.prometheusRule.enabled -}}
+{{- /*
+  Alerts for failure modes siglake has hit, plus correctness boundaries with
+  deterministic regressions where one occurrence loses accepted or computed
+  data.
+
+  Every counter below is instrumented in-process and graphed by the starter
+  Grafana dashboard (`deploy/grafana/siglake-overview.json`; import it by
+  hand, the chart does not render it): its Durability row holds the mirror
+  register/upload abandons, WAL CRC mismatches, schema drift and group-count
+  delta failures, and its Drain-and-compaction row holds "Reclaims without
+  proof" and the mirror-sync panels. A panel is not a page, though: this rule
+  is the only thing that alerts on any of them. Two of these counters
+  carry in-code comments explicitly calling them alerting signals for silent
+  data loss, and one of them —
+  `siglake_wal_mirror_register_abandoned_total` — describes the exact 2026-08-15
+  incident where 36,122 rows were accepted, durable, and permanently
+  unqueryable with zero errors anywhere.
+
+  Grouped by what an operator should DO, not by subsystem:
+    - data-loss: rows are gone or unreachable. Page.
+    - stalled: the pipeline has stopped making progress while ingest continues.
+    - refusing: siglake is correctly rejecting work; someone must act.
+    - saturation: capacity, not correctness.
+
+  Every `for:` is deliberately short on the data-loss group: these counters do
+  not move in normal operation, so a single increment is the signal.
+*/ -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "siglake.fullname" . }}
+  labels:
+    {{- include "siglake.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: siglake.data-loss
+      rules:
+        - alert: SiglakeBatchCompletionRejectedByRecovery
+          # Recovery already made the row terminal. The executor either refuses
+          # to start or discards a completion, depending on when it observes
+          # that verdict. Client cancellation and TTL expiry are expected
+          # conflicts and deliberately excluded by the cause label.
+          expr: increase(siglake_query_job_terminal_conflict_total{cause="recovery"}[10m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: Batch recovery refused executor work
+            description: >-
+              {{ "{{ $value }}" }} batch lifecycle transition(s) were refused after
+              recovery declared their executor gone. A refused running
+              publication prevents execution; a refused completion discards its
+              computed output. The failed job remains terminal and tells the
+              client to resubmit; inspect the query-server WARN line for the job
+              id, owner, attempted transition and disposition. Client
+              cancellations, TTL expiry, oversized results and terminal-write
+              errors do not fire this alert.
+        - alert: SiglakeBatchRowStrandedNonTerminal
+          # #1942 made this state observable; this rule is what pages on it. A
+          # run whose execution ENDED without its terminal write landing leaves
+          # a `running` row, and these two series are the two ways nothing is
+          # left to resolve it before the executor exits:
+          # `cause="write_abandoned"` is the run reporting that it could not
+          # even be tracked, and the dropped counter is the owner-local
+          # bookkeeping (1024 ids) refusing it. Either way the client polls
+          # `running` until the process exits and lease-expiry recovery on a
+          # peer condemns the row, and the answer the run computed is gone.
+          #
+          # `cause="write_deferred"` is deliberately excluded: that row IS
+          # parked, and its executor retries the same conditional write every
+          # 5s, so it resolves without an operator. So is the
+          # `siglake_query_jobs_unreconciled` gauge — a nonzero one is a store
+          # outage in progress with reconciliation working as designed, which
+          # is dashboard material, not a page.
+          #
+          # One page per pod, not two. The two series move together by
+          # construction today: a run reports `write_abandoned` exactly when
+          # `park_finished_unpersisted` returned `Full` and incremented the
+          # dropped counter (crates/siglake-query-server/src/sql.rs), and
+          # `or` between two differently-labelled vectors would fire twice for
+          # that one event. Reducing both sides to (namespace, pod) makes `or`
+          # drop the right-hand series wherever the left already fired, while
+          # still alerting if either end is ever incremented on its own.
+          expr: >-
+            sum by (namespace, pod) (
+              increase(siglake_query_job_terminal_conflict_total{cause="write_abandoned"}[10m])
+            ) > 0
+            or
+            sum by (namespace, pod) (
+              increase(siglake_query_jobs_unreconciled_dropped_total[10m])
+            ) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: A finished batch job's row is stranded non-terminal until its executor restarts
+            description: >-
+              {{ "{{ $value }}" }} batch run(s) on {{ "{{ $labels.pod }}" }}
+              finished without persisting a verdict and are not being retried
+              by anything: their clients read `running` until this pod exits
+              and a peer condemns the rows on lease expiry. Read the
+              query-server ERROR lines "batch terminal state could not be
+              persisted and could not be tracked" and "job-store outage
+              outlasted this replica's reconciliation bookkeeping" for the job
+              ids and owner. The cause is a job-store outage that outlasted
+              this replica's 1024-id bookkeeping; restore the store, then
+              restart the pod to release the stranded rows. Rows whose
+              executor is still reconciling them (cause="write_deferred",
+              siglake_query_jobs_unreconciled) do not fire this alert.
+        - alert: SiglakeWalMirrorRegisterAbandoned
+          # The 2026-08-15 mode exactly: the segment uploaded to object storage
+          # but its catalog row was never written, so the drain never claims it.
+          # `catch_up_sweep` repairs "not uploaded", not "not registered".
+          expr: increase(siglake_wal_mirror_register_abandoned_total[10m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: WAL segments are durable in the mirror but absent from the catalog
+            description: >-
+              {{ "{{ $value }}" }} segment registration(s) were abandoned. Those rows were
+              ACKED to the client and are permanently unqueryable — no error will
+              be raised anywhere else. Run `siglake wal-recover` or
+              re-register the affected keys.
+        - alert: SiglakeWalMirrorUploadAbandoned
+          expr: increase(siglake_wal_mirror_upload_abandoned_total[10m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: WAL segments gave up on their mirror upload
+            description: >-
+              The PVC is now the only copy of {{ "{{ $value }}" }} segment(s). A volume
+              loss becomes real data loss.
+        - alert: SiglakeWalCrcMismatch
+          expr: increase(siglake_wal_crc_mismatch_total[15m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: A WAL segment failed CRC validation
+            description: >-
+              Framing corruption on a segment that was acked. It will be
+              quarantined rather than committed, so its rows are unreachable.
+        - alert: SiglakeSchemaWritesRefused
+          # Not loss — the refusal is what PREVENTS loss — but it means ingest
+          # is 5xx-ing until someone migrates.
+          expr: increase(siglake_storage_schema_drift_total{disposition="refused"}[10m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: Writes are being refused because a table is behind the running binary
+            description: >-
+              This binary declares columns the table lacks, so writes are
+              refused rather than silently dropping them. Run
+              `siglake migrate-schema --all-tables --all-namespaces`.
+        - alert: SiglakeReclaimWithoutProof
+          expr: increase(siglake_compactor_reclaim_unprovable_total[30m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: Abandoned claims were requeued without proof they were uncommitted
+            description: >-
+              Neither the durable consumed-proof property nor retained
+              snapshot history covered these claims, so requeueing may
+              duplicate rows. Inspect durable-proof decode/cap errors; during
+              a mixed-version rollout keep retainLast at least 400 through
+              1,025 seconds after the final old writer exits.
+        - alert: SiglakeConsumedProofAtCapacity
+          expr: increase(siglake_consumed_proof_cap_refusals_total[30m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: A table commit was refused because its durable consumed proof reached its cap
+            description: >-
+              Siglake fails closed at the consumed-proof metadata cap instead
+              of dropping commit evidence and risking duplicate rows. Compare
+              the current and last-successful watermark lag series, then
+              inspect terminal-proof pruning and unusually large claim groups
+              before retrying writes.
+        - alert: SiglakeWalPartialAdopted
+          expr: increase(siglake_wal_partials_adopted_total[30m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: An ingester adopted another writer's abandoned WAL segment
+            description: >-
+              Expected after a pod dies mid-write. Repeated firing on a healthy
+              fleet suggests writers are being starved past the adoption
+              threshold, which risks a live segment being taken.
+        - alert: SiglakeWalPartialTailDropped
+          expr: increase(siglake_wal_partial_tail_dropped_total[30m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: A recovered WAL partial ended in a torn IPC message
+            description: >-
+              Siglake committed or served the complete fsynced prefix and left
+              the torn source bytes intact. Correlate this warning with an
+              ingester restart or storage failure; repeated events indicate
+              an unstable WAL volume or process.
+        - alert: SiglakeGroupCountDeltaLost
+          # Not row loss — every row is committed and every answer stays exact —
+          # but an automatic repair that errors or cannot restore full coverage
+          # leaves GROUP BY on the affected columns on the per-file path. The
+          # lost-delta counter does not fire this rule: a lost delta writes a
+          # durable marker, and the next compactor aggregate fold normally
+          # repairs it without operator action. Errors leave the marker for a
+          # later retry; an incomplete rebuild has reached the next fold and
+          # proved that the shortfall persists.
+          #
+          # The 1h window keeps either abnormal rebuild outcome visible across
+          # the compactor cadence without paging on the original lost delta.
+          expr: increase(siglake_group_count_auto_rebuilds_total{outcome=~"failed|incomplete"}[1h]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: Automatic group-count repair for {{ "{{ $labels.table }}" }} was {{ "{{ $labels.outcome }}" }}
+            description: >-
+              {{ "{{ $value }}" }} automatic group-count rebuild(s) for table
+              {{ "{{ $labels.table }}" }} were {{ "{{ $labels.outcome }}" }} in
+              the last hour. Answers stay exact, but GROUP BY on the affected
+              columns remains on the per-file path. The compactor retries a
+              failed rebuild while its durable marker remains; as the operator
+              fallback, run
+              `siglake rebuild-group-counts --table {{ "{{ $labels.table }}" }}`,
+              which recomputes the aggregate from the committed files and is
+              safe to re-run.
+        - alert: SiglakeSideAggregatePublicationLost
+          # The inline aggregate object's counterpart to the delta loss above,
+          # and the reason it pages on the failure counter rather than on a
+          # repair outcome: no marker repairs this object. The compactor can
+          # rebuild the wide group counts from committed files, so those columns
+          # come back; the inline time aggregates have no rebuild, so a lost
+          # publication keeps every windowed GROUP BY on this table on the exact
+          # per-file path until the object is rebuilt. Answers stay exact
+          # throughout — the guard refuses a short aggregate.
+          expr: increase(siglake_side_aggregate_publish_failures_total[1h]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: A side-aggregate publication for {{ "{{ $labels.table }}" }} was lost
+            description: >-
+              {{ "{{ $value }}" }} side-aggregate publication(s) for table
+              {{ "{{ $labels.table }}" }} on {{ "{{ $labels.pod }}" }} spent all
+              four attempts in the last hour. Each one was carrying a commit's
+              group counts and time aggregates that exist nowhere else, so the
+              object now stays short of total-records and no later commit closes
+              the gap. Check warehouse object-store health and credential
+              refresh (IMDS) on that pod; run
+              `siglake rebuild-group-counts --table {{ "{{ $labels.table }}" }}`
+              to restore the group-count aggregate, which does not rebuild the
+              inline time aggregates.
+        - alert: SiglakeGroupCountDeltaRetrying
+          # The precursor to the alert above. A delta write that succeeds on a
+          # retry is fine in isolation — a credential refresh or one slow PUT —
+          # but four attempts span only 1.5s, so a backend that keeps failing
+          # intermittently will sooner or later fail four times in a row on one
+          # commit. `for:` is twice the range so that a single burst, which
+          # keeps `rate()` positive for one range, cannot fire it; sustaining
+          # it needs retries across at least two consecutive windows. The
+          # counter carries both the table supplied by the commit path and the
+          # pod added by Prometheus, so this identifies both.
+          expr: rate(siglake_group_count_delta_write_retries_total[15m]) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: Group-count delta writes for {{ "{{ $labels.table }}" }} have needed retries for half an hour
+            description: >-
+              Delta writes for table {{ "{{ $labels.table }}" }} on
+              {{ "{{ $labels.pod }}" }} have been succeeding only on retry for
+              30 minutes. Each retry is a transient object-store or credential
+              failure; a sustained rate is the precursor to
+              SiglakeGroupCountDeltaLost, which fires once a write exhausts all
+              four attempts. Check warehouse object-store health and credential
+              refresh (IMDS) on that pod before a delta is lost.
+
+    - name: siglake.stalled
+      rules:
+        - alert: SiglakeCompactorWatchdogTripping
+          # Tripped 52 times on 2026-08-15 with nothing watching.
+          expr: increase(siglake_compactor_watchdog_trips_total[30m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: Compaction is being killed by its own watchdog
+            description: >-
+              A drain cycle or recluster pass exceeded its deadline and was
+              aborted. Sustained firing means compaction is not converging and
+              query latency will degrade with layout depth.
+        - alert: SiglakeDrainBacklogGrowing
+          # Depth alone is ambiguous (a deep queue draining fast is fine); the
+          # AGE of the oldest unclaimed segment is the growth signal.
+          expr: siglake_compactor_sealed_pending_oldest_age_seconds > 900
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: The oldest unclaimed WAL segment is over 15 minutes old
+            description: >-
+              The drain is not keeping up with ingest. Rows are durable but not
+              yet queryable, and the WAL volume is filling. Add drain capacity.
+        - alert: SiglakeSegmentsQuarantined
+          expr: siglake_catalog_claim_quarantined > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: WAL segments have been set aside and will not drain without intervention
+            description: >-
+              {{ "{{ $value }}" }} segment(s) are quarantined. Their rows are durable and
+              unqueryable. Either the drain failed on them repeatedly — usually an
+              index that does not exist — or a mirrored segment could not be placed in
+              the table its index resolves to now, which is set aside on the first
+              cycle because no retry can change it. The `reason` field on the
+              `segment QUARANTINED` log line says which. Resolve, then
+              `requeue_quarantined`.
+        - alert: SiglakeMirrorReconciliationErrors
+          # The bounded-page activity counter advances before reconciliation
+          # lists the mirror. A listing or registration failure can therefore
+          # masquerade as slow progress to the rotation-stall rule for its full
+          # six-hour default window; the cycle outcome names the cause directly.
+          expr: increase(siglake_compactor_cycles_total{outcome="catalog_sync_error"}[30m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: Mirror-to-catalog reconciliation is failing
+            description: >-
+              One or more reconciliation passes failed while listing the mirror
+              or registering its objects in the last 30 minutes. Uploaded WAL
+              segments without catalog rows remain unqueryable until a pass
+              succeeds. Read the dashboard's "Cycles by outcome" panel and the
+              compactor warning log for the underlying object-store or catalog
+              error.
+          {{- /* The bound on a whole mirror-to-catalog wraparound rotation.
+               Unlike the warm cadence below there is no pod-side counterpart to
+               follow (the compactor's SIGLAKE_MIRROR_SYNC_INTERVAL_SECS is a
+               per-PAGE cadence, and the chart does not render it), so this is a
+               plain chart value; check-chart.py holds the rendered rule to it.
+               0 does not render the rule. */}}
+          {{- $mirrorStall := int .Values.prometheusRule.mirrorRotationStallSecs }}
+          {{- if gt $mirrorStall 0 }}
+        - alert: SiglakeMirrorReconciliationStalled
+          # Mirror-to-catalog reconciliation is the only owner of the
+          # "object in the mirror, no catalog row" window — the 2026-08-15 mode
+          # where 36,122 rows were accepted, durable and permanently
+          # unqueryable. Since the scan became bounded and cursor-durable it
+          # can no longer fail loudly: it pages through the prefix, and a
+          # rotation that never wraps around simply leaves part of the prefix
+          # unvisited forever, at full page throughput, with every other
+          # compactor signal healthy.
+          #
+          # Both arms are needed, and neither alone is a stall.
+          # `mirror_sync_total` says bounded pages ARE running — the counter
+          # increments before the listing, so it stays true when the listing
+          # itself is failing, and it is false (no series movement) when
+          # reconciliation is deliberately off (SIGLAKE_MIRROR_SYNC_INTERVAL_
+          # SECS=off) or nothing holds the maintenance lease, neither of which
+          # this rule should page for. The examined-to-date gauge is therefore
+          # dashboard progress only: it retains a stale nonzero value in both
+          # cases and does not exist if the first listing fails.
+          # `rotations_completed` is the durable
+          # cursor generation, republished on EVERY page rather than only on a
+          # wraparound, so `changes() == 0` over the window means "pages ran,
+          # none of them was the last page of a rotation" and not "no scrape".
+          # `max()` over the pod series, not a bare comparison: a handed-off
+          # owner leaves a constant stale series whose `changes()` is 0 for the
+          # rest of the window, and the fleet is stalled only when NO series
+          # moved. A first rotation that has never completed reads 0 here and
+          # is caught the same way — the gauge exists from the first page.
+          expr: >-
+            sum(increase(siglake_compactor_mirror_sync_total[{{ $mirrorStall }}s])) > 0
+            and
+            max(changes(siglake_compactor_mirror_sync_rotations_completed[{{ $mirrorStall }}s])) == 0
+          # The window is the threshold; `for:` only demands that it hold
+          # across several scrapes rather than on one evaluation that landed
+          # between a rotation's last page and its successor's first.
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Mirror-to-catalog reconciliation has not completed a rotation in {{ $mirrorStall }}s
+            description: >-
+              Bounded reconciliation pages keep running but no rotation has
+              wrapped around in {{ $mirrorStall }}s
+              (prometheusRule.mirrorRotationStallSecs). Part of the mirror
+              prefix is going unvisited, so a segment that was uploaded but
+              never registered stays unqueryable with no other symptom. Read
+              the dashboard's "Mirror repairs / rotation completion" panel:
+              completion age
+              (siglake_compactor_mirror_sync_last_completed_timestamp_seconds)
+              gives the true age across owner handoff, and pages/min beside
+              "Mirror sync objects per pass" says whether the prefix is simply
+              growing faster than one rotation can walk it — raise
+              prometheusRule.mirrorRotationStallSecs, or lower
+              compactor.committedRetentionSecs — while a flat objects/page below the
+              1,024 page budget with no completion means the walk itself is
+              stuck.
+          {{- end }}
+        - alert: SiglakeDeleteTaskStalled
+          # An acknowledged GDPR deletion request that no sweep will look at
+          # again. A task is left non-terminal by a process that died between
+          # the `running` write and the terminal write, by a terminal write
+          # that failed after the rewrite committed, by the sweep watchdog
+          # cancelling the stage, or by a death between the claim and the
+          # `running` write. Nothing sweeps any of them up: the executor takes
+          # `pending` tasks only, claims are never released or taken over, and
+          # recovery is an explicit resubmission under a new task id.
+          #
+          # `increase(...) > 0`, not a rate and not the gauge. The counter
+          # counts OBSERVATIONS of a stalled task, so its rate is proportional
+          # to the sweep cadence and means nothing; only movement does, which
+          # is what decouples this window from SIGLAKE_DRAIN_WATCHDOG_SECS.
+          # Its `siglake_compactor_delete_tasks_nonterminal` gauge sibling is
+          # dashboard-only and must never appear here — a live pod retains that
+          # value when delete-task execution is disabled, when it loses the
+          # `delete_tasks` lease and when the stage's watchdog trips, so an
+          # alert on it would read stale-healthy exactly when the truth is
+          # "unobserved" (check-chart.py enforces this).
+          expr: increase(siglake_compactor_delete_tasks_stalled_total[1h]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: An acknowledged deletion request has been left unexecuted
+            description: >-
+              A delete task has been non-terminal ({{ "{{ $labels.state }}" }})
+              for longer than twice the delete sweep's own watchdog ceiling, so
+              no execution this compactor allows could still hold it. It does
+              NOT prove the executor is dead, and it does not say whether the
+              rewrite committed: the age is the claim object's, which bounds
+              execution duration from above and keeps growing after the task
+              strands. Nothing will retry it. Find the task id and index in the
+              compactor's WARN line, read GET /api/v1/delete-tasks/{id} for the
+              record and its claim, decide from your audit trail whether the
+              original rewrite landed, and resubmit the request under a new
+              task id.
+        - alert: SiglakeTableNotConverging
+          expr: siglake_table_overlap_depth > 60
+          for: 60m
+          labels:
+            severity: warning
+          annotations:
+            summary: Table layout depth is not converging
+            description: >-
+              Overlap depth {{ "{{ $value }}" }} sustained for an hour. Scanning queries
+              degrade with depth; the 2026-08-27 round measured a windowed
+              browse at 40.9s against 0.13s converged.
+
+    - name: siglake.refusing
+      rules:
+        - alert: SiglakeIngestLanesRefused
+          expr: increase(siglake_ingest_lane_refused_total[10m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ingest is refusing new tenant/index lanes at its cap
+            description: >-
+              Either a legitimate tenant is being turned away, or a client is
+              varying X-Scope-OrgID / x-siglake-index. Only the lane cap
+              increments this counter, so check ingester.maxLanes. A refusal
+              at ingester.maxTenants lands on SiglakeTenantsDenied with
+              reason at_capacity instead.
+        - alert: SiglakeTenantsDenied
+          expr: increase(siglake_ingest_tenant_denied_total[10m]) > 10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ingest is denying tenants
+            description: >-
+              Sustained denials mean a misconfigured client, a tenant missing
+              from ingester.allowedTenants, or an ingester at
+              ingester.maxTenants turning novel tenants away. The reason label
+              says which: at_capacity is the cap, not_allowed the allow-list,
+              header_not_trusted a client selecting a tenant on a
+              single-tenant ingester, and the claim_* reasons a token whose
+              tenant claim is missing or unusable.
+        - alert: SiglakeQueryTenantsDenied
+          expr: increase(siglake_query_tenant_denied_total[10m]) > 10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Query is denying tenants
+            description: >-
+              Verified tokens are arriving without a usable
+              query.oidc.tenantClaim value, so their queries are refused with
+              403 rather than routed to the default namespace. Either the IDP
+              is not minting the claim or the configured claim name is wrong.
+
+    - name: siglake.saturation
+      rules:
+        - alert: SiglakeQueryPoolNearLimit
+          expr: >-
+            siglake_query_memory_pool_bytes > 0
+            and siglake_query_memory_pool_reserved_bytes
+                / siglake_query_memory_pool_bytes > 0.9
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: The query memory pool is over 90% reserved
+            description: >-
+              Queries will spill or degrade to fewer open files. Every
+              memory-related outage this project has had lived in the query pod.
+        - alert: SiglakeQueryPoolRefusing
+          expr: >-
+            sum by (namespace, pod) (
+              increase(siglake_query_breaker_trips_total{breaker="pool_exhausted"}[10m])
+            ) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: The query memory pool is refusing work
+            description: >-
+              Compare SiglakeQueryPoolNearLimit and inspect
+              GET /debug/memory-pool, then review the chart's
+              query.resources.limits.memory, query.spill.maxBytes and
+              query.spill.sizeLimit sizing.
+        - alert: SiglakeQueryShardPinUnresolved
+          expr: >-
+            sum by (namespace, pod) (
+              rate(siglake_query_shard_pin_total{outcome="miss"}[5m])
+            ) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Query workers cannot resolve the coordinator's generation
+            description: >-
+              Distributed queries are being refused with 503
+              reason="shard_pin_unresolved" rather than mixing generations.
+              The worker log names which half of the pin it refused. For a
+              snapshot, raise compactor.snapshotExpire.retainLast, or lower
+              SIGLAKE_ICEBERG_METADATA_CACHE_TTL_SECS so coordinators stop
+              serving snapshots before the catalog expires them. For a schema,
+              the pinned schema id is in no generation the worker's catalog
+              read retains: check the workers read the same warehouse and that
+              their metadata refreshes are succeeding.
+        # #1561: publication of a table-metadata reload is fenced by a
+        # per-table epoch, so a reload that loses the race either serves the
+        # entry that beat it (action="superseded") or re-loads
+        # (action="reload"). Both are healthy contention under a commit storm
+        # and deliberately do NOT alert. Running out of attempts is different:
+        # action="unpublished" hands the caller its metadata but leaves the
+        # cache EMPTY for that table, so every later read re-runs load_table
+        # over the whole metadata.json — seconds on a busy table, and exactly
+        # the cost the cache exists to avoid. rate()[10m] over a `for: 15m`
+        # means one fenced-out burst is ignored and only a table that keeps
+        # losing fires.
+        - alert: SiglakeTableCacheUnpublished
+          expr: >-
+            sum by (namespace, pod) (
+              rate(siglake_iceberg_table_cache_fenced_total{action="unpublished"}[10m])
+            ) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Table-metadata cache reloads keep being fenced out unpublished
+            description: >-
+              Reloads have exhausted their attempts against concurrent
+              invalidations for over 15 minutes, so this pod's table-metadata
+              cache stays empty and every read pays a full load_table. The
+              counter cannot name the table (index-table names are only known
+              at the increment, so a table label would not be
+              pre-registerable); grep this pod's log for the WARN line
+              "table-cache refresh fenced out" — it carries table= and
+              attempts=. The healthy arms (action="superseded",
+              action="reload") are on the dashboard's fence panel; if they are
+              moving too, the table is simply committing faster than its
+              metadata loads. Lower the commit rate (raise
+              compactor.commitBatch.targetMb / maxAgeSecs) or shrink the
+              metadata.json being loaded (lower
+              compactor.snapshotExpire.retainLast, or its intervalSecs).
+        # #967: every discovery failure RETAINS the last known good membership,
+        # deliberately — a DNS blip must not shrink the cluster mid-flight. The
+        # cost is that a pod whose resolver has been broken since boot is
+        # indistinguishable from a healthy one-member cluster: it answers every
+        # query, locally, forever, and no query-side counter moves. So the
+        # signal is not "a refresh failed" (one is normal during a rollout) but
+        # "no refresh has SUCCEEDED while refreshes are being attempted".
+        - alert: SiglakeQueryPeerDiscoveryStalled
+          expr: >-
+            sum by (namespace, pod) (
+              increase(siglake_query_peer_discovery_refresh_total{outcome=~"error|empty|unmatched"}[10m])
+            ) > 0
+            unless
+            sum by (namespace, pod) (
+              increase(siglake_query_peer_discovery_refresh_total{outcome=~"changed|unchanged"}[10m])
+            ) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: A query pod has not resolved a usable peer membership
+            description: >-
+              This pod is serving every query single-pod because it has no
+              published membership. Check the outcome label: error is the SRV
+              lookup itself (CoreDNS, NetworkPolicy, or a
+              --query-peer-discovery-srv that does not name the headless
+              Service's http port); empty is a Service with no Ready
+              endpoints; unmatched is a pod that cannot find its OWN name in
+              the answer, which also leaves it without a failover target
+              (check SIGLAKE_QUERY_PEER_SELF_NAME against the SRV targets).
+        - alert: SiglakeQueryScanAttributionIncomplete
+          expr: increase(siglake_query_scan_attribution_incomplete_total[15m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: A query returned before all scan partitions finished unwinding
+            description: >-
+              Find affected requests by stats.scan.unsettled_partitions > 0 in
+              their responses and by the warning log line "scan partitions still
+              unwinding at the settle deadline; this response's stats.scan is
+              missing their counters (unsettled_partitions)". Repeated events
+              indicate a stuck synchronous poll or an exec pool too saturated
+              for scan pumps to finish within two seconds.
+        - alert: SiglakeQueryPoolReservedWhileIdle
+          # After the 2026-09-01 suite the pool read 3.66 GiB with admission at 0
+          # and nothing in flight; the healthy idle value, established at 1TB on
+          # 08-29, is 0. A scrape cannot tell a live query it happened to catch
+          # from a reservation that will never return, and the two need opposite
+          # responses. This is the second case: bytes held while the request
+          # gauge has read zero for ten minutes.
+          #
+          # Background work (the cache warmer's ordered-edge probes, Tier-2
+          # rebuilds) is not counted by `siglake_query_in_flight` and does hold
+          # pool bytes, but each probe is capped at SIGLAKE_QUERY_WARM_PROBE_
+          # TIMEOUT_SECS (30s) and a whole warm cycle at max(4x interval, 120s),
+          # so ten minutes of continuous occupancy with no request cannot be one
+          # of them: it is either a leak or wedged background work, and both are
+          # actionable. The pod's own log names the consumer holding the bytes
+          # ("query memory pool holds reservations with no request in flight").
+          #
+          # `unless`, not `and ... == 0`: the metrics crate registers a series on
+          # first write, so a pod that has served no request yet has NO in-flight
+          # series, and `and` would silently never match on exactly the pod whose
+          # only work is background probes. `unless` keeps every pool series
+          # with no busy counterpart, which is the idle set.
+          expr: >-
+            siglake_query_memory_pool_reserved_bytes > 0
+            unless siglake_query_in_flight > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: The query memory pool holds bytes with no request in flight
+            description: >-
+              A reservation has outlived every request. Read the query pod's
+              "holds reservations with no request in flight" log line for the
+              consumer names, then decide: a wedged warm probe restarts with the
+              pod; a named operator is a leak to fix. Left alone it inflates
+              SiglakeQueryPoolNearLimit and the KEDA signal.
+        - alert: SiglakeQueriesAbandoned
+          expr: increase(siglake_query_exec_pool_abandoned_total[10m]) > 20
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Queries are being abandoned in volume
+            description: >-
+              Clients are disconnecting or timing out. Accumulated abandonments
+              historically preceded the query degradation that only a restart
+              cured.
+          {{- /* The cadence the query pods run (query.warmIntervalSecs is what the
+               StatefulSet renders as SIGLAKE_QUERY_WARM_INTERVAL_SECS), unless
+               prometheusRule.queryWarmIntervalSecs overrides it for pods whose
+               cadence comes from somewhere else. `default` treats 0 as unset, so
+               an explicit 0 override also follows the pods. */}}
+          {{- $warm := int (default .Values.query.warmIntervalSecs .Values.prometheusRule.queryWarmIntervalSecs) }}
+          {{- $stale := mul 3 $warm }}
+          {{- /* 0 = startup-only warm: there is no cycle to miss, and the rule
+               below would degenerate to `for: 0s` on an always-true clause. */}}
+          {{- if gt $warm 0 }}
+        - alert: SiglakeQueryWarmCycleStalled
+          # The warmer froze for two hours on 2026-08-23 and wedged for 5h24m
+          # on 08-24, and both times it stopped BEFORE the browse 504s began, so
+          # this is the earliest signal we have for the still-open query
+          # degradation observed on those dates. It lives here rather than
+          # in `stalled` because what it predicts is a capacity failure of the
+          # query pod, not a pipeline that stopped draining.
+          #
+          # Both gauges are needed. `last_completed_seconds` does not exist
+          # until the first cycle finishes (the metrics crate registers a
+          # series on first write), so a pod whose FIRST warm never completes is
+          # visible only through `in_progress`. And `in_progress` alone would
+          # flag a healthy pod whose cycles are long but completing — a
+          # scrape landing mid-cycle reads 1 either way — which a fresh
+          # `last_completed` rules out. Guarding on `> 0` rather than presence
+          # keeps this correct if the gauge is ever pre-registered at zero.
+          # A cycle that hits its cap (4 intervals, at least 120s) and recovers
+          # on the next tick never reaches `for:`; a warmer that keeps missing
+          # does. The stall clause is exactly the doc comment on
+          # `WarmCycleProgress` (siglake-query-server/src/lib.rs).
+          expr: >-
+            (
+              siglake_query_warm_cycle_in_progress == 1
+              unless siglake_query_warm_last_completed_seconds > 0
+            )
+            or (
+              time() - (siglake_query_warm_last_completed_seconds > 0) > {{ $stale }}
+            )
+          for: {{ $stale }}s
+          labels:
+            severity: warning
+          annotations:
+            summary: The query-cache warmer has not completed a cycle in three intervals
+            description: >-
+              No warm cycle has completed on {{ "{{ $labels.pod }}" }} for over
+              {{ $stale }}s (three {{ $warm }}s intervals; the query pods run
+              SIGLAKE_QUERY_WARM_INTERVAL_SECS={{ $warm }}, from
+              query.warmIntervalSecs or the prometheusRule.queryWarmIntervalSecs
+              override). On 2026-08-23 and
+              08-24 the warmer stalled like this before the known query
+              degradation set in: a single browse 504s at 60s while `count(*)`
+              answers in 0.15s, readiness stays green, and only a restart cures
+              it. Action: restart the pod. Then check whether
+              siglake_query_warm_cycle_in_progress is pinned at 1 (wedged
+              mid-cycle) or at 0 (the warm loop is gone). Root cause remains
+              open after the 2026-08-23/24 observations.
+          {{- end }}
+        - alert: SiglakeQueryWarmCyclesAbandoned
+          # Each abandonment is a cycle that hit its cap or died mid-flight.
+          # One is a slow object store; a steady rate is the wedge above, seen
+          # one cap-period earlier. `increase()` needs two samples, so every
+          # counter an `increase()` rule in this file reads is pre-registered
+          # at 0 when its binary starts (siglake_core::metrics::preregister;
+          # check-chart.py holds the two lists equal) and the very first
+          # abandonment on a fresh pod is a visible delta. The one exception
+          # is siglake_storage_schema_drift_total, whose `column` label is
+          # only known at the increment.
+          expr: increase(siglake_query_warm_cycles_abandoned_total[10m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: Query-cache warm cycles are being abandoned
+            description: >-
+              {{ "{{ $value }}" }} warm cycle(s) on {{ "{{ $labels.pod }}" }} were
+              abandoned in the last 10 minutes: each exceeded its cap or was
+              cancelled before completing. Repeated firing is the query-pod
+              wedge that ended in browse 504s with a green readiness probe in
+              the 2026-08-23/24 incidents; a restart cured it.
+              Compare with siglake_query_warm_cycle_timeouts_total to tell
+              cap timeouts from cancellations.
+{{- end }}

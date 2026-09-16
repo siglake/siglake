@@ -1,0 +1,31 @@
+# Minimal Prometheus config for the local stress-test stack.
+# Scrapes /metrics from the ingester and compactor every 5s.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: siglake-ingester
+    static_configs:
+      - targets: ["ingester:9100"]
+        labels:
+          role: ingester
+
+  - job_name: siglake-compactor
+    static_configs:
+      - targets: ["compactor:9101"]
+        labels:
+          role: compactor
+
+
+
+  - job_name: siglake-query-server
+    static_configs:
+      - targets: ["query-server:9105"]
+        labels:
+          role: query-server
+
+  - job_name: prometheus-self
+    static_configs:
+      - targets: ["localhost:9090"]

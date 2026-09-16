@@ -1,0 +1,78 @@
+# Image for the operator binary itself. Distinct from the
+# `SiglakeCluster.spec.image` field — that one is the image rolled
+# onto the workload Deployments the operator manages.
+image:
+  repository: ghcr.io/siglake/siglake-operator
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Where the operator queries metrics for autoscaling decisions. The default
+# names the `prometheus-server` Service the prometheus-community/prometheus
+# chart installs in the `monitoring` namespace, on its port 80 — the same
+# address the siglake chart's `keda.prometheusServerAddress` defaults to, since
+# both read the same series. kube-prometheus-stack installs a differently named
+# Service on a different port, `<release>-prometheus` on 9090:
+#
+#   --set-string prometheus.url=http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+prometheus:
+  url: http://prometheus-server.monitoring.svc.cluster.local:80
+
+# Replicas. Additional replicas rely on leader election to keep
+# reconciliation single-active. Default 1.
+replicas: 1
+
+# Install the CRD as part of the Helm release. Disable when the CRD
+# is managed externally (e.g. by ArgoCD's `Application.spec.sync.prune
+# = false` policy, or by a separate CRD-only release).
+crd:
+  install: true
+
+# Restrict the operator to a list of namespaces. Empty list means
+# "watch every namespace" (the default ClusterRole grants
+# cluster-wide). Per-namespace operator deployments are the right
+# model for hard multi-tenant isolation.
+watchNamespaces: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 1
+    memory: 512Mi
+
+# Operator log level.
+logLevel: "info,siglake_operator=debug"
+
+podSecurityContext:
+  fsGroup: 65532
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Extra env applied to the operator container (proxies, etc).
+extraEnv: []
+
+# Service exposing the operator's `/metrics` endpoint. On by
+# default — the operator binary always serves the endpoint, the
+# Service makes it scrapeable from a ServiceMonitor.
+metricsService:
+  enabled: true
+  port: 9190
+
+# Optional `ServiceMonitor` for Prometheus Operator installs. Off by
+# default — only renders when both `metricsService.enabled` and
+# `serviceMonitor.enabled` are true, and the
+# `monitoring.coreos.com/v1` CRD is installed in the cluster.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}

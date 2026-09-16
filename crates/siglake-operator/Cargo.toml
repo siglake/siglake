@@ -1,0 +1,45 @@
+[package]
+name = "siglake-operator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kubernetes operator: SiglakeCluster CRD + autoscaling reconciler."
+
+[[bin]]
+name = "siglake-operator"
+path = "src/main.rs"
+
+[dependencies]
+siglake-core = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+k8s-openapi = { version = "0.25", features = ["v1_31"] }
+kube = { version = "1.1", features = ["runtime", "derive", "client"] }
+# Direct rustls dep so we can install the aws-lc-rs CryptoProvider
+# before any TLS request; the transitive dep from kube/reqwest leaves
+# the global provider unset and panics on first use.
+rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
+metrics = { workspace = true }
+reqwest = { workspace = true }
+schemars = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+http = "1"
+rand = "0.8"
+tempfile = "3"
+tokio = { workspace = true }
+tower = { workspace = true }
+
+[lints]
+workspace = true

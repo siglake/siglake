@@ -1,0 +1,66 @@
+{{- if .Values.networkPolicy.enabled -}}
+{{- $ns := .Release.Namespace -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "siglake.fullname" . }}-egress
+  labels:
+    {{- include "siglake.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "siglake.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # DNS — every pod needs it.
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # S3 — manifest read + Parquet read/write.
+    {{- with .Values.networkPolicy.egress.s3.cidrs }}
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        {{- range $.Values.networkPolicy.egress.s3.ports }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+    {{- end }}
+    # Postgres — Iceberg catalog.
+    {{- with .Values.networkPolicy.egress.postgres.cidrs }}
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        {{- range $.Values.networkPolicy.egress.postgres.ports }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+    {{- end }}
+    # OIDC — only consumed by the query-server in oidc mode.
+    {{- with .Values.networkPolicy.egress.oidc.cidrs }}
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        {{- range $.Values.networkPolicy.egress.oidc.ports }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+    {{- end }}
+    # Intra-namespace — ingester ↔ query-server etc.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns | quote }}
+{{- end }}

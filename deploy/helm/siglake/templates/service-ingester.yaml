@@ -1,0 +1,28 @@
+{{- if .Values.ingester.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "siglake.componentName" (list . "ingester") }}
+  labels:
+    {{- include "siglake.componentLabels" (list . "ingester") | nindent 4 }}
+    siglake.limnion.ai/scrape: "true"
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "siglake.componentSelectorLabels" (list . "ingester") | nindent 4 }}
+  ports:
+    - name: ingest
+      port: 8088
+      targetPort: ingest
+      protocol: TCP
+    {{- if .Values.ingester.otlpGrpc.enabled }}
+    - name: otlp-grpc
+      port: {{ .Values.ingester.otlpGrpc.port }}
+      targetPort: otlp-grpc
+      protocol: TCP
+    {{- end }}
+    - name: metrics
+      port: 9100
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

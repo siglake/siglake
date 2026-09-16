@@ -1,0 +1,42 @@
+# Garage config for the opt-in comparison arm of the local dev stack
+# (task #2958). Mounted read-only at /etc/garage.toml by deploy/docker-compose.yml
+# and only read when SIGLAKE_OBJECT_STORE=garage selects compose profile `garage`.
+#
+# `s3_region` is pinned to us-east-1 rather than Garage's own `garage` default so
+# the stack keeps the credentials contract it already has: AWS_REGION stays
+# us-east-1 for both stores, and siglake's warehouse_operator() default
+# (crates/siglake-storage/src/iceberg.rs:1629-1631) needs no override.
+#
+# `replication_factor = 1` is what a single-node dev stack wants and what
+# `garage server --single-node` assumes. Garage's own known-issues page names it
+# as unsafe for anything durable: metadata shares the data replication factor,
+# so one corrupted node loses the cluster. That is fine here and is a reason
+# this file must never be copied to a real deployment.
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "sqlite"
+
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+# Loopback-only dev secret, the same posture as minioadmin/minioadmin above it.
+# Regenerate with `openssl rand -hex 32` for anything that is not this stack.
+rpc_secret = "00000000000000000000000000000000000000000000000000000000000dev01"
+
+[s3_api]
+s3_region = "us-east-1"
+api_bind_addr = "[::]:3900"
+# Only used for virtual-host-style addressing, which siglake does not use:
+# OpenDAL's S3 backend is path-style unless enable_virtual_host_style is set,
+# and nothing in the tree sets it.
+root_domain = ".s3.garage.localhost"
+
+[s3_web]
+bind_addr = "[::]:3902"
+root_domain = ".web.garage.localhost"
+index = "index.html"
+
+[admin]
+api_bind_addr = "[::]:3903"

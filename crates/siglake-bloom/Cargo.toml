@@ -1,0 +1,18 @@
+[package]
+name = "siglake-bloom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared on-disk footer formats: raw-content token tokenizer + bloom filter and the compact group-count encoding, used by the compactor (write) and the query read path (skip/summarize)."
+
+[dependencies]
+# Only the compact group-count footer codec (`group_counts`) needs these; the
+# tokenizer + bloom core stays dependency-free and byte-stable.
+base64 = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

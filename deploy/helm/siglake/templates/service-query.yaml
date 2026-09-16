@@ -1,0 +1,22 @@
+{{- if .Values.query.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "siglake.componentName" (list . "query") }}
+  labels:
+    {{- include "siglake.componentLabels" (list . "query") | nindent 4 }}
+    siglake.limnion.ai/scrape: "true"
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "siglake.componentSelectorLabels" (list . "query") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8089
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: 9105
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

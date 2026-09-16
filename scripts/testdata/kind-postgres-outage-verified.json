@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-07T12:02:00Z",
+  "revisions": {
+    "repository_commit": "0123456789abcdef",
+    "query_pods": [
+      {"pod": "siglake-query-0", "image": "siglake:kind", "image_id": "sha256:query0"},
+      {"pod": "siglake-query-1", "image": "siglake:kind", "image_id": "sha256:query1"}
+    ],
+    "postgres": {"pod": "postgres-0", "image": "postgres:16-alpine", "image_id": "sha256:postgres"}
+  },
+  "settings": {
+    "persistent_job_store": true,
+    "reconcile_interval_seconds": 5,
+    "reconcile_write_timeout_seconds": 10,
+    "max_unreconciled_per_pod": 1024,
+    "sample_interval_seconds": 5,
+    "outage_seconds": 45,
+    "drain_timeout_seconds": 120
+  },
+  "expected_pods": ["siglake-query-0", "siglake-query-1"],
+  "timestamps": {
+    "submission_started_at": "2026-09-07T12:00:01Z",
+    "submission_finished_at": "2026-09-07T12:00:02Z",
+    "outage_started_at": "2026-09-07T12:00:03Z",
+    "restoration_started_at": "2026-09-07T12:00:48Z",
+    "postgres_ready_at": "2026-09-07T12:00:50Z",
+    "sampling_ended_at": "2026-09-07T12:01:05Z"
+  },
+  "submissions": [
+    {"submitted_at": "2026-09-07T12:00:01Z", "http_status": 202, "job_id": "job-a"},
+    {"submitted_at": "2026-09-07T12:00:02Z", "http_status": 202, "job_id": "job-b"}
+  ],
+  "samples": [
+    {
+      "at": "2026-09-07T12:00:00Z",
+      "phase": "baseline",
+      "backlog": [{"pod": "siglake-query-0", "value": 0}, {"pod": "siglake-query-1", "value": 0}],
+      "completions": [{"pod": "siglake-query-0", "value": 10}, {"pod": "siglake-query-1", "value": 12}]
+    },
+    {
+      "at": "2026-09-07T12:00:30Z",
+      "phase": "outage",
+      "backlog": [{"pod": "siglake-query-0", "value": 2}, {"pod": "siglake-query-1", "value": 1}],
+      "completions": [{"pod": "siglake-query-0", "value": 10}, {"pod": "siglake-query-1", "value": 12}]
+    },
+    {
+      "at": "2026-09-07T12:00:52Z",
+      "phase": "recovery",
+      "backlog": [{"pod": "siglake-query-0", "value": 1}, {"pod": "siglake-query-1", "value": 0}],
+      "completions": [{"pod": "siglake-query-0", "value": 11}, {"pod": "siglake-query-1", "value": 13}]
+    },
+    {
+      "at": "2026-09-07T12:01:02Z",
+      "phase": "recovery",
+      "backlog": [{"pod": "siglake-query-0", "value": 0}, {"pod": "siglake-query-1", "value": 0}],
+      "completions": [{"pod": "siglake-query-0", "value": 12}, {"pod": "siglake-query-1", "value": 13}]
+    }
+  ]
+}

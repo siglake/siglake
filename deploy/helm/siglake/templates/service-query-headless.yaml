@@ -1,0 +1,43 @@
+{{- if .Values.query.enabled -}}
+{{- /*
+Headless Service giving each query StatefulSet pod stable DNS
+(`<name>-query-<ordinal>.<name>-query-headless`). Distributed query routes
+shard `i` to pod `i` over this address, so the names must be stable across
+restarts — which a Deployment + ClusterIP Service cannot provide.
+
+#967: this Service's SRV record is also the peer DIRECTORY — the query pods
+resolve `_http._tcp.<this service>` to discover each other. So
+`publishNotReadyAddresses: true` is deliberately gone: it used to let a
+coordinator resolve a peer that was still warming up, which was harmless when
+the peer list was rendered, but as a membership source it would put pods that
+cannot serve a shard into the fan-out. Ready endpoints only ⇒ a pod joins
+after its readiness probe passes and leaves the next DNS view when it goes
+unready. A stale answer that still names a departed pod is a latency event:
+that shard fails over to the coordinator with its `(i, N)` and snapshot pin
+intact.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "siglake.componentName" (list . "query-headless") }}
+  labels:
+    {{- include "siglake.componentLabels" (list . "query") | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "siglake.componentSelectorLabels" (list . "query") | nindent 4 }}
+  # NO metrics port, deliberately. This Service and the ClusterIP one carry
+  # identical component labels, and the ServiceMonitor selects on those labels
+  # alone — so a `metrics` port here made Prometheus build one target per
+  # (Endpoints object, pod) pair and scrape every query pod TWICE. Every query
+  # counter and gauge read double, including `siglake_query_in_flight`, which
+  # drives both the KEDA query trigger and the operator's autoscaler: the
+  # effective per-pod target was half the configured one. Scraping belongs to
+  # the ClusterIP Service; this one exists for stable per-pod DNS.
+  ports:
+    - name: http
+      port: 8089
+      targetPort: http
+      protocol: TCP
+{{- end }}

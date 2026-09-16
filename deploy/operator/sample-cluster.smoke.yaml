@@ -1,0 +1,71 @@
+# Smoke-tuned `SiglakeCluster` example.
+#
+# Where `sample-cluster.yaml` is the canonical production-shape
+# reference (multi-replica autoscaling, ghcr image, no storage
+# overrides), this one is what the AWS smoke runbook applies
+# against a freshly-`up.sh`-provisioned EKS cluster:
+#
+# - **`image`**: placeholder `__ECR_REPO_URL__:0.1.0` — substituted
+#   by `deploy/aws/operator-smoke.sh` from `terraform output -raw
+#   ecr_repository_url`. The smoke pushes a fresh build to the
+#   per-account ECR; the canonical sample's `ghcr.io/siglake/siglake`
+#   isn't reachable from the smoke EKS without credentials.
+# - **`catalogUri`**: placeholder `__CATALOG_URI__` — substituted
+#   from the RDS endpoint + the postgres Secret materialized by
+#   `up.sh`. Real customer deployments resolve this via Secrets
+#   Manager / ESO; smoke wires it directly.
+# - **`autoscaling.min: 1`** across every component. The operator
+#   doesn't (yet) pass node-affinity into rendered Deployments,
+#   so multi-replica + `ReadWriteOnce` would race the per-AZ EBS
+#   volume between pods. Single-replica per component keeps the
+#   operator-managed smoke working on `gp2` without an RWX
+#   storage class.
+# - **`storage.walAccessMode: ReadWriteOnce`** + **`walStorageClassName:
+#   gp2`**. Matches the chart's smoke values
+#   (`deploy/aws/config/values.smoke.yaml`). The chart-managed
+#   deployment pins to a single AZ explicitly; for the operator
+#   path, single-replica autoscaling above accomplishes the same
+#   "one pod per role on one node" guarantee.
+apiVersion: siglake.limnion.ai/v1alpha1
+kind: SiglakeCluster
+metadata:
+  name: example
+  namespace: __NAMESPACE__
+spec:
+  image: __ECR_REPO_URL__:0.1.0
+  warehouseUrl: __WAREHOUSE_URL__
+  catalogUri: __CATALOG_URI__
+  # operator-smoke.sh substitutes these placeholders from terraform
+  # output (`region`) and a pre-existing IRSA-annotated
+  # ServiceAccount the smoke script creates.
+  awsRegion: __AWS_REGION__
+  serviceAccountName: __SERVICE_ACCOUNT__
+  autoscaling:
+    ingester:
+      min: 1
+      max: 4
+      target: 1000.0
+    compactor:
+      min: 1
+      max: 2
+      target: 5.0
+    query:
+      min: 1
+      max: 1           # fixed until query peer discovery is dynamic
+      target: 4.0      # retained for forward compatibility
+  tenants:
+    - name: acme
+    - name: widgets
+  authTokensSecretRef:
+    name: siglake-auth
+    key: tokens
+  storage:
+    walSize: 5Gi
+    walAccessMode: ReadWriteOnce
+    walStorageClassName: gp2
+  retention:
+    # The operator renders a CronJob that runs `siglake audit-rotate`
+    # on this cadence. Smoke uses daily
+    # so a manual `kubectl create job --from=cronjob/...`
+    # trigger has a well-defined template to copy from.
+    queryAuditRotateIntervalDays: 1

@@ -1,0 +1,72 @@
+[package]
+name = "siglake-query-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP query server: SPL/SQL JSON endpoints over the siglake Iceberg warehouse."
+
+[[bin]]
+name = "siglake-query-server"
+path = "src/main.rs"
+
+[dependencies]
+siglake-bloom = { workspace = true }
+siglake-core = { workspace = true }
+siglake-storage = { workspace = true }
+siglake-wal = { workspace = true }
+
+anyhow = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-json = "57"
+async-stream = "0.3"
+regex = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+bytes = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+clap = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+# #967 dynamic query-peer discovery: SRV lookups against the cluster resolver.
+# Default features are the tokio provider + /etc/resolv.conf parsing; its own
+# answer cache is switched off in `discovery.rs` so CoreDNS stays the TTL
+# authority.
+hickory-resolver = "0.26"
+jsonwebtoken = "9"
+metrics = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "json", "macros", "tls-rustls-aws-lc-rs"] }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tikv-jemallocator = "0.7.0"
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+
+[dev-dependencies]
+# #2640 characterizes what a normal drain does to WAL segments that outlive an
+# index deletion, so the test needs the real `Compactor::run_once`, not a
+# hand-rolled stand-in for it.
+siglake-compactor = { workspace = true }
+siglake-ingest = { workspace = true }
+# `test-util` for the pausable clock: the batch run's deadline tests split one
+# budget across two phases, and virtual time makes that split exact instead of
+# raced. Dev-only under resolver 2, so the shipped binaries keep the real clock.
+tokio = { workspace = true, features = ["test-util"] }
+metrics-util = "0.20"
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "gen-tonic-messages", "trace", "with-serde"] }
+rcgen = "0.13"
+tempfile = "3"
+
+[lints]
+workspace = true

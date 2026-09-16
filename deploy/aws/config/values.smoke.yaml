@@ -1,0 +1,74 @@
+# Helm values overrides for the smoke environment.
+#
+# Layered on top of the Terraform-emitted base values by deploy/aws/up.sh.
+# Goal: keep replicas + storage tiny so the smoke test fits inside a
+# single small EKS cluster *without* needing EFS provisioning.
+#
+# WAL strategy for smoke: ReadWriteOnce on `gp2` (EBS), with both
+# ingester and compactor pinned to one AZ so they land on the same
+# node and can co-mount the volume. The full RWX/EFS path is the
+# production deployment; see `deploy/terraform/aws/README.md` for the
+# EFS CSI recipe.
+#
+# Region note: the AZ below (`us-east-1a`) is a PLACEHOLDER — up.sh
+# now overrides both zone selectors at install time with
+# `${REGION}a` (or $SIGLAKE_WAL_ZONE), so a `TF_VAR_region` override
+# Just Works. The values here only matter for a manual helm install
+# that skips up.sh.
+
+ingester:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 1
+      memory: 512Mi
+  walSegmentMaxEvents: 256
+  walSegmentMaxAgeSecs: 2
+  # Pin to one AZ so both ingester and compactor land on the same node
+  # (RWO PVC can be co-mounted on a single node).
+  nodeSelector:
+    topology.kubernetes.io/zone: us-east-1a
+
+compactor:
+  replicas: 1
+  fsBatch:
+    maxSegments: 32
+    maxBytes: 33554432
+  extraEnv:
+    - name: SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES
+      value: "33554432"
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 2
+      memory: 1Gi
+  nodeSelector:
+    topology.kubernetes.io/zone: us-east-1a
+
+query:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 1
+      memory: 512Mi
+  # Smoke runs without auth so the curl assertions don't need a token.
+  tokens:
+    existingSecret: ""
+    list: []
+
+# WAL storage. EKS doesn't mark gp2 (or anything) as the default
+# StorageClass, so we must pin it explicitly — otherwise the PVC
+# stays Pending forever. RWO works for this smoke because both WAL
+# writers are pinned to the same AZ above.
+wal:
+  size: 5Gi
+  accessMode: ReadWriteOnce
+  storageClassName: "gp2"

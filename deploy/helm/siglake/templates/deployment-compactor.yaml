@@ -1,0 +1,165 @@
+{{- if .Values.compactor.enabled -}}
+{{- include "siglake.compactorScaleGuard" . -}}
+{{- /*
+  Concurrent bins multiply the compactor's peak memory (each holds its own
+  decoded working set). Raising binConcurrency without the memory to back it
+  does not produce faster compaction — it produces an OOMKill loop, in which
+  compaction silently stops. Fail at install time instead, since the alternative
+  failure mode is invisible until a layout stops converging.
+
+  Floor is 1Gi + 4Gi PER BIN (not per additional bin — the first bin needs its
+  working set too): a 2026-08-05 200G round with
+  binConcurrency 4 peaked at 14.44 GiB of compaction-only RSS (1TB; 12.03 at
+  200G — the per-bin cost grows with corpus size). This checks the
+  ACTUAL limit against that floor, not merely whether the packaged default was
+  edited — "raised, but nowhere near enough" is the more likely mistake, and an
+  earlier version of this guard let 4Gi-for-4-bins through.
+*/ -}}
+{{- $conc := int (.Values.compactor.binConcurrency | default 1) }}
+{{- if gt $conc 1 }}
+{{- $floorMi := add 1024 (mul 4096 $conc) }}
+{{- $lim := toString (dig "resources" "limits" "memory" "" .Values.compactor) }}
+{{- $haveMi := 0 }}
+{{- if hasSuffix "Gi" $lim }}{{ $haveMi = mul 1024 (int (trimSuffix "Gi" $lim)) }}
+{{- else if hasSuffix "Mi" $lim }}{{ $haveMi = int (trimSuffix "Mi" $lim) }}
+{{- else if hasSuffix "G" $lim }}{{ $haveMi = div (mul 1000 (int (trimSuffix "G" $lim))) 1048576 | mul 1000 }}
+{{- end }}
+{{- if and (gt $haveMi 0) (lt $haveMi $floorMi) }}
+{{- fail (printf "compactor.binConcurrency=%d needs compactor.resources.limits.memory >= %dMi (~4Gi per concurrent bin, measured); got %s. Under-provisioned, the compactor OOMKills instead of compacting faster. See the chart README." $conc $floorMi $lim) }}
+{{- end }}
+{{- if eq $haveMi 0 }}
+{{- fail (printf "compactor.binConcurrency=%d requires an explicit compactor.resources.limits.memory in Mi or Gi so it can be checked against the ~%dMi floor (~3Gi per concurrent bin)." $conc $floorMi) }}
+{{- end }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "siglake.componentName" (list . "compactor") }}
+  labels:
+    {{- include "siglake.componentLabels" (list . "compactor") | nindent 4 }}
+spec:
+  # Compactor uses optimistic-concurrency commits, so replicas that share no
+  # claim table contend on Iceberg snapshot retries. With
+  # `compactor.catalogClaim.enabled = true`, two replicas split the
+  # work safely via the shared `wal_segments` claim table. Default = 1, and
+  # anything above it without the claim is refused by the guard at the top of
+  # this file rather than installed.
+  replicas: {{ .Values.compactor.replicas }}
+  selector:
+    matchLabels:
+      {{- include "siglake.componentSelectorLabels" (list . "compactor") | nindent 6 }}
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "siglake.componentLabels" (list . "compactor") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "siglake.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: compactor
+          image: {{ include "siglake.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - compactor
+            - --metrics-bind
+            - 0.0.0.0:9101
+            - --wal
+            - /var/lib/siglake/wal
+            - --warehouse
+            - {{ .Values.s3.warehousePrefix | quote }}
+            - --interval-secs
+            - {{ .Values.compactor.intervalSecs | quote }}
+            - --fs-claim-max-segments
+            - {{ .Values.compactor.fsBatch.maxSegments | int64 | quote }}
+            - --fs-claim-max-bytes
+            - {{ .Values.compactor.fsBatch.maxBytes | int64 | quote }}
+            {{- if .Values.compactor.catalogClaim.enabled }}
+            - --catalog-claim
+            - --catalog-claim-batch
+            - {{ .Values.compactor.catalogClaim.batch | quote }}
+            - --mirror-prefix
+            - {{ .Values.wal.mirror.prefix | quote }}
+            {{- end }}
+            {{- range .Values.compactor.promoteAttrs }}
+            - --promote-attr
+            - {{ . | quote }}
+            {{- end }}
+            {{- with .Values.compactor.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            {{- include "siglake.commonEnv" . | nindent 12 }}
+            # QW-3b: build Puffin-sidecar inverted indexes for re-clustered
+            # files after each recluster pass. Off in the binary since
+            # 2026-09-14; rendered either way so the pod states what it runs
+            # and `indexRebuild: true` is the explicit opt-in.
+            - name: SIGLAKE_INDEX_REBUILD
+              value: {{ ternary "1" "0" .Values.compactor.indexRebuild | quote }}
+            # QW-7: execute pending delete tasks in the idle cycle. Default-on,
+            # and rendered either way: the binary defaults ON since 2026-09-11,
+            # so `deleteTasks: false` has to say "0" out loud — omitting the
+            # variable would leave the sweep running.
+            - name: SIGLAKE_DELETE_TASKS
+              value: {{ ternary "1" "0" .Values.compactor.deleteTasks | quote }}
+            # Concurrent bins per leveled pass. See values.yaml — peak memory
+            # scales with this, and the default resource limits only support 1.
+            - name: SIGLAKE_COMPACTOR_BIN_CONCURRENCY
+              value: {{ .Values.compactor.binConcurrency | default 1 | quote }}
+            # Commit batching + snapshot expiry — default-on
+            # (round-60 soak validated). Set commitBatch.targetMb or
+            # snapshotExpire.intervalSecs to 0 to opt a deployment out.
+            - name: SIGLAKE_COMMIT_BATCH_TARGET_MB
+              value: {{ .Values.compactor.commitBatch.targetMb | quote }}
+            - name: SIGLAKE_COMMIT_BATCH_MAX_AGE_SECS
+              value: {{ .Values.compactor.commitBatch.maxAgeSecs | quote }}
+            - name: SIGLAKE_SNAPSHOT_EXPIRE_INTERVAL_SECS
+              value: {{ .Values.compactor.snapshotExpire.intervalSecs | quote }}
+            - name: SIGLAKE_SNAPSHOT_RETAIN_LAST
+              value: {{ .Values.compactor.snapshotExpire.retainLast | quote }}
+            - name: SIGLAKE_COMMITTED_RETENTION_SECS
+              value: {{ .Values.compactor.committedRetentionSecs | quote }}
+            # Search: build a per-file inverted index (term → row ordinals) into
+            # each events data file's footer KV. Render both states so false is
+            # an explicit binary opt-out rather than an omitted default.
+            - name: SIGLAKE_INVERTED_INDEX
+              value: {{ ternary "1" "0" .Values.compactor.invertedIndex.enabled | quote }}
+            {{- with .Values.compactor.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: metrics
+              containerPort: 9101
+              protocol: TCP
+          livenessProbe:
+            tcpSocket:
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: wal
+              mountPath: /var/lib/siglake/wal
+          resources:
+            {{- toYaml .Values.compactor.resources | nindent 12 }}
+      volumes:
+        - name: wal
+          {{- if .Values.compactor.catalogClaim.enabled }}
+          # Catalog-claim compactors read segments from the object-store
+          # mirror, not the WAL volume — an emptyDir satisfies the mount
+          # without pinning replicas to the (possibly RWO) WAL claim's node,
+          # which is what lets `replicas > 1` schedule freely across nodes.
+          emptyDir: {}
+          {{- else }}
+          persistentVolumeClaim:
+            claimName: {{ include "siglake.walClaimName" . }}
+          {{- end }}
+      {{- include "siglake.scheduling" (list . .Values.compactor "compactor") | nindent 6 }}
+{{- end }}

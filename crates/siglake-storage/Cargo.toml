@@ -1,0 +1,68 @@
+[package]
+name = "siglake-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Object-store backed Parquet writer/reader and DataFusion table registration."
+
+[features]
+default = []
+# Task #1990: isolated, disposable-warehouse measurement arm. This is not a
+# production format or configuration surface.
+experimental-exact-point-rollup = []
+
+[dev-dependencies]
+arrow-array = { workspace = true }
+chrono = { workspace = true }
+metrics-util = "0.20"
+proptest = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
+# #1730 — the fenced-out table-cache WARN is the only place the table name
+# appears, so a test captures it through the same fmt + EnvFilter stack the
+# binaries install and asserts it survives the chart's default filter.
+tracing-subscriber = { workspace = true }
+
+[dependencies]
+siglake-core = { workspace = true }
+siglake-bloom = { workspace = true }
+siglake-index = { workspace = true }
+
+anyhow = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
+parquet = { workspace = true }
+datafusion = { workspace = true }
+iceberg = { workspace = true }
+iceberg-catalog-sql = { workspace = true }
+iceberg-datafusion = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
+metrics = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# BIG-3 orphan GC lists + deletes warehouse files directly via opendal
+# (the Storage trait in the vendored iceberg fork has no list API and the
+# concrete opendal-backed Storage is not vendored). Warehouse-scoped
+# Operator built the same way the WAL mirror builds its S3/Fs backend.
+opendal = { workspace = true }
+reqsign = { workspace = true }
+reqwest = { workspace = true }
+# `iceberg-catalog-sql` brings sqlx in transitively but does not enable a
+# runtime feature on it; we depend on sqlx here purely to flip the
+# `runtime-tokio` feature flag on the unified resolution.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "tls-rustls"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+url = "2"
+utoipa = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

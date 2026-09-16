@@ -1,0 +1,71 @@
+# Postgres for the Iceberg catalog inside kind.
+# RWO emptyDir-backed PVC — data is lost on pod restart, which is fine
+# for the inner-dev loop.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: siglake-postgres
+  labels:
+    app: postgres
+type: Opaque
+stringData:
+  host: postgres
+  port: "5432"
+  user: siglake
+  password: siglake
+  database: siglake
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: siglake
+            - name: POSTGRES_PASSWORD
+              value: siglake
+            - name: POSTGRES_DB
+              value: siglake
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "siglake", "-d", "siglake"]
+            initialDelaySeconds: 5
+            periodSeconds: 2
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}

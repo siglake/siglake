@@ -1,0 +1,44 @@
+# cargo-deny configuration — license and advisory gate (runs in CI).
+
+[graph]
+all-features = false
+
+[licenses]
+# Everything in the tree must resolve to one of these. Copyleft (GPL/AGPL/
+# LGPL/SSPL) is deliberately absent.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "bzip2-1.0.6",
+    "CDLA-Permissive-2.0",
+    # BOOST Software License (permissive, OSI-approved) — NOT the Business
+    # Source License, despite the SPDX id.
+    "BSL-1.0",
+]
+confidence-threshold = 0.8
+
+[advisories]
+# A yank is the author saying a version is unfit; keep this policy at deny.
+# If no replacement exists, add { crate = "name@version", reason = "..." } to ignore below.
+yanked = "deny"
+ignore = [
+    "RUSTSEC-2024-0436", # paste is transitive through DataFusion/Parquet/utoipa; no safe upgrade exists.
+    "RUSTSEC-2026-0194", # quick-xml <0.41 is pinned by reqsign/object_store; upgrade with those dependencies.
+    "RUSTSEC-2026-0195", # quick-xml <0.41 is pinned by reqsign/object_store; upgrade with those dependencies.
+    "RUSTSEC-2023-0071", # rsa is transitive through reqsign, and no patched release exists.
+    "RUSTSEC-2025-0134", # rustls-pemfile is transitive through axum-server/object_store; migrate upstream.
+]
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

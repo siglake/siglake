@@ -1,0 +1,709 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-09T05:30:00Z",
+  "revisions": {
+    "repository_commit": "4d6343cbb2f6f5b3d0a8b1d1f4e2c7a9b6d3e0f1",
+    "image_a": {
+      "tag": "siglake:kind",
+      "id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "source_revision": "4d6343cbb2f6f5b3d0a8b1d1f4e2c7a9b6d3e0f1",
+      "cargo_features": ""
+    },
+    "image_b": {
+      "tag": "siglake:kind-rollback-probe",
+      "id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "source_revision": "4d6343cbb2f6f5b3d0a8b1d1f4e2c7a9b6d3e0f1",
+      "cargo_features": "siglake-core/experimental-schema-rollback-probe"
+    },
+    "operator_image": {
+      "tag": "siglake-operator:kind",
+      "id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  },
+  "settings": {
+    "namespace": "default",
+    "release": "siglake",
+    "operator_namespace": "siglake-rollback",
+    "operator_release": "siglake-operator-rollback",
+    "cr_name": "rollback",
+    "cr_schema_version": 1,
+    "chart_start_revision": 3,
+    "ingest_batch": 200,
+    "probe_column": "rollback_probe",
+    "probe_value": 1,
+    "query_endpoint": "http://127.0.0.1:8089/api/v1/sql"
+  },
+  "chart_arm": {
+    "steps": [
+      {
+        "name": "ingest_under_a",
+        "at": "2026-09-09T02:00:00Z",
+        "action": "ingest under the installed image",
+        "expected_image": "siglake:kind",
+        "revision": 3,
+        "ingested": 200,
+        "rows": {
+          "endpoint": "http://127.0.0.1:8089/api/v1/sql",
+          "total": 6200,
+          "group_by_key": "host",
+          "groups": [
+            {
+              "key": "rollback-host-00",
+              "n": 775
+            },
+            {
+              "key": "rollback-host-01",
+              "n": 775
+            },
+            {
+              "key": "rollback-host-02",
+              "n": 775
+            },
+            {
+              "key": "rollback-host-03",
+              "n": 775
+            },
+            {
+              "key": "rollback-host-04",
+              "n": 775
+            },
+            {
+              "key": "rollback-host-05",
+              "n": 775
+            },
+            {
+              "key": "rollback-host-06",
+              "n": 775
+            },
+            {
+              "key": "rollback-host-07",
+              "n": 775
+            }
+          ],
+          "distributed_mode": "aggregate"
+        },
+        "probe_column_present": false,
+        "migration_jobs": [
+          {
+            "name": "siglake-migrate-schema-2",
+            "uid": "3f1a0002-0000-4000-8000-000000000002",
+            "created_at": "2026-09-09T01:00:00Z",
+            "completed_at": "2026-09-09T01:00:12Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind"
+          }
+        ],
+        "pods": [
+          {
+            "pod": "siglake-compactor-6d4f9c8b7d-2xqzr",
+            "component": "compactor",
+            "image": "siglake:kind",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-ingester-7c9d5f4b86-lm4vn",
+            "component": "ingester",
+            "image": "siglake:kind",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-query-0",
+            "component": "query",
+            "image": "siglake:kind",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-query-1",
+            "component": "query",
+            "image": "siglake:kind",
+            "phase": "Running"
+          }
+        ]
+      },
+      {
+        "name": "upgrade_to_b",
+        "at": "2026-09-09T03:00:20Z",
+        "action": "helm upgrade to image B",
+        "expected_image": "siglake:kind-rollback-probe",
+        "revision": 4,
+        "ingested": 0,
+        "rows": {
+          "endpoint": "http://127.0.0.1:8089/api/v1/sql",
+          "total": 6200,
+          "group_by_key": "rollback_probe",
+          "groups": [
+            {
+              "key": null,
+              "n": 6200
+            }
+          ],
+          "distributed_mode": "aggregate"
+        },
+        "probe_column_present": true,
+        "migration_jobs": [
+          {
+            "name": "siglake-migrate-schema-2",
+            "uid": "3f1a0002-0000-4000-8000-000000000002",
+            "created_at": "2026-09-09T01:00:00Z",
+            "completed_at": "2026-09-09T01:00:12Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind"
+          },
+          {
+            "name": "siglake-migrate-schema-4",
+            "uid": "3f1a0004-0000-4000-8000-000000000004",
+            "created_at": "2026-09-09T03:00:00Z",
+            "completed_at": "2026-09-09T03:00:12Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind-rollback-probe"
+          }
+        ],
+        "pods": [
+          {
+            "pod": "siglake-compactor-6d4f9c8b7d-2xqzr",
+            "component": "compactor",
+            "image": "siglake:kind-rollback-probe",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-ingester-7c9d5f4b86-lm4vn",
+            "component": "ingester",
+            "image": "siglake:kind-rollback-probe",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-query-0",
+            "component": "query",
+            "image": "siglake:kind-rollback-probe",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-query-1",
+            "component": "query",
+            "image": "siglake:kind-rollback-probe",
+            "phase": "Running"
+          }
+        ]
+      },
+      {
+        "name": "ingest_under_b",
+        "at": "2026-09-09T03:02:00Z",
+        "action": "ingest under image B",
+        "expected_image": "siglake:kind-rollback-probe",
+        "revision": 4,
+        "ingested": 200,
+        "rows": {
+          "endpoint": "http://127.0.0.1:8089/api/v1/sql",
+          "total": 6400,
+          "group_by_key": "rollback_probe",
+          "groups": [
+            {
+              "key": null,
+              "n": 6200
+            },
+            {
+              "key": "1",
+              "n": 200
+            }
+          ],
+          "distributed_mode": "aggregate"
+        },
+        "probe_column_present": true,
+        "migration_jobs": [
+          {
+            "name": "siglake-migrate-schema-2",
+            "uid": "3f1a0002-0000-4000-8000-000000000002",
+            "created_at": "2026-09-09T01:00:00Z",
+            "completed_at": "2026-09-09T01:00:12Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind"
+          },
+          {
+            "name": "siglake-migrate-schema-4",
+            "uid": "3f1a0004-0000-4000-8000-000000000004",
+            "created_at": "2026-09-09T03:00:00Z",
+            "completed_at": "2026-09-09T03:00:12Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind-rollback-probe"
+          }
+        ],
+        "pods": [
+          {
+            "pod": "siglake-compactor-6d4f9c8b7d-2xqzr",
+            "component": "compactor",
+            "image": "siglake:kind-rollback-probe",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-ingester-7c9d5f4b86-lm4vn",
+            "component": "ingester",
+            "image": "siglake:kind-rollback-probe",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-query-0",
+            "component": "query",
+            "image": "siglake:kind-rollback-probe",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-query-1",
+            "component": "query",
+            "image": "siglake:kind-rollback-probe",
+            "phase": "Running"
+          }
+        ]
+      },
+      {
+        "name": "rollback_to_a",
+        "at": "2026-09-09T04:00:00Z",
+        "action": "helm rollback to the pre-upgrade revision",
+        "expected_image": "siglake:kind",
+        "revision": 5,
+        "ingested": 0,
+        "rows": {
+          "endpoint": "http://127.0.0.1:8089/api/v1/sql",
+          "total": 6400,
+          "group_by_key": "rollback_probe",
+          "groups": [
+            {
+              "key": null,
+              "n": 6200
+            },
+            {
+              "key": "1",
+              "n": 200
+            }
+          ],
+          "distributed_mode": "aggregate"
+        },
+        "probe_column_present": true,
+        "migration_jobs": [
+          {
+            "name": "siglake-migrate-schema-2",
+            "uid": "3f1a0002-0000-4000-8000-000000000002",
+            "created_at": "2026-09-09T01:00:00Z",
+            "completed_at": "2026-09-09T01:00:12Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind"
+          },
+          {
+            "name": "siglake-migrate-schema-4",
+            "uid": "3f1a0004-0000-4000-8000-000000000004",
+            "created_at": "2026-09-09T03:00:00Z",
+            "completed_at": "2026-09-09T03:00:12Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind-rollback-probe"
+          }
+        ],
+        "pods": [
+          {
+            "pod": "siglake-compactor-6d4f9c8b7d-2xqzr",
+            "component": "compactor",
+            "image": "siglake:kind",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-ingester-7c9d5f4b86-lm4vn",
+            "component": "ingester",
+            "image": "siglake:kind",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-query-0",
+            "component": "query",
+            "image": "siglake:kind",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-query-1",
+            "component": "query",
+            "image": "siglake:kind",
+            "phase": "Running"
+          }
+        ]
+      },
+      {
+        "name": "ingest_after_rollback",
+        "at": "2026-09-09T04:02:00Z",
+        "action": "ingest under the rolled-back image A",
+        "expected_image": "siglake:kind",
+        "revision": 5,
+        "ingested": 200,
+        "rows": {
+          "endpoint": "http://127.0.0.1:8089/api/v1/sql",
+          "total": 6600,
+          "group_by_key": "rollback_probe",
+          "groups": [
+            {
+              "key": null,
+              "n": 6400
+            },
+            {
+              "key": "1",
+              "n": 200
+            }
+          ],
+          "distributed_mode": "aggregate"
+        },
+        "probe_column_present": true,
+        "migration_jobs": [
+          {
+            "name": "siglake-migrate-schema-2",
+            "uid": "3f1a0002-0000-4000-8000-000000000002",
+            "created_at": "2026-09-09T01:00:00Z",
+            "completed_at": "2026-09-09T01:00:12Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind"
+          },
+          {
+            "name": "siglake-migrate-schema-4",
+            "uid": "3f1a0004-0000-4000-8000-000000000004",
+            "created_at": "2026-09-09T03:00:00Z",
+            "completed_at": "2026-09-09T03:00:12Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind-rollback-probe"
+          }
+        ],
+        "pods": [
+          {
+            "pod": "siglake-compactor-6d4f9c8b7d-2xqzr",
+            "component": "compactor",
+            "image": "siglake:kind",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-ingester-7c9d5f4b86-lm4vn",
+            "component": "ingester",
+            "image": "siglake:kind",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-query-0",
+            "component": "query",
+            "image": "siglake:kind",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-query-1",
+            "component": "query",
+            "image": "siglake:kind",
+            "phase": "Running"
+          }
+        ]
+      },
+      {
+        "name": "upgrade_forward_to_b",
+        "at": "2026-09-09T05:00:00Z",
+        "action": "helm upgrade forward to image B",
+        "expected_image": "siglake:kind-rollback-probe",
+        "revision": 6,
+        "ingested": 0,
+        "rows": {
+          "endpoint": "http://127.0.0.1:8089/api/v1/sql",
+          "total": 6600,
+          "group_by_key": "rollback_probe",
+          "groups": [
+            {
+              "key": null,
+              "n": 6400
+            },
+            {
+              "key": "1",
+              "n": 200
+            }
+          ],
+          "distributed_mode": "aggregate"
+        },
+        "probe_column_present": true,
+        "migration_jobs": [
+          {
+            "name": "siglake-migrate-schema-2",
+            "uid": "3f1a0002-0000-4000-8000-000000000002",
+            "created_at": "2026-09-09T01:00:00Z",
+            "completed_at": "2026-09-09T01:00:12Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind"
+          },
+          {
+            "name": "siglake-migrate-schema-4",
+            "uid": "3f1a0004-0000-4000-8000-000000000004",
+            "created_at": "2026-09-09T03:00:00Z",
+            "completed_at": "2026-09-09T03:00:12Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind-rollback-probe"
+          },
+          {
+            "name": "siglake-migrate-schema-6",
+            "uid": "3f1a0006-0000-4000-8000-000000000006",
+            "created_at": "2026-09-09T06:00:00Z",
+            "completed_at": "2026-09-09T06:00:12Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind-rollback-probe"
+          }
+        ],
+        "pods": [
+          {
+            "pod": "siglake-compactor-6d4f9c8b7d-2xqzr",
+            "component": "compactor",
+            "image": "siglake:kind-rollback-probe",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-ingester-7c9d5f4b86-lm4vn",
+            "component": "ingester",
+            "image": "siglake:kind-rollback-probe",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-query-0",
+            "component": "query",
+            "image": "siglake:kind-rollback-probe",
+            "phase": "Running"
+          },
+          {
+            "pod": "siglake-query-1",
+            "component": "query",
+            "image": "siglake:kind-rollback-probe",
+            "phase": "Running"
+          }
+        ]
+      }
+    ]
+  },
+  "operator_arm": {
+    "steps": [
+      {
+        "name": "install_at_a",
+        "at": "2026-09-09T05:20:00Z",
+        "action": "apply the CR at image A",
+        "requested_image": "siglake:kind",
+        "spec_image": "siglake:kind",
+        "generation": 1,
+        "observed_generation": 1,
+        "spec_schema_version": 1,
+        "status_schema_version": 1,
+        "deployments": [
+          {"name": "rollback-compactor", "component": "compactor", "generation": 1, "observed_generation": 1, "desired_replicas": 1, "updated_replicas": 1, "ready_replicas": 1, "available_replicas": 1, "image": "siglake:kind"},
+          {"name": "rollback-ingester", "component": "ingester", "generation": 1, "observed_generation": 1, "desired_replicas": 1, "updated_replicas": 1, "ready_replicas": 1, "available_replicas": 1, "image": "siglake:kind"}
+        ],
+        "statefulsets": [
+          {"name": "rollback-query", "component": "query", "generation": 1, "observed_generation": 1, "desired_replicas": 1, "updated_replicas": 1, "ready_replicas": 1, "current_replicas": 1, "current_revision": "query-a", "update_revision": "query-a", "image": "siglake:kind"}
+        ],
+        "pods": [
+          {"name": "rollback-compactor-0", "component": "compactor", "image": "siglake:kind", "phase": "Running", "ready": true},
+          {"name": "rollback-ingester-0", "component": "ingester", "image": "siglake:kind", "phase": "Running", "ready": true},
+          {"name": "rollback-query-0", "component": "query", "image": "siglake:kind", "phase": "Running", "ready": true}
+        ],
+        "deleted_job_uid": null,
+        "job": {
+          "name": "rollback-migrate-schema-v1-1f4c9a2b",
+          "uid": "8a11c0de-0000-4000-8000-0000000000a1",
+          "created_at": "2026-09-09T05:10:00Z",
+          "completed_at": "2026-09-09T05:10:11Z",
+          "succeeded": 1,
+          "failed": 0,
+          "image": "siglake:kind"
+        },
+        "jobs": [
+          {
+            "name": "rollback-migrate-schema-v1-1f4c9a2b",
+            "uid": "8a11c0de-0000-4000-8000-0000000000a1",
+            "created_at": "2026-09-09T05:10:00Z",
+            "completed_at": "2026-09-09T05:10:11Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind"
+          }
+        ],
+        "rollout_held_total": {
+          "present": false,
+          "value": null
+        }
+      },
+      {
+        "name": "upgrade_to_b",
+        "at": "2026-09-09T05:20:00Z",
+        "action": "patch spec.image to image B",
+        "requested_image": "siglake:kind-rollback-probe",
+        "spec_image": "siglake:kind-rollback-probe",
+        "generation": 2,
+        "observed_generation": 2,
+        "spec_schema_version": 1,
+        "status_schema_version": 1,
+        "deployments": [
+          {"name": "rollback-compactor", "component": "compactor", "generation": 2, "observed_generation": 2, "desired_replicas": 1, "updated_replicas": 1, "ready_replicas": 1, "available_replicas": 1, "image": "siglake:kind-rollback-probe"},
+          {"name": "rollback-ingester", "component": "ingester", "generation": 2, "observed_generation": 2, "desired_replicas": 1, "updated_replicas": 1, "ready_replicas": 1, "available_replicas": 1, "image": "siglake:kind-rollback-probe"}
+        ],
+        "statefulsets": [
+          {"name": "rollback-query", "component": "query", "generation": 2, "observed_generation": 2, "desired_replicas": 1, "updated_replicas": 1, "ready_replicas": 1, "current_replicas": 1, "current_revision": "query-b", "update_revision": "query-b", "image": "siglake:kind-rollback-probe"}
+        ],
+        "pods": [
+          {"name": "rollback-compactor-0", "component": "compactor", "image": "siglake:kind-rollback-probe", "phase": "Running", "ready": true},
+          {"name": "rollback-ingester-0", "component": "ingester", "image": "siglake:kind-rollback-probe", "phase": "Running", "ready": true},
+          {"name": "rollback-query-0", "component": "query", "image": "siglake:kind-rollback-probe", "phase": "Running", "ready": true}
+        ],
+        "deleted_job_uid": null,
+        "job": {
+          "name": "rollback-migrate-schema-v1-7b0e35d4",
+          "uid": "8a11c0de-0000-4000-8000-0000000000b2",
+          "created_at": "2026-09-09T05:12:00Z",
+          "completed_at": "2026-09-09T05:12:14Z",
+          "succeeded": 1,
+          "failed": 0,
+          "image": "siglake:kind-rollback-probe"
+        },
+        "jobs": [
+          {
+            "name": "rollback-migrate-schema-v1-1f4c9a2b",
+            "uid": "8a11c0de-0000-4000-8000-0000000000a1",
+            "created_at": "2026-09-09T05:10:00Z",
+            "completed_at": "2026-09-09T05:10:11Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind"
+          },
+          {
+            "name": "rollback-migrate-schema-v1-7b0e35d4",
+            "uid": "8a11c0de-0000-4000-8000-0000000000b2",
+            "created_at": "2026-09-09T05:12:00Z",
+            "completed_at": "2026-09-09T05:12:14Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind-rollback-probe"
+          }
+        ],
+        "rollout_held_total": {
+          "present": true,
+          "value": 1.0
+        }
+      },
+      {
+        "name": "revert_to_a_retained",
+        "at": "2026-09-09T05:20:00Z",
+        "action": "revert spec.image to image A with the completed Job still retained",
+        "requested_image": "siglake:kind",
+        "spec_image": "siglake:kind",
+        "generation": 3,
+        "observed_generation": 3,
+        "spec_schema_version": 1,
+        "status_schema_version": 1,
+        "deployments": [
+          {"name": "rollback-compactor", "component": "compactor", "generation": 3, "observed_generation": 3, "desired_replicas": 1, "updated_replicas": 1, "ready_replicas": 1, "available_replicas": 1, "image": "siglake:kind"},
+          {"name": "rollback-ingester", "component": "ingester", "generation": 3, "observed_generation": 3, "desired_replicas": 1, "updated_replicas": 1, "ready_replicas": 1, "available_replicas": 1, "image": "siglake:kind"}
+        ],
+        "statefulsets": [
+          {"name": "rollback-query", "component": "query", "generation": 3, "observed_generation": 3, "desired_replicas": 1, "updated_replicas": 1, "ready_replicas": 1, "current_replicas": 1, "current_revision": "query-a2", "update_revision": "query-a2", "image": "siglake:kind"}
+        ],
+        "pods": [
+          {"name": "rollback-compactor-0", "component": "compactor", "image": "siglake:kind", "phase": "Running", "ready": true},
+          {"name": "rollback-ingester-0", "component": "ingester", "image": "siglake:kind", "phase": "Running", "ready": true},
+          {"name": "rollback-query-0", "component": "query", "image": "siglake:kind", "phase": "Running", "ready": true}
+        ],
+        "deleted_job_uid": null,
+        "job": {
+          "name": "rollback-migrate-schema-v1-1f4c9a2b",
+          "uid": "8a11c0de-0000-4000-8000-0000000000a1",
+          "created_at": "2026-09-09T05:10:00Z",
+          "completed_at": "2026-09-09T05:10:11Z",
+          "succeeded": 1,
+          "failed": 0,
+          "image": "siglake:kind"
+        },
+        "jobs": [
+          {
+            "name": "rollback-migrate-schema-v1-1f4c9a2b",
+            "uid": "8a11c0de-0000-4000-8000-0000000000a1",
+            "created_at": "2026-09-09T05:10:00Z",
+            "completed_at": "2026-09-09T05:10:11Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind"
+          },
+          {
+            "name": "rollback-migrate-schema-v1-7b0e35d4",
+            "uid": "8a11c0de-0000-4000-8000-0000000000b2",
+            "created_at": "2026-09-09T05:12:00Z",
+            "completed_at": "2026-09-09T05:12:14Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind-rollback-probe"
+          }
+        ],
+        "rollout_held_total": {
+          "present": true,
+          "value": 1.0
+        }
+      },
+      {
+        "name": "revert_to_a_recreated",
+        "at": "2026-09-09T05:20:00Z",
+        "action": "delete the retained Job, then reconcile the same image A revert",
+        "requested_image": "siglake:kind",
+        "spec_image": "siglake:kind",
+        "generation": 3,
+        "observed_generation": 3,
+        "spec_schema_version": 1,
+        "status_schema_version": 1,
+        "deployments": [
+          {"name": "rollback-compactor", "component": "compactor", "generation": 3, "observed_generation": 3, "desired_replicas": 1, "updated_replicas": 1, "ready_replicas": 1, "available_replicas": 1, "image": "siglake:kind"},
+          {"name": "rollback-ingester", "component": "ingester", "generation": 3, "observed_generation": 3, "desired_replicas": 1, "updated_replicas": 1, "ready_replicas": 1, "available_replicas": 1, "image": "siglake:kind"}
+        ],
+        "statefulsets": [
+          {"name": "rollback-query", "component": "query", "generation": 3, "observed_generation": 3, "desired_replicas": 1, "updated_replicas": 1, "ready_replicas": 1, "current_replicas": 1, "current_revision": "query-a2", "update_revision": "query-a2", "image": "siglake:kind"}
+        ],
+        "pods": [
+          {"name": "rollback-compactor-0", "component": "compactor", "image": "siglake:kind", "phase": "Running", "ready": true},
+          {"name": "rollback-ingester-0", "component": "ingester", "image": "siglake:kind", "phase": "Running", "ready": true},
+          {"name": "rollback-query-0", "component": "query", "image": "siglake:kind", "phase": "Running", "ready": true}
+        ],
+        "deleted_job_uid": "8a11c0de-0000-4000-8000-0000000000a1",
+        "job": {
+          "name": "rollback-migrate-schema-v1-1f4c9a2b",
+          "uid": "8a11c0de-0000-4000-8000-0000000000c3",
+          "created_at": "2026-09-09T05:18:00Z",
+          "completed_at": "2026-09-09T05:18:10Z",
+          "succeeded": 1,
+          "failed": 0,
+          "image": "siglake:kind"
+        },
+        "jobs": [
+          {
+            "name": "rollback-migrate-schema-v1-7b0e35d4",
+            "uid": "8a11c0de-0000-4000-8000-0000000000b2",
+            "created_at": "2026-09-09T05:12:00Z",
+            "completed_at": "2026-09-09T05:12:14Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind-rollback-probe"
+          },
+          {
+            "name": "rollback-migrate-schema-v1-1f4c9a2b",
+            "uid": "8a11c0de-0000-4000-8000-0000000000c3",
+            "created_at": "2026-09-09T05:18:00Z",
+            "completed_at": "2026-09-09T05:18:10Z",
+            "succeeded": 1,
+            "failed": 0,
+            "image": "siglake:kind"
+          }
+        ],
+        "rollout_held_total": {
+          "present": true,
+          "value": 2.0
+        }
+      }
+    ]
+  }
+}

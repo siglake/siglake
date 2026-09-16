@@ -1,0 +1,25 @@
+# Workspace clippy configuration. Applies to every member crate (clippy walks
+# up from the crate manifest to find this file); the vendored forks under
+# `third_party/` are path deps, not members, so they are not linted.
+#
+# `siglake_storage::bounded_task_context()` builds a `TaskContext` on the shared
+# bounded runtime but with a DEFAULT `SessionConfig`, so every
+# `datafusion.execution.*` option the plan's session was built with is dropped
+# silently at execution. That is what #2251 was, on three request paths, and it
+# went unnoticed from the pool fix until #2231 measured it. A test that wants
+# the shared runtime and nothing else is a legitimate caller and opts back in
+# with `#[allow(clippy::disallowed_methods)]` at the narrowest scope; a request
+# path never does.
+#
+# `IcebergContext::stamp_schema_version` writes the version it is given in
+# either direction, so a migrator that read a stale base lowers a version a
+# concurrent migrator already published. That reopens the window #2553 closed
+# and README's rollback contract promises is closed. The method survives for
+# the rollback and drift fixtures that must claim a version below the table's
+# shape; those opt back in with `#[allow(clippy::disallowed_methods)]` at the
+# call. A migration run uses `stamp_schema_version_at_least`, which takes the
+# maximum inside the transaction, against the base each attempt commits onto.
+disallowed-methods = [
+    { path = "siglake_storage::bounded_task_context", reason = "discards the plan's SessionConfig at execution (#2251): use midflight::task_ctx_for(&df) / bounded_task_context_from" },
+    { path = "siglake_storage::iceberg::IcebergContext::stamp_schema_version", reason = "lowers a version a concurrent migrator published (#2553): production migration runs use stamp_schema_version_at_least" },
+]

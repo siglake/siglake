@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "synthetic",
+  "revisions": {
+    "repository_commit": "synthetic-siglake-revision",
+    "benchmark_commit": "synthetic-benchmark-revision"
+  },
+  "status": "complete",
+  "source": "candidate_arm_counter",
+  "clock": "monotonic_elapsed",
+  "unit": "nanoseconds",
+  "counter_reset": false,
+  "role_nanoseconds": {
+    "drain_append": 900000000,
+    "compaction_rewrite": 600000000
+  },
+  "per_pod": [
+    {
+      "pod": "synthetic-ingester-0",
+      "drain_append": 900000000,
+      "compaction_rewrite": 0
+    },
+    {
+      "pod": "synthetic-compactor-0",
+      "drain_append": 0,
+      "compaction_rewrite": 600000000
+    }
+  ],
+  "aggregate_seconds": 1.5,
+  "verdict": "passed"
+}

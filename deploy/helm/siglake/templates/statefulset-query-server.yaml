@@ -1,0 +1,377 @@
+{{- if .Values.query.enabled -}}
+{{- include "siglake.queryJobsScaleGuard" . -}}
+{{- /*
+  #4273: three ways the token Secret comes into existence, and all three have
+  to resolve — in siglake.queryTokensSecret, which NOTES.txt reads through
+  siglake.queryAuthOn so the note and the pods cannot disagree about whether
+  this tier has an allow-list (#4317). The ESO arm used to be missing from that
+  resolution, so an install that wired tokens through a SecretStore rendered
+  the ExternalSecret, rendered no SIGLAKE_QUERY_TOKENS, and served
+  /api/v1/sql open on the `AuthConfig::open()` branch behind one warning line.
+
+  The conflict between the two chart-owned sources is refused here rather than
+  in the helper: they resolve to ONE Secret name, and only this render knows
+  that both a Secret and an ExternalSecret would then claim it.
+*/ -}}
+{{- $esoTokens := and .Values.externalSecrets.enabled .Values.externalSecrets.queryTokens.remoteKey -}}
+{{- if and (not .Values.query.tokens.existingSecret) .Values.query.tokens.list $esoTokens -}}
+{{- fail "query.tokens.list and externalSecrets.queryTokens.remoteKey cannot both be set when query.tokens.existingSecret is empty: both sources would manage the same query-token Secret. Clear query.tokens.list or externalSecrets.queryTokens.remoteKey." -}}
+{{- end -}}
+{{- $tokensSecret := include "siglake.queryTokensSecret" . -}}
+{{- $oidc := default dict .Values.query.oidc -}}
+{{- $oidcIssuer := trim (toString (default "" $oidc.issuer)) -}}
+{{- $oidcAudience := trim (toString (default "" $oidc.audience)) -}}
+{{- $oidcClaim := trim (toString (default "" $oidc.tenantClaim)) -}}
+{{- /*
+  #4303: refuse a partial OIDC block BEFORE the coordinator-token guard below.
+  Both are install refusals, and this one is a values-shape error the operator
+  can fix by itself, while the coordinator guard reports an interaction with
+  the topology — reporting the interaction first would tell someone whose OIDC
+  block is incomplete to go set a coordinator token. It also has to run ahead
+  of $oidcOn, which is the answer this makes trustworthy.
+*/ -}}
+{{- include "siglake.oidcGuard" (list "query" $oidcIssuer $oidcAudience $oidcClaim) -}}
+{{- $oidcOn := include "siglake.oidcOn" (list $oidcIssuer $oidcAudience) -}}
+{{- $authOn := include "siglake.queryAuthOn" . -}}
+{{- /*
+  #967: fan-out is now a runtime property, not a render-time one. Peers are
+  discovered from the headless Service's SRV record, so a tier that renders
+  ONE replica still fans out once KEDA adds a second. The auth guard below
+  therefore has to consider the KEDA ceiling too — asking "will this install
+  ever have more than one query pod?" rather than "does it start with more
+  than one?".
+*/ -}}
+{{- $kedaQuery := and .Values.keda.enabled .Values.keda.query.enabled -}}
+{{- $kedaMax := int .Values.keda.query.maxReplicas -}}
+{{- $maxQueryPods := int .Values.query.replicas -}}
+{{- if and $kedaQuery (gt $kedaMax $maxQueryPods) -}}
+{{- $maxQueryPods = $kedaMax -}}
+{{- end -}}
+{{- $fanOut := and .Values.query.distributed.enabled (gt $maxQueryPods 1) -}}
+{{- $coordSecret := .Values.query.distributed.coordinatorToken.existingSecret -}}
+{{- if and (not $coordSecret) .Values.query.distributed.coordinatorToken.value -}}
+{{- $coordSecret = include "siglake.componentName" (list . "query-coordinator-token") -}}
+{{- end -}}
+{{- /*
+  FAIL THE INSTALL rather than ship a cluster whose queries 401.
+
+  A shard request carries the COORDINATOR's credential, not the caller's. With
+  peer auth enabled and no coordinator token the coordinator sends none, every
+  peer answers 401, and 401 is deliberately non-retryable — so turning on the
+  only authentication the chart supports broke every scanning query on the
+  default topology (replicas: 2, distributed.enabled: true). That combination is
+  now unrepresentable instead of merely undocumented.
+*/ -}}
+{{- if and $authOn $fanOut (not $coordSecret) -}}
+{{- fail "query auth is enabled and distributed query can fan out across replicas, but query.distributed.coordinatorToken is unset: the coordinator would present no credential to its peers and every shard request would 401. Set query.distributed.coordinatorToken.value (or .existingSecret), or hold the query tier at a single pod (query.replicas: 1 with keda.query.maxReplicas: 1) / set query.distributed.enabled: false." -}}
+{{- end -}}
+{{- /*
+  #967 removed the refusal that lived here: `keda.query.maxReplicas >
+  query.replicas` was rejected because `--query-peers` was rendered from
+  query.replicas, so a pod KEDA added beyond that count coordinated but
+  received no shard work and nothing reported it. The pods now discover each
+  other through the headless Service's SRV record, every READY replica is in
+  the membership, and query.replicas is only the starting/non-KEDA count. The
+  ordinary min/max range is KEDA's own to validate.
+*/ -}}
+apiVersion: apps/v1
+# StatefulSet (not Deployment): distributed query (#7) routes shard `i` to a
+# specific peer pod, so pods need stable network identities. The headless
+# Service + ordinal pod names give `<name>-query-<i>.<name>-query-headless`,
+# and its SRV record is what `--query-peer-discovery-srv` resolves below.
+kind: StatefulSet
+metadata:
+  name: {{ include "siglake.componentName" (list . "query") }}
+  labels:
+    {{- include "siglake.componentLabels" (list . "query") | nindent 4 }}
+spec:
+  {{- if $kedaQuery }}
+  # replicas deliberately OMITTED: KEDA owns spec.replicas on this tier, and
+  # rendering it here made every `helm upgrade` snap a scaled tier back to
+  # query.replicas (2 by default) before KEDA re-scaled it — a replica cliff on
+  # every routine chart change. Helm leaves an unset field alone on upgrade.
+  #
+  # Since #967 the scaled range is genuinely usable: peers come from the
+  # headless Service's SRV record, so keda.query.maxReplicas may exceed
+  # query.replicas and every ready pod receives shard work.
+  {{- else }}
+  replicas: {{ .Values.query.replicas }}
+  {{- end }}
+  serviceName: {{ include "siglake.componentName" (list . "query-headless") }}
+  # Pods form a symmetric peer mesh with no startup ordering dependency — bring
+  # them up together rather than one at a time.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "siglake.componentSelectorLabels" (list . "query") | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        {{- include "siglake.componentLabels" (list . "query") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "siglake.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: query-server
+          image: {{ include "siglake.componentImage" (list . .Values.query.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Distinct entrypoint — the query-server is its own binary,
+          # not a subcommand of `siglake`.
+          command:
+            - /usr/local/bin/siglake-query-server
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - --bind
+            - 0.0.0.0:8089
+            - --metrics-bind
+            - 0.0.0.0:9105
+            - --warehouse
+            - {{ .Values.s3.warehousePrefix | quote }}
+            {{- if .Values.query.distributed.enabled }}
+            # Distributed query (#7, #967): fan each query across all READY
+            # replicas + merge. `/api/v1/sql` coordinates transparently;
+            # `/api/v1/sql/local` forces single-pod.
+            #
+            # Rendered even at one replica: a one-member membership takes the
+            # local path anyway, so scaling out later needs no rollout. Each
+            # query pins the membership it captured, so a pod that joins or
+            # leaves mid-query cannot change that query's answer. Until the
+            # first SRV answer resolves, this pod answers locally.
+            - --query-peer-discovery-srv
+            - {{ include "siglake.queryPeerSrv" . | quote }}
+            - --query-peer-scheme
+            - {{ ternary "https" "http" .Values.query.tls.enabled | quote }}
+            {{- end }}
+            {{- with .Values.query.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            {{- include "siglake.commonEnv" . | nindent 12 }}
+            {{- if .Values.query.distributed.enabled }}
+            # #967: the coordinator finds its OWN entry in the SRV answer by
+            # pod name — that URL is the failover target for a departed peer's
+            # shard. Taken from the downward API rather than $HOSTNAME: the CRI
+            # sets the container's hostname but does not guarantee the
+            # environment variable, and a wrong self match means a pod that
+            # cannot fan out at all.
+            - name: SIGLAKE_QUERY_PEER_SELF_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- end }}
+            - name: SIGLAKE_QUERY_SPILL_DIR
+              value: {{ .Values.query.spill.directory | quote }}
+            - name: SIGLAKE_QUERY_SPILL_MAX_BYTES
+              value: {{ .Values.query.spill.maxBytes | quote }}
+            {{- if gt (int64 .Values.query.admission.budgetBytes) 0 }}
+            # QW-4 interactive-query admission budget override.
+            - name: SIGLAKE_QUERY_ADMISSION_BUDGET_BYTES
+              value: {{ .Values.query.admission.budgetBytes | quote }}
+            {{- end }}
+            {{- if gt (int .Values.query.admission.waitMs) 0 }}
+            - name: SIGLAKE_QUERY_ADMISSION_WAIT_MS
+              value: {{ .Values.query.admission.waitMs | quote }}
+            {{- end }}
+            {{- if gt (int64 .Values.query.breaker.rowsScannedCeiling) 0 }}
+            # Mid-flight interactive row-scan breaker ceiling. Raise for large
+            # datasets so a legitimately big windowed scan degrades to slow
+            # instead of 413 (default 100M suits ~50G). See QW-200G.
+            - name: SIGLAKE_QUERY_CEILING_ROWS_SCANNED
+              value: {{ .Values.query.breaker.rowsScannedCeiling | quote }}
+            {{- end }}
+            {{- if gt (int64 .Values.query.breaker.bytesScannedCeilingGb) 0 }}
+            - name: SIGLAKE_QUERY_CEILING_BYTES_SCANNED_GB
+              value: {{ .Values.query.breaker.bytesScannedCeilingGb | quote }}
+            {{- end }}
+            {{- if $coordSecret }}
+            - name: SIGLAKE_QUERY_COORDINATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $coordSecret | quote }}
+                  key: {{ .Values.query.distributed.coordinatorToken.secretKey | quote }}
+            {{- end }}
+            {{- if $tokensSecret }}
+            - name: SIGLAKE_QUERY_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $tokensSecret | quote }}
+                  key: {{ .Values.query.tokens.secretKey | quote }}
+            {{- end }}
+            {{- if $oidcOn }}
+            # The guard at the top of this file already refused every partial
+            # block, so an issuer here means an audience with it.
+            - name: SIGLAKE_OIDC_ISSUER
+              value: {{ $oidcIssuer | quote }}
+            - name: SIGLAKE_OIDC_AUDIENCE
+              value: {{ $oidcAudience | quote }}
+            {{- if $oidcClaim }}
+            - name: SIGLAKE_OIDC_TENANT_CLAIM
+              value: {{ $oidcClaim | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.query.jobs.persistent }}
+            # Default ON: the batch-job store is the catalog Postgres these
+            # pods already talk to, shared by every replica. Omitting the
+            # variable is the `query.jobs.persistent: false` opt-out, and it
+            # gives each pod its own in-memory store -- correct only at one
+            # replica. Defined after SIGLAKE_CATALOG_URI on purpose: K8s
+            # expands $(VAR) from entries EARLIER in this list.
+            - name: SIGLAKE_JOBS_POSTGRES_URI
+              value: "$(SIGLAKE_CATALOG_URI)"
+            {{- end }}
+            {{- if gt (int .Values.query.scan.targetPartitions) 0 }}
+            - name: SIGLAKE_QUERY_SCAN_PARTITIONS
+              value: {{ .Values.query.scan.targetPartitions | quote }}
+            {{- end }}
+            {{- if gt (int .Values.query.scan.readerBudget) 0 }}
+            - name: SIGLAKE_QUERY_SCAN_READER_BUDGET
+              value: {{ .Values.query.scan.readerBudget | quote }}
+            {{- end }}
+            {{- if gt (int .Values.query.scan.fileConcurrency) 0 }}
+            - name: SIGLAKE_QUERY_SCAN_FILE_CONCURRENCY
+              value: {{ .Values.query.scan.fileConcurrency | quote }}
+            {{- end }}
+            {{- if gt (int .Values.query.scan.batchSize) 0 }}
+            - name: SIGLAKE_QUERY_SCAN_BATCH_SIZE
+              value: {{ .Values.query.scan.batchSize | quote }}
+            {{- end }}
+            {{- if gt (int .Values.query.scan.rangeCoalesceBytes) 0 }}
+            - name: SIGLAKE_QUERY_SCAN_RANGE_COALESCE_BYTES
+              value: {{ .Values.query.scan.rangeCoalesceBytes | quote }}
+            {{- end }}
+            {{- if gt (int .Values.query.scan.rangeFetchConcurrency) 0 }}
+            - name: SIGLAKE_QUERY_SCAN_RANGE_FETCH_CONCURRENCY
+              value: {{ .Values.query.scan.rangeFetchConcurrency | quote }}
+            {{- end }}
+            {{- if gt (int .Values.query.scan.rangeAdaptiveMinBytes) 0 }}
+            - name: SIGLAKE_QUERY_SCAN_RANGE_ADAPTIVE_MIN_BYTES
+              value: {{ .Values.query.scan.rangeAdaptiveMinBytes | quote }}
+            {{- end }}
+            {{- if gt (int .Values.query.scan.rangeAdaptiveMinFiles) 0 }}
+            - name: SIGLAKE_QUERY_SCAN_RANGE_ADAPTIVE_MIN_FILES
+              value: {{ .Values.query.scan.rangeAdaptiveMinFiles | quote }}
+            {{- end }}
+            {{- if gt (int .Values.query.scan.adaptivePartitionMinBytes) 0 }}
+            - name: SIGLAKE_QUERY_SCAN_ADAPTIVE_PARTITION_MIN_BYTES
+              value: {{ .Values.query.scan.adaptivePartitionMinBytes | quote }}
+            {{- end }}
+            {{- if gt (int .Values.query.scan.adaptivePartitionMinFiles) 0 }}
+            - name: SIGLAKE_QUERY_SCAN_ADAPTIVE_PARTITION_MIN_FILES
+              value: {{ .Values.query.scan.adaptivePartitionMinFiles | quote }}
+            {{- end }}
+            {{- if hasKey .Values.query.scan "fileCacheMaxBytes" }}
+            - name: SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_BYTES
+              value: {{ .Values.query.scan.fileCacheMaxBytes | quote }}
+            {{- end }}
+            {{- if hasKey .Values.query.scan "fileCacheMaxEntries" }}
+            - name: SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_ENTRIES
+              value: {{ .Values.query.scan.fileCacheMaxEntries | quote }}
+            {{- end }}
+            {{- if .Values.query.tls.enabled }}
+            - name: SIGLAKE_QUERY_TLS_CERT
+              value: /etc/siglake/tls/tls.crt
+            - name: SIGLAKE_QUERY_TLS_KEY
+              value: /etc/siglake/tls/tls.key
+            {{- end }}
+            {{- if .Values.query.walBuffer.enabled }}
+            # Real-time WAL queryability: union un-committed WAL segments into
+            # `events`. Reads the ingester's WAL via the shared RWX claim.
+            - name: SIGLAKE_QUERY_WAL_BUFFER_DIR
+              value: /var/lib/siglake/wal
+            {{- end }}
+            {{- if .Values.query.hotCaches.enabled }}
+            # Query-tier hot caches: last_values()/distinct_values() UDTFs
+            # served from a WAL-tail last-value + distinct cache. Needs the WAL
+            # mount (walBuffer must also be enabled).
+            - name: SIGLAKE_QUERY_HOT_CACHES
+              value: "true"
+            {{- end }}
+            # #79 continuous pre-warm cadence. Rendered unconditionally (0 is a
+            # real setting: startup-only) so the pods and the
+            # SiglakeQueryWarmCycleStalled threshold read the same value.
+            - name: SIGLAKE_QUERY_WARM_INTERVAL_SECS
+              value: {{ .Values.query.warmIntervalSecs | quote }}
+            {{- with .Values.query.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8089
+              protocol: TCP
+            - name: metrics
+              containerPort: 9105
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              {{- if .Values.query.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+              {{- if .Values.query.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.query.resources | nindent 12 }}
+          {{- if gt (int .Values.query.preStopSleepSeconds) 0 }}
+          # Graceful scale-down: pause before SIGTERM so the Service stops
+          # routing new queries before the process shuts down; on SIGTERM the
+          # stateless query pod drains in-flight queries (graceful HTTP) and
+          # exits. No durable state to flush.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep {{ .Values.query.preStopSleepSeconds }}"]
+          {{- end }}
+          volumeMounts:
+            - name: query-spill
+              mountPath: {{ .Values.query.spill.directory | quote }}
+            {{- if .Values.query.tls.enabled }}
+            - name: tls
+              mountPath: /etc/siglake/tls
+              readOnly: true
+            {{- end }}
+            {{- if or .Values.query.walBuffer.enabled .Values.query.hotCaches.enabled }}
+            - name: wal
+              mountPath: /var/lib/siglake/wal
+              readOnly: true
+            {{- end }}
+      # Must exceed preStopSleepSeconds + the longest in-flight query you want
+      # to let finish before SIGKILL.
+      terminationGracePeriodSeconds: {{ .Values.query.terminationGracePeriodSeconds }}
+      volumes:
+        - name: query-spill
+          emptyDir:
+            sizeLimit: {{ .Values.query.spill.sizeLimit | quote }}
+        {{- if .Values.query.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ required "query.tls.existingSecret is required when tls.enabled=true" .Values.query.tls.existingSecret | quote }}
+        {{- end }}
+        {{- if or .Values.query.walBuffer.enabled .Values.query.hotCaches.enabled }}
+        # Shared RWX WAL claim (same as the ingester's). Real-time WAL
+        # queryability requires query pods to read the ingester's un-committed
+        # segments, so the claim's storage class must support ReadWriteMany (EFS).
+        - name: wal
+          persistentVolumeClaim:
+            claimName: {{ include "siglake.walClaimName" . }}
+            readOnly: true
+        {{- end }}
+      {{- include "siglake.scheduling" (list . .Values.query "query") | nindent 6 }}
+{{- end }}

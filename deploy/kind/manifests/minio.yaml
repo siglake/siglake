@@ -1,0 +1,94 @@
+# Minio (S3-compatible) for the Iceberg warehouse inside kind.
+#
+# Both images come from quay.io, MinIO's own registry: docker.io/minio/minio
+# and docker.io/minio/mc answer 401 to anonymous pulls as of 2026-09-11. Keep
+# these tags in step with deploy/docker-compose.yml.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+spec:
+  type: ClusterIP
+  selector:
+    app: minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: 9000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-console
+spec:
+  type: NodePort
+  selector:
+    app: minio
+  ports:
+    - name: console
+      port: 9001
+      targetPort: 9001
+      nodePort: 30901
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          ports:
+            - containerPort: 9000
+            - containerPort: 9001
+          env:
+            - name: MINIO_ROOT_USER
+              value: minioadmin
+            - name: MINIO_ROOT_PASSWORD
+              value: minioadmin
+          readinessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 2
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+# One-shot Job that creates the warehouse bucket on first install.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-bucket-init
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until mc alias set local http://minio:9000 minioadmin minioadmin; do
+                echo "waiting for minio…"
+                sleep 2
+              done
+              mc mb --ignore-existing local/siglake-warehouse
+              echo "bucket siglake-warehouse ready"

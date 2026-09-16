@@ -1,0 +1,76 @@
+{{- if .Values.schemaMigration.enabled -}}
+{{- /*
+  Additive schema migration, as a pre-upgrade hook.
+
+  This chart is the other control plane, and until now it had no migration
+  affordance at all — the only mention was a comment in values.yaml telling the
+  operator to run `siglake migrate-schema` by hand. Meanwhile the README
+  promises residual attributes are "preserved losslessly", a guarantee that
+  silently depended on that unprompted, unenforced, unverified manual step.
+
+  A binary newer than its table cannot write the columns the table lacks. The
+  storage layer now REFUSES such a write rather than dropping the column
+  silently, so a missed migration is a visible ingest outage instead of
+  permanent data loss — better, but still an outage. Running the migration
+  BEFORE the new pods roll is what prevents it.
+
+  pre-upgrade, not post-: helm blocks on a pre-upgrade hook completing, so a
+  failed migration stops the rollout instead of shipping a binary whose writes
+  will be refused. It runs the NEW image, which is what declares the new
+  schema. Not rendered on a fresh install — there is no table to migrate, and
+  the tiers provision at the current schema.
+
+  `migrate-schema` is additive-only and idempotent, so running it on every
+  upgrade is safe and cheap; when nothing needs adding it prints "up to date"
+  per table and exits 0.
+*/ -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Release-revision suffixed: a Job's spec.template is immutable, so reusing
+  # one name across upgrades would 422 the moment the image tag changes.
+  name: {{ include "siglake.componentName" (list . "migrate-schema") }}-{{ .Release.Revision }}
+  labels:
+    {{- include "siglake.componentLabels" (list . "migrate-schema") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.schemaMigration.backoffLimit }}
+  ttlSecondsAfterFinished: {{ .Values.schemaMigration.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "siglake.componentLabels" (list . "migrate-schema") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "siglake.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrate-schema
+          image: {{ include "siglake.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - migrate-schema
+            - --all-tables
+            # Tenancy is header-based, so `events` exists once per tenant
+            # namespace. Migrating only the release namespace reports success
+            # having left every other tenant's table narrow.
+            - --all-namespaces
+            {{- range .Values.compactor.promoteAttrs }}
+            - --promote-attr
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            {{- include "siglake.commonEnv" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.schemaMigration.resources | nindent 12 }}
+{{- end }}

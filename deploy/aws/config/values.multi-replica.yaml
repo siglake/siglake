@@ -1,0 +1,64 @@
+# Helm values overrides for the multi-replica scaling test
+# (round 12+). Layered on top of the Terraform-emitted base values
+# by `deploy/aws/up.sh` when `SIGLAKE_VALUES_EXTRA` points here.
+#
+# Compared to `values.smoke.yaml`:
+# - Ingester replicas: 1 → 3 (the test target). Compactor + query
+#   stay at 1; they're not the bottleneck under ingest load.
+# - WAL access mode: ReadWriteOnce → ReadWriteMany so 3 ingester
+#   pods can share the WAL volume across AZs.
+# - WAL storage class: gp2 (EBS, single-AZ) → efs-sc (EFS, multi-
+#   AZ). `deploy/aws/up.sh` installs the StorageClass post-
+#   terraform-apply, pointing at the EFS file system terraform
+#   provisions.
+# - No AZ pinning — pods spread across the 3 EKS node-group AZs.
+# - Detection is not part of this chart: the tiered detectors live in
+#   their own repo and consume WAL segments through
+#   `siglake_wal::consumer::SegmentConsumer`.
+
+# Same per-account ECR override as values.smoke.yaml — see
+# `deploy/aws/up.sh` which sets image.repository from the
+# terraform-emitted ecr_repository_url.
+
+ingester:
+  replicas: 3
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 1
+      memory: 512Mi
+  walSegmentMaxEvents: 4096
+  walSegmentMaxAgeSecs: 5
+  # No nodeSelector — let EKS spread the 3 replicas across AZs.
+
+compactor:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 1
+      memory: 512Mi
+
+query:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 1
+      memory: 512Mi
+  tokens:
+    existingSecret: ""
+    list: []
+
+# EFS-backed RWX WAL so all 3 ingester replicas can write.
+wal:
+  size: 10Gi
+  accessMode: ReadWriteMany
+  storageClassName: "efs-sc"
+

@@ -1,0 +1,65 @@
+[package]
+name = "siglake-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OTLP/HTTP ingest server: events in → WAL segments out."
+
+[[bench]]
+name = "otlp_ingest"
+harness = false
+
+[dependencies]
+siglake-core = { workspace = true }
+siglake-wal = { workspace = true }
+
+anyhow = { workspace = true }
+arrow-array = { workspace = true }
+async-stream = "0.3"
+async-trait = { workspace = true }
+redis = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+metrics = { workspace = true }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "gen-tonic-messages", "logs", "trace", "with-serde"] }
+prost = "0.14"
+serde = { workspace = true }
+serde_json = { workspace = true }
+simd-json = "0.14"
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "transport", "router"] }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+jsonwebtoken = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tower = { workspace = true }
+criterion = "0.5"
+mimalloc = { version = "0.1", default-features = false }
+datafusion = { workspace = true }
+futures = { workspace = true }
+siglake-compactor = { workspace = true }
+# Building the StreamedEvent the SSE lag test overruns the broadcast with.
+siglake-core = { workspace = true }
+siglake-storage = { workspace = true }
+# Snapshotting siglake_ingest_stream_lagged_total from a thread-local recorder
+# in the SSE lag test.
+metrics-util = "0.20"
+reqwest = { workspace = true }
+tempfile = "3"
+# Building a WalMirror handle, to prove commit=force refuses where it cannot
+# observe the commit.
+opendal = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

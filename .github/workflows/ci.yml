@@ -1,0 +1,829 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# THIS WORKFLOW RUNS CONTRIBUTOR CODE, SO IT IS THE RESTRICTED HALF OF A PAIR.
+# `pull_request` is the only trigger that may appear above -- a fork's run of
+# it gets a read-only token, no secrets, and an Actions cache scoped to
+# `refs/pull/N/merge`, all three enforced by GitHub rather than by anything
+# here. The privileged half is ci-authorize.yml, which runs on
+# `pull_request_target`, never checks out the pull request, and approves the
+# queued run for the one commit a maintainer labelled `ci:run`.
+# scripts/check-ci-authorization.py fails the build if `pull_request_target`,
+# `workflow_run` or `workflow_call` is ever added here, because every claim in
+# this paragraph stops holding the moment one is.
+#
+# Read, not the repository default (write in this organization). Job-level
+# blocks narrow it further; `docker` is the one job that widens it, for OIDC
+# on a push to main, and its role assume is conditioned on an event and a
+# secret a fork's run has neither of.
+permissions:
+  contents: read
+
+# Applies to every cargo job below.
+#
+# CARGO_PROFILE_*_DEBUG: full debug info is the dev/test default and is by far
+# the largest thing in `target/`. On 2026-08-28 it ran the runner out of disk
+# MID-JOB: `cargo test --workspace` and `cargo clippy --all-targets` both
+# PASSED, then the runner died with `No space left on device` before the OpenAPI
+# gate -- a green build reported as a failure with no compiler error anywhere.
+# It also costs codegen and link time on every single build. `line-tables-only`
+# keeps file/line in panic backtraces, which is all a failing test needs; the
+# full `debug = 2` payload was never read by anything in CI.
+#
+# The four gates used to be ONE serial job, so `cargo fmt` -- which needs no
+# build at all -- sat behind a 9-minute compile and never ran on a red run.
+# They are now separate jobs: wall clock is the slowest gate, not their sum.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+# RUSTFLAGS IS NOT IN THE BLOCK ABOVE AND MUST NOT GO BACK INTO IT.
+# `-C link-arg=-fuse-ld=mold` needs mold on the runner and no runner image ships
+# it, so each job that wants it installs it. Workflow-wide, the flag reached the
+# one cargo job that has no install step. `docker` gained cargo steps on
+# 2026-09-05, a week after the flag moved up here, and not one of its runs since
+# has linked. They die on the first build script --
+#
+#   = note: "cc" ... "-fuse-ld=lld" ... "-nodefaultlibs" "-fuse-ld=mold"
+#   = note: collect2: fatal error: cannot find 'ld'
+#   error: could not compile `libc` (build script)
+#
+# -- which surfaces under the name of the step that runs the MinIO and Postgres
+# suites, so it reads as a test failure. It was not: cargo never got as far as a
+# test. The flag now lives in the `env:` of each job that installs mold, next to
+# the install, and scripts/check-ci-linker.py fails the build if the two come
+# apart again. A job with neither links with the default linker -- slower, and
+# that is the whole cost of forgetting.
+
+# THIS FILE RUNS UNCHANGED IN MORE THAN ONE REPOSITORY. The development repo
+# has Depot runners and an AWS role; the public repo has neither, and a job
+# that asks for a `depot-*` label there waits for a runner that never comes.
+# Two repository variables pick the runner per repo, and the defaults are the
+# Depot labels so a repo that sets nothing behaves exactly as before:
+#
+#   SIGLAKE_CI_RUNNER        every job but `test`   (default depot-ubuntu-24.04-8)
+#   SIGLAKE_CI_RUNNER_LARGE  the `test` job         (default depot-ubuntu-24.04-64)
+#
+# A repo without Depot sets both to `ubuntu-24.04` (Settings > Secrets and
+# variables > Actions > Variables) BEFORE its first push. `vars` is one of the
+# few contexts `runs-on` accepts, which is why this is a variable and not a
+# secret or an env entry. The pinned label, not `ubuntu-latest`: the Depot
+# labels pin 24.04, and `ubuntu-latest` (24.04 in 2026-09) will move to 26.04
+# -- in public preview since 2026-06 -- at a time GitHub picks, which would
+# put the two repos on different images with nothing in this file saying so.
+#
+# A standard GitHub-hosted runner is 4 vCPU, 16 GB, and ~21 GB free on / (14 GB
+# is what GitHub guarantees) against Depot's 8-64 vCPU and 150-250 GB. Nothing
+# below was tuned for that box; the `test` job's free-disk step is what lets it
+# fit at all, and the rest is a wall-clock difference, not a correctness one.
+jobs:
+  # No compilation at all -- this one needs neither a big runner nor a cache.
+  fmt:
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # `bash -n` on every tracked shell script. Also no compilation.
+  #
+  # Added after the sibling benchmarks repo carried a shell script that was
+  # BROKEN IN MAIN FOR A WEEK without anyone noticing: a collapsed quote chain
+  # meant the variable it was building never got assigned and the script died at
+  # parse time. Nothing in either repo checked. siglake's exposure is the same
+  # shape -- `scripts/` and `deploy/aws/` are the install, release and squash
+  # paths, run rarely and by hand, so a parse error waits until someone needs
+  # them.
+  #
+  # The broad source gate is `bash -n` only: it answers "would this run at all",
+  # which is the failure that actually happened, and it has no false positives
+  # to argue with. Targeted runtime checks can be separate steps, as the compose
+  # formatter check below is. This tree has long been described as
+  # shellcheck-clean and nothing has ever enforced it -- turning that on is a
+  # separate change with a real chance of noise.
+  #
+  # No python equivalent here, unlike the benchmarks repo: this tree has exactly
+  # four python files and CI already RUNS all of them (check-chart.py and
+  # check-public-tree.py in `helm`, check-set-var.py and
+  # check-shell-job-parity.py below), so a syntax error in any already fails a
+  # job that matters. A compile gate would be redundant rather than cheap
+  # insurance.
+  #
+  # The same job carries the set_var guard: also source-only, also no
+  # compilation, and a wrong answer from either is a red build in under a
+  # minute rather than after the four-minute test job.
+  shell:
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: bash -n every shell script
+        run: |
+          set -uo pipefail
+
+          # Tracked files only, so vendored trees (compare/quickwit,
+          # .terraform/modules) and untracked scratch files cannot fail the
+          # build -- none of those are ours to keep parseable.
+          mapfile -t files < <(git ls-files '*.sh' '*.sh.tpl' '*.bash' | sort)
+
+          # ABSENCE IS NEVER SILENCE. An empty list means the glob or the
+          # checkout broke, and a gate that passes because it checked NOTHING is
+          # the exact failure this tree keeps finding elsewhere.
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no shell scripts found -- the gate checked nothing, which is not the same as passing"
+            exit 1
+          fi
+
+          # Report EVERY broken script, not just the first: a fail-fast loop
+          # turns one green run per fix into N runs.
+          rc=0
+          for f in "${files[@]}"; do
+            if ! err="$(bash -n "$f" 2>&1)"; then
+              echo "::error file=$f::bash -n failed: $(head -1 <<<"$err")"
+              printf '  FAIL %s\n%s\n' "$f" "$(sed 's/^/       /' <<<"$err")"
+              rc=1
+            fi
+          done
+
+          echo
+          echo "checked ${#files[@]} shell scripts"
+          [ "$rc" -eq 0 ] && echo "all parse" || echo "SOME DO NOT PARSE (above)"
+          exit "$rc"
+      - name: compose smoke formats host counts and propagates pipeline failures
+        run: scripts/check-smoke.sh
+      - name: loadgen reports its missing local-binary prerequisite before preflight
+        run: scripts/check-loadgen.sh
+      - name: compose preflight rejects an occupied published port
+        run: scripts/check-compose-preflight.sh
+      # ci-local.sh's own reporting is code, and until now the only thing that
+      # checked it was running the local gate. These three tests cover the
+      # helpers whose wrong answer is a gate that reports success: the
+      # test-binary identity guard (a concurrent relink of the shared target
+      # binary turning a contaminated run green), the external-reader skip
+      # accounting (`ok (0 engine(s) agreed, 3 skipped)` under `--strict`), and
+      # the image-size block (a size recorded without its image store driver,
+      # which is ~4x apart between containerd and overlay2). All three are
+      # hermetic and take under four seconds total: the guard test sources
+      # ci-local-test-guard.sh and fakes the cargo JSON, the readers test builds
+      # its own stub PATH so the missing-engine arms are missing-engine arms
+      # even on a box that has duckdb, and the size test stubs `docker` -- no
+      # daemon, no engine, no cargo.
+      - name: the ci-local test-binary identity guard catches a relink
+        run: scripts/check-ci-local-test-guard.sh
+      # The loopback bench scripts bind fixed ports and then poll /healthz for
+      # two minutes; a bind collision reaches only the server's own log, after a
+      # multi-GB corpus has been ingested. The knobs and the startup-death
+      # report are checked with stand-in binaries on free ports -- no corpus, no
+      # cargo build, no container.
+      - name: the bench scripts honour their port knobs and report a dead server
+        run: scripts/check-bench-ports.sh
+      # The Jaeger UI recording workflow (#2311) needs a container runtime and a
+      # browser, so the runner cannot take a recording either. Its two offline
+      # halves run here: the extractor over synthetic fixtures, and the
+      # recording proxy end to end against stand-in upstreams.
+      - name: the Jaeger UI recorder rewrites, attributes and reports correctly
+        run: scripts/check-jaeger-ui-recording.sh
+      # The tag that publishes an image (`v0.1.0`) is not the tag an install
+      # asks for (both charts default to the numeric appVersion), and until
+      # #2717 nothing compared them. This evaluates publish.yml's
+      # tag-resolution step and checks it against the chart defaults, the
+      # workspace version and the tags pinned in deploy/.
+      - name: the published image tag is the tag the charts install
+        run: python3 scripts/check-release-tags.py
+      # `-C link-arg=-fuse-ld=mold` was set for the whole workflow while only
+      # four of the five cargo jobs installed mold. The fifth, `docker`, failed
+      # every run at its first link under the name of the MinIO and Postgres
+      # suites, which never ran. This requires the flag and the install to stay
+      # in the same job, in both directions, in every workflow here.
+      - name: every job that asks for the mold linker installs it
+        run: python3 scripts/check-ci-linker.py
+      # The other half: the env block above, and the flag beside each install,
+      # reaching scripts/ci-local.sh. Until #2947 none of them did -- the local
+      # gate built with full debuginfo, incrementally, and linked with the
+      # default linker, so "the local gate passes" answered a question this
+      # workflow was not asking. This compares scripts/ci-local-build-env.sh
+      # with both, and drives its mold prerequisite: a box without mold has to
+      # report the cargo jobs unexercised rather than quietly linking with
+      # something else.
+      - name: the local gate builds under this workflow's build settings
+        run: python3 scripts/check-ci-build-env.py
+      # A fork's pull request runs one commit: the one a maintainer read and
+      # labelled `ci:run`. The two halves of that are this workflow, which may
+      # only ever be reached from `pull_request` (read-only token, no secrets,
+      # a cache scoped to the pull request), and ci-authorize.yml, which holds
+      # the write-capable token and never checks out the fork. The decision
+      # table and the static checks that keep those two properties true are in
+      # the first script; the second drives the approval's head recheck -- the
+      # step between a label and a runner -- against a stand-in `gh`.
+      - name: a labelled fork head authorizes exactly one reviewed commit
+        run: python3 scripts/check-ci-authorization.py
+      - name: the run approval refuses a head that moved
+        run: scripts/check-ci-approve-run.sh
+      - name: ci-local's external-reader reporting counts skips as skips
+        run: scripts/check-external-readers-report.sh
+      - name: ci-local's image-size reporting never drops the store driver
+        run: scripts/check-image-sizes-report.sh
+      # The kind round installs the query tier with KEDA headroom (min at the
+      # base, max at the target) and then drives the floor base -> target ->
+      # base under load. With the ceiling back at the base the step still runs
+      # and still fails, but on its grace timeout rather than on the range --
+      # which is how task #968 spent six rounds unverifiable. This reads the
+      # round script's constants, its `--set` lines and the name it derives for
+      # the scale evidence file, and requires the documents that point a reader
+      # at that file to name the same one. No cluster, no kubectl, no helm.
+      - name: the kind round keeps KEDA headroom on the query tier
+        run: scripts/check-kind-round-scale.sh
+      - name: Postgres outage evidence rejects missing and non-draining traces
+        run: scripts/check-kind-postgres-outage-evidence.sh
+      - name: schema rollback evidence covers chart and operator reverts
+        run: scripts/check-kind-schema-rollback-evidence.sh
+      - name: exact-point evidence separates completeness from falsification
+        run: scripts/check-exact-point-falsifier-evidence.sh
+      # The ingester's `pod` label comes from Prometheus Operator's relabeling,
+      # so nothing rendered here proves it exists and only a round with two
+      # scraped pods can tell the operator's per-pod mean from the fleet total.
+      # This pins the round's captured expression against prom.rs, drives the
+      # capture function against stand-in kubectl/curl/git, and requires the
+      # grader to refuse a missing or empty `pod`, a single active pod and an
+      # arithmetic mismatch. No cluster.
+      - name: ingester per-pod label capture keeps labels and arithmetic
+        run: scripts/check-kind-ingester-pod-labels.sh
+      # A failed round's diagnostics dump every not-Ready pod's logs except the
+      # ones already carried by a Job dump above them. That membership test used
+      # to be `printf '%s\n' "${jobs[@]}" | grep -qx`, where `grep -q` exits at
+      # its first match and `pipefail` turns the writer's SIGPIPE into a failed
+      # match -- a hit read as a miss. This drives the real function with a
+      # stand-in kubectl over match, miss, no-label and empty-list fixtures, on
+      # a job list large enough to make the old race deterministic, and requires
+      # the whole dump to leave the round's exit status alone. No cluster.
+      - name: a failed kind round dumps each pod's logs once
+        run: scripts/check-kind-round-diagnostics.sh
+      # The steps above are a hand-maintained copy of scripts/ci-local.sh's
+      # `shell` block, and until 2026-09-07 three of them existed only there:
+      # the local gate passed, the pull request never ran them, and nothing said
+      # so. This step compares the two lists statically -- every
+      # `scripts/check-*` the local shell block runs must be a `run:` here, and
+      # every guard here must run somewhere in ci-local (the two steps below
+      # have their own local jobs). Stdlib python only; this job installs
+      # nothing.
+      - name: CI's shell guards and the local gate stay in sync
+        run: python3 scripts/check-shell-job-parity.py
+      # The session brief is read whole at the start of every session and once
+      # carried a 2,100-line status log. The cap, the message and the file name
+      # live in the script, which is the one shipping file allowed to name the
+      # brief: the squash drops it, so in the published tree this step reports
+      # `skipped` and passes -- there is nothing to cap.
+      - name: the session brief stays under 200 lines
+        run: scripts/check-claude-md.sh
+      # TESTS MUST NOT MUTATE THE PROCESS ENVIRONMENT. The harness runs a
+      # binary's tests on parallel threads, so two `set_var`s of the same knob
+      # race and one test reads the other's value; the storage attributes
+      # compression test failed one run in several that way on 2026-09-02, and
+      # the compactor's idle-backoff test before it. The convention since then
+      # is a pure resolver twin `fn x_from(Option<&str>)` that tests drive
+      # directly.
+      #
+      # check-set-var.py scans every tracked Rust file under crates/ and reports
+      # the file:line of any set_var or remove_var call; line comments are
+      # stripped so resolver documentation does not trip the gate.
+      - name: no std::env::set_var or remove_var calls in crates
+        run: python3 scripts/check-set-var.py
+
+  test:
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER_LARGE || 'depot-ubuntu-24.04-64' }}
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+      # THIS JOB DOES NOT FIT A STANDARD GITHUB-HOSTED RUNNER WITHOUT THIS STEP.
+      # `cargo test --workspace` links 124 test binaries (107 of them one per
+      # `tests/*.rs` file, each carrying its own copy of DataFusion, Arrow and
+      # the AWS SDK) and cargo builds all of them before it runs any, so the
+      # peak is the sum. Measured 2026-09-04 from a warm tree with exactly the
+      # env block above: 36.6 GiB of test binaries (median 296 MiB, largest
+      # 461 MiB) plus 4.6 GiB of rlibs, rmeta and build scripts -- 41 GiB before
+      # the toolchain (0.6 GB) and the registry (2 GB). With the default full
+      # debuginfo it is 101 GiB, which is the ENOSPC the env block describes.
+      #
+      # The 24.04 image ships roughly 25-30 GB of toolchains nothing here uses
+      # (Android SDK, .NET, GHC, CodeQL, Swift, PowerShell modules, Miniconda,
+      # Julia, cached docker images). Deleting them is the difference between
+      # ~21 GB free and ~45-50 GB, which is enough with a margin under 10 GB --
+      # so the `df -h` at the end of this job is the number to read on the first
+      # run in a repo without Depot. If it still dies, the next rung is
+      # `CARGO_PROFILE_TEST_DEBUG=0` for these runners only (roughly 22 GiB of
+      # test binaries by section arithmetic on the largest one, not measured;
+      # the panic message keeps file:line, only backtrace frames lose it), and
+      # the structural fix is fewer integration-test binaries.
+      #
+      # GitHub-hosted only: Depot runners register as self-hosted, have 150 GB
+      # or more, and would only pay the 1-3 minutes the deletes take. Plain `rm`
+      # rather than a marketplace action so the list is in front of whoever
+      # reads the `df` output, and a missing path is not an error.
+      - name: Free disk (GitHub-hosted runners only)
+        if: runner.environment == 'github-hosted'
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL \
+                      /usr/share/swift \
+                      /usr/local/share/powershell \
+                      /usr/share/miniconda \
+                      /usr/local/julia* \
+                      /usr/local/share/chromium
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          echo "after:"; df -h / | tail -1
+      # cache-on-failure, because the whole point is the RED runs.
+      #
+      # This defaults to false, and every `ci` run in this repo's history had
+      # failed, so rust-cache had NEVER saved a cache for this job -- the only
+      # entry in the repo was `v0-rust-operator-cluster-...`, from the one job
+      # that passes. Every run therefore paid a full cold build of ~600
+      # dependency crates: 550s of the 777s `cargo test` step, on every push,
+      # while a cache sat unwritten because the job it belonged to was fixing
+      # the very failure that discarded it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install mold linker
+        run: sudo apt-get install -y mold
+      # The operator's autoscaling queries are PromQL, and whether one of them
+      # answers the contract its CRD field promises is a question only
+      # Prometheus' engine can settle. siglake-operator's `prom_fixture` test
+      # feeds the expression it GENERATES to `promtool test rules` over
+      # synthetic series, the way check-chart.py does for the rendered
+      # PrometheusRule. It skips when promtool is absent, so it needs both the
+      # install (92 MB, against this job's ~10 GB margin) and the variable
+      # below, which turns that skip into a failure here.
+      - name: Install promtool
+        run: sudo apt-get install -y --no-install-recommends prometheus
+      - run: cargo test --workspace --no-fail-fast
+        env:
+          SIGLAKE_OPERATOR_REQUIRE_PROMTOOL: "1"
+      # Disk is a real budget here (see the env block). Report it so the next
+      # ENOSPC arrives as a number rather than a mystery runner death. /mnt is
+      # the Azure scratch disk on GitHub-hosted runners (absent elsewhere); it
+      # is printed because moving `target` there is a candidate next rung, and
+      # whether it exists and how big it is has never been observed from here.
+      - name: Disk and target size
+        if: always()
+        run: |
+          df -h / /mnt 2>/dev/null || true
+          du -sh target 2>/dev/null || true
+
+  clippy:
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install mold linker
+        run: sudo apt-get install -y mold
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Both gates here are `cargo run` of a workspace binary, so they share one
+  # job (and one warm target dir) rather than one runner each.
+  # THE CHART IS THE SUPPORTED INSTALL SURFACE and nothing rendered it until
+  # now. Two live defects shipped as a direct result — a Service targeting a
+  # container port that did not exist (ingest unreachable through its own
+  # Service, pods Ready throughout) and a query HPA targeting a Deployment for
+  # a StatefulSet (FailedGetScale, never scales, install succeeds). Both are
+  # visible in `helm template` output.
+  helm:
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@v4
+      # check-chart.py strips each rendered PrometheusRule down to `groups:`
+      # and hands it to Prometheus's own PromQL/rule parser and rule-test
+      # runner. Ubuntu packages promtool with the prometheus server rather
+      # than as a separate package.
+      - name: Install promtool
+        run: sudo apt-get install -y --no-install-recommends prometheus
+      - name: Lint charts
+        run: |
+          helm lint deploy/helm/siglake
+          helm lint deploy/helm/siglake-operator
+      - name: Render and validate the chart
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/check-chart.py --require-promtool
+      # THE PUBLISHED TREE IS NOT THE TREE WE DEVELOP IN. The launch squash drops
+      # the internal docs, the bench harness and the session brief (the exact
+      # list lives in the checker, next to the regexes that match them), so a
+      # reference into any of them is dead on arrival — and a local absolute
+      # path leaks a filesystem layout, or the location of a private repo. Both
+      # are invisible locally, because the dropped paths are present.
+      #
+      # Found 14 dead references on 2026-08-31, including one in the README, plus
+      # two public design docs citing a private analysis repo by local path.
+      - name: The tree that ships carries no dead references or local paths
+        run: python3 scripts/check-public-tree.py
+      # The install guards are load-bearing: they refuse configurations that
+      # cannot produce a working cluster. If one stops firing, it stops
+      # protecting anyone.
+      - name: Install guards still refuse the configurations they exist for
+        run: |
+          set -e
+          base="--set s3.region=us-west-2 --set s3.bucket=ci"
+          if helm template t deploy/helm/siglake $base \
+               --set query.tokens.list='{tok}' >/dev/null 2>&1; then
+            echo "FAIL: auth + fan-out with no coordinator token was allowed" >&2
+            exit 1
+          fi
+          if helm template t deploy/helm/siglake $base \
+               --set compactor.binConcurrency=4 >/dev/null 2>&1; then
+            echo "FAIL: raised bin concurrency without a memory limit was allowed" >&2
+            exit 1
+          fi
+          # #2955: a compactor tier that can hold more than one pod without
+          # the claim table, by either of the two values that size it, and a
+          # claim with no mirror to claim from.
+          if helm template t deploy/helm/siglake $base \
+               --set compactor.replicas=2 >/dev/null 2>&1; then
+            echo "FAIL: a second compactor pod without the catalog claim was allowed" >&2
+            exit 1
+          fi
+          if helm template t deploy/helm/siglake $base \
+               --set autoscaling.compactor.enabled=true >/dev/null 2>&1; then
+            echo "FAIL: a compactor HPA ceiling above one pod without the catalog claim was allowed" >&2
+            exit 1
+          fi
+          if helm template t deploy/helm/siglake $base \
+               --set compactor.catalogClaim.enabled=true \
+               --set wal.mirror.enabled=false >/dev/null 2>&1; then
+            echo "FAIL: the catalog claim with no WAL mirror to claim from was allowed" >&2
+            exit 1
+          fi
+          # #3718: under the claim every compactor publishes the whole shared
+          # sealed queue, and the HPA can only ask for that gauge per pod, so
+          # the same backlog asks for a count proportional to the count already
+          # running. Both doors, including a tier this chart does not render.
+          backlog="--set autoscaling.compactor.enabled=true \
+            --set autoscaling.compactor.customMetric.enabled=true \
+            --set compactor.catalogClaim.enabled=true"
+          if helm template t deploy/helm/siglake $base $backlog >/dev/null 2>&1; then
+            echo "FAIL: the compactor backlog metric under the catalog claim was allowed" >&2
+            exit 1
+          fi
+          if helm template t deploy/helm/siglake $base $backlog \
+               --set compactor.enabled=false >/dev/null 2>&1; then
+            echo "FAIL: the compactor backlog metric under a claim whose tier is not rendered was allowed" >&2
+            exit 1
+          fi
+          # #3075: the same contention reached through `ingester.extraArgs`. An
+          # embedded compactor takes no claim and the chart renders none for it,
+          # so the refusal is unconditional — at one replica the rolling update
+          # still overlaps two pods. The claim does not waive it either.
+          if helm template t deploy/helm/siglake $base \
+               --set 'ingester.extraArgs[0]=--with-compactor' >/dev/null 2>&1; then
+            echo "FAIL: an embedded compactor on the ingester was allowed" >&2
+            exit 1
+          fi
+          if helm template t deploy/helm/siglake $base \
+               --set 'ingester.extraArgs[0]=--with-compactor' \
+               --set keda.enabled=true --set ingester.replicas=1 >/dev/null 2>&1; then
+            echo "FAIL: an embedded compactor under a KEDA ingester ceiling was allowed" >&2
+            exit 1
+          fi
+          if helm template t deploy/helm/siglake $base \
+               --set 'ingester.extraArgs[0]=--with-compactor' \
+               --set compactor.catalogClaim.enabled=true >/dev/null 2>&1; then
+            echo "FAIL: an embedded compactor waived by the catalog claim was allowed" >&2
+            exit 1
+          fi
+          # The other half of that guard: an ordinary ingester still scales, and
+          # an autoscaler that is off contributes no ceiling to any count.
+          if ! helm template t deploy/helm/siglake $base \
+               --set ingester.replicas=3 --set autoscaling.ingester.enabled=true \
+               --set keda.enabled=true >/dev/null 2>&1; then
+            echo "FAIL: an ordinary ingester tier above one pod was refused" >&2
+            exit 1
+          fi
+          # The three neighbours of #3718's refusal. check-chart.py holds the
+          # metrics each of these HPAs actually carries; here they only have to
+          # render.
+          if ! helm template t deploy/helm/siglake $base \
+               --set autoscaling.compactor.enabled=true \
+               --set compactor.catalogClaim.enabled=true >/dev/null 2>&1; then
+            echo "FAIL: claim-mode compactor scaling on CPU alone was refused" >&2
+            exit 1
+          fi
+          if ! helm template t deploy/helm/siglake $base \
+               --set autoscaling.compactor.enabled=true \
+               --set autoscaling.compactor.maxReplicas=1 \
+               --set autoscaling.compactor.customMetric.enabled=true >/dev/null 2>&1; then
+            echo "FAIL: the compactor backlog metric in filesystem mode at one pod was refused" >&2
+            exit 1
+          fi
+          if ! helm template t deploy/helm/siglake $base \
+               --set autoscaling.ingester.enabled=true \
+               --set autoscaling.ingester.customMetric.enabled=true \
+               --set compactor.catalogClaim.enabled=true >/dev/null 2>&1; then
+            echo "FAIL: the ingester's per-pod custom metric under the catalog claim was refused" >&2
+            exit 1
+          fi
+          # A KEDA query ceiling above query.replicas was a third guard here.
+          # It was refused only because --query-peers was rendered from the
+          # replica count; since #967 the pods discover each other from the
+          # headless Service's SRV record, so that range is supported and the
+          # render must SUCCEED. The replacement coverage is in the chart check
+          # step above: the `query-scale-out` scenario renders exactly this
+          # configuration and check_query_peer_discovery holds the conditions
+          # that make it safe. Re-adding a refusal here would re-impose the
+          # ceiling that #967 lifted.
+          echo "ok: all ten guards refused, and the four supported renders went through"
+      # The kind round's schema-rollback arm installs the operator chart with
+      # exactly these flags. An operator pointed at an address that resolves to
+      # nothing holds every replica count and stays Ready while doing it, so the
+      # arm meets it as a rollout timeout (#3489). The offline half of this —
+      # the round, the probe and the chart agreeing on the address — is in
+      # check-kind-schema-rollback-evidence.sh, which needs no helm.
+      - name: The operator chart puts the rollback arm's Prometheus on the command line
+        run: |
+          set -e
+          url=http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+          render="${RUNNER_TEMP:-/tmp}/operator-render.yaml"
+          helm template t deploy/helm/siglake-operator \
+            --set-string prometheus.url="$url" >"$render"
+          rendered=$(grep -A1 -F -- '- --prometheus-url' "$render" || true)
+          case "$rendered" in
+            *"$url"*) echo "ok: --prometheus-url $url" ;;
+            *) echo "FAIL: the operator chart rendered no --prometheus-url $url" >&2
+               exit 1 ;;
+          esac
+
+  generated:
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install mold linker
+        run: sudo apt-get install -y mold
+      # OpenAPI freshness gate. `docs/api/*.yaml` are generated from the same
+      # `#[utoipa::path]` annotations that register the axum routes, so a route
+      # added without docs — or a changed request/response type — surfaces here
+      # as a diff. There is deliberately no runtime /openapi.json endpoint.
+      # Regenerate locally with: cargo run -p siglake-openapi -- --out docs/api
+      - name: OpenAPI specs are up to date
+        run: |
+          cargo run --locked -p siglake-openapi -- --out docs/api
+          git add -A -- docs/api
+          if ! git diff --cached --quiet -- docs/api; then
+            echo "::error::docs/api is stale. Run: cargo run -p siglake-openapi -- --out docs/api"
+            git --no-pager diff --cached -- docs/api
+            exit 1
+          fi
+      # The CRD is generated from the Rust types, but two copies of it are
+      # committed: one applied directly, one shipped in the operator chart under
+      # crds/. Helm NEVER upgrades crds/, so a stale copy there is not a
+      # cosmetic diff -- it becomes the structural schema on every install and
+      # silently PRUNES fields the CR sets. The chart copy had fallen 30 lines
+      # behind and was dropping spec.extraEnv, the documented escape hatch, with
+      # no error anywhere. Nothing regenerated or compared them, so drift was
+      # invisible until someone read both files side by side.
+      - name: CRD manifests match the generated schema
+        run: |
+          cargo run -q -p siglake-operator -- --print-crd > /tmp/crd.yaml
+          for f in deploy/operator/crd.yaml \
+                   deploy/helm/siglake-operator/crds/siglakecluster.yaml; do
+            if ! diff -u "$f" /tmp/crd.yaml; then
+              echo "::error file=$f::CRD is stale -- regenerate with:"
+              echo "  cargo run -p siglake-operator -- --print-crd > $f"
+              exit 1
+            fi
+          done
+
+  # THE OPERATOR IS A CONTROL PLANE AND WAS NEVER EXERCISED BY CI.
+  #
+  # `cargo test --workspace` skips every operator cluster test: they are
+  # `#[ignore]`d because they need a real API server. So the operator's actual
+  # job -- reconciling a CR into workloads -- was covered by nothing that runs
+  # automatically, and the only gate above is a CRD text diff.
+  #
+  # That is how the autoscaling bug shipped: the operator rendered a
+  # ScaledObject targeting a Deployment for a tier that is a StatefulSet.
+  # Every hermetic test passed, because none of them ever asked a cluster to
+  # accept the output. Three real tests already existed and were simply never
+  # run (`operator::integration` once, `operator::leader_chaos` twice).
+  #
+  # kind gives a real API server in ~40s, which is all these tests need -- they
+  # assert on objects the operator creates, not on pods becoming ready.
+  operator-cluster:
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install mold linker
+        run: sudo apt-get install -y mold
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: siglake-op-ci
+          wait: 120s
+      - name: Cluster is reachable
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+      - name: Apply the CRD
+        run: kubectl apply -f deploy/operator/crd.yaml
+      # --ignored runs ONLY the ignored tests, which is exactly the set that
+      # `cargo test --workspace` cannot reach. --test-threads=1 because these
+      # share a cluster and the leader-election tests contend deliberately.
+      #
+      # ONE invocation, then assert on its output. A green run must also mean
+      # tests RAN: `--ignored` with a filter matching nothing exits 0 and prints
+      # "0 passed", which reads identically to success. 4 tests: 2 reconcile
+      # (one honoured spec, one refused `query.max > query.min` spec) + 2
+      # leader-election. The 3-test set was verified against kind on
+      # 2026-08-24; the refusal test was added 2026-09-05 after the first
+      # nightly kind run caught the honoured-spec sample asking for 1/4.
+      - name: Operator tests against a real API server
+        run: |
+          set -o pipefail
+          set +e
+          cargo test -p siglake-operator -- --ignored --test-threads=1 2>&1 | tee /tmp/op-tests.log
+          test_rc=${PIPESTATUS[0]}
+          set -e
+          read -r passed failed < <(
+            awk '/^test result: (ok|FAILED)\./ {p+=$4; f+=$6} END {print p+0, f+0}' /tmp/op-tests.log
+          )
+          if [ "$test_rc" -ne 0 ] || [ "$passed" -lt 4 ] || [ "$failed" -ne 0 ]; then
+            echo "::error::operator cluster tests FAIL ($passed passed, $failed failed)"
+            grep -E '^test .* \.\.\. FAILED$' /tmp/op-tests.log || true
+            if [ "$passed" -lt 4 ] && [ "$failed" -eq 0 ]; then
+              echo "Only $passed tests ran; expected 4+. A job that runs no tests passes just as loudly as one that runs them."
+            fi
+            exit 1
+          fi
+          echo "operator cluster tests ok ($passed tests)"
+        env:
+          SIGLAKE_OPERATOR_REQUIRE_CLUSTER: "1"
+
+  deny:
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # RustSec is fetched at run time, so a newly published advisory can make
+      # this job red even when neither the code nor Cargo.lock changed.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses sources
+
+  # Builds both images on every run; pushes them to ECR only where there is an
+  # ECR to push to. The public repo has no AWS account behind it, so every
+  # AWS step is conditioned on the `AWS_ROLE_ARN` secret being set: with it, a
+  # push to main assumes the role and pushes `ci-<sha>` tags as before; without
+  # it, the job is build-only on push as well as on pull requests, and never
+  # asks to assume a role that does not exist (which is a hard failure, not a
+  # skip). Pull requests never push in either repo. `secrets` cannot be read
+  # in a step's `if`, so the test is made once here and read back through
+  # `env` -- the release path to GHCR is publish.yml and is not touched by this.
+  #
+  # THE ONE PRIVILEGED JOB HERE, and the only one that may be: `id-token: write`
+  # is what assumes the ECR role, and every step that touches it is behind
+  # `ECR_PUSH`, which is a push to main AND the secret being set. A pull
+  # request satisfies neither, and a fork's pull request cannot resolve the
+  # secret at all -- GitHub gives that run a read-only token and no secrets.
+  # scripts/check-ci-authorization.py holds all three halves of that: the
+  # job-level write permission is allow-listed there by name, an AWS step
+  # without its condition is a red build, and so is a `secrets.` reference the
+  # event does not gate.
+  docker:
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ECR_PUSH: ${{ github.event_name == 'push' && secrets.AWS_ROLE_ARN != '' }}
+      # Two cargo suites run below, so this job links Rust like `test` does and
+      # installs mold for the same reason. Both halves or neither -- see the
+      # note under the workflow `env:` block.
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install mold linker
+        run: sudo apt-get install -y mold
+
+      - name: Set image tag
+        run: echo "TAG=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        if: env.ECR_PUSH == 'true'
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Login to ECR
+        id: login-ecr
+        if: env.ECR_PUSH == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # The `scope=` names below are shared with main's runs, and that is safe
+      # for the same reason the token is: GitHub scopes cache WRITES to the ref
+      # of the run, so a pull request -- from this repository or from a fork --
+      # reads main's entry and writes its own. `refs/heads/main`'s cache cannot
+      # be overwritten from a pull request, which is the property that would be
+      # lost if these jobs ever ran from `pull_request_target` (the checker
+      # refuses that trigger, and this is one of the reasons).
+      - name: Build and push siglake
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: ${{ env.ECR_PUSH == 'true' }}
+          build-args: SIGLAKE_GIT_SHA=${{ env.TAG }}
+          tags: ${{ env.ECR_PUSH == 'true' && format('{0}/siglake:ci-{1}', steps.login-ecr.outputs.registry, env.TAG) || format('siglake:ci-{0}', env.TAG) }}
+          cache-from: type=gha,scope=siglake
+          cache-to: type=gha,scope=siglake,mode=max
+
+      - name: Build and push siglake-operator
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/Dockerfile.operator
+          push: ${{ env.ECR_PUSH == 'true' }}
+          build-args: SIGLAKE_GIT_SHA=${{ env.TAG }}
+          tags: ${{ env.ECR_PUSH == 'true' && format('{0}/siglake-operator:ci-{1}', steps.login-ecr.outputs.registry, env.TAG) || format('siglake-operator:ci-{0}', env.TAG) }}
+          cache-from: type=gha,scope=siglake-operator
+          cache-to: type=gha,scope=siglake-operator,mode=max
+
+      # Both suites need the compose stack, so they share one lifecycle.
+      # The second is SQL that no hermetic test can reach: shared-store batch
+      # job ownership (#1845), where getting it wrong destroys a live
+      # replica's job result on every query scale-out, and the cancellation
+      # half (#1846), where a DELETE persisted by one replica has to stop the
+      # future another replica is executing, and graceful owner release
+      # (#1852). compose's Postgres is the only one CI starts, so these run
+      # here or nowhere. Recovery is fleet-wide, so the tests sharing this
+      # scratch database must be serialized.
+      - name: Native S3 mirror pagination against MinIO, two-store job ownership against Postgres
+        env:
+          SIGLAKE_TEST_S3_ENDPOINT: http://localhost:9000
+          SIGLAKE_TEST_JOBS_POSTGRES_URI: postgres://siglake:siglake@localhost:5433/siglake
+        run: |
+          trap 'scripts/down.sh' EXIT
+          scripts/up.sh
+          cargo test -p siglake-compactor --test s3_mirror_pagination -- --ignored --nocapture
+          cargo test -p siglake-query-server --test jobs_postgres_ownership -- \
+            --ignored --nocapture --test-threads=1
+
+      # Same reason as the `test` job's report: the builder stage's release
+      # target measured 4.1 GiB on 2026-09-04, which should fit a standard
+      # runner's ~21 GB, but the buildkit state that holds it has never been
+      # sized on one. A number here beats a runner death.
+      - name: Disk after the image builds
+        if: always()
+        run: df -h / /mnt 2>/dev/null || true

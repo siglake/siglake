@@ -1,0 +1,156 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/siglake-core",
+    "crates/siglake-bloom",
+    "crates/siglake-index",
+    "crates/siglake-storage",
+    "crates/siglake-wal",
+    "crates/siglake-ingest",
+    "crates/siglake-compactor",
+    "crates/siglake-cli",
+    "crates/siglake-loadgen",
+    "crates/siglake-query-server",
+    "crates/siglake-operator",
+    "crates/siglake-openapi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/siglake/siglake"
+
+# Cancellation-safety / reliability lints (WS-0). Held as `deny` because a
+# `std`/`parking_lot` lock guard kept alive across an `.await` is always a bug
+# in async code (it serializes the executor and can deadlock under cancellation).
+# Each member opts in via `[lints] workspace = true`. The vendored forks under
+# `third_party/` are path deps, not members, so they are intentionally exempt.
+# Note: `tokio::sync::Mutex` is *designed* to be held across `.await`; this lint
+# targets the synchronous guards that are not. The other mechanical guard is
+# `clippy.toml`, whose `disallowed-methods` list carries the calls a production
+# path must not make; each entry's reason names the operation to use instead.
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+
+[workspace.dependencies]
+# Async / utilities
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+bytes = "1"
+base64 = "0.22"
+zstd = "0.13"
+futures = "0.3"
+async-trait = "0.1"
+
+# Arrow / Parquet / DataFusion stack.
+# Pinning to versions known to be mutually compatible. Bump as a set.
+arrow = "57"
+arrow-array = "57"
+arrow-schema = "57"
+parquet = { version = "57", features = ["async", "object_store"] }
+datafusion = "52"
+object_store = { version = "0.12", features = ["aws", "gcp", "azure"] }
+opendal = { version = "0.55", features = ["services-s3", "services-memory", "services-fs"] }
+
+# Iceberg stack — pinned to 0.9 (Apache official).
+# We use `iceberg-catalog-sql` for catalog persistence: SQLite for local dev
+# (a single .db file alongside the warehouse) and Postgres for production.
+# The in-tree `iceberg::memory::MemoryCatalog` is *not* used because it
+# hardcodes an in-memory FileIO and never writes Parquet to disk.
+iceberg = "0.9.1"
+iceberg-catalog-sql = "0.9.1"
+iceberg-datafusion = "0.9.1"
+iceberg-storage-opendal = "0.9.1"
+
+# HTTP / server stack
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustyline = { version = "15", default-features = false, features = ["with-file-history"] }
+jsonwebtoken = "9"
+reqsign = "0.16.5"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# OpenAPI 3.1 spec generation. The `#[utoipa::path]` annotations live next to
+# the axum handlers and `utoipa-axum`'s `OpenApiRouter` registers the route and
+# its documentation in the same call, so an endpoint cannot ship undocumented
+# (see `docs/api/README.md`). NOTE: do NOT enable utoipa's `yaml` feature — it
+# pulls `serde_norway` + `unsafe-libyaml-norway`, and cargo feature unification
+# would land both in the shipped binaries. `siglake-openapi` uses the
+# workspace's existing `serde_yaml` for serialization instead.
+# `chrono` here is a codegen flag only (teaches the derive to map
+# `DateTime<Utc>` -> string/date-time); it adds no dependency.
+utoipa = { version = "5.5", default-features = false, features = ["macros", "axum_extras", "chrono", "uuid"] }
+utoipa-axum = "0.2"
+
+# Internal
+siglake-core = { path = "crates/siglake-core" }
+siglake-bloom = { path = "crates/siglake-bloom" }
+siglake-index = { path = "crates/siglake-index" }
+siglake-storage = { path = "crates/siglake-storage" }
+siglake-wal = { path = "crates/siglake-wal" }
+siglake-ingest = { path = "crates/siglake-ingest" }
+siglake-compactor = { path = "crates/siglake-compactor" }
+siglake-loadgen = { path = "crates/siglake-loadgen" }
+siglake-query-server = { path = "crates/siglake-query-server" }
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
+
+# Loadgen
+hdrhistogram = "7"
+humantime = "2"
+rand = { version = "0.8", features = ["small_rng"] }
+
+# Redis client for the cross-replica `RateBudget` impl (Phase
+# 4.12.17). `tokio-comp` selects the async I/O backend; `connection-
+# manager` gives us auto-reconnect.
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+
+# Sketch-based detectors (HLL for cardinality, CMS for new-value)
+hyperloglogplus = { version = "0.4", features = ["const-loop"] }
+
+# Regex (the query server's kv_extract search-time UDF).
+regex = "1"
+
+# Property-based testing (invariant kernels: bloom no-false-negatives,
+# encode/decode round-trips, merge multiset-equality).
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+
+# Vendored apache/iceberg-rust 0.9.1 (third_party/iceberg) so we own and can
+# modify the Parquet read path. Redirects siglake + the iceberg-catalog-sql /
+# -datafusion / -storage-opendal companions to our in-tree copy.
+#
+# iceberg-catalog-sql is *also* vendored (third_party/iceberg-catalog-sql) so we
+# own the commit path: BIG-4 lever-2 threads the already-loaded base table into
+# `update_table`, dropping its redundant per-commit `metadata.json` re-load.
+[patch.crates-io]
+iceberg = { path = "third_party/iceberg" }
+iceberg-catalog-sql = { path = "third_party/iceberg-catalog-sql" }
+# Vendored for the S3 multipart-upload concurrency knob (F10). Upstream builds
+# every writer as `op.writer(path)` with no options, and opendal's WriteOptions
+# defaults `concurrent: 0` — so every Parquet file siglake writes to S3 sends
+# its parts one at a time. Flush is 30.2% of append time on the 2026-08-08 1TB
+# round, the largest single stage.
+iceberg-storage-opendal = { path = "third_party/iceberg-storage-opendal" }
