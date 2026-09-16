@@ -1262,11 +1262,11 @@ number of the cache's own turnovers and then becomes an ordinary candidate,
 because nothing here can see that a file has been compacted away and its blob
 would otherwise be retained for the life of the process. What survives is
 arithmetic and measured: a repeat suite re-fetches the indexed files the blob
-budget cannot cover, and nothing more. Both bounds apply to every entry, so a per-file index sized
-by its row count cannot push the cache past the byte ceiling the way the entry
-count alone allowed. Setting the entry count to `0` turns both caches off and
-returns to fetching and deserializing per query; setting the blob byte bound to
-`0` drops only the serialized copy. Both budgets are subtracted from the query
+budget cannot cover, and nothing more. Both bounds apply to every entry, so a
+per-file index sized by its row count cannot push the cache past the byte
+ceiling the way the entry count alone allowed. Setting the entry count to `0`
+turns both caches off and returns to fetching and deserializing per query;
+setting the blob byte bound to `0` drops only the serialized copy. Both budgets are subtracted from the query
 memory pool like every other read cache and published on
 `siglake_cache_budget_bytes{kind="text_index"}`.
 

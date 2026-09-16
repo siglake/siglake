@@ -7022,13 +7022,9 @@ message schema {
                 let keep_blob = |caches: &mut Self| {
                     if !had_blob {
                         let twins = caches.twin_ranks();
-                        caches.blobs.put(
-                            blob_key,
-                            blob,
-                            caches.blob_max_bytes,
-                            128,
-                            &twins,
-                        );
+                        caches
+                            .blobs
+                            .put(blob_key, blob, caches.blob_max_bytes, 128, &twins);
                     }
                 };
                 if self.coupled {
