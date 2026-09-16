@@ -28,6 +28,7 @@ mod index_template_durability;
 mod inverted_index;
 mod inverted_index_default;
 mod memory_gauges_published;
+mod merge_row_group_target;
 mod mg_sketch;
 mod multi_tenant;
 mod native_bloom_cost;

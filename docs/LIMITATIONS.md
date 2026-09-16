@@ -1029,22 +1029,24 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   keep a compactor that stopped censusing from paging off a stale reading.
 - **A streamed delete rewrite never holds its input, but it does hold its
   survivors.** The streaming arm decodes the candidate a batch at a time, and
-  the writer it streams into buffers an open row group of 1,048,576 rows as
-  decoded Arrow batches — so a rewrite whose survivors fit in one row group
-  holds all of them. Measured 2026-09-16 in a debug build over single-candidate
-  fixtures of 16 Ki to 64 Ki rows: peak ≈ 0.96 × the survivors' decoded bytes
-  + ~18 MB, and flat in the candidate's own size (an eighth of a 78.7 MB
-  candidate's rows costs what half of a 19.7 MB one does). Against the in-RAM
-  arm's four copies of the whole decoded file that is the gate's win, and it is
-  still not a bound that holds at any size: a narrow GDPR delete leaves nearly
-  every row a survivor, and 1 Mi rows at the ~1.2 KB decoded per row those
-  fixtures carry is over a gigabyte before the row-group cap engages at all.
-  Neither `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` nor the equivalent tuning
-  field reaches this writer — the merge-output path asks for a row-group size
-  with no sample batch and gets the 1 Mi-row fallback, the byte target unread.
-  What a 256 MiB cold-target candidate costs a compactor packaged at 1Gi is not
-  established: the measurement is net heap growth on fixtures three orders of
-  magnitude smaller.
+  the writer it streams into buffers the open row group as decoded Arrow
+  batches — so a rewrite whose survivors fit in one row group holds all of
+  them. Measured 2026-09-16 in a debug build over single-candidate fixtures of
+  16 Ki to 64 Ki rows: peak ≈ 0.96 × the survivors' decoded bytes + ~18 MB, and
+  flat in the candidate's own size (an eighth of a 78.7 MB candidate's rows
+  costs what half of a 19.7 MB one does). Against the in-RAM arm's four copies
+  of the whole decoded file that is the gate's win. Since #4754 the row group
+  is `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` (or
+  `IcebergTuning::target_row_group_bytes`) divided by the first written batch's
+  row size, so lowering the target lowers what a rewrite holds; until then the
+  merge-output writer asked with no sample batch and took a flat 1,048,576 rows
+  with the byte target unread. It remains a target and not a cap, and it stops
+  at the 128 Ki-row floor (`MIN_ROW_GROUP_ROWS`): at the ~1.2 KB decoded per row
+  those fixtures carry, the smallest row group any target can ask for still
+  holds ~157 MB of survivors, and a narrow GDPR delete leaves nearly every row a
+  survivor. What a 256 MiB cold-target candidate costs a compactor packaged at
+  1Gi is not established: the measurement is net heap growth on fixtures three
+  orders of magnitude smaller.
 - **Streamed rewrite output carries no inline inverted index.** Every rewrite
   past the in-RAM caps — a leveled compaction merge, a re-clustering pass, or
   a delete task's large candidates (16 MiB compressed / 128 Ki rows) — is
