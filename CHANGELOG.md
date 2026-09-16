@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.1.1
+
+Four changes on top of 0.1.0. Nothing about the on-disk format, the HTTP
+surface or the configuration moves: a 0.1.0 warehouse is read and written
+unchanged, every default holds, and no flag or values key is removed. The
+workspace version, both chart `version`/`appVersion` pairs, the pinned image
+tags under `deploy/` and the two OpenAPI documents' `info.version` all read
+`0.1.1`, and git tag `v0.1.1` publishes image tag `0.1.1`.
+
+- **Query**: whether to *use* a text index a file already carries is now
+  decided per execution. Loading one costs a deserialization proportional to
+  the file's rows, and a text predicate under a bare `LIMIT` stops the scan
+  after a sliver of the first file, so that shape stays on the scan path; the
+  `ORDER BY timestamp` form of the same decline shipped in 0.1.0. An unclipped
+  text scan keeps the index, which is the regime it wins in. On a 14 × 7.34M-row
+  local fixture with every index resident, the four clipped shapes went from
+  24.4 / 13.6 / 50.3 / 869.2 ms indexed to 7.5 / 10.1 / 10.8 / 5.4 ms, while
+  two unclipped rare scans kept their indexed 126.3 and 39.4 ms against
+  1,757.2 and 535.2 ms scanned. The rule is deliberately blunt and the same
+  fixture shows what it costs: a rare term under a `LIMIT` is declined with
+  the rest and scans in 531.2 ms where a resident index would have answered in
+  45.8 ms. Document frequency lives inside the whole-file index being
+  declined, so choosing by it would first pay the load the decline avoids.
+  Answers are unaffected either way: the index only ever
+  produced a superset row selection, blooms stay active, and the exact
+  predicate is re-evaluated above the scan either way. A decline increments
+  `siglake_query_inverted_index_declined_total{reason}` and is named in the
+  scan's plan line (`text_index:[declined:clipped_limit]`). Puffin rebuild
+  still ships off. (#4375)
+- **Operator**: `siglake-operator --adopt-values` now prints one YAML
+  document, with its findings and runbook as comments, so the saved file is
+  what the runbook's own `kubectl apply -f cluster.yaml` can apply — the output
+  used to stop being parseable YAML right after the synthesized
+  `SiglakeCluster`. `--adopt-namespace <NS>` sets `metadata.namespace` and the
+  `-n` on every runbook command, including the abort path and helm's
+  release-namespace annotation, and defaults to the release name. The CRD is
+  namespaced, so a release installed into a namespace that is not its name
+  previously produced a report that applied wherever the current kube context
+  pointed. (#4544)
+- **AWS reference deployment**: `deploy/aws/up.sh` writes its own mode-0600
+  kubeconfig, verifies the context it wrote names the cluster it just
+  provisioned, and passes `--kubeconfig` / `--context` to every `kubectl` and
+  `helm` call. It leaves the caller's default kubeconfig and current context
+  alone, prints the `KUBECONFIG` export the follow-on scripts need, and removes
+  the file on failure. `deploy/terraform/aws/README.md` documents the same
+  by-hand recipe. `scripts/check-aws-up-kubeconfig.sh` holds the script to this
+  in the `shell` job. (#4545)
+- **Naming**: the ingest handlers, their rate-limit middleware and the prose
+  around ingest tokens no longer carry the name of the HTTP event-collector
+  compatibility surface that was removed in 2026-06. The middleware is named in
+  three shipped `429` descriptions, so `docs/api/openapi-ingest.yaml` is
+  regenerated. No runtime behaviour changes. (#4569)
+
 ## 0.1.0 — initial public release
 
 siglake: a horizontally-scalable, OTLP-native log analytics platform on
