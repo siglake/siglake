@@ -920,15 +920,23 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   buckets and 2-D time×group counts written without a snapshot-coverage chain
   remain readable but cannot prove which equal-row-count snapshot they
   describe, so queries use the exact per-file tiers. `rebuild-group-counts`
-  restores the folded wide group-count object; no command rebuilds the inline
-  time aggregates in v0. Nothing repairs the condition on its own either:
-  further appends publish coverage edges that never join a chain with no head,
-  and a row-conserving re-cluster has no edge to walk back to
+  restores the folded wide group-count object; `rebuild-time-aggregates`
+  restores the inline object's time buckets and 2-D time×group counts. Nothing
+  repairs the condition automatically: further appends publish coverage edges
+  that never join a chain with no head, and a row-conserving re-cluster has no
+  edge to walk back to
   (`crates/siglake-storage/tests/storage/pre_coverage_time_agg.rs`). Measured
   on that file's report, the fallback costs 23–59× Tier-1 warm but stays under
   ~2ms, and 3.8–35× cold over 49–168 live files, growing with the file count —
-  so a cold, large, rarely-queried table is where it is felt.
-  `docs/DESIGN_inline_time_aggregate_rebuild.md` specifies the repair.
+  so a cold, large, rarely-queried table is where it is felt. Three limits on
+  the repair: it drops the inline whole-table group counts rather than certify
+  maps it cannot prove (they were already refused, so nothing readable is
+  lost, but an unwindowed `GROUP BY` below the raised cardinality cap stays on
+  Tier-2); it leaves absent any component short of `total-records`, which a
+  table with delete files or NULL timestamps always is; and it cannot merge a
+  commit that lands under it, so on a table under live ingest it retries three
+  times and exits without writing. See
+  `docs/DESIGN_inline_time_aggregate_rebuild.md`.
 - **Streamed rewrite output carries no inline inverted index.** Every rewrite
   past the in-RAM caps — a leveled compaction merge, a re-clustering pass, or
   a delete task's large candidates (16 MiB compressed / 128 Ki rows) — is

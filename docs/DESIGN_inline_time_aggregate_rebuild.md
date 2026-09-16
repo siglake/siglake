@@ -1,8 +1,8 @@
 # Rebuilding a pre-coverage inline time aggregate
 
-**Status:** measured and specified, not implemented. The publication protocol
-below is the part that needs a decision before code; two open questions are at
-the end. Task #3082.
+**Status:** implemented as `siglake rebuild-time-aggregates`
+(`IcebergContext::rebuild_inline_time_aggregates`). Both open questions were
+answered on 2026-09-16 and are recorded as decisions at the end. Task #3082.
 
 ## The condition
 
@@ -185,14 +185,22 @@ The links are redundant, and leaving them would let `add_coverage_link` advance
 `coverage` past `S` on a chain the rebuild has already superseded.
 
 **Bounding the retry.** Under continuous ingest step 6 can fail every time: the
-rebuild races a commit cadence it cannot beat. Two shapes, and this is open
-question 2. The cheap one is to bound the attempts and tell the operator to run
-it in a quiet window. The convergent one is a catch-up pass: on conflict, do not
-rescan the table, fold in only the files added by the snapshots between `S` and
-the new current snapshot, and rescan from scratch only if an intervening commit
-was neither an append nor a row-conserving re-cluster. The catch-up shrinks
-toward one commit's worth of work and converges; it is also a second code path
-over the same maps, which is where a repair acquires its own bugs.
+rebuild races a commit cadence it cannot beat. Two shapes. The cheap one is to
+bound the attempts and tell the operator to run it in a quiet window — what was
+built, see the decisions below. The convergent one is a catch-up pass: on
+conflict, do not rescan the table, fold in only the files added by the snapshots
+between `S` and the new current snapshot, and rescan from scratch only if an
+intervening commit was neither an append nor a row-conserving re-cluster. The
+catch-up shrinks toward one commit's worth of work and converges; it is also a
+second code path over the same maps, which is where a repair acquires its own
+bugs.
+
+**Why step 4 is a no-op and not an error.** Coverage already reaching `S` means
+a previous pass did this work and nothing has invalidated it. Reporting that
+rather than rewriting is what makes the command safe to put in a runbook. It
+also falls out of the re-rooting property: after a successful pass, the next
+append's edge has `S` as its parent and joins the chain, so a table that is
+being maintained normally reports "already covered" rather than looking broken.
 
 ## What this does not touch
 
@@ -227,20 +235,47 @@ pays the 2-D decode cost each time, where an operator-invoked repair pays it
 once — which is the argument for the containment optimization being settled
 here first.
 
-## Open questions
+## Decisions, 2026-09-16
 
-**1. What happens to the inline `group_counts` the rebuild does not recompute?**
-One `coverage` field covers the whole object, so granting coverage to maps
-computed at an unknown earlier snapshot is precisely the unmarked-overwrite
-hazard the field exists to catch. Dropping them costs nothing that was readable
-— a pre-coverage object's group counts are already refused — but it does mean
-the object's inline group counts stay short from the next commit onward, which
-on a table below the raised cardinality cap leaves unwindowed `GROUP BY` on
-Tier-2 for good. The alternative is to recompute them in the same pass through
-`grouped_counts_from_files`, at the price of one more Tier-2 pass per column.
+**The inline `group_counts` are dropped, not certified.** One `coverage` field
+covers the whole object, so granting coverage to maps computed at an unknown
+earlier snapshot is the unmarked-overwrite hazard the field exists to catch.
+Dropping them costs nothing that was readable — a pre-coverage object's group
+counts were already refused by every consult. What it does carry: from the next
+commit onward the inline group counts hold that commit alone and stay short of
+`total-records`, so on a table below the raised cardinality cap an unwindowed
+`GROUP BY` stays on Tier-2. Accepted rather than recomputing them in the same
+pass, which would have cost one more Tier-2 pass per column.
 
-**2. Bounded retry or catch-up?** See "Bounding the retry" above. A table under
-live ingest is exactly the case the "does not heal" property makes interesting,
-and the bounded-retry version cannot serve it.
+**The retry is bounded, not convergent.** Three attempts, then the command
+exits non-zero asking for a window with no ingest to the table. The convergent
+shape — fold in only the files the snapshots between `S` and the new current
+snapshot added, rescanning in full when an intervening commit was neither an
+append nor a row-conserving re-cluster — is specified above and can be added
+without changing anything published here. It was not built because it is a
+second code path over the same maps, and because the measurement puts the cost
+this command addresses on cold, rarely-queried tables, which are the ones a
+retry wins against: a warm table's per-file fallback measured ~2ms.
 
-Both are recorded on task #3082 with recommendations.
+## What was built
+
+- `IcebergContext::rebuild_inline_time_aggregates`, steps 1-8 above, with the
+  two decisions applied. `siglake_inline_time_aggregate_rebuilds_total` counts
+  a publication, `..._conflicts_total` an attempt lost to a commit, and
+  `siglake_inline_time_{,group_}rebuild_files_total{source="footer"|"decode"}`
+  says which arm each file took.
+- `siglake rebuild-time-aggregates --table <t>`, reporting per component
+  whether it was restored, because exiting 0 is not the same as the fast path
+  being back.
+- `crates/siglake-storage/tests/storage/pre_coverage_time_agg.rs`: the refusal
+  and its permanence, the repair restoring Tier-1 with byte-identical answers,
+  coverage advancing on the appends that follow, the second pass as a reported
+  no-op, the footer and decode arms agreeing with what maintenance accumulated,
+  and the refusal to invent an object that is not there.
+- `crates/siglake-cli/tests/cli/rebuild_time_aggregates_cli.rs`: the report an
+  operator reads, from the real binary.
+
+One thing the measurement did not cover and the implementation therefore does
+not claim: the 2-D decode's cost at scale. It is a two-column pass over the
+live files, so it is bounded by what a Tier-2 query already costs on the same
+table, but no at-scale figure has been taken.

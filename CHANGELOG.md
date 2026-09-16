@@ -2,7 +2,7 @@
 
 ## 0.1.1
 
-Six changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
+Seven changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
 surface moves, and a 0.1.0 warehouse is read and written unchanged: one values
 key and four environment knobs are added, every existing default holds, and no
 flag or values key is removed. The
@@ -69,6 +69,30 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   still the operator's to rebuild by hand. A rebuild records the columns it
   could not restore, so one unreadable column does not buy a full rebuild every
   pass. (#3000)
+- **Maintenance**: new `siglake rebuild-time-aggregates --table <t>`, for a table
+  whose inline aggregate object predates the snapshot-coverage chain. Such an
+  object cannot prove which equal-row-count snapshot it describes, so every
+  query refuses it and `date_histogram` and windowed `GROUP BY` fall to the
+  exact per-file tier — and it does not heal, because a chain with no head
+  cannot be rejoined by later appends or by a compaction. The command
+  recomputes the time buckets (one footer read per live file) and the 2-D
+  time×group rollup (a two-column decode per live file, or that file's
+  group-count footer where its whole time range sits inside one bucket),
+  replaces both, and publishes the scanned snapshot's coverage edge, after
+  which ordinary commit-path maintenance carries the chain forward. Measured on
+  a local fixture, the fallback it removes costs 23–59× the Tier-1 path warm
+  (though under ~2ms) and 3.8–35× cold across 49–168 live files, growing with
+  the file count. Three limits, all reported by the command: the inline
+  whole-table group counts are dropped rather than certified, since one
+  coverage edge governs the object and they cannot be proven (they were already
+  refused, so nothing readable is lost); a component short of `total-records`
+  is left absent rather than written short; and a commit landing under the pass
+  cannot be merged, so on a table under live ingest it retries three times and
+  exits without writing. Re-running after success is a reported no-op. Distinct
+  from the entry above: a short aggregate has a provable chain and too few
+  rows, and `rebuild-group-counts` (or the opt-in automatic repair) is its
+  remedy; this one has the rows and cannot prove which snapshot they belong
+  to. No existing behaviour, default or format changes. (#3082)
 - **Drain**: a WAL segment the local filesystem drain cannot read no longer
   takes every batch it joins down with it. The read phase now names the
   segments that failed instead of returning one error for the whole batch, and
@@ -93,7 +117,6 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   compatibility surface that was removed in 2026-06. The middleware is named in
   three shipped `429` descriptions, so `docs/api/openapi-ingest.yaml` is
   regenerated. No runtime behaviour changes. (#4569)
-
 ## 0.1.0 — initial public release
 
 siglake: a horizontally-scalable, OTLP-native log analytics platform on
