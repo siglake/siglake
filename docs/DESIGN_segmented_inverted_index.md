@@ -239,7 +239,8 @@ row) with `rareneedle` on one row in 100,000 — the same generator the #4329 an
 #4375 tables were taken on. One file is 7,340,000 rows in 7 row groups of
 1,048,576, which is the compacted layout's default row-group target
 (`target_row_group_rows`). Nine executions per shape for the per-file section,
-three for the plan section, medians reported.
+medians reported; three for the plan section, where the first is reported as
+`cold` and the median of the other two as `warm`.
 
 Every arm's rows are asserted equal to the whole-file index's answer, restricted
 to the row groups the shape kept, before any timing is reported.
@@ -256,7 +257,8 @@ to the row groups the shape kept, before any timing is reported.
 Resident bytes fall **510x**; the blob is 0.74x the size of the v1 one, split
 35.9 MiB dictionary, 49.4 MiB postings, 474.9 KiB directory. The blob shrinking
 while gaining a directory and a per-term document frequency is the dictionary
-blocks: v1 writes every term in full (`lib.rs:250`), and on this corpus almost
+blocks: v1 writes every term in full
+(`crates/siglake-index/src/lib.rs:250`), and on this corpus almost
 every term is `row-NNNNNN`, so a block's shared prefix covers most of it.
 
 "parse/open" is the asymmetry the format exists for. v1 must decode 116.5 MiB
@@ -287,8 +289,8 @@ microseconds.
 
 Read the first five rows as the partial-read case and the last as its limit. A
 point lookup touches two to fourteen ranges and thousandths of a percent of the
-blob, at tens of microseconds against v1's hundreds of nanoseconds — a real
-100x on an operation that is already negligible beside the 3.27 s decode that
+blob, at tens of microseconds against v1's hundreds of nanoseconds — 40x to
+170x, on an operation that is already negligible beside the 3.27 s decode that
 has to precede it. Pruning compounds: keeping the last quarter of the row groups
 takes `rare_scan` from 14 reads to 4, because a rejected group costs no read.
 
