@@ -12,13 +12,25 @@ ROUND=scripts/kind-round.sh
 PROBE=scripts/kind-postgres-outage-probe.sh
 JOBS_SOURCE=crates/siglake-query-server/src/jobs.rs
 SQL_SOURCE=crates/siglake-query-server/src/sql.rs
+POSTGRES_MANIFEST=deploy/kind/manifests/postgres.yaml
+CHART_DIR=deploy/helm/siglake
 
 fail() { echo "FAIL $*" >&2; exit 1; }
 contains() { case "$1" in *"$2"*) ;; *) return 1 ;; esac; }
 
-for file in "$GRADER" "$FIXTURE" "$RUN76" "$ROUND" "$PROBE"; do
+for file in "$GRADER" "$FIXTURE" "$RUN76" "$ROUND" "$PROBE" "$POSTGRES_MANIFEST"; do
   [[ -f "$file" ]] || fail "$file does not exist"
 done
+
+# Commit timestamps are postmaster-only, so the throwaway kind install has to
+# ask for them at start-up; Postgres defaults the setting off, which is what
+# every other deployment keeps. A chart that started setting it would be a
+# behaviour change nobody asked this probe for.
+contains "$(<"$POSTGRES_MANIFEST")" 'args: ["-c", "track_commit_timestamp=on"]' ||
+  fail "$POSTGRES_MANIFEST does not start kind Postgres with commit timestamps tracked"
+if grep -rq 'track_commit_timestamp' "$CHART_DIR" deploy/aws deploy/docker-compose.yml 2>/dev/null; then
+  fail "track_commit_timestamp leaked out of the throwaway kind install"
+fi
 
 # The live path must remain opt-in, and it must measure the job store the chart
 # ships: persistent since 2026-09-11, so the round installs it unconditionally
@@ -95,7 +107,7 @@ fi
 # no way to date the counters it read, so the probe must now retain a process
 # state per sample, a bounded write in each phase, the container's identity
 # across the window, and the Prometheus scrape each value came from.
-contains "$probe_body" '"schema_version": 2' ||
+contains "$probe_body" '"schema_version": 3' ||
   fail "$PROBE does not retain the pause-evidence schema version"
 contains "$probe_body" 'state_status=$(postgres_process_state "$TMP_DIR/postgres-state")' ||
   fail "$PROBE does not read the Postgres process state on every sample"
@@ -110,9 +122,50 @@ done
 contains "$probe_body" '"postgres_container": {' ||
   fail "$PROBE does not retain the Postgres container identity across the window"
 
-# The two remote readers are the pieces a cluster would run, so run their exact
-# text here: the state reader against a synthetic /proc, the write probe against
-# a psql stand-in that returns, hangs, or fails.
+# A counter cannot say when a row was written, so the row itself has to be
+# dated. The commit-time reading is taken after the bounded recovery window --
+# a ready postmaster is not a finished reconciliation -- and the stamps read
+# either side of the pause and continuation execs are what place a commit
+# inside the window rather than against a stamp taken before the signal.
+contains "$probe_body" 'COMMIT_TIMES_STATUS=$(postgres_commit_times "$TMP_DIR/commit-times")' ||
+  fail "$PROBE does not read the job rows' commit timestamps"
+contains "$probe_body" 'pg_xact_commit_timestamp(xmin)' ||
+  fail "$PROBE does not date the job rows by their Postgres commit timestamp"
+contains "$probe_body" 'SHOW track_commit_timestamp' ||
+  fail "$PROBE does not retain the effective track_commit_timestamp setting"
+python3 - "$PROBE" <<'PY' || fail "$PROBE does not collect commit times after the bounded recovery window"
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+recovery = next(i for i, line in enumerate(lines)
+                if line == "SAMPLING_ENDED_AT=$(iso_now)")
+collect = next(i for i, line in enumerate(lines)
+               if line.startswith("COMMIT_TIMES_STATUS="))
+ready = next(i for i, line in enumerate(lines)
+             if line == "POSTGRES_READY_AT=$(iso_now)")
+if not ready < recovery < collect:
+    raise SystemExit(
+        "expected readiness, the end of the recovery window and the commit-time read in "
+        f"order; got {ready + 1}, {recovery + 1}, {collect + 1}"
+    )
+PY
+for stamp in PAUSE_APPLIED_AT RESTORATION_APPLIED_AT; do
+  contains "$probe_body" "$stamp=\$(iso_now)" ||
+    fail "$PROBE does not stamp the applied side of the pause/restoration signal ($stamp)"
+done
+contains "$probe_body" '"pause_applied_at": pause_applied,' ||
+  fail "$PROBE does not retain pause_applied_at"
+contains "$probe_body" '"restoration_applied_at": restoration_applied,' ||
+  fail "$PROBE does not retain restoration_applied_at"
+# `pg_xact_commit_timestamp` raises when the setting is off, so the reader must
+# not report a failed query as a row set with nothing committed in the pause.
+contains "$probe_body" '"exec_status": int(exec_status) if exec_status.isdigit() else 1,' ||
+  fail "$PROBE does not retain the commit-time reader's exec status"
+
+# The three remote readers are the pieces a cluster would run, so run their
+# exact text here: the state reader against a synthetic /proc, the write probe
+# against a psql stand-in that returns, hangs, or fails, and the commit-time
+# reader against one that has the setting on and one that has it off.
 extract_snippet() {
   python3 - "$PROBE" "$1" "$2" <<'PY'
 import pathlib
@@ -135,6 +188,7 @@ trap 'rm -rf -- "$fixture_dir"' EXIT
 
 extract_snippet state-snippet "$fixture_dir/state.sh"
 extract_snippet write-probe-snippet "$fixture_dir/write-probe.sh"
+extract_snippet commit-times-snippet "$fixture_dir/commit-times.sh"
 
 # `pid:comm:state:starttime` per process. Field 3 of /proc/<pid>/stat is the
 # state and field 22 the start time; the reader has to find both by position
@@ -189,6 +243,54 @@ write_probe_arm completes 'exit 0' completed
 write_probe_arm hangs 'sleep 60' blocked
 write_probe_arm refuses 'echo "connection refused" >&2; exit 2' error
 
+# The commit-time reader, against a psql stand-in that answers `SHOW` and the
+# row query separately. The second arm is the one that matters: with the
+# setting off, `pg_xact_commit_timestamp` raises, and the reader has to come
+# back saying so rather than as an empty row set.
+commit_times_arm() {
+  local name=$1 setting=$2 rows=$3 rc=$4 out
+  cat >"$fixture_dir/psql-commit-$name" <<STANDIN
+#!/bin/sh
+for arg in "\$@"; do
+  case "\$arg" in
+    "SHOW track_commit_timestamp") printf '%s\n' "$setting"; exit 0 ;;
+  esac
+done
+printf '%s' "$rows"
+[ "$rc" -eq 0 ] || echo "ERROR: could not get commit timestamp data" >&2
+exit "$rc"
+STANDIN
+  chmod +x "$fixture_dir/psql-commit-$name"
+  out=$(COMMIT_TIMES_PSQL="$fixture_dir/psql-commit-$name" \
+    COMMIT_TIMES_ERRORS="$fixture_dir/psql-commit-$name.err" \
+    COMMIT_TIMES_ROWS="$fixture_dir/psql-commit-$name.rows" \
+    sh -eu -c "$(<"$fixture_dir/commit-times.sh")" commit-times)
+  printf '%s' "$out"
+}
+
+on_arm=$(commit_times_arm on on \
+  'job-a	succeeded	2026-09-07 12:00:01+00	2026-09-07 12:00:51+00		2026-09-07 12:00:51.88+00
+' 0)
+contains "$on_arm" "$(printf 'status\t0\t0')" ||
+  fail "the commit-time reader did not report both query statuses: $on_arm"
+contains "$on_arm" "$(printf 'setting\ton')" ||
+  fail "the commit-time reader did not report the effective setting: $on_arm"
+contains "$on_arm" "$(printf 'row\tjob-a\tsucceeded')" ||
+  fail "the commit-time reader did not tag its rows: $on_arm"
+fixtures=$((fixtures + 1))
+
+off_arm=$(commit_times_arm off off '' 3)
+contains "$off_arm" "$(printf 'status\t0\t3')" ||
+  fail "the commit-time reader hid a failed row query: $off_arm"
+contains "$off_arm" "$(printf 'setting\toff')" ||
+  fail "the commit-time reader did not report the off setting: $off_arm"
+contains "$off_arm" 'could not get commit timestamp data' ||
+  fail "the commit-time reader dropped the error detail: $off_arm"
+if contains "$off_arm" "$(printf 'row\t')"; then
+  fail "the commit-time reader invented rows from a failed query: $off_arm"
+fi
+fixtures=$((fixtures + 1))
+
 # Drive the whole probe once against recording stand-ins, so the retained
 # document's shape is proven by the script that writes it rather than by a
 # fixture someone kept in step by hand. The `kubectl` stand-in runs only the two
@@ -232,7 +334,8 @@ case "$command" in
     if [[ "$text" == *"kill -STOP"* || "$text" == *"kill -CONT"* ]]; then
       exit 0
     fi
-    if [[ "$text" == *PROC_ROOT* || "$text" == *WRITE_PROBE_PSQL* ]]; then
+    if [[ "$text" == *PROC_ROOT* || "$text" == *WRITE_PROBE_PSQL* \
+      || "$text" == *COMMIT_TIMES_PSQL* ]]; then
       exec "${body[@]}"
     fi
     exit 0
@@ -269,7 +372,11 @@ if [[ -z "$expression" ]]; then
     fi
   done
   if [[ -n "$response" ]]; then
-    printf '{"job_id":"job-%s"}' "$RANDOM" >"$response"
+    # Named after the probe's own submission index, and recorded, so the psql
+    # stand-in can answer with commit times for the ids that were accepted.
+    job_id="job-$(basename "$response" .response.json)"
+    printf '{"job_id":"%s"}' "$job_id" >"$response"
+    printf '%s\n' "$job_id" >>"$STANDIN_STATE/job-ids"
   fi
   printf '202'
   exit 0
@@ -327,12 +434,34 @@ printf '#!/bin/sh\n[ -e "$STANDIN_STATE/paused" ] && exec sleep 60\nexit 0\n' \
   >"$fixture_dir/psql-standin"
 chmod +x "$fixture_dir/psql-standin"
 
+# The commit-time stand-in answers for the ids the curl stand-in accepted. Its
+# timestamps sit a few seconds ahead of the stand-in's own collection instant:
+# the grader places a commit against the recorded pause and restoration stamps,
+# and this keeps the arm from depending on how long a stand-in recovery loop
+# happens to take to reach the read.
+cat >"$fixture_dir/psql-commit-standin" <<'STANDIN'
+#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    "SHOW track_commit_timestamp") echo on; exit 0 ;;
+  esac
+done
+committed=$(date -u -d "+3 seconds" "+%Y-%m-%d %H:%M:%S.%6N+00")
+while IFS= read -r job_id; do
+  printf '%s\tsucceeded\t%s\t%s\t\t%s\n' "$job_id" "$committed" "$committed" "$committed"
+done <"$STANDIN_STATE/job-ids"
+STANDIN
+chmod +x "$fixture_dir/psql-commit-standin"
+
 standin_rc=0
 PATH="$standin_dir:$PATH" \
   STANDIN_STATE="$standin_state" \
   PROC_ROOT="$paused_tree" \
   WRITE_PROBE_PSQL="$fixture_dir/psql-standin" \
   WRITE_PROBE_ERRORS="$fixture_dir/standin-psql.err" \
+  COMMIT_TIMES_PSQL="$fixture_dir/psql-commit-standin" \
+  COMMIT_TIMES_ERRORS="$fixture_dir/standin-commit.err" \
+  COMMIT_TIMES_ROWS="$fixture_dir/standin-commit.rows" \
   KUBE_CONTEXT=fixture NAMESPACE=fixture PROM_URL=http://fixture.invalid \
   RESULTS_DIR="$standin_state/results" \
   POSTGRES_OUTAGE_JOBS=2 POSTGRES_OUTAGE_SECONDS=2 \
@@ -345,10 +474,18 @@ PATH="$standin_dir:$PATH" \
 python3 - "$standin_state/results/postgres-outage-reconnect.json" <<'PY' ||
 import json, sys
 document = json.load(open(sys.argv[1], encoding="utf-8"))
-assert document["schema_version"] == 2, document["schema_version"]
+assert document["schema_version"] == 3, document["schema_version"]
 evidence = document["evidence"]
 assert evidence["grade"] == "verified", evidence["problems"]
 summary = evidence["summary"]
+commits = summary["job_commit_times"]
+assert commits["track_commit_timestamp"] == "on", commits
+assert commits["correlated_jobs"] == 2, commits
+assert commits["committed_after_restoration"] == 2, commits
+assert commits["committed_in_pause"] == [], commits
+assert commits["unplaceable_commits"] == [], commits
+assert commits["gaps"] == [], commits
+assert commits["settles_pause"] is True, commits
 assert summary["peak_backlog_total"] == 2, summary
 assert summary["pre_restoration_drain"] is None, summary
 assert summary["stopped_postgres_processes"] == 3, summary
@@ -476,16 +613,28 @@ fixtures=$((fixtures + 1))
 # Mutate a copy of the passing trace. Each case must become unverified for the
 # intended reason, so a grader that silently treats a missing observation as
 # zero cannot pass these fixtures.
-expect_unverified() {
-  local mutation=$1 want=$2
-  local input="$fixture_dir/${mutation}.input.json"
-  local output="$fixture_dir/${mutation}.output.json"
-  local log="$fixture_dir/${mutation}.log" rc=0
+mutate() {
+  local mutation=$1 input=$2
   python3 - "$FIXTURE" "$input" "$mutation" <<'PY'
 import datetime as dt
 import json, sys
 source, destination, mutation = sys.argv[1:]
 document = json.load(open(source, encoding="utf-8"))
+
+def commit_row(job_id):
+    return next(
+        row for row in document["job_commit_times"]["rows"] if row["job_id"] == job_id
+    )
+
+def pre_restoration_drain():
+    """Run #76's shape: the backlog empties and completions rise while the
+    samples are still labelled `outage`."""
+    sample = document["samples"][2]
+    for row in sample["backlog"]:
+        row["value"] = 0
+    for row in sample["completions"]:
+        row["value"] += 1
+
 if mutation == "missing-series":
     document["samples"][1]["backlog"] = []
 elif mutation == "no-rise":
@@ -499,24 +648,60 @@ elif mutation == "no-drain":
 elif mutation == "missing-revision":
     del document["revisions"]["repository_commit"]
 elif mutation == "pre-restoration-drain":
-    # The run #76 shape: the backlog empties and completions rise while the
-    # samples are still labelled `outage`.
-    sample = document["samples"][2]
-    for row in sample["backlog"]:
-        row["value"] = 0
-    for row in sample["completions"]:
-        row["value"] += 1
+    pre_restoration_drain()
+elif mutation == "pre-restoration-drain-undated":
+    pre_restoration_drain()
+    document["job_commit_times"]["rows"] = [
+        row for row in document["job_commit_times"]["rows"] if row["job_id"] != "job-b"
+    ]
+elif mutation == "commit-inside-pause":
+    pre_restoration_drain()
+    commit_row("job-b")["committed_at"] = "2026-09-07 12:00:20.551200+00"
+elif mutation == "commit-at-pause-edge":
+    # Within the second the pause stamps are truncated to: the signal may not
+    # have landed yet when this commit was made.
+    commit_row("job-b")["committed_at"] = "2026-09-07 12:00:04.412000+00"
+elif mutation == "commit-at-restoration-edge":
+    commit_row("job-b")["committed_at"] = "2026-09-07 12:00:48.114000+00"
+elif mutation == "amended-job-row":
+    pre_restoration_drain()
+    commit_row("job-a")["recovered_at"] = "2026-09-07 12:00:51.000000+00"
+elif mutation == "null-commit-time":
+    commit_row("job-b")["committed_at"] = None
+elif mutation == "nonterminal-job-row":
+    commit_row("job-b")["status"] = "running"
+elif mutation == "stray-in-pause-commit":
+    # Not one of this burst's ids, and still a write that landed while the
+    # processes were stopped -- which is what the pause claims is impossible.
+    document["job_commit_times"]["rows"].append({
+        "job_id": "job-from-an-earlier-round",
+        "status": "succeeded",
+        "submitted_at": "2026-09-07 11:59:00+00",
+        "ended_at": "2026-09-07 12:00:20+00",
+        "recovered_at": None,
+        "committed_at": "2026-09-07 12:00:21.330000+00",
+    })
+elif mutation == "uncorrelated-job-row":
+    commit_row("job-b")["job_id"] = "job-from-an-earlier-round"
+elif mutation == "commit-tracking-off":
+    document["job_commit_times"]["track_commit_timestamp"] = "off"
+elif mutation == "commit-query-failed":
+    document["job_commit_times"]["query_status"] = 3
+    document["job_commit_times"]["rows"] = []
+    document["job_commit_times"]["detail"] = "ERROR: could not get commit timestamp data"
+elif mutation == "missing-commit-times":
+    del document["job_commit_times"]
 elif mutation == "delayed-observation":
-    sample = document["samples"][2]
-    for row in sample["backlog"]:
-        row["value"] = 0
-    for row in sample["completions"]:
-        row["value"] += 1
+    # A drain whose scrape predates the pause, with the commit times dropped:
+    # the scrape provenance is the only reading left, and it is not enough to
+    # settle where the write landed.
+    pre_restoration_drain()
+    document["job_commit_times"]["rows"] = []
     outage_at = dt.datetime.fromisoformat(
         document["timestamps"]["outage_started_at"].replace("Z", "+00:00")
     ).timestamp()
     for field in ("backlog", "completions"):
-        for row in sample[field]:
+        for row in document["samples"][2][field]:
             row["sample_time"] = outage_at - 1
 elif mutation == "missing-scrape-time":
     document["samples"][1]["completions"][0]["sample_time"] = None
@@ -543,6 +728,14 @@ else:
     raise SystemExit(f"unknown mutation {mutation}")
 json.dump(document, open(destination, "w", encoding="utf-8"))
 PY
+}
+
+expect_unverified() {
+  local mutation=$1 want=$2
+  local input="$fixture_dir/${mutation}.input.json"
+  local output="$fixture_dir/${mutation}.output.json"
+  local log="$fixture_dir/${mutation}.log" rc=0
+  mutate "$mutation" "$input"
   python3 "$GRADER" "$input" --output "$output" 2>"$log" || rc=$?
   [[ "$rc" -eq 1 ]] || fail "$mutation exited $rc, expected the unverified exit 1"
   grade=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["evidence"]["grade"])' "$output")
@@ -552,11 +745,54 @@ PY
   fixtures=$((fixtures + 1))
 }
 
+# The other half of the reading: a drain observation whose accepted job rows are
+# all dated outside the pause is resolved, not a standing problem. It has to
+# stay a `verified` grade with the resolution recorded, otherwise the commit
+# times are just another unreadable observation.
+expect_resolved() {
+  local mutation=$1
+  local input="$fixture_dir/${mutation}.input.json"
+  local output="$fixture_dir/${mutation}.output.json"
+  local log="$fixture_dir/${mutation}.log"
+  mutate "$mutation" "$input"
+  python3 "$GRADER" "$input" --output "$output" 2>"$log" ||
+    fail "$mutation did not clear the pre-restoration drain: $(cat "$log")"
+  python3 - "$output" <<'PY' || fail "$mutation did not record how the drain was resolved"
+import json, sys
+evidence = json.load(open(sys.argv[1], encoding="utf-8"))["evidence"]
+assert evidence["grade"] == "verified", evidence["problems"]
+drain = evidence["summary"]["pre_restoration_drain"]
+assert drain is not None, evidence["summary"]
+resolution = drain["resolution"]
+assert resolution["state"] == "resolved", resolution
+assert resolution["by"] == "job_commit_times", resolution
+assert "none inside it" in resolution["detail"], resolution
+problems = "\n".join(evidence["problems"])
+assert "the pause window is unexplained" not in problems, problems
+PY
+  fixtures=$((fixtures + 1))
+}
+
 expect_unverified missing-series 'no usable backlog observation'
 expect_unverified no-rise 'no observed unreconciled backlog'
 expect_unverified no-drain 'did not drain after restoration'
 expect_unverified missing-revision 'missing pinned repository revision'
-expect_unverified pre-restoration-drain 'shows zero backlog with completions up by 2 before restoration'
+expect_resolved pre-restoration-drain
+expect_unverified pre-restoration-drain-undated 'shows zero backlog with completions up by 2 before restoration'
+expect_unverified pre-restoration-drain-undated 'no job row for accepted job job-b'
+expect_unverified commit-inside-pause 'job job-b committed at 2026-09-07T12:00:20.551200+00:00, inside the pause window'
+expect_unverified commit-inside-pause 'shows zero backlog with completions up by 2 before restoration'
+expect_unverified commit-at-pause-edge 'within 1s of the pause applied at 2026-09-07T12:00:04+00:00'
+expect_unverified commit-at-restoration-edge 'within 1s of restoration at 2026-09-07T12:00:48+00:00'
+expect_unverified amended-job-row 'may be an amendment of an earlier terminal write'
+expect_unverified amended-job-row 'the pause window is unexplained'
+expect_unverified null-commit-time 'job job-b has no usable commit timestamp'
+expect_unverified nonterminal-job-row "job job-b is 'running' after the recovery window"
+expect_unverified uncorrelated-job-row 'no job row for accepted job job-b'
+expect_unverified stray-in-pause-commit 'job job-from-an-earlier-round committed at 2026-09-07T12:00:21.330000+00:00, inside the pause window'
+expect_unverified commit-tracking-off "track_commit_timestamp='off'"
+expect_unverified commit-query-failed 'the job-row commit-time query did not run'
+expect_unverified missing-commit-times 'missing job-row commit-time observations'
 expect_unverified delayed-observation 'delayed observation of pre-pause work, not a write during the pause'
 expect_unverified missing-scrape-time 'no Prometheus scrape timestamp in 1 of 5 samples'
 expect_unverified missing-process-state 'no usable Postgres process-state observation in 1 of 2 outage samples'

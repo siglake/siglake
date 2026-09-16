@@ -579,9 +579,20 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   restart count across the window; the grader rejects a trace missing any of
   that, and flags an outage sample with zero backlog and rising completions —
   separately when its scrape predates the pause, which makes it delayed
-  observation of pre-pause work rather than a write that landed during it. What
-  happened in run #76 is still unexplained; nothing here establishes a
-  persistence failure.
+  observation of pre-pause work rather than a write that landed during it. The
+  kind Postgres now starts with `track_commit_timestamp=on` (postmaster-only,
+  off by default, set for that throwaway install alone), and the probe dates
+  each job row by `pg_xact_commit_timestamp(xmin)` after the bounded recovery
+  window; the grader correlates those rows with the accepted submissions,
+  reports how many committed inside the pause window, and resolves the
+  zero-backlog observation when every accepted job is dated outside it. That
+  reading is bounded: the commit timestamp dates the row version visible at
+  collection, not every status transition, so a recovered row — which the
+  amendment path can rewrite after it went terminal — a missing row, a NULL
+  timestamp, a nonterminal job, or a commit inside the second the probe's own
+  stamps are truncated to all leave the observation unexplained. No live round
+  has supplied a dated trace yet, so what happened in run #76 is still
+  unexplained; nothing here establishes a persistence failure.
 - **The query server's `/healthz` is a constant 200, so no probe acts on the
   one known query degradation.** `/healthz` answers `ok` for as long as the
   process is serving and `/readyz` only round-trips the catalog. The still-open
