@@ -1376,6 +1376,78 @@ an operator whose only bound was `maxTenants` had none.
   the chart in kind. Single-process demo: `siglake ingest-server
   --with-compactor`, POST OTLP to `/v1/logs`, then `siglake sql`.
 
+## Diagnostics
+
+### The metrics port is node-local, and nothing on it is authenticated
+
+Every role serves `--metrics-bind` (9100 for the ingester, 9101 for the
+compactor, 9105 for the query tier): `/metrics` for Prometheus, `/` as a
+one-line pointer to it, and nothing else in a release build. The compactor's
+liveness probe is a `tcpSocket` against it. None of it checks a token — the
+query tier's bearer tokens and OIDC guard 8089, not this — so **treat the
+metrics port as an internal control surface and do not route it through an
+Ingress or a LoadBalancer.**
+
+The chart's `networkPolicy.enabled` writes an **egress** policy only; there is
+no shipped ingress restriction on the metrics port, so the reachability you get
+is whatever your cluster's default is. A cluster that allows pod-to-pod traffic
+allows scrapes from anywhere in it. Restricting it further is an operator
+decision: your own `NetworkPolicy` admitting only the Prometheus
+ServiceAccount's pods, or no policy and `kubectl port-forward` for ad-hoc
+reads. On the AWS bench stack the security group opens 8088, 8089 and 22 only,
+which is why the port is reachable from the node and its peers and nowhere
+else.
+
+### On-demand profiling and the `PROFILING=1` image
+
+`/debug/pprof/{profile,heap,runtime}` serve a CPU profile (gzipped pprof
+protobuf, 99 Hz, `?seconds=` clamped to 1..=600), a jemalloc heap profile in
+`jeprof` text, and tokio runtime counters as JSON measured over a real window
+(`?seconds=` clamped to 1..=60). They mount on the metrics port because it is
+the one HTTP surface every role shares, so one mount point profiles the
+ingester, the compactor and the query tier. **They are never mounted on the
+public API port:** a CPU profile is a stack-trace oracle and the heap route
+names allocation sites, and neither should be reachable by a caller who is
+merely authorized to query. Everything in the paragraph above about restricting
+the metrics port applies with more force once these are armed.
+
+A released image cannot serve them at all. Reaching them takes both opt-ins,
+which are not redundant:
+
+1. **A build.** `siglake-core`'s `profiling` cargo feature is off by default
+   and no published image sets it, so the code is absent rather than disabled.
+   `deploy/Dockerfile` with `--build-arg PROFILING=1` is the only build that
+   turns it on; it also passes `--cfg tokio_unstable` (without which
+   tokio-metrics reports a much smaller counter set) and
+   `-C force-frame-pointers=yes`, and skips `strip --strip-debug` so profiles
+   resolve to file:line. That DWARF is most of why the image is ~1.95 GB
+   against ~115–123 MB per stripped binary, so it is built on request
+   (`.github/workflows/profiling-image.yml`, `workflow_dispatch`) and tagged
+   `prof-<sha>`, never published as a release image.
+2. **An operator.** Even that image mounts nothing until
+   `SIGLAKE_PPROF_ENABLED=1` is set in the process environment; any other
+   value, including a misspelling, leaves the routes absent. A disarmed
+   profiler answers `404`, which is what lets a profiling round refuse at its
+   readback gate instead of capturing nothing.
+
+A feature flag alone would be too easy to ship by accident; an env var alone
+could not remove the code. The pair is the contract, and neither half is
+scheduled to become a default.
+
+One capture runs at a time, CPU or heap: a heap dump walks allocator state
+while the CPU profiler's `SIGPROF` handler interrupts threads, so a second
+request of either kind is refused with `409` rather than interleaved. The
+admission ticket releases on drop, so a client that hangs up mid-window leaves
+the endpoint usable.
+
+The heap route needs one more thing the image cannot give it: the process must
+have **started** with `_RJEM_MALLOC_CONF=prof:true,prof_active:true` — prefixed,
+because `tikv-jemalloc-sys` builds jemalloc with a prefixed symbol namespace and
+ignores the plain `MALLOC_CONF`. jemalloc samples only while `prof.active` is
+true and a dump reports live sampled allocations, so arming it at dump time
+would report a near-empty heap; the handler therefore only dumps, and answers
+`412` naming what is missing when sampling was never on.
+
 ## Performance (measured on AWS, 3-node clusters)
 
 Benchmarks against Quickwit, Elasticsearch, ClickHouse, and a
