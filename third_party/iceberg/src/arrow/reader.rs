@@ -2428,20 +2428,24 @@ impl ArrowReader {
             let input = file_io.new_input(path)?;
             let reader = PuffinReader::new(input);
             let blob = reader.blob(&blob_metadata).await?;
+            PUFFIN_BLOB_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             record_text_index_stage(
                 TEXT_INDEX_STAGE_BLOB_FETCH,
                 TEXT_INDEX_STORAGE_PUFFIN,
                 fetched.elapsed(),
             );
-            if !cache_bypass {
+            // Decode first, then keep the bytes: the blob cache's eviction
+            // reads which files the parsed cache holds (#4182), and this file
+            // has to be one of them before it can be told apart from the
+            // entries whose parsed twin has already gone. A blob that did not
+            // decode — or whose index does not cover `file_rows` — is not kept
+            // at all: it would occupy the budget as a re-parse source for a
+            // parse that is rejected again.
+            let index = Self::decode_and_cache_index(key, blob.data(), cache_bypass, file_rows);
+            if !cache_bypass && index.is_some() {
                 puffin_blob_cache_put(path, offset, blob.data());
             }
-            return Ok(Self::decode_and_cache_index(
-                key,
-                blob.data(),
-                cache_bypass,
-                file_rows,
-            ));
+            return Ok(index);
         }
         Ok(None)
     }
@@ -4668,7 +4672,8 @@ async fn puffin_file_metadata_cached(
 /// deserialization (242 ms for a 7.3M-row file) without the object-store fetch
 /// that precedes it (81 MB for the same file). That is only worth the memory if
 /// the two caches cover the same files, which is what the byte bound below is
-/// sized for.
+/// sized for — and what [`blob_cache_victim`] enforces when they cannot both
+/// cover the plan.
 #[derive(Default)]
 struct PuffinBlobCacheInner {
     order: std::collections::VecDeque<(String, u64)>,
@@ -4681,28 +4686,77 @@ impl PuffinBlobCacheInner {
         self.map.get(key).cloned()
     }
 
-    /// Insert under both bounds. Eviction is first-in-first-out: a blob's value
-    /// does not grow with use the way a parsed index's does, and re-reading one
-    /// costs a fetch, not a decode.
-    fn put(&mut self, key: (String, u64), blob: Arc<[u8]>, max_bytes: usize, max_entries: usize) {
+    /// Insert under both bounds, dropping whatever [`blob_cache_victim`] names
+    /// until the incoming blob fits.
+    ///
+    /// Room is made BEFORE the insert, so the incoming blob is never a
+    /// candidate victim. It could not be a good one: its parsed twin was just
+    /// admitted, which is precisely the state in which a blob cannot be read.
+    fn put(
+        &mut self,
+        key: (String, u64),
+        blob: Arc<[u8]>,
+        max_bytes: usize,
+        max_entries: usize,
+        parsed_twins: &std::collections::HashMap<(String, u64), usize>,
+    ) {
         let size = blob.len();
         // A blob larger than the whole budget would evict everything else and
         // then be evicted itself: leave it to be fetched per decode.
-        if size > max_bytes || self.map.contains_key(&key) {
+        if max_entries == 0 || size > max_bytes || self.map.contains_key(&key) {
             return;
         }
-        self.map.insert(key.clone(), blob);
-        self.order.push_back(key);
-        self.bytes += size;
-        while self.order.len() > max_entries || self.bytes > max_bytes {
-            let Some(evicted) = self.order.pop_front() else {
+        while self.order.len() + 1 > max_entries || self.bytes + size > max_bytes {
+            let Some(position) = blob_cache_victim(&self.order, parsed_twins) else {
+                break;
+            };
+            let Some(evicted) = self.order.remove(position) else {
                 break;
             };
             if let Some(blob) = self.map.remove(&evicted) {
                 self.bytes -= blob.len();
             }
         }
+        self.map.insert(key.clone(), blob);
+        self.order.push_back(key);
+        self.bytes += size;
     }
+}
+
+/// Which entry this cache should drop to make room, as a position in `order`.
+///
+/// WHY NOT FIRST-IN-FIRST-OUT (#4182). A warm query is served by the parsed
+/// cache and never looks here, so a blob whose parsed twin is resident cannot
+/// be read at all — it is dead weight until its twin is evicted. FIFO ignored
+/// that, and a blob's turn at the front of the queue is exactly when its twin
+/// has just left the parsed cache: run #81's `keyword_and_label` plan, 14
+/// indexed files against caches holding about seven each, re-fetched every
+/// blob on every execution (4.60 GB over 183 index-phase reads, against 0.50
+/// GB over 73 for the same plan under the entry bound this byte bound
+/// replaced). A blob was evicted one step before the query that wanted it.
+///
+/// So: drop a blob whose twin is resident, and among those the one whose twin
+/// sits furthest from the parsed cache's eviction end — the one that stays
+/// unreadable longest. `parsed_twins` maps each resident Puffin entry to its
+/// position in the parsed LRU queue, 0 being the next eviction.
+///
+/// With every resident blob live — a parsed budget far below this one, or a
+/// parsed cache turned off — there is nothing redundant to drop and this falls
+/// back to FIFO, which is what every eviction used to be. It never declines
+/// the incoming blob: a cache that refuses to evict retains the blobs of files
+/// the plan has stopped reading, and this one has no way to tell that a file is
+/// gone.
+fn blob_cache_victim(
+    order: &std::collections::VecDeque<(String, u64)>,
+    parsed_twins: &std::collections::HashMap<(String, u64), usize>,
+) -> Option<usize> {
+    let redundant = order
+        .iter()
+        .enumerate()
+        .filter_map(|(position, key)| parsed_twins.get(key).map(|rank| (*rank, position)))
+        .max()
+        .map(|(_, position)| position);
+    redundant.or_else(|| (!order.is_empty()).then_some(0))
 }
 
 static PUFFIN_BLOB_CACHE: std::sync::OnceLock<std::sync::Mutex<PuffinBlobCacheInner>> =
@@ -4854,10 +4908,14 @@ fn puffin_blob_cache_get(path: &str, offset: u64) -> Option<Arc<[u8]>> {
     if puffin_blob_cache_max_entries() == 0 || puffin_blob_cache_max_bytes() == 0 {
         return None;
     }
-    puffin_blob_cache()
+    let hit = puffin_blob_cache()
         .lock()
         .unwrap()
-        .get(&(path.to_string(), offset))
+        .get(&(path.to_string(), offset));
+    if hit.is_some() {
+        PUFFIN_BLOB_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    hit
 }
 
 fn puffin_blob_cache_put(path: &str, offset: u64, bytes: &[u8]) {
@@ -4868,12 +4926,37 @@ fn puffin_blob_cache_put(path: &str, offset: u64, bytes: &[u8]) {
     if max_entries == 0 || max_bytes == 0 || bytes.len() > max_bytes {
         return;
     }
+    let parsed_twins = parsed_index_puffin_twin_ranks();
     puffin_blob_cache().lock().unwrap().put(
         (path.to_string(), offset),
         Arc::<[u8]>::from(bytes),
         max_bytes,
         max_entries,
+        &parsed_twins,
     );
+}
+
+/// Which Puffin entries the parsed-index cache holds, and where each sits in
+/// its LRU queue (0 = next to be evicted). What [`blob_cache_victim`] reads.
+///
+/// Taken while the blob cache is UNLOCKED, and released before it is locked:
+/// the two caches' locks are never held at once, in either order, so coupling
+/// their eviction adds no lock cycle. A footer-KV entry is not listed — it has
+/// no blob here to be redundant with. The clone costs one pass over at most
+/// `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_ENTRIES` keys, on a path that has just paid
+/// an object-store fetch.
+fn parsed_index_puffin_twin_ranks() -> std::collections::HashMap<(String, u64), usize> {
+    parsed_index_cache()
+        .lock()
+        .unwrap()
+        .order
+        .iter()
+        .enumerate()
+        .filter_map(|(rank, key)| match key {
+            ParsedIndexKey::Puffin { path, offset } => Some(((path.clone(), *offset), rank)),
+            ParsedIndexKey::FooterKv { .. } => None,
+        })
+        .collect()
 }
 
 /// Which write-once identity a parsed index is held under. Both storage shapes
@@ -5153,6 +5236,28 @@ fn parsed_index_cache() -> &'static std::sync::Mutex<ParsedIndexCacheInner> {
 static INVERTED_INDEX_DECODES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static INVERTED_INDEX_CACHE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+static PUFFIN_BLOB_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PUFFIN_BLOB_CACHE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many index blobs this process has read from object storage, and how many
+/// decodes were handed bytes the blob cache still held instead.
+///
+/// The second number is what the blob cache exists for, and the first is what
+/// it is meant to stop growing: a plan whose indexed files exceed the parsed
+/// budget re-parses per execution either way, but it should not re-FETCH per
+/// execution (#4182). Diagnostics for tests and local measurement — not a
+/// metric, and not exported; a round reads the same fact off
+/// `siglake_object_store_read_bytes_total{phase="index"}` against
+/// `siglake_iceberg_parsed_index_cache_lookups_total{outcome="miss"}`.
+pub fn puffin_blob_fetch_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PUFFIN_BLOB_FETCHES.load(Relaxed),
+        PUFFIN_BLOB_CACHE_HITS.load(Relaxed),
+    )
+}
 
 /// How many whole per-file inverted indexes this process has deserialized, and
 /// how many query-time lookups were served from the parsed-index cache instead.
@@ -6686,17 +6791,22 @@ message schema {
     /// An index blob is data-sized — 81 MB for a 7.3M-row file — so the entry
     /// count alone never bounded what this holds. Bytes and entries both cap
     /// it, and the byte total tracks insertions and evictions exactly.
+    ///
+    /// Every insert here passes an empty twin map: with the parsed cache
+    /// holding none of these files, [`blob_cache_victim`] is first-in-
+    /// first-out, which is the rule these bounds were written against.
     #[test]
     fn puffin_blob_cache_honours_both_bounds() {
         use crate::arrow::reader::PuffinBlobCacheInner;
 
         let blob = |size: usize| Arc::<[u8]>::from(vec![7u8; size]);
         let key = |n: u64| (format!("s3://bucket/stats-{n}.puffin"), n);
+        let no_twins = std::collections::HashMap::new();
 
         // Byte bound: room for two 100-byte blobs, the third evicts the first.
         let mut cache = PuffinBlobCacheInner::default();
         for n in 0..3 {
-            cache.put(key(n), blob(100), 200, 128);
+            cache.put(key(n), blob(100), 200, 128, &no_twins);
         }
         assert!(cache.get(&key(0)).is_none(), "oldest entry evicted");
         assert!(cache.get(&key(1)).is_some());
@@ -6704,7 +6814,7 @@ message schema {
         assert_eq!(cache.bytes, 200);
 
         // One oversized blob does not evict the entries that fit.
-        cache.put(key(3), blob(201), 200, 128);
+        cache.put(key(3), blob(201), 200, 128, &no_twins);
         assert!(cache.get(&key(3)).is_none(), "oversized blob refused");
         assert!(cache.get(&key(1)).is_some(), "survivors kept");
         assert_eq!(cache.bytes, 200);
@@ -6712,7 +6822,7 @@ message schema {
         // Entry bound, independent of bytes.
         let mut cache = PuffinBlobCacheInner::default();
         for n in 0..3 {
-            cache.put(key(n), blob(100), usize::MAX, 2);
+            cache.put(key(n), blob(100), usize::MAX, 2, &no_twins);
         }
         assert!(cache.get(&key(0)).is_none());
         assert!(cache.get(&key(1)).is_some());
@@ -6721,14 +6831,228 @@ message schema {
         // A repeat insert neither duplicates nor double-counts, and eviction
         // returns the bytes it took.
         let mut cache = PuffinBlobCacheInner::default();
-        cache.put(key(0), blob(100), usize::MAX, 2);
-        cache.put(key(0), blob(100), usize::MAX, 2);
+        cache.put(key(0), blob(100), usize::MAX, 2, &no_twins);
+        cache.put(key(0), blob(100), usize::MAX, 2, &no_twins);
         assert_eq!(cache.order.len(), 1);
         assert_eq!(cache.bytes, 100);
-        cache.put(key(1), blob(50), usize::MAX, 2);
-        cache.put(key(2), blob(50), usize::MAX, 2);
+        cache.put(key(1), blob(50), usize::MAX, 2, &no_twins);
+        cache.put(key(2), blob(50), usize::MAX, 2, &no_twins);
         assert_eq!(cache.bytes, 100, "evicting the 100-byte entry frees 100");
         assert!(cache.get(&key(0)).is_none());
+    }
+
+    /// Which entry a full blob cache drops, entry by entry.
+    #[test]
+    fn blob_cache_victim_spares_the_blobs_the_parsed_cache_has_dropped() {
+        use crate::arrow::reader::blob_cache_victim;
+
+        let key = |n: u64| (format!("s3://bucket/stats-{n}.puffin"), n);
+        let order: std::collections::VecDeque<(String, u64)> = (0..4).map(key).collect();
+
+        // Nothing resident: first-in-first-out, as before #4182.
+        assert_eq!(
+            blob_cache_victim(&order, &std::collections::HashMap::new()),
+            Some(0)
+        );
+        assert_eq!(
+            blob_cache_victim(&std::collections::VecDeque::new(), &[(key(0), 0)].into()),
+            None,
+            "an empty cache has nothing to drop"
+        );
+
+        // Entries 1 and 3 are covered by a parsed entry and cannot be read
+        // while it lives; 3's twin is furthest from the parsed cache's
+        // eviction end, so 3 is the one that stays unreadable longest.
+        let twins: std::collections::HashMap<(String, u64), usize> =
+            [(key(1), 0), (key(3), 1)].into();
+        assert_eq!(blob_cache_victim(&order, &twins), Some(3));
+
+        // With only the front entry covered, FIFO and this rule agree.
+        let twins: std::collections::HashMap<(String, u64), usize> = [(key(0), 5)].into();
+        assert_eq!(blob_cache_victim(&order, &twins), Some(0));
+
+        // Every entry live: there is no redundant blob to drop and the rule
+        // falls back to FIFO rather than declining to cache anything.
+        let twins: std::collections::HashMap<(String, u64), usize> = [(key(9), 0)].into();
+        assert_eq!(blob_cache_victim(&order, &twins), Some(0));
+    }
+
+    /// Both caches and the two arms' worth of budget, for replaying a fixed
+    /// text plan through them.
+    ///
+    /// `coupled` is the arm switch. `false` is the pre-#4182 path — the blob
+    /// cached before its parsed twin is admitted, and evicted first-in-
+    /// first-out — reached through the same code by handing the eviction an
+    /// empty twin map.
+    struct ReplayedCaches {
+        parsed: crate::arrow::reader::ParsedIndexCacheInner,
+        blobs: crate::arrow::reader::PuffinBlobCacheInner,
+        index: Arc<siglake_index::InvertedIndex>,
+        parsed_max_bytes: usize,
+        blob_max_bytes: usize,
+        blob_len: usize,
+        coupled: bool,
+    }
+
+    impl ReplayedCaches {
+        fn new(index: &Arc<siglake_index::InvertedIndex>, held: usize, coupled: bool) -> Self {
+            // Round-81 proportions: a blob is about a quarter of its parsed
+            // form, and each cache holds `held` of them.
+            let parsed_size = index.heap_size_bytes();
+            let blob_len = parsed_size / 4;
+            Self {
+                parsed: Default::default(),
+                blobs: Default::default(),
+                index: Arc::clone(index),
+                parsed_max_bytes: parsed_size * held,
+                blob_max_bytes: blob_len * held,
+                blob_len,
+                coupled,
+            }
+        }
+
+        /// One pass of a plan over `files` indexed files, driven the way
+        /// `puffin_inverted_index` drives these caches: parsed lookup, then the
+        /// blob cache, then a fetch. Returns the fetches the pass paid.
+        fn pass(&mut self, files: u64) -> usize {
+            use crate::arrow::reader::ParsedIndexKey;
+
+            let mut fetches = 0;
+            for file in 0..files {
+                let path = format!("s3://bucket/stats-{file}.puffin");
+                let parsed_key = ParsedIndexKey::puffin(&path, file);
+                if self.parsed.get(&parsed_key).is_some() {
+                    continue;
+                }
+                let blob_key = (path, file);
+                let had_blob = self.blobs.get(&blob_key).is_some();
+                if !had_blob {
+                    fetches += 1;
+                }
+                let blob = Arc::<[u8]>::from(vec![7u8; self.blob_len]);
+                let keep_blob = |caches: &mut Self| {
+                    if !had_blob {
+                        let twins = caches.twin_ranks();
+                        caches.blobs.put(
+                            blob_key,
+                            blob,
+                            caches.blob_max_bytes,
+                            128,
+                            &twins,
+                        );
+                    }
+                };
+                if self.coupled {
+                    self.parsed.put(
+                        parsed_key,
+                        Arc::clone(&self.index),
+                        self.parsed_max_bytes,
+                        128,
+                    );
+                    keep_blob(self);
+                } else {
+                    keep_blob(self);
+                    self.parsed.put(
+                        parsed_key,
+                        Arc::clone(&self.index),
+                        self.parsed_max_bytes,
+                        128,
+                    );
+                }
+            }
+            fetches
+        }
+
+        /// `parsed_index_puffin_twin_ranks` over these caches, or the empty map
+        /// the uncoupled arm evicts against.
+        fn twin_ranks(&self) -> std::collections::HashMap<(String, u64), usize> {
+            use crate::arrow::reader::ParsedIndexKey;
+
+            if !self.coupled {
+                return std::collections::HashMap::new();
+            }
+            self.parsed
+                .order
+                .iter()
+                .enumerate()
+                .filter_map(|(rank, key)| match key {
+                    ParsedIndexKey::Puffin { path, offset } => {
+                        Some(((path.clone(), *offset), rank))
+                    }
+                    ParsedIndexKey::FooterKv { .. } => None,
+                })
+                .collect()
+        }
+    }
+
+    /// #4182: a text plan whose indexed files exceed BOTH caches re-fetched
+    /// every index blob on every execution — run #81's `keyword_and_label`
+    /// read 4.60 GB over 183 index-phase reads where the same plan had read
+    /// 0.50 GB over 73.
+    ///
+    /// THE DEFECT THIS GUARDS. The blob cache is a re-parse source: it is read
+    /// only when the parsed twin is gone. Evicting first-in-first-out dropped
+    /// each blob one step BEFORE the execution that wanted it, because a
+    /// blob's turn at the front of the queue is when its twin has just left
+    /// the parsed cache. Replay a fixed plan — the same files in the same
+    /// order, as a repeat text suite does — and count the fetches per pass.
+    ///
+    /// The first arm is the negative control: it is the rule this replaced, and
+    /// it pays a fetch for every file on every pass. Both arms decode every
+    /// file every pass; that is the parsed budget's business (#4102), not this
+    /// one's.
+    #[test]
+    fn a_plan_larger_than_both_caches_stops_refetching_every_blob() {
+        let index = Arc::new(siglake_index::InvertedIndex::from_rows([
+            "database timeout on shard four",
+            "request complete in 41ms",
+            "cache eviction chose a live blob",
+        ]));
+        let held = 7;
+
+        // Measured 2026-09-16 over six passes, `held` = 7 of each form. What a
+        // repeat pass fetches, coupled, is the plan's excess over the blob
+        // budget and nothing more — the budget's nominal coverage, which FIFO
+        // delivered none of once the plan outgrew it:
+        //
+        // | indexed files | 4 | 7 | 8 | 10 | 14 | 18 | 24 | 28 |
+        // |---|---|---|---|---|---|---|---|---|
+        // | FIFO (before) | 0 | 0 | 8 | 10 | 14 | 18 | 24 | 28 |
+        // | coupled       | 0 | 0 | 1 |  3 |  7 | 11 | 17 | 21 |
+        //
+        // Zero is reached only while the plan fits the PARSED budget (the first
+        // two columns), which is the sizing question on #4102; both arms decode
+        // every file on every pass beyond it.
+        for files in [4u64, 7, 8, 10, 14, 18, 24, 28] {
+            let excess = files as usize - (files as usize).min(held);
+            for coupled in [false, true] {
+                let mut caches = ReplayedCaches::new(&index, held, coupled);
+                let passes: Vec<usize> = (0..6).map(|_| caches.pass(files)).collect();
+                assert_eq!(
+                    passes[0], files as usize,
+                    "files={files} coupled={coupled}: the first pass is cold"
+                );
+                assert!(
+                    caches.blobs.bytes <= caches.blob_max_bytes
+                        && caches.parsed.bytes <= caches.parsed_max_bytes,
+                    "files={files} coupled={coupled}: both caches stay inside their \
+                     budgets ({} B of blobs, {} B parsed)",
+                    caches.blobs.bytes,
+                    caches.parsed.bytes
+                );
+                let repeats: Vec<usize> = passes[1..].to_vec();
+                let expected = if coupled || excess == 0 {
+                    excess
+                } else {
+                    files as usize
+                };
+                assert!(
+                    repeats.iter().all(|fetches| *fetches == expected),
+                    "files={files} coupled={coupled}: every repeat pass must fetch \
+                     {expected}, not {repeats:?}"
+                );
+            }
+        }
     }
 
     /// #3896 replaced "complement of the matches as a delete vector" with a
