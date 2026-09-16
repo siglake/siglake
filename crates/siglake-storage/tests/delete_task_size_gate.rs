@@ -41,6 +41,13 @@ use siglake_storage::iceberg::{
     DeleteTaskState, IcebergContext, IcebergTuning, GROUP_COUNTS_KV_KEY, TIME_BUCKETS_KV_KEY,
 };
 
+/// The `--test storage` binary's fixture clock, included rather than copied:
+/// the fixtures below count files and rewrites per candidate too, so they take
+/// their event timestamps from the same fixed UTC day.
+#[path = "storage/fixture_clock.rs"]
+mod fixture_clock;
+use fixture_clock::fixture_base;
+
 /// Peak live heap bytes between [`start_tracking`] and [`peak_tracked`].
 ///
 /// A test-only wrapper around the system allocator. Tracking is off unless a
@@ -321,7 +328,7 @@ fn the_streaming_arm_deletes_exactly_the_matching_rows() {
             .with_tuning(force_streaming());
         ice.create_index(&config).await.unwrap();
 
-        let now = Utc::now();
+        let now = fixture_base();
         append_index_events(
             &ice,
             &config,
@@ -398,7 +405,7 @@ fn the_row_cap_is_the_boundary_between_the_two_arms() {
                 });
             ice.create_index(&config).await.unwrap();
 
-            let now = Utc::now();
+            let now = fixture_base();
             let events: Vec<Event> = (0..rows)
                 .map(|i| {
                     let host = if i == 0 { "victim" } else { "keep" };
@@ -476,7 +483,7 @@ fn a_streamed_whole_file_delete_writes_no_survivor_file() {
             .with_tuning(force_streaming());
         ice.create_index(&config).await.unwrap();
 
-        let now = Utc::now();
+        let now = fixture_base();
         append_index_events(
             &ice,
             &config,
@@ -526,7 +533,7 @@ fn a_refused_predicate_on_the_streaming_arm_deletes_nothing() {
             .with_tuning(force_streaming());
         ice.create_index(&config).await.unwrap();
 
-        let now = Utc::now();
+        let now = fixture_base();
         append_index_events(
             &ice,
             &config,
@@ -589,7 +596,7 @@ fn a_guard_failure_mid_write_commits_no_partial_deletion() {
             .with_tuning(force_streaming());
         ice.create_index(&config).await.unwrap();
 
-        let now = Utc::now();
+        let now = fixture_base();
         let events: Vec<Event> = (0..ROWS)
             .map(|i| {
                 event(
@@ -642,6 +649,13 @@ fn a_guard_failure_mid_write_commits_no_partial_deletion() {
 
 /// Peak live heap across one delete sweep over a fixture of `rows` rows of
 /// `raw_len`-byte raw text, plus the decoded size of that fixture.
+///
+/// One row per second, so the 64 Ki fixture spans 18 hours and the
+/// `day(timestamp)` partition splits it into two candidate files, while 16 Ki
+/// and 32 Ki fit inside one. Off `Utc::now()` which of the three split depended
+/// on the hour the measurement ran; off [`fixture_base`] the split is the same
+/// on every run. [`measure_peak_allocation_per_arm`] records what that costs
+/// the reading.
 async fn sweep_peak(rows: usize, raw_len: usize, tuning: IcebergTuning) -> (usize, usize) {
     let raw: String = "x".repeat(raw_len);
     let tmp = tempfile::tempdir().unwrap();
@@ -653,7 +667,7 @@ async fn sweep_peak(rows: usize, raw_len: usize, tuning: IcebergTuning) -> (usiz
         .with_tuning(tuning);
     ice.create_index(&config).await.unwrap();
 
-    let now = Utc::now();
+    let now = fixture_base();
     let events: Vec<Event> = (0..rows)
         .map(|i| {
             let host = if i % 2 == 0 { "victim" } else { "keep" };
@@ -690,21 +704,35 @@ async fn sweep_peak(rows: usize, raw_len: usize, tuning: IcebergTuning) -> (usiz
 /// ```
 ///
 /// What it records is net heap growth across one delete sweep, per arm, over
-/// the same fixture. Measured 2026-09-11 (debug build, 1 KiB of raw text per
-/// row, half the rows deleted):
+/// the same fixture. Measured 2026-09-16 (debug build, 1 KiB of raw text per
+/// row, half the rows deleted), off the fixed [`fixture_base`] and so
+/// repeatable, which the 2026-09-11 numbers it replaces were not — those were
+/// taken off `Utc::now()`, where the hour of the run decided how the day
+/// partition split the fixture:
 ///
 /// ```text
 /// rows    decoded    in-RAM peak   streaming peak
-/// 16 Ki   19.7 MB    54.1 MB       27.3 MB
-/// 32 Ki   39.3 MB    95.1 MB       36.7 MB
-/// 64 Ki   78.7 MB   102.3 MB       36.9 MB
+/// 16 Ki   19.7 MB    54.2 MB       27.4 MB
+/// 32 Ki   39.3 MB    95.1 MB       36.9 MB
+/// 64 Ki   78.7 MB   125.4 MB       41.6 MB
 /// ```
 ///
 /// The shape is the point, not the absolute bytes (freeing memory allocated
-/// before the sweep started biases every number down): the streaming arm is
-/// FLAT — the file doubles from 32 Ki to 64 Ki rows and its peak moves by
-/// 0.5% — while the in-RAM arm tracks the candidate. That flat line is what
-/// keeps a cold-target candidate inside a 1Gi compactor.
+/// before the sweep started biases every number down): the fixture doubles
+/// from 32 Ki to 64 Ki rows and the streaming arm's peak moves 13% while the
+/// in-RAM arm's tracks the candidate. That near-flat line is what keeps a
+/// cold-target candidate inside a 1Gi compactor.
+///
+/// HOW MUCH OF IT IS THE FIXTURE (#3999). [`sweep_peak`] spaces its rows one
+/// second apart, so the 64 Ki fixture spans 18 hours and arrives as TWO
+/// day-partitioned candidate files where 32 Ki arrives as one. Spacing the
+/// same 64 Ki rows a millisecond apart to make one candidate of them, measured
+/// 2026-09-16, puts the streaming arm at 55.7 MB against 36.9 MB at 32 Ki: it
+/// grows with the candidate, sublinearly (2x the rows, 1.5x the peak), and the
+/// first assertion below fails. So part of the near-flat line is the split,
+/// and nothing here yet says what one whole cold-target candidate costs the
+/// streaming arm. Left as recorded rather than redefined: what the gate should
+/// measure is a design question, not a fixture-hardening one (#4703).
 #[ignore]
 #[test]
 fn measure_peak_allocation_per_arm() {
@@ -762,7 +790,7 @@ fn a_streamed_delete_rewrite_output_carries_no_inline_index() {
             });
         ice.create_index(&config).await.unwrap();
 
-        let now = Utc::now();
+        let now = fixture_base();
         append_index_events(
             &ice,
             &config,
@@ -870,7 +898,7 @@ fn a_streamed_delete_rewrite_with_rebuild_off_carries_no_index_at_all() {
             });
         ice.create_index(&config).await.unwrap();
 
-        let now = Utc::now();
+        let now = fixture_base();
         append_index_events(
             &ice,
             &config,

@@ -28,9 +28,13 @@ pub fn fixture_base() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2023, 11, 15, 12, 0, 0).unwrap()
 }
 
-/// How far a fixture may reach off [`fixture_base`] in either direction. The
-/// widest window today is the two hours `delete_task_claim::seed_with_predicate`
-/// reaches back.
+/// How far a fixture that needs its rows in one file may reach off
+/// [`fixture_base`] in either direction. The widest such window today is the
+/// two hours `delete_task_claim::seed_with_predicate` reaches back.
+///
+/// A fixture is free to span more than this and take the split — the 18-hour
+/// one in `tests/delete_task_size_gate.rs` does — as long as it says so and its
+/// assertions hold for it. What the base must not do is decide that for them.
 const MARGIN_HOURS: i64 = 3;
 
 /// Moving [`fixture_base`] to within [`MARGIN_HOURS`] of a UTC midnight puts
