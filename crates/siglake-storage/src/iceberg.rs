@@ -11470,11 +11470,19 @@ impl IcebergContext {
                 // one a repair must not make on its own.
                 GroupCountRebuildOptions::default(),
                 &BTreeMap::new(),
-                // Recompute the sketches too. The rebuild's watermark makes
-                // every delta at or below it redundant and the fold deletes
-                // them, so a sketch left at its last stored state would be
-                // permanently short by whatever was outstanding.
-                Some(&BTreeSet::new()),
+                // NOT the sketches. Asking for them recomputes every sketched
+                // column from the files and fails the WHOLE rebuild on the
+                // first one the files cannot serve — which on the events table
+                // is `timestamp_ns` the moment its per-row-unique values get it
+                // demoted, so the repair would never complete on the table that
+                // needs it most. The cost of leaving them is bounded: a sketch
+                // stays at its last stored state, so it misses whatever was
+                // outstanding when the rebuild ran (nothing, on the idle cycle
+                // this pass shares with the fold that just absorbed them), and
+                // an under-counted Misra-Gries summary reports its own
+                // `rows_accounted`. The exact columns are the ones Tier-1
+                // serves, and they are rebuilt from the files.
+                None,
                 Some(&short),
             )
             .await

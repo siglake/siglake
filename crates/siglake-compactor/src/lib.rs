@@ -5863,6 +5863,94 @@ mod agg_fold_tests {
             "the base compactor must discover and repair the tenant namespace"
         );
     }
+
+    /// #3000 through the compactor's own plumbing: a tenant table short with no
+    /// marker anywhere. The storage tests cover the census's rules; what this
+    /// covers is that the pass reaches a `tenant_*` namespace at all, and that
+    /// its budget is what decides whether any file is read.
+    ///
+    /// The cardinality here (8,192 against 8,200 distinct hosts over the two
+    /// commits) also puts a DEMOTED sketch column in the folded base, which is
+    /// the state the repair must survive — see the `None` sketch argument in
+    /// `repair_short_group_count_aggregate`.
+    #[tokio::test]
+    async fn the_short_aggregate_census_reaches_tenant_namespaces_under_its_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("warehouse");
+        let base = Arc::new(IcebergContext::open(&warehouse).await.unwrap().with_tuning(
+            IcebergTuning {
+                table_group_count_cardinality: Some(8_192),
+                result_caches: Some(false),
+                ..Default::default()
+            },
+        ));
+        let tenant = base.for_namespace("tenant_acme").await.unwrap();
+        let commit = |nth: usize| -> Vec<Event> {
+            (0..4_100)
+                .map(|i| {
+                    let mut event = Event::now(format!("row {nth}-{i}"));
+                    event.host = format!("host-{nth}-{i:04}");
+                    event
+                })
+                .collect()
+        };
+        tenant.append_events(&commit(0)).await.unwrap();
+        // No marker: the first commit's contribution simply vanishes, the way a
+        // process killed between its commit and its delta PUT leaves it. The
+        // second commit's delta lands, so nothing outstanding explains the gap.
+        let mut deltas: Vec<_> = walk_files(&warehouse)
+            .into_iter()
+            .filter(|path| {
+                path.to_string_lossy().contains("tenant_acme")
+                    && path.to_string_lossy().contains("siglake-agg-deltas")
+            })
+            .collect();
+        assert_eq!(deltas.len(), 1, "precondition: one commit, one delta");
+        std::fs::remove_file(deltas.pop().unwrap()).unwrap();
+        tenant.append_events(&commit(1)).await.unwrap();
+        tenant
+            .invalidate_cached_table(tenant.events_table_ident())
+            .await;
+        assert_eq!(
+            tenant
+                .grouped_counts_with_summary("events", "host", None, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .source_label(),
+            "materialized",
+            "precondition: short, and no marker to explain it"
+        );
+
+        let compactor = Compactor::new(tmp.path().join("wal"), base);
+        // A census with no budget reports and reads nothing — the default
+        // install, where the counter and the alert are the whole output.
+        compactor.run_agg_short_repair_once(0).await;
+        assert!(
+            !walk_files(&warehouse).iter().any(|path| path
+                .file_name()
+                .is_some_and(|name| name == "siglake-agg-wide.json")),
+            "a census with no repair budget must not write a base object"
+        );
+
+        compactor.run_agg_short_repair_once(1).await;
+        // This handle is a different `IcebergContext` from the one the pass
+        // opened for the namespace, and holds its own memo of the folded base —
+        // as a query pod in another process would.
+        tenant
+            .invalidate_cached_table(tenant.events_table_ident())
+            .await;
+        assert_eq!(
+            tenant
+                .grouped_counts_with_summary("events", "host", None, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .source_label(),
+            "tier1_wide",
+            "with a budget, the tenant namespace's short aggregate is rebuilt"
+        );
+    }
 }
 
 #[cfg(test)]
