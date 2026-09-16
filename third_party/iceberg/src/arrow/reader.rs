@@ -4677,13 +4677,31 @@ async fn puffin_file_metadata_cached(
 #[derive(Default)]
 struct PuffinBlobCacheInner {
     order: std::collections::VecDeque<(String, u64)>,
-    map: std::collections::HashMap<(String, u64), Arc<[u8]>>,
+    map: std::collections::HashMap<(String, u64), PuffinBlobEntry>,
     bytes: usize,
+    /// Blobs this cache has admitted: its own clock, which ticks with the work
+    /// it is there to avoid. [`blob_cache_victim`] measures an entry's age on
+    /// it, so a cache that nothing is inserting into ages nothing out.
+    admitted: u64,
+}
+
+struct PuffinBlobEntry {
+    blob: Arc<[u8]>,
+    /// The `admitted` count when this entry last did something — entered the
+    /// cache, or handed its bytes to a decode.
+    active: u64,
 }
 
 impl PuffinBlobCacheInner {
-    fn get(&self, key: &(String, u64)) -> Option<Arc<[u8]>> {
-        self.map.get(key).cloned()
+    /// A read renews the entry: this is the one event that proves a blob was
+    /// worth keeping, and eviction reads it back through
+    /// [`PuffinBlobEntry::active`].
+    fn get(&mut self, key: &(String, u64)) -> Option<Arc<[u8]>> {
+        let admitted = self.admitted;
+        self.map.get_mut(key).map(|entry| {
+            entry.active = admitted;
+            Arc::clone(&entry.blob)
+        })
     }
 
     /// Insert under both bounds, dropping whatever [`blob_cache_victim`] names
@@ -4707,17 +4725,23 @@ impl PuffinBlobCacheInner {
             return;
         }
         while self.order.len() + 1 > max_entries || self.bytes + size > max_bytes {
-            let Some(position) = blob_cache_victim(&self.order, parsed_twins) else {
+            let Some(position) =
+                blob_cache_victim(&self.order, &self.map, parsed_twins, self.admitted)
+            else {
                 break;
             };
             let Some(evicted) = self.order.remove(position) else {
                 break;
             };
-            if let Some(blob) = self.map.remove(&evicted) {
-                self.bytes -= blob.len();
+            if let Some(entry) = self.map.remove(&evicted) {
+                self.bytes -= entry.blob.len();
             }
         }
-        self.map.insert(key.clone(), blob);
+        self.admitted += 1;
+        self.map.insert(key.clone(), PuffinBlobEntry {
+            blob,
+            active: self.admitted,
+        });
         self.order.push_back(key);
         self.bytes += size;
     }
@@ -4735,28 +4759,60 @@ impl PuffinBlobCacheInner {
 /// GB over 73 for the same plan under the entry bound this byte bound
 /// replaced). A blob was evicted one step before the query that wanted it.
 ///
-/// So: drop a blob whose twin is resident, and among those the one whose twin
-/// sits furthest from the parsed cache's eviction end — the one that stays
-/// unreadable longest. `parsed_twins` maps each resident Puffin entry to its
-/// position in the parsed LRU queue, 0 being the next eviction.
+/// So, in order of preference:
 ///
-/// With every resident blob live — a parsed budget far below this one, or a
-/// parsed cache turned off — there is nothing redundant to drop and this falls
-/// back to FIFO, which is what every eviction used to be. It never declines
-/// the incoming blob: a cache that refuses to evict retains the blobs of files
-/// the plan has stopped reading, and this one has no way to tell that a file is
-/// gone.
+/// 1. A blob nothing has read while this cache turned over twice. Its file has
+///    left the working set — compacted away, or simply not queried — and
+///    protecting it is how "keep what the parsed cache dropped" turns into a
+///    cache pinned to dead files. Nothing here can see that a file is gone, so
+///    the only available proof is that the blob has been readable for two
+///    turnovers and no decode wanted it. A read renews the entry, so a file the
+///    plan keeps reading is never stale: it is read once per pass, and a pass
+///    admits fewer blobs than the cache holds for as long as the cache covers
+///    any of the plan.
+/// 2. A blob whose parsed twin is resident, and among those the one whose twin
+///    sits furthest from the parsed cache's eviction end — the one that stays
+///    unreadable longest. `parsed_twins` maps each resident Puffin entry to its
+///    position in the parsed LRU queue, 0 being the next eviction.
+/// 3. Failing both — every resident blob live and recent, which is what a
+///    parsed budget far below this one or a disabled parsed cache leaves —
+///    first-in-first-out, as every eviction used to be.
+///
+/// It never declines the incoming blob. A cache that refuses to evict cannot
+/// follow a working set at all, and the fetch has already been paid by the time
+/// this is asked.
+/// How many of its own turnovers a blob keeps its protection for, with nothing
+/// reading it. The gap between a blob being cached and the next execution
+/// reaching its file is one pass of the plan, which admits one blob per file
+/// the cache does not hold — so this covers a plan up to about three times the
+/// blob budget, and past that the pair is simply too small for the plan (#4102)
+/// and protection lapses into first-in-first-out. Measured over the plan sizes
+/// in `a_plan_larger_than_both_caches_stops_refetching_every_blob`.
+const BLOB_PROTECTION_TURNOVERS: u64 = 4;
+
 fn blob_cache_victim(
     order: &std::collections::VecDeque<(String, u64)>,
+    entries: &std::collections::HashMap<(String, u64), PuffinBlobEntry>,
     parsed_twins: &std::collections::HashMap<(String, u64), usize>,
+    admitted: u64,
 ) -> Option<usize> {
-    let redundant = order
-        .iter()
-        .enumerate()
-        .filter_map(|(position, key)| parsed_twins.get(key).map(|rank| (*rank, position)))
-        .max()
-        .map(|(_, position)| position);
-    redundant.or_else(|| (!order.is_empty()).then_some(0))
+    let turnover = BLOB_PROTECTION_TURNOVERS * order.len().max(1) as u64;
+    let stale = order.iter().position(|key| {
+        entries
+            .get(key)
+            .is_some_and(|entry| admitted.saturating_sub(entry.active) >= turnover)
+    });
+    let redundant = || {
+        order
+            .iter()
+            .enumerate()
+            .filter_map(|(position, key)| parsed_twins.get(key).map(|rank| (*rank, position)))
+            .max()
+            .map(|(_, position)| position)
+    };
+    stale
+        .or_else(redundant)
+        .or_else(|| (!order.is_empty()).then_some(0))
 }
 
 static PUFFIN_BLOB_CACHE: std::sync::OnceLock<std::sync::Mutex<PuffinBlobCacheInner>> =
@@ -4898,8 +4954,8 @@ pub fn puffin_blob_cache_stats(path_substring: &str) -> (usize, usize, usize) {
         .map
         .iter()
         .filter(|((path, _), _)| path.contains(path_substring))
-        .fold((0, 0), |(entries, bytes), (_, blob)| {
-            (entries + 1, bytes + blob.len())
+        .fold((0, 0), |(entries, bytes), (_, entry)| {
+            (entries + 1, bytes + entry.blob.len())
         });
     (entries, bytes, cache.bytes)
 }
@@ -6844,18 +6900,35 @@ message schema {
     /// Which entry a full blob cache drops, entry by entry.
     #[test]
     fn blob_cache_victim_spares_the_blobs_the_parsed_cache_has_dropped() {
-        use crate::arrow::reader::blob_cache_victim;
+        use crate::arrow::reader::{PuffinBlobEntry, blob_cache_victim};
 
         let key = |n: u64| (format!("s3://bucket/stats-{n}.puffin"), n);
         let order: std::collections::VecDeque<(String, u64)> = (0..4).map(key).collect();
+        // Four entries, each active at a different tick; `admitted` = 4 leaves
+        // all of them inside the two turnovers protection lasts.
+        let entries: std::collections::HashMap<(String, u64), PuffinBlobEntry> = (0..4)
+            .map(|n| {
+                (key(n), PuffinBlobEntry {
+                    blob: Arc::<[u8]>::from(vec![7u8; 8]),
+                    active: n + 1,
+                })
+            })
+            .collect();
+        let no_twins = std::collections::HashMap::new();
+        let victim = |twins: &std::collections::HashMap<(String, u64), usize>, admitted| {
+            blob_cache_victim(&order, &entries, twins, admitted)
+        };
 
-        // Nothing resident: first-in-first-out, as before #4182.
+        // Nothing resident and nothing stale: first-in-first-out, as before
+        // #4182.
+        assert_eq!(victim(&no_twins, 4), Some(0));
         assert_eq!(
-            blob_cache_victim(&order, &std::collections::HashMap::new()),
-            Some(0)
-        );
-        assert_eq!(
-            blob_cache_victim(&std::collections::VecDeque::new(), &[(key(0), 0)].into()),
+            blob_cache_victim(
+                &std::collections::VecDeque::new(),
+                &entries,
+                &[(key(0), 0)].into(),
+                4
+            ),
             None,
             "an empty cache has nothing to drop"
         );
@@ -6863,18 +6936,28 @@ message schema {
         // Entries 1 and 3 are covered by a parsed entry and cannot be read
         // while it lives; 3's twin is furthest from the parsed cache's
         // eviction end, so 3 is the one that stays unreadable longest.
-        let twins: std::collections::HashMap<(String, u64), usize> =
-            [(key(1), 0), (key(3), 1)].into();
-        assert_eq!(blob_cache_victim(&order, &twins), Some(3));
+        assert_eq!(victim(&[(key(1), 0), (key(3), 1)].into(), 4), Some(3));
 
         // With only the front entry covered, FIFO and this rule agree.
-        let twins: std::collections::HashMap<(String, u64), usize> = [(key(0), 5)].into();
-        assert_eq!(blob_cache_victim(&order, &twins), Some(0));
+        assert_eq!(victim(&[(key(0), 5)].into(), 4), Some(0));
 
         // Every entry live: there is no redundant blob to drop and the rule
         // falls back to FIFO rather than declining to cache anything.
-        let twins: std::collections::HashMap<(String, u64), usize> = [(key(9), 0)].into();
-        assert_eq!(blob_cache_victim(&order, &twins), Some(0));
+        assert_eq!(victim(&[(key(9), 0)].into(), 4), Some(0));
+
+        // `BLOB_PROTECTION_TURNOVERS` turnovers of the four entries with
+        // nothing reading entry 0: its file has left the working set, and it
+        // goes before the blob a resident parsed entry is merely covering.
+        let turnovers = crate::arrow::reader::BLOB_PROTECTION_TURNOVERS * order.len() as u64;
+        assert_eq!(
+            victim(&[(key(1), 0), (key(3), 1)].into(), turnovers + 1),
+            Some(0)
+        );
+        assert_eq!(
+            victim(&[(key(1), 0), (key(3), 1)].into(), turnovers),
+            Some(3),
+            "one tick short of the protection window is not yet stale"
+        );
     }
 
     /// Both caches and the two arms' worth of budget, for replaying a fixed
@@ -6911,14 +6994,20 @@ message schema {
             }
         }
 
-        /// One pass of a plan over `files` indexed files, driven the way
-        /// `puffin_inverted_index` drives these caches: parsed lookup, then the
-        /// blob cache, then a fetch. Returns the fetches the pass paid.
         fn pass(&mut self, files: u64) -> usize {
+            self.pass_from(0, files)
+        }
+
+        /// One pass of a plan over `files` indexed files starting at `offset`,
+        /// driven the way `puffin_inverted_index` drives these caches: parsed
+        /// lookup, then the blob cache, then a fetch. Returns the fetches the
+        /// pass paid. A different `offset` is a different set of files — the
+        /// plan moving on, as compaction moves it.
+        fn pass_from(&mut self, offset: u64, files: u64) -> usize {
             use crate::arrow::reader::ParsedIndexKey;
 
             let mut fetches = 0;
-            for file in 0..files {
+            for file in offset..offset + files {
                 let path = format!("s3://bucket/stats-{file}.puffin");
                 let parsed_key = ParsedIndexKey::puffin(&path, file);
                 if self.parsed.get(&parsed_key).is_some() {
@@ -7053,6 +7142,56 @@ message schema {
                 );
             }
         }
+    }
+
+    /// #4182, the other half: protection that never lapses is a cache pinned to
+    /// dead files.
+    ///
+    /// THE DEFECT THIS GUARDS. "Keep the blob whose parsed twin was evicted"
+    /// says nothing about a file the plan has stopped reading — compaction
+    /// rewrites files, and the blob of a file nothing queries is live forever
+    /// by that rule. The first attempt at this fix held those blobs against
+    /// every new one, which cost the measured warehouse of
+    /// `text_index_blob_refetch.rs` all but one of its three blob slots. So a
+    /// blob keeps its protection for `BLOB_PROTECTION_TURNOVERS` of this
+    /// cache's own turnover and no longer; move the plan to a disjoint set of
+    /// files and the cache must reach the same steady state it had before.
+    #[test]
+    fn the_blobs_of_a_plan_that_moved_on_lose_their_protection() {
+        let index = Arc::new(siglake_index::InvertedIndex::from_rows([
+            "database timeout on shard four",
+            "request complete in 41ms",
+        ]));
+        let (held, files) = (7, 14u64);
+        let mut caches = ReplayedCaches::new(&index, held, true);
+        let warm: Vec<usize> = (0..4).map(|_| caches.pass(files)).collect();
+        assert_eq!(
+            warm[1..],
+            [files as usize - held; 3],
+            "the first plan must reach its steady state before the plan moves"
+        );
+
+        // A disjoint set of files, as a compaction leaves: none of the retained
+        // blobs can serve it, and none of them will ever be read again.
+        let moved: Vec<usize> = (0..8).map(|_| caches.pass_from(1_000, files)).collect();
+        assert_eq!(
+            moved[0], files as usize,
+            "the new plan's first pass is cold"
+        );
+        let settled = &moved[3..];
+        assert!(
+            settled.contains(&(files as usize - held))
+                && settled
+                    .iter()
+                    .all(|fetches| *fetches <= files as usize - held + 1),
+            "the new plan must end up as well served as the old one, within the \
+             pass the protection window costs back: {moved:?}"
+        );
+        assert!(
+            caches.blobs.order.iter().all(|(_, file)| *file >= 1_000),
+            "no blob of the abandoned plan may still be resident: {:?}",
+            caches.blobs.order
+        );
     }
 
     /// #3896 replaced "complement of the matches as a delete vector" with a
