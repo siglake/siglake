@@ -1092,6 +1092,22 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   (others row-eval); the current metadata path retains Puffin statistics
   registration after its data snapshot expires; strict mapping mode enforces
   at commit time as lenient-plus-counter.
+- **Nothing authenticates the metrics port, and the chart does not restrict who
+  may reach it.** `--metrics-bind` (9100/9101/9105) serves `/metrics` and `/`
+  with no token check of its own — the query tier's bearer tokens and OIDC
+  guard 8089, not this — and `networkPolicy.enabled` writes an **egress**
+  policy only, so reachability is whatever the cluster's default is. A cluster
+  that allows pod-to-pod traffic allows scrapes from anywhere in it. Adding an
+  ingress rule was left out because the set of callers that must reach the port
+  is the operator's (a Prometheus ServiceAccount, a ServiceMonitor's namespace,
+  a `port-forward`), and a policy the chart guessed at would either break
+  scrapes or read as protection it does not provide. What would change it: an
+  opt-in `networkPolicy.ingress.metrics` naming the allowed selectors. This
+  matters more in a `PROFILING=1` build, where the same port can serve
+  `/debug/pprof/*` — a CPU profile is a stack-trace oracle and the heap route
+  names allocation sites. That build is off by default twice over (cargo
+  feature and `SIGLAKE_PPROF_ENABLED=1`), is never published, and is described
+  in [Diagnostics](ARCHITECTURE.md#diagnostics).
 - **Operator adoption of existing Helm releases** is offline in v1: the
   operator synthesizes a `SiglakeCluster` from chart values and preflights
   name/selector parity, but the ownership handover (annotation flip + helm
