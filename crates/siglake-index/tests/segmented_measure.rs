@@ -123,8 +123,10 @@ const SHAPES: &[Shape] = &[
         substring: false,
     },
     Shape {
+        // A substring no tokenizer produces, so it forces the whole-dictionary
+        // sweep rather than a term lookup. It occurs only inside `checkout`.
         name: "substring_scan",
-        term: "hec",
+        term: "eckou",
         tail_fraction: None,
         substring: true,
     },
@@ -369,11 +371,14 @@ fn report_segmented_vs_whole_file() {
     // Every logical file carries the same blob bytes; only the cache key
     // differs. That is exactly the working-set-to-budget ratio a 14-file text
     // plan puts on the cache, without building 14 distinct corpora.
+    // Cold and warm are reported apart, not medianed together: the first
+    // execution is the one that opens every reader and decodes every index, and
+    // for the segmented arm it is the only one that pays a directory read.
     println!(
         "\n## a {files}-file plan under a {} parsed-index budget\n\n\
-         {plan_runs} executions per shape.\n\n\
-         | shape | v1 total | v1 hits/misses/evictions | seg total | seg hits/misses/evictions | seg fetched |\n\
-         |---|---:|---:|---:|---:|---:|",
+         {plan_runs} executions per shape; `cold` is the first, `warm` the median of the rest.\n\n\
+         | shape | v1 cold | v1 warm | v1 hits/misses/evictions | seg cold | seg warm | seg hits/misses/evictions | seg cold fetched | seg warm fetched |\n\
+         |---|---:|---:|---:|---:|---:|---:|---:|---:|",
         mib(parsed_bytes as u64)
     );
     for shape in SHAPES {
@@ -410,8 +415,9 @@ fn report_segmented_vs_whole_file() {
 
         let mut seg_cache: ByteLru<SegmentedReader<SliceSource>> = ByteLru::new(parsed_bytes);
         let mut seg_samples = Vec::with_capacity(plan_runs);
-        let mut seg_fetched = 0u64;
+        let mut seg_fetched_per_run = Vec::with_capacity(plan_runs);
         for _ in 0..plan_runs {
+            let mut seg_fetched = 0u64;
             let timed = Instant::now();
             for file in 0..files {
                 let reader = match seg_cache.get(file) {
@@ -446,20 +452,42 @@ fn report_segmented_vs_whole_file() {
                 reader.source().reset_counters();
             }
             seg_samples.push(timed.elapsed());
+            seg_fetched_per_run.push(seg_fetched);
         }
 
+        // `cold` is the first execution; `warm` the median of what follows it,
+        // or the same sample when only one execution was asked for.
+        let split = |samples: &[Duration]| -> (Duration, Duration) {
+            let cold = samples[0];
+            let warm = if samples.len() > 1 {
+                median(samples[1..].to_vec())
+            } else {
+                cold
+            };
+            (cold, warm)
+        };
+        let (v1_cold, v1_warm) = split(&v1_samples);
+        let (seg_cold, seg_warm) = split(&seg_samples);
+        let warm_fetched = if seg_fetched_per_run.len() > 1 {
+            seg_fetched_per_run[1..].iter().sum::<u64>() / (seg_fetched_per_run.len() - 1) as u64
+        } else {
+            seg_fetched_per_run[0]
+        };
         println!(
-            "| {} | {:?} | {}/{}/{} | {:?} | {}/{}/{} | {} |",
+            "| {} | {:?} | {:?} | {}/{}/{} | {:?} | {:?} | {}/{}/{} | {} | {} |",
             shape.name,
-            median(v1_samples),
+            v1_cold,
+            v1_warm,
             v1_cache.hits,
             v1_cache.misses,
             v1_cache.evictions,
-            median(seg_samples),
+            seg_cold,
+            seg_warm,
             seg_cache.hits,
             seg_cache.misses,
             seg_cache.evictions,
-            mib(seg_fetched / plan_runs as u64),
+            mib(seg_fetched_per_run[0]),
+            mib(warm_fetched),
         );
     }
     println!(

@@ -660,9 +660,12 @@ impl<S: RangeSource> SegmentedReader<S> {
         self.matching_rows_all_in_groups(terms, None)
     }
 
-    /// [`Self::matching_rows_all`] restricted to `groups`. Terms are resolved
-    /// rarest-first *by the directory's document frequencies*: an absent term
-    /// ends the lookup before any other term's postings are fetched.
+    /// [`Self::matching_rows_all`] restricted to `groups`. A term that no group
+    /// has ends the lookup at once, and the intersection runs shortest-list
+    /// first. Both happen *after* each term's postings are fetched, in argument
+    /// order: the dictionary's document frequencies could order the fetches
+    /// too, and skip the rest once the rarest term's list is known, but that is
+    /// a reader-side policy question and belongs with #4561's integration.
     pub fn matching_rows_all_in_groups(
         &self,
         terms: &[&str],
