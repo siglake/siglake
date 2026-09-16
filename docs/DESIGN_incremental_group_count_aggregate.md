@@ -197,6 +197,11 @@ last case is the only one a rewrite is truly required for, and the CLI's report
 separates it from the case the flag fixes. Admitted columns land in the wide
 object, the rebuild's only output, so they read back as `tier1_wide`.
 
+A separate repair, for the separate failure of an inline object with no
+coverage chain at all, is specified in
+`DESIGN_inline_time_aggregate_rebuild.md`. It targets the inline object only
+and leaves everything in this document untouched.
+
 **The rebuild is deliberately wide-only (decision 2026-09-04).** It does not
 also repair `siglake-aggregates.json`, even for a rebuilt column below
 the 4096 inline cap. Such a column stays `tier1_wide`; on a cold metadata cache

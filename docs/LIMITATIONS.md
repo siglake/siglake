@@ -921,7 +921,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   remain readable but cannot prove which equal-row-count snapshot they
   describe, so queries use the exact per-file tiers. `rebuild-group-counts`
   restores the folded wide group-count object; no command rebuilds the inline
-  time aggregates in v0.
+  time aggregates in v0. Nothing repairs the condition on its own either:
+  further appends publish coverage edges that never join a chain with no head,
+  and a row-conserving re-cluster has no edge to walk back to
+  (`crates/siglake-storage/tests/storage/pre_coverage_time_agg.rs`). Measured
+  on that file's report, the fallback costs 23–59× Tier-1 warm but stays under
+  ~2ms, and 3.8–35× cold over 49–168 live files, growing with the file count —
+  so a cold, large, rarely-queried table is where it is felt.
+  `docs/DESIGN_inline_time_aggregate_rebuild.md` specifies the repair.
 - **Streamed rewrite output carries no inline inverted index.** Every rewrite
   past the in-RAM caps — a leveled compaction merge, a re-clustering pass, or
   a delete task's large candidates (16 MiB compressed / 128 Ki rows) — is
