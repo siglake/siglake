@@ -408,6 +408,24 @@ object instead of taking the inline shortcut. Keeping the repair wide-only
 avoids a second CAS and a staleness protocol against concurrent commit-path
 merges; answers remain exact and use Tier-1 once repaired.
 
+By default the rebuild repairs only the columns the aggregate already carries.
+A table created before typed columns joined the side aggregates has its typed
+dimensions (`status`-like `long`/`double`/`bool` columns) in every file's footer
+and in no aggregate, so `GROUP BY` on them reports `served_by: "materialized"`
+for the life of the table; the plain rebuild names those columns as ones it
+could add, and `--admit-typed-columns` adds them, computing each exact full-table
+total from the files. **No rewrite is needed for that case.** A rewrite is
+required only when some live file can serve the column from neither its footer
+nor a raw-page decode — the column is missing from that file's schema, or the
+file predates typed footers — and then the rebuild leaves the column absent and
+says so rather than writing a partial total; compaction rewrites such files with
+footers for the current column set. An admitted column is held to
+`SIGLAKE_TYPED_GROUP_COUNT_CARDINALITY` (default `1024`) on its whole-table
+distinct count and is reported, not written, when over it. The same knob caps
+the exact group-count cardinality of typed columns admitted by inference at
+write time; declared dimensions retain the table-level cap. Raising it admits
+wider typed columns but also increases per-commit delta size and counting work.
+
 The inline object's own repair is a separate command, for a separate failure —
 an object whose coverage chain cannot be proven at all:
 
@@ -429,24 +447,6 @@ against a table being ingested: a commit landing under the pass cannot be
 merged, so the command retries and then exits without writing, asking for a
 window with no ingest. Details in
 `docs/DESIGN_inline_time_aggregate_rebuild.md`.
-
-By default the rebuild repairs only the columns the aggregate already carries.
-A table created before typed columns joined the side aggregates has its typed
-dimensions (`status`-like `long`/`double`/`bool` columns) in every file's footer
-and in no aggregate, so `GROUP BY` on them reports `served_by: "materialized"`
-for the life of the table; the plain rebuild names those columns as ones it
-could add, and `--admit-typed-columns` adds them, computing each exact full-table
-total from the files. **No rewrite is needed for that case.** A rewrite is
-required only when some live file can serve the column from neither its footer
-nor a raw-page decode — the column is missing from that file's schema, or the
-file predates typed footers — and then the rebuild leaves the column absent and
-says so rather than writing a partial total; compaction rewrites such files with
-footers for the current column set. An admitted column is held to
-`SIGLAKE_TYPED_GROUP_COUNT_CARDINALITY` (default `1024`) on its whole-table
-distinct count and is reported, not written, when over it. The same knob caps
-the exact group-count cardinality of typed columns admitted by inference at
-write time; declared dimensions retain the table-level cap. Raising it admits
-wider typed columns but also increases per-commit delta size and counting work.
 
 **Residual attributes (WS-7).** OTLP resource/log attributes that aren't
 promoted columns are preserved losslessly in a JSON-string `attributes`
