@@ -19,13 +19,16 @@
 //! row-removing commits are repaired by `rebuild-time-aggregates` rather than by
 //! anything on the commit path.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{Duration, TimeZone, Utc};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use siglake_core::index_config::IndexConfig;
 use siglake_core::Event;
 use siglake_storage::iceberg::{
-    IcebergContext, IcebergTuning, SnapshotAggregates, TimeBounds, SNAPSHOT_TIME_BUCKET_BASE_NS,
+    IcebergContext, IcebergTuning, InlineCoverageOutcome, SnapshotAggregates, TimeBounds,
+    SNAPSHOT_TIME_BUCKET_BASE_NS,
 };
 
 const INDEX: &str = "logs-orphan-coverage";
@@ -160,6 +163,149 @@ async fn windowed_groups(
     let mut rows = got.to_rows();
     rows.sort();
     (got.source_label().to_string(), rows)
+}
+
+/// Run one census pass under a local recorder and return what it made of
+/// [`INDEX`] together with the single gauge sample it wrote for that table:
+/// value, and the labels the chart alert selects and renders on.
+///
+/// No query runs here. That is the point of the census — the only other signal
+/// for this state, `siglake_query_side_aggs_cache_total{result="unproven_coverage"}`,
+/// needs a query to arrive and names no table.
+async fn census_samples(
+    ice: &IcebergContext,
+) -> (InlineCoverageOutcome, Vec<(f64, BTreeMap<String, String>)>) {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let guard = metrics::set_default_local_recorder(&recorder);
+    let outcomes = ice.census_inline_coverage().await;
+    drop(guard);
+
+    let outcome = outcomes
+        .iter()
+        .find(|(table, _)| table == INDEX)
+        .map(|(_, outcome)| *outcome)
+        .unwrap_or_else(|| panic!("the census skipped {INDEX}: {outcomes:?}"));
+
+    let samples: Vec<(f64, BTreeMap<String, String>)> = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, _, _, _)| k.key().name() == "siglake_inline_coverage_unproven")
+        .filter_map(|(k, _, _, v)| {
+            let labels: BTreeMap<String, String> = k
+                .key()
+                .labels()
+                .map(|l| (l.key().to_string(), l.value().to_string()))
+                .collect();
+            (labels.get("table").map(String::as_str) == Some(INDEX)).then_some(match v {
+                DebugValue::Gauge(g) => (*g, labels),
+                other => panic!("{other:?} is not a gauge"),
+            })
+        })
+        .collect();
+    (outcome, samples)
+}
+
+/// The same pass, for the tables the census reaches a verdict on: exactly one
+/// gauge sample, and its value and labels.
+async fn census(ice: &IcebergContext) -> (InlineCoverageOutcome, f64, BTreeMap<String, String>) {
+    let (outcome, mut samples) = census_samples(ice).await;
+    assert_eq!(
+        samples.len(),
+        1,
+        "one gauge sample per table per pass: {samples:?}"
+    );
+    let (value, labels) = samples.pop().unwrap();
+    (outcome, value, labels)
+}
+
+/// #4674: the state every remaining orphaning trigger ends in has a name on it.
+/// A delete task removes rows, so the object describes a generation that no
+/// longer exists and no commit republishes its chain; the census reports the
+/// table by name, and the census after the rebuild clears it.
+#[tokio::test]
+async fn the_census_names_a_table_a_delete_task_left_unprovable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = seed(tmp.path()).await;
+
+    // Healthy first, or a gauge stuck at 1 would pass the assertion below for
+    // free.
+    let (outcome, unproven, labels) = census(&ice).await;
+    assert_eq!(outcome, InlineCoverageOutcome::Covered);
+    assert_eq!(unproven, 0.0, "a covered table must be reported at 0");
+    assert_eq!(
+        labels,
+        BTreeMap::from([
+            ("iceberg_namespace".to_string(), "siglake".to_string()),
+            ("table".to_string(), INDEX.to_string()),
+        ]),
+        "the alert selects on these two labels and renders both into its \
+         `rebuild-time-aggregates` line"
+    );
+
+    ice.create_delete_task(INDEX, "host = 'host-0'", None, None)
+        .await
+        .unwrap();
+    let outcome = ice.execute_delete_tasks(INDEX).await.unwrap();
+    assert!(outcome.rows_deleted > 0, "the delete task removed nothing");
+
+    let (outcome, unproven, _) = census(&ice).await;
+    assert_eq!(
+        outcome,
+        InlineCoverageOutcome::Unproven,
+        "the census did not report the orphaned object"
+    );
+    assert_eq!(unproven, 1.0);
+    // Exact all the way through: the guard refuses the object, it does not
+    // serve it.
+    assert_eq!(
+        windowed_groups(&ice, last25(APPENDS * PER_APPEND)).await.0,
+        "materialized"
+    );
+
+    let report = ice.rebuild_inline_time_aggregates(INDEX).await.unwrap();
+    assert!(
+        report.published,
+        "the rebuild published nothing: {report:?}"
+    );
+
+    let (outcome, unproven, _) = census(&ice).await;
+    assert_eq!(
+        outcome,
+        InlineCoverageOutcome::Covered,
+        "the census did not clear after the repair"
+    );
+    assert_eq!(
+        unproven, 0.0,
+        "the gauge stayed raised after the repair, so the alert would never resolve"
+    );
+}
+
+/// A pass that could not READ the object has no evidence about its coverage,
+/// and must not overwrite the last real reading with one. Writing a 0 here
+/// would clear a standing alert on an object-store blip; writing a 1 would page
+/// for a table that is fine.
+#[tokio::test]
+async fn a_census_that_cannot_read_the_object_reports_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = seed(tmp.path()).await;
+    assert_eq!(census(&ice).await.0, InlineCoverageOutcome::Covered);
+    drop(ice);
+
+    // The object is THERE and unusable — the case `load_side_aggregates`
+    // reports as `parse_error` and otherwise returns as an indistinguishable
+    // `None`, exactly as it would for a table that never published one.
+    let path = aggregate_dir(&tmp.path().join("warehouse")).join("siglake-aggregates.json");
+    std::fs::write(&path, b"{not json").unwrap();
+
+    let ice = open(tmp.path()).await;
+    let (outcome, samples) = census_samples(&ice).await;
+    assert_eq!(outcome, InlineCoverageOutcome::Unreadable);
+    assert!(
+        samples.is_empty(),
+        "a failed read wrote a coverage verdict: {samples:?}"
+    );
 }
 
 /// THE REPRODUCTION, and then the fix: expiring the snapshot the coverage edge

@@ -6869,6 +6869,28 @@ fn record_group_count_short_aggregate(table: &str, outcome: &'static str) {
     .increment(1);
 }
 
+/// The maintenance census's current-state reading for one table's inline
+/// aggregate object (#4674).
+///
+/// A gauge, not a counter, because the condition is a STATE: it is true from
+/// the commit that orphaned the chain until an operator rebuilds, and an
+/// operator needs to know which tables are in it right now, not how many times
+/// a census noticed. Labelled by namespace as well as table because a
+/// warehouse's tenant namespaces each hold an `events` table, and a bare table
+/// name cannot say which one to repair.
+///
+/// `iceberg_namespace`, not `namespace`: Prometheus attaches the Kubernetes
+/// namespace to every scraped series under that name, and a colliding metric
+/// label is silently renamed to `exported_namespace`.
+fn record_inline_coverage(namespace: &NamespaceIdent, table: &str, unproven: bool) {
+    metrics::gauge!(
+        "siglake_inline_coverage_unproven",
+        "iceberg_namespace" => namespace.to_string(),
+        "table" => table.to_owned()
+    )
+    .set(if unproven { 1.0 } else { 0.0 });
+}
+
 /// Test-only view of [`retry_delta_write`].
 #[doc(hidden)]
 pub async fn retry_delta_write_for_test<F, Fut>(
@@ -7210,6 +7232,47 @@ pub enum ShortAggregateOutcome {
     },
     /// The rebuild errored. The deficit is unchanged and a later pass retries.
     Failed,
+}
+
+/// What the inline-coverage census made of one table (#4674).
+///
+/// Separated the way [`ShortAggregateOutcome`]'s cases are, and for the same
+/// reason: only one of these is a state an operator has to act on, and the two
+/// that look like it from the outside — a publication still in flight, a GET
+/// that failed — are transient. Collapsing them would page on every busy table
+/// and on every object-store blip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineCoverageOutcome {
+    /// Nothing claims coverage here: no provable incarnation (#2919), no rows
+    /// yet, or no object. Not a repair target — `rebuild-time-aggregates`
+    /// refuses a table with no object to rebuild from.
+    NotApplicable,
+    /// The object's coverage edge reaches the current snapshot through
+    /// row-conserving re-clusters. Tier-1 serves this table.
+    Covered,
+    /// The edge does not reach current, but one of the object's pending links
+    /// does. A commit is mid-publication; the next one settles it.
+    Publishing,
+    /// The object is there, its edge does not reach the current snapshot, and
+    /// no pending link bridges the gap. PERSISTENT: answers stay exact on the
+    /// per-file tiers, and only `siglake rebuild-time-aggregates` clears it.
+    Unproven,
+    /// The object exists and could not be read or parsed. Says nothing about
+    /// coverage in either direction, so the census leaves the last reading
+    /// standing rather than reporting a state it did not observe.
+    Unreadable,
+}
+
+impl InlineCoverageOutcome {
+    /// What this pass should write to `siglake_inline_coverage_unproven`, or
+    /// `None` when it observed nothing worth writing.
+    fn gauge_value(&self) -> Option<bool> {
+        match self {
+            Self::Unproven => Some(true),
+            Self::Covered | Self::Publishing | Self::NotApplicable => Some(false),
+            Self::Unreadable => None,
+        }
+    }
 }
 
 /// Fold every unabsorbed delta into the wide base, then GC.
@@ -11664,6 +11727,136 @@ impl IcebergContext {
             columns,
             unrestored,
         }
+    }
+
+    /// Name every maintained table whose inline aggregate object cannot prove
+    /// coverage of the current snapshot (#4674).
+    ///
+    /// After #3800 the orphaning triggers that remain — a delete task,
+    /// retention, a foreign overwrite, and the two residual windows at expiry —
+    /// all end in one state: an object the read guard refuses, so windowed
+    /// `GROUP BY`, date histograms and windowed counts answer from the exact
+    /// per-file tiers until `siglake rebuild-time-aggregates --table <t>` runs.
+    /// Answers stay exact throughout; what is lost is the fast path, and it
+    /// does not come back on its own — no commit republishes a chain the reader
+    /// cannot walk.
+    ///
+    /// Nothing named the table before this. `siglake_query_side_aggs_cache_total{result="unproven_coverage"}`
+    /// needs a query to arrive and carries no table label, and the expiry
+    /// path's warn fires only in the window where its own re-root failed. The
+    /// census reports the CURRENT state instead: one gauge per visited table,
+    /// set every pass, so a repaired table clears itself at the next one.
+    ///
+    /// Metadata only — it never rebuilds. Automatic repair is #4675.
+    ///
+    /// Returns one entry per visited table, in `aggregate_table_idents` order.
+    pub async fn census_inline_coverage(&self) -> Vec<(String, InlineCoverageOutcome)> {
+        let mut out = Vec::new();
+        for ident in self.aggregate_table_idents().await {
+            // One table's transient read error must not skip the rest: this is
+            // a whole-warehouse sweep on a timer, and a namespace whose base
+            // `events` table was never created is the ordinary case on an
+            // index-only warehouse.
+            let outcome = match self.inline_coverage_census(&ident).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::warn!(error = ?error, table = %ident,
+                        "inline-coverage census failed");
+                    continue;
+                }
+            };
+            match &outcome {
+                InlineCoverageOutcome::Unproven => tracing::warn!(
+                    table = %ident,
+                    "the inline aggregate object cannot prove coverage of the current \
+                     snapshot; windowed GROUP BY, date histograms and windowed counts \
+                     on this table answer EXACTLY from the per-file path and will keep \
+                     doing so — no commit repairs this. Run \
+                     `siglake rebuild-time-aggregates --namespace <ns> --table <t>`"
+                ),
+                InlineCoverageOutcome::Publishing => tracing::debug!(
+                    table = %ident,
+                    "the inline aggregate's edge does not reach the current snapshot \
+                     yet, but a pending link does; leaving it to the commit path"
+                ),
+                InlineCoverageOutcome::Unreadable => tracing::warn!(
+                    table = %ident,
+                    "the inline aggregate object exists but could not be read or \
+                     parsed; this pass has no evidence about its coverage either way"
+                ),
+                InlineCoverageOutcome::Covered | InlineCoverageOutcome::NotApplicable => {}
+            }
+            // Set every pass, for every table the census reached a verdict on.
+            // That is what clears a repaired table, and what puts a healthy
+            // table on the board at 0 rather than leaving it absent. An
+            // `Unreadable` pass deliberately writes nothing: it is not evidence,
+            // and overwriting a standing 1 with a 0 on a failed GET would hide
+            // exactly the state this exists to report.
+            if let Some(unproven) = outcome.gauge_value() {
+                record_inline_coverage(self.namespace(), ident.name(), unproven);
+            }
+            out.push((ident.name().to_string(), outcome));
+        }
+        out
+    }
+
+    /// Whether one table's inline aggregate object proves coverage now.
+    ///
+    /// The predicate is the read guard's, called on the same object the guard
+    /// reads: `aggregate_covers_current_snapshot` walks table metadata only, so
+    /// what this costs is the object — one HEAD and, when it is there, one GET.
+    /// Read straight from storage rather than through
+    /// [`Self::cached_side_aggregates`], which collapses every refusal into
+    /// `None` and so cannot say WHY a table is off Tier-1.
+    async fn inline_coverage_census(&self, ident: &TableIdent) -> Result<InlineCoverageOutcome> {
+        let cached = self.cached_table_entry(ident).await?;
+        // Incarnation fence (#2919): a table with no provable incarnation reads
+        // no aggregate at all, so it has no coverage claim to refuse, and the
+        // object at the shared path is somebody else's.
+        let Some(path) = side_aggregates_path(&cached.table) else {
+            return Ok(InlineCoverageOutcome::NotApplicable);
+        };
+        if cached
+            .table
+            .metadata()
+            .current_snapshot()
+            .and_then(|s| s.summary().additional_properties.get("total-records"))
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|rc| *rc > 0)
+            .is_none()
+        {
+            return Ok(InlineCoverageOutcome::NotApplicable);
+        }
+        // `load_side_aggregates` returns `Ok(None)` for absent, unreadable and
+        // unparseable alike — the distinction the census exists to draw. Probe
+        // existence first so an `Ok(None)` after this point can only mean the
+        // object is there and was lost.
+        let input = cached.table.file_io().new_input(&path)?;
+        match input.exists().await {
+            Ok(true) => {}
+            // No object: nothing claims coverage, and `rebuild-time-aggregates`
+            // refuses a table with no object to rebuild from. A table that
+            // should have one and does not is
+            // `SiglakeSideAggregatePublicationLost`, not this.
+            Ok(false) => return Ok(InlineCoverageOutcome::NotApplicable),
+            Err(_) => return Ok(InlineCoverageOutcome::Unreadable),
+        }
+        let Some(side) = load_side_aggregates(cached.table.file_io(), &path).await? else {
+            return Ok(InlineCoverageOutcome::Unreadable);
+        };
+        if aggregate_covers_current_snapshot(&cached.table, side.coverage) {
+            return Ok(InlineCoverageOutcome::Covered);
+        }
+        // A commit whose link is written but not yet folded into the edge is a
+        // second old, not broken. Reporting it would page on every busy table.
+        if aggregate_evidence_reaches_current_snapshot(
+            &cached.table,
+            side.coverage,
+            &side.coverage_links,
+        ) {
+            return Ok(InlineCoverageOutcome::Publishing);
+        }
+        Ok(InlineCoverageOutcome::Unproven)
     }
 
     /// WS-7 auto-promotion: sample the newest live files' `attributes` JSON,

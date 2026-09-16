@@ -2,9 +2,9 @@
 
 ## 0.1.1
 
-Eleven changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
+Twelve changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
 surface moves, and a 0.1.0 warehouse is read and written unchanged: one values
-key and five environment knobs are added, and no flag or values key is removed.
+key and six environment knobs are added, and no flag or values key is removed.
 Two defaults move. The audit worker now gives each append 30 s instead of
 awaiting it forever, and every process except the query server budgets zero for
 the two text-index caches — a ceiling rather than a behaviour, since those
@@ -121,6 +121,30 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   Retention, a delete task and a foreign overwrite still retire the object
   until `rebuild-time-aggregates` runs, which is
   `docs/LIMITATIONS.md`. (#3800)
+- **Maintenance**: the tables in that state are now named. The triggers that
+  remain after the re-root — retention, a delete task, a foreign overwrite and
+  the two residual windows at expiry — all end in one state: an object the read
+  guard refuses, so windowed `GROUP BY`, date histograms and windowed counts on
+  that table answer exactly from the per-file tiers, for the life of the table,
+  because no commit republishes a chain the reader cannot walk. Nothing said
+  which table it was. `siglake_query_side_aggs_cache_total{result="unproven_coverage"}`
+  needs a query to arrive and carries no table label, and the expiry path's warn
+  fires only in the window where its own re-root failed. The maintenance
+  compactor now censuses every maintained table's inline object every 15 minutes
+  under the `agg_fold` lease
+  (`SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS`, `off` to disable), asking the
+  read guard's own question, and sets
+  `siglake_inline_coverage_unproven{iceberg_namespace,table}` to 1 or 0 for
+  every table it reaches a verdict on — so a table repaired by
+  `siglake rebuild-time-aggregates` clears at the next pass. A publication still
+  in flight reads as covered, and an object the census could not read writes no
+  sample at all, since a failed GET is not evidence in either direction.
+  `SiglakeInlineCoverageUnproven` (critical, 35 alerts) fires after 30 minutes —
+  two censuses — and renders the repair command with both labels filled in; it
+  carries `increase(siglake_inline_coverage_census_total[1h]) > 0` on the same
+  pod as a liveness arm, so a compactor that stopped censusing leaves the alert
+  rather than paging from a reading nobody is refreshing. The census reads and
+  never rebuilds. No format, default or query behaviour changes. (#4674)
 - **Maintenance**: the compactor, the ingest server and the `siglake`
   maintenance subcommands resolve their own cache budgets at startup instead of
   inheriting the vendored reader's constants. The two text-index caches are an

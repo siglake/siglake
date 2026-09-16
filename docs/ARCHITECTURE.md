@@ -487,6 +487,30 @@ merged, so the command retries and then exits without writing, asking for a
 window with no ingest. Details in
 `docs/DESIGN_inline_time_aggregate_rebuild.md`.
 
+**Which table needs it.** The state that command repairs is reported by name.
+Every 15 minutes (`SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS`, `off` to
+disable) the maintenance compactor reads each maintained table's inline object
+under the `agg_fold` lease and asks the read guard's own question — does its
+coverage edge reach the current snapshot? — and sets
+`siglake_inline_coverage_unproven{iceberg_namespace,table}` to 1 or 0 for every
+table it reaches a verdict on. A repaired table clears on the next pass. The
+census never rebuilds: it reads table metadata and one object per table, and
+automating the repair is separate work. An object it cannot READ writes no
+sample at all — a failed GET is not evidence about coverage in either direction
+— and a publication still in flight (the edge does not reach current, but one of
+the object's pending links does) is reported as covered, because the next commit
+settles it.
+
+The counter beside it, `siglake_inline_coverage_census_total`, is one increment
+per completed pass. The gauge is a last observation, so a compactor that stops
+censusing keeps serving its last reading; `SiglakeInlineCoverageUnproven` pairs
+the two, and a pod that stopped looking leaves the alert rather than paging from
+a reading nobody is refreshing. It is the one alert in this area at `critical`
+severity: the two beside it name events that automatic maintenance or an
+operator's `rebuild-group-counts` repairs, and this one names a state that
+persists for the life of the table until a human runs a command. Answers stay
+exact throughout — what is lost is Tier-1, not correctness.
+
 **Residual attributes (WS-7).** OTLP resource/log attributes that aren't
 promoted columns are preserved losslessly in a JSON-string `attributes`
 column, queryable via the `attr_get(attributes, key)` UDF (values come back as

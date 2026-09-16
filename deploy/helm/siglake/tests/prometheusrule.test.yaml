@@ -605,6 +605,62 @@ tests:
         alertname: SiglakeGroupCountAggregateShort
         exp_alerts: []
 
+  # #4674: the gauge is a current state, so the alert has to fire while it
+  # stands and clear on the census pass after the repair — without a query
+  # ever arriving. `for: 30m` is two censuses at the default cadence.
+  - name: a table whose inline aggregate cannot prove coverage is named and pages
+    interval: 1m
+    input_series:
+      - series: 'siglake_inline_coverage_unproven{namespace="logs",pod="compactor-0",iceberg_namespace="tenant_acme",table="events"}'
+        values: '1+0x40 0+0x15'
+      - series: 'siglake_inline_coverage_census_total{namespace="logs",pod="compactor-0"}'
+        values: '0+1x60'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: SiglakeInlineCoverageUnproven
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: SiglakeInlineCoverageUnproven
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              iceberg_namespace: tenant_acme
+              table: events
+              severity: critical
+            exp_annotations:
+              summary: The inline aggregate for events cannot prove coverage
+              description: >-
+                The maintenance census found that table tenant_acme.events has
+                an inline aggregate object whose coverage edge does not reach
+                the current snapshot, with no publication in flight. ANSWERS
+                STAY EXACT — the guard refuses the object — but windowed GROUP
+                BY, date histograms and windowed counts run on the per-file
+                tiers and will keep doing so: no commit repairs this. Run
+                `siglake rebuild-time-aggregates --namespace tenant_acme --table
+                events`, which recomputes the object from the committed files
+                and is safe to re-run. The compactor's WARN line names the same
+                table.
+      # The census after `rebuild-time-aggregates` wrote 0 over the same series.
+      - eval_time: 50m
+        alertname: SiglakeInlineCoverageUnproven
+        exp_alerts: []
+
+  # The liveness arm. A compactor that stopped censusing keeps serving its last
+  # reading forever, so without the second arm this gauge would page for a table
+  # another pod may already have repaired.
+  - name: a stale unproven gauge on a pod that stopped censusing stays silent
+    interval: 1m
+    input_series:
+      - series: 'siglake_inline_coverage_unproven{namespace="logs",pod="compactor-1",iceberg_namespace="siglake",table="events"}'
+        values: '1+0x120'
+      - series: 'siglake_inline_coverage_census_total{namespace="logs",pod="compactor-1"}'
+        values: '7+0x120'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SiglakeInlineCoverageUnproven
+        exp_alerts: []
+
   # #3143: the local filesystem drain's `poison/` set-aside is the same
   # operator situation as the claim table's quarantine, so it fires the same
   # alert — and a cluster with neither must stay silent.
