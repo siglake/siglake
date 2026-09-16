@@ -157,6 +157,19 @@ short by the next delta, so the rebuild records the columns it failed to restore
 rebuild) and the census skips them until another rebuild — a marker repair, or
 the CLI — clears the record.
 
+A census rebuild recomputes the **exact** columns from the files and leaves the
+sketches alone: recomputing them costs a second Tier-2 query per sketched column
+and fails the whole rebuild on the first column the files cannot serve, which on
+the events table is `timestamp_ns` the moment its per-row-unique values demote
+it. That leaves one edge to close. `rebuilt_through` makes every delta at or
+below it redundant, and both folds then delete rather than fold it — sketch half
+included, which no later commit re-adds. So the rebuild merges the sketch half of
+exactly those deltas into the base in the same write, under the same predicate
+the fold uses, and drops from the carry any column it just restored exactly: a
+column represented both ways is reconciled by demoting the exact side, which
+would undo the repair. The marker path, which does recompute sketches from the
+files, is unchanged.
+
 Measured 2026-09-16 (release, local filesystem, one dimension column): census
 12.3ms / repair 64.4ms at 40k rows, 139.3ms / 849.4ms at 400k. Both are linear
 in the column's distinct values and the repair is ~6× the census per column, so

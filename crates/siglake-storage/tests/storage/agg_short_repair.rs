@@ -21,8 +21,9 @@
 use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
 use siglake_core::index_config::{DocMapping, FieldMapping, FieldType, IndexConfig, MappingMode};
 use siglake_storage::iceberg::{
-    ColumnGroupCounts, FileGroupCounts, IcebergContext, IcebergTuning, ShortAggregateOutcome,
-    ShortAggregateRepair, WideGroupCounts,
+    ColumnGroupCounts, ColumnSketch, FileGroupCounts, GroupCountDelta, GroupCountSketches,
+    IcebergContext, IcebergTuning, ShortAggregateOutcome, ShortAggregateRepair, WideGroupCounts,
+    GROUP_COUNT_SKETCH_VERSION,
 };
 use std::collections::BTreeMap;
 
@@ -369,6 +370,130 @@ async fn a_contribution_that_has_not_landed_yet_is_not_rebuilt_for() {
     assert_eq!(
         served(&ice, "inflight").await,
         ("tier1_wide".to_string(), (3 * ROWS) as u64)
+    );
+}
+
+/// The rebuild reads the EXACT half out of the files and nothing else, so its
+/// watermark must not take the approximate half down with it: every delta at or
+/// below `rebuilt_through` is deleted rather than folded, sketches included.
+///
+/// The carry is selective — it drops any column the rebuild just restored
+/// exactly, because a column represented both ways is reconciled by demoting
+/// the exact side, which would undo the repair. That arm is defence rather than
+/// a state this test can reach: a delta that sketches a column the base holds
+/// exactly demotes it at READ time, so by the time the census runs the column
+/// is out of the exact map and is never selected for repair.
+///
+/// The delta is written by hand: it is the artifact a commit writes for a
+/// column whose per-batch cardinality it could not count exactly, and getting
+/// the write path to produce one alongside a short exact column needs a fixture
+/// an order of magnitude larger than the state under test.
+#[tokio::test]
+async fn a_repair_carries_the_sketch_half_of_the_deltas_its_watermark_retires() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wh = tmp.path().join("warehouse");
+    let ice = open(&wh).await;
+    let cfg = index_config("sketched");
+    ice.create_index(&cfg).await.unwrap();
+    let ident = ice.index_table_ident("sketched");
+
+    for n in 0..2 {
+        ice.append_to_table(&ident, batch(&cfg, n), &["host"])
+            .await
+            .unwrap();
+    }
+    // The first commit's contribution is lost and the second's is folded in, so
+    // the exact half is short with nothing outstanding to explain it.
+    let mut deltas: Vec<std::path::PathBuf> = aggregate_artifacts(&wh)
+        .into_iter()
+        .filter(|p| p.to_string_lossy().contains("siglake-agg-deltas"))
+        .collect();
+    deltas.sort();
+    let lost = deltas.remove(0);
+    let lost_sequence: i64 = lost
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.parse().ok())
+        .expect("a delta object is named for its sequence number");
+    std::fs::remove_file(&lost).unwrap();
+    ice.fold_group_count_deltas(1).await.unwrap();
+
+    // What that commit did publish: a sketch for a column it could not count
+    // exactly. Unabsorbed, and below the sequence number the repair is about to
+    // write as its watermark.
+    const SKETCH_ROWS: u64 = 77;
+    let mut columns = BTreeMap::new();
+    columns.insert(
+        "trace_id".to_string(),
+        ColumnSketch::from_exact(
+            64,
+            [("trace-top".to_string(), SKETCH_ROWS)]
+                .into_iter()
+                .collect(),
+            SKETCH_ROWS,
+        ),
+    );
+    std::fs::write(
+        &lost,
+        serde_json::to_vec(&GroupCountDelta {
+            sequence_number: lost_sequence,
+            sketches: Some(GroupCountSketches {
+                version: GROUP_COUNT_SKETCH_VERSION,
+                columns,
+            }),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    ice.invalidate_cached_table(&ident).await;
+
+    assert_eq!(
+        ice.repair_short_group_count_aggregates(1)
+            .await
+            .unwrap()
+            .first()
+            .map(|(_, outcome)| outcome.clone()),
+        Some(ShortAggregateOutcome::Repaired {
+            columns: vec!["host".to_string()],
+            unrestored: Vec::new()
+        }),
+        "precondition: the exact half is what the census found and rebuilt"
+    );
+    let wide = read_wide(&wh);
+    let carried = wide.sketches.as_ref().expect("the sketch half is carried");
+    assert_eq!(
+        carried.columns.keys().collect::<Vec<_>>(),
+        vec!["trace_id"],
+        "the approximate-only column keeps its rows; the repaired column does \
+         not come back as a sketch beside its own exact map"
+    );
+    assert_eq!(carried.columns["trace_id"].rows, SKETCH_ROWS);
+
+    // The fold now deletes that delta as redundant. Whatever the base did not
+    // carry is gone for good at this point, which is what makes the assertion
+    // above worth more after this line than before it.
+    ice.fold_group_count_deltas(1).await.unwrap();
+    assert!(
+        !aggregate_artifacts(&wh)
+            .iter()
+            .any(|p| p.to_string_lossy().contains("siglake-agg-deltas")),
+        "precondition: the watermark retired every delta"
+    );
+    ice.invalidate_cached_table(&ident).await;
+    assert_eq!(
+        served(&ice, "sketched").await,
+        ("tier1_wide".to_string(), (2 * ROWS) as u64),
+        "the exact repair survives the fold"
+    );
+    let approximate = ice
+        .approximate_top_group_counts("sketched", "trace_id", 10, None)
+        .await
+        .unwrap()
+        .expect("the carried sketch answers after its delta is gone");
+    assert_eq!(
+        (approximate.rows_accounted, approximate.rows.len()),
+        (SKETCH_ROWS, 1)
     );
 }
 

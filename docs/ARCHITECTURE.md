@@ -375,7 +375,10 @@ siglake rebuild-group-counts --table <table>
 
 Both automatic and operator-triggered rebuilds use the same exact per-file
 Tier-2 path as a query, record a `rebuilt_through` watermark so an old or late
-delta is not folded twice, and are safe to re-run. They deliberately repair
+delta is not folded twice, and are safe to re-run. A census rebuild rebuilds the
+exact columns only, so it merges the sketch half of every delta that watermark
+retires into the base first — the fold deletes those deltas rather than folding
+them, and an approximate column's rows are not re-added by any later commit. They deliberately repair
 only the incarnation's `siglake-agg-wide.json`, not the inline
 `siglake-aggregates.json` object maintained by the commit path. A
 repaired column therefore reports `served_by: "tier1_wide"` even when it is

@@ -11475,13 +11475,12 @@ impl IcebergContext {
                 // first one the files cannot serve — which on the events table
                 // is `timestamp_ns` the moment its per-row-unique values get it
                 // demoted, so the repair would never complete on the table that
-                // needs it most. The cost of leaving them is bounded: a sketch
-                // stays at its last stored state, so it misses whatever was
-                // outstanding when the rebuild ran (nothing, on the idle cycle
-                // this pass shares with the fold that just absorbed them), and
-                // an under-counted Misra-Gries summary reports its own
-                // `rows_accounted`. The exact columns are the ones Tier-1
-                // serves, and they are rebuilt from the files.
+                // needs it most. What the rebuild does instead is carry the
+                // sketch half of every delta its watermark is about to make
+                // deletable, so an approximate column keeps its rows without
+                // costing a second Tier-2 query per sketched column. The exact
+                // columns are the ones Tier-1 serves, and they are rebuilt from
+                // the files.
                 None,
                 Some(&short),
             )
@@ -19388,7 +19387,49 @@ impl IcebergContext {
             }
             Some(sketches)
         } else {
-            None
+            // Not recomputing the sketches, but they must not silently LOSE
+            // rows either. `rebuilt_through` makes every delta at or below it
+            // redundant, and both folds then DELETE rather than fold it —
+            // correct for the exact half, which this rebuild read out of the
+            // files, and wrong for the sketch half, which it did not touch. So
+            // merge the sketch half of exactly those deltas first, under the
+            // same predicate the fold's `redundant` uses, and let the watermark
+            // delete them afterwards.
+            //
+            // Columns this rebuild restored exactly are dropped from the carry:
+            // a column represented both ways is reconciled by demoting the
+            // exact side, which would undo the repair and leave the next census
+            // rebuilding the same column every pass.
+            let mut carried = existing
+                .as_ref()
+                .and_then(|w| w.sketches.clone())
+                .unwrap_or_else(|| GroupCountSketches {
+                    version: GROUP_COUNT_SKETCH_VERSION,
+                    columns: BTreeMap::new(),
+                });
+            let absorbed: BTreeSet<i64> = existing
+                .as_ref()
+                .map(|w| w.absorbed.iter().copied().collect())
+                .unwrap_or_default();
+            for (seq, path) in list_group_count_deltas(&op).await? {
+                if seq > sequence_number || absorbed.contains(&seq) {
+                    continue;
+                }
+                let Some(delta) = read_group_count_delta(&op, &path).await? else {
+                    continue;
+                };
+                let Some(mut sketches) = delta.sketches else {
+                    continue;
+                };
+                sketches
+                    .columns
+                    .retain(|column, _| !rebuilt.columns.contains_key(column));
+                if sketches.is_empty() {
+                    continue;
+                }
+                carried.merge(&sketches);
+            }
+            Some(carried)
         };
 
         // CAS the object. On conflict the whole rebuild is redone rather than
