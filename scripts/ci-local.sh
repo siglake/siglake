@@ -283,8 +283,8 @@ fi
 job_started=$SECONDS
 # check-chart.py's checks that need no render: every deployed SIGLAKE_* env name
 # in compose and the operator is named by non-test Rust source; every
-# `siglake_*` series a deploy/grafana panel queries is one crates/ emits, in the
-# form the exporter renders it; the README's alert count matches the
+# `siglake_*` series a deploy/grafana panel queries is one crates/ or an owned
+# fork emits, in the form the exporter renders it; the README's alert count matches the
 # PrometheusRule template source; and every counter the template reads through
 # `increase()` is in a pre-registration list in siglake-core's metrics.rs. CI
 # runs them inside the helm job's full check-chart.py; here they are
@@ -294,10 +294,11 @@ job_started=$SECONDS
 # four-minute test job for the same reason set-var does: a wrong answer here is
 # red in a second.
 #
-# One of these checks evaluates the drain-backlog panel's PromQL with promtool,
-# which the helm job installs in CI but which is also worth using here whenever
-# it happens to be on PATH: the panel's arithmetic is what the check is about,
-# and skipping it silently on a box that could have run it is the worse default.
+# Two of these checks evaluate a panel's PromQL with promtool (the drain backlog
+# and the text-index startup stages), which the helm job installs in CI but
+# which is also worth using here whenever it happens to be on PATH: the panels'
+# arithmetic is what those checks are about, and skipping it silently on a box
+# that could have run it is the worse default.
 dashboard_args=(--source-only)
 if command -v promtool >/dev/null 2>&1; then
   dashboard_args+=(--require-promtool)
