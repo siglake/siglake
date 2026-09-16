@@ -63,16 +63,11 @@ jobs:
         with:
           cache-on-failure: true
 
-      - name: clippy, profiling feature
-        run: cargo clippy -p siglake-core --features profiling -- -D warnings
-
-      - name: clippy, profiling feature with tokio_unstable
-        env:
-          RUSTFLAGS: "--cfg tokio_unstable -C force-frame-pointers=yes"
-        run: cargo clippy -p siglake-core --features profiling -- -D warnings
-
-      - name: unit tests, profiling feature
-        run: cargo test -p siglake-core --features profiling
+      # The same script ci.yml's `clippy` job and scripts/ci-local.sh's
+      # `profiling` job run: clippy plus the crate's tests, in both
+      # configurations.
+      - name: Profiling feature, both tokio_unstable configurations
+        run: scripts/check-profiling-feature.sh
 
   image:
     needs: check
