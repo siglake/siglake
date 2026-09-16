@@ -210,6 +210,23 @@ over the same maps, which is where a repair acquires its own bugs.
   of `record_count` and schedules a Tier-2 rebuild. A pre-coverage object is not
   short; it is unprovable. Keeping them separate is deliberate.
 
+## The same machinery serves #3800
+
+#3082 is one way an inline object ends up with an unprovable chain: it never
+had one. #3800 is the other set — retention, a delete task, a foreign
+overwrite, or a stretch of re-clusters longer than `retain_last` so the ancestor
+walk runs off the end of retained metadata. The trigger differs; the repair does
+not. #3800's stated acceptance is "a full recompute that sets `coverage` to the
+snapshot it read, as the wide rebuild does", which is steps 5 through 8 above.
+
+Two differences to carry into #3800 rather than assume away. Its triggers can
+remove rows, so its rebuild has to run after the row-removing commit rather
+than race it, and the object's totals are already short on their own terms
+until it does. And a repair that fires automatically after every such commit
+pays the 2-D decode cost each time, where an operator-invoked repair pays it
+once — which is the argument for the containment optimization being settled
+here first.
+
 ## Open questions
 
 **1. What happens to the inline `group_counts` the rebuild does not recompute?**
