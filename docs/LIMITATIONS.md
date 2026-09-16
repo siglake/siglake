@@ -1008,8 +1008,9 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   table and renders the `rebuild-time-aggregates` line for it. Three limits on
   the census: it reports, it never rebuilds (automating the repair is separate
   work); it says nothing about a table whose object it could not read, leaving
-  the previous reading standing rather than writing one it did not observe; and
-  the gauge is a last observation, so the alert carries
+  the previous reading standing rather than writing one it did not observe
+  (a table it stops reaching altogether, a dropped index, is zeroed instead);
+  and the gauge is a last observation, so the alert carries
   `increase(siglake_inline_coverage_census_total[1h]) > 0` as a liveness arm to
   keep a compactor that stopped censusing from paging off a stale reading.
 - **Streamed rewrite output carries no inline inverted index.** Every rewrite

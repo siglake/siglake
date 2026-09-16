@@ -6882,10 +6882,15 @@ fn record_group_count_short_aggregate(table: &str, outcome: &'static str) {
 /// `iceberg_namespace`, not `namespace`: Prometheus attaches the Kubernetes
 /// namespace to every scraped series under that name, and a colliding metric
 /// label is silently renamed to `exported_namespace`.
-fn record_inline_coverage(namespace: &NamespaceIdent, table: &str, unproven: bool) {
+///
+/// The one writer of this gauge, and `pub` so the compactor can zero a reading
+/// for a table its census no longer reaches: a series is never removed from a
+/// live process, so an index dropped while its object was unprovable would page
+/// until a restart.
+pub fn report_inline_coverage(namespace: &str, table: &str, unproven: bool) {
     metrics::gauge!(
         "siglake_inline_coverage_unproven",
-        "iceberg_namespace" => namespace.to_string(),
+        "iceberg_namespace" => namespace.to_owned(),
         "table" => table.to_owned()
     )
     .set(if unproven { 1.0 } else { 0.0 });
@@ -7257,10 +7262,13 @@ pub enum InlineCoverageOutcome {
     /// no pending link bridges the gap. PERSISTENT: answers stay exact on the
     /// per-file tiers, and only `siglake rebuild-time-aggregates` clears it.
     Unproven,
-    /// The object exists and could not be read or parsed. Says nothing about
+    /// This pass could not read what it needed — the table would not load, or
+    /// the object is there and could not be read or parsed. Says nothing about
     /// coverage in either direction, so the census leaves the last reading
-    /// standing rather than reporting a state it did not observe.
-    Unreadable,
+    /// standing rather than reporting a state it did not observe. The table is
+    /// still maintained: a caller clearing readings for tables that have gone
+    /// away must not clear this one.
+    Undetermined,
 }
 
 impl InlineCoverageOutcome {
@@ -7270,7 +7278,7 @@ impl InlineCoverageOutcome {
         match self {
             Self::Unproven => Some(true),
             Self::Covered | Self::Publishing | Self::NotApplicable => Some(false),
-            Self::Unreadable => None,
+            Self::Undetermined => None,
         }
     }
 }
@@ -11749,7 +11757,9 @@ impl IcebergContext {
     ///
     /// Metadata only — it never rebuilds. Automatic repair is #4675.
     ///
-    /// Returns one entry per visited table, in `aggregate_table_idents` order.
+    /// Returns one entry per maintained table, in `aggregate_table_idents`
+    /// order — including the ones this pass could not reach a verdict on, so a
+    /// caller can tell "no longer maintained" from "not determined this pass".
     pub async fn census_inline_coverage(&self) -> Vec<(String, InlineCoverageOutcome)> {
         let mut out = Vec::new();
         for ident in self.aggregate_table_idents().await {
@@ -11762,7 +11772,7 @@ impl IcebergContext {
                 Err(error) => {
                     tracing::warn!(error = ?error, table = %ident,
                         "inline-coverage census failed");
-                    continue;
+                    InlineCoverageOutcome::Undetermined
                 }
             };
             match &outcome {
@@ -11779,21 +11789,24 @@ impl IcebergContext {
                     "the inline aggregate's edge does not reach the current snapshot \
                      yet, but a pending link does; leaving it to the commit path"
                 ),
-                InlineCoverageOutcome::Unreadable => tracing::warn!(
+                // The per-table warn above this loop names what failed; this
+                // one says what the failure costs.
+                InlineCoverageOutcome::Undetermined => tracing::warn!(
                     table = %ident,
-                    "the inline aggregate object exists but could not be read or \
-                     parsed; this pass has no evidence about its coverage either way"
+                    "the inline-coverage census could not read this table or its \
+                     aggregate object; this pass has no evidence about its coverage \
+                     either way and leaves the last reading standing"
                 ),
                 InlineCoverageOutcome::Covered | InlineCoverageOutcome::NotApplicable => {}
             }
             // Set every pass, for every table the census reached a verdict on.
             // That is what clears a repaired table, and what puts a healthy
             // table on the board at 0 rather than leaving it absent. An
-            // `Unreadable` pass deliberately writes nothing: it is not evidence,
+            // `Undetermined` pass deliberately writes nothing: it is not evidence,
             // and overwriting a standing 1 with a 0 on a failed GET would hide
             // exactly the state this exists to report.
             if let Some(unproven) = outcome.gauge_value() {
-                record_inline_coverage(self.namespace(), ident.name(), unproven);
+                report_inline_coverage(&self.namespace().to_string(), ident.name(), unproven);
             }
             out.push((ident.name().to_string(), outcome));
         }
@@ -11839,10 +11852,10 @@ impl IcebergContext {
             // should have one and does not is
             // `SiglakeSideAggregatePublicationLost`, not this.
             Ok(false) => return Ok(InlineCoverageOutcome::NotApplicable),
-            Err(_) => return Ok(InlineCoverageOutcome::Unreadable),
+            Err(_) => return Ok(InlineCoverageOutcome::Undetermined),
         }
         let Some(side) = load_side_aggregates(cached.table.file_io(), &path).await? else {
-            return Ok(InlineCoverageOutcome::Unreadable);
+            return Ok(InlineCoverageOutcome::Undetermined);
         };
         if aggregate_covers_current_snapshot(&cached.table, side.coverage) {
             return Ok(InlineCoverageOutcome::Covered);

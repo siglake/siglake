@@ -599,6 +599,12 @@ pub struct Compactor {
     /// restart, which costs a poisoned segment one more round of attempts and
     /// cannot lose its bytes.
     segment_read_failures: Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    /// #4674: the `(iceberg namespace, table)` readings the previous complete
+    /// inline-coverage census published. Shared across clones for the reason
+    /// `published_fs_backlog_tenants` is: a series is never removed from a live
+    /// process, so an index dropped while its object was unprovable would page
+    /// until a restart unless a later pass explicitly zeroes it.
+    published_inline_coverage: Arc<std::sync::Mutex<BTreeSet<(String, String)>>>,
     /// See [`Self::with_verified_owner_for_test`].
     verified_owner_for_test: Option<String>,
     /// See [`Self::with_transient_fs_commit_failures_for_test`].
@@ -630,6 +636,7 @@ impl Compactor {
             delete_tasks_enabled: false,
             delete_task_stall_logged: Default::default(),
             published_fs_backlog_tenants: Default::default(),
+            published_inline_coverage: Default::default(),
             commit_batch: None,
             drain_concurrency: None,
             drain_cycle_budget: None,
@@ -1964,6 +1971,11 @@ impl Compactor {
     /// #4675 — so unlike the short-aggregate pass beside it, this one has no
     /// budget to spend and nothing to opt into.
     ///
+    /// A table the pass no longer reaches has its reading zeroed. The gauge is
+    /// per `(iceberg namespace, table)` and a series is never removed from a
+    /// live process, so an index dropped while its object was unprovable would
+    /// otherwise page until a restart.
+    ///
     /// The pass counter is the alert's liveness arm. `siglake_inline_coverage_unproven`
     /// is a last-observation gauge: a pod that stops censusing — it lost the
     /// `agg_fold` lease, the census was switched off, the watchdog cut it —
@@ -1974,6 +1986,7 @@ impl Compactor {
     /// so a pod that stopped looking drops out of the alert instead of paging
     /// from a stale reading.
     async fn run_inline_coverage_census_once(&self) {
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
         for ice in self.aggregate_contexts("inline-coverage census").await {
             let namespace = ice.namespace().to_string();
             for (table, outcome) in ice.census_inline_coverage().await {
@@ -1983,7 +1996,19 @@ impl Compactor {
                     outcome = ?outcome,
                     "inline-coverage census"
                 );
+                seen.insert((namespace.clone(), table));
             }
+        }
+        // A namespace this pass could not open is missing from `seen` entirely,
+        // and zeroing its tables would read as "repaired" when the truth is
+        // "unvisited". `aggregate_contexts` warns and skips such a namespace,
+        // so hold the previous set when the pass reached nothing at all.
+        if !seen.is_empty() {
+            let mut published = self.published_inline_coverage.lock().unwrap();
+            for (namespace, table) in vanished_inline_coverage(&published, &seen) {
+                siglake_storage::iceberg::report_inline_coverage(&namespace, &table, false);
+            }
+            *published = seen;
         }
         metrics::counter!("siglake_inline_coverage_census_total").increment(1);
     }
@@ -5773,6 +5798,21 @@ fn inline_coverage_scan_interval_from(configured: Option<&str>) -> Option<Durati
     Some(Duration::from_secs(raw.parse().unwrap_or(900).max(1)))
 }
 
+/// Which `(iceberg namespace, table)` readings a completed inline-coverage
+/// census must zero: the ones the previous pass published and this one no
+/// longer reaches.
+///
+/// A table this pass could not read is still in `seen` — the census returns
+/// `Undetermined` for it rather than dropping it — so only a table that has
+/// genuinely stopped being maintained is cleared. Pure, so the set arithmetic
+/// is tested without a warehouse.
+fn vanished_inline_coverage(
+    published: &BTreeSet<(String, String)>,
+    seen: &BTreeSet<(String, String)>,
+) -> Vec<(String, String)> {
+    published.difference(seen).cloned().collect()
+}
+
 /// Whether the inline-coverage census interval has elapsed since the last pass.
 /// Its own stamp, not the short-aggregate census's: the two run on independent
 /// intervals and sharing one would make whichever ran first suppress the other.
@@ -7721,6 +7761,32 @@ mod agg_short_repair_knob_tests {
             super::inline_coverage_scan_interval_from(Some("nonsense")),
             Some(Duration::from_secs(900))
         );
+    }
+
+    /// A dropped index must not page until the process restarts: the gauge has
+    /// no delete, so the pass that stops reaching a table has to zero it. A
+    /// table the pass merely could not READ stays in the seen set
+    /// (`InlineCoverageOutcome::Undetermined`) and keeps its reading.
+    #[test]
+    fn a_table_the_census_no_longer_reaches_is_zeroed() {
+        let entry = |ns: &str, t: &str| (ns.to_string(), t.to_string());
+        let published = std::collections::BTreeSet::from([
+            entry("siglake", "events"),
+            entry("siglake", "logs-archive"),
+            entry("tenant_acme", "events"),
+        ]);
+        let seen = std::collections::BTreeSet::from([
+            entry("siglake", "events"),
+            entry("tenant_acme", "events"),
+        ]);
+        assert_eq!(
+            super::vanished_inline_coverage(&published, &seen),
+            vec![entry("siglake", "logs-archive")]
+        );
+        // A table seen for the first time is not something to clear, and a
+        // pass that reaches everything clears nothing.
+        assert!(super::vanished_inline_coverage(&seen, &published).is_empty());
+        assert!(super::vanished_inline_coverage(&published, &published).is_empty());
     }
 
     /// The liveness arm of `SiglakeInlineCoverageUnproven`. Without the series

@@ -499,7 +499,9 @@ automating the repair is separate work. An object it cannot READ writes no
 sample at all — a failed GET is not evidence about coverage in either direction
 — and a publication still in flight (the edge does not reach current, but one of
 the object's pending links does) is reported as covered, because the next commit
-settles it.
+settles it. A table the pass no longer reaches at all — a dropped index — has its
+reading zeroed, since a metric series is never removed from a live process and a
+standing 1 would otherwise page until a restart.
 
 The counter beside it, `siglake_inline_coverage_census_total`, is one increment
 per completed pass. The gauge is a last observation, so a compactor that stops

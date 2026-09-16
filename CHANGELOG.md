@@ -137,8 +137,10 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   `siglake_inline_coverage_unproven{iceberg_namespace,table}` to 1 or 0 for
   every table it reaches a verdict on — so a table repaired by
   `siglake rebuild-time-aggregates` clears at the next pass. A publication still
-  in flight reads as covered, and an object the census could not read writes no
-  sample at all, since a failed GET is not evidence in either direction.
+  in flight reads as covered, an object the census could not read writes no
+  sample at all (a failed GET is not evidence in either direction), and a table
+  the pass stops reaching — a dropped index — has its reading zeroed rather than
+  left standing until the process restarts.
   `SiglakeInlineCoverageUnproven` (critical, 35 alerts) fires after 30 minutes —
   two censuses — and renders the repair command with both labels filled in; it
   carries `increase(siglake_inline_coverage_census_total[1h]) > 0` on the same

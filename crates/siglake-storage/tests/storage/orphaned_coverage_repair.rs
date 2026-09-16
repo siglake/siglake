@@ -301,7 +301,7 @@ async fn a_census_that_cannot_read_the_object_reports_nothing() {
 
     let ice = open(tmp.path()).await;
     let (outcome, samples) = census_samples(&ice).await;
-    assert_eq!(outcome, InlineCoverageOutcome::Unreadable);
+    assert_eq!(outcome, InlineCoverageOutcome::Undetermined);
     assert!(
         samples.is_empty(),
         "a failed read wrote a coverage verdict: {samples:?}"
