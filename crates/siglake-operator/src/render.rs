@@ -3017,8 +3017,8 @@ mod tests {
     /// Every Service's named `targetPort` must exist on the workload it selects.
     ///
     /// THE DEFECT THIS GUARDS. The ingester Service targeted the ingest port's
-    /// old name while the container declared `ingest` — residue of the
-    /// OTLP rename landing in one of two copies. A named `targetPort` matching no
+    /// old name while the container declared `ingest` — residue of the OTLP
+    /// rename landing in one of two copies. A named `targetPort` matching no
     /// container port is silently DROPPED by the endpoints controller: the
     /// EndpointSlice carries no port for 8088 and every connection to
     /// `<cr>-ingester:8088` is refused, while the pods stay Ready because the
