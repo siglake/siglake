@@ -5845,6 +5845,7 @@ dependencies = [
  "clap",
  "datafusion",
  "iceberg",
+ "libc",
  "metrics",
  "object_store",
  "opendal",
