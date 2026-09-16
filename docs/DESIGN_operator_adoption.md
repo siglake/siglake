@@ -43,6 +43,12 @@ itself adopts (`meta.helm.sh/release-*` + `app.kubernetes.io/managed-by`):
    values.yaml surface). The operator renders the SAME resource names
    the chart used (a `nameTemplate: helm-compat` spec knob), so
    adoption is metadata-only.
+   The preflight's stdout is ONE YAML document: the synthesized resource,
+   with the findings and the runbook below it as comments. Step 3b applies
+   that file, so a bare command line in the report would stop the saved copy
+   from parsing (#4544). The resource carries `metadata.namespace` and every
+   runbook command carries the same `-n`; the namespace comes from
+   `--adopt-namespace` and falls back to the release name.
 3. **Handover commit**:
    a. `helm uninstall --no-hooks --keep-history` is NOT used —
       instead `kubectl annotate/label` flips

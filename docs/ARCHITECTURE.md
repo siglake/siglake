@@ -1120,6 +1120,10 @@ an operator whose only bound was `maxTenants` had none.
   anything not yet committed to Iceberg stays on the release's claim), and
   each configured authentication or tenant control above, with the tier it
   belongs to and how to keep it (`deploy/helm/siglake-operator/README.md`).
+  The report is a single applicable manifest — findings and runbook are
+  comments — and `--adopt-namespace` (default: the release name) sets both
+  `metadata.namespace` and the `-n` on every runbook command, so a release
+  installed into a namespace that is not its name adopts into the right one.
 - **Terraform/EKS BYOC** (`deploy/terraform`): EKS + EFS (RWX WAL) + RDS
   (catalog) + S3 (warehouse), validated across the AWS smoke rounds; Grafana
   overview dashboard in `deploy/grafana/`.
