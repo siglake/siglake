@@ -669,6 +669,15 @@ through 200 GB and 1 TB sustained-ingest rounds
   (`SIGLAKE_INDEX_REBUILD=1`) registers Puffin sidecars for it.
   Group-count, time-bucket and row-group-bloom footers are written
   either way (see [`LIMITATIONS.md`](LIMITATIONS.md)).
+  Row groups on merged output are sized in BYTES: the writer is built on the
+  merge's first output batch and takes
+  `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` (or
+  `IcebergTuning::target_row_group_bytes`, 256 MB uncompressed by default)
+  divided by that batch's decoded row size, clamped to 128 Ki–4 Mi rows — the
+  same sizing the flush path makes from the batch it is handed. The open row
+  group is buffered decoded while its bloom accumulates, so that target is also
+  what bounds a merge's, a re-cluster's and a delete rewrite's writer-side
+  memory (see [`LIMITATIONS.md`](LIMITATIONS.md)).
 - **Metadata hygiene on the same loop:** snapshot expiry (count + age),
   orphan-file GC with its own safety age (deliberately not the retention
   window — a file younger than the longest write-then-commit gap may be about

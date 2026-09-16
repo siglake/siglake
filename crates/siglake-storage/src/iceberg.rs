@@ -930,6 +930,68 @@ impl MergePathKind {
     }
 }
 
+/// A merge output writer built on the FIRST batch written through it, so its
+/// row group can be sized from that batch against the configured byte target
+/// (`SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` /
+/// [`IcebergTuning::target_row_group_bytes`]).
+///
+/// Rows are the unit parquet takes and the target is bytes, so converting one
+/// to the other needs an observed row size. The flush path has its whole batch
+/// in hand before it builds a writer; a merge's rows do not exist until the
+/// merge runs, and building the writer up front is what made the target
+/// unreachable on every merge path — leveled compaction, re-clustering and the
+/// streaming delete-task survivor rewrite all passed no sample, which returns
+/// the 1,048,576-row fallback WITHOUT reading the target (see
+/// [`target_row_group_rows_with_target`]). That matters because the open row
+/// group is buffered decoded whenever a row-group bloom column is set (which
+/// `with_footers` always sets): below one row group the buffer is the whole
+/// output, so 1 Mi rows of a 1.2 KB-per-row table is ~1.2 GB held.
+///
+/// Deferring also means a writer that is never written is never built, so no
+/// empty output file is created. `close` on an unwritten writer returns no data
+/// files, which is what the eager writer's `close` returned for the same case.
+struct LazyMergeOutputWriter<'a> {
+    ctx: &'a IcebergContext,
+    table: &'a Table,
+    files: &'a [DataFile],
+    bloom_columns: &'a [&'a str],
+    with_footers: bool,
+    rewrite_gen: u32,
+    inner: Option<Box<dyn IcebergWriter>>,
+}
+
+impl LazyMergeOutputWriter<'_> {
+    async fn write(&mut self, batch: RecordBatch) -> Result<()> {
+        if self.inner.is_none() {
+            self.inner = Some(
+                self.ctx
+                    .build_merge_output_writer(
+                        self.table,
+                        self.files,
+                        self.bloom_columns,
+                        self.with_footers,
+                        self.rewrite_gen,
+                        Some(&batch),
+                    )
+                    .await?,
+            );
+        }
+        self.inner
+            .as_mut()
+            .expect("writer built above")
+            .write(batch)
+            .await
+            .context("DataFileWriter::write")
+    }
+
+    async fn close(&mut self) -> Result<Vec<DataFile>> {
+        match self.inner.as_mut() {
+            Some(writer) => writer.close().await.context("DataFileWriter::close"),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
 /// Outcome of a tier-2 re-clustering rewrite. See [`IcebergContext::recluster_files`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReclusterStats {
@@ -1848,9 +1910,48 @@ fn target_row_group_rows_with_target(sample: Option<&RecordBatch>, target_bytes:
         _ => return 1_048_576,
     };
     let bytes = sample.unwrap().get_array_memory_size();
-    let avg = (bytes / rows).max(1);
-    let target = target_bytes / avg;
+    row_group_rows_for_avg((bytes / rows).max(1), target_bytes)
+}
+
+/// Turn an observed average decoded row size into a row-group row count for
+/// `target_bytes`, under the [`MIN_ROW_GROUP_ROWS`]/[`MAX_ROW_GROUP_ROWS`]
+/// clamps. Split out of [`target_row_group_rows_with_target`] because the merge
+/// paths measure their sample differently (see [`sampled_row_bytes`]).
+fn row_group_rows_for_avg(avg_row_bytes: usize, target_bytes: usize) -> usize {
+    let target = target_bytes / avg_row_bytes.max(1);
     target.clamp(MIN_ROW_GROUP_ROWS, MAX_ROW_GROUP_ROWS)
+}
+
+/// Average decoded bytes per row of `batch`, measured over the rows the batch
+/// actually spans.
+///
+/// NOT `get_array_memory_size`, which the flush path uses on a batch it
+/// assembled itself: that reports whole buffer allocations, and the merge paths
+/// write zero-copy SLICES of a decoded input part (the page-bounded merge emits
+/// a whole run as slices; `RecordBatch::slice` shares the part's buffers). On a
+/// 2,000-row slice of an 8,192-row part it would report the part's bytes and
+/// size the row group as if every row were four times its weight — the sizing
+/// would then follow how the plan happened to cut its first run rather than the
+/// data. `ArrayData::get_slice_memory_size` prices the slice's own extent,
+/// including the variable-width bytes its offsets span.
+///
+/// The extent is not all the writer holds: a buffered batch keeps whole
+/// buffers, and a batch built by the ingest path carries ~2x its extent in
+/// allocation slack (measured 2026-09-16 on the delete fixture: 432 B/row by
+/// `get_array_memory_size` against 216 B/row here). So the byte target is a
+/// target for the rows, and the resident bytes can run over it by that slack.
+/// Pricing the slack instead is what cannot be done here — on a slice it is the
+/// whole part behind it, shared with every other slice of that part.
+fn sampled_row_bytes(batch: &RecordBatch) -> Option<usize> {
+    let rows = batch.num_rows();
+    if rows == 0 {
+        return None;
+    }
+    let mut bytes = 0usize;
+    for col in batch.columns() {
+        bytes = bytes.saturating_add(col.to_data().get_slice_memory_size().ok()?);
+    }
+    Some((bytes / rows).max(1))
 }
 
 fn target_row_group_uncompressed_bytes() -> usize {
@@ -15152,8 +15253,12 @@ impl IcebergContext {
     /// the Parquet reader's row-group buffer plus the writer's open row group.
     ///
     /// THE INPUT IS NEVER HELD; THE OUTPUT IS. The writer's open row group is
-    /// `build_merge_output_writer`'s 1,048,576 rows, buffered decoded, so a
-    /// rewrite whose survivors fit in one row group holds all of them.
+    /// buffered decoded, so a rewrite whose survivors fit in one row group
+    /// holds all of them. That row group was a flat 1,048,576 rows until #4754;
+    /// it is now the byte target divided by the first survivor batch's row size
+    /// (see [`LazyMergeOutputWriter`]), clamped at [`MIN_ROW_GROUP_ROWS`], so
+    /// lowering `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` lowers what a rewrite
+    /// holds — down to that floor's worth of survivors and no further.
     /// Measured 2026-09-16 (#4703,
     /// `tests/delete_task_size_gate.rs::measure_peak_allocation_per_arm`):
     /// peak ≈ 0.96 × the survivors' decoded bytes + ~18 MB, and flat in the
@@ -15224,21 +15329,9 @@ impl IcebergContext {
         // A preview (`apply == false`) runs the same pass with no writer, so
         // it still answers the question the guard below asks: would this
         // rewrite conserve the file's rows?
-        let mut writer = if apply {
-            Some(
-                self.build_merge_output_writer(
-                    table,
-                    std::slice::from_ref(file),
-                    bloom_columns,
-                    true,
-                    0,
-                )
-                .await
-                .context("build delete-task survivor writer")?,
-            )
-        } else {
-            None
-        };
+        let mut writer = apply.then(|| {
+            self.lazy_merge_output_writer(table, std::slice::from_ref(file), bloom_columns, true, 0)
+        });
         let mut survivor_rows = 0u64;
         while let Some(batch) = survivors.next().await {
             let batch = batch
@@ -15922,6 +16015,28 @@ impl IcebergContext {
         Ok((arrow_schema, ts_col, merge_col, descending))
     }
 
+    /// The merge output writer every merge path writes through, held unbuilt
+    /// until its first batch so the row group is sized from a real row size
+    /// against the configured byte target. See [`LazyMergeOutputWriter`].
+    fn lazy_merge_output_writer<'a>(
+        &'a self,
+        table: &'a Table,
+        files: &'a [DataFile],
+        bloom_columns: &'a [&'a str],
+        with_footers: bool,
+        rewrite_gen: u32,
+    ) -> LazyMergeOutputWriter<'a> {
+        LazyMergeOutputWriter {
+            ctx: self,
+            table,
+            files,
+            bloom_columns,
+            with_footers,
+            rewrite_gen,
+            inner: None,
+        }
+    }
+
     /// Build the rolling data-file writer both merge executors write through:
     /// row-group blooms incremental, a `SortingColumn` footer claiming ONLY the
     /// `timestamp` order the merge actually guarantees (in the declared
@@ -15938,6 +16053,13 @@ impl IcebergContext {
         bloom_columns: &[&str],
         with_footers: bool,
         rewrite_gen: u32,
+        // The first batch the caller is about to write, as the row-size sample
+        // the byte target is divided by. `None` — no output batch exists yet —
+        // is what every merge path used to pass, and it reaches the
+        // 1,048,576-row fallback that reads no target at all. Callers go
+        // through `lazy_merge_output_writer`, which holds the build until it
+        // has a batch.
+        sample: Option<&RecordBatch>,
         // Boxed rather than `impl IcebergWriter`: an opaque return here makes
         // every future up the compactor call chain trip rustc's
         // higher-ranked-lifetime `Send` limitation at `tokio::spawn`.
@@ -15949,7 +16071,19 @@ impl IcebergContext {
             descending,
             nulls_first: false,
         }];
-        let row_group_rows = target_row_group_rows_with_target(None, self.target_row_group_bytes());
+        let target_bytes = self.target_row_group_bytes();
+        let sample_row_bytes = sample.and_then(sampled_row_bytes);
+        let row_group_rows = match sample_row_bytes {
+            Some(avg) => row_group_rows_for_avg(avg, target_bytes),
+            None => target_row_group_rows_with_target(None, target_bytes),
+        };
+        tracing::debug!(
+            row_group_rows,
+            sample_row_bytes,
+            target_bytes,
+            with_footers,
+            "merge output row group sized"
+        );
         let mut parquet_builder = ParquetWriterBuilder::new(
             siglake_writer_properties(
                 bloom_columns,
@@ -16061,9 +16195,8 @@ impl IcebergContext {
             sources.push(stream);
         }
 
-        let mut writer = self
-            .build_merge_output_writer(table, files, bloom_columns, with_footers, rewrite_gen)
-            .await?;
+        let mut writer =
+            self.lazy_merge_output_writer(table, files, bloom_columns, with_footers, rewrite_gen);
 
         let mut merge =
             crate::merge::TimestampKwayMerge::new(sources, merge_col, MERGE_BATCH_ROWS, descending);
@@ -16075,11 +16208,11 @@ impl IcebergContext {
             stages.assemble += t_assemble.elapsed().as_nanos() as u64;
             rows += batch.num_rows();
             let t_write = std::time::Instant::now();
-            writer.write(batch).await.context("DataFileWriter::write")?;
+            writer.write(batch).await?;
             stages.write += t_write.elapsed().as_nanos() as u64;
         }
         let t_close = std::time::Instant::now();
-        let added = writer.close().await.context("DataFileWriter::close")?;
+        let added = writer.close().await?;
         stages.write += t_close.elapsed().as_nanos() as u64;
         // Fold in the merger's own input/assemble split.
         let inner = merge.stages();
@@ -16305,9 +16438,8 @@ impl IcebergContext {
             inflight.push_back(spawn_fetch(ci, args));
         }
 
-        let mut writer = self
-            .build_merge_output_writer(table, files, bloom_columns, true, rewrite_gen)
-            .await?;
+        let mut writer =
+            self.lazy_merge_output_writer(table, files, bloom_columns, true, rewrite_gen);
         let mut rows_written = 0usize;
         let mut fetch_total_nanos = 0u64;
         loop {
@@ -16404,7 +16536,7 @@ impl IcebergContext {
                         let b = self.maybe_repromote(table, b)?;
                         rows_written += b.num_rows();
                         let t = std::time::Instant::now();
-                        writer.write(b).await.context("DataFileWriter::write")?;
+                        writer.write(b).await?;
                         chunk_write_nanos += t.elapsed().as_nanos() as u64;
                         indices.clear();
                     }
@@ -16435,7 +16567,7 @@ impl IcebergContext {
                         let b = self.maybe_repromote(table, b)?;
                         rows_written += b.num_rows();
                         let t = std::time::Instant::now();
-                        writer.write(b).await.context("DataFileWriter::write")?;
+                        writer.write(b).await?;
                         chunk_write_nanos += t.elapsed().as_nanos() as u64;
                         emitted += take;
                     }
@@ -16448,7 +16580,7 @@ impl IcebergContext {
                             let b = self.maybe_repromote(table, b)?;
                             rows_written += b.num_rows();
                             let t = std::time::Instant::now();
-                            writer.write(b).await.context("DataFileWriter::write")?;
+                            writer.write(b).await?;
                             chunk_write_nanos += t.elapsed().as_nanos() as u64;
                             indices.clear();
                         }
@@ -16461,7 +16593,7 @@ impl IcebergContext {
                 let b = self.maybe_repromote(table, b)?;
                 rows_written += b.num_rows();
                 let t = std::time::Instant::now();
-                writer.write(b).await.context("DataFileWriter::write")?;
+                writer.write(b).await?;
                 chunk_write_nanos += t.elapsed().as_nanos() as u64;
             }
             stages.write += chunk_write_nanos;
@@ -16474,7 +16606,7 @@ impl IcebergContext {
             "page-bounded merge wrote {rows_written} rows, planned {total_rows}"
         );
         let t_close = std::time::Instant::now();
-        let added = writer.close().await.context("DataFileWriter::close")?;
+        let added = writer.close().await?;
         stages.write += t_close.elapsed().as_nanos() as u64;
         // Gross fetch time vs the part that actually stalled the merge. The
         // difference is what chunk pipelining hid behind encode, and it is the
@@ -22473,6 +22605,44 @@ mod row_group_tests {
             (MIN_ROW_GROUP_ROWS..=MAX_ROW_GROUP_ROWS).contains(&n),
             "expected in-band, got {n}"
         );
+    }
+
+    /// The knob has to move the answer ABOVE the floor, where the clamp is not
+    /// the one deciding. Doubling the target doubles the rows; halving it
+    /// halves them; and both land between the clamps, so this fails if the
+    /// target is ignored (either fallback would be a constant).
+    #[test]
+    fn row_group_rows_track_the_byte_target_above_the_floor() {
+        let avg = 600; // decoded bytes per row, mid-range for a log event
+        let base = row_group_rows_for_avg(avg, 256 * 1024 * 1024);
+        assert_eq!(base, 256 * 1024 * 1024 / avg);
+        assert!((MIN_ROW_GROUP_ROWS..MAX_ROW_GROUP_ROWS).contains(&base));
+        assert_eq!(row_group_rows_for_avg(avg, 512 * 1024 * 1024), base * 2);
+        let half = row_group_rows_for_avg(avg, 128 * 1024 * 1024);
+        assert_eq!(half, base / 2);
+        assert!(half > MIN_ROW_GROUP_ROWS, "{half} is at the floor");
+    }
+
+    /// A merge writes zero-copy slices of decoded input parts, and the
+    /// row-group size must not depend on how wide the slice happens to be.
+    /// `get_array_memory_size` — what the flush path measures — reports the
+    /// whole part for every slice of it, which is the trap this avoids.
+    #[test]
+    fn sampled_row_bytes_prices_a_slice_not_the_part_behind_it() {
+        let part = make_batch(8192, 256);
+        let whole = sampled_row_bytes(&part).expect("non-empty");
+        let slice = part.slice(0, 64);
+        let sliced = sampled_row_bytes(&slice).expect("non-empty");
+        assert!(
+            sliced.abs_diff(whole) * 20 < whole,
+            "a 64-row slice priced {sliced} B/row against the part's {whole} B/row"
+        );
+        assert!(
+            slice.get_array_memory_size() / 64 > whole * 10,
+            "the trap this test exists for is gone: get_array_memory_size no \
+             longer inflates a slice"
+        );
+        assert_eq!(sampled_row_bytes(&make_batch(0, 0)), None);
     }
 
     #[test]

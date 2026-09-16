@@ -38,7 +38,8 @@ use siglake_core::index_config::{FieldType, IndexConfig};
 use siglake_core::{events_to_record_batch, Event};
 use siglake_index::INVERTED_INDEX_KV_KEY;
 use siglake_storage::iceberg::{
-    DeleteTaskState, IcebergContext, IcebergTuning, GROUP_COUNTS_KV_KEY, TIME_BUCKETS_KV_KEY,
+    DeleteTaskState, IcebergContext, IcebergTuning, GROUP_COUNTS_KV_KEY, MIN_ROW_GROUP_ROWS,
+    TIME_BUCKETS_KV_KEY,
 };
 
 /// The `--test storage` binary's fixture clock, included rather than copied:
@@ -201,15 +202,22 @@ async fn append_index_events(
     ice: &IcebergContext,
     config: &IndexConfig,
     events: &[Event],
-) -> usize {
+) -> (usize, usize) {
+    use arrow::array::Array;
+
     let batch = events_to_record_batch(events).unwrap();
     let decoded_bytes = batch.get_array_memory_size();
+    let slice_bytes: usize = batch
+        .columns()
+        .iter()
+        .map(|c| c.to_data().get_slice_memory_size().unwrap())
+        .sum();
     let blooms = bloom_columns(config);
     let bloom_refs: Vec<&str> = blooms.iter().map(String::as_str).collect();
     ice.append_to_table(&ice.index_table_ident(&config.index_id), batch, &bloom_refs)
         .await
         .unwrap();
-    decoded_bytes
+    (decoded_bytes, slice_bytes)
 }
 
 async fn count_index_rows(ice: &IcebergContext, index_id: &str, where_sql: Option<&str>) -> i64 {
@@ -655,12 +663,23 @@ struct SweepPeak {
     /// `get_array_memory_size` of the appended batch — the decoded size of the
     /// one candidate the sweep rewrites.
     decoded: usize,
+    /// The same batch priced the way the WRITER prices its sample: the extent
+    /// the rows span, without the slack in the buffers holding them. Runs
+    /// ~2x under [`Self::decoded`] here, which is the difference between a byte
+    /// target that splits the output's row groups and one that does not.
+    decoded_slice: usize,
     /// The committed candidate's compressed size on the store.
     file_bytes: u64,
     /// Rows the predicate did NOT match, out of [`Self::rows`] — the rows the
     /// rewrite has to write back out.
     survivors: usize,
     rows: usize,
+    /// Rows in the rewrite output's first row group, and how many groups it
+    /// wrote: what the byte target resolved to for this fixture's rows. The
+    /// open row group is what the arm buffers decoded, so this is the number
+    /// [`Self::peak`] is supposed to follow.
+    first_row_group: usize,
+    row_groups: usize,
 }
 
 impl SweepPeak {
@@ -713,7 +732,7 @@ async fn sweep_peak(
             )
         })
         .collect();
-    let decoded = append_index_events(&ice, &config, &events).await;
+    let (decoded, decoded_slice) = append_index_events(&ice, &config, &events).await;
     drop(events);
 
     let files = ice
@@ -746,12 +765,16 @@ async fn sweep_peak(
         "{outcome:?}"
     );
     assert_eq!(count_index_rows(&ice, "logs", None).await, survivors as i64);
+    let groups = index_output_row_groups(&ice, "logs").await;
     SweepPeak {
         peak,
         decoded,
+        decoded_slice,
         file_bytes,
         survivors,
         rows,
+        first_row_group: groups[0],
+        row_groups: groups.len(),
     }
 }
 
@@ -788,16 +811,18 @@ async fn sweep_peak(
 /// 1.39 / 0.94 / 0.71 / 0.36 — a ratio that says nothing on its own, which is
 /// why it is not what the assertions use.
 ///
-/// 0.96 of the output is one whole decoded copy, and the code says where:
-/// `build_merge_output_writer` sizes its row group with
-/// `target_row_group_rows_with_target(None, …)`, which with no sample returns
-/// the 1,048,576-row fallback and ignores the byte target it was passed; the
+/// 0.96 of the output is one whole decoded copy, and the code says where: the
 /// fork's `ParquetWriter` buffers the open row group as decoded Arrow batches
-/// in `pending` whenever a row-group bloom column is set, which
-/// `with_footers` always sets here. So every output under 1 Mi rows is held
-/// entire. The answer to #4703's question is yes: the rolling writer buffers a
-/// row group proportional to the output, and below 1 Mi rows the row group IS
-/// the output.
+/// in `pending` whenever a row-group bloom column is set, which `with_footers`
+/// always sets here. The answer to #4703's question is yes: the rolling writer
+/// buffers a row group proportional to the output, and every fixture above is
+/// one row group. When these were taken that row group was a flat 1,048,576
+/// rows — `build_merge_output_writer` asked for its size with no sample batch,
+/// and that branch returns the fallback without reading the byte target it was
+/// passed (#4754). The fix leaves this table standing: none of these fixtures
+/// reaches even the 128 Ki-row floor, so no target could have split their
+/// output. [`measure_peak_against_row_group_target`] is where the target is
+/// measured, on a fixture large enough for it to bite.
 ///
 /// WHAT THIS DOES NOT ESTABLISH. Not that a 256 MiB cold-target candidate fits
 /// a compactor packaged at `memory: 1Gi` (`deploy/helm/siglake/values.yaml`).
@@ -919,6 +944,210 @@ fn measure_peak_allocation_per_arm() {
             same_output.decoded,
             narrow.peak,
             narrow.decoded,
+        );
+    });
+}
+
+/// THE KNOB, MEASURED (#4754) — by hand, like the sweep above and for the same
+/// reason; this fixture is eight times the largest one there:
+///
+/// ```text
+/// cargo test -p siglake-storage --test delete_task_size_gate \
+///     measure_peak_against_row_group_target -- --ignored --nocapture
+/// ```
+///
+/// The peak the sweep above measured is the open row group, and the row group
+/// is now `target_row_group_bytes / observed row size` clamped to
+/// [`MIN_ROW_GROUP_ROWS`]. So the target moves the peak — but ONLY on a rewrite
+/// whose survivors exceed the 128 Ki-row floor. Every fixture in
+/// [`measure_peak_allocation_per_arm`] writes at most 32 Ki survivors, where
+/// the floor alone decides the row group and no target can lower it; that is
+/// why the numbers there are unchanged by this fix and why this measurement
+/// needs 256 Ki survivors of its own.
+///
+/// Recorded 2026-09-16 post-fix, debug build, 512 Ki rows of 128 B raw text,
+/// half deleted — 262,144 survivors, 113.2 MB decoded by
+/// `get_array_memory_size`, 201 B/row by extent:
+///
+/// ```text
+/// target             row groups        peak
+/// default (256 MB)   1 x 262,144    80.4 MB
+/// 26.3 MB            2 x 131,727    56.5 MB   ratio 0.70
+/// ```
+///
+/// Halving the row group took 23.8 MB off the peak, against a fixed ~18 MB the
+/// arm pays either way: ~300 B per row no longer buffered. That is above the
+/// 201 B/row the writer's sample priced, because a buffered batch keeps whole
+/// buffers and the rows' extent is not their allocation — the target bounds the
+/// rows, and the bytes resident for them run over it.
+///
+/// The first reading of this measurement sized its target off
+/// `get_array_memory_size` (432 B/row here, twice the extent), asked for a row
+/// group larger than the whole output, and reported ratio 1.00 over two arms
+/// that emitted one row group each. The row-group columns are in the print for
+/// that reason.
+#[ignore]
+#[test]
+fn measure_peak_against_row_group_target() {
+    serialized(|_snapshotter| async move {
+        // 512 Ki rows, half deleted: 256 Ki survivors, twice the floor, so a
+        // target sized for the floor halves the open row group.
+        const ROWS: usize = 512 * 1024;
+        let whole = sweep_peak(ROWS, 128, 2, force_streaming()).await;
+        // Priced off `decoded_slice`, not `decoded`: the writer measures the
+        // extent its sample batch spans, and the ~2x slack in
+        // `get_array_memory_size` is enough to ask for a row group larger than
+        // the whole output and measure nothing (the first reading here did).
+        let per_row = whole.decoded_slice / whole.rows;
+        let floor_target = per_row * MIN_ROW_GROUP_ROWS;
+        let floored = sweep_peak(
+            ROWS,
+            128,
+            2,
+            IcebergTuning {
+                target_row_group_bytes: Some(floor_target),
+                ..force_streaming()
+            },
+        )
+        .await;
+        println!(
+            "survivors={} survivor_decoded={} per_row={per_row} whole_peak={} \
+             whole_groups={}x{} floor_target={floor_target} floored_peak={} \
+             floored_groups={}x{} ratio={:.2}",
+            whole.survivors,
+            whole.survivor_decoded(),
+            whole.peak,
+            whole.row_groups,
+            whole.first_row_group,
+            floored.peak,
+            floored.row_groups,
+            floored.first_row_group,
+            floored.peak as f64 / whole.peak as f64,
+        );
+        // Half the row group, so about half of the growth term and all of the
+        // fixed ~18 MB. 0.85 fails a target that never reaches the writer
+        // (identical arms, ratio ~1.0) while leaving room for the fixed term.
+        assert!(
+            floored.peak * 100 < whole.peak * 85,
+            "a target sized for the {MIN_ROW_GROUP_ROWS}-row floor peaked at {} B \
+             against the default target's {} B over the same {} survivor bytes; the \
+             target is not reaching the survivor writer",
+            floored.peak,
+            whole.peak,
+            whole.survivor_decoded(),
+        );
+    });
+}
+
+/// Row groups of the one file the index table holds, in file order.
+async fn index_output_row_groups(ice: &IcebergContext, index_id: &str) -> Vec<usize> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let files = ice
+        .live_data_files(&ice.index_table_ident(index_id))
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1, "expected ONE rewritten file, got {files:?}");
+    let path = files[0]
+        .file_path()
+        .trim_start_matches("file://")
+        .to_string();
+    let bytes = std::fs::read(&path).unwrap();
+    ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+        .unwrap()
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|rg| rg.num_rows() as usize)
+        .collect()
+}
+
+/// One streamed delete sweep over a single candidate, at `target_row_group_bytes`.
+/// Returns the survivor output's row groups.
+async fn delete_arm_row_groups(target_row_group_bytes: Option<usize>) -> Vec<usize> {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = logs_index("logs");
+    let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+        .await
+        .unwrap()
+        .with_tuning(IcebergTuning {
+            target_row_group_bytes,
+            ..force_streaming()
+        });
+    ice.create_index(&config).await.unwrap();
+
+    let now = fixture_base();
+    let events: Vec<Event> = (0..DELETE_ROW_GROUP_ROWS)
+        .map(|i| {
+            let host = if i % 10 == 0 { "victim" } else { "keep" };
+            event(
+                now - ChronoDuration::milliseconds((DELETE_ROW_GROUP_ROWS - i) as i64),
+                host,
+                "GET /api/v1/logs 200 in 13ms",
+                None,
+            )
+        })
+        .collect();
+    append_index_events(&ice, &config, &events).await;
+    drop(events);
+
+    ice.create_delete_task("logs", "host = 'victim'", None, None)
+        .await
+        .unwrap();
+    let outcome = ice.execute_delete_tasks("logs").await.unwrap();
+    assert_eq!(outcome.files_rewritten, 1, "{outcome:?}");
+    let survivors = DELETE_ROW_GROUP_ROWS - DELETE_ROW_GROUP_ROWS / 10;
+    assert_eq!(
+        count_index_rows(&ice, "logs", None).await,
+        survivors as i64,
+        "the survivors are what the row groups below have to hold"
+    );
+    let groups = index_output_row_groups(&ice, "logs").await;
+    assert_eq!(groups.iter().sum::<usize>(), survivors, "rows conserved");
+    groups
+}
+
+/// Rows in the delete fixture below. Nine in ten survive, so the survivors
+/// (144,000) clear `MIN_ROW_GROUP_ROWS` — the smallest fixture that can show a
+/// row-group size the byte target decided rather than the clamp.
+const DELETE_ROW_GROUP_ROWS: usize = 160_000;
+
+/// THE SURVIVOR WRITER READS THE BYTE TARGET (task #4754). The streaming arm
+/// writes through `build_merge_output_writer`, which asked for its row-group
+/// size with no sample batch — and that branch returns a flat 1,048,576 rows
+/// without reading the target at all. Since the writer is built on its first
+/// survivor batch, a 1-byte target clamps the row group to `MIN_ROW_GROUP_ROWS`
+/// and the default target (256 MB against ~200 B rows here) takes the whole
+/// output in one. Before the fix both arms emitted a single 144,000-row group,
+/// which is what makes this an A/B and not a shape assertion.
+///
+/// That the row group is what the arm HOLDS is measured separately, in
+/// [`measure_peak_allocation_per_arm`]: the open row group is buffered decoded
+/// whenever a row-group bloom column is set, which this writer always sets.
+#[test]
+fn a_streamed_delete_rewrite_sizes_its_row_group_from_the_byte_target() {
+    serialized(|_snapshotter| async move {
+        let clamped = delete_arm_row_groups(Some(1)).await;
+        println!("clamped={clamped:?}");
+        assert_eq!(
+            clamped.first().copied(),
+            Some(MIN_ROW_GROUP_ROWS),
+            "a 1-byte target must clamp the survivor row group to the floor, got \
+             {clamped:?}"
+        );
+        assert!(
+            clamped.len() > 1,
+            "144,000 survivors at a 128 Ki-row floor need a second row group, got \
+             {clamped:?}"
+        );
+
+        let default_target = delete_arm_row_groups(None).await;
+        println!("default={default_target:?}");
+        assert_eq!(
+            default_target.len(),
+            1,
+            "the default 256 MB target holds these survivors in one row group, got \
+             {default_target:?}"
         );
     });
 }
