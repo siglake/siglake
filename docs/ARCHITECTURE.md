@@ -966,7 +966,30 @@ count alone allowed. Setting the entry count to `0` turns both caches off and
 returns to fetching and deserializing per query; setting the blob byte bound to
 `0` drops only the serialized copy. Both budgets are subtracted from the query
 memory pool like every other read cache and published on
-`siglake_cache_budget_bytes{kind="text_index"}`. They are also the last claim
+`siglake_cache_budget_bytes{kind="text_index"}`. What the parsed side is doing
+under those budgets is readable per query rather than inferred from latency:
+`siglake_iceberg_parsed_index_cache_lookups_total{outcome,storage}` records one
+`hit` or `miss` per file a text query acquires an index for, and
+`siglake_iceberg_parsed_index_cache_evictions_total{reason}` names the bound
+that dropped an entry — `byte_bound`, `entry_bound`, or `oversized` for an index
+that alone exceeds the budget and is therefore never admitted at all. A hit
+ratio cannot separate a first read from an entry this cache decoded and threw
+away, which is the difference between a cold plan and a thrashing one; the
+resident set is charted against its bound on
+`siglake_iceberg_parsed_index_cache_bytes` and
+`siglake_iceberg_parsed_index_cache_max_bytes`, both published where the bounds
+are enforced and therefore absent until the pod's first indexed text query.
+The startup cost itself is split by stage on
+`siglake_iceberg_text_index_startup_seconds{stage,storage}`: `permit_wait` for
+the load semaphore, `blob_fetch` for the Puffin read, `decode` for
+`InvertedIndex::from_bytes` and `selection` for the postings lookup plus the
+row-selection runs. `decode` is recorded only on a miss and `selection` on
+every file the index prunes, so the two sample counts together say how much of
+a plan started warm — run #73 could not tell those four apart from a round's
+artifacts, which is what the split is for. The "Text-index startup" panels of
+`deploy/grafana/siglake-overview.json` read all of it, and the two counters are
+pre-registered at 0 on the query server so a tier serving no text query charts
+zero rather than no data. They are also the last claim
 on the limit: the derivation gives them only what is left once the pool can
 still reserve one compacted file's decode working set, so the packaged 4Gi pod
 — where that reservation is the whole remainder — caches no text indexes unless
