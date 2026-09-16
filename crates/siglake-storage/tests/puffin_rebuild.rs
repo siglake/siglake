@@ -102,6 +102,22 @@ fn ordered_text_context() -> SessionContext {
     SessionContext::new_with_state(state)
 }
 
+/// What the query server builds for a text query carrying a literal `LIMIT n`
+/// with no `ORDER BY`: `ClippedScanLimit` and neither ordering extension. See
+/// `sql.rs::clipping_scan_limit` for which statements qualify.
+fn clipped_text_context(limit: usize) -> SessionContext {
+    let base = siglake_storage::session_context_with_order(Some(4), None, None);
+    let mut state = base.state();
+    state
+        .config_mut()
+        .set_extension(std::sync::Arc::new(siglake_storage::ClippedScanLimit {
+            limit,
+        }));
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_udf(ScalarUDF::from(MatchTermsUdf::new()));
+    ctx
+}
+
 async fn rewritten_text_fixture(
     path: &std::path::Path,
     rebuild: bool,
@@ -1413,10 +1429,17 @@ async fn raw_column(ctx: &SessionContext, sql: &str) -> Vec<String> {
 
 /// #3895: the text shapes run #73 measured are bare `LIMIT 100` — no
 /// `ORDER BY`, so the session carries neither ordering extension and #3771's
-/// ordered-LIMIT decline (`query_provider.rs`) never applies to them. They keep
-/// the inverted index; what they must not do, and did until #3896, is
-/// deserialize each planned file's whole index again on every execution, a cost
-/// proportional to the file's rows and independent of the `LIMIT`.
+/// ordered-LIMIT decline (`query_provider.rs`) never applies to them. What
+/// they must not do, and did until #3896, is deserialize each planned file's
+/// whole index again on every execution, a cost proportional to the file's
+/// rows and independent of the `LIMIT`.
+///
+/// Since #4375 the query server declines the index for exactly this shape, so
+/// what runs here is the index path WITHOUT that hint — the session sets no
+/// `ClippedScanLimit`, which is all it takes. The parse-once property still has
+/// to hold: it is what every remaining index-eligible shape depends on, and
+/// `clipped_text_limit_shapes_decline_the_whole_file_index` covers the hinted
+/// half of the same three shapes.
 ///
 /// The three shapes are the ones in the benchmark's `queries.json`: a
 /// `match_terms` keyword, a `LIKE` substring, and a keyword inside a timestamp
@@ -1623,6 +1646,155 @@ async fn unordered_text_limit_shapes_keep_the_index_and_parse_it_once() {
     assert!(
         clipped.iter().all(|row| matches.contains(row)),
         "every clipped row must be one of the control's matches"
+    );
+}
+
+/// #4375: the same three shapes with the session hint the query server now
+/// carries for them. A literal `LIMIT` over a plain select clips the scan row
+/// for row, so the scan owes a sliver of the first file and must not pay a
+/// whole file's index decode for it — #4329 measured that cost at 20.3 ms
+/// against 6.1 ms scanned for `keyword`, and 813.1 ms against 4.5 ms for
+/// `substring_scan`, with every index already resident.
+///
+/// What this owes beyond the counters: the same rows. The decline changes
+/// which rows the reader DECODES, never which rows the query returns, so every
+/// shape is compared against the unindexed control, and the shape with no
+/// `LIMIT` is run in the same process to show the index is declined per
+/// EXECUTION rather than switched off for the table.
+#[tokio::test]
+async fn clipped_text_limit_shapes_decline_the_whole_file_index() {
+    use chrono::{Duration, TimeZone, Utc};
+
+    // This test attributes process-wide decode counters to its own queries.
+    let _gate = PUFFIN_QUERY_GATE.lock().await;
+
+    let base = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = tmp.path().join("indexed");
+    let indexed = bench_shaped_fixture(&warehouse, true, base).await;
+    let control = bench_shaped_fixture(&tmp.path().join("control"), false, base).await;
+
+    let table = indexed
+        .catalog()
+        .load_table(indexed.events_table_ident())
+        .await
+        .unwrap();
+    let files = indexed
+        .live_data_files(indexed.events_table_ident())
+        .await
+        .unwrap();
+    assert_eq!(files.len(), TEXT_SHAPE_FILES);
+    assert!(
+        files.iter().all(|file| puffin_indexes_file(&table, file)),
+        "the decline must be measured against a table that HAS indexes"
+    );
+
+    // One warehouse, two sessions: the hint is per request, not per table.
+    let clipped_ctx = clipped_text_context(100);
+    indexed
+        .register_with_datafusion(&clipped_ctx)
+        .await
+        .unwrap();
+    let unclipped_ctx = unordered_text_context();
+    indexed
+        .register_with_datafusion(&unclipped_ctx)
+        .await
+        .unwrap();
+    let control_ctx = unordered_text_context();
+    control
+        .register_with_datafusion(&control_ctx)
+        .await
+        .unwrap();
+
+    let plan_of = |ctx: &SessionContext, sql: &str| {
+        let ctx = ctx.clone();
+        let sql = sql.to_string();
+        async move {
+            let plan = ctx.sql(&sql).await.unwrap().create_physical_plan().await;
+            format!(
+                "{}",
+                datafusion::physical_plan::displayable(plan.unwrap().as_ref()).indent(true)
+            )
+        }
+    };
+
+    let window_start = (base + Duration::seconds(TEXT_SHAPE_ROWS_PER_FILE as i64)).to_rfc3339();
+    let window_end = (base + Duration::seconds(2 * TEXT_SHAPE_ROWS_PER_FILE as i64)).to_rfc3339();
+    let shapes = [
+        (
+            "keyword",
+            "SELECT timestamp, raw FROM events WHERE match_terms(raw, 'queen') LIMIT 100"
+                .to_string(),
+        ),
+        (
+            "substring_scan",
+            "SELECT timestamp, raw FROM events WHERE raw LIKE '%checkout%' LIMIT 100".to_string(),
+        ),
+        (
+            "keyword_window",
+            format!(
+                "SELECT timestamp, raw FROM events WHERE match_terms(raw, 'queen') \
+                 AND timestamp >= TIMESTAMP '{window_start}' \
+                 AND timestamp < TIMESTAMP '{window_end}' LIMIT 100"
+            ),
+        ),
+    ];
+
+    // Statistics scoped to this warehouse; the control arm has no index to
+    // parse and the other tests in this binary query their own warehouses.
+    let warehouse = warehouse.to_string_lossy().to_string();
+    let cache_stats = || iceberg::arrow::parsed_inverted_index_cache_stats(&warehouse);
+    let decodes = || iceberg::arrow::inverted_index_decode_counts().0;
+    assert_eq!(
+        cache_stats(),
+        (0, 0),
+        "nothing parsed before the first query"
+    );
+
+    for (name, sql) in &shapes {
+        let plan = plan_of(&clipped_ctx, sql).await;
+        assert!(
+            plan.contains("text_index:[declined:clipped_limit]"),
+            "{name}: the plan must say which path it took:\n{plan}"
+        );
+
+        let before_decodes = decodes();
+        let rows = raw_column(&clipped_ctx, sql).await;
+        assert_eq!(
+            rows,
+            raw_column(&control_ctx, sql).await,
+            "{name}: declining the index changed the result"
+        );
+        assert_eq!(
+            decodes() - before_decodes,
+            0,
+            "{name}: a declined shape must not deserialize an index"
+        );
+        assert_eq!(
+            cache_stats(),
+            (0, 0),
+            "{name}: and must not look one up either"
+        );
+    }
+
+    // The regime the index is FOR, in the same process against the same files:
+    // no `LIMIT`, so nothing clips the scan and the hint is absent.
+    let unclipped = "SELECT timestamp, raw FROM events WHERE match_terms(raw, 'queen')";
+    let plan = plan_of(&unclipped_ctx, unclipped).await;
+    assert!(
+        plan.contains("text_index:[allowed]"),
+        "an unclipped text scan keeps the index:\n{plan}"
+    );
+    let before_decodes = decodes();
+    assert_eq!(
+        raw_column(&unclipped_ctx, unclipped).await,
+        raw_column(&control_ctx, unclipped).await,
+        "the index path must agree with the control"
+    );
+    assert_eq!(
+        decodes() - before_decodes,
+        TEXT_SHAPE_FILES as u64,
+        "the unclipped scan selects its rows from each planned file's index"
     );
 }
 
