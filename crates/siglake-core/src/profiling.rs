@@ -42,10 +42,18 @@
 //!
 //! Never take a CPU window and a heap dump concurrently: the heap dump walks
 //! allocator state while the CPU profiler's `SIGPROF` handler is interrupting
-//! threads. `CPU_PROFILE_IN_FLIGHT` makes concurrent CPU requests fail fast
-//! rather than interleave, and the harness helper
+//! threads. [`ProfileAdmission`] is one process-wide ticket covering BOTH
+//! routes, so any second capture — CPU beside CPU, heap beside CPU, either way
+//! round — is refused with `409` rather than interleaved. The harness helper
 //! (`quickwit-testing/bench/lib/profile_capture.sh`) sequences heap *after* the
-//! CPU window closes.
+//! CPU window closes, so in a healthy round the ticket is never contended; it
+//! is there for the round that is not healthy.
+//!
+//! The ticket is released on drop, which is what makes it correct under
+//! cancellation: a harness that hangs up mid-window, or a `curl` killed at its
+//! own timeout, drops the request future and the profiler is usable again. An
+//! explicit "clear the flag after the await" would be skipped on exactly that
+//! path and leave the endpoint permanently busy for the rest of the round.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -75,10 +83,46 @@ const MIN_SECONDS: u64 = 1;
 const MAX_SECONDS: u64 = 600;
 const DEFAULT_SECONDS: u64 = 30;
 
-/// One CPU profile at a time. Two overlapping `pprof` guards in one process
-/// produce a corrupt profile rather than an error, so the second request is
-/// refused instead.
-static CPU_PROFILE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// One profile at a time, of either kind. Two overlapping `pprof` guards in one
+/// process produce a corrupt profile rather than an error, and a heap dump
+/// walking allocator state while `SIGPROF` interrupts threads corrupts both, so
+/// the second request is refused instead.
+static PROFILE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// What a refused capture says. One message for both routes, because the caller
+/// cannot tell from its own request which kind of capture is holding the
+/// ticket.
+const IN_FLIGHT_BODY: &str =
+    "a profile is already in flight; concurrent CPU and heap captures would corrupt both\n";
+
+/// Exclusive admission to the profiler, released on drop.
+///
+/// Drop rather than an explicit release is the whole point: both handlers do
+/// their work across an `.await`, so a dropped request future (client hangs up,
+/// harness times out, the runtime shuts down) must not leave the endpoint busy.
+/// A `store(false)` placed after the await is unreachable on precisely that
+/// path, which is how the endpoint could wedge for the rest of a round.
+///
+/// Not `Clone`, not constructible except through [`Self::try_acquire`], so the
+/// only way to hold it is to have won it.
+struct ProfileAdmission;
+
+impl ProfileAdmission {
+    /// The ticket, or `None` when a capture is already in flight.
+    fn try_acquire() -> Option<Self> {
+        if PROFILE_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for ProfileAdmission {
+    fn drop(&mut self) {
+        PROFILE_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Pure resolver twin for [`PPROF_ENABLED_ENV`]: tests drive this, never the
 /// environment (the harness runs a binary's tests on parallel threads, so env
@@ -171,16 +215,12 @@ pub fn routes() -> Router {
 async fn cpu_profile(Query(params): Query<ProfileParams>) -> Response {
     let seconds = clamp_seconds(params.seconds);
 
-    if CPU_PROFILE_IN_FLIGHT.swap(true, Ordering::SeqCst) {
-        return (
-            StatusCode::CONFLICT,
-            "a CPU profile is already in flight; concurrent profiles would corrupt both\n",
-        )
-            .into_response();
-    }
-    // Everything below must clear the flag, including the error paths.
+    let Some(_admission) = ProfileAdmission::try_acquire() else {
+        return (StatusCode::CONFLICT, IN_FLIGHT_BODY).into_response();
+    };
+    // Held for the whole operation and released on drop, so the error paths and
+    // a request future dropped mid-window both free the profiler.
     let result = collect_cpu_profile(seconds).await;
-    CPU_PROFILE_IN_FLIGHT.store(false, Ordering::SeqCst);
 
     match result {
         Ok(body) => (
@@ -254,8 +294,27 @@ fn gzip(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// startup, so profiling cannot be turned on later, and only allocations made
 /// while sampling was active appear in a dump. Either missing and this answers
 /// 412 rather than a misleading near-empty profile.
+///
+/// Shares [`ProfileAdmission`] with the CPU route: `prof.dump` walks allocator
+/// state, which is not safe beside the CPU profiler's `SIGPROF` handler.
 async fn heap_profile() -> Response {
-    match tokio::task::spawn_blocking(collect_heap_profile).await {
+    let Some(admission) = ProfileAdmission::try_acquire() else {
+        return (StatusCode::CONFLICT, IN_FLIGHT_BODY).into_response();
+    };
+
+    // The ticket moves INTO the blocking closure instead of being held by this
+    // future. `spawn_blocking` work is not cancelled when the future awaiting
+    // it is dropped, so a ticket held out here would be released while
+    // `prof.dump` was still running — and a CPU capture could then start on top
+    // of a live allocator walk, which is the exact overlap the ticket exists to
+    // prevent. Released when the dump returns, cancelled request or not.
+    let dumped = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        collect_heap_profile()
+    })
+    .await;
+
+    match dumped {
         Ok(Ok(body)) => (
             StatusCode::OK,
             [
@@ -473,6 +532,142 @@ async fn runtime_stats(Query(params): Query<ProfileParams>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The admission ticket is process-global and `cargo test` runs a binary's
+    /// tests on parallel threads, so the tests that touch it have to take turns:
+    /// otherwise one test reads another's legitimately-held ticket as the
+    /// refusal it was asserting, or as the leak it was asserting the absence of.
+    static PROFILE_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Poisoning is ignored on purpose. The mutex guards nothing but test
+    /// ordering, so a panicking test must not turn every later one red and hide
+    /// the one real failure.
+    fn serialized() -> std::sync::MutexGuard<'static, ()> {
+        PROFILE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn multi_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    #[test]
+    fn admission_is_exclusive_and_releases_on_drop() {
+        let _serial = serialized();
+
+        let held = ProfileAdmission::try_acquire().expect("uncontended");
+        assert!(
+            ProfileAdmission::try_acquire().is_none(),
+            "a second capture must be refused while the first holds the ticket"
+        );
+        drop(held);
+        assert!(
+            ProfileAdmission::try_acquire().is_some(),
+            "the ticket must be free again once the holder drops"
+        );
+    }
+
+    /// THE CANCELLATION REGRESSION.
+    ///
+    /// The first version cleared its flag only after awaiting the collector, so
+    /// a request future dropped inside the window — a harness that hangs up, a
+    /// `curl` killed at its own timeout — never ran the clear, and every later
+    /// capture for the rest of the round got a `409`. A paid round would then
+    /// deliver one profile and six refusals.
+    #[test]
+    fn a_dropped_cpu_request_leaves_the_endpoint_usable() {
+        let _serial = serialized();
+        let runtime = multi_thread_runtime();
+
+        runtime.block_on(async {
+            // The longest window the route allows, so nothing but the drop can
+            // end it: if this ever completes, the test is measuring the wrong
+            // thing and the assertion below says so.
+            let capturing = cpu_profile(Query(ProfileParams {
+                seconds: Some(MAX_SECONDS),
+            }));
+            let outcome = tokio::time::timeout(Duration::from_millis(150), capturing).await;
+            assert!(
+                outcome.is_err(),
+                "a {MAX_SECONDS}s window cannot have finished in 150ms"
+            );
+
+            // `timeout` drops the request future before it returns, so by here
+            // the ticket must already be free.
+            assert!(
+                !PROFILE_IN_FLIGHT.load(Ordering::SeqCst),
+                "the dropped request left the profiler marked busy"
+            );
+            let next = heap_profile().await;
+            assert_ne!(
+                next.status(),
+                StatusCode::CONFLICT,
+                "a capture after a dropped one must not be refused as overlapping"
+            );
+        });
+    }
+
+    /// THE OVERLAP REGRESSION, both directions.
+    ///
+    /// `heap_profile` had no exclusion at all: it went straight to
+    /// `spawn_blocking(collect_heap_profile)`, so a heap dump could walk
+    /// allocator state while the CPU profiler's `SIGPROF` handler was
+    /// interrupting threads — the one ordering the module's header forbids.
+    ///
+    /// Stands in for an in-flight capture by holding the ticket directly rather
+    /// than starting a real one, so neither half needs `pprof` to install a
+    /// signal handler or jemalloc to have been built with `--enable-prof`.
+    #[test]
+    fn a_capture_during_another_capture_is_refused() {
+        let _serial = serialized();
+        let runtime = multi_thread_runtime();
+
+        runtime.block_on(async {
+            let cpu_in_flight = ProfileAdmission::try_acquire().expect("uncontended");
+            let heap = heap_profile().await;
+            assert_eq!(
+                heap.status(),
+                StatusCode::CONFLICT,
+                "a heap dump during a CPU capture must be refused"
+            );
+            drop(cpu_in_flight);
+
+            let heap_in_flight = ProfileAdmission::try_acquire().expect("ticket released");
+            let cpu = cpu_profile(Query(ProfileParams { seconds: Some(1) })).await;
+            assert_eq!(
+                cpu.status(),
+                StatusCode::CONFLICT,
+                "a CPU capture during a heap dump must be refused"
+            );
+            drop(heap_in_flight);
+        });
+    }
+
+    /// The heap route's ticket moves into the blocking closure, so a bug there
+    /// leaks it: the closure would hold a ticket nothing ever drops and the
+    /// endpoint would wedge after the first dump, 412 or not.
+    #[test]
+    fn a_completed_heap_request_releases_admission() {
+        let _serial = serialized();
+        let runtime = multi_thread_runtime();
+
+        runtime.block_on(async {
+            // 412 here (the test binary's allocator is not a prof-enabled
+            // jemalloc) and 200 in a profiling image are both fine; what is
+            // asserted is that the ticket came back either way.
+            let response = heap_profile().await;
+            assert_ne!(response.status(), StatusCode::CONFLICT, "nothing else held");
+            assert!(
+                !PROFILE_IN_FLIGHT.load(Ordering::SeqCst),
+                "the heap route kept the ticket after its dump returned"
+            );
+        });
+    }
 
     #[test]
     fn only_one_and_true_arm_the_profiler() {
