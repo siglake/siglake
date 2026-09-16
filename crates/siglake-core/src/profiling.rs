@@ -45,9 +45,9 @@
 //! threads. [`ProfileAdmission`] is one process-wide ticket covering BOTH
 //! routes, so any second capture — CPU beside CPU, heap beside CPU, either way
 //! round — is refused with `409` rather than interleaved. The harness helper
-//! (`quickwit-testing/bench/lib/profile_capture.sh`) sequences heap *after* the
-//! CPU window closes, so in a healthy round the ticket is never contended; it
-//! is there for the round that is not healthy.
+//! that sequences heap *after* the CPU window closes lives in the benchmark
+//! repository (`siglake-benchmarks`, its own pull request), so in a healthy
+//! round the ticket is never contended; it is there for the round that is not.
 //!
 //! The ticket is released on drop, which is what makes it correct under
 //! cancellation: a harness that hangs up mid-window, or a `curl` killed at its
@@ -186,9 +186,10 @@ pub fn clamp_runtime_window(requested: Option<u64>) -> u64 {
 /// The `/debug/pprof/*` routes, or an empty router when the env gate is off.
 ///
 /// Returning an empty router (rather than routes that answer 403) is what makes
-/// the harness gate meaningful: a `404` from this path means "this build or this
-/// process cannot profile", which is exactly the condition the round must refuse
-/// on. See the `PPROF_OK` gate in `quickwit-testing/bench/siglake_aws_run.sh`.
+/// a harness readback gate meaningful: a `404` from this path means "this build
+/// or this process cannot profile", which is exactly the condition a round must
+/// refuse on rather than run and deliver nothing. The gate itself is the
+/// benchmark repository's (`siglake-benchmarks`, its own pull request).
 pub fn routes() -> Router {
     if !pprof_enabled_from(std::env::var(PPROF_ENABLED_ENV).ok().as_deref()) {
         tracing::debug!(

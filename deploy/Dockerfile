@@ -78,6 +78,7 @@ COPY third_party ./third_party
 # its own BUILD_CACHE_ID: the target cache is not keyed by feature set, so
 # reusing `default` would leave feature-built objects in the cache the release
 # image links from.
+#
 # PROFILING=1 builds the image a profiling round needs, and is the escape hatch
 # the paragraph above refers to. Three differences from the shipped build, all
 # of them reasons this cannot just be the default:
@@ -89,8 +90,8 @@ COPY third_party ./third_party
 #      always-available subset (no poll counts, no queue depths), and
 #      `-C force-frame-pointers=yes`, because a release build omits frame
 #      pointers and pprof's SIGPROF handler then walks a call graph that
-#      collapses to `0x1` -- the exact failure recorded in
-#      quickwit-testing's bench/wedge_capture.sh header.
+#      collapses to `0x1` -- the exact failure recorded in the header of the
+#      harness's siglake-benchmarks/bench/wedge_capture.sh.
 #   3. NO `strip --strip-debug`, restoring the file:line resolution and
 #      DWARF-unwound call graphs the shipped build gives up. This is what makes
 #      the image ~1.95 GB again, so it stays opt-in.

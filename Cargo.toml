@@ -129,7 +129,7 @@ metrics-exporter-prometheus = { version = "0.17", default-features = false }
 # the SIGPROF handler, which is why the profiling build also passes
 # `-C force-frame-pointers=yes` -- a release build omits them otherwise, and
 # that is exactly the collapsed-to-`0x1` call graph
-# `quickwit-testing/bench/wedge_capture.sh` was written to work around. The
+# `siglake-benchmarks/bench/wedge_capture.sh` was written to work around. The
 # `flamegraph` feature (and its `inferno` dep) is NOT enabled: the handler
 # returns pprof protobuf and `pprof -http` renders the flame graph itself.
 pprof = { version = "0.15", default-features = false, features = ["protobuf-codec", "frame-pointer"] }
