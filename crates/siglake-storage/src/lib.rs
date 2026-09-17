@@ -203,9 +203,9 @@ pub const MAX_FILE_CACHE_ENTRY_FRACTION: u64 = query_provider::MAX_FILE_CACHE_EN
 /// The smallest byte budget that can hold ONE entry of `decoded_bytes` at all.
 ///
 /// The quarter rule is what makes a file cache budget a statement about file
-/// SIZE and not just about total memory: a budget below this caches nothing on
-/// this table, charges `outcome="skip_oversized"` on every population, and
-/// still subtracts its bytes from the query memory pool. A compacted file is
+/// SIZE and not just about total memory: a budget below this never holds a file
+/// of that size, charges `outcome="skip_oversized"` on every population of one,
+/// and still subtracts its bytes from the query memory pool. A compacted file is
 /// the size that matters — `cold_target_file_bytes` (256 MiB) times the scan's
 /// decompression estimate (5) is about 1.25 GiB decoded, so holding one takes a
 /// 5 GiB file cache, which [`derive_file_cache_limits`] reaches at a 40 GiB
