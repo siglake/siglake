@@ -1,7 +1,11 @@
 # Root identity for `siglake wal-recover` (task #4964)
 
-**Status:** investigation and design. No production CLI behaviour, default or
-object layout changed on this card. **Date:** 2026-09-17.
+**Status:** option C is SHIPPED (#4973, 2026-09-17): `wal-recover` plans unless
+it is given `--apply`, and the listing carries the root verdict. No `--force`,
+no 0.1.1 default change, and `--catalog` (option D) is still a follow-on slice.
+The sections below are the investigation that chose it; the measured behaviour
+in "What the restore does, measured" is the PRE-#4973 picture, kept because it
+is what the remedy is priced against. **Date:** 2026-09-17.
 
 #4928 made a restore that recognised NO key exit nonzero. The case it cannot
 see is `--from` exactly ONE component above the mirror root. The shallowest key
@@ -14,10 +18,14 @@ the mirror prefix, the command prints `pulled N segments` and exits 0.
 This document records what a `file://` qualification measured, shows why no
 rule reading only the keys can fix it, prices four remedies and recommends one.
 The evidence is
-`crates/siglake-cli/tests/cli/wal_recover_root_identity.rs` — ten hermetic
-cases, all green. None asserts a fix for root identity; two of them were
-rewritten on #4972, which fixed the unrelated discovery-dir defect this
-qualification turned up (see "Defects found while reading this path").
+`crates/siglake-cli/tests/cli/wal_recover_root_identity.rs`, hermetic
+`file://` cases that ran the real binary. They measured the behaviour
+described below; #4973 rewrote them onto the shipped contract, so they now
+assert the refusal where a marker is misplaced and the plan-and-no-write
+where none is, and they still pin the legitimate installs no key can
+distinguish from the mistake. Two of them came from #4972, which fixed the
+unrelated discovery-dir defect this qualification turned up (see "Defects
+found while reading this path").
 
 ## Why one component, and why it is the likely mistake
 
@@ -163,9 +171,10 @@ reconstructs the layout, prints what it would write, and writes nothing.
 `--apply` performs the restore. The plan is exactly the work the command
 already does before its first GET — `recover_from_object_store` collects the
 whole listing into `candidates` before it reads one body
-(`crates/siglake-wal/src/mirror.rs:1102-1145`) — so a plan costs the LIST the
-restore was going to pay and zero GETs, and costs nothing on the object-store
-bill that `--apply` does not also pay.
+(`crates/siglake-wal/src/mirror.rs:1102-1145`) — so a plan costs one LIST and
+zero segment GETs. The two invocations each pay their own LIST, which is the
+one line on the bill the split adds: an apply must decide on the listing that
+is current when it writes, not on the one the plan run saw.
 
 The plan is per `(tenant, index)`: segment count, byte total, and a sample key
 with the destination it reconstructs. An operator looking at
@@ -183,9 +192,15 @@ On top of the plan, the verdict from the evidence table:
 - a `.arrow.partial` under a first component `_active`, or a key ending `/owner`
   at depth 2 ⇒ **root confirmed**;
 - either marker exactly one component deeper than that ⇒ **refuse**, naming the
-  directory to pass instead, and `--apply` fails without `--force`;
+  directory to pass instead, and `--apply` fails. There is no override: Todd
+  settled the open decision below against `--force` on 2026-09-17, so the way
+  past a contradicted root is to pass the directory the refusal names;
 - neither present ⇒ **unverified**, and `--apply` proceeds on the operator's
   reading of the plan.
+
+A listing holding markers at BOTH depths refuses too. A marker at root depth
+is not an alibi for a misplaced one — no mirror root has both — and the
+refusal reports the confirming key alongside the misplaced one.
 
 ### D — `--catalog <uri>`, as a complement to C
 
@@ -238,36 +253,43 @@ segment is then admitted or quarantined on its own frame identity
 Synthesising a marker from a mirror key would vouch for segments on the
 strength of the same key shape this document is about.
 
-## What the implementation card must carry
+## What the implementation carried (#4973)
 
-1. The plan/apply split, with `--apply` the only path that writes.
-2. The per-`(tenant, index)` plan, with counts, bytes and reconstructed
-   destinations, and the skip count #4928 already reports.
-3. The marker verdict, and `--apply` refusing a contradicted root without
-   `--force`.
-4. Hermetic `file://` CLI tests: one component above a mirror WITH `_active/`
-   fails and names the right directory; one component above a bare mirror
-   writes nothing without `--apply` and prints a plan naming the invented
-   tenant; the legitimate tenant called `wal-mirror` still restores under
-   `--apply`; `--apply` twice is still idempotent; and the #4928 all-skipped
-   exit status is unchanged. The ten cases in
-   `crates/siglake-cli/tests/cli/wal_recover_root_identity.rs` are the before
-   picture and should be updated in the same commit rather than deleted.
-5. `docs/ARCHITECTURE.md:91` and `docs/LIMITATIONS.md` move with the contract,
-   and a siglake-docs follow-up for the DR runbook.
+1. The plan/apply split, with `--apply` the only path that writes:
+   `plan_recovery` and `apply_plan` in `crates/siglake-wal/src/mirror.rs`,
+   one LIST per invocation.
+2. The per-`(tenant, index)` plan, with counts, reconstructed destinations, a
+   sample key and the skip and already-present counts #4928 added. Bytes come
+   from the listing, so a store that reports no size in a listing (opendal's
+   `fs` and in-memory services; S3 does report it) prints `size unknown`
+   rather than a per-object stat the plan's cost claim does not allow.
+3. The marker verdict, `--apply` refusing a contradicted root, and no
+   `--force`. The refusal happens before `create_wal_dir`, so a contradicted
+   apply leaves the volume as it found it.
+4. Hermetic `file://` CLI tests in
+   `crates/siglake-cli/tests/cli/wal_recover_root_identity.rs`, updated rather
+   than deleted, plus unit tests for the plan and the verdict in
+   `mirror.rs`. The refusals were A/B'd against the pre-change binary: both
+   marker fixtures exited 0 and restored into the invented tenant before, and
+   exit nonzero with `--to` never created after.
+5. `docs/ARCHITECTURE.md`, `docs/LIMITATIONS.md`, the chart's DR recipe and
+   the alert runbook line moved with the contract; siglake-docs #4995 carries
+   the DR runbook.
 
-## Open decisions for the maintainer
+## Decisions (settled 2026-09-17)
 
-- **Is the plan/apply break acceptable before 0.2.0?** `wal-recover` is an
-  operator command with a documented single-command form. The alternative that
-  preserves it — default to writing, require `--apply` only when the markers
-  contradict the root — leaves the evidence-free default install exactly where
-  it is today.
-- **Does `--force` exist at all?** A refusal with no override is a support
-  escalation the first time a marker is stale; an override is a flag that ends
-  up in the runbook.
-- **Should `--catalog` be in the same release?** It is the only exact answer,
-  and it is the answer for the population that has a catalog but no markers.
+- **The plan/apply break ships in 0.2.0.** Plan by default, `--apply` the only
+  writing form, no 0.1.1 default change and no `--yes` alias. The alternative
+  that preserved the single command — default to writing, require `--apply`
+  only when the markers contradict the root — leaves the evidence-free default
+  install exactly where it is today, and that population is the whole problem.
+- **No `--force`.** A refusal with no override is a support escalation the
+  first time a marker is stale; an override is a flag that ends up in the
+  runbook, and the escape hatch it would provide already exists — pass the
+  directory the refusal names.
+- **`--catalog` is a later slice**, not this release. It is the only exact
+  answer, and it is the answer for the population that has a catalog but no
+  markers.
 
 ## Defects found while reading this path
 

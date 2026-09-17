@@ -323,9 +323,9 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   never deleted or rewritten: requeueing is an operator running `siglake
   wal-requeue --wal <wal-root>` once the cause is fixed, and a segment requeued
   unchanged simply spends its attempts again. Where the corruption is local and
-  the WAL mirror holds a good copy, `siglake wal-recover` is the other way back
-  — the set-aside left no file under `sealed/`, so recovery pulls that segment
-  again and the drain commits it, with the unreadable bytes still under
+  the WAL mirror holds a good copy, `siglake wal-recover --apply` is the other
+  way back — the set-aside left no file under `sealed/`, so recovery pulls that
+  segment again and the drain commits it, with the unreadable bytes still under
   `poison/` to look at. Until then its rows are acknowledged,
   durable on the volume, and not queryable — which is the trade the set-aside
   makes, against a queue behind it that never drains.
@@ -1082,9 +1082,9 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   the object store after it seals, so the ack→upload window is real and an
   acknowledgement is not remotely durable. `wal.mirror.activeIntervalSecs`
   snapshots the in-flight segment every N seconds, which narrows that window
-  to N seconds on one recovery path: an operator runs `siglake wal-recover` to
-  rebuild the WAL root from the mirror, and the filesystem drain commits the
-  recovered segments. No restart consumes an active snapshot by itself, and
+  to N seconds on one recovery path: an operator runs `siglake wal-recover
+  --apply` to rebuild the WAL root from the mirror, and the filesystem drain
+  commits the recovered segments. No restart consumes an active snapshot by itself, and
   the catalog-claim drain (`compactor.catalogClaim.enabled`) reconciles sealed
   objects only — it never reads `_active/`, so it has no N-second target. An
   object-store group-commit PUT-as-ack design is a flagged decision for a
@@ -1100,28 +1100,40 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   device. A network filesystem answers `fsync(2)` on its own terms and
   siglake measures none of them, so ext4 or xfs on a node-attached volume is
   the substrate the power-loss claim is made for.
-- **`siglake wal-recover` cannot tell the mirror root from its parent.** #4928
-  made a restore that recognised no key exit nonzero, which catches `--from`
-  two or more components too high. One component too high is still reported as
-  a success: the shallowest mirror keys shift into the
-  `<tenant>[/<index>]/<segment>` shape recovery routes on, so segments are
-  restored under a tenant named after the mirror prefix and the command prints
-  `pulled N segments`. The mirror root is
-  `s3://<bucket>/<s3.warehousePrefix>/<wal.mirror.prefix>/`, so the one
-  component above it is the warehouse URL the operator already has. A legacy
-  flat mirror — keys with no tenant component — then commits into
-  `tenant_<prefix>`; any other layout is walked as a tenant named after the
-  prefix, with the real tenant name read as an index, so the drain stops at
-  `ensure_index` and the segments stay in `sealed/` under a counted backlog and
+- **`siglake wal-recover` can only tell the mirror root from its parent where
+  the mirror has a marker.** #4928 made a restore that recognised no key exit
+  nonzero, which catches `--from` two or more components too high. One
+  component too high fits the layout: the shallowest mirror keys shift into
+  the `<tenant>[/<index>]/<segment>` shape recovery routes on, so segments
+  would be restored under a tenant named after the mirror prefix. The mirror
+  root is `s3://<bucket>/<s3.warehousePrefix>/<wal.mirror.prefix>/`, so the one
+  component above it is the warehouse URL the operator already has.
+
+  #4973 answers this in two parts. The command now PLANS unless it is given
+  `--apply`, so the reconstructed destinations — the tenant an operator does
+  not have, spelled out — are on screen before a byte is written. And where
+  the mirror carries one of siglake's own markers (`_active/…​.arrow.partial`,
+  or `<tenant>/<index>/owner` from the catalog-claim drain) the listing
+  settles it: at its own depth the marker confirms the root, one component
+  deeper it refuses the run and names the directory to pass instead.
+
+  What remains is the mirror with neither marker — no managed index and no
+  active mirroring, which is the default install. Its listing one component up
+  is indistinguishable from a legitimate mirror whose first tenant happens to
+  be named after a prefix, so the verdict is `unverified` and the plan is the
+  whole check: an operator who reads it and passes `--apply` anyway restores
+  into the invented tenant, and a legacy flat mirror then commits into
+  `tenant_<prefix>` while any other layout stops at `ensure_index` with the
+  segments in `sealed/` under a counted backlog and
   `siglake_compactor_index_unresolved_total`.
-  `docs/DESIGN_wal_recovery_root_identity.md` has the measured cases and the
-  selected remedy (a plan step the operator reads before anything is written);
-  until it ships, check the restored layout under `--to` before starting the
-  drain. The second defect that document records — a correct restore of a
-  tenant with only index segments omitted the tenant discovery dir the ingester
-  writes and was never drained — is fixed (#4972): the restore rebuilds
-  `<tenant>/sealed/`, and re-running the command repairs a WAL root restored
-  before that.
+  `docs/DESIGN_wal_recovery_root_identity.md` has the measured cases, and
+  names the remaining exact answer as its own slice: `--catalog <uri>`, which
+  reads the true `(tenant, index_id)` and prefix out of `wal_segments`.
+  The second defect that document records — a correct restore of a tenant with
+  only index segments omitted the tenant discovery dir the ingester writes and
+  was never drained — is fixed (#4972): the restore rebuilds
+  `<tenant>/sealed/`, and re-running the command with `--apply` repairs a WAL
+  root restored before that.
 - **Attribute auto-promotion is opt-in** — hot-key sampling and promotion of
   OTLP attributes to typed columns ships default-off
   (`SIGLAKE_AUTO_PROMOTE_MIN_PCT`); promoted keys can also be listed

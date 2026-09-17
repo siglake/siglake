@@ -37,9 +37,24 @@ pub(crate) fn place(mirror: &Path, key: &str, src: &Path) -> String {
     key.to_string()
 }
 
+/// The PLAN form — `wal-recover` with no `--apply` (#4973). It lists,
+/// reconstructs and prints; nothing under `--to` is created.
 pub(crate) fn recover(from: &str, to: &Path) -> (String, String, bool) {
-    let out = Command::new(env!("CARGO_BIN_EXE_siglake"))
-        .args(["wal-recover", "--from", from, "--to", to.to_str().unwrap()])
+    run_recover(from, to, false)
+}
+
+/// The APPLY form: the only one that writes.
+pub(crate) fn recover_apply(from: &str, to: &Path) -> (String, String, bool) {
+    run_recover(from, to, true)
+}
+
+fn run_recover(from: &str, to: &Path, apply: bool) -> (String, String, bool) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_siglake"));
+    cmd.args(["wal-recover", "--from", from, "--to", to.to_str().unwrap()]);
+    if apply {
+        cmd.arg("--apply");
+    }
+    let out = cmd
         // `--from` also reads this env var; the caller's environment must not
         // be able to supply the source of a recovery test.
         .env_remove("SIGLAKE_WAL_MIRROR_URL")
@@ -116,6 +131,9 @@ fn assert_restored(wal: &Path, names: &[String; 3]) {
 /// The acceptance: a `--from` URL with a path restores the segments under it,
 /// with and without a trailing slash. Against the pre-#4912 binary both arms
 /// print `pulled 0 segments` and exit 0.
+///
+/// Since #4973 the restore is `--apply`; the plan run before it is the
+/// checkpoint, and this pins that it writes nothing.
 #[test]
 fn recover_restores_the_layout_from_a_url_with_a_path() {
     let tmp = tempfile::tempdir().unwrap();
@@ -126,7 +144,22 @@ fn recover_restores_the_layout_from_a_url_with_a_path() {
         ("trailing slash", format!("file://{}/", mirror.display())),
     ] {
         let wal = tmp.path().join(format!("wal-{}", arm.replace(' ', "-")));
+
+        // The plan first: the same three segments, none of them written, and
+        // not even `--to` created.
         let (stdout, stderr, ok) = recover(&from, &wal);
+        assert!(ok, "{arm} plan: {stdout}{stderr}");
+        assert!(
+            stdout.contains("totals: 3 segments") && stdout.contains("nothing written"),
+            "{arm} plan: {stdout}{stderr}"
+        );
+        assert!(
+            !stdout.contains("pulled"),
+            "a plan does not report a restore: {stdout}"
+        );
+        assert!(!wal.exists(), "{arm}: the plan created {}", wal.display());
+
+        let (stdout, stderr, ok) = recover_apply(&from, &wal);
         assert!(ok, "{arm}: {stdout}{stderr}");
         assert!(
             stdout.contains("pulled 3 segments"),
@@ -138,7 +171,7 @@ fn recover_restores_the_layout_from_a_url_with_a_path() {
         // present, nothing is re-pulled, and nothing is disturbed. The count
         // of what is already there is what separates this line from a restore
         // that understood nothing (#4928).
-        let (stdout, stderr, ok) = recover(&from, &wal);
+        let (stdout, stderr, ok) = recover_apply(&from, &wal);
         assert!(ok, "{arm} rerun: {stdout}{stderr}");
         assert!(
             stdout.contains("pulled 0 segments"),
@@ -149,6 +182,15 @@ fn recover_restores_the_layout_from_a_url_with_a_path() {
             "{arm} rerun: {stdout}{stderr}"
         );
         assert_restored(&wal, &names);
+
+        // And the plan over a restored root counts what is there rather than
+        // proposing it again.
+        let (stdout, stderr, ok) = recover(&from, &wal);
+        assert!(ok, "{arm} plan rerun: {stdout}{stderr}");
+        assert!(
+            stdout.contains("3 already present"),
+            "{arm} plan rerun: {stdout}{stderr}"
+        );
     }
 }
 
@@ -168,7 +210,7 @@ fn recover_prefers_a_sealed_copy_over_its_active_prefix() {
     place(&mirror, &format!("_active/acme/{name}.partial"), &short);
 
     let wal = tmp.path().join("wal");
-    let (stdout, stderr, ok) = recover(&format!("file://{}", mirror.display()), &wal);
+    let (stdout, stderr, ok) = recover_apply(&format!("file://{}", mirror.display()), &wal);
     assert!(ok, "{stdout}{stderr}");
     assert!(
         stdout.contains("pulled 1 segments"),
@@ -186,6 +228,10 @@ fn recover_prefers_a_sealed_copy_over_its_active_prefix() {
 /// exited 0 — the same line and the same status as a re-run with nothing left
 /// to do — so an operator read a restore that recovered nothing as a restore
 /// that had nothing to recover.
+///
+/// #4973 keeps the exit status in BOTH forms and moves the counts onto the
+/// plan's totals line, which the plan and the apply print alike: an apply that
+/// would restore nothing stops there, before it creates `--to`.
 #[test]
 fn recovering_from_an_ancestor_of_the_mirror_root_fails_and_counts_the_skips() {
     let tmp = tempfile::tempdir().unwrap();
@@ -195,35 +241,42 @@ fn recovering_from_an_ancestor_of_the_mirror_root_fails_and_counts_the_skips() {
     // `…/store`, two components above `…/store/warehouse/wal-mirror`: every
     // key is deeper than the `<tenant>[/<index>]/<segment>` layout allows.
     let ancestor = tmp.path().join("store");
-    let (stdout, stderr, ok) = recover(&format!("file://{}", ancestor.display()), &wal);
-    assert!(!ok, "a restore that understood nothing must not exit 0");
-    assert!(
-        stdout.contains("pulled 0 segments") && stdout.contains("3 keys skipped"),
-        "the skipped count belongs on stdout next to the pulled count: {stdout}{stderr}"
-    );
-    assert!(
-        stderr.contains("--from must name the MIRROR ROOT"),
-        "the diagnostic names the thing to fix: {stderr}"
-    );
-    assert!(
-        stderr.contains("warehouse/wal-mirror"),
-        "and shows a refused key: {stderr}"
-    );
-    assert_eq!(
-        std::fs::read_dir(&wal).unwrap().count(),
-        0,
-        "nothing was restored under {}",
-        wal.display()
-    );
+    for (arm, run) in [
+        ("plan", recover as fn(&str, &Path) -> (String, String, bool)),
+        ("apply", recover_apply),
+    ] {
+        let (stdout, stderr, ok) = run(&format!("file://{}", ancestor.display()), &wal);
+        assert!(
+            !ok,
+            "{arm}: a restore that understood nothing must not exit 0"
+        );
+        assert!(
+            stdout.contains("totals: 0 segments") && stdout.contains("3 keys skipped"),
+            "{arm}: the skipped count belongs on stdout: {stdout}{stderr}"
+        );
+        assert!(
+            stderr.contains("--from must name the MIRROR ROOT"),
+            "{arm}: the diagnostic names the thing to fix: {stderr}"
+        );
+        assert!(
+            stderr.contains("warehouse/wal-mirror"),
+            "{arm}: and shows a refused key: {stderr}"
+        );
+        assert!(
+            !wal.exists(),
+            "{arm}: nothing was created at {}",
+            wal.display()
+        );
+    }
 
     // The control for the exit status: the same command pointed at the mirror
     // root restores, and its idempotent re-run — also `pulled 0 segments` —
     // succeeds.
     let from = format!("file://{}", mirror.display());
-    let (stdout, stderr, ok) = recover(&from, &wal);
+    let (stdout, stderr, ok) = recover_apply(&from, &wal);
     assert!(ok, "{stdout}{stderr}");
     assert!(stdout.contains("pulled 3 segments"), "{stdout}{stderr}");
-    let (stdout, stderr, ok) = recover(&from, &wal);
+    let (stdout, stderr, ok) = recover_apply(&from, &wal);
     assert!(ok, "an idempotent re-run succeeds: {stdout}{stderr}");
     assert!(stdout.contains("pulled 0 segments"), "{stdout}{stderr}");
 }
@@ -238,6 +291,14 @@ fn recovering_from_an_empty_mirror_succeeds_quietly() {
     let wal = tmp.path().join("wal");
 
     let (stdout, stderr, ok) = recover(&format!("file://{}", mirror.display()), &wal);
+    assert!(ok, "plan: {stdout}{stderr}");
+    assert!(stdout.contains("totals: 0 segments"), "{stdout}{stderr}");
+    assert!(
+        !stdout.contains("skipped"),
+        "nothing was refused: {stdout}{stderr}"
+    );
+
+    let (stdout, stderr, ok) = recover_apply(&format!("file://{}", mirror.display()), &wal);
     assert!(ok, "{stdout}{stderr}");
     assert!(stdout.contains("pulled 0 segments"), "{stdout}{stderr}");
     assert!(
@@ -266,7 +327,7 @@ fn a_mirror_with_unknown_keys_alongside_segments_restores_and_reports_both() {
 
     let from = format!("file://{}", mirror.display());
     let wal = tmp.path().join("wal");
-    let (stdout, stderr, ok) = recover(&from, &wal);
+    let (stdout, stderr, ok) = recover_apply(&from, &wal);
     assert!(ok, "a mixed mirror still restores: {stdout}{stderr}");
     assert!(
         stdout.contains("pulled 3 segments") && stdout.contains("2 keys skipped"),
@@ -274,7 +335,7 @@ fn a_mirror_with_unknown_keys_alongside_segments_restores_and_reports_both() {
     );
     assert_restored(&wal, &names);
 
-    let (stdout, stderr, ok) = recover(&from, &wal);
+    let (stdout, stderr, ok) = recover_apply(&from, &wal);
     assert!(ok, "rerun: {stdout}{stderr}");
     assert!(
         stdout.contains("pulled 0 segments")
@@ -288,19 +349,33 @@ fn a_mirror_with_unknown_keys_alongside_segments_restores_and_reports_both() {
 
 /// `--to` is the WAL ROOT. Pointing it at a `sealed/` directory would build
 /// `<wal>/sealed/<tenant>/sealed/...`, which nothing drains, so it is refused
-/// with the path to use instead — before anything is downloaded.
+/// with the path to use instead — before anything is downloaded, and in the
+/// PLAN as well: a plan that could not be applied should say so before it
+/// spends the listing (#4973).
 #[test]
 fn recover_refuses_a_sealed_directory_as_the_target() {
     let tmp = tempfile::tempdir().unwrap();
     let (mirror, _names) = mirror_with_three_segments(tmp.path());
     let wal = tmp.path().join("wal");
 
-    let (stdout, stderr, ok) = recover(
-        &format!("file://{}", mirror.display()),
-        &wal.join(SEALED_DIR),
-    );
-    assert!(!ok, "{stdout}{stderr}");
-    assert!(stderr.contains("must be the WAL ROOT"), "{stderr}");
-    assert!(stderr.contains(wal.to_str().unwrap()), "{stderr}");
-    assert!(!wal.exists(), "nothing was written: {stdout}{stderr}");
+    for (arm, run) in [
+        ("plan", recover as fn(&str, &Path) -> (String, String, bool)),
+        ("apply", recover_apply),
+    ] {
+        let (stdout, stderr, ok) = run(
+            &format!("file://{}", mirror.display()),
+            &wal.join(SEALED_DIR),
+        );
+        assert!(!ok, "{arm}: {stdout}{stderr}");
+        assert!(stderr.contains("must be the WAL ROOT"), "{arm}: {stderr}");
+        assert!(stderr.contains(wal.to_str().unwrap()), "{arm}: {stderr}");
+        assert!(
+            !stdout.contains("plan for"),
+            "{arm}: the refusal comes before the listing: {stdout}"
+        );
+        assert!(
+            !wal.exists(),
+            "{arm}: nothing was written: {stdout}{stderr}"
+        );
+    }
 }
