@@ -636,7 +636,12 @@ query:
       # SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES and
       # SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES explicitly; either way both are
       # subtracted from the pool and published on
-      # siglake_cache_budget_bytes{kind="text_index"}.
+      # siglake_cache_budget_bytes{kind="text_index"}. The workload that wants
+      # them raised well past the derivation is a repeated text query on a rare
+      # term with no LIMIT to clip it: locally, 1Gi/256Mi to 8Gi/2Gi took one
+      # such shape's p50 from 22,798.9 ms to 120.2 ms, at 20.2-21.3 GiB of
+      # process RSS for the pair (#4102). See docs/LIMITATIONS.md before
+      # copying either number into a pod spec.
       # Enabling the file-batch cache subtracts its configured
       # bytes before the 50% pool share is calculated. The pool is a real bound
       # as of 2026-08: DataFusion sorts and aggregates SPILL at it rather than
