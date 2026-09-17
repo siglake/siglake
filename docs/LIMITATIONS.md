@@ -387,7 +387,8 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   them, but no external v2-only engine can, and there is no in-place upgrade:
   Iceberg cannot change a column's precision and cannot downgrade a v3 table.
   **Recreate such a warehouse** (delete and re-ingest). A read-old/write-new
-  rewrite tool is not built — 0.1.0 is untagged and no data predates it. See
+  rewrite tool is not built: the contract is in 0.1.0, so no released warehouse
+  predates it and only a pre-release experimental one can need such a tool. See
   `docs/DESIGN_time_ordered_storage.md` ("Timestamp contract").
 - **No rollback has been qualified against an actual older image.** The
   additive-rollback mechanism is regression-tested
