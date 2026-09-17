@@ -236,8 +236,12 @@ Shape:
 
 ### What Option C does not cover
 
-- Installs with no catalog URI at all (`file://` dev warehouses with the default
-  SQLite catalog do have one; a genuinely catalog-less install does not).
+- Installs with no explicit catalog URI. `--catalog-uri` / `SIGLAKE_CATALOG_URI`
+  unset means the ingester's registrar never starts, so there are no rows to
+  mark; the Iceberg context's own SQLite fallback under the warehouse directory
+  is not the same thing. The chart sets the URI on every pod, so this is the
+  single-binary dev shape, where the prefix growing is not the problem it is on
+  a cluster.
 - Objects no local drain ever commits: a dropped incarnation's segments, an
   ingester whose volume was lost before its segments drained, and `_active/`
   blobs. These need Option A, and the limitation should keep saying so.
