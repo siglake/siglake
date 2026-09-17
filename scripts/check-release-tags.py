@@ -10,7 +10,7 @@ registry holding only `v0.1.0` -- an ImagePullBackOff on the first release. The
 kind scripts always pass `image.tag` explicitly, so the default was never
 exercised against a registry.
 
-Four questions, all answered from tracked files with no registry and no helm:
+Five questions, all answered from tracked files with no registry and no helm:
 
 1. The workflow's tag-resolution step, evaluated over `v<workspace version>`,
    produces the workspace version. The step's shell body is EXECUTED, not
@@ -22,8 +22,10 @@ Four questions, all answered from tracked files with no registry and no helm:
    checkout still uses the original `v` ref -- the release commit is the tag's.
 3. Both charts' default rendered image tag -- `image.tag` when set, otherwise
    `appVersion` through the chart's image helper -- is the workspace version.
-4. Every version-shaped image tag pinned in `deploy/` (the operator sample, the
-   install examples) is that same version, with no `v` prefix.
+4. The first numbered release in `CHANGELOG.md` is the workspace version.
+5. Every version-shaped image tag pinned in `deploy/` (the operator sample, the
+   install examples and the AWS image defaults) is that same version, with no
+   `v` prefix.
 
 Stdlib only and no helm: this runs in the `shell` job, which installs nothing,
 and in the local gate's shell block, which must answer the same question. The
@@ -47,13 +49,14 @@ import sys
 import tempfile
 
 CARGO_TOML = pathlib.PurePath("Cargo.toml")
+CHANGELOG = pathlib.PurePath("CHANGELOG.md")
 PUBLISH_YML = pathlib.PurePath(".github/workflows/publish.yml")
 CHARTS = (
     pathlib.PurePath("deploy/helm/siglake"),
     pathlib.PurePath("deploy/helm/siglake-operator"),
 )
-# Tracked trees whose literal image tags ship to a user: the operator sample
-# manifest and the install examples in the deployment READMEs.
+# Tracked trees whose literal image tags ship to a user: operator samples,
+# launchers and install examples.
 PINNED_TAG_ROOT = pathlib.PurePath("deploy")
 
 # `version = "0.1.0"` under `[workspace.package]`.
@@ -75,6 +78,18 @@ IMAGE_REF = re.compile(
 )
 # `--set image.tag=0.1.0`, `--set "image.tag=$IMAGE_TAG"`.
 SET_IMAGE_TAG = re.compile(r"image\.tag=(?P<tag>[^\s\"']+)")
+# AWS examples use placeholders because the registry is supplied by the
+# operator. Keep these exact so ordinary host:version prose is not treated as
+# a pinned image.
+PLACEHOLDER_IMAGE_REF = re.compile(
+    r"(?P<image>__ECR_REPO_URL__|<ECR>):(?P<tag>[A-Za-z0-9._-]+)"
+)
+# The AWS launcher and its documentation spell the same default three ways.
+SIGLAKE_IMAGE_TAG_DEFAULTS = (
+    re.compile(r"SIGLAKE_IMAGE_TAG:-(?P<tag>[A-Za-z0-9._-]+)"),
+    re.compile(r"SIGLAKE_IMAGE_TAG[^\n]*?\bdefault:\s*`?(?P<tag>[A-Za-z0-9._-]+)"),
+    re.compile(r"SIGLAKE_IMAGE_TAG`?\s*\|\s*`?(?P<tag>[A-Za-z0-9._-]+)"),
+)
 
 # A release version inside a tag: `0.1.0`, `0.1.0-rc.1`. Prefixed and suffixed
 # tags (`operator-0.1.0`) carry one too and are held to the same version.
@@ -86,6 +101,10 @@ DEFINE = re.compile(r'\{\{-?\s*define\s+"(?P<name>[^"]+)"\s*-?\}\}')
 END = re.compile(r"\{\{-?\s*end\s*-?\}\}")
 
 APP_VERSION = re.compile(r'^appVersion:\s*"?(?P<value>[^"\s]+)"?\s*$')
+CHANGELOG_RELEASE = re.compile(
+    r"^##\s+(?P<version>\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)(?:\s|$)",
+    re.MULTILINE,
+)
 
 
 class ExtractionError(Exception):
@@ -113,6 +132,14 @@ def workspace_version(text: str) -> str:
         if m:
             return m.group("value")
     raise ExtractionError(f"{CARGO_TOML} has no `version` under `[workspace.package]`")
+
+
+def changelog_version(text: str) -> str:
+    """Leading version token from the first numbered changelog section."""
+    match = CHANGELOG_RELEASE.search(text)
+    if not match:
+        raise ExtractionError(f"{CHANGELOG} has no numbered `## <version>` section")
+    return match.group("version")
 
 
 def run_scalars(text: str) -> list[str]:
@@ -329,6 +356,16 @@ def chart_problems(label: str, default_tag: str, version: str) -> list[str]:
     ]
 
 
+def changelog_problems(changelog: str, version: str) -> list[str]:
+    recorded = changelog_version(changelog)
+    if recorded == version:
+        return []
+    return [
+        f"{CHANGELOG}: first numbered release is `{recorded}`, but the workspace "
+        f"version is `{version}` -- land the version bump and release section together"
+    ]
+
+
 def pinned_tag_problems(path: str, text: str, version: str) -> list[str]:
     """Version-shaped image tags written out in shipped files.
 
@@ -339,6 +376,11 @@ def pinned_tag_problems(path: str, text: str, version: str) -> list[str]:
     problems = []
     candidates = [(m.group("tag"), m.group(0)) for m in IMAGE_REF.finditer(text)]
     candidates += [(m.group("tag"), m.group(0)) for m in SET_IMAGE_TAG.finditer(text)]
+    candidates += [
+        (m.group("tag"), m.group(0)) for m in PLACEHOLDER_IMAGE_REF.finditer(text)
+    ]
+    for pattern in SIGLAKE_IMAGE_TAG_DEFAULTS:
+        candidates += [(m.group("tag"), m.group(0)) for m in pattern.finditer(text)]
     for tag, whole in candidates:
         if "$" in tag or tag == "latest":
             continue
@@ -471,6 +513,42 @@ jobs:
         raise AssertionError("fixture: a v-prefixed pinned tag passed")
     checked += 1
 
+    changelog = "# Changelog\n\n## Unreleased\n\n## 0.1.0\n"
+    if changelog_problems(changelog, "0.1.0"):
+        raise AssertionError("fixture: a plain current changelog section was reported")
+    checked += 1
+    if changelog_problems(changelog.replace("## 0.1.0", "## 0.1.0 — first release"), "0.1.0"):
+        raise AssertionError("fixture: a subtitled current changelog section was reported")
+    checked += 1
+    stale_changelog = changelog.replace("## 0.1.0", "## 0.0.9\n\n## 0.1.0")
+    if not changelog_problems(stale_changelog, "0.1.0"):
+        raise AssertionError("fixture: a stale first release section passed")
+    checked += 1
+    try:
+        changelog_problems("# Changelog\n\n## Unreleased\n", "0.1.0")
+    except ExtractionError:
+        checked += 1
+    else:
+        raise AssertionError("fixture: a changelog with no release section passed")
+
+    aws_pins = """\
+image: __ECR_REPO_URL__:0.1.0
+pushed `<ECR>:operator-0.1.0` and `<ECR>:0.1.0`
+SIGLAKE_IMAGE_TAG image tag to deploy (default: 0.1.0)
+| `SIGLAKE_IMAGE_TAG` | `0.1.0` | Image tag to deploy. |
+IMAGE_TAG="${SIGLAKE_IMAGE_TAG:-0.1.0}"
+"""
+    if pinned_tag_problems("f", aws_pins, "0.1.0"):
+        raise AssertionError("fixture: current AWS image pins were reported")
+    checked += 1
+    if len(pinned_tag_problems("f", aws_pins, "0.1.1")) != 6:
+        raise AssertionError("fixture: stale AWS image pins were not all reported")
+    checked += 1
+    prose = "pre-0.1.0; tagged v0.1.0; rollback boundary 0.1.0; example.invalid:0.1.0\n"
+    if pinned_tag_problems("f", prose, "0.1.1"):
+        raise AssertionError("fixture: release prose was treated as a pinned image")
+    checked += 1
+
     for name, text, extract in (
         ("Cargo.toml without a workspace version", "[package]\nversion = \"9.9.9\"\n", workspace_version),
         ("a workflow with no TAG step", "jobs:\n  p:\n    steps:\n      - run: true\n", tag_resolution_step),
@@ -509,6 +587,7 @@ def main(argv: list[str]) -> int:
     try:
         fixtures = run_fixtures()
         version = workspace_version((root / CARGO_TOML).read_text())
+        problems += changelog_problems((root / CHANGELOG).read_text(), version)
         publish = (root / PUBLISH_YML).read_text()
         problems += normalization_problems(tag_resolution_step(publish), version)
         problems += trigger_problems(publish)
@@ -547,8 +626,7 @@ def main(argv: list[str]) -> int:
             print(f"FAIL {problem}", file=sys.stderr)
             annotate(problem)
         print(
-            f"\n{len(problems)} mismatch(es) between the published image tag and "
-            "what an install asks for.",
+            f"\n{len(problems)} release-version mismatch(es).",
             file=sys.stderr,
         )
         return 1
@@ -557,8 +635,8 @@ def main(argv: list[str]) -> int:
         print(f"workspace version: {version}")
         print(f"publish tag for v{version}: {evaluate_tag(tag_resolution_step(publish), f'v{version}')}")
     print(
-        f"ok   {len(CHARTS)} charts and {len(pinned_files)} deploy files agree on "
-        f"image tag {version}; {fixtures} fixtures"
+        f"ok   changelog, {len(CHARTS)} charts and {len(pinned_files)} deploy files "
+        f"agree on release version {version}; {fixtures} fixtures"
     )
     return 0
 
