@@ -254,7 +254,7 @@ correct answer by everything the format checks.
 Not in `seg1`, and the reason is a number rather than a principle. Measured at
 the per-file scale above (`report_posting_checksum_and_compression_options`):
 
-| option | cost on disk | what a point lookup fetches per group | catches the residual |
+| option | cost on disk | median bytes a point lookup fetches per row group | catches the residual |
 |---|---:|---:|---|
 | nothing (`seg1`) | — | 1,621 B | no |
 | CRC per term | 28.0 MiB, **+32.6%** of the blob | 1,621 B | yes |

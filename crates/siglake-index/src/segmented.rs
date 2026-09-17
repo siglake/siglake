@@ -1766,8 +1766,9 @@ mod tests {
         // directory's checks pass, the block itself verifies, and the term's
         // postings are decoded from the wrong offset. This is the residual the
         // format knowingly carries — only a checksum over the postings
-        // themselves sees it, at 4 bytes per term
-        // (`docs/DESIGN_segmented_inverted_index.md`, "Integrity").
+        // themselves sees it, and what that costs is measured in
+        // `docs/DESIGN_segmented_inverted_index.md`, "Do posting sections need
+        // their own checksum?".
         let middle = reader.groups[0].blocks[1].first_term.to_string();
         let Lookup::Rows(middle_truth) = reader.postings(&middle) else {
             panic!("the block's own first term is present");
