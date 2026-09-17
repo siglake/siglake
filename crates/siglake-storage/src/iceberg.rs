@@ -26762,11 +26762,19 @@ pub fn derive_read_cache_bytes(memory_limit_bytes: Option<u64>) -> Option<(u64, 
 /// condition for holding the serialized copy at all, since a blob whose parsed
 /// twin was evicted only helps while the blob itself survives.
 ///
-/// Capped rather than grown past today's constants because nothing has measured
-/// a working set larger than the three or four big compacted files 1 GiB holds;
-/// a bigger pod earns a bigger pool and more headroom instead. `None` (no
-/// cgroup limit) leaves the fallback to the caller, as
-/// `derive_read_cache_bytes` does.
+/// Capped rather than grown past today's constants, and #4102 has now measured
+/// the working set that used to be the open question. A fourteen-file,
+/// 7.34M-row-per-file text plan holds 7,830,305,508 bytes of parsed index —
+/// 533.4 MiB per file, so 1 GiB holds ONE of them rather than the three or four
+/// this comment assumed. Reaching the whole set through the 1/16 rule would
+/// take a pod of about 117 GiB even with the cap removed, and the 8 GiB passes
+/// that do hold it held 20.2-21.3 GiB resident in the process. The cap
+/// stays because the sidecar format, not the budget, is what a query pod cannot
+/// afford (`docs/DESIGN_inverted_index.md`, #4376), and because #4375's
+/// per-execution decline already keeps every clipped shape off the index at
+/// either budget; a deployment whose text queries are unclipped rare-term scans
+/// sets `SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES` by hand. `None` (no cgroup
+/// limit) leaves the fallback to the caller, as `derive_read_cache_bytes` does.
 ///
 /// AND THEY TAKE ONLY WHAT IS LEFT. The packaged 4Gi query pod is the floor
 /// precisely because the pool it derives there — half of what the other caches

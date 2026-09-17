@@ -2348,6 +2348,43 @@ fn ab_reuse_dir_from(raw: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf
         .map(std::path::PathBuf::from)
 }
 
+/// Current and peak resident set in bytes, from `/proc/self/status`'s `VmRSS`
+/// and `VmHWM` (both reported in kB). What a cache budget costs the process is
+/// the half of a sizing measurement the cache footprint cannot show: the
+/// budget is a bound on the entries, not on the pages the decode touched
+/// reaching them. `VmHWM` is a high-water mark for the process, so a run that
+/// wants a pass attributed on its own gives that pass its own process.
+fn rss_bytes_from(status: &str) -> (Option<u64>, Option<u64>) {
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.trim().strip_suffix(" kB"))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|kib| kib * 1024)
+    };
+    (field("VmRSS:"), field("VmHWM:"))
+}
+
+fn print_process_rss(label: &str) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let (rss, peak) = rss_bytes_from(&status);
+    let show = |value: Option<u64>| value.map_or_else(|| "unknown".to_string(), |b| b.to_string());
+    println!("rss_{label} bytes={} peak_bytes={}", show(rss), show(peak));
+}
+
+#[test]
+fn rss_reads_the_two_status_fields_in_bytes() {
+    let status =
+        "Name:\tpuffin_rebuild\nVmPeak:\t 1234 kB\nVmRSS:\t    2048 kB\nVmHWM:\t 4096 kB\n";
+    assert_eq!(
+        rss_bytes_from(status),
+        (Some(2048 * 1024), Some(4096 * 1024))
+    );
+    // A kernel without these fields reports nothing rather than zero: a run on
+    // such a box must not read as a process that held no memory.
+    assert_eq!(rss_bytes_from("Name:\tpuffin_rebuild\n"), (None, None));
+}
+
 #[test]
 fn ab_reuse_dir_resolves_without_process_environment() {
     use std::ffi::OsStr;
@@ -3028,6 +3065,7 @@ async fn report_rebuild_on_off_text_shapes() {
         seg_footprint.evictions,
         seg_footprint.oversized_skips
     );
+    print_process_rss("baseline");
     // One row per (shape, arm) since #4375 added the third arm: a fixed
     // column per arm stops being readable at three and would have to change
     // again at four. #4562's segmented columns are the same shape: the reads
@@ -3182,6 +3220,7 @@ async fn report_rebuild_on_off_text_shapes() {
                 seg_footprint.hits,
                 seg_footprint.evictions
             );
+            print_process_rss(&format!("{pass_name}_{}", indexed.label));
         }
     }
 
