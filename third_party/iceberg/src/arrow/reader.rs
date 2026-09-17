@@ -9601,6 +9601,15 @@ message schema {
         rows: &[String],
         group_rows: u32,
     ) -> (FileIO, String) {
+        write_mixed_sidecar_for(dir, rows, group_rows, "file:///data/0.parquet").await
+    }
+
+    async fn write_mixed_sidecar_for(
+        dir: &TempDir,
+        rows: &[String],
+        group_rows: u32,
+        data_file: &str,
+    ) -> (FileIO, String) {
         let file_io = FileIO::new_with_fs();
         let path = format!("{}/sidecar.puffin", dir.path().to_str().unwrap());
         let output = file_io.new_output(&path).unwrap();
@@ -9608,7 +9617,7 @@ message schema {
             .await
             .unwrap();
         let properties = HashMap::from([
-            ("data_file".to_string(), "file:///data/0.parquet".to_string()),
+            ("data_file".to_string(), data_file.to_string()),
             ("column".to_string(), "raw".to_string()),
             ("tokenizer".to_string(), "simple".to_string()),
         ]);
@@ -9663,14 +9672,16 @@ message schema {
         path: &str,
         blob_type: &str,
     ) -> crate::puffin::BlobMetadata {
-        ArrowReader::puffin_blob_metadata(
-            file_io,
-            path,
-            blob_type,
-            "raw",
-            "file:///data/0.parquet",
-            true,
-        )
+        sidecar_blob_for(file_io, path, blob_type, "file:///data/0.parquet").await
+    }
+
+    async fn sidecar_blob_for(
+        file_io: &FileIO,
+        path: &str,
+        blob_type: &str,
+        data_file: &str,
+    ) -> crate::puffin::BlobMetadata {
+        ArrowReader::puffin_blob_metadata(file_io, path, blob_type, "raw", data_file, true)
         .await
         .unwrap()
         .expect("the sidecar carries this blob type")
@@ -9799,9 +9810,24 @@ message schema {
             blob.length(),
             v1.heap_size_bytes()
         );
-        // Every row includes this prototype's cold open — the trailer and the
-        // whole directory, two reads — because nothing caches an opened
-        // reader between files or queries yet.
+        // Every row below includes this prototype's cold open, because nothing
+        // caches an opened reader between files or queries yet. An empty group
+        // selection is a definitive no-match, so it costs the open and nothing
+        // else — which is how the open is priced here.
+        let (_, open) = ArrowReader::segmented_matching_rows(
+            &file_io,
+            &path,
+            &blob,
+            &counts,
+            Some(&[]),
+            &all_terms_spec(&["rareneedle"]),
+        )
+        .await
+        .unwrap();
+        println!(
+            "cold open (trailer + directory): {} reads, {} B",
+            open.reads, open.bytes
+        );
         println!("shape                 rows      reads     fetched   ÷ blob   resident");
 
         let shapes: Vec<(&str, RawPruneSpec, Option<&[usize]>)> = vec![
@@ -10197,5 +10223,174 @@ message schema {
             "{outcome:?}"
         );
         assert_eq!(cost.reads, 1, "the trailer, and nothing after it");
+    }
+
+    /// The whole reader path on a real Parquet file and a real statistics
+    /// file: discovery by blob type, the row-domain check against the file's
+    /// Parquet metadata, and a `RowSelection` over the row groups the scan
+    /// kept.
+    #[tokio::test]
+    async fn a_registered_segmented_sidecar_selects_the_scans_rows() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(2_000);
+        let data_file = format!("{}/0.parquet", dir.path().to_str().unwrap());
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("raw", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(StringArray::from_iter_values(rows.iter())) as ArrayRef],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_size(512)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(&data_file).unwrap(),
+            Arc::clone(&arrow_schema),
+            Some(props),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let parquet = SerializedFileReader::new(File::open(&data_file).unwrap()).unwrap();
+        let metadata = parquet.metadata();
+        assert_eq!(metadata.num_row_groups(), 4);
+
+        let (file_io, sidecar) = write_mixed_sidecar_for(&dir, &rows, 512, &data_file).await;
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "raw", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let blob_properties = HashMap::from([
+            ("data_file".to_string(), data_file.clone()),
+            ("column".to_string(), "raw".to_string()),
+        ]);
+        let task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&data_file).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: Some(2_000),
+            data_file_path: data_file.clone(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: schema.clone(),
+            project_field_ids: vec![1],
+            predicate: None,
+            deletes: vec![],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            statistics_blobs: vec![crate::scan::StatisticsBlobReference {
+                statistics_path: sidecar.clone(),
+                blob_type: SEGMENTED_BLOB_TYPE.to_string(),
+                properties: blob_properties.clone(),
+            }],
+        };
+        let spec = all_terms_spec(&["rareneedle"]);
+        let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
+        let matching = v1.postings("rareneedle").unwrap().to_vec();
+        assert!(
+            matching.len() > 1 && matching.last().unwrap() >= &1_024,
+            "the term straddles row groups: {matching:?}"
+        );
+
+        let selection = ArrowReader::segmented_index_row_selection(
+            &file_io, &task, metadata, &None, &spec, true,
+        )
+        .await
+        .unwrap()
+        .expect("the registered sidecar answers");
+        assert_eq!(
+            selection,
+            ArrowReader::index_matches_row_selection(metadata.row_groups(), &None, &matching),
+            "the same selection the whole-file index's ordinals produce"
+        );
+
+        // Restricted to the row groups a scan kept, the selection covers those
+        // groups only — the same shape the v1 path produces.
+        let kept = Some(vec![2, 3]);
+        let selection = ArrowReader::segmented_index_row_selection(
+            &file_io, &task, metadata, &kept, &spec, true,
+        )
+        .await
+        .unwrap()
+        .expect("the registered sidecar answers");
+        assert_eq!(
+            selection,
+            ArrowReader::index_matches_row_selection(metadata.row_groups(), &kept, &matching)
+        );
+
+        // A kept-group list that is not strictly ascending is refused rather
+        // than answered over a different set of groups than the selection is
+        // then built for.
+        assert!(
+            ArrowReader::segmented_index_row_selection(
+                &file_io,
+                &task,
+                metadata,
+                &Some(vec![3, 2]),
+                &spec,
+                true,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        // A file whose only registered sidecar is a v1 one is not this path's
+        // to answer: it falls through to the whole-file index.
+        let legacy = FileScanTask {
+            statistics_blobs: vec![crate::scan::StatisticsBlobReference {
+                statistics_path: sidecar.clone(),
+                blob_type: "siglake-inverted-v1".to_string(),
+                properties: blob_properties,
+            }],
+            ..task.clone()
+        };
+        assert!(
+            ArrowReader::segmented_index_row_selection(
+                &file_io, &legacy, metadata, &None, &spec, true,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        // And a sidecar written for a different row-group layout prunes
+        // nothing, however well its blob parses.
+        let other_dir = TempDir::new().unwrap();
+        let (other_io, other_sidecar) =
+            write_mixed_sidecar_for(&other_dir, &rows, 400, &data_file).await;
+        let mismatched = FileScanTask {
+            statistics_blobs: vec![crate::scan::StatisticsBlobReference {
+                statistics_path: other_sidecar,
+                blob_type: SEGMENTED_BLOB_TYPE.to_string(),
+                properties: HashMap::from([
+                    ("data_file".to_string(), data_file.clone()),
+                    ("column".to_string(), "raw".to_string()),
+                ]),
+            }],
+            ..task.clone()
+        };
+        assert!(
+            ArrowReader::segmented_index_row_selection(
+                &other_io, &mismatched, metadata, &None, &spec, true,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
     }
 }
