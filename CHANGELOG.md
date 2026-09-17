@@ -105,6 +105,18 @@
   a base namespace moved by `SIGLAKE_TENANT_NAMESPACE` are known only at the
   increment. (#4737)
 
+- **Release images report the commit they were built from**: `siglake
+  --version` and the `siglake_build_info` metric read a revision stamped in at
+  build time, and the publish workflow passed none. The builds copy no Git
+  metadata, so the fallback `git rev-parse` had nothing to read and every
+  published image — both the server and the operator — said `unknown`, leaving
+  no way to tell a release apart from a rebuild carrying later fixes. Both
+  builds now get the commit the release checkout resolved to, which for a
+  manual dispatch is the commit named by its `tag` input rather than the
+  revision the workflow itself ran from. Image repositories and the image tag
+  are unchanged: the tag still says what the release is called, and the
+  revision now says what is in it. (#4557)
+
 ## 0.1.1
 
 Twelve changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
