@@ -77,6 +77,10 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 bytes = "1"
 base64 = "0.22"
 zstd = "0.13"
+# Already in the tree behind flate2; taken directly by siglake-index for the
+# experimental sidecar's checksums (#4560), where the writer CRCs every
+# dictionary block of every file.
+crc32fast = "1"
 futures = "0.3"
 async-trait = "0.1"
 

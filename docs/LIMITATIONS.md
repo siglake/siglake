@@ -50,9 +50,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   selected is replaced by one it should not. Extra rows are harmless — the
   exact predicate runs above the scan — so the exposure is a dropped match, and
   only for a file whose index is corrupt on disk rather than absent. Closing it
-  means a CRC per posting section, costed at about a third of the blob in
-  `DESIGN_segmented_inverted_index.md`, and is the trade to revisit when
-  postings feed an answer directly instead of a superset selection.
+  means a checksum over the postings, and
+  `DESIGN_segmented_inverted_index.md` now prices the granularities: 4 bytes
+  per term is about a third of a *segmented* blob, because a partial reader
+  fetches one term's postings and can only verify what it fetched, while a CRC
+  per block's posting span is a thousandth of it. Neither figure is this
+  format's, which is read whole — what that costs, and which storage path is
+  exposed at all once the Puffin sidecar's Zstd frame checksum is accounted
+  for, is #4991. Still the trade to revisit when postings feed an answer
+  directly instead of a superset selection.
 - **A maintenance process's cache budgets are readable at startup, not on
   `/metrics`.** The compactor, the ingest server and the `siglake` maintenance
   subcommands resolve their own budgets now — zero for the two text-index
