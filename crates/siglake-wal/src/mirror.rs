@@ -968,6 +968,10 @@ struct RecoveryTarget {
     /// Path relative to the WAL root, e.g. `acme/sealed/x.arrow` or
     /// `acme/orders/sealed/x.arrow`.
     rel: std::path::PathBuf,
+    /// For an INDEX segment, the tenant's own `sealed/` relative to the WAL
+    /// root — the tenant discovery dir. `None` for an events segment, whose
+    /// destination directory IS that path.
+    discovery: Option<std::path::PathBuf>,
     /// Segment stem, used to prefer a sealed copy over an active one.
     stem: String,
     /// True for `_active/` objects: a flushed but unsealed prefix of the
@@ -1013,12 +1017,21 @@ fn recovery_target(suffix: &str) -> Option<RecoveryTarget> {
         _ => return None,
     };
     let mut rel = std::path::PathBuf::from(tenant);
+    // An index segment's own directory says nothing about the tenant: the
+    // drain enumerates a tenant only by its own `sealed/`, so the segment
+    // carries the discovery dir it needs alongside it (#4972).
+    let discovery = index.map(|_| rel.join(crate::SEALED_DIR));
     if let Some(index) = index {
         rel.push(index);
     }
     rel.push(crate::SEALED_DIR);
     rel.push(format!("{stem}.arrow"));
-    Some(RecoveryTarget { rel, stem, partial })
+    Some(RecoveryTarget {
+        rel,
+        discovery,
+        stem,
+        partial,
+    })
 }
 
 /// What one [`recover_from_object_store`] pass did, in the counts an operator
@@ -1062,6 +1075,17 @@ pub struct RecoverySummary {
 /// `<wal_root>/<tenant>/sealed/` and `<wal_root>/<tenant>/<index>/sealed/`, so
 /// the ordinary FS drain commits each one to the namespace and table it came
 /// from.
+///
+/// Restoring an index segment also creates the tenant's own `sealed/` — the
+/// ingester's "tenant discovery dir" (`siglake-ingest`), which exists because
+/// `list_tenant_dirs` enumerates a child of the WAL root only if it has one.
+/// Without it a mirror holding only index segments for a tenant — an
+/// Elasticsearch-bulk-only tenant whose events lane never sealed — restored
+/// from the RIGHT prefix, with a clean report, into a layout the drain never
+/// walks: no commit, no `siglake_compactor_index_unresolved_total`, no backlog
+/// gauge, nothing in `orphans/` (#4972). It is created before the
+/// already-present skip below, so a re-run repairs a restore that predates
+/// this.
 ///
 /// Active-mirror objects (`_active/`) are recovered too — they are the whole
 /// point of `wal.mirror.activeIntervalSecs`, which bounds the window a PVC loss
@@ -1144,6 +1168,21 @@ pub async fn recover_from_object_store(
 
     for (key, target) in candidates.into_values() {
         let dest = wal_root.join(&target.rel);
+        // BEFORE the already-present skip, because the skip is the path a
+        // re-run takes over a restore that landed the segments and not this
+        // directory — and that restore is the invisible one. Repairing it
+        // costs one `is_dir` per candidate on the common path.
+        if let Some(discovery) = &target.discovery {
+            let discovery = wal_root.join(discovery);
+            if !discovery.is_dir() {
+                crate::create_wal_dir(&discovery)
+                    .with_context(|| format!("create {}", discovery.display()))?;
+                tracing::info!(
+                    dir = %discovery.display(),
+                    "wal-recover: created the tenant discovery dir the drain enumerates on"
+                );
+            }
+        }
         if dest.exists() {
             summary.already_present += 1;
             tracing::debug!(dest = %dest.display(), "wal-recover: already present, skipping");
@@ -2054,6 +2093,216 @@ mod tests {
             !root.join(SEALED_DIR).exists(),
             "no segment may be written to a tenant-less sealed/ directory"
         );
+    }
+
+    /// #4972: a tenant is enumerated by its OWN `sealed/`
+    /// (`list_layout_dirs`), which the ingester creates before it opens any
+    /// per-index lane and calls the tenant discovery dir. A mirror holding
+    /// only index segments for a tenant — Elasticsearch-bulk-only traffic
+    /// whose events lane never sealed — restored to the right layout from the
+    /// right prefix and was still never walked: the tenant did not exist as
+    /// far as the drain was concerned.
+    ///
+    /// Against the pre-fix code this test FAILS on `list_tenant_dirs`.
+    #[tokio::test]
+    async fn recovery_rebuilds_the_tenant_discovery_dir_for_an_index_only_tenant() {
+        use crate::durability::probe;
+
+        let op = memory_op();
+        op.write(
+            "wal-mirror/acme/orders/s1.arrow",
+            bytes::Bytes::from_static(b"A1"),
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        probe::record();
+        let summary = recover_from_object_store(op, "wal-mirror", &root)
+            .await
+            .unwrap();
+        let ops = probe::taken();
+        assert_eq!(summary.pulled, 1);
+        assert!(root
+            .join("acme")
+            .join("orders")
+            .join(SEALED_DIR)
+            .join("s1.arrow")
+            .exists());
+
+        assert_eq!(
+            crate::list_tenant_dirs(&root)
+                .unwrap()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            vec!["acme".to_string()],
+            "the drain enumerates the tenant it restored"
+        );
+        assert_eq!(
+            crate::list_index_dirs(&root.join("acme"))
+                .unwrap()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            vec!["orders".to_string()],
+            "and reaches the index directory beneath it"
+        );
+
+        // Same durability as the rest of the restore: the discovery dir is
+        // created BEFORE the segment it makes reachable, and each new
+        // component's parent is fsynced, so a power loss cannot leave the
+        // segment under a directory whose own entry never reached the device.
+        let tenant = ops
+            .iter()
+            .position(|op| op == "create_dir acme")
+            .unwrap_or_else(|| panic!("{ops:?}"));
+        assert_eq!(
+            &ops[tenant..tenant + 4],
+            &[
+                "create_dir acme".to_string(),
+                "sync_dir wal".to_string(),
+                "create_dir sealed".to_string(),
+                "sync_dir acme".to_string(),
+            ],
+            "the discovery dir is the FIRST thing the restore creates under the \
+             tenant, and each component's parent is synced: {ops:?}"
+        );
+        assert!(
+            ops[tenant + 4..].contains(&"rename s1.arrow".to_string()),
+            "and the segment is published after it: {ops:?}"
+        );
+    }
+
+    /// A restore that predates #4972 left the segments and not the discovery
+    /// dir, and the only command an operator has is this one again — which
+    /// takes the already-present skip on every segment. The repair therefore
+    /// runs BEFORE that skip. It claims nothing it did not do: the re-run
+    /// still reports zero pulled and one already present.
+    #[tokio::test]
+    async fn a_rerun_repairs_a_discovery_dir_an_earlier_restore_omitted() {
+        let op = memory_op();
+        op.write(
+            "wal-mirror/acme/orders/s1.arrow",
+            bytes::Bytes::from_static(b"A1"),
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        recover_from_object_store(op.clone(), "wal-mirror", &root)
+            .await
+            .unwrap();
+        // The layout the old code produced: segments present, tenant invisible.
+        std::fs::remove_dir(root.join("acme").join(SEALED_DIR)).unwrap();
+        assert!(crate::list_tenant_dirs(&root).unwrap().is_empty());
+
+        let rerun = recover_from_object_store(op, "wal-mirror", &root)
+            .await
+            .unwrap();
+        assert_eq!(rerun.pulled, 0, "nothing is re-pulled or re-counted");
+        assert_eq!(rerun.already_present, 1);
+        assert_eq!(rerun.skipped, 0);
+        assert_eq!(
+            crate::list_tenant_dirs(&root)
+                .unwrap()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            vec!["acme".to_string()],
+            "and the stranded segments become reachable"
+        );
+        assert_eq!(
+            std::fs::read(
+                root.join("acme")
+                    .join("orders")
+                    .join(SEALED_DIR)
+                    .join("s1.arrow")
+            )
+            .unwrap(),
+            b"A1",
+            "the segment already on the volume is left exactly as it was"
+        );
+    }
+
+    /// A discovery dir that cannot be made durable fails the restore rather
+    /// than reporting segments whose reachability did not reach the device.
+    /// The failure is before the download, so nothing is counted and the
+    /// re-run — the only thing that can finish the restore — has everything
+    /// left to do.
+    #[tokio::test]
+    async fn a_discovery_dir_that_cannot_be_made_durable_fails_the_restore() {
+        use crate::durability::probe;
+
+        let op = memory_op();
+        op.write(
+            "wal-mirror/acme/orders/s1.arrow",
+            bytes::Bytes::from_static(b"A1"),
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        // The fsync of `acme/` that publishes the `sealed/` entry inside it.
+        probe::fail(&["sync_dir acme"]);
+        let err = recover_from_object_store(op.clone(), "wal-mirror", &root)
+            .await
+            .unwrap_err();
+        probe::disarm();
+        assert!(
+            format!("{err:#}").contains("injected durability failure at `sync_dir acme`"),
+            "{err:#}"
+        );
+        assert!(
+            crate::list_sealed(&root.join("acme").join("orders"))
+                .unwrap()
+                .is_empty(),
+            "no segment is published under a directory the drain may not reach"
+        );
+
+        let summary = recover_from_object_store(op, "wal-mirror", &root)
+            .await
+            .unwrap();
+        assert_eq!(summary.pulled, 1);
+        assert_eq!(summary.already_present, 0);
+        assert_eq!(
+            crate::list_tenant_dirs(&root)
+                .unwrap()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            vec!["acme".to_string()]
+        );
+    }
+
+    /// An events segment's destination IS the tenant discovery dir, so the
+    /// repair adds no directory of its own — a restore of `<tenant>/<seg>`
+    /// must not invent an index directory or a second `sealed/`.
+    #[tokio::test]
+    async fn an_events_only_restore_grows_no_extra_directories() {
+        let op = memory_op();
+        op.write("wal-mirror/acme/s1.arrow", bytes::Bytes::from_static(b"A1"))
+            .await
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        assert_eq!(
+            recover_from_object_store(op, "wal-mirror", &root)
+                .await
+                .unwrap()
+                .pulled,
+            1
+        );
+        let mut children: Vec<String> = std::fs::read_dir(root.join("acme"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        children.sort();
+        assert_eq!(children, vec![SEALED_DIR.to_string()]);
     }
 
     /// #4912: an operator ROOTED at the mirror passes an empty relative
