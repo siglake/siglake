@@ -259,6 +259,63 @@ by setting `SIGLAKE_REBUILD_AB_REUSE_DIR` to its root containing `off/` and
 `on/`. This remains local evidence: it does not cover HTTP, object storage,
 distributed execution or AWS, and it does not qualify a new default.
 
+#### The parsed-index ceiling A/B (2026-09-17, #4102)
+
+`derive_text_index_cache_bytes` caps the derived parsed-index budget at 1 GiB
+(`crates/siglake-storage/src/iceberg.rs`). #4102 asked whether a pod with room
+should be allowed more. The same completed 14-file fixture was re-timed at two
+budgets — the deployed 1 GiB / 256 MiB pair and an 8 GiB / 2 GiB pair that
+holds the whole set — with one process per budget so the resident set
+attributes to that budget alone, three passes each, alternating so a drifting
+box could not favour one. Release build, five executions per shape and arm.
+
+The sizing reproduced #4329's exactly. At 8 GiB all fourteen parsed indexes
+were resident at 7,830,305,508 bytes in every pass, with zero evictions. At
+1 GiB the cache held **one** index, 559,896,106 bytes, and took 325, 337 and
+349 evictions. Two of those entries are 1,067.9 MiB, so the 1 GiB cap misses
+holding a second by about 44 MiB, and a fourteen-file plan takes every lookup
+as a miss.
+
+| shape | OFF p50 | indexed p50 @1 GiB | indexed p50 @8 GiB | policy p50 @1 GiB | policy p50 @8 GiB | policy decodes 1 / 8 |
+|---|---:|---:|---:|---:|---:|---|
+| keyword | 7.5 ms | 7,108.9 ms | 26.8 ms | 9.9 ms | 9.9 ms | 0 / 0 |
+| keyword_last25 | 20.9 ms | 7,066.4 ms | 25.3 ms | 19.7 ms | 19.2 ms | 0 / 0 |
+| keyword_last5 | 10.9 ms | 8,605.3 ms | 63.5 ms | 10.8 ms | 9.4 ms | 0 / 0 |
+| substring_scan | 5.2 ms | 15,225.4 ms | 807.4 ms | 7.0 ms | 6.6 ms | 0 / 0 |
+| rare_scan | 1,711.7 ms | 50,393.7 ms | 125.8 ms | 22,798.9 ms | 120.2 ms | 69 / 0 |
+| rare_scan_last25 | 673.1 ms | 6,079.5 ms | 34.5 ms | 4,843.4 ms | 38.2 ms | 15 / 0 |
+| rare_keyword | 542.2 ms | 16,238.8 ms | 43.8 ms | 549.5 ms | 529.6 ms | 0 / 0 |
+
+Each cell is the median over the three passes at that budget; the OFF column is
+the median over all six, since it reads no index and both budgets should give
+it the same number.
+
+The policy columns are the path the query server takes, and they answer the
+card. #4375's per-execution decline fires the same way at both budgets — zero
+decodes on all five clipped shapes either way — so the four shapes the 50G gate
+measures sit within noise of each other at 1 GiB and at 8 GiB. Raising the
+ceiling buys them nothing, because they never load an index for a cache to
+hold. What it buys is the unclipped regime, where the decline keeps the index
+and the 1 GiB budget then evicts it: `rare_scan` goes from 22,798.9 ms to
+120.2 ms (190x) and `rare_scan_last25` from 4,843.4 ms to 38.2 ms (127x).
+
+The 8 GiB budget is also not free of the pod. Its passes held 20.2-21.3 GiB
+resident against 14.3-15.6 GiB at 1 GiB on the same fixture, and #4329's
+attempt at a 12 GiB budget was killed by the box before it printed. Reaching
+7.83 GB through the 1/16 derivation would take a pod of about 117 GiB even with
+the cap removed.
+
+The ceiling therefore stays at 1 GiB, which is now a measured decision rather
+than an unmeasured one: it costs the shipped shapes nothing, the whole-file
+format is what a query pod cannot afford (#4376), and a deployment whose text
+queries are unclipped rare-term scans has
+`SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES` to raise it by hand. Reproduce either
+budget with the command above, `SIGLAKE_REBUILD_AB_REUSE_DIR` pointed at a
+completed fixture, and `SIGLAKE_REBUILD_AB_PARSED_BYTES` /
+`SIGLAKE_REBUILD_AB_BLOB_BYTES` set to the pair being measured; the run prints
+`rss_<pass> bytes=… peak_bytes=…` beside each footprint. This is local evidence
+again: it does not cover HTTP, object storage, distributed execution or AWS.
+
 `tests/puffin_rebuild.rs` covers both rewrite paths under the opt-in, the
 default-off path (a rewrite leaves its output unindexed, and a table indexed
 before the rewrite still serves index reads), exact filtered and unfiltered
