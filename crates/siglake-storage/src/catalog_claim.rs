@@ -221,6 +221,25 @@ pub struct ClaimedSegment {
     pub claimed_at: DateTime<Utc>,
 }
 
+/// A segment the local filesystem drain committed, for
+/// [`SqlSegmentClaim::mark_committed_local`].
+///
+/// `segment_url` must be the key the uploader wrote — root-relative
+/// `<mirror prefix>/<tenant>/<index>/<id>.arrow`, the same string
+/// [`SqlSegmentClaim::register`] records — because that is the key retention
+/// deletes. It is only used when the row is absent; where a registered row
+/// exists, its own `segment_url` is preserved.
+#[derive(Debug, Clone)]
+pub struct LocalCommittedSegment {
+    /// Segment id: the file basename without `.arrow`.
+    pub id: String,
+    pub tenant: String,
+    /// User-index id, or the empty string for the built-in `events` table.
+    pub index_id: String,
+    pub segment_url: String,
+    pub bytes: i64,
+}
+
 /// Catalog-tracked claim coordinator. Cheap to clone — wraps a
 /// connection pool.
 /// Drain attempts before a segment is set aside. Generous, because most
@@ -875,6 +894,114 @@ impl SqlSegmentClaim {
             }
         }
         Ok(())
+    }
+
+    /// Mark segments the LOCAL filesystem drain committed, for mirror
+    /// reclamation under a drain that never claimed them (#4913).
+    ///
+    /// This is deliberately not [`Self::mark_committed`]: that one requires
+    /// `status = 'processing' AND claimer = ?`, and there is no claim here —
+    /// the evidence is the drain's own `committed/` rename, which is ordered
+    /// after its Iceberg append. It also writes NO consumed-proof watermark:
+    /// that boundary exists to let claim reclaim decide whether an abandoned
+    /// claim was already committed, and this path leaves no claims to reclaim.
+    ///
+    /// An UPSERT, not an UPDATE. A late `catch_up_sweep` registration is
+    /// `ON CONFLICT DO NOTHING` (see [`Self::register`]), so it cannot undo a
+    /// `committed` row written first — but an update-only mark would lose the
+    /// reverse race (mark before the upload registers) and leak the object,
+    /// because retention only ever sees rows.
+    ///
+    /// `committed_at_ms` is stamped once and then preserved: the caller
+    /// re-marks from `committed/` every cycle, and re-stamping would keep
+    /// pushing the retention clock forward for as long as the local file
+    /// lives. Only a `sealed` or already-`committed` row is touched; a
+    /// `processing`, `released` or quarantined row belongs to a claim-mode
+    /// drain and is left exactly as it is.
+    ///
+    /// Returns the ids whose `committed` row is durable after this call — the
+    /// only ones whose local evidence the caller may then destroy.
+    pub async fn mark_committed_local(
+        &self,
+        segments: &[LocalCommittedSegment],
+    ) -> Result<Vec<String>> {
+        let mut durable = Vec::new();
+        for chunk in segments.chunks(256) {
+            let ids: Vec<&str> = chunk.iter().map(|s| s.id.as_str()).collect();
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let q = self.dialect.rewrite(&format!(
+                "UPDATE wal_segments \
+                     SET status = 'committed', \
+                         committed_at_ms = COALESCE(committed_at_ms, ?) \
+                     WHERE id IN ({placeholders}) \
+                       AND status IN ('sealed', 'committed')"
+            ));
+            let mut query = sqlx::query(&q).bind(now_millis());
+            for id in &ids {
+                query = query.bind(*id);
+            }
+            query
+                .execute(&self.pool)
+                .await
+                .context("mark locally-committed wal segments")?;
+            // Read back rather than trusting `rows_affected`: it cannot say
+            // WHICH ids transitioned, and a row left in another state must not
+            // be reported as marked.
+            let read_q = self.dialect.rewrite(&format!(
+                "SELECT id FROM wal_segments \
+                 WHERE id IN ({placeholders}) AND status = 'committed'"
+            ));
+            let mut read = sqlx::query_scalar::<_, String>(&read_q);
+            for id in &ids {
+                read = read.bind(*id);
+            }
+            let marked: std::collections::BTreeSet<String> = read
+                .fetch_all(&self.pool)
+                .await
+                .context("read back locally-committed wal segments")?
+                .into_iter()
+                .collect();
+            for segment in chunk {
+                if marked.contains(&segment.id) {
+                    durable.push(segment.id.clone());
+                    continue;
+                }
+                // Absent, or in a state this path must not touch. Insert-only:
+                // a conflict means a row appeared between the UPDATE and here
+                // (the registrar's `sealed`, or a claim), and the next cycle's
+                // UPDATE picks that up rather than overwriting it now.
+                let insert = self.dialect.rewrite(
+                    r#"
+                    INSERT INTO wal_segments
+                        (id, tenant, index_id, segment_url, bytes, rows,
+                         status, committed_at_ms, registered_at_ms)
+                        VALUES (?, ?, ?, ?, ?, 0, 'committed', ?, ?)
+                    ON CONFLICT(id) DO NOTHING
+                    "#,
+                );
+                let now = now_millis();
+                let inserted = sqlx::query(&insert)
+                    .bind(&segment.id)
+                    .bind(&segment.tenant)
+                    .bind(&segment.index_id)
+                    .bind(&segment.segment_url)
+                    .bind(segment.bytes)
+                    .bind(now)
+                    .bind(now)
+                    .execute(&self.pool)
+                    .await
+                    .with_context(|| {
+                        format!("insert locally-committed wal segment {}", segment.id)
+                    })?
+                    .rows_affected();
+                if inserted > 0 {
+                    durable.push(segment.id.clone());
+                }
+            }
+        }
+        Ok(durable)
     }
 
     /// Catalog-certified low watermark for one Iceberg target. Every segment

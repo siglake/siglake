@@ -1022,6 +1022,13 @@ pub fn list_orphaned(dir: &Path) -> Result<Vec<PathBuf>> {
     list_segments(dir, ORPHANS_DIR)
 }
 
+/// List locally-committed segments under `<dir>/committed/`, sorted. These are
+/// the segments whose Iceberg append returned, still held for secondary
+/// consumers and for the mirror-reclamation mark (#4913).
+pub fn list_committed(dir: &Path) -> Result<Vec<PathBuf>> {
+    list_segments(dir, COMMITTED_DIR)
+}
+
 /// What a WAL directory's [`OWNER_FILE`] says about `expected`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalOwner {
@@ -2421,6 +2428,17 @@ pub fn min_consumer_watermark(dir: &Path, stale_after: Duration) -> Result<Optio
     Ok(min)
 }
 
+/// What one [`sweep_committed_gated`] pass removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedSweep {
+    /// Files removed.
+    pub deleted: usize,
+    /// Of those, the ones removed at the hard ceiling while the mark gate still
+    /// refused them: local commit evidence destroyed before remote evidence
+    /// exists. Always zero without a gate.
+    pub unmarked: usize,
+}
+
 /// Delete `committed/` segments whose mtime is older than `retention`,
 /// coordinated with secondary consumers: a segment is kept until every fresh
 /// consumer has processed past it (its name ≤ the min consumer watermark),
@@ -2433,13 +2451,33 @@ pub fn sweep_committed_coordinated(
     max_retention: Duration,
     stale_after: Duration,
 ) -> Result<usize> {
+    sweep_committed_gated(dir, retention, max_retention, stale_after, None).map(|s| s.deleted)
+}
+
+/// [`sweep_committed_coordinated`] with a second gate: when `marked` is
+/// `Some`, a file is removed only once its name is in that set — the names
+/// whose remote commit evidence is durable (#4913). Local evidence is
+/// therefore destroyed only after remote evidence exists.
+///
+/// The hard ceiling still overrides the gate, because coupling the local sweep
+/// to a remote write means a catalog outage would otherwise grow the WAL volume
+/// without bound. A file swept that way is counted in
+/// [`CommittedSweep::unmarked`]: its mirror object is a leak this reclaimer can
+/// no longer collect, and the caller reports it rather than hiding it.
+pub fn sweep_committed_gated(
+    dir: &Path,
+    retention: Duration,
+    max_retention: Duration,
+    stale_after: Duration,
+    marked: Option<&std::collections::BTreeSet<String>>,
+) -> Result<CommittedSweep> {
     let committed = dir.join(COMMITTED_DIR);
     if !committed.exists() {
-        return Ok(0);
+        return Ok(CommittedSweep::default());
     }
     let watermark = min_consumer_watermark(dir, stale_after)?;
     let now = std::time::SystemTime::now();
-    let mut deleted = 0usize;
+    let mut swept = CommittedSweep::default();
     for entry in fs::read_dir(&committed)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
@@ -2461,19 +2499,30 @@ pub fn sweep_committed_coordinated(
             Some(wm) => name <= wm.as_str(),
             None => true,
         };
-        let sweepable = age >= max_retention || (age >= retention && consumed);
-        if sweepable {
-            match fs::remove_file(&p) {
-                Ok(()) => {
-                    remove_sidecar(&p);
-                    deleted += 1;
+        let expired = age >= max_retention;
+        if !(expired || (age >= retention && consumed)) {
+            continue;
+        }
+        let gated = match marked {
+            Some(set) => !set.contains(name),
+            None => false,
+        };
+        if gated && !expired {
+            continue;
+        }
+        match fs::remove_file(&p) {
+            Ok(()) => {
+                remove_sidecar(&p);
+                swept.deleted += 1;
+                if gated {
+                    swept.unmarked += 1;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).context("sweep_committed remove"),
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("sweep_committed remove"),
         }
     }
-    Ok(deleted)
+    Ok(swept)
 }
 
 /// Delete `committed/` segments whose mtime is older than `retention`,

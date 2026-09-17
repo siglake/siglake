@@ -681,10 +681,25 @@ pub async fn catch_up_sweep(
         }
 
         // The local drain may move the file after candidate discovery. Read
-        // the same segment from processing/ or committed/ before treating it
-        // as gone.
+        // the same segment from processing/ before treating it as gone.
         let bytes = match read_sweep_candidate(&candidate.path).await {
-            Ok(b) => b,
+            Ok(SweepCandidateRead::Bytes(b)) => b,
+            Ok(SweepCandidateRead::LocallyCommitted) => {
+                // Discovery is not proof that the upload is still owed. This
+                // candidate was in `sealed/` when the pass started and is now
+                // only in `committed/`: the local drain's Iceberg append
+                // returned, so its rows are durable without the mirror, and
+                // mirror reclamation may already have collected the key from
+                // the ledger mark that same rename drives (#4913). Uploading
+                // it here would recreate a reclaimed object that no later pass
+                // revisits. A segment whose upload IS still owed keeps its
+                // `mirror-pending/` pin, which is a candidate in its own right
+                // and reads from its own hard link.
+                metrics::counter!("siglake_wal_mirror_sweep_committed_skipped_total").increment(1);
+                tracing::debug!(path = %candidate.path.display(), key = %candidate.key,
+                    "catch-up sweep: segment was committed locally mid-sweep; not uploading");
+                continue;
+            }
             Err(e) => {
                 tracing::debug!(path = %candidate.path.display(), error = ?e,
                     "catch-up sweep: local segment vanished mid-sweep; skipping");
@@ -757,6 +772,22 @@ pub async fn catch_up_sweep(
     Ok(uploaded)
 }
 
+/// File names under `<dir>/mirror-pending/`: the segments in one WAL directory
+/// whose upload is still owed. A pin is created before the queue send and
+/// removed only once the object is confirmed present, so a name here means the
+/// mirror object may not exist yet — and a name that has left can never come
+/// back, because pins are minted at seal time only.
+///
+/// The mirror-reclamation mark reads this to skip pinned segments (#4913): a
+/// mark plus retention would delete a key the uploader is about to write.
+pub fn mirror_pending_names(dir: &Path) -> std::collections::BTreeSet<String> {
+    list_pending(dir)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(str::to_string))
+        .collect()
+}
+
 fn list_pending(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let pending = dir.join(MIRROR_PENDING_DIR);
     if !pending.exists() {
@@ -794,27 +825,42 @@ fn remove_candidate_pin(path: &Path) {
     }
 }
 
-async fn read_sweep_candidate(path: &Path) -> std::io::Result<Vec<u8>> {
+/// What a sweep candidate's bytes turned out to be.
+enum SweepCandidateRead {
+    Bytes(Vec<u8>),
+    /// The segment's only remaining local name is `committed/`: the local
+    /// drain's Iceberg append returned while this pass was in flight.
+    LocallyCommitted,
+}
+
+async fn read_sweep_candidate(path: &Path) -> std::io::Result<SweepCandidateRead> {
     match tokio::fs::read(path).await {
-        Ok(bytes) => return Ok(bytes),
+        Ok(bytes) => return Ok(SweepCandidateRead::Bytes(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
 
     let Some(filename) = path.file_name() else {
-        return tokio::fs::read(path).await;
+        return tokio::fs::read(path).await.map(SweepCandidateRead::Bytes);
     };
     let Some(wal_dir) = path.parent().and_then(Path::parent) else {
-        return tokio::fs::read(path).await;
+        return tokio::fs::read(path).await.map(SweepCandidateRead::Bytes);
     };
-    for subdir in [crate::PROCESSING_DIR, crate::COMMITTED_DIR] {
-        match tokio::fs::read(wal_dir.join(subdir).join(filename)).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
+    // `processing/` is a claim in flight: the commit has not returned, so the
+    // mirror copy is still owed. `committed/` is the opposite answer and is
+    // reported, not read — see the caller.
+    match tokio::fs::read(wal_dir.join(crate::PROCESSING_DIR).join(filename)).await {
+        Ok(bytes) => return Ok(SweepCandidateRead::Bytes(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
-    tokio::fs::read(path).await
+    if tokio::fs::try_exists(wal_dir.join(crate::COMMITTED_DIR).join(filename))
+        .await
+        .unwrap_or(false)
+    {
+        return Ok(SweepCandidateRead::LocallyCommitted);
+    }
+    tokio::fs::read(path).await.map(SweepCandidateRead::Bytes)
 }
 
 /// Search every local name that may retain a segment for the uploader.

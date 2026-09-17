@@ -3808,8 +3808,53 @@ async fn run_compactor(
             last_reclaim: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     } else {
-        Compactor::new(&wal_dir, ice)
-            .with_fs_batch_limits(fs_claim_max_segments, fs_claim_max_bytes)
+        let mut fs = Compactor::new(&wal_dir, ice)
+            .with_fs_batch_limits(fs_claim_max_segments, fs_claim_max_bytes);
+        // #4913: ledger-only mirror reclamation. The filesystem drain commits
+        // out of local `sealed/` and never reads the mirror, so nothing deleted
+        // the objects the ingester uploads, nor the `wal_segments` row it wrote
+        // per object. Opt-in: it adds a claim-store dependency this path does
+        // not otherwise have, and it deletes objects.
+        if siglake_compactor::mirror_ledger_reclaim_enabled() {
+            match (catalog_uri, warehouse_url, mirror_prefix.trim()) {
+                (Some(claim_uri), Some(url), prefix) if !prefix.is_empty() => {
+                    let store = build_opendal_operator(url)?;
+                    let marker = std::env::var("SIGLAKE_COMPACTOR_ID")
+                        .or_else(|_| hostname_lossy())
+                        .unwrap_or_else(|_| format!("comp-{}", &Uuid::new_v4().to_string()[..8]));
+                    let claim =
+                        siglake_storage::catalog_claim::SqlSegmentClaim::connect(claim_uri, marker)
+                            .await
+                            .with_context(|| {
+                                format!("connect claim DB at {claim_uri} for mirror reclamation")
+                            })?;
+                    fs = fs.with_mirror_ledger(siglake_compactor::CatalogClaimConfig {
+                        claim,
+                        store,
+                        prefix: prefix.to_string(),
+                        // Read by the claim path only; this mode never claims.
+                        batch_size: 0,
+                        last_mirror_sync: Default::default(),
+                        last_reclaim: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                    });
+                }
+                // A cluster-wide env var reaches every tier (the operator's
+                // `spec.extraEnv`), and an empty mirror prefix is the
+                // ingester's mirror opt-out. Say what is missing and keep
+                // draining rather than failing a pod that was draining fine.
+                (claim, url, prefix) => {
+                    tracing::warn!(
+                        catalog_uri = claim.is_some(),
+                        warehouse_url = url.is_some(),
+                        mirror_prefix = prefix,
+                        "SIGLAKE_MIRROR_LEDGER_RECLAIM is set but mirror reclamation needs \
+                         --catalog-uri, --warehouse-url and a non-empty --mirror-prefix; \
+                         mirror objects will keep accumulating"
+                    );
+                }
+            }
+        }
+        fs
     };
     if let Some(cfg) = recluster_cfg_from_env() {
         compactor = compactor.with_reclustering(cfg);
