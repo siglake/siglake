@@ -800,7 +800,10 @@ through 200 GB and 1 TB sustained-ingest rounds
   same sizing the flush path makes from the batch it is handed. The open row
   group is buffered decoded while its bloom accumulates, so that target is also
   what bounds a merge's, a re-cluster's and a delete rewrite's writer-side
-  memory (see [`LIMITATIONS.md`](LIMITATIONS.md)).
+  memory (see [`LIMITATIONS.md`](LIMITATIONS.md)). The default is measured
+  against the packaged 1Gi compactor in
+  [`DESIGN_row_group_target_qualification.md`](DESIGN_row_group_target_qualification.md),
+  which keeps it and records 64 MiB as a compactor-scoped candidate for 0.2.0.
 - **Metadata hygiene on the same loop:** snapshot expiry (count + age),
   orphan-file GC with its own safety age (deliberately not the retention
   window — a file younger than the longest write-then-commit gap may be about
