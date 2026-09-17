@@ -124,8 +124,9 @@ spec:
             description: >-
               {{ "{{ $value }}" }} segment registration(s) were abandoned. Those rows were
               ACKED to the client and are permanently unqueryable — no error will
-              be raised anywhere else. Run `siglake wal-recover` or
-              re-register the affected keys.
+              be raised anywhere else. Run `siglake wal-recover` (it prints a
+              plan; re-run it with `--apply` to restore) or re-register the
+              affected keys.
         - alert: SiglakeWalMirrorUploadAbandoned
           expr: increase(siglake_wal_mirror_upload_abandoned_total[10m]) > 0
           for: 0m

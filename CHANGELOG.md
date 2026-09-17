@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- **Recovery (breaking)**: `siglake wal-recover` plans by default and writes
+  only under `--apply`. The plan is the listing the restore already did before
+  its first GET: one line per `(tenant, index)` with the segment count, the
+  byte total the listing reported, a sample key and the destination it
+  reconstructs, plus the already-present and skipped counts. It creates
+  nothing under `--to`, `--to` itself included. A script or runbook calling
+  the old single-command form stops writing and prints a plan instead.
+
+  The same listing settles whether `--from` is the mirror root. siglake writes
+  two markers at a fixed depth under it — a first component `_active` with a
+  `.arrow.partial` tail, and `<tenant>/<index>/owner` from the catalog-claim
+  drain — so either at its own depth confirms the root, and either exactly one
+  component deeper means `--from` is one component above it: the run exits
+  nonzero naming the directory to pass instead, in both forms, and the apply
+  before it creates anything. A marker at root depth does not excuse a
+  misplaced one. A mirror with neither marker is reported `unverified` and
+  restores under `--apply` on the operator's reading of the plan; that is the
+  population no rule reading only the keys can separate from a legitimate
+  mirror whose first tenant is named after a prefix, and it is why the plan
+  exists. There is no `--force`.
+
+  #4928's all-skipped nonzero exit is unchanged, with its counts on the plan's
+  totals line; the `sealed/`-as-target refusal still runs before the listing;
+  and the restore's durability, routing, ownership and #4972 discovery-dir
+  repair are untouched. `siglake_wal::mirror` gains `plan_recovery` and
+  `apply_plan`; `recover_from_object_store` keeps its signature and is now
+  both halves in one call. (#4973)
+
 - **Recovery (fix)**: `siglake wal-recover` rebuilds the tenant discovery
   directory, so a restore that holds only index segments for a tenant is
   drained. The compactor enumerates a tenant by its own `<tenant>/sealed/`,

@@ -1,7 +1,11 @@
 # Root identity for `siglake wal-recover` (task #4964)
 
-**Status:** investigation and design. No production CLI behaviour, default or
-object layout changed on this card. **Date:** 2026-09-17.
+**Status:** option C is SHIPPED (#4973, 2026-09-17): `wal-recover` plans unless
+it is given `--apply`, and the listing carries the root verdict. No `--force`,
+no 0.1.1 default change, and `--catalog` (option D) is still a follow-on slice.
+The sections below are the investigation that chose it; the measured behaviour
+in "What the restore does, measured" is the PRE-#4973 picture, kept because it
+is what the remedy is priced against. **Date:** 2026-09-17.
 
 #4928 made a restore that recognised NO key exit nonzero. The case it cannot
 see is `--from` exactly ONE component above the mirror root. The shallowest key
@@ -163,9 +167,10 @@ reconstructs the layout, prints what it would write, and writes nothing.
 `--apply` performs the restore. The plan is exactly the work the command
 already does before its first GET — `recover_from_object_store` collects the
 whole listing into `candidates` before it reads one body
-(`crates/siglake-wal/src/mirror.rs:1102-1145`) — so a plan costs the LIST the
-restore was going to pay and zero GETs, and costs nothing on the object-store
-bill that `--apply` does not also pay.
+(`crates/siglake-wal/src/mirror.rs:1102-1145`) — so a plan costs one LIST and
+zero segment GETs. The two invocations each pay their own LIST, which is the
+one line on the bill the split adds: an apply must decide on the listing that
+is current when it writes, not on the one the plan run saw.
 
 The plan is per `(tenant, index)`: segment count, byte total, and a sample key
 with the destination it reconstructs. An operator looking at
@@ -183,9 +188,15 @@ On top of the plan, the verdict from the evidence table:
 - a `.arrow.partial` under a first component `_active`, or a key ending `/owner`
   at depth 2 ⇒ **root confirmed**;
 - either marker exactly one component deeper than that ⇒ **refuse**, naming the
-  directory to pass instead, and `--apply` fails without `--force`;
+  directory to pass instead, and `--apply` fails. There is no override: Todd
+  settled the open decision below against `--force` on 2026-09-17, so the way
+  past a contradicted root is to pass the directory the refusal names;
 - neither present ⇒ **unverified**, and `--apply` proceeds on the operator's
   reading of the plan.
+
+A listing holding markers at BOTH depths refuses too. A marker at root depth
+is not an alibi for a misplaced one — no mirror root has both — and the
+refusal reports the confirming key alongside the misplaced one.
 
 ### D — `--catalog <uri>`, as a complement to C
 
@@ -256,18 +267,20 @@ strength of the same key shape this document is about.
 5. `docs/ARCHITECTURE.md:91` and `docs/LIMITATIONS.md` move with the contract,
    and a siglake-docs follow-up for the DR runbook.
 
-## Open decisions for the maintainer
+## Decisions (settled 2026-09-17)
 
-- **Is the plan/apply break acceptable before 0.2.0?** `wal-recover` is an
-  operator command with a documented single-command form. The alternative that
-  preserves it — default to writing, require `--apply` only when the markers
-  contradict the root — leaves the evidence-free default install exactly where
-  it is today.
-- **Does `--force` exist at all?** A refusal with no override is a support
-  escalation the first time a marker is stale; an override is a flag that ends
-  up in the runbook.
-- **Should `--catalog` be in the same release?** It is the only exact answer,
-  and it is the answer for the population that has a catalog but no markers.
+- **The plan/apply break ships in 0.2.0.** Plan by default, `--apply` the only
+  writing form, no 0.1.1 default change and no `--yes` alias. The alternative
+  that preserved the single command — default to writing, require `--apply`
+  only when the markers contradict the root — leaves the evidence-free default
+  install exactly where it is today, and that population is the whole problem.
+- **No `--force`.** A refusal with no override is a support escalation the
+  first time a marker is stale; an override is a flag that ends up in the
+  runbook, and the escape hatch it would provide already exists — pass the
+  directory the refusal names.
+- **`--catalog` is a later slice**, not this release. It is the only exact
+  answer, and it is the answer for the population that has a catalog but no
+  markers.
 
 ## Defects found while reading this path
 

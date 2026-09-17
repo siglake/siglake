@@ -89,21 +89,34 @@ CRC-validated framing (WS-8), and sealed + active segments
 mirror to object storage on configurable intervals — **sealed segments mirror by
 default** wherever a warehouse URL is set, so the WAL volume is not the only copy
 of what has been acknowledged. `siglake wal-recover --from
-s3://<bucket>/<prefix> --to <wal-root>` restores from the mirror for DR,
-rebuilding the per-tenant and per-index layout so each segment returns to the
-namespace and table it came from — including the tenant's own `sealed/`, the
-discovery directory the drain enumerates tenants by, which an index-only
-restore would otherwise leave out (#4972); each restored segment is written to
-a temp name, `fsync(2)`ed and renamed under a synced directory before it is
-counted,
+s3://<bucket>/<prefix> --to <wal-root>` restores from the mirror for DR, in two
+steps: without `--apply` it PLANS — it lists the mirror, reconstructs the
+layout, prints one line per `(tenant, index)` with the segment count, the byte
+total the listing reported, a sample key and the destination it would write,
+and creates nothing under `--to`, `--to` itself included. `--apply` performs
+the restore, rebuilding the per-tenant and per-index layout so each segment
+returns to the namespace and table it came from — including the tenant's own
+`sealed/`, the discovery directory the drain enumerates tenants by, which an
+index-only restore would otherwise leave out (#4972); each restored segment is
+written to a temp name, `fsync(2)`ed and renamed under a synced directory
+before it is counted,
 so a restore that reports 400 segments has 400 whole ones on the volume. The
 report carries the counts that separate a finished restore from one that
 understood nothing — segments already present, and keys skipped for a layout
 recovery will not guess at — and exits nonzero when every key was skipped and
 nothing was restored, which is `--from` naming an ancestor of the mirror root.
-An ancestor exactly ONE component up is not caught: its keys still fit the
-layout, so segments are restored under a tenant named after the mirror prefix
-and the command reports a success. See `docs/LIMITATIONS.md` and
+
+The same listing decides whether `--from` IS the mirror root, from the two
+markers siglake writes at a fixed depth under it: a first component `_active`
+with a `.arrow.partial` tail, or a key ending `/owner` at depth 2. Either at
+its own depth confirms the root; either exactly one component deeper means
+`--from` is one component above it, and both forms of the command then exit
+nonzero naming the directory to pass instead — the apply before it creates
+anything. A marker at root depth does not cancel a misplaced one. A mirror
+with neither marker (no managed index, no active mirroring) is reported
+unverified, and the plan is the only checkpoint: its keys still fit the layout
+one component up, so an operator who applies it anyway restores under a tenant
+named after the mirror prefix. See `docs/LIMITATIONS.md` and
 `docs/DESIGN_wal_recovery_root_identity.md`.
 Multi-pod deployments coordinate through a
 SQL claim table (`wal_segments`, atomic `try_claim`); crash recovery
