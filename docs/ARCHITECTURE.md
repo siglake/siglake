@@ -49,7 +49,7 @@ design.
 |---|---|
 | **Ingester** (`siglake ingest-server`) | OTLP/HTTP on 8088 and OTLP/gRPC on 4317, plus bulk endpoints → WAL segments. Backpressure router with bounded per-tenant lanes (full lane ⇒ fast `503` + `Retry-After`), token-bucket rate budgets (in-memory or Redis-backed shared across replicas), WAL mirroring to object storage, force-seals the WAL on SIGTERM for safe scale-down. Can run the compactor in-process (`--with-compactor`) for single-process dev and bench runs; the Helm chart refuses that flag, because the embedded compactor takes no catalog claim. |
 | **Compactor / drain** (`siglake compactor`) | Drains sealed WAL segments into Iceberg commits — continuous dispatch with N commits in flight, commit-accumulation batching — and runs **leveled compaction**, snapshot expiry, retention/delete sweeps, and orphan GC on the same budgeted loop, so maintenance never starves the commit path. Multi-pod-safe via SQL catalog claims. |
-| **Query** (`siglake-query-server`) | Distributed SQL: replicas behind a headless Service with stable DNS; any replica transparently coordinates (file-shard fan-out, two-phase merge, Arrow IPC transport). Replicas add throughput; fan-out engages for large scans, while small-`LIMIT` browses and Tier-1 aggregates are answered locally by design (see [`LIMITATIONS.md`](LIMITATIONS.md)). A process-wide memory pool bounds every sort, aggregate and join; when it refuses (rather than spills) the client gets `503` + `Retry-After`, the same capacity answer the ingester gives, forwarded from a worker rather than re-run on the coordinator. Serves uncommitted WAL data for the events table via the real-time buffer (`--query-wal-buffer-dir`) plus hot last-value caches. |
+| **Query** (`siglake-query-server`) | Distributed SQL: replicas behind a headless Service with stable DNS; any replica transparently coordinates (file-shard fan-out, two-phase merge, Arrow IPC transport). Replicas add throughput; fan-out engages for large scans, while small-`LIMIT` browses and Tier-1 aggregates are answered locally by design (see [`LIMITATIONS.md`](LIMITATIONS.md)). A process-wide memory pool bounds every sort, aggregate and join; when it refuses (rather than spills) the client gets `503` + `Retry-After`, the same capacity answer the ingester gives, forwarded from a worker rather than re-run on the coordinator. Serves uncommitted WAL data for `events` and for every managed user index a query references, via the real-time buffer (`--query-wal-buffer-dir`) plus hot last-value caches. |
 | **Operator** (`siglake-operator`) | `SiglakeCluster` CRD → renders the deployment; leader-elected; reports `observedGeneration` + schema versions. |
 | **Catalog** | Iceberg on SQLite (dev) or Postgres (prod), through siglake's **vendored Iceberg forks** (`third_party/iceberg`, `third_party/iceberg-catalog-sql`). |
 
@@ -341,11 +341,18 @@ result: the index only ever produced a superset row selection, blooms stay
 active, and the exact predicate is re-evaluated above the scan either way.
 
 **Freshness.** The query tier's WAL buffer serves *uncommitted* sealed +
-processing segments for the events table, unioned with Iceberg under the same
-name and de-overlapped via commit-stamped consumed-segment lists — measured
-**~5.8 s ingest→queryable** for a lone marker on a bench node (seal-age
-dominated; sustained streams seal by size). User indexes see commit-cycle
-visibility until per-index buffer serving lands (see roadmap).
+processing segments, unioned with Iceberg under the same table name and
+de-overlapped via commit-stamped consumed-segment lists. It covers `events`
+(from the tenant's WAL directory) and every managed user index a query
+references (from that index's own `<root>/<tenant>/<index>/` directory, with
+the carrier-shaped WAL batches mapped through the index's doc-mapping before
+the union); `query_audit` is served committed-only. All of it requires the
+query pod to see the ingester's WAL — a shared RWX volume (EFS) in the
+distributed deployment — and is off unless `--query-wal-buffer-dir` is set.
+The measured figure is **~5.8 s ingest→queryable** for a lone marker on a
+bench node (seal-age dominated; sustained streams seal by size); that
+measurement is on `events`, and the index path has not been measured
+separately.
 
 ## Storage
 
@@ -847,7 +854,8 @@ through 200 GB and 1 TB sustained-ingest rounds
 ## Query
 
 **SQL, with guardrails.** `/api/v1/sql` plans through DataFusion against the
-Iceberg snapshot (+ the WAL buffer for events). Every request gets a
+Iceberg snapshot (+ the WAL buffer, for `events` and for managed user
+indexes). Every request gets a
 manifest-walk cost estimate pre-flight (bytes/rows rejection before any data
 IO), per-tier ceilings clamp per-request limits, a mid-flight rows-scanned
 breaker aborts runaway scans at batch boundaries, and a wall-clock timeout
