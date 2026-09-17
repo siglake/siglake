@@ -1919,15 +1919,28 @@ impl Compactor {
             tracing::warn!(error = ?e, "promotion backfill property check failed");
         }
         // WS-7 auto-promotion (env-gated, default OFF): sample the newest
-        // files' attributes JSON and promote hot string keys. Everything
+        // files' attributes JSON and promote hot scalar keys. Everything
         // downstream composes: the property-driven write path materializes
         // on the next commit, the backfill selector above rewrites old
         // files, and the completion property re-gates the rewrite.
+        //
+        // This mutates the table SCHEMA with no operator in the loop —
+        // `declare_promotions_for` widens it and records the property — which
+        // is why it ships off and why its bounds are the whole of #3052's
+        // qualification (`docs/DESIGN_auto_promotion_qualification.md`). The
+        // operator's schema-migration Job is the opposite arrangement: it runs
+        // only when the CR names a `schemaVersion`, and the operator reports
+        // what it observed rather than deciding anything.
         let min_fraction = auto_promote_min_fraction();
         if min_fraction > 0.0 && auto_promote_due() {
             match self
                 .ice
-                .auto_promote_hot_keys(min_fraction, auto_promote_max_columns(), 4, 4096)
+                .auto_promote_hot_keys(
+                    min_fraction,
+                    auto_promote_max_columns(),
+                    auto_promote_sample_files(),
+                    auto_promote_sample_rows(),
+                )
                 .await
             {
                 Ok(newly) if !newly.is_empty() => {
@@ -5883,23 +5896,117 @@ impl Compactor {
 /// The compactor calls this at the start of every cycle so an
 /// ingester crash between upload-to-S3 and register-in-catalog
 /// doesn't leave segments invisible to claim.
+/// Least share of the sample a key must hold to be promotable at all.
+///
+/// The sample is bounded ([`AUTO_PROMOTE_SAMPLE_FILES`] files ×
+/// [`AUTO_PROMOTE_SAMPLE_ROWS`] rows), so a threshold finer than this asks it
+/// a question it cannot answer: at the default bound 1% is 164 rows of
+/// evidence, 0.1% is 16, and below that the ranking is noise deciding
+/// irreversible schema changes. A request under the floor is RAISED to it —
+/// stricter than asked, which errs toward fewer promotions.
+const AUTO_PROMOTE_MIN_PCT_FLOOR: f64 = 1.0;
+
+/// Most promotions one table may accumulate, whatever the knob says.
+///
+/// Every promoted column is materialized on every write, re-extracted by
+/// every backfill rewrite, and cannot be removed from the schema, so the
+/// ceiling is the blast radius of a mistyped knob. 64 is 4× the default and
+/// 8× the largest promotion list any round has used.
+const AUTO_PROMOTE_MAX_COLUMNS_CEILING: usize = 64;
+
+/// Default promotion cap (`SIGLAKE_AUTO_PROMOTE_MAX_COLUMNS`).
+const DEFAULT_AUTO_PROMOTE_MAX_COLUMNS: usize = 16;
+
+/// Live files one sampling pass reads (`SIGLAKE_AUTO_PROMOTE_SAMPLE_FILES`),
+/// newest first, and rows it reads from each
+/// (`SIGLAKE_AUTO_PROMOTE_SAMPLE_ROWS`). Their product is the pass's whole
+/// cost: `files × rows` residual JSON documents parsed, once per cadence.
+const AUTO_PROMOTE_SAMPLE_FILES: usize = 4;
+const AUTO_PROMOTE_SAMPLE_ROWS: usize = 4096;
+
 /// WS-7 auto-promotion knobs. `SIGLAKE_AUTO_PROMOTE_MIN_PCT` (percent of
 /// sampled rows a key must appear in; 0 = auto-promotion OFF, the default),
 /// `SIGLAKE_AUTO_PROMOTE_MAX_COLUMNS` (total promotion cap, default 16),
+/// `SIGLAKE_AUTO_PROMOTE_SAMPLE_FILES` / `_SAMPLE_ROWS` (the sampling bound),
 /// and a fixed 300s cadence between sampling runs.
 fn auto_promote_min_fraction() -> f64 {
-    std::env::var("SIGLAKE_AUTO_PROMOTE_MIN_PCT")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .map(|pct| pct / 100.0)
-        .unwrap_or(0.0)
+    auto_promote_min_fraction_from(
+        std::env::var("SIGLAKE_AUTO_PROMOTE_MIN_PCT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure resolver for [`auto_promote_min_fraction`]. Absent, unparseable, not
+/// finite, or non-positive ⇒ `0.0`, which is the off switch the shipped
+/// default relies on. Anything positive is clamped into
+/// `[AUTO_PROMOTE_MIN_PCT_FLOOR, 100]` and returned as a fraction.
+fn auto_promote_min_fraction_from(configured: Option<&str>) -> f64 {
+    let Some(pct) = configured
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p > 0.0)
+    else {
+        return 0.0;
+    };
+    pct.clamp(AUTO_PROMOTE_MIN_PCT_FLOOR, 100.0) / 100.0
 }
 
 fn auto_promote_max_columns() -> usize {
-    std::env::var("SIGLAKE_AUTO_PROMOTE_MAX_COLUMNS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(16)
+    auto_promote_max_columns_from(
+        std::env::var("SIGLAKE_AUTO_PROMOTE_MAX_COLUMNS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure resolver for [`auto_promote_max_columns`]. Absent or unparseable ⇒
+/// the default; anything else is capped at
+/// [`AUTO_PROMOTE_MAX_COLUMNS_CEILING`]. `0` passes through: a deployment that
+/// wants the sampling pass inert without unsetting the threshold has a second
+/// off switch.
+fn auto_promote_max_columns_from(configured: Option<&str>) -> usize {
+    configured
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_AUTO_PROMOTE_MAX_COLUMNS)
+        .min(AUTO_PROMOTE_MAX_COLUMNS_CEILING)
+}
+
+fn auto_promote_sample_files() -> usize {
+    auto_promote_sample_files_from(
+        std::env::var("SIGLAKE_AUTO_PROMOTE_SAMPLE_FILES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure resolver for [`auto_promote_sample_files`]: clamped to `1..=64`. Zero
+/// is not an off switch here — the threshold and the column cap are — so it
+/// resolves to one file rather than a pass that samples nothing and concludes
+/// nothing.
+fn auto_promote_sample_files_from(configured: Option<&str>) -> usize {
+    configured
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(AUTO_PROMOTE_SAMPLE_FILES)
+        .clamp(1, 64)
+}
+
+fn auto_promote_sample_rows() -> usize {
+    auto_promote_sample_rows_from(
+        std::env::var("SIGLAKE_AUTO_PROMOTE_SAMPLE_ROWS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure resolver for [`auto_promote_sample_rows`]: clamped to `256..=65536`
+/// rows per file. The floor keeps [`AUTO_PROMOTE_MIN_PCT_FLOOR`] meaningful
+/// (256 rows is 2 hits at 1%); the ceiling bounds one pass at 64 × 65536 ≈
+/// 4.2M parsed documents in the worst configured case.
+fn auto_promote_sample_rows_from(configured: Option<&str>) -> usize {
+    configured
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(AUTO_PROMOTE_SAMPLE_ROWS)
+        .clamp(256, 65_536)
 }
 
 fn auto_promote_due() -> bool {
@@ -6568,6 +6675,109 @@ mod watchdog_tests {
         assert_eq!(poison_attempts_from(Some("nope")), DEFAULT_POISON_ATTEMPTS);
         assert_eq!(poison_attempts_from(Some("-1")), DEFAULT_POISON_ATTEMPTS);
         assert_eq!(poison_attempts_from(Some("")), DEFAULT_POISON_ATTEMPTS);
+    }
+}
+
+/// #3052: the bounds of WS-7 auto-promotion, driven through the pure
+/// resolvers. Never `set_var` — the knobs are process-global and the
+/// promotion they gate mutates schemas.
+#[cfg(test)]
+mod auto_promotion_knob_tests {
+    use super::*;
+
+    /// #3052: the opt-out. Auto-promotion widens a table's schema
+    /// irreversibly, so every way of NOT asking for it — unset, empty,
+    /// garbage, zero, negative, a NaN — has to resolve to off, and only a
+    /// positive percentage may turn it on.
+    #[test]
+    fn auto_promotion_is_off_unless_explicitly_asked_for() {
+        for absent in [None, Some(""), Some("  "), Some("nope"), Some("on")] {
+            assert_eq!(
+                auto_promote_min_fraction_from(absent),
+                0.0,
+                "{absent:?} must leave auto-promotion off"
+            );
+        }
+        for off in ["0", "0.0", "-1", "-0.5", "NaN", "inf", "-inf"] {
+            assert_eq!(
+                auto_promote_min_fraction_from(Some(off)),
+                0.0,
+                "{off} must leave auto-promotion off"
+            );
+        }
+        assert_eq!(auto_promote_min_fraction_from(Some("50")), 0.5);
+        assert_eq!(auto_promote_min_fraction_from(Some(" 25 ")), 0.25);
+    }
+
+    /// #3052: a threshold under the floor is raised to it (stricter than
+    /// asked), and one over 100% saturates rather than turning into a bar no
+    /// key can clear.
+    #[test]
+    fn auto_promotion_threshold_is_bounded_at_both_ends() {
+        assert_eq!(
+            auto_promote_min_fraction_from(Some("0.001")),
+            AUTO_PROMOTE_MIN_PCT_FLOOR / 100.0
+        );
+        assert_eq!(
+            auto_promote_min_fraction_from(Some("1")),
+            AUTO_PROMOTE_MIN_PCT_FLOOR / 100.0
+        );
+        assert_eq!(auto_promote_min_fraction_from(Some("100")), 1.0);
+        assert_eq!(auto_promote_min_fraction_from(Some("1000")), 1.0);
+    }
+
+    /// #3052: the column ceiling, the blast radius of a mistyped knob.
+    #[test]
+    fn auto_promotion_column_cap_is_bounded() {
+        assert_eq!(
+            auto_promote_max_columns_from(None),
+            DEFAULT_AUTO_PROMOTE_MAX_COLUMNS
+        );
+        assert_eq!(
+            auto_promote_max_columns_from(Some("nope")),
+            DEFAULT_AUTO_PROMOTE_MAX_COLUMNS
+        );
+        assert_eq!(
+            auto_promote_max_columns_from(Some("-4")),
+            DEFAULT_AUTO_PROMOTE_MAX_COLUMNS,
+            "a negative cap is garbage, not an off switch"
+        );
+        assert_eq!(auto_promote_max_columns_from(Some(" 8 ")), 8);
+        // The second off switch: a cap of zero promotes nothing.
+        assert_eq!(auto_promote_max_columns_from(Some("0")), 0);
+        assert_eq!(
+            auto_promote_max_columns_from(Some("100000")),
+            AUTO_PROMOTE_MAX_COLUMNS_CEILING
+        );
+    }
+
+    /// #3052: the sampling bound. `files × rows` is the whole per-pass cost,
+    /// so both ends are clamped and neither is an off switch.
+    #[test]
+    fn auto_promotion_sample_bound_is_clamped() {
+        assert_eq!(
+            auto_promote_sample_files_from(None),
+            AUTO_PROMOTE_SAMPLE_FILES
+        );
+        assert_eq!(auto_promote_sample_files_from(Some("0")), 1);
+        assert_eq!(auto_promote_sample_files_from(Some("1000")), 64);
+        assert_eq!(auto_promote_sample_files_from(Some("16")), 16);
+        assert_eq!(
+            auto_promote_sample_files_from(Some("garbage")),
+            AUTO_PROMOTE_SAMPLE_FILES
+        );
+
+        assert_eq!(
+            auto_promote_sample_rows_from(None),
+            AUTO_PROMOTE_SAMPLE_ROWS
+        );
+        assert_eq!(auto_promote_sample_rows_from(Some("1")), 256);
+        assert_eq!(auto_promote_sample_rows_from(Some("1000000")), 65_536);
+        assert_eq!(auto_promote_sample_rows_from(Some(" 1024 ")), 1024);
+        assert_eq!(
+            auto_promote_sample_rows_from(Some("")),
+            AUTO_PROMOTE_SAMPLE_ROWS
+        );
     }
 }
 
