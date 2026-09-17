@@ -130,6 +130,90 @@ pub fn resolve_query_read_cache_config(
     }
 }
 
+/// Which half of the decoded-file cache's configuration is present when the
+/// other is missing — the state in which the cache is OFF although an operator
+/// asked for it.
+///
+/// Both limits have to be positive ([`resolve_query_read_cache_config`]), and
+/// the chart and the operator both render BOTH variables with an explicit `0`.
+/// So the likely way to ask for the cache and not get it is to override one of
+/// them (`spec.extraEnv`, a single `--set`) and leave the other at its zero,
+/// which resolved silently to "disabled" and logged the same `None` an
+/// unconfigured pod logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileCacheHalfConfigured {
+    /// A positive byte budget with no entry limit.
+    BytesOnly,
+    /// A positive entry limit with no byte budget.
+    EntriesOnly,
+}
+
+/// Whether the decoded-file cache's two limits disagree about being on.
+///
+/// Pure, and separate from the resolver, because the resolver's answer is
+/// deliberately the same in both cases — off — and the caller needs to say so
+/// out loud rather than infer it from a `None`.
+pub fn file_cache_half_configured(
+    file_cache_max_bytes: Option<u64>,
+    file_cache_max_entries: Option<usize>,
+) -> Option<FileCacheHalfConfigured> {
+    let bytes = file_cache_max_bytes.is_some_and(|value| value > 0);
+    let entries = file_cache_max_entries.is_some_and(|value| value > 0);
+    match (bytes, entries) {
+        (true, false) => Some(FileCacheHalfConfigured::BytesOnly),
+        (false, true) => Some(FileCacheHalfConfigured::EntriesOnly),
+        _ => None,
+    }
+}
+
+/// Positive byte and entry limits for the decoded-file cache, derived from the
+/// same container memory limit every other cache is sized from.
+///
+/// NOTHING APPLIES THIS BY DEFAULT. The cache stays off unless an operator sets
+/// both knobs ([`resolve_query_read_cache_config`]); this is the pair to set
+/// when they decide to, and the pair the startup warning names when only one
+/// half arrives. Keeping the recommendation in the same arithmetic as the
+/// budget is the point: an operator who picks a number by hand picks it against
+/// nothing, and these bytes come out of the query memory pool.
+///
+/// Bytes: `derive_read_cache_bytes`' second value (an eighth of the limit, 64
+/// MiB floor, 8 GiB cap), which has always been documented as this cache's
+/// sizing recommendation and until now had no entry-limit twin.
+///
+/// Entries: one per MiB of budget, clamped to at least
+/// [`MAX_FILE_CACHE_ENTRY_FRACTION`] (below that the byte budget could never be
+/// filled, since one entry may not exceed a quarter of it). An entry is one
+/// data file's decoded batches under one projection, measured at 5.5 MiB for a
+/// 65,536-row file of ~60-byte events (#3053), so at one per MiB the entry
+/// bound cannot bite before the byte bound for any file of ordinary size — it
+/// is there to stop the map growing without limit over the small files a
+/// sub-second WAL drain produces, and the BYTES are the bound that means
+/// anything to the pool.
+pub fn derive_file_cache_limits(memory_limit_bytes: Option<u64>) -> Option<(u64, usize)> {
+    let (_, file_cache_bytes) = crate::iceberg::derive_read_cache_bytes(memory_limit_bytes)?;
+    let entries = (file_cache_bytes / (1024 * 1024)).max(MAX_FILE_CACHE_ENTRY_FRACTION) as usize;
+    Some((file_cache_bytes, entries))
+}
+
+/// An entry larger than a quarter of the byte budget is never cached: one
+/// oversized file would evict everything useful and then sit alone
+/// (`QueryFileBatchCache::insert`).
+pub const MAX_FILE_CACHE_ENTRY_FRACTION: u64 = query_provider::MAX_FILE_CACHE_ENTRY_FRACTION;
+
+/// The smallest byte budget that can hold ONE entry of `decoded_bytes` at all.
+///
+/// The quarter rule is what makes a file cache budget a statement about file
+/// SIZE and not just about total memory: a budget below this caches nothing on
+/// this table, charges `outcome="skip_oversized"` on every population, and
+/// still subtracts its bytes from the query memory pool. A compacted file is
+/// the size that matters — `cold_target_file_bytes` (256 MiB) times the scan's
+/// decompression estimate (5) is about 1.25 GiB decoded, so holding one takes a
+/// 5 GiB file cache, which [`derive_file_cache_limits`] reaches at a 40 GiB
+/// container. See `docs/DESIGN_source_file_cache_qualification.md`.
+pub fn min_file_cache_bytes_for_entry(decoded_bytes: u64) -> u64 {
+    decoded_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)
+}
+
 /// [`resolve_query_read_cache_config`] for raw environment values.
 ///
 /// Kept pure so environment parsing is covered without mutating the process
@@ -669,7 +753,31 @@ impl MemoryBudget {
 }
 
 pub fn memory_budget_for(limit: Option<u64>, fraction: f64) -> MemoryBudget {
-    let read_caches = resolve_query_read_cache_config(limit, None, None, None).reserved_bytes();
+    memory_budget_with_file_cache(limit, fraction, None)
+}
+
+/// [`memory_budget_for`] with the decoded-file cache turned ON at
+/// `file_cache_max_bytes`.
+///
+/// The default budget cannot express this: the file cache is off, so
+/// [`resolve_query_read_cache_config`] contributes nothing for it and the
+/// arithmetic an operator would check before enabling it did not exist. Its
+/// bytes come out of the same remainder the pool takes its fraction of — the
+/// chart's `values.yaml` says so in prose, and this is that sentence as a
+/// function.
+pub fn memory_budget_with_file_cache(
+    limit: Option<u64>,
+    fraction: f64,
+    file_cache_max_bytes: Option<u64>,
+) -> MemoryBudget {
+    // The entry limit never moves the budget; only bytes are reserved. Pass the
+    // one the recommendation would use so the config resolves as enabled.
+    let file_cache_max_entries = file_cache_max_bytes
+        .filter(|bytes| *bytes > 0)
+        .map(|bytes| (bytes / (1024 * 1024)).max(MAX_FILE_CACHE_ENTRY_FRACTION) as usize);
+    let read_caches =
+        resolve_query_read_cache_config(limit, None, file_cache_max_bytes, file_cache_max_entries)
+            .reserved_bytes();
     let metadata = crate::iceberg::derive_metadata_cache_bytes(limit) as u64;
     let text_index_caches = resolve_text_index_cache_config(limit, None, None).reserved_bytes();
     let pool = query_pool_bytes_full(
