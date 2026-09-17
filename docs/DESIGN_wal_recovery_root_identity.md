@@ -14,8 +14,10 @@ the mirror prefix, the command prints `pulled N segments` and exits 0.
 This document records what a `file://` qualification measured, shows why no
 rule reading only the keys can fix it, prices four remedies and recommends one.
 The evidence is
-`crates/siglake-cli/tests/cli/wal_recover_root_identity.rs` — nine hermetic
-cases, all green, none of them asserting a fix.
+`crates/siglake-cli/tests/cli/wal_recover_root_identity.rs` — ten hermetic
+cases, all green. None asserts a fix for root identity; two of them were
+rewritten on #4972, which fixed the unrelated discovery-dir defect this
+qualification turned up (see "Defects found while reading this path").
 
 ## Why one component, and why it is the likely mistake
 
@@ -58,22 +60,26 @@ splits three ways by key depth, and neither of those was the common branch.
    (`crates/siglake-compactor/src/lib.rs:2346-2355`). The rows commit into
    `tenant_<prefix>` and the namespace they belong to stays empty:
    `a_misplaced_flat_restore_commits_rows_into_an_invented_namespace`.
-2. **Tenant- or index-scoped mirror → invisible.** The restore leaves
-   `<wal>/<prefix>/` with index-shaped children and no `sealed/` of its own, and
-   `list_layout_dirs` enumerates a child only if it HAS one
-   (`crates/siglake-wal/src/lib.rs:2188`). `<prefix>` is therefore not a tenant,
-   its children are never walked, `ensure_index` is never reached and no
-   namespace is created. The segments sit on the volume with no commit, no
+2. **Tenant- or index-scoped mirror → walked, and refused at the index gate.**
+   The restore leaves `<wal>/<prefix>/` with index-shaped children; as measured
+   on this card it had no `sealed/` of its own, and `list_layout_dirs`
+   enumerates a child only if it HAS one
+   (`crates/siglake-wal/src/lib.rs:2188`), so `<prefix>` was not a tenant, its
+   children were never walked, `ensure_index` was never reached and no
+   namespace was created — segments on the volume with no commit, no
    `siglake_compactor_index_unresolved_total`, no backlog gauge and nothing in
-   `orphans/`: `a_misplaced_index_restore_is_invisible_to_the_drain`. An
-   operator who ran the runbook and watched the drain sees a clean restore and
-   an empty cluster.
-3. **Mixed mirror → both, plus the `ensure_index` stall the scope note
-   describes**, because the flat keys give `<prefix>/` its own `sealed/` and the
-   tenant walk then reaches the index dirs.
+   `orphans/`. **#4972 fixed the cause** (the restore now rebuilds the tenant
+   discovery dir), so the misplacement is walked: `tenant_<prefix>` is created,
+   the real tenant name is read as an index, `ensure_index` refuses it, and the
+   segments wait in `sealed/` under a counted backlog.
+   `a_misplaced_index_restore_is_walked_and_refused_at_the_index_gate` records
+   that; the rows still do not reach the namespace they belong to, which is
+   what this document is about.
+3. **Mixed mirror → both**: the flat keys commit into `tenant_<prefix>` and the
+   deeper ones stop at `ensure_index`.
 
-The flat population gets a wrong-table commit. Every other population gets a
-silent hole: segments on the volume that no drain cycle will ever look at. Both
+The flat population gets a wrong-table commit. Every other population stalls at
+the index gate with the rows intact but in the wrong namespace's queue. Both
 are worse than the report the operator is handed.
 
 ## Why the key cannot decide
@@ -244,7 +250,7 @@ strength of the same key shape this document is about.
    writes nothing without `--apply` and prints a plan naming the invented
    tenant; the legitimate tenant called `wal-mirror` still restores under
    `--apply`; `--apply` twice is still idempotent; and the #4928 all-skipped
-   exit status is unchanged. The nine cases in
+   exit status is unchanged. The ten cases in
    `crates/siglake-cli/tests/cli/wal_recover_root_identity.rs` are the before
    picture and should be updated in the same commit rather than deleted.
 5. `docs/ARCHITECTURE.md:91` and `docs/LIMITATIONS.md` move with the contract,
@@ -265,20 +271,37 @@ strength of the same key shape this document is about.
 
 ## Defects found while reading this path
 
-- **Recovery does not rebuild the tenant discovery dir, so a correct restore of
-  an index-only tenant is never drained.** `list_layout_dirs` enumerates a child
-  only if it has its own `sealed/` (`crates/siglake-wal/src/lib.rs:2188`), and
-  the ingester creates `<tenant>/sealed/` before it opens any per-index lane
-  precisely so that happens — the code calls it the "tenant discovery dir"
+- **Recovery did not rebuild the tenant discovery dir, so a correct restore of
+  an index-only tenant was never drained. Fixed on #4972.**
+  `list_layout_dirs` enumerates a child only if it has its own `sealed/`
+  (`crates/siglake-wal/src/lib.rs:2188`), and the ingester creates
+  `<tenant>/sealed/` before it opens any per-index lane precisely so that
+  happens — the code calls it the "tenant discovery dir"
   (`crates/siglake-ingest/src/lib.rs:571-580`). `recover_from_object_store`
-  rebuilds `<tenant>/<index>/sealed/` and not that, so a mirror holding only
+  rebuilt `<tenant>/<index>/sealed/` and not that, so a mirror holding only
   index segments for a tenant — an Elasticsearch-bulk-only tenant whose events
-  lane never sealed — restores into a layout the drain never walks, from the
-  RIGHT `--from`, with a clean report:
-  `a_correct_restore_of_an_index_only_tenant_is_never_drained`. This is
-  independent of root identity and should be fixed on its own card; it is a
-  one-line `create_wal_dir` in the restore path. It is also what makes outcome 2
-  above so quiet.
+  lane never sealed — restored into a layout the drain never walks, from the
+  RIGHT `--from`, with a clean report. The restore now creates it durably,
+  before the already-present skip, so re-running the command is the repair for
+  a WAL root restored by the old code:
+  `a_correct_restore_of_an_index_only_tenant_is_drained` and
+  `an_index_only_restore_whose_index_does_not_resolve_reaches_the_index_gate`.
+  This was independent of root identity, and it is what made outcome 2 above so
+  quiet.
+
+  Recovery was the only writer that could produce the state. Both ingest paths
+  create the discovery dir before the lane's own directory
+  (`crates/siglake-ingest/src/lib.rs:571-580`,
+  `crates/siglake-ingest/src/backpressure.rs:620-626`). The compactor creates
+  directories only inside one it is already draining
+  (`recover_orphaned_processing`, `quarantine_stale_wal_dir`, the orphan
+  sweep's `sealed/`), which it reached through the same enumeration, and
+  nothing removes a `sealed/` once it exists. `siglake wal-requeue` enumerates
+  with `list_tenant_dirs`/`list_index_dirs` (`wal_dirs_under`,
+  `crates/siglake-cli/src/main.rs:2715-2725`) and so shares the blindness, but
+  it creates nothing and cannot reach the state: a poisoned segment exists only
+  where a drain ran, and a drain running is what the missing directory
+  prevented.
 - Recovery counts the mirror's own `owner` markers as unrecognised keys, so a
   healthy fleet mirror reports a skip count proportional to its managed index
   count. Harmless today, and noise against the signal #4928 added.

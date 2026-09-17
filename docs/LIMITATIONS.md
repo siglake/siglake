@@ -1104,15 +1104,18 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `s3://<bucket>/<s3.warehousePrefix>/<wal.mirror.prefix>/`, so the one
   component above it is the warehouse URL the operator already has. A legacy
   flat mirror — keys with no tenant component — then commits into
-  `tenant_<prefix>`; any other layout restores into a directory the drain never
-  enumerates, so the segments sit on the volume unreached — nothing commits
-  them and nothing in the metrics
-  moves. `docs/DESIGN_wal_recovery_root_identity.md` has the measured
-  cases and the selected remedy (a plan step the operator reads before anything
-  is written); until it ships, check the restored layout under `--to` before
-  starting the drain. The same document records a second defect on this path: a
-  correct restore of a tenant that has only index segments omits the tenant
-  discovery dir the ingester writes, and is never drained either.
+  `tenant_<prefix>`; any other layout is walked as a tenant named after the
+  prefix, with the real tenant name read as an index, so the drain stops at
+  `ensure_index` and the segments stay in `sealed/` under a counted backlog and
+  `siglake_compactor_index_unresolved_total`.
+  `docs/DESIGN_wal_recovery_root_identity.md` has the measured cases and the
+  selected remedy (a plan step the operator reads before anything is written);
+  until it ships, check the restored layout under `--to` before starting the
+  drain. The second defect that document records — a correct restore of a
+  tenant with only index segments omitted the tenant discovery dir the ingester
+  writes and was never drained — is fixed (#4972): the restore rebuilds
+  `<tenant>/sealed/`, and re-running the command repairs a WAL root restored
+  before that.
 - **Attribute auto-promotion is opt-in** — hot-key sampling and promotion of
   OTLP attributes to typed columns ships default-off
   (`SIGLAKE_AUTO_PROMOTE_MIN_PCT`); promoted keys can also be listed
