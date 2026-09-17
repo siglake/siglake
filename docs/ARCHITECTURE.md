@@ -1046,6 +1046,23 @@ runs, and k-way-merges overlapping partitions (bounded fan-in) otherwise.
 Direction-aware for legacy DESC tables; observable via
 `siglake_query_scan_output_ordering_total`.
 
+**Unordered clipped `LIMIT`: a staged start.** The opposite shape — `WHERE …
+LIMIT n` with no `ORDER BY` — keeps its parallel pruned plan, one partition per
+file, and a residual `FilterExec` above the scan that DataFusion cannot push a
+limit through. Every partition therefore believes it owes its whole file, and on
+a fully compacted table they all open at once and decode their first megabytes
+before the global limit can cancel them. The scan instead admits partitions in
+widening waves: one to start, doubling each time the admitted partitions have
+produced their own number of batches or ends. Scheduling only — a partition that
+waits still reads every row it would have read, and the limit still lives above
+the residual filter, so no qualifying row can be lost. Scoped to the shape whose
+rows the limit clips one for one (the same test that gates the index decline
+above), so ordered drains and aggregates are untouched. Observable via
+`siglake_query_scan_clipped_admission_total{outcome}` and
+`siglake_query_scan_clipped_admission_wait_seconds`; `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE=0`
+turns it off. Measured in
+[`DESIGN_clipped_limit_admission.md`](DESIGN_clipped_limit_admission.md).
+
 **Implicit newest-first.** An interactive `SELECT` that names one table and
 asks for no ordering of its own is given `ORDER BY timestamp DESC` — the
 browse a log reader means when they write `SELECT timestamp, raw FROM t LIMIT

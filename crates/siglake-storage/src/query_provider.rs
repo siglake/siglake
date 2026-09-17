@@ -48,6 +48,12 @@ const DEFAULT_SCAN_DECOMPRESSION_FACTOR: u64 = 5;
 const DEFAULT_ORDERED_DRAIN_BUFFER_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_ORDERED_MERGE_GLOBAL_FANIN: usize = 32;
 const MIN_AGGREGATE_READER_BUDGET: usize = 2;
+/// #4865: how fast the clipped-limit admission ramp opens. See
+/// [`ScanAdmission`]; `2` doubles the admitted partition count on every batch
+/// the scan emits and on every partition that ends, so a scan reaches full
+/// fan-out in `log2(partitions)` steps and a `LIMIT` answered by the first
+/// batch never opens more than two partitions.
+const DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE: usize = 2;
 
 fn ordered_drain_buffer_bytes() -> u64 {
     ordered_drain_buffer_bytes_from(
@@ -88,6 +94,35 @@ fn ordered_merge_global_fanin_for(state: &dyn Session) -> usize {
         Some(budget) => budget.fan_in,
         None => ordered_merge_global_fanin_from(
             std::env::var("SIGLAKE_ORDERED_MERGE_GLOBAL_FANIN")
+                .ok()
+                .as_deref(),
+        ),
+    }
+}
+
+/// Resolve the clipped-limit admission ramp factor from the raw
+/// `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE` string (`None` = unset). `0` turns the
+/// ramp off (every partition starts at once, the pre-#4865 behavior, and the
+/// negative-control arm of the local A/B); anything else is clamped to at least
+/// 2, because a factor of 1 would never widen the ramp. Unparseable values fall
+/// back to the default. Pure for the same reason as
+/// [`ordered_drain_buffer_bytes_from`].
+fn clipped_admission_wave_from(configured: Option<&str>) -> usize {
+    match configured.and_then(|raw| raw.parse::<usize>().ok()) {
+        Some(0) => 0,
+        Some(factor) => factor.max(2),
+        None => DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE,
+    }
+}
+
+/// The admission ramp factor for one scan: the session's
+/// [`ClippedAdmissionWave`] extension when set, else the environment, else the
+/// default.
+fn clipped_admission_wave_for(state: &dyn Session) -> usize {
+    match state.config().get_extension::<ClippedAdmissionWave>() {
+        Some(wave) => wave.factor,
+        None => clipped_admission_wave_from(
+            std::env::var("SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE")
                 .ok()
                 .as_deref(),
         ),
@@ -221,6 +256,19 @@ pub struct OrderedScanLimit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClippedScanLimit {
     pub limit: usize,
+}
+
+/// Per-session override of the clipped-limit admission ramp factor (#4865).
+/// `0` disables the ramp, so every partition starts decoding at once.
+///
+/// Injected through `SessionConfig` so a measurement can run the gated and
+/// ungated arms in one process without `set_var`, which the binary's parallel
+/// tests would observe. When absent the scan reads
+/// `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE` and falls back to
+/// [`DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClippedAdmissionWave {
+    pub factor: usize,
 }
 
 /// Per-request preferred output direction for a `timestamp`-ordered scan.
@@ -1691,6 +1739,11 @@ pub struct SiglakeIcebergTableScan {
     /// Partition streams handed out by `execute` and not yet finished; see
     /// [`ScanPartitionTracker`] and [`settle_scan_partitions`].
     partition_tracker: Arc<ScanPartitionTracker>,
+    /// #4865: the staged start for an unordered, row-clipped `LIMIT`. `None`
+    /// for every other shape — an ordered scan, an aggregate, a single
+    /// partition, or a session carrying no [`ClippedScanLimit`] — which is
+    /// exactly the pre-#4865 behavior.
+    admission: Option<Arc<ScanAdmission>>,
     /// The downstream ordered `LIMIT` (`OrderedScanLimit`), when the session
     /// carries one. Caps the per-cluster merge's OUTPUT batch and, when no
     /// residual filter sits above the scan, the ordered partition's output: a
@@ -2061,6 +2114,22 @@ impl SiglakeIcebergTableScan {
             );
         }
         let partition_count = task_partitions.len().max(1);
+        // #4865: stage the start of an UNORDERED, row-clipped `LIMIT n` scan.
+        // Scoped by query shape, not by layout: `ClippedScanLimit` is set only
+        // where every operator between the scan and the limit passes rows
+        // through unchanged (`sql.rs::clipping_scan_limit` — one plain table, no
+        // join/CTE/GROUP BY/DISTINCT/aggregate/window/subquery, no ORDER BY), so
+        // the rows this scan owes really are `n`. Ordered scans keep their
+        // in-order drain and aggregates never carry the hint, so both are
+        // untouched. See [`ScanAdmission`] for why waiting cannot drop a row.
+        let clipped_admission = {
+            let wave = clipped_admission_wave_for(state);
+            (!preserve_task_order
+                && partition_count > 1
+                && wave > 0
+                && state.config().get_extension::<ClippedScanLimit>().is_some())
+            .then(|| Arc::new(ScanAdmission::new(partition_count, wave)))
+        };
         let (sort_descending, reverse_scan, partition_clusters) = ordering
             .plan
             .as_ref()
@@ -2182,6 +2251,7 @@ impl SiglakeIcebergTableScan {
             ordering_outcome,
             residual_filtered: filtered_scan,
             partition_tracker: Arc::new(ScanPartitionTracker::default()),
+            admission: clipped_admission,
             ordered_limit: state
                 .config()
                 .get_extension::<OrderedScanLimit>()
@@ -3685,6 +3755,154 @@ impl ScanPartitionTracker {
     }
 }
 
+/// #4865: staged start for the partitions of an UNORDERED, row-clipped
+/// `LIMIT n` scan.
+///
+/// The shape: one partition per data file, no ordering to preserve, and a
+/// residual `FilterExec` above the scan that DataFusion cannot push a limit
+/// through — so every partition believes it owes the whole file and they all
+/// open at once. On a fully compacted 15-file table that decoded 419,840 rows
+/// to return 100 (task #4865; the same query answered from 597,696 bytes on a
+/// layout whose small tail happened to satisfy the limit first). The partitions
+/// are not small, so #4353's coalesce does not apply; what is wrong is that
+/// they all start.
+///
+/// The gate is SCHEDULING ONLY. A partition that waits still reads every row it
+/// would have read, and the limit still lives above the residual filter, so no
+/// qualifying row can be lost — the ramp decides when a partition starts, never
+/// how much of it is read.
+///
+/// Admission: a partition takes a ticket when it is executed and runs once
+/// `admitted` passes its ticket. `admitted` starts at 1 and multiplies by
+/// `wave` (default 2) each time the cumulative CREDITS reach the admitted width
+/// — one credit per batch the scan emits and one per partition that ends.
+/// Charging the width rather than every batch is what keeps the first wave
+/// narrow: a limit answered out of the first batch leaves the ramp at `wave`,
+/// where widening per batch would already have reached `wave^3` by the time the
+/// root stream closed (measured on the local fixture: 4 files opened against
+/// 2).
+///
+///   * A limit answered out of the first batch therefore opens `wave`
+///     partitions, which is the case this exists for.
+///   * A sparse term, or a term with too few matches, reaches full fan-out
+///     after `partitions / wave` credits — 8 batches on the 15-file layout,
+///     against the 430 batches one of its files holds — which is the case this
+///     must not slow down.
+///
+/// Liveness, since a gated partition returns `Pending` to a pump that may be
+/// the only one running: every terminal event pays a credit. If tickets are
+/// waiting then `admitted < partitions`, the tickets below `admitted` are all
+/// registered, and each of them pays at least the credit it owes by ending — so
+/// the credits reach `admitted` and the ramp widens even if not one batch is
+/// ever emitted. Tickets are handed out modulo the partition count, so a caller
+/// that executes a single partition takes ticket 0 and is admitted at once, and
+/// a plan executed a second time finds the ramp already open (it degrades to
+/// the ungated behavior rather than blocking).
+#[derive(Debug)]
+struct ScanAdmission {
+    /// Ticket counter; a ticket is `fetch_add % partitions`.
+    next_ticket: std::sync::atomic::AtomicUsize,
+    /// Highest ticket + 1 that may run. Monotone, capped at `partitions`.
+    admitted: std::sync::atomic::AtomicUsize,
+    /// Credits paid by the current wave; widens and resets at `admitted`.
+    credits: std::sync::atomic::AtomicUsize,
+    partitions: usize,
+    wave: usize,
+    notify: tokio::sync::Notify,
+}
+
+impl ScanAdmission {
+    fn new(partitions: usize, wave: usize) -> Self {
+        Self {
+            next_ticket: std::sync::atomic::AtomicUsize::new(0),
+            admitted: std::sync::atomic::AtomicUsize::new(1),
+            credits: std::sync::atomic::AtomicUsize::new(0),
+            partitions: partitions.max(1),
+            wave: wave.max(2),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn register(&self) -> usize {
+        self.next_ticket
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            % self.partitions
+    }
+
+    fn is_admitted(&self, ticket: usize) -> bool {
+        ticket < self.admitted.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Pay one credit and widen the ramp once the credits reach the admitted
+    /// width, waking whatever that admits. A no-op once every ticket is
+    /// admitted, which is the steady state of any scan that is not
+    /// early-stopped — so the common full-scan path pays one acquire load per
+    /// batch and nothing else. Races between concurrent partitions can only
+    /// widen a credit early or late.
+    ///
+    /// The count is CUMULATIVE and is never reset. A per-wave counter deadlocks
+    /// the shape that pays nothing but its ends: with `admitted` at 2 and its
+    /// first partition already finished (bloom-pruned, no batch), only one
+    /// partition is left to pay and the wave never completes. Cumulative
+    /// credits against `admitted` cannot: the `admitted` partitions pay one
+    /// credit each just by ending, which is exactly the threshold.
+    fn advance(&self) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let admitted = self.admitted.load(Acquire);
+        if admitted >= self.partitions {
+            return;
+        }
+        if self.credits.fetch_add(1, AcqRel) + 1 < admitted {
+            return;
+        }
+        self.admitted.fetch_max(
+            admitted.saturating_mul(self.wave).min(self.partitions),
+            AcqRel,
+        );
+        self.notify.notify_waiters();
+    }
+
+    /// Resolves once `ticket` may run.
+    async fn wait(&self, ticket: usize) {
+        loop {
+            // Created BEFORE the check, as in `ScanPartitionTracker::wait_idle`:
+            // an `advance` landing between the load and the await is observed by
+            // the `Notified` rather than lost.
+            let notified = self.notify.notified();
+            if self.is_admitted(ticket) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Where one partition stream stands in the #4865 admission ramp.
+enum AdmissionGate {
+    /// Not ramped: no clipped limit, one partition, or an order-preserving scan.
+    Open,
+    /// Registered, not yet admitted. Nothing below this stream has been polled,
+    /// so it has fetched nothing.
+    Waiting {
+        admission: Arc<ScanAdmission>,
+        wait: BoxFuture<'static, ()>,
+        since: Instant,
+    },
+    /// Running; its batches and its end widen the ramp for the others.
+    Admitted(Arc<ScanAdmission>),
+}
+
+impl AdmissionGate {
+    fn admission(&self) -> Option<&Arc<ScanAdmission>> {
+        match self {
+            AdmissionGate::Open => None,
+            AdmissionGate::Waiting { admission, .. } | AdmissionGate::Admitted(admission) => {
+                Some(admission)
+            }
+        }
+    }
+}
+
 /// Outcome of [`settle_scan_partitions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanSettle {
@@ -3780,6 +3998,9 @@ struct SourceMetricsStream {
     /// Decremented once, after the fold, so `settle_scan_partitions` wakes to
     /// complete counters.
     partition_tracker: Arc<ScanPartitionTracker>,
+    /// #4865: this partition's place in the clipped-limit admission ramp.
+    /// `AdmissionGate::Open` for every other shape.
+    gate: AdmissionGate,
     finished: bool,
 }
 
@@ -3879,11 +4100,40 @@ impl ScanDetailMetrics {
 }
 
 impl SourceMetricsStream {
+    /// Poll the #4865 admission ramp. `Ready` for every ungated shape and for
+    /// an already-admitted partition; `Pending` only while this partition is
+    /// still queued behind the ramp, in which case the waker is held by the
+    /// admission's `Notify`.
+    fn poll_admission(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let admitted_since = match &mut self.gate {
+            AdmissionGate::Open | AdmissionGate::Admitted(_) => return Poll::Ready(()),
+            AdmissionGate::Waiting { wait, since, .. } => match wait.poll_unpin(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => *since,
+            },
+        };
+        metrics::histogram!("siglake_query_scan_clipped_admission_wait_seconds")
+            .record(admitted_since.elapsed().as_secs_f64());
+        let admission = self
+            .gate
+            .admission()
+            .cloned()
+            .expect("a Waiting gate carries its admission");
+        self.gate = AdmissionGate::Admitted(admission);
+        Poll::Ready(())
+    }
+
     fn finish(&mut self, error: Option<&DataFusionError>) {
         if self.finished {
             return;
         }
         self.finished = true;
+        // #4865 liveness: a partition that ends — exhausted, failed, or dropped
+        // by an early `LIMIT` — widens the ramp, so the queued partitions cannot
+        // be left waiting on a scan that has nothing left running.
+        if let Some(admission) = self.gate.admission() {
+            admission.advance();
+        }
         let elapsed = self.started_at.elapsed();
         let stream_build_secs = self
             .stream_built_at
@@ -3973,9 +4223,21 @@ impl Stream for SourceMetricsStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // #4865: nothing below this point is polled until the ramp admits this
+        // partition, and the reader fetches only on poll — so a waiting
+        // partition costs no object-store read and no decode.
+        if self.poll_admission(cx).is_pending() {
+            return self.baseline.record_poll(Poll::Pending);
+        }
         let poll = self.inner.as_mut().poll_next(cx);
         match &poll {
             Poll::Ready(Some(Ok(batch))) => {
+                // A batch means the consumer is still asking for rows, so the
+                // limit above the residual filter is not yet met: widen the
+                // ramp by one wave.
+                if let AdmissionGate::Admitted(admission) = &self.gate {
+                    admission.advance();
+                }
                 let now = Instant::now();
                 if self.first_batch_at.is_none() {
                     self.first_batch_at = Some(now);
@@ -4713,6 +4975,33 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                 .duration_since(reader_build_started)
                 .as_secs_f64(),
         );
+        // #4865: take this partition's ticket HERE, while `execute` is still
+        // running for the whole plan, so tickets follow execution order rather
+        // than the order the pumps happen to be scheduled in. Nothing below the
+        // gate has been polled yet, so a partition that waits has fetched
+        // nothing.
+        let gate = match &self.admission {
+            Some(admission) => {
+                let ticket = admission.register();
+                let immediate = admission.is_admitted(ticket);
+                metrics::counter!(
+                    "siglake_query_scan_clipped_admission_total",
+                    "outcome" => if immediate { "immediate" } else { "queued" }
+                )
+                .increment(1);
+                if immediate {
+                    AdmissionGate::Admitted(admission.clone())
+                } else {
+                    let waiting = admission.clone();
+                    AdmissionGate::Waiting {
+                        admission: admission.clone(),
+                        wait: async move { waiting.wait(ticket).await }.boxed(),
+                        since: Instant::now(),
+                    }
+                }
+            }
+            None => AdmissionGate::Open,
+        };
         // Counted from here: the stream below owns the matching `end` (in
         // `finish`, reached by end-of-input, error, or drop).
         self.partition_tracker.begin();
@@ -4743,6 +5032,7 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
             file_cache_counters,
             detail_metrics: ScanDetailMetrics::new(&metrics, partition),
             partition_tracker: self.partition_tracker.clone(),
+            gate,
             finished: false,
         }))
     }
@@ -7210,6 +7500,95 @@ mod tests {
                 "budget must default for {cleared:?}"
             );
         }
+    }
+
+    /// #4865's ramp factor resolver. `0` is the documented off switch (and the
+    /// negative-control arm of the local A/B); a factor of 1 would never widen
+    /// the ramp, so it clamps to 2. Drives the pure `_from` function, so
+    /// nothing here touches the process environment.
+    #[test]
+    fn clipped_admission_wave_is_overridable_and_never_stalls() {
+        assert_eq!(clipped_admission_wave_from(Some("0")), 0);
+        assert_eq!(clipped_admission_wave_from(Some("4")), 4);
+        assert_eq!(
+            clipped_admission_wave_from(Some("1")),
+            2,
+            "a factor of 1 would leave the ramp at its initial width forever"
+        );
+        for cleared in [None, Some(""), Some("-1"), Some("garbage")] {
+            assert_eq!(
+                clipped_admission_wave_from(cleared),
+                DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE,
+                "wave must default for {cleared:?}"
+            );
+        }
+    }
+
+    /// The ramp itself: ticket 0 runs at once, the rest wait, and the admitted
+    /// count doubles each time the cumulative credits reach it — at 1, 2, 4 and
+    /// 8. Eight credits open all fifteen partitions; one credit opens two,
+    /// which is the whole point.
+    #[test]
+    fn the_admission_ramp_widens_one_wave_at_a_time() {
+        let admission = ScanAdmission::new(15, 2);
+        let tickets: Vec<usize> = (0..15).map(|_| admission.register()).collect();
+        assert_eq!(tickets, (0..15).collect::<Vec<_>>());
+        assert!(admission.is_admitted(0));
+        assert!(!admission.is_admitted(1));
+        for (credits, expected) in [
+            (0usize, 1usize),
+            (1, 2),
+            (2, 4),
+            (3, 4),
+            (4, 8),
+            (7, 8),
+            (8, 15),
+            (40, 15),
+        ] {
+            let admission = ScanAdmission::new(15, 2);
+            for _ in 0..credits {
+                admission.advance();
+            }
+            let open = (0..15).filter(|t| admission.is_admitted(*t)).count();
+            assert_eq!(open, expected, "after {credits} credits");
+        }
+    }
+
+    /// Tickets are handed out modulo the partition count, so a caller that
+    /// executes one partition (or executes the same plan twice) is never left
+    /// holding a ticket the ramp can never reach.
+    #[test]
+    fn admission_tickets_wrap_so_a_lone_partition_runs() {
+        let admission = ScanAdmission::new(4, 2);
+        assert_eq!(admission.register(), 0);
+        assert!(admission.is_admitted(0));
+        let admission = ScanAdmission::new(4, 2);
+        for _ in 0..4 {
+            admission.register();
+        }
+        assert_eq!(admission.register(), 0, "a second round restarts at 0");
+    }
+
+    /// A gated partition's wait resolves as soon as the ramp reaches it, and
+    /// not before. `timeout(ZERO)` is deliberately avoided (#2931): the future
+    /// is hand-polled instead, so the assertion cannot race a timer tick.
+    #[tokio::test]
+    async fn a_gated_partition_waits_until_the_ramp_reaches_it() {
+        let admission = Arc::new(ScanAdmission::new(4, 2));
+        for _ in 0..4 {
+            admission.register();
+        }
+        let waiting = admission.clone();
+        let mut wait = async move { waiting.wait(3).await }.boxed();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(
+            wait.poll_unpin(&mut cx).is_pending(),
+            "ticket 3 must not run while the ramp is at 1"
+        );
+        admission.advance();
+        assert!(wait.poll_unpin(&mut cx).is_pending(), "ramp at 2");
+        admission.advance();
+        assert!(wait.poll_unpin(&mut cx).is_ready(), "ramp at 4");
     }
 
     #[tokio::test]
