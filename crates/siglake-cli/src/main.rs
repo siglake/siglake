@@ -1541,15 +1541,17 @@ async fn local_wal_sweep_once(
     root: &std::path::Path,
     settled: Duration,
 ) -> anyhow::Result<(u64, usize)> {
-    // Tenant subdirs AND the legacy top level, for the same reason the drain
-    // sweeps both: a deployment that toggled backpressure off leaves segments
-    // at the top level while `default/` lingers.
-    let mut dirs: Vec<std::path::PathBuf> = siglake_wal::list_tenant_dirs(root)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(_, d)| d)
-        .collect();
-    dirs.push(root.to_path_buf());
+    // The WHOLE layout, for the same reason the drain walks all of it: the
+    // legacy top level (a deployment that toggled backpressure off leaves
+    // segments there while `default/` lingers), each tenant, and each tenant's
+    // per-index dirs. Listing one level deep reclaimed nothing for a managed
+    // index — `<root>/<tenant>/<index>/sealed/` was never visited, so its
+    // segments were neither deleted nor counted in `remaining`: a directory
+    // nothing lists contributes nothing to the gauge either (#4915).
+    //
+    // A `read_dir` that fails degrades to the root alone, as the one-level walk
+    // did: a sweep that reclaims part of the disk beats one that reclaims none.
+    let dirs = wal_dirs_under(root).unwrap_or_else(|_| vec![root.to_path_buf()]);
 
     let mut deleted = 0u64;
     let mut remaining = 0usize;
@@ -1611,20 +1613,15 @@ mod local_wal_sweep_tests {
         assert_eq!(local_wal_sweep_config_from(Some("0"), None), None);
     }
 
-    #[tokio::test]
-    async fn local_copy_is_removed_while_the_committed_row_still_exists() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut writer = siglake_wal::WalWriter::with_thresholds(
-            tmp.path(),
-            "ingester",
-            1,
-            Duration::from_secs(60),
-        )
-        .unwrap();
+    /// Seal one segment in `dir` and return `(id, path)`.
+    fn seal_one(dir: &std::path::Path, body: &str) -> (String, std::path::PathBuf) {
+        let mut writer =
+            siglake_wal::WalWriter::with_thresholds(dir, "ingester", 1, Duration::from_secs(60))
+                .unwrap();
         let segment = writer
-            .append_events(&[siglake_core::Event::now("retained")])
+            .append_events(&[siglake_core::Event::now(body)])
             .unwrap()
-            .unwrap();
+            .expect("max_events=1 seals on the first append");
         let id = segment
             .path
             .file_stem()
@@ -1632,34 +1629,118 @@ mod local_wal_sweep_tests {
             .to_str()
             .unwrap()
             .to_string();
-        let uri = format!(
-            "sqlite://{}?mode=rwc",
-            tmp.path().join("claim.db").display()
-        );
+        (id, segment.path)
+    }
+
+    /// The sweep's whole job, over the layout it actually runs against: the
+    /// legacy root, a tenant, and a tenant's managed index. The index level is
+    /// the #4915 regression — the sweep listed one level deep, so a managed
+    /// index's segments were never deleted and never counted in `remaining`,
+    /// which left the gauge blind to a PVC filling for the life of the pod.
+    ///
+    /// The retained cases are the other half: deletion is gated on a catalog
+    /// row that says `committed` and has settled, so an unregistered segment, a
+    /// claimed-but-uncommitted one, and every committed one inside its settle
+    /// window all stay on disk — and the rows themselves outlive the files,
+    /// because remote retention still needs them.
+    #[tokio::test]
+    async fn the_sweep_reclaims_every_layout_level_and_retains_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let tenant_dir = root.join("acme");
+        let index_dir = tenant_dir.join("app1");
+
+        // Committed at each level of the layout. The tenant writer creates
+        // `acme/sealed/`, which is what makes the tenant discoverable at all.
+        let (root_id, root_path) = seal_one(root, "root");
+        let (tenant_id, tenant_path) = seal_one(&tenant_dir, "tenant");
+        let (index_id, index_path) = seal_one(&index_dir, "index");
+        // Claimed but never committed, and never registered: both retained.
+        let (pending_id, pending_path) = seal_one(&index_dir, "pending");
+        let (_, unknown_path) = seal_one(&index_dir, "unknown");
+
+        let uri = format!("sqlite://{}?mode=rwc", root.join("claim.db").display());
         let claim = siglake_storage::catalog_claim::SqlSegmentClaim::connect(&uri, "drain")
             .await
             .unwrap();
-        claim
-            .register(&id, "default", "", "wal-mirror/segment.arrow", 1, 1)
-            .await
-            .unwrap();
-        assert_eq!(claim.try_claim(1).await.unwrap().len(), 1);
-        claim.mark_committed(&id).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-
-        let (deleted, remaining) = local_wal_sweep_once(&claim, tmp.path(), Duration::ZERO)
-            .await
-            .unwrap();
-        assert_eq!((deleted, remaining), (1, 0));
-        assert!(!segment.path.exists(), "the local sealed copy was retained");
-        assert_eq!(
+        for (id, tenant, index) in [
+            (&root_id, "default", ""),
+            (&tenant_id, "acme", ""),
+            (&index_id, "acme", "app1"),
+            (&pending_id, "acme", "app1"),
+        ] {
             claim
-                .purgeable_committed(Duration::ZERO, 10)
+                .register(id, tenant, index, &format!("wal-mirror/{id}.arrow"), 1, 1)
                 .await
-                .unwrap()
-                .len(),
-            1,
-            "local cleanup must not remove the row remote retention still needs"
+                .unwrap();
+        }
+        assert_eq!(claim.try_claim(10).await.unwrap().len(), 4);
+        for id in [&root_id, &tenant_id, &index_id] {
+            claim.mark_committed(id).await.unwrap();
+        }
+
+        let present = || {
+            [
+                &root_path,
+                &tenant_path,
+                &index_path,
+                &pending_path,
+                &unknown_path,
+            ]
+            .iter()
+            .filter(|p| p.exists())
+            .count()
+        };
+
+        // Nothing has settled: a one-hour floor deletes none of them, and all
+        // five are counted as still sealed — including the three under the
+        // index directory.
+        let (deleted, remaining) = local_wal_sweep_once(&claim, root, Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(
+            (deleted, remaining),
+            (0, 5),
+            "a committed segment was deleted inside its settle window, \
+             or the index directory was not counted"
+        );
+        assert_eq!(present(), 5);
+
+        // Past the millisecond the commits happened in (`committed_at_ms <
+        // cutoff`), the three committed copies go and the two ineligible ones
+        // stay.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let (deleted, remaining) = local_wal_sweep_once(&claim, root, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            (deleted, remaining),
+            (3, 2),
+            "the root, tenant and managed-index copies were not all reclaimed"
+        );
+        for path in [&root_path, &tenant_path, &index_path] {
+            assert!(!path.exists(), "{} was retained", path.display());
+        }
+        for path in [&pending_path, &unknown_path] {
+            assert!(
+                path.exists(),
+                "{} was deleted without a committed, settled row",
+                path.display()
+            );
+        }
+        let mut purgeable: Vec<String> = claim
+            .purgeable_committed(Duration::ZERO, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, _url)| id)
+            .collect();
+        purgeable.sort();
+        let mut expected = vec![root_id, tenant_id, index_id];
+        expected.sort();
+        assert_eq!(
+            purgeable, expected,
+            "local cleanup must not remove the rows remote retention still needs"
         );
     }
 }
@@ -2838,9 +2919,14 @@ async fn run_wal_recover(from: &str, to: &std::path::Path, apply: bool) -> Resul
     Ok(())
 }
 
-/// Every WAL directory under `root` that can hold a `poison/`: the root
-/// itself (legacy single-tenant layout), each tenant, and each tenant's
-/// per-index directories. The same walk the drain does each cycle.
+/// Every WAL directory under `root` that can hold segments: the root itself
+/// (legacy single-tenant layout), each tenant, and each tenant's per-index
+/// directories. The same walk the drain does each cycle.
+///
+/// Used by `wal-requeue` for `poison/` and by the ingester's local sweep for
+/// `sealed/`. Both need the second level: a managed index's segments live at
+/// `<root>/<tenant>/<index>/`, and a walk that stops at the tenant leaves them
+/// untouched and uncounted.
 fn wal_dirs_under(root: &std::path::Path) -> Result<Vec<PathBuf>> {
     let mut dirs = vec![root.to_path_buf()];
     for (_tenant, dir) in siglake_wal::list_tenant_dirs(root)? {
