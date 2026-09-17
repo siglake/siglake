@@ -231,19 +231,21 @@ fn a_custom_prefix_misreads_the_same_way_under_a_different_name() {
 /// scope note pushed back, because `Compactor::run_once` gates an INDEX
 /// directory on `ensure_index` (`crates/siglake-compactor/src/lib.rs:2372`) and
 /// `IndexManager::ensure_index` needs an existing index or a matching template
-/// (`crates/siglake-storage/src/index_manager.rs:656`). Both are true, and they
-/// split by layout:
+/// (`crates/siglake-storage/src/index_manager.rs:656`). The outcome splits by
+/// the DEPTH of the misplaced key, and only one of the three branches is the
+/// one either of us named:
 ///
-/// - `<prefix>/<tenant>/<index>/<seg>` (case 1) misplaces to an INDEX dir, and
-///   `ensure_index` stops it — the rows sit unresolved, counted by
-///   `siglake_compactor_index_unresolved_total`, a stuck queue rather than a
-///   wrong commit.
 /// - `<prefix>/<seg>` — the legacy flat mirror of case 3 — misplaces to a
-///   TENANT dir, and there is no equivalent gate: `ice_for_tenant` calls
-///   `for_namespace`, which `ensure_namespace`s and `ensure_events_table`s on
-///   the spot (`crates/siglake-storage/src/iceberg.rs:9936`). This test runs
-///   that path end to end: the rows land in `tenant_wal-mirror`, and the
-///   namespace they belonged to stays empty.
+///   TENANT events dir, and there is no gate on that path at all:
+///   `ice_for_tenant` calls `for_namespace`, which `ensure_namespace`s and
+///   `ensure_events_table`s on the spot
+///   (`crates/siglake-storage/src/iceberg.rs:9936`). This test runs it end to
+///   end: the rows commit into `tenant_wal-mirror`, and the namespace they
+///   belong to stays empty. The wrong-table commit is real, for this
+///   population.
+/// - `<prefix>/<tenant>/<seg>` and `<prefix>/<tenant>/<index>/<seg>` never
+///   reach `ensure_index`:
+///   `a_misplaced_index_restore_is_invisible_to_the_drain` below.
 #[tokio::test]
 async fn a_misplaced_flat_restore_commits_rows_into_an_invented_namespace() {
     use std::sync::Arc;
@@ -317,6 +319,67 @@ async fn a_misplaced_flat_restore_commits_rows_into_an_invented_namespace() {
         1
     );
     assert_eq!(count_events(&ice).await, 1);
+}
+
+/// The other branch, and it is worse than either the card or the scope note
+/// assumed. A tenant-scoped mirror misplaced one component up restores to
+/// `<wal>/<prefix>/<tenant>/{SEALED_DIR}/`, which leaves `<wal>/<prefix>/` with
+/// no `sealed/` of its own — and `list_layout_dirs` only enumerates a child
+/// that HAS one (`crates/siglake-wal/src/lib.rs:2188`). So `<prefix>` is not a
+/// tenant as far as the drain is concerned, its children are never walked,
+/// `ensure_index` is never reached and no namespace is created.
+///
+/// The segments are on the volume, reported as restored, and invisible: no
+/// commit, no `siglake_compactor_index_unresolved_total`, no backlog gauge,
+/// nothing in `orphans/`. An operator who followed the runbook and watched the
+/// drain sees a successful restore and an empty cluster.
+#[tokio::test]
+async fn a_misplaced_index_restore_is_invisible_to_the_drain() {
+    use std::sync::Arc;
+
+    use siglake_compactor::Compactor;
+    use siglake_storage::iceberg::IcebergContext;
+
+    let tmp = tempfile::tempdir().unwrap();
+    mirror_with(tmp.path(), "warehouse/wal-mirror", &["acme/seg.arrow"]);
+
+    let wal = tmp.path().join("wal");
+    let ancestor = tmp.path().join("warehouse");
+    let (stdout, stderr, ok) = recover(&format!("file://{}", ancestor.display()), &wal);
+    assert!(ok, "{stdout}{stderr}");
+    assert_eq!(
+        restored_layout(&wal),
+        vec![format!("wal-mirror/acme/{SEALED_DIR}/seg.arrow")]
+    );
+
+    // The drain does not see `wal-mirror` as a tenant: it has index dirs but no
+    // `sealed/` of its own.
+    assert!(
+        siglake_wal::list_tenant_dirs(&wal).unwrap().is_empty(),
+        "no tenant is enumerated under the restored root"
+    );
+
+    let ice = Arc::new(IcebergContext::open(&tmp.path().join("ice")).await.unwrap());
+    let compactor = Compactor::new(&wal, ice.clone());
+    assert_eq!(compactor.run_once().await.unwrap(), 0);
+    assert_eq!(
+        compactor.run_once().await.unwrap(),
+        0,
+        "and every later cycle sees the same nothing"
+    );
+    assert_eq!(
+        restored_layout(&wal),
+        vec![format!("wal-mirror/acme/{SEALED_DIR}/seg.arrow")],
+        "the segment is not committed, not quarantined and not deleted"
+    );
+    assert!(
+        !ice.catalog()
+            .namespace_exists(&iceberg::NamespaceIdent::new("tenant_wal-mirror".into()))
+            .await
+            .unwrap(),
+        "the tenant walk never reaches this dir, so not even a namespace is \
+         created — there is no artifact to notice"
+    );
 }
 
 /// **The evidence that is actually in the store.** The catalog-claim drain
