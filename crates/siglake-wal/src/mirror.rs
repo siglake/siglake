@@ -1021,10 +1021,35 @@ fn recovery_target(suffix: &str) -> Option<RecoveryTarget> {
     Some(RecoveryTarget { rel, stem, partial })
 }
 
+/// What one [`recover_from_object_store`] pass did, in the counts an operator
+/// needs to tell a finished restore from one that understood nothing.
+///
+/// A restore that recognises no key and a re-run with nothing left to do both
+/// pull zero segments, so reporting only that number turns "nothing
+/// understood" into "nothing to do" — which is what pointing `--from`
+/// one component above the mirror root produces (#4928). `skipped` is the
+/// keys [`recovery_target`] refuses. Neither an already-present destination
+/// nor the active copy of a segment also held sealed is a skip: both mean the
+/// segment is on the WAL root.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoverySummary {
+    /// Segments written onto the WAL root by this pass, each one fsynced
+    /// under its final name before it was counted.
+    pub pulled: usize,
+    /// Keys under the prefix whose layout recovery refuses to guess at.
+    pub skipped: usize,
+    /// Recognised segments whose destination already existed, so this pass
+    /// left them alone.
+    pub already_present: usize,
+    /// One refused key, verbatim, so a caller can show the operator what the
+    /// layout under `--from` actually looked like.
+    pub sample_skipped_key: Option<String>,
+}
+
 /// Disaster-recovery helper: pull every WAL segment under `<prefix>/` in the
 /// object store back onto a local WAL root, RECONSTRUCTING the
-/// `<tenant>[/<index>]/sealed/` layout the drain routes on. Returns the count
-/// of segments pulled.
+/// `<tenant>[/<index>]/sealed/` layout the drain routes on. Returns a
+/// [`RecoverySummary`].
 ///
 /// `prefix` is RELATIVE to the operator's root, and may be empty when the
 /// operator is already rooted at the mirror (the `siglake wal-recover` shape:
@@ -1056,7 +1081,7 @@ pub async fn recover_from_object_store(
     op: Operator,
     prefix: &str,
     wal_root: &Path,
-) -> Result<usize> {
+) -> Result<RecoverySummary> {
     use futures::stream::StreamExt;
 
     crate::create_wal_dir(wal_root).with_context(|| format!("create {}", wal_root.display()))?;
@@ -1084,7 +1109,7 @@ pub async fn recover_from_object_store(
     // and the sealed copy must win.
     let mut candidates: std::collections::HashMap<String, (String, RecoveryTarget)> =
         std::collections::HashMap::new();
-    let mut skipped = 0usize;
+    let mut summary = RecoverySummary::default();
     while let Some(entry) = listing.next().await {
         let entry = entry.context("list entry")?;
         let path = entry.path().to_string();
@@ -1097,7 +1122,10 @@ pub async fn recover_from_object_store(
             continue;
         };
         let Some(target) = recovery_target(suffix) else {
-            skipped += 1;
+            summary.skipped += 1;
+            summary
+                .sample_skipped_key
+                .get_or_insert_with(|| path.clone());
             tracing::warn!(key = %path, "wal-recover: unrecognised key, skipped");
             continue;
         };
@@ -1110,14 +1138,14 @@ pub async fn recover_from_object_store(
             }
         }
     }
-    if skipped > 0 {
-        metrics::counter!("siglake_wal_recover_skipped_total").increment(skipped as u64);
+    if summary.skipped > 0 {
+        metrics::counter!("siglake_wal_recover_skipped_total").increment(summary.skipped as u64);
     }
 
-    let mut downloaded = 0usize;
     for (key, target) in candidates.into_values() {
         let dest = wal_root.join(&target.rel);
         if dest.exists() {
+            summary.already_present += 1;
             tracing::debug!(dest = %dest.display(), "wal-recover: already present, skipping");
             continue;
         }
@@ -1139,7 +1167,7 @@ pub async fn recover_from_object_store(
         let tmp = std::path::PathBuf::from(tmp);
         crate::durability::publish_file(&dest, &tmp, &body)
             .with_context(|| format!("write {}", dest.display()))?;
-        downloaded += 1;
+        summary.pulled += 1;
         tracing::info!(
             key = %key,
             dest = %target.rel.display(),
@@ -1148,7 +1176,7 @@ pub async fn recover_from_object_store(
             "wal-recover: pulled"
         );
     }
-    Ok(downloaded)
+    Ok(summary)
 }
 
 /// Tiny adapter so the lister works the same way it did with
@@ -1952,10 +1980,10 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wal");
-        let pulled = recover_from_object_store(op, "wal-mirror", &root)
+        let summary = recover_from_object_store(op, "wal-mirror", &root)
             .await
             .unwrap();
-        assert_eq!(pulled, 2);
+        assert_eq!(summary.pulled, 2);
         assert!(root
             .join("default")
             .join(SEALED_DIR)
@@ -1998,10 +2026,10 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wal");
-        let pulled = recover_from_object_store(op, "wal-mirror", &root)
+        let summary = recover_from_object_store(op, "wal-mirror", &root)
             .await
             .unwrap();
-        assert_eq!(pulled, 3);
+        assert_eq!(summary.pulled, 3);
         assert!(
             root.join("acme").join(SEALED_DIR).join("s1.arrow").exists(),
             "acme's events segment must land in acme's WAL, not the default tenant's"
@@ -2056,10 +2084,10 @@ mod tests {
 
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().join("wal");
-            let pulled = recover_from_object_store(op.clone(), prefix, &root)
+            let summary = recover_from_object_store(op.clone(), prefix, &root)
                 .await
                 .unwrap();
-            assert_eq!(pulled, 3, "prefix {prefix:?} restored nothing");
+            assert_eq!(summary.pulled, 3, "prefix {prefix:?} restored nothing");
             assert!(root.join("acme").join(SEALED_DIR).join("s1.arrow").exists());
             assert!(root
                 .join("acme")
@@ -2076,10 +2104,10 @@ mod tests {
             );
 
             // Idempotent: a second pass re-pulls nothing it already has.
-            assert_eq!(
-                recover_from_object_store(op, prefix, &root).await.unwrap(),
-                0
-            );
+            let rerun = recover_from_object_store(op, prefix, &root).await.unwrap();
+            assert_eq!(rerun.pulled, 0);
+            assert_eq!(rerun.already_present, 3, "and says why it pulled nothing");
+            assert_eq!(rerun.skipped, 0);
         }
     }
 
@@ -2102,8 +2130,21 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wal");
-        let pulled = recover_from_object_store(op, "", &root).await.unwrap();
-        assert_eq!(pulled, 0, "an ancestor of the mirror root restores nothing");
+        let summary = recover_from_object_store(op, "", &root).await.unwrap();
+        assert_eq!(
+            summary.pulled, 0,
+            "an ancestor of the mirror root restores nothing"
+        );
+        assert_eq!(
+            summary.skipped, 1,
+            "and the refusal is counted, not silent (#4928)"
+        );
+        assert_eq!(
+            summary.sample_skipped_key.as_deref(),
+            Some("warehouse/wal-mirror/acme/s1.arrow"),
+            "one refused key is carried out verbatim for the operator's diagnostic"
+        );
+        assert_eq!(summary.already_present, 0);
         assert!(
             !root.join("warehouse").exists(),
             "a prefix component must not be taken for a tenant"
@@ -2128,10 +2169,10 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wal");
-        let pulled = recover_from_object_store(op, "wal-mirror", &root)
+        let summary = recover_from_object_store(op, "wal-mirror", &root)
             .await
             .unwrap();
-        assert_eq!(pulled, 1);
+        assert_eq!(summary.pulled, 1);
         assert!(root.join("acme").join(SEALED_DIR).join("s1.arrow").exists());
         assert!(
             !root.join("acme").join(SEALED_DIR).join("s2.arrow").exists(),
@@ -2174,10 +2215,13 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wal");
-        let pulled = recover_from_object_store(op, "wal-mirror", &root)
+        let summary = recover_from_object_store(op, "wal-mirror", &root)
             .await
             .unwrap();
-        assert_eq!(pulled, 2, "two distinct segments, not three objects");
+        assert_eq!(
+            summary.pulled, 2,
+            "two distinct segments, not three objects"
+        );
 
         let sealed = root.join("acme").join(SEALED_DIR);
         assert!(
@@ -2208,11 +2252,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wal");
         probe::record();
-        let pulled = recover_from_object_store(op, "wal-mirror", &root)
+        let summary = recover_from_object_store(op, "wal-mirror", &root)
             .await
             .unwrap();
         let ops = probe::taken();
-        assert_eq!(pulled, 1);
+        assert_eq!(summary.pulled, 1);
 
         // The tail is the publish: temp, fsync, rename, directory fsync. The
         // head is the durable creation of the reconstructed layout.
@@ -2266,10 +2310,10 @@ mod tests {
         // A leftover `.tmp` is invisible to the drain and does not block the
         // retry, which pulls the segment again and counts it this time.
         assert!(crate::list_sealed(&root.join("acme")).unwrap().is_empty());
-        let pulled = recover_from_object_store(op, "wal-mirror", &root)
+        let summary = recover_from_object_store(op, "wal-mirror", &root)
             .await
             .unwrap();
-        assert_eq!(pulled, 1);
+        assert_eq!(summary.pulled, 1);
         assert_eq!(std::fs::read(&dest).unwrap(), b"A1");
     }
 

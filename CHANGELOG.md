@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Recovery (behaviour change)**: `siglake wal-recover` reports what it
+  understood, not only what it pulled. A `--from` naming an ancestor of the
+  mirror root — `…/store` where the segments are at
+  `…/store/warehouse/wal-mirror/<tenant>/` — recognises no key, and printed
+  `pulled 0 segments` and exited 0: the same line and the same status as a
+  re-run with nothing left to do, so "nothing understood" read as "nothing to
+  do" on the path that is the reason WAL mirroring is on by default. The
+  report now appends the count already present and the count of keys skipped
+  for an unrecognised layout (`pulled 0 segments into <wal> (3 keys skipped:
+  unrecognised layout)`), and the command exits nonzero, naming a refused key
+  and what `--from` should point at, when nothing was pulled, nothing was
+  already present and keys were skipped. A mixed mirror still succeeds — the
+  recognised segments are restored, the skip count is on stdout and the skip
+  is logged — and so does an idempotent re-run and an empty mirror.
+  `recover_from_object_store` returns a `RecoverySummary` (pulled, skipped,
+  already-present, one sample refused key) in place of the pulled `usize`;
+  tenant and index routing, the preference for a sealed copy over its active
+  prefix and the fsync-before-count durability are unchanged. (#4928)
+
 - **WAL mirror reclamation for the filesystem drain (new, off by default)**:
   `compactor.mirrorLedgerReclaim` (`SIGLAKE_MIRROR_LEDGER_RECLAIM`) lets the
   default single-replica compactor delete the mirror objects it has committed.
