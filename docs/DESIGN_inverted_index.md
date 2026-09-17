@@ -265,9 +265,10 @@ distributed execution or AWS, and it does not qualify a new default.
 (`crates/siglake-storage/src/iceberg.rs`). #4102 asked whether a pod with room
 should be allowed more. The same completed 14-file fixture was re-timed at two
 budgets — the deployed 1 GiB / 256 MiB pair and an 8 GiB / 2 GiB pair that
-holds the whole set — with one process per budget so the resident set
-attributes to that budget alone, three passes each, alternating so a drifting
-box could not favour one. Release build, five executions per shape and arm.
+holds the whole set — one process per budget, so the difference between their
+resident sets is the budget's rather than a high-water mark both passes share.
+Three passes each, alternating, so a drifting box could not favour one. Release
+build, five executions per shape and arm.
 
 The sizing reproduced #4329's exactly. At 8 GiB all fourteen parsed indexes
 were resident at 7,830,305,508 bytes in every pass, with zero evictions. At
@@ -299,7 +300,7 @@ hold. What it buys is the unclipped regime, where the decline keeps the index
 and the 1 GiB budget then evicts it: `rare_scan` goes from 22,798.9 ms to
 120.2 ms (190x) and `rare_scan_last25` from 4,843.4 ms to 38.2 ms (127x).
 
-The 8 GiB budget is also not free of the pod. Its passes held 20.2-21.3 GiB
+The 8 GiB budget is not free of the pod either. Its passes held 20.2-21.3 GiB
 resident against 14.3-15.6 GiB at 1 GiB on the same fixture, and #4329's
 attempt at a 12 GiB budget was killed by the box before it printed. Reaching
 7.83 GB through the 1/16 derivation would take a pod of about 117 GiB even with
