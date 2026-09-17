@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Alerting (docs)**: `SiglakeTenantsDenied` now says what to do about
+  `reason="header_not_trusted"`, the single-tenant default refusing a routing
+  `X-Scope-OrgID`: bind the tenant to a verified identity with
+  `ingester.oidc.tenantClaim`, and set `ingester.trustScopeHeader` only where a
+  gateway in front of the ingester sets the header itself and strips the
+  client's. The rule is otherwise untouched — same name, same
+  `increase(siglake_ingest_tenant_denied_total[10m]) > 10` over every reason,
+  same `for: 5m` — and the chart's promtool fixtures now pin that reason's
+  behaviour: a sustained rate fires and then resolves on its own once the
+  refusals leave the 10m window, while one client retrying a stale header four
+  times and a half-hour trickle at half the threshold both stay quiet. (#3067)
+
 - **Query (fix)**: a filtered browse written `WHERE TIMESTAMP >= …` gets the
   same scan-order hint and distribution estimate as the lowercase spelling. The
   two shape detectors behind the selectivity-aware ordered policy and the
