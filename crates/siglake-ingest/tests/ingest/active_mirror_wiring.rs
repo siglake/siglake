@@ -172,18 +172,46 @@ async fn active_keys(op: &Operator) -> Vec<String> {
     keys
 }
 
-/// Poll until the mirror holds `want` active objects. Convergence, not a sleep:
-/// the assertion is on the end state, and the loop's tick is what gets there.
+/// Rows an active object reads back as, or 0 if it does not read back at all.
+///
+/// A listing is not enough to wait on. `build_opendal_operator` builds a
+/// `file://` store with no `atomic_write_dir`, and opendal's fs writer then
+/// creates the target file IN PLACE — so the key is listable, and stat-able at
+/// zero bytes, from before the first byte of the body lands. Waiting on the
+/// listing alone and then aborting the loop caught one object mid-PUT and left
+/// it empty, which is the flake this test hit in CI once. What every arm
+/// actually wants is "the object is recoverable", so that is what it waits for.
+/// A prefix that stops after the schema message reads back as zero rows, which
+/// is why this counts rows rather than testing for an `Ok`.
+async fn active_object_rows(op: &Operator, key: &str) -> usize {
+    let Ok(body) = op.read(key).await else {
+        return 0;
+    };
+    siglake_wal::read_segment_from_bytes(&body.to_bytes())
+        .map(|batches| batches.iter().map(|b| b.num_rows()).sum())
+        .unwrap_or(0)
+}
+
+/// Poll until the mirror holds `want` active objects whose bodies read back as
+/// segments with rows. Convergence, not a sleep: the assertion is on the end
+/// state, and the loop's tick is what gets there.
 async fn wait_for_active(op: &Operator, want: usize) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let keys = active_keys(op).await;
-        if keys.len() >= want {
-            return keys;
+        let mut readable = Vec::with_capacity(keys.len());
+        for key in &keys {
+            if active_object_rows(op, key).await > 0 {
+                readable.push(key.clone());
+            }
+        }
+        if readable.len() >= want {
+            return readable;
         }
         if Instant::now() >= deadline {
             panic!(
-                "mirror holds {} active objects, wanted {want}: {keys:?}",
+                "mirror holds {} readable active objects of {} listed, wanted {want}: {keys:?}",
+                readable.len(),
                 keys.len()
             );
         }
@@ -381,12 +409,12 @@ async fn an_unchanged_segment_is_not_uploaded_twice() {
     );
 
     // One more write and the object moves again — the skip is byte-count
-    // based, not a one-shot.
+    // based, not a one-shot. Read back as rows, not as a length: a length can
+    // be read mid-PUT, and "the second row is in the mirror" is the claim.
     post(&server.app, Some("acme"), None, "acme-events-2").await;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let now = server.op.stat(&keys[0]).await.unwrap();
-        if now.content_length() > first.content_length() {
+        if active_object_rows(&server.op, &keys[0]).await == 2 {
             break;
         }
         assert!(
