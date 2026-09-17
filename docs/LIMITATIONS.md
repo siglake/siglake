@@ -33,7 +33,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   wants 7.19 GiB (#4376, `DESIGN_segmented_inverted_index.md`). At the 1 GiB
   budget that plan takes zero cache hits and 41 evictions. Sizing cannot close
   that gap at any cap a query pod can afford, which is why the format itself is
-  the open item rather than the budget. Whether the
+  the open item rather than the budget. The reader can now read a segmented
+  sidecar in part (#4561, `SIGLAKE_SEGMENTED_INDEX_READS`), which holds a
+  directory instead of a parsed index — but nothing writes one, nothing caches
+  an opened reader between queries, and the format has not been measured
+  end-to-end, so neither budget above changes. Whether the
   serialized copy earns its share at all is a separate open question: since a
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no
