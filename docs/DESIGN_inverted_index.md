@@ -163,8 +163,10 @@ decode pass disappears. None of them changes a 0.1.0 or 0.1.x default.
 [`DESIGN_segmented_inverted_index.md`](DESIGN_segmented_inverted_index.md):
 per-row-group postings and dictionary blocks addressed by byte range, with the
 directory and trailer written last so a merge can emit the blob in one forward
-pass. Nothing is wired — the format has its own magic, footer-KV key and Puffin
-blob type, so this reader does not see one. Measured on one 7,340,000-row file
+pass. The format has its own magic, footer-KV key and Puffin blob type, so this
+reader does not see one — and #4561 gave the scan path a second reader that
+does, behind `SIGLAKE_SEGMENTED_INDEX_READS` and with no writer producing the
+format, so every default is unchanged. Measured on one 7,340,000-row file
 from the same corpus: 526.0 MiB parsed for the whole-file index against
 474.9 KiB of resident directory, and a rare term answered from 14 range reads
 of 9.8 KiB rather than a 3.27 s whole-file decode.
@@ -192,8 +194,13 @@ of the blob, while block-granularity checksums and compression together cost
 0.1% and take the blob from 85.8 MiB to 16.4 MiB at 1.58x the bytes a point
 lookup fetches), and both are `seg2` questions for #4562's disposition (#4988).
 
-The remaining slices are #4561 (reader integration and bounded partial reads)
-and #4562 (the six-shape comparison that decides #4377).
+#4561 wired the reading half: a sub-range read against the Puffin statistics
+file (`PuffinReader::blob_range_reader`, uncompressed blobs only), discovery by
+blob type per file, the directory checked against the file's Parquet row
+groups, and AND/OR/substring answered over the row groups the scan kept — with
+every outcome the sidecar cannot conclude falling back to this reader or to an
+exact scan. The remaining slice is #4562, the six-shape comparison that decides
+#4377.
 
 #### The per-execution policy arm (2026-09-16, #4375)
 
