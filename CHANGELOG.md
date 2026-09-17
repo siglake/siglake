@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Recovery (fix)**: `siglake wal-recover` rebuilds the tenant discovery
+  directory, so a restore that holds only index segments for a tenant is
+  drained. The compactor enumerates a tenant by its own `<tenant>/sealed/`,
+  which the ingester creates before it opens any per-index lane; recovery
+  rebuilt `<tenant>/<index>/sealed/` and not that, so a mirror for a tenant
+  whose events lane never sealed a segment — Elasticsearch-bulk-only traffic —
+  restored from the right `--from`, printed `pulled N segments`, and left the
+  rows in a layout no drain cycle walks: no commit, no
+  `siglake_compactor_index_unresolved_total`, no backlog gauge, nothing in
+  `orphans/`. The directory is now created on the restore path with the same
+  durability as the segments, before the already-present skip, so re-running
+  the command repairs a WAL root restored by an earlier version. Segment
+  contents, tenant and index routing, ownership checks and the report are
+  unchanged. (#4972)
+
 - **Recovery (behaviour change)**: `siglake wal-recover` reports what it
   understood, not only what it pulled. A `--from` naming an ancestor of the
   mirror root — `…/store` where the segments are at
