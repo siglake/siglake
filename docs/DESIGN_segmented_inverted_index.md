@@ -512,7 +512,7 @@ What remains, in order:
 2. **#4562** — the six-shape harness with a third arm, cold and warm separately,
    under 1 GiB parsed / 256 MiB blob, plus the OFF control; that is where a
    proceed/revise/reject disposition for #4377 comes from.
-3. **A `seg2` question for #4562's disposition**: per-block compression and a
+3. **A `seg2` question for #4562's disposition** (#4988): per-block compression and a
    per-block posting checksum, which are one decision — both need the block's
    posting span to be the unit the reader fetches whole, and the measured price
    of that is 1.58x the bytes a point lookup fetches per group. What they buy is

@@ -178,8 +178,9 @@ ordinals: group `i` **is** Parquet row group `i`, postings are stored
 group-relative and returned file-physical, and the directory states every
 group's row count so the sidecar can be checked against the file's actual row
 groups rather than against one stamped `row_group_size`. Directory offsets are
-bounded by an exact tiling of the blob body, not just by the directory's own
-offset. Compatibility is per-file metadata and never table state: a table may
+checked against an exact tiling of the blob body, so every section's range is
+pinned by its neighbours. Compatibility is per-file metadata and never table
+state: a table may
 carry both kinds at once, with no migration, and a file with neither is
 scanned. The lookup API is three-valued —
 `Lookup::{Rows, Absent, Unanswerable}` — because a partial reader fails per
@@ -189,7 +190,7 @@ rows. Posting sections carry no checksum in `seg1` and sections are stored
 uncompressed; both were priced rather than assumed (4 bytes per term is 32.6%
 of the blob, while block-granularity checksums and compression together cost
 0.1% and take the blob from 85.8 MiB to 16.4 MiB at 1.58x the bytes a point
-lookup fetches), and both are `seg2` questions for #4562's disposition.
+lookup fetches), and both are `seg2` questions for #4562's disposition (#4988).
 
 The remaining slices are #4561 (reader integration and bounded partial reads)
 and #4562 (the six-shape comparison that decides #4377).
