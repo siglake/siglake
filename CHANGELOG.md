@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Ingest (fix)**: the ingester's local WAL sweep reclaims a managed index's
+  sealed segments. It listed the WAL root and its tenant directories one level
+  deep, and a managed index's segments sit at
+  `<root>/<tenant>/<index>/sealed/`, so in catalog-claim mode — where the drain
+  reads the mirror and this sweep is the only thing that deletes an ingester's
+  local copies — nothing was removed for a managed index and the PVC grew for
+  the life of the pod. `siglake_wal_local_sealed_segments` counts only the
+  directories the sweep visits, so it did not report the backlog either: a
+  directory nothing lists contributes nothing to the gauge. The walk is now the
+  drain's own — root, each tenant, each tenant's indexes. The deletion gates
+  are unchanged: a local copy goes only once its catalog row says `committed`
+  and has settled for `SIGLAKE_WAL_LOCAL_SWEEP_SETTLE_SECS`, and the row itself
+  is left for remote retention. (#4915)
+
 - **Recovery (breaking)**: `siglake wal-recover` plans by default and writes
   only under `--apply`. The plan is the listing the restore already did before
   its first GET: one line per `(tenant, index)` with the segment count, the
