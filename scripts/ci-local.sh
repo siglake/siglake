@@ -241,6 +241,12 @@ else
   # answer with both charts' default rendered image tag and the pinned tags in
   # deploy/ -- no registry, no helm.
   python3 scripts/check-release-tags.py >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  # What is inside the released image, as opposed to what it is called. The
+  # Dockerfiles copy no Git metadata, so SIGLAKE_GIT_SHA is the only source of
+  # the revision in `--version` and siglake_build_info, and publish.yml passed
+  # none. This executes its revision step against a synthetic tagged checkout
+  # under both triggers -- no registry, no image build.
+  python3 scripts/check-release-provenance.py >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   # This list and ci.yml's `shell` job are two copies of the same list, and a
   # guard added to only one of them ran nowhere the other looked -- which is how
   # the three guards above it were local-only until 2026-09-07. The check reads

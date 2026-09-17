@@ -203,6 +203,14 @@ jobs:
       # workspace version and the tags pinned in deploy/.
       - name: the published image tag is the tag the charts install
         run: python3 scripts/check-release-tags.py
+      # The other half of a release image's identity: what is inside it. The
+      # images CI builds here get SIGLAKE_GIT_SHA and the published ones did
+      # not, so every released binary reported revision `unknown`. This
+      # executes publish.yml's revision step against a synthetic tagged
+      # checkout, under a tag push and under a dispatch from a later revision --
+      # the two agree on github.sha only for the first.
+      - name: the published images carry the release commit
+        run: python3 scripts/check-release-provenance.py
       # `-C link-arg=-fuse-ld=mold` was set for the whole workflow while only
       # four of the five cargo jobs installed mold. The fifth, `docker`, failed
       # every run at its first link under the name of the MinIO and Postgres
