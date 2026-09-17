@@ -356,6 +356,12 @@ enum Command {
     /// segment to the namespace and table it came from. Skips segments already
     /// present locally, and recovers the active mirror too (preferring the
     /// sealed copy of any segment present as both).
+    ///
+    /// Reports `pulled N segments into <wal-root>`, followed by the count
+    /// already present and the count of keys skipped for an unrecognised
+    /// layout when either is nonzero. Exits nonzero when every key was
+    /// skipped and nothing was restored — `--from` naming an ancestor of the
+    /// mirror root rather than the root itself.
     WalRecover {
         /// Full source URL (e.g. `s3://bucket/wal-mirror`).
         #[arg(long, env = "SIGLAKE_WAL_MIRROR_URL")]
@@ -2645,8 +2651,61 @@ async fn run_wal_recover(from: &str, to: &std::path::Path) -> Result<()> {
     // every `--from` carrying a path restored 0 segments and exited 0 (#4912).
     let store = build_opendal_operator(from)?;
     tracing::info!(from, to = %to.display(), "wal-recover starting");
-    let pulled = siglake_wal::mirror::recover_from_object_store(store, "", to).await?;
-    println!("pulled {pulled} segments into {}", to.display());
+    let summary = siglake_wal::mirror::recover_from_object_store(store, "", to).await?;
+
+    // `pulled 0 segments` alone reads the same whether the re-run had nothing
+    // left to do or the restore understood not one key, which is what `--from`
+    // aimed one component above the mirror root produces (#4928). The counts
+    // go on the same line, after the prefix operators and the runbook already
+    // read.
+    let mut detail = Vec::new();
+    if summary.already_present > 0 {
+        detail.push(format!("{} already present", summary.already_present));
+    }
+    if summary.skipped > 0 {
+        detail.push(format!(
+            "{} keys skipped: unrecognised layout",
+            summary.skipped
+        ));
+    }
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", detail.join(", "))
+    };
+    println!(
+        "pulled {} segments into {}{detail}",
+        summary.pulled,
+        to.display()
+    );
+
+    // Nothing pulled, nothing already there, and keys refused: the WAL root is
+    // still empty and no re-run of this command will change that, so it exits
+    // nonzero and names the thing to fix. A mixed result succeeds — those
+    // segments are restored — with the skip count on stdout and a warning in
+    // the log.
+    if summary.pulled == 0 && summary.already_present == 0 && summary.skipped > 0 {
+        anyhow::bail!(
+            "restored nothing: all {} keys under --from have a layout recovery will not guess \
+             at{}. --from must name the MIRROR ROOT — the directory holding \
+             <tenant>[/<index>]/<segment>.arrow and _active/ — not an ancestor of it \
+             (…/warehouse rather than …/warehouse/wal-mirror). {} is unchanged.",
+            summary.skipped,
+            summary
+                .sample_skipped_key
+                .as_deref()
+                .map(|k| format!(" (e.g. `{k}`)"))
+                .unwrap_or_default(),
+            to.display()
+        );
+    }
+    if summary.skipped > 0 {
+        tracing::warn!(
+            skipped = summary.skipped,
+            sample = summary.sample_skipped_key.as_deref().unwrap_or(""),
+            "wal-recover: keys under --from were skipped as unrecognised"
+        );
+    }
     Ok(())
 }
 

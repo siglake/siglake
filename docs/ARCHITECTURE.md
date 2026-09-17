@@ -93,7 +93,12 @@ s3://<bucket>/<prefix> --to <wal-root>` restores from the mirror for DR,
 rebuilding the per-tenant and per-index layout so each segment returns to the
 namespace and table it came from; each restored segment is written to a temp
 name, `fsync(2)`ed and renamed under a synced directory before it is counted,
-so a restore that reports 400 segments has 400 whole ones on the volume. Multi-pod deployments coordinate through a
+so a restore that reports 400 segments has 400 whole ones on the volume. The
+report carries the counts that separate a finished restore from one that
+understood nothing — segments already present, and keys skipped for a layout
+recovery will not guess at — and exits nonzero when every key was skipped and
+nothing was restored, which is `--from` naming an ancestor of the mirror root.
+Multi-pod deployments coordinate through a
 SQL claim table (`wal_segments`, atomic `try_claim`); crash recovery
 quarantines ambiguous `processing/` segments rather than risk double commits.
 The Helm chart refuses to render a compactor tier that can hold more than one

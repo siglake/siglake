@@ -135,11 +135,17 @@ fn recover_restores_the_layout_from_a_url_with_a_path() {
         assert_restored(&wal, &names);
 
         // Rerunning the runbook is safe and says so: everything is already
-        // present, nothing is re-pulled, and nothing is disturbed.
+        // present, nothing is re-pulled, and nothing is disturbed. The count
+        // of what is already there is what separates this line from a restore
+        // that understood nothing (#4928).
         let (stdout, stderr, ok) = recover(&from, &wal);
         assert!(ok, "{arm} rerun: {stdout}{stderr}");
         assert!(
             stdout.contains("pulled 0 segments"),
+            "{arm} rerun: {stdout}{stderr}"
+        );
+        assert!(
+            stdout.contains("(3 already present)"),
             "{arm} rerun: {stdout}{stderr}"
         );
         assert_restored(&wal, &names);
@@ -173,6 +179,111 @@ fn recover_prefers_a_sealed_copy_over_its_active_prefix() {
         std::fs::read(&sealed).unwrap(),
         "the sealed copy must win over its active prefix"
     );
+}
+
+/// #4928: `--from` one component too high understands not one key, and the
+/// report has to say so. Before this, the run printed `pulled 0 segments` and
+/// exited 0 — the same line and the same status as a re-run with nothing left
+/// to do — so an operator read a restore that recovered nothing as a restore
+/// that had nothing to recover.
+#[test]
+fn recovering_from_an_ancestor_of_the_mirror_root_fails_and_counts_the_skips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mirror, _names) = mirror_with_three_segments(tmp.path());
+    let wal = tmp.path().join("wal");
+
+    // `…/store`, two components above `…/store/warehouse/wal-mirror`: every
+    // key is deeper than the `<tenant>[/<index>]/<segment>` layout allows.
+    let ancestor = tmp.path().join("store");
+    let (stdout, stderr, ok) = recover(&format!("file://{}", ancestor.display()), &wal);
+    assert!(!ok, "a restore that understood nothing must not exit 0");
+    assert!(
+        stdout.contains("pulled 0 segments") && stdout.contains("3 keys skipped"),
+        "the skipped count belongs on stdout next to the pulled count: {stdout}{stderr}"
+    );
+    assert!(
+        stderr.contains("--from must name the MIRROR ROOT"),
+        "the diagnostic names the thing to fix: {stderr}"
+    );
+    assert!(
+        stderr.contains("warehouse/wal-mirror"),
+        "and shows a refused key: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&wal).unwrap().count(),
+        0,
+        "nothing was restored under {}",
+        wal.display()
+    );
+
+    // The control for the exit status: the same command pointed at the mirror
+    // root restores, and its idempotent re-run — also `pulled 0 segments` —
+    // succeeds.
+    let from = format!("file://{}", mirror.display());
+    let (stdout, stderr, ok) = recover(&from, &wal);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(stdout.contains("pulled 3 segments"), "{stdout}{stderr}");
+    let (stdout, stderr, ok) = recover(&from, &wal);
+    assert!(ok, "an idempotent re-run succeeds: {stdout}{stderr}");
+    assert!(stdout.contains("pulled 0 segments"), "{stdout}{stderr}");
+}
+
+/// An empty mirror is a clean answer, not a failure: nothing was refused, so
+/// there is nothing to warn about and nothing for the operator to fix.
+#[test]
+fn recovering_from_an_empty_mirror_succeeds_quietly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mirror = tmp.path().join("warehouse").join("wal-mirror");
+    std::fs::create_dir_all(&mirror).unwrap();
+    let wal = tmp.path().join("wal");
+
+    let (stdout, stderr, ok) = recover(&format!("file://{}", mirror.display()), &wal);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(stdout.contains("pulled 0 segments"), "{stdout}{stderr}");
+    assert!(
+        !stdout.contains("skipped"),
+        "nothing was refused: {stdout}{stderr}"
+    );
+}
+
+/// A mirror holding recognised segments AND foreign keys restores the
+/// segments and succeeds — the operator is not blocked by a stray object —
+/// but the skip count is on stdout both times, and the re-run separates the
+/// three segments it already has from the two keys it still does not
+/// understand.
+#[test]
+fn a_mirror_with_unknown_keys_alongside_segments_restores_and_reports_both() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mirror, names) = mirror_with_three_segments(tmp.path());
+    // Neither of these is a segment: one has no `.arrow` suffix at all, the
+    // other is deeper than tenant/index.
+    std::fs::write(mirror.join("README.md"), b"operator notes").unwrap();
+    place(
+        &mirror,
+        &format!("acme/orders/nested/{}", names[0]),
+        &mirror.join("acme").join(&names[0]),
+    );
+
+    let from = format!("file://{}", mirror.display());
+    let wal = tmp.path().join("wal");
+    let (stdout, stderr, ok) = recover(&from, &wal);
+    assert!(ok, "a mixed mirror still restores: {stdout}{stderr}");
+    assert!(
+        stdout.contains("pulled 3 segments") && stdout.contains("2 keys skipped"),
+        "{stdout}{stderr}"
+    );
+    assert_restored(&wal, &names);
+
+    let (stdout, stderr, ok) = recover(&from, &wal);
+    assert!(ok, "rerun: {stdout}{stderr}");
+    assert!(
+        stdout.contains("pulled 0 segments")
+            && stdout.contains("3 already present")
+            && stdout.contains("2 keys skipped"),
+        "a rerun with unrelated keys is still a success, and says why it pulled \
+         nothing: {stdout}{stderr}"
+    );
+    assert_restored(&wal, &names);
 }
 
 /// `--to` is the WAL ROOT. Pointing it at a `sealed/` directory would build
