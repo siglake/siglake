@@ -38,6 +38,21 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no
   measurement against a real store has settled. Both are kept for now.
+- **A v1 inverted-index blob has no checksum over its postings.** #4558 made
+  the decoder validate everything the format can check itself — the serialized
+  lengths against the bytes behind them, the narrowing conversions, the varint
+  range, the dictionary's ascent, and each posting's ascent and place inside
+  `n_rows` — and made the reader match the index's row domain against the
+  Parquet file before either a warm or a cold index prunes it. What is left is
+  a bit flip inside a posting delta that leaves the ordinals ascending and in
+  range: 120 of 112,304 single-bit flips of a 14 KB blob
+  (`report_single_bit_corruption_rates`), where an ordinal the scan should have
+  selected is replaced by one it should not. Extra rows are harmless — the
+  exact predicate runs above the scan — so the exposure is a dropped match, and
+  only for a file whose index is corrupt on disk rather than absent. Closing it
+  means a CRC per posting section, costed at about a third of the blob in
+  `DESIGN_segmented_inverted_index.md`, and is the trade to revisit when
+  postings feed an answer directly instead of a superset selection.
 - **A maintenance process's cache budgets are readable at startup, not on
   `/metrics`.** The compactor, the ingest server and the `siglake` maintenance
   subcommands resolve their own budgets now — zero for the two text-index

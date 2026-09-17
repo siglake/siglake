@@ -250,6 +250,57 @@ answerable substrings, fragments, absent terms, a delimiter-bearing fallback,
 and a dimensional-predicate intersection, with many row groups + bloom-skip
 active.
 
+### What a v1 blob has to prove before it prunes (2026-09-17, #4558)
+
+A footer KV and a Puffin blob are both bytes off storage, so every length in
+them is untrusted input. Two layers check them, and a blob that fails either is
+not an error — the file falls back to an exact scan, which is slower and right.
+
+**`InvertedIndex::from_bytes`** refuses, before allocating anything from a
+serialized count:
+
+- a count no remaining payload could cover (`n_terms` against
+  `remaining / 3` — the cheapest entry is a zero-length term, a posting count
+  and one delta byte; `plen` and `tlen` against the bytes left), so a nine-byte
+  blob claiming 2^32 postings costs nine bytes of work rather than a 16 GiB
+  `Vec::with_capacity`;
+- a value that does not fit the field it is read into (`n_rows`, a posting
+  delta and the running ordinal are all `u32`; they were narrowed with `as`);
+- a varint that does not round-trip a `u64` — more than ten bytes, or a tenth
+  byte carrying more than the one payload bit that fits (the shift dropped
+  those bits, so `2^64 + 1` decoded as `1`);
+- a repeated or descending term (the encoder walks a `BTreeMap`, so terms are
+  strictly ascending; `insert` used to collapse a duplicate silently);
+- an empty postings list, a posting at or past `n_rows`, or a non-first delta
+  of zero, all of which break "postings are strictly ascending file-local row
+  ordinals";
+- trailing payload after the last dictionary entry.
+
+Valid v1 bytes are unaffected — the encoder has always held every one of these.
+An empty term stays legal: the `raw` tokenizer emits one for a null value.
+
+**The reader** then matches the index's row domain against the Parquet file
+(`ArrowReader::index_covers_file`) before either a freshly decoded or a warm
+cached index reaches `inverted_index_row_selection`, on both the footer-KV and
+the Puffin path, counting `siglake_index_row_domain_mismatch_total{storage}`.
+`from_bytes` only proves the postings are inside the *index's* own `n_rows`,
+which says nothing about the file they are about to prune, and
+`index_matches_row_selection` drops ordinals it cannot place — so an index over
+20 rows stamped onto a 30-row file skips rows 20..30 before decode and **loses
+the matches there**, rather than merely admitting extra rows. Both regressions
+(`siglake-storage/tests/inverted_index_row_domain.rs`,
+`tests/puffin_index_row_domain.rs`) put a match in the file's final row group
+and past the index's domain, and fail against the pre-fix reader by returning
+two matching rows of four and one of two respectively.
+
+What neither layer catches is a flipped bit inside a posting delta that leaves
+the ordinals ascending and in range: v1 carries no checksum. The exhaustive
+single-bit sweep in `docs/DESIGN_segmented_inverted_index.md` under "Integrity"
+prices what changed — over 112,304 flips of a 14,038-byte blob, refusals went
+from 28,050 to 99,019, answers that came back wrong from 142 to 120, ordinals
+outside the row domain from 22 to **0**, and a present term reported absent
+from 135 to 29. The 120 are the residual.
+
 ### Slice C — AWS validation (remaining)
 
 `scripts/ws5-validate.sh`: with `compactor.invertedIndex.enabled=true`, ingest a

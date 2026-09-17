@@ -291,6 +291,19 @@ impl InvertedIndex {
 
     /// Parse a blob produced by [`to_bytes`](Self::to_bytes). Returns `None` on a
     /// bad magic/version or a truncated/garbled body.
+    ///
+    /// Every length in the blob is untrusted input — a footer KV or a Puffin
+    /// blob can be corrupt on disk — so no count is allocated from before it is
+    /// checked against the bytes that are left: a five-byte blob claiming four
+    /// billion postings has to cost five bytes of work, not 16 GiB of `Vec`.
+    /// The structural invariants [`to_bytes`](Self::to_bytes) holds are checked
+    /// too — terms strictly ascending, postings strictly ascending and inside
+    /// `0..n_rows` — because the reader turns postings straight into a Parquet
+    /// `RowSelection` and cannot tell a corrupt ordinal from a real one. What
+    /// this cannot catch is a flipped bit inside a delta that leaves the
+    /// ordinals ordered and in range; there is no checksum in v1 (recorded
+    /// under "Integrity" in `docs/DESIGN_segmented_inverted_index.md`), which
+    /// is why the reader also checks the row domain against the file.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut c = Cursor::new(bytes);
         if c.take(4)? != INDEX_MAGIC {
@@ -299,20 +312,60 @@ impl InvertedIndex {
         if c.u8()? != INDEX_VERSION {
             return None;
         }
-        let n_rows = c.varint()? as u32;
-        let n_terms = c.varint()? as usize;
-        let mut postings = BTreeMap::new();
+        let n_rows: u32 = c.varint()?.try_into().ok()?;
+        let n_terms: usize = c.varint()?.try_into().ok()?;
+        // Cheapest a dictionary entry can be: a one-byte zero term length, no
+        // term bytes, a one-byte posting count, and one byte for the single
+        // delta that count must cover.
+        if n_terms > c.remaining() / 3 {
+            return None;
+        }
+        let mut postings: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         for _ in 0..n_terms {
-            let tlen = c.varint()? as usize;
+            let tlen: usize = c.varint()?.try_into().ok()?;
             let term = std::str::from_utf8(c.take(tlen)?).ok()?.to_string();
-            let plen = c.varint()? as usize;
+            // The encoder walks a `BTreeMap`, so terms arrive strictly
+            // ascending. Equal or descending means a duplicate entry — which
+            // `insert` below would silently collapse, keeping the last
+            // postings list and dropping the first — or a garbled dictionary.
+            // (An empty term is legitimate: the `raw` tokenizer emits one for
+            // a null or empty column value.)
+            if postings
+                .last_key_value()
+                .is_some_and(|(last, _)| term.as_str() <= last.as_str())
+            {
+                return None;
+            }
+            let plen: usize = c.varint()?.try_into().ok()?;
+            // A term is stored only when some row has it, and each of its
+            // deltas costs at least one byte.
+            if plen == 0 || plen > c.remaining() {
+                return None;
+            }
             let mut rows = Vec::with_capacity(plen);
             let mut prev = 0u32;
-            for _ in 0..plen {
-                prev = prev.checked_add(c.varint()? as u32)?;
+            for nth in 0..plen {
+                let delta: u32 = c.varint()?.try_into().ok()?;
+                // Only the first ordinal may be zero: postings are strictly
+                // ascending, so every later delta is at least one.
+                if nth > 0 && delta == 0 {
+                    return None;
+                }
+                prev = prev.checked_add(delta)?;
+                // Postings are row ordinals within this file. One at or past
+                // `n_rows` would select a row the index does not claim to
+                // cover.
+                if prev >= n_rows {
+                    return None;
+                }
                 rows.push(prev);
             }
             postings.insert(term, rows);
+        }
+        // A well-formed blob is consumed exactly: trailing bytes mean the
+        // dictionary count disagrees with the payload.
+        if c.remaining() != 0 {
+            return None;
         }
         Some(Self { postings, n_rows })
     }
@@ -421,6 +474,16 @@ impl<'a> Cursor<'a> {
     fn u8(&mut self) -> Option<u8> {
         self.take(1).map(|s| s[0])
     }
+    /// Bytes not yet consumed — the ceiling every serialized count in the blob
+    /// is checked against before anything is allocated from it.
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+    /// LEB128, rejecting any encoding that does not round-trip through `u64`:
+    /// more than ten bytes, or a tenth byte carrying more than the single
+    /// payload bit that fits. The shift alone used to drop those bits, so
+    /// `0x80 … 0x80 0x7f` (ten bytes) decoded as a plausible small count
+    /// instead of being refused.
     fn varint(&mut self) -> Option<u64> {
         let mut result = 0u64;
         let mut shift = 0u32;
@@ -429,7 +492,11 @@ impl<'a> Cursor<'a> {
             if shift >= 64 {
                 return None; // overlong / corrupt
             }
-            result |= ((byte & 0x7f) as u64) << shift;
+            let payload = (byte & 0x7f) as u64;
+            if payload << shift >> shift != payload {
+                return None; // the shift would silently discard value bits
+            }
+            result |= payload << shift;
             if byte & 0x80 == 0 {
                 return Some(result);
             }
@@ -612,13 +679,229 @@ mod tests {
         assert_eq!(InvertedIndex::from_bytes(&i.to_bytes()), Some(i));
     }
 
+    /// A blob header, then whatever body the case wants: the shortest way to
+    /// hand the decoder a hostile length.
+    fn blob(n_rows: u64, n_terms: u64, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(INDEX_MAGIC);
+        out.push(INDEX_VERSION);
+        write_varint(&mut out, n_rows);
+        write_varint(&mut out, n_terms);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// One dictionary entry, spelled out so a case can break exactly one field.
+    fn term_entry(term: &str, deltas: &[u64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_varint(&mut out, term.len() as u64);
+        out.extend_from_slice(term.as_bytes());
+        write_varint(&mut out, deltas.len() as u64);
+        for delta in deltas {
+            write_varint(&mut out, *delta);
+        }
+        out
+    }
+
+    /// The header-only refusals: a count that no remaining payload could
+    /// justify has to be rejected from the count itself, before any `Vec` is
+    /// reserved. The decoder allocated `Vec::with_capacity(plen)` straight from
+    /// the serialized posting count, so a nine-byte blob could ask for 16 GiB
+    /// (task #4558). Nothing here asserts on allocation directly — the proof is
+    /// that the blob is refused while it is still a handful of bytes.
+    #[test]
+    fn from_bytes_refuses_counts_the_payload_cannot_cover() {
+        // 2^32 - 1 terms behind an empty body.
+        let bytes = blob(10, u32::MAX as u64, &[]);
+        assert!(bytes.len() < 16, "the hostile blob stays tiny: {bytes:?}");
+        assert!(InvertedIndex::from_bytes(&bytes).is_none());
+        // ... and behind a body that could hold one entry, not four billion.
+        assert!(
+            InvertedIndex::from_bytes(&blob(10, u32::MAX as u64, &term_entry("ab", &[1])))
+                .is_none()
+        );
+        // 2^32 - 1 postings for a real term behind two bytes of deltas.
+        let mut body = Vec::new();
+        write_varint(&mut body, 2);
+        body.extend_from_slice(b"ab");
+        write_varint(&mut body, u32::MAX as u64);
+        body.extend_from_slice(&[1, 1]);
+        let bytes = blob(10, 1, &body);
+        assert!(bytes.len() < 24, "the hostile blob stays tiny: {bytes:?}");
+        assert!(InvertedIndex::from_bytes(&bytes).is_none());
+        // A term length past the end of the blob.
+        assert!(InvertedIndex::from_bytes(&blob(10, 1, &[200, b'a', b'b'])).is_none());
+        // The exact-fit boundary is accepted: an empty term with one posting is
+        // three bytes, so one term behind three bytes is plausible.
+        assert_eq!(
+            InvertedIndex::from_bytes(&blob(1, 1, &term_entry("", &[0])))
+                .map(|index| index.n_terms()),
+            Some(1)
+        );
+    }
+
+    /// Counts that do not fit the types they are read into. `n_rows` and the
+    /// postings were narrowed with `as u32`, so `n_rows = 2^32` decoded as 0
+    /// and a delta of `2^32 + 5` as 5 — a silently different index, not a
+    /// refusal.
+    #[test]
+    fn from_bytes_refuses_values_that_do_not_fit_their_field() {
+        assert!(
+            InvertedIndex::from_bytes(&blob(1u64 << 32, 0, &[])).is_none(),
+            "n_rows past u32"
+        );
+        assert!(
+            InvertedIndex::from_bytes(&blob(u64::MAX, 0, &[])).is_none(),
+            "n_rows at u64::MAX"
+        );
+        assert!(
+            InvertedIndex::from_bytes(&blob(100, 1, &term_entry("ab", &[(1u64 << 32) + 5])))
+                .is_none(),
+            "posting delta past u32"
+        );
+        // A delta that fits u32 but walks the running ordinal past u32.
+        assert!(
+            InvertedIndex::from_bytes(&blob(
+                u32::MAX as u64,
+                1,
+                &term_entry("ab", &[u32::MAX as u64, u32::MAX as u64])
+            ))
+            .is_none(),
+            "running ordinal overflows u32"
+        );
+    }
+
+    /// Postings are the reader's row ordinals. Out of domain, out of order, or
+    /// repeated, they have to be refused rather than handed to
+    /// `row_selection_runs`, which silently drops what it cannot place.
+    #[test]
+    fn from_bytes_refuses_postings_outside_the_row_domain() {
+        // n_rows = 3, so ordinal 3 does not exist.
+        assert!(InvertedIndex::from_bytes(&blob(3, 1, &term_entry("ab", &[3]))).is_none());
+        assert!(InvertedIndex::from_bytes(&blob(3, 1, &term_entry("ab", &[1, 2]))).is_none());
+        // Zero rows cannot carry a posting at all.
+        assert!(InvertedIndex::from_bytes(&blob(0, 1, &term_entry("ab", &[0]))).is_none());
+        // A zero delta after the first repeats the previous ordinal.
+        assert!(InvertedIndex::from_bytes(&blob(9, 1, &term_entry("ab", &[2, 0]))).is_none());
+        // An empty postings list: a term is only stored when a row has it.
+        assert!(InvertedIndex::from_bytes(&blob(9, 1, &term_entry("ab", &[]))).is_none());
+        // In-domain and ascending is accepted, including ordinal 0 and the last.
+        assert_eq!(
+            InvertedIndex::from_bytes(&blob(3, 1, &term_entry("abc", &[0, 2])))
+                .and_then(|index| index.postings("abc").map(<[u32]>::to_vec)),
+            Some(vec![0, 2])
+        );
+    }
+
+    /// The dictionary is serialized in `BTreeMap` order, so a repeated or
+    /// descending term is corruption. `insert` used to collapse a duplicate,
+    /// keeping the second postings list and dropping the first — a decode that
+    /// succeeds with fewer terms than the blob claims.
+    #[test]
+    fn from_bytes_refuses_duplicate_or_unordered_terms() {
+        let mut duplicate = term_entry("ab", &[0]);
+        duplicate.extend_from_slice(&term_entry("ab", &[1]));
+        assert!(InvertedIndex::from_bytes(&blob(9, 2, &duplicate)).is_none());
+
+        let mut descending = term_entry("cd", &[0]);
+        descending.extend_from_slice(&term_entry("ab", &[1]));
+        assert!(InvertedIndex::from_bytes(&blob(9, 2, &descending)).is_none());
+
+        let mut ascending = term_entry("ab", &[0]);
+        ascending.extend_from_slice(&term_entry("cd", &[1]));
+        assert_eq!(
+            InvertedIndex::from_bytes(&blob(9, 2, &ascending)).map(|index| index.n_terms()),
+            Some(2)
+        );
+    }
+
+    /// Bytes past the last dictionary entry mean the term count disagrees with
+    /// the payload, which is the truncation case seen from the other end.
+    #[test]
+    fn from_bytes_refuses_trailing_payload() {
+        let mut bytes = idx().to_bytes();
+        bytes.push(0);
+        assert!(InvertedIndex::from_bytes(&bytes).is_none());
+        let mut bytes = idx().to_bytes();
+        bytes.extend_from_slice(&term_entry("zzzz", &[1]));
+        assert!(InvertedIndex::from_bytes(&bytes).is_none());
+    }
+
+    /// Every one-byte truncation of a valid blob, and every single-byte
+    /// mutation of its length fields, must come back as `None` or as a decoded
+    /// index — never as a panic and never as an allocation the blob cannot pay
+    /// for. Runs the mutations to completion rather than sampling, since the
+    /// blob is small.
+    #[test]
+    fn from_bytes_survives_truncation_and_length_mutation() {
+        let good = idx().to_bytes();
+        for cut in 0..good.len() {
+            assert!(
+                InvertedIndex::from_bytes(&good[..cut]).is_none(),
+                "a truncated blob is never valid (cut at {cut})"
+            );
+        }
+        for pos in 0..good.len() {
+            for replacement in [0x00u8, 0x01, 0x7f, 0x80, 0xff] {
+                let mut mutated = good.clone();
+                mutated[pos] = replacement;
+                if let Some(index) = InvertedIndex::from_bytes(&mutated) {
+                    // Whatever survives must still be internally consistent:
+                    // every posting inside the row domain it declares.
+                    for (term, rows) in index.terms() {
+                        assert!(
+                            rows.iter().all(|row| *row < index.n_rows()),
+                            "term {term:?} escaped the row domain after \
+                             byte {pos} := {replacement:#04x}"
+                        );
+                        assert!(rows.windows(2).all(|w| w[0] < w[1]), "postings unordered");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn varint_round_trips_boundaries() {
-        for v in [0u64, 1, 127, 128, 300, 16383, 16384, u32::MAX as u64] {
+        for v in [
+            0u64,
+            1,
+            127,
+            128,
+            300,
+            16383,
+            16384,
+            u32::MAX as u64,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
             let mut b = Vec::new();
             write_varint(&mut b, v);
             let mut c = Cursor::new(&b);
             assert_eq!(c.varint(), Some(v), "varint {v}");
+            assert_eq!(c.remaining(), 0, "varint {v} consumed exactly its bytes");
         }
+    }
+
+    /// The tenth byte of a `u64` LEB128 holds one payload bit. Anything more
+    /// was shifted off the top and the varint decoded as a small number, so
+    /// `2^64 + 1` read back as `1` and reached a `Vec::with_capacity` as a
+    /// plausible count.
+    #[test]
+    fn varint_refuses_payload_bits_that_do_not_fit_u64() {
+        // Ten bytes, tenth byte = 2: bit 64, which has nowhere to go.
+        let overflow = [0x80u8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        assert_eq!(Cursor::new(&overflow).varint(), None);
+        // Tenth byte = 1 is the largest that fits, and is u64::MAX's encoding.
+        let max = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        assert_eq!(Cursor::new(&max).varint(), Some(u64::MAX));
+        // Tenth byte = 0x7f: six payload bits past the top of a u64.
+        let dropped = [0x80u8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f];
+        assert_eq!(Cursor::new(&dropped).varint(), None);
+        // Eleven bytes is never valid, whatever the last one carries.
+        let overlong = [0x80u8; 11];
+        assert_eq!(Cursor::new(&overlong).varint(), None);
+        // Unterminated (continuation bit on every byte, then end of input).
+        assert_eq!(Cursor::new(&[0x80u8, 0x80]).varint(), None);
     }
 }
