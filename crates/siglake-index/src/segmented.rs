@@ -106,6 +106,34 @@ pub fn segmented_index_kv_key(column: &str) -> Cow<'static, str> {
 /// Outcome of a single-term lookup. The three cases are distinct on purpose:
 /// only `Unanswerable` may fall back to a scan, and only `Absent` licenses
 /// skipping rows.
+///
+/// The contract, stated here because #4561's reader integration is written
+/// against it and the v1 decoder has no equivalent (it returns `None` for both
+/// "absent" and "unparseable"):
+///
+/// - **`Rows`** is *strictly ascending*, file-physical, and covers every group
+///   the lookup was allowed to read. A caller may skip every row not in it.
+/// - **`Absent`** is a definitive no-match over the groups the lookup covered:
+///   the term normalizes, every group the caller kept was read, and none has
+///   it. Skipping the whole file (or the kept groups) is licensed. An empty
+///   group selection lands here — the caller pruned everything, so nothing in
+///   the kept set matches.
+/// - **`Unanswerable`** is "this index concluded nothing; scan". It covers a
+///   term that does not normalize, a malformed section, a failed range read,
+///   and a row-group selection this sidecar cannot serve (see
+///   [`SegmentedReader::postings_in_groups`]). It is never partial: a lookup that
+///   found rows in one group and could not read another returns
+///   `Unanswerable`, not the rows it managed to get.
+///
+/// Two deliberate divergences from the shipped index. Where
+/// [`InvertedIndex::postings`](crate::InvertedIndex::postings) returns `None`
+/// for a term that does not normalize and
+/// [`InvertedIndex::matching_rows_all`](crate::InvertedIndex::matching_rows_all)
+/// then reads that as "no rows match", a segmented lookup answers
+/// `Unanswerable` and its AND entry point returns `None` — an unindexable term
+/// constrains nothing, so it must not license skipping rows. And where the v1
+/// decoder's failure is confined to `from_bytes`, a partial reader can fail
+/// per lookup, which is why the third case has to exist at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup {
     /// Ascending **file-physical** row ordinals containing the term.
@@ -627,16 +655,24 @@ impl<S: RangeSource> SegmentedReader<S> {
         self.postings_in_groups(term, None)
     }
 
-    /// [`Self::postings`] restricted to `groups` (indices into the file's row
-    /// groups, ascending) — the reject path: a group the scan already pruned
-    /// costs no read at all.
+    /// [`Self::postings`] restricted to `groups` — the reject path: a group the
+    /// scan already pruned costs no read at all.
+    ///
+    /// `groups` are indices into the file's row groups and must be **strictly
+    /// ascending and in range**; anything else is [`Lookup::Unanswerable`]
+    /// (see [`Self::group_indices`]). `Some(&[])` is not malformed — the caller
+    /// pruned every group, so no kept row matches, which is
+    /// [`Lookup::Absent`].
     pub fn postings_in_groups(&self, term: &str, groups: Option<&[usize]>) -> Lookup {
         let Some(normalized) = normalize_query_term(term) else {
             return Lookup::Unanswerable;
         };
+        let Some(indices) = self.group_indices(groups) else {
+            return Lookup::Unanswerable;
+        };
         let mut rows: Vec<u32> = Vec::new();
         let mut found = false;
-        for index in self.group_indices(groups) {
+        for index in indices {
             let group = &self.groups[index];
             match self.group_postings(group, &normalized) {
                 Ok(Some(group_rows)) => {
@@ -660,17 +696,22 @@ impl<S: RangeSource> SegmentedReader<S> {
         self.matching_rows_all_in_groups(terms, None)
     }
 
-    /// [`Self::matching_rows_all`] restricted to `groups`. A term that no group
-    /// has ends the lookup at once, and the intersection runs shortest-list
-    /// first. Both happen *after* each term's postings are fetched, in argument
-    /// order: the dictionary's document frequencies could order the fetches
-    /// too, and skip the rest once the rarest term's list is known, but that is
-    /// a reader-side policy question and belongs with #4561's integration.
+    /// [`Self::matching_rows_all`] restricted to `groups`, under the same
+    /// selection contract [`Self::postings_in_groups`] states. A term that no
+    /// group has ends the lookup at once, and the intersection runs
+    /// shortest-list first. Both happen *after* each term's postings are
+    /// fetched, in argument order: the dictionary's document frequencies could
+    /// order the fetches too, and skip the rest once the rarest term's list is
+    /// known, but that is a reader-side policy question and belongs with
+    /// #4561's integration.
     pub fn matching_rows_all_in_groups(
         &self,
         terms: &[&str],
         groups: Option<&[usize]>,
     ) -> Option<Vec<u32>> {
+        // Checked before the empty-term shortcut, so a selection this sidecar
+        // cannot serve never gets an answer at all.
+        self.group_indices(groups)?;
         if terms.is_empty() {
             return Some(Vec::new());
         }
@@ -713,8 +754,9 @@ impl<S: RangeSource> SegmentedReader<S> {
         groups: Option<&[usize]>,
     ) -> Option<Vec<u32>> {
         let normalized = normalize_query_term(substr)?;
+        let indices = self.group_indices(groups)?;
         let mut rows: Vec<u32> = Vec::new();
-        for index in self.group_indices(groups) {
+        for index in indices {
             let group = &self.groups[index];
             let mut matches: Vec<(u64, u32, u32)> = Vec::new();
             for block in &group.blocks {
@@ -759,15 +801,26 @@ impl<S: RangeSource> SegmentedReader<S> {
         self.groups.iter().map(|group| group.postings_len).sum()
     }
 
-    fn group_indices(&self, groups: Option<&[usize]>) -> Vec<usize> {
-        match groups {
-            None => (0..self.groups.len()).collect(),
-            Some(selected) => selected
-                .iter()
-                .copied()
-                .filter(|index| *index < self.groups.len())
-                .collect(),
+    /// Validate a caller's row-group selection: strictly ascending, and every
+    /// index inside this sidecar's groups. `None` — which every caller turns
+    /// into "cannot answer, scan" — rather than skipping an out-of-range index
+    /// or serving a repeated one, because both produce a row set the caller
+    /// reads as complete: the first answers over fewer groups than it asked
+    /// for, the second returns a group's postings twice and so is not
+    /// ascending, and `intersect_sorted` / `row_selection_runs` both drop rows
+    /// from a list that is not.
+    fn group_indices(&self, groups: Option<&[usize]>) -> Option<Vec<usize>> {
+        let Some(selected) = groups else {
+            return Some((0..self.groups.len()).collect());
+        };
+        let mut previous: Option<usize> = None;
+        for &index in selected {
+            if index >= self.groups.len() || previous.is_some_and(|previous| index <= previous) {
+                return None;
+            }
+            previous = Some(index);
         }
+        Some(selected.to_vec())
     }
 
     /// `Ok(None)` = this group does not have the term; `Err(())` = malformed.
@@ -1259,9 +1312,75 @@ mod tests {
         let reader = open(encoded(&rows, 100));
         assert_eq!(reader.postings("absentterm"), Lookup::Absent);
         assert_eq!(reader.matching_rows_all(&["absentterm"]), Some(Vec::new()));
-        // An unanswerable term must not be read as "no rows match".
+        // An unanswerable term must not be read as "no rows match" — the
+        // divergence from v1, which conflates the two and so lets a term too
+        // short to index skip every row in the file.
+        assert_eq!(reader.postings("ab"), Lookup::Unanswerable);
         assert_eq!(reader.matching_rows_all(&["ab"]), None);
+        let v1 = InvertedIndex::from_rows(rows.iter().map(String::as_str));
+        assert_eq!(v1.postings("ab"), None);
+        assert_eq!(v1.matching_rows_all(&["ab"]), Vec::<u32>::new());
         assert_eq!(reader.matching_rows_all(&[]), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_row_group_selection_the_sidecar_cannot_serve_is_unanswerable() {
+        let rows = corpus(1_000);
+        let reader = open(encoded(&rows, 250));
+        assert_eq!(reader.n_groups(), 4);
+        let Lookup::Rows(truth) = reader.postings("queen") else {
+            panic!("present");
+        };
+
+        // The contract a caller has to hold: ascending, no repeats, every index
+        // inside the sidecar's groups.
+        assert_eq!(
+            reader.postings_in_groups("queen", Some(&[0, 1, 2, 3])),
+            Lookup::Rows(truth)
+        );
+        // Out of range means the caller's row-group map and the sidecar
+        // disagree — the case `matches_row_groups` exists to catch. Answering
+        // over the groups that do exist would look complete and silently drop
+        // the rest.
+        assert_eq!(
+            reader.postings_in_groups("queen", Some(&[0, 1, 9])),
+            Lookup::Unanswerable
+        );
+        assert_eq!(
+            reader.matching_rows_all_in_groups(&["queen"], Some(&[0, 9])),
+            None
+        );
+        assert_eq!(reader.rows_containing_in_groups("ueen", Some(&[9])), None);
+        // A repeat would count a group's postings twice and a descending pair
+        // would return them out of order; every consumer of the result
+        // (`intersect_sorted`, `row_selection_runs`) drops rows from a list
+        // that is not strictly ascending, so neither may be served.
+        assert_eq!(
+            reader.postings_in_groups("queen", Some(&[1, 1])),
+            Lookup::Unanswerable
+        );
+        assert_eq!(
+            reader.postings_in_groups("queen", Some(&[2, 0])),
+            Lookup::Unanswerable
+        );
+        assert_eq!(
+            reader.rows_containing_in_groups("ueen", Some(&[0, 0])),
+            None
+        );
+        // An empty selection is not a malformed one: the caller pruned every
+        // group, so no row in the kept set matches.
+        assert_eq!(
+            reader.postings_in_groups("queen", Some(&[])),
+            Lookup::Absent
+        );
+        assert_eq!(
+            reader.matching_rows_all_in_groups(&["queen"], Some(&[])),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            reader.rows_containing_in_groups("ueen", Some(&[])),
+            Some(Vec::new())
+        );
     }
 
     #[test]
