@@ -2821,7 +2821,7 @@ impl ArrowReader {
                 .iter()
                 .map(|row_group| row_group.num_rows() as u64)
                 .collect();
-            let (outcome, reads) = Self::segmented_matching_rows(
+            let (outcome, cost) = Self::segmented_matching_rows(
                 file_io,
                 path,
                 &blob_metadata,
@@ -2846,9 +2846,9 @@ impl ArrowReader {
             )
             .increment(1);
             metrics::histogram!("siglake_iceberg_segmented_index_range_reads")
-                .record(reads.reads as f64);
+                .record(cost.reads as f64);
             metrics::histogram!("siglake_iceberg_segmented_index_fetched_bytes")
-                .record(reads.bytes as f64);
+                .record(cost.bytes as f64);
             metrics::histogram!("siglake_iceberg_segmented_index_resident_bytes")
                 .record(resident_bytes as f64);
             metrics::histogram!("siglake_iceberg_segmented_index_selected_rows")
