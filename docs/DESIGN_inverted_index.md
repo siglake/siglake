@@ -167,9 +167,32 @@ pass. Nothing is wired — the format has its own magic, footer-KV key and Puffi
 blob type, so this reader does not see one. Measured on one 7,340,000-row file
 from the same corpus: 526.0 MiB parsed for the whole-file index against
 474.9 KiB of resident directory, and a rare term answered from 14 range reads
-of 9.8 KiB rather than a 3.27 s whole-file decode. The remaining slices are
-#4560 (codec and fixtures), #4561 (reader integration and bounded partial
-reads) and #4562 (the six-shape comparison that decides #4377).
+of 9.8 KiB rather than a 3.27 s whole-file decode.
+
+#4560 settled the format's own questions on top of that prototype, and the
+answers are recorded in that document rather than here. Version identification
+is four separate discriminators (magic, a version byte at both ends, its own
+Puffin blob type and footer-KV key), so a 0.1.x reader never sees a segmented
+sidecar and a segmented reader refuses v1 bytes. Row-group boundaries and
+ordinals: group `i` **is** Parquet row group `i`, postings are stored
+group-relative and returned file-physical, and the directory states every
+group's row count so the sidecar can be checked against the file's actual row
+groups rather than against one stamped `row_group_size`. Directory offsets are
+bounded by an exact tiling of the blob body, not just by the directory's own
+offset. Compatibility is per-file metadata and never table state: a table may
+carry both kinds at once, with no migration, and a file with neither is
+scanned. The lookup API is three-valued —
+`Lookup::{Rows, Absent, Unanswerable}` — because a partial reader fails per
+lookup, where this format's decoder can only fail at `from_bytes`; only
+`Unanswerable` may fall back to a scan and only `Absent` licenses skipping
+rows. Posting sections carry no checksum in `seg1` and sections are stored
+uncompressed; both were priced rather than assumed (4 bytes per term is 32.6%
+of the blob, while block-granularity checksums and compression together cost
+0.1% and take the blob from 85.8 MiB to 16.4 MiB at 1.58x the bytes a point
+lookup fetches), and both are `seg2` questions for #4562's disposition.
+
+The remaining slices are #4561 (reader integration and bounded partial reads)
+and #4562 (the six-shape comparison that decides #4377).
 
 #### The per-execution policy arm (2026-09-16, #4375)
 

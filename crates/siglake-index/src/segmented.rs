@@ -47,7 +47,17 @@
 //!   *absent* in one row group and silently drop its rows, so the directory
 //!   carries a CRC per block and its own CRC sits in the trailer. Posting
 //!   sections are covered by their stated document frequency only; the residual
-//!   that leaves is stated in `docs/DESIGN_segmented_inverted_index.md`.
+//!   that leaves is measured and priced in
+//!   `docs/DESIGN_segmented_inverted_index.md`.
+//! - **The directory cannot address bytes that are not its own.** The body is
+//!   tiled exactly by the sections — group `i`'s postings, then its dictionary,
+//!   in group order, from the header to the directory — and a block's postings
+//!   base starts at 0, strictly ascends and ends before its section does. Both
+//!   are checked at [`SegmentedReader::open`], because bounding each range
+//!   against the directory's offset alone accepts a directory whose sections
+//!   overlap, and a lookup that reads one term's postings out of another's
+//!   bytes can answer with the wrong rows
+//!   (`a_directory_that_is_consistent_and_lies_about_the_structure_is_refused`).
 //!
 //! The format is deliberately **not** wired into the writer, the reader or any
 //! default: it carries its own magic, its own footer-KV key
@@ -995,34 +1005,20 @@ fn scan_block(
     Ok(())
 }
 
-/// CRC-32 (IEEE 802.3), bytewise. Hand-rolled to keep this crate's dependency
-/// list at one entry for the prototype; a production version should take
-/// `crc32fast`, which is already in the lockfile and is SIMD-accelerated.
+/// CRC-32 (IEEE 802.3, reflected, `0xedb8_8320`) — the format's checksum,
+/// wherever it is computed.
+///
+/// `crc32fast` rather than the prototype's bytewise table: the writer
+/// checksums every dictionary block of every file (35.9 MiB per 7.34M-row file
+/// on the measurement corpus) and a cold open checksums the whole directory
+/// (474.9 KiB), which the table version does at ~0.5 GB/s against ~50 GB/s
+/// hardware-accelerated. The crate was already in the tree behind flate2, so
+/// taking it directly resolves no new package. `crc32_reference` in this
+/// module's tests pins the value against the algorithm and the standard check
+/// vector, so the bytes on disk do not depend on which implementation computes
+/// them.
 fn crc32(bytes: &[u8]) -> u32 {
-    const TABLE: [u32; 256] = {
-        let mut table = [0u32; 256];
-        let mut index = 0usize;
-        while index < 256 {
-            let mut value = index as u32;
-            let mut bit = 0;
-            while bit < 8 {
-                value = if value & 1 == 1 {
-                    0xedb8_8320 ^ (value >> 1)
-                } else {
-                    value >> 1
-                };
-                bit += 1;
-            }
-            table[index] = value;
-            index += 1;
-        }
-        table
-    };
-    let mut crc = 0xffff_ffffu32;
-    for &byte in bytes {
-        crc = TABLE[((crc ^ u32::from(byte)) & 0xff) as usize] ^ (crc >> 8);
-    }
-    !crc
+    crc32fast::hash(bytes)
 }
 
 fn write_varint(out: &mut Vec<u8>, mut value: u64) {
@@ -1158,6 +1154,30 @@ mod tests {
 
     fn open(bytes: Vec<u8>) -> SegmentedReader<SliceSource> {
         SegmentedReader::open(SliceSource::new(bytes)).expect("well-formed blob opens")
+    }
+
+    /// One row of the measurement corpus, with the sparse term's period taken
+    /// from a knob — the same text
+    /// `tests/segmented_measure.rs` generates, so the report below is
+    /// comparable with the tables in
+    /// `docs/DESIGN_segmented_inverted_index.md`.
+    fn measurement_row(row: usize, rare_every: usize) -> String {
+        let queen = if row.is_multiple_of(50) { " queen" } else { "" };
+        let checkout = if row.is_multiple_of(20) {
+            " checkout"
+        } else {
+            ""
+        };
+        let rare = if rare_every > 0 && row.is_multiple_of(rare_every) {
+            " rareneedle"
+        } else {
+            ""
+        };
+        format!(
+            "service-{} status {}{queen}{checkout}{rare} row-{row:06}",
+            row % 20,
+            200 + row % 5
+        )
     }
 
     fn encoded(rows: &[String], group_rows: u32) -> Vec<u8> {
@@ -1836,6 +1856,55 @@ mod tests {
         );
     }
 
+    /// The format's checksum, written out: reflected CRC-32 with polynomial
+    /// `0xedb8_8320`, initial value `0xffff_ffff`, final inversion. This is the
+    /// specification `crc32` has to keep agreeing with, and the reason
+    /// swapping in an accelerated implementation cannot change a byte on disk.
+    fn crc32_reference(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    0xedb8_8320 ^ (crc >> 1)
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn the_checksum_is_ieee_crc32_whoever_computes_it() {
+        // The standard check value: CRC-32 of "123456789".
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(crc32(b""), 0);
+        // Agreement with the written-out algorithm over the shapes the format
+        // actually checksums — a directory, a dictionary block, and the sizes
+        // where a chunked implementation's boundaries would show.
+        let rows = corpus(500);
+        let blob = encoded(&rows, 125);
+        let reader = open(blob.clone());
+        let directory = encode_directory(reader.n_rows(), &reader.groups);
+        assert_eq!(crc32(&directory), crc32_reference(&directory));
+        for group in &reader.groups {
+            for block in &group.blocks {
+                let bytes = reader
+                    .read_block(group, block)
+                    .expect("the fixture's blocks verify");
+                assert_eq!(crc32(&bytes), crc32_reference(&bytes));
+                assert_eq!(crc32(&bytes), block.crc);
+            }
+        }
+        for len in [1usize, 7, 8, 15, 16, 31, 63, 64, 127, 128, 1_024, 4_096] {
+            let bytes: Vec<u8> = (0..len)
+                .map(|index| (index as u8).wrapping_mul(31))
+                .collect();
+            assert_eq!(crc32(&bytes), crc32_reference(&bytes), "{len} bytes");
+        }
+    }
+
     #[test]
     fn the_varint_reader_rejects_overflow_and_non_canonical_forms() {
         assert_eq!(Reader::new(&[0x00]).varint(), Some(0));
@@ -1907,5 +1976,216 @@ mod tests {
                 "term {term}"
             );
         }
+    }
+
+    /// The two open format questions #4560 owes, priced at the scale
+    /// `docs/DESIGN_segmented_inverted_index.md` reports: whether posting
+    /// sections need their own checksum, and what per-section compression
+    /// would cost. Both turn on the same number — the bytes behind one
+    /// dictionary block's terms — because both can only be done at a
+    /// granularity the reader fetches whole.
+    ///
+    /// ```
+    /// cargo test -p siglake-index --release --lib \
+    ///   report_posting_checksum_and_compression_options -- --ignored --nocapture
+    /// ```
+    ///
+    /// Sized by `SIGLAKE_SEG_ROWS`, `SIGLAKE_SEG_GROUP_ROWS`,
+    /// `SIGLAKE_SEG_RARE_EVERY` and `SIGLAKE_SEG_BLOCK_BYTES`.
+    #[test]
+    #[ignore = "measurement: builds a multi-million-row sidecar"]
+    fn report_posting_checksum_and_compression_options() {
+        fn knob(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        }
+        fn mib(bytes: u64) -> f64 {
+            bytes as f64 / (1024.0 * 1024.0)
+        }
+        // Puffin registers a compressed blob at zstd level 3
+        // (`third_party/iceberg/src/compression.rs`), so every ratio here is
+        // taken at the level the shipped sidecar actually pays.
+        fn zstd_len(bytes: &[u8]) -> u64 {
+            zstd::encode_all(bytes, 3).expect("zstd").len() as u64
+        }
+
+        let rows = knob("SIGLAKE_SEG_ROWS", 7_340_000);
+        let group_rows = knob("SIGLAKE_SEG_GROUP_ROWS", 1_048_576);
+        let rare_every = knob("SIGLAKE_SEG_RARE_EVERY", 100_000);
+        let block_bytes = knob("SIGLAKE_SEG_BLOCK_BYTES", DEFAULT_TARGET_BLOCK_BYTES);
+
+        let mut writer = SegmentedWriter::new(block_bytes);
+        let mut n_terms = 0usize;
+        let mut group_start = 0usize;
+        while group_start < rows {
+            let group_end = (group_start + group_rows).min(rows);
+            // One group's text at a time: the whole corpus materialized would
+            // be ~400 MB of `String` at the default size.
+            let text: Vec<String> = (group_start..group_end)
+                .map(|row| measurement_row(row, rare_every))
+                .collect();
+            let group = InvertedIndex::from_rows(text.iter().map(String::as_str));
+            n_terms += group.terms().len();
+            writer.push_group_index(&group);
+            group_start = group_end;
+        }
+        let blob = writer.finish();
+        let blob_len = blob.len() as u64;
+        let reader = open(blob.clone());
+        let directory = encode_directory(reader.n_rows(), &reader.groups);
+        let n_blocks: usize = reader.groups.iter().map(|group| group.blocks.len()).sum();
+
+        println!(
+            "corpus {rows} rows, {} groups of {group_rows}, {n_terms} terms, \
+{n_blocks} blocks at {block_bytes} B",
+            reader.n_groups()
+        );
+        println!(
+            "blob {:.1} MiB = dictionary {:.1} + postings {:.1} + directory {:.1} KiB",
+            mib(blob_len),
+            mib(reader.dictionary_bytes()),
+            mib(reader.postings_bytes()),
+            directory.len() as f64 / 1024.0
+        );
+
+        // --- what one block's postings weigh -------------------------------
+        // A block's posting span runs from its own base to the next block's
+        // (the last one's to the end of the section). It is the unit a reader
+        // would have to fetch whole to verify a checksum over postings, and
+        // the unit a per-section codec could compress.
+        let mut spans: Vec<u64> = Vec::with_capacity(n_blocks);
+        let mut per_term: Vec<u64> = Vec::new();
+        for group in &reader.groups {
+            for (index, block) in group.blocks.iter().enumerate() {
+                let end = match group.blocks.get(index + 1) {
+                    Some(next) => next.postings_base,
+                    None => group.postings_len,
+                };
+                spans.push(end - block.postings_base);
+                let bytes = reader.read_block(group, block).expect("block verifies");
+                scan_block(&bytes, block.postings_base, |_, _, _, len| {
+                    per_term.push(u64::from(len));
+                    true
+                })
+                .expect("block walks");
+            }
+        }
+        spans.sort_unstable();
+        per_term.sort_unstable();
+        let median = |sorted: &[u64]| sorted[sorted.len() / 2];
+        println!(
+            "posting bytes per block: min {} median {} max {} | per term: median {} max {}",
+            spans[0],
+            median(&spans),
+            spans[spans.len() - 1],
+            median(&per_term),
+            per_term[per_term.len() - 1],
+        );
+
+        // --- checksum options ----------------------------------------------
+        let per_term_cost = 4 * n_terms as u64;
+        let per_block_cost = 4 * n_blocks as u64;
+        println!(
+            "checksum over postings: per term {:.1} MiB (+{:.1}% of blob), \
+per block {:.1} KiB (+{:.3}% of blob)",
+            mib(per_term_cost),
+            100.0 * per_term_cost as f64 / blob_len as f64,
+            per_block_cost as f64 / 1024.0,
+            100.0 * per_block_cost as f64 / blob_len as f64,
+        );
+        // What that costs a point lookup, which already fetches a whole
+        // dictionary block per group: the comparison the decision turns on is
+        // total fetched bytes, not the posting slice in isolation.
+        let mut block_lens: Vec<u64> = reader
+            .groups
+            .iter()
+            .flat_map(|group| group.blocks.iter().map(|block| u64::from(block.len)))
+            .collect();
+        block_lens.sort_unstable();
+        let today = median(&block_lens) + median(&per_term);
+        let verified = median(&block_lens) + median(&spans);
+        println!(
+            "per-block verification fetches the block's whole span, not one \
+term's slice: postings {} -> {} B, and a point lookup's bytes per group \
+{today} -> {verified} B ({:.2}x, dictionary block median {} B)",
+            median(&per_term),
+            median(&spans),
+            verified as f64 / today as f64,
+            median(&block_lens),
+        );
+
+        // --- compression ----------------------------------------------------
+        // Whole-blob zstd is what a Puffin-registered v1 sidecar pays and what
+        // a segmented one cannot use: `PuffinReader::blob` decompresses the
+        // whole thing, which is exactly the property the format exists to
+        // avoid. Per-block is the finest granularity that stays
+        // range-addressable.
+        let whole = zstd_len(&blob);
+        let mut dict_compressed = 0u64;
+        let mut postings_compressed = 0u64;
+        for group in &reader.groups {
+            for (index, block) in group.blocks.iter().enumerate() {
+                let bytes = reader.read_block(group, block).expect("block verifies");
+                dict_compressed += zstd_len(&bytes);
+                let end = match group.blocks.get(index + 1) {
+                    Some(next) => next.postings_base,
+                    None => group.postings_len,
+                };
+                let span = reader
+                    .source()
+                    .read(
+                        group.postings_offset + block.postings_base,
+                        (end - block.postings_base) as usize,
+                    )
+                    .expect("the span is inside the blob");
+                postings_compressed += zstd_len(&span);
+            }
+        }
+        let per_block_total = dict_compressed + postings_compressed + directory.len() as u64;
+        println!(
+            "zstd-3 whole blob {:.1} MiB ({:.2}x) | per block: dictionary \
+{:.1} MiB ({:.2}x), postings {:.1} MiB ({:.2}x), total with the directory \
+{:.1} MiB ({:.2}x)",
+            mib(whole),
+            whole as f64 / blob_len as f64,
+            mib(dict_compressed),
+            dict_compressed as f64 / reader.dictionary_bytes() as f64,
+            mib(postings_compressed),
+            postings_compressed as f64 / reader.postings_bytes() as f64,
+            mib(per_block_total),
+            per_block_total as f64 / blob_len as f64,
+        );
+
+        // --- the checksum's own cost ----------------------------------------
+        // What the writer and a cold open spend on CRCs: the writer checksums
+        // every dictionary block, an open checksums the directory.
+        let timed = |bytes: &[u8], f: fn(&[u8]) -> u32| {
+            let started = std::time::Instant::now();
+            let mut sink = 0u32;
+            let mut total = 0u64;
+            while started.elapsed() < std::time::Duration::from_millis(200) {
+                sink ^= f(bytes);
+                total += bytes.len() as u64;
+            }
+            std::hint::black_box(sink);
+            total as f64 / started.elapsed().as_secs_f64() / 1e9
+        };
+        // Over the blob itself, not a cache-resident sample: the writer's CRCs
+        // stream tens of MiB and the accelerated implementation is then
+        // bandwidth-bound rather than issue-bound.
+        let fast = timed(&blob, crc32);
+        let reference = timed(&blob, crc32_reference);
+        println!(
+            "crc32 over {:.1} MiB: crc32fast {fast:.2} GB/s, bytewise reference \
+{reference:.3} GB/s | per file: dictionary {:.1} ms vs {:.1} ms, directory \
+{:.2} ms vs {:.2} ms",
+            mib(blob_len),
+            reader.dictionary_bytes() as f64 / (fast * 1e9) * 1e3,
+            reader.dictionary_bytes() as f64 / (reference * 1e9) * 1e3,
+            directory.len() as f64 / (fast * 1e9) * 1e3,
+            directory.len() as f64 / (reference * 1e9) * 1e3,
+        );
     }
 }

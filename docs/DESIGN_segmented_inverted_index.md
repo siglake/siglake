@@ -1,11 +1,12 @@
 # Design — row-group-addressable inverted-index sidecars (#4376 prototype)
 
-Status (2026-09-16): **prototype, nothing wired.** The codec and its reader are
+Status (2026-09-17): **prototype, nothing wired.** The codec and its reader are
 `siglake_index::segmented`; the writer, the scan path and every default are
 untouched. This document is the format decision #4377 needs ahead of building
 postings during a streaming merge, and the specification the remaining slices
-implement: #4560 (the codec and its fixtures), #4561 (reader integration and
-bounded partial reads), #4562 (the measured proceed/revise/reject disposition).
+implement: #4560 (the codec, its fixtures and the format's open questions —
+settled below), #4561 (reader integration and bounded partial reads), #4562
+(the measured proceed/revise/reject disposition).
 
 It exists because the shipped format has one property that cannot be fixed by
 sizing a cache: **it is only readable whole.**
@@ -66,6 +67,19 @@ EOF-25     trailer                         fixed 25 bytes
 | per block: `offset`, `len` | varint, relative to `dict_offset` | the block's byte range |
 | per block: `postings_base` | varint, relative to `postings_offset` | the block's first term's postings |
 | per block: `crc` | `u32` LE | see [Integrity](#integrity) |
+
+The directory is not just a set of offsets a reader trusts. `open` refuses one
+whose sections do not **tile the body exactly** — group `i`'s postings, then its
+dictionary, in group order, from the end of the header to the start of the
+directory — and one whose block `postings_base` values do not start at 0,
+strictly ascend and end before their section does. Both checks exist because a
+range bounded only against `dir_offset` can overlap another section, and a
+block is bounded only by its own group's `dict_len`: an inflated one would let a
+lookup read a neighbouring group's postings as a dictionary block. Twenty
+fixtures cover the class — fifteen structural mutations and five hand-written
+directory bodies — each re-encoded with a recomputed `dir_crc` so it reaches the
+parser rather than stopping at the checksum
+(`a_directory_that_is_consistent_and_lies_about_the_structure_is_refused`).
 
 **Dictionary block**: `n_terms`, then per term `shared_prefix_len`,
 `suffix_len`, suffix bytes, `df`, `postings_len`. Terms ascend, so the shared
@@ -176,11 +190,28 @@ Three mechanisms, in the order they fire:
 - **The document frequency**, cross-checked against the postings decoded for a
   term, beside strict ascent and the group's row domain.
 
-And a third outcome in the API: `Lookup::{Rows, Absent, Unanswerable}`, where
-the v1 decoder returns `None` for both "absent" and "unparseable". Only
-`Unanswerable` may fall back to a scan; only `Absent` licenses skipping rows.
-The AND and substring entry points return `None` for "cannot answer" and
-`Some(vec![])` only for a definitive no-match.
+And a third outcome in the API, `Lookup::{Rows, Absent, Unanswerable}`, whose
+contract #4561 is written against:
+
+- **`Rows`** is strictly ascending, file-physical, and covers every row group
+  the lookup was allowed to read. The caller may skip every row not in it.
+- **`Absent`** is a definitive no-match over the groups the lookup covered. The
+  term normalizes, every kept group was read, none has it.
+- **`Unanswerable`** is "this index concluded nothing; scan". It is never
+  partial: a lookup that found rows in one group and could not read another
+  returns `Unanswerable`, not the rows it managed to get.
+
+Three things land in `Unanswerable` that a reader has to plan for. A term that
+does not normalize — where v1's `postings` returns `None` and its
+`matching_rows_all` then reads that as "no rows match", so a term too short to
+index licenses skipping every row in the file. A malformed section or a failed
+range read. And a **row-group selection this sidecar cannot serve**: the
+indices must be strictly ascending and in range, because an out-of-range index
+means the caller's row-group map and the sidecar disagree, and a repeated one
+would return a group's postings twice — and both `intersect_sorted` and
+`row_selection_runs` drop rows from a list that is not ascending. An *empty*
+selection is not malformed: the caller pruned every group, so nothing in the
+kept set matches, which is `Absent`.
 
 Exhaustive single-bit sweep, every bit of every byte, asking one present term
 for its rows (`report_single_bit_corruption_rates`):
@@ -199,15 +230,65 @@ on the remaining columns: v1 still conflates "absent" with "unparseable" 29
 times where the segmented reader never does, and only the segmented format can
 be read in part.
 
-The residual, identical in both formats, is the 120 (0.13% of flips): a bit flip
-inside a posting delta that leaves the varint count intact, the ordinals
-ascending and every one of them inside the row domain yields a different,
-structurally valid row set. Nothing short of a checksum over the postings sees
-it. A segmented reader could close it with a CRC per posting section, at 4 bytes
-per term, which on this corpus is ~4 bytes per row and about a third of the
-blob. That is not worth it for a superset selection whose rows are re-checked
-above the scan; it is the trade to revisit if postings ever feed an answer
-directly.
+The residual, identical in both formats at the codec level, is the 120 (0.13% of
+flips): a bit flip inside a posting delta that leaves the varint count intact,
+the ordinals ascending and every one of them inside the row domain yields a
+different, structurally valid row set. It is a wrong answer, not a wider one, and
+a row the scan never decodes is not recovered by re-checking the predicate above
+it. Nothing short of a checksum over the postings sees it.
+
+A mis-addressed posting range is the same hole reached from the other side, and
+a fixture pins what it does: a block's `postings_base` moved by one byte answers
+row 23 for a term whose row is 22
+(`a_directory_that_misaddresses_a_block_is_unanswerable_not_absent`). That one is
+not corruption — the directory is checksummed, so it can only arrive from a
+writer that computed the offset wrong — but it decodes the stated document
+frequency, ascending and in domain, and is therefore indistinguishable from a
+correct answer by everything the format checks.
+
+### Do posting sections need their own checksum?
+
+Not in `seg1`, and the reason is a number rather than a principle. Measured at
+the per-file scale above (`report_posting_checksum_and_compression_options`):
+
+| option | cost on disk | what a point lookup fetches per group | catches the residual |
+|---|---:|---:|---|
+| nothing (`seg1`) | — | 1,621 B | no |
+| CRC per term | 28.0 MiB, **+32.6%** of the blob | 1,621 B | yes |
+| CRC per block's posting span | 90.0 KiB, **+0.103%** | 2,563 B (**1.58x**) | yes |
+
+A point lookup reads one term's postings — a median of 3 bytes on this corpus —
+so a checksum it can verify without extra reads has to be per term, and 4 bytes
+per term against a median 3-byte posting list is where the 32.6% comes from. The
+alternative moves the unit to the one the reader already fetches whole: a CRC
+over each *block's* posting span costs 90.0 KiB and is verifiable only if the
+lookup fetches that span (a median 945 B) instead of the term's slice. Against
+the 1,618 B dictionary block it fetches anyway, that is 1.58x the bytes per
+group and still thousandths of a percent of the blob.
+
+The prototype takes neither, because nothing reads it yet and the exposure
+equals the shipped format's at the codec level. Two things should reopen it,
+and both belong to #4562's disposition rather than here:
+
+- **Registering uncompressed removes a checksum that exists today.** The v1
+  sidecar travels inside a Zstd frame written with `include_checksum(true)`
+  (`third_party/iceberg/src/compression.rs`), so in deployment a flipped bit
+  anywhere in it fails decompression and the file is scanned. An uncompressed
+  segmented blob has no such cover, and its posting sections are then the only
+  part of it no checksum spans.
+- **Per-block compression wants the same granularity** (see
+  [Publication semantics](#publication-semantics-what-4377-needs)), so a
+  version that compresses per block gets the checksum at no additional read
+  cost — the span is already the fetch unit.
+
+The checksum itself is IEEE CRC-32 from `crc32fast`, which the tree already
+carried behind flate2. The prototype's bytewise table ran at 0.531 GB/s against
+12.68 GB/s, which is 71.0 ms against 3.0 ms of writer time per file for the
+dictionary blocks, and 0.92 ms against 0.04 ms for the directory — a quarter of
+a 3.65 ms cold open spent checksumming it. `crc32_reference` in the module's
+tests writes the algorithm out and pins `crc32` against it and against the
+standard check vector, so which implementation computes a blob's checksums
+cannot change the bytes on disk.
 
 ## Publication semantics (what #4377 needs)
 
@@ -237,10 +318,35 @@ thing. **A segmented blob must be registered uncompressed**, and the reader
 needs a sub-range read against the statistics file rather than
 `PuffinReader::blob`. The cost of that is visible in the measurement: 85.8 MiB
 uncompressed against the ~16 MiB per file the Zstd'd v1 sidecar occupies on disk
-(#4329: 229 MB of statistics increment over 14 files). The prototype leaves
-sections uncompressed and states the trade rather than hiding it; per-section
-compression is a later version's concern, and the byte ranges the directory
-addresses do not change shape when a codec byte arrives.
+(#4329: 229 MB of statistics increment over 14 files).
+
+### What per-section compression would recover
+
+`seg1` stores every section uncompressed, and that is a prototype decision, not
+a property of the layout. Measured on the same file, at the zstd level Puffin
+uses (3):
+
+| | bytes | ratio |
+|---|---:|---:|
+| `seg1` as written | 85.8 MiB | 1.00x |
+| zstd over the whole blob (what a v1 sidecar pays, and what a range reader cannot use) | 16.3 MiB | 0.19x |
+| zstd per dictionary block | 2.5 MiB of 35.9 | 0.07x |
+| zstd per block posting span | 13.4 MiB of 49.4 | 0.27x |
+| per-block total, directory uncompressed | **16.4 MiB** | **0.19x** |
+
+Compressing at block granularity recovers the whole storage gap — 16.4 MiB
+against 16.3 MiB for whole-blob zstd, within 0.6% — while every section stays
+reachable by a range read. It is the same trade the per-block posting checksum
+asks for and for the same reason: the block's span becomes the unit the reader
+fetches whole, since nothing can be sliced out of a compressed block. A
+directory field per block would carry the compressed and raw lengths; the byte
+ranges the directory addresses do not change shape.
+
+That is a `seg2` question, deliberately left to #4562's disposition: it costs a
+decompression per lookup, the 1.58x fetched bytes above, and a format field that
+`seg1` has no reader for. What the measurement settles is that "85.8 MiB against
+16 MiB" is not an argument against the layout — it is the cost of this
+prototype's simplest choice.
 
 ## Measurements
 
@@ -403,7 +509,12 @@ What remains, in order:
 2. **#4562** — the six-shape harness with a third arm, cold and warm separately,
    under 1 GiB parsed / 256 MiB blob, plus the OFF control; that is where a
    proceed/revise/reject disposition for #4377 comes from.
-3. **An open question for #4561**: the substring sweep reads the whole
+3. **A `seg2` question for #4562's disposition**: per-block compression and a
+   per-block posting checksum, which are one decision — both need the block's
+   posting span to be the unit the reader fetches whole, and the measured price
+   of that is 1.58x the bytes a point lookup fetches per group. What they buy is
+   16.4 MiB per file instead of 85.8, and the end of the residual above.
+4. **An open question for #4561**: the substring sweep reads the whole
    dictionary, and `keyword`-class terms with millions of postings read megabytes
    of posting bytes. Both are regimes where partial reads buy little, and #4375's
    per-execution policy is the place to decline them. The document frequency a
@@ -418,14 +529,22 @@ cargo test -p siglake-index --release --test segmented_measure \
   report_segmented_vs_whole_file -- --ignored --nocapture
 cargo test -p siglake-index --release --test segmented_measure \
   report_single_bit_corruption_rates -- --ignored --nocapture
+cargo test -p siglake-index --release --lib \
+  report_posting_checksum_and_compression_options -- --ignored --nocapture
 ```
 
-Sized by `SIGLAKE_SEG_ROWS_PER_FILE` (7,340,000 above), `SIGLAKE_SEG_GROUP_ROWS`
+The first two are sized by `SIGLAKE_SEG_ROWS_PER_FILE` (7,340,000 above), `SIGLAKE_SEG_GROUP_ROWS`
 (1,048,576), `SIGLAKE_SEG_FILES` (14), `SIGLAKE_SEG_RUNS` (9),
 `SIGLAKE_SEG_PLAN_RUNS` (3), `SIGLAKE_SEG_RARE_EVERY` (100,000),
 `SIGLAKE_SEG_PARSED_BYTES` (1 GiB) and `SIGLAKE_SEG_BLOCK_BYTES` (4,096). Those
 are the values every table above was taken at; the run takes 14 minutes, almost
 all of it the v1 arm's 42 re-decodes per shape.
+
+The third is the checksum and compression table: 14 s, sized by
+`SIGLAKE_SEG_ROWS` (7,340,000), `SIGLAKE_SEG_GROUP_ROWS` (1,048,576),
+`SIGLAKE_SEG_RARE_EVERY` (100,000) and `SIGLAKE_SEG_BLOCK_BYTES` (4,096). Its
+byte counts reproduce the per-file section's exactly, which is what makes the
+two sets of figures comparable.
 
 The file's default `ROWS_PER_FILE` is 1,000,000, which finishes in about a
 minute and is a useful negative control rather than a smaller version of the
@@ -438,7 +557,8 @@ working set that exceeds the budget; where residency is free, this format costs.
 
 The codec's own fixtures run in the crate's normal test pass
 (`cargo test -p siglake-index`): v1 equivalence term by term, group-straddling
-ordinals, empty and partial groups, the reject path's read count, malformed
-blocks, truncated and corrupt blobs, the two formats' mutual refusal, unknown
-versions, the block-size trade, and per-group construction from an existing
-index.
+ordinals, empty and partial groups, the reject path's read count, the row-group
+selection contract, malformed blocks, truncated and corrupt blobs, twenty
+malformed directories re-encoded with recomputed CRCs, the two formats' mutual
+refusal, unknown versions, the checksum against a written-out reference, the
+block-size trade, and per-group construction from an existing index.
