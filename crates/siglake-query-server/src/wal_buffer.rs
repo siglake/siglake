@@ -1,11 +1,17 @@
 //! WS-6 real-time queryability: a WAL-backed in-memory buffer provider.
 //!
-//! Today a query sees `events` rows only **after** the compactor commits a
+//! Without it a query sees rows only **after** the compactor commits a
 //! WAL→Iceberg snapshot, so ingest-to-queryability lag is the seal threshold
 //! plus the compaction cycle. This module closes that gap by exposing the
 //! **un-committed** WAL segments — those in `sealed/` and `processing/`, i.e.
 //! sealed but not yet committed to Iceberg — as a queryable Arrow table, and
-//! unioning it with the Iceberg snapshot under the `events` name.
+//! unioning it with the Iceberg snapshot under the table's own name. That
+//! covers `events` ([`UnionEventsProvider::try_new`], WAL directory from
+//! [`resolve_tenant_wal_dir`]) and every managed user index a query references
+//! (#61: [`UnionEventsProvider::try_new_for_index`], which maps the
+//! carrier-shaped WAL batches through the index's doc-mapping first, over the
+//! per-index directory from [`resolve_index_wal_dir`]). `query_audit` is not
+//! buffered.
 //!
 //! ## Correctness model
 //!
