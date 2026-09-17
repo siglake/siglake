@@ -48,7 +48,9 @@ use tokio::time::sleep;
 use opendal::Operator;
 use siglake_core::index_config::{FieldType, IndexConfig};
 use siglake_core::mapping::map_carrier_batch_with_stats;
-use siglake_storage::catalog_claim::{ConsumedProofWatermark, ProofProvenance, SqlSegmentClaim};
+use siglake_storage::catalog_claim::{
+    ConsumedProofWatermark, LocalCommittedSegment, ProofProvenance, SqlSegmentClaim,
+};
 use siglake_storage::consumed_proof::{ConsumedProofEntry, ConsumedProofRead, ReclaimProofSources};
 use siglake_storage::iceberg::{
     AppendIncarnationMismatch, DeleteTaskState, IcebergContext, LevelPolicy, LeveledPassOptions,
@@ -56,17 +58,16 @@ use siglake_storage::iceberg::{
     ProofMaintenanceIncarnationMismatch, ReclusterPolicy, ShortAggregateOutcome,
 };
 use siglake_wal::{
-    claim_segment, finish_segment, list_index_dirs, list_orphaned, list_poisoned, list_sealed,
-    list_tenant_dirs, list_visible, quarantine_poison_segment, read_segment,
-    read_segment_from_bytes, recover_orphaned_processing, release_segment,
-    sweep_committed_coordinated,
+    claim_segment, finish_segment, list_committed, list_index_dirs, list_orphaned, list_poisoned,
+    list_sealed, list_tenant_dirs, list_visible, quarantine_poison_segment, read_segment,
+    read_segment_from_bytes, recover_orphaned_processing, release_segment, sweep_committed_gated,
 };
 
 /// How long to retain `committed/` segments before sweep deletes them.
 /// Gives secondary consumers (detector et al.) a wider catch-up window. This is
 /// the **soft floor** — committed segments are never swept before this, and are
 /// held longer if a fresh consumer hasn't processed them yet (see
-/// [`sweep_committed_coordinated`]).
+/// [`sweep_committed_gated`]).
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(60);
 /// Hard ceiling on `committed/` retention: a segment older than this is swept
 /// regardless of consumer watermarks, so a stuck/lagging consumer can't grow
@@ -320,6 +321,43 @@ const RETENTION_PAGE_OBJECTS: usize = 512;
 const RETENTION_OBJECT_DELETE_CONCURRENCY: usize = 32;
 const RETENTION_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Maximum NEW mirror-reclamation marks one cycle writes for one WAL directory
+/// (#4913).
+///
+/// The mark runs inline in the per-directory retention sweep, so its catalog
+/// round trips are on the drain's cycle. A segment is marked once per process
+/// (the per-directory cache holds the rest), but the first cycle after the knob
+/// is turned on — or after a restart — sees everything a whole
+/// [`CONSUMER_MAX_RETENTION`] window of commits left in `committed/`. Paging
+/// that turns an unbounded first cycle into a bounded one; the segments past
+/// the page keep their local evidence and are marked on a later cycle, which
+/// arrives long before the ceiling could sweep them unmarked.
+const MIRROR_MARK_PAGE_SEGMENTS: usize = 2_048;
+
+/// Whether the filesystem drain marks the `wal_segments` ledger so committed
+/// retention can reclaim its mirror objects (`SIGLAKE_MIRROR_LEDGER_RECLAIM`).
+///
+/// OFF by default. Turning it on gives the filesystem drain a claim-store
+/// dependency it does not have today, and the reclamation it enables deletes
+/// objects — so it is an operator's explicit choice per
+/// `docs/DESIGN_wal_mirror_reclamation.md`, not an upgrade's side effect.
+pub fn mirror_ledger_reclaim_enabled() -> bool {
+    mirror_ledger_reclaim_from(
+        std::env::var("SIGLAKE_MIRROR_LEDGER_RECLAIM")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The pure half, so the default and the accepted spellings are tested without
+/// mutating process-global environment.
+pub fn mirror_ledger_reclaim_from(configured: Option<&str>) -> bool {
+    matches!(
+        configured.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
 /// Resolve committed mirror retention from its raw environment value.
 ///
 /// Pure so configuration parsing can be tested without mutating the
@@ -570,6 +608,18 @@ pub struct Compactor {
     retention: Duration,
     fs_batch: FsBatchConfig,
     catalog: Option<CatalogClaimConfig>,
+    /// Ledger-only mirror reclamation for the filesystem drain (#4913): the
+    /// same claim store and mirror operator as [`Self::catalog`], attached
+    /// WITHOUT the claim path. Set only when `catalog` is `None`; the claim
+    /// drain already purges what it commits.
+    mirror_ledger: Option<CatalogClaimConfig>,
+    /// Per-WAL-directory segment ids this process has already seen durably
+    /// `committed` in the ledger, so the per-cycle re-mark over `committed/`
+    /// costs one catalog round trip per NEW file rather than per file. Shared
+    /// across clones, replaced (not accumulated) on every pass so it stays
+    /// bounded by the live `committed/` population. Correctness comes from the
+    /// ledger; a restart just re-marks.
+    mirror_marked: Arc<std::sync::Mutex<HashMap<PathBuf, BTreeSet<String>>>>,
     recluster: Option<ReclusterConfig>,
     expire: Option<ExpireConfig>,
     delete_tasks_enabled: bool,
@@ -631,6 +681,8 @@ impl Compactor {
                 max_bytes: DEFAULT_FS_MAX_BYTES,
             },
             catalog: None,
+            mirror_ledger: None,
+            mirror_marked: Default::default(),
             recluster: None,
             expire: None,
             delete_tasks_enabled: false,
@@ -1185,7 +1237,15 @@ impl Compactor {
     /// gone. That is inert (no path re-reads it) and the next pass removes it.
     /// The reverse order has no such benign failure.
     async fn run_retention_once(&self) -> usize {
-        let Some(max_age) = committed_retention() else {
+        self.run_retention_with(committed_retention()).await
+    }
+
+    /// [`Self::run_retention_once`] against an already-resolved window, so the
+    /// `SIGLAKE_COMMITTED_RETENTION_SECS=0` opt-out can be driven through
+    /// [`committed_retention_from`] in a test instead of the process
+    /// environment. `None` deletes nothing, which is what `0` means.
+    async fn run_retention_with(&self, max_age: Option<Duration>) -> usize {
+        let Some(max_age) = max_age else {
             return 0;
         };
         self.run_retention_bounded(max_age, RETENTION_RUN_OBJECTS, RETENTION_PAGE_OBJECTS)
@@ -1202,7 +1262,7 @@ impl Compactor {
     ) -> usize {
         use futures::StreamExt as _;
 
-        let Some(cfg) = self.catalog.as_ref() else {
+        let Some(cfg) = self.retention_cfg() else {
             return 0;
         };
         let page_objects = page_objects.max(1);
@@ -1295,6 +1355,14 @@ impl Compactor {
     /// maintenance would be far worse than duplicating it). Iceberg's CAS
     /// remains the correctness backstop either way -- this is about wasted work,
     /// not about safety.
+    ///
+    /// Deliberately reads the CLAIM config, not [`Self::retention_cfg`]: a
+    /// filesystem drain that opted into ledger mirror reclamation (#4913) gets
+    /// a claim-store connection for retention's sake, and electing its
+    /// reclustering, expiry and delete sweeps through it would let another
+    /// compactor's lease silently stop maintenance that runs unelected today.
+    /// The object-first retention delete has its own exclusion, which does
+    /// cover that mode: [`Self::acquire_mirror_reconciliation_lease`].
     async fn maintenance_lease(&self, purpose: &str) -> bool {
         let Some(cfg) = self.catalog.as_ref() else {
             return true;
@@ -1335,7 +1403,7 @@ impl Compactor {
     /// skipped repair or retention pass retries safely, while running without
     /// exclusion can recreate a purged row from a stale listing.
     async fn acquire_mirror_reconciliation_lease(&self) -> bool {
-        let Some(cfg) = self.catalog.as_ref() else {
+        let Some(cfg) = self.retention_cfg() else {
             return true;
         };
         match cfg
@@ -1368,7 +1436,7 @@ impl Compactor {
     /// release is safe: the lease TTL delays the next pass rather than allowing
     /// the two operations to overlap.
     async fn release_mirror_reconciliation_lease(&self) {
-        let Some(cfg) = self.catalog.as_ref() else {
+        let Some(cfg) = self.retention_cfg() else {
             return;
         };
         if let Err(e) = cfg
@@ -1495,6 +1563,48 @@ impl Compactor {
         );
         self.catalog = Some(cfg);
         self
+    }
+
+    /// Attach the claim store and the mirror operator for LEDGER-ONLY mirror
+    /// reclamation, without the claim path (#4913, `docs/DESIGN_wal_mirror_reclamation.md`
+    /// Option C).
+    ///
+    /// The filesystem drain commits out of local `sealed/` and never reads the
+    /// mirror, so nothing deleted the objects the ingester uploads — the prefix
+    /// grew for as long as the cluster ingested, and so did one `wal_segments`
+    /// row per object. This mode marks the rows the ingester already wrote for
+    /// the segments this drain committed, and lets the existing retention pass
+    /// delete the object and then the row.
+    ///
+    /// What stays OFF is the point: no `try_claim`, no mirror-to-catalog
+    /// reconciliation sweep, no abandoned-claim reclaim. This mode must never
+    /// register an object it did not commit, because registering by listing is
+    /// the only thing that could turn an unattributable object into a delete.
+    ///
+    /// Ignored when a catalog claim is already configured: that drain purges
+    /// what it claimed, which is stronger evidence than this path has.
+    pub fn with_mirror_ledger(mut self, cfg: CatalogClaimConfig) -> Self {
+        if self.catalog.is_some() {
+            tracing::warn!(
+                "mirror ledger reclamation ignored: the catalog-claim drain already \
+                 retains what it commits"
+            );
+            return self;
+        }
+        tracing::info!(
+            mirror_prefix = %cfg.prefix,
+            committed_retention = ?committed_retention(),
+            "ledger-only mirror reclamation enabled (no claiming, no mirror listing)"
+        );
+        self.mirror_ledger = Some(cfg);
+        self
+    }
+
+    /// The claim store and mirror operator committed retention deletes
+    /// through: the claim drain's own config, or the filesystem drain's
+    /// ledger-only one.
+    fn retention_cfg(&self) -> Option<&CatalogClaimConfig> {
+        self.catalog.as_ref().or(self.mirror_ledger.as_ref())
     }
 
     /// Enable periodic tier-2 re-clustering of the events table (off by default).
@@ -2229,7 +2339,7 @@ impl Compactor {
             // that drained at the top level and then moved to tenant subdirs
             // leaves a `committed/` tail here that no later cycle would reach,
             // because this branch is the one it lands in from now on.
-            self.sweep_retention_at(&self.wal_dir, "default");
+            self.sweep_retention_at(&self.wal_dir, "default").await;
         }
         for (tenant, dir) in tenants {
             let ice = self.ice_for_tenant(Some(&tenant)).await?;
@@ -2256,7 +2366,7 @@ impl Compactor {
                     // stops receiving writes still has a `committed/` tail from
                     // its last drain, and this branch is the only one it will
                     // ever reach again.
-                    self.sweep_retention_at(&index_dir, &tenant);
+                    self.sweep_retention_at(&index_dir, &tenant).await;
                     continue;
                 }
                 if ice
@@ -2283,7 +2393,7 @@ impl Compactor {
                     // stuck here is stuck here on EVERY later cycle too, so its
                     // `committed/` tail would be stranded for exactly the same
                     // reason.
-                    self.sweep_retention_at(&index_dir, &tenant);
+                    self.sweep_retention_at(&index_dir, &tenant).await;
                     continue;
                 }
                 // #2661: `index_dir` is keyed by the index NAME, so a
@@ -2317,7 +2427,7 @@ impl Compactor {
                         // next cycle drains.
                         let kept = list_sealed(&index_dir).map(|v| v.len()).unwrap_or(0);
                         backlog.observe_dir(&tenant, &index_dir, kept);
-                        self.sweep_retention_at(&index_dir, &tenant);
+                        self.sweep_retention_at(&index_dir, &tenant).await;
                         continue;
                     }
                 };
@@ -2582,25 +2692,184 @@ impl Compactor {
     /// so a busy multi-tenant deployment still stranded the tail for every
     /// tenant and index that went quiet, and the volume scaled with the rate
     /// that had been running rather than with how idle the system was.
-    fn sweep_retention_at(&self, dir: &Path, tenant_label: &str) {
-        match sweep_committed_coordinated(
+    ///
+    /// In ledger-only reclamation the sweep is also gated on the mark being
+    /// durable ([`Self::mark_mirror_ledger_at`]): a `committed/` file is the
+    /// local evidence that the segment's rows are in Iceberg, and destroying
+    /// it before the ledger says so would leave the mirror object with nothing
+    /// left to prove it can be deleted. The hard ceiling still wins, so a
+    /// catalog outage costs a bounded leak rather than an unbounded volume.
+    async fn sweep_retention_at(&self, dir: &Path, tenant_label: &str) {
+        let marked = self.mark_mirror_ledger_at(dir, tenant_label).await;
+        match sweep_committed_gated(
             dir,
             self.retention,
             CONSUMER_MAX_RETENTION,
             CONSUMER_STALE_AFTER,
+            marked.as_ref(),
         ) {
-            Ok(0) => {}
-            Ok(n) => {
+            Ok(swept) if swept.deleted == 0 => {}
+            Ok(swept) => {
                 tracing::debug!(
                     tenant = tenant_label,
-                    deleted = n,
+                    deleted = swept.deleted,
+                    unmarked = swept.unmarked,
                     "swept retention-expired segments"
                 );
-                metrics::counter!("siglake_compactor_segments_swept_total").increment(n as u64);
+                metrics::counter!("siglake_compactor_segments_swept_total")
+                    .increment(swept.deleted as u64);
+                if swept.unmarked > 0 {
+                    // The leak the ceiling buys, reported where an operator
+                    // can see it rather than inferred from a growing prefix.
+                    tracing::warn!(
+                        tenant = tenant_label,
+                        unmarked = swept.unmarked,
+                        ceiling_secs = CONSUMER_MAX_RETENTION.as_secs(),
+                        "swept locally-committed segments the ledger never accepted; \
+                         their mirror objects are now unreclaimable by this drain"
+                    );
+                    metrics::counter!("siglake_compactor_mirror_unreclaimed_total")
+                        .increment(swept.unmarked as u64);
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "retention sweep failed");
             }
+        }
+    }
+
+    /// Upsert a `committed` ledger row for every segment in `<dir>/committed/`,
+    /// and return the file names whose mark is durable — the sweep gate.
+    ///
+    /// Driven off the DIRECTORY, not off the commit return, which is what
+    /// makes it idempotent and crash-repairing: a compactor that dies between
+    /// the Iceberg append and the mark finds the file still in `committed/` on
+    /// its next cycle.
+    ///
+    /// A segment with a live `mirror-pending/` pin is skipped entirely. Its
+    /// upload is still owed, and a mark would let retention delete a key the
+    /// uploader is about to write — which leaks an object no pass revisits. A
+    /// pin that never clears is covered by the sweep's hard ceiling.
+    ///
+    /// `None` (no gate) whenever ledger reclamation is off, which is every
+    /// deployment that did not opt in.
+    async fn mark_mirror_ledger_at(
+        &self,
+        dir: &Path,
+        tenant_label: &str,
+    ) -> Option<BTreeSet<String>> {
+        let cfg = self.mirror_ledger.as_ref()?;
+        let committed = match list_committed(dir) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, dir = %dir.display(),
+                    "mirror ledger: could not list committed segments");
+                // No gate rather than an empty one: a listing failure is not
+                // evidence that nothing is marked, and an empty gate would
+                // hold every file to the ceiling and then call it a leak.
+                return None;
+            }
+        };
+        if committed.is_empty() {
+            return Some(BTreeSet::new());
+        }
+        let pinned = siglake_wal::mirror::mirror_pending_names(dir);
+        let subdir = self.mirror_subdir_for(dir);
+        let prefix = cfg.prefix.trim_matches('/');
+        let mut already: BTreeSet<String> = BTreeSet::new();
+        let mut pending = Vec::new();
+        {
+            let cache = self.mirror_marked.lock().expect("mirror mark cache");
+            let seen = cache.get(dir);
+            for path in &committed {
+                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if pinned.contains(name) {
+                    continue;
+                }
+                let id = name.trim_end_matches(".arrow").to_string();
+                if seen.is_some_and(|s| s.contains(&id)) {
+                    already.insert(name.to_string());
+                    continue;
+                }
+                let suffix = if subdir.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{subdir}/{name}")
+                };
+                let (tenant, index_id) = siglake_wal::mirror::parse_mirror_key_suffix(&suffix);
+                pending.push(LocalCommittedSegment {
+                    id,
+                    tenant,
+                    index_id,
+                    segment_url: format!("{prefix}/{suffix}"),
+                    bytes: path.metadata().map(|m| m.len() as i64).unwrap_or(0),
+                });
+            }
+        }
+        // Bound the catalog work one cycle can add to the drain. The mark runs
+        // inline in the per-directory sweep, and the first cycle after the knob
+        // is turned on sees every file a whole ceiling's worth of commits left
+        // behind. Segments past the page are marked on later cycles, long
+        // before that ceiling can sweep them unmarked.
+        if pending.len() > MIRROR_MARK_PAGE_SEGMENTS {
+            pending.truncate(MIRROR_MARK_PAGE_SEGMENTS);
+        }
+        let marked = if pending.is_empty() {
+            Vec::new()
+        } else {
+            match cfg.claim.mark_committed_local(&pending).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::warn!(error = %e, tenant = tenant_label,
+                        "mirror ledger: marking locally-committed segments failed; \
+                         holding their local evidence until the ceiling");
+                    metrics::counter!("siglake_compactor_mirror_mark_errors_total").increment(1);
+                    self.remember_marks(dir, &already);
+                    return Some(already);
+                }
+            }
+        };
+        metrics::counter!("siglake_compactor_mirror_marked_total").increment(marked.len() as u64);
+        for id in marked {
+            already.insert(format!("{id}.arrow"));
+        }
+        self.remember_marks(dir, &already);
+        Some(already)
+    }
+
+    /// Replace one WAL directory's remembered marks with the set this cycle
+    /// confirmed. Replacing rather than accumulating is what bounds the cache
+    /// by the live `committed/` population: an id whose file has been swept
+    /// drops out, and re-marking a segment whose row retention already purged
+    /// would resurrect it.
+    fn remember_marks(&self, dir: &Path, marked: &BTreeSet<String>) {
+        let ids = marked
+            .iter()
+            .map(|name| name.trim_end_matches(".arrow").to_string())
+            .collect();
+        self.mirror_marked
+            .lock()
+            .expect("mirror mark cache")
+            .insert(dir.to_path_buf(), ids);
+    }
+
+    /// The mirror key subdir for one WAL directory: `""` for the legacy root,
+    /// `<tenant>`, or `<tenant>/<index>` — the layout
+    /// [`siglake_wal::mirror::catch_up_sweep`] uploads under and
+    /// `parse_mirror_key_suffix` reads back.
+    fn mirror_subdir_for(&self, dir: &Path) -> String {
+        match dir.strip_prefix(&self.wal_dir) {
+            Ok(rel) => rel
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect::<Vec<_>>()
+                .join("/"),
+            // Not under this compactor's WAL root: the caller only ever passes
+            // directories it discovered there, so treat it as the root rather
+            // than inventing a key.
+            Err(_) => String::new(),
         }
     }
 
@@ -2644,7 +2913,7 @@ impl Compactor {
             // An idle directory is exactly where the previous drain's
             // `committed/` tail comes due: this is the only cycle shape that
             // will ever see those segments past the retention floor.
-            self.sweep_retention_at(dir, tenant_label);
+            self.sweep_retention_at(dir, tenant_label).await;
             return Ok(0);
         }
         // BIG-4 #4b: commit-accumulation gate. If batching is enabled
@@ -2665,7 +2934,7 @@ impl Compactor {
                 // hold a low-rate tenant off for many consecutive cycles, and
                 // `committed/` retention is independent of when the next
                 // commit happens.
-                self.sweep_retention_at(dir, tenant_label);
+                self.sweep_retention_at(dir, tenant_label).await;
                 return Ok(0);
             }
         }
@@ -2965,7 +3234,7 @@ impl Compactor {
             );
         }
 
-        self.sweep_retention_at(dir, tenant_label);
+        self.sweep_retention_at(dir, tenant_label).await;
 
         result
     }
@@ -7634,6 +7903,334 @@ mod committed_retention_tests {
             .await
             .unwrap()
             .is_empty());
+    }
+}
+
+/// Ledger-only mirror reclamation under the filesystem drain (#4913,
+/// `docs/DESIGN_wal_mirror_reclamation.md` Option C).
+///
+/// Each test seeds what a default install seeds: a segment sealed into the
+/// local WAL, its bytes in the mirror, and the `sealed` row the ingester's
+/// registrar writes for that upload. What varies is the state the reclaimer
+/// has to read it in.
+#[cfg(test)]
+mod mirror_ledger_reclaim_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use opendal::services::Memory;
+
+    use super::*;
+
+    struct Seeded {
+        compactor: Compactor,
+        claim: SqlSegmentClaim,
+        store: Operator,
+        wal: PathBuf,
+        id: String,
+        key: String,
+    }
+
+    /// A drain with ledger reclamation attached, a mirrored segment in
+    /// `sealed/`, and the ingester's row for it. `retention` is the local
+    /// `committed/` soft floor: `ZERO` lets the sweep act on the same cycle.
+    async fn seed(tmp: &std::path::Path, retention: Duration, register: bool) -> Seeded {
+        let wal = tmp.join("wal");
+        let store = Operator::new(Memory::default()).unwrap().finish();
+        let uri = format!("sqlite://{}?mode=rwc", tmp.join("claim.db").display());
+        let claim = SqlSegmentClaim::connect(&uri, "reclaim-test")
+            .await
+            .unwrap();
+
+        let mut writer =
+            siglake_wal::WalWriter::with_thresholds(&wal, "ing-a", 2, Duration::from_secs(60))
+                .unwrap();
+        let segment = writer
+            .append_events(&[
+                siglake_core::Event::now("one".to_string()),
+                siglake_core::Event::now("two".to_string()),
+            ])
+            .unwrap()
+            .expect("seals at the threshold");
+        drop(writer);
+        let id = segment
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_string();
+        let key = format!("wal-mirror/{id}.arrow");
+        let bytes = std::fs::read(&segment.path).unwrap();
+        let len = bytes.len() as i64;
+        store.write(&key, Bytes::from(bytes)).await.unwrap();
+        if register {
+            claim
+                .register(&id, "default", "", &key, len, 2)
+                .await
+                .unwrap();
+        }
+
+        let ice = Arc::new(IcebergContext::open(&tmp.join("warehouse")).await.unwrap());
+        let compactor = Compactor::with_retention(&wal, ice, retention).with_mirror_ledger(
+            CatalogClaimConfig {
+                claim: claim.clone(),
+                store: store.clone(),
+                prefix: "wal-mirror".to_string(),
+                batch_size: 0,
+                last_mirror_sync: Default::default(),
+                last_reclaim: Default::default(),
+            },
+        );
+        Seeded {
+            compactor,
+            claim,
+            store,
+            wal,
+            id,
+            key,
+        }
+    }
+
+    async fn purgeable(claim: &SqlSegmentClaim) -> Vec<String> {
+        claim
+            .purgeable_committed(Duration::ZERO, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, key)| key)
+            .collect()
+    }
+
+    fn committed_files(wal: &std::path::Path) -> Vec<String> {
+        list_committed(wal)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(str::to_string))
+            .collect()
+    }
+
+    /// The whole point: a segment the local drain committed has its mirror
+    /// object and its catalog row removed once `committedRetentionSecs` is up.
+    #[tokio::test]
+    async fn a_locally_committed_segment_is_reclaimed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), DEFAULT_RETENTION, true).await;
+
+        assert_eq!(s.compactor.run_once().await.unwrap(), 1);
+        assert_eq!(
+            purgeable(&s.claim).await,
+            vec![s.key.clone()],
+            "the drain's commit must transition the ingester's row"
+        );
+        // The age predicate is strict at millisecond precision.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            s.compactor.run_retention_with(Some(Duration::ZERO)).await,
+            1
+        );
+        assert!(!s.store.exists(&s.key).await.unwrap());
+        assert!(purgeable(&s.claim).await.is_empty());
+    }
+
+    /// The negative control, driven through the resolver rather than the
+    /// process environment: `SIGLAKE_COMMITTED_RETENTION_SECS=0` still means
+    /// delete nothing, reclamation or not.
+    #[tokio::test]
+    async fn the_retention_opt_out_reclaims_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), DEFAULT_RETENTION, true).await;
+
+        assert_eq!(s.compactor.run_once().await.unwrap(), 1);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            s.compactor
+                .run_retention_with(committed_retention_from(Some("0")))
+                .await,
+            0
+        );
+        assert!(s.store.exists(&s.key).await.unwrap());
+        assert_eq!(purgeable(&s.claim).await, vec![s.key]);
+    }
+
+    /// A segment with a live `mirror-pending/` pin still owes an upload.
+    /// Marking it would let retention delete a key the uploader is about to
+    /// write — an object no later pass revisits. So it is not marked, and its
+    /// local evidence is held rather than swept.
+    #[tokio::test]
+    async fn a_pinned_segment_is_neither_marked_nor_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), Duration::ZERO, true).await;
+        let name = format!("{}.arrow", s.id);
+        let pin = s.wal.join("mirror-pending").join(&name);
+        std::fs::create_dir_all(pin.parent().unwrap()).unwrap();
+        std::fs::hard_link(s.wal.join("sealed").join(&name), &pin).unwrap();
+
+        assert_eq!(s.compactor.run_once().await.unwrap(), 1);
+        assert!(
+            purgeable(&s.claim).await.is_empty(),
+            "a pinned segment must not be marked committed"
+        );
+        assert_eq!(
+            committed_files(&s.wal),
+            vec![name.clone()],
+            "and its local evidence must be held, despite a zero retention floor"
+        );
+
+        // The upload lands and the pin clears: the next cycle marks it.
+        std::fs::remove_file(&pin).unwrap();
+        s.compactor.run_once().await.unwrap();
+        assert_eq!(purgeable(&s.claim).await, vec![s.key.clone()]);
+        assert!(
+            committed_files(&s.wal).is_empty(),
+            "once the mark is durable the local copy is releasable"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            s.compactor.run_retention_with(Some(Duration::ZERO)).await,
+            1
+        );
+        assert!(!s.store.exists(&s.key).await.unwrap());
+    }
+
+    /// The crash the mark step is driven off `committed/` to repair: the
+    /// Iceberg append returned and the rename happened, then the process died
+    /// before marking. The next cycle finds the file and marks it, so the
+    /// object is still reclaimed.
+    #[tokio::test]
+    async fn a_crash_between_the_append_and_the_mark_is_repaired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), DEFAULT_RETENTION, true).await;
+        let name = format!("{}.arrow", s.id);
+        let committed = s.wal.join("committed").join(&name);
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::rename(s.wal.join("sealed").join(&name), &committed).unwrap();
+
+        // An idle cycle: nothing to commit, everything to repair.
+        assert_eq!(s.compactor.run_once().await.unwrap(), 0);
+        assert_eq!(purgeable(&s.claim).await, vec![s.key.clone()]);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            s.compactor.run_retention_with(Some(Duration::ZERO)).await,
+            1
+        );
+        assert!(!s.store.exists(&s.key).await.unwrap());
+    }
+
+    /// The mark has to be an UPSERT. The uploader's registration is
+    /// `ON CONFLICT DO NOTHING`, so a `committed` row written first survives a
+    /// late catch-up registration and retention still collects the object. An
+    /// update-only mark would find no row, write nothing, and leak.
+    #[tokio::test]
+    async fn a_mark_that_precedes_the_registration_still_collects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), DEFAULT_RETENTION, false).await;
+
+        assert_eq!(s.compactor.run_once().await.unwrap(), 1);
+        assert_eq!(
+            purgeable(&s.claim).await,
+            vec![s.key.clone()],
+            "the mark must insert the row the upload has not registered yet"
+        );
+        // The uploader's registrar catches up afterwards.
+        assert!(!s
+            .claim
+            .register(&s.id, "default", "", &s.key, 1, 2)
+            .await
+            .unwrap());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            s.compactor.run_retention_with(Some(Duration::ZERO)).await,
+            1
+        );
+        assert!(!s.store.exists(&s.key).await.unwrap());
+        assert!(purgeable(&s.claim).await.is_empty());
+    }
+
+    /// Segments of a dropped incarnation are quarantined into `stale/` by the
+    /// drain's owner check and never commit (the quarantine itself is covered
+    /// by `a_recreated_index_does_not_claim_the_dropped_incarnations_mirror`).
+    /// They are therefore never marked, and reclamation produces no delete:
+    /// an unattributable object is one only an operator-side lifecycle rule
+    /// may collect.
+    #[tokio::test]
+    async fn quarantined_segments_produce_no_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), Duration::ZERO, true).await;
+        let name = format!("{}.arrow", s.id);
+        let quarantine = s.wal.join("stale").join("00000000-dropped");
+        std::fs::create_dir_all(&quarantine).unwrap();
+        std::fs::rename(s.wal.join("sealed").join(&name), quarantine.join(&name)).unwrap();
+
+        assert_eq!(s.compactor.run_once().await.unwrap(), 0);
+        assert!(
+            purgeable(&s.claim).await.is_empty(),
+            "a quarantined segment must never be marked committed"
+        );
+        assert_eq!(
+            s.compactor.run_retention_with(Some(Duration::ZERO)).await,
+            0
+        );
+        assert!(s.store.exists(&s.key).await.unwrap());
+        assert!(quarantine.join(&name).exists());
+    }
+
+    /// Without the opt-in nothing changes: no mark, no reclamation, and the
+    /// local sweep is ungated exactly as before.
+    #[tokio::test]
+    async fn reclamation_is_off_unless_it_is_attached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), Duration::ZERO, true).await;
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse2"))
+                .await
+                .unwrap(),
+        );
+        let plain = Compactor::with_retention(&s.wal, ice, Duration::ZERO);
+
+        assert_eq!(plain.run_once().await.unwrap(), 1);
+        assert!(
+            purgeable(&s.claim).await.is_empty(),
+            "the row stays sealed forever, which is the limitation this closes"
+        );
+        assert!(
+            committed_files(&s.wal).is_empty(),
+            "and the ungated sweep still removes the local copy"
+        );
+        assert_eq!(plain.run_retention_with(Some(Duration::ZERO)).await, 0);
+        assert!(s.store.exists(&s.key).await.unwrap());
+    }
+
+    /// The mark page has to outpace segment creation, or `committed/` would
+    /// grow marks-behind forever; and a whole ceiling's worth of backlog has to
+    /// clear in far fewer cycles than the ceiling itself allows, or the first
+    /// cycle after a restart would sweep unmarked files and call them leaks.
+    #[test]
+    fn the_mark_page_outpaces_creation_and_clears_a_full_ceiling() {
+        const DOCUMENTED_EPS: usize = 50_000;
+        const ROWS_PER_SEGMENT: usize = 4_096;
+        let per_second = DOCUMENTED_EPS.div_ceil(ROWS_PER_SEGMENT);
+        assert!(
+            MIRROR_MARK_PAGE_SEGMENTS > per_second * 60,
+            "one page must cover a minute of the documented creation rate"
+        );
+        let ceiling_backlog = per_second * CONSUMER_MAX_RETENTION.as_secs() as usize;
+        let cycles = ceiling_backlog.div_ceil(MIRROR_MARK_PAGE_SEGMENTS);
+        assert!(
+            cycles < 60,
+            "a full ceiling's backlog must clear in {cycles} cycles, not a ceiling's worth"
+        );
+    }
+
+    #[test]
+    fn the_reclaim_knob_is_off_by_default_and_reads_the_usual_spellings() {
+        assert!(!mirror_ledger_reclaim_from(None));
+        for off in ["", "0", "false", "no", "off", "maybe"] {
+            assert!(!mirror_ledger_reclaim_from(Some(off)), "{off:?}");
+        }
+        for on in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(mirror_ledger_reclaim_from(Some(on)), "{on:?}");
+        }
     }
 }
 

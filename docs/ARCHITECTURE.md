@@ -159,6 +159,32 @@ this is an S3 measurement: AWS run 65 measured the S3 uploader at least 64
 seconds behind at about 15 seals/s, and the former 60-second committed-file
 reaper removed 285 segments before their first upload attempt.
 
+**Reclaiming mirror objects.** Committed retention
+(`compactor.committedRetentionSecs`, default 24 h, `0` opts out, non-zero
+floored at 901 s) deletes a mirror object and then its `wal_segments` row —
+object first, so an interruption leaves a committed row with no object, which
+is inert, rather than an unknown object a listing would re-register and drain
+twice. That pass belongs to the catalog-claim drain, which knows an object was
+committed because it is the thing that claimed it. The filesystem drain commits
+out of local `sealed/` and never reads the mirror, so it reclaimed nothing at
+all until `compactor.mirrorLedgerReclaim` (off by default). With that on, the
+compactor attaches the claim store and the mirror operator **without** the
+claim path — no `try_claim`, no mirror-to-catalog reconciliation, no
+abandoned-claim reclaim, so it can never register an object it did not commit —
+and upserts the ingester's row from `sealed` to `committed` for each file in
+local `committed/`. The mark is driven off that directory rather than off the
+commit return, which makes it idempotent and repairs a crash between the
+Iceberg append and the mark; it skips segments holding a live `mirror-pending/`
+pin, whose upload is still owed; and the local sweep is gated on it, so local
+commit evidence is destroyed only after remote evidence exists. The 3600 s
+`committed/` ceiling still wins over that gate — a catalog outage costs a
+bounded leak, counted in `siglake_compactor_mirror_unreclaimed_total`, rather
+than an unbounded WAL volume. Objects no local drain ever committed (a dropped
+incarnation's quarantined segments, an ingester whose volume was lost) are
+deliberately left to an operator-side lifecycle rule.
+`docs/DESIGN_wal_mirror_reclamation.md` prices the three options and
+`docs/LIMITATIONS.md` states what remains uncollected.
+
 **Drain.** The drain claims bounded batches (default ≤64 segments / 64 MiB per
 commit) and keeps `SIGLAKE_DRAIN_CONCURRENCY` commits in flight
 *continuously* — topping up the moment one lands, re-listing `sealed/` as new

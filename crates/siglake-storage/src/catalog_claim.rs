@@ -151,6 +151,37 @@ pub(crate) const WATERMARK_ESTABLISH_SQL: &str = "INSERT INTO consumed_proof_wat
          acknowledged_through_ms = excluded.acknowledged_through_ms, \
          table_uuid = excluded.table_uuid";
 
+/// The three statements of the local-drain mirror-reclamation mark (#4913),
+/// named so they can be parse-gated against the Postgres dialect: this store
+/// has no live Postgres in CI, and a Postgres-only syntax error here would be a
+/// silent runtime failure on the path that decides which mirror objects may be
+/// deleted.
+///
+/// `placeholders` is the `?, ?, …` list for one chunk of ids. The single `?`
+/// inside `COALESCE` comes FIRST in the text, so it binds first.
+fn local_mark_update_sql(placeholders: &str) -> String {
+    format!(
+        "UPDATE wal_segments \
+             SET status = 'committed', \
+                 committed_at_ms = COALESCE(committed_at_ms, ?) \
+             WHERE id IN ({placeholders}) \
+               AND status IN ('sealed', 'committed')"
+    )
+}
+
+fn local_mark_readback_sql(placeholders: &str) -> String {
+    format!(
+        "SELECT id FROM wal_segments \
+         WHERE id IN ({placeholders}) AND status = 'committed'"
+    )
+}
+
+const LOCAL_MARK_INSERT_SQL: &str = "INSERT INTO wal_segments \
+         (id, tenant, index_id, segment_url, bytes, rows, \
+          status, committed_at_ms, registered_at_ms) \
+         VALUES (?, ?, ?, ?, ?, 0, 'committed', ?, ?) \
+     ON CONFLICT(id) DO NOTHING";
+
 /// Unix-millis representation. We store timestamps as `BIGINT` to
 /// dodge the cross-dialect (sqlite ↔ postgres) chrono ↔ timestamptz
 /// type-mapping mismatch when binding through `sqlx::AnyPool`.
@@ -219,6 +250,25 @@ pub struct ClaimedSegment {
     pub bytes: i64,
     pub rows: i64,
     pub claimed_at: DateTime<Utc>,
+}
+
+/// A segment the local filesystem drain committed, for
+/// [`SqlSegmentClaim::mark_committed_local`].
+///
+/// `segment_url` must be the key the uploader wrote — root-relative
+/// `<mirror prefix>/<tenant>/<index>/<id>.arrow`, the same string
+/// [`SqlSegmentClaim::register`] records — because that is the key retention
+/// deletes. It is only used when the row is absent; where a registered row
+/// exists, its own `segment_url` is preserved.
+#[derive(Debug, Clone)]
+pub struct LocalCommittedSegment {
+    /// Segment id: the file basename without `.arrow`.
+    pub id: String,
+    pub tenant: String,
+    /// User-index id, or the empty string for the built-in `events` table.
+    pub index_id: String,
+    pub segment_url: String,
+    pub bytes: i64,
 }
 
 /// Catalog-tracked claim coordinator. Cheap to clone — wraps a
@@ -875,6 +925,99 @@ impl SqlSegmentClaim {
             }
         }
         Ok(())
+    }
+
+    /// Mark segments the LOCAL filesystem drain committed, for mirror
+    /// reclamation under a drain that never claimed them (#4913).
+    ///
+    /// This is deliberately not [`Self::mark_committed`]: that one requires
+    /// `status = 'processing' AND claimer = ?`, and there is no claim here —
+    /// the evidence is the drain's own `committed/` rename, which is ordered
+    /// after its Iceberg append. It also writes NO consumed-proof watermark:
+    /// that boundary exists to let claim reclaim decide whether an abandoned
+    /// claim was already committed, and this path leaves no claims to reclaim.
+    ///
+    /// An UPSERT, not an UPDATE. A late `catch_up_sweep` registration is
+    /// `ON CONFLICT DO NOTHING` (see [`Self::register`]), so it cannot undo a
+    /// `committed` row written first — but an update-only mark would lose the
+    /// reverse race (mark before the upload registers) and leak the object,
+    /// because retention only ever sees rows.
+    ///
+    /// `committed_at_ms` is stamped once and then preserved: the caller
+    /// re-marks from `committed/` every cycle, and re-stamping would keep
+    /// pushing the retention clock forward for as long as the local file
+    /// lives. Only a `sealed` or already-`committed` row is touched; a
+    /// `processing`, `released` or quarantined row belongs to a claim-mode
+    /// drain and is left exactly as it is.
+    ///
+    /// Returns the ids whose `committed` row is durable after this call — the
+    /// only ones whose local evidence the caller may then destroy.
+    pub async fn mark_committed_local(
+        &self,
+        segments: &[LocalCommittedSegment],
+    ) -> Result<Vec<String>> {
+        let mut durable = Vec::new();
+        for chunk in segments.chunks(256) {
+            let ids: Vec<&str> = chunk.iter().map(|s| s.id.as_str()).collect();
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let q = self.dialect.rewrite(&local_mark_update_sql(&placeholders));
+            let mut query = sqlx::query(&q).bind(now_millis());
+            for id in &ids {
+                query = query.bind(*id);
+            }
+            query
+                .execute(&self.pool)
+                .await
+                .context("mark locally-committed wal segments")?;
+            // Read back rather than trusting `rows_affected`: it cannot say
+            // WHICH ids transitioned, and a row left in another state must not
+            // be reported as marked.
+            let read_q = self
+                .dialect
+                .rewrite(&local_mark_readback_sql(&placeholders));
+            let mut read = sqlx::query_scalar::<_, String>(&read_q);
+            for id in &ids {
+                read = read.bind(*id);
+            }
+            let marked: std::collections::BTreeSet<String> = read
+                .fetch_all(&self.pool)
+                .await
+                .context("read back locally-committed wal segments")?
+                .into_iter()
+                .collect();
+            for segment in chunk {
+                if marked.contains(&segment.id) {
+                    durable.push(segment.id.clone());
+                    continue;
+                }
+                // Absent, or in a state this path must not touch. Insert-only:
+                // a conflict means a row appeared between the UPDATE and here
+                // (the registrar's `sealed`, or a claim), and the next cycle's
+                // UPDATE picks that up rather than overwriting it now.
+                let insert = self.dialect.rewrite(LOCAL_MARK_INSERT_SQL);
+                let now = now_millis();
+                let inserted = sqlx::query(&insert)
+                    .bind(&segment.id)
+                    .bind(&segment.tenant)
+                    .bind(&segment.index_id)
+                    .bind(&segment.segment_url)
+                    .bind(segment.bytes)
+                    .bind(now)
+                    .bind(now)
+                    .execute(&self.pool)
+                    .await
+                    .with_context(|| {
+                        format!("insert locally-committed wal segment {}", segment.id)
+                    })?
+                    .rows_affected();
+                if inserted > 0 {
+                    durable.push(segment.id.clone());
+                }
+            }
+        }
+        Ok(durable)
     }
 
     /// Catalog-certified low watermark for one Iceberg target. Every segment
@@ -3399,5 +3542,160 @@ mod crash_window_tests {
         );
         // And a committed row can never be requeued by the other branch.
         assert_eq!(c.requeue_claims(&["s4".to_string()]).await.unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod local_commit_mark_tests {
+    use super::*;
+
+    async fn fresh() -> (SqlSegmentClaim, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("sqlite://{}/c.db?mode=rwc", tmp.path().display());
+        let c = SqlSegmentClaim::connect(&uri, "t".to_string())
+            .await
+            .unwrap();
+        (c, tmp)
+    }
+
+    fn local(id: &str) -> LocalCommittedSegment {
+        LocalCommittedSegment {
+            id: id.to_string(),
+            tenant: "default".to_string(),
+            index_id: String::new(),
+            segment_url: format!("wal-mirror/{id}.arrow"),
+            bytes: 7,
+        }
+    }
+
+    async fn row(c: &SqlSegmentClaim, id: &str) -> Option<(String, Option<i64>, String)> {
+        sqlx::query_as::<_, (String, Option<i64>, String)>(
+            "SELECT status, committed_at_ms, segment_url FROM wal_segments WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&c.pool)
+        .await
+        .unwrap()
+    }
+
+    /// #4913: the local drain's mark transitions the row the INGESTER wrote,
+    /// keeping the key the uploader used, and inserts one where the upload has
+    /// not registered yet — so a late `ON CONFLICT DO NOTHING` registration
+    /// cannot take the object back out of retention's reach.
+    #[tokio::test]
+    async fn the_local_mark_upserts_sealed_rows_and_absent_ones() {
+        let (c, _t) = fresh().await;
+        c.register("reg", "default", "", "wal-mirror/reg.arrow", 11, 3)
+            .await
+            .unwrap();
+        let marked = c
+            .mark_committed_local(&[local("reg"), local("absent")])
+            .await
+            .unwrap();
+        assert_eq!(marked, vec!["reg".to_string(), "absent".to_string()]);
+        let (status, committed_at, url) = row(&c, "reg").await.unwrap();
+        assert_eq!(status, "committed");
+        assert!(committed_at.is_some());
+        assert_eq!(url, "wal-mirror/reg.arrow", "the uploader's key is the key");
+        assert_eq!(row(&c, "absent").await.unwrap().0, "committed");
+        // The late registration loses, as `register` is insert-ignore.
+        assert!(!c
+            .register("absent", "default", "", "wal-mirror/absent.arrow", 1, 1)
+            .await
+            .unwrap());
+        assert_eq!(row(&c, "absent").await.unwrap().0, "committed");
+        // Both are now purgeable by the unchanged retention pass.
+        let purgeable = c.purgeable_committed(Duration::ZERO, 10).await.unwrap();
+        let keys: Vec<&str> = purgeable.iter().map(|(_, k)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["wal-mirror/reg.arrow", "wal-mirror/absent.arrow"]
+        );
+    }
+
+    /// The mark runs every cycle for as long as the file is in `committed/`.
+    /// Re-stamping `committed_at_ms` would push retention's clock forward each
+    /// time and the object would never come due.
+    #[tokio::test]
+    async fn re_marking_preserves_the_first_committed_timestamp() {
+        let (c, _t) = fresh().await;
+        c.mark_committed_local(&[local("s")]).await.unwrap();
+        let first = row(&c, "s").await.unwrap().1.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let marked = c.mark_committed_local(&[local("s")]).await.unwrap();
+        assert_eq!(
+            marked,
+            vec!["s".to_string()],
+            "idempotent, and still durable"
+        );
+        assert_eq!(row(&c, "s").await.unwrap().1.unwrap(), first);
+    }
+
+    /// A claim-mode drain owns its `processing` rows. The local mark must not
+    /// take one over — that drain will mark it with its own claimer guard, and
+    /// its consumed-proof watermark depends on the transition.
+    #[tokio::test]
+    async fn the_local_mark_leaves_claimed_rows_alone() {
+        let (c, _t) = fresh().await;
+        c.register("held", "default", "", "wal-mirror/held.arrow", 1, 1)
+            .await
+            .unwrap();
+        c.try_claim(1).await.unwrap();
+        let marked = c.mark_committed_local(&[local("held")]).await.unwrap();
+        assert!(
+            marked.is_empty(),
+            "a claimed segment's local evidence must be held, not released"
+        );
+        assert_eq!(row(&c, "held").await.unwrap().0, "processing");
+    }
+
+    /// The deployed catalog is Postgres and this store has none in CI, so a
+    /// Postgres-only syntax error in the mark would be a silent runtime failure
+    /// on the path that decides which mirror objects may be deleted. Parse each
+    /// statement in the form the Postgres dialect actually sends.
+    #[test]
+    fn every_local_mark_statement_parses_as_postgres() {
+        use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+        use datafusion::sql::sqlparser::parser::Parser;
+
+        let placeholders = "?, ?";
+        for sql in [
+            local_mark_update_sql(placeholders),
+            local_mark_readback_sql(placeholders),
+            LOCAL_MARK_INSERT_SQL.to_string(),
+        ] {
+            let rendered = Dialect::Postgres.rewrite(&sql);
+            assert!(!rendered.contains('?'), "unrewritten marker in {rendered}");
+            let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &rendered)
+                .unwrap_or_else(|e| panic!("does not parse as Postgres: {e}\n{rendered}"));
+            assert_eq!(parsed.len(), 1, "one statement per execute(): {rendered}");
+        }
+    }
+
+    /// The bind order is the text order, and getting it wrong binds a timestamp
+    /// as an id (or an id as a timestamp) only on Postgres, where the markers
+    /// are numbered. `$1` must be the COALESCE timestamp.
+    #[test]
+    fn the_mark_update_binds_its_timestamp_first() {
+        let rendered = Dialect::Postgres.rewrite(&local_mark_update_sql("?, ?"));
+        assert!(
+            rendered.contains("COALESCE(committed_at_ms, $1)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("id IN ($2, $3)"), "{rendered}");
+    }
+
+    /// There are no claims to reclaim on this path, so the mark writes no
+    /// consumed-proof boundary: a watermark written without a terminal claim
+    /// transition is exactly the unproved acknowledgement #2889 refuses.
+    #[tokio::test]
+    async fn the_local_mark_writes_no_consumed_proof_watermark() {
+        let (c, _t) = fresh().await;
+        c.mark_committed_local(&[local("s")]).await.unwrap();
+        assert!(c
+            .consumed_proof_watermark("default", "")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

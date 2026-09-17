@@ -465,6 +465,28 @@ compactor:
   # beyond the sum if either local-WAL window is increased. Set it to 0 if the
   # local-WAL sweep is disabled but mirror catch-up remains on.
   committedRetentionSecs: 86400
+  # Let the FILESYSTEM drain reclaim mirror objects too (off by default).
+  #
+  # `committedRetentionSecs` above is enforced by the catalog-claim drain, which
+  # deletes an object because it is the thing that claimed and committed it.
+  # The default single-replica compactor drains local `<wal>/sealed/` and never
+  # reads the mirror, so it purges nothing: the mirror prefix, and the
+  # `wal_segments` row the ingester writes per upload, grow for as long as the
+  # cluster ingests. See `docs/LIMITATIONS.md`.
+  #
+  # With this on, the compactor connects the catalog and the mirror store
+  # WITHOUT claiming: it marks the ingester's row `committed` for each segment
+  # it committed out of local `committed/`, and the same retention pass then
+  # deletes the object and the row. It never registers an object it did not
+  # commit, so a segment no local drain ever committed — a dropped index
+  # incarnation's, or one whose ingester volume was lost — is still left for an
+  # object-store lifecycle rule. Needs `catalogUri` and `s3.warehouseUrl` set
+  # and a non-empty `wal.mirror.prefix`; the compactor warns and keeps draining
+  # if they are not.
+  #
+  # Being opt-in is deliberate: it deletes objects, and it gives a drain that
+  # needs no claim-store connection today a dependency on one.
+  mirrorLedgerReclaim: false
   # Dense extraction: promote declared OTLP attributes out of the
   # `attributes` JSON into their own typed columns (Parquet stats/bloom pruning
   # + clean typed SQL, vs `attr_get()` over the JSON). Each entry is

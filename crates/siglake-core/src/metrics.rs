@@ -275,6 +275,19 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
         name: "siglake_compactor_reclaim_unprovable_total",
         series: UNLABELLED,
     },
+    // #4913: a mirror object the ledger mark never reached, swept locally at
+    // the 3600-second ceiling so the WAL volume stays bounded. Both series
+    // exist at 0 on every compactor, whether or not mirror reclamation is on:
+    // the dashboard panel that reads them has to distinguish "off" and "on and
+    // leaking nothing" from "no data".
+    AlertedCounter {
+        name: "siglake_compactor_mirror_unreclaimed_total",
+        series: UNLABELLED,
+    },
+    AlertedCounter {
+        name: "siglake_compactor_mirror_mark_errors_total",
+        series: UNLABELLED,
+    },
     AlertedCounter {
         name: "siglake_compactor_watchdog_trips_total",
         series: &[

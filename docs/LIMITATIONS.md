@@ -764,34 +764,58 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   start-to-start, so a backlog does not wait another interval after a long pass;
   even one full budget per default 600s watchdog window is more than twice the
   documented 50K-EPS segment-creation rate.
-- **Nothing reclaims mirror objects unless the drain claims from them.** WAL
-  mirroring is on by default; the retention pass above belongs to the
-  catalog-claim drain, which knows an object was committed because it is the
-  thing that claimed it. The default single-replica compactor drains local
-  `sealed/` instead and never reads the mirror, so the prefix grows for as
-  long as the cluster ingests. The DR copy retains every sealed segment: the
-  asynchronous uploader holds a durable `mirror-pending/` link across local
-  compaction and retention, and the catch-up sweep resumes pins left by an
-  outage or process exit. Nothing expires remote objects, and the
-  `wal_segments` row the ingester writes for each uploaded object is never
-  purged either: retention only deletes `committed` rows, and under the local
-  drain no row reaches that state. At the 20K EPS / 4,096-event roll measured in
-  `docs/PERF_WAL_MIRROR_2026-09-11.md` that is 421,632 objects, 37.3 GB and the
-  same number of catalog rows per day. Give the mirror prefix an object-store
-  lifecycle expiry longer than your worst-case drain backlog, or run the claim
-  drain (`compactor.catalogClaim.enabled`), which purges what it commits.
-  Turning the mirror off (`wal.mirror.enabled: false`, or an empty
-  `SIGLAKE_WAL_MIRROR_PREFIX`) is the third option, and gives up the
-  off-volume copy. Two things to get right when writing that rule. The prefix to
-  match is `<s3.warehousePrefix>/<wal.mirror.prefix>/`: the uploader's object
-  store is rooted at the warehouse URL, so mirror keys sit under the warehouse
-  prefix rather than beside it. And the Terraform module adds no current-object
-  expiry for any prefix — `deploy/terraform/aws/s3.tf` has one optional rule,
-  gated on `warehouse_lifecycle_days_to_glacier`, that transitions the whole
-  bucket to `GLACIER_IR` and expires noncurrent versions; when it is on it
-  already covers mirror objects, transitioning them rather than removing them.
-  `docs/DESIGN_wal_mirror_reclamation.md` prices this against a commit-proven
-  reclaimer for the local drain.
+- **The filesystem drain reclaims mirror objects only if you turn it on, and
+  never the ones it did not commit.** WAL mirroring is on by default; the
+  retention pass above belongs to the catalog-claim drain, which knows an
+  object was committed because it is the thing that claimed it. The default
+  single-replica compactor drains local `sealed/` instead and never reads the
+  mirror, so out of the box it purges nothing: the prefix grows for as long as
+  the cluster ingests, and so does the `wal_segments` row the ingester writes
+  per uploaded object, because retention only deletes `committed` rows and no
+  row reaches that state under this drain. At the 20K EPS / 4,096-event roll
+  measured in `docs/PERF_WAL_MIRROR_2026-09-11.md` that is 421,632 objects,
+  37.3 GB and the same number of catalog rows per day.
+
+  `compactor.mirrorLedgerReclaim` (`SIGLAKE_MIRROR_LEDGER_RECLAIM`, off by
+  default) closes that for the segments this drain commits: it connects the
+  catalog and the mirror store WITHOUT claiming, marks the ingester's row
+  `committed` for each file in local `committed/`, and lets the same retention
+  pass delete the object and then the row — bounded by
+  `committedRetentionSecs`, whose `0` still means delete nothing. It needs
+  `catalogUri`, `s3.warehouseUrl` and a non-empty `wal.mirror.prefix`; without
+  them the compactor warns and keeps draining. Being opt-in is deliberate: it
+  deletes objects, and it gives a drain that needs no claim-store connection
+  today a dependency on one. Default-on waits on a retained object-store
+  acceptance run and a separate release decision.
+
+  Two populations stay outside it either way. A segment no local drain ever
+  committed — a dropped index incarnation's, quarantined into `stale/`, or one
+  whose ingester volume was lost before it drained — is never marked and is
+  never deleted, by design: registering an unattributable object would be the
+  one thing that could turn a listing into a delete. And a locally-committed
+  segment whose mark never became durable (a Postgres outage longer than the
+  3600s `committed/` ceiling) has its local copy swept anyway, to keep the WAL
+  volume bounded, and its object counted in
+  `siglake_compactor_mirror_unreclaimed_total` — a leak that needs the
+  lifecycle rule below or a manual pass. `_active/` blobs are outside all of
+  it (#4914).
+
+  So an object-store lifecycle expiry longer than your worst-case drain backlog
+  remains the operator-side complement, and the only thing that collects those
+  three populations. Two things to get right when writing that rule. The prefix
+  to match is `<s3.warehousePrefix>/<wal.mirror.prefix>/`: the uploader's
+  object store is rooted at the warehouse URL, so mirror keys sit under the
+  warehouse prefix rather than beside it. And the Terraform module adds no
+  current-object expiry for any prefix — `deploy/terraform/aws/s3.tf` has one
+  optional rule, gated on `warehouse_lifecycle_days_to_glacier`, that
+  transitions the whole bucket to `GLACIER_IR` and expires noncurrent
+  versions; when it is on it already covers mirror objects, transitioning them
+  rather than removing them. Running the claim drain
+  (`compactor.catalogClaim.enabled`) is the other way to get reclamation, and
+  turning the mirror off (`wal.mirror.enabled: false`, or an empty
+  `SIGLAKE_WAL_MIRROR_PREFIX`) gives up the off-volume copy.
+  `docs/DESIGN_wal_mirror_reclamation.md` records why this shape was chosen
+  over a lifecycle default and over a compactor-owned journal.
 - **The embedded compactor is a single-process shape, and the chart refuses
   it.** `ingest-server --with-compactor` runs the drain and the maintenance
   loop inside the ingester; the dev quickstart and the bench scripts use it.

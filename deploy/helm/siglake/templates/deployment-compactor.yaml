@@ -134,6 +134,12 @@ spec:
               value: {{ .Values.compactor.snapshotExpire.retainLast | quote }}
             - name: SIGLAKE_COMMITTED_RETENTION_SECS
               value: {{ .Values.compactor.committedRetentionSecs | quote }}
+            # Ledger-only mirror reclamation for the filesystem drain. Rendered
+            # in both states: the opt-out has to be explicit, because turning
+            # this on gives that drain a claim-store dependency and lets it
+            # delete mirror objects.
+            - name: SIGLAKE_MIRROR_LEDGER_RECLAIM
+              value: {{ ternary "1" "0" .Values.compactor.mirrorLedgerReclaim | quote }}
             # Search: build a per-file inverted index (term → row ordinals) into
             # each events data file's footer KV. Render both states so false is
             # an explicit binary opt-out rather than an omitted default.

@@ -833,6 +833,40 @@
    "description": "Both counters count refusal EVENTS, which is not a count of distinct objects held back: a mirrored object requeued out of quarantine and refused again counts again, and a filesystem segment whose move under stale/ fails stays in sealed/ and is counted on every cycle that re-examines it. Owner mismatch is the prefix-level finding — a WAL directory or a mirror key prefix stamped for a dropped incarnation of the index. On the filesystem it counts the segments that move under stale/; on the mirror there is nothing to move, so it counts the re-stamp, once. Segment refusals are per object: a frame header naming a table the index no longer resolves to, or (under a prefix that has itself named a dropped table) an object carrying no identity at all. Filesystem segments go under stale/; mirrored objects stay where they are and their claim is quarantined on the cycle that refuses it, since no retry can change a verdict a never-reused table uuid makes terminal — which Segments quarantined and SiglakeSegmentsQuarantined already read. The cumulative arms are here because both series are labelled by tenant and appear only with their first increment, so a single filesystem event has no rate to read but does move the total. Above zero with the drain otherwise healthy is the narrow case #2729 left behind: the index commits normally while individual objects are held back, and requeue_quarantined is the deliberate way back."
   },
   {
+   "id": 163,
+   "type": "timeseries",
+   "title": "Mirror objects left unreclaimed (ledger mark never landed)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 63
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(siglake_compactor_mirror_unreclaimed_total{namespace=~\"$namespace\"}[30m]))",
+     "legendFormat": "unreclaimed",
+     "refId": "A"
+    },
+    {
+     "expr": "sum(increase(siglake_compactor_mirror_mark_errors_total{namespace=~\"$namespace\"}[30m]))",
+     "legendFormat": "mark errors",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "description": "Both are zero unless compactor.mirrorLedgerReclaim is on, and both should stay zero when it is. The filesystem drain marks its locally-committed segments in the wal_segments ledger, and committed retention deletes the mirror object and then the row. Unreclaimed counts the other outcome: the mark never became durable, so the local committed/ file was swept at the 3600-second ceiling to keep the WAL volume bounded, and that object is now beyond this drain's reach -- it needs an object-store lifecycle rule or a manual pass. Mark errors are the cause to read first; a Postgres outage lasting longer than the ceiling produces both."
+  },
+  {
    "id": 119,
    "type": "row",
    "title": "Layout (query latency tracks depth)",
@@ -840,7 +874,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 63
+    "y": 71
    },
    "collapsed": false
   },
@@ -856,7 +890,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 64
+    "y": 72
    },
    "targets": [
     {
@@ -879,7 +913,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 64
+    "y": 72
    },
    "targets": [
     {
@@ -897,7 +931,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 72
+    "y": 80
    },
    "collapsed": false
   },
@@ -913,7 +947,7 @@
     "h": 8,
     "w": 6,
     "x": 0,
-    "y": 73
+    "y": 81
    },
    "targets": [
     {
@@ -940,7 +974,7 @@
     "h": 8,
     "w": 6,
     "x": 6,
-    "y": 73
+    "y": 81
    },
    "targets": [
     {
@@ -972,7 +1006,7 @@
     "h": 8,
     "w": 6,
     "x": 12,
-    "y": 73
+    "y": 81
    },
    "targets": [
     {
@@ -1005,7 +1039,7 @@
     "h": 8,
     "w": 6,
     "x": 18,
-    "y": 73
+    "y": 81
    },
    "targets": [
     {
@@ -1033,7 +1067,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 81
+    "y": 89
    },
    "targets": [
     {
@@ -1063,7 +1097,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 81
+    "y": 89
    },
    "targets": [
     {
@@ -1092,7 +1126,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 89
+    "y": 97
    },
    "targets": [
     {
@@ -1121,7 +1155,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 89
+    "y": 97
    },
    "targets": [
     {
@@ -1150,7 +1184,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 97
+    "y": 105
    },
    "targets": [
     {
@@ -1189,7 +1223,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 97
+    "y": 105
    },
    "targets": [
     {
@@ -1228,7 +1262,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 105
+    "y": 113
    },
    "collapsed": false
   },
@@ -1244,7 +1278,7 @@
     "h": 8,
     "w": 6,
     "x": 0,
-    "y": 106
+    "y": 114
    },
    "targets": [
     {
@@ -1272,7 +1306,7 @@
     "h": 8,
     "w": 6,
     "x": 6,
-    "y": 106
+    "y": 114
    },
    "targets": [
     {
@@ -1331,7 +1365,7 @@
     "h": 8,
     "w": 6,
     "x": 12,
-    "y": 106
+    "y": 114
    },
    "targets": [
     {
@@ -1364,7 +1398,7 @@
     "h": 8,
     "w": 6,
     "x": 18,
-    "y": 106
+    "y": 114
    },
    "targets": [
     {
@@ -1394,7 +1428,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 114
+    "y": 122
    },
    "targets": [
     {
@@ -1429,7 +1463,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 114
+    "y": 122
    },
    "targets": [
     {
@@ -1459,7 +1493,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 122
+    "y": 130
    },
    "targets": [
     {
@@ -1488,7 +1522,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 122
+    "y": 130
    },
    "targets": [
     {
@@ -1517,7 +1551,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 130
+    "y": 138
    },
    "targets": [
     {
@@ -1551,7 +1585,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 130
+    "y": 138
    },
    "targets": [
     {
@@ -1585,7 +1619,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 130
+    "y": 138
    },
    "targets": [
     {
@@ -1619,7 +1653,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 138
+    "y": 146
    },
    "targets": [
     {
@@ -1644,7 +1678,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 146
+    "y": 154
    },
    "collapsed": false
   },
@@ -1660,7 +1694,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 147
+    "y": 155
    },
    "targets": [
     {
@@ -1707,7 +1741,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 147
+    "y": 155
    },
    "targets": [
     {
@@ -1738,7 +1772,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 147
+    "y": 155
    },
    "targets": [
     {
@@ -1772,7 +1806,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 155
+    "y": 163
    },
    "collapsed": false
   },
@@ -1788,7 +1822,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 156
+    "y": 164
    },
    "targets": [
     {
@@ -1816,7 +1850,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 156
+    "y": 164
    },
    "targets": [
     {
@@ -1849,7 +1883,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 164
+    "y": 172
    },
    "targets": [
     {
@@ -1883,7 +1917,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 172
+    "y": 180
    },
    "targets": [
     {
