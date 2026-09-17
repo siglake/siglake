@@ -1,14 +1,19 @@
 //! WS-7 dense extraction: promote declared OTLP attributes from the residual
 //! `attributes` JSON column into their own typed Parquet columns.
 //!
-//! Declared (not frequency-driven yet): an operator lists `(attr_key, column,
-//! type)` triples; the storage write path calls [`promote_attributes`] to widen
+//! Declared: an operator lists `(attr_key, column, type)` triples; the storage
+//! write path calls [`promote_attributes`] to widen
 //! each events batch with the typed columns, extracted from each row's
 //! `attributes` JSON. Typed columns get Parquet statistics + (for strings)
 //! blooms, so queries on them prune files/row-groups instead of scanning +
 //! `attr_get`-ing the JSON. The long tail stays in `attributes`.
 //!
 //! Opt-in: an empty promotion list reproduces the fixed 7-column schema exactly.
+//!
+//! The list can also be chosen for the operator, by the compactor's
+//! frequency-driven sampling pass — which widens the schema on its own and so
+//! ships off. Its bounds, cost and evidence:
+//! `docs/DESIGN_auto_promotion_qualification.md`.
 
 use std::sync::Arc;
 

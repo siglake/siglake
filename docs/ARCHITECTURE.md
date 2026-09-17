@@ -609,6 +609,25 @@ column, queryable via the `attr_get(attributes, key)` UDF (values come back as
 text so they `CAST` cleanly) and `LIKE`. Existing tables gain the column via
 the additive `siglake migrate-schema` — see **Upgrades** below.
 
+**Auto-promotion is the one schema mutation nobody requests.** Promoted columns
+are normally declared: an operator lists `(attr_key, column, type)` triples and
+the write path extracts them. The compactor can also choose them itself — it
+samples a bounded slice of the newest live files every 300 s and promotes each
+key that clears a frequency threshold — and that path calls the same
+`declare_promotions_for`, so a sampling verdict records the promotion property
+and widens the table's schema on its own. Additive widening is irreversible
+(nothing in the product drops a column), which puts it at the opposite end of
+the spectrum from the migration described under **Upgrades**: that one runs
+because a chart upgrade or a `spec.schemaVersion` change asked for it, and the
+operator's part is to observe and record the outcome, never to decide. So
+auto-promotion ships off (`SIGLAKE_AUTO_PROMOTE_MIN_PCT=0`), and the whole of
+what makes it safe is its bounds — a 1% threshold floor, a hard ceiling of 64
+promoted columns per table, a sample bounded in files × rows, and a capped key
+census. Those are specified, measured and tested in
+[`DESIGN_auto_promotion_qualification.md`](DESIGN_auto_promotion_qualification.md),
+with the evidence a default-on decision would need and the open items that
+decision is still missing; nothing in this section changes until one is taken.
+
 **Upgrades and schema versions.** A siglake binary declares the schema it
 wants; a table records the schema it is at, under the
 `siglake.schema_version.v1` table property. When the binary is newer than the
@@ -1634,8 +1653,8 @@ At **200 GB / 394 M rows** (m6i-class nodes, S3 warehouse):
   histogram / negation ~3 ms warm, exact (manifest + rollup fast paths, no
   file reads).
 - **Attribute queries:** hot OTLP attribute keys auto-promote to typed
-  columns; attribute `GROUP BY` in ~3 ms over 394 M rows, attribute filters
-  in the label-filter class (~9 ms).
+  columns — opt-in, and this round ran with it on; attribute `GROUP BY` in
+  ~3 ms over 394 M rows, attribute filters in the label-filter class (~9 ms).
 - **Selective search:** keyword ~8–12 ms, label ~9 ms, substring via trigram
   blooms — bloom-pruned scans touching 10⁴–10⁵ of 394 M rows.
 - **Ordered browse:** `ORDER BY timestamp DESC LIMIT 100` over the whole

@@ -4,6 +4,13 @@
 round 70 (WS-7 dense extraction validated on EKS),
 `crates/siglake-core/src/promote.rs`.*
 
+*2026-09-17 (#3052): both "Later slices" below have since shipped — the
+backfill gate (`siglake.promotion_backfill_complete.v1`, which the compactor
+flips once every live file carries every promoted column) and frequency-driven
+promotion, which is opt-in and qualified in
+`DESIGN_auto_promotion_qualification.md`. The rest of this document is the
+design as written.*
+
 ## What already shipped (don't re-implement)
 
 The BIG_TRACKS Track-4 description lagged reality. Landed and

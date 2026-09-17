@@ -6158,7 +6158,6 @@ pub fn cumulative_consumed_segments(table: &Table) -> std::collections::HashSet<
         .collect()
 }
 
-/// Fixed per-table path of the [`SnapshotAggregates`] side object.
 /// Type lattice for WS-7 auto-promotion sampling: every sampled value of a
 /// key merges into one kind; `Mixed` (or non-scalar) keys stay residual.
 /// Int widens to Float; nothing else widens — conservative by design.
@@ -6198,6 +6197,405 @@ fn merge_sampled_kind(acc: Option<SampledKind>, value: &serde_json::Value) -> Op
         Some(SampledKind::Float) if kind == SampledKind::Int => SampledKind::Float,
         Some(_) => SampledKind::Mixed,
     })
+}
+
+/// Distinct attribute keys one auto-promotion sampling pass tracks.
+///
+/// The sample is bounded in ROWS (files × rows-per-file); the key space those
+/// rows carry is not. A tenant whose attribute keys embed an identifier
+/// (`user.42.role`) presents a fresh key per row, so an uncapped census grows
+/// with the sample instead of with the schema it is deciding — and it decides
+/// nothing, because a key seen once cannot cross any admissible threshold.
+/// 4096 is two orders of magnitude above the column ceiling, so a key the
+/// census drops could not have won a promotion slot either.
+const MAX_SAMPLED_KEYS: usize = 4096;
+
+/// Bounded per-pass census of attribute keys, their hit counts and their
+/// sampled type. `rows` counts every sampled row including those with a null
+/// or unparseable `attributes`, so a threshold is a fraction of the data the
+/// pass actually looked at rather than of the rows that happened to parse.
+#[derive(Debug)]
+struct SampledKeys {
+    rows: usize,
+    keys: std::collections::HashMap<String, (usize, Option<SampledKind>)>,
+    dropped_keys: usize,
+    cap: usize,
+}
+
+impl SampledKeys {
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            rows: 0,
+            keys: std::collections::HashMap::new(),
+            dropped_keys: 0,
+            cap: cap.max(1),
+        }
+    }
+
+    /// Record one sampled row. `attributes` is its residual JSON, or `None`
+    /// for a null cell. OTLP residuals hold nested objects; their scalar
+    /// LEAVES are the promotable units, addressed by dotted key (one level —
+    /// deeper nesting stays residual).
+    fn observe_row(&mut self, attributes: Option<&str>) {
+        self.rows += 1;
+        let Some(json) = attributes else {
+            return;
+        };
+        let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json)
+        else {
+            return;
+        };
+        for (key, value) in &map {
+            match value {
+                serde_json::Value::Object(inner) => {
+                    for (sub, sub_value) in inner {
+                        self.hit(format!("{key}.{sub}"), sub_value);
+                    }
+                }
+                _ => self.hit(key.clone(), value),
+            }
+        }
+    }
+
+    /// Charge one hit to `key`. A key already in the census is always updated;
+    /// a new one is dropped (and counted) once the census is full, so the
+    /// truncation is visible instead of silently reshaping the ranking.
+    fn hit(&mut self, key: String, value: &serde_json::Value) {
+        if let Some(slot) = self.keys.get_mut(&key) {
+            slot.0 += 1;
+            slot.1 = merge_sampled_kind(slot.1, value);
+        } else if self.keys.len() >= self.cap {
+            self.dropped_keys += 1;
+        } else {
+            self.keys.insert(key, (1, merge_sampled_kind(None, value)));
+        }
+    }
+}
+
+/// Is this threshold an off switch? Zero is the shipped default; a negative or
+/// NaN one reaches here only from a caller that bypassed the compactor's
+/// resolver, and the safe reading of an unusable threshold is "promote
+/// nothing".
+fn threshold_is_off(min_fraction: f64) -> bool {
+    min_fraction.is_nan() || min_fraction <= 0.0
+}
+
+/// Pure selection step of auto-promotion: which columns this pass would ADD,
+/// given a census, the promotions the table already carries, the threshold and
+/// the column ceiling. No IO, so the thresholds, the caps, the tie-break, the
+/// name collisions and the mixed-type exclusions are all testable without a
+/// warehouse.
+///
+/// `name_in_schema` reports whether a candidate's sanitized name is already a
+/// column of the target table (a promotion must never shadow one).
+///
+/// Deliberately conservative, because every element of the result is an
+/// irreversible additive schema change: scalar single-kind values only, an
+/// empty census promotes nothing, `max_columns` counts EXISTING promotions
+/// too, and nothing here demotes.
+fn select_promotions(
+    census: &SampledKeys,
+    existing: &[siglake_core::PromotedColumn],
+    min_fraction: f64,
+    max_columns: usize,
+    name_in_schema: &dyn Fn(&str) -> bool,
+) -> Vec<siglake_core::PromotedColumn> {
+    if census.rows == 0 || existing.len() >= max_columns || threshold_is_off(min_fraction) {
+        return Vec::new();
+    }
+    let already: std::collections::HashSet<&str> =
+        existing.iter().map(|c| c.attr_key.as_str()).collect();
+    let mut candidates: Vec<(&str, usize, siglake_core::PromotedType)> = census
+        .keys
+        .iter()
+        .filter_map(|(key, (rows, kind))| {
+            let ty = kind.and_then(SampledKind::promoted_type)?;
+            (!already.contains(key.as_str())
+                && (*rows as f64) / (census.rows as f64) >= min_fraction)
+                .then_some((key.as_str(), *rows, ty))
+        })
+        .collect();
+    // Hottest first; deterministic tie-break by name.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+    let mut taken: std::collections::HashSet<String> =
+        existing.iter().map(|c| c.name.clone()).collect();
+    let mut promoted_now = Vec::new();
+    for (key, _, ty) in candidates {
+        if existing.len() + promoted_now.len() >= max_columns {
+            break;
+        }
+        let name = key.replace(['.', '-'], "_");
+        if name_in_schema(&name) || taken.contains(&name) {
+            continue;
+        }
+        taken.insert(name.clone());
+        promoted_now.push(siglake_core::PromotedColumn {
+            attr_key: key.to_string(),
+            name,
+            ty,
+        });
+    }
+    promoted_now
+}
+
+/// One live file as an auto-promotion sample candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SampleCandidate {
+    /// The file's timestamp upper bound, when its manifest carries one.
+    newest_ns: Option<i64>,
+    size_bytes: i64,
+    path: String,
+}
+
+/// The `limit` files an auto-promotion pass samples: NEWEST data first.
+///
+/// Newest, not largest: the pass decides which keys a table's FUTURE writes
+/// will materialize, so the sample has to represent what is arriving. Sorting
+/// by size instead — which is what this path did until 2026-09-17, against its
+/// own comment — samples whichever files compaction last merged, and on a
+/// table whose attribute shape changed it answers about the wrong era.
+///
+/// A file whose manifest carries no timestamp bound sorts after every file
+/// that does, largest first; path breaks the remaining ties so a pass over an
+/// unchanged table samples the same files and reaches the same verdict.
+fn newest_sample_files(mut files: Vec<SampleCandidate>, limit: usize) -> Vec<SampleCandidate> {
+    files.sort_by(|a, b| {
+        b.newest_ns
+            .cmp(&a.newest_ns)
+            .then_with(|| b.size_bytes.cmp(&a.size_bytes))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    files.truncate(limit.max(1));
+    files
+}
+
+/// #3052 qualification: the bounded sampling and column-cap rules of WS-7
+/// auto-promotion, driven through their pure functions (no warehouse, no
+/// `set_var`). The end-to-end promotion / backfill / query-equivalence
+/// coverage lives in `siglake-query-server`'s `promoted_prune.rs` and
+/// `typed_promotion.rs`; the opt-out and mixed-type table behaviour in
+/// `tests/auto_promotion_bounds.rs`.
+#[cfg(test)]
+mod auto_promotion_sampling_tests {
+    use super::*;
+    use siglake_core::{PromotedColumn, PromotedType};
+
+    fn census(rows: &[Option<&str>]) -> SampledKeys {
+        let mut c = SampledKeys::with_cap(MAX_SAMPLED_KEYS);
+        for row in rows {
+            c.observe_row(*row);
+        }
+        c
+    }
+
+    fn no_schema_collision(_: &str) -> bool {
+        false
+    }
+
+    #[test]
+    fn kind_lattice_widens_int_to_float_and_nothing_else() {
+        use serde_json::json as j;
+        let merge = |values: &[serde_json::Value]| values.iter().fold(None, merge_sampled_kind);
+        assert_eq!(merge(&[j!(1), j!(2)]), Some(SampledKind::Int));
+        assert_eq!(merge(&[j!(1), j!(2.5)]), Some(SampledKind::Float));
+        assert_eq!(merge(&[j!(2.5), j!(1)]), Some(SampledKind::Float));
+        assert_eq!(merge(&[j!("a"), j!("b")]), Some(SampledKind::Str));
+        assert_eq!(merge(&[j!(true), j!(false)]), Some(SampledKind::Bool));
+        // Every other mix is Mixed, and Mixed never recovers.
+        assert_eq!(merge(&[j!("1"), j!(1)]), Some(SampledKind::Mixed));
+        assert_eq!(merge(&[j!(true), j!(1)]), Some(SampledKind::Mixed));
+        assert_eq!(merge(&[j!("1"), j!(1), j!("2")]), Some(SampledKind::Mixed));
+        // A list, and an explicit JSON null, are non-scalar: both poison the
+        // key rather than being skipped. Pinned, not endorsed — see #3052's
+        // finding on null-poisoning.
+        assert_eq!(merge(&[j!([1, 2])]), Some(SampledKind::Mixed));
+        assert_eq!(merge(&[j!("a"), j!(null)]), Some(SampledKind::Mixed));
+        assert_eq!(
+            SampledKind::Mixed.promoted_type(),
+            None,
+            "a mixed-type key must stay residual"
+        );
+    }
+
+    #[test]
+    fn census_counts_every_sampled_row_as_the_denominator() {
+        // 4 rows: one null cell, one unparseable, two carrying `a`. `a` is
+        // present in half the SAMPLE, not in all of the rows that parsed.
+        let c = census(&[
+            Some(r#"{"a":"x"}"#),
+            Some(r#"{"a":"y"}"#),
+            None,
+            Some("not json"),
+        ]);
+        assert_eq!(c.rows, 4);
+        assert_eq!(c.keys.get("a").map(|s| s.0), Some(2));
+        assert!(select_promotions(&c, &[], 0.5, 16, &no_schema_collision)
+            .iter()
+            .any(|col| col.attr_key == "a"));
+        assert!(
+            select_promotions(&c, &[], 0.51, 16, &no_schema_collision).is_empty(),
+            "0.5 of the sample must not clear a 0.51 threshold"
+        );
+    }
+
+    #[test]
+    fn nested_leaves_are_counted_by_dotted_key() {
+        let c = census(&[Some(r#"{"http":{"status":500,"host":"a"},"k":"v"}"#)]);
+        assert_eq!(
+            c.keys.get("http.status").map(|s| s.1),
+            Some(Some(SampledKind::Int))
+        );
+        assert_eq!(
+            c.keys.get("http.host").map(|s| s.1),
+            Some(Some(SampledKind::Str))
+        );
+        assert!(
+            !c.keys.contains_key("http"),
+            "the object itself is not a candidate: {:?}",
+            c.keys
+        );
+        // Two levels down stays residual.
+        let deep = census(&[Some(r#"{"a":{"b":{"c":1}}}"#)]);
+        assert_eq!(
+            deep.keys.get("a.b").map(|s| s.1),
+            Some(Some(SampledKind::Mixed)),
+            "a nested object leaf is not a scalar"
+        );
+        assert!(!deep.keys.contains_key("a.b.c"));
+    }
+
+    #[test]
+    fn key_census_is_capped_and_counts_what_it_drops() {
+        let mut c = SampledKeys::with_cap(2);
+        for i in 0..100 {
+            c.observe_row(Some(&format!(r#"{{"hot":"v","id.{i}":"v"}}"#)));
+        }
+        assert_eq!(c.keys.len(), 2, "{:?}", c.keys);
+        assert_eq!(
+            c.keys.get("hot").map(|s| s.0),
+            Some(100),
+            "a key already in the census keeps accruing after the cap: {:?}",
+            c.keys
+        );
+        // `hot` and the first id key fill the census; the other 99 drop.
+        assert_eq!(c.dropped_keys, 99);
+        // Neither a dropped key nor the one id key that got in is promotable:
+        // one hit in a 100-row sample is 1%, under the threshold.
+        let promoted = select_promotions(&c, &[], 0.02, 64, &no_schema_collision);
+        assert_eq!(
+            promoted
+                .iter()
+                .map(|c| c.attr_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hot"]
+        );
+    }
+
+    #[test]
+    fn column_ceiling_counts_existing_promotions() {
+        let c = census(&[Some(r#"{"a":"1","b":"2","c":"3"}"#)]);
+        let existing = vec![PromotedColumn {
+            attr_key: "z".into(),
+            name: "z".into(),
+            ty: PromotedType::Utf8,
+        }];
+        assert_eq!(
+            select_promotions(&c, &existing, 0.5, 3, &no_schema_collision).len(),
+            2,
+            "one existing promotion leaves two of a three-column ceiling"
+        );
+        assert!(
+            select_promotions(&c, &existing, 0.5, 1, &no_schema_collision).is_empty(),
+            "a table at its ceiling promotes nothing"
+        );
+        assert!(
+            select_promotions(&c, &[], 0.5, 0, &no_schema_collision).is_empty(),
+            "a zero ceiling is an off switch"
+        );
+        assert!(
+            select_promotions(&c, &[], 0.0, 16, &no_schema_collision).is_empty(),
+            "a zero threshold is an off switch, not promote-everything"
+        );
+    }
+
+    #[test]
+    fn selection_is_hottest_first_with_a_deterministic_tie_break() {
+        // `hot` in 3 of 3 rows, `b` and `a` in 2 each.
+        let c = census(&[
+            Some(r#"{"hot":"x","a":"1","b":"2"}"#),
+            Some(r#"{"hot":"x","a":"1","b":"2"}"#),
+            Some(r#"{"hot":"x"}"#),
+        ]);
+        let picked = select_promotions(&c, &[], 0.5, 2, &no_schema_collision);
+        assert_eq!(
+            picked
+                .iter()
+                .map(|c| c.attr_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hot", "a"],
+            "hottest first, then name — and the ceiling cuts the rest"
+        );
+    }
+
+    #[test]
+    fn already_promoted_and_colliding_names_are_skipped() {
+        let c = census(&[Some(r#"{"a":"1","host":"h","b-1":"2"}"#)]);
+        let existing = vec![PromotedColumn {
+            attr_key: "a".into(),
+            name: "a".into(),
+            ty: PromotedType::Utf8,
+        }];
+        let picked = select_promotions(&c, &existing, 0.5, 16, &|name| name == "host");
+        let keys: Vec<&str> = picked.iter().map(|c| c.attr_key.as_str()).collect();
+        assert_eq!(keys, vec!["b-1"], "{picked:?}");
+        assert_eq!(picked[0].name, "b_1", "`.`/`-` sanitize into the name");
+        // An already-promoted key is never re-declared, so the pass is
+        // idempotent on an unchanged table.
+        let second = select_promotions(
+            &c,
+            &[existing[0].clone(), picked[0].clone()],
+            0.5,
+            16,
+            &|name| name == "host",
+        );
+        assert!(second.is_empty(), "{second:?}");
+    }
+
+    #[test]
+    fn an_empty_sample_promotes_nothing() {
+        let c = SampledKeys::with_cap(MAX_SAMPLED_KEYS);
+        assert!(select_promotions(&c, &[], 0.01, 64, &no_schema_collision).is_empty());
+    }
+
+    #[test]
+    fn sample_files_are_newest_first_then_largest() {
+        let f = |newest: Option<i64>, size: i64, path: &str| SampleCandidate {
+            newest_ns: newest,
+            size_bytes: size,
+            path: path.into(),
+        };
+        let files = vec![
+            f(Some(10), 1_000_000, "big-old"),
+            f(Some(30), 10, "small-new"),
+            f(None, 500, "unbounded"),
+            f(Some(20), 10, "mid-b"),
+            f(Some(20), 10, "mid-a"),
+        ];
+        let picked: Vec<String> = newest_sample_files(files.clone(), 4)
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        assert_eq!(picked, vec!["small-new", "mid-a", "mid-b", "big-old"]);
+        // No timestamp bound anywhere ⇒ largest first, the old behaviour.
+        let sizeless: Vec<String> = newest_sample_files(vec![f(None, 1, "s"), f(None, 9, "l")], 2)
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        assert_eq!(sizeless, vec!["l", "s"]);
+        // A zero limit still samples one file rather than nothing.
+        assert_eq!(newest_sample_files(files, 0).len(), 1);
+    }
 }
 
 /// The inline aggregates object for this table's incarnation, or `None` when
@@ -12060,6 +12458,13 @@ impl IcebergContext {
     /// Deliberately conservative: scalar single-kind values only (Int widens
     /// to Float; any other mix stays residual), sanitized names that don't
     /// collide with existing schema columns, and never demotes.
+    ///
+    /// This is the one path that mutates a schema with no operator in the
+    /// loop, and additive widening cannot be undone, so it ships off and its
+    /// bounds carry the argument: see
+    /// `docs/DESIGN_auto_promotion_qualification.md` for the thresholds, the
+    /// measured per-pass and per-column cost, and what a default-on decision
+    /// would still need.
     pub async fn auto_promote_hot_keys(
         &self,
         min_fraction: f64,
@@ -12078,6 +12483,13 @@ impl IcebergContext {
             .await?;
         for config in self.list_indexes().await.unwrap_or_default() {
             let ident = self.index_table_ident(&config.index_id);
+            // `list_indexes` reports the events table among the indexes, and
+            // its ident is this namespace's `table_ident` — sampling it again
+            // would pay a second pass over the same files to reach the
+            // verdict already reached above.
+            if ident == self.table_ident {
+                continue;
+            }
             newly.extend(
                 self.auto_promote_hot_keys_for(
                     &ident,
@@ -12106,20 +12518,36 @@ impl IcebergContext {
 
         let entry = self.cached_table_entry(table_ident).await?;
         let existing = self.promoted_for_table(&entry.table);
-        if existing.len() >= max_columns {
+        // Both are hard off-switches, checked before any IO: an operator who
+        // sets the ceiling to zero, or a table already at it, must not pay a
+        // sampling pass for a verdict that cannot promote anything.
+        if existing.len() >= max_columns || threshold_is_off(min_fraction) {
             return Ok(Vec::new());
         }
         let schema = entry.table.metadata().current_schema();
 
-        // Newest files first (largest timestamp upper bound ~ newest data).
-        let mut files = self.live_data_files(table_ident).await?;
-        files.sort_by_key(|f| std::cmp::Reverse(f.file_size_in_bytes()));
-        files.truncate(sample_files.max(1));
+        // Newest data first: see `newest_sample_files`. A table with no
+        // resolvable time column orders by size alone.
+        let time_field = TimeBoundField::resolve(schema, "timestamp");
+        let live = self.live_data_files(table_ident).await?;
+        let by_path: std::collections::HashMap<&str, &DataFile> =
+            live.iter().map(|f| (f.file_path(), f)).collect();
+        let sampled = newest_sample_files(
+            live.iter()
+                .map(|f| SampleCandidate {
+                    newest_ns: time_field.and_then(|field| data_file_timestamp_upper_ns(f, field)),
+                    size_bytes: f.file_size_in_bytes() as i64,
+                    path: f.file_path().to_string(),
+                })
+                .collect(),
+            sample_files,
+        );
 
-        let mut sampled_rows = 0usize;
-        let mut hits: std::collections::HashMap<String, (usize, Option<SampledKind>)> =
-            std::collections::HashMap::new(); // key -> (rows present, all-string)
-        for f in &files {
+        let mut census = SampledKeys::with_cap(MAX_SAMPLED_KEYS);
+        for candidate in &sampled {
+            let Some(f) = by_path.get(candidate.path.as_str()) else {
+                continue;
+            };
             let (mut stream, _) = pruned_window_batch_stream(
                 entry.table.file_io(),
                 f.file_path(),
@@ -12142,81 +12570,31 @@ impl IcebergContext {
                 };
                 let take = attrs.len().min(remaining);
                 for row in 0..take {
-                    sampled_rows += 1;
-                    if attrs.is_null(row) {
-                        continue;
-                    }
-                    let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
-                        attrs.value(row),
-                    ) else {
-                        continue;
-                    };
-                    for (key, value) in &map {
-                        match value {
-                            // OTLP residuals hold nested objects; their scalar
-                            // LEAVES are the promotable units, addressed by
-                            // dotted key (one level — deeper nesting stays
-                            // residual).
-                            serde_json::Value::Object(inner) => {
-                                for (sub, sub_value) in inner {
-                                    let slot =
-                                        hits.entry(format!("{key}.{sub}")).or_insert((0, None));
-                                    slot.0 += 1;
-                                    slot.1 = merge_sampled_kind(slot.1, sub_value);
-                                }
-                            }
-                            _ => {
-                                let slot = hits.entry(key.clone()).or_insert((0, None));
-                                slot.0 += 1;
-                                slot.1 = merge_sampled_kind(slot.1, value);
-                            }
-                        }
-                    }
+                    census.observe_row((!attrs.is_null(row)).then(|| attrs.value(row)));
                 }
                 remaining -= take;
             }
         }
-        if sampled_rows == 0 {
-            return Ok(Vec::new());
+        if census.dropped_keys > 0 {
+            tracing::warn!(
+                table = %table_ident,
+                tracked = census.keys.len(),
+                dropped = census.dropped_keys,
+                "auto-promotion: attribute key census truncated; a dropped key was seen too rarely to promote"
+            );
+            metrics::counter!("siglake_auto_promotion_sampled_keys_dropped_total")
+                .increment(census.dropped_keys as u64);
         }
 
-        let already: std::collections::HashSet<&str> =
-            existing.iter().map(|c| c.attr_key.as_str()).collect();
-        let mut candidates: Vec<(String, usize, siglake_core::PromotedType)> = hits
-            .into_iter()
-            .filter_map(|(key, (rows, kind))| {
-                let ty = kind.and_then(SampledKind::promoted_type)?;
-                (!already.contains(key.as_str())
-                    && (rows as f64) / (sampled_rows as f64) >= min_fraction)
-                    .then_some((key, rows, ty))
-            })
-            .collect();
-        // Hottest first; deterministic tie-break by name.
-        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-        let mut new_list = existing.clone();
-        let mut promoted_now = Vec::new();
-        for (key, _, ty) in candidates {
-            if new_list.len() >= max_columns {
-                break;
-            }
-            let name = key.replace(['.', '-'], "_");
-            let collides =
-                schema.field_id_by_name(&name).is_some() || new_list.iter().any(|c| c.name == name);
-            if collides {
-                continue;
-            }
-            let col = siglake_core::PromotedColumn {
-                attr_key: key,
-                name,
-                ty,
-            };
-            new_list.push(col.clone());
-            promoted_now.push(col);
-        }
+        let promoted_now =
+            select_promotions(&census, &existing, min_fraction, max_columns, &|name| {
+                schema.field_id_by_name(name).is_some()
+            });
         if promoted_now.is_empty() {
             return Ok(Vec::new());
         }
+        let mut new_list = existing.clone();
+        new_list.extend(promoted_now.iter().cloned());
 
         self.declare_promotions_for(table_ident, &new_list).await?;
         tracing::info!(
