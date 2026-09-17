@@ -886,8 +886,9 @@ enum PopulateEnd {
     /// Polled at least once and dropped before end-of-stream or an error. A
     /// `LIMIT` satisfied from the first batches is this, and so is a cancelled
     /// or failed-elsewhere query: the stream cannot tell them apart, so the
-    /// label does not claim to. A round reads this against its own query
-    /// outcomes (`--require-successful` in the reader).
+    /// label does not claim to. A round reads it against its own record of
+    /// which queries succeeded — the reader's `--stats` input is the responses
+    /// that returned, and it says so on every shape that has clipped samples.
     Clipped,
     /// End-of-stream reached. The entry may or may not have landed (oversized,
     /// contended, already populated by another partition); the decode depth is
