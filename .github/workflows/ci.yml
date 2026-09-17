@@ -252,6 +252,13 @@ jobs:
         run: scripts/check-kind-schema-rollback-evidence.sh
       - name: exact-point evidence separates completeness from falsification
         run: scripts/check-exact-point-falsifier-evidence.sh
+      # #4890's population-depth reader decides a 0.2.0 cache question from a
+      # round's exposition snapshots, so a shape with no samples must read as
+      # ineligible rather than as zero decode depth, and an export re-bucketed
+      # away from the 131,072-row floor must be refused. It reads fixture
+      # exports from disk and needs neither a cluster nor a compiled binary.
+      - name: population-depth reader separates ineligible shapes from zero depth
+        run: scripts/check-file-cache-populate-depth-reader.sh
       # The ingester's `pod` label comes from Prometheus Operator's relabeling,
       # so nothing rendered here proves it exists and only a round with two
       # scraped pods can tell the operator's per-pod mean from the fleet total.

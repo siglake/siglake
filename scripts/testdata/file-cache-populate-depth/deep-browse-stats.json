@@ -1,0 +1,6 @@
+[
+  {"stats": {"scan": {"files_read": 2, "file_cache_hits": 1, "file_cache_misses": 4,
+                       "file_cache_bypasses": 2, "file_cache_populate_rows": 721072}}},
+  {"stats": {"scan": {"files_read": 2, "file_cache_hits": 2, "file_cache_misses": 5,
+                       "file_cache_bypasses": 3, "file_cache_populate_rows": 1908576}}}
+]

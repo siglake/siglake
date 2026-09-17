@@ -1,0 +1,5 @@
+# TYPE siglake_query_scan_file_cache_populate_rows summary
+siglake_query_scan_file_cache_populate_rows{outcome="clipped",quantile="0.5"} 256
+siglake_query_scan_file_cache_populate_rows{outcome="clipped",quantile="0.99"} 1024
+siglake_query_scan_file_cache_populate_rows_sum{outcome="clipped"} 5000
+siglake_query_scan_file_cache_populate_rows_count{outcome="clipped"} 16

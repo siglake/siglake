@@ -531,6 +531,29 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   reachable only in-process
   (`QueryScanTuning::file_cache_row_group_prototype`), with no environment, CLI,
   chart or operator surface.
+  Since #4890 the shipped path measures that quantity instead of leaving it
+  unmeasurable: `siglake_query_scan_file_cache_populate_rows{outcome}` records,
+  once per population in `CachePopulateStream`'s `Drop`, the rows the reader
+  handed it — cumulative, unaffected by the candidate being inserted or thrown
+  away, and labelled `completed` / `clipped` / `unpolled` / `error` so a browse
+  that stops early is separated from a read error and from a task that never
+  started. Its buckets carry an edge at 131,071, so the fraction at or above the
+  131,072-row floor is exact. A request carries the same depth in
+  `stats.scan.file_cache_populate_rows`, beside
+  `stats.scan.file_cache_bypasses`, because after #4891 a shape with no
+  population samples is usually INELIGIBLE rather than shallow, and those read
+  opposite ways. Reading depth is the reader's job:
+  `scripts/read-file-cache-populate-depth.py`, fixtured by
+  `scripts/check-file-cache-populate-depth-reader.sh`. What the metric does NOT
+  establish: reaching 131,072 rows is necessary for row-group population, not
+  sufficient — a file whose groups are larger closes none at that depth, and a
+  read that does not start on a group boundary closes none at any depth, so the
+  reader takes recorded footer geometry as a separate input. No fleet numbers
+  exist yet: the local evidence is hermetic fixtures
+  (`crates/siglake-storage/tests/file_cache_populate_depth.rs`,
+  `crates/siglake-query-server/tests/file_cache_populate_depth_stats.rs`), and
+  nothing here authorizes row-group adoption or a default change. The fleet
+  reading is #4938.
 - **Query scales by REPLICATION, not by fan-out, for ordinary log search.**
   Adding query replicas multiplies throughput — measured 705 QPS on one
   replica and 2,269 on three (3.22x), with browse p50 flat at 13–21ms through

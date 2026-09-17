@@ -1,0 +1,7 @@
+# HELP siglake_query_scan_file_cache_requests_total Decoded-file-cache request outcomes.
+# TYPE siglake_query_scan_file_cache_requests_total counter
+siglake_query_scan_file_cache_requests_total{outcome="hit"} 0
+siglake_query_scan_file_cache_requests_total{outcome="miss"} 0
+siglake_query_scan_file_cache_requests_total{outcome="bypass"} 192
+siglake_query_scan_file_cache_requests_total{outcome="insert"} 0
+siglake_query_scan_file_cache_requests_total{outcome="abandoned"} 0

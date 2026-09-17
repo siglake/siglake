@@ -2627,6 +2627,17 @@ components:
           type: integer
           format: int64
           minimum: 0
+        file_cache_bypasses:
+          type: integer
+          format: int64
+          description: |-
+            File tasks that consulted the decoded file-batch cache, found nothing,
+            and declined to populate it because they carry a converted predicate or
+            a raw/promoted prune spec (#4891): they read with their filtering
+            intact, exactly as a cache-disabled install does. Counted apart from
+            `file_cache_misses` so a response with no population can say whether
+            nothing was decoded or every task was ineligible.
+          minimum: 0
         file_cache_hits:
           type: integer
           format: int64
@@ -2645,6 +2656,17 @@ components:
             File tasks that consulted the decoded file-batch cache, found nothing,
             and read the file (populating the cache on the way). Tasks carrying a
             raw or promoted prune spec bypass the cache and count in neither field.
+          minimum: 0
+        file_cache_populate_rows:
+          type: integer
+          format: int64
+          description: |-
+            Rows this request's populations were handed before they stopped (#4890)
+            — decode depth offered to the cache, summed over the tasks that
+            populated. Counted before the residual filter above the scan drops any
+            of them, and it keeps rising after a candidate goes oversized, so it
+            measures how far the read got rather than what was kept. A clipped
+            browse populates nothing today, and this is how deep it got anyway.
           minimum: 0
         files_planned:
           type: integer

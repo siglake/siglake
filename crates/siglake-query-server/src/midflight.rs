@@ -64,6 +64,11 @@ pub struct PlanRuntimeStats {
     /// move for them) and tasks that consulted the cache and read the file.
     pub file_cache_hits: u64,
     pub file_cache_misses: u64,
+    /// #4890: tasks that consulted the cache and declined to populate it (they
+    /// carry a predicate or a prune spec), and rows this request's populations
+    /// were handed before they stopped.
+    pub file_cache_bypasses: u64,
+    pub file_cache_populate_rows: u64,
     /// Scan partition streams still live when this summary was taken. Their
     /// counters fold only when they finish, so a non-zero value means this
     /// summary is missing that many partitions' worth of scan attribution.
@@ -652,6 +657,8 @@ pub fn summarize_plan_runtime(plan: &Arc<dyn ExecutionPlan>) -> PlanRuntimeStats
             out.bytes_other += sum("bytes_other");
             out.file_cache_hits += sum("file_cache_hits");
             out.file_cache_misses += sum("file_cache_misses");
+            out.file_cache_bypasses += sum("file_cache_bypasses");
+            out.file_cache_populate_rows += sum("file_cache_populate_rows");
             if node.children().is_empty() {
                 out.leaf_output_rows += aggregate.output_rows().unwrap_or_default() as u64;
             }

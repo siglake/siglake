@@ -81,6 +81,33 @@ pub const MIRROR_ROTATION_OBJECT_BUCKETS: &[f64] = &[
     2_000_000.0,
 ];
 
+/// Rows decoded by one decoded-file-cache population (#4890). The edges that
+/// matter are 131,071 and 131,072: the write path's `MIN_ROW_GROUP_ROWS` is
+/// 131,072, so a population closed at least one row group at the shipped floor
+/// exactly when it was handed 131,072 rows or more. `le` is inclusive, so the
+/// fraction BELOW the floor is `le="131071"` and the fraction at or above it is
+/// `+Inf` minus that; the 131,072 edge next to it isolates the population that
+/// stopped precisely on the boundary. A row group may be far larger than the
+/// floor (`MAX_ROW_GROUP_ROWS` is 4 Mi), so crossing 131,072 rows does not by
+/// itself prove a group was completed — that needs the file's footer geometry,
+/// which is why the reader takes it as a separate input.
+pub const POPULATE_ROW_BUCKETS: &[f64] = &[
+    0.0,
+    1.0,
+    100.0,
+    1_000.0,
+    8_192.0,
+    32_768.0,
+    65_536.0,
+    131_071.0,
+    131_072.0,
+    262_144.0,
+    524_288.0,
+    1_048_576.0,
+    4_194_304.0,
+    16_777_216.0,
+];
+
 /// Count histograms exported in histogram form, matched by full name.
 pub const COUNT_HISTOGRAMS: &[&str] = &[
     "siglake_group_count_deltas_folded",
@@ -114,7 +141,12 @@ pub fn builder() -> Result<PrometheusBuilder> {
             Matcher::Full("siglake_compactor_mirror_sync_rotation_objects".to_string()),
             MIRROR_ROTATION_OBJECT_BUCKETS,
         )
-        .context("mirror rotation object buckets")
+        .context("mirror rotation object buckets")?
+        .set_buckets_for_metric(
+            Matcher::Full("siglake_query_scan_file_cache_populate_rows".to_string()),
+            POPULATE_ROW_BUCKETS,
+        )
+        .context("file cache population row buckets")
 }
 
 /// A counter a shipped alert reads through `increase()`, with every label set
@@ -821,8 +853,41 @@ mod tests {
             COUNT_BUCKETS,
             MIRROR_ROTATION_DURATION_BUCKETS_SECONDS,
             MIRROR_ROTATION_OBJECT_BUCKETS,
+            POPULATE_ROW_BUCKETS,
         ] {
             assert!(buckets.windows(2).all(|w| w[0] < w[1]), "{buckets:?}");
+        }
+    }
+
+    /// #4890's reader divides at the shipped row-group floor, and can only do
+    /// that if the exposition carries an edge there. `le="131071"` is the
+    /// fraction strictly below the floor, so `+Inf - le("131071")` is the
+    /// population that was handed at least `MIN_ROW_GROUP_ROWS` rows.
+    #[test]
+    fn population_row_depth_renders_buckets_at_the_row_group_floor() {
+        let out = render_with(|| {
+            let depth = |rows: f64, outcome: &'static str| {
+                metrics::histogram!(
+                    "siglake_query_scan_file_cache_populate_rows",
+                    "outcome" => outcome
+                )
+                .record(rows)
+            };
+            depth(256.0, "clipped");
+            depth(131_072.0, "clipped");
+            depth(2_000_000.0, "completed");
+        });
+        assert!(
+            out.contains("# TYPE siglake_query_scan_file_cache_populate_rows histogram"),
+            "{out}"
+        );
+        for line in [
+            "siglake_query_scan_file_cache_populate_rows_bucket{outcome=\"clipped\",le=\"131071\"} 1",
+            "siglake_query_scan_file_cache_populate_rows_bucket{outcome=\"clipped\",le=\"131072\"} 2",
+            "siglake_query_scan_file_cache_populate_rows_bucket{outcome=\"completed\",le=\"131071\"} 0",
+            "siglake_query_scan_file_cache_populate_rows_bucket{outcome=\"completed\",le=\"+Inf\"} 1",
+        ] {
+            assert!(out.contains(line), "missing {line} in {out}");
         }
     }
 

@@ -1,0 +1,18 @@
+# HELP siglake_query_scan_file_cache_populate_rows Rows handed to one decoded-file-cache population.
+# TYPE siglake_query_scan_file_cache_populate_rows histogram
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="0"} 0
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="1"} 0
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="100"} 0
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="1000"} 14
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="8192"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="32768"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="65536"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="131072"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="262144"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="524288"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="1048576"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="4194304"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="16777216"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="+Inf"} 16
+siglake_query_scan_file_cache_populate_rows_sum{outcome="clipped"} 12376
+siglake_query_scan_file_cache_populate_rows_count{outcome="clipped"} 16
