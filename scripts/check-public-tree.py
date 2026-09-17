@@ -118,14 +118,6 @@ ENGINE_REPO_URL = re.compile(
     r"github\.com[/:]([A-Za-z0-9][A-Za-z0-9._-]*/siglake)(?:\.git)?(?![\w.-])"
 )
 
-# deploy/helm/siglake-operator/Chart.yaml carries the same `home`/`sources`
-# defect. Correcting it belongs to the operator chart's own metadata task
-# (#4856), so it is exempt here rather than fixed under a data-plane card. The
-# exemption is checked for being still necessary: once that chart names the
-# published repository, this set has to shrink, so the hole cannot outlive the
-# defect it was opened for.
-ENGINE_REPO_EXEMPT = {"deploy/helm/siglake-operator/Chart.yaml"}
-
 # The squash deletes crates/siglake-bench AND `sed -i`s its workspace-members
 # line out of Cargo.toml, so that one reference is handled by construction.
 #
@@ -308,7 +300,6 @@ def main() -> int:
     shipping = shipping_files(root)
     shipping_names = {rel.as_posix() for rel in shipping}
     excluded_md_ref = excluded_markdown_names(root, shipping)
-    engine_repo_exempt_used: set[str] = set()
 
     for rel in shipping:
         path = root / rel
@@ -333,9 +324,6 @@ def main() -> int:
                     f"the open tree must not link or name it: {line.strip()[:110]}"
                 )
             for owner in foreign_engine_repos(line):
-                if rel.as_posix() in ENGINE_REPO_EXEMPT:
-                    engine_repo_exempt_used.add(rel.as_posix())
-                    continue
                 problems.append(
                     f"{rel}:{lineno} source metadata names `{owner}`, not the "
                     f"published repository `{CANONICAL_ENGINE_REPO}` — crates.io "
@@ -379,12 +367,6 @@ def main() -> int:
                         f"{line.strip()[:110]}"
                     )
                     break
-
-    for stale in sorted(ENGINE_REPO_EXEMPT - engine_repo_exempt_used):
-        problems.append(
-            f"{stale} no longer names another owner of `siglake`, so its entry in "
-            f"ENGINE_REPO_EXEMPT is a hole with nothing behind it — drop it"
-        )
 
     if problems:
         for p in problems:
