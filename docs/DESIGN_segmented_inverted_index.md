@@ -236,9 +236,9 @@ be read in part.
 The residual, identical in both formats at the codec level, is the 120 (0.13% of
 flips): a bit flip inside a posting delta that leaves the varint count intact,
 the ordinals ascending and every one of them inside the row domain yields a
-different, structurally valid row set. It is a wrong answer, not a wider one, and
-a row the scan never decodes is not recovered by re-checking the predicate above
-it. Nothing short of a checksum over the postings sees it.
+different, structurally valid row set. The result is a wrong row set, and a row
+the scan never decodes is not recovered by re-checking the predicate above it.
+Nothing short of a checksum over the postings sees it.
 
 A mis-addressed posting range is the same hole reached from the other side, and
 a fixture pins what it does: a block's `postings_base` moved by one byte answers
@@ -251,8 +251,8 @@ correct answer by everything the format checks.
 
 ### Do posting sections need their own checksum?
 
-Not in `seg1`, and the reason is a number rather than a principle. Measured at
-the per-file scale above (`report_posting_checksum_and_compression_options`):
+Not in `seg1`, on these numbers. Measured at the per-file scale above
+(`report_posting_checksum_and_compression_options`):
 
 | option | cost on disk | median bytes a point lookup fetches per row group | catches the residual |
 |---|---:|---:|---|
@@ -325,8 +325,8 @@ uncompressed against the ~16 MiB per file the Zstd'd v1 sidecar occupies on disk
 
 ### What per-section compression would recover
 
-`seg1` stores every section uncompressed, and that is a prototype decision, not
-a property of the layout. Measured on the same file, at the zstd level Puffin
+`seg1` stores every section uncompressed. That is a prototype decision the
+layout does not require. Measured on the same file, at the zstd level Puffin
 uses (3):
 
 | | bytes | ratio |
