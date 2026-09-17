@@ -803,9 +803,10 @@ wal:
   # If true the chart leaves the PVC alone (customer pre-creates it).
   existingClaim: ""
   # WAL → object-store mirror. Each sealed WAL segment is uploaded to
-  # `s3://<s3.bucket>/<wal.mirror.prefix>/` on a best-effort background
-  # task. DR recipe: `siglake wal-recover --from
-  # s3://<bucket>/<prefix> --to <wal-root>` — `--to` is the WAL ROOT, and
+  # `s3://<s3.bucket>/<s3.warehousePrefix>/<wal.mirror.prefix>/` on a
+  # best-effort background task. DR recipe: `siglake wal-recover --from
+  # s3://<bucket>/<warehousePrefix>/<prefix> --to <wal-root>` — `--to` is the
+  # WAL ROOT, and
   # recovery rebuilds the <tenant>[/<index>]/sealed/ layout beneath it so each
   # segment is committed to the namespace and table it came from.
   #
@@ -825,9 +826,12 @@ wal:
   # Two things to set alongside it:
   #  - Nothing deletes mirror objects unless `compactor.catalogClaim.enabled`
   #    is on: that drain claims from the mirror and purges what it committed.
-  #    With the default single-replica FS drain the prefix grows forever —
-  #    give `<wal.mirror.prefix>/` an object-store lifecycle expiry (the
-  #    Terraform module does not add one yet).
+  #    With the default single-replica FS drain the prefix grows forever, and
+  #    so does the `wal_segments` row the ingester writes per object — 421,632
+  #    objects and 37.3 GB per day at 20K EPS. Give the prefix an object-store
+  #    lifecycle expiry; the Terraform module adds no current-object expiry,
+  #    only an optional bucket-wide GLACIER_IR transition. The key to match is
+  #    `<s3.warehousePrefix>/<wal.mirror.prefix>/`, see `prefix` below.
   #  - `?commit=force` is refused with a 400 when the catalog-claim drain is on. Use
   #    `?commit=wait_for` (the default) and query for visibility.
   #
@@ -835,8 +839,9 @@ wal:
   # binary's opt-out; omitting the variable would leave the mirror running.
   mirror:
     enabled: true
-    # Bucket-root-relative path. Lives as a sibling to `s3.warehousePrefix`,
-    # not underneath it.
+    # Relative to the warehouse URL, so the objects land under
+    # `s3://<s3.bucket>/<s3.warehousePrefix>/<prefix>/` — inside the warehouse
+    # prefix, not beside it. That is the path a lifecycle rule must name.
     prefix: wal-mirror
     # Also snapshot the in-flight (active) segment every N seconds to
     # `<prefix>/_active/<filename>`. N is the upload window for that
