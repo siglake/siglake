@@ -187,18 +187,27 @@ for its rows (`report_single_bit_corruption_rates`):
 
 | format | blob | flips | refused | unchanged answer | wrong rows | outside row domain | reported absent |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| whole-file v1 | 14,038 | 112,304 | 28,050 | 83,977 | 142 | 22 | 135 |
+| whole-file v1 | 14,038 | 112,304 | 99,019 | 13,136 | 120 | 0 | 29 |
 | segmented | 11,186 | 89,488 | 45,000 | 44,368 | 120 | 0 | 0 |
 
-The residual is the 120 (0.13% of flips): a bit flip inside a posting delta that
-leaves the varint count intact yields a different, structurally valid row set.
-The v1 format has the same exposure at the same rate, so this is not a
-regression — but a segmented reader could close it with a CRC per posting
-section, at 4 bytes per term, which on this corpus is ~4 bytes per row and about
-a third of the blob. That is not worth it for a superset selection whose rows
-are re-checked above the scan; it is the trade to revisit if postings ever feed
-an answer directly. The `outside row domain` and `reported absent` columns are
-the two classes this design removes outright.
+The v1 row is the **post-#4558** decoder, re-measured 2026-09-17. Before that
+task hardened `from_bytes` it read 28,050 refused / 83,977 unchanged / 142 wrong
+/ **22 outside the row domain** / 135 reported absent — those 22 were the case
+this design was partly arguing against, and validating the serialized lengths
+and the postings' ascent and domain closed them in v1 too. The comparison stands
+on the remaining columns: v1 still conflates "absent" with "unparseable" 29
+times where the segmented reader never does, and only the segmented format can
+be read in part.
+
+The residual, identical in both formats, is the 120 (0.13% of flips): a bit flip
+inside a posting delta that leaves the varint count intact, the ordinals
+ascending and every one of them inside the row domain yields a different,
+structurally valid row set. Nothing short of a checksum over the postings sees
+it. A segmented reader could close it with a CRC per posting section, at 4 bytes
+per term, which on this corpus is ~4 bytes per row and about a third of the
+blob. That is not worth it for a superset selection whose rows are re-checked
+above the scan; it is the trade to revisit if postings ever feed an answer
+directly.
 
 ## Publication semantics (what #4377 needs)
 

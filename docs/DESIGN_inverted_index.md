@@ -294,10 +294,12 @@ and past the index's domain, and fail against the pre-fix reader by returning
 two matching rows of four and one of two respectively.
 
 What neither layer catches is a flipped bit inside a posting delta that leaves
-the ordinals ordered and in range: v1 carries no checksum (the rate is measured
-in `docs/DESIGN_segmented_inverted_index.md` under "Integrity" — 142 of 112,304
-single-bit flips changed the answer, and 22 of those escaped the row domain,
-which is the part these checks close).
+the ordinals ascending and in range: v1 carries no checksum. The exhaustive
+single-bit sweep in `docs/DESIGN_segmented_inverted_index.md` under "Integrity"
+prices what changed — over 112,304 flips of a 14,038-byte blob, refusals went
+from 28,050 to 99,019, answers that came back wrong from 142 to 120, ordinals
+outside the row domain from 22 to **0**, and a present term reported absent
+from 135 to 29. The 120 are the residual.
 
 ### Slice C — AWS validation (remaining)
 
