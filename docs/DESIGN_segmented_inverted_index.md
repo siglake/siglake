@@ -659,8 +659,9 @@ regardless.
   comparison those need: 1,671.8 ms cold / 1,801.2 ms p50 for the 14-file
   `rare_scan`. What this measures is that the shipped index spends 44 s on the
   index term alone — 24x the entire OFF budget — where the segmented reader
-  spends 35.6 ms cold and 1.07 ms warm. That makes the acceptance plausible and
-  does not establish it: the scan-side term could dominate both.
+  spends 35.6 ms cold and 1.07 ms warm. That made the acceptance plausible and
+  did not establish it; the section below runs the same three formats through
+  the query path, where the scan-side term is present (#4562).
 - **Are not** an object-store measurement. `SliceSource` counts what the reader
   *asks for* — 14 reads of 9.8 KiB is 14 GETs against S3, where the shipped path
   issues one GET of ~16 MiB and decompresses it. Whether many small ranges beat
