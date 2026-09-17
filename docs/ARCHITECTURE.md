@@ -1394,6 +1394,13 @@ whole block only when the pair was complete, so an incomplete one vanished into
 a tier running on static tokens or open — and, because the variables were never
 rendered, the binaries' own refusals never saw it either.
 
+A blank value is not a claim, on either boundary. `SIGLAKE_OIDC_TENANT_CLAIM=`
+is how a shared `extraEnv` turns the option off against an entry the operator
+already renders, so both binaries trim the value and read empty as unset: the
+tier starts single-tenant instead of one refusing to start while the other
+runs. A whitespace-only name never reaches the verifier as a claim name no
+token can carry.
+
 **Configuring a tenant claim makes it mandatory, on both boundaries.** Once
 `--oidc-tenant-claim` is set, a verified token whose claim is missing, blank,
 not a string, longer than 128 characters, or outside `[A-Za-z0-9_-]` is
