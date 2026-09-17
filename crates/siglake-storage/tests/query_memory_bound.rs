@@ -444,6 +444,71 @@ mod memory_budget_tests {
         );
     }
 
+    /// #3053: what turning the opt-in source-file cache ON does to the rest of
+    /// the budget, at the sizing it is pointed at.
+    ///
+    /// The cache is off by default, so `memory_budget_for` reports it as zero
+    /// and an operator considering it had no arithmetic to check — the same
+    /// state the text-index caches were in before #4056, and the reason the
+    /// packaged query pod is 4Gi is that its whole remainder is the pool's
+    /// first-file decode reservation. Enabling the cache spends that remainder.
+    #[test]
+    fn enabling_the_file_cache_comes_out_of_the_pool_and_the_headroom() {
+        for limit_gib in [4u64, 8, 16, 64] {
+            let limit = limit_gib * GIB;
+            let (recommended, entries) =
+                siglake_storage::derive_file_cache_limits(Some(limit)).unwrap();
+            assert!(entries > 0, "{limit_gib}Gi recommends no entries");
+
+            let off = siglake_storage::memory_budget_for(Some(limit), 0.5);
+            let on =
+                siglake_storage::memory_budget_with_file_cache(Some(limit), 0.5, Some(recommended));
+
+            assert_eq!(
+                on.read_caches,
+                off.read_caches + recommended,
+                "{limit_gib}Gi: the file cache's bytes are not in the read-cache budget"
+            );
+            assert!(
+                on.pool < off.pool,
+                "{limit_gib}Gi: the pool did not shrink after reserving {} MB \
+                 of file cache ({} MB then {} MB)",
+                mb(recommended),
+                mb(off.pool),
+                mb(on.pool)
+            );
+            assert!(
+                on.committed() <= limit,
+                "{limit_gib}Gi over-commits with the file cache on: {} MB of {} MB",
+                mb(on.committed()),
+                mb(limit)
+            );
+            // The floor pod is the case worth naming: it has no room to give,
+            // so the cache takes the headroom the process runs in rather than
+            // finding bytes nobody was using.
+            assert!(
+                on.headroom(limit) < off.headroom(limit),
+                "{limit_gib}Gi: the file cache cost the process no headroom, \
+                 which would mean its bytes came from nowhere"
+            );
+        }
+
+        // And it is not free at the floor: the packaged 4Gi query pod keeps a
+        // pool holding one compacted file's decode estimate (1.25 GiB) only
+        // while the cache is off.
+        let floor = 4 * GIB;
+        let (recommended, _) = siglake_storage::derive_file_cache_limits(Some(floor)).unwrap();
+        let on =
+            siglake_storage::memory_budget_with_file_cache(Some(floor), 0.5, Some(recommended));
+        assert!(
+            mb(on.pool) < 1280,
+            "the 4Gi pod kept its {} MB decode reservation while also holding a \
+             {} MB file cache; one of the two numbers is wrong",
+            mb(on.pool),
+            mb(recommended)
+        );
+    }
+
     /// Subtracting the metadata caches must have actually MOVED the pool — if it
     /// did not, the accounting change was cosmetic.
     #[test]

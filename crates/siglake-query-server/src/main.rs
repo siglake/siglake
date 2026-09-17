@@ -377,6 +377,27 @@ async fn run() -> Result<()> {
         cli.query_scan_file_cache_max_bytes,
         cli.query_scan_file_cache_max_entries,
     );
+    // The decoded-file cache needs BOTH limits positive, and the chart and the
+    // operator both render both variables with an explicit 0 — so overriding
+    // one of them is a request for the cache that resolves to `None` and used
+    // to log exactly what an unconfigured pod logs. Say it instead, with the
+    // pair this container's memory limit would size.
+    if let Some(half) = siglake_storage::file_cache_half_configured(
+        cli.query_scan_file_cache_max_bytes,
+        cli.query_scan_file_cache_max_entries,
+    ) {
+        let derived = siglake_storage::derive_file_cache_limits(
+            siglake_storage::iceberg::cgroup_memory_limit_bytes(),
+        );
+        tracing::warn!(
+            ?half,
+            suggested_max_bytes = derived.map(|(bytes, _)| bytes),
+            suggested_max_entries = derived.map(|(_, entries)| entries),
+            "the source-file batch cache stays DISABLED: it needs \
+             SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_BYTES and \
+             SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_ENTRIES both positive"
+        );
+    }
     siglake_storage::configure_query_read_caches(read_caches);
 
     // The two text-index caches live in the vendored fork, which cannot read
@@ -802,6 +823,100 @@ mod tests {
         assert_eq!(config.file_cache_max_bytes, Some(536_870_912));
         assert_eq!(config.file_cache_max_entries, Some(512));
         assert_eq!(config.reserved_bytes(), 3_758_096_384);
+    }
+
+    /// #3053. The flags an operator would set to turn the source-file cache on
+    /// have to reach the resolver from the command line as well as from the
+    /// environment, and the resolved pair is what the pool subtracts. Both
+    /// halves are required: the value of `--query-scan-file-cache-max-bytes`
+    /// alone is not a cache, and neither is an entry limit alone.
+    #[test]
+    fn enabling_the_file_cache_takes_both_flags() {
+        let resolved = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).expect("flags parse");
+            (
+                resolve_query_read_cache_config(
+                    Some(16 * 1024 * 1024 * 1024),
+                    cli.query_object_cache_max_bytes,
+                    cli.query_scan_file_cache_max_bytes,
+                    cli.query_scan_file_cache_max_entries,
+                ),
+                siglake_storage::file_cache_half_configured(
+                    cli.query_scan_file_cache_max_bytes,
+                    cli.query_scan_file_cache_max_entries,
+                ),
+            )
+        };
+
+        let (both, half) = resolved(&[
+            "siglake-query-server",
+            "--query-scan-file-cache-max-bytes",
+            "2147483648",
+            "--query-scan-file-cache-max-entries",
+            "2048",
+        ]);
+        assert_eq!(both.file_cache_max_bytes, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(both.file_cache_max_entries, Some(2048));
+        assert_eq!(half, None);
+        // 16Gi derives a 4 GiB object cache, and the file cache's bytes are
+        // reserved ON TOP of it — the subtraction the pool makes.
+        assert_eq!(both.reserved_bytes(), 6 * 1024 * 1024 * 1024);
+
+        for argv in [
+            vec![
+                "siglake-query-server",
+                "--query-scan-file-cache-max-bytes",
+                "2147483648",
+            ],
+            vec![
+                "siglake-query-server",
+                "--query-scan-file-cache-max-entries",
+                "2048",
+            ],
+            // What the chart and the operator render when nobody overrides
+            // them, and the explicit disablement an operator writes.
+            vec![
+                "siglake-query-server",
+                "--query-scan-file-cache-max-bytes",
+                "0",
+                "--query-scan-file-cache-max-entries",
+                "0",
+            ],
+        ] {
+            let (config, _) = resolved(&argv);
+            assert_eq!(config.file_cache_max_bytes, None, "{argv:?}");
+            assert_eq!(config.file_cache_max_entries, None, "{argv:?}");
+            assert_eq!(
+                config.reserved_bytes(),
+                config.object_cache_max_bytes,
+                "{argv:?}: a disabled file cache must reserve nothing"
+            );
+        }
+
+        // And a half-configuration is REPORTED rather than resolved silently to
+        // the same `None` an unconfigured pod resolves to.
+        assert_eq!(
+            resolved(&[
+                "siglake-query-server",
+                "--query-scan-file-cache-max-bytes",
+                "2147483648",
+                "--query-scan-file-cache-max-entries",
+                "0",
+            ])
+            .1,
+            Some(siglake_storage::FileCacheHalfConfigured::BytesOnly)
+        );
+        assert_eq!(
+            resolved(&[
+                "siglake-query-server",
+                "--query-scan-file-cache-max-bytes",
+                "0",
+                "--query-scan-file-cache-max-entries",
+                "2048",
+            ])
+            .1,
+            Some(siglake_storage::FileCacheHalfConfigured::EntriesOnly)
+        );
     }
 
     /// The persistent store is the chart default, so the only ways to ask for

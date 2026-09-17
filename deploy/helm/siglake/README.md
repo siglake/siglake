@@ -139,8 +139,19 @@ running normally. Keep the shared store on to scale the query tier.
 ### Query source-file cache limits
 
 `query.scan.fileCacheMaxBytes` and `query.scan.fileCacheMaxEntries` bound the
-per-query-pod source-file batch cache. Set either value to `0` to disable the
-cache. Both default to `0`; set both to positive limits to enable it.
+per-query-pod source-file batch cache, which holds whole DECODED files. Both
+default to `0`, which is off; both have to be positive to enable it, and a pod
+that gets one of the two logs a warning at startup and runs without the cache.
+
+Before enabling it, read what the budget buys. An entry larger than a quarter of
+`fileCacheMaxBytes` is never cached, and a compacted file is 256Mi of Parquet at
+the scan's x5 decode estimate — about 1.25Gi — so a cache that holds one is 5Gi.
+The packaged 4Gi query pod is nowhere near that: at its recommended 512Mi it
+holds only pre-compaction files, and those 512Mi come out of the query memory
+pool, which at 4Gi is exactly one compacted file's decode reservation. Raise
+`query.resources.limits.memory` alongside the cache. The recommendation for a
+pod that has the room is an eighth of the memory limit, with one entry per MiB
+of it. `docs/DESIGN_source_file_cache_qualification.md` has the measurements.
 
 ### Scaling the compactor past one pod
 

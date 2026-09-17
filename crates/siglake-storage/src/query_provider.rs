@@ -278,7 +278,7 @@ struct CachedFileBatches {
 /// An entry larger than `budget / MAX_FILE_CACHE_ENTRY_FRACTION` is not cached in
 /// the decoded-batch cache (it would thrash). The byte-range object cache serves
 /// those reads instead.
-const MAX_FILE_CACHE_ENTRY_FRACTION: u64 = 4;
+pub(crate) const MAX_FILE_CACHE_ENTRY_FRACTION: u64 = 4;
 
 #[derive(Default)]
 struct QueryFileBatchCache {
