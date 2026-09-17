@@ -2835,7 +2835,8 @@ fn resolve_traces_index_value(raw: Option<&str>, source: &str) -> Result<String,
 /// removed in 2026-06. It bought nothing once the protocol was OTLP — no OTLP
 /// client sends it — while widening the accepted credential shapes on the
 /// ingest path, and it was covered by no test at all.
-/// Nothing has shipped that accepted it: 0.1.0 is unreleased.
+/// Nothing that shipped accepted it: the removal predates the 0.1.0 tag, whose
+/// tree already extracts `Bearer` alone.
 fn extract_bearer_token(raw: &str) -> Option<&str> {
     raw.strip_prefix("Bearer ")
         .map(str::trim)

@@ -135,9 +135,10 @@ written down.
   large ones, and per-file group-count and time-bucket footers ride with the
   data, and compaction policy is computable from file names and the manifest
   alone. Footer inverted indexes are written by default. The post-rewrite
-  Puffin rebuild ships **off** in 0.1.0: a compacted file's parsed index costs
-  about 40 bytes per indexed row, and at 50 GB-class layouts the sidecar path
-  landed above the text-search ceilings that were measured on the scan path.
+  Puffin rebuild is **off** by default across 0.1.x: a compacted file's parsed
+  index costs about 40 bytes per indexed row, and at 50 GB-class layouts the
+  sidecar path landed above the text-search ceilings that were measured on the
+  scan path.
   Whether a query uses an index it finds is decided per execution: a text
   predicate under a `LIMIT` — ordered or bare — reads a sliver of the first
   file and would pay a whole file's postings to do it, so it stays on the scan

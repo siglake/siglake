@@ -7,8 +7,9 @@
 //! path accepts, and it was covered by no test at all: the acceptance was
 //! untested, so the removal would have been too.
 //!
-//! The removal breaks nothing that shipped — 0.1.0 is unreleased, with no tag
-//! and no published image.
+//! The removal breaks nothing that shipped: it predates the 0.1.0 tag, whose
+//! tree already extracts `Bearer` alone, so no released build ever accepted the
+//! second scheme.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};

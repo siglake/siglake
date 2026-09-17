@@ -33,7 +33,8 @@ External SQL uses `to_timestamp_nanos(timestamp_ns)` when it needs exactness.
 are format version 3 with a nanosecond `timestamp` and no `timestamp_ns`
 sibling. Iceberg can neither change a column's precision by schema evolution nor
 downgrade a v3 table in place, so there is no upgrade path — delete and
-re-ingest. 0.1.0 is untagged, so no released data predates the contract.
+re-ingest. The contract is in 0.1.0, so a warehouse written by a released build
+already has it; only a pre-release experimental warehouse can need the recreate.
 
 `scripts/check-external-timestamp-contract.sh` is the regression check: it
 writes the `siglake iceberg-demo` fixture, asserts the contract in-process
