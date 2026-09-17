@@ -2126,6 +2126,217 @@ async fn open_sized_bench_fixture(path: &std::path::Path, rebuild: bool) -> Iceb
         })
 }
 
+/// Whether this process's iceberg reader will answer a text predicate from a
+/// segmented sidecar (`SIGLAKE_SEGMENTED_INDEX_READS`, #4561). The reader
+/// resolves the knob once, at its first lookup, so a measurement can only read
+/// the environment it was started in — hence the twin here rather than a
+/// `set_var`.
+fn segmented_reads_enabled_from(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+#[test]
+fn segmented_reads_knob_resolves_without_process_environment() {
+    assert!(!segmented_reads_enabled_from(None));
+    assert!(!segmented_reads_enabled_from(Some("")));
+    assert!(!segmented_reads_enabled_from(Some("0")));
+    assert!(segmented_reads_enabled_from(Some("1")));
+    assert!(segmented_reads_enabled_from(Some(" TRUE ")));
+}
+
+fn puffin_segmented_indexes_file(table: &Table, file: &DataFile) -> bool {
+    table.metadata().statistics_iter().any(|stats_file| {
+        stats_file.blob_metadata.iter().any(|blob| {
+            blob.r#type == siglake_index::segmented::SEGMENTED_BLOB_TYPE
+                && blob
+                    .properties
+                    .get("data_file")
+                    .is_some_and(|path| path == file.file_path())
+        })
+    })
+}
+
+/// What building one arm's segmented sidecars cost, reported apart from any
+/// query latency: #4562 prices the codec separately from the read path.
+struct SegmentedBuildReport {
+    files: usize,
+    groups: usize,
+    /// Encode time only — reading the Parquet back is charged to `decode_s`.
+    encode_s: f64,
+    decode_s: f64,
+    blob_bytes: u64,
+    statistics_bytes: i64,
+}
+
+/// #4562's third arm needs sidecars in the segmented format and no writer
+/// produces one for a real table — that is #4377, which this measurement is
+/// the input to. So the harness writes them: one blob per live data file whose
+/// groups **are** that file's Parquet row groups (the identity
+/// `docs/DESIGN_segmented_inverted_index.md` requires, and the reader's
+/// `matches_row_groups` enforces), all of them in one uncompressed Puffin file
+/// registered on the current snapshot.
+///
+/// Uncompressed is not a choice: a codec leaves the blob with no addressable
+/// interior and the reader declines it (`reason="compressed"`).
+async fn write_segmented_sidecars(
+    ice: &IcebergContext,
+    block_bytes: usize,
+) -> SegmentedBuildReport {
+    use iceberg::puffin::{Blob as PuffinBlob, CompressionCodec, PuffinReader, PuffinWriter};
+    use iceberg::spec::{BlobMetadata as StatisticsBlobMetadata, StatisticsFile};
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let ident = ice.events_table_ident().clone();
+    let table = ice.catalog().load_table(&ident).await.unwrap();
+    let data_files = ice.live_data_files(&ident).await.unwrap();
+    let snapshot = table.metadata().current_snapshot().unwrap().clone();
+    let field_id = table
+        .metadata()
+        .current_schema()
+        .field_id_by_name("raw")
+        .unwrap_or_default();
+
+    let mut report = SegmentedBuildReport {
+        files: data_files.len(),
+        groups: 0,
+        encode_s: 0.0,
+        decode_s: 0.0,
+        blob_bytes: 0,
+        statistics_bytes: 0,
+    };
+    let mut blobs: Vec<(String, Vec<u8>, usize)> = Vec::with_capacity(data_files.len());
+    for data_file in &data_files {
+        let bytes = table
+            .file_io()
+            .new_input(data_file.file_path())
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let metadata = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+            .unwrap()
+            .metadata()
+            .clone();
+        let row_group_size = metadata
+            .row_groups()
+            .iter()
+            .map(|group| group.num_rows() as usize)
+            .max()
+            .unwrap_or(0);
+        let mut writer = siglake_index::segmented::SegmentedWriter::new(block_bytes)
+            .with_tokenizer(siglake_bloom::Tokenizer::Default);
+        for group in 0..metadata.row_groups().len() {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+                .unwrap()
+                .with_row_groups(vec![group])
+                .build()
+                .unwrap();
+            // One group's index, built from that group's rows in physical
+            // order, so the blob's group `i` is the file's row group `i`.
+            let decode = std::time::Instant::now();
+            let mut builder =
+                siglake_index::IndexBuilder::with_tokenizer(siglake_bloom::Tokenizer::Default);
+            for batch in reader {
+                let batch = batch.unwrap();
+                let column = batch.schema().index_of("raw").unwrap();
+                let raw = batch
+                    .column(column)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for value in raw.iter() {
+                    builder.push_row(value.unwrap_or(""));
+                }
+            }
+            let index = builder.build();
+            report.decode_s += decode.elapsed().as_secs_f64();
+            let encode = std::time::Instant::now();
+            writer.push_group_index(&index);
+            report.encode_s += encode.elapsed().as_secs_f64();
+            report.groups += 1;
+        }
+        let encode = std::time::Instant::now();
+        let blob = writer.finish();
+        report.encode_s += encode.elapsed().as_secs_f64();
+        report.blob_bytes += blob.len() as u64;
+        blobs.push((data_file.file_path().to_string(), blob, row_group_size));
+    }
+
+    let statistics_path = format!(
+        "{}/siglake-index-seg-{}.puffin",
+        table
+            .metadata_location_result()
+            .unwrap()
+            .rsplit_once('/')
+            .unwrap()
+            .0,
+        uuid::Uuid::now_v7()
+    );
+    let output_file = table.file_io().new_output(&statistics_path).unwrap();
+    let mut writer = PuffinWriter::new(&output_file, std::collections::HashMap::new(), false)
+        .await
+        .unwrap();
+    let mut blob_metadata = Vec::with_capacity(blobs.len());
+    for (data_file_path, blob, row_group_size) in blobs {
+        let properties = std::collections::HashMap::from([
+            ("data_file".to_string(), data_file_path),
+            ("column".to_string(), "raw".to_string()),
+            ("tokenizer".to_string(), "default".to_string()),
+            ("row_group_size".to_string(), row_group_size.to_string()),
+            ("format".to_string(), "seg1".to_string()),
+        ]);
+        writer
+            .add(
+                PuffinBlob::builder()
+                    .r#type(siglake_index::segmented::SEGMENTED_BLOB_TYPE.to_string())
+                    .fields(vec![field_id])
+                    .snapshot_id(snapshot.snapshot_id())
+                    .sequence_number(snapshot.sequence_number())
+                    .data(blob)
+                    .properties(properties.clone())
+                    .build(),
+                // The interior has to stay addressable; see above.
+                CompressionCodec::None,
+            )
+            .await
+            .unwrap();
+        blob_metadata.push(StatisticsBlobMetadata {
+            r#type: siglake_index::segmented::SEGMENTED_BLOB_TYPE.to_string(),
+            snapshot_id: snapshot.snapshot_id(),
+            sequence_number: snapshot.sequence_number(),
+            fields: vec![field_id],
+            properties,
+        });
+    }
+    writer.close().await.unwrap();
+    let input = output_file.to_input_file();
+    report.statistics_bytes = input.metadata().await.unwrap().size as i64;
+    let footer_size = PuffinReader::new(input)
+        .footer_size_in_bytes()
+        .await
+        .unwrap() as i64;
+    let statistics = StatisticsFile {
+        snapshot_id: snapshot.snapshot_id(),
+        statistics_path,
+        file_size_in_bytes: report.statistics_bytes,
+        file_footer_size_in_bytes: footer_size,
+        key_metadata: None,
+        blob_metadata,
+    };
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_statistics()
+        .set_statistics(statistics)
+        .apply(tx)
+        .unwrap();
+    tx.commit(ice.catalog().as_ref()).await.unwrap();
+    report
+}
+
 fn median(samples: &[f64]) -> f64 {
     let mut sorted = samples.to_vec();
     sorted.sort_by(f64::total_cmp);
@@ -2147,6 +2358,115 @@ fn ab_reuse_dir_resolves_without_process_environment() {
         ab_reuse_dir_from(Some(OsStr::new("/measurement/fixture"))),
         Some(std::path::PathBuf::from("/measurement/fixture"))
     );
+}
+
+/// One arm of the comparison below: a registered session over one fixture,
+/// and — for a policy arm — the arm whose session an unclipped shape runs in
+/// instead, since the rule under test only fires on a clipped statement.
+struct AbArm {
+    label: &'static str,
+    unhinted: Option<&'static str>,
+    ctx: SessionContext,
+    file_rows: Vec<u64>,
+    warehouse: String,
+    /// Whether this arm's fixture carries segmented sidecars (#4562).
+    segmented: bool,
+}
+
+/// What the segmented reader did for one execution, or for every execution of
+/// one (shape, arm): the quantities #4562 keeps apart from latency. `reads`
+/// and `fetched` are what the lookups asked the object store for, `resident`
+/// is the largest directory a lookup reported holding, and `declines` is why a
+/// file fell back — an arm with declines is not measuring what it says.
+#[derive(Clone, Debug, Default)]
+struct SegmentedArmCost {
+    used: u64,
+    reads: u64,
+    fetched: u64,
+    resident: u64,
+    selected_rows: u64,
+    declines: std::collections::BTreeMap<String, u64>,
+}
+
+impl SegmentedArmCost {
+    fn add(&mut self, other: &Self) {
+        self.used += other.used;
+        self.reads += other.reads;
+        self.fetched += other.fetched;
+        self.resident = self.resident.max(other.resident);
+        self.selected_rows += other.selected_rows;
+        for (reason, count) in &other.declines {
+            *self.declines.entry(reason.clone()).or_default() += count;
+        }
+    }
+}
+
+/// Drain the recorder and read the segmented counters out of it. Every read of
+/// a `DebuggingRecorder` snapshot is a delta, so this is exactly the work done
+/// since the previous call — which is how one execution's reads and bytes are
+/// attributed to it.
+fn drain_segmented_cost(snapshotter: Option<&Snapshotter>) -> SegmentedArmCost {
+    let Some(snapshotter) = snapshotter else {
+        return SegmentedArmCost::default();
+    };
+    let snapshot = snapshotter.snapshot().into_vec();
+    let histogram_sum = |name: &str| -> u64 {
+        snapshot
+            .iter()
+            .filter(|(key, _, _, _)| key.key().name() == name)
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Histogram(samples) => samples
+                    .iter()
+                    .map(|sample| sample.into_inner())
+                    .sum::<f64>() as u64,
+                _ => 0,
+            })
+            .sum()
+    };
+    let histogram_max = |name: &str| -> u64 {
+        snapshot
+            .iter()
+            .filter(|(key, _, _, _)| key.key().name() == name)
+            .flat_map(|(_, _, _, value)| match value {
+                DebugValue::Histogram(samples) => samples
+                    .iter()
+                    .map(|sample| sample.into_inner() as u64)
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    let mut declines: std::collections::BTreeMap<String, u64> = Default::default();
+    for (key, _, _, value) in &snapshot {
+        if key.key().name() != "siglake_iceberg_segmented_index_declined_total" {
+            continue;
+        }
+        let DebugValue::Counter(count) = value else {
+            continue;
+        };
+        let reason = key
+            .key()
+            .labels()
+            .find(|label| label.key() == "reason")
+            .map_or_else(
+                || "unlabelled".to_string(),
+                |label| label.value().to_string(),
+            );
+        *declines.entry(reason).or_default() += count;
+    }
+    SegmentedArmCost {
+        used: counter_sum(
+            &snapshot,
+            "siglake_iceberg_segmented_index_used_total",
+            None,
+        ),
+        reads: histogram_sum("siglake_iceberg_segmented_index_range_reads"),
+        fetched: histogram_sum("siglake_iceberg_segmented_index_fetched_bytes"),
+        resident: histogram_max("siglake_iceberg_segmented_index_resident_bytes"),
+        selected_rows: histogram_sum("siglake_iceberg_segmented_index_selected_rows"),
+        declines,
+    }
 }
 
 /// One shape of the on/off comparison below.
@@ -2199,6 +2519,16 @@ struct AbShape {
 ///   cargo test -p siglake-storage --release --test puffin_rebuild \
 ///     report_rebuild_on_off_text_shapes -- --ignored --nocapture
 ///
+/// #4562 adds the third FORMAT, `seg` (and its policy twin `seg_policy`): the
+/// same corpus with no whole-file sidecar and a segmented one per file, which
+/// the harness writes because no writer produces the format for a real table —
+/// that is #4377, and this measurement is its input. The arm exists only when
+/// `SIGLAKE_SEGMENTED_INDEX_READS` is set in the environment the process
+/// started in, since the reader resolves that knob once; without it the run is
+/// the four-arm one #4375 left. Its costs are reported apart from the
+/// milliseconds: files answered from a sidecar, range reads, fetched bytes and
+/// the directory bytes a lookup held.
+///
 /// Knobs, read from the environment (nothing here sets one):
 ///   SIGLAKE_REBUILD_AB_FILES          files per arm (default 4)
 ///   SIGLAKE_REBUILD_AB_ROWS_PER_FILE  rows per file (default 1,000,000)
@@ -2206,9 +2536,22 @@ struct AbShape {
 ///   SIGLAKE_REBUILD_AB_RARE_EVERY     one rare-term row in this many (100,000)
 ///   SIGLAKE_REBUILD_AB_PARSED_BYTES   parsed-index cache budget, bytes
 ///   SIGLAKE_REBUILD_AB_BLOB_BYTES     Puffin blob cache budget, bytes
-///   SIGLAKE_REBUILD_AB_PASSES         re-time the ON arm at further budgets:
-///                                     `name=parsed:blob`, comma-separated
-///   SIGLAKE_REBUILD_AB_REUSE_DIR      completed fixture root with off/ and on/
+///   SIGLAKE_REBUILD_AB_PASSES         re-time each indexed arm at further
+///                                     budgets: `name=parsed:blob`, comma-separated
+///   SIGLAKE_REBUILD_AB_REUSE_DIR      fixture root with off/, on/ and seg/;
+///                                     an arm it does not carry is built and kept
+///   SIGLAKE_REBUILD_AB_SEG_BLOCK_BYTES  segmented dictionary block target (4,096)
+///   SIGLAKE_SEGMENTED_INDEX_READS     the reader's own knob; the `seg` arms
+///                                     exist only when it is set
+///   SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES  the segmented arm's own
+///                                     budget (64 MiB; `0` makes every lookup
+///                                     re-read its directory, the cold control)
+///
+/// What "cold" means per arm: the first execution of a shape. For the `on` arm
+/// that is a decode under the parsed budget; for `seg` it is an open only if
+/// the shape is the first one to touch the file, since a directory held from
+/// an earlier shape is what #5006 retains. The per-execution cold cost of
+/// every shape is a separate run with the directory budget at `0`.
 ///
 /// The cache knobs are how a local corpus reproduces the deployed
 /// working-set-to-cache ratio. Left unset, the caches keep whatever the process
@@ -2269,6 +2612,39 @@ async fn report_rebuild_on_off_text_shapes() {
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok());
     let reuse_dir = ab_reuse_dir_from(std::env::var_os("SIGLAKE_REBUILD_AB_REUSE_DIR").as_deref());
+    // #4562: the segmented arm exists only if this process's reader will read
+    // a segmented sidecar. The knob is the iceberg reader's, resolved once at
+    // its first lookup, so it has to be in the environment the run started in.
+    let segmented_reads = segmented_reads_enabled_from(
+        std::env::var("SIGLAKE_SEGMENTED_INDEX_READS")
+            .ok()
+            .as_deref(),
+    );
+    let seg_block_bytes = knob("SIGLAKE_REBUILD_AB_SEG_BLOCK_BYTES", 4_096);
+    // Per-execution segmented cost is histogram-shaped, so the arm needs a
+    // recorder. `DebuggingRecorder` reports every read as a delta, which is
+    // exactly the per-execution attribution this wants; a run that cannot
+    // install one (another test in this binary got there first) reports the
+    // latencies and leaves the segmented columns empty rather than lying.
+    let snapshotter = if segmented_reads {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        match recorder.install() {
+            Ok(()) => Some(snapshotter),
+            Err(err) => {
+                println!("segmented counters unavailable: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    println!(
+        "segmented_index_reads={segmented_reads} seg_block_bytes={seg_block_bytes} \
+         seg_directory_cache_max_bytes={}",
+        std::env::var("SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES")
+            .unwrap_or_else(|_| "default".to_string())
+    );
     if let (Some(parsed), Some(blob)) = (parsed_bytes, blob_bytes) {
         siglake_storage::configure_text_index_caches(siglake_storage::TextIndexCacheConfig {
             parsed_index_max_bytes: parsed as u64,
@@ -2405,22 +2781,66 @@ async fn report_rebuild_on_off_text_shapes() {
     let fixture_root = reuse_dir
         .as_deref()
         .unwrap_or_else(|| tmp.as_ref().unwrap().path());
-    let mut contexts = Vec::new();
-    for (label, rebuild) in [("off", false), ("on", true)] {
+    let mut contexts: Vec<AbArm> = Vec::new();
+    // #4562's third fixture: the same corpus with no v1 sidecar and a
+    // segmented one per file. It is a separate warehouse because the reads
+    // knob is process-wide — a segmented blob on the `off` table would stop it
+    // being the scan control.
+    let fixtures: Vec<(&str, bool, bool)> = if segmented_reads {
+        vec![
+            ("off", false, false),
+            ("on", true, false),
+            ("seg", false, true),
+        ]
+    } else {
+        vec![("off", false, false), ("on", true, false)]
+    };
+    for (label, rebuild, segmented) in fixtures {
         let warehouse = fixture_root.join(label);
         let build = Instant::now();
-        let ice = if reuse_dir.is_some() {
+        // A reuse root that does not carry this arm yet is BUILT into and
+        // kept, which is what lets a second process re-measure the same
+        // corpus — a run with a different cache or reader configuration is a
+        // different measurement, not a different fixture.
+        let ice = if reuse_dir.is_some() && warehouse.exists() {
             open_sized_bench_fixture(&warehouse, rebuild).await
         } else {
             sized_bench_fixture(&warehouse, rebuild, base, files, rows_per_file, rare_every).await
         };
         let build_s = build.elapsed().as_secs_f64();
         let ident = ice.events_table_ident().clone();
-        let table = ice.catalog().load_table(&ident).await.unwrap();
+        let mut table = ice.catalog().load_table(&ident).await.unwrap();
         let data_files = ice.live_data_files(&ident).await.unwrap();
+        assert!(
+            !data_files.is_empty(),
+            "arm {label} has no data files — a reused fixture root is missing {label}/"
+        );
+        if segmented
+            && !data_files
+                .iter()
+                .all(|file| puffin_segmented_indexes_file(&table, file))
+        {
+            // Construction cost, reported apart from every latency below.
+            let report = write_segmented_sidecars(&ice, seg_block_bytes).await;
+            println!(
+                "arm={label} seg_build files={} groups={} encode_s={:.1} parquet_decode_s={:.1} \
+                 blob_bytes={} statistics_bytes={} block_bytes={seg_block_bytes}",
+                report.files,
+                report.groups,
+                report.encode_s,
+                report.decode_s,
+                report.blob_bytes,
+                report.statistics_bytes
+            );
+            table = ice.catalog().load_table(&ident).await.unwrap();
+        }
         let indexed = data_files
             .iter()
             .filter(|file| puffin_indexes_file(&table, file))
+            .count();
+        let seg_indexed = data_files
+            .iter()
+            .filter(|file| puffin_segmented_indexes_file(&table, file))
             .count();
         let file_rows: Vec<u64> = data_files.iter().map(|file| file.record_count()).collect();
         let bytes: u64 = data_files
@@ -2434,7 +2854,8 @@ async fn report_rebuild_on_off_text_shapes() {
             .sum();
         println!(
             "arm={label} rebuild={rebuild} build_s={build_s:.1} files={} indexed_files={indexed} \
-             parquet_bytes={bytes} puffin_bytes={puffin_bytes} file_rows={file_rows:?}",
+             seg_indexed_files={seg_indexed} parquet_bytes={bytes} puffin_bytes={puffin_bytes} \
+             file_rows={file_rows:?}",
             data_files.len()
         );
         if rebuild {
@@ -2444,8 +2865,13 @@ async fn report_rebuild_on_off_text_shapes() {
                 "the ON arm must carry a sidecar per file"
             );
         } else {
-            assert_eq!(indexed, 0, "the OFF arm must carry no sidecar at all");
+            assert_eq!(indexed, 0, "a non-rebuild arm must carry no v1 sidecar");
         }
+        assert_eq!(
+            seg_indexed,
+            if segmented { data_files.len() } else { 0 },
+            "the segmented arm carries a segmented sidecar per file and no other arm carries one"
+        );
         let ctx = unordered_text_context();
         ice.register_with_datafusion(&ctx).await.unwrap();
         let path = warehouse.to_string_lossy().to_string();
@@ -2453,47 +2879,100 @@ async fn report_rebuild_on_off_text_shapes() {
         // the query server now builds for a clipped statement. It is a third
         // ARM rather than a replacement for `on` because the question is what
         // the policy is worth against the index it declines, and `off` alone
-        // cannot answer that — it has no index to decline.
-        let policy = if rebuild {
-            let clipped = clipped_text_context(100);
-            ice.register_with_datafusion(&clipped).await.unwrap();
-            Some(("policy", clipped, file_rows.clone(), path.clone()))
-        } else {
-            None
+        // cannot answer that — it has no index to decline. The segmented arm
+        // gets the same pair: #4375's rule gates both formats, so what it is
+        // worth against a partial-read index is its own measurement.
+        let policy_label = match label {
+            "on" => Some("policy"),
+            "seg" => Some("seg_policy"),
+            _ => None,
         };
-        contexts.push((label, ctx, file_rows, path));
+        let policy = match policy_label {
+            Some(policy_label) => {
+                let clipped = clipped_text_context(100);
+                ice.register_with_datafusion(&clipped).await.unwrap();
+                Some(AbArm {
+                    label: policy_label,
+                    unhinted: Some(label),
+                    ctx: clipped,
+                    file_rows: file_rows.clone(),
+                    warehouse: path.clone(),
+                    segmented,
+                })
+            }
+            None => None,
+        };
+        contexts.push(AbArm {
+            label,
+            unhinted: None,
+            ctx,
+            file_rows,
+            warehouse: path,
+            segmented,
+        });
         contexts.extend(policy);
     }
-    assert_eq!(
-        contexts[0].2, contexts[1].2,
-        "the arms must have identical Parquet layout, or the shapes are not comparable"
-    );
+    for arm in &contexts {
+        assert_eq!(
+            contexts[0].file_rows, arm.file_rows,
+            "the arms must have identical Parquet layout, or the shapes are not comparable"
+        );
+    }
+    let arm_labels: Vec<&'static str> = contexts.iter().map(|arm| arm.label).collect();
 
     let mut samples: std::collections::BTreeMap<(&str, &str), Vec<f64>> = Default::default();
     let mut decodes: std::collections::BTreeMap<(&str, &str), (u64, u64)> = Default::default();
+    let mut seg_costs: std::collections::BTreeMap<(&str, &str), SegmentedArmCost> =
+        Default::default();
+    let mut cold_seg_costs: std::collections::BTreeMap<(&str, &str), SegmentedArmCost> =
+        Default::default();
     let mut results: std::collections::BTreeMap<(&str, &str), Vec<String>> = Default::default();
 
     // Interleave the arms per execution: a drift on this box hits both.
     for run in 0..runs {
         for shape in &shapes {
-            for (label, ctx, _, _) in &contexts {
+            for arm in &contexts {
                 // The policy arm decides per EXECUTION, which is the whole
                 // claim: a shape nothing clips runs in the unhinted session
                 // and keeps the index it would have used.
-                let ctx = match (*label, shape.clip) {
-                    ("policy", None) => &contexts[1].1,
-                    _ => ctx,
+                let ctx = match (arm.unhinted, shape.clip) {
+                    (Some(base), None) => {
+                        &contexts
+                            .iter()
+                            .find(|candidate| candidate.label == base)
+                            .expect("a policy arm's base arm is built before it")
+                            .ctx
+                    }
+                    _ => &arm.ctx,
                 };
-                let (elapsed, found, delta) = time_ab_shape(shape, label, ctx, run == 0).await;
+                let (elapsed, found, delta, seg) =
+                    time_ab_shape(shape, arm.label, ctx, run == 0, snapshotter.as_ref()).await;
                 samples
-                    .entry((shape.name, label))
+                    .entry((shape.name, arm.label))
                     .or_default()
                     .push(elapsed);
-                let counted = decodes.entry((shape.name, label)).or_default();
+                let counted = decodes.entry((shape.name, arm.label)).or_default();
                 counted.0 += delta.0;
                 counted.1 += delta.1;
+                let seg_total = seg_costs.entry((shape.name, arm.label)).or_default();
+                seg_total.add(&seg);
                 if run == 0 {
-                    results.insert((shape.name, label), found);
+                    cold_seg_costs.insert((shape.name, arm.label), seg.clone());
+                    // The segmented arm has to be seen using its sidecars.
+                    // An arm that silently declined every file would be a
+                    // scan wearing the label, and its numbers would be the
+                    // OFF column with extra steps.
+                    if arm.segmented && arm.unhinted.is_none() {
+                        assert!(
+                            seg.used > 0,
+                            "{}/{}: the segmented arm answered no file from a sidecar \
+                             (declines: {:?})",
+                            shape.name,
+                            arm.label,
+                            seg.declines
+                        );
+                    }
+                    results.insert((shape.name, arm.label), found);
                 }
             }
         }
@@ -2502,8 +2981,8 @@ async fn report_rebuild_on_off_text_shapes() {
     for shape in &shapes {
         let name = shape.name;
         let off = &results[&(name, "off")];
-        for arm in ["on", "policy"] {
-            let found = &results[&(name, arm)];
+        for arm in arm_labels.iter().filter(|label| **label != "off") {
+            let found = &results[&(name, *arm)];
             assert_eq!(
                 off.len(),
                 found.len(),
@@ -2519,23 +2998,45 @@ async fn report_rebuild_on_off_text_shapes() {
         }
     }
 
-    // `policy` shares the indexed warehouse with `on`, so it has no cache
-    // statistics of its own; its decodes are attributed per execution below.
-    for (label, _, _, warehouse) in contexts.iter().filter(|(label, ..)| *label != "policy") {
-        let (entries, lookups) = iceberg::arrow::parsed_inverted_index_cache_stats(warehouse);
-        println!("arm={label} cached_indexes={entries} cache_lookups={lookups}");
+    // A policy arm shares its warehouse with the arm it declines for, so it
+    // has no cache statistics of its own; its decodes are attributed per
+    // execution below.
+    for arm in contexts.iter().filter(|arm| arm.unhinted.is_none()) {
+        let (entries, lookups) = iceberg::arrow::parsed_inverted_index_cache_stats(&arm.warehouse);
+        let (seg_entries, seg_hits) =
+            iceberg::arrow::segmented_directory_cache_stats(&arm.warehouse);
+        println!(
+            "arm={} cached_indexes={entries} cache_lookups={lookups} \
+             seg_directories={seg_entries} seg_directory_hits={seg_hits}",
+            arm.label
+        );
     }
     let footprint = iceberg::arrow::parsed_inverted_index_cache_footprint();
     println!(
         "parsed_cache entries={} bytes={} evictions={} oversized_skips={}",
         footprint.entries, footprint.bytes, footprint.evictions, footprint.oversized_skips
     );
+    // The segmented arm's resident state is a directory per blob under a
+    // budget of its own (#5006) — not the parsed-index budget above, which it
+    // never touches.
+    let seg_footprint = iceberg::arrow::segmented_directory_cache_footprint();
+    println!(
+        "seg_directory_cache entries={} bytes={} hits={} evictions={} oversized_skips={}",
+        seg_footprint.entries,
+        seg_footprint.bytes,
+        seg_footprint.hits,
+        seg_footprint.evictions,
+        seg_footprint.oversized_skips
+    );
     // One row per (shape, arm) since #4375 added the third arm: a fixed
     // column per arm stops being readable at three and would have to change
-    // again at four.
+    // again at four. #4562's segmented columns are the same shape: the reads
+    // and bytes a lookup asked for, summed over the executions, and kept
+    // apart from the milliseconds.
     println!(
         "shape,arm,clip,corpus_matches,selectivity,rows_returned,cold_ms,p50_ms,over_off,\
-         decodes,cache_hits,all_ms"
+         decodes,cache_hits,seg_files_used,seg_reads,seg_fetched_bytes,seg_resident_bytes,\
+         seg_declines,all_ms"
     );
     let format_all = |values: &[f64]| {
         values
@@ -2548,12 +3049,15 @@ async fn report_rebuild_on_off_text_shapes() {
         // The first execution of each arm is its cold one; the p50 is over the
         // rest, which is what the benchmark's repeated iterations report.
         let off_p50 = median(&samples[&(name, "off")][1..]);
-        for arm in ["off", "on", "policy"] {
+        for arm in &arm_labels {
+            let arm = *arm;
             let arm_samples = &samples[&(name, arm)];
             let p50 = median(&arm_samples[1..]);
             let (arm_decodes, arm_hits) = decodes[&(name, arm)];
+            let seg = &seg_costs[&(name, arm)];
             println!(
-                "{name},{arm},{},{},{:.6},{},{:.1},{p50:.1},{:.2}x,{arm_decodes},{arm_hits},{:?}",
+                "{name},{arm},{},{},{:.6},{},{:.1},{p50:.1},{:.2}x,{arm_decodes},{arm_hits},\
+                 {},{},{},{},{},{:?}",
                 shape
                     .clip
                     .map_or_else(|| "none".to_string(), |n| n.to_string()),
@@ -2562,8 +3066,43 @@ async fn report_rebuild_on_off_text_shapes() {
                 results[&(name, arm)].len(),
                 arm_samples[0],
                 p50 / off_p50,
+                seg.used,
+                seg.reads,
+                seg.fetched,
+                seg.resident,
+                if seg.declines.is_empty() {
+                    "none".to_string()
+                } else {
+                    seg.declines
+                        .iter()
+                        .map(|(reason, count)| format!("{reason}:{count}"))
+                        .collect::<Vec<_>>()
+                        .join("+")
+                },
                 format_all(arm_samples),
             );
+        }
+    }
+    // Per-execution segmented cost, cold apart from warm: the first execution
+    // of a shape is the one that opens fourteen sidecars and the rest reuse
+    // their directories (#5006). Summed columns above cannot show that.
+    if segmented_reads {
+        println!(
+            "shape,arm,seg_cold_reads,seg_cold_bytes,seg_warm_reads_total,seg_warm_bytes_total"
+        );
+        for shape in &shapes {
+            for arm in arm_labels.iter().filter(|label| label.starts_with("seg")) {
+                let cold = &cold_seg_costs[&(shape.name, *arm)];
+                let total = &seg_costs[&(shape.name, *arm)];
+                println!(
+                    "{},{arm},{},{},{},{}",
+                    shape.name,
+                    cold.reads,
+                    cold.fetched,
+                    total.reads - cold.reads,
+                    total.fetched - cold.fetched
+                );
+            }
         }
     }
     // Further passes over the SAME indexed arm at other cache budgets. Each one
@@ -2574,39 +3113,76 @@ async fn report_rebuild_on_off_text_shapes() {
             parsed_index_max_bytes: *parsed,
             puffin_blob_max_bytes: *blob,
         });
-        let (label, ctx, _, _) = &contexts[1];
-        assert_eq!(*label, "on", "an extra pass re-times the indexed arm");
-        let mut pass_samples: std::collections::BTreeMap<&str, Vec<f64>> = Default::default();
-        let mut pass_decodes: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
-        for _ in 0..runs {
-            for shape in &shapes {
-                let (elapsed, _, delta) = time_ab_shape(shape, pass_name, ctx, false).await;
-                pass_samples.entry(shape.name).or_default().push(elapsed);
-                let counted = pass_decodes.entry(shape.name).or_default();
-                counted.0 += delta.0;
-                counted.1 += delta.1;
+        // Both index arms are re-timed, not just the whole-file one: the
+        // packaged 4Gi configuration derives no parsed cache at all, and what
+        // that does to a format that keeps no parsed index is the question
+        // #4562 is asking. The segmented arm's own budget is the directory
+        // cache's and is not one of these two.
+        for indexed in contexts
+            .iter()
+            .filter(|arm| arm.unhinted.is_none() && arm.label != "off")
+        {
+            let mut pass_samples: std::collections::BTreeMap<&str, Vec<f64>> = Default::default();
+            let mut pass_decodes: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
+            let mut pass_seg: std::collections::BTreeMap<&str, SegmentedArmCost> =
+                Default::default();
+            for _ in 0..runs {
+                for shape in &shapes {
+                    let (elapsed, _, delta, seg) =
+                        time_ab_shape(shape, pass_name, &indexed.ctx, false, snapshotter.as_ref())
+                            .await;
+                    pass_samples.entry(shape.name).or_default().push(elapsed);
+                    let counted = pass_decodes.entry(shape.name).or_default();
+                    counted.0 += delta.0;
+                    counted.1 += delta.1;
+                    pass_seg.entry(shape.name).or_default().add(&seg);
+                }
             }
-        }
-        println!("pass={pass_name} parsed_bytes={parsed} blob_bytes={blob}");
-        println!("shape,cold_ms,p50_ms,over_off,decodes,cache_hits,all_ms");
-        for shape in &shapes {
-            let name = shape.name;
-            let pass = &pass_samples[name];
-            let p50 = median(&pass[1..]);
-            let off_p50 = median(&samples[&(name, "off")][1..]);
-            let (decoded, hits) = pass_decodes[name];
             println!(
-                "{name},{:.1},{p50:.1},{:.2}x,{decoded},{hits},{:?}",
-                pass[0],
-                p50 / off_p50,
-                format_all(pass),
+                "pass={pass_name} arm={} parsed_bytes={parsed} blob_bytes={blob}",
+                indexed.label
+            );
+            println!(
+                "shape,arm,cold_ms,p50_ms,over_off,decodes,cache_hits,seg_files_used,seg_reads,\
+                 seg_fetched_bytes,all_ms"
+            );
+            for shape in &shapes {
+                let name = shape.name;
+                let pass = &pass_samples[name];
+                let p50 = median(&pass[1..]);
+                let off_p50 = median(&samples[&(name, "off")][1..]);
+                let (decoded, hits) = pass_decodes[name];
+                let seg = &pass_seg[name];
+                println!(
+                    "{name},{},{:.1},{p50:.1},{:.2}x,{decoded},{hits},{},{},{},{:?}",
+                    indexed.label,
+                    pass[0],
+                    p50 / off_p50,
+                    seg.used,
+                    seg.reads,
+                    seg.fetched,
+                    format_all(pass),
+                );
+            }
+            let footprint = iceberg::arrow::parsed_inverted_index_cache_footprint();
+            println!(
+                "parsed_cache_{pass_name}_{} entries={} bytes={} evictions={} oversized_skips={}",
+                indexed.label,
+                footprint.entries,
+                footprint.bytes,
+                footprint.evictions,
+                footprint.oversized_skips
+            );
+            let seg_footprint = iceberg::arrow::segmented_directory_cache_footprint();
+            println!(
+                "seg_directory_cache_{pass_name}_{} entries={} bytes={} hits={} evictions={}",
+                indexed.label,
+                seg_footprint.entries,
+                seg_footprint.bytes,
+                seg_footprint.hits,
+                seg_footprint.evictions
             );
         }
-        let footprint = iceberg::arrow::parsed_inverted_index_cache_footprint();
-        println!(
-            "parsed_cache_{pass_name} entries={} bytes={} evictions={} oversized_skips={}",
-            footprint.entries, footprint.bytes, footprint.evictions, footprint.oversized_skips
-        );
     }
 
     // Leave the process's cache budgets as they were found.
@@ -2624,11 +3200,15 @@ async fn time_ab_shape(
     label: &str,
     ctx: &SessionContext,
     first: bool,
-) -> (f64, Vec<String>, (u64, u64)) {
+    snapshotter: Option<&Snapshotter>,
+) -> (f64, Vec<String>, (u64, u64), SegmentedArmCost) {
     let before = iceberg::arrow::inverted_index_decode_counts();
+    // Clear the recorder so what it holds after the query is this execution's.
+    let _ = drain_segmented_cost(snapshotter);
     let started = std::time::Instant::now();
     let found = raw_column(ctx, &shape.sql).await;
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+    let segmented = drain_segmented_cost(snapshotter);
     let after = iceberg::arrow::inverted_index_decode_counts();
     let name = shape.name;
     if first {
@@ -2659,5 +3239,10 @@ async fn time_ab_shape(
             );
         }
     }
-    (elapsed, found, (after.0 - before.0, after.1 - before.1))
+    (
+        elapsed,
+        found,
+        (after.0 - before.0, after.1 - before.1),
+        segmented,
+    )
 }

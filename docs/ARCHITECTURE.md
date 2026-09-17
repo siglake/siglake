@@ -298,7 +298,12 @@ anything it cannot conclude falling back to the v1 index or an exact scan
 its own (#5006, `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`, separate
 from the two budgets above) — but only when `SIGLAKE_SEGMENTED_INDEX_READS` is
 set, and no writer produces one, so nothing in this section changes by
-default, and nothing is retained under the new budget either.
+default, and nothing is retained under the new budget either. The three
+formats have been compared through the query path on a 102.76M-row local
+corpus (#4562): a rare unclipped text predicate is 11.5x faster than the scan
+where the shipped sidecar is 22.4x slower, and the result holds with both
+budgets above at zero. The format is 5.59x the shipped sidecar's bytes on disk
+until its blocks are compressed, which is what stands between it and a writer.
 
 **Whether to USE an index is decided per execution.** Loading one is a
 whole-file cost, so a query that wants a handful of rows cannot pay it: a text

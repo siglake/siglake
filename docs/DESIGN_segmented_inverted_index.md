@@ -659,8 +659,9 @@ regardless.
   comparison those need: 1,671.8 ms cold / 1,801.2 ms p50 for the 14-file
   `rare_scan`. What this measures is that the shipped index spends 44 s on the
   index term alone — 24x the entire OFF budget — where the segmented reader
-  spends 35.6 ms cold and 1.07 ms warm. That makes the acceptance plausible and
-  does not establish it: the scan-side term could dominate both.
+  spends 35.6 ms cold and 1.07 ms warm. That made the acceptance plausible and
+  did not establish it; the section below runs the same three formats through
+  the query path, where the scan-side term is present (#4562).
 - **Are not** an object-store measurement. `SliceSource` counts what the reader
   *asks for* — 14 reads of 9.8 KiB is 14 GETs against S3, where the shipped path
   issues one GET of ~16 MiB and decompresses it. Whether many small ranges beat
@@ -668,6 +669,286 @@ regardless.
   round, after #4561 has code to validate. Nothing here qualifies an AWS result.
 - **Are not** a writer-cost benchmark. The build columns are sequential local
   fixture construction, one arm after the other.
+
+## Through the query path: scan, whole-file, segmented (#4562)
+
+The sections above measure the index term on its own. This one runs the same
+three formats under DataFusion, where the scan-side term is present, using
+`crates/siglake-storage/tests/puffin_rebuild.rs`'s
+`report_rebuild_on_off_text_shapes` and the protocol at
+[`DESIGN_inverted_index.md`](DESIGN_inverted_index.md) (line 102). Five arms per
+shape, interleaved per execution:
+
+| arm | what it is |
+|---|---|
+| `off` | the same corpus with no text sidecar of any kind — the scan control |
+| `on` | one whole-file v1 Puffin sidecar per file |
+| `policy` | the `on` warehouse queried the way the query server queries it, so #4375's per-execution rule declines the index for a clipped `LIMIT` |
+| `seg` | no v1 sidecar; one segmented sidecar per file, groups identical to the file's Parquet row groups |
+| `seg_policy` | the `seg` warehouse under the same #4375 rule |
+
+No writer produces the segmented format, so the harness writes the sidecars
+(`write_segmented_sidecars`): one uncompressed blob per live data file,
+registered as one Puffin statistics file on the current snapshot. The arms exist
+only under `SIGLAKE_SEGMENTED_INDEX_READS`, which the reader resolves once per
+process.
+
+14 files × 7,340,000 rows = **102,760,000 rows**, one day per file, 42 row groups
+(3 per file, byte-targeted by the writer, not the codec harness's 1,048,576-row
+target). Identical Parquet layout across arms — 92,325,000 bytes and the same
+`file_rows` vector — asserted before anything is timed. Five executions per
+shape; the first is reported as `cold` and the median of the rest as `p50`.
+
+**Exact answers first.** Every arm's rows are compared against the `off` arm's
+before any cost is reported: an unclipped shape row for row and against the
+generator's own count of corpus matches, a clipped one on row count plus a
+per-row check that the row carries the term and falls inside the shape's window.
+A segmented arm that answered no file from a sidecar fails the test rather than
+reporting the scan's numbers under its label. All three runs below passed every
+one of those assertions, in every arm, on every shape. The format returned no
+wrong row and no missing row anywhere in this measurement.
+
+### Latency, under the deployed 1 GiB parsed / 256 MiB blob budgets
+
+The segmented arm's directory cache is at its own 64 MiB default, which is not
+one of those two budgets and is not derived from a pod's memory (#5006).
+`÷ off` is the arm's p50 over the `off` p50.
+
+| shape | clip | selectivity | off cold | off p50 | v1 cold | v1 p50 | v1 ÷ off | policy p50 | seg cold | seg p50 | seg ÷ off | seg_policy p50 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| keyword | 100 | 2% | 41.2 ms | 8.4 ms | 12,566.1 ms | 6,030.9 ms | 722x | 10.2 ms | 45.1 ms | 37.3 ms | 4.46x | 15.1 ms |
+| keyword_last25 | 100 | 0.5% | 21.6 ms | 18.5 ms | 5,012.3 ms | 10,447.1 ms | 564x | 16.0 ms | 34.0 ms | 29.7 ms | 1.60x | 22.5 ms |
+| keyword_last5 | 100 | 0.1% | 13.9 ms | 11.1 ms | 1,233.7 ms | 4,773.0 ms | 431x | 11.6 ms | 83.6 ms | 66.8 ms | 6.03x | 10.2 ms |
+| substring_scan | 100 | 5% | 6.6 ms | 5.6 ms | 4,639.9 ms | 15,011.8 ms | 2,682x | 6.5 ms | 1,017.0 ms | 972.4 ms | 174x | 6.6 ms |
+| rare_scan | none | 0.001% | 1,656.6 ms | 1,838.9 ms | 40,780.6 ms | 41,114.6 ms | 22.4x | 22,009.1 ms | 119.9 ms | **160.2 ms** | **0.09x** | 137.4 ms |
+| rare_scan_last25 | none | 0.00025% | 627.5 ms | 692.1 ms | 4,756.2 ms | 5,070.8 ms | 7.33x | 4,438.9 ms | 50.7 ms | **39.8 ms** | **0.06x** | 37.4 ms |
+| rare_keyword | 100 | 0.001% | 540.4 ms | 530.7 ms | 17,889.2 ms | 16,646.5 ms | 31.4x | 538.0 ms | 45.7 ms | **47.6 ms** | **0.09x** | 550.4 ms |
+
+Four results, in the order they bear on #4377.
+
+**The rare shapes cross from loss to win.** `rare_scan` is 22.4x slower than the
+scan with the shipped format and **11.5x faster** with the segmented one
+(1,838.9 → 160.2 ms), `rare_scan_last25` 7.33x slower against 17.4x faster. This
+is #4376's acceptance, under the budgets it names, end to end: the shipped
+format cannot reach it at any cache size a query pod can afford (its own winning
+regime needs the whole 7.3 GiB parsed working set resident), and the segmented
+one reaches it with 15.95 MiB of resident directory and no eviction.
+
+**It also removes #4375's one known loss.** `rare_keyword` — a clipped `LIMIT`
+over a term rare enough that an index would have won — is the shape the
+per-execution decline gives up on: 530.7 ms of scan, against 16,646.5 ms if it
+had kept the whole-file index. The segmented format answers it in 47.6 ms,
+**11.1x faster than the scan**, and `seg_policy` declines it anyway and pays
+550.4 ms. The decline exists because loading an index is a whole-file cost. That
+premise does not hold for this format, so #4375's rule has to become
+document-frequency aware before #4377's format can pay off on clipped shapes;
+the df it needs is already in the directory.
+
+**The clipped high-df shapes still need the decline.** `keyword` (2% density) is
+4.46x the scan and `keyword_last5` 6.03x: a scan that stops at 100 rows reads a
+sliver of one file, while the index reads megabytes of postings for millions of
+documents. `seg_policy` declines them and lands at 0.92-1.81x. Partial reads
+narrow the loss from 431-722x to 1.6-6.0x and do not close it.
+
+**`substring_scan` marks the format's boundary.** 972.4 ms against the
+scan's 5.6 ms, 174x, because a non-tokenizable `LIKE '%…%'` means finding every
+dictionary term containing the substring and that reads every block. The policy
+declines it (1.17x). #4375's per-execution rule is where this belongs and the
+answer is to keep declining it.
+
+### Cost, apart from latency
+
+Range reads and fetched bytes are drained per execution from a debugging
+recorder and reported separately, because the two questions differ: a local
+file's 8 MiB read is cheap and an object store's is not. `cold` is a shape's
+first execution — in a process where earlier shapes have already opened some
+directories — and warm is the mean of the four after it.
+
+| shape | seg files answered / exec | cold reads | cold fetched | warm reads / exec | warm fetched / exec |
+|---|---:|---:|---:|---:|---:|
+| keyword | 8.8 | 40 | 3,525,113 | 58.5 | 1,453,611 |
+| keyword_last25 | 4.0 | 28 | 2,276,680 | 22.0 | 540,007 |
+| keyword_last5 | 1.0 | 6 | 149,038 | 6.0 | 149,038 |
+| substring_scan | 1.4 | 23,041 | 37,864,577 | 35,251.5 | 56,910,821 |
+| rare_scan | 14.0 | 94 | 2,894,562 | 84.0 | **35,592** |
+| rare_scan_last25 | 4.0 | 22 | 8,387 | 22.0 | 8,387 |
+| rare_keyword | 10.2 | 54 | 22,785 | 63.0 | 27,403 |
+
+A warm 14-file `rare_scan` fetches **35,592 bytes** — 2,542 bytes per file, six
+range reads each — to answer a predicate over 102.76M rows, against the `off`
+arm's 1,838.9 ms of Parquet decode and the shipped format's 7.3 GiB of parsed
+index for the same answer.
+
+The clipped shapes' file coverage is not fixed: a clipped `LIMIT` cancels the
+remaining partitions once it has its rows, and how many files answered before
+that varies per execution (`keyword`: 8.8 files per execution here, 3.3 in the
+cold-control run below). Their byte columns are therefore not comparable across
+passes; the unclipped shapes' are.
+
+**Resident memory**, at the end of the pass:
+
+| | entries | bytes | evictions | hits |
+|---|---:|---:|---:|---:|
+| parsed v1 index cache (1 GiB) | 1 | 559,896,106 | 314 | 0 |
+| segmented directory cache (64 MiB default) | 14 | 16,722,773 | 0 | 388 |
+
+One 534.0 MiB parsed index resident and 314 evictions with zero hits, against
+fourteen directories in 15.95 MiB (1.14 MiB each) with zero evictions. The
+14-file v1 working set is 7.30 GiB; the segmented one is 0.2% of it.
+
+### Construction cost, apart from both
+
+The harness builds each file's sidecar per row group from that group's rows:
+145.6 s of Parquet decode plus term-dictionary construction across 42 groups,
+and **11.9 s of codec encode** (`push_group_index` + `finish`) for all fourteen
+files — 0.85 s per file, 8.6M rows/s. The decode half is an artifact of building
+sidecars for files that already exist; #4377 builds the postings during the
+streaming merge, where the rows are in hand. The encode half is what #4377 adds
+to a merge. For scale: #4329's fixture build was 574.7 s with the rebuild off
+and 729.0 s with the v1 rebuild on, so the v1 sidecars cost ~154 s for the same
+fourteen files.
+
+**On-disk bytes go the wrong way.** Measured as the statistics-file bytes each
+arm adds over the no-text-index baseline (224,474,617 B), the v1 sidecars add
+15.59 MiB per file and the segmented ones **87.19 MiB**, **5.59x**. The gap is
+compression, not layout: the v1 sidecar's 116.5 MiB of serialized index travels
+inside a Zstd frame and occupies 15.59 MiB, while a segmented blob has to stay
+uncompressed for its interior to be addressable — 87.19 MiB here, against the
+85.8 MiB the per-file section measured on a file cut into seven row groups
+instead of this fixture's three. #4988's per-block compression projects 16.4 MiB
+per file, which is where parity is. This is the one number in this measurement
+that argues against shipping the format as prototyped.
+
+### The packaged 4Gi configuration (both shipped budgets off)
+
+Re-timed on the same corpus with `parsed=0, blob=0`, which is what
+`derive_text_index_cache_bytes` returns on the packaged 4Gi query pod once the
+pool's first-file decode reservation has taken the remainder:
+
+| shape | v1 cold | v1 p50 | v1 ÷ off | seg cold | seg p50 | seg ÷ off |
+|---|---:|---:|---:|---:|---:|---:|
+| keyword | 3,792.1 ms | 3,433.3 ms | 411x | 23.2 ms | 28.1 ms | 3.37x |
+| keyword_last25 | 10,575.7 ms | 10,705.1 ms | 578x | 31.0 ms | 32.1 ms | 1.73x |
+| keyword_last5 | 3,843.1 ms | 3,448.3 ms | 311x | 70.8 ms | 70.9 ms | 6.40x |
+| substring_scan | 11,351.5 ms | 11,171.0 ms | 1,996x | 968.6 ms | 851.4 ms | 152x |
+| rare_scan | 21,400.7 ms | 27,699.2 ms | 15.1x | 123.3 ms | 119.6 ms | **0.07x** |
+| rare_scan_last25 | 3,808.1 ms | 4,560.7 ms | 6.59x | 34.6 ms | 39.7 ms | **0.06x** |
+| rare_keyword | 10,385.7 ms | 10,589.2 ms | 20.0x | 40.6 ms | 44.1 ms | **0.08x** |
+
+The segmented column is the deployed-budget column again, within run-to-run
+jitter: the format never touched either budget, so turning them off costs it
+nothing. That is the structural result — the packaged pod's inability to hold a
+parsed index stops being a text-query problem. The v1 column stays in the same
+regime it was in at 1 GiB, because one resident index out of fourteen and none
+out of fourteen differ only in which executions re-decode.
+
+Two cautions on that table. The parsed-cache footprint printed after a
+zero-budget pass is process-cumulative — a zero budget refuses admissions and
+evicts nothing, so the 534.0 MiB entry from the earlier pass is still counted;
+the per-shape `cache_hits=0` beside nonzero `decodes` is what shows the cache
+was off. And a packaged pod today enables no segmented reads at all, so this
+arm's seg column is what such a pod would cost if it did, at the 64 MiB
+directory default.
+
+### The segmented format's own budget, swept
+
+`SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES` is the only retention this
+path has, and the eviction pressure that broke the v1 format has to be put on it
+too. Three passes over the same fixture at the same two shipped budgets, 14
+files of 1.14 MiB of directory each:
+
+| directory budget | dir entries / hits / evictions | rare_scan p50 | reads / exec | fetched / exec |
+|---|---:|---:|---:|---:|
+| 64 MiB (default) | 14 / 388 / **0** | 160.2 ms | 84.0 | 35,592 |
+| 4 MiB (3 of 14 fit) | 3 / 0 / **125** | 135.2 ms | 106.0 | 6,292,130 |
+| 0 (no retention) | 0 / 0 / n/a | 138.9 ms | 112.0 | 7,954,450 |
+
+The 4 MiB pass is the v1 arm's failure mode reproduced on the new cache: a
+14-file plan round-robins through a budget that holds three, so the entry is
+gone before it is reused — **0 hits, 125 evictions**, the same shape as the
+parsed cache's 0/42/41. What it costs is the difference between the two formats.
+Re-reading a 565 KiB directory costs milliseconds, so `rare_scan` stays at
+135.2 ms and 0.08x the scan; re-decoding a 534 MiB parsed index costs seconds,
+which is how the same pressure puts v1 at 22.1x. A thrashing directory cache
+degrades to the unretained cost and no further, and unretained is still 12.7x
+better than that pass's own scan control (138.9 ms against 1,761.1 ms).
+
+Retention shows up in bytes rather than latency: 35,592 bytes per execution held
+against 7,954,450 unretained, **223x**, for a 33% difference in read count and
+none in wall time, because 7.95 MiB of local-file range reads costs less than
+the jitter between runs on this box. That is the quantity an object store prices
+and this measurement cannot (see below). The unretained pass is also the honest
+per-shape cold column, since no earlier shape can have opened a directory for
+it: `rare_scan` 112 reads and 7.95 MiB, `rare_keyword` 80 reads and 5.73 MiB,
+`keyword_last5` 8 reads and 742 KiB.
+
+The 4 MiB and 0 passes ran at a load average of 3.5 against the main pass's 1.8,
+so read the counts and bytes from them rather than the milliseconds — their
+`off` control moved too (`rare_scan` cold 3,372.5 ms against 1,656.6 ms).
+
+### What this measurement is, and is not
+
+- **Is:** the end-to-end query-path comparison #4376's acceptance asked for, at
+  the budgets it named and with both of them off, cold and warm apart and under
+  eviction pressure on each format's own cache, with exact-answer equality
+  asserted per arm per shape, and with reads, bytes, resident memory and codec
+  construction reported apart from latency.
+- **Is not** a distributed, object-store or HTTP measurement. One process, a
+  `file://` warehouse, no query server, no shards. The reads column is what the
+  reader asked for, not what S3 would charge for it; a warm `rare_scan`'s 84
+  reads of ~2.5 KiB would be 84 GETs, against the shipped path's fourteen large
+  ones. Whether that trade holds at per-request latency is a prepared round's
+  question and nothing here qualifies an AWS result.
+- **Is not** a defaults change. `SIGLAKE_SEGMENTED_INDEX_READS` stays off, no
+  writer produces the format, and neither shipped budget moves.
+- **Is not** a writer benchmark. The construction numbers are sequential local
+  fixture building, and the Parquet-decode half of them is an artifact of
+  building sidecars after the fact.
+- **Carries one attribution defect.** A clipped `LIMIT` returns before the
+  partitions it cancelled have finished loading their indexes, so a few of the
+  `on` arm's decodes land in the next arm's counter window and its per-execution
+  millisecond columns swing by 3-10x between runs of the same shape (`keyword`:
+  12,566 / 6,222 / 6,031 / 10.5 / 16.1 ms). The `on` arm's cold column and its
+  summed decode counts are sound; its p50 for a clipped shape is an
+  overestimate of what one execution costs and an underestimate for whichever
+  arm ran next. Nothing in the `seg` arm's own numbers depends on it — that
+  fixture carries no v1 index to decode — and the disposition below turns on
+  ratios of 10x and more.
+
+## Disposition for #4377: proceed, with two revisions
+
+**Proceed.** The format does the thing it was designed for, measured through the
+query path: the rare unclipped shapes go from 7.3-22.4x slower than a scan to
+11.5-17.4x faster, the clipped rare shape #4375 has to decline goes to 11.1x
+faster than the scan, the resident working set falls from 7.30 GiB to 15.95 MiB,
+every answer is exact, and none of it depends on the two cache budgets a 4Gi
+query pod cannot fund. Starved of its own budget it degrades to 0.08x the scan
+instead of 22x it (0 hits and 125 evictions at 4 MiB, the parsed cache's failure
+mode on a cache whose miss costs milliseconds). No cache sizing reaches that
+result with the shipped format.
+
+Two revisions belong in #4377's scope rather than after it:
+
+1. **#4988's per-block compression is a prerequisite, not a follow-on.** As
+   prototyped the sidecar is 5.59x the on-disk bytes of the v1 one it replaces
+   (87.19 MiB against 15.59 MiB per file), because the interior has to stay
+   addressable. #4988 projects 16.4 MiB per file with per-block compression,
+   which is parity, and it settles the posting-span checksum in the same
+   decision. Building the format into the merge at 5.59x storage would ship a
+   regression the compaction path pays on every file.
+2. **#4375's decline has to become document-frequency aware.** Its rule declines
+   any clipped `LIMIT`, which is right for a whole-file decode and wrong for this
+   format: it costs `rare_keyword` an 11.1x win (47.6 ms against 550.4 ms) while
+   correctly saving `keyword` and `substring_scan` from 4.5-174x losses. The
+   directory carries each term's df, so the rule can ask what the postings would
+   cost before deciding. Until it does, the format's clipped-shape behaviour is
+   the scan's.
+
+**Not blocking, and still open:** the substring sweep reads the whole dictionary
+and stays a decline; the directory cache's value is measured in bytes and
+requests, not local latency, so what it is worth depends on an object-store
+round; and the sync/async seam still holds a blocking thread for a whole lookup,
+which one process at 14 files does not stress.
 
 ## What the acceptance still needs
 
@@ -686,14 +967,22 @@ What remains, in order:
    blob reads no trailer and no directory, under a byte budget of its own.
    What is still left for #4562: no writer produces a sidecar for a real
    table, so the harness builds one.
-3. **#4562** — the six-shape harness with a third arm, cold and warm separately,
-   under 1 GiB parsed / 256 MiB blob, plus the OFF control; that is where a
-   proceed/revise/reject disposition for #4377 comes from.
-4. **A `seg2` question for #4562's disposition** (#4988): per-block compression and a
+3. ~~**#4562**~~ — done, see [Through the query
+   path](#through-the-query-path-scan-whole-file-segmented-4562) and the
+   [disposition](#disposition-for-4377-proceed-with-two-revisions): the
+   seven-shape harness with the third format, cold and warm apart, under 1 GiB
+   parsed / 256 MiB blob and again with both off, plus the OFF control.
+   **Proceed, with two revisions** — #4988 first, and a df-aware decline in
+   #4375's rule.
+4. **A `seg2` question #4562's disposition promotes to a prerequisite** (#4988):
+   per-block compression and a
    per-block posting checksum, which are one decision — both need the block's
    posting span to be the unit the reader fetches whole, and the measured price
    of that is 1.58x the bytes a point lookup fetches per group. What they buy is
-   16.4 MiB per file instead of 85.8, and the end of the residual above.
+   16.4 MiB per file instead of 85.8, and the end of the residual above. #4562
+   measured the format 5.59x the v1 sidecar's bytes **on disk**, where the v1
+   blob is Zstd-compressed and this one cannot be, which is why it now blocks
+   #4377 rather than following it.
 5. **An open question for #4561**: the substring sweep reads the whole
    dictionary, and `keyword`-class terms with millions of postings read megabytes
    of posting bytes. Both are regimes where partial reads buy little, and #4375's
@@ -749,6 +1038,39 @@ sized by `SIGLAKE_SEG_READER_ROWS` (1,000,000) and `SIGLAKE_SEG_READER_GROUPS`
 directory cache's footprint; running it under
 `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES=0` is the negative control,
 where the warm columns come back equal to the cold ones.
+
+The query-path comparison (#4562) is `report_rebuild_on_off_text_shapes` in
+`crates/siglake-storage/tests/puffin_rebuild.rs`, run three times over one kept
+fixture. `SIGLAKE_SEGMENTED_INDEX_READS` has to be in the environment the
+process starts in — the reader resolves it once — and
+`SIGLAKE_REBUILD_AB_REUSE_DIR` is what keeps the 5 GB fixture across the three:
+
+```
+export SIGLAKE_SEGMENTED_INDEX_READS=1
+export SIGLAKE_REBUILD_AB_FILES=14 SIGLAKE_REBUILD_AB_ROWS_PER_FILE=7340000
+export SIGLAKE_REBUILD_AB_RARE_EVERY=100000
+export SIGLAKE_REBUILD_AB_PARSED_BYTES=1073741824
+export SIGLAKE_REBUILD_AB_BLOB_BYTES=268435456
+export SIGLAKE_REBUILD_AB_REUSE_DIR=$TMPDIR/4562/fixture
+
+# deployed budgets + the packaged cache-off pass, 28 min (first run builds the
+# fixture: ~9 min more, and the segmented sidecars another ~3)
+SIGLAKE_REBUILD_AB_RUNS=5 SIGLAKE_REBUILD_AB_PASSES=packaged=0:0 \
+  cargo test -p siglake-storage --release --test puffin_rebuild \
+  report_rebuild_on_off_text_shapes -- --ignored --nocapture
+
+# the same, with the segmented format's own retention off and then under
+# eviction pressure, 6 min each
+SIGLAKE_REBUILD_AB_RUNS=3 SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES=0 \
+  cargo test …
+SIGLAKE_REBUILD_AB_RUNS=3 SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES=4194304 \
+  cargo test …
+```
+
+Without `SIGLAKE_SEGMENTED_INDEX_READS` the run is #4375's four-arm one, which
+is the negative control for the arm's existence: the `seg` arms disappear rather
+than silently becoming scans. A run that keeps them but declines every file
+fails on `seg.used > 0`.
 
 The codec's own fixtures run in the crate's normal test pass
 (`cargo test -p siglake-index`): v1 equivalence term by term, group-straddling
