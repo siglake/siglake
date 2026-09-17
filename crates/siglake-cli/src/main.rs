@@ -2624,8 +2624,7 @@ async fn run_ingest_server(
 }
 
 async fn run_wal_recover(from: &str, to: &std::path::Path) -> Result<()> {
-    let url = url::Url::parse(from).with_context(|| format!("parse --from URL: {from}"))?;
-    let prefix = url.path().trim_start_matches('/').trim_end_matches('/');
+    url::Url::parse(from).with_context(|| format!("parse --from URL: {from}"))?;
     // `--to` used to mean `<wal>/sealed` (recovery flattened everything into
     // one directory). It now means the WAL ROOT, and the layout is rebuilt
     // beneath it. Refuse the old spelling rather than silently building
@@ -2640,9 +2639,13 @@ async fn run_wal_recover(from: &str, to: &std::path::Path) -> Result<()> {
             to.parent().unwrap_or(to).display()
         );
     }
+    // The operator is rooted at the WHOLE `--from` URL, path included, so the
+    // listing prefix is relative to the mirror root and therefore EMPTY.
+    // Passing the URL path again made the lister walk `<path>/<path>/`, so
+    // every `--from` carrying a path restored 0 segments and exited 0 (#4912).
     let store = build_opendal_operator(from)?;
-    tracing::info!(from, to = %to.display(), prefix, "wal-recover starting");
-    let pulled = siglake_wal::mirror::recover_from_object_store(store, prefix, to).await?;
+    tracing::info!(from, to = %to.display(), "wal-recover starting");
+    let pulled = siglake_wal::mirror::recover_from_object_store(store, "", to).await?;
     println!("pulled {pulled} segments into {}", to.display());
     Ok(())
 }
