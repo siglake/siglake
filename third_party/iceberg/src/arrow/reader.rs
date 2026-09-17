@@ -2348,6 +2348,7 @@ impl ArrowReader {
         metadata: &ParquetMetaData,
         column: &str,
         cache_bypass: bool,
+        file_rows: u64,
     ) -> Result<Option<Arc<siglake_index::InvertedIndex>>> {
         for stats_blob in &task.statistics_blobs {
             if stats_blob.blob_type != "siglake-inverted-v1" {
@@ -2413,7 +2414,12 @@ impl ArrowReader {
                 return Ok(Some(index));
             }
             if !cache_bypass && let Some(bytes) = puffin_blob_cache_get(path, offset) {
-                return Ok(Self::decode_and_cache_index(key, bytes.as_ref(), cache_bypass));
+                return Ok(Self::decode_and_cache_index(
+                    key,
+                    bytes.as_ref(),
+                    cache_bypass,
+                    file_rows,
+                ));
             }
             let fetched = std::time::Instant::now();
             let input = file_io.new_input(path)?;
@@ -2427,28 +2433,85 @@ impl ArrowReader {
             if !cache_bypass {
                 puffin_blob_cache_put(path, offset, blob.data());
             }
-            return Ok(Self::decode_and_cache_index(key, blob.data(), cache_bypass));
+            return Ok(Self::decode_and_cache_index(
+                key,
+                blob.data(),
+                cache_bypass,
+                file_rows,
+            ));
         }
         Ok(None)
     }
 
     /// Deserialize an index blob and, unless the caller bypasses caches, keep
     /// the parsed form under the write-once identity it came from — for a
-    /// Puffin blob, the same one the blob-bytes cache uses.
+    /// Puffin blob, the same one the blob-bytes cache uses. An index whose row
+    /// domain is not `file_rows` is dropped here rather than cached
+    /// ([`Self::index_covers_file`]).
     fn decode_and_cache_index(
         key: ParsedIndexKey,
         bytes: &[u8],
         cache_bypass: bool,
+        file_rows: u64,
     ) -> Option<Arc<siglake_index::InvertedIndex>> {
         INVERTED_INDEX_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         record_parsed_index_lookup(PARSED_INDEX_CACHE_MISS, key.storage());
         let decoded = std::time::Instant::now();
         let index = Arc::new(siglake_index::InvertedIndex::from_bytes(bytes)?);
         record_text_index_stage(TEXT_INDEX_STAGE_DECODE, key.storage(), decoded.elapsed());
+        if !Self::index_covers_file(file_rows, &index, key.storage()) {
+            return None;
+        }
         if !cache_bypass {
             parsed_index_cache_put(key, Arc::clone(&index));
         }
         Some(index)
+    }
+
+    /// The file's physical row count, from its Parquet row-group metadata —
+    /// the ordinal space an inverted index's postings have to live in.
+    fn parquet_row_count(metadata: &ParquetMetaData) -> u64 {
+        metadata
+            .row_groups()
+            .iter()
+            .map(|row_group| row_group.num_rows() as u64)
+            .sum()
+    }
+
+    /// Refuse an index that is not about this file's rows.
+    ///
+    /// `InvertedIndex::from_bytes` proves every posting is inside the index's
+    /// own `n_rows`, which says nothing about the file the postings are about
+    /// to prune. Two ways they diverge: a corrupt `n_rows` in the blob, and a
+    /// footer-KV index built over a whole batch that the rolling writer then
+    /// split across several data files — every one of them carries the same
+    /// blob, and only the first file's prefix of ordinals means anything
+    /// (`sidecar_blob_specs_for_data_files` in siglake-storage already refuses
+    /// the Puffin spillover for exactly that case, and says so). Either way
+    /// [`Self::index_matches_row_selection`] would be handed ordinals the file
+    /// does not have and drop them, so the file's real matches in the rows
+    /// past the index's domain would be skipped before decode — losing rows
+    /// from the answer rather than adding them. Refusing means no row
+    /// selection, which is an exact scan: slower, and right.
+    ///
+    /// Checked on every handout, warm or cold, because a parsed index outlives
+    /// the query that decoded it.
+    fn index_covers_file(
+        file_rows: u64,
+        index: &siglake_index::InvertedIndex,
+        storage: &'static str,
+    ) -> bool {
+        if file_rows == index.n_rows() as u64 {
+            return true;
+        }
+        // Counter only, no log line: this crate carries no logging facade, the
+        // same reason `siglake_index_stamp_mismatch_total` is counter-only.
+        metrics::counter!(
+            "siglake_index_row_domain_mismatch_total",
+            "storage" => storage
+        )
+        .increment(1);
+        false
     }
 
     /// Global bound on concurrent per-file inverted-index loads (see the
@@ -2466,12 +2529,36 @@ impl ArrowReader {
         })
     }
 
+    /// The index that may prune this file, footer KV first and Puffin second,
+    /// with its storage label.
+    ///
+    /// The row-domain check ([`Self::index_covers_file`]) is applied here as
+    /// well as at each decode, so that nothing — a fresh decode or a parsed
+    /// index handed over warm from an earlier query — reaches
+    /// [`Self::inverted_index_row_selection`] without having been matched
+    /// against this file's Parquet row count (task #4558).
     async fn file_inverted_index(
         file_io: &FileIO,
         task: &FileScanTask,
         metadata: &ParquetMetaData,
         column: &str,
         cache_bypass: bool,
+    ) -> Result<Option<(Arc<siglake_index::InvertedIndex>, &'static str)>> {
+        let file_rows = Self::parquet_row_count(metadata);
+        Ok(
+            Self::resolve_inverted_index(file_io, task, metadata, column, cache_bypass, file_rows)
+                .await?
+                .filter(|(index, storage)| Self::index_covers_file(file_rows, index, storage)),
+        )
+    }
+
+    async fn resolve_inverted_index(
+        file_io: &FileIO,
+        task: &FileScanTask,
+        metadata: &ParquetMetaData,
+        column: &str,
+        cache_bypass: bool,
+        file_rows: u64,
     ) -> Result<Option<(Arc<siglake_index::InvertedIndex>, &'static str)>> {
         if let Some(hex) = Self::footer_inverted_index_hex(metadata, column) {
             // A data file is written once, so `(data file, column)` names this
@@ -2512,15 +2599,22 @@ impl ArrowReader {
                 INVERTED_INDEX_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 record_parsed_index_lookup(PARSED_INDEX_CACHE_MISS, TEXT_INDEX_STORAGE_FOOTER_KV);
                 let index = Arc::new(index);
-                if !cache_bypass {
-                    parsed_index_cache_put(key, Arc::clone(&index));
+                // A footer index that is not about this file's rows is neither
+                // returned nor cached, and the Puffin path below is tried
+                // instead — the same disposition a blob `from_hex` refuses gets.
+                if Self::index_covers_file(file_rows, &index, TEXT_INDEX_STORAGE_FOOTER_KV) {
+                    if !cache_bypass {
+                        parsed_index_cache_put(key, Arc::clone(&index));
+                    }
+                    return Ok(Some((index, "footer_kv")));
                 }
-                return Ok(Some((index, "footer_kv")));
             }
         }
-        Ok(Self::puffin_inverted_index(file_io, task, metadata, column, cache_bypass)
-            .await?
-            .map(|index| (index, "puffin")))
+        Ok(
+            Self::puffin_inverted_index(file_io, task, metadata, column, cache_bypass, file_rows)
+                .await?
+                .map(|index| (index, "puffin")),
+        )
     }
 
     fn union_sorted_u32(a: &[u32], b: &[u32]) -> Vec<u32> {
@@ -2710,11 +2804,7 @@ impl ArrowReader {
         let Some(matching) = matching else {
             return Ok(None);
         };
-        let total_rows: u64 = metadata
-            .row_groups()
-            .iter()
-            .map(|rg| rg.num_rows() as u64)
-            .sum();
+        let total_rows = Self::parquet_row_count(metadata);
         // Observability: the index fired for this file, selecting `matching` of
         // `total_rows` rows for decode (the rest are skipped before decode).
         metrics::counter!(
