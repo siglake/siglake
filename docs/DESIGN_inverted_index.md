@@ -199,8 +199,17 @@ file (`PuffinReader::blob_range_reader`, uncompressed blobs only), discovery by
 blob type per file, the directory checked against the file's Parquet row
 groups, and AND/OR/substring answered over the row groups the scan kept — with
 every outcome the sidecar cannot conclude falling back to this reader or to an
-exact scan. The remaining slice is #4562, the six-shape comparison that decides
-#4377.
+exact scan. #5006 then gave the parsed directory a byte budget of its own so a
+repeat lookup reads neither trailer nor directory.
+
+#4562 ran the comparison that decides #4377 — the same seven shapes, five arms,
+through the query path on this corpus, at the deployed budgets and again with
+both of them zero. Its disposition is **proceed with two revisions**: #4988's
+per-block compression first, because the prototype costs 5.59x the v1 sidecar's
+bytes on disk, and a document-frequency-aware decline in #4375's rule, because
+declining every clipped `LIMIT` costs `rare_keyword` an 11.1x win the segmented
+format can now deliver. The tables are in
+[`DESIGN_segmented_inverted_index.md`](DESIGN_segmented_inverted_index.md).
 
 #### The per-execution policy arm (2026-09-16, #4375)
 

@@ -38,9 +38,16 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   directory instead of a parsed index, and holds it between queries under a
   byte budget of its own (#5006,
   `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`) — but nothing writes
-  one and the format has not been measured end-to-end, so neither budget above
-  changes, and with the prototype off nothing is retained under the new one
-  either. Whether the
+  one, so neither budget above changes, and with the prototype off nothing is
+  retained under the new one either. That format has now been measured through
+  the query path against both the scan and the shipped sidecar at these
+  budgets and again with both of them off (#4562): the rare unclipped shapes go
+  from 7.3-22.4x slower than a scan to 11.5-17.4x faster, with 15.95 MiB of
+  resident directory for the same fourteen files and no eviction, and the
+  result does not move when the two budgets above are zero, because that path
+  uses neither. It costs 5.59x the v1 sidecar's bytes on disk as prototyped
+  (the interior must stay uncompressed to be addressable), so per-block
+  compression (#4988) comes before a writer (#4377). Whether the
   serialized copy earns its share at all is a separate open question: since a
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no
