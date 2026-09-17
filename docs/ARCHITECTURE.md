@@ -98,6 +98,10 @@ report carries the counts that separate a finished restore from one that
 understood nothing — segments already present, and keys skipped for a layout
 recovery will not guess at — and exits nonzero when every key was skipped and
 nothing was restored, which is `--from` naming an ancestor of the mirror root.
+An ancestor exactly ONE component up is not caught: its keys still fit the
+layout, so segments are restored under a tenant named after the mirror prefix
+and the command reports a success. See `docs/LIMITATIONS.md` and
+`docs/DESIGN_wal_recovery_root_identity.md`.
 Multi-pod deployments coordinate through a
 SQL claim table (`wal_segments`, atomic `try_claim`); crash recovery
 quarantines ambiguous `processing/` segments rather than risk double commits.

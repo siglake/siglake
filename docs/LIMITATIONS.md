@@ -1079,6 +1079,25 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   device. A network filesystem answers `fsync(2)` on its own terms and
   siglake measures none of them, so ext4 or xfs on a node-attached volume is
   the substrate the power-loss claim is made for.
+- **`siglake wal-recover` cannot tell the mirror root from its parent.** #4928
+  made a restore that recognised no key exit nonzero, which catches `--from`
+  two or more components too high. One component too high is still reported as
+  a success: the shallowest mirror keys shift into the
+  `<tenant>[/<index>]/<segment>` shape recovery routes on, so segments are
+  restored under a tenant named after the mirror prefix and the command prints
+  `pulled N segments`. The mirror root is
+  `s3://<bucket>/<s3.warehousePrefix>/<wal.mirror.prefix>/`, so the one
+  component above it is the warehouse URL the operator already has. A legacy
+  flat mirror — keys with no tenant component — then commits into
+  `tenant_<prefix>`; any other layout restores into a directory the drain never
+  enumerates, so the segments sit on the volume unreached — nothing commits
+  them and nothing in the metrics
+  moves. `docs/DESIGN_wal_recovery_root_identity.md` has the measured
+  cases and the selected remedy (a plan step the operator reads before anything
+  is written); until it ships, check the restored layout under `--to` before
+  starting the drain. The same document records a second defect on this path: a
+  correct restore of a tenant that has only index segments omits the tenant
+  discovery dir the ingester writes, and is never drained either.
 - **Attribute auto-promotion is opt-in** — hot-key sampling and promotion of
   OTLP attributes to typed columns ships default-off
   (`SIGLAKE_AUTO_PROMOTE_MIN_PCT`); promoted keys can also be listed

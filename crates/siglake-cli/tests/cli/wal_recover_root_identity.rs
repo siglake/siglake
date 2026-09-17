@@ -11,7 +11,7 @@
 //!
 //! These tests RECORD current behaviour; none of them asserts a fix. They are
 //! the evidence behind `docs/DESIGN_wal_recovery_root_identity.md`, and the
-//! thing that design has to keep true: cases 2-4 below are legitimate installs
+//! thing that design has to keep true: cases 2, 3 and 4 are legitimate installs
 //! whose keys are byte-identical to the misplacement in case 1, so no rule
 //! reading only the key can separate them.
 
@@ -133,6 +133,45 @@ fn one_component_above_the_mirror_root_restores_into_an_invented_tenant() {
     assert!(
         list_sealed(&wal.join("acme")).unwrap().is_empty(),
         "and nothing lands where the drain would route it to acme"
+    );
+}
+
+/// **Why the one-component miss is the likely one.** `wal.mirror.prefix` is
+/// relative to the warehouse URL, so the mirror root is
+/// `s3://<bucket>/<warehousePrefix>/wal-mirror/`
+/// (`deploy/helm/siglake/values.yaml:864-867`) and its parent is the warehouse
+/// URL the operator already has in their config and their shell history. This
+/// is that mistake against a warehouse-shaped ancestor: the Iceberg objects
+/// alongside the mirror are all skipped (none of them ends in `.arrow`), so the
+/// report is a large skip count next to a small pull — and the pull is enough
+/// to keep the exit status at 0.
+#[test]
+fn the_warehouse_url_an_operator_already_has_is_the_one_component_miss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = tmp.path().join("bucket").join("warehouse");
+    let src = seal_one(&tmp.path().join("src"), "row");
+    place(&warehouse, "wal-mirror/acme/seg.arrow", &src);
+    for key in [
+        "siglake/events/metadata/v1.metadata.json",
+        "siglake/events/data/part-0.parquet",
+        "tenant_acme/events/data/part-1.parquet",
+    ] {
+        let dest = warehouse.join(key);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"not a segment").unwrap();
+    }
+
+    let wal = tmp.path().join("wal");
+    let (stdout, stderr, ok) = recover(&format!("file://{}", warehouse.display()), &wal);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(
+        stdout.contains("pulled 1 segments") && stdout.contains("3 keys skipped"),
+        "{stdout}{stderr}"
+    );
+    assert_eq!(
+        restored_layout(&wal),
+        vec![format!("wal-mirror/acme/{SEALED_DIR}/seg.arrow")],
+        "acme's segment lands under a tenant named after the mirror prefix"
     );
 }
 
@@ -379,6 +418,62 @@ async fn a_misplaced_index_restore_is_invisible_to_the_drain() {
             .unwrap(),
         "the tenant walk never reaches this dir, so not even a namespace is \
          created — there is no artifact to notice"
+    );
+}
+
+/// A defect this qualification turned up that has nothing to do with `--from`.
+/// The ingester creates `<tenant>/sealed/` before it opens any per-index lane,
+/// and calls it the "tenant discovery dir"
+/// (`crates/siglake-ingest/src/lib.rs:571-580`) — it exists so
+/// `list_layout_dirs` enumerates the tenant. Recovery rebuilds
+/// `<tenant>/<index>/sealed/` and does NOT rebuild that, so a mirror holding
+/// only index segments for a tenant — an Elasticsearch-bulk-only tenant whose
+/// events lane never sealed — restores CORRECTLY, from the right `--from`, into
+/// a layout the drain never walks.
+#[tokio::test]
+async fn a_correct_restore_of_an_index_only_tenant_is_never_drained() {
+    use std::sync::Arc;
+
+    use siglake_compactor::Compactor;
+    use siglake_storage::iceberg::IcebergContext;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mirror = mirror_with(
+        tmp.path(),
+        "warehouse/wal-mirror",
+        &["acme/orders/seg.arrow"],
+    );
+
+    let wal = tmp.path().join("wal");
+    let (stdout, stderr, ok) = recover(&format!("file://{}", mirror.display()), &wal);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(stdout.contains("pulled 1 segments"), "{stdout}{stderr}");
+    assert_eq!(
+        restored_layout(&wal),
+        vec![format!("acme/orders/{SEALED_DIR}/seg.arrow")],
+        "the layout is right: this is the tenant and index the segment came from"
+    );
+
+    assert!(
+        siglake_wal::list_tenant_dirs(&wal).unwrap().is_empty(),
+        "and still no tenant is enumerated"
+    );
+    let ice = Arc::new(IcebergContext::open(&tmp.path().join("ice")).await.unwrap());
+    assert_eq!(
+        Compactor::new(&wal, ice).run_once().await.unwrap(),
+        0,
+        "a correct restore that the drain never reaches"
+    );
+
+    // The discovery dir is the whole difference.
+    std::fs::create_dir_all(wal.join("acme").join(SEALED_DIR)).unwrap();
+    assert_eq!(
+        siglake_wal::list_tenant_dirs(&wal)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["acme".to_string()]
     );
 }
 
