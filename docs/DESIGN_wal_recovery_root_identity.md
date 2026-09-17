@@ -126,7 +126,7 @@ even when it fires. Rejected, as the card directed.
 
 | evidence | where | present when | what it proves |
 |---|---|---|---|
-| `_active/…<seg>.arrow.partial` | depth 1 under the root | `wal.mirror.activeIntervalSecs > 0` (default 0) | conclusive: only the active loop writes a first component `_active` with a `.partial` tail (`crates/siglake-wal/src/mirror.rs:945-948`); a sealed key never ends in `.partial` |
+| `_active/…<seg>.arrow.partial` | depth 1 under the root | `wal.mirror.activeIntervalSecs > 0` (default 0) | conclusive: only the active loop writes a first component `_active` with a `.partial` tail (`crates/siglake-wal/src/mirror.rs:1036-1039`); a sealed key never ends in `.partial` |
 | `<tenant>/<index>/owner` | depth 2 under the root | catalog-claim drain has run for a managed index | conclusive: a key whose last component is `owner` exists at exactly that depth (`mirror_owner_key`, `crates/siglake-wal/src/mirror.rs:96-98`) |
 | `wal_segments.segment_url` | catalog DB | a catalog URI is configured; the DB survived the PVC loss | exact: the row holds `<prefix>/<suffix>` plus the true `(tenant, index_id)` (`crates/siglake-storage/src/catalog_claim.rs:480-500`) |
 | WAL frame header | every v2 segment body | since #2693 | the object IS a segment (`LWAL` magic) and names its Iceberg table UUID — but says nothing about depth, and resolving the UUID to a name needs a catalog |

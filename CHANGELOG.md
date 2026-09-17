@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Ingest (fix)**: `wal.mirror.activeIntervalSecs` /
+  `--wal-active-mirror-interval-secs` uploads the segments ingest is writing.
+  The loop was handed the ingester's root `WalWriter`, and every request lands
+  in a per-tenant writer or a backpressure lane's writer instead — the server
+  installs one of those routers in every configuration. So each tick flushed an
+  empty writer and sent nothing: a process that logged "WAL active-segment
+  mirror enabled" wrote no `_active/` object, the N-second loss bound the flag
+  advertises did not hold anywhere, and `wal-recover`'s `root confirmed`
+  verdict, which keys off an `_active/` object, was unreachable. The loop now
+  takes the writer sets the HTTP handlers resolve against and asks them on every
+  tick, so tenants, managed indexes and write shards created by later traffic
+  are covered as they appear. One object per open writer, keyed
+  `_active/<tenant>[/<index>]/<segment>` as recovery expects, and a segment
+  that has not grown since its last upload is skipped rather than re-PUT.
+  Flushes stay under the writer's lock (or inside its lane task) and the upload
+  outside it. Off by default, unchanged; sealed mirroring and shutdown sealing
+  are untouched. (#5055)
+
 - **Alerting (docs)**: `SiglakeTenantsDenied` now says what to do about
   `reason="header_not_trusted"`, the single-tenant default refusing a routing
   `X-Scope-OrgID`: bind the tenant to a verified identity with

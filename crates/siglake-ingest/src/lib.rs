@@ -654,6 +654,26 @@ impl TenantWalRouter {
     }
 }
 
+/// Active mirroring covers this router's writers, which on the non-backpressure
+/// ingest path are the ONLY writers that receive rows (#5055).
+///
+/// Taken per tick, not once: a tenant's or index's writer is created by its
+/// first write, so a snapshot taken at startup would cover nothing.
+#[async_trait::async_trait]
+impl siglake_wal::mirror::ActiveMirrorSource for TenantWalRouter {
+    async fn flush_active(&self) -> Vec<siglake_wal::mirror::ActiveSnapshot> {
+        let mut out = Vec::new();
+        // The writers map is not held across the flushes: a flush takes one
+        // writer's lock, and holding the map as well would put every new
+        // tenant's first write behind this tick.
+        for writer in self.writers_snapshot().await {
+            let mut writer = writer.lock().await;
+            out.extend(siglake_wal::mirror::snapshot_active(&mut writer));
+        }
+        out
+    }
+}
+
 /// The distinct tenants this process has let in, and the gate that decides
 /// whether one more fits under [`AppState::max_tenants`].
 ///
@@ -907,6 +927,30 @@ impl AppState {
     pub fn with_tenants(mut self, tenants: TenantWalRouter) -> Self {
         self.tenants = Some(Arc::new(tenants));
         self
+    }
+
+    /// Every writer set a request on this server can land rows in, for the
+    /// active-segment mirror (`wal.mirror.activeIntervalSecs`).
+    ///
+    /// Derived from the state the HTTP handlers resolve against, deliberately:
+    /// the loop used to be handed the root `writer` alone, which is the one
+    /// writer that receives nothing once a router is installed — and the ingest
+    /// server always installs one. Nothing was ever uploaded (#5055). The set
+    /// mirrors [`Self::writer_for_index_request`]'s own branch, plus the
+    /// backpressure router that overrides it.
+    ///
+    /// The root writer is always included: it costs one uncontended lock per
+    /// tick, and it is the writer that holds the rows when `tenants` is `None`.
+    pub fn active_mirror_sources(&self) -> Vec<Arc<dyn siglake_wal::mirror::ActiveMirrorSource>> {
+        let mut sources: Vec<Arc<dyn siglake_wal::mirror::ActiveMirrorSource>> = Vec::new();
+        if let Some(bp) = &self.backpressure {
+            sources.push(bp.clone());
+        }
+        if let Some(tenants) = &self.tenants {
+            sources.push(tenants.clone());
+        }
+        sources.push(self.writer.clone());
+        sources
     }
 
     /// Resolve a request to its writer + tenant identifier. Used by

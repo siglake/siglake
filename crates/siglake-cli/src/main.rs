@@ -181,11 +181,13 @@ enum Command {
         /// value to turn the mirror off.
         #[arg(long, env = "SIGLAKE_WAL_MIRROR_PREFIX")]
         wal_mirror_prefix: Option<String>,
-        /// When > 0 and `--wal-mirror-prefix` is set, also mirror the
+        /// When > 0 and `--wal-mirror-prefix` is set, also mirror every
         /// currently-active segment every N seconds to
-        /// `<prefix>/_active/<filename>`. N is the upload window for the
-        /// in-flight segment, and it becomes an N-second data-loss bound
-        /// on ONE recovery path: a successful upload is recovered when an
+        /// `<prefix>/_active/<tenant>[/<index>]/<filename>` — one object
+        /// per open writer, which is one per (tenant, index, write shard)
+        /// with rows in it. N is the upload window for an in-flight
+        /// segment, and it becomes an N-second data-loss bound on ONE
+        /// recovery path: a successful upload is recovered when an
         /// operator runs `siglake wal-recover` onto the WAL root and the
         /// filesystem drain commits what it finds. Nothing reads an
         /// active snapshot on its own, and the catalog-claim drain
@@ -2198,6 +2200,8 @@ async fn run_ingest_server(
     // enqueued for background upload to `<warehouse_url>/<prefix>/`.
     // Failures don't block ingest.
     let wal_mirror_prefix = wal_mirror_prefix_from(wal_mirror_prefix, warehouse_url);
+    let active_mirror_interval =
+        siglake_wal::mirror::active_mirror_interval(wal_active_mirror_interval_secs);
     let mut mirror_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut active_mirror_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut active_mirror_store: Option<opendal::Operator> = None;
@@ -2303,11 +2307,11 @@ async fn run_ingest_server(
                 }
             });
         }
-        if wal_active_mirror_interval_secs > 0 {
+        if active_mirror_interval.is_some() {
             active_mirror_store = Some(store);
             active_mirror_prefix = Some(prefix.to_string());
         }
-    } else if wal_active_mirror_interval_secs > 0 {
+    } else if active_mirror_interval.is_some() {
         anyhow::bail!("--wal-active-mirror-interval-secs requires --wal-mirror-prefix");
     }
 
@@ -2325,28 +2329,6 @@ async fn run_ingest_server(
             }
         }
     });
-
-    // Periodic active-segment mirror. Disabled unless both
-    // --wal-mirror-prefix and --wal-active-mirror-interval-secs are
-    // set.
-    if let (Some(store), Some(prefix)) = (active_mirror_store, active_mirror_prefix) {
-        let interval_secs = wal_active_mirror_interval_secs;
-        tracing::info!(
-            interval_secs,
-            prefix = prefix.as_str(),
-            "WAL active-segment mirror enabled"
-        );
-        let task_writer = writer.clone();
-        active_mirror_task = Some(tokio::spawn(async move {
-            siglake_wal::mirror::active_mirror_loop(
-                task_writer,
-                store,
-                prefix,
-                Duration::from_secs(interval_secs),
-            )
-            .await;
-        }));
-    }
 
     // Always open the Iceberg context once on startup. Two reasons:
     //   1. Validate catalog connectivity early (ingest starts unhealthy if
@@ -2646,6 +2628,31 @@ async fn run_ingest_server(
     };
     if let Some(bp) = backpressure_router {
         state = state.with_backpressure_arc(bp);
+    }
+    // Periodic active-segment mirror. Disabled unless both --wal-mirror-prefix
+    // and --wal-active-mirror-interval-secs are set.
+    //
+    // Spawned HERE, from the state the handlers serve from, because the writers
+    // it has to flush are the ones the handlers resolve to. It used to be handed
+    // `writer` — the root writer, which receives nothing once a router is
+    // installed, and the ingest server always installs one. The loop flushed an
+    // empty writer every tick and uploaded nothing at all: the flag logged
+    // itself as enabled and bounded nothing (#5055).
+    if let (Some(store), Some(prefix), Some(interval)) = (
+        active_mirror_store,
+        active_mirror_prefix,
+        active_mirror_interval,
+    ) {
+        let sources = state.active_mirror_sources();
+        tracing::info!(
+            interval_secs = wal_active_mirror_interval_secs,
+            prefix = prefix.as_str(),
+            writer_sources = sources.len(),
+            "WAL active-segment mirror enabled"
+        );
+        active_mirror_task = Some(tokio::spawn(async move {
+            siglake_wal::mirror::active_mirror_loop(sources, store, prefix, interval).await;
+        }));
     }
     // WS-8 RSS memory circuit breaker: opt-in via --ingest-mem-limit-mib.
     if ingest_mem_limit_mib > 0 {

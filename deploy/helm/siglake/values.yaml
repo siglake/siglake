@@ -845,8 +845,9 @@ wal:
   # README "Ingest path": the saturation ceiling moved -0.8%, inside the spread
   # between repeats, and ack p50 rose 0.27ms at 20k EPS (1.53 -> 1.80ms) and
   # 0.08ms at saturation. Uploads stayed within one sealed segment of the
-  # writer at 61 seals/s. PUT volume is one object per sealed segment (plus one
-  # per `activeIntervalSecs` tick), which is what an S3 bill sees; on S3 the
+  # writer at 61 seals/s. PUT volume is one object per sealed segment (plus,
+  # per `activeIntervalSecs` tick, one per open writer that grew since the last
+  # tick — see `activeIntervalSecs`), which is what an S3 bill sees; on S3 the
   # backlog follows remote PUT latency, and no AWS measurement has been taken.
   #
   # Two things to set alongside it:
@@ -869,15 +870,20 @@ wal:
     # `s3://<s3.bucket>/<s3.warehousePrefix>/<prefix>/` — inside the warehouse
     # prefix, not beside it. That is the path a lifecycle rule must name.
     prefix: wal-mirror
-    # Also snapshot the in-flight (active) segment every N seconds to
-    # `<prefix>/_active/<filename>`. N is the upload window for that
-    # segment. After PVC loss a successful upload becomes rows only when
+    # Also snapshot every in-flight (active) segment every N seconds to
+    # `<prefix>/_active/<tenant>[/<index>]/<filename>`. N is the upload window
+    # for a segment. After PVC loss a successful upload becomes rows only when
     # an operator runs `siglake wal-recover --apply` onto the WAL root and the
     # filesystem drain commits what it finds; nothing recovers an active
     # snapshot on a restart. These objects are also the evidence that pins
     # the mirror root for `wal-recover`. The catalog-claim drain
     # (`compactor.catalogClaim.enabled`) reconciles sealed objects only and
     # never reads `_active/`, so it gets no N-second target.
+    #
+    # One object per OPEN WRITER, so the PUT volume per tick is the number of
+    # (tenant, index, `ingester.backpressure.shards`) combinations currently
+    # holding rows — not one. A writer whose segment has not grown since its
+    # last upload is skipped, so an idle tenant costs nothing per tick.
     # 0 disables.
     activeIntervalSecs: 0
 

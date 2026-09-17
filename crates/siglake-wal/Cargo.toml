@@ -12,6 +12,9 @@ anyhow = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+# `mirror::ActiveMirrorSource`: the active-mirror loop asks each source to
+# flush, and one of them (the backpressure router) has to message a task.
+async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
