@@ -91,6 +91,23 @@ workspace version, both chart `version`/`appVersion` pairs, the pinned image
 tags under `deploy/` and the two OpenAPI documents' `info.version` all read
 `0.1.1`, and git tag `v0.1.1` publishes image tag `0.1.1`.
 
+- **Recovery**: `siglake wal-recover --from <url> --to <wal-root>` restores the
+  segments under the URL's path. It built its object store rooted at the whole
+  `--from` URL and then passed that same path again as the listing prefix, so
+  the lister walked `<path>/<path>/`. Every URL carrying a path — including the
+  `s3://<bucket>/<warehousePrefix>/<prefix>` the chart's DR recipe prints —
+  printed `pulled 0 segments` and exited 0: a restore that reported clean and
+  had recovered nothing, on the path that is the reason WAL mirroring is on by
+  default. The prefix is now relative to the operator's root, which on that
+  path means empty, and `recover_from_object_store` takes an empty prefix
+  instead of listing `"/"` and then failing to strip `"/"` off every relative
+  key. A nonempty prefix still selects only what sits under it, for a caller
+  whose operator is rooted above the mirror. The tenant and index routing, the
+  preference for a sealed copy over its active prefix, the fsync-before-count
+  durability and the skip of what is already present are unchanged, and a
+  re-run still pulls nothing twice. `wal-recover` now has a test that runs the
+  binary against a `file://` mirror, with and without a trailing slash.
+  (#4912)
 - **Query (experimental cache, off by default)**: with the decoded-file cache
   switched on (`SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_{BYTES,ENTRIES}`, both `0`
   everywhere the project packages), a scan whose predicate converts to an

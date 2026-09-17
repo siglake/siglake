@@ -980,6 +980,12 @@ fn recovery_target(suffix: &str) -> Option<RecoveryTarget> {
 /// `<tenant>[/<index>]/sealed/` layout the drain routes on. Returns the count
 /// of segments pulled.
 ///
+/// `prefix` is RELATIVE to the operator's root, and may be empty when the
+/// operator is already rooted at the mirror (the `siglake wal-recover` shape:
+/// the store is built from the whole `--from` URL, path included). Pass the
+/// mirror prefix only when the operator is rooted above it, as the uploader's
+/// own operator is.
+///
 /// `wal_root` is the WAL ROOT — the directory the ingester and compactor are
 /// pointed at — not a `sealed/` directory. Segments are placed at
 /// `<wal_root>/<tenant>/sealed/` and `<wal_root>/<tenant>/<index>/sealed/`, so
@@ -1008,11 +1014,22 @@ pub async fn recover_from_object_store(
     use futures::stream::StreamExt;
 
     crate::create_wal_dir(wal_root).with_context(|| format!("create {}", wal_root.display()))?;
+    // An EMPTY prefix means the operator is already ROOTED at the mirror —
+    // which is the only shape `siglake wal-recover` can pass, because
+    // `build_opendal_operator` roots the store at the `--from` URL. Formatting
+    // `"{prefix}/"` unconditionally turned that into listing `"/"` and
+    // stripping `"/"` off relative keys, which fails for every entry, so the
+    // whole restore was dropped and the command still exited 0 (#4912).
     let prefix = prefix.trim_matches('/').to_string();
+    let listing_prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}/")
+    };
 
     // Lister yields `Entry` (dirs + files); filter to files only.
     let lister = op
-        .lister_with(&format!("{prefix}/"))
+        .lister_with(&listing_prefix)
         .recursive(true)
         .await
         .context("list WAL mirror")?;
@@ -1028,7 +1045,9 @@ pub async fn recover_from_object_store(
         if !entry.metadata().is_file() {
             continue;
         }
-        let Some(suffix) = path.strip_prefix(&format!("{prefix}/")) else {
+        // With an empty prefix the listed key is already relative to the
+        // mirror root, so it is its own suffix.
+        let Some(suffix) = path.strip_prefix(listing_prefix.as_str()) else {
             continue;
         };
         let Some(target) = recovery_target(suffix) else {
@@ -1912,6 +1931,117 @@ mod tests {
         assert!(
             !root.join(SEALED_DIR).exists(),
             "no segment may be written to a tenant-less sealed/ directory"
+        );
+    }
+
+    /// #4912: an operator ROOTED at the mirror passes an empty relative
+    /// prefix, which is the only thing `siglake wal-recover` can pass — it
+    /// builds the store from the whole `--from` URL. `format!("{prefix}/")`
+    /// turned that into listing `"/"` and stripping `"/"` off relative keys,
+    /// which fails for every entry, so the restore silently pulled nothing.
+    ///
+    /// Against that code this test FAILS (0 pulled).
+    #[tokio::test]
+    async fn recovery_accepts_an_empty_prefix_from_an_operator_rooted_at_the_mirror() {
+        for prefix in ["", "/"] {
+            let op = memory_op();
+            // Keys as they appear relative to the mirror root: a tenant's
+            // events segment, an index segment, and an active-mirror prefix.
+            op.write("acme/s1.arrow", bytes::Bytes::from_static(b"A1"))
+                .await
+                .unwrap();
+            op.write("acme/orders/s2.arrow", bytes::Bytes::from_static(b"A2"))
+                .await
+                .unwrap();
+            op.write(
+                "_active/widgets/s3.arrow.partial",
+                bytes::Bytes::from_static(b"W3"),
+            )
+            .await
+            .unwrap();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("wal");
+            let pulled = recover_from_object_store(op.clone(), prefix, &root)
+                .await
+                .unwrap();
+            assert_eq!(pulled, 3, "prefix {prefix:?} restored nothing");
+            assert!(root.join("acme").join(SEALED_DIR).join("s1.arrow").exists());
+            assert!(root
+                .join("acme")
+                .join("orders")
+                .join(SEALED_DIR)
+                .join("s2.arrow")
+                .exists());
+            assert!(
+                root.join("widgets")
+                    .join(SEALED_DIR)
+                    .join("s3.arrow")
+                    .exists(),
+                "an active-mirror object recovers as a sealed segment"
+            );
+
+            // Idempotent: a second pass re-pulls nothing it already has.
+            assert_eq!(
+                recover_from_object_store(op, prefix, &root).await.unwrap(),
+                0
+            );
+        }
+    }
+
+    /// Rooting the operator ABOVE the mirror — `--from …/store` when the
+    /// segments are at `…/store/warehouse/wal-mirror/<tenant>/` — does not
+    /// guess. The keys are deeper than the layout allows, so each one is
+    /// refused and counted as skipped rather than filed under a tenant named
+    /// `warehouse`. The empty-prefix listing is what makes those keys visible
+    /// to the refusal at all; before #4912 they were dropped by the failed
+    /// `strip_prefix` without a warning or a count.
+    #[tokio::test]
+    async fn recovery_refuses_keys_deeper_than_the_layout_instead_of_guessing() {
+        let op = memory_op();
+        op.write(
+            "warehouse/wal-mirror/acme/s1.arrow",
+            bytes::Bytes::from_static(b"A1"),
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        let pulled = recover_from_object_store(op, "", &root).await.unwrap();
+        assert_eq!(pulled, 0, "an ancestor of the mirror root restores nothing");
+        assert!(
+            !root.join("warehouse").exists(),
+            "a prefix component must not be taken for a tenant"
+        );
+    }
+
+    /// The other half of #4912's convention: a NONEMPTY prefix still selects
+    /// only what sits under it, so the uploader's unrooted operator and the
+    /// library's callers keep working.
+    #[tokio::test]
+    async fn recovery_with_a_nonempty_prefix_ignores_keys_outside_it() {
+        let op = memory_op();
+        op.write("wal-mirror/acme/s1.arrow", bytes::Bytes::from_static(b"A1"))
+            .await
+            .unwrap();
+        op.write(
+            "other-prefix/acme/s2.arrow",
+            bytes::Bytes::from_static(b"X"),
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        let pulled = recover_from_object_store(op, "wal-mirror", &root)
+            .await
+            .unwrap();
+        assert_eq!(pulled, 1);
+        assert!(root.join("acme").join(SEALED_DIR).join("s1.arrow").exists());
+        assert!(
+            !root.join("acme").join(SEALED_DIR).join("s2.arrow").exists(),
+            "a key outside the prefix must not be restored"
         );
     }
 

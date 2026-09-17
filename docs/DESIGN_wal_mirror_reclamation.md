@@ -291,13 +291,18 @@ and A holds no fact at all.
 ## Defects found while reading this path
 
 1. **`siglake wal-recover` recovers nothing from any URL with a path.**
-   `run_wal_recover` builds the operator rooted at the whole `--from` URL and
-   then passes the same path as the listing prefix
-   (`crates/siglake-cli/src/main.rs:2626-2646`), so it lists
-   `<path>/<path>/`. Measured with the release binary against a
+   FIXED (#4912). `run_wal_recover` built the operator rooted at the whole
+   `--from` URL and then passed the same path as the listing prefix, so it
+   listed `<path>/<path>/`. Measured with the release binary against a
    `file://` store holding one segment: `pulled 0 segments`, for both
    `--from …/warehouse/wal-mirror` and `--from …/store`. This is the documented
-   DR path and the justification for the mirror existing.
+   DR path and the justification for the mirror existing. The prefix is now
+   relative to the operator's root — empty on the CLI path, since
+   `build_opendal_operator` roots the store at the URL — and
+   `recover_from_object_store` accepts an empty prefix instead of listing `"/"`
+   and stripping `"/"` off relative keys. `crates/siglake-cli/tests/cli/wal_recover_cli.rs`
+   runs the binary against a `file://` mirror, with and without a trailing
+   slash.
 2. **`_active/` blobs are never reclaimed by anything.** The active mirror
    overwrites one key per in-flight segment, and when that segment seals its
    blob is left behind; mirror-to-catalog sync explicitly skips `_active/`
