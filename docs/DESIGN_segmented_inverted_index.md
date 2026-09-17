@@ -1,12 +1,15 @@
 # Design — row-group-addressable inverted-index sidecars (#4376 prototype)
 
-Status (2026-09-17): **prototype, nothing wired.** The codec and its reader are
-`siglake_index::segmented`; the writer, the scan path and every default are
-untouched. This document is the format decision #4377 needs ahead of building
-postings during a streaming merge, and the specification the remaining slices
-implement: #4560 (the codec, its fixtures and the format's open questions —
-settled below), #4561 (reader integration and bounded partial reads), #4562
-(the measured proceed/revise/reject disposition).
+Status (2026-09-17): **prototype; the scan path can read one, off by default.**
+The codec and its reader are `siglake_index::segmented`, and the reader
+integration (#4561) is behind `SIGLAKE_SEGMENTED_INDEX_READS` — see
+[Reader integration](#reader-integration-4561). The writer is untouched:
+nothing produces a segmented sidecar, so with the knob unset every default
+behaves exactly as it did. This document is the format decision #4377 needs
+ahead of building postings during a streaming merge, and the specification the
+remaining slices implement: #4560 (the codec, its fixtures and the format's
+open questions — settled below), #4561 (reader integration and bounded partial
+reads — below), #4562 (the measured proceed/revise/reject disposition).
 
 It exists because the shipped format has one property that cannot be fixed by
 sizing a cache: **it is only readable whole.**
@@ -351,6 +354,125 @@ decompression per lookup, the 1.58x fetched bytes above, and a format field that
 16 MiB" is not an argument against the layout — it is the cost of this
 prototype's simplest choice.
 
+## Reader integration (#4561)
+
+The scan path can now answer a text predicate from a segmented sidecar,
+reading byte ranges of it. It is off unless `SIGLAKE_SEGMENTED_INDEX_READS` is
+set (`1`/`true`/`yes`/`on`), and nothing writes the format, so with the knob
+unset the reader behaves exactly as it did: a file carrying only a segmented
+sidecar is scanned, and a file carrying a v1 one takes the v1 path.
+
+**A sub-range entry point.** `PuffinReader::blob` reads a blob's whole
+`offset..offset + length` and decompresses it, which is the cost this format
+exists to avoid. `PuffinReader::blob_range_reader` returns a `BlobRangeReader`
+instead: one opened file reader, ranges bounded by the *blob* rather than the
+file, and a refusal for any codec but `None` — a compressed blob has no
+addressable interior. Each range is charged to
+`ObjectStoreReadPhase::Index`, the phase the whole-blob fetch charges, so the
+fetched bytes land in the accounting the sidecar read they replace used.
+
+**Discovery is per file, by blob type.** The reader looks through the scan
+task's statistics blobs for `siglake-inverted-seg-v1` with a matching `column`
+property, then resolves the blob's offset and length from the Puffin footer
+(through the same cached footer read the v1 path uses). The v1 path looks for
+`siglake-inverted-v1` and does not see a segmented blob; the segmented path
+runs first and falls through to it, so a file carrying both is answered by the
+segmented reader and a file carrying either is answered by that one. The
+footer-KV key (`siglake.inverted_index.seg1`) is not wired: a footer index
+arrives with the Parquet metadata the scan already read, so there is nothing to
+read in part.
+
+**The sync/async seam.** `RangeSource` is synchronous and the object store is
+not. The lookup runs on a blocking thread and hands each range to the async
+side over a channel, one at a time; a range the async side cannot serve comes
+back as `None`, which the reader turns into `Unanswerable`. Nothing is cached
+per lookup: the reader holds the directory and asks for what a term needs. The
+blocking thread is held for the whole lookup, IO waits included, which is a
+prototype's simplification and not what a shipped version should do — one
+scanned file occupies one thread of tokio's blocking pool for as long as its
+lookup takes.
+
+**The prototype is instrumented apart from the v1 path.** A file answered by a
+segmented sidecar increments
+`siglake_iceberg_segmented_index_used_total{source}` and does *not* touch
+`siglake_iceberg_inverted_index_used_total`, the parsed-index cache counters,
+the `text_index_startup_seconds` stages or the scan's `EXPLAIN`
+`text_index:[…]` attribution — all of which describe loading a whole-file
+index, which this path never does. #4562's harness has to read the segmented
+counters; reading the v1 ones would show a plan that used no index at all.
+
+**What the policy does with the three outcomes.** Only a definitive answer
+prunes. `Declined` is recorded with a reason
+(`siglake_iceberg_segmented_index_declined_total{reason}`) and leaves the
+caller where it would have been anyway — the v1 index if the file has one, an
+exact scan otherwise:
+
+| reason | when |
+|---|---|
+| `compressed` | the sidecar was registered with a codec, so it has no addressable interior |
+| `open` | trailer, directory CRC or structural tiling refused the blob |
+| `row_domain` | `matches_row_groups` disagrees with the file's Parquet row groups |
+| `row_group_order` | the scan's kept-group list is not strictly ascending, so the sidecar and the selection would cover different groups |
+| `unanswerable` | a term that does not normalize, a malformed section, or a failed range read |
+| `no_hints` | the prune spec carries nothing this index can answer |
+
+Two entry points changed in `siglake_index::segmented` for this, both
+reader-side policy the codec deliberately left open:
+
+- **AND resolves rarest first, per group.** Every term is located in the
+  group's dictionary before any postings are fetched — the block read a point
+  lookup pays anyway — and the postings are then read in ascending document
+  frequency, stopping as soon as the running intersection empties. A group
+  missing one of the terms reads no posting section at all. The df the policy
+  needs is in the directory; the v1 index has no equivalent, since it has
+  already decoded everything by the time it could use one.
+- **OR has an entry point at all.** `RawPruneSpec::any_terms` had none: the v1
+  path unions `postings` per term and skips a term it cannot answer, which is
+  safe only because `extract_match_udf_prune` fills the spec from tokenizer
+  output. Under the three-outcome contract a skipped term would license
+  skipping rows it might have matched, so `matching_rows_any_in_groups`
+  declines the whole disjunction instead.
+
+The substring sweep is answered exactly and costs what it costs (below);
+declining it is a per-execution decision and belongs with #4375's policy, which
+already gates this path along with the v1 one.
+
+### What a lookup costs through the reader
+
+`report_segmented_reader_read_cost` (`third_party/iceberg/src/arrow/reader.rs`,
+`#[ignore]`d) measures the same quantities the tables below do, through the
+Puffin container. Release build, 1,000,000 rows in 8 row groups, a 12,127,530-byte
+segmented blob against a 74,284,630-byte parsed v1 index:
+
+| shape | rows | reads | fetched | ÷ blob |
+|---|---:|---:|---:|---:|
+| rare | 1,004 | 18 | 65,481 | 0.540% |
+| rare_last25 | 251 | 6 | 58,108 | 0.479% |
+| keyword | 20,000 | 18 | 83,475 | 0.688% |
+| unique_token | 1 | 4 | 57,415 | 0.473% |
+| and_rare_keyword | 21 | 34 | 93,296 | 0.769% |
+| or_rare_unique | 1,005 | 20 | 67,236 | 0.554% |
+| substring_sweep | 20,000 | 2,938 | 5,207,615 | 42.940% |
+
+Resident state is 135,238 bytes for every row — the directory, 549x smaller
+than the parsed v1 index of the same file. Every row's answer is asserted equal
+to the whole-file index's, restricted to the groups the shape kept, before any
+cost is reported.
+
+**Every row of that table includes the cold open**, because nothing caches an
+opened reader: two reads and 55,660 bytes of trailer and directory, which is
+most of what every point shape fetches here. At the 7.34M-row scale that read
+is 474.9 KiB. The codec-level table's warm column reuses readers across
+executions and is the one to compare a deployed cost against; a reader cache
+keyed by `(statistics file, blob offset)` is the obvious next step and is not
+in this slice — #4562's configuration needs one to measure a warm arm at all.
+
+`and_rare_keyword` reads both terms' postings here — `rareneedle` and `queen`
+are both in every row group, so the intersection never empties early — and its
+34 reads are two dictionary lookups plus two posting reads per group. The
+saving the df ordering buys shows where a term is absent from a group or the
+intersection empties, which the codec's own fixtures pin.
+
 ## Measurements
 
 Release build, this box, local instrumentation only. The corpus is
@@ -505,10 +627,11 @@ this prototype settles is that the format can be read in part, what one lookup
 costs in reads and bytes, and that the resident working set falls by ~510x.
 What remains, in order:
 
-1. **#4561** — a sub-range read against a Puffin statistics file (not
-   `PuffinReader::blob`), the reader's `RawPruneSpec` path taking a segmented
-   sidecar when one is registered, the row-domain check against Parquet
-   metadata, and legacy/segmented/absent mixtures all landing on exact results.
+1. ~~**#4561**~~ — done, see [Reader integration](#reader-integration-4561):
+   the sub-range read, the `RawPruneSpec` path, the row-domain check and the
+   mixtures. What it left for #4562: nothing caches an opened reader, so every
+   lookup pays the directory read, and no writer produces a sidecar for a real
+   table — the harness builds one.
 2. **#4562** — the six-shape harness with a third arm, cold and warm separately,
    under 1 GiB parsed / 256 MiB blob, plus the OFF control; that is where a
    proceed/revise/reject disposition for #4377 comes from.
@@ -557,6 +680,18 @@ arm's 160 µs for the 14-file `rare_scan`, because a warm `BTreeMap` hit beats a
 pair of range reads. One million rows is also a single row group, so it does not
 exercise the reject path either. The measured claim is specifically about a
 working set that exceeds the budget; where residency is free, this format costs.
+
+The reader integration's fixtures are the iceberg fork's own unit tests
+(`scripts/check-fork-tests.sh --fork iceberg`), and its measurement runs from a
+kept mirror:
+
+```
+scripts/check-fork-tests.sh --fork iceberg --keep
+cargo test --release --lib report_segmented_reader_read_cost -- --ignored --nocapture
+```
+
+sized by `SIGLAKE_SEG_READER_ROWS` (1,000,000) and `SIGLAKE_SEG_READER_GROUPS`
+(8).
 
 The codec's own fixtures run in the crate's normal test pass
 (`cargo test -p siglake-index`): v1 equivalence term by term, group-straddling

@@ -747,13 +747,17 @@ impl<S: RangeSource> SegmentedReader<S> {
     }
 
     /// [`Self::matching_rows_all`] restricted to `groups`, under the same
-    /// selection contract [`Self::postings_in_groups`] states. A term that no
-    /// group has ends the lookup at once, and the intersection runs
-    /// shortest-list first. Both happen *after* each term's postings are
-    /// fetched, in argument order: the dictionary's document frequencies could
-    /// order the fetches too, and skip the rest once the rarest term's list is
-    /// known, but that is a reader-side policy question and belongs with
-    /// #4561's integration.
+    /// selection contract [`Self::postings_in_groups`] states.
+    ///
+    /// Resolution is per group and **rarest first**, which is what the
+    /// directory's document frequencies buy over the v1 index: every term is
+    /// located in the group's dictionary first (one block read each, the read
+    /// a point lookup pays anyway), and only then are postings fetched, in
+    /// ascending `df`, stopping as soon as the running intersection empties. A
+    /// term the group does not have ends the group before any posting section
+    /// is read at all. On the measurement corpus that is the difference
+    /// between reading a 2%-density term's 152.9 KiB of postings and not
+    /// reading them (`docs/DESIGN_segmented_inverted_index.md`).
     pub fn matching_rows_all_in_groups(
         &self,
         terms: &[&str],
@@ -761,27 +765,80 @@ impl<S: RangeSource> SegmentedReader<S> {
     ) -> Option<Vec<u32>> {
         // Checked before the empty-term shortcut, so a selection this sidecar
         // cannot serve never gets an answer at all.
-        self.group_indices(groups)?;
+        let indices = self.group_indices(groups)?;
         if terms.is_empty() {
             return Some(Vec::new());
         }
-        let mut lists: Vec<Vec<u32>> = Vec::with_capacity(terms.len());
+        // Up front, so a term that does not normalize is `Unanswerable` for
+        // the whole lookup rather than per group.
+        let mut normalized: Vec<String> = Vec::with_capacity(terms.len());
+        for term in terms {
+            normalized.push(normalize_query_term(term)?);
+        }
+        let mut rows: Vec<u32> = Vec::new();
+        for index in indices {
+            let group = &self.groups[index];
+            let mut located: Vec<(u64, u32, u32)> = Vec::with_capacity(normalized.len());
+            for term in &normalized {
+                match self.locate_term(group, term) {
+                    Ok(Some(hit)) => located.push(hit),
+                    // No group-wide match is possible, and no postings were
+                    // read for the terms already located.
+                    Ok(None) => break,
+                    Err(()) => return None,
+                }
+            }
+            if located.len() != normalized.len() {
+                continue;
+            }
+            located.sort_by_key(|(_, _, df)| *df);
+            let mut acc: Option<Vec<u32>> = None;
+            for (offset, len, df) in located {
+                let list = self.read_postings(group, offset, len, df).ok()?;
+                acc = Some(match acc {
+                    None => list,
+                    Some(previous) => intersect_sorted(&previous, &list),
+                });
+                if acc.as_ref().is_some_and(Vec::is_empty) {
+                    break;
+                }
+            }
+            rows.extend(acc.unwrap_or_default());
+        }
+        Some(rows)
+    }
+
+    /// Rows matching **any** of `terms` — the disjunction the shipped reader
+    /// builds for `RawPruneSpec::any_terms`, which the v1 index has no entry
+    /// point for either (it unions `postings` per term and skips what it
+    /// cannot answer).
+    ///
+    /// Under the three-outcome contract that skip is not available: a term this
+    /// index cannot answer might have matched any row, so the disjunction as a
+    /// whole concludes nothing and this returns `None`. An
+    /// [`Absent`](Lookup::Absent) term contributes no rows, and an empty
+    /// `terms` is a definitive no-match.
+    pub fn matching_rows_any(&self, terms: &[&str]) -> Option<Vec<u32>> {
+        self.matching_rows_any_in_groups(terms, None)
+    }
+
+    /// [`Self::matching_rows_any`] restricted to `groups`, under the same
+    /// selection contract [`Self::postings_in_groups`] states.
+    pub fn matching_rows_any_in_groups(
+        &self,
+        terms: &[&str],
+        groups: Option<&[usize]>,
+    ) -> Option<Vec<u32>> {
+        self.group_indices(groups)?;
+        let mut rows: Vec<u32> = Vec::new();
         for term in terms {
             match self.postings_in_groups(term, groups) {
-                Lookup::Rows(rows) => lists.push(rows),
-                Lookup::Absent => return Some(Vec::new()),
+                Lookup::Rows(list) => rows = union_sorted(&rows, &list),
+                Lookup::Absent => {}
                 Lookup::Unanswerable => return None,
             }
         }
-        lists.sort_by_key(Vec::len);
-        let mut acc = lists.swap_remove(0);
-        for list in &lists {
-            acc = intersect_sorted(&acc, list);
-            if acc.is_empty() {
-                break;
-            }
-        }
-        Some(acc)
+        Some(rows)
     }
 
     /// Rows matching `raw LIKE '%substr%'` under the same argument v1's
@@ -875,6 +932,23 @@ impl<S: RangeSource> SegmentedReader<S> {
 
     /// `Ok(None)` = this group does not have the term; `Err(())` = malformed.
     fn group_postings(&self, group: &GroupEntry, normalized: &str) -> Result<Option<Vec<u32>>, ()> {
+        match self.locate_term(group, normalized)? {
+            None => Ok(None),
+            Some((offset, len, df)) => self.read_postings(group, offset, len, df).map(Some),
+        }
+    }
+
+    /// The term's `(postings offset, length, document frequency)` in this
+    /// group, from one dictionary-block read — the half of a lookup that costs
+    /// the block and not the postings, which is what lets an AND order its
+    /// posting fetches by `df` and skip a group that is missing a term.
+    ///
+    /// `Ok(None)` = this group does not have the term; `Err(())` = malformed.
+    fn locate_term(
+        &self,
+        group: &GroupEntry,
+        normalized: &str,
+    ) -> Result<Option<(u64, u32, u32)>, ()> {
         // Pick the one block whose term range can hold the term. No block read
         // at all when the term sorts before the group's first term.
         let block_index = group
@@ -897,10 +971,7 @@ impl<S: RangeSource> SegmentedReader<S> {
                 std::cmp::Ordering::Greater => false,
             }
         })?;
-        match hit {
-            None => Ok(None),
-            Some((offset, len, df)) => self.read_postings(group, offset, len, df).map(Some),
-        }
+        Ok(hit)
     }
 
     /// Fetch and verify one dictionary block. `None` — not "the term is not
@@ -1333,6 +1404,99 @@ mod tests {
                 .collect::<Vec<_>>(),
             "restriction is exactly the rows of those groups"
         );
+    }
+
+    #[test]
+    fn an_and_skips_a_group_that_is_missing_a_term_before_reading_postings() {
+        let rows = corpus(20_000);
+        let v1 = InvertedIndex::from_rows(rows.iter().map(String::as_str));
+        let reader = open(encoded(&rows, 5_000));
+
+        // `000001` is one row's unique token, so three of the four groups
+        // cannot match the conjunction at all. `status` is on every row, so
+        // its posting sections are the bytes worth not reading.
+        reader.source().reset_counters();
+        let common = reader.postings("status");
+        let common_bytes = reader.source().bytes_read();
+        assert!(matches!(common, Lookup::Rows(_)));
+
+        reader.source().reset_counters();
+        let matching = reader.matching_rows_all(&["status", "000001"]);
+        let and_bytes = reader.source().bytes_read();
+
+        assert_eq!(matching, Some(vec![1]));
+        assert_eq!(matching, Some(v1.matching_rows_all(&["status", "000001"])));
+        assert!(
+            and_bytes < common_bytes,
+            "the conjunction fetched {and_bytes} bytes, more than the common \
+             term's own {common_bytes}: a missing term did not stop the group"
+        );
+    }
+
+    #[test]
+    fn an_and_stops_fetching_once_the_intersection_is_empty() {
+        let rows = corpus(20_000);
+        let v1 = InvertedIndex::from_rows(rows.iter().map(String::as_str));
+        let reader = open(encoded(&rows, 5_000));
+        // Row 1 carries neither `queen` (every 50th) nor `checkout` (every
+        // 20th), so the rarest list empties the intersection in the one group
+        // that has `000001`, before the densest term's section is read.
+        let terms = ["status", "queen", "000001"];
+
+        reader.source().reset_counters();
+        let common = reader.postings("status");
+        let common_bytes = reader.source().bytes_read();
+        assert!(matches!(common, Lookup::Rows(_)));
+
+        reader.source().reset_counters();
+        let matching = reader.matching_rows_all(&terms);
+        let and_bytes = reader.source().bytes_read();
+
+        assert_eq!(matching, Some(Vec::new()));
+        assert_eq!(matching, Some(v1.matching_rows_all(&terms)));
+        assert!(
+            and_bytes < common_bytes,
+            "the conjunction fetched {and_bytes} bytes against {common_bytes} \
+             for one of its common terms alone"
+        );
+    }
+
+    #[test]
+    fn an_or_unions_what_it_can_answer_and_refuses_what_it_cannot() {
+        let rows = corpus(1_100);
+        let v1 = InvertedIndex::from_rows(rows.iter().map(String::as_str));
+        let reader = open(encoded(&rows, 256));
+
+        for terms in [
+            vec!["queen", "checkout"],
+            vec!["rareneedle", "absentterm"],
+            vec!["absentterm", "alsoabsent"],
+            vec!["000001", "000999", "queen"],
+        ] {
+            let expected = terms.iter().fold(Vec::new(), |acc: Vec<u32>, term| {
+                union_sorted(&acc, v1.postings(term).unwrap_or(&[]))
+            });
+            assert_eq!(
+                reader.matching_rows_any(&terms),
+                Some(expected),
+                "OR {terms:?}"
+            );
+        }
+
+        // A term that does not normalize might have matched any row, so the
+        // disjunction concludes nothing — it does not quietly drop the term
+        // the way the v1 reader's per-term union does.
+        assert_eq!(reader.matching_rows_any(&["queen", "qu"]), None);
+        // And the row-group selection contract holds for the OR entry point.
+        assert_eq!(
+            reader.matching_rows_any_in_groups(&["queen"], Some(&[99])),
+            None
+        );
+        assert_eq!(
+            reader.matching_rows_any_in_groups(&["queen"], Some(&[])),
+            Some(Vec::new())
+        );
+        assert_eq!(reader.matching_rows_any(&[]), Some(Vec::new()));
     }
 
     #[test]

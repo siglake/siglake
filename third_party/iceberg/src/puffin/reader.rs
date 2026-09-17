@@ -20,11 +20,12 @@ use std::sync::OnceLock;
 use tokio::sync::OnceCell;
 
 use super::validate_puffin_compression;
-use crate::Result;
+use crate::compression::CompressionCodec;
 use crate::io::read_observability::{
     ObjectStoreReadPhase, ReadDebouncer, record_object_store_read,
 };
-use crate::io::InputFile;
+use crate::io::{FileRead, InputFile};
+use crate::{Error, ErrorKind, Result};
 use crate::puffin::blob::Blob;
 use crate::puffin::metadata::{BlobMetadata, FileMetadata};
 
@@ -109,6 +110,81 @@ impl PuffinReader {
             data: data.as_ref().to_vec(),
             properties: blob_metadata.properties.clone(),
         })
+    }
+
+    /// siglake: a reader for byte ranges *inside* one blob, for a blob whose
+    /// interior is addressable — the segmented inverted-index sidecar
+    /// (`siglake_index::segmented`), which a lookup reads a few kilobytes of
+    /// rather than whole.
+    ///
+    /// [`Self::blob`] cannot serve that: it reads the blob's entire
+    /// `offset..offset + length` and decompresses it, which is the whole cost
+    /// the segmented format exists to avoid. An interior offset is only
+    /// meaningful in an **uncompressed** blob, so this refuses any other codec
+    /// — a compressed blob has no addressable interior and its reader must
+    /// take the whole-blob path (`docs/DESIGN_segmented_inverted_index.md`).
+    pub async fn blob_range_reader(&self, blob_metadata: &BlobMetadata) -> Result<BlobRangeReader> {
+        if blob_metadata.compression_codec != CompressionCodec::None {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "blob {} is {:?}-compressed and cannot be read in part",
+                    blob_metadata.r#type, blob_metadata.compression_codec
+                ),
+            ));
+        }
+        Ok(BlobRangeReader {
+            file_read: self.input_file.reader().await?,
+            start: blob_metadata.offset,
+            len: blob_metadata.length,
+        })
+    }
+}
+
+/// siglake: byte ranges inside one uncompressed Puffin blob, over a single
+/// opened file reader ([`PuffinReader::blob_range_reader`]).
+///
+/// Every range is bounded by the blob, not by the file: an offset past the
+/// blob's length is an error rather than a read of whatever follows it. Each
+/// range is charged to [`ObjectStoreReadPhase::Index`], the phase the
+/// whole-blob path charges, so a segmented lookup's fetched bytes land in the
+/// same accounting as the sidecar read it replaces. The count is what the
+/// reader *asked for*: an identical range served again may come from the
+/// object cache (`CachingFileRead`) without reaching storage.
+pub struct BlobRangeReader {
+    file_read: Box<dyn FileRead>,
+    start: u64,
+    len: u64,
+}
+
+impl BlobRangeReader {
+    /// The blob's length — the addressable space of [`Self::read_at`].
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the blob has any bytes to address.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// `len` bytes at `offset` within the blob.
+    pub async fn read_at(&self, offset: u64, len: u64) -> Result<bytes::Bytes> {
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= self.len)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("range {offset}..+{len} is outside a {}-byte blob", self.len),
+                )
+            })?;
+        let bytes = self
+            .file_read
+            .read(self.start + offset..self.start + end)
+            .await?;
+        record_object_store_read(ObjectStoreReadPhase::Index, bytes.len() as u64);
+        Ok(bytes)
     }
 }
 
