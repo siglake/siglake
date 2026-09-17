@@ -461,6 +461,16 @@ synchronous seal time" is a loopback number that does not transfer to the
 deployed shape. No round has measured a seal histogram on EFS; a follow-up asks
 for one.
 
+That changes the shape of this argument without changing its verdict. The two
+cases arrive at the same place from opposite directions: where the fsync is
+expensive (local ext4) the deferral cannot be closed safely, and where the
+deferral would be unnecessary (a filesystem whose `LINK` returns durable) the
+fsync is already cheap. Whether it can be skipped is a per-mount property —
+which filesystem, which mount options, which server — that the writer cannot
+detect and must not guess, so it pays for the weakest assumption every time.
+That is the sense in which the cost is irreducible: no code in the writer can
+tell when the fsync is buying nothing.
+
 ## What this does not measure
 
 - **Any filesystem but ext4.** XFS, NFS/EFS and overlay mounts were not
