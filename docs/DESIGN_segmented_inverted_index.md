@@ -851,28 +851,46 @@ directory default.
 ### The segmented format's own budget, swept
 
 `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES` is the only retention this
-path has. Three passes over the same fixture, same two shipped budgets:
+path has, and the eviction pressure that broke the v1 format has to be put on it
+too. Three passes over the same fixture at the same two shipped budgets, 14
+files of 1.14 MiB of directory each:
 
-| directory budget | rare_scan p50 | rare_scan reads / exec | rare_scan fetched / exec | dir evictions |
+| directory budget | dir entries / hits / evictions | rare_scan p50 | reads / exec | fetched / exec |
 |---|---:|---:|---:|---:|
-| 64 MiB (default) | 160.2 ms | 84.0 | 35,592 | 0 |
-| 0 (no retention) | 138.9 ms | 112.0 | 7,954,450 | n/a |
+| 64 MiB (default) | 14 / 388 / **0** | 160.2 ms | 84.0 | 35,592 |
+| 4 MiB (3 of 14 fit) | 3 / 0 / **125** | 135.2 ms | 106.0 | 6,292,130 |
+| 0 (no retention) | 0 / 0 / n/a | 138.9 ms | 112.0 | 7,954,450 |
 
-With no retention, every lookup re-reads its file's trailer and directory: reads
-rise 33% and fetched bytes **223x**, while latency does not move — 7.95 MiB of
-local-file range reads costs less than the jitter between runs on this box. The
-cache's value here is in requests and bytes, which is where an object store
-prices it, and this measurement cannot price that (see below). The unretained
-pass is also the honest per-shape cold column, since no earlier shape can have
-opened a directory for it: `rare_scan` 112 reads and 7.95 MiB, `rare_keyword` 80
-reads and 5.73 MiB, `keyword_last5` 8 reads and 742 KiB.
+The 4 MiB pass is the v1 arm's failure mode reproduced on the new cache: a
+14-file plan round-robins through a budget that holds three, so the entry is
+gone before it is reused — **0 hits, 125 evictions**, the same shape as the
+parsed cache's 0/42/41. What it costs is the difference between the two formats.
+Re-reading a 565 KiB directory costs milliseconds, so `rare_scan` stays at
+135.2 ms and 0.08x the scan; re-decoding a 534 MiB parsed index costs seconds,
+which is how the same pressure puts v1 at 22.1x. A thrashing directory cache
+degrades to the unretained cost and no further, and the unretained cost is still
+11x better than the scan.
+
+Retention shows up in bytes rather than latency: 35,592 bytes per execution held
+against 7,954,450 unretained, **223x**, for a 33% difference in read count and
+none in wall time, because 7.95 MiB of local-file range reads costs less than
+the jitter between runs on this box. That is the quantity an object store prices
+and this measurement cannot (see below). The unretained pass is also the honest
+per-shape cold column, since no earlier shape can have opened a directory for
+it: `rare_scan` 112 reads and 7.95 MiB, `rare_keyword` 80 reads and 5.73 MiB,
+`keyword_last5` 8 reads and 742 KiB.
+
+The 4 MiB and 0 passes ran at a load average of 3.5 against the main pass's 1.8,
+so read the counts and bytes from them rather than the milliseconds — their
+`off` control moved too (`rare_scan` cold 3,372.5 ms against 1,656.6 ms).
 
 ### What this measurement is, and is not
 
 - **Is:** the end-to-end query-path comparison #4376's acceptance asked for, at
-  the budgets it named, with exact-answer equality asserted per arm per shape,
-  and with reads, bytes, resident memory and codec construction reported apart
-  from latency.
+  the budgets it named and with both of them off, cold and warm apart and under
+  eviction pressure on each format's own cache, with exact-answer equality
+  asserted per arm per shape, and with reads, bytes, resident memory and codec
+  construction reported apart from latency.
 - **Is not** a distributed, object-store or HTTP measurement. One process, a
   `file://` warehouse, no query server, no shards. The reads column is what the
   reader asked for, not what S3 would charge for it; a warm `rare_scan`'s 84
@@ -902,8 +920,10 @@ query path: the rare unclipped shapes go from 7.3-22.4x slower than a scan to
 11.5-17.4x faster, the clipped rare shape #4375 has to decline goes to 11.1x
 faster than the scan, the resident working set falls from 7.30 GiB to 15.95 MiB,
 every answer is exact, and none of it depends on the two cache budgets a 4Gi
-query pod cannot fund. No cache sizing reaches that result with the shipped
-format.
+query pod cannot fund. Starved of its own budget it degrades to 0.08x the scan
+instead of 22x it (0 hits and 125 evictions at 4 MiB, the parsed cache's failure
+mode on a cache whose miss costs milliseconds). No cache sizing reaches that
+result with the shipped format.
 
 Two revisions belong in #4377's scope rather than after it:
 
