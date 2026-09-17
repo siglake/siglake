@@ -368,8 +368,8 @@ enum Command {
     /// object or a `<tenant>/<index>/owner` marker one component deeper than
     /// the mirror layout puts it means `--from` is one component above the
     /// mirror root, and both forms then exit nonzero naming the directory to
-    /// pass instead (#4964). Both also exit nonzero when every key was
-    /// skipped and there is nothing to restore (#4928).
+    /// pass instead. Both also exit nonzero when every key was skipped and
+    /// there is nothing to restore.
     WalRecover {
         /// Full source URL (e.g. `s3://bucket/wal-mirror`).
         #[arg(long, env = "SIGLAKE_WAL_MIRROR_URL")]
