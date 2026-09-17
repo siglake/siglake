@@ -399,12 +399,17 @@ async fn run() -> Result<()> {
     )
     .await?;
 
+    // Resolved once and read at all three sites below (the verifier, the
+    // no-OIDC refusal, the tenant registry), so none of them can disagree
+    // about whether this process derives tenancy from a claim.
+    let oidc_tenant_claim = oidc_tenant_claim_from(cli.oidc_tenant_claim.as_deref());
+
     let auth = match (cli.oidc_issuer.as_deref(), cli.oidc_audience.as_deref()) {
         (Some(issuer), Some(audience)) => {
             let mut verifier = OidcVerifier::from_issuer(issuer.to_string(), audience.to_string())
                 .await
                 .with_context(|| format!("oidc discovery for {issuer}"))?;
-            if let Some(claim) = cli.oidc_tenant_claim.as_deref() {
+            if let Some(claim) = oidc_tenant_claim {
                 verifier = verifier.with_tenant_claim(claim);
                 tracing::info!(claim, "per-request tenant routing enabled");
             }
@@ -414,7 +419,7 @@ async fn run() -> Result<()> {
             anyhow::bail!("--oidc-issuer and --oidc-audience must both be set (or both unset)");
         }
         (None, None) => {
-            if cli.oidc_tenant_claim.is_some() {
+            if oidc_tenant_claim.is_some() {
                 anyhow::bail!("--oidc-tenant-claim requires --oidc-issuer + --oidc-audience");
             }
             match cli.tokens.as_deref() {
@@ -565,7 +570,7 @@ async fn run() -> Result<()> {
         }
     }
 
-    if cli.oidc_tenant_claim.is_some() {
+    if oidc_tenant_claim.is_some() {
         state = state.with_tenants(siglake_query_server::TenantRegistry::new(ice.clone()));
     }
 
@@ -710,10 +715,24 @@ fn jobs_store_uri_from(configured: Option<&str>) -> Option<&str> {
     (!uri.is_empty()).then_some(uri)
 }
 
+/// The JWT claim this server binds tenancy to, or `None` when the option is
+/// unset or carries nothing.
+///
+/// The same rule as the ingester's `oidc_tenant_claim_from`: empty is not a
+/// claim, because `SIGLAKE_OIDC_TENANT_CLAIM=` is how a shared `extraEnv`
+/// says "off" and an operator who sets it that way should not get one
+/// boundary single-tenant and the other refusing to start. Trimmed, because
+/// the value arrives from a ConfigMap as often as from a flag — and an
+/// untrimmed `" "` would reach `with_tenant_claim` as a real claim name that
+/// no token can carry.
+fn oidc_tenant_claim_from(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim).filter(|claim| !claim.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{jobs_store_uri_from, Cli};
-    use clap::CommandFactory;
+    use super::{jobs_store_uri_from, oidc_tenant_claim_from, Cli, OidcVerifier};
+    use clap::{CommandFactory, Parser};
     use siglake_storage::resolve_query_read_cache_config;
 
     #[test]
@@ -798,6 +817,63 @@ mod tests {
             jobs_store_uri_from(Some("  postgres://siglake:pw@db:5432/siglake  ")),
             Some("postgres://siglake:pw@db:5432/siglake")
         );
+    }
+
+    /// The rule the ingester's `oidc_tenant_claim_from` reads, so a shared
+    /// `SIGLAKE_OIDC_TENANT_CLAIM=` does not start one tier single-tenant
+    /// while the other refuses to start.
+    #[test]
+    fn an_empty_tenant_claim_is_off_rather_than_a_refusal() {
+        assert_eq!(oidc_tenant_claim_from(None), None);
+        assert_eq!(oidc_tenant_claim_from(Some("")), None);
+        assert_eq!(oidc_tenant_claim_from(Some("   ")), None);
+        assert_eq!(oidc_tenant_claim_from(Some(" org ")), Some("org"));
+
+        // The startup refusal, the log line and the tenant registry all read
+        // the resolved value, so what an operator can actually write into a
+        // shared `extraEnv` is what the test parses.
+        let resolved = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).expect("flags parse");
+            oidc_tenant_claim_from(cli.oidc_tenant_claim.as_deref()).map(str::to_string)
+        };
+        assert_eq!(resolved(&["siglake-query-server"]), None);
+        assert_eq!(
+            resolved(&["siglake-query-server", "--oidc-tenant-claim", ""]),
+            None
+        );
+        assert_eq!(
+            resolved(&["siglake-query-server", "--oidc-tenant-claim", "  "]),
+            None
+        );
+        assert_eq!(
+            resolved(&["siglake-query-server", "--oidc-tenant-claim", " org "]),
+            Some("org".to_string())
+        );
+    }
+
+    /// The resolved value is what reaches the verifier, so a whitespace-only
+    /// name no longer binds tenancy to a claim no token can carry — and a
+    /// real name still binds it, which is what makes a token without that
+    /// claim a 403 rather than a default-namespace read.
+    #[test]
+    fn only_a_resolved_claim_binds_tenancy_on_the_verifier() {
+        let verifier = || {
+            OidcVerifier::with_jwks_uri(
+                "https://idp.example.com".to_string(),
+                "siglake".to_string(),
+                "https://idp.example.com/jwks".to_string(),
+                reqwest::Client::new(),
+            )
+        };
+        let bound = |raw| match oidc_tenant_claim_from(raw) {
+            Some(claim) => verifier().with_tenant_claim(claim).has_tenant_claim(),
+            None => verifier().has_tenant_claim(),
+        };
+
+        assert!(!bound(None));
+        assert!(!bound(Some("")));
+        assert!(!bound(Some("   ")));
+        assert!(bound(Some(" org ")));
     }
 
     #[test]
