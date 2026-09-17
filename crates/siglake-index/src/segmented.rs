@@ -78,6 +78,7 @@
 //! edit the same code.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use siglake_bloom::{normalize_query_term, Tokenizer};
 
@@ -505,20 +506,28 @@ impl RangeSource for SliceSource {
     }
 }
 
-/// A segmented blob opened for lookups. Resident state is the directory only
-/// ([`Self::resident_bytes`]); everything else is fetched per lookup.
-pub struct SegmentedReader<S: RangeSource> {
-    source: S,
+/// The parsed directory of a segmented blob: every group's row domain and
+/// section extents, and the dictionary-block index inside each. This is the
+/// whole of a reader's resident state ([`Self::resident_bytes`]) and it is a
+/// pure function of the blob's bytes, which a Puffin blob at an offset never
+/// changes — so it is shareable, and a second reader on the same blob can be
+/// built from it without reading the trailer or the directory again
+/// ([`SegmentedReader::open_with_directory`], siglake #5006).
+#[derive(Debug)]
+pub struct SegmentedDirectory {
     groups: Vec<GroupEntry>,
     n_rows: u32,
+    /// Blob length the directory was parsed against. A source of a different
+    /// length is not this blob, whatever the caller keyed it under.
+    blob_len: u64,
 }
 
-impl<S: RangeSource> SegmentedReader<S> {
+impl SegmentedDirectory {
     /// Read the trailer and the directory and validate both. `None` on a bad
     /// magic, an unknown version, an out-of-range offset, or a directory whose
     /// groups do not tile `0..n_rows` — every one of which leaves the caller on
     /// the scan path.
-    pub fn open(source: S) -> Option<Self> {
+    pub fn read<S: RangeSource + ?Sized>(source: &S) -> Option<Self> {
         let total = source.len();
         if total < (SEGMENTED_TRAILER_LEN + 5) as u64 {
             return None;
@@ -641,14 +650,10 @@ impl<S: RangeSource> SegmentedReader<S> {
             return None;
         }
         Some(Self {
-            source,
             groups,
             n_rows,
+            blob_len: total,
         })
-    }
-
-    pub fn source(&self) -> &S {
-        &self.source
     }
 
     /// Rows the sidecar covers — the ordinal space of every posting it returns.
@@ -665,6 +670,11 @@ impl<S: RangeSource> SegmentedReader<S> {
         self.groups.iter().map(|group| group.n_rows).collect()
     }
 
+    /// The blob length this directory was parsed against.
+    pub fn blob_len(&self) -> u64 {
+        self.blob_len
+    }
+
     /// Whether this sidecar describes exactly the given Parquet row groups.
     /// The shipped v1 path can only compare one stamped `row_group_size`
     /// against the file's groups; a segmented directory states every group, so
@@ -679,9 +689,10 @@ impl<S: RangeSource> SegmentedReader<S> {
                 .all(|(group, rows)| u64::from(group.n_rows) == *rows)
     }
 
-    /// Bytes the reader holds between lookups: the parsed directory. This is
-    /// the number the whole prototype is about — the v1 comparison is
-    /// [`InvertedIndex::heap_size_bytes`].
+    /// Bytes a reader holds between lookups: this directory. It is the number
+    /// the whole prototype is about — the v1 comparison is
+    /// [`InvertedIndex::heap_size_bytes`] — and, since a cache of directories
+    /// holds exactly this, the size such a cache budgets against.
     pub fn resident_bytes(&self) -> usize {
         const GROUP: usize = std::mem::size_of::<GroupEntry>();
         const BLOCK: usize = std::mem::size_of::<BlockEntry>();
@@ -698,6 +709,76 @@ impl<S: RangeSource> SegmentedReader<S> {
                             .sum::<usize>()
                 })
                 .sum::<usize>()
+    }
+}
+
+/// A segmented blob opened for lookups. Resident state is the directory only
+/// ([`Self::resident_bytes`]); everything else is fetched per lookup.
+pub struct SegmentedReader<S: RangeSource> {
+    source: S,
+    directory: Arc<SegmentedDirectory>,
+}
+
+impl<S: RangeSource> SegmentedReader<S> {
+    /// Read and validate this blob's directory ([`SegmentedDirectory::read`]),
+    /// then open on it. Two range reads before any term work: the trailer and
+    /// the directory.
+    pub fn open(source: S) -> Option<Self> {
+        let directory = SegmentedDirectory::read(&source)?;
+        Some(Self {
+            source,
+            directory: Arc::new(directory),
+        })
+    }
+
+    /// Open on a directory parsed earlier from the same blob — no trailer and
+    /// no directory read (siglake #5006). `None` when `source` is not the blob
+    /// the directory was parsed from, which the caller must treat as it treats
+    /// any other failure to open: read it again, or scan.
+    ///
+    /// Callers still validate the row domain per lookup
+    /// ([`Self::matches_row_groups`]): the directory states which groups it
+    /// covers, and the Parquet file it is being applied to is not part of the
+    /// blob's identity.
+    pub fn open_with_directory(source: S, directory: Arc<SegmentedDirectory>) -> Option<Self> {
+        if source.len() != directory.blob_len {
+            return None;
+        }
+        Some(Self { source, directory })
+    }
+
+    pub fn source(&self) -> &S {
+        &self.source
+    }
+
+    /// The parsed directory, to hold for the next reader on this blob.
+    pub fn directory(&self) -> &Arc<SegmentedDirectory> {
+        &self.directory
+    }
+
+    /// Rows the sidecar covers — the ordinal space of every posting it returns.
+    pub fn n_rows(&self) -> u32 {
+        self.directory.n_rows
+    }
+
+    pub fn n_groups(&self) -> usize {
+        self.directory.n_groups()
+    }
+
+    /// Each group's row count, in file order.
+    pub fn group_rows(&self) -> Vec<u32> {
+        self.directory.group_rows()
+    }
+
+    /// Whether this sidecar describes exactly the given Parquet row groups.
+    pub fn matches_row_groups(&self, parquet_row_counts: &[u64]) -> bool {
+        self.directory.matches_row_groups(parquet_row_counts)
+    }
+
+    /// Bytes the reader holds between lookups: the parsed directory
+    /// ([`SegmentedDirectory::resident_bytes`]).
+    pub fn resident_bytes(&self) -> usize {
+        self.directory.resident_bytes()
     }
 
     /// Ascending file-physical ordinals containing `term`, across every group.
@@ -723,7 +804,7 @@ impl<S: RangeSource> SegmentedReader<S> {
         let mut rows: Vec<u32> = Vec::new();
         let mut found = false;
         for index in indices {
-            let group = &self.groups[index];
+            let group = &self.directory.groups[index];
             match self.group_postings(group, &normalized) {
                 Ok(Some(group_rows)) => {
                     found = true;
@@ -777,7 +858,7 @@ impl<S: RangeSource> SegmentedReader<S> {
         }
         let mut rows: Vec<u32> = Vec::new();
         for index in indices {
-            let group = &self.groups[index];
+            let group = &self.directory.groups[index];
             let mut located: Vec<(u64, u32, u32)> = Vec::with_capacity(normalized.len());
             for term in &normalized {
                 match self.locate_term(group, term) {
@@ -864,7 +945,7 @@ impl<S: RangeSource> SegmentedReader<S> {
         let indices = self.group_indices(groups)?;
         let mut rows: Vec<u32> = Vec::new();
         for index in indices {
-            let group = &self.groups[index];
+            let group = &self.directory.groups[index];
             let mut matches: Vec<(u64, u32, u32)> = Vec::new();
             for block in &group.blocks {
                 let bytes = self.read_block(group, block)?;
@@ -894,18 +975,26 @@ impl<S: RangeSource> SegmentedReader<S> {
     /// index cannot answer.
     pub fn matching_row_selection(&self, terms: &[&str]) -> Option<Vec<(bool, u32)>> {
         let matching = self.matching_rows_all(terms)?;
-        Some(row_selection_runs(&matching, self.n_rows))
+        Some(row_selection_runs(&matching, self.directory.n_rows))
     }
 
     /// Total dictionary bytes — what a substring sweep reads.
     pub fn dictionary_bytes(&self) -> u64 {
-        self.groups.iter().map(|group| group.dict_len).sum()
+        self.directory
+            .groups
+            .iter()
+            .map(|group| group.dict_len)
+            .sum()
     }
 
     /// Total postings bytes — what a v1 decode reads in full and a point lookup
     /// reads a slice of.
     pub fn postings_bytes(&self) -> u64 {
-        self.groups.iter().map(|group| group.postings_len).sum()
+        self.directory
+            .groups
+            .iter()
+            .map(|group| group.postings_len)
+            .sum()
     }
 
     /// Validate a caller's row-group selection: strictly ascending, and every
@@ -918,11 +1007,13 @@ impl<S: RangeSource> SegmentedReader<S> {
     /// from a list that is not.
     fn group_indices(&self, groups: Option<&[usize]>) -> Option<Vec<usize>> {
         let Some(selected) = groups else {
-            return Some((0..self.groups.len()).collect());
+            return Some((0..self.directory.groups.len()).collect());
         };
         let mut previous: Option<usize> = None;
         for &index in selected {
-            if index >= self.groups.len() || previous.is_some_and(|previous| index <= previous) {
+            if index >= self.directory.groups.len()
+                || previous.is_some_and(|previous| index <= previous)
+            {
                 return None;
             }
             previous = Some(index);
@@ -1523,6 +1614,54 @@ mod tests {
         );
     }
 
+    /// siglake #5006: a reader built on a directory parsed earlier reads the
+    /// trailer and the directory zero times and answers identically.
+    #[test]
+    fn a_reader_opened_on_a_held_directory_reads_neither_trailer_nor_directory() {
+        let rows = corpus(20_000);
+        let blob = encoded(&rows, 5_000);
+        let bytes: Arc<[u8]> = blob.clone().into();
+        let cold = SegmentedReader::open(SliceSource::shared(Arc::clone(&bytes))).unwrap();
+        let open_reads = cold.source().reads();
+        let open_bytes = cold.source().bytes_read();
+        assert_eq!(open_reads, 2, "the trailer and the directory");
+        let Lookup::Rows(expected) = cold.postings("rareneedle") else {
+            panic!("the sparse term is present");
+        };
+        let cold_total = cold.source().bytes_read();
+        let directory = Arc::clone(cold.directory());
+
+        let warm = SegmentedReader::open_with_directory(
+            SliceSource::shared(Arc::clone(&bytes)),
+            Arc::clone(&directory),
+        )
+        .expect("the same blob");
+        assert_eq!(warm.source().reads(), 0, "nothing read to open");
+        assert_eq!(warm.postings("rareneedle"), Lookup::Rows(expected));
+        assert_eq!(
+            warm.source().reads(),
+            cold.source().reads() - open_reads,
+            "the term's reads, without the open's"
+        );
+        assert_eq!(warm.source().bytes_read(), cold_total - open_bytes);
+        assert_eq!(warm.resident_bytes(), cold.resident_bytes());
+        assert_eq!(warm.group_rows(), cold.group_rows());
+        assert!(warm.matches_row_groups(&[5_000, 5_000, 5_000, 5_000]));
+
+        // The directory is about one blob: a source of a different length is
+        // refused rather than addressed with another blob's offsets.
+        assert!(SegmentedReader::open_with_directory(
+            SliceSource::new(blob[..blob.len() - 1].to_vec()),
+            Arc::clone(&directory),
+        )
+        .is_none());
+        let mut longer = blob.clone();
+        longer.push(0);
+        assert!(
+            SegmentedReader::open_with_directory(SliceSource::new(longer), directory).is_none()
+        );
+    }
+
     #[test]
     fn an_absent_term_is_a_definitive_no_match_and_a_malformed_one_is_not() {
         let rows = corpus(300);
@@ -1745,8 +1884,8 @@ mod tests {
     fn with_directory(blob: &[u8], edit: impl FnOnce(&mut u32, &mut Vec<GroupEntry>)) -> Vec<u8> {
         let reader = SegmentedReader::open(SliceSource::new(blob.to_vec()))
             .expect("a fixture starts from a well-formed blob");
-        let mut n_rows = reader.n_rows;
-        let mut groups = reader.groups.clone();
+        let mut n_rows = reader.directory.n_rows;
+        let mut groups = reader.directory.groups.clone();
         edit(&mut n_rows, &mut groups);
         let mut out = blob[..trailer_dir_offset(blob)].to_vec();
         append_directory_and_trailer(&mut out, &encode_directory(n_rows, &groups));
@@ -1769,7 +1908,11 @@ mod tests {
         let reader = open(blob.clone());
         assert_eq!(reader.n_groups(), 4);
         assert!(
-            reader.groups.iter().all(|group| group.blocks.len() > 2),
+            reader
+                .directory
+                .groups
+                .iter()
+                .all(|group| group.blocks.len() > 2),
             "the fixture needs several blocks per group: {:?}",
             reader.group_rows()
         );
@@ -1849,7 +1992,7 @@ mod tests {
         // Hand-written directory bodies: a count that cannot be backed by the
         // bytes behind it must never be allocated from, and a body the reader
         // does not consume exactly is corrupt.
-        let group = &reader.groups[0];
+        let group = &reader.directory.groups[0];
         let mut group_header = Vec::new();
         write_varint(&mut group_header, u64::from(group.first_row));
         write_varint(&mut group_header, u64::from(group.n_rows));
@@ -1873,11 +2016,11 @@ mod tests {
         write_varint(&mut truncated, 2);
         truncated.extend_from_slice(&group_header);
 
-        let mut trailing = encode_directory(reader.n_rows, &reader.groups);
+        let mut trailing = encode_directory(reader.directory.n_rows, &reader.directory.groups);
         trailing.push(0);
 
-        let mut not_utf8 = encode_directory(reader.n_rows, &reader.groups);
-        let term = reader.groups[0].blocks[0].first_term.as_bytes();
+        let mut not_utf8 = encode_directory(reader.directory.n_rows, &reader.directory.groups);
+        let term = reader.directory.groups[0].blocks[0].first_term.as_bytes();
         let at = not_utf8
             .windows(term.len())
             .position(|window| window == term)
@@ -1909,7 +2052,7 @@ mod tests {
         let rows = corpus(1_000);
         let blob = multi_block_blob(&rows, 250);
         let reader = open(blob.clone());
-        let term = reader.groups[0].blocks[0].first_term.to_string();
+        let term = reader.directory.groups[0].blocks[0].first_term.to_string();
         assert!(matches!(reader.postings(&term), Lookup::Rows(_)));
 
         // Two blocks' byte ranges swapped: each block's recorded CRC now
@@ -1933,7 +2076,7 @@ mod tests {
         // themselves sees it, and what that costs is measured in
         // `docs/DESIGN_segmented_inverted_index.md`, "Do posting sections need
         // their own checksum?".
-        let middle = reader.groups[0].blocks[1].first_term.to_string();
+        let middle = reader.directory.groups[0].blocks[1].first_term.to_string();
         let Lookup::Rows(middle_truth) = reader.postings(&middle) else {
             panic!("the block's own first term is present");
         };
@@ -2054,9 +2197,9 @@ mod tests {
         let rows = corpus(500);
         let blob = encoded(&rows, 125);
         let reader = open(blob.clone());
-        let directory = encode_directory(reader.n_rows(), &reader.groups);
+        let directory = encode_directory(reader.n_rows(), &reader.directory.groups);
         assert_eq!(crc32(&directory), crc32_reference(&directory));
-        for group in &reader.groups {
+        for group in &reader.directory.groups {
             for block in &group.blocks {
                 let bytes = reader
                     .read_block(group, block)
@@ -2202,8 +2345,13 @@ mod tests {
         let blob = writer.finish();
         let blob_len = blob.len() as u64;
         let reader = open(blob.clone());
-        let directory = encode_directory(reader.n_rows(), &reader.groups);
-        let n_blocks: usize = reader.groups.iter().map(|group| group.blocks.len()).sum();
+        let directory = encode_directory(reader.n_rows(), &reader.directory.groups);
+        let n_blocks: usize = reader
+            .directory
+            .groups
+            .iter()
+            .map(|group| group.blocks.len())
+            .sum();
 
         println!(
             "corpus {rows} rows, {} groups of {group_rows}, {n_terms} terms, \
@@ -2225,7 +2373,7 @@ mod tests {
         // the unit a per-section codec could compress.
         let mut spans: Vec<u64> = Vec::with_capacity(n_blocks);
         let mut per_term: Vec<u64> = Vec::new();
-        for group in &reader.groups {
+        for group in &reader.directory.groups {
             for (index, block) in group.blocks.iter().enumerate() {
                 let end = match group.blocks.get(index + 1) {
                     Some(next) => next.postings_base,
@@ -2267,6 +2415,7 @@ per block {:.1} KiB (+{:.3}% of blob)",
         // dictionary block per group: the comparison the decision turns on is
         // total fetched bytes, not the posting slice in isolation.
         let mut block_lens: Vec<u64> = reader
+            .directory
             .groups
             .iter()
             .flat_map(|group| group.blocks.iter().map(|block| u64::from(block.len)))
@@ -2293,7 +2442,7 @@ term's slice: postings {} -> {} B, and a point lookup's bytes per group \
         let whole = zstd_len(&blob);
         let mut dict_compressed = 0u64;
         let mut postings_compressed = 0u64;
-        for group in &reader.groups {
+        for group in &reader.directory.groups {
             for (index, block) in group.blocks.iter().enumerate() {
                 let bytes = reader.read_block(group, block).expect("block verifies");
                 dict_compressed += zstd_len(&bytes);
