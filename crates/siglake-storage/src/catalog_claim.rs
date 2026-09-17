@@ -151,6 +151,37 @@ pub(crate) const WATERMARK_ESTABLISH_SQL: &str = "INSERT INTO consumed_proof_wat
          acknowledged_through_ms = excluded.acknowledged_through_ms, \
          table_uuid = excluded.table_uuid";
 
+/// The three statements of the local-drain mirror-reclamation mark (#4913),
+/// named so they can be parse-gated against the Postgres dialect: this store
+/// has no live Postgres in CI, and a Postgres-only syntax error here would be a
+/// silent runtime failure on the path that decides which mirror objects may be
+/// deleted.
+///
+/// `placeholders` is the `?, ?, …` list for one chunk of ids. The single `?`
+/// inside `COALESCE` comes FIRST in the text, so it binds first.
+fn local_mark_update_sql(placeholders: &str) -> String {
+    format!(
+        "UPDATE wal_segments \
+             SET status = 'committed', \
+                 committed_at_ms = COALESCE(committed_at_ms, ?) \
+             WHERE id IN ({placeholders}) \
+               AND status IN ('sealed', 'committed')"
+    )
+}
+
+fn local_mark_readback_sql(placeholders: &str) -> String {
+    format!(
+        "SELECT id FROM wal_segments \
+         WHERE id IN ({placeholders}) AND status = 'committed'"
+    )
+}
+
+const LOCAL_MARK_INSERT_SQL: &str = "INSERT INTO wal_segments \
+         (id, tenant, index_id, segment_url, bytes, rows, \
+          status, committed_at_ms, registered_at_ms) \
+         VALUES (?, ?, ?, ?, ?, 0, 'committed', ?, ?) \
+     ON CONFLICT(id) DO NOTHING";
+
 /// Unix-millis representation. We store timestamps as `BIGINT` to
 /// dodge the cross-dialect (sqlite ↔ postgres) chrono ↔ timestamptz
 /// type-mapping mismatch when binding through `sqlx::AnyPool`.
@@ -931,13 +962,7 @@ impl SqlSegmentClaim {
             let placeholders = std::iter::repeat_n("?", ids.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let q = self.dialect.rewrite(&format!(
-                "UPDATE wal_segments \
-                     SET status = 'committed', \
-                         committed_at_ms = COALESCE(committed_at_ms, ?) \
-                     WHERE id IN ({placeholders}) \
-                       AND status IN ('sealed', 'committed')"
-            ));
+            let q = self.dialect.rewrite(&local_mark_update_sql(&placeholders));
             let mut query = sqlx::query(&q).bind(now_millis());
             for id in &ids {
                 query = query.bind(*id);
@@ -949,10 +974,9 @@ impl SqlSegmentClaim {
             // Read back rather than trusting `rows_affected`: it cannot say
             // WHICH ids transitioned, and a row left in another state must not
             // be reported as marked.
-            let read_q = self.dialect.rewrite(&format!(
-                "SELECT id FROM wal_segments \
-                 WHERE id IN ({placeholders}) AND status = 'committed'"
-            ));
+            let read_q = self
+                .dialect
+                .rewrite(&local_mark_readback_sql(&placeholders));
             let mut read = sqlx::query_scalar::<_, String>(&read_q);
             for id in &ids {
                 read = read.bind(*id);
@@ -972,15 +996,7 @@ impl SqlSegmentClaim {
                 // a conflict means a row appeared between the UPDATE and here
                 // (the registrar's `sealed`, or a claim), and the next cycle's
                 // UPDATE picks that up rather than overwriting it now.
-                let insert = self.dialect.rewrite(
-                    r#"
-                    INSERT INTO wal_segments
-                        (id, tenant, index_id, segment_url, bytes, rows,
-                         status, committed_at_ms, registered_at_ms)
-                        VALUES (?, ?, ?, ?, ?, 0, 'committed', ?, ?)
-                    ON CONFLICT(id) DO NOTHING
-                    "#,
-                );
+                let insert = self.dialect.rewrite(LOCAL_MARK_INSERT_SQL);
                 let now = now_millis();
                 let inserted = sqlx::query(&insert)
                     .bind(&segment.id)
@@ -3631,6 +3647,42 @@ mod local_commit_mark_tests {
             "a claimed segment's local evidence must be held, not released"
         );
         assert_eq!(row(&c, "held").await.unwrap().0, "processing");
+    }
+
+    /// The deployed catalog is Postgres and this store has none in CI, so a
+    /// Postgres-only syntax error in the mark would be a silent runtime failure
+    /// on the path that decides which mirror objects may be deleted. Parse each
+    /// statement in the form the Postgres dialect actually sends.
+    #[test]
+    fn every_local_mark_statement_parses_as_postgres() {
+        use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+        use datafusion::sql::sqlparser::parser::Parser;
+
+        let placeholders = "?, ?";
+        for sql in [
+            local_mark_update_sql(placeholders),
+            local_mark_readback_sql(placeholders),
+            LOCAL_MARK_INSERT_SQL.to_string(),
+        ] {
+            let rendered = Dialect::Postgres.rewrite(&sql);
+            assert!(!rendered.contains('?'), "unrewritten marker in {rendered}");
+            let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &rendered)
+                .unwrap_or_else(|e| panic!("does not parse as Postgres: {e}\n{rendered}"));
+            assert_eq!(parsed.len(), 1, "one statement per execute(): {rendered}");
+        }
+    }
+
+    /// The bind order is the text order, and getting it wrong binds a timestamp
+    /// as an id (or an id as a timestamp) only on Postgres, where the markers
+    /// are numbered. `$1` must be the COALESCE timestamp.
+    #[test]
+    fn the_mark_update_binds_its_timestamp_first() {
+        let rendered = Dialect::Postgres.rewrite(&local_mark_update_sql("?, ?"));
+        assert!(
+            rendered.contains("COALESCE(committed_at_ms, $1)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("id IN ($2, $3)"), "{rendered}");
     }
 
     /// There are no claims to reclaim on this path, so the mark writes no
