@@ -37,8 +37,8 @@ use arrow_string::like::starts_with;
 use bytes::Bytes;
 use fnv::FnvHashSet;
 use futures::future::BoxFuture;
-use siglake_index::segmented::SegmentedDirectory;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use siglake_index::segmented::SegmentedDirectory;
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
 };
@@ -2939,8 +2939,8 @@ impl ArrowReader {
         // parse is what the next lookup on this blob should not repeat, and a
         // decline over one file's row groups says nothing about the next
         // query's.
-        if let Some(directory) = parsed
-            && !cache_bypass
+        if !cache_bypass
+            && let Some(directory) = parsed
         {
             segmented_directory_cache_put(statistics_path, offset, directory);
         }
