@@ -1989,6 +1989,33 @@ mod tests {
         }
     }
 
+    /// Rooting the operator ABOVE the mirror — `--from …/store` when the
+    /// segments are at `…/store/warehouse/wal-mirror/<tenant>/` — does not
+    /// guess. The keys are deeper than the layout allows, so each one is
+    /// refused and counted as skipped rather than filed under a tenant named
+    /// `warehouse`. The empty-prefix listing is what makes those keys visible
+    /// to the refusal at all; before #4912 they were dropped by the failed
+    /// `strip_prefix` without a warning or a count.
+    #[tokio::test]
+    async fn recovery_refuses_keys_deeper_than_the_layout_instead_of_guessing() {
+        let op = memory_op();
+        op.write(
+            "warehouse/wal-mirror/acme/s1.arrow",
+            bytes::Bytes::from_static(b"A1"),
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        let pulled = recover_from_object_store(op, "", &root).await.unwrap();
+        assert_eq!(pulled, 0, "an ancestor of the mirror root restores nothing");
+        assert!(
+            !root.join("warehouse").exists(),
+            "a prefix component must not be taken for a tenant"
+        );
+    }
+
     /// The other half of #4912's convention: a NONEMPTY prefix still selects
     /// only what sits under it, so the uploader's unrooted operator and the
     /// library's callers keep working.
