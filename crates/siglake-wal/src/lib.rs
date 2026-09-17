@@ -80,6 +80,10 @@ const WAL_FRAME_FLAG_ZSTD: u8 = 0b0000_0001;
 /// written only at seal time, exactly the populations that survive a crash
 /// would be the ones with no owner.
 const WAL_FRAME_FLAG_PARTIAL: u8 = 0b0000_0010;
+/// The four bytes that precede an Arrow IPC message's metadata length in the
+/// stream format (pre-0.15 writers omit them). `arrow-ipc` keeps its own copy
+/// private, so [`ipc_stream_extent`] carries one to walk the framing.
+const IPC_CONTINUATION_MARKER: [u8; 4] = [0xFF; 4];
 /// zstd level for the framed body. Level 1 — the WAL is latency-sensitive and
 /// short-lived; level 1 gives most of the ratio at a fraction of higher levels'
 /// CPU, and the seal path is off the ingest ack hot path anyway.
@@ -2681,44 +2685,44 @@ fn decode_wal_frame(path: &Path, bytes: &[u8]) -> Result<Vec<RecordBatch>> {
 /// PARTIAL frame: sealed frames and legacy segments retain their all-or-nothing
 /// integrity checks.
 fn read_partial_segment_bytes(path: &Path, bytes: &[u8]) -> Result<Vec<RecordBatch>> {
-    let cursor = std::io::Cursor::new(bytes);
-    let mut reader = StreamReader::try_new(cursor, None).context("StreamReader::try_new")?;
-    let mut last_complete = reader.get_ref().position() as usize;
-    let mut batches = Vec::new();
+    // The framing walk locates the torn message without reading it, so the
+    // tolerated tail costs nothing even when the crash left a length that
+    // points past the end of the file (#4650).
+    let (torn_at, detail) = match ipc_stream_extent(bytes) {
+        IpcStreamExtent::Complete => return decode_ipc_stream(bytes),
+        IpcStreamExtent::Truncated { offset, detail } => (offset, detail),
+        // Bytes all present and still not a message: corruption, not a tear.
+        IpcStreamExtent::Malformed { offset, detail } => bail!(
+            "WAL partial-segment IPC framing check for {}: the message at byte {offset} {detail}",
+            path.display()
+        ),
+    };
 
-    while let Some(batch) = reader.next() {
-        match batch {
-            Ok(batch) => {
-                batches.push(batch);
-                last_complete = reader.get_ref().position() as usize;
-            }
-            Err(error) => {
-                // Tolerance is for a message cut short by EOF, not an IPC
-                // error detected while more bytes remain. Requiring a prior
-                // complete batch also keeps a garbled first append an error.
-                let unexpected_eof = matches!(
-                    &error,
-                    arrow_schema::ArrowError::IoError(_, source)
-                        if source.kind() == std::io::ErrorKind::UnexpectedEof
-                );
-                let reached_eof = reader.get_ref().position() as usize == bytes.len();
-                if batches.is_empty() || !unexpected_eof || !reached_eof {
-                    return Err(error).context("reading IPC batch");
-                }
-                let dropped_bytes = bytes.len().saturating_sub(last_complete);
-                let recovered_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-                metrics::counter!("siglake_wal_partial_tail_dropped_total").increment(1);
-                tracing::warn!(
-                    segment = %path.display(),
-                    recovered_rows,
-                    dropped_bytes,
-                    error = %error,
-                    "WAL: dropped an incomplete final message from a recovered partial"
-                );
-                return Ok(batches);
-            }
-        }
+    // Tolerance is for a message cut short by the crash, and only behind at
+    // least one complete batch: a garbled first append stays an error.
+    let batches = decode_ipc_stream(&bytes[..torn_at]).with_context(|| {
+        format!(
+            "decoding the complete prefix of {} (first {torn_at} bytes)",
+            path.display()
+        )
+    })?;
+    if batches.is_empty() {
+        bail!(
+            "WAL partial-segment IPC framing check for {}: the message at byte {torn_at} {detail}, \
+             and no complete batch precedes it",
+            path.display()
+        );
     }
+    let dropped_bytes = bytes.len() - torn_at;
+    let recovered_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    metrics::counter!("siglake_wal_partial_tail_dropped_total").increment(1);
+    tracing::warn!(
+        segment = %path.display(),
+        recovered_rows,
+        dropped_bytes,
+        reason = %detail,
+        "WAL: dropped an incomplete final message from a recovered partial"
+    );
     Ok(batches)
 }
 
@@ -3086,7 +3090,122 @@ fn validate_segment_crc(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Read all `RecordBatch`es from a sealed segment's raw bytes —
 /// the in-memory analogue of [`read_segment`] used by the multi-pod
 /// compactor path that fetches segments from object storage.
+///
+/// The IPC length prefixes are walked against the byte count first, so a
+/// corrupt segment cannot drive an allocation from a length nobody checked
+/// (#4650).
 pub fn read_segment_bytes(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
+    match ipc_stream_extent(bytes) {
+        IpcStreamExtent::Complete => {}
+        IpcStreamExtent::Truncated { offset, detail }
+        | IpcStreamExtent::Malformed { offset, detail } => {
+            bail!("WAL segment IPC framing check: the message at byte {offset} {detail}")
+        }
+    }
+    decode_ipc_stream(bytes)
+}
+
+/// Where an Arrow IPC stream's messages stop tiling `bytes`, found by walking
+/// the length prefixes without decoding or allocating anything.
+///
+/// Arrow's `StreamReader` sizes the metadata buffer from the 4-byte length
+/// prefix and the body buffer from the metadata's `bodyLength`, and allocates
+/// both *before* reading the spans they describe. An unframed segment — one
+/// written before WS-8, or a framed one whose magic was destroyed by the same
+/// corruption that made it unreadable — reaches that decoder with no CRC
+/// behind it, so four corrupt bytes become a multi-gigabyte zero-fill per read
+/// attempt (#4650: an ASCII `truncated` of nine bytes cost 9.2 s a read).
+/// Walking first bounds every length by the segment.
+enum IpcStreamExtent {
+    /// Every message's metadata and body fit. Fewer than a length prefix's
+    /// worth of bytes may follow the last one; `StreamReader` treats EOF there
+    /// as a clean end of stream, and so does this walk.
+    Complete,
+    /// The message starting at `offset` declares more bytes than the segment
+    /// holds. In a sealed or legacy segment that is corruption; in a recovered
+    /// PARTIAL frame it is the append the crash cut short.
+    Truncated { offset: usize, detail: String },
+    /// The message starting at `offset` cannot be read at all: a length no
+    /// `usize` can hold, or metadata the flatbuffer verifier rejects. Never a
+    /// torn tail — the bytes are all present and still do not describe a
+    /// message.
+    Malformed { offset: usize, detail: String },
+}
+
+/// Walk `bytes` as an Arrow IPC stream, checking each message's declared
+/// metadata and body length against what is left of the segment. Mirrors
+/// `StreamReader`'s own framing rules: an optional continuation marker, a
+/// little-endian `i32` metadata length, the flatbuffer metadata, then the body
+/// `bodyLength` names. A zero length is the end-of-stream marker.
+fn ipc_stream_extent(bytes: &[u8]) -> IpcStreamExtent {
+    let mut pos = 0usize;
+    loop {
+        let start = pos;
+        if bytes.len() - pos < 4 {
+            return IpcStreamExtent::Complete;
+        }
+        let mut prefix: [u8; 4] = bytes[pos..pos + 4].try_into().unwrap();
+        pos += 4;
+        if prefix == IPC_CONTINUATION_MARKER {
+            if bytes.len() - pos < 4 {
+                return IpcStreamExtent::Truncated {
+                    offset: start,
+                    detail: "has a continuation marker and no metadata length".to_string(),
+                };
+            }
+            prefix = bytes[pos..pos + 4].try_into().unwrap();
+            pos += 4;
+        }
+        let declared_meta = i32::from_le_bytes(prefix);
+        if declared_meta == 0 {
+            return IpcStreamExtent::Complete;
+        }
+        let Ok(meta_len) = usize::try_from(declared_meta) else {
+            return IpcStreamExtent::Malformed {
+                offset: start,
+                detail: format!("declares a negative metadata length {declared_meta}"),
+            };
+        };
+        let remaining = bytes.len() - pos;
+        if meta_len > remaining {
+            return IpcStreamExtent::Truncated {
+                offset: start,
+                detail: format!(
+                    "declares {meta_len} metadata bytes with {remaining} left in the segment"
+                ),
+            };
+        }
+        let meta = &bytes[pos..pos + meta_len];
+        pos += meta_len;
+        let Ok(message) = arrow::ipc::root_as_message(meta) else {
+            return IpcStreamExtent::Malformed {
+                offset: start,
+                detail: format!("has {meta_len} metadata bytes the flatbuffer verifier rejects"),
+            };
+        };
+        let declared_body = message.bodyLength();
+        let Ok(body_len) = usize::try_from(declared_body) else {
+            return IpcStreamExtent::Malformed {
+                offset: start,
+                detail: format!("declares a body length {declared_body} no segment can hold"),
+            };
+        };
+        let remaining = bytes.len() - pos;
+        if body_len > remaining {
+            return IpcStreamExtent::Truncated {
+                offset: start,
+                detail: format!(
+                    "declares {body_len} body bytes with {remaining} left in the segment"
+                ),
+            };
+        }
+        pos += body_len;
+    }
+}
+
+/// Decode an Arrow IPC stream whose framing [`ipc_stream_extent`] has already
+/// checked. All-or-nothing: any decode error is the caller's error.
+fn decode_ipc_stream(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     let reader = StreamReader::try_new(std::io::Cursor::new(bytes), None)
         .context("StreamReader::try_new")?;
     let mut batches = Vec::new();
@@ -3613,7 +3732,7 @@ mod crc_integrity_tests {
         bytes.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x08, 0x00]);
         let err = read_segment_from_bytes(&bytes).unwrap_err();
         assert!(
-            format!("{err:#}").contains("reading IPC batch"),
+            format!("{err:#}").contains("no complete batch precedes it"),
             "a torn first batch is not a recoverable prefix: {err:#}"
         );
     }
@@ -3873,5 +3992,299 @@ mod segment_owner_tests {
         fs::rename(&again, path.parent().unwrap().join(&name)).unwrap();
         quarantine_stale_segment(&path, DROPPED).unwrap();
         assert!(list_sealed(tmp.path()).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ipc_framing_tests {
+    use super::*;
+
+    /// A genuine legacy (pre-WS-8) raw-IPC segment: schema message, one
+    /// record-batch message, EOS marker.
+    fn legacy_bytes(rows: usize) -> Vec<u8> {
+        let evs: Vec<Event> = (0..rows).map(|i| Event::now(format!("row {i}"))).collect();
+        let batch = events_to_record_batch(&evs).unwrap();
+        let mut buf = Vec::new();
+        let mut w = StreamWriter::try_new(&mut buf, &batch.schema()).unwrap();
+        w.write(&batch).unwrap();
+        w.finish().unwrap();
+        drop(w);
+        buf
+    }
+
+    /// One message of a raw-IPC stream, located by the same framing rules
+    /// [`ipc_stream_extent`] walks: where its metadata starts, how long it is,
+    /// and the body length it declares.
+    struct Message {
+        meta_start: usize,
+        meta_len: usize,
+        body_len: usize,
+    }
+
+    /// Locate every message in a well-formed raw-IPC stream. Test-side only —
+    /// it panics rather than classifying, so a fixture that stops being
+    /// well-formed fails loudly.
+    fn messages(bytes: &[u8]) -> Vec<Message> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while bytes.len() - pos >= 4 {
+            let mut prefix: [u8; 4] = bytes[pos..pos + 4].try_into().unwrap();
+            pos += 4;
+            if prefix == IPC_CONTINUATION_MARKER {
+                prefix = bytes[pos..pos + 4].try_into().unwrap();
+                pos += 4;
+            }
+            let meta_len = i32::from_le_bytes(prefix) as usize;
+            if meta_len == 0 {
+                break; // end-of-stream marker
+            }
+            let message = arrow::ipc::root_as_message(&bytes[pos..pos + meta_len]).unwrap();
+            let body_len = message.bodyLength() as usize;
+            out.push(Message {
+                meta_start: pos,
+                meta_len,
+                body_len,
+            });
+            pos += meta_len + body_len;
+        }
+        out
+    }
+
+    /// `Message.bodyLength`'s slot in the flatbuffer vtable: `version`,
+    /// `header_type`, `header` (a union spends two slots), then `bodyLength`.
+    /// Matches `arrow_ipc::Message::VT_BODYLENGTH`, which is not public.
+    const VT_BODYLENGTH: usize = 10;
+
+    /// Rewrite a message's declared `bodyLength` in place. Flatbuffers store
+    /// the field as an inline little-endian `i64`, reached through the root
+    /// offset and the table's vtable, so the edit is a byte substitution that
+    /// leaves the metadata verifiable.
+    fn set_declared_body_len(bytes: &mut [u8], message: &Message, to: i64) {
+        let meta = message.meta_start;
+        let u16_at = |at: usize| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize;
+        let table = meta + u32::from_le_bytes(bytes[meta..meta + 4].try_into().unwrap()) as usize;
+        let vtable =
+            table - i32::from_le_bytes(bytes[table..table + 4].try_into().unwrap()) as usize;
+        assert!(
+            u16_at(vtable) > VT_BODYLENGTH,
+            "the vtable must carry a bodyLength slot"
+        );
+        let field = u16_at(vtable + VT_BODYLENGTH);
+        assert_ne!(field, 0, "bodyLength must be stored, not defaulted");
+        let at = table + field;
+        assert_eq!(
+            i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()),
+            message.body_len as i64,
+            "the located field must hold the declared body length"
+        );
+        bytes[at..at + 8].copy_from_slice(&to.to_le_bytes());
+        assert_eq!(
+            arrow::ipc::root_as_message(
+                &bytes[message.meta_start..message.meta_start + message.meta_len]
+            )
+            .unwrap()
+            .bodyLength(),
+            to,
+            "the patch must land on bodyLength"
+        );
+    }
+
+    /// The adversarial segments: bytes whose IPC length prefixes declare far
+    /// more than the segment holds, each with the byte count a pre-#4650
+    /// reader would have allocated and zero-filled.
+    fn adversarial() -> Vec<(&'static str, Vec<u8>, u64)> {
+        let mut cases: Vec<(&'static str, Vec<u8>, u64)> = Vec::new();
+
+        // The measured fixture: nine ASCII bytes whose first four read as a
+        // 1.85 GB metadata length. Cost 9.2 s per drain attempt (#4650).
+        cases.push(("ascii `truncated`", b"truncated".to_vec(), 0x6e75_7274));
+
+        // The largest length the prefix can express, with nothing behind it.
+        let mut max = i32::MAX.to_le_bytes().to_vec();
+        max.extend_from_slice(b"xx");
+        cases.push(("i32::MAX metadata length", max, i32::MAX as u64));
+
+        // Same, behind a continuation marker — the modern framing.
+        let mut marked = IPC_CONTINUATION_MARKER.to_vec();
+        marked.extend_from_slice(&i32::MAX.to_le_bytes());
+        marked.extend_from_slice(b"xxxx");
+        cases.push(("continuation marker then i32::MAX", marked, i32::MAX as u64));
+
+        // A continuation marker with a torn length behind it.
+        let mut short = IPC_CONTINUATION_MARKER.to_vec();
+        short.extend_from_slice(b"ab");
+        cases.push(("continuation marker, no length", short, 0));
+
+        // A length that reads as negative: `usize::try_from` in the walk, and
+        // an unchecked `as usize` widening in the decoder.
+        let mut negative = i32::MIN.to_le_bytes().to_vec();
+        negative.extend_from_slice(b"garbage");
+        cases.push(("negative metadata length", negative, 0));
+
+        // Corruption in a *later* message: a genuine schema and batch read
+        // clean, then the appended prefix declares 1.85 GB. Checking only the
+        // first prefix would leave this reachable.
+        let mut later = legacy_bytes(4);
+        later.truncate(later.len() - 8); // drop the EOS marker
+        later.extend_from_slice(b"truncated");
+        cases.push(("second message declares 1.85 GB", later, 0x6e75_7274));
+
+        // A body length nobody checked: the record batch's metadata is genuine
+        // and verifies, and declares a 1 TiB body.
+        let mut huge_body = legacy_bytes(4);
+        let batch_message = messages(&huge_body).pop().expect("a record-batch message");
+        set_declared_body_len(&mut huge_body, &batch_message, 1 << 40);
+        cases.push(("record batch declares a 1 TiB body", huge_body, 1 << 40));
+
+        // The same body check against a real truncation rather than a patch.
+        let whole = legacy_bytes(4);
+        let batch_message = messages(&whole).pop().expect("a record-batch message");
+        cases.push((
+            "record batch metadata whole, body absent",
+            whole[..batch_message.meta_start + batch_message.meta_len].to_vec(),
+            0,
+        ));
+
+        cases
+    }
+
+    /// Every adversarial segment is refused by the pure framing walk, which
+    /// allocates nothing: the verdict names the declared length and what was
+    /// left of the segment, so the refusal is provably ahead of the decoder's
+    /// `resize`/`from_len_zeroed` rather than merely fast.
+    #[test]
+    fn the_framing_walk_refuses_every_adversarial_length() {
+        for (label, bytes, declared) in adversarial() {
+            let verdict = ipc_stream_extent(&bytes);
+            let detail = match &verdict {
+                IpcStreamExtent::Complete => panic!("{label}: accepted as a complete stream"),
+                IpcStreamExtent::Truncated { detail, .. }
+                | IpcStreamExtent::Malformed { detail, .. } => detail.clone(),
+            };
+            if declared != 0 {
+                assert!(
+                    detail.contains(&declared.to_string()),
+                    "{label}: the verdict must name the declared length {declared}: {detail}"
+                );
+            }
+        }
+    }
+
+    /// Both public readers refuse the adversarial segments, and the whole
+    /// table costs a fraction of the 9.2 s one of these bytes used to cost on
+    /// its own. The bound is deliberately loose — the assertion that the
+    /// refusal precedes the allocation is
+    /// [`the_framing_walk_refuses_every_adversarial_length`]; this one only
+    /// rules out a multi-gigabyte zero-fill still happening somewhere.
+    #[test]
+    fn the_readers_refuse_adversarial_segments_without_allocating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        for (label, bytes, _) in adversarial() {
+            let err = read_segment_bytes(&bytes)
+                .map(|b| b.len())
+                .expect_err(&format!("{label}: read_segment_bytes must refuse"));
+            assert!(
+                format!("{err:#}").contains("IPC framing check"),
+                "{label}: refused by the framing check, not the decoder: {err:#}"
+            );
+
+            // The same bytes as a file: `read_segment` must route an unframed
+            // segment through the checked path, not straight at the decoder.
+            let path = tmp.path().join("legacy.arrow");
+            fs::write(&path, &bytes).unwrap();
+            assert!(!is_framed(&bytes), "{label}: the fixture is unframed");
+            let err = read_segment(&path)
+                .map(|b| b.len())
+                .expect_err(&format!("{label}: read_segment must refuse"));
+            assert!(
+                format!("{err:#}").contains("IPC framing check"),
+                "{label}: read_segment refused by the framing check: {err:#}"
+            );
+
+            // And over the object-store path the catalog-claim drain uses.
+            assert!(
+                read_segment_from_bytes(&bytes).is_err(),
+                "{label}: read_segment_from_bytes must refuse"
+            );
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "refusing {} adversarial segments took {elapsed:?}; one of these bytes cost 9.2 s \
+             before the framing walk",
+            adversarial().len()
+        );
+    }
+
+    /// The negative control, kept runnable rather than described: the decoder
+    /// the framing walk now guards is unchanged, so calling it directly on the
+    /// #4650 fixture reproduces the cost the walk removes. Ignored because it
+    /// spends seconds and gigabytes on purpose.
+    ///
+    /// `cargo test -p siglake-wal --lib unguarded_decode -- --ignored --nocapture`
+    #[test]
+    #[ignore = "allocates ~1.85 GB and takes seconds, by design"]
+    fn the_unguarded_decode_still_pays_for_the_declared_length() {
+        let started = Instant::now();
+        assert!(decode_ipc_stream(b"truncated").is_err());
+        let unguarded = started.elapsed();
+
+        let started = Instant::now();
+        assert!(read_segment_bytes(b"truncated").is_err());
+        let guarded = started.elapsed();
+
+        println!("unguarded decode {unguarded:?}, guarded read {guarded:?}");
+        assert!(
+            unguarded > guarded * 100,
+            "the walk must be orders cheaper than the allocation it avoids: \
+             unguarded {unguarded:?} vs guarded {guarded:?}"
+        );
+    }
+
+    /// The check does not cost the honest cases anything: a genuine legacy
+    /// raw-IPC segment and a framed one both still read, through every reader.
+    #[test]
+    fn genuine_segments_still_read() {
+        let legacy = legacy_bytes(4);
+        assert!(matches!(
+            ipc_stream_extent(&legacy),
+            IpcStreamExtent::Complete
+        ));
+        let rows = |batches: Vec<RecordBatch>| batches.iter().map(|b| b.num_rows()).sum::<usize>();
+        assert_eq!(rows(read_segment_bytes(&legacy).unwrap()), 4);
+        assert_eq!(rows(read_segment_from_bytes(&legacy).unwrap()), 4);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy.arrow");
+        fs::write(&path, &legacy).unwrap();
+        assert_eq!(rows(read_segment(&path).unwrap()), 4);
+
+        // A stream whose EOS marker never made it to disk is still complete —
+        // that is what every recovered partial looks like.
+        let no_eos = &legacy[..legacy.len() - 8];
+        assert!(matches!(
+            ipc_stream_extent(no_eos),
+            IpcStreamExtent::Complete
+        ));
+        assert_eq!(rows(read_segment_bytes(no_eos).unwrap()), 4);
+
+        // Trailing bytes too few to hold a length prefix: `StreamReader`
+        // treats EOF there as a clean end of stream, and so does the walk.
+        for extra in 1..=3 {
+            let mut torn = no_eos.to_vec();
+            torn.extend_from_slice(&IPC_CONTINUATION_MARKER[..extra]);
+            assert!(
+                matches!(ipc_stream_extent(&torn), IpcStreamExtent::Complete),
+                "{extra} byte(s) of a continuation marker is a clean end of stream"
+            );
+            assert_eq!(rows(read_segment_bytes(&torn).unwrap()), 4);
+        }
+
+        // The framed path this build writes, for completeness.
+        let mut w = WalWriter::new(tmp.path(), "ing").unwrap();
+        w.append_events(&[Event::now("framed")]).unwrap();
+        let sealed = w.seal().unwrap().expect("a sealed segment");
+        assert_eq!(rows(read_segment(&sealed.path).unwrap()), 1);
     }
 }

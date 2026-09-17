@@ -85,7 +85,11 @@ drain's progress is not something a power loss takes back. Losing one of these r
 acknowledged row on its own (the segment is reachable from one of the two
 directories, and the compactor's consumed proof stops a requeued orphan from
 committing twice); what it takes back is reported progress. Segments carry
-CRC-validated framing (WS-8), and sealed + active segments
+CRC-validated framing (WS-8); a segment without that framing — written before
+WS-8, or framed and then corrupted past recognition — has its Arrow IPC length
+prefixes walked against the file size before anything is decoded, so no
+declared metadata or body length can size an allocation the file cannot back
+(#4650). Sealed + active segments
 mirror to object storage on configurable intervals — **sealed segments mirror by
 default** wherever a warehouse URL is set, so the WAL volume is not the only copy
 of what has been acknowledged. `siglake wal-recover --from

@@ -1098,7 +1098,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   before it, leaves the original bytes intact, and reports the discarded tail
   through a warning and `siglake_wal_partial_tail_dropped_total`. A partial
   without one complete batch still fails decoding; complete sealed frames and
-  legacy segments retain their all-or-nothing integrity checks. The ack is also only as
+  legacy segments retain their all-or-nothing integrity checks. Every read
+  walks the Arrow IPC length prefixes against the byte count first, so a
+  declared length cannot size an allocation the segment cannot back — but the
+  file size is the whole of that bound, and in a segment with no frame CRC
+  behind it a torn tail and deliberate corruption are the same bytes. The ack is also only as
   durable as the filesystem under the WAL: siglake syncs the segment's bytes
   and every directory entry that names it, and assumes those syncs reach the
   device. A network filesystem answers `fsync(2)` on its own terms and
