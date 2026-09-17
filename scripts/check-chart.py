@@ -2045,8 +2045,17 @@ TEXT_INDEX_STARTUP_EXPECTED = {
     "0.50": {"decode": 0.05 + (0.5 - 0.05) * 0.5, "permit_wait": 0.0025 * 0.5},
     "0.99": {"decode": 0.05 + (0.5 - 0.05) * 0.99, "permit_wait": 0.0025 * 0.99},
 }
-# "Drain backlog (segments + bytes)".
+# "Drain backlog (segments + bytes)" and the "Oldest unclaimed segment age"
+# panel an operator is told to read beside it, as `metric -> (panel, reduction)`.
+# The reduction is what the namespace's own number is: depth adds a tenant's
+# queue up, age takes the oldest of them.
 DRAIN_BACKLOG_PANEL = 111
+DRAIN_AGE_PANEL = 112
+DRAIN_BACKLOG_METRICS = {
+    "siglake_compactor_sealed_pending": (DRAIN_BACKLOG_PANEL, "sum"),
+    "siglake_compactor_sealed_pending_bytes": (DRAIN_BACKLOG_PANEL, "sum"),
+    "siglake_compactor_sealed_pending_oldest_age_seconds": (DRAIN_AGE_PANEL, "max"),
+}
 # Two clusters' worth of `siglake_compactor_sealed_pending*` series, as
 # `namespace -> [(pod, tenant, value)]`.
 #
@@ -2056,6 +2065,11 @@ DRAIN_BACKLOG_PANEL = 111
 # it. `logs-staging` is a filesystem drain — one pod, one series per tenant,
 # which do add up. Both shapes have to read correctly under ONE expression,
 # and the two namespaces have to stay two lines.
+#
+# The ages carry the same shapes: one repeated age across the claim fleet, two
+# tenants' ages under the drain. They are deliberately unequal per namespace —
+# the healthier cluster's 300s has to survive beside the worse one's 900s, which
+# an ungrouped `max` swallows.
 DRAIN_BACKLOG_SERIES = {
     "siglake_compactor_sealed_pending": {
         "logs": [
@@ -2079,25 +2093,36 @@ DRAIN_BACKLOG_SERIES = {
             ("compactor-0", "globex", 2048),
         ],
     },
+    "siglake_compactor_sealed_pending_oldest_age_seconds": {
+        "logs": [
+            ("compactor-0", "default", 900),
+            ("compactor-1", "default", 900),
+            ("compactor-2", "default", 900),
+        ],
+        "logs-staging": [
+            ("compactor-0", "acme", 300),
+            ("compactor-0", "globex", 120),
+        ],
+    },
 }
 
 
 def drain_backlog_exprs(dashboard: dict) -> dict[str, str]:
-    """Panel 111's expressions, keyed by the metric each one reads.
+    """Panels 111 and 112's expressions, keyed by the metric each one reads.
 
-    Read from the shipped panel rather than copied, so the fixture below tests
+    Read from the shipped panels rather than copied, so the fixture below tests
     what an operator imports. A panel or metric that has moved returns short and
     is reported: this check must be re-pointed, not left passing on nothing.
     """
     out: dict[str, str] = {}
     for panel in dashboard_panels(dashboard):
-        if panel.get("id") != DRAIN_BACKLOG_PANEL:
-            continue
         for target in panel.get("targets") or []:
             expr = target.get("expr")
             if not isinstance(expr, str):
                 continue
-            for metric in DRAIN_BACKLOG_SERIES:
+            for metric, (panel_id, _reduction) in DRAIN_BACKLOG_METRICS.items():
+                if panel.get("id") != panel_id:
+                    continue
                 # The selector brace is what separates `…_pending` from
                 # `…_pending_bytes`, which has the shorter name as a prefix.
                 if re.search(rf"\b{metric}\{{", expr):
@@ -2116,13 +2141,41 @@ def deduplicated_totals(series: dict[str, list]) -> dict[str, int]:
     return totals
 
 
-def drain_backlog_fixture(exprs: dict[str, str]) -> str:
-    """A `promtool test rules` file over panel 111's two expressions.
+def namespace_maxima(series: dict[str, list]) -> dict[str, int]:
+    """Each namespace's oldest age: the largest of its series, duplicates and
+    tenants alike — `max` needs no deduplication to survive a repeated series."""
+    return {
+        namespace: max(value for _pod, _tenant, value in entries)
+        for namespace, entries in series.items()
+    }
 
-    Each gets the fleet sum beside it as the control arm — the reading the panel
-    charted before #3692, which counts one shared queue once per worker and
-    collapses every selected namespace into one line. A fixture both expressions
-    satisfy would be no evidence, so the caller checks they differ.
+
+def drain_backlog_expected(metric: str) -> dict[str, int]:
+    """What each namespace's line reads under the panel's expression."""
+    series = DRAIN_BACKLOG_SERIES[metric]
+    if DRAIN_BACKLOG_METRICS[metric][1] == "max":
+        return namespace_maxima(series)
+    return deduplicated_totals(series)
+
+
+def drain_backlog_collapsed(metric: str) -> tuple[str, int]:
+    """The control arm: the one-line reading an ungrouped expression charts,
+    as (expression, value)."""
+    reduction = DRAIN_BACKLOG_METRICS[metric][1]
+    values = [
+        v for entries in DRAIN_BACKLOG_SERIES[metric].values() for _p, _t, v in entries
+    ]
+    return f"{reduction}({metric})", (max if reduction == "max" else sum)(values)
+
+
+def drain_backlog_fixture(exprs: dict[str, str]) -> str:
+    """A `promtool test rules` file over panels 111 and 112's expressions.
+
+    Each gets its collapsed whole-fleet reading beside it as the control arm —
+    what the depth panel charted before #3692, counting one shared queue once
+    per worker, and what the age panel charted before #3722, hiding the
+    healthier cluster behind the worse one. A fixture both readings satisfy
+    would be no evidence, so the caller checks they differ.
     """
     out = "evaluation_interval: 1m\ntests:\n"
     for metric, expr in sorted(exprs.items()):
@@ -2141,26 +2194,27 @@ def drain_backlog_fixture(exprs: dict[str, str]) -> str:
         out += "    promql_expr_test:\n"
         out += f"      - expr: '{expr.replace('$namespace', '.*')}'\n"
         out += "        eval_time: 5m\n        exp_samples:\n"
-        for namespace, total in sorted(deduplicated_totals(series).items()):
+        for namespace, expected in sorted(drain_backlog_expected(metric).items()):
             out += (
                 f"          - labels: '{{namespace=\"{namespace}\"}}'\n"
-                f"            value: {total}\n"
+                f"            value: {expected}\n"
             )
-        fleet = sum(v for entries in series.values() for _p, _t, v in entries)
-        out += f"      - expr: 'sum({metric})'\n"
+        collapsed_expr, collapsed = drain_backlog_collapsed(metric)
+        out += f"      - expr: '{collapsed_expr}'\n"
         out += "        eval_time: 5m\n        exp_samples:\n"
-        out += f"          - labels: '{{}}'\n            value: {fleet}\n"
+        out += f"          - labels: '{{}}'\n            value: {collapsed}\n"
     return out
 
 
 def check_drain_backlog_panel(require_promtool: bool = False) -> tuple[list[str], bool]:
-    """Evaluate panel 111's expressions with Prometheus' own engine.
+    """Evaluate panels 111 and 112's expressions with Prometheus' own engine.
 
     `check_dashboard` holds every panel to a metric something emits; it says
     nothing about what the expression computes from it. This one does, for the
-    panel where the arithmetic is not obvious: the backlog gauge is a shared
+    panels where the arithmetic is not obvious: the backlog gauge is a shared
     queue under the catalog claim and per-tenant local counts under the
-    filesystem drain, and one expression charts both.
+    filesystem drain, and one expression charts both. The age panel beside it is
+    read against the same series and has to keep a line per namespace too.
 
     Returns (problems, skipped); a box without promtool skips unless
     `require_promtool`.
@@ -2172,22 +2226,30 @@ def check_drain_backlog_panel(require_promtool: bool = False) -> tuple[list[str]
     exprs = drain_backlog_exprs(dashboard)
     missing = sorted(set(DRAIN_BACKLOG_SERIES) - set(exprs))
     if missing:
+        panels = ", ".join(
+            str(p) for p in sorted({DRAIN_BACKLOG_METRICS[m][0] for m in missing})
+        )
         return [
-            f"{OVERVIEW_DASHBOARD}: panel {DRAIN_BACKLOG_PANEL} no longer reads "
-            f"{', '.join(missing)}; re-point DRAIN_BACKLOG_SERIES rather than "
+            f"{OVERVIEW_DASHBOARD}: panel {panels} no longer reads "
+            f"{', '.join(missing)}; re-point DRAIN_BACKLOG_METRICS rather than "
             f"leaving this check evaluating nothing"
         ], False
     for metric, expr in exprs.items():
         if "'" in expr:
             return [f"{OVERVIEW_DASHBOARD}: {metric} expression needs YAML escaping"], False
-        totals = deduplicated_totals(DRAIN_BACKLOG_SERIES[metric])
-        fleet = sum(
-            v for entries in DRAIN_BACKLOG_SERIES[metric].values() for _p, _t, v in entries
-        )
-        if sum(totals.values()) == fleet:
+        expected = drain_backlog_expected(metric)
+        collapsed_expr, collapsed = drain_backlog_collapsed(metric)
+        # A per-namespace `max` always differs from an ungrouped one in its
+        # labels, but only unequal namespaces make the collapse visible as a
+        # lost line; a `sum` has to survive the repeated series as well.
+        if DRAIN_BACKLOG_METRICS[metric][1] == "max":
+            indistinguishable = len(set(expected.values())) < 2
+        else:
+            indistinguishable = sum(expected.values()) == collapsed
+        if indistinguishable:
             return [
                 f"{OVERVIEW_DASHBOARD}: the {metric} fixture reads the same under the "
-                f"panel and under a bare sum, so it cannot tell them apart"
+                f"panel and under a bare {collapsed_expr}, so it cannot tell them apart"
             ], False
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = pathlib.Path(tmp_dir)
@@ -2210,8 +2272,9 @@ def check_drain_backlog_panel(require_promtool: bool = False) -> tuple[list[str]
         except subprocess.CalledProcessError as e:
             output = "\n".join(s for s in (e.stdout.strip(), e.stderr.strip()) if s)
             return [
-                f"{OVERVIEW_DASHBOARD}: panel {DRAIN_BACKLOG_PANEL} does not read one "
-                f"queue depth per namespace:" + (f"\n{output}" if output else "")
+                f"{OVERVIEW_DASHBOARD}: panels {DRAIN_BACKLOG_PANEL} and "
+                f"{DRAIN_AGE_PANEL} do not read one queue depth and one oldest "
+                f"age per namespace:" + (f"\n{output}" if output else "")
             ], False
     return [], False
 
@@ -2855,8 +2918,8 @@ def source_checks(
         panel_result = (
             "; panel expressions skipped (promtool not installed)"
             if panel_skipped
-            else f"; panels {DRAIN_BACKLOG_PANEL} and {TEXT_INDEX_STARTUP_PANEL} "
-            f"passed promtool"
+            else f"; panels {DRAIN_BACKLOG_PANEL}, {DRAIN_AGE_PANEL} and "
+            f"{TEXT_INDEX_STARTUP_PANEL} passed promtool"
         )
         print(
             f"ok   [dashboard] {count} dashboard(s) under {DASHBOARD_DIR}{panel_result}",
