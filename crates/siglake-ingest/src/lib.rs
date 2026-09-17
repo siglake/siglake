@@ -3660,8 +3660,8 @@ async fn es_search_not_implemented() -> Result<Response, ApiError> {
 /// whose data is the number of dropped events, so a lag burst leaves a
 /// reported gap rather than ending the stream. No history; no
 /// durability. For replayable subscriptions use the
-/// Iceberg-incremental `siglake subscribe` path. Server-side filtering was
-/// removed with SPL — filter client-side or use the subscribe path.
+/// Iceberg-incremental `siglake subscribe` path. There is no server-side
+/// filtering — filter client-side or use the subscribe path.
 #[utoipa::path(
     get,
     path = "/api/v1/stream",

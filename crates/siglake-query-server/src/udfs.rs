@@ -8,8 +8,9 @@
 //! No match ⇒ NULL. Lets SQL queries pull fields out of unstructured `raw`
 //! text, e.g. `SELECT kv_extract(raw, 'status') FROM events`.
 //!
-//! Relocated from `siglake-spl` when SPL was removed at the query layer — this
-//! is a generally-useful SQL UDF, independent of the (deleted) SPL pipeline.
+//! Relocated from the deleted query-language crate when the query layer went
+//! SQL-only (`docs/design/00-architecture-changes-2026-06.md` §1) — this is a
+//! generally-useful SQL UDF, independent of that removed pipeline.
 //!
 //! ## `attr_get(attributes, key) → Utf8`
 //!
