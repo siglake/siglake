@@ -11,6 +11,9 @@
 //! matches only at the HEAD of the tail. A `LIMIT 100` browse therefore decodes
 //! group 0 whole and stops one batch into group 1.
 //!
+//! The browse's predicate is a residual one (`lower(host) = …`); see `BROWSE`
+//! for why a converted predicate reaches no populate path since #4891.
+//!
 //! Phases, all on one table so the difference is the POLICY and nothing else:
 //!
 //! 1. shipped whole-file policy, clipped browse, twice: one miss and one
@@ -207,13 +210,22 @@ async fn raws(ctx: &SessionContext, sql: &str) -> Vec<String> {
     rows
 }
 
-const BROWSE: &str = "SELECT raw FROM events WHERE host = 'needle' LIMIT 100";
-const UNCLIPPED: &str = "SELECT raw FROM events WHERE host = 'needle'";
+/// The browse, under a RESIDUAL predicate: `lower(host)` does not convert to an
+/// Iceberg predicate, so nothing reaches the reader and the clip lands where the
+/// fixture puts it. Since #4891 a task carrying a CONVERTED predicate bypasses
+/// the cache at either granularity (it would have to be read with the predicate
+/// stripped, which costs more than not caching — see
+/// `file_cache_predicate_bypass.rs`), so `host = 'needle'` would exercise no
+/// population here at all. This is the `resid/*` regime of
+/// `row_group_cache_measurement.rs`, and it is the one where the prototype's win
+/// was measured.
+const BROWSE: &str = "SELECT raw FROM events WHERE lower(host) = 'needle' LIMIT 100";
+const UNCLIPPED: &str = "SELECT raw FROM events WHERE lower(host) = 'needle'";
 /// A drain that projects what the browse projects (`raw` AND the `host` its
 /// residual filter reads), so it addresses the same entries. Cache identity
 /// includes the projection at either granularity, so a bare `SELECT raw` is a
 /// different key and populates its own entries — see `DRAIN`.
-const DRAIN_BROWSE_PROJECTION: &str = "SELECT raw FROM events WHERE host = 'bulk'";
+const DRAIN_BROWSE_PROJECTION: &str = "SELECT raw FROM events WHERE lower(host) = 'bulk'";
 const DRAIN: &str = "SELECT raw FROM events";
 
 #[tokio::test(flavor = "multi_thread")]

@@ -3,6 +3,12 @@
 //! The cache stores whole-file batches under a predicate-independent key. With
 //! the cache enabled, exact-capable predicates therefore need to remain as
 //! residual DataFusion filters on both cache misses and hits.
+//!
+//! Since #4891 a task carrying a converted predicate BYPASSES the cache instead
+//! of populating it from a read with the predicate stripped, so each case here
+//! reaches its warm entry through a predicate-free scan of the same projection.
+//! That is the interesting arm for exactness anyway: the entry then holds rows
+//! the case's predicate rejects, and only the residual filter removes them.
 
 use chrono::{Duration, TimeZone, Utc};
 use datafusion::physical_plan::displayable;
@@ -68,54 +74,57 @@ async fn exact_filters_match_cache_disabled_results_on_cold_and_warm_cache() {
         name: &'static str,
         sql: &'static str,
         expected_rows: usize,
-        warmup_sql: Option<&'static str>,
+        /// A predicate-free scan over the SAME projection as `sql` — including
+        /// the columns the residual filter needs, which is what the scan is
+        /// asked for. It drains the file, so it populates the entry `sql` then
+        /// hits.
+        warmup_sql: &'static str,
     }
 
     // Each case gets a distinct table/file path so its first cache-enabled
-    // execution is a genuine cold miss. The LIMIT case uses an unbounded query
-    // with the same projection to finish population before the warm execution.
+    // execution is a genuine cold read.
     let cases = [
         Case {
             name: "equality",
             sql: "SELECT raw FROM events WHERE host = 'alpha'",
             expected_rows: 3,
-            warmup_sql: None,
+            warmup_sql: "SELECT raw, host FROM events",
         },
         Case {
             name: "range",
             sql: "SELECT raw FROM events WHERE host >= 'beta' AND host < 'gamma'",
             expected_rows: 3,
-            warmup_sql: None,
+            warmup_sql: "SELECT raw, host FROM events",
         },
         Case {
             name: "in",
             sql: "SELECT raw FROM events WHERE source IN ('api', 'edge')",
             expected_rows: 4,
-            warmup_sql: None,
+            warmup_sql: "SELECT raw, source FROM events",
         },
         Case {
             name: "null",
             sql: "SELECT raw FROM events WHERE attributes IS NULL",
             expected_rows: 4,
-            warmup_sql: None,
+            warmup_sql: "SELECT raw, attributes FROM events",
         },
         Case {
             name: "and",
             sql: "SELECT raw FROM events WHERE host = 'alpha' AND \"index\" = 'prod'",
             expected_rows: 2,
-            warmup_sql: None,
+            warmup_sql: "SELECT raw, host, \"index\" FROM events",
         },
         Case {
             name: "or",
             sql: "SELECT raw FROM events WHERE host = 'gamma' OR source = 'worker'",
             expected_rows: 5,
-            warmup_sql: None,
+            warmup_sql: "SELECT raw, host, source FROM events",
         },
         Case {
             name: "limit",
             sql: "SELECT host FROM events WHERE sourcetype = 'json' LIMIT 2",
             expected_rows: 2,
-            warmup_sql: Some("SELECT host FROM events WHERE sourcetype = 'json'"),
+            warmup_sql: "SELECT host, sourcetype FROM events",
         },
     ];
 
@@ -149,9 +158,7 @@ async fn exact_filters_match_cache_disabled_results_on_cold_and_warm_cache() {
         );
         assert_eq!(cold, rows, "{} cold-cache result", case.name);
 
-        if let Some(warmup_sql) = case.warmup_sql {
-            let _ = plan_and_strings(&ctx, warmup_sql).await;
-        }
+        let _ = plan_and_strings(&ctx, case.warmup_sql).await;
         let (_, warm) = plan_and_strings(&ctx, case.sql).await;
         assert_eq!(warm, rows, "{} warm-cache result", case.name);
     }
@@ -175,9 +182,15 @@ async fn exact_filters_match_cache_disabled_results_on_cold_and_warm_cache() {
     };
     let misses = cache_outcome("miss");
     let hits = cache_outcome("hit");
+    let bypasses = cache_outcome("bypass");
+    assert!(
+        bypasses >= cases.len() as u64,
+        "each predicate shape must bypass the cache on its cold read (#4891); \
+         got {bypasses}"
+    );
     assert!(
         misses >= cases.len() as u64,
-        "each predicate shape must exercise a cold cache miss; got {misses}"
+        "each warmup must exercise a cold cache miss and populate; got {misses}"
     );
     assert!(
         hits >= cases.len() as u64,

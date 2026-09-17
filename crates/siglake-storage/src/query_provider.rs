@@ -3947,6 +3947,14 @@ fn task_cache_key_with_direction(task: &FileScanTask, reverse: bool) -> String {
     format!("{}:reverse={reverse}", task_cache_key(task))
 }
 
+/// The task a population reads under: the query's predicate removed, so the
+/// entry is a function of the file and the projection alone and a later query
+/// with a different predicate can reuse it.
+///
+/// Since #4891 the caller declines to populate a task that HAS a predicate, so
+/// this strips nothing on the live paths; it stays as the statement of what an
+/// entry is allowed to depend on, and as the guard if a predicate ever reaches
+/// a populate call some other way.
 fn cacheable_task(task: &FileScanTask) -> FileScanTask {
     let mut task = task.clone();
     task.predicate = None;
@@ -4054,7 +4062,22 @@ async fn open_task_batch_stream_cached(
         );
     }
 
-    if raw_prune_spec.is_some() || !promoted_prune.is_empty() {
+    // #4891: a task carrying a converted predicate reads FEWER pages than any
+    // population of it can. An entry has to be reusable by a query with a
+    // different predicate, so the populate read strips `task.predicate` and
+    // decodes the whole projection where the reader's page index would have
+    // skipped most of it — measured 2.8x slower than the cache-disabled arm on
+    // a `host = '<label>' LIMIT 100` browse, which then inserts nothing because
+    // the clip drops the stream before end-of-stream (#4494, #4847). So a
+    // predicate task takes the same bypass a raw or promoted prune takes: it
+    // reads with its predicate intact, exactly as a cache-disabled install
+    // does, and a cache-enabled install cannot lose to one on that shape.
+    //
+    // Only the POPULATE path is declined. The lookup above is unchanged, so an
+    // entry a predicate-free scan left behind still serves this query, and
+    // `filter_pushdown_with_file_cache` keeps DataFusion's residual filter
+    // whenever the cache is on, so both routes answer exactly.
+    if task.predicate.is_some() || raw_prune_spec.is_some() || !promoted_prune.is_empty() {
         metrics::counter!(
             "siglake_query_scan_file_cache_requests_total",
             "outcome" => "bypass"
@@ -4795,11 +4818,13 @@ fn filter_pushdown_with_file_cache(
     kind: TableProviderFilterPushDown,
     file_cache_enabled: bool,
 ) -> TableProviderFilterPushDown {
-    // Cache entries are whole-file decoded batches: population deliberately
-    // removes the task predicate so the entry can be shared by later queries,
-    // and hits return those unfiltered batches. Keep DataFusion's residual
-    // FilterExec whenever that path is enabled; otherwise an Exact declaration
-    // would let a miss or hit expose rows that the SQL predicate rejects.
+    // Cache entries are whole-file decoded batches read under no predicate, so
+    // an entry populated by one query is returned unfiltered to the next one,
+    // whatever it asked for. Keep DataFusion's residual FilterExec whenever that
+    // path is enabled; otherwise an Exact declaration would let a hit expose
+    // rows that the SQL predicate rejects. This holds after #4891: a predicate
+    // task now bypasses the cache on a miss, but it can still HIT an entry a
+    // predicate-free scan left behind.
     if file_cache_enabled && kind == TableProviderFilterPushDown::Exact {
         TableProviderFilterPushDown::Inexact
     } else {
