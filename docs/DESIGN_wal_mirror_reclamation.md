@@ -1,7 +1,8 @@
 # Reclaiming WAL mirror objects under the local drain (task #3060)
 
-**Status:** design only. Nothing here is implemented, and this investigation
-deleted no objects. **Date:** 2026-09-17.
+**Status:** Option C implemented in #4913, off by default
+(`compactor.mirrorLedgerReclaim` / `SIGLAKE_MIRROR_LEDGER_RECLAIM`). The open
+decisions below are answered; see "What shipped". **Date:** 2026-09-17.
 
 Since #2953 the WAL mirror is on by default. Retention for mirror objects lives
 in the catalog-claim drain, which deletes an object because it is the thing that
@@ -256,7 +257,52 @@ already durable, already crash-ordered, and already being maintained by the
 default install, while B asks for a second durable format to hold the same fact
 and A holds no fact at all.
 
+## What shipped (#4913)
+
+Option C, opt-in. The answers to the two open decisions below:
+
+1. **Ledger unreachable:** sweep at the 3600 s `CONSUMER_MAX_RETENTION` ceiling
+   and count the leak. `sweep_committed_gated` takes the set of names whose
+   mark is durable and holds everything else — except past the ceiling, where
+   the file goes anyway and `siglake_compactor_mirror_unreclaimed_total`
+   records that its object is now beyond this drain's reach. That counter and
+   `siglake_compactor_mirror_mark_errors_total` are pre-registered at 0 on
+   every compactor and read by panel 163 of `deploy/grafana/siglake-overview.json`.
+   Neither pinned bytes nor the accumulated mirror leak is bounded by this; the
+   WAL volume is.
+2. **Not on by default.** Default-on needs a retained object-store acceptance
+   run and a separate non-patch release decision, not one release elapsing.
+
+What the implementation adds, against the shape above:
+
+- `Compactor::with_mirror_ledger` — the ledger-only config. Ignored if a
+  catalog claim is already attached.
+- `SqlSegmentClaim::mark_committed_local` — the upsert. It is not
+  `mark_committed` (which requires `status = 'processing' AND claimer = ?`),
+  it writes no consumed-proof watermark, it stamps `committed_at_ms` once and
+  preserves it across the per-cycle re-mark, and it leaves a `processing`,
+  `released` or quarantined row untouched.
+- The mark runs inside the per-directory retention sweep, so every cycle shape
+  that sweeps also marks, and the gate is computed from the same listing.
+- `catch_up_sweep` no longer uploads a candidate whose only remaining local
+  name is `committed/`. Discovery is not proof that the upload is still owed:
+  a candidate found in `sealed/` at the start of a pass can be committed,
+  marked and reclaimed before the pass reaches it, and the old
+  `processing/`-or-`committed/` read fallback would then recreate the object.
+  `processing/` keeps the fallback — that commit has not returned.
+- A per-directory cache of ids already seen `committed` keeps the re-mark to
+  one catalog round trip per new file, and stops a re-mark from resurrecting a
+  row retention has already purged.
+
+Not covered, and still true: a locally-committed segment whose row retention
+purged while its local file is held past the retention window (a stuck
+consumer, i.e. > 901 s after the mark) can have that row re-inserted once by a
+restarted compactor, which costs a no-op object delete and a bounded row. A
+second `committed_retention` window collects it.
+
 ## Open decisions for the maintainer
+
+*Both answered above; kept for the reasoning.*
 
 1. **What happens when the ledger is unreachable and `committed/` cannot be
    swept.** Coupling the sweep to the mark means a long Postgres outage grows
@@ -275,18 +321,30 @@ and A holds no fact at all.
 
 ## Verification an implementation card must carry
 
+All but the last are in `mirror_ledger_reclaim_tests`
+(`crates/siglake-compactor/src/lib.rs`), `local_commit_mark_tests`
+(`crates/siglake-storage/src/catalog_claim.rs`) and the gate and sweep tests in
+`crates/siglake-wal`:
+
 - A test that an object whose segment was committed locally is deleted after
-  `committedRetentionSecs`, and its row with it.
+  `committedRetentionSecs`, and its row with it. —
+  `a_locally_committed_segment_is_reclaimed`
 - A negative control: with `SIGLAKE_COMMITTED_RETENTION_SECS=0`, nothing is
-  deleted.
+  deleted. — `the_retention_opt_out_reclaims_nothing`, driven through
+  `committed_retention_from(Some("0"))` rather than the process environment.
 - A test that a segment with a live `mirror-pending/` pin is not reclaimed, and
-  that an upload landing after the mark still leaves a `committed` row.
+  that an upload landing after the mark still leaves a `committed` row. —
+  `a_pinned_segment_is_neither_marked_nor_swept`,
+  `a_mark_that_precedes_the_registration_still_collects`
 - A crash test: kill between the Iceberg commit and the mark; the next cycle
-  marks it from `committed/` and the object is still reclaimed.
-- A test that a dropped incarnation's quarantined segments produce no delete.
+  marks it from `committed/` and the object is still reclaimed. —
+  `a_crash_between_the_append_and_the_mark_is_repaired`
+- A test that a dropped incarnation's quarantined segments produce no delete. —
+  `quarantined_segments_produce_no_delete`
 - An object-store acceptance run (MinIO or a prepared AWS round) measuring the
   prefix's object count reaching steady state rather than growing, with the
-  measurement stated next to `committedRetentionSecs`.
+  measurement stated next to `committedRetentionSecs`. — **outstanding**, and
+  the gate on any decision to make this default-on.
 
 ## Defects found while reading this path
 

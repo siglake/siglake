@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **WAL mirror reclamation for the filesystem drain (new, off by default)**:
+  `compactor.mirrorLedgerReclaim` (`SIGLAKE_MIRROR_LEDGER_RECLAIM`) lets the
+  default single-replica compactor delete the mirror objects it has committed.
+  Committed retention belonged to the catalog-claim drain, which purges what it
+  claimed; the filesystem drain commits out of local `sealed/` and never reads
+  the mirror, so the prefix grew for as long as the cluster ingested — 421,632
+  objects and 37.3 GB a day at 20K EPS — and so did the `wal_segments` row the
+  ingester writes per upload, because retention only deletes `committed` rows
+  and none reached that state. With the knob on, the compactor connects the
+  catalog and the mirror store WITHOUT claiming — no `try_claim`, no
+  mirror-to-catalog reconciliation, no abandoned-claim reclaim, so it never
+  registers an object it did not commit — upserts the ingester's row to
+  `committed` for each file in local `committed/`, and the unchanged retention
+  pass deletes the object and then the row under `committedRetentionSecs`,
+  whose `0` still means delete nothing. The mark is driven off the directory
+  rather than the commit return, so it repairs a crash between the Iceberg
+  append and the mark; it skips a segment whose `mirror-pending/` pin says an
+  upload is still owed; and the local sweep waits for it, so local commit
+  evidence outlives remote evidence. The 3600 s `committed/` ceiling still
+  wins, charging `siglake_compactor_mirror_unreclaimed_total` (panel 163) when
+  a catalog outage leaves an object beyond reach. Segments no local drain ever
+  committed — a dropped index incarnation's, an ingester whose volume was lost
+  — are still left to an object-store lifecycle rule, as `docs/LIMITATIONS.md`
+  says. One related fix on the ingest side: the mirror catch-up sweep no longer
+  uploads a candidate whose only remaining local name is `committed/`, which
+  could recreate a reclaimed object. (#4913)
+
 - **Observability (new, off by default)**: setting
   `OTEL_EXPORTER_OTLP_ENDPOINT` exports the log lines every binary already
   writes as OTLP log records, and the spans at the boundaries that cost

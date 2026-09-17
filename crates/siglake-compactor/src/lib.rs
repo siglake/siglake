@@ -7876,6 +7876,313 @@ mod committed_retention_tests {
     }
 }
 
+/// Ledger-only mirror reclamation under the filesystem drain (#4913,
+/// `docs/DESIGN_wal_mirror_reclamation.md` Option C).
+///
+/// Each test seeds what a default install seeds: a segment sealed into the
+/// local WAL, its bytes in the mirror, and the `sealed` row the ingester's
+/// registrar writes for that upload. What varies is the state the reclaimer
+/// has to read it in.
+#[cfg(test)]
+mod mirror_ledger_reclaim_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use opendal::services::Memory;
+
+    use super::*;
+
+    struct Seeded {
+        compactor: Compactor,
+        claim: SqlSegmentClaim,
+        store: Operator,
+        wal: PathBuf,
+        id: String,
+        key: String,
+    }
+
+    /// A drain with ledger reclamation attached, a mirrored segment in
+    /// `sealed/`, and the ingester's row for it. `retention` is the local
+    /// `committed/` soft floor: `ZERO` lets the sweep act on the same cycle.
+    async fn seed(tmp: &std::path::Path, retention: Duration, register: bool) -> Seeded {
+        let wal = tmp.join("wal");
+        let store = Operator::new(Memory::default()).unwrap().finish();
+        let uri = format!("sqlite://{}?mode=rwc", tmp.join("claim.db").display());
+        let claim = SqlSegmentClaim::connect(&uri, "reclaim-test")
+            .await
+            .unwrap();
+
+        let mut writer =
+            siglake_wal::WalWriter::with_thresholds(&wal, "ing-a", 2, Duration::from_secs(60))
+                .unwrap();
+        let segment = writer
+            .append_events(&[
+                siglake_core::Event::now("one".to_string()),
+                siglake_core::Event::now("two".to_string()),
+            ])
+            .unwrap()
+            .expect("seals at the threshold");
+        drop(writer);
+        let id = segment
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_string();
+        let key = format!("wal-mirror/{id}.arrow");
+        let bytes = std::fs::read(&segment.path).unwrap();
+        let len = bytes.len() as i64;
+        store.write(&key, Bytes::from(bytes)).await.unwrap();
+        if register {
+            claim
+                .register(&id, "default", "", &key, len, 2)
+                .await
+                .unwrap();
+        }
+
+        let ice = Arc::new(IcebergContext::open(&tmp.join("warehouse")).await.unwrap());
+        let compactor = Compactor::with_retention(&wal, ice, retention).with_mirror_ledger(
+            CatalogClaimConfig {
+                claim: claim.clone(),
+                store: store.clone(),
+                prefix: "wal-mirror".to_string(),
+                batch_size: 0,
+                last_mirror_sync: Default::default(),
+                last_reclaim: Default::default(),
+            },
+        );
+        Seeded {
+            compactor,
+            claim,
+            store,
+            wal,
+            id,
+            key,
+        }
+    }
+
+    async fn purgeable(claim: &SqlSegmentClaim) -> Vec<String> {
+        claim
+            .purgeable_committed(Duration::ZERO, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, key)| key)
+            .collect()
+    }
+
+    fn committed_files(wal: &std::path::Path) -> Vec<String> {
+        list_committed(wal)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(str::to_string))
+            .collect()
+    }
+
+    /// The whole point: a segment the local drain committed has its mirror
+    /// object and its catalog row removed once `committedRetentionSecs` is up.
+    #[tokio::test]
+    async fn a_locally_committed_segment_is_reclaimed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), DEFAULT_RETENTION, true).await;
+
+        assert_eq!(s.compactor.run_once().await.unwrap(), 1);
+        assert_eq!(
+            purgeable(&s.claim).await,
+            vec![s.key.clone()],
+            "the drain's commit must transition the ingester's row"
+        );
+        // The age predicate is strict at millisecond precision.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            s.compactor.run_retention_with(Some(Duration::ZERO)).await,
+            1
+        );
+        assert!(!s.store.exists(&s.key).await.unwrap());
+        assert!(purgeable(&s.claim).await.is_empty());
+    }
+
+    /// The negative control, driven through the resolver rather than the
+    /// process environment: `SIGLAKE_COMMITTED_RETENTION_SECS=0` still means
+    /// delete nothing, reclamation or not.
+    #[tokio::test]
+    async fn the_retention_opt_out_reclaims_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), DEFAULT_RETENTION, true).await;
+
+        assert_eq!(s.compactor.run_once().await.unwrap(), 1);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            s.compactor
+                .run_retention_with(committed_retention_from(Some("0")))
+                .await,
+            0
+        );
+        assert!(s.store.exists(&s.key).await.unwrap());
+        assert_eq!(purgeable(&s.claim).await, vec![s.key]);
+    }
+
+    /// A segment with a live `mirror-pending/` pin still owes an upload.
+    /// Marking it would let retention delete a key the uploader is about to
+    /// write — an object no later pass revisits. So it is not marked, and its
+    /// local evidence is held rather than swept.
+    #[tokio::test]
+    async fn a_pinned_segment_is_neither_marked_nor_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), Duration::ZERO, true).await;
+        let name = format!("{}.arrow", s.id);
+        let pin = s.wal.join("mirror-pending").join(&name);
+        std::fs::create_dir_all(pin.parent().unwrap()).unwrap();
+        std::fs::hard_link(s.wal.join("sealed").join(&name), &pin).unwrap();
+
+        assert_eq!(s.compactor.run_once().await.unwrap(), 1);
+        assert!(
+            purgeable(&s.claim).await.is_empty(),
+            "a pinned segment must not be marked committed"
+        );
+        assert_eq!(
+            committed_files(&s.wal),
+            vec![name.clone()],
+            "and its local evidence must be held, despite a zero retention floor"
+        );
+
+        // The upload lands and the pin clears: the next cycle marks it.
+        std::fs::remove_file(&pin).unwrap();
+        s.compactor.run_once().await.unwrap();
+        assert_eq!(purgeable(&s.claim).await, vec![s.key.clone()]);
+        assert!(
+            committed_files(&s.wal).is_empty(),
+            "once the mark is durable the local copy is releasable"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            s.compactor.run_retention_with(Some(Duration::ZERO)).await,
+            1
+        );
+        assert!(!s.store.exists(&s.key).await.unwrap());
+    }
+
+    /// The crash the mark step is driven off `committed/` to repair: the
+    /// Iceberg append returned and the rename happened, then the process died
+    /// before marking. The next cycle finds the file and marks it, so the
+    /// object is still reclaimed.
+    #[tokio::test]
+    async fn a_crash_between_the_append_and_the_mark_is_repaired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), DEFAULT_RETENTION, true).await;
+        let name = format!("{}.arrow", s.id);
+        let committed = s.wal.join("committed").join(&name);
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::rename(s.wal.join("sealed").join(&name), &committed).unwrap();
+
+        // An idle cycle: nothing to commit, everything to repair.
+        assert_eq!(s.compactor.run_once().await.unwrap(), 0);
+        assert_eq!(purgeable(&s.claim).await, vec![s.key.clone()]);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            s.compactor.run_retention_with(Some(Duration::ZERO)).await,
+            1
+        );
+        assert!(!s.store.exists(&s.key).await.unwrap());
+    }
+
+    /// The mark has to be an UPSERT. The uploader's registration is
+    /// `ON CONFLICT DO NOTHING`, so a `committed` row written first survives a
+    /// late catch-up registration and retention still collects the object. An
+    /// update-only mark would find no row, write nothing, and leak.
+    #[tokio::test]
+    async fn a_mark_that_precedes_the_registration_still_collects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), DEFAULT_RETENTION, false).await;
+
+        assert_eq!(s.compactor.run_once().await.unwrap(), 1);
+        assert_eq!(
+            purgeable(&s.claim).await,
+            vec![s.key.clone()],
+            "the mark must insert the row the upload has not registered yet"
+        );
+        // The uploader's registrar catches up afterwards.
+        assert!(!s
+            .claim
+            .register(&s.id, "default", "", &s.key, 1, 2)
+            .await
+            .unwrap());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            s.compactor.run_retention_with(Some(Duration::ZERO)).await,
+            1
+        );
+        assert!(!s.store.exists(&s.key).await.unwrap());
+        assert!(purgeable(&s.claim).await.is_empty());
+    }
+
+    /// Segments of a dropped incarnation are quarantined into `stale/` by the
+    /// drain's owner check and never commit (the quarantine itself is covered
+    /// by `a_recreated_index_does_not_claim_the_dropped_incarnations_mirror`).
+    /// They are therefore never marked, and reclamation produces no delete:
+    /// an unattributable object is one only an operator-side lifecycle rule
+    /// may collect.
+    #[tokio::test]
+    async fn quarantined_segments_produce_no_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), Duration::ZERO, true).await;
+        let name = format!("{}.arrow", s.id);
+        let quarantine = s.wal.join("stale").join("00000000-dropped");
+        std::fs::create_dir_all(&quarantine).unwrap();
+        std::fs::rename(s.wal.join("sealed").join(&name), quarantine.join(&name)).unwrap();
+
+        assert_eq!(s.compactor.run_once().await.unwrap(), 0);
+        assert!(
+            purgeable(&s.claim).await.is_empty(),
+            "a quarantined segment must never be marked committed"
+        );
+        assert_eq!(
+            s.compactor.run_retention_with(Some(Duration::ZERO)).await,
+            0
+        );
+        assert!(s.store.exists(&s.key).await.unwrap());
+        assert!(quarantine.join(&name).exists());
+    }
+
+    /// Without the opt-in nothing changes: no mark, no reclamation, and the
+    /// local sweep is ungated exactly as before.
+    #[tokio::test]
+    async fn reclamation_is_off_unless_it_is_attached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = seed(tmp.path(), Duration::ZERO, true).await;
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse2"))
+                .await
+                .unwrap(),
+        );
+        let plain = Compactor::with_retention(&s.wal, ice, Duration::ZERO);
+
+        assert_eq!(plain.run_once().await.unwrap(), 1);
+        assert!(
+            purgeable(&s.claim).await.is_empty(),
+            "the row stays sealed forever, which is the limitation this closes"
+        );
+        assert!(
+            committed_files(&s.wal).is_empty(),
+            "and the ungated sweep still removes the local copy"
+        );
+        assert_eq!(plain.run_retention_with(Some(Duration::ZERO)).await, 0);
+        assert!(s.store.exists(&s.key).await.unwrap());
+    }
+
+    #[test]
+    fn the_reclaim_knob_is_off_by_default_and_reads_the_usual_spellings() {
+        assert!(!mirror_ledger_reclaim_from(None));
+        for off in ["", "0", "false", "no", "off", "maybe"] {
+            assert!(!mirror_ledger_reclaim_from(Some(off)), "{off:?}");
+        }
+        for on in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(mirror_ledger_reclaim_from(Some(on)), "{on:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod mirror_sync_gate_tests {
     use super::mirror_sync_interval_from;
