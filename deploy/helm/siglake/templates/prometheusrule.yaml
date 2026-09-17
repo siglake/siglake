@@ -579,7 +579,12 @@ spec:
               says which: at_capacity is the cap, not_allowed the allow-list,
               header_not_trusted a client selecting a tenant on a
               single-tenant ingester, and the claim_* reasons a token whose
-              tenant claim is missing or unusable.
+              tenant claim is missing or unusable. A sustained
+              header_not_trusted rate is a client that expects its
+              X-Scope-OrgID to route: bind the tenant to a verified identity
+              with ingester.oidc.tenantClaim, and set
+              ingester.trustScopeHeader only where a gateway in front of the
+              ingester sets the header itself and strips the client's.
         - alert: SiglakeQueryTenantsDenied
           expr: increase(siglake_query_tenant_denied_total[10m]) > 10
           for: 5m

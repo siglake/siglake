@@ -499,7 +499,12 @@ tests:
                 label says which: at_capacity is the cap, not_allowed the
                 allow-list, header_not_trusted a client selecting a tenant on a
                 single-tenant ingester, and the claim_* reasons a token whose
-                tenant claim is missing or unusable.
+                tenant claim is missing or unusable. A sustained
+                header_not_trusted rate is a client that expects its
+                X-Scope-OrgID to route: bind the tenant to a verified identity
+                with ingester.oidc.tenantClaim, and set
+                ingester.trustScopeHeader only where a gateway in front of the
+                ingester sets the header itself and strips the client's.
 
   # And the pre-registered zeros themselves do not page: an ingester below its
   # cap publishes every reason at 0 from its first scrape, which is what makes
@@ -514,6 +519,78 @@ tests:
       - series: 'siglake_ingest_tenant_denied_total{namespace="logs",pod="ingester-0",reason="header_not_trusted"}'
         values: '0x30'
     alert_rule_test:
+      - eval_time: 30m
+        alertname: SiglakeTenantsDenied
+        exp_alerts: []
+
+  # #3067: header_not_trusted is the single-tenant default refusing a routing
+  # X-Scope-OrgID (crates/siglake-ingest/src/lib.rs), and it reads through the
+  # same reason-unfiltered rule as every other refusal rather than a rule of
+  # its own. The series is the signature of an upgrade that stopped honouring a
+  # client's header: the client sees 403s and this is the ingester saying why.
+  - name: sustained header_not_trusted refusals raise the tenancy alert, then clear
+    interval: 1m
+    input_series:
+      - series: 'siglake_ingest_tenant_denied_total{namespace="logs",pod="ingester-0",reason="header_not_trusted"}'
+        values: '0 0 3 6 9 12 15 18 21 24 27 30 33 36 39 39x16'
+      - series: 'siglake_ingest_tenant_denied_total{namespace="logs",pod="ingester-0",reason="at_capacity"}'
+        values: '0x30'
+    alert_rule_test:
+      # Already past the threshold, still inside `for: 5m`.
+      - eval_time: 6m
+        alertname: SiglakeTenantsDenied
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: SiglakeTenantsDenied
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: ingester-0
+              reason: header_not_trusted
+              severity: warning
+            exp_annotations:
+              summary: Ingest is denying tenants
+              description: >-
+                Sustained denials mean a misconfigured client, a tenant missing
+                from ingester.allowedTenants, or an ingester at
+                ingester.maxTenants turning novel tenants away. The reason
+                label says which: at_capacity is the cap, not_allowed the
+                allow-list, header_not_trusted a client selecting a tenant on a
+                single-tenant ingester, and the claim_* reasons a token whose
+                tenant claim is missing or unusable. A sustained
+                header_not_trusted rate is a client that expects its
+                X-Scope-OrgID to route: bind the tenant to a verified identity
+                with ingester.oidc.tenantClaim, and set
+                ingester.trustScopeHeader only where a gateway in front of the
+                ingester sets the header itself and strips the client's.
+      # Routing fixed (or the client stopped) at 14m: once the refusals leave
+      # the 10m window the alert resolves without an operator touching it.
+      - eval_time: 26m
+        alertname: SiglakeTenantsDenied
+        exp_alerts: []
+
+  # A few refusals are not that signature, and the rule is a rate bound, not a
+  # first-refusal page: ingester-0 is one client retrying a stale header four
+  # times, ingester-1 a trickle at half the threshold for half an hour.
+  # Neither pages, and the pre-registered zero still makes both visible as an
+  # increase() on a dashboard.
+  - name: brief or below-threshold header_not_trusted refusals do not page
+    interval: 1m
+    input_series:
+      - series: 'siglake_ingest_tenant_denied_total{namespace="logs",pod="ingester-0",reason="header_not_trusted"}'
+        values: '0 0 2 4 4x18'
+      - series: 'siglake_ingest_tenant_denied_total{namespace="logs",pod="ingester-1",reason="header_not_trusted"}'
+        values: '0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SiglakeTenantsDenied
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: SiglakeTenantsDenied
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: SiglakeTenantsDenied
+        exp_alerts: []
       - eval_time: 30m
         alertname: SiglakeTenantsDenied
         exp_alerts: []
