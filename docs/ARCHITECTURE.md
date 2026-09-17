@@ -91,8 +91,11 @@ default** wherever a warehouse URL is set, so the WAL volume is not the only cop
 of what has been acknowledged. `siglake wal-recover --from
 s3://<bucket>/<prefix> --to <wal-root>` restores from the mirror for DR,
 rebuilding the per-tenant and per-index layout so each segment returns to the
-namespace and table it came from; each restored segment is written to a temp
-name, `fsync(2)`ed and renamed under a synced directory before it is counted,
+namespace and table it came from — including the tenant's own `sealed/`, the
+discovery directory the drain enumerates tenants by, which an index-only
+restore would otherwise leave out (#4972); each restored segment is written to
+a temp name, `fsync(2)`ed and renamed under a synced directory before it is
+counted,
 so a restore that reports 400 segments has 400 whole ones on the volume. The
 report carries the counts that separate a finished restore from one that
 understood nothing — segments already present, and keys skipped for a layout

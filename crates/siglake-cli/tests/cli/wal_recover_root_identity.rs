@@ -360,20 +360,25 @@ async fn a_misplaced_flat_restore_commits_rows_into_an_invented_namespace() {
     assert_eq!(count_events(&ice).await, 1);
 }
 
-/// The other branch, and it is worse than either the card or the scope note
-/// assumed. A tenant-scoped mirror misplaced one component up restores to
-/// `<wal>/<prefix>/<tenant>/{SEALED_DIR}/`, which leaves `<wal>/<prefix>/` with
-/// no `sealed/` of its own — and `list_layout_dirs` only enumerates a child
-/// that HAS one (`crates/siglake-wal/src/lib.rs:2188`). So `<prefix>` is not a
-/// tenant as far as the drain is concerned, its children are never walked,
-/// `ensure_index` is never reached and no namespace is created.
+/// The other branch. A tenant-scoped mirror misplaced one component up
+/// restores to `<wal>/<prefix>/<tenant>/{SEALED_DIR}/`, reading `<prefix>` as
+/// the tenant and the real tenant name as an index.
 ///
-/// The segments are on the volume, reported as restored, and invisible: no
-/// commit, no `siglake_compactor_index_unresolved_total`, no backlog gauge,
-/// nothing in `orphans/`. An operator who followed the runbook and watched the
-/// drain sees a successful restore and an empty cluster.
+/// Before #4972 that left `<wal>/<prefix>/` with no `sealed/` of its own, and
+/// `list_layout_dirs` enumerates only a child that HAS one
+/// (`crates/siglake-wal/src/lib.rs:2188`): the segments sat on the volume,
+/// reported as restored, with no commit, no
+/// `siglake_compactor_index_unresolved_total`, no backlog gauge and nothing in
+/// `orphans/`. An operator who followed the runbook and watched the drain saw a
+/// successful restore and an empty cluster.
+///
+/// The restore now rebuilds the discovery dir, so the misplacement is WALKED:
+/// `tenant_<prefix>` is created and `ensure_index` refuses the invented index.
+/// The rows still do not reach the namespace they belong to — that is #4964's
+/// subject, and this test keeps pinning it — but the wrong `--from` now leaves
+/// an artifact to notice.
 #[tokio::test]
-async fn a_misplaced_index_restore_is_invisible_to_the_drain() {
+async fn a_misplaced_index_restore_is_walked_and_refused_at_the_index_gate() {
     use std::sync::Arc;
 
     use siglake_compactor::Compactor;
@@ -391,11 +396,15 @@ async fn a_misplaced_index_restore_is_invisible_to_the_drain() {
         vec![format!("wal-mirror/acme/{SEALED_DIR}/seg.arrow")]
     );
 
-    // The drain does not see `wal-mirror` as a tenant: it has index dirs but no
-    // `sealed/` of its own.
-    assert!(
-        siglake_wal::list_tenant_dirs(&wal).unwrap().is_empty(),
-        "no tenant is enumerated under the restored root"
+    // `wal-mirror` is a tenant as far as the drain is concerned, and `acme` —
+    // the real tenant — is read as an index under it.
+    assert_eq!(
+        siglake_wal::list_tenant_dirs(&wal)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["wal-mirror".to_string()]
     );
 
     let ice = Arc::new(IcebergContext::open(&tmp.path().join("ice")).await.unwrap());
@@ -404,7 +413,7 @@ async fn a_misplaced_index_restore_is_invisible_to_the_drain() {
     assert_eq!(
         compactor.run_once().await.unwrap(),
         0,
-        "and every later cycle sees the same nothing"
+        "and every later cycle refuses it the same way"
     );
     assert_eq!(
         restored_layout(&wal),
@@ -412,29 +421,76 @@ async fn a_misplaced_index_restore_is_invisible_to_the_drain() {
         "the segment is not committed, not quarantined and not deleted"
     );
     assert!(
-        !ice.catalog()
+        ice.catalog()
             .namespace_exists(&iceberg::NamespaceIdent::new("tenant_wal-mirror".into()))
             .await
             .unwrap(),
-        "the tenant walk never reaches this dir, so not even a namespace is \
-         created — there is no artifact to notice"
+        "the namespace named after the mirror prefix is the artifact the wrong \
+         --from now leaves behind"
+    );
+    assert_eq!(
+        count_events_in(&ice, "tenant_acme").await,
+        None,
+        "and the namespace the rows belong to still gets nothing"
     );
 }
 
-/// A defect this qualification turned up that has nothing to do with `--from`.
-/// The ingester creates `<tenant>/sealed/` before it opens any per-index lane,
-/// and calls it the "tenant discovery dir"
+/// `count(*)` over a namespace's `events`, or `None` when the namespace has
+/// never been created.
+async fn count_events_in(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    namespace: &str,
+) -> Option<i64> {
+    use datafusion::prelude::SessionContext;
+
+    if !ice
+        .catalog()
+        .namespace_exists(&iceberg::NamespaceIdent::new(namespace.into()))
+        .await
+        .unwrap()
+    {
+        return None;
+    }
+    let ns = ice.for_namespace(namespace).await.unwrap();
+    let ctx = SessionContext::new();
+    ns.register_with_datafusion(&ctx).await.unwrap();
+    let batches = ctx
+        .sql("SELECT count(*) AS n FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    Some(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0),
+    )
+}
+
+/// A defect this qualification turned up that has nothing to do with `--from`,
+/// fixed on its own card (#4972). The ingester creates `<tenant>/sealed/`
+/// before it opens any per-index lane, and calls it the "tenant discovery dir"
 /// (`crates/siglake-ingest/src/lib.rs:571-580`) — it exists so
-/// `list_layout_dirs` enumerates the tenant. Recovery rebuilds
-/// `<tenant>/<index>/sealed/` and does NOT rebuild that, so a mirror holding
-/// only index segments for a tenant — an Elasticsearch-bulk-only tenant whose
-/// events lane never sealed — restores CORRECTLY, from the right `--from`, into
-/// a layout the drain never walks.
+/// `list_layout_dirs` enumerates the tenant. Recovery rebuilt
+/// `<tenant>/<index>/sealed/` and not that, so a mirror holding only index
+/// segments for a tenant — an Elasticsearch-bulk-only tenant whose events lane
+/// never sealed — restored CORRECTLY, from the right `--from`, into a layout
+/// the drain never walked.
+///
+/// The restore now rebuilds it, so the tenant is enumerated, the index
+/// directory beneath it is reached, and the segment goes through the ordinary
+/// index gates: resolved here, because the index exists. Against the pre-fix
+/// code every assertion after the restore fails.
 #[tokio::test]
-async fn a_correct_restore_of_an_index_only_tenant_is_never_drained() {
+async fn a_correct_restore_of_an_index_only_tenant_is_drained() {
     use std::sync::Arc;
 
     use siglake_compactor::Compactor;
+    use siglake_core::index_config::IndexConfig;
     use siglake_storage::iceberg::IcebergContext;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -453,27 +509,91 @@ async fn a_correct_restore_of_an_index_only_tenant_is_never_drained() {
         vec![format!("acme/orders/{SEALED_DIR}/seg.arrow")],
         "the layout is right: this is the tenant and index the segment came from"
     );
-
     assert!(
-        siglake_wal::list_tenant_dirs(&wal).unwrap().is_empty(),
-        "and still no tenant is enumerated"
-    );
-    let ice = Arc::new(IcebergContext::open(&tmp.path().join("ice")).await.unwrap());
-    assert_eq!(
-        Compactor::new(&wal, ice).run_once().await.unwrap(),
-        0,
-        "a correct restore that the drain never reaches"
+        wal.join("acme").join(SEALED_DIR).is_dir(),
+        "and the restore rebuilt the discovery dir the enumeration reads"
     );
 
-    // The discovery dir is the whole difference.
-    std::fs::create_dir_all(wal.join("acme").join(SEALED_DIR)).unwrap();
     assert_eq!(
         siglake_wal::list_tenant_dirs(&wal)
             .unwrap()
             .into_iter()
             .map(|(name, _)| name)
             .collect::<Vec<_>>(),
-        vec!["acme".to_string()]
+        vec!["acme".to_string()],
+        "the tenant is enumerated"
+    );
+    assert_eq!(
+        siglake_wal::list_index_dirs(&wal.join("acme"))
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["orders".to_string()],
+        "and the walk reaches the index directory"
+    );
+
+    let ice = Arc::new(IcebergContext::open(&tmp.path().join("ice")).await.unwrap());
+    let acme = ice.for_namespace("tenant_acme").await.unwrap();
+    let mut config = IndexConfig::builtin_events();
+    config.index_id = "orders".to_string();
+    acme.create_index(&config).await.unwrap();
+
+    assert_eq!(
+        Compactor::new(&wal, ice).run_once().await.unwrap(),
+        1,
+        "the restored segment is committed to the index it came from"
+    );
+    assert!(
+        restored_layout(&wal)
+            .iter()
+            .all(|p| !p.contains(&format!("/{SEALED_DIR}/"))),
+        "and it leaves sealed/: {:?}",
+        restored_layout(&wal)
+    );
+}
+
+/// The same restore when the index does NOT resolve. The outcome the card
+/// asked for is a VISIBLE one: the tenant is walked, `ensure_index` refuses,
+/// and the segment is left in `sealed/` under a counted, exported backlog
+/// instead of sitting on the volume with nothing to notice it.
+#[tokio::test]
+async fn an_index_only_restore_whose_index_does_not_resolve_reaches_the_index_gate() {
+    use std::sync::Arc;
+
+    use siglake_compactor::Compactor;
+    use siglake_storage::iceberg::IcebergContext;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mirror = mirror_with(
+        tmp.path(),
+        "warehouse/wal-mirror",
+        &["acme/orders/seg.arrow"],
+    );
+
+    let wal = tmp.path().join("wal");
+    let (stdout, stderr, ok) = recover(&format!("file://{}", mirror.display()), &wal);
+    assert!(ok, "{stdout}{stderr}");
+
+    let ice = Arc::new(IcebergContext::open(&tmp.path().join("ice")).await.unwrap());
+    let compactor = Compactor::new(&wal, ice.clone());
+    assert_eq!(
+        compactor.run_once().await.unwrap(),
+        0,
+        "nothing is committed: no index `orders` and no template matches it"
+    );
+    assert_eq!(
+        restored_layout(&wal),
+        vec![format!("acme/orders/{SEALED_DIR}/seg.arrow")],
+        "the segment is not committed, not quarantined and not deleted"
+    );
+    assert!(
+        ice.catalog()
+            .namespace_exists(&iceberg::NamespaceIdent::new("tenant_acme".into()))
+            .await
+            .unwrap(),
+        "but the tenant walk reached this dir — the namespace it creates on the \
+         way to `ensure_index` is the artifact an operator can see"
     );
 }
 
