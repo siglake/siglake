@@ -440,8 +440,8 @@
    },
    "targets": [
     {
-     "expr": "max(siglake_compactor_sealed_pending_oldest_age_seconds{namespace=~\"$namespace\"})",
-     "legendFormat": "oldest age",
+     "expr": "max by (namespace) (siglake_compactor_sealed_pending_oldest_age_seconds{namespace=~\"$namespace\"})",
+     "legendFormat": "{{namespace}} oldest age",
      "refId": "A"
     }
    ],
@@ -450,7 +450,7 @@
      "unit": "s"
     }
    },
-   "description": "The growth signal a depth count cannot give. Steady depth with a rising age is a drain that is not keeping up."
+   "description": "The growth signal a depth count cannot give. Steady depth with a rising age is a drain that is not keeping up. Under the catalog claim every compactor replica reports the same oldest age, and the max takes it once. One line per namespace, matching the depth panel, so a healthy cluster's age is not hidden behind a worse one's."
   },
   {
    "id": 113,
