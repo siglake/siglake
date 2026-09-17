@@ -704,7 +704,7 @@ before any cost is reported: an unclipped shape row for row and against the
 generator's own count of corpus matches, a clipped one on row count plus a
 per-row check that the row carries the term and falls inside the shape's window.
 A segmented arm that answered no file from a sidecar fails the test rather than
-reporting the scan's numbers under its label. Both full runs below passed every
+reporting the scan's numbers under its label. All three runs below passed every
 one of those assertions, in every arm, on every shape. The format returned no
 wrong row and no missing row anywhere in this measurement.
 
@@ -732,7 +732,7 @@ scan with the shipped format and **11.5x faster** with the segmented one
 is #4376's acceptance, under the budgets it names, end to end: the shipped
 format cannot reach it at any cache size a query pod can afford (its own winning
 regime needs the whole 7.3 GiB parsed working set resident), and the segmented
-one reaches it with 15.9 MiB of resident directory and no eviction.
+one reaches it with 15.95 MiB of resident directory and no eviction.
 
 **It also removes #4375's one known loss.** `rare_keyword` — a clipped `LIMIT`
 over a term rare enough that an index would have won — is the shape the
@@ -747,10 +747,10 @@ the df it needs is already in the directory.
 **The clipped high-df shapes still need the decline.** `keyword` (2% density) is
 4.46x the scan and `keyword_last5` 6.03x: a scan that stops at 100 rows reads a
 sliver of one file, while the index reads megabytes of postings for millions of
-documents. `seg_policy` declines all three and lands at 0.92-1.81x. Partial
-reads narrow the loss from 431-722x to 1.6-6.0x, and do not close it.
+documents. `seg_policy` declines them and lands at 0.92-1.81x. Partial reads
+narrow the loss from 431-722x to 1.6-6.0x and do not close it.
 
-**`substring_scan` is the format's boundary, not a win.** 972.4 ms against the
+**`substring_scan` marks the format's boundary.** 972.4 ms against the
 scan's 5.6 ms, 174x, because a non-tokenizable `LIKE '%…%'` means finding every
 dictionary term containing the substring and that reads every block. The policy
 declines it (1.17x). #4375's per-execution rule is where this belongs and the
@@ -808,12 +808,14 @@ to a merge. For scale: #4329's fixture build was 574.7 s with the rebuild off
 and 729.0 s with the v1 rebuild on, so the v1 sidecars cost ~154 s for the same
 fourteen files.
 
-**On-disk bytes go the wrong way.** The v1 sidecars add 15.59 MiB per file over
-the no-text-index baseline; the segmented ones add **87.19 MiB**, 5.59x. The
-comparison is between a Zstd-compressed v1 blob and a segmented blob that must
-stay uncompressed for its interior to be addressable — the same 85.8 MiB
-serialized figure the per-file section reports, next to a v1 blob whose 116.5 MiB
-serialize down to 15.6 on disk. #4988's per-block compression projects 16.4 MiB
+**On-disk bytes go the wrong way.** Measured as the statistics-file bytes each
+arm adds over the no-text-index baseline (224,474,617 B), the v1 sidecars add
+15.59 MiB per file and the segmented ones **87.19 MiB**, **5.59x**. The gap is
+compression, not layout: the v1 sidecar's 116.5 MiB of serialized index travels
+inside a Zstd frame and occupies 15.59 MiB, while a segmented blob has to stay
+uncompressed for its interior to be addressable — 87.19 MiB here, against the
+85.8 MiB the per-file section measured on a file cut into seven row groups
+instead of this fixture's three. #4988's per-block compression projects 16.4 MiB
 per file, which is where parity is. This is the one number in this measurement
 that argues against shipping the format as prototyped.
 
