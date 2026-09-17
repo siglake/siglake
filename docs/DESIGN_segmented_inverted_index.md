@@ -386,7 +386,20 @@ read in part.
 not. The lookup runs on a blocking thread and hands each range to the async
 side over a channel, one at a time; a range the async side cannot serve comes
 back as `None`, which the reader turns into `Unanswerable`. Nothing is cached
-per lookup: the reader holds the directory and asks for what a term needs.
+per lookup: the reader holds the directory and asks for what a term needs. The
+blocking thread is held for the whole lookup, IO waits included, which is a
+prototype's simplification and not what a shipped version should do — one
+scanned file occupies one thread of tokio's blocking pool for as long as its
+lookup takes.
+
+**The prototype is instrumented apart from the v1 path.** A file answered by a
+segmented sidecar increments
+`siglake_iceberg_segmented_index_used_total{source}` and does *not* touch
+`siglake_iceberg_inverted_index_used_total`, the parsed-index cache counters,
+the `text_index_startup_seconds` stages or the scan's `EXPLAIN`
+`text_index:[…]` attribution — all of which describe loading a whole-file
+index, which this path never does. #4562's harness has to read the segmented
+counters; reading the v1 ones would show a plan that used no index at all.
 
 **What the policy does with the three outcomes.** Only a definitive answer
 prunes. `Declined` is recorded with a reason
