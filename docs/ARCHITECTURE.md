@@ -104,18 +104,32 @@ s3://<bucket>/<prefix> --to <wal-root>` restores from the mirror for DR, in two
 steps: without `--apply` it PLANS — it lists the mirror, reconstructs the
 layout, prints one line per `(tenant, index)` with the segment count, the byte
 total the listing reported, a sample key and the destination it would write,
-and creates nothing under `--to`, `--to` itself included. `--apply` performs
+and creates nothing under `--to`, `--to` itself included. The plan reads the
+body of each candidate it would write and decodes it, so a candidate that is
+not a WAL segment is named, with its reason, before `--apply` rather than in
+the report afterwards; an already-present destination is not read, so a re-run
+does not re-download the mirror. `--apply` performs
 the restore, rebuilding the per-tenant and per-index layout so each segment
 returns to the namespace and table it came from — including the tenant's own
 `sealed/`, the discovery directory the drain enumerates tenants by, which an
 index-only restore would otherwise leave out (#4972); each restored segment is
 written to a temp name, `fsync(2)`ed and renamed under a synced directory
 before it is counted,
-so a restore that reports 400 segments has 400 whole ones on the volume. The
-report carries the counts that separate a finished restore from one that
-understood nothing — segments already present, and keys skipped for a layout
-recovery will not guess at — and exits nonzero when every key was skipped and
-nothing was restored, which is `--from` naming an ancestor of the mirror root.
+so a restore that reports 400 segments has 400 whole ones on the volume. Each
+body has to DECODE as a WAL segment carrying at least one row before it is
+written, sealed and `_active/` alike (#5077): an `_active/` object is listable,
+and stat-able at zero bytes, before its body lands on any store whose PUT is
+not atomic, and restoring that published a zero-byte sealed segment the drain
+could not read. A body that does not decode is counted apart from `pulled`, in
+`unreadable` and `siglake_wal_recover_unreadable_total`, named in the output,
+and left in the mirror — nothing is created for it, and nothing is quarantined,
+because the command writes only under `--to`. A flushed prefix whose final
+Arrow IPC message is torn still restores: that is the case the active mirror is
+built around. The report carries the counts that separate a finished restore
+from one that understood nothing — segments already present, unreadable
+candidates, and keys skipped for a layout recovery will not guess at — and
+exits nonzero when every key was skipped and nothing was restored, which is
+`--from` naming an ancestor of the mirror root.
 
 The same listing decides whether `--from` IS the mirror root, from the two
 markers siglake writes at a fixed depth under it: a first component `_active`

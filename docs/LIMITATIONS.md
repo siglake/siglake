@@ -1138,7 +1138,16 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   before it, leaves the original bytes intact, and reports the discarded tail
   through a warning and `siglake_wal_partial_tail_dropped_total`. A partial
   without one complete batch still fails decoding; complete sealed frames and
-  legacy segments retain their all-or-nothing integrity checks. Every read
+  legacy segments retain their all-or-nothing integrity checks.
+  `wal-recover` puts every candidate through that same decode before it writes
+  (#5077): one that does not yield a row is refused, counted in `unreadable`
+  rather than `pulled`, named in the plan and the report, and left where it is.
+  An `_active/` object is listable, and stat-able at zero bytes, before its
+  body lands on any store whose PUT is not atomic, and it used to become a
+  zero-byte sealed segment the drain then could not read. What is left out is
+  any disposition for the object itself: `wal-recover` writes only under
+  `--to`, so a refused object stays in the mirror, and nothing reclaims
+  `_active/` at all (#4914). Every read
   walks the Arrow IPC length prefixes against the byte count first, so a
   declared length cannot size an allocation the segment cannot back — but the
   file size is the whole of that bound, and in a segment with no frame CRC

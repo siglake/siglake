@@ -176,6 +176,13 @@ zero segment GETs. The two invocations each pay their own LIST, which is the
 one line on the bill the split adds: an apply must decide on the listing that
 is current when it writes, not on the one the plan run saw.
 
+> Amended by #5077: a plan costs one LIST and one GET per candidate it would
+> write. A candidate whose body does not decode as a WAL segment must be
+> refused rather than published, the decode needs the body, and the count
+> belongs in the plan the operator reads before `--apply` rather than in the
+> report after it. Already-present destinations are still not read, so a re-run
+> pays the LIST alone.
+
 The plan is per `(tenant, index)`: segment count, byte total, and a sample key
 with the destination it reconstructs. An operator looking at
 
