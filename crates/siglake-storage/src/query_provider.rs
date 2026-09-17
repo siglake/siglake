@@ -2797,10 +2797,6 @@ async fn scan_output_ordering(
                     .iter()
                     .filter(|plan| plan.iter().any(|c| !matches!(c, OrderedCluster::Run(_))))
                     .count();
-                for _ in 0..overlap_partition_count {
-                    metrics::counter!("siglake_query_scan_ordered_merge_partitions_total")
-                        .increment(1);
-                }
                 *task_partitions = parts
                     .into_iter()
                     .map(|p| p.into_iter().map(|(t, _)| t).collect())
@@ -2885,6 +2881,15 @@ async fn scan_output_ordering(
         );
     };
     debug_assert_eq!(col.index(), idx);
+    // Charged once the plan is known to be advertised, not where the
+    // arrangement is built: a plan the global-fan-in gate above refuses, or one
+    // put back to its singleton partitions, runs no merge at all, and counting
+    // its clusters overstated ordered merge planning (#4366). The restored
+    // singleton case reads zero here because `overlap_partition_count` is reset
+    // along with the partitioning.
+    for _ in 0..overlap_partition_count {
+        metrics::counter!("siglake_query_scan_ordered_merge_partitions_total").increment(1);
+    }
     metrics::counter!(
         "siglake_query_scan_output_ordering_total",
         "outcome" => "advertised"

@@ -12,10 +12,10 @@ use std::sync::Arc;
 use chrono::{Duration, TimeZone, Utc};
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::SessionContext;
-use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use siglake_core::Event;
 use siglake_storage::iceberg::IcebergContext;
-use siglake_storage::{OrderedScanLimit, PreferredScanOrder};
+use siglake_storage::{OrderedMergeGlobalBudget, OrderedScanLimit, PreferredScanOrder};
 
 type SnapshotVec = Vec<(
     metrics_util::CompositeKey,
@@ -23,6 +23,21 @@ type SnapshotVec = Vec<(
     Option<metrics::SharedString>,
     DebugValue,
 )>;
+
+const MERGE_PARTITIONS: &str = "siglake_query_scan_ordered_merge_partitions_total";
+
+/// One recorder per process — `install` refuses a second — and one planned
+/// query at a time under it: the coalesce test asserts the merge counter MOVED
+/// and the restored-singleton test asserts it stayed at ZERO, and both read the
+/// same process-wide counter. `Snapshotter::snapshot` drains the registry, so
+/// each gate holder's snapshot covers only its own planning.
+static METRICS: std::sync::LazyLock<(tokio::sync::Mutex<()>, Snapshotter)> =
+    std::sync::LazyLock::new(|| {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        recorder.install().expect("install debugging recorder");
+        (tokio::sync::Mutex::new(()), snapshotter)
+    });
 
 fn counter_sum(snapshot: &SnapshotVec, name: &str) -> u64 {
     snapshot
@@ -107,9 +122,9 @@ fn collect_ts(batches: Vec<arrow_array::RecordBatch>) -> Vec<i64> {
 
 #[tokio::test]
 async fn small_limit_browse_coalesces_singleton_partitions_into_one_merge() {
-    let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    recorder.install().expect("install debugging recorder");
+    let (gate, snapshotter) = &*METRICS;
+    let _held = gate.lock().await;
+    snapshotter.snapshot();
 
     let (_tmp, ice) = overlapping_files(8).await;
     let ctx = browse_context(8, 100);
@@ -150,18 +165,71 @@ async fn small_limit_browse_coalesces_singleton_partitions_into_one_merge() {
     // merged, not concatenated. Pre-fix this counter stayed at 0 (the tuning
     // record's `ordered_merge_overlap_partitions=0`).
     assert!(
-        counter_sum(
-            &snapshot,
-            "siglake_query_scan_ordered_merge_partitions_total"
-        ) > 0,
+        counter_sum(&snapshot, MERGE_PARTITIONS) > 0,
         "the coalesced partition must plan an overlap merge"
+    );
+}
+
+/// #4366: the same browse under a global fan-in budget the coalesced merge
+/// cannot fit keeps (restores) its singleton partitions, so it runs no merge —
+/// and must not report one. Pre-fix the counter was charged inside the
+/// arrangement loop, before the restore, and read 1 here.
+#[tokio::test]
+async fn restored_singleton_browse_reports_no_merge_partition() {
+    let (gate, snapshotter) = &*METRICS;
+    let _held = gate.lock().await;
+    snapshotter.snapshot();
+
+    let (_tmp, ice) = overlapping_files(8).await;
+    let mut state = browse_context(8, 100).state();
+    // The five files mutually overlap, so the coalesced partition needs five
+    // concurrent streams; a budget of two refuses the arrangement.
+    state
+        .config_mut()
+        .set_extension(Arc::new(OrderedMergeGlobalBudget { fan_in: 2 }));
+    let ctx = SessionContext::new_with_state(state);
+    ice.register_with_datafusion(&ctx).await.unwrap();
+
+    let df = ctx
+        .sql("SELECT \"timestamp\" FROM events ORDER BY \"timestamp\" DESC LIMIT 100")
+        .await
+        .unwrap();
+    let plan_str = format!(
+        "{}",
+        displayable(df.clone().create_physical_plan().await.unwrap().as_ref()).indent(true)
+    );
+    // The fallback is the pre-#4353 shape: one partition per file, still
+    // advertised, merged by the SortPreservingMerge above.
+    assert!(
+        plan_str.contains(&format!(
+            "SiglakeIcebergTableScan partitions:[{}]",
+            FILES as usize
+        )),
+        "the refused arrangement must be put back to one partition per file:\n{plan_str}"
+    );
+    assert!(
+        !plan_str.contains("SortExec"),
+        "the restored singleton plan still advertises ordering:\n{plan_str}"
+    );
+
+    assert_eq!(
+        collect_ts(df.collect().await.unwrap()),
+        newest_timestamps(100)
+    );
+
+    assert_eq!(
+        counter_sum(&snapshotter.snapshot().into_vec(), MERGE_PARTITIONS),
+        0,
+        "a plan restored to singleton partitions must not report an overlap merge"
     );
 }
 
 /// The coalesce is for SMALL limits only: a browse past
 /// `SIGLAKE_ORDERED_SINGLE_PARTITION_MAX_LIMIT`'s bucket (here, no
 /// `OrderedScanLimit` at all — the shape `sql.rs` leaves alone) keeps its
-/// per-file scan parallelism.
+/// per-file scan parallelism. Takes no `METRICS` gate: a singleton-only scan
+/// with no fallback in hand leaves the arrangement unbuilt, so it charges no
+/// merge partitions to the other tests' snapshots.
 #[tokio::test]
 async fn ordered_scan_without_a_small_limit_keeps_its_singleton_partitions() {
     let (_tmp, ice) = overlapping_files(8).await;
