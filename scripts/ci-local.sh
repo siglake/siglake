@@ -247,6 +247,14 @@ else
   # none. This executes its revision step against a synthetic tagged checkout
   # under both triggers -- no registry, no image build.
   python3 scripts/check-release-provenance.py >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  # The 2026-09-16 sweep rule: the published tree does not discuss non-OSS
+  # competitors. #4569 cleared one vendor's name and its event-collector
+  # protocol out of sixteen files by hand -- one of them a middleware whose
+  # name reached three published OpenAPI descriptions -- and the sweep that
+  # found them was a grep nobody would think to run again. This reads the files
+  # that ship (the set check-public-tree.py defines) against a maintained
+  # denylist, and takes `vendor-name-ok: <why>` on the line as the exception.
+  python3 scripts/check-vendor-names.py >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   # This list and ci.yml's `shell` job are two copies of the same list, and a
   # guard added to only one of them ran nowhere the other looked -- which is how
   # the three guards above it were local-only until 2026-09-07. The check reads

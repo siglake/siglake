@@ -286,6 +286,19 @@ jobs:
       # the whole dump to leave the round's exit status alone. No cluster.
       - name: a failed kind round dumps each pod's logs once
         run: scripts/check-kind-round-diagnostics.sh
+      # The 2026-09-16 sweep rule: the published tree does not discuss non-OSS
+      # competitors. Task #4569 cleared one vendor's name and its
+      # event-collector protocol out of sixteen files by hand -- one of them a
+      # middleware whose name reached three published OpenAPI descriptions --
+      # and the sweep that found them was a one-off grep, so the next comment
+      # written with a competitor's product page open had nothing to stop it.
+      # This reads the files that ship, the set check-public-tree.py defines,
+      # against a maintained denylist of proprietary vendors; the open-source
+      # engines the docs benchmark against are not on it, and a legitimate
+      # mention stays with `vendor-name-ok: <why>` on the line, where review
+      # sees it.
+      - name: the published tree names no proprietary observability vendor
+        run: python3 scripts/check-vendor-names.py
       # The steps above are a hand-maintained copy of scripts/ci-local.sh's
       # `shell` block, and until 2026-09-07 three of them existed only there:
       # the local gate passed, the pull request never ran them, and nothing said
