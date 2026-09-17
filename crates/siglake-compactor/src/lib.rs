@@ -321,6 +321,19 @@ const RETENTION_PAGE_OBJECTS: usize = 512;
 const RETENTION_OBJECT_DELETE_CONCURRENCY: usize = 32;
 const RETENTION_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Maximum NEW mirror-reclamation marks one cycle writes for one WAL directory
+/// (#4913).
+///
+/// The mark runs inline in the per-directory retention sweep, so its catalog
+/// round trips are on the drain's cycle. A segment is marked once per process
+/// (the per-directory cache holds the rest), but the first cycle after the knob
+/// is turned on — or after a restart — sees everything a whole
+/// [`CONSUMER_MAX_RETENTION`] window of commits left in `committed/`. Paging
+/// that turns an unbounded first cycle into a bounded one; the segments past
+/// the page keep their local evidence and are marked on a later cycle, which
+/// arrives long before the ceiling could sweep them unmarked.
+const MIRROR_MARK_PAGE_SEGMENTS: usize = 2_048;
+
 /// Whether the filesystem drain marks the `wal_segments` ledger so committed
 /// retention can reclaim its mirror objects (`SIGLAKE_MIRROR_LEDGER_RECLAIM`).
 ///
@@ -2679,6 +2692,7 @@ impl Compactor {
     /// so a busy multi-tenant deployment still stranded the tail for every
     /// tenant and index that went quiet, and the volume scaled with the rate
     /// that had been running rather than with how idle the system was.
+    ///
     /// In ledger-only reclamation the sweep is also gated on the mark being
     /// durable ([`Self::mark_mirror_ledger_at`]): a `committed/` file is the
     /// local evidence that the segment's rows are in Iceberg, and destroying
@@ -2793,6 +2807,14 @@ impl Compactor {
                     bytes: path.metadata().map(|m| m.len() as i64).unwrap_or(0),
                 });
             }
+        }
+        // Bound the catalog work one cycle can add to the drain. The mark runs
+        // inline in the per-directory sweep, and the first cycle after the knob
+        // is turned on sees every file a whole ceiling's worth of commits left
+        // behind. Segments past the page are marked on later cycles, long
+        // before that ceiling can sweep them unmarked.
+        if pending.len() > MIRROR_MARK_PAGE_SEGMENTS {
+            pending.truncate(MIRROR_MARK_PAGE_SEGMENTS);
         }
         let marked = if pending.is_empty() {
             Vec::new()
@@ -8177,6 +8199,27 @@ mod mirror_ledger_reclaim_tests {
         );
         assert_eq!(plain.run_retention_with(Some(Duration::ZERO)).await, 0);
         assert!(s.store.exists(&s.key).await.unwrap());
+    }
+
+    /// The mark page has to outpace segment creation, or `committed/` would
+    /// grow marks-behind forever; and a whole ceiling's worth of backlog has to
+    /// clear in far fewer cycles than the ceiling itself allows, or the first
+    /// cycle after a restart would sweep unmarked files and call them leaks.
+    #[test]
+    fn the_mark_page_outpaces_creation_and_clears_a_full_ceiling() {
+        const DOCUMENTED_EPS: usize = 50_000;
+        const ROWS_PER_SEGMENT: usize = 4_096;
+        let per_second = DOCUMENTED_EPS.div_ceil(ROWS_PER_SEGMENT);
+        assert!(
+            MIRROR_MARK_PAGE_SEGMENTS > per_second * 60,
+            "one page must cover a minute of the documented creation rate"
+        );
+        let ceiling_backlog = per_second * CONSUMER_MAX_RETENTION.as_secs() as usize;
+        let cycles = ceiling_backlog.div_ceil(MIRROR_MARK_PAGE_SEGMENTS);
+        assert!(
+            cycles < 60,
+            "a full ceiling's backlog must clear in {cycles} cycles, not a ceiling's worth"
+        );
     }
 
     #[test]
