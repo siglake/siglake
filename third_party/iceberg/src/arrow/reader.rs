@@ -37,6 +37,7 @@ use arrow_string::like::starts_with;
 use bytes::Bytes;
 use fnv::FnvHashSet;
 use futures::future::BoxFuture;
+use siglake_index::segmented::SegmentedDirectory;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
@@ -2828,6 +2829,7 @@ impl ArrowReader {
                 &row_counts,
                 selected_row_groups.as_deref(),
                 spec,
+                cache_bypass,
             )
             .await?;
             let (rows, resident_bytes) = match outcome {
@@ -2866,8 +2868,15 @@ impl ArrowReader {
     /// One segmented lookup over one blob: the range reads run on a blocking
     /// thread ([`siglake_index::segmented::RangeSource`] is synchronous) and
     /// are served from here, one at a time, by
-    /// [`crate::puffin::BlobRangeReader`]. Nothing is cached: the reader holds
-    /// a directory and asks for what a term needs.
+    /// [`crate::puffin::BlobRangeReader`]. The reader holds a directory and
+    /// asks for what a term needs.
+    ///
+    /// The directory itself is held between lookups (#5006,
+    /// [`segmented_directory_cache_get`]), so a repeat lookup on the same
+    /// `(statistics file, blob offset)` reads neither the trailer nor the
+    /// directory; `cache_bypass` skips the cache in both directions, for a
+    /// caller measuring a cold read. Everything below the directory is still
+    /// fetched per lookup, and the cost returned is this lookup's alone.
     async fn segmented_matching_rows(
         file_io: &FileIO,
         statistics_path: &str,
@@ -2875,6 +2884,7 @@ impl ArrowReader {
         row_counts: &[u64],
         groups: Option<&[usize]>,
         spec: &RawPruneSpec,
+        cache_bypass: bool,
     ) -> Result<(SegmentedOutcome, SegmentedReadCost)> {
         let input = file_io.new_input(statistics_path)?;
         let puffin = PuffinReader::new(input);
@@ -2897,11 +2907,17 @@ impl ArrowReader {
             requests,
             counters: Arc::clone(&counters),
         };
+        let offset = blob_metadata.offset();
+        let held = if cache_bypass {
+            None
+        } else {
+            segmented_directory_cache_get(statistics_path, offset)
+        };
         let row_counts = row_counts.to_vec();
         let groups = groups.map(<[usize]>::to_vec);
         let spec = spec.clone();
         let lookup = tokio::task::spawn_blocking(move || {
-            segmented_lookup(source, &row_counts, groups.as_deref(), &spec)
+            segmented_lookup(source, &row_counts, groups.as_deref(), &spec, held)
         });
         // Serve the lookup's reads until it drops the source, which it does by
         // returning — so this ends whether it answered, declined or panicked.
@@ -2913,12 +2929,21 @@ impl ArrowReader {
                 .map(|bytes| bytes.to_vec());
             let _ = reply.send(bytes);
         }
-        let outcome = lookup.await.map_err(|err| {
+        let (outcome, parsed) = lookup.await.map_err(|err| {
             Error::new(
                 ErrorKind::Unexpected,
                 format!("segmented index lookup: {err}"),
             )
         })?;
+        // A directory this lookup parsed is kept whatever the outcome: the
+        // parse is what the next lookup on this blob should not repeat, and a
+        // decline over one file's row groups says nothing about the next
+        // query's.
+        if let Some(directory) = parsed
+            && !cache_bypass
+        {
+            segmented_directory_cache_put(statistics_path, offset, directory);
+        }
         Ok((outcome, counters.cost()))
     }
 
@@ -3597,6 +3622,12 @@ impl SegmentedReadCounters {
 /// range to the async side over a channel. A read the async side could not
 /// serve comes back as `None`, which the segmented reader turns into
 /// `Unanswerable` — a scan, never a wrong answer.
+///
+/// Cloneable so one lookup can hand the same channel to a second open of the
+/// same blob (#5006's fallback when a held directory turns out not to be this
+/// blob's). Both clones read over the one channel and charge the one set of
+/// counters, so the cost stays the lookup's.
+#[derive(Clone)]
 struct PuffinRangeSource {
     len: u64,
     requests: tokio::sync::mpsc::Sender<SegmentedRangeRequest>,
@@ -3638,21 +3669,46 @@ pub(crate) enum SegmentedOutcome {
 /// conclude — a malformed section, a term that does not normalize, a
 /// row-group selection the sidecar cannot serve — declines the file and
 /// leaves an exact scan (or the v1 index) to answer it.
+/// `held` is a directory parsed from this blob by an earlier lookup: the
+/// reader opens on it and reads neither the trailer nor the directory. The
+/// second return is a directory this call parsed, for the caller to hold —
+/// `None` when it opened on `held`.
 fn segmented_lookup(
     source: PuffinRangeSource,
     row_counts: &[u64],
     groups: Option<&[usize]>,
     spec: &RawPruneSpec,
-) -> SegmentedOutcome {
-    let Some(index) = siglake_index::segmented::SegmentedReader::open(source) else {
-        return SegmentedOutcome::Declined("open");
+    held: Option<Arc<siglake_index::segmented::SegmentedDirectory>>,
+) -> (SegmentedOutcome, Option<Arc<SegmentedDirectory>>) {
+    use siglake_index::segmented::SegmentedReader;
+    let opened = match held {
+        // A held directory that is not this blob's is not a reason to decline
+        // the file: read the blob's own, exactly as an unheld one does.
+        Some(directory) => SegmentedReader::open_with_directory(source.clone(), directory)
+            .map(|index| (index, None))
+            .or_else(|| {
+                SegmentedReader::open(source).map(|index| {
+                    let parsed = Arc::clone(index.directory());
+                    (index, Some(parsed))
+                })
+            }),
+        None => SegmentedReader::open(source).map(|index| {
+            let parsed = Arc::clone(index.directory());
+            (index, Some(parsed))
+        }),
+    };
+    let Some((index, parsed)) = opened else {
+        return (SegmentedOutcome::Declined("open"), None);
     };
     // The directory states every group's row count, so a sidecar written for
     // a different row-group layout is refused before it prunes anything —
     // where the v1 path can only compare one stamped `row_group_size` against
-    // the file's groups and accepts a layout whose sizes happen to agree.
+    // the file's groups and accepts a layout whose sizes happen to agree. It
+    // is checked per lookup, held directory or not: the directory describes
+    // the blob, and which Parquet file the blob is being applied to is the
+    // caller's question, not the cache's.
     if !index.matches_row_groups(row_counts) {
-        return SegmentedOutcome::Declined("row_domain");
+        return (SegmentedOutcome::Declined("row_domain"), parsed);
     }
     let resident_bytes = index.resident_bytes();
     let mut matching: Option<Vec<u32>> = None;
@@ -3660,7 +3716,7 @@ fn segmented_lookup(
     if !spec.all_terms.is_empty() {
         let terms: Vec<&str> = spec.all_terms.iter().map(String::as_str).collect();
         let Some(rows) = index.matching_rows_all_in_groups(&terms, groups) else {
-            return SegmentedOutcome::Declined("unanswerable");
+            return (SegmentedOutcome::Declined("unanswerable"), parsed);
         };
         matching = Some(rows);
     }
@@ -3671,7 +3727,7 @@ fn segmented_lookup(
         // answer, a skipped term here would license skipping rows it might
         // have matched: the whole disjunction declines instead.
         let Some(rows) = index.matching_rows_any_in_groups(&terms, groups) else {
-            return SegmentedOutcome::Declined("unanswerable");
+            return (SegmentedOutcome::Declined("unanswerable"), parsed);
         };
         matching = Some(match matching {
             Some(existing) => ArrowReader::intersect_sorted_u32(&existing, &rows),
@@ -3685,7 +3741,7 @@ fn segmented_lookup(
     // per-execution policy decision and belongs with #4375's, not here.
     for substr in &spec.index_substrings {
         let Some(rows) = index.rows_containing_in_groups(substr, groups) else {
-            return SegmentedOutcome::Declined("unanswerable");
+            return (SegmentedOutcome::Declined("unanswerable"), parsed);
         };
         matching = Some(match matching {
             Some(existing) => ArrowReader::intersect_sorted_u32(&existing, &rows),
@@ -3693,13 +3749,14 @@ fn segmented_lookup(
         });
     }
 
-    match matching {
+    let outcome = match matching {
         Some(rows) => SegmentedOutcome::Matching {
             rows,
             resident_bytes,
         },
         None => SegmentedOutcome::Declined("no_hints"),
-    }
+    };
+    (outcome, parsed)
 }
 
 /// Build the map of parquet field id to Parquet column index in the schema.
@@ -5169,6 +5226,254 @@ fn parsed_index_cache_put(key: ParsedIndexKey, index: Arc<siglake_index::Inverte
         .put(key, index, max_bytes, max_entries);
 }
 
+// ---------------------------------------------------------------------------
+// siglake #5006: parsed segmented directories.
+//
+// A third cache beside the two above, and deliberately separate from both: it
+// holds neither a parsed index (`parsed_index_cache_*`) nor blob bytes
+// (`puffin_blob_cache_*`) but the directory of a segmented sidecar — ~1.0 MiB
+// for a 7.34M-row file, against 526 MiB parsed and 85.8 MiB of blob for the
+// same file (`docs/DESIGN_segmented_inverted_index.md`). Its budget is its
+// own, it is not part of `text_index_cache_max_bytes_in_force`, and nothing
+// the query pool subtracts changes: the segmented path is a 0.2.0 prototype
+// that runs only under `SIGLAKE_SEGMENTED_INDEX_READS`, so a packaged process
+// never reaches this cache and never retains a byte in it.
+// ---------------------------------------------------------------------------
+
+/// A segmented directory's identity: the statistics file and the blob's offset
+/// within it. A Puffin blob at an offset is written once, so an entry can
+/// never go stale — as with [`ParsedIndexKey::Puffin`], it is dropped only by
+/// the byte bound.
+type SegmentedDirectoryKey = (String, u64);
+
+struct SegmentedDirectoryEntry {
+    directory: Arc<SegmentedDirectory>,
+    /// [`SegmentedDirectory::resident_bytes`] plus the key's own heap — what
+    /// this entry costs the budget.
+    size: usize,
+    /// Lookups served since it was parsed. Diagnostics, read through
+    /// [`segmented_directory_cache_footprint`]: what #4562 needs to tell a
+    /// warm arm from a cold one.
+    hits: u64,
+}
+
+#[derive(Default)]
+struct SegmentedDirectoryCacheInner {
+    order: VecDeque<SegmentedDirectoryKey>,
+    map: HashMap<SegmentedDirectoryKey, SegmentedDirectoryEntry>,
+    bytes: usize,
+    evictions: u64,
+    oversized_skips: u64,
+}
+
+impl SegmentedDirectoryCacheInner {
+    fn get(&mut self, key: &SegmentedDirectoryKey) -> Option<Arc<SegmentedDirectory>> {
+        let hit = self.map.get_mut(key).map(|entry| {
+            entry.hits += 1;
+            Arc::clone(&entry.directory)
+        })?;
+        // Least-recently-used: a plan whose directories exceed the budget
+        // keeps the files it is querying rather than the ones it opened first.
+        if let Some(position) = self.order.iter().position(|entry| entry == key) {
+            let key = self.order.remove(position).expect("position is in range");
+            self.order.push_back(key);
+        }
+        Some(hit)
+    }
+
+    fn put(
+        &mut self,
+        key: SegmentedDirectoryKey,
+        directory: Arc<SegmentedDirectory>,
+        max_bytes: usize,
+    ) {
+        let size = directory.resident_bytes() + key.0.len() + std::mem::size_of_val(&key);
+        // One directory larger than the whole budget would evict everything
+        // and then be evicted itself: leave that file to open per lookup.
+        if size > max_bytes {
+            self.oversized_skips += 1;
+            record_segmented_directory_dropped(SEGMENTED_DIRECTORY_DROP_OVERSIZED);
+            return;
+        }
+        if self.map.contains_key(&key) {
+            return;
+        }
+        self.map.insert(key.clone(), SegmentedDirectoryEntry {
+            directory,
+            size,
+            hits: 0,
+        });
+        self.order.push_back(key);
+        self.bytes += size;
+        while self.bytes > max_bytes {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.map.remove(&evicted) {
+                self.bytes -= entry.size;
+                self.evictions += 1;
+                record_segmented_directory_dropped(SEGMENTED_DIRECTORY_DROP_BYTE_BOUND);
+            }
+        }
+        // Published where the bound is enforced, apart from the two shipped
+        // caches' gauges: #4562 compares a warm arm against a cold one and has
+        // to be able to say what the warm one cost in memory.
+        metrics::gauge!("siglake_iceberg_segmented_index_directory_cache_bytes")
+            .set(self.bytes as f64);
+        metrics::gauge!("siglake_iceberg_segmented_index_directory_cache_max_bytes")
+            .set(max_bytes as f64);
+    }
+}
+
+const SEGMENTED_DIRECTORY_CACHE_HIT: &str = "hit";
+const SEGMENTED_DIRECTORY_CACHE_MISS: &str = "miss";
+
+/// Both `outcome` values of
+/// `siglake_iceberg_segmented_index_directory_cache_lookups_total`. Neither is
+/// recorded while retention is off — an absent series is how a round reads a
+/// zero budget.
+pub const SEGMENTED_DIRECTORY_CACHE_OUTCOMES: &[&str] = &[
+    SEGMENTED_DIRECTORY_CACHE_HIT,
+    SEGMENTED_DIRECTORY_CACHE_MISS,
+];
+
+const SEGMENTED_DIRECTORY_DROP_BYTE_BOUND: &str = "byte_bound";
+const SEGMENTED_DIRECTORY_DROP_OVERSIZED: &str = "oversized";
+
+/// Every `reason` value of
+/// `siglake_iceberg_segmented_index_directory_cache_evictions_total`.
+pub const SEGMENTED_DIRECTORY_CACHE_DROP_REASONS: &[&str] = &[
+    SEGMENTED_DIRECTORY_DROP_BYTE_BOUND,
+    SEGMENTED_DIRECTORY_DROP_OVERSIZED,
+];
+
+fn record_segmented_directory_lookup(outcome: &'static str) {
+    metrics::counter!(
+        "siglake_iceberg_segmented_index_directory_cache_lookups_total",
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+fn record_segmented_directory_dropped(reason: &'static str) {
+    metrics::counter!(
+        "siglake_iceberg_segmented_index_directory_cache_evictions_total",
+        "reason" => reason
+    )
+    .increment(1);
+}
+
+static SEGMENTED_DIRECTORY_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<SegmentedDirectoryCacheInner>,
+> = std::sync::OnceLock::new();
+
+/// A 7.34M-row file's directory is ~1.0 MiB, so this holds the directories of
+/// about sixty large compacted files — a whole plan's worth, which is the
+/// point: the working set the two shipped caches cannot hold is exactly what
+/// this format is for. It is an experimental budget, not a packaged one:
+/// nothing consults this cache unless `SIGLAKE_SEGMENTED_INDEX_READS` is set,
+/// so with the prototype off the process retains nothing here whatever this
+/// says, and the query pool's accounting is unchanged.
+const DEFAULT_SEGMENTED_DIRECTORY_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Byte bound on the segmented-directory cache. `0` disables retention: every
+/// lookup then reads the trailer and the directory, which is what #4561
+/// measured. There is no entry bound — a directory's size is counted with its
+/// key, so the byte bound governs the entry count too.
+fn segmented_directory_cache_max_bytes() -> usize {
+    segmented_directory_cache_max_bytes_from(
+        std::env::var("SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn segmented_directory_cache_max_bytes_from(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_SEGMENTED_DIRECTORY_CACHE_MAX_BYTES)
+}
+
+fn segmented_directory_cache() -> &'static std::sync::Mutex<SegmentedDirectoryCacheInner> {
+    SEGMENTED_DIRECTORY_CACHE
+        .get_or_init(|| std::sync::Mutex::new(SegmentedDirectoryCacheInner::default()))
+}
+
+/// What the segmented-directory cache holds and what it has thrown away.
+/// Whole-cache numbers, like [`ParsedIndexCacheFootprint`]: the bound is
+/// enforced across every warehouse in the process. Diagnostics for tests and
+/// local measurement — not a metric, and not exported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SegmentedDirectoryCacheFootprint {
+    /// Directories resident now.
+    pub entries: usize,
+    /// What they cost the budget — the memory a warm segmented arm spends,
+    /// which #4562 reports beside the bytes its lookups fetched.
+    pub bytes: usize,
+    /// Lookups served by a held directory since the process started.
+    pub hits: u64,
+    /// Entries dropped by the byte bound.
+    pub evictions: u64,
+    /// Directories never admitted because one exceeded the whole budget.
+    pub oversized_skips: u64,
+}
+
+/// A snapshot of [`SegmentedDirectoryCacheFootprint`].
+pub fn segmented_directory_cache_footprint() -> SegmentedDirectoryCacheFootprint {
+    let cache = segmented_directory_cache().lock().unwrap();
+    SegmentedDirectoryCacheFootprint {
+        entries: cache.map.len(),
+        bytes: cache.bytes,
+        hits: cache.map.values().map(|entry| entry.hits).sum(),
+        evictions: cache.evictions,
+        oversized_skips: cache.oversized_skips,
+    }
+}
+
+/// How many directories are held for statistics files whose path contains
+/// `path_substring`, and how many lookups they have served since they were
+/// parsed. Per-warehouse where [`segmented_directory_cache_footprint`] is
+/// process-global: a test asserting its own second lookup was warm cannot use
+/// a counter every other test in the process contributes to. Reading this is
+/// not a lookup and does not renew an entry.
+pub fn segmented_directory_cache_stats(path_substring: &str) -> (usize, u64) {
+    segmented_directory_cache()
+        .lock()
+        .unwrap()
+        .map
+        .iter()
+        .filter(|((path, _), _)| path.contains(path_substring))
+        .fold((0, 0), |(entries, hits), (_, entry)| {
+            (entries + 1, hits + entry.hits)
+        })
+}
+
+fn segmented_directory_cache_get(path: &str, offset: u64) -> Option<Arc<SegmentedDirectory>> {
+    if segmented_directory_cache_max_bytes() == 0 {
+        return None;
+    }
+    let hit = segmented_directory_cache()
+        .lock()
+        .unwrap()
+        .get(&(path.to_string(), offset));
+    record_segmented_directory_lookup(if hit.is_some() {
+        SEGMENTED_DIRECTORY_CACHE_HIT
+    } else {
+        SEGMENTED_DIRECTORY_CACHE_MISS
+    });
+    hit
+}
+
+fn segmented_directory_cache_put(path: &str, offset: u64, directory: Arc<SegmentedDirectory>) {
+    let max_bytes = segmented_directory_cache_max_bytes();
+    if max_bytes == 0 {
+        return;
+    }
+    segmented_directory_cache()
+        .lock()
+        .unwrap()
+        .put((path.to_string(), offset), directory, max_bytes);
+}
+
 /// ArrowFileReader is a wrapper around a FileRead that impls parquets AsyncFileReader.
 pub struct ArrowFileReader {
     meta: FileMetadata,
@@ -5437,8 +5742,13 @@ mod tests {
     use crate::ErrorKind;
 
     use crate::arrow::reader::{
-        CollectFieldIdVisitor, PARQUET_FIELD_ID_META_KEY, ParquetReadOptions, RawPruneSpec,
-        SegmentedOutcome, segmented_index_reads_from,
+        CollectFieldIdVisitor, DEFAULT_SEGMENTED_DIRECTORY_CACHE_MAX_BYTES,
+        PARQUET_FIELD_ID_META_KEY, ParquetReadOptions, RawPruneSpec, SegmentedDirectory,
+        SegmentedDirectoryCacheInner, SegmentedOutcome, SegmentedReadCost,
+        parsed_inverted_index_cache_stats, puffin_blob_cache_stats,
+        segmented_directory_cache_footprint,
+        segmented_directory_cache_max_bytes_from, segmented_directory_cache_put,
+        segmented_directory_cache_stats, segmented_index_reads_from,
     };
     use siglake_index::segmented::{SEGMENTED_BLOB_TYPE, SEGMENTED_FORMAT_PROPERTY};
     use crate::arrow::{ArrowReader, ArrowReaderBuilder};
@@ -9733,6 +10043,7 @@ message schema {
             &row_counts(20_000, 5_000),
             None,
             &all_terms_spec(&["rareneedle"]),
+            true,
         )
         .await
         .unwrap();
@@ -9766,6 +10077,284 @@ message schema {
             "resident {resident_bytes} against a parsed v1 index of {}",
             v1.heap_size_bytes()
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // siglake #5006: the directory a lookup parsed is held for the next one.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn the_directory_budget_is_resolved_from_its_own_knob() {
+        // Unset or unparseable is the experimental default, not zero: an
+        // unreadable value must not silently turn retention off.
+        assert_eq!(
+            segmented_directory_cache_max_bytes_from(None),
+            DEFAULT_SEGMENTED_DIRECTORY_CACHE_MAX_BYTES
+        );
+        assert_eq!(
+            segmented_directory_cache_max_bytes_from(Some("")),
+            DEFAULT_SEGMENTED_DIRECTORY_CACHE_MAX_BYTES
+        );
+        assert_eq!(
+            segmented_directory_cache_max_bytes_from(Some("plenty")),
+            DEFAULT_SEGMENTED_DIRECTORY_CACHE_MAX_BYTES
+        );
+        assert_eq!(
+            segmented_directory_cache_max_bytes_from(Some("-1")),
+            DEFAULT_SEGMENTED_DIRECTORY_CACHE_MAX_BYTES
+        );
+        assert_eq!(segmented_directory_cache_max_bytes_from(Some("0")), 0);
+        assert_eq!(
+            segmented_directory_cache_max_bytes_from(Some(" 1048576 ")),
+            1024 * 1024
+        );
+    }
+
+    /// The acceptance: a second lookup on the same `(statistics file, blob
+    /// offset)` reads neither the trailer nor the directory, and the two
+    /// shipped text-index caches are untouched by either lookup.
+    #[tokio::test]
+    async fn a_second_lookup_on_the_same_blob_reads_no_directory() {
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(20_000);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, 5_000).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let counts = row_counts(20_000, 5_000);
+        let spec = all_terms_spec(&["rareneedle"]);
+
+        // What the open costs on this blob, priced the way #4561's table
+        // prices it: an empty group selection reads the trailer and the
+        // directory and nothing else.
+        let (_, open) = ArrowReader::segmented_matching_rows(
+            &file_io,
+            &path,
+            &blob,
+            &counts,
+            Some(&[]),
+            &spec,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(open.reads, 2);
+
+        let (cold, cold_cost) = ArrowReader::segmented_matching_rows(
+            &file_io, &path, &blob, &counts, None, &spec, false,
+        )
+        .await
+        .unwrap();
+        let (warm, warm_cost) = ArrowReader::segmented_matching_rows(
+            &file_io, &path, &blob, &counts, None, &spec, false,
+        )
+        .await
+        .unwrap();
+
+        let (
+            SegmentedOutcome::Matching {
+                rows: cold_rows,
+                resident_bytes: cold_resident,
+            },
+            SegmentedOutcome::Matching {
+                rows: warm_rows,
+                resident_bytes: warm_resident,
+            },
+        ) = (cold, warm)
+        else {
+            panic!("both lookups answer");
+        };
+        assert_eq!(cold_rows, warm_rows, "the same answer, warm");
+        assert_eq!(
+            warm_cost.reads,
+            cold_cost.reads - open.reads,
+            "the warm lookup read the term's ranges and nothing else"
+        );
+        assert_eq!(warm_cost.bytes, cold_cost.bytes - open.bytes);
+        // The resident cost does not disappear when it is paid once: both
+        // lookups report it, which is what #4562's warm arm reports as memory.
+        assert_eq!(warm_resident, cold_resident);
+        assert!(warm_resident > 0);
+        assert_eq!(segmented_directory_cache_stats(&path), (1, 1));
+
+        // A bypassing lookup neither reads the held directory nor adds one.
+        let (_, bypassed) = ArrowReader::segmented_matching_rows(
+            &file_io, &path, &blob, &counts, None, &spec, true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bypassed.reads, cold_cost.reads);
+        assert_eq!(segmented_directory_cache_stats(&path), (1, 1));
+
+        // And this path spends none of the two shipped caches' budgets: it
+        // holds no parsed index and no blob bytes.
+        assert_eq!(parsed_inverted_index_cache_stats(&path), (0, 0));
+        let (blob_entries, blob_bytes, _) = puffin_blob_cache_stats(&path);
+        assert_eq!((blob_entries, blob_bytes), (0, 0));
+    }
+
+    /// Two sidecars are two entries: a held directory answers for the blob it
+    /// was parsed from and no other.
+    #[tokio::test]
+    async fn held_directories_are_per_blob_identity() {
+        let first_dir = TempDir::new().unwrap();
+        let second_dir = TempDir::new().unwrap();
+        let first_rows = segmented_corpus(4_000);
+        let second_rows = segmented_corpus(2_000);
+        let (first_io, first_path) = write_mixed_sidecar(&first_dir, &first_rows, 1_000).await;
+        let (second_io, second_path) = write_mixed_sidecar(&second_dir, &second_rows, 500).await;
+        let first_blob = sidecar_blob(&first_io, &first_path, SEGMENTED_BLOB_TYPE).await;
+        let second_blob = sidecar_blob(&second_io, &second_path, SEGMENTED_BLOB_TYPE).await;
+        let spec = all_terms_spec(&["rareneedle"]);
+        let v1_first =
+            siglake_index::InvertedIndex::from_rows(first_rows.iter().map(String::as_str));
+        let v1_second =
+            siglake_index::InvertedIndex::from_rows(second_rows.iter().map(String::as_str));
+
+        for _ in 0..2 {
+            for (io, path, blob, counts, expected) in [
+                (
+                    &first_io,
+                    &first_path,
+                    &first_blob,
+                    row_counts(4_000, 1_000),
+                    v1_first.postings("rareneedle").unwrap().to_vec(),
+                ),
+                (
+                    &second_io,
+                    &second_path,
+                    &second_blob,
+                    row_counts(2_000, 500),
+                    v1_second.postings("rareneedle").unwrap().to_vec(),
+                ),
+            ] {
+                let (outcome, _) = ArrowReader::segmented_matching_rows(
+                    io, path, blob, &counts, None, &spec, false,
+                )
+                .await
+                .unwrap();
+                let SegmentedOutcome::Matching { rows, .. } = outcome else {
+                    panic!("{path}: {outcome:?}");
+                };
+                assert_eq!(rows, expected, "{path}");
+            }
+        }
+        assert_eq!(segmented_directory_cache_stats(&first_path), (1, 1));
+        assert_eq!(segmented_directory_cache_stats(&second_path), (1, 1));
+
+        // The row domain is re-checked against the caller's file on every
+        // lookup, held directory or not: the directory describes the blob, not
+        // the Parquet file it is being applied to.
+        let (outcome, _) = ArrowReader::segmented_matching_rows(
+            &first_io,
+            &first_path,
+            &first_blob,
+            &[2_000, 2_000],
+            None,
+            &spec,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, SegmentedOutcome::Declined("row_domain")),
+            "{outcome:?}"
+        );
+    }
+
+    /// A held directory that is not this blob's is not a reason to decline the
+    /// file: the lookup reads the blob's own directory and answers.
+    #[tokio::test]
+    async fn a_directory_that_is_not_this_blobs_falls_back_to_reading_it() {
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(4_000);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, 1_000).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let counts = row_counts(4_000, 1_000);
+        let spec = all_terms_spec(&["rareneedle"]);
+        let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
+
+        // A directory parsed from a different blob, planted under this blob's
+        // identity — the shape a mis-keyed or stale entry would have.
+        let other = siglake_index::segmented::encode_from_rows(
+            segmented_corpus(2_000).iter().map(String::as_str),
+            500,
+        );
+        let planted = siglake_index::segmented::SegmentedDirectory::read(
+            &siglake_index::segmented::SliceSource::new(other),
+        )
+        .expect("the fixture blob parses");
+        segmented_directory_cache_put(&path, blob.offset(), Arc::new(planted));
+
+        let (outcome, cost) = ArrowReader::segmented_matching_rows(
+            &file_io, &path, &blob, &counts, None, &spec, false,
+        )
+        .await
+        .unwrap();
+        let SegmentedOutcome::Matching { rows: matching, .. } = outcome else {
+            panic!("the blob's own directory answers: {outcome:?}");
+        };
+        assert_eq!(matching, v1.postings("rareneedle").unwrap().to_vec());
+        assert!(
+            cost.reads >= 2,
+            "it read the trailer and the directory itself: {} reads",
+            cost.reads
+        );
+    }
+
+    /// The budget is enforced by bytes, and one directory larger than the
+    /// whole of it is never admitted. Driven against the cache itself: the
+    /// budget is resolved from the environment, and tests do not set that.
+    #[test]
+    fn the_directory_cache_evicts_by_bytes_and_skips_an_oversized_entry() {
+        fn directory(rows: usize, group_rows: u32) -> Arc<SegmentedDirectory> {
+            let corpus = segmented_corpus(rows);
+            let blob = siglake_index::segmented::encode_from_rows(
+                corpus.iter().map(String::as_str),
+                group_rows,
+            );
+            Arc::new(
+                siglake_index::segmented::SegmentedDirectory::read(
+                    &siglake_index::segmented::SliceSource::new(blob),
+                )
+                .expect("the fixture blob parses"),
+            )
+        }
+
+        let small = directory(1_000, 500);
+        let size = small.resident_bytes();
+        let mut cache = SegmentedDirectoryCacheInner::default();
+        // Room for two entries and not a third.
+        let budget = 2 * (size + "/sidecar-0.puffin".len() + 24) + 16;
+        for index in 0..3 {
+            cache.put(
+                (format!("/sidecar-{index}.puffin"), 0),
+                Arc::clone(&small),
+                budget,
+            );
+        }
+        assert_eq!(cache.map.len(), 2, "the byte bound holds two");
+        assert_eq!(cache.evictions, 1);
+        assert!(cache.bytes <= budget);
+        // Least-recently-used: the one evicted is the one not looked up.
+        assert!(cache.get(&("/sidecar-0.puffin".to_string(), 0)).is_none());
+        assert!(cache.get(&("/sidecar-2.puffin".to_string(), 0)).is_some());
+
+        // One directory larger than the whole budget is left to be read per
+        // lookup rather than evicting everything and then itself.
+        let before = cache.bytes;
+        cache.put(
+            ("/huge.puffin".to_string(), 0),
+            directory(1_000, 500),
+            size / 2,
+        );
+        assert_eq!(cache.oversized_skips, 1);
+        assert_eq!(cache.bytes, before, "nothing admitted, nothing evicted");
+        assert_eq!(cache.evictions, 1);
+
+        // Re-inserting a held key is a no-op, not a second charge.
+        let held = cache.bytes;
+        let entries = cache.map.len();
+        cache.put(("/sidecar-2.puffin".to_string(), 0), small, budget);
+        assert_eq!((cache.bytes, cache.map.len()), (held, entries));
     }
 
     /// What a text predicate costs through the reader's segmented path, per
@@ -9810,10 +10399,11 @@ message schema {
             blob.length(),
             v1.heap_size_bytes()
         );
-        // Every row below includes this prototype's cold open, because nothing
-        // caches an opened reader between files or queries yet. An empty group
-        // selection is a definitive no-match, so it costs the open and nothing
-        // else — which is how the open is priced here.
+        // The `cold` columns below include the open; the `warm` ones are the
+        // same lookup with the directory held (#5006), which is the deployed
+        // cost once a file has been queried once. An empty group selection is
+        // a definitive no-match, so it costs the open and nothing else —
+        // which is how the open is priced here.
         let (_, open) = ArrowReader::segmented_matching_rows(
             &file_io,
             &path,
@@ -9821,6 +10411,7 @@ message schema {
             &counts,
             Some(&[]),
             &all_terms_spec(&["rareneedle"]),
+            true,
         )
         .await
         .unwrap();
@@ -9828,7 +10419,10 @@ message schema {
             "cold open (trailer + directory): {} reads, {} B",
             open.reads, open.bytes
         );
-        println!("shape                 rows      reads     fetched   ÷ blob   resident");
+        println!(
+            "shape                 rows  cold reads  cold fetched   ÷ blob  \
+             warm reads  warm fetched   ÷ blob   resident"
+        );
 
         let shapes: Vec<(&str, RawPruneSpec, Option<&[usize]>)> = vec![
             ("rare", all_terms_spec(&["rareneedle"]), None),
@@ -9860,9 +10454,11 @@ message schema {
 
         for (name, spec, groups) in shapes {
             let (outcome, cost) =
-                ArrowReader::segmented_matching_rows(&file_io, &path, &blob, &counts, groups, &spec)
-                    .await
-                    .unwrap();
+                ArrowReader::segmented_matching_rows(
+                &file_io, &path, &blob, &counts, groups, &spec, true,
+            )
+            .await
+            .unwrap();
             let SegmentedOutcome::Matching {
                 rows: matching,
                 resident_bytes,
@@ -9892,15 +10488,47 @@ message schema {
                 expected.retain(|row| u64::from(*row) >= first_row);
             }
             assert_eq!(matching, expected, "{name}");
+            // The warm arm: the first of these parses the directory and holds
+            // it, the second runs on the held one. Both answer the same rows
+            // as the cold arm, which is asserted before either is reported.
+            let mut warm = SegmentedReadCost::default();
+            for _ in 0..2 {
+                let (outcome, cost) = ArrowReader::segmented_matching_rows(
+                    &file_io, &path, &blob, &counts, groups, &spec, false,
+                )
+                .await
+                .unwrap();
+                let SegmentedOutcome::Matching {
+                    rows: warm_rows, ..
+                } = outcome
+                else {
+                    panic!("{name} warm: {outcome:?}");
+                };
+                assert_eq!(warm_rows, expected, "{name} warm");
+                warm = cost;
+            }
             println!(
-                "{name:<20} {:>8} {:>10} {:>11} {:>7.3}% {:>10}",
+                "{name:<20} {:>8} {:>11} {:>13} {:>7.3}% {:>11} {:>13} {:>7.3}% {:>10}",
                 matching.len(),
                 cost.reads,
                 cost.bytes,
                 100.0 * cost.bytes as f64 / blob.length() as f64,
+                warm.reads,
+                warm.bytes,
+                100.0 * warm.bytes as f64 / blob.length() as f64,
                 resident_bytes
             );
         }
+        let footprint = segmented_directory_cache_footprint();
+        println!(
+            "\ndirectory cache: {} entries, {} B resident, {} hits, {} evictions, \
+             {} oversized",
+            footprint.entries,
+            footprint.bytes,
+            footprint.hits,
+            footprint.evictions,
+            footprint.oversized_skips
+        );
     }
 
     #[tokio::test]
@@ -9914,9 +10542,11 @@ message schema {
         let spec = all_terms_spec(&["queen"]);
 
         let (whole, whole_cost) =
-            ArrowReader::segmented_matching_rows(&file_io, &path, &blob, &counts, None, &spec)
-                .await
-                .unwrap();
+            ArrowReader::segmented_matching_rows(
+                &file_io, &path, &blob, &counts, None, &spec, true,
+            )
+            .await
+            .unwrap();
         let (kept, kept_cost) = ArrowReader::segmented_matching_rows(
             &file_io,
             &path,
@@ -9924,6 +10554,7 @@ message schema {
             &counts,
             Some(&[2, 3]),
             &spec,
+            true,
         )
         .await
         .unwrap();
@@ -9962,6 +10593,7 @@ message schema {
             &counts,
             Some(&[]),
             &spec,
+            true,
         )
         .await
         .unwrap();
@@ -10032,9 +10664,11 @@ message schema {
             }
 
             let (outcome, _) =
-                ArrowReader::segmented_matching_rows(&file_io, &path, &blob, &counts, None, &spec)
-                    .await
-                    .unwrap();
+                ArrowReader::segmented_matching_rows(
+                &file_io, &path, &blob, &counts, None, &spec, true,
+            )
+            .await
+            .unwrap();
             let SegmentedOutcome::Matching { rows: matching, .. } = outcome else {
                 panic!("{spec:?} is answerable: {outcome:?}");
             };
@@ -10066,9 +10700,11 @@ message schema {
             },
         ] {
             let (outcome, _) =
-                ArrowReader::segmented_matching_rows(&file_io, &path, &blob, &counts, None, &spec)
-                    .await
-                    .unwrap();
+                ArrowReader::segmented_matching_rows(
+                &file_io, &path, &blob, &counts, None, &spec, true,
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(outcome, SegmentedOutcome::Declined("unanswerable")),
                 "{spec:?}: {outcome:?}"
@@ -10083,6 +10719,7 @@ message schema {
             &counts,
             None,
             &RawPruneSpec::default(),
+            true,
         )
         .await
         .unwrap();
@@ -10113,7 +10750,7 @@ message schema {
             vec![2_000],
         ] {
             let (outcome, _) = ArrowReader::segmented_matching_rows(
-                &file_io, &path, &blob, &counts, None, &spec,
+                &file_io, &path, &blob, &counts, None, &spec, true,
             )
             .await
             .unwrap();
@@ -10155,6 +10792,7 @@ message schema {
             &row_counts(2_000, 512),
             None,
             &all_terms_spec(&["queen"]),
+            true,
         )
         .await
         .unwrap();
@@ -10185,7 +10823,7 @@ message schema {
         std::fs::write(corrupt.trim_start_matches("file://"), &bytes).unwrap();
 
         let (outcome, _) = ArrowReader::segmented_matching_rows(
-            &file_io, &corrupt, &blob, &counts, None, &spec,
+            &file_io, &corrupt, &blob, &counts, None, &spec, true,
         )
         .await
         .unwrap();
@@ -10215,6 +10853,7 @@ message schema {
             &counts,
             None,
             &spec,
+            true,
         )
         .await
         .unwrap();

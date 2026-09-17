@@ -294,8 +294,11 @@ magic, footer-KV key and Puffin blob type. The scan path can read one —
 uncompressed, by byte range, through `PuffinReader::blob_range_reader`, with
 the sidecar's directory checked against the file's actual row groups and
 anything it cannot conclude falling back to the v1 index or an exact scan
-(#4561) — but only when `SIGLAKE_SEGMENTED_INDEX_READS` is set, and no writer
-produces one, so nothing in this section changes by default.
+(#4561), and the parsed directory held between lookups under a byte budget of
+its own (#5006, `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`, separate
+from the two budgets above) — but only when `SIGLAKE_SEGMENTED_INDEX_READS` is
+set, and no writer produces one, so nothing in this section changes by
+default, and nothing is retained under the new budget either.
 
 **Whether to USE an index is decided per execution.** Loading one is a
 whole-file cost, so a query that wants a handful of rows cannot pay it: a text

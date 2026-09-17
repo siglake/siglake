@@ -9,7 +9,8 @@ behaves exactly as it did. This document is the format decision #4377 needs
 ahead of building postings during a streaming merge, and the specification the
 remaining slices implement: #4560 (the codec, its fixtures and the format's
 open questions — settled below), #4561 (reader integration and bounded partial
-reads — below), #4562 (the measured proceed/revise/reject disposition).
+reads — below), #5006 (the directory held between lookups — below), #4562 (the
+measured proceed/revise/reject disposition).
 
 It exists because the shipped format has one property that cannot be fixed by
 sizing a cache: **it is only readable whole.**
@@ -385,12 +386,53 @@ read in part.
 **The sync/async seam.** `RangeSource` is synchronous and the object store is
 not. The lookup runs on a blocking thread and hands each range to the async
 side over a channel, one at a time; a range the async side cannot serve comes
-back as `None`, which the reader turns into `Unanswerable`. Nothing is cached
-per lookup: the reader holds the directory and asks for what a term needs. The
-blocking thread is held for the whole lookup, IO waits included, which is a
-prototype's simplification and not what a shipped version should do — one
-scanned file occupies one thread of tokio's blocking pool for as long as its
-lookup takes.
+back as `None`, which the reader turns into `Unanswerable`. Below the
+directory nothing is cached: the reader asks for what a term needs, per
+lookup. The blocking thread is held for the whole lookup, IO waits included,
+which is a prototype's simplification and not what a shipped version should
+do — one scanned file occupies one thread of tokio's blocking pool for as long
+as its lookup takes.
+
+### Holding the directory between lookups (#5006)
+
+`SegmentedDirectory` is the parsed directory on its own, split out of
+`SegmentedReader` so a second reader on the same blob can be built from one
+parsed earlier (`SegmentedReader::open_with_directory`). A blob at a Puffin
+offset is written once, so the directory is a pure function of its bytes and
+an entry can no more go stale than a parsed v1 index can; the reader holds
+them in a cache keyed by `(statistics file, blob offset)`, the same write-once
+identity `ParsedIndexKey::Puffin` uses. A repeat lookup then reads neither the
+trailer nor the directory — the two reads and 55,660 bytes the table below
+charges every shape at 1M rows, 474.9 KiB per file at 7.34M.
+
+Four things this deliberately does not do:
+
+- **It holds no per-lookup state.** The channel, the counters and the
+  `BlobRangeReader` are built per lookup and the cost reported
+  (`_range_reads`, `_fetched_bytes`) is that lookup's alone, warm or cold. The
+  resident-byte histogram is recorded on a warm lookup too: the memory a warm
+  arm spends is the thing #4562 is comparing, and it must not vanish from the
+  report because it was paid once.
+- **It does not skip the row-domain check.** `matches_row_groups` runs per
+  lookup against the caller's Parquet metadata. The directory describes the
+  blob; which data file the blob is being applied to is the caller's question,
+  and a held directory must not answer it.
+- **It does not turn a mis-keyed entry into a decline.** A held directory
+  whose blob length is not this blob's is refused by
+  `open_with_directory`, and the lookup reads the blob's own directory as if
+  nothing had been held.
+- **It does not touch the two shipped budgets.**
+  `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES` (default 64 MiB, `0`
+  disables retention) is its own, enforced by bytes with no entry bound, and
+  it is not part of `text_index_cache_max_bytes_in_force()` — the query pool
+  subtracts what it subtracted before. An experimental budget, not a packaged
+  one: nothing consults this cache unless `SIGLAKE_SEGMENTED_INDEX_READS` is
+  set, so a packaged process retains nothing in it whatever the knob says. Its
+  own numbers are
+  `siglake_iceberg_segmented_index_directory_cache_bytes` /
+  `_max_bytes` and
+  `_lookups_total{outcome}` / `_evictions_total{reason}`, and
+  `segmented_directory_cache_footprint()` for a harness.
 
 **The prototype is instrumented apart from the v1 path.** A file answered by a
 segmented sidecar increments
@@ -459,13 +501,14 @@ than the parsed v1 index of the same file. Every row's answer is asserted equal
 to the whole-file index's, restricted to the groups the shape kept, before any
 cost is reported.
 
-**Every row of that table includes the cold open**, because nothing caches an
-opened reader: two reads and 55,660 bytes of trailer and directory, which is
-most of what every point shape fetches here. At the 7.34M-row scale that read
-is 474.9 KiB. The codec-level table's warm column reuses readers across
-executions and is the one to compare a deployed cost against; a reader cache
-keyed by `(statistics file, blob offset)` is the obvious next step and is not
-in this slice — #4562's configuration needs one to measure a warm arm at all.
+**Every row of that table includes the cold open**: two reads and 55,660 bytes
+of trailer and directory, which is most of what every point shape fetches
+here. At the 7.34M-row scale that read is 474.9 KiB. #5006 added the warm
+columns beside them — the same shape with the directory held, which is the
+deployed cost once a file has been queried once, and what the codec-level
+table's warm column measures without the Puffin container. The numbers above
+are #4561's run and predate those columns; re-running
+`report_segmented_reader_read_cost` prints both.
 
 `and_rare_keyword` reads both terms' postings here — `rareneedle` and `queen`
 are both in every row group, so the intersection never empties early — and its
@@ -629,18 +672,21 @@ What remains, in order:
 
 1. ~~**#4561**~~ — done, see [Reader integration](#reader-integration-4561):
    the sub-range read, the `RawPruneSpec` path, the row-domain check and the
-   mixtures. What it left for #4562: nothing caches an opened reader, so every
-   lookup pays the directory read, and no writer produces a sidecar for a real
-   table — the harness builds one.
-2. **#4562** — the six-shape harness with a third arm, cold and warm separately,
+   mixtures.
+2. ~~**#5006**~~ — done, see [Holding the directory between
+   lookups](#holding-the-directory-between-lookups-5006): a repeat lookup on a
+   blob reads no trailer and no directory, under a byte budget of its own.
+   What is still left for #4562: no writer produces a sidecar for a real
+   table, so the harness builds one.
+3. **#4562** — the six-shape harness with a third arm, cold and warm separately,
    under 1 GiB parsed / 256 MiB blob, plus the OFF control; that is where a
    proceed/revise/reject disposition for #4377 comes from.
-3. **A `seg2` question for #4562's disposition** (#4988): per-block compression and a
+4. **A `seg2` question for #4562's disposition** (#4988): per-block compression and a
    per-block posting checksum, which are one decision — both need the block's
    posting span to be the unit the reader fetches whole, and the measured price
    of that is 1.58x the bytes a point lookup fetches per group. What they buy is
    16.4 MiB per file instead of 85.8, and the end of the residual above.
-4. **An open question for #4561**: the substring sweep reads the whole
+5. **An open question for #4561**: the substring sweep reads the whole
    dictionary, and `keyword`-class terms with millions of postings read megabytes
    of posting bytes. Both are regimes where partial reads buy little, and #4375's
    per-execution policy is the place to decline them. The document frequency a
