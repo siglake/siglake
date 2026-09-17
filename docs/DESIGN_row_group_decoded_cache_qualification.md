@@ -68,8 +68,10 @@ x 155,648 rows, each written at the row-group floor
 `MIN_ROW_GROUP_ROWS`), so every file holds group 0 = 131,072 rows and group 1 =
 24,576. Cache 8 GiB / 16,384 entries — the bench rounds' tuning. 4 target
 partitions, batch size 8,192, browse = `… WHERE <predicate> LIMIT 100`, 5
-consecutive executions per arm; `warm` is the median of executions 2-5. Two
-repeat runs agreed within 0.2 ms except where noted.
+consecutive executions per arm; `warm` is the median of executions 2-5. The
+table is one run; two further runs on 2026-09-17 reproduced every arm's warm p50
+within 0.4 ms and every figure in the memory table exactly, so read the
+milliseconds below as +/- 0.4 and the ratios as the ranges given in the text.
 
 Regimes cross two axes. How deep the clip reads: `bound` puts the matching rows
 at the END of a group, so the clip covers group 0 whole; `inside` puts them at
@@ -99,7 +101,8 @@ Three readings.
 
 **Where the clip covers a whole group, the prototype is the only arm that gets
 faster on repetition.** `resid/bound` warm p50 falls from 6.7 ms (whole-file) and
-6.2 ms (no cache) to 2.0 ms, a 3.3x improvement over the shipped policy, and the
+6.2 ms (no cache) to 2.0 ms, a 3.2x improvement over the shipped policy
+(3.1-3.4x across the three runs), and the
 reader's fetched bytes on the warm executions fall from 0.5 MiB to under 0.05
 MiB. The shipped policy in the same regime abandons 4 populations per execution,
 20 over the 5, and leaves the cache empty.
@@ -115,7 +118,7 @@ browse runs in 2.3 ms because the reader's page index skips the pages the
 predicate cannot match (the scan emits ~0 MiB). Both cache arms strip the
 predicate from the read — which is what makes an entry reusable by another
 query — and therefore decode the whole projection: 32.6 MiB emitted, 6.4 ms warm
-for the whole-file policy, **2.6x slower than not caching at all**. The
+for the whole-file policy, **2.8x slower than not caching at all**. The
 prototype recovers to 1.8 ms once populated, slightly under the no-cache arm,
 but only because it has the decoded rows in memory. This cost belongs to the
 cache's design, not to its granularity, and it applies to every convertible
@@ -197,7 +200,7 @@ It does not, on this evidence, earn adoption:
    where they are above it, this change buys a footer read and nothing else.
 2. **The larger effect for a convertible predicate is the stripped predicate,
    not the granularity.** Turning the shipped cache on made a page-prunable
-   browse 2.6x slower than leaving it off. Any decision to adopt row-group
+   browse 2.8x slower than leaving it off. Any decision to adopt row-group
    population should be taken after that cost is either accepted with numbers or
    removed (predicate-carrying entries, or declining to populate when the reader
    would prune).

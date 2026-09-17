@@ -495,7 +495,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   decodes the whole projection instead of the pages the predicate would have
   selected. Measured 2026-09-16 on a local two-row-group fixture (#4847), a
   `LIMIT 100` browse whose `host` predicate converts to an Iceberg predicate ran
-  at 2.3 ms warm with the cache off and 6.4 ms with it on — **2.6x slower for a
+  at 2.3 ms warm with the cache off and 6.4 ms with it on — **2.8x slower for a
   cache that then inserted nothing**. This cost is independent of what the
   entries are keyed on.
   #4847 qualified the row-group-granular alternative locally and the disposition
