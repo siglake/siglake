@@ -1246,6 +1246,45 @@ fn root_evidence(suffix: &str) -> Option<RootEvidence> {
     None
 }
 
+/// Rows in `body` read as a WAL segment, or the reason it is not one.
+///
+/// The check a candidate has to pass before it is written onto the WAL root
+/// (#5077). An `_active/` object is listable, and stat-able at zero bytes,
+/// before its body lands — opendal's `fs` writer creates the target in place
+/// when no `atomic_write_dir` is set, and `build_opendal_operator` sets none —
+/// and any interrupted uploader leaves the same state on any store whose PUT
+/// is not atomic. Restoring that body published a zero-byte SEALED segment
+/// under the drain's nose and counted it pulled.
+///
+/// [`crate::read_segment_from_bytes`] tolerates exactly what the active mirror
+/// is designed around: a flushed prefix whose final IPC message is torn keeps
+/// every complete batch before it. So a body that fails here is a body with no
+/// complete batch at all — an empty object, a tear inside the first message, a
+/// sealed frame whose CRC or length does not hold. A body that decodes to no
+/// rows fails too: the drain would commit it as nothing.
+fn segment_rows(body: &[u8]) -> Result<usize> {
+    let batches = crate::read_segment_from_bytes(body)?;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if rows == 0 {
+        anyhow::bail!("decoded to 0 rows");
+    }
+    Ok(rows)
+}
+
+/// A candidate recovery REFUSED because its body is not a readable WAL
+/// segment, carried out by key so an operator can go and look at the object.
+///
+/// Refuse-and-count, not quarantine: `wal-recover` reads the mirror and writes
+/// only under the local WAL root, so the object is left exactly where it is and
+/// named here instead. Reclaiming `_active/` is #4914's and #5071's work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableCandidate {
+    /// The store key, verbatim.
+    pub key: String,
+    /// What the decode said, for the operator's line.
+    pub reason: String,
+}
+
 /// One `(tenant, index)` destination in a [`RecoveryPlan`]: what would be
 /// written there, and where "there" is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1274,8 +1313,14 @@ pub struct PlanGroup {
 ///
 /// This is the LIST the restore was going to pay for anyway
 /// (`recover_from_object_store` collects every key before it reads one body),
-/// and no segment GET. A separate `--apply` invocation lists again, because it
-/// must decide on the listing that is current when it writes.
+/// plus one GET per candidate it would WRITE: the body check that keeps an
+/// unreadable object from becoming a sealed segment has to read the body, and
+/// an operator reading a plan before an apply is owed that count before the
+/// write, not after it (#5077). Candidates whose destination already exists
+/// are not read: nothing will be written for them, so a re-run of a large
+/// restore does not re-download the mirror. A separate `--apply` invocation
+/// lists again, because it must decide on the listing that is current when it
+/// writes.
 #[derive(Debug, Clone)]
 pub struct RecoveryPlan {
     /// Destinations, ordered by tenant then index.
@@ -1284,6 +1329,13 @@ pub struct RecoveryPlan {
     pub skipped: usize,
     /// One refused key, verbatim.
     pub sample_skipped_key: Option<String>,
+    /// Candidates whose layout was recognised and whose BODY is not a
+    /// readable WAL segment, ordered by key. They are not in `groups` and not
+    /// in the work list: a plan proposes only what an apply would write.
+    ///
+    /// Empty for a [`RootVerdict::Contradicted`] plan, which is refused whole:
+    /// no body is read, because no body would be written.
+    pub unreadable: Vec<UnreadableCandidate>,
     /// What the listing says about `--from` being the mirror root.
     pub verdict: RootVerdict,
     /// The objects to fetch, keyed by store key — an apply's work list.
@@ -1332,6 +1384,11 @@ impl RecoveryPlan {
 /// itself: creating it is a visible change on a volume the operator may be
 /// inspecting, and a plan that changes the thing it is describing is not a
 /// checkpoint.
+///
+/// Each candidate that would be WRITTEN is read once and decoded
+/// ([`segment_rows`]); the ones that are not WAL segments go to
+/// [`RecoveryPlan::unreadable`] and out of the plan's groups, so what the plan
+/// proposes is what an apply would publish.
 pub async fn plan_recovery(op: &Operator, prefix: &str, wal_root: &Path) -> Result<RecoveryPlan> {
     use futures::stream::StreamExt;
 
@@ -1422,8 +1479,27 @@ pub async fn plan_recovery(op: &Operator, prefix: &str, wal_root: &Path) -> Resu
     let mut by_dest: std::collections::BTreeMap<(String, Option<String>), PlanGroup> =
         std::collections::BTreeMap::new();
     let mut work: Vec<(String, RecoveryTarget)> = Vec::with_capacity(candidates.len());
+    let mut unreadable: Vec<UnreadableCandidate> = Vec::new();
+    // A contradicted listing is refused whole by `apply_plan`, so reading its
+    // bodies would buy an operator nothing and cost a GET per key.
+    let check_bodies = !matches!(verdict, RootVerdict::Contradicted { .. });
     for (key, bytes, target) in candidates.into_values() {
         let dest = wal_root.join(&target.rel);
+        if check_bodies && !dest.exists() {
+            let body = op.read(&key).await.with_context(|| format!("GET {key}"))?;
+            if let Err(e) = segment_rows(&body.to_bytes()) {
+                tracing::warn!(
+                    key = %key,
+                    error = %format!("{e:#}"),
+                    "wal-recover: candidate body is not a readable WAL segment, refused"
+                );
+                unreadable.push(UnreadableCandidate {
+                    key,
+                    reason: format!("{e:#}"),
+                });
+                continue;
+            }
+        }
         let group = by_dest
             .entry((target.tenant.clone(), target.index.clone()))
             .or_insert_with(|| PlanGroup {
@@ -1450,10 +1526,16 @@ pub async fn plan_recovery(op: &Operator, prefix: &str, wal_root: &Path) -> Resu
     // Stable order for the apply too, so two runs of the same plan write in
     // the same sequence.
     work.sort_by(|a, b| a.0.cmp(&b.0));
+    unreadable.sort_by(|a, b| a.key.cmp(&b.key));
+    if !unreadable.is_empty() {
+        metrics::counter!("siglake_wal_recover_unreadable_total")
+            .increment(unreadable.len() as u64);
+    }
     Ok(RecoveryPlan {
         groups: by_dest.into_values().collect(),
         skipped,
         sample_skipped_key,
+        unreadable,
         verdict,
         candidates: work,
     })
@@ -1466,9 +1548,10 @@ pub async fn plan_recovery(op: &Operator, prefix: &str, wal_root: &Path) -> Resu
 /// pull zero segments, so reporting only that number turns "nothing
 /// understood" into "nothing to do" — which is what pointing `--from`
 /// one component above the mirror root produces (#4928). `skipped` is the
-/// keys [`recovery_target`] refuses. Neither an already-present destination
-/// nor the active copy of a segment also held sealed is a skip: both mean the
-/// segment is on the WAL root.
+/// keys [`recovery_target`] refuses on their LAYOUT; `unreadable` is the ones
+/// whose layout was fine and whose body is not a WAL segment. Neither an
+/// already-present destination nor the active copy of a segment also held
+/// sealed is a skip: both mean the segment is on the WAL root.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoverySummary {
     /// Segments written onto the WAL root by this pass, each one fsynced
@@ -1479,9 +1562,16 @@ pub struct RecoverySummary {
     /// Recognised segments whose destination already existed, so this pass
     /// left them alone.
     pub already_present: usize,
+    /// Recognised candidates whose BODY is not a readable WAL segment, so this
+    /// pass wrote nothing for them and left the object in the mirror (#5077).
+    /// Counted apart from `pulled` because a zero-byte `_active/` object
+    /// published as a sealed segment is a hole the drain finds, not a restore.
+    pub unreadable: usize,
     /// One refused key, verbatim, so a caller can show the operator what the
     /// layout under `--from` actually looked like.
     pub sample_skipped_key: Option<String>,
+    /// One unreadable candidate's key, verbatim.
+    pub sample_unreadable_key: Option<String>,
 }
 
 /// Disaster-recovery helper: pull every WAL segment under `<prefix>/` in the
@@ -1519,6 +1609,15 @@ pub struct RecoverySummary {
 /// they end in `.arrow.partial`. A sealed copy always wins over an active one:
 /// the active object is a flushed prefix of the same segment, so taking both
 /// would duplicate its rows.
+///
+/// Every candidate's body has to DECODE as a WAL segment with at least one row
+/// before it is written (#5077): an `_active/` object is listable, and
+/// stat-able at zero bytes, before its body lands on any store whose PUT is not
+/// atomic, and restoring that published a zero-byte sealed segment the drain
+/// then failed to read — reported as pulled. A body that does not decode is
+/// counted in `unreadable`, named in the log, and left in the mirror; nothing
+/// is created for it. A flushed prefix whose final IPC message is torn still
+/// restores: that is the case the active mirror is built around.
 ///
 /// Every segment it counts is durable (#3149): the body goes to a `.tmp`
 /// sibling, is fsynced, is renamed onto its final name and the `sealed/`
@@ -1563,32 +1662,45 @@ pub async fn apply_plan(
     let mut summary = RecoverySummary {
         skipped: plan.skipped,
         sample_skipped_key: plan.sample_skipped_key.clone(),
+        unreadable: plan.unreadable.len(),
+        sample_unreadable_key: plan.unreadable.first().map(|u| u.key.clone()),
         ..RecoverySummary::default()
     };
 
     crate::create_wal_dir(wal_root).with_context(|| format!("create {}", wal_root.display()))?;
     for (key, target) in plan.candidates {
         let dest = wal_root.join(&target.rel);
-        // BEFORE the already-present skip, because the skip is the path a
-        // re-run takes over a restore that landed the segments and not this
-        // directory — and that restore is the invisible one. Repairing it
-        // costs one `is_dir` per candidate on the common path.
-        if let Some(discovery) = &target.discovery {
-            let discovery = wal_root.join(discovery);
-            if !discovery.is_dir() {
-                crate::create_wal_dir(&discovery)
-                    .with_context(|| format!("create {}", discovery.display()))?;
-                tracing::info!(
-                    dir = %discovery.display(),
-                    "wal-recover: created the tenant discovery dir the drain enumerates on"
-                );
-            }
-        }
         if dest.exists() {
+            // The discovery-dir repair runs on this path too, because the
+            // already-present skip is the path a re-run takes over a restore
+            // that landed the segments and not that directory — and that
+            // restore is the invisible one (#4972). It costs one `is_dir`.
+            ensure_discovery_dir(wal_root, &target)?;
             summary.already_present += 1;
             tracing::debug!(dest = %dest.display(), "wal-recover: already present, skipping");
             continue;
         }
+        let bs = op.read(&key).await.with_context(|| format!("GET {key}"))?;
+        let body = bs.to_bytes();
+        // The plan read this body too, and it read it EARLIER: an `_active/`
+        // object re-PUT in between is listable at zero bytes while its body
+        // lands, so the bytes about to be published are the ones that have to
+        // decode. Before the directories, so a refused candidate leaves no
+        // `.tmp`, no `sealed/` and no discovery dir behind it (#5077).
+        if let Err(e) = segment_rows(&body) {
+            summary.unreadable += 1;
+            summary
+                .sample_unreadable_key
+                .get_or_insert_with(|| key.clone());
+            metrics::counter!("siglake_wal_recover_unreadable_total").increment(1);
+            tracing::warn!(
+                key = %key,
+                error = %format!("{e:#}"),
+                "wal-recover: candidate body is not a readable WAL segment, nothing written"
+            );
+            continue;
+        }
+        ensure_discovery_dir(wal_root, &target)?;
         let Some(parent) = dest.parent() else {
             anyhow::bail!(
                 "restored segment {} has no parent directory",
@@ -1596,8 +1708,6 @@ pub async fn apply_plan(
             );
         };
         crate::create_wal_dir(parent).with_context(|| format!("create {}", parent.display()))?;
-        let bs = op.read(&key).await.with_context(|| format!("GET {key}"))?;
-        let body = bs.to_bytes();
         // Temp sibling, fsync, rename, fsync the directory — the same ordering
         // the seal uses for the same reason. A `.tmp` left by an interrupted
         // run is invisible to the drain (it scans for `.arrow`) and is
@@ -1617,6 +1727,26 @@ pub async fn apply_plan(
         );
     }
     Ok(summary)
+}
+
+/// Create the tenant's own `sealed/` — the discovery directory
+/// `list_tenant_dirs` enumerates tenants by — when restoring `target` needs one
+/// that is not there (#4972). Durable like the rest of the restore: the new
+/// component's parent is fsynced before anything under it is published.
+fn ensure_discovery_dir(wal_root: &Path, target: &RecoveryTarget) -> Result<()> {
+    let Some(discovery) = &target.discovery else {
+        return Ok(());
+    };
+    let discovery = wal_root.join(discovery);
+    if discovery.is_dir() {
+        return Ok(());
+    }
+    crate::create_wal_dir(&discovery).with_context(|| format!("create {}", discovery.display()))?;
+    tracing::info!(
+        dir = %discovery.display(),
+        "wal-recover: created the tenant discovery dir the drain enumerates on"
+    );
+    Ok(())
 }
 
 /// Tiny adapter so the lister works the same way it did with
@@ -1690,6 +1820,44 @@ mod tests {
             raw: format!("e{i}"),
             attributes: None,
         }
+    }
+
+    /// Real sealed-segment bytes, `tag` rows of them.
+    ///
+    /// Every recovery fixture needs these now that a candidate whose body does
+    /// not decode is refused instead of published (#5077) — a `b"BODY"`
+    /// fixture is precisely the state the card is about.
+    fn sealed_body(tag: usize) -> bytes::Bytes {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = crate::WalWriter::with_thresholds(
+            tmp.path(),
+            "fixture",
+            tag,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let events: Vec<Event> = (0..tag).map(synth_event).collect();
+        let sealed = writer.append_events(&events).unwrap().expect("seal");
+        bytes::Bytes::from(std::fs::read(&sealed.path).unwrap())
+    }
+
+    /// Real active-mirror bytes: a flushed PARTIAL frame carrying `tag` rows,
+    /// ending on an IPC message boundary — what the active loop uploads.
+    fn active_body(tag: usize) -> bytes::Bytes {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = crate::WalWriter::with_thresholds(
+            tmp.path(),
+            "fixture",
+            1_000_000,
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let events: Vec<Event> = (0..tag).map(synth_event).collect();
+        writer.append_events(&events).unwrap();
+        let snapshot = snapshot_active(&mut writer).expect("a flushed active segment");
+        let body = std::fs::read(&snapshot.path).unwrap();
+        assert_eq!(body.len() as u64, snapshot.bytes, "flushed prefix");
+        bytes::Bytes::from(body)
     }
 
     #[tokio::test]
@@ -2489,12 +2657,12 @@ mod tests {
             "wal-mirror/acme/b.arrow",
             "wal-mirror/acme/orders/c.arrow",
             "wal-mirror/flat.arrow",
-            "wal-mirror/README.md",
         ] {
-            op.write(key, bytes::Bytes::from_static(b"BODY"))
-                .await
-                .unwrap();
+            op.write(key, sealed_body(1)).await.unwrap();
         }
+        op.write("wal-mirror/README.md", bytes::Bytes::from_static(b"BODY"))
+            .await
+            .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wal");
@@ -2508,6 +2676,7 @@ mod tests {
             Some("wal-mirror/README.md")
         );
         assert_eq!(plan.already_present(), 0);
+        assert!(plan.unreadable.is_empty(), "{:?}", plan.unreadable);
         assert_eq!(
             plan.groups
                 .iter()
@@ -2662,10 +2831,10 @@ mod tests {
     #[tokio::test]
     async fn mirror_recovers_flat_legacy_keys_as_the_default_tenant() {
         let op = memory_op();
-        op.write("wal-mirror/a.arrow", bytes::Bytes::from_static(b"AAA"))
+        op.write("wal-mirror/a.arrow", sealed_body(1))
             .await
             .unwrap();
-        op.write("wal-mirror/b.arrow", bytes::Bytes::from_static(b"BBB"))
+        op.write("wal-mirror/b.arrow", sealed_body(2))
             .await
             .unwrap();
 
@@ -2699,21 +2868,15 @@ mod tests {
     #[tokio::test]
     async fn recovery_rebuilds_the_tenant_and_index_layout() {
         let op = memory_op();
-        op.write("wal-mirror/acme/s1.arrow", bytes::Bytes::from_static(b"A1"))
+        op.write("wal-mirror/acme/s1.arrow", sealed_body(1))
             .await
             .unwrap();
-        op.write(
-            "wal-mirror/widgets/s2.arrow",
-            bytes::Bytes::from_static(b"W2"),
-        )
-        .await
-        .unwrap();
-        op.write(
-            "wal-mirror/acme/orders/s3.arrow",
-            bytes::Bytes::from_static(b"A3"),
-        )
-        .await
-        .unwrap();
+        op.write("wal-mirror/widgets/s2.arrow", sealed_body(2))
+            .await
+            .unwrap();
+        op.write("wal-mirror/acme/orders/s3.arrow", sealed_body(3))
+            .await
+            .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wal");
@@ -2761,12 +2924,9 @@ mod tests {
         use crate::durability::probe;
 
         let op = memory_op();
-        op.write(
-            "wal-mirror/acme/orders/s1.arrow",
-            bytes::Bytes::from_static(b"A1"),
-        )
-        .await
-        .unwrap();
+        op.write("wal-mirror/acme/orders/s1.arrow", sealed_body(1))
+            .await
+            .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wal");
@@ -2835,12 +2995,10 @@ mod tests {
     #[tokio::test]
     async fn a_rerun_repairs_a_discovery_dir_an_earlier_restore_omitted() {
         let op = memory_op();
-        op.write(
-            "wal-mirror/acme/orders/s1.arrow",
-            bytes::Bytes::from_static(b"A1"),
-        )
-        .await
-        .unwrap();
+        let body = sealed_body(1);
+        op.write("wal-mirror/acme/orders/s1.arrow", body.clone())
+            .await
+            .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wal");
@@ -2874,7 +3032,7 @@ mod tests {
                     .join("s1.arrow")
             )
             .unwrap(),
-            b"A1",
+            body,
             "the segment already on the volume is left exactly as it was"
         );
     }
@@ -2889,12 +3047,9 @@ mod tests {
         use crate::durability::probe;
 
         let op = memory_op();
-        op.write(
-            "wal-mirror/acme/orders/s1.arrow",
-            bytes::Bytes::from_static(b"A1"),
-        )
-        .await
-        .unwrap();
+        op.write("wal-mirror/acme/orders/s1.arrow", sealed_body(1))
+            .await
+            .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wal");
@@ -2936,7 +3091,7 @@ mod tests {
     #[tokio::test]
     async fn an_events_only_restore_grows_no_extra_directories() {
         let op = memory_op();
-        op.write("wal-mirror/acme/s1.arrow", bytes::Bytes::from_static(b"A1"))
+        op.write("wal-mirror/acme/s1.arrow", sealed_body(1))
             .await
             .unwrap();
 
@@ -2970,18 +3125,13 @@ mod tests {
             let op = memory_op();
             // Keys as they appear relative to the mirror root: a tenant's
             // events segment, an index segment, and an active-mirror prefix.
-            op.write("acme/s1.arrow", bytes::Bytes::from_static(b"A1"))
+            op.write("acme/s1.arrow", sealed_body(1)).await.unwrap();
+            op.write("acme/orders/s2.arrow", sealed_body(2))
                 .await
                 .unwrap();
-            op.write("acme/orders/s2.arrow", bytes::Bytes::from_static(b"A2"))
+            op.write("_active/widgets/s3.arrow.partial", active_body(3))
                 .await
                 .unwrap();
-            op.write(
-                "_active/widgets/s3.arrow.partial",
-                bytes::Bytes::from_static(b"W3"),
-            )
-            .await
-            .unwrap();
 
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().join("wal");
@@ -3058,15 +3208,12 @@ mod tests {
     #[tokio::test]
     async fn recovery_with_a_nonempty_prefix_ignores_keys_outside_it() {
         let op = memory_op();
-        op.write("wal-mirror/acme/s1.arrow", bytes::Bytes::from_static(b"A1"))
+        op.write("wal-mirror/acme/s1.arrow", sealed_body(1))
             .await
             .unwrap();
-        op.write(
-            "other-prefix/acme/s2.arrow",
-            bytes::Bytes::from_static(b"X"),
-        )
-        .await
-        .unwrap();
+        op.write("other-prefix/acme/s2.arrow", sealed_body(2))
+            .await
+            .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wal");
@@ -3094,25 +3241,17 @@ mod tests {
     async fn recovery_takes_active_partials_but_prefers_a_sealed_copy() {
         let op = memory_op();
         // Only ever mirrored while active — its writer died before sealing.
-        op.write(
-            "wal-mirror/_active/acme/lost.arrow.partial",
-            bytes::Bytes::from_static(b"PARTIAL"),
-        )
-        .await
-        .unwrap();
+        op.write("wal-mirror/_active/acme/lost.arrow.partial", active_body(1))
+            .await
+            .unwrap();
         // Present as BOTH: the sealed copy is the complete one.
-        op.write(
-            "wal-mirror/_active/acme/both.arrow.partial",
-            bytes::Bytes::from_static(b"PREFIX"),
-        )
-        .await
-        .unwrap();
-        op.write(
-            "wal-mirror/acme/both.arrow",
-            bytes::Bytes::from_static(b"COMPLETE-SEALED"),
-        )
-        .await
-        .unwrap();
+        op.write("wal-mirror/_active/acme/both.arrow.partial", active_body(2))
+            .await
+            .unwrap();
+        let complete = sealed_body(3);
+        op.write("wal-mirror/acme/both.arrow", complete.clone())
+            .await
+            .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wal");
@@ -3131,9 +3270,172 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(sealed.join("both.arrow")).unwrap(),
-            b"COMPLETE-SEALED",
+            complete,
             "the sealed copy must win over its active prefix"
         );
+    }
+
+    /// #5077: an `_active/` object is listable, and stat-able at zero bytes,
+    /// before its body lands — opendal's `fs` writer creates the target in
+    /// place with no `atomic_write_dir`, and any interrupted uploader leaves
+    /// the same state. That object became a zero-byte SEALED segment under the
+    /// drain's nose and the restore reported it pulled; the drain then failed
+    /// to read it ("Expected schema message, found empty stream").
+    ///
+    /// Against the pre-fix code this test FAILS: `pulled` is 1.
+    #[tokio::test]
+    async fn an_unreadable_candidate_is_refused_counted_and_named_not_published() {
+        const TORN: &str = "wal-mirror/_active/acme/torn.arrow.partial";
+        let op = memory_op();
+        op.write(TORN, bytes::Bytes::new()).await.unwrap();
+        op.write("wal-mirror/acme/good.arrow", sealed_body(1))
+            .await
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+
+        // The plan names it, and proposes only what an apply would write.
+        let plan = plan_recovery(&op, "wal-mirror", &root).await.unwrap();
+        assert_eq!(plan.segments(), 1, "the torn object is not a proposal");
+        assert_eq!(
+            plan.unreadable
+                .iter()
+                .map(|u| u.key.as_str())
+                .collect::<Vec<_>>(),
+            vec![TORN],
+            "the operator is told which object to go and look at"
+        );
+
+        let summary = apply_plan(&op, plan, &root).await.unwrap();
+        assert_eq!(summary.pulled, 1, "only the readable segment is pulled");
+        assert_eq!(summary.unreadable, 1, "counted apart from pulled");
+        assert_eq!(summary.sample_unreadable_key.as_deref(), Some(TORN));
+        assert_eq!(summary.skipped, 0, "its LAYOUT was fine; its body was not");
+        assert_eq!(summary.already_present, 0);
+
+        let sealed = root.join("acme").join(SEALED_DIR);
+        assert!(sealed.join("good.arrow").exists());
+        let mut left: Vec<String> = std::fs::read_dir(&sealed)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["good.arrow".to_string()],
+            "no segment and no `.tmp` for a body that does not decode"
+        );
+        // Refuse-and-count, not quarantine: nothing under `--from` moves.
+        assert!(op.exists(TORN).await.unwrap(), "the object is left alone");
+    }
+
+    /// The tolerance the active mirror is built around is kept, and the check
+    /// is what is left over: a flushed prefix restores, with or without a torn
+    /// final message behind a complete batch, and a body with no complete
+    /// batch at all does not.
+    #[tokio::test]
+    async fn the_body_check_takes_a_flushed_prefix_and_refuses_one_with_no_complete_batch() {
+        // Two appends, so the tear can land behind a complete batch.
+        let torn_tail = {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut writer = crate::WalWriter::with_thresholds(
+                tmp.path(),
+                "fixture",
+                1_000_000,
+                std::time::Duration::from_secs(3600),
+            )
+            .unwrap();
+            writer.append_events(&[synth_event(1)]).unwrap();
+            writer.append_events(&[synth_event(2)]).unwrap();
+            let snapshot = snapshot_active(&mut writer).expect("a flushed active segment");
+            let mut body = std::fs::read(&snapshot.path).unwrap();
+            body.truncate(body.len() - 16);
+            bytes::Bytes::from(body)
+        };
+        let whole_prefix = active_body(2);
+        let header_only = whole_prefix.slice(..crate::WAL_FRAME_HEADER_LEN);
+        let first_message_torn = whole_prefix.slice(..crate::WAL_FRAME_HEADER_LEN + 24);
+
+        for (name, body, restored) in [
+            ("a whole flushed prefix", whole_prefix.clone(), true),
+            ("a tear behind a complete batch", torn_tail, true),
+            ("an empty body", bytes::Bytes::new(), false),
+            ("a header and no body", header_only, false),
+            ("a tear inside the first message", first_message_torn, false),
+        ] {
+            let op = memory_op();
+            op.write("_active/acme/s.arrow.partial", body)
+                .await
+                .unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("wal");
+            let summary = recover_from_object_store(op, "", &root).await.unwrap();
+            assert_eq!(
+                (summary.pulled, summary.unreadable),
+                if restored { (1, 0) } else { (0, 1) },
+                "{name}: {summary:?}"
+            );
+            assert_eq!(
+                root.join("acme").join(SEALED_DIR).join("s.arrow").exists(),
+                restored,
+                "{name}"
+            );
+        }
+    }
+
+    /// A sealed candidate gets the same treatment: the body a restore is about
+    /// to publish is the one that has to decode, wherever in the mirror it came
+    /// from. A truncated sealed frame fails its own length and CRC checks.
+    #[tokio::test]
+    async fn a_sealed_candidate_whose_body_does_not_decode_is_refused_like_an_active_one() {
+        let whole = sealed_body(1);
+        let op = memory_op();
+        op.write("wal-mirror/acme/s1.arrow", whole.slice(..whole.len() - 8))
+            .await
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        let summary = recover_from_object_store(op, "wal-mirror", &root)
+            .await
+            .unwrap();
+        assert_eq!(summary.pulled, 0);
+        assert_eq!(summary.unreadable, 1);
+        assert!(
+            crate::list_sealed(&root.join("acme")).unwrap().is_empty(),
+            "a truncated sealed frame must not be published either"
+        );
+    }
+
+    /// The apply re-checks the body it actually read: the plan read an earlier
+    /// one, and an `_active/` object re-PUT in between is listable at zero
+    /// bytes while its body lands. The refusal creates nothing — not the
+    /// segment, not its `sealed/`, not the tenant discovery dir.
+    #[tokio::test]
+    async fn a_candidate_replaced_between_the_plan_and_the_apply_is_refused_by_the_apply() {
+        const KEY: &str = "wal-mirror/acme/orders/s1.arrow";
+        let op = memory_op();
+        op.write(KEY, sealed_body(1)).await.unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        let plan = plan_recovery(&op, "wal-mirror", &root).await.unwrap();
+        assert_eq!(plan.segments(), 1, "the plan saw a readable body");
+        assert!(plan.unreadable.is_empty());
+
+        // The uploader's next tick, mid-PUT.
+        op.write(KEY, bytes::Bytes::new()).await.unwrap();
+
+        let summary = apply_plan(&op, plan, &root).await.unwrap();
+        assert_eq!(summary.pulled, 0);
+        assert_eq!(summary.unreadable, 1, "{summary:?}");
+        assert_eq!(summary.sample_unreadable_key.as_deref(), Some(KEY));
+        assert!(
+            crate::list_tenant_dirs(&root).unwrap().is_empty(),
+            "no tenant is invented for a body that does not decode"
+        );
+        assert!(!root.join("acme").exists(), "and no directory under it");
     }
 
     /// #3149: a restore reports segments an operator then plans around, so
@@ -3146,7 +3448,8 @@ mod tests {
         use crate::durability::probe;
 
         let op = memory_op();
-        op.write("wal-mirror/acme/s1.arrow", bytes::Bytes::from_static(b"A1"))
+        let body = sealed_body(1);
+        op.write("wal-mirror/acme/s1.arrow", body.clone())
             .await
             .unwrap();
 
@@ -3178,7 +3481,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(root.join("acme").join(SEALED_DIR).join("s1.arrow")).unwrap(),
-            b"A1"
+            body
         );
     }
 
@@ -3190,7 +3493,8 @@ mod tests {
         use crate::durability::probe;
 
         let op = memory_op();
-        op.write("wal-mirror/acme/s1.arrow", bytes::Bytes::from_static(b"A1"))
+        let body = sealed_body(1);
+        op.write("wal-mirror/acme/s1.arrow", body.clone())
             .await
             .unwrap();
 
@@ -3215,7 +3519,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary.pulled, 1);
-        assert_eq!(std::fs::read(&dest).unwrap(), b"A1");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
     }
 
     const LIVE: &str = "11111111-1111-4111-8111-111111111111";

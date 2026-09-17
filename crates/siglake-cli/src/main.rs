@@ -2749,9 +2749,11 @@ fn human_bytes(n: u64) -> String {
 /// Print the reconstructed layout, one line per `(tenant, index)`, then the
 /// totals and the root verdict.
 ///
-/// Under `--apply` this is what is ABOUT to be written, printed before the
-/// first GET; without it, it is the whole of the command's output. Either way
-/// it is the same listing, so the two forms print the same block.
+/// Under `--apply` this is what is ABOUT to be written; without it, it is the
+/// whole of the command's output. Either way it is the same listing and the
+/// same body checks, so the two forms print the same block — including the
+/// candidates whose body does not decode as a WAL segment, which an operator
+/// has to see BEFORE the apply rather than in its report (#5077).
 fn print_recovery_plan(plan: &siglake_wal::mirror::RecoveryPlan, from: &str, to: &std::path::Path) {
     println!("plan for {from} -> {}", to.display());
     let tenant_width = plan
@@ -2788,9 +2790,31 @@ fn print_recovery_plan(plan: &siglake_wal::mirror::RecoveryPlan, from: &str, to:
             iw = index_width,
         );
     }
+    // Named, with the reason, one line each: the operator's next move is to
+    // go and look at the object, and they cannot do that from a count. Capped
+    // so a mirror full of torn objects cannot bury the plan itself.
+    const UNREADABLE_LINES: usize = 10;
+    for bad in plan.unreadable.iter().take(UNREADABLE_LINES) {
+        println!(
+            "  UNREADABLE: `{}` is not a WAL segment ({}); it will be left in the mirror",
+            bad.key, bad.reason
+        );
+    }
+    if plan.unreadable.len() > UNREADABLE_LINES {
+        println!(
+            "  ... and {} more unreadable candidates",
+            plan.unreadable.len() - UNREADABLE_LINES
+        );
+    }
     let mut detail = Vec::new();
     if plan.already_present() > 0 {
         detail.push(format!("{} already present", plan.already_present()));
+    }
+    if !plan.unreadable.is_empty() {
+        detail.push(format!(
+            "{} unreadable: body does not decode",
+            plan.unreadable.len()
+        ));
     }
     if plan.skipped > 0 {
         detail.push(format!(
@@ -2808,8 +2832,9 @@ fn print_recovery_plan(plan: &siglake_wal::mirror::RecoveryPlan, from: &str, to:
         format!(" ({})", detail.join(", "))
     };
     // Sizes are whatever the LISTING carried — S3 reports them, opendal's
-    // `fs` and in-memory services do not — because a plan costs one LIST and
-    // no per-object request.
+    // `fs` and in-memory services do not. The plan's body checks read the
+    // candidates it would write, but not the already-present ones, so their
+    // lengths would not add up to the segment count on the same line.
     println!(
         "  totals: {} segments, {}{detail}",
         plan.segments(),
@@ -2842,10 +2867,11 @@ async fn run_wal_recover(from: &str, to: &std::path::Path, apply: bool) -> Resul
     // every `--from` carrying a path restored 0 segments and exited 0 (#4912).
     let store = build_opendal_operator(from)?;
     tracing::info!(from, to = %to.display(), apply, "wal-recover starting");
-    // ONE listing per invocation, plan or apply: the plan is exactly the work
-    // the restore does before its first GET, and an apply decides on the
+    // ONE listing per invocation, plan or apply, and an apply decides on the
     // listing that is current when it writes rather than on whatever an
-    // earlier plan run saw.
+    // earlier plan run saw. The plan also reads the body of each candidate it
+    // would write, because a candidate that is not a WAL segment has to be
+    // refused and named before the apply, not after it (#5077).
     let plan = siglake_wal::mirror::plan_recovery(&store, "", to).await?;
     print_recovery_plan(&plan, from, to);
     let contradicted = matches!(
@@ -2895,6 +2921,17 @@ async fn run_wal_recover(from: &str, to: &std::path::Path, apply: bool) -> Resul
     let mut detail = Vec::new();
     if summary.already_present > 0 {
         detail.push(format!("{} already present", summary.already_present));
+    }
+    if summary.unreadable > 0 {
+        detail.push(format!(
+            "{} unreadable: body does not decode as a WAL segment, left in the mirror{}",
+            summary.unreadable,
+            summary
+                .sample_unreadable_key
+                .as_deref()
+                .map(|k| format!(" (e.g. `{k}`)"))
+                .unwrap_or_default()
+        ));
     }
     if summary.skipped > 0 {
         detail.push(format!(
