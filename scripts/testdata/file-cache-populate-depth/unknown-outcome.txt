@@ -1,0 +1,19 @@
+# HELP siglake_query_scan_file_cache_populate_rows Rows handed to one decoded-file-cache population.
+# TYPE siglake_query_scan_file_cache_populate_rows histogram
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="0"} 0
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="1"} 0
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="100"} 0
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="1000"} 1
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="8192"} 1
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="32768"} 1
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="65536"} 1
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="131071"} 1
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="131072"} 1
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="262144"} 1
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="524288"} 1
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="1048576"} 1
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="4194304"} 1
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="16777216"} 1
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="cancelled",le="+Inf"} 1
+siglake_query_scan_file_cache_populate_rows_sum{outcome="cancelled"} 256
+siglake_query_scan_file_cache_populate_rows_count{outcome="cancelled"} 1

@@ -267,12 +267,79 @@ reason (1) (#4890). The gate
 under `lower(host)` for the same reason: a converted predicate reaches no
 population to assert on.
 
+## 2026-09-17: reason (1) is measurable, and what the number will and will not say
+
+#4890 instruments the SHIPPED whole-file path, not the prototype (whose
+counters sit behind `file_cache_row_group_prototype`, which nothing outside the
+process can set). `CachePopulateStream` now records one observation per
+population in `Drop`:
+
+```
+siglake_query_scan_file_cache_populate_rows{outcome="completed|clipped|unpolled|error"}
+```
+
+The quantity is defined narrowly. It is the rows the inner reader HANDED the
+population, summed over the stream, counted before the residual `FilterExec`
+above the scan drops any of them. It is not the rows the query returned, not
+the rows the cache kept (a candidate that crosses the entry bound is discarded
+and the count keeps rising), and not total physical decoder work (row selection
+the reader applies under it — positional deletes, time bounds — and decoded
+pages that never became a batch are not in it). The populate read carries no
+predicate and no prune spec, because a task with either bypasses population
+entirely since #4891, so nothing page-prunes below it. On a `LIMIT 10` browse
+over a 1,024-row file at 256-row batches the observation is 256: one batch, not
+10 rows and not the file.
+
+The four outcomes are the whole label set, and each has a different reading.
+`completed` is a drained read. `clipped` is a population dropped before
+end-of-stream — a `LIMIT` satisfied early, and equally a cancelled or
+failed-elsewhere query, which the stream cannot tell apart, so a round reads it
+against its own query outcomes. `unpolled` is a task the plan opened and never
+polled (zero by construction, charged `miss` and `abandoned` like any other, and
+excluded from the qualifying fraction). `error` is a failed read, also excluded.
+
+Per request, `stats.scan.file_cache_populate_rows` carries the same depth and
+`stats.scan.file_cache_bypasses` the tasks that declined population. The second
+exists because after #4891 the rounds' label shapes produce NO population
+samples, and "decoded nothing" and "was never eligible" are opposite readings of
+the same absence.
+
+Reading it: `scripts/read-file-cache-populate-depth.py --shape NAME=after.txt
+[--baseline NAME=before.txt] [--geometry NAME=geom.json] [--stats
+NAME=responses.json]`. The floor is exact — `POPULATE_ROW_BUCKETS` carries an
+edge at 131,071, so `+Inf − le("131071")` is the population handed at least
+`MIN_ROW_GROUP_ROWS` rows — and the reader refuses an export that was
+re-bucketed away from that edge or rendered as a summary rather than reporting a
+number it cannot support.
+
+Two things the number will not settle, both stated by the reader rather than
+left to the reader's reader. **Reaching the floor is necessary, not
+sufficient**: `MAX_ROW_GROUP_ROWS` is 4 Mi, so a file whose groups are larger
+closes none of them at 131,072 rows, and a read that does not start on a group
+boundary closes none at any depth — hence `--geometry`, which downgrades the
+claim to an upper bound when the measured files hold larger groups. **And
+selectivity is not location**: a predicate matching 1 row in 1,300 says how many
+rows a clip must cross, not where the matches sit, so a shape can clear the
+floor on one file and not on the next.
+
+Local evidence only. `crates/siglake-storage/tests/file_cache_populate_depth.rs`
+pins the accounting (drained, clipped, hit, bypassed),
+`crates/siglake-query-server/tests/file_cache_populate_depth_stats.rs` pins the
+per-request fields through the router, and
+`scripts/check-file-cache-populate-depth-reader.sh` pins the reader against
+fixture exports. None of it is fleet evidence: the rounds' `label_filter`,
+`label_filter_last25` and `multi_label_and` numbers still need a prepared normal
+round, and until they exist reason (1) is measurable but unmeasured.
+
 ## Reproduce
 
 ```sh
 # the gates
 cargo test -p siglake-storage --test row_group_cache_population_shape
 cargo test -p siglake-storage --test file_cache_predicate_bypass
+cargo test -p siglake-storage --test file_cache_populate_depth
+cargo test -p siglake-query-server --test file_cache_populate_depth_stats
+scripts/check-file-cache-populate-depth-reader.sh
 
 # the numbers in this document
 cargo test --release -p siglake-storage --test row_group_cache_measurement \

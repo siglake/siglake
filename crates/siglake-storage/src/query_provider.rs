@@ -872,6 +872,43 @@ impl<S> Drop for OrderedTaskDrain<S> {
     }
 }
 
+/// #4890: how one population ended. Decided in `poll_next`, read once in
+/// `Drop`, and the complete label set of
+/// `siglake_query_scan_file_cache_populate_rows{outcome}` — four values, none
+/// of them derived from data, so the series set is bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopulateEnd {
+    /// The partition stream was built and never polled: the plan's `LIMIT` was
+    /// satisfied elsewhere before this task read anything. Zero rows decoded,
+    /// and distinct from a clip that decoded nothing — `miss` and `abandoned`
+    /// are charged for both.
+    Unpolled,
+    /// Polled at least once and dropped before end-of-stream or an error. A
+    /// `LIMIT` satisfied from the first batches is this, and so is a cancelled
+    /// or failed-elsewhere query: the stream cannot tell them apart, so the
+    /// label does not claim to. A round reads this against its own query
+    /// outcomes (`--require-successful` in the reader).
+    Clipped,
+    /// End-of-stream reached. The entry may or may not have landed (oversized,
+    /// contended, already populated by another partition); the decode depth is
+    /// the same either way.
+    Completed,
+    /// The inner stream yielded an error. Not a measurement of how deep a
+    /// successful browse reads, and excluded from the reader's fractions.
+    Failed,
+}
+
+impl PopulateEnd {
+    fn label(self) -> &'static str {
+        match self {
+            PopulateEnd::Unpolled => "unpolled",
+            PopulateEnd::Clipped => "clipped",
+            PopulateEnd::Completed => "completed",
+            PopulateEnd::Failed => "error",
+        }
+    }
+}
+
 struct CachePopulateStream {
     key: String,
     tuning: EffectiveFileCacheTuning,
@@ -882,6 +919,27 @@ struct CachePopulateStream {
     insert_done: bool,
     /// Off-pool population memory this stream holds — see [`PopulationMeter`].
     charge: PopulationCharge,
+    /// #4890: rows this population has been handed, cumulative over the whole
+    /// stream. Deliberately independent of `buffered`, which is emptied by an
+    /// insert and cleared outright when the entry goes oversized: the question
+    /// is how deep the read got, not what survived in the candidate.
+    ///
+    /// Exactly: rows in the batches the inner reader yielded to this stream,
+    /// counted before DataFusion's residual filter above the scan drops any of
+    /// them. The inner read carries no predicate and no prune spec (a task with
+    /// either takes the bypass above), so nothing below it page-prunes; row
+    /// selection the reader still applies — positional deletes, time bounds —
+    /// happens under this number, and decoder work that never became a batch is
+    /// not in it. It is decode depth offered to population, not total physical
+    /// work.
+    yielded_rows: u64,
+    /// Terminal disposition for the `Drop` observation.
+    end: PopulateEnd,
+    /// Per-request twin of `yielded_rows` (→ `stats.scan.file_cache_populate_rows`),
+    /// added per batch rather than at `Drop`: a clipped plan drops this stream
+    /// after `SourceMetricsStream` has folded its counters, so anything charged
+    /// from `Drop` would miss the request it belongs to.
+    cache_counters: Arc<FileCacheCounters>,
 }
 
 impl CachePopulateStream {
@@ -937,6 +995,15 @@ impl Drop for CachePopulateStream {
             )
             .increment(1);
         }
+        // #4890: one observation per population, here rather than in the
+        // end-of-stream arm so that every population produces exactly one —
+        // including the ones that never reach it (the clipped browse this
+        // exists to measure, and the task dropped before its first poll).
+        metrics::histogram!(
+            "siglake_query_scan_file_cache_populate_rows",
+            "outcome" => self.end.label()
+        )
+        .record(self.yielded_rows as f64);
     }
 }
 
@@ -948,8 +1015,18 @@ impl Stream for CachePopulateStream {
         if this.insert_done {
             return Poll::Ready(None);
         }
+        if this.end == PopulateEnd::Unpolled {
+            // A poll that returns Pending still means the read started, so the
+            // task is no longer one the plan opened and abandoned untouched.
+            this.end = PopulateEnd::Clipped;
+        }
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(batch))) => {
+                this.yielded_rows = this.yielded_rows.saturating_add(batch.num_rows() as u64);
+                this.cache_counters.populate_rows.fetch_add(
+                    batch.num_rows() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 if !this.oversized {
                     let buffered_bytes = this
                         .buffered_bytes
@@ -974,6 +1051,7 @@ impl Stream for CachePopulateStream {
             }
             Poll::Ready(Some(Err(err))) => {
                 this.insert_done = true;
+                this.end = PopulateEnd::Failed;
                 Poll::Ready(Some(Err(err)))
             }
             Poll::Ready(None) => {
@@ -1011,6 +1089,7 @@ impl Stream for CachePopulateStream {
                     }
                 }
                 this.insert_done = true;
+                this.end = PopulateEnd::Completed;
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -3538,6 +3617,15 @@ async fn per_file_timestamp_bounds(
 struct FileCacheCounters {
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
+    /// #4890: tasks that consulted the cache, found nothing, and declined to
+    /// populate because they carry a predicate or a prune spec (#4891). Without
+    /// it a request with no population samples is unreadable: "nothing was
+    /// decoded" and "every task was ineligible" look identical.
+    bypasses: std::sync::atomic::AtomicU64,
+    /// #4890: rows the request's populate streams were handed, summed over
+    /// tasks — the per-request twin of
+    /// `siglake_query_scan_file_cache_populate_rows`.
+    populate_rows: std::sync::atomic::AtomicU64,
 }
 
 /// Live-partition accounting for one scan node: how many partition streams
@@ -3715,6 +3803,12 @@ struct ScanDetailMetrics {
     /// the cache, found nothing, and read the file.
     file_cache_hits: Count,
     file_cache_misses: Count,
+    /// #4890: tasks that declined population (predicate or prune spec), and
+    /// rows the request's populations were handed. The first says why a shape
+    /// produced no decode-depth samples; the second is the depth itself,
+    /// attributable to one query rather than to the process.
+    file_cache_bypasses: Count,
+    file_cache_populate_rows: Count,
 }
 
 impl ScanDetailMetrics {
@@ -3736,6 +3830,8 @@ impl ScanDetailMetrics {
             bytes_other: c("bytes_other"),
             file_cache_hits: c("file_cache_hits"),
             file_cache_misses: c("file_cache_misses"),
+            file_cache_bypasses: c("file_cache_bypasses"),
+            file_cache_populate_rows: c("file_cache_populate_rows"),
         }
     }
 
@@ -3744,6 +3840,10 @@ impl ScanDetailMetrics {
         self.file_cache_hits.add(cache.hits.load(Relaxed) as usize);
         self.file_cache_misses
             .add(cache.misses.load(Relaxed) as usize);
+        self.file_cache_bypasses
+            .add(cache.bypasses.load(Relaxed) as usize);
+        self.file_cache_populate_rows
+            .add(cache.populate_rows.load(Relaxed) as usize);
         self.files_read
             .add(counters.files_read.load(Relaxed) as usize);
         self.files_pruned_bloom
@@ -4083,6 +4183,9 @@ async fn open_task_batch_stream_cached(
             "outcome" => "bypass"
         )
         .increment(1);
+        cache_counters
+            .bypasses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return open_task_batch_stream_uncached(
             file_io,
             task,
@@ -4142,6 +4245,9 @@ async fn open_task_batch_stream_cached(
         oversized: false,
         insert_done: false,
         charge: PopulationCharge::open(),
+        yielded_rows: 0,
+        end: PopulateEnd::Unpolled,
+        cache_counters,
     }))
 }
 
@@ -6713,6 +6819,9 @@ mod tests {
                     oversized: false,
                     insert_done: false,
                     charge: PopulationCharge::open(),
+                    yielded_rows: 0,
+                    end: PopulateEnd::Unpolled,
+                    cache_counters: Arc::new(FileCacheCounters::default()),
                 };
 
                 assert!(stream.next().await.unwrap().is_ok());
@@ -6777,6 +6886,9 @@ mod tests {
             oversized: false,
             insert_done: false,
             charge: PopulationCharge::open(),
+            yielded_rows: 0,
+            end: PopulateEnd::Unpolled,
+            cache_counters: Arc::new(FileCacheCounters::default()),
         };
 
         let recorder = DebuggingRecorder::new();

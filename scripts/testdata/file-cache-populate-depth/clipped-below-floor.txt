@@ -1,0 +1,43 @@
+# HELP siglake_query_scan_file_cache_populate_rows Rows handed to one decoded-file-cache population.
+# TYPE siglake_query_scan_file_cache_populate_rows histogram
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="0"} 0
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="1"} 0
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="100"} 0
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="1000"} 14
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="8192"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="32768"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="65536"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="131071"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="131072"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="262144"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="524288"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="1048576"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="4194304"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="16777216"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="clipped",le="+Inf"} 16
+siglake_query_scan_file_cache_populate_rows_sum{outcome="clipped"} 12376
+siglake_query_scan_file_cache_populate_rows_count{outcome="clipped"} 16
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="0"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="1"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="100"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="1000"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="8192"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="32768"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="65536"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="131071"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="131072"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="262144"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="524288"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="1048576"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="4194304"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="16777216"} 2
+siglake_query_scan_file_cache_populate_rows_bucket{outcome="unpolled",le="+Inf"} 2
+siglake_query_scan_file_cache_populate_rows_sum{outcome="unpolled"} 0
+siglake_query_scan_file_cache_populate_rows_count{outcome="unpolled"} 2
+# HELP siglake_query_scan_file_cache_requests_total Decoded-file-cache request outcomes.
+# TYPE siglake_query_scan_file_cache_requests_total counter
+siglake_query_scan_file_cache_requests_total{outcome="hit"} 0
+siglake_query_scan_file_cache_requests_total{outcome="miss"} 18
+siglake_query_scan_file_cache_requests_total{outcome="bypass"} 0
+siglake_query_scan_file_cache_requests_total{outcome="insert"} 0
+siglake_query_scan_file_cache_requests_total{outcome="abandoned"} 18

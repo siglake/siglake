@@ -6425,6 +6425,8 @@ fn scan_detail_from_runtime(
         decoded_bytes: runtime.decoded_bytes,
         file_cache_hits: runtime.file_cache_hits,
         file_cache_misses: runtime.file_cache_misses,
+        file_cache_bypasses: runtime.file_cache_bypasses,
+        file_cache_populate_rows: runtime.file_cache_populate_rows,
         unsettled_partitions: runtime.unsettled_partitions,
         ordering: runtime.ordering_outcome.map(str::to_string),
     }))

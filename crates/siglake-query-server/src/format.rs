@@ -149,6 +149,8 @@ impl ScanDetail {
         self.bytes_other += o.bytes_other;
         self.file_cache_hits += o.file_cache_hits;
         self.file_cache_misses += o.file_cache_misses;
+        self.file_cache_bypasses += o.file_cache_bypasses;
+        self.file_cache_populate_rows += o.file_cache_populate_rows;
         self.unsettled_partitions += o.unsettled_partitions;
         // Shards agree in practice (one gate decision per table); keep the
         // first-seen outcome, or surface any shard's refusal over nothing.
@@ -201,6 +203,22 @@ pub struct ScanDetail {
     /// raw or promoted prune spec bypass the cache and count in neither field.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub file_cache_misses: u64,
+    /// File tasks that consulted the decoded file-batch cache, found nothing,
+    /// and declined to populate it because they carry a converted predicate or
+    /// a raw/promoted prune spec (#4891): they read with their filtering
+    /// intact, exactly as a cache-disabled install does. Counted apart from
+    /// `file_cache_misses` so a response with no population can say whether
+    /// nothing was decoded or every task was ineligible.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub file_cache_bypasses: u64,
+    /// Rows this request's populations were handed before they stopped (#4890)
+    /// — decode depth offered to the cache, summed over the tasks that
+    /// populated. Counted before the residual filter above the scan drops any
+    /// of them, and it keeps rising after a candidate goes oversized, so it
+    /// measures how far the read got rather than what was kept. A clipped
+    /// browse populates nothing today, and this is how deep it got anyway.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub file_cache_populate_rows: u64,
     /// Scan partitions still unwinding when this block was built. Their
     /// counters fold only when they finish, so a non-zero value means every
     /// count above is missing that many partitions' worth of reads. The
