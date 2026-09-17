@@ -467,7 +467,8 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   The `bypass` count is the text shapes, whose `raw_prune_spec` sends them to
   the pruning reader by design, as a promoted-column predicate would. So an
   entry needs a scan that is
-  non-order-preserving, has no raw or promoted prune, and drains one task —
+  non-order-preserving, has no raw or promoted prune, and drains one task (since
+  #4891, and carries no converted predicate) —
   plus decoded batches for that task under a quarter of the budget (2 GiB at
   8 GiB), which at 50G scale is ~615 MB for a `timestamp, raw` projection
   (98.47M rows over 16 files at ~100 decoded bytes/row), so ~13 of that
@@ -490,14 +491,34 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   ("Decoded-file cache populations") in `deploy/grafana/siglake-overview.json`
   charts them; on a default install, where the cache is off, every arm stays at
   zero.
-  **An operator who turns the cache on also pays for the populate path stripping
-  the query's predicate**, which is what makes an entry reusable: the read then
-  decodes the whole projection instead of the pages the predicate would have
-  selected. Measured 2026-09-16 on a local two-row-group fixture (#4847), a
-  `LIMIT 100` browse whose `host` predicate converts to an Iceberg predicate ran
-  at 2.3 ms warm with the cache off and 6.4 ms with it on — **2.8x slower for a
-  cache that then inserted nothing**. This cost is independent of what the
-  entries are keyed on.
+  Until 2026-09-17 an operator who turned the cache on also paid for the populate
+  path stripping the query's predicate, which is what makes an entry reusable:
+  the read then decoded the whole projection instead of the pages the predicate
+  would have selected. Measured 2026-09-16 on a local two-row-group fixture
+  (#4847), a `LIMIT 100` browse whose `host` predicate converts to an Iceberg
+  predicate ran at 2.3 ms warm with the cache off and 6.4 ms with it on — 2.8x
+  slower for a cache that then inserted nothing. **#4891 removed that by
+  declining to populate**: a task carrying a converted predicate now takes the
+  same bypass a raw-text or promoted-column prune takes and is read with its
+  predicate intact, so the reader prunes exactly as it does with the cache off.
+  Over four runs on 2026-09-17 the same browse is within 0.3 ms of its
+  cache-disabled control in every run and emits 0.0 MiB where it used to emit
+  32.6. Lookups did not change: a predicate query still hits an entry a
+  predicate-free scan left behind, and DataFusion's residual filter is what keeps
+  that answer exact
+  (`crates/siglake-storage/tests/file_cache_predicate_bypass.rs`).
+  **What the cache can fill from is narrower as a result.** An entry now needs a
+  scan that is non-order-preserving, carries no predicate the converter accepts —
+  which includes a time window — and drains one task. On a log-UI workload that
+  is close to nothing; the shapes that populate are drains and unfiltered
+  aggregates. A cache-enabled install is no longer slower than a cache-disabled
+  one on a page-prunable browse, but it is not faster either until something
+  fills the entry.
+  Two costs the fix does not touch, both from the cache being on at all: a
+  predicate query loses its `LIMIT` pushdown, because exact-capable filters are
+  declared `Inexact` so a hit can be re-filtered (measured at 0.1-0.6 ms and 0.5
+  MiB emitted on the fixture's shallower browse), and the budget is still
+  subtracted from the query pool.
   #4847 qualified the row-group-granular alternative locally and the disposition
   is REVISE, with the shipped policy kept: per-row-group population does insert
   from a clipped browse and cuts its repeat from 6.7 ms to 2.0 ms, and it drops

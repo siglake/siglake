@@ -203,7 +203,8 @@ It does not, on this evidence, earn adoption:
    browse 2.8x slower than leaving it off. Any decision to adopt row-group
    population should be taken after that cost is either accepted with numbers or
    removed (predicate-carrying entries, or declining to populate when the reader
-   would prune).
+   would prune). *Removed on 2026-09-17 by #4891, by declining — which also
+   removes the prototype's best regime. See "reason (2) is fixed" below.*
 3. **Scan attribution goes partly blind.** A group served from cache builds no
    reader, so `row_groups_read`, `rows_pruned_selection` and fetched bytes
    under-report — already true of a whole-file hit, but a task can now be half
@@ -217,11 +218,61 @@ SHIPPED populate path, against the 131,072-row floor) and reason (2) as #4891
 page-prunable browse at either granularity). Reason (3) is work only an
 adoption would owe, so it is recorded here rather than filed.
 
+## 2026-09-17: reason (2) is fixed, and it changes what `push/*` measures
+
+#4891 took the first of the two shapes it offered: a task that carries a
+converted predicate no longer reaches the populate path at all. It takes the
+bypass the raw-text and promoted-column prunes already took
+(`open_task_batch_stream_cached`, `crates/siglake-storage/src/query_provider.rs`)
+and is read with its predicate intact, at either granularity — the bypass sits
+above the prototype branch, so this is one policy and not two. Lookups are
+untouched: a predicate query still HITS an entry a predicate-free scan left.
+
+Same fixture, same box, same command, four runs on 2026-09-17 (the numbers above
+are not rewritten; these are the post-fix arms, and the matched pairs within a
+run are what to read — the box is shared and the absolute values drift between
+runs):
+
+| regime | arm | warm p50 ms, 4 runs | scan emitted, per warm execution |
+| --- | --- | --- | --- |
+| push/bound | disabled | 2.0 / 2.3 / 2.4 / 2.4 | 0.0 MiB |
+| push/bound | whole_file | 2.0 / 2.5 / 2.7 / 2.5 | 0.0 MiB (was 32.6) |
+| push/bound | row_group | 2.2 / 2.4 / 2.6 / 2.6 | 0.0 MiB |
+| push/inside | disabled | 2.3 / 2.5 / 2.6 / 2.4 | 0.0 MiB |
+| push/inside | whole_file | 2.5 / 2.6 / 3.2 / 3.0 | 0.5 MiB |
+| push/inside | row_group | 2.2 / 2.6 / 2.6 / 2.9 | 0.5 MiB |
+
+`push/bound`, the 2.8x regression, is within 0.3 ms of the cache-disabled arm in
+every run, and the emitted bytes that caused it are gone: the pages the page
+index skips are skipped again. The `resid/*` arms are unchanged, as they must
+be — nothing there converts, so nothing bypasses.
+
+Two things this does not claim. **The cache-on arm is not free on a predicate
+browse.** `push/inside` stays 0.1-0.6 ms above its control and still emits 0.5
+MiB where the control emits 0.0, because a cache-enabled provider declares
+exact-capable filters `Inexact` (`filter_pushdown_with_file_cache`) so that a
+hit's unfiltered batches are re-filtered. DataFusion then cannot push the
+`LIMIT` into the scan, and the scan emits more rows before it stops. That is the
+price of hits being reusable and is unrelated to the populate path. **And one
+fixture is not a guarantee**: this is a local `file://` warehouse, two row
+groups per file, one predicate shape.
+
+For the prototype, reason (2) closing also removes its best regime. `push/bound`
+was where per-row-group population beat no cache outright (1.8 ms against 2.3);
+it now bypasses like everything else with a converted predicate, so the case for
+adoption rests on `resid/bound` alone — 2.1 ms against 6.1, and only when the
+clip covers a whole 131,072-row group, which is still the unmeasured quantity of
+reason (1) (#4890). The gate
+(`crates/siglake-storage/tests/row_group_cache_population_shape.rs`) browses
+under `lower(host)` for the same reason: a converted predicate reaches no
+population to assert on.
+
 ## Reproduce
 
 ```sh
-# the gate
+# the gates
 cargo test -p siglake-storage --test row_group_cache_population_shape
+cargo test -p siglake-storage --test file_cache_predicate_bypass
 
 # the numbers in this document
 cargo test --release -p siglake-storage --test row_group_cache_measurement \

@@ -27,8 +27,10 @@
 //!   (>= `MIN_ROW_GROUP_ROWS` = 131,072 rows, targeting 256 MB uncompressed)
 //!   puts a log-UI browse whose label is not rare.
 //! * `push/*`   — `host = '<label>'`, which converts to an Iceberg predicate, so
-//!   the READER prunes pages too. The cached arms strip the predicate to keep
-//!   entries reusable, so they decode what pruning would have skipped.
+//!   the READER prunes pages too. Until #4891 the cached arms stripped the
+//!   predicate to keep entries reusable and decoded what pruning would have
+//!   skipped; they now bypass the cache and read as the disabled arm does, which
+//!   is what the `byp=` column and their matched warm p50s show.
 //! * `resid/*`  — `lower(host) = '<label>'`, which does not convert, so every
 //!   arm reads the same rows. The like-for-like comparison.
 //!
@@ -208,6 +210,11 @@ fn counter(
 struct Counters {
     hit: u64,
     miss: u64,
+    /// Since #4891 a `push/*` browse takes this arm at either granularity: its
+    /// predicate converts, so the task is read with the predicate intact and
+    /// nothing is populated. Without it in this table those regimes read as no
+    /// cache activity at all.
+    bypass: u64,
     insert: u64,
     contended: u64,
     abandoned: u64,
@@ -249,6 +256,7 @@ impl Counters {
         Self {
             hit: counter(&snapshot, shipped, "hit"),
             miss: counter(&snapshot, shipped, "miss"),
+            bypass: counter(&snapshot, shipped, "bypass"),
             insert: counter(&snapshot, shipped, "insert"),
             contended: counter(&snapshot, shipped, "insert_skipped_contended"),
             abandoned: counter(&snapshot, shipped, "abandoned"),
@@ -265,6 +273,7 @@ impl Counters {
     fn add(&mut self, other: Self) {
         self.hit += other.hit;
         self.miss += other.miss;
+        self.bypass += other.bypass;
         self.insert += other.insert;
         self.contended += other.contended;
         self.abandoned += other.abandoned;
@@ -391,9 +400,10 @@ async fn row_group_cache_repeat_browse_measurement() {
             warm.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let summary = |c: &Counters, runs: u64| {
                 format!(
-                    "hit={} miss={} ins={} cont={} aband={} rg_ins={} part={} whole={} mis={} foot={} out={:.1}MiB read={:.1}MiB",
+                    "hit={} miss={} byp={} ins={} cont={} aband={} rg_ins={} part={} whole={} mis={} foot={} out={:.1}MiB read={:.1}MiB",
                     c.hit / runs,
                     c.miss / runs,
+                    c.bypass / runs,
                     c.insert,
                     c.contended,
                     c.abandoned,

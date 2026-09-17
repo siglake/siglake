@@ -91,6 +91,23 @@ workspace version, both chart `version`/`appVersion` pairs, the pinned image
 tags under `deploy/` and the two OpenAPI documents' `info.version` all read
 `0.1.1`, and git tag `v0.1.1` publishes image tag `0.1.1`.
 
+- **Query (experimental cache, off by default)**: with the decoded-file cache
+  switched on (`SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_{BYTES,ENTRIES}`, both `0`
+  everywhere the project packages), a scan whose predicate converts to an
+  Iceberg predicate no longer populates the cache. An entry is keyed by file and
+  projection, so it had to be read with the predicate removed to stay reusable —
+  and that read decodes the whole projection where the reader's page index would
+  have skipped most of it. On a local two-row-group fixture a
+  `host = '<label>' LIMIT 100` browse ran 2.8x slower with the cache on than
+  with it off, for a population the browse's `LIMIT` then discarded. Such a scan
+  now reads with its predicate intact, as it does with the cache off, and is
+  within 0.3 ms of that control over four runs. It can still be served from an
+  entry a predicate-free scan left behind; answers are unchanged either way,
+  since an exact-capable filter is declared `Inexact` whenever the cache is on
+  and re-applied above the scan. The cost of this is a narrower fill: an entry
+  needs a drained, non-order-preserving scan carrying no convertible predicate,
+  which on a log-UI workload is close to nothing (`docs/LIMITATIONS.md`).
+  (#4891)
 - **Query**: whether to *use* a text index a file already carries is now
   decided per execution. Loading one costs a deserialization proportional to
   the file's rows, and a text predicate under a bare `LIMIT` stops the scan
