@@ -112,7 +112,7 @@ Service-specific knobs:
 | Service     | Knobs                                                                  |
 |-------------|-------------------------------------------------------------------------|
 | ingester    | `walSegmentMaxEvents`, `walSegmentMaxAgeSecs`                           |
-| compactor   | `intervalSecs`, `binConcurrency`, `committedRetentionSecs`              |
+| compactor   | `intervalSecs`, `binConcurrency`, `committedRetentionSecs`, `mirrorLedgerReclaim` |
 | query       | `tokens.existingSecret` or `tokens.list`; `jobs.persistent`; `scan.fileCacheMaxBytes`, `scan.fileCacheMaxEntries` |
 
 ### The batch-job store
@@ -236,6 +236,32 @@ retention disabled too unless mirror catch-up is also disabled.
 The claim-reclaim age is not part of this floor. A claim remains `processing`
 and cannot be purged while it awaits disposition; if reclaim proves it already
 committed, the retention clock starts from that later disposition.
+
+### `compactor.mirrorLedgerReclaim`
+
+Retention above is enforced by the catalog-claim drain, which deletes a mirror
+object because it is the thing that claimed and committed it. The default
+single-replica compactor drains local `<wal>/sealed/` and never reads the
+mirror, so it purges nothing: the prefix and the `wal_segments` row the
+ingester writes per upload grow for as long as the cluster ingests
+(`docs/LIMITATIONS.md` gives the daily figures).
+
+`mirrorLedgerReclaim: true` closes that for the segments this drain commits. The
+compactor connects the catalog and the mirror store **without** claiming, marks
+the ingester's row `committed` for each segment it committed out of local
+`committed/`, and the same retention pass deletes the object and then the row.
+It needs `catalogUri`, `s3.warehouseUrl` and a non-empty `wal.mirror.prefix`;
+without them the compactor warns and keeps draining. It never registers an
+object it did not commit, so a dropped index incarnation's quarantined
+segments, and an ingester whose volume was lost before its segments drained,
+are still left to an object-store lifecycle rule.
+
+Off by default: it deletes objects, and it gives a drain that needs no
+claim-store connection today a dependency on one. Watch
+`siglake_compactor_mirror_unreclaimed_total` — a locally-committed segment
+whose mark never became durable has its local copy swept at the 3600-second
+ceiling to keep the WAL volume bounded, and its object is then beyond this
+drain's reach.
 
 ### Consumed-proof rolling upgrades
 
