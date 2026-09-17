@@ -112,9 +112,9 @@ left to win.
   group is strictly less data: 0.80 -> 0.28 MB from 256 to 128 MiB. At 32 MiB
   the same shape read 1.13 MB, more than the default — reproducibly, three times
   — which is a page-level effect inside the group the reader selects and not
-  something this fixture explains. The full predicate scan reads every row group
-  by construction and cost 18.44 -> 18.82 MB (+2%) with wall times inside the
-  noise of a loaded box.
+  something this fixture explains (#5133). The full predicate scan reads every
+  row group by construction and cost 18.44 -> 18.82 MB (+2%) with wall times
+  inside the noise of a loaded box.
 * **If the native blooms ever come back, the target's cost changes class.**
   Parquet-native blooms are default-off (`native_blooms_enabled`, measured
   useless on this layout). Priced back on: 0.57 MB at 4 row groups, 2.00 MB at
@@ -163,7 +163,7 @@ Bounded, and on an already-planned normal round rather than one raised for this:
 3. **Compactor RSS, as the container sees it.** `container_memory_working_set_bytes`
    for the compactor pod across the pass, peak and p95, plus any OOMKill. The
    local heap column does not transfer; the local RSS reading is one process on
-   a `file://` warehouse with no S3 client, no WAL drain and no index work.
+   a `file://` warehouse, without an S3 client, a WAL drain or index work.
 4. **Write cost.** Merged bytes out per bin and merge rows/s per arm, and the
    per-file footer share, so the +0.4% local reading is checked at fleet row
    sizes.
@@ -182,11 +182,14 @@ it.
 One corpus, one row width, one bin, one merge path, one `file://` warehouse, one
 box. Nothing here exercised S3, concurrent bins, delete rewrites (the delete
 arm's own numbers are in `delete_task_size_gate.rs`) or the ingest flush path.
-The local RSS numbers say
-what a merge adds to one process on this machine; they are not what a packaged
-compactor's container reports, and nothing here establishes that 256 MiB is
-unsafe at 1Gi — only that it is measurably closer to the limit than it needs to
-be, on a bin far smaller than the ones the fleet merges.
+The local RSS numbers say what a merge adds to one process on this machine; they
+are not what a packaged compactor's container reports, and nothing here
+establishes that 256 MiB is unsafe at 1Gi — only that it is measurably closer to
+the limit than it needs to be, on a bin far smaller than the ones the fleet
+merges.
+
+The follow-ups this left open: #5132 is the chart change if a round supports it,
+and #5133 is the 32 MiB arm's backwards selective read.
 
 ## Reproduce
 
