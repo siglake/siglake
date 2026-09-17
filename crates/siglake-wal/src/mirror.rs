@@ -964,7 +964,12 @@ pub async fn active_mirror_loop(
 
 /// Where a mirrored object belongs on a reconstructed WAL root, and whether it
 /// is a complete sealed segment or an active-mirror prefix of one.
+#[derive(Debug, Clone)]
 struct RecoveryTarget {
+    /// Tenant the key routes to; `default` for the legacy flat layout.
+    tenant: String,
+    /// Index the key routes to, or `None` for an events segment.
+    index: Option<String>,
     /// Path relative to the WAL root, e.g. `acme/sealed/x.arrow` or
     /// `acme/orders/sealed/x.arrow`.
     rel: std::path::PathBuf,
@@ -1027,10 +1032,333 @@ fn recovery_target(suffix: &str) -> Option<RecoveryTarget> {
     rel.push(crate::SEALED_DIR);
     rel.push(format!("{stem}.arrow"));
     Some(RecoveryTarget {
+        tenant: tenant.to_string(),
+        index: index.map(str::to_string),
         rel,
         discovery,
         stem,
         partial,
+    })
+}
+
+/// What the LISTING under `--from` says about whether `--from` is the mirror
+/// root, from the two markers that sit at a known depth under it
+/// (`docs/DESIGN_wal_recovery_root_identity.md`, "Identity evidence that
+/// already exists").
+///
+/// Neither marker is universal: a mirror with no managed index and no active
+/// mirroring — the default install — has neither, and that population gets
+/// [`RootVerdict::Unverified`] and the plan.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RootVerdict {
+    /// A marker sits at exactly the depth the mirror layout puts it: `--from`
+    /// IS the mirror root.
+    Confirmed {
+        /// The key that pinned it, verbatim.
+        evidence: String,
+    },
+    /// A marker sits exactly one component deeper than the layout allows, so
+    /// `--from` is one component above the mirror root — the near miss #4928
+    /// cannot see.
+    Contradicted {
+        /// The misplaced marker key, verbatim.
+        evidence: String,
+        /// The first component of that key: the directory to pass instead.
+        directory: String,
+        /// A marker that DID sit at root depth, when the listing holds both.
+        /// A confirming marker does not erase the contradiction: a listing
+        /// with markers at two depths is not a mirror root either way.
+        also_confirmed: Option<String>,
+    },
+    /// No marker at either depth. The plan is the only checkpoint.
+    #[default]
+    Unverified,
+}
+
+impl RootVerdict {
+    /// One line for the operator, whatever the verdict.
+    pub fn line(&self) -> String {
+        match self {
+            Self::Confirmed { evidence } => {
+                format!("root confirmed by `{evidence}`, a mirror marker at its own depth")
+            }
+            Self::Contradicted {
+                evidence,
+                directory,
+                also_confirmed,
+            } => {
+                let both = also_confirmed
+                    .as_deref()
+                    .map(|k| format!(" (`{k}` sits at root depth: the listing has markers at two depths, which no mirror root has)"))
+                    .unwrap_or_default();
+                format!(
+                    "root CONTRADICTED: `{evidence}` is a mirror marker one component deeper \
+                     than the layout puts it, so --from is one component above the mirror root. \
+                     Pass the `{directory}` directory under it instead{both}"
+                )
+            }
+            Self::Unverified => "root unverified: this mirror carries no `_active/` object and \
+                                 no `<tenant>/<index>/owner` marker, so nothing in the listing \
+                                 pins the root. Read the plan"
+                .to_string(),
+        }
+    }
+}
+
+/// The identity evidence one listed key carries, if any.
+enum RootEvidence {
+    /// A marker at the depth the mirror layout puts it.
+    AtRoot,
+    /// The same marker one component deeper: the first component is the
+    /// directory `--from` should have named.
+    OneDeeper(String),
+}
+
+/// Read one key suffix for root evidence.
+///
+/// Both markers are written by siglake itself at a fixed depth under the
+/// mirror root: the active loop writes a first component `_active` with a
+/// `.arrow.partial` tail (`mirror_active_loop`), and the catalog-claim drain
+/// writes `<tenant>/<index>/owner` (`mirror_owner_key`). A sealed segment key
+/// never ends in `.partial` and never ends in `owner`, so neither test can
+/// fire on ordinary traffic.
+fn root_evidence(suffix: &str) -> Option<RootEvidence> {
+    let parts: Vec<&str> = suffix
+        .trim_matches('/')
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect();
+    let last = *parts.last()?;
+    if last.ends_with(".arrow.partial") {
+        if parts[0] == "_active" && parts.len() >= 2 {
+            return Some(RootEvidence::AtRoot);
+        }
+        if parts.len() >= 3 && parts[1] == "_active" {
+            return Some(RootEvidence::OneDeeper(parts[0].to_string()));
+        }
+        return None;
+    }
+    if last == crate::OWNER_FILE {
+        // `<tenant>/<index>/owner` is the only depth the drain writes it at.
+        return match parts.len() {
+            3 => Some(RootEvidence::AtRoot),
+            4 => Some(RootEvidence::OneDeeper(parts[0].to_string())),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// One `(tenant, index)` destination in a [`RecoveryPlan`]: what would be
+/// written there, and where "there" is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanGroup {
+    /// Tenant the segments route to; `default` for the legacy flat layout.
+    pub tenant: String,
+    /// Index they route to, or `None` for a tenant's events lane.
+    pub index: Option<String>,
+    /// Distinct segments (a sealed key and its active prefix are one).
+    pub segments: usize,
+    /// Bytes the listing reported for them, or `None` when the store does not
+    /// report sizes in a listing (opendal's in-memory service does not).
+    pub bytes: Option<u64>,
+    /// One key, verbatim, so the operator can see what the layout looked like.
+    pub sample_key: String,
+    /// Absolute destination directory under the WAL root.
+    pub dest: std::path::PathBuf,
+    /// Segments of this group already on the WAL root, which an apply would
+    /// leave alone.
+    pub already_present: usize,
+}
+
+/// A restore that has not happened: the whole listing under `--from`,
+/// reconstructed into the layout the drain routes on, plus the verdict on the
+/// root itself. Nothing on the WAL root is created or modified to build one.
+///
+/// This is the LIST the restore was going to pay for anyway
+/// (`recover_from_object_store` collects every key before it reads one body),
+/// and no segment GET. A separate `--apply` invocation lists again, because it
+/// must decide on the listing that is current when it writes.
+#[derive(Debug, Clone)]
+pub struct RecoveryPlan {
+    /// Destinations, ordered by tenant then index.
+    pub groups: Vec<PlanGroup>,
+    /// Keys under the prefix whose layout recovery refuses to guess at.
+    pub skipped: usize,
+    /// One refused key, verbatim.
+    pub sample_skipped_key: Option<String>,
+    /// What the listing says about `--from` being the mirror root.
+    pub verdict: RootVerdict,
+    /// The objects to fetch, keyed by store key — an apply's work list.
+    candidates: Vec<(String, RecoveryTarget)>,
+}
+
+impl RecoveryPlan {
+    /// Distinct segments the plan would restore, already-present ones
+    /// included.
+    pub fn segments(&self) -> usize {
+        self.groups.iter().map(|g| g.segments).sum()
+    }
+
+    /// Segments already on the WAL root, which an apply would leave alone.
+    pub fn already_present(&self) -> usize {
+        self.groups.iter().map(|g| g.already_present).sum()
+    }
+
+    /// Bytes across every group, or `None` when the store reported no sizes.
+    pub fn bytes(&self) -> Option<u64> {
+        let total: u64 = self.groups.iter().filter_map(|g| g.bytes).sum();
+        (total > 0).then_some(total)
+    }
+
+    /// The error an apply owes the operator when the listing contradicts the
+    /// root. Separate from [`RootVerdict::line`] because it has to name the
+    /// destination it did NOT touch.
+    fn refusal(&self, wal_root: &Path) -> Option<anyhow::Error> {
+        let RootVerdict::Contradicted { .. } = self.verdict else {
+            return None;
+        };
+        Some(anyhow::anyhow!(
+            "refusing to restore: {}. Nothing under {} was created or changed.",
+            self.verdict.line(),
+            wal_root.display()
+        ))
+    }
+}
+
+/// List `<prefix>/` and reconstruct what a restore onto `wal_root` would
+/// write, without writing it — the plan `siglake wal-recover` prints when it
+/// is not given `--apply`.
+///
+/// `wal_root` is READ (each reconstructed destination is tested for a segment
+/// that is already there) and never created or modified, including the root
+/// itself: creating it is a visible change on a volume the operator may be
+/// inspecting, and a plan that changes the thing it is describing is not a
+/// checkpoint.
+pub async fn plan_recovery(op: &Operator, prefix: &str, wal_root: &Path) -> Result<RecoveryPlan> {
+    use futures::stream::StreamExt;
+
+    // An EMPTY prefix means the caller is already ROOTED at the mirror —
+    // which is the only shape `siglake wal-recover` can pass, because
+    // `build_opendal_operator` roots the store at the `--from` URL. Formatting
+    // `"{prefix}/"` unconditionally turned that into listing `"/"` and
+    // stripping `"/"` off relative keys, which fails for every entry, so the
+    // whole restore was dropped and the command still exited 0 (#4912).
+    let prefix = prefix.trim_matches('/').to_string();
+    let listing_prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}/")
+    };
+
+    // Lister yields `Entry` (dirs + files); filter to files only.
+    let lister = op
+        .lister_with(&listing_prefix)
+        .recursive(true)
+        .await
+        .context("list WAL mirror")?;
+    let mut listing = lister.fuse();
+    // Collect first, then decide: a segment can appear both sealed and active,
+    // and the sealed copy must win.
+    let mut candidates: std::collections::HashMap<String, (String, u64, RecoveryTarget)> =
+        std::collections::HashMap::new();
+    let mut skipped = 0usize;
+    let mut sample_skipped_key: Option<String> = None;
+    let mut at_root: Option<String> = None;
+    let mut one_deeper: Option<(String, String)> = None;
+    while let Some(entry) = listing.next().await {
+        let entry = entry.context("list entry")?;
+        let path = entry.path().to_string();
+        if !entry.metadata().is_file() {
+            continue;
+        }
+        // With an empty prefix the listed key is already relative to the
+        // mirror root, so it is its own suffix.
+        let Some(suffix) = path.strip_prefix(listing_prefix.as_str()) else {
+            continue;
+        };
+        // The verdict reads keys recovery refuses as well as keys it takes:
+        // both markers are refused keys, and the misplaced one is the whole
+        // point.
+        match root_evidence(suffix) {
+            Some(RootEvidence::AtRoot) => {
+                at_root.get_or_insert_with(|| path.clone());
+            }
+            Some(RootEvidence::OneDeeper(dir)) => {
+                one_deeper.get_or_insert_with(|| (path.clone(), dir));
+            }
+            None => {}
+        }
+        let bytes = entry.metadata().content_length();
+        let Some(target) = recovery_target(suffix) else {
+            skipped += 1;
+            sample_skipped_key.get_or_insert_with(|| path.clone());
+            tracing::warn!(key = %path, "wal-recover: unrecognised key, skipped");
+            continue;
+        };
+        match candidates.get(&target.stem) {
+            // Already have a sealed copy of this segment; an active prefix of
+            // it adds nothing and would duplicate rows.
+            Some((_, _, existing)) if !existing.partial => continue,
+            _ => {
+                candidates.insert(target.stem.clone(), (path, bytes, target));
+            }
+        }
+    }
+    if skipped > 0 {
+        metrics::counter!("siglake_wal_recover_skipped_total").increment(skipped as u64);
+    }
+
+    // Contradiction wins over confirmation: a listing holding markers at two
+    // depths is not a mirror root under either reading, and the misplaced one
+    // is the evidence that `--from` is too high.
+    let verdict = match (one_deeper, at_root) {
+        (Some((evidence, directory)), also_confirmed) => RootVerdict::Contradicted {
+            evidence,
+            directory,
+            also_confirmed,
+        },
+        (None, Some(evidence)) => RootVerdict::Confirmed { evidence },
+        (None, None) => RootVerdict::Unverified,
+    };
+
+    let mut by_dest: std::collections::BTreeMap<(String, Option<String>), PlanGroup> =
+        std::collections::BTreeMap::new();
+    let mut work: Vec<(String, RecoveryTarget)> = Vec::with_capacity(candidates.len());
+    for (key, bytes, target) in candidates.into_values() {
+        let dest = wal_root.join(&target.rel);
+        let group = by_dest
+            .entry((target.tenant.clone(), target.index.clone()))
+            .or_insert_with(|| PlanGroup {
+                tenant: target.tenant.clone(),
+                index: target.index.clone(),
+                segments: 0,
+                bytes: None,
+                sample_key: key.clone(),
+                dest: dest.parent().map(Path::to_path_buf).unwrap_or_default(),
+                already_present: 0,
+            });
+        group.segments += 1;
+        if bytes > 0 {
+            *group.bytes.get_or_insert(0) += bytes;
+        }
+        if key < group.sample_key {
+            group.sample_key = key.clone();
+        }
+        if dest.exists() {
+            group.already_present += 1;
+        }
+        work.push((key, target));
+    }
+    // Stable order for the apply too, so two runs of the same plan write in
+    // the same sequence.
+    work.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(RecoveryPlan {
+        groups: by_dest.into_values().collect(),
+        skipped,
+        sample_skipped_key,
+        verdict,
+        candidates: work,
     })
 }
 
@@ -1101,72 +1429,48 @@ pub struct RecoverySummary {
 /// reported as complete is page-cache-durable only, and the
 /// already-present skip below turns a power loss into a permanent hole — a
 /// truncated file the operator is told they have and a re-run never re-pulls.
+///
+/// [`plan_recovery`] and [`apply_plan`] in one call: the listing this apply
+/// writes from is its own, taken here. `siglake wal-recover --apply` calls the
+/// two halves separately so it can print the plan it is about to apply, and
+/// pays the same single LIST.
 pub async fn recover_from_object_store(
     op: Operator,
     prefix: &str,
     wal_root: &Path,
 ) -> Result<RecoverySummary> {
-    use futures::stream::StreamExt;
+    let plan = plan_recovery(&op, prefix, wal_root).await?;
+    apply_plan(&op, plan, wal_root).await
+}
 
-    crate::create_wal_dir(wal_root).with_context(|| format!("create {}", wal_root.display()))?;
-    // An EMPTY prefix means the operator is already ROOTED at the mirror —
-    // which is the only shape `siglake wal-recover` can pass, because
-    // `build_opendal_operator` roots the store at the `--from` URL. Formatting
-    // `"{prefix}/"` unconditionally turned that into listing `"/"` and
-    // stripping `"/"` off relative keys, which fails for every entry, so the
-    // whole restore was dropped and the command still exited 0 (#4912).
-    let prefix = prefix.trim_matches('/').to_string();
-    let listing_prefix = if prefix.is_empty() {
-        String::new()
-    } else {
-        format!("{prefix}/")
+/// Write `plan` onto the WAL root: the only path in this module that creates
+/// anything under `wal_root`.
+///
+/// A [`RootVerdict::Contradicted`] plan is refused before anything is created,
+/// `wal_root` itself included — the listing says `--from` is one component
+/// above the mirror root, and restoring it would invent a tenant named after
+/// the mirror prefix (#4964).
+///
+/// `plan` must come from the listing THIS apply is deciding on
+/// (`recover_from_object_store` is the one-call form): the already-present
+/// counts in a plan printed by an earlier invocation are a report, not a
+/// work list.
+pub async fn apply_plan(
+    op: &Operator,
+    plan: RecoveryPlan,
+    wal_root: &Path,
+) -> Result<RecoverySummary> {
+    if let Some(refusal) = plan.refusal(wal_root) {
+        return Err(refusal);
+    }
+    let mut summary = RecoverySummary {
+        skipped: plan.skipped,
+        sample_skipped_key: plan.sample_skipped_key.clone(),
+        ..RecoverySummary::default()
     };
 
-    // Lister yields `Entry` (dirs + files); filter to files only.
-    let lister = op
-        .lister_with(&listing_prefix)
-        .recursive(true)
-        .await
-        .context("list WAL mirror")?;
-    let mut listing = lister.fuse();
-    // Collect first, then decide: a segment can appear both sealed and active,
-    // and the sealed copy must win.
-    let mut candidates: std::collections::HashMap<String, (String, RecoveryTarget)> =
-        std::collections::HashMap::new();
-    let mut summary = RecoverySummary::default();
-    while let Some(entry) = listing.next().await {
-        let entry = entry.context("list entry")?;
-        let path = entry.path().to_string();
-        if !entry.metadata().is_file() {
-            continue;
-        }
-        // With an empty prefix the listed key is already relative to the
-        // mirror root, so it is its own suffix.
-        let Some(suffix) = path.strip_prefix(listing_prefix.as_str()) else {
-            continue;
-        };
-        let Some(target) = recovery_target(suffix) else {
-            summary.skipped += 1;
-            summary
-                .sample_skipped_key
-                .get_or_insert_with(|| path.clone());
-            tracing::warn!(key = %path, "wal-recover: unrecognised key, skipped");
-            continue;
-        };
-        match candidates.get(&target.stem) {
-            // Already have a sealed copy of this segment; an active prefix of
-            // it adds nothing and would duplicate rows.
-            Some((_, existing)) if !existing.partial => continue,
-            _ => {
-                candidates.insert(target.stem.clone(), (path, target));
-            }
-        }
-    }
-    if summary.skipped > 0 {
-        metrics::counter!("siglake_wal_recover_skipped_total").increment(summary.skipped as u64);
-    }
-
-    for (key, target) in candidates.into_values() {
+    crate::create_wal_dir(wal_root).with_context(|| format!("create {}", wal_root.display()))?;
+    for (key, target) in plan.candidates {
         let dest = wal_root.join(&target.rel);
         // BEFORE the already-present skip, because the skip is the path a
         // re-run takes over a restore that landed the segments and not this
@@ -2004,6 +2308,186 @@ mod tests {
         }
         assert_eq!(found, 1, "expected exactly one active-mirror blob");
         assert!(total_bytes > 0, "active-mirror blob is empty");
+    }
+
+    /// The plan groups by the destination the drain routes on, and touches
+    /// the WAL root not at all — not the root, not a `sealed/`, not the
+    /// tenant discovery dir (#4973).
+    #[tokio::test]
+    async fn plan_groups_by_destination_and_writes_nothing() {
+        let op = memory_op();
+        for key in [
+            "wal-mirror/acme/a.arrow",
+            "wal-mirror/acme/b.arrow",
+            "wal-mirror/acme/orders/c.arrow",
+            "wal-mirror/flat.arrow",
+            "wal-mirror/README.md",
+        ] {
+            op.write(key, bytes::Bytes::from_static(b"BODY"))
+                .await
+                .unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        let plan = plan_recovery(&op, "wal-mirror", &root).await.unwrap();
+
+        assert!(!root.exists(), "the plan created {}", root.display());
+        assert_eq!(plan.segments(), 4);
+        assert_eq!(plan.skipped, 1);
+        assert_eq!(
+            plan.sample_skipped_key.as_deref(),
+            Some("wal-mirror/README.md")
+        );
+        assert_eq!(plan.already_present(), 0);
+        assert_eq!(
+            plan.groups
+                .iter()
+                .map(|g| (
+                    g.tenant.as_str(),
+                    g.index.as_deref(),
+                    g.segments,
+                    g.dest
+                        .strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("acme", None, 2, format!("acme/{SEALED_DIR}")),
+                (
+                    "acme",
+                    Some("orders"),
+                    1,
+                    format!("acme/orders/{SEALED_DIR}")
+                ),
+                ("default", None, 1, format!("default/{SEALED_DIR}")),
+            ]
+        );
+        // opendal's in-memory service reports no size in a listing, and a
+        // plan pays one LIST and no per-object request, so it says so rather
+        // than inventing a total.
+        assert_eq!(plan.bytes(), None);
+
+        // After the apply, a second plan counts what is there instead of
+        // proposing it again.
+        let summary = recover_from_object_store(op.clone(), "wal-mirror", &root)
+            .await
+            .unwrap();
+        assert_eq!(summary.pulled, 4);
+        let plan = plan_recovery(&op, "wal-mirror", &root).await.unwrap();
+        assert_eq!(plan.already_present(), 4);
+    }
+
+    /// Both markers pin the root at their own depth, and refuse one component
+    /// above it. A confirming marker does not cancel a contradicting one.
+    #[tokio::test]
+    async fn the_root_verdict_reads_both_markers_at_their_own_depth() {
+        async fn verdict_for(keys: &[&str], prefix: &str) -> RootVerdict {
+            let op = memory_op();
+            for key in keys {
+                op.write(key, bytes::Bytes::from_static(b"BODY"))
+                    .await
+                    .unwrap();
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            plan_recovery(&op, prefix, &tmp.path().join("wal"))
+                .await
+                .unwrap()
+                .verdict
+        }
+
+        // At their own depth, from the mirror root.
+        for key in [
+            "m/_active/x.arrow.partial",
+            "m/_active/acme/x.arrow.partial",
+            "m/_active/acme/orders/x.arrow.partial",
+            "m/acme/orders/owner",
+        ] {
+            assert!(
+                matches!(
+                    verdict_for(&[key], "m").await,
+                    RootVerdict::Confirmed { .. }
+                ),
+                "{key} pins the root"
+            );
+        }
+
+        // One component deeper: the near miss, naming the directory to pass.
+        for (key, dir) in [
+            ("m/wal-mirror/_active/acme/x.arrow.partial", "wal-mirror"),
+            ("m/wal-mirror/acme/orders/owner", "wal-mirror"),
+        ] {
+            match verdict_for(&[key], "m").await {
+                RootVerdict::Contradicted {
+                    directory,
+                    also_confirmed,
+                    ..
+                } => {
+                    assert_eq!(directory, dir);
+                    assert_eq!(also_confirmed, None);
+                }
+                other => panic!("{key} should contradict, got {other:?}"),
+            }
+        }
+
+        // Neither: the default install.
+        assert_eq!(
+            verdict_for(&["m/acme/x.arrow", "m/README.md"], "m").await,
+            RootVerdict::Unverified
+        );
+
+        // Both depths at once: the contradiction wins and the confirming key
+        // is reported alongside it.
+        match verdict_for(
+            &[
+                "m/_active/acme/a.arrow.partial",
+                "m/wal-mirror/_active/acme/b.arrow.partial",
+            ],
+            "m",
+        )
+        .await
+        {
+            RootVerdict::Contradicted {
+                evidence,
+                directory,
+                also_confirmed,
+            } => {
+                assert_eq!(evidence, "m/wal-mirror/_active/acme/b.arrow.partial");
+                assert_eq!(directory, "wal-mirror");
+                assert_eq!(
+                    also_confirmed.as_deref(),
+                    Some("m/_active/acme/a.arrow.partial")
+                );
+            }
+            other => panic!("the contradiction must win, got {other:?}"),
+        }
+    }
+
+    /// An apply over a contradicted root creates NOTHING — not the segment,
+    /// not its directories, and not the WAL root itself.
+    #[tokio::test]
+    async fn an_apply_refuses_a_contradicted_root_before_it_creates_anything() {
+        let op = memory_op();
+        for key in [
+            "warehouse/wal-mirror/acme/a.arrow",
+            "warehouse/wal-mirror/_active/acme/b.arrow.partial",
+        ] {
+            op.write(key, bytes::Bytes::from_static(b"BODY"))
+                .await
+                .unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        let err = recover_from_object_store(op, "warehouse", &root)
+            .await
+            .expect_err("a contradicted root must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("wal-mirror"), "{msg}");
+        assert!(msg.contains("one component above the mirror root"), "{msg}");
+        assert!(!root.exists(), "{} was created", root.display());
     }
 
     /// Legacy flat keys predate tenancy, so they mean the default tenant.

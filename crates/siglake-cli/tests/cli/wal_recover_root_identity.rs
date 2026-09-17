@@ -1,29 +1,34 @@
-//! #4964: what `siglake wal-recover` can and cannot tell about the root it was
-//! pointed at, measured against a `file://` mirror.
+//! #4964 and #4973: what `siglake wal-recover` can and cannot tell about the
+//! root it was pointed at, measured against a `file://` mirror.
 //!
 //! #4928 made a restore that understood NOTHING exit nonzero. The near miss it
 //! cannot see is `--from` exactly ONE component too high: the shallowest key
 //! under a mirror root is `<tenant>/<segment>.arrow`, and one component up it
 //! is `<prefix>/<tenant>/<segment>.arrow` — which
 //! `siglake_wal::mirror::recovery_target` reads as the `<tenant>/<index>/`
-//! layout. Real segments are then restored under a tenant named after the
-//! mirror prefix, nothing is skipped on that key, and the command exits 0.
+//! layout. Real segments were then restored under a tenant named after the
+//! mirror prefix, nothing was skipped on that key, and the command exited 0.
 //!
-//! These tests RECORD current behaviour; none of them asserts a fix for root
-//! identity. They are the evidence behind
-//! `docs/DESIGN_wal_recovery_root_identity.md`, and the thing that design has
-//! to keep true: cases 2, 3 and 4 are legitimate installs whose keys are
-//! byte-identical to the misplacement in case 1, so no rule reading only the
-//! key can separate them.
+//! #4964 measured that and #4973 answered it with option C of
+//! `docs/DESIGN_wal_recovery_root_identity.md`: the command PLANS unless it is
+//! given `--apply`, and the same listing that produces the plan carries the
+//! verdict. These cases now separate the three populations:
 //!
-//! The last two cases do assert a fix, for the unrelated defect this
-//! qualification turned up: #4972, the tenant discovery dir a restore left out.
+//! - a mirror whose listing holds an `_active/` object or a
+//!   `<tenant>/<index>/owner` marker ONE component too deep — refused, in both
+//!   forms, naming the directory to pass instead;
+//! - a mirror whose markers sit at their own depth — confirmed;
+//! - a mirror with neither, which is the default install — unverified, and the
+//!   plan is the whole checkpoint. The cases that follow the plan with
+//!   `--apply` are that population, and they still misplace: no rule reading
+//!   only the keys can separate them, which is what the legitimate installs in
+//!   cases 2, 3 and 4 pin.
 
 use std::path::{Path, PathBuf};
 
 use siglake_wal::{list_sealed, SEALED_DIR};
 
-use super::wal_recover_cli::{place, recover, seal_one};
+use super::wal_recover_cli::{place, recover, recover_apply, seal_one};
 
 /// Every `.arrow` a restore left on the WAL root, as paths relative to it,
 /// sorted. This is the routing the FS drain then reads: the first component is
@@ -64,6 +69,14 @@ fn mirror_with(tmp: &Path, root: &str, keys: &[&str]) -> PathBuf {
     mirror
 }
 
+/// Write a non-segment object into the mirror — an owner marker, a stray
+/// README — at `key`.
+fn place_marker(mirror: &Path, key: &str, body: &[u8]) {
+    let dest = mirror.join(key);
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::write(&dest, body).unwrap();
+}
+
 /// The segment filename a `mirror_with` fixture used, so a caller can build the
 /// key it expects on the WAL root.
 fn segment_name(mirror: &Path) -> String {
@@ -89,15 +102,19 @@ fn segment_name(mirror: &Path) -> String {
         .into_owned()
 }
 
-/// **Case 1, the defect.** `--from` exactly one component above the mirror root
-/// restores the shallowest keys into a tenant named after the mirror prefix and
-/// exits 0. The deeper keys — an index segment and the active mirror — are the
-/// only ones refused, so the report carries a skip count that reads like a
-/// mirror with stray objects in it (which
-/// `a_mirror_with_unknown_keys_alongside_segments_restores_and_reports_both`
-/// pins as a SUCCESS), not like a wrong `--from`.
+/// **Case 1, the defect, and #4973's answer to it.** `--from` exactly one
+/// component above a mirror that has an active-mirror object used to restore
+/// the shallowest keys into a tenant named after the mirror prefix and exit 0.
+/// The `_active/` object it skipped on the way past is the evidence: under the
+/// mirror root its first component IS `_active`, and here it is one component
+/// deeper. Both forms of the command now refuse, name `wal-mirror` as the
+/// directory to pass, and leave `--to` alone — the apply before the WAL root
+/// is created at all.
+///
+/// Against the pre-#4973 binary the apply arm exits 0 and writes the invented
+/// tenant.
 #[test]
-fn one_component_above_the_mirror_root_restores_into_an_invented_tenant() {
+fn one_component_above_a_mirror_with_an_active_object_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let mirror = tmp.path().join("warehouse").join("wal-mirror");
     let events = seal_one(&tmp.path().join("src").join("acme"), "acme-events");
@@ -116,28 +133,118 @@ fn one_component_above_the_mirror_root_restores_into_an_invented_tenant() {
         &active,
     );
 
-    let wal = tmp.path().join("wal");
-    let ancestor = tmp.path().join("warehouse");
-    let (stdout, stderr, ok) = recover(&format!("file://{}", ancestor.display()), &wal);
+    let ancestor = format!("file://{}", tmp.path().join("warehouse").display());
+    for (arm, run) in [
+        ("plan", recover as fn(&str, &Path) -> (String, String, bool)),
+        ("apply", recover_apply),
+    ] {
+        let wal = tmp.path().join(format!("wal-{arm}"));
+        let (stdout, stderr, ok) = run(&ancestor, &wal);
+        assert!(!ok, "{arm}: the misplaced marker must refuse: {stdout}");
+        assert!(
+            stderr.contains("one component above the mirror root")
+                && stderr.contains("`wal-mirror` directory"),
+            "{arm}: the refusal names the directory to pass: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("_active/widgets/{}.partial", names[2])),
+            "{arm}: and the key it read it from: {stderr}"
+        );
+        assert!(
+            !wal.exists(),
+            "{arm}: {} must not be created",
+            wal.display()
+        );
+        // The plan is still printed, so the operator sees the tenant the
+        // command would have invented next to the reason it will not.
+        assert!(
+            stdout.contains("tenant=wal-mirror index=acme"),
+            "{arm}: {stdout}"
+        );
+    }
 
-    assert!(
-        ok,
-        "TODAY this succeeds — the near miss #4928 cannot see: {stdout}{stderr}"
-    );
-    assert!(
-        stdout.contains("pulled 1 segments") && stdout.contains("2 keys skipped"),
-        "{stdout}{stderr}"
-    );
+    // The control: from the mirror root the same objects restore, and the
+    // verdict is the confirming one.
+    let wal = tmp.path().join("wal-right");
+    let (stdout, stderr, ok) = recover_apply(&format!("file://{}", mirror.display()), &wal);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(stdout.contains("root confirmed"), "{stdout}");
     assert_eq!(
         restored_layout(&wal),
-        vec![format!("wal-mirror/acme/{}/{}", SEALED_DIR, names[0])],
-        "acme's events segment lands under a tenant called `wal-mirror`, with \
-         `acme` read as its index"
+        vec![
+            format!("acme/orders/{}/{}", SEALED_DIR, names[1]),
+            format!("acme/{}/{}", SEALED_DIR, names[0]),
+            format!("widgets/{}/{}", SEALED_DIR, names[2]),
+        ],
+        "every object lands where the drain routes it to its own tenant"
+    );
+    assert_eq!(list_sealed(&wal.join("acme")).unwrap().len(), 1);
+}
+
+/// The other marker, on its own. A fleet mirror with a managed index carries
+/// `<tenant>/<index>/owner` (`siglake_wal::mirror::mirror_owner_key`) and may
+/// carry no `_active/` object at all — `wal.mirror.activeIntervalSecs`
+/// defaults to 0. One component up that marker is four components deep, which
+/// the mirror layout never puts it at, and it refuses the same way.
+#[test]
+fn an_owner_marker_one_component_too_deep_refuses_the_apply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mirror = mirror_with(tmp.path(), "warehouse/wal-mirror", &["acme/seg.arrow"]);
+    place_marker(
+        &mirror,
+        "acme/orders/owner",
+        b"11111111-2222-3333-4444-555555555555\n",
+    );
+    assert!(!mirror.join("_active").exists(), "no active mirror here");
+
+    let ancestor = format!("file://{}", tmp.path().join("warehouse").display());
+    let wal = tmp.path().join("wal");
+    let (stdout, stderr, ok) = recover_apply(&ancestor, &wal);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(
+        stderr.contains("`wal-mirror` directory") && stderr.contains("acme/orders/owner"),
+        "{stderr}"
+    );
+    assert!(!wal.exists(), "nothing was created: {stdout}{stderr}");
+
+    // From the mirror root the same marker CONFIRMS, and the restore runs.
+    let right = tmp.path().join("wal-right");
+    let (stdout, stderr, ok) = recover_apply(&format!("file://{}", mirror.display()), &right);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(stdout.contains("root confirmed"), "{stdout}");
+    assert_eq!(
+        restored_layout(&right),
+        vec![format!("acme/{SEALED_DIR}/seg.arrow")]
+    );
+}
+
+/// A confirming marker does not erase a contradicting one. A listing that
+/// holds markers at BOTH depths is not a mirror root under either reading —
+/// an ancestor holding two mirrors, or a mirror root with a stray copy of one
+/// under it — so the refusal wins and says both keys.
+#[test]
+fn a_confirming_marker_does_not_erase_a_contradiction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ancestor = tmp.path().join("warehouse");
+    let src = seal_one(&tmp.path().join("src"), "row");
+    // At root depth: `_active/<tenant>/<seg>.arrow.partial`.
+    place(&ancestor, "_active/acme/a.arrow.partial", &src);
+    // One deeper, under a second directory: the contradiction.
+    place(&ancestor, "wal-mirror/_active/acme/b.arrow.partial", &src);
+    place(&ancestor, "wal-mirror/acme/seg.arrow", &src);
+
+    let wal = tmp.path().join("wal");
+    let (stdout, stderr, ok) = recover_apply(&format!("file://{}", ancestor.display()), &wal);
+    assert!(!ok, "the contradiction wins: {stdout}{stderr}");
+    assert!(
+        stderr.contains("wal-mirror/_active/acme/b.arrow.partial"),
+        "the misplaced marker is the evidence: {stderr}"
     );
     assert!(
-        list_sealed(&wal.join("acme")).unwrap().is_empty(),
-        "and nothing lands where the drain would route it to acme"
+        stderr.contains("_active/acme/a.arrow.partial") && stderr.contains("markers at two depths"),
+        "and the confirming one is reported, not obeyed: {stderr}"
     );
+    assert!(!wal.exists(), "nothing was created: {stdout}{stderr}");
 }
 
 /// **Why the one-component miss is the likely one.** `wal.mirror.prefix` is
@@ -145,10 +252,11 @@ fn one_component_above_the_mirror_root_restores_into_an_invented_tenant() {
 /// `s3://<bucket>/<warehousePrefix>/wal-mirror/`
 /// (`deploy/helm/siglake/values.yaml:864-867`) and its parent is the warehouse
 /// URL the operator already has in their config and their shell history. This
-/// is that mistake against a warehouse-shaped ancestor: the Iceberg objects
-/// alongside the mirror are all skipped (none of them ends in `.arrow`), so the
-/// report is a large skip count next to a small pull — and the pull is enough
-/// to keep the exit status at 0.
+/// is that mistake against a warehouse-shaped ancestor. This mirror has no
+/// marker of either kind — the default install — so nothing in the listing
+/// contradicts the root and the verdict is `unverified`. What #4973 adds for
+/// this population is the checkpoint: the plan names the tenant it would
+/// invent, and writes nothing until the operator passes `--apply`.
 #[test]
 fn the_warehouse_url_an_operator_already_has_is_the_one_component_miss() {
     let tmp = tempfile::tempdir().unwrap();
@@ -166,12 +274,28 @@ fn the_warehouse_url_an_operator_already_has_is_the_one_component_miss() {
     }
 
     let wal = tmp.path().join("wal");
-    let (stdout, stderr, ok) = recover(&format!("file://{}", warehouse.display()), &wal);
+    let from = format!("file://{}", warehouse.display());
+    let (stdout, stderr, ok) = recover(&from, &wal);
     assert!(ok, "{stdout}{stderr}");
     assert!(
-        stdout.contains("pulled 1 segments") && stdout.contains("3 keys skipped"),
+        stdout.contains("totals: 1 segments") && stdout.contains("3 keys skipped"),
         "{stdout}{stderr}"
     );
+    assert!(
+        stdout.contains("root unverified"),
+        "no marker either way: {stdout}"
+    );
+    assert!(
+        stdout.contains("tenant=wal-mirror index=acme"),
+        "the plan names the tenant it would invent: {stdout}"
+    );
+    assert!(!wal.exists(), "and writes nothing: {stdout}{stderr}");
+
+    // An operator who reads the plan and applies it anyway gets the old
+    // outcome: nothing in this listing could have told the command otherwise.
+    let (stdout, stderr, ok) = recover_apply(&from, &wal);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(stdout.contains("pulled 1 segments"), "{stdout}{stderr}");
     assert_eq!(
         restored_layout(&wal),
         vec![format!("wal-mirror/acme/{SEALED_DIR}/seg.arrow")],
@@ -185,59 +309,96 @@ fn the_warehouse_url_an_operator_already_has_is_the_one_component_miss() {
 /// the same place. Here that placement is CORRECT. Nothing in the key, the
 /// object body or the listing separates the two; refusing a first component
 /// named after a prefix would break this install and still not see a mirror
-/// whose prefix is `mirror`, `wal` or a date.
+/// whose prefix is `mirror`, `wal` or a date. #4973 leaves this install
+/// working: the plan describes it, `--apply` restores it, and the marker
+/// verdict never fires because nothing in the listing is misplaced. A re-run
+/// of the apply is idempotent, as the runbook's second attempt has to be.
 #[test]
 fn a_tenant_named_after_the_prefix_produces_the_same_keys_and_the_same_restore() {
     let tmp = tempfile::tempdir().unwrap();
     // The mirror root is `.../store`; the tenant under it is called
-    // `wal-mirror`, with an index `acme`.
+    // `wal-mirror`, with an index `acme`. It carries the markers a healthy
+    // fleet mirror carries, at their own depth.
     let mirror = mirror_with(tmp.path(), "store", &["wal-mirror/acme/seg.arrow"]);
+    place_marker(&mirror, "wal-mirror/acme/owner", b"a-table-uuid\n");
     let name = segment_name(&mirror);
     assert_eq!(name, "seg.arrow");
 
+    let from = format!("file://{}", mirror.display());
     let wal = tmp.path().join("wal");
-    let (stdout, stderr, ok) = recover(&format!("file://{}", mirror.display()), &wal);
+    let (stdout, stderr, ok) = recover(&from, &wal);
+    assert!(ok, "plan: {stdout}{stderr}");
+    assert!(stdout.contains("root confirmed"), "{stdout}{stderr}");
+    assert!(!wal.exists(), "the plan wrote nothing: {stdout}{stderr}");
+
+    let (stdout, stderr, ok) = recover_apply(&from, &wal);
     assert!(ok, "{stdout}{stderr}");
     assert!(stdout.contains("pulled 1 segments"), "{stdout}{stderr}");
+    let expected = vec![format!("wal-mirror/acme/{SEALED_DIR}/seg.arrow")];
     assert_eq!(
         restored_layout(&wal),
-        vec![format!("wal-mirror/acme/{SEALED_DIR}/seg.arrow")],
+        expected,
         "the legitimate restore of a tenant called `wal-mirror` is the SAME \
          layout case 1 produces by mistake"
     );
+
+    let (stdout, stderr, ok) = recover_apply(&from, &wal);
+    assert!(ok, "the second apply is idempotent: {stdout}{stderr}");
+    assert!(
+        stdout.contains("pulled 0 segments") && stdout.contains("1 already present"),
+        "{stdout}{stderr}"
+    );
+    assert_eq!(restored_layout(&wal), expected);
 }
 
-/// **Case 3, the silent one.** A legacy flat mirror — keys with no tenant
-/// component at all, which `recovery_target` maps to the default tenant —
-/// read from one component up produces NO skips whatsoever. The report is
-/// `pulled N segments` with nothing after it: the exact line a correct restore
-/// prints. Every segment lands under a tenant named after the mirror prefix
-/// instead of `default`.
+/// **Case 3, the silent one — and the case the plan exists for.** A legacy
+/// flat mirror (keys with no tenant component at all, which `recovery_target`
+/// maps to the default tenant) read from one component up produces NO skips
+/// whatsoever, and no marker either. The two runs differ in exactly one place
+/// an operator can see before anything is written: the destination on the plan
+/// line, `default/` against `wal-mirror/`.
 #[test]
-fn a_legacy_flat_mirror_one_component_up_reports_a_clean_restore() {
+fn a_legacy_flat_mirror_one_component_up_plans_a_different_destination() {
     let tmp = tempfile::tempdir().unwrap();
     let mirror = mirror_with(tmp.path(), "warehouse/wal-mirror", &["seg.arrow"]);
 
     // The control: from the mirror root, the flat key is the default tenant.
     let right = tmp.path().join("wal-right");
-    let (stdout, stderr, ok) = recover(&format!("file://{}", mirror.display()), &right);
+    let from = format!("file://{}", mirror.display());
+    let (stdout, stderr, ok) = recover(&from, &right);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(
+        stdout.contains("tenant=default") && stdout.contains("root unverified"),
+        "{stdout}{stderr}"
+    );
+    let (stdout, stderr, ok) = recover_apply(&from, &right);
     assert!(ok, "{stdout}{stderr}");
     assert_eq!(
         restored_layout(&right),
         vec![format!("default/{SEALED_DIR}/seg.arrow")]
     );
 
-    // One component up: same exit status, same stdout shape, wrong namespace.
+    // One component up: no marker contradicts it, so the plan is all the
+    // operator gets — and the plan says `wal-mirror`, which is the tenant they
+    // do not have. Nothing is written until they say so.
     let wrong = tmp.path().join("wal-wrong");
-    let ancestor = tmp.path().join("warehouse");
-    let (stdout, stderr, ok) = recover(&format!("file://{}", ancestor.display()), &wrong);
+    let ancestor = format!("file://{}", tmp.path().join("warehouse").display());
+    let (stdout, stderr, ok) = recover(&ancestor, &wrong);
     assert!(ok, "{stdout}{stderr}");
-    assert!(stdout.contains("pulled 1 segments"), "{stdout}{stderr}");
     assert!(
-        !stdout.contains("skipped"),
-        "nothing is refused, so the report is indistinguishable from a correct \
+        stdout.contains("totals: 1 segments") && !stdout.contains("skipped"),
+        "nothing is refused, so the counts are indistinguishable from a correct \
          restore: {stdout}{stderr}"
     );
+    assert!(
+        stdout.contains("tenant=wal-mirror"),
+        "the destination is the difference: {stdout}"
+    );
+    assert!(!wrong.exists(), "and nothing is written: {stdout}{stderr}");
+
+    let (stdout, stderr, ok) = recover_apply(&ancestor, &wrong);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(stdout.contains("pulled 1 segments"), "{stdout}{stderr}");
     assert_eq!(
         restored_layout(&wrong),
         vec![format!("wal-mirror/{SEALED_DIR}/seg.arrow")],
@@ -255,10 +416,16 @@ fn a_custom_prefix_misreads_the_same_way_under_a_different_name() {
     let mirror = mirror_with(tmp.path(), "lake/m", &["acme/seg.arrow"]);
 
     let wal = tmp.path().join("wal");
-    let (stdout, stderr, ok) = recover(
-        &format!("file://{}", tmp.path().join("lake").display()),
-        &wal,
+    let from = format!("file://{}", tmp.path().join("lake").display());
+    let (stdout, stderr, ok) = recover(&from, &wal);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(
+        stdout.contains("tenant=m index=acme") && stdout.contains("root unverified"),
+        "the plan names the invented tenant: {stdout}{stderr}"
     );
+    assert!(!wal.exists(), "and writes nothing: {stdout}{stderr}");
+
+    let (stdout, stderr, ok) = recover_apply(&from, &wal);
     assert!(ok, "{stdout}{stderr}");
     assert!(stdout.contains("pulled 1 segments"), "{stdout}{stderr}");
     assert_eq!(
@@ -323,7 +490,7 @@ async fn a_misplaced_flat_restore_commits_rows_into_an_invented_namespace() {
     // Recover one component too high, then drain exactly as the runbook says.
     let wal = tmp.path().join("wal");
     let ancestor = tmp.path().join("warehouse");
-    let (stdout, stderr, ok) = recover(&format!("file://{}", ancestor.display()), &wal);
+    let (stdout, stderr, ok) = recover_apply(&format!("file://{}", ancestor.display()), &wal);
     assert!(ok, "{stdout}{stderr}");
 
     let ice = Arc::new(
@@ -348,7 +515,7 @@ async fn a_misplaced_flat_restore_commits_rows_into_an_invented_namespace() {
     // The control: the same mirror, recovered from its root, commits to the
     // default namespace and creates no tenant namespace at all.
     let right = tmp.path().join("wal-right");
-    let (stdout, stderr, ok) = recover(&format!("file://{}", mirror.display()), &right);
+    let (stdout, stderr, ok) = recover_apply(&format!("file://{}", mirror.display()), &right);
     assert!(ok, "{stdout}{stderr}");
     let ice = Arc::new(
         IcebergContext::open(&tmp.path().join("ice-right"))
@@ -394,7 +561,7 @@ async fn a_misplaced_index_restore_is_walked_and_refused_at_the_index_gate() {
 
     let wal = tmp.path().join("wal");
     let ancestor = tmp.path().join("warehouse");
-    let (stdout, stderr, ok) = recover(&format!("file://{}", ancestor.display()), &wal);
+    let (stdout, stderr, ok) = recover_apply(&format!("file://{}", ancestor.display()), &wal);
     assert!(ok, "{stdout}{stderr}");
     assert_eq!(
         restored_layout(&wal),
@@ -506,7 +673,17 @@ async fn a_correct_restore_of_an_index_only_tenant_is_drained() {
     );
 
     let wal = tmp.path().join("wal");
-    let (stdout, stderr, ok) = recover(&format!("file://{}", mirror.display()), &wal);
+    let from = format!("file://{}", mirror.display());
+
+    // The plan names the index destination and creates nothing — not the
+    // segment's directory and not the tenant discovery dir #4972 added, which
+    // is the one write a plan could most easily leak.
+    let (stdout, stderr, ok) = recover(&from, &wal);
+    assert!(ok, "plan: {stdout}{stderr}");
+    assert!(stdout.contains("tenant=acme index=orders"), "{stdout}");
+    assert!(!wal.exists(), "the plan created {}", wal.display());
+
+    let (stdout, stderr, ok) = recover_apply(&from, &wal);
     assert!(ok, "{stdout}{stderr}");
     assert!(stdout.contains("pulled 1 segments"), "{stdout}{stderr}");
     assert_eq!(
@@ -517,6 +694,21 @@ async fn a_correct_restore_of_an_index_only_tenant_is_drained() {
     assert!(
         wal.join("acme").join(SEALED_DIR).is_dir(),
         "and the restore rebuilt the discovery dir the enumeration reads"
+    );
+
+    // #4972's repair path is unchanged by the split: a re-run over a root
+    // whose segments are present but whose discovery dir is missing recreates
+    // it, under `--apply`.
+    std::fs::remove_dir(wal.join("acme").join(SEALED_DIR)).unwrap();
+    let (stdout, stderr, ok) = recover_apply(&from, &wal);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(
+        stdout.contains("1 already present"),
+        "the segment is not re-pulled: {stdout}{stderr}"
+    );
+    assert!(
+        wal.join("acme").join(SEALED_DIR).is_dir(),
+        "and the discovery dir is repaired anyway"
     );
 
     assert_eq!(
@@ -577,7 +769,7 @@ async fn an_index_only_restore_whose_index_does_not_resolve_reaches_the_index_ga
     );
 
     let wal = tmp.path().join("wal");
-    let (stdout, stderr, ok) = recover(&format!("file://{}", mirror.display()), &wal);
+    let (stdout, stderr, ok) = recover_apply(&format!("file://{}", mirror.display()), &wal);
     assert!(ok, "{stdout}{stderr}");
 
     let ice = Arc::new(IcebergContext::open(&tmp.path().join("ice")).await.unwrap());
@@ -602,17 +794,18 @@ async fn an_index_only_restore_whose_index_does_not_resolve_reaches_the_index_ga
     );
 }
 
-/// **The evidence that is actually in the store.** The catalog-claim drain
-/// stamps `<tenant>/<index>/owner` under the mirror prefix
-/// (`siglake_wal::mirror::mirror_owner_key`), and the active mirror writes
-/// `_active/…`. Both sit at a KNOWN depth relative to the mirror root, so
-/// either one present under `--from` pins the root — and one component up they
-/// are one component deeper. Recovery skips both today (neither ends in
-/// `.arrow`), and the skip is not distinguished from an unreadable layout.
+/// **The evidence that is actually in the store, and the population that has
+/// none of it.** The catalog-claim drain stamps `<tenant>/<index>/owner` under
+/// the mirror prefix (`siglake_wal::mirror::mirror_owner_key`), and the active
+/// mirror writes `_active/…`. Both sit at a KNOWN depth relative to the mirror
+/// root, so either one present under `--from` pins it. Recovery still counts
+/// them as unrecognised keys — they are not segments — and now also reads them
+/// for the verdict, which is the one thing that distinguishes those skips from
+/// a stray README.
 ///
-/// The limit of this evidence is what the design has to weigh: a mirror with no
-/// managed index and no active mirroring has neither key, and this test shows
-/// that mirror restoring one component up with a clean report.
+/// The limit is the last arm: a mirror with no managed index and no active
+/// mirroring has neither key, one component up reports no skip at all, and the
+/// plan is the only thing between the operator and the invented tenant.
 #[test]
 fn the_markers_that_do_pin_the_root_sit_at_a_known_depth() {
     let tmp = tempfile::tempdir().unwrap();
@@ -623,19 +816,22 @@ fn the_markers_that_do_pin_the_root_sit_at_a_known_depth() {
         "the owner marker is exactly two components under the mirror root"
     );
 
-    // A mirror that HAS the markers: from the root they are two and two
-    // components deep; from one up, three.
+    // A mirror that HAS the marker, read from its root: confirmed, and the
+    // marker is still counted as a key recovery does not restore.
     let mirror = mirror_with(tmp.path(), "warehouse/wal-mirror", &["acme/seg.arrow"]);
-    std::fs::create_dir_all(mirror.join("acme").join("orders")).unwrap();
-    std::fs::write(mirror.join("acme").join("orders").join("owner"), b"uuid\n").unwrap();
+    place_marker(&mirror, "acme/orders/owner", b"uuid\n");
 
     let wal = tmp.path().join("wal");
-    let (stdout, stderr, ok) = recover(&format!("file://{}", mirror.display()), &wal);
+    let (stdout, stderr, ok) = recover_apply(&format!("file://{}", mirror.display()), &wal);
     assert!(ok, "{stdout}{stderr}");
     assert!(
         stdout.contains("pulled 1 segments") && stdout.contains("1 keys skipped"),
         "the owner marker is counted as an unrecognised key, the same as a \
          stray README: {stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains("root confirmed by `acme/orders/owner`"),
+        "but unlike a README it also pins the root: {stdout}"
     );
 
     // A mirror WITHOUT them — no managed index, no active mirroring — is the
@@ -643,15 +839,19 @@ fn the_markers_that_do_pin_the_root_sit_at_a_known_depth() {
     let bare = mirror_with(tmp.path(), "warehouse2/wal-mirror", &["acme/seg.arrow"]);
     assert!(!bare.join("_active").exists());
     let wal2 = tmp.path().join("wal2");
-    let (stdout, stderr, ok) = recover(
-        &format!("file://{}", tmp.path().join("warehouse2").display()),
-        &wal2,
-    );
+    let from = format!("file://{}", tmp.path().join("warehouse2").display());
+    let (stdout, stderr, ok) = recover(&from, &wal2);
     assert!(ok, "{stdout}{stderr}");
     assert!(
-        stdout.contains("pulled 1 segments") && !stdout.contains("skipped"),
-        "a bare mirror one component up restores clean: {stdout}{stderr}"
+        stdout.contains("totals: 1 segments")
+            && !stdout.contains("skipped")
+            && stdout.contains("root unverified"),
+        "a bare mirror one component up plans clean: {stdout}{stderr}"
     );
+    assert!(!wal2.exists(), "and writes nothing: {stdout}{stderr}");
+
+    let (stdout, stderr, ok) = recover_apply(&from, &wal2);
+    assert!(ok, "{stdout}{stderr}");
     assert_eq!(
         restored_layout(&wal2),
         vec![format!("wal-mirror/acme/{SEALED_DIR}/seg.arrow")]

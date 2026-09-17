@@ -357,11 +357,19 @@ enum Command {
     /// present locally, and recovers the active mirror too (preferring the
     /// sealed copy of any segment present as both).
     ///
-    /// Reports `pulled N segments into <wal-root>`, followed by the count
-    /// already present and the count of keys skipped for an unrecognised
-    /// layout when either is nonzero. Exits nonzero when every key was
-    /// skipped and nothing was restored — `--from` naming an ancestor of the
-    /// mirror root rather than the root itself.
+    /// TWO STEPS. Without `--apply` this is a PLAN: it lists the mirror,
+    /// reconstructs the layout, prints what it would write per
+    /// `(tenant, index)` and touches the WAL root not at all. `--apply` does
+    /// the restore and reports `pulled N segments into <wal-root>`, followed
+    /// by the count already present and the count of keys skipped for an
+    /// unrecognised layout when either is nonzero.
+    ///
+    /// Both forms read the root identity off the same listing: an `_active/`
+    /// object or a `<tenant>/<index>/owner` marker one component deeper than
+    /// the mirror layout puts it means `--from` is one component above the
+    /// mirror root, and both forms then exit nonzero naming the directory to
+    /// pass instead (#4964). Both also exit nonzero when every key was
+    /// skipped and there is nothing to restore (#4928).
     WalRecover {
         /// Full source URL (e.g. `s3://bucket/wal-mirror`).
         #[arg(long, env = "SIGLAKE_WAL_MIRROR_URL")]
@@ -372,6 +380,10 @@ enum Command {
         /// it.
         #[arg(long)]
         to: PathBuf,
+        /// Perform the restore. Without it the command prints the plan and
+        /// writes nothing — not one segment, and not `--to` itself.
+        #[arg(long)]
+        apply: bool,
     },
 
     /// Return segments the drain set aside under `<wal>/poison/` to `sealed/`,
@@ -1210,7 +1222,7 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Command::WalRecover { from, to } => run_wal_recover(&from, &to).await,
+        Command::WalRecover { from, to, apply } => run_wal_recover(&from, &to, apply).await,
         Command::WalRequeue {
             wal,
             segment,
@@ -2629,7 +2641,98 @@ async fn run_ingest_server(
     serve_result
 }
 
-async fn run_wal_recover(from: &str, to: &std::path::Path) -> Result<()> {
+/// `<n> B` / `<n.n> KiB` / … for a plan line. Sizes come from the LISTING, so
+/// they are the mirror's bytes, not the restore's.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Print the reconstructed layout, one line per `(tenant, index)`, then the
+/// totals and the root verdict.
+///
+/// Under `--apply` this is what is ABOUT to be written, printed before the
+/// first GET; without it, it is the whole of the command's output. Either way
+/// it is the same listing, so the two forms print the same block.
+fn print_recovery_plan(plan: &siglake_wal::mirror::RecoveryPlan, from: &str, to: &std::path::Path) {
+    println!("plan for {from} -> {}", to.display());
+    let tenant_width = plan
+        .groups
+        .iter()
+        .map(|g| g.tenant.len())
+        .max()
+        .unwrap_or(0);
+    let index_width = plan
+        .groups
+        .iter()
+        .map(|g| g.index.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(1);
+    for group in &plan.groups {
+        let size = group
+            .bytes
+            .map(human_bytes)
+            .unwrap_or_else(|| "size unknown".to_string());
+        let present = if group.already_present > 0 {
+            format!(" [{} already present]", group.already_present)
+        } else {
+            String::new()
+        };
+        println!(
+            "  tenant={:<tw$} index={:<iw$}  {:>6} segments  {:>12}  -> {}/  (e.g. `{}`){present}",
+            group.tenant,
+            group.index.as_deref().unwrap_or("-"),
+            group.segments,
+            size,
+            group.dest.display(),
+            group.sample_key,
+            tw = tenant_width,
+            iw = index_width,
+        );
+    }
+    let mut detail = Vec::new();
+    if plan.already_present() > 0 {
+        detail.push(format!("{} already present", plan.already_present()));
+    }
+    if plan.skipped > 0 {
+        detail.push(format!(
+            "{} keys skipped: unrecognised layout{}",
+            plan.skipped,
+            plan.sample_skipped_key
+                .as_deref()
+                .map(|k| format!(" (e.g. `{k}`)"))
+                .unwrap_or_default()
+        ));
+    }
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", detail.join(", "))
+    };
+    // Sizes are whatever the LISTING carried — S3 reports them, opendal's
+    // `fs` and in-memory services do not — because a plan costs one LIST and
+    // no per-object request.
+    println!(
+        "  totals: {} segments, {}{detail}",
+        plan.segments(),
+        plan.bytes().map(human_bytes).unwrap_or_else(|| {
+            "size unknown (this store reports no sizes in a listing)".to_string()
+        }),
+    );
+    println!("  {}", plan.verdict.line());
+}
+
+async fn run_wal_recover(from: &str, to: &std::path::Path, apply: bool) -> Result<()> {
     url::Url::parse(from).with_context(|| format!("parse --from URL: {from}"))?;
     // `--to` used to mean `<wal>/sealed` (recovery flattened everything into
     // one directory). It now means the WAL ROOT, and the layout is rebuilt
@@ -2650,8 +2753,51 @@ async fn run_wal_recover(from: &str, to: &std::path::Path) -> Result<()> {
     // Passing the URL path again made the lister walk `<path>/<path>/`, so
     // every `--from` carrying a path restored 0 segments and exited 0 (#4912).
     let store = build_opendal_operator(from)?;
-    tracing::info!(from, to = %to.display(), "wal-recover starting");
-    let summary = siglake_wal::mirror::recover_from_object_store(store, "", to).await?;
+    tracing::info!(from, to = %to.display(), apply, "wal-recover starting");
+    // ONE listing per invocation, plan or apply: the plan is exactly the work
+    // the restore does before its first GET, and an apply decides on the
+    // listing that is current when it writes rather than on whatever an
+    // earlier plan run saw.
+    let plan = siglake_wal::mirror::plan_recovery(&store, "", to).await?;
+    print_recovery_plan(&plan, from, to);
+    let contradicted = matches!(
+        plan.verdict,
+        siglake_wal::mirror::RootVerdict::Contradicted { .. }
+    );
+    // The plan is printed first either way, then the run bails: the counts an
+    // operator needs to see the mistake are on stdout before the diagnostic
+    // that names it.
+    if plan.segments() == 0 && plan.skipped > 0 && !contradicted {
+        anyhow::bail!(
+            "restored nothing: all {} keys under --from have a layout recovery will not guess \
+             at{}. --from must name the MIRROR ROOT — the directory holding \
+             <tenant>[/<index>]/<segment>.arrow and _active/ — not an ancestor of it \
+             (…/warehouse rather than …/warehouse/wal-mirror). {} is unchanged.",
+            plan.skipped,
+            plan.sample_skipped_key
+                .as_deref()
+                .map(|k| format!(" (e.g. `{k}`)"))
+                .unwrap_or_default(),
+            to.display()
+        );
+    }
+    if !apply {
+        if contradicted {
+            // A plan that cannot be applied says so in its exit status, so a
+            // runbook that plans before it applies stops here.
+            anyhow::bail!(
+                "{}. Nothing under {} was created or changed; --apply would refuse the same way.",
+                plan.verdict.line(),
+                to.display()
+            );
+        }
+        println!(
+            "nothing written. Re-run with --apply to restore into {}",
+            to.display()
+        );
+        return Ok(());
+    }
+    let summary = siglake_wal::mirror::apply_plan(&store, plan, to).await?;
 
     // `pulled 0 segments` alone reads the same whether the re-run had nothing
     // left to do or the restore understood not one key, which is what `--from`
@@ -2679,26 +2825,9 @@ async fn run_wal_recover(from: &str, to: &std::path::Path) -> Result<()> {
         to.display()
     );
 
-    // Nothing pulled, nothing already there, and keys refused: the WAL root is
-    // still empty and no re-run of this command will change that, so it exits
-    // nonzero and names the thing to fix. A mixed result succeeds — those
-    // segments are restored — with the skip count on stdout and a warning in
-    // the log.
-    if summary.pulled == 0 && summary.already_present == 0 && summary.skipped > 0 {
-        anyhow::bail!(
-            "restored nothing: all {} keys under --from have a layout recovery will not guess \
-             at{}. --from must name the MIRROR ROOT — the directory holding \
-             <tenant>[/<index>]/<segment>.arrow and _active/ — not an ancestor of it \
-             (…/warehouse rather than …/warehouse/wal-mirror). {} is unchanged.",
-            summary.skipped,
-            summary
-                .sample_skipped_key
-                .as_deref()
-                .map(|k| format!(" (e.g. `{k}`)"))
-                .unwrap_or_default(),
-            to.display()
-        );
-    }
+    // The "understood nothing" exit is decided on the plan above, before any
+    // write: a listing whose every key is refused has no candidates, so this
+    // apply had nothing to pull and nothing already present either.
     if summary.skipped > 0 {
         tracing::warn!(
             skipped = summary.skipped,
