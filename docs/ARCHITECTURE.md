@@ -1156,6 +1156,18 @@ against that policy and against no cache at all in
 `docs/DESIGN_row_group_decoded_cache_qualification.md` — a local prototype
 reachable only in-process, with the recorded disposition and what would change
 it, so nothing in this section changes until it is adopted.
+Sizing it, for the operator who does turn it on, is
+`docs/DESIGN_source_file_cache_qualification.md`: both limits have to be
+positive (a pod given one of the two warns at startup and runs without the
+cache), an entry over a quarter of the byte budget is refused outright, and a
+decoded compacted file is about 1.25 GiB — so a cache that holds one is 5 GiB,
+which is a larger pod than anything this project packages. The recommendation
+`derive_file_cache_limits` carries is an eighth of the container limit with one
+entry per MiB of it, and its bytes leave the query memory pool before the pool
+takes its share: at the chart's 4Gi floor that spends the one-file decode
+reservation the floor exists to hold. Measured locally, the cache is 5-7x faster
+warm when the budget covers the working set and within noise of no cache when it
+covers half of it.
 
 **Which budget a process gets is its role.** The query server derives both from
 its pod's limit. The `siglake` binary resolves its own at startup, and for the

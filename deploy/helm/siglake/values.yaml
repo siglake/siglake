@@ -782,8 +782,24 @@ query:
     # target-partitions ceiling.
     adaptivePartitionMinBytes: 0
     adaptivePartitionMinFiles: 0
-    # Experimental per-query-pod source-file batch cache. Disabled unless both
-    # limits are explicitly set to positive values.
+    # Experimental per-query-pod source-file batch cache: one entry is one data
+    # file's DECODED batches under one projection. Disabled unless both limits
+    # are positive; setting one and leaving the other at 0 disables it, and the
+    # pod logs a warning naming the pair its memory limit would size.
+    #
+    # Sizing (measured 2026-09-17, docs/DESIGN_source_file_cache_qualification.md).
+    # Two rules decide whether a budget buys anything:
+    #   * an entry larger than a QUARTER of the budget is never cached, so the
+    #     budget has to be four decoded files wide before it holds one;
+    #   * a compacted file is 256Mi of Parquet at the scan's x5 decode estimate
+    #     -- about 1.25Gi -- so holding ONE takes a 5Gi cache. This 4Gi pod
+    #     cannot give that, and at its recommended 512Mi the cache holds only
+    #     files below 128Mi decoded, which means pre-compaction files.
+    # The recommendation when a larger pod enables it: an eighth of the memory
+    # limit, and one entry per MiB of that (512Mi/512 here, 8Gi/8192 at 64Gi).
+    # Those bytes are subtracted from the query memory pool above BEFORE its 50%
+    # share is taken, so enabling it at this floor spends the pool's one-file
+    # decode reservation. Raise `resources.limits.memory` with it.
     fileCacheMaxBytes: 0
     fileCacheMaxEntries: 0
   # In-binary TLS. Default off — customers typically front the

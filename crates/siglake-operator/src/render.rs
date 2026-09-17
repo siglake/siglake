@@ -142,6 +142,17 @@ pub const QUERY_SPILL_VOLUME_NAME: &str = "query-spill";
 pub const QUERY_SPILL_MOUNT_PATH: &str = "/var/lib/siglake/spill";
 pub const QUERY_SPILL_MAX_BYTES: &str = "8589934592";
 pub const QUERY_SPILL_SIZE_LIMIT: &str = "10Gi";
+/// The experimental source-file batch cache, off — the chart's default and the
+/// compose file's, rendered explicitly so a pod's configuration says what it
+/// holds rather than leaving it to the binary's fallback.
+///
+/// No CRD field: enabling it is an `spec.extraEnv` override of BOTH variables
+/// (one alone leaves the cache off and logs a warning), which is deliberate
+/// while the cache stays opt-in. The operator renders 2Gi query pods by default
+/// and a decoded compacted file is about 1.25Gi, so there is no size here at
+/// which the cache could hold one — see
+/// `docs/DESIGN_source_file_cache_qualification.md` before raising a limit to
+/// enable it.
 const QUERY_FILE_CACHE_MAX_BYTES: &str = "0";
 const QUERY_FILE_CACHE_MAX_ENTRIES: &str = "0";
 

@@ -589,6 +589,28 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `crates/siglake-query-server/tests/file_cache_populate_depth_stats.rs`), and
   nothing here authorizes row-group adoption or a default change. The fleet
   reading is #4938.
+  **The sizing question #3053 carried is answered locally, and the answer is
+  that no packaged pod can hold a compacted file.** An entry over a quarter of
+  the byte budget is refused (`skip_oversized`), and a compacted file is 256 MiB
+  of Parquet at the scan's x5 decode estimate — about 1.25 GiB — so a cache that
+  holds ONE is 5 GiB, which the recommendation (an eighth of the container
+  limit) reaches only at a 40 GiB pod. The chart's query pod is 4Gi and the
+  operator renders 2Gi, so enabled there the cache holds pre-compaction files
+  and nothing else. Measured 2026-09-17 over three runs on a local 8-file
+  fixture (`crates/siglake-storage/tests/file_cache_budget_measurement.rs`): a
+  budget covering the working set is 5-7x faster warm (1.2-1.6 ms against
+  7.6-9.3), a budget covering HALF of it is within noise of no cache at all,
+  because an LRU over a repeated scan evicts what the next pass wants, and a
+  budget below four entries caches nothing while still subtracting its bytes
+  from the query memory pool. Population memory is charged on top of the budget
+  and outside the pool: 30-37 MiB peak across 8 concurrent streams against an 88
+  MiB budget, and 27-28 MiB in the arm that inserts nothing. Both limits must be
+  positive; a pod given one of the two now logs a warning naming the derived
+  pair. Bounds, quarter rule and explicit zero are pinned by
+  `crates/siglake-storage/tests/file_cache_budget_bounds.rs`, the pool
+  subtraction by `query_memory_bound.rs`, and the whole qualification is
+  `docs/DESIGN_source_file_cache_qualification.md`. Defaults are unchanged: this
+  is what to set when enabling it, not a recommendation to enable it.
 - **Query scales by REPLICATION, not by fan-out, for ordinary log search.**
   Adding query replicas multiplies throughput — measured 705 QPS on one
   replica and 2,269 on three (3.22x), with browse p50 flat at 13–21ms through

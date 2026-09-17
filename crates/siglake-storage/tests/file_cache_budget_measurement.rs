@@ -267,6 +267,61 @@ async fn file_cache_budget_measurement() {
     siglake_storage::clear_decoded_file_cache();
 }
 
+/// The sizing table the qualification doc quotes: what
+/// [`siglake_storage::derive_file_cache_limits`] recommends at each pod size,
+/// and what accepting it does to the query memory pool and the process
+/// headroom.
+///
+/// `#[ignore]`d because it prints rather than asserts — the assertions on this
+/// arithmetic live in `query_memory_bound.rs` and `file_cache_budget_bounds.rs`.
+///
+/// ```text
+/// cargo test -p siglake-storage --test file_cache_budget_measurement \
+///   -- --ignored --nocapture file_cache_budget_table
+/// ```
+#[test]
+#[ignore = "prints the sizing table quoted in docs/DESIGN_source_file_cache_qualification.md"]
+fn file_cache_budget_table() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    // A compacted file: `cold_target_file_bytes` at the scan's decompression
+    // estimate. The size the quarter rule is really about.
+    let compacted_entry = 256 * 1024 * 1024 * 5;
+    let needed = siglake_storage::min_file_cache_bytes_for_entry(compacted_entry);
+    println!(
+        "one decoded compacted file ~{:.0} MiB; a cache that can hold one is {:.0} MiB\n",
+        mib(compacted_entry),
+        mib(needed)
+    );
+    println!(
+        "{:>6} {:>10} {:>8} {:>10} {:>10} {:>11} {:>11} {:>10}",
+        "pod",
+        "rec_bytes",
+        "entries",
+        "pool_off",
+        "pool_on",
+        "headroom_off",
+        "headroom_on",
+        "holds_cold"
+    );
+    for limit_gib in [2u64, 4, 8, 16, 32, 64] {
+        let limit = limit_gib * GIB;
+        let (bytes, entries) = siglake_storage::derive_file_cache_limits(Some(limit)).unwrap();
+        let off = siglake_storage::memory_budget_for(Some(limit), 0.5);
+        let on = siglake_storage::memory_budget_with_file_cache(Some(limit), 0.5, Some(bytes));
+        println!(
+            "{:>5}Gi {:>9.0}M {:>8} {:>9.0}M {:>9.0}M {:>10.0}M {:>10.0}M {:>10}",
+            limit_gib,
+            mib(bytes),
+            entries,
+            mib(off.pool),
+            mib(on.pool),
+            mib(off.headroom(limit)),
+            mib(on.headroom(limit)),
+            if bytes >= needed { "yes" } else { "no" },
+        );
+    }
+}
+
 fn summary(counters: &Counters, runs: u64) -> String {
     format!(
         "hit={} miss={} ins={} evict={} oversize={} cont={} aband={} (per run, {runs} run(s))",
