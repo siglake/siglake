@@ -2186,3 +2186,164 @@ mod upload_retry_tests {
         );
     }
 }
+
+/// Task #3787's measurement of what `pin_segment` costs a seal, part by part.
+#[cfg(test)]
+mod pin_cost_tests {
+    use super::*;
+    use crate::SEALED_DIR;
+
+    /// #3787: where does the seal path's pin cost go, and what would batching
+    /// the directory fsync recover?
+    ///
+    /// `pin_segment` does three things — resolve the segment's current local
+    /// name, hard-link it into `mirror-pending/`, and fsync that directory so
+    /// the new name survives a power loss. #3758 measured the three together
+    /// (0.474 ms per seal at saturation, `docs/PERF_WAL_MIRROR_2026-09-11.md`
+    /// "Re-measurement 2026-09-13") and could not say which part it was. This
+    /// prices each one, and prices the alternative: `batch` links under one
+    /// `sync_dir`, amortized per pin. The last column is what a barrier costs
+    /// when the directory has nothing pending — the drain-side design, where
+    /// the process about to recycle a sealed name syncs the pins first.
+    ///
+    /// Each iteration seals a segment the way `WalWriter::seal` does (body
+    /// fsynced, renamed into `sealed/`, `sealed/` fsynced) before timing the
+    /// pin, so the journal is in the state the pin actually meets.
+    ///
+    /// Run it on the filesystem the WAL lives on. On tmpfs every fsync here
+    /// returns without reaching a device and the whole report reads zero.
+    ///
+    ///     TMPDIR=/var/tmp cargo test -p siglake-wal --lib \
+    ///         report_pin_cost_breakdown -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement, not a gate"]
+    fn report_pin_cost_breakdown() {
+        use std::time::Instant;
+
+        fn knob(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+
+        /// Mean / p50 / p90, in microseconds. Consumes the order.
+        fn stats(samples: &mut [f64]) -> (f64, f64, f64) {
+            samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN durations"));
+            let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+            let at = |p: f64| samples[(((samples.len() - 1) as f64) * p).round() as usize];
+            (mean, at(0.5), at(0.9))
+        }
+
+        fn since(t: Instant) -> f64 {
+            t.elapsed().as_secs_f64() * 1e6
+        }
+
+        /// Lay a sealed segment down exactly as the seal path leaves it.
+        fn seal_one(sealed: &Path, name: &str, body: &[u8]) -> PathBuf {
+            let final_path = sealed.join(name);
+            let tmp_path = sealed.join(format!("{name}.tmp"));
+            {
+                let mut f = std::fs::File::create(&tmp_path).unwrap();
+                std::io::Write::write_all(&mut f, body).unwrap();
+                crate::durability::sync_file(&f, &tmp_path).unwrap();
+            }
+            crate::durability::rename(&tmp_path, &final_path).unwrap();
+            crate::durability::sync_dir(sealed).unwrap();
+            final_path
+        }
+
+        let iters = knob("PIN_COST_ITERS", 200);
+        let seg_bytes = knob("PIN_COST_SEGMENT_BYTES", 90 * 1024);
+        // 164.8 MB over 1,819 segments in the saturation arm: ~90 KiB each.
+        let body = vec![0x5au8; seg_bytes];
+
+        println!(
+            "\n#3787 pin cost: {iters} seals x {seg_bytes} B, tmpdir {} (fsync must reach a device)",
+            std::env::temp_dir().display()
+        );
+        println!("all figures microseconds per pin\n");
+
+        // Arm 0: the whole `pin_segment`, for a total to check the parts against.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let sealed = tmp.path().join(SEALED_DIR);
+            std::fs::create_dir_all(&sealed).unwrap();
+            let mut whole = Vec::with_capacity(iters);
+            for i in 0..iters {
+                let name = format!("ing-{i:06}.arrow");
+                let path = seal_one(&sealed, &name, &body);
+                let segment = WalSegment {
+                    path,
+                    rows: 1,
+                    bytes: seg_bytes as u64,
+                    mirror_key_suffix: name,
+                };
+                let t = Instant::now();
+                pin_segment(&segment).unwrap();
+                whole.push(since(t));
+            }
+            let (mean, p50, p90) = stats(&mut whole);
+            println!("pin_segment, whole:  mean {mean:8.1}  p50 {p50:8.1}  p90 {p90:8.1}");
+        }
+
+        println!(
+            "\n{:>5}  {:>10}  {:>10}  {:>12}  {:>12}  {:>12}",
+            "batch", "lookup", "hard_link", "sync_dir/pin", "pin total", "idle barrier"
+        );
+        for batch in [1usize, 2, 4, 8, 16, 64] {
+            let tmp = tempfile::tempdir().unwrap();
+            let sealed = tmp.path().join(SEALED_DIR);
+            std::fs::create_dir_all(&sealed).unwrap();
+            let pending = tmp.path().join(MIRROR_PENDING_DIR);
+            std::fs::create_dir_all(&pending).unwrap();
+            crate::durability::sync_dir(tmp.path()).unwrap();
+
+            let mut lookup = Vec::with_capacity(iters);
+            let mut link = Vec::with_capacity(iters);
+            let mut sync = Vec::with_capacity(iters / batch + 1);
+            let mut idle = Vec::with_capacity(iters / batch + 1);
+            let mut unsynced = 0usize;
+            for i in 0..iters {
+                let name = format!("ing-{i:06}.arrow");
+                let path = seal_one(&sealed, &name, &body);
+                let segment = WalSegment {
+                    path,
+                    rows: 1,
+                    bytes: seg_bytes as u64,
+                    mirror_key_suffix: name.clone(),
+                };
+
+                let t = Instant::now();
+                let source = find_segment(&segment).expect("just sealed");
+                lookup.push(since(t));
+
+                let t = Instant::now();
+                std::fs::hard_link(&source, pending.join(&name)).unwrap();
+                link.push(since(t));
+
+                unsynced += 1;
+                if unsynced == batch {
+                    let t = Instant::now();
+                    crate::durability::sync_dir(&pending).unwrap();
+                    sync.push(since(t) / batch as f64);
+                    // Same directory, nothing pending: the floor under any
+                    // design that syncs on someone else's schedule.
+                    let t = Instant::now();
+                    crate::durability::sync_dir(&pending).unwrap();
+                    idle.push(since(t));
+                    unsynced = 0;
+                }
+            }
+            let (lookup_mean, ..) = stats(&mut lookup);
+            let (link_mean, ..) = stats(&mut link);
+            let (sync_mean, ..) = stats(&mut sync);
+            let (idle_mean, ..) = stats(&mut idle);
+            println!(
+                "{batch:>5}  {lookup_mean:>10.1}  {link_mean:>10.1}  {sync_mean:>12.1}  {:>12.1}  {idle_mean:>12.1}",
+                lookup_mean + link_mean + sync_mean
+            );
+        }
+        println!();
+    }
+}

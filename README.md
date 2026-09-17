@@ -117,8 +117,11 @@ written down.
   query tier's WAL buffer serves uncommitted rows in the meantime (~5.5 s
   ingest→queryable measured). Sealed segments mirror to object storage by
   default wherever a warehouse URL is set, so the WAL volume is not the only
-  copy of what was acknowledged
-  ([Ingest path](docs/ARCHITECTURE.md#ingest-path)).
+  copy of what was acknowledged. Holding a segment for its upload costs the
+  writer one directory fsync per seal, and that cost is irreducible: a lane
+  never has a second pin to share the fsync with, and the only actor that could
+  close a deferred one — the compactor — reaches the WAL over a shared volume
+  from another node ([Ingest path](docs/ARCHITECTURE.md#ingest-path)).
 - **Time order is a storage invariant, and compaction never stops.** Every
   write physically sorts rows by the table's declared sort order and stamps
   Parquet `SortingColumn` footers, and no compaction bin splits a
