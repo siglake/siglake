@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Query (fix)**: a filtered browse written `WHERE TIMESTAMP >= …` gets the
+  same scan-order hint and distribution estimate as the lowercase spelling. The
+  two shape detectors behind the selectivity-aware ordered policy and the
+  distribution gate compared an identifier's written value with `timestamp`,
+  and an unquoted `TIMESTAMP` — the same column everywhere else in the planner
+  — matched neither the pure-time-range test nor the exclusion on the
+  dimensional arm, so the term was read as the browse's dimension or, with a
+  real dimension already present, sank the shape. Both now apply SQL's own case
+  rules: unquoted identifiers case-fold, and a quoted `"Timestamp"` remains the
+  distinct ordinary column a managed mapping may declare. Results were never
+  affected — a missed shape costs an early-stop drain and sends the query to
+  the gate's limit-only fallback. (#4217)
+
 - **Ingest (fix)**: the ingester's local WAL sweep reclaims a managed index's
   sealed segments. It listed the WAL root and its tenant directories one level
   deep, and a managed index's segments sit at

@@ -2094,11 +2094,15 @@ fn flatten_and_conjuncts<'a>(expr: &'a SqlAstExpr, out: &mut Vec<&'a SqlAstExpr>
     }
 }
 
-fn sql_ident_name(expr: &SqlAstExpr) -> Option<String> {
+/// The identifier an expression names, if it names one. Hands back the `Ident`
+/// rather than its written value so callers can weigh the quote style with
+/// `ident_is_timestamp` — an unquoted `TIMESTAMP` is the canonical column,
+/// a quoted `"Timestamp"` is a different one (#4217).
+fn sql_ident(expr: &SqlAstExpr) -> Option<&Ident> {
     match expr {
-        SqlAstExpr::Identifier(ident) => Some(ident.value.clone()),
-        SqlAstExpr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()),
-        SqlAstExpr::Nested(inner) => sql_ident_name(inner),
+        SqlAstExpr::Identifier(ident) => Some(ident),
+        SqlAstExpr::CompoundIdentifier(parts) => parts.last(),
+        SqlAstExpr::Nested(inner) => sql_ident(inner),
         _ => None,
     }
 }
@@ -2128,7 +2132,7 @@ fn sql_expr_is_time_range(expr: &SqlAstExpr) -> bool {
     }
     [left, right]
         .iter()
-        .any(|side| sql_ident_name(side).as_deref() == Some("timestamp"))
+        .any(|side| sql_ident(side).is_some_and(ident_is_timestamp))
 }
 
 /// One dimensional term: `col = 'v'`, `col <> 'v'`, `col IN (…)`,
@@ -2138,26 +2142,26 @@ fn sql_expr_dimensional_term(expr: &SqlAstExpr) -> Option<(String, Vec<String>, 
     use datafusion::sql::sqlparser::ast::BinaryOperator as Op;
     match expr {
         SqlAstExpr::BinaryOp { left, op, right } if matches!(op, Op::Eq | Op::NotEq) => {
-            let (col, value) = match (sql_ident_name(left), sql_string_literal(right)) {
+            let (col, value) = match (sql_ident(left), sql_string_literal(right)) {
                 (Some(c), Some(v)) => (c, v),
-                _ => (sql_ident_name(right)?, sql_string_literal(left)?),
+                _ => (sql_ident(right)?, sql_string_literal(left)?),
             };
-            if col == "timestamp" {
+            if ident_is_timestamp(col) {
                 return None;
             }
-            Some((col, vec![value], matches!(op, Op::NotEq)))
+            Some((col.value.clone(), vec![value], matches!(op, Op::NotEq)))
         }
         SqlAstExpr::InList {
             expr,
             list,
             negated,
         } => {
-            let col = sql_ident_name(expr)?;
-            if col == "timestamp" {
+            let col = sql_ident(expr)?;
+            if ident_is_timestamp(col) {
                 return None;
             }
             let values: Option<Vec<String>> = list.iter().map(sql_string_literal).collect();
-            Some((col, values?, *negated))
+            Some((col.value.clone(), values?, *negated))
         }
         SqlAstExpr::Nested(inner) => sql_expr_dimensional_term(inner),
         _ => None,
@@ -10790,6 +10794,99 @@ mod tests {
         );
         assert_eq!(
             shape("SELECT count(*) FROM events WHERE host = 'a' ORDER BY timestamp DESC LIMIT 5"),
+            None
+        );
+    }
+
+    /// #4217: both detectors read the WHERE clause's identifiers under SQL's
+    /// case rules. An unquoted `TIMESTAMP` range is the same pure time range as
+    /// `timestamp` — before this, the term fell through to the dimensional arm
+    /// and either displaced the real dimension or (with one already present)
+    /// lost the shape entirely. A quoted `"Timestamp"` stays a different column.
+    #[test]
+    fn browse_detectors_read_an_unquoted_timestamp_as_the_canonical_column() {
+        let ordered = |sql: &str| detect_ordered_residual_browse(sql);
+        let plain = |sql: &str| detect_dim_browse(sql);
+        let expected = Some(ResidualBrowseShape {
+            table: "logs-bench".into(),
+            column: "cloud_provider".into(),
+            values: vec!["gcp".into()],
+            negated: false,
+        });
+
+        // One dimensional predicate + a time range + LIMIT: the unquoted range
+        // classifies exactly as the lowercase one, ordered and plain alike.
+        assert_eq!(
+            ordered(
+                "SELECT timestamp, raw FROM \"logs-bench\" WHERE cloud_provider = 'gcp' \
+                 AND TIMESTAMP >= '2024-01-01T00:00:00Z' ORDER BY timestamp DESC LIMIT 100"
+            ),
+            expected
+        );
+        assert_eq!(
+            ordered(
+                "SELECT timestamp, raw FROM \"logs-bench\" WHERE cloud_provider = 'gcp' \
+                 AND timestamp >= '2024-01-01T00:00:00Z' ORDER BY timestamp DESC LIMIT 100"
+            ),
+            expected
+        );
+        assert_eq!(
+            plain(
+                "SELECT timestamp, raw FROM \"logs-bench\" WHERE cloud_provider = 'gcp' \
+                 AND TIMESTAMP >= '2024-01-01T00:00:00Z' LIMIT 100"
+            ),
+            expected
+        );
+        assert_eq!(
+            plain(
+                "SELECT timestamp, raw FROM \"logs-bench\" WHERE cloud_provider = 'gcp' \
+                 AND timestamp >= '2024-01-01T00:00:00Z' LIMIT 100"
+            ),
+            expected
+        );
+        // A compound `t.TIMESTAMP` qualifier reads the same way.
+        assert_eq!(
+            plain(
+                "SELECT timestamp, raw FROM \"logs-bench\" WHERE cloud_provider = 'gcp' \
+                 AND \"logs-bench\".TIMESTAMP >= '2024-01-01T00:00:00Z' LIMIT 100"
+            ),
+            expected
+        );
+
+        // The equality and IN exclusions apply to the unquoted spelling too:
+        // an equality on the event-time column is no dimension, so the shape is
+        // refused rather than reported with `TIMESTAMP` as its dimension.
+        for sql in [
+            "SELECT raw FROM \"logs-bench\" WHERE TIMESTAMP = '2024-01-01T00:00:00Z' LIMIT 5",
+            "SELECT raw FROM \"logs-bench\" WHERE TIMESTAMP <> '2024-01-01T00:00:00Z' LIMIT 5",
+            "SELECT raw FROM \"logs-bench\" WHERE TIMESTAMP IN ('2024-01-01T00:00:00Z') LIMIT 5",
+        ] {
+            assert_eq!(plain(sql), None, "should refuse: {sql}");
+            let with_order = sql.replace("LIMIT 5", "ORDER BY timestamp DESC LIMIT 5");
+            assert_eq!(ordered(&with_order), None, "should refuse: {with_order}");
+        }
+
+        // Quoted `"Timestamp"` is an ordinary column: its equality IS the
+        // dimensional term, and it does not stand in for the time range.
+        assert_eq!(
+            plain(
+                "SELECT raw FROM \"logs-bench\" WHERE \"Timestamp\" = 'gcp' \
+                 AND timestamp >= '2024-01-01T00:00:00Z' LIMIT 100"
+            ),
+            Some(ResidualBrowseShape {
+                table: "logs-bench".into(),
+                column: "Timestamp".into(),
+                values: vec!["gcp".into()],
+                negated: false,
+            })
+        );
+        // ... so a range on it is neither a time range nor a dimension, and the
+        // shape is refused.
+        assert_eq!(
+            plain(
+                "SELECT raw FROM \"logs-bench\" WHERE cloud_provider = 'gcp' \
+                 AND \"Timestamp\" >= '2024-01-01T00:00:00Z' LIMIT 100"
+            ),
             None
         );
     }
