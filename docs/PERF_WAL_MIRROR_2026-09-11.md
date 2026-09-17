@@ -263,7 +263,8 @@ mirror, multi-tenant fan-out — and two more:
 
 # Can the pin share a directory sync? (task #3787)
 
-**Date:** 2026-09-17 · **Commit:** this branch · **Verdict: no, and the reason is
+**Date:** 2026-09-17 · **Evidence:** `report_pin_cost_breakdown`, added on this
+branch; four runs, numbers reproducible by re-running it · **Verdict: no, and the reason is
 not the crash window. The fsync is 94 % of the pin, and there is never a second
 unsynced pin to share it with: one writer owns each `mirror-pending/` directory
 and seals under its own lock, so the directory holds at most one unsynced entry
@@ -294,8 +295,10 @@ on NVMe, load average 6.9–7.7, four runs. Microseconds per pin, means:
 | 16 | 4.6 | 21.2 | 24.8 | 50.6 | 22.4 |
 | 64 | 4.7 | 21.8 | 6.1 | 32.7 | 37.2 |
 
-Whole `pin_segment`, same runs: 410–427 µs mean, 406–423 µs p50, which is
-#3758's 474 µs on a quieter box. The lookup and the link together are 26 µs —
+Whole `pin_segment`, same runs: 410–427 µs mean, 406–423 µs p50, against the
+474 µs #3758 read out of the seal histogram — the same number to within the
+spread between two sessions on a shared box, and reached a different way, which
+is the cross-check. The lookup and the link together are 26 µs —
 6 % of it. The directory fsync is the rest, and it amortizes almost linearly:
 one sync per 8 pins would cost 76 µs per seal instead of 420, and at the
 measured 60.6 seals/s that returns 2.1 of the 2.9 points of writer-second the
