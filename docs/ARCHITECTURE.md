@@ -92,7 +92,14 @@ declared metadata or body length can size an allocation the file cannot back
 (#4650). Sealed + active segments
 mirror to object storage on configurable intervals — **sealed segments mirror by
 default** wherever a warehouse URL is set, so the WAL volume is not the only copy
-of what has been acknowledged. `siglake wal-recover --from
+of what has been acknowledged. Active mirroring
+(`wal.mirror.activeIntervalSecs`, off by default) covers every writer that has
+rows: each tick flushes the per-tenant router's writers and each backpressure
+lane's task-owned writer, and uploads one
+`_active/<tenant>[/<index>]/<segment>.arrow.partial` per writer whose segment
+grew since the last tick. The flush happens under the writer's own lock (or
+inside its lane task) and the PUT outside it, so no acknowledgement waits on
+object storage. `siglake wal-recover --from
 s3://<bucket>/<prefix> --to <wal-root>` restores from the mirror for DR, in two
 steps: without `--apply` it PLANS — it lists the mirror, reconstructs the
 layout, prints one line per `(tenant, index)` with the segment count, the byte

@@ -855,7 +855,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   volume bounded, and its object counted in
   `siglake_compactor_mirror_unreclaimed_total` — a leak that needs the
   lifecycle rule below or a manual pass. `_active/` blobs are outside all of
-  it (#4914).
+  it (#4914), and since #5055 there is one per open writer rather than one per
+  ingester: a segment's blob is left behind when that segment seals, so what
+  the prefix accumulates is one object per (tenant, index, write shard,
+  segment) the flag was on for. Nothing but the lifecycle rule collects them.
 
   So an object-store lifecycle expiry longer than your worst-case drain backlog
   remains the operator-side complement, and the only thing that collects those
@@ -1117,10 +1120,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   to the WAL. The mirror is on by default and asynchronous: a segment reaches
   the object store after it seals, so the ack→upload window is real and an
   acknowledgement is not remotely durable. `wal.mirror.activeIntervalSecs`
-  snapshots the in-flight segment every N seconds, which narrows that window
-  to N seconds on one recovery path: an operator runs `siglake wal-recover
-  --apply` to rebuild the WAL root from the mirror, and the filesystem drain
-  commits the recovered segments. No restart consumes an active snapshot by itself, and
+  snapshots every in-flight segment every N seconds — one object per open
+  writer, keyed `_active/<tenant>[/<index>]/<segment>` — which narrows that
+  window to N seconds on one recovery path: an operator runs `siglake
+  wal-recover --apply` to rebuild the WAL root from the mirror, and the
+  filesystem drain commits the recovered segments. Until #5055 that path
+  narrowed nothing on a server: the loop was handed the ingester's root
+  writer, which receives no rows once a tenant or backpressure router is
+  installed, so an install with the flag on uploaded no `_active/` object at
+  all. No restart consumes an active snapshot by itself, and
   the catalog-claim drain (`compactor.catalogClaim.enabled`) reconciles sealed
   objects only — it never reads `_active/`, so it has no N-second target. An
   object-store group-commit PUT-as-ack design is a flagged decision for a

@@ -367,7 +367,9 @@ All but the last are in `mirror_ledger_reclaim_tests`
    (`crates/siglake-compactor/src/lib.rs:6040-6042`) and no retention path
    touches it. Off by default (`activeIntervalSecs: 0`), so it bounds nothing
    today, but an install that turns it on leaks one object per segment even in
-   claim mode.
+   claim mode — and since #5055 that is one per (tenant, index, write shard,
+   segment), because the loop covers every writer that holds rows rather than
+   the one root writer it used to be handed.
 3. **The ingester's local WAL sweep never looks at per-index WAL directories.**
    `local_wal_sweep_once` walks tenant directories and the root
    (`crates/siglake-cli/src/main.rs:1529-1534`), while the catch-up sweep and the

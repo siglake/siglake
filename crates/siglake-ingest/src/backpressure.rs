@@ -87,6 +87,11 @@ enum LaneCommand {
     /// by [`BackpressureRouter::refresh_table_identities`]; the writer seals
     /// the open segment under the previous identity before adopting it.
     Rebind(Option<uuid::Uuid>),
+    /// #5055: flush the lane's active segment and report where it is, so the
+    /// active-segment mirror can upload it. The writer is OWNED by the lane
+    /// task, so this is the only way to reach it; the object-store PUT happens
+    /// in the mirror loop, off this task.
+    MirrorActive(oneshot::Sender<Option<siglake_wal::mirror::ActiveSnapshot>>),
 }
 
 /// Apply a rebind to a lane's writer, logging what it sealed under the
@@ -180,6 +185,10 @@ impl Lane {
                         rebind_writer(&mut writer, uuid, &tenant, &index);
                         continue;
                     }
+                    LaneCommand::MirrorActive(reply) => {
+                        let _ = reply.send(siglake_wal::mirror::snapshot_active(&mut writer));
+                        continue;
+                    }
                 };
                 let mut drained_commands = 1usize;
                 let mut total_rows = first.batch.num_rows();
@@ -189,6 +198,12 @@ impl Lane {
                 let mut replies = vec![first.reply];
                 let mut tick_requested = false;
                 let mut pending_rebind: Option<Option<uuid::Uuid>> = None;
+                // Answered AFTER the batch is appended, like `tick_requested`:
+                // the snapshot an active-mirror tick uploads should carry the
+                // rows this lane has already accepted, not stop short of them.
+                let mut mirror_replies: Vec<
+                    oneshot::Sender<Option<siglake_wal::mirror::ActiveSnapshot>>,
+                > = Vec::new();
                 // Phase 4.13k group-commit mode: when group_commit_ms > 0
                 // we deliberately *wait* up to that many ms for more
                 // commands to accumulate before flushing. Trades a few
@@ -219,6 +234,9 @@ impl Lane {
                                     }
                                     Some(LaneCommand::Tick) => {
                                         tick_requested = true;
+                                    }
+                                    Some(LaneCommand::MirrorActive(reply)) => {
+                                        mirror_replies.push(reply);
                                     }
                                     // Not mid-batch: the rows already drained
                                     // into `batches` were accepted for the
@@ -252,6 +270,9 @@ impl Lane {
                             }
                             LaneCommand::Tick => {
                                 tick_requested = true;
+                            }
+                            LaneCommand::MirrorActive(reply) => {
+                                mirror_replies.push(reply);
                             }
                             LaneCommand::Rebind(uuid) => {
                                 pending_rebind = Some(uuid);
@@ -323,6 +344,11 @@ impl Lane {
                         Ok(receipt) => Ok(receipt.clone()),
                         Err(e) => Err(anyhow::anyhow!("{e}")),
                     });
+                }
+                // Answer the active-mirror requests this batch overtook, now
+                // that the rows they should carry are on disk.
+                for reply in mirror_replies.drain(..) {
+                    let _ = reply.send(siglake_wal::mirror::snapshot_active(&mut writer));
                 }
                 // AFTER the batch is written and acked: the rows in it were
                 // accepted for the identity the writer still holds.
@@ -771,6 +797,43 @@ impl BackpressureRouter {
         }
     }
 
+    /// Flush every lane's active segment for the active-segment mirror, and
+    /// report the ones with something to upload.
+    ///
+    /// One request per shard lane, because one WalWriter per shard lane is what
+    /// holds the rows. A lane whose channel is full is skipped and picked up on
+    /// the next tick — the same best-effort contract as [`Self::tick_all`],
+    /// which is what keeps a saturated lane from stalling the mirror loop.
+    async fn flush_active_segments(&self) -> Vec<siglake_wal::mirror::ActiveSnapshot> {
+        let mut waiters = Vec::new();
+        {
+            let lanes = self.lanes.lock().await;
+            for group in lanes.values() {
+                for lane in &group.lanes {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    if lane
+                        .tx
+                        .try_send(LaneCommand::MirrorActive(reply_tx))
+                        .is_ok()
+                    {
+                        waiters.push(reply_rx);
+                    }
+                }
+            }
+        }
+        // The lanes map is released before any await: a `submit` that needs a
+        // new lane must not queue behind a mirror tick.
+        let mut out = Vec::with_capacity(waiters.len());
+        for reply_rx in waiters {
+            // `Err` is a writer task that went away between the send and the
+            // reply — shutdown. Nothing to mirror either way.
+            if let Ok(Some(snapshot)) = reply_rx.await {
+                out.push(snapshot);
+            }
+        }
+        out
+    }
+
     /// Gracefully drop every tenant's mpsc sender, then join the
     /// writer tasks. Used by `siglake-cli`'s shutdown path so
     /// in-flight writes finish before the process exits.
@@ -798,6 +861,15 @@ impl BackpressureRouter {
             }
         }
         metrics::gauge!("siglake_ingest_backpressure_lanes").set(0.0);
+    }
+}
+
+/// Active mirroring covers the lanes' writers, which on the default ingest path
+/// are the only writers that receive rows (#5055).
+#[async_trait::async_trait]
+impl siglake_wal::mirror::ActiveMirrorSource for BackpressureRouter {
+    async fn flush_active(&self) -> Vec<siglake_wal::mirror::ActiveSnapshot> {
+        self.flush_active_segments().await
     }
 }
 

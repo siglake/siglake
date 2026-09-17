@@ -1,3 +1,4 @@
+mod active_mirror_wiring;
 mod auth_scheme;
 mod commit_force;
 mod elastic_bulk;

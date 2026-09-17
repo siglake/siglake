@@ -881,17 +881,101 @@ fn find_segment(segment: &WalSegment) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Periodically snapshot the in-flight (active) WAL segment and
-/// write the partial Arrow IPC stream to `<prefix>/_active/<filename>`.
-/// Replaces the previous tick's blob each cycle, so the object store
-/// holds at most one active blob per (ingester, segment-uuid).
+/// One writer's flushed active segment: the local path of the unsealed
+/// `.partial` file, its byte count at flush time, and the
+/// `<tenant>[/<index>]` its mirror key must carry.
+#[derive(Debug, Clone)]
+pub struct ActiveSnapshot {
+    pub path: PathBuf,
+    pub bytes: u64,
+    /// `None` for the legacy flat layout, whose key has no tenant component.
+    pub subdir: Option<String>,
+}
+
+/// Flush a writer's active segment and describe it for the mirror.
 ///
-/// On every tick: lock the writer, flush its BufWriter to disk, read
-/// the on-disk file into memory, write it. Failures emit
-/// `siglake_wal_mirror_failures_total{reason="active_upload"}` and a
-/// tracing warn; the loop continues.
+/// `None` when there is nothing to upload: no open segment, a rows-empty one,
+/// or a flush that failed (charged to
+/// `siglake_wal_mirror_failures_total{reason="active_flush"}`).
+pub fn snapshot_active(writer: &mut crate::WalWriter) -> Option<ActiveSnapshot> {
+    let flushed = match writer.flush_active_for_mirror() {
+        Ok(s) => s,
+        Err(e) => {
+            metrics::counter!("siglake_wal_mirror_failures_total",
+                "reason" => "active_flush")
+            .increment(1);
+            tracing::warn!(error = %e, "WAL active mirror flush failed");
+            return None;
+        }
+    };
+    let (path, bytes) = flushed?;
+    // The active key must carry the same `<tenant>[/<index>]` path the SEALED
+    // keys carry. Without it recovery cannot tell whose rows these are, so the
+    // whole active mirror — the thing that bounds the PVC-loss window — is
+    // unrecoverable on any multi-tenant install.
+    let subdir = writer.mirror_subdir().map(str::to_string);
+    Some(ActiveSnapshot {
+        path,
+        bytes,
+        subdir,
+    })
+}
+
+/// The writers one tick of [`active_mirror_loop`] snapshots.
+///
+/// The loop used to take a single `Arc<Mutex<WalWriter>>`, and on the ingest
+/// server that was the ROOT writer — the one writer ingest never appends to.
+/// Every row goes to a per-tenant writer (`TenantWalRouter`) or to a
+/// backpressure lane's task-owned writer, so the loop flushed an empty writer
+/// every tick and uploaded nothing at all: the flag logged itself as enabled
+/// and the N-second bound it advertises did not exist (#5055). A source is
+/// whatever owns writers, and it is asked on every tick because tenants,
+/// indexes and shards come into being as traffic arrives.
+///
+/// Implementors flush under their own lock (or, for a task-owned writer, inside
+/// the task) and return paths. The object-store PUT is the loop's, so no upload
+/// ever waits on a writer lock and no writer lock ever waits on an upload.
+#[async_trait::async_trait]
+pub trait ActiveMirrorSource: Send + Sync {
+    /// Flush every writer this source owns, skipping the ones with nothing to
+    /// mirror. Best-effort: a writer that cannot be reached this tick is left
+    /// for the next one.
+    async fn flush_active(&self) -> Vec<ActiveSnapshot>;
+}
+
+/// A single writer behind its own lock: the legacy flat path, and the shape
+/// `AppState` still uses when no tenant router is installed.
+#[async_trait::async_trait]
+impl ActiveMirrorSource for tokio::sync::Mutex<crate::WalWriter> {
+    async fn flush_active(&self) -> Vec<ActiveSnapshot> {
+        let mut writer = self.lock().await;
+        snapshot_active(&mut writer).into_iter().collect()
+    }
+}
+
+/// The interval `--wal-active-mirror-interval-secs` (or
+/// `wal.mirror.activeIntervalSecs`) asks for, or `None` for off.
+///
+/// `0` is the documented disable and the default; it is also the value
+/// `tokio::time::interval` panics on, so the two answers are one function.
+pub fn active_mirror_interval(secs: u64) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Periodically snapshot every in-flight (active) WAL segment and write each
+/// partial Arrow IPC stream to `<prefix>/_active/<tenant>[/<index>]/<filename>`.
+/// Replaces the previous tick's blob each cycle, so the object store holds at
+/// most one active blob per (ingester, segment-uuid).
+///
+/// On every tick: ask each [`ActiveMirrorSource`] to flush its writers, then
+/// read each flushed file and PUT it. A segment whose byte count has not moved
+/// since this loop last uploaded it is skipped — the object already holds those
+/// bytes, and an idle tenant would otherwise cost a PUT per tick for as long as
+/// its segment stays open. Failures emit
+/// `siglake_wal_mirror_failures_total{reason="active_upload"}` and a tracing
+/// warn; the loop continues.
 pub async fn active_mirror_loop(
-    writer: std::sync::Arc<tokio::sync::Mutex<crate::WalWriter>>,
+    sources: Vec<Arc<dyn ActiveMirrorSource>>,
     op: Operator,
     prefix: String,
     interval: std::time::Duration,
@@ -901,64 +985,77 @@ pub async fn active_mirror_loop(
     // Skip the immediate first fire: we want the first upload to happen
     // *after* one interval, not at startup before any events have arrived.
     ticker.tick().await;
+    // Bytes each open segment held when this loop last uploaded it. Keyed by
+    // the local path, which is unique per (ingester, segment-uuid), and pruned
+    // to the segments still open at the end of every tick — a sealed segment's
+    // path never comes back.
+    let mut uploaded: std::collections::HashMap<PathBuf, u64> = std::collections::HashMap::new();
     loop {
         ticker.tick().await;
-        let (snapshot, subdir) = {
-            let mut w = writer.lock().await;
-            let snapshot = match w.flush_active_for_mirror() {
-                Ok(s) => s,
+        let mut snapshots = Vec::new();
+        for source in &sources {
+            snapshots.extend(source.flush_active().await);
+        }
+        let mut still_open = std::collections::HashSet::with_capacity(snapshots.len());
+        for snapshot in snapshots {
+            let ActiveSnapshot {
+                path,
+                bytes,
+                subdir,
+            } = snapshot;
+            still_open.insert(path.clone());
+            if uploaded.get(&path) == Some(&bytes) {
+                continue;
+            }
+            let Some(filename) = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let body = match tokio::fs::read(&path).await {
+                Ok(b) => b,
+                // Sealed between the flush and this read: the segment is the
+                // sealed uploader's now, and it carries every byte this tick
+                // would have sent.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(path = %path.display(),
+                        "WAL active mirror: segment sealed before its snapshot was read");
+                    continue;
+                }
                 Err(e) => {
                     metrics::counter!("siglake_wal_mirror_failures_total",
-                        "reason" => "active_flush")
+                        "reason" => "active_read")
                     .increment(1);
-                    tracing::warn!(error = %e, "WAL active mirror flush failed");
+                    tracing::warn!(error = %e, "WAL active mirror read failed");
                     continue;
                 }
             };
-            // The active key must carry the same `<tenant>[/<index>]` path the
-            // SEALED keys carry. Without it recovery cannot tell whose rows
-            // these are, so the whole active mirror — the thing that bounds the
-            // PVC-loss window — is unrecoverable on any multi-tenant install.
-            (snapshot, w.mirror_subdir().map(str::to_string))
-        };
-        let Some((path, _bytes)) = snapshot else {
-            continue;
-        };
-        let Some(filename) = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let body = match tokio::fs::read(&path).await {
-            Ok(b) => b,
-            Err(e) => {
-                metrics::counter!("siglake_wal_mirror_failures_total",
-                    "reason" => "active_read")
-                .increment(1);
-                tracing::warn!(error = %e, "WAL active mirror read failed");
-                continue;
-            }
-        };
-        let n = body.len() as u64;
-        let key = match subdir.as_deref() {
-            Some(sub) if !sub.is_empty() => format!("{prefix}/_active/{sub}/{filename}"),
-            _ => format!("{prefix}/_active/{filename}"),
-        };
-        match op.write(&key, body).await {
-            Ok(_) => {
-                metrics::counter!("siglake_wal_mirror_active_uploads_total").increment(1);
-                metrics::counter!("siglake_wal_mirror_bytes_uploaded_total").increment(n);
-                tracing::debug!(%key, bytes = n, "WAL active mirror upload ok");
-            }
-            Err(e) => {
-                metrics::counter!("siglake_wal_mirror_failures_total",
-                    "reason" => "active_upload")
-                .increment(1);
-                tracing::warn!(%key, error = ?e, "WAL active mirror upload failed");
+            let n = body.len() as u64;
+            let key = match subdir.as_deref() {
+                Some(sub) if !sub.is_empty() => format!("{prefix}/_active/{sub}/{filename}"),
+                _ => format!("{prefix}/_active/{filename}"),
+            };
+            match op.write(&key, body).await {
+                Ok(_) => {
+                    metrics::counter!("siglake_wal_mirror_active_uploads_total").increment(1);
+                    metrics::counter!("siglake_wal_mirror_bytes_uploaded_total").increment(n);
+                    tracing::debug!(%key, bytes = n, "WAL active mirror upload ok");
+                    // The bytes that reached the object store, not the count
+                    // the flush reported: appends land between the two, and
+                    // the next tick must re-upload what this one did not send.
+                    uploaded.insert(path, n);
+                }
+                Err(e) => {
+                    metrics::counter!("siglake_wal_mirror_failures_total",
+                        "reason" => "active_upload")
+                    .increment(1);
+                    tracing::warn!(%key, error = ?e, "WAL active mirror upload failed");
+                }
             }
         }
+        uploaded.retain(|path, _| still_open.contains(path));
     }
 }
 
@@ -2276,7 +2373,7 @@ mod tests {
 
         let op = memory_op();
         let task_op = op.clone();
-        let task_writer = writer.clone();
+        let task_writer: Vec<Arc<dyn ActiveMirrorSource>> = vec![writer.clone()];
         let task = tokio::spawn(async move {
             active_mirror_loop(
                 task_writer,
@@ -2308,6 +2405,77 @@ mod tests {
         }
         assert_eq!(found, 1, "expected exactly one active-mirror blob");
         assert!(total_bytes > 0, "active-mirror blob is empty");
+    }
+
+    /// One tick covers every source, each writer keyed by its own subdir.
+    ///
+    /// The ingest server has one source per router and one writer per
+    /// (tenant, index, shard); a loop that stopped at the first source with
+    /// something to send would bound one tenant's loss window and no other.
+    /// `active_mirror_wiring.rs` in `siglake-ingest` is the same claim through
+    /// the HTTP handlers.
+    #[tokio::test]
+    async fn active_mirror_covers_every_source_per_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sources: Vec<Arc<dyn ActiveMirrorSource>> = Vec::new();
+        for tenant in ["acme", "widgets"] {
+            let dir = tmp.path().join(tenant);
+            let mut writer = crate::WalWriter::with_thresholds(
+                &dir,
+                "ing-test",
+                1_000_000,
+                std::time::Duration::from_secs(3600),
+            )
+            .unwrap();
+            writer.set_mirror_subdir(Some(tenant.to_string()));
+            writer
+                .append_events(&[synth_event(1), synth_event(2)])
+                .unwrap();
+            sources.push(Arc::new(tokio::sync::Mutex::new(writer)));
+        }
+
+        let op = memory_op();
+        let task_op = op.clone();
+        let task = tokio::spawn(async move {
+            active_mirror_loop(
+                sources,
+                task_op,
+                "wal-mirror".to_string(),
+                std::time::Duration::from_millis(20),
+            )
+            .await;
+        });
+
+        use futures::stream::StreamExt;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let keys = loop {
+            let mut listing = op
+                .lister_with("wal-mirror/_active/")
+                .recursive(true)
+                .await
+                .unwrap()
+                .fuse();
+            let mut keys = Vec::new();
+            while let Some(entry) = listing.next().await {
+                let entry = entry.unwrap();
+                if entry.metadata().is_file() {
+                    keys.push(entry.path().to_string());
+                }
+            }
+            if keys.len() >= 2 || std::time::Instant::now() >= deadline {
+                keys.sort();
+                break keys;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        task.abort();
+
+        assert_eq!(keys.len(), 2, "one blob per source: {keys:?}");
+        assert!(
+            keys[0].starts_with("wal-mirror/_active/acme/")
+                && keys[1].starts_with("wal-mirror/_active/widgets/"),
+            "each blob is keyed by its writer's subdir: {keys:?}"
+        );
     }
 
     /// The plan groups by the destination the drain routes on, and touches
