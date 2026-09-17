@@ -955,7 +955,13 @@ two-phase-merges — including distributed ordered scans (shards sort+limit,
 coordinator merge-sorts). Mergeable aggregates (`count`, `sum`, `min`, `max`,
 with or without `GROUP BY`) under a top-level `ORDER BY [LIMIT n]` also
 distribute; only non-mergeable aggregates (`DISTINCT`, `avg`, and aggregates
-over subqueries) and other classifier fallbacks stay single-pod. A worker
+over subqueries) and other classifier fallbacks stay single-pod. Whether the
+one referenced table is a managed index at all — the gate a fan-out passes
+before anything is dispatched — is answered from the catalog row plus the
+bounded-staleness table-metadata cache, never an uncached `load_table`: that is
+the per-query metadata.json read table registration was already changed to
+avoid, and a gate holding it merely moved the same read one step earlier in the
+request. A worker
 fragment carries the same one-budget-per-request rule as the local path,
 anchored when the shard request arrives: preparation (tenant resolution, table
 registration, generation pin, planning) spends the same clock as the scan, so a

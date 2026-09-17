@@ -15142,7 +15142,13 @@ async fn distributed_inner(
     };
     let distributable = match referenced_tables(&req.query).as_deref() {
         Some([t]) if t == "events" => true,
-        Some([t]) => ice.get_index(t).await.ok().flatten().is_some(),
+        // #4074: the same question `get_index` used to answer here, read from
+        // the bounded-staleness table cache. `get_index` does an uncached
+        // `load_table` — the per-query metadata.json read that
+        // `register_index_with_datafusion` was changed to avoid — and this gate
+        // runs before anything is dispatched, so keeping it here just moved
+        // that read one step earlier in the same request.
+        Some([t]) => ice.is_managed_index(t).await.unwrap_or(false),
         _ => false,
     };
     if !distributable {
