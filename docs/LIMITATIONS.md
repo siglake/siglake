@@ -26,16 +26,38 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   reservation for warm indexes; 5Gi buys both. A pod in that state is now
   visible rather than inferred: every acquisition is a `miss` on
   `siglake_iceberg_parsed_index_cache_lookups_total` with no eviction beside it,
-  which is the shape the "Text-index startup" panels were added for (#3969). The caps above 16Gi are policy
-  rather than measurement, but the working set below them has now been sized,
-  and it is larger than the caps assume: one 7.34M-row compacted file's parsed
+  which is the shape the "Text-index startup" panels were added for (#3969).
+  The caps that bind above 16Gi were chosen as policy; the parsed one has since
+  been timed against a budget eight times its size and kept at 1 GiB on that
+  evidence (#4102, below). The working set beneath them has been sized too, and
+  it is larger than the caps assume: one 7.34M-row compacted file's parsed
   index is 526.0 MiB, so 1 GiB holds **one** of them, and a 14-file text plan
   wants 7.19 GiB (#4376, `DESIGN_segmented_inverted_index.md`). At the 1 GiB
   budget that plan takes zero cache hits and 41 evictions. Sizing cannot close
   that gap at any cap a query pod can afford, which is why the format itself is
-  the open item rather than the budget. The reader can now read a segmented
-  sidecar in part (#4561, `SIGLAKE_SEGMENTED_INDEX_READS`), which holds a
-  directory instead of a parsed index, and holds it between queries under a
+  the open item rather than the budget. One workload earns the override on
+  measured grounds: a text query whose `match_terms` term is rare (0.001% of
+  rows in the fixture) and which carries no LIMIT for #4375's per-execution
+  decline to clip, run repeatedly over a fully-compacted table — that plan
+  keeps its indexes, and 1 GiB evicts them between lookups. In a local
+  paired-budget experiment (#4102,
+  [`DESIGN_inverted_index.md`](DESIGN_inverted_index.md), "The parsed-index
+  ceiling A/B") raising `SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES` and
+  `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES` together from 1 GiB / 256 MiB to
+  8 GiB / 2 GiB took that shape's p50 from 22,798.9 ms to 120.2 ms and its
+  `_last25` variant's from 4,843.4 ms to 38.2 ms, while the five clipped shapes
+  stayed within noise; neither knob was varied alone, so the pair is what those
+  numbers cover. What the budget costs is a pod's worth of memory: the 8 GiB
+  passes measured 20.2-21.3 GiB total process RSS against 14.3-15.6 GiB at the
+  shipped pair, which is the whole process on a local fixture rather than the
+  cache's incremental cost or a limit to copy into a pod spec. That experiment
+  covered no HTTP, object storage, distributed execution or AWS, so read the
+  override as a sizing option for a deployment that has both the query shape
+  and the memory to spare; the derivation, its 1 GiB cap and the packaged 4Gi
+  limit stay as they are.
+  The reader can now read a segmented sidecar in part (#4561,
+  `SIGLAKE_SEGMENTED_INDEX_READS`), which holds a directory instead of a
+  parsed index, and holds it between queries under a
   byte budget of its own (#5006,
   `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`) — but nothing writes
   one, so neither budget above changes, and with the prototype off nothing is
