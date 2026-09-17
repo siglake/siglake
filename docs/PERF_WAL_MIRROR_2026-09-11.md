@@ -258,3 +258,232 @@ mirror, multi-tenant fan-out — and two more:
   filesystem, so `mirror-pending/` never held more than a segment or two. The pin
   cost is per seal and does not change with store latency, but the directory the
   pins accumulate in has only been exercised near-empty.
+
+---
+
+# Can the pin share a directory sync? (task #3787)
+
+**Date:** 2026-09-17 · **Evidence:** `report_pin_cost_breakdown`, added on this
+branch; four runs, numbers reproducible by re-running it · **Verdict: no, and the reason is
+not the crash window. The fsync is 94 % of the pin, and there is never a second
+unsynced pin to share it with: one writer owns each `mirror-pending/` directory
+and seals under its own lock, so the directory holds at most one unsynced entry
+at any instant. Every "batched sync" is therefore a deferred sync, and the
+happens-before a deferral needs is against the compactor — which on the volume
+the chart renders is a different process on a different node.**
+
+## Where the 0.47 ms goes
+
+`pin_segment` (`crates/siglake-wal/src/mirror.rs:503`) does three things:
+resolve the segment's current local name (`find_segment`, four `exists()`
+probes), hard-link it into `mirror-pending/`, and fsync that directory. #3758
+measured the three together and said so. `report_pin_cost_breakdown`
+(`crates/siglake-wal/src/mirror.rs`, `#[ignore]`d) prices them apart: each
+iteration lays a segment into `sealed/` the way `WalWriter::seal` does — body
+fsynced, renamed, `sealed/` fsynced — so the journal is in the state the pin
+actually meets, and then times the three steps separately.
+
+200 seals of 92,160 B (the saturation arm's 164.8 MB over 1,819 segments), ext4
+on NVMe, load average 6.9–7.7, four runs. Microseconds per pin, means:
+
+| batch | `find_segment` | `hard_link` | `sync_dir` per pin | pin total | idle barrier |
+|---|---|---|---|---|---|
+| 1 | 4.9 | 21.2 | 393.8 | 419.8 | 18.5 |
+| 2 | 4.6 | 20.9 | 196.1 | 221.6 | 18.1 |
+| 4 | 4.6 | 21.0 | 101.1 | 126.6 | 19.7 |
+| 8 | 4.9 | 21.8 | 49.7 | 76.3 | 17.7 |
+| 16 | 4.6 | 21.2 | 24.8 | 50.6 | 22.4 |
+| 64 | 4.7 | 21.8 | 6.1 | 32.7 | 37.2 |
+
+Whole `pin_segment`, same runs: 410–427 µs mean, 406–423 µs p50, against the
+474 µs #3758 read out of the seal histogram — the same number to within the
+spread between two sessions on a shared box, and reached a different way, which
+is the cross-check. The lookup and the link together are 26 µs —
+6 % of it. The directory fsync is the rest, and it amortizes almost linearly:
+one sync per 8 pins would cost 76 µs per seal instead of 420, and at the
+measured 60.6 seals/s that returns 2.1 of the 2.9 points of writer-second the
+pin consumes. The arithmetic in #3787's premise is right.
+
+The last column is an fsync of the same directory immediately repeated, with
+nothing pending: 18–37 µs by the mean, an order of magnitude under a dirty one.
+It is the noisiest column here — there are only `200 / batch` samples of it per
+run, and one sample at batch 64 read 131 µs, which is most of that column's
+37. A barrier that fires when there is nothing to persist is still cheap enough
+to ignore, which matters to the drain-side design below.
+
+## There is no batch to form
+
+`WalMirrorHandle::enqueue` has exactly one caller, `WalWriter::seal`
+(`crates/siglake-wal/src/lib.rs:928`), and `hard_link` exactly one production
+call site. `mirror-pending/` is per WAL directory (`pending_path`,
+`mirror.rs:492`), and a WAL directory is one `(tenant, index)` lane, held by one
+`Arc<Mutex<WalWriter>>` in `TenantWalRouter`
+(`crates/siglake-ingest/src/lib.rs:343`). `seal` takes `&mut self` and calls
+`enqueue` before it returns, so a lane's pin is created and synced inside its
+own critical section.
+
+61 seals/s is a rate through that serialized writer, not a concurrency. The
+count of unsynced pins in one directory is one, at every instant, at any ingest
+rate. Multi-tenant fan-out raises pins per second but gives each lane its own
+directory, and `fsync(2)` on a directory covers that directory. Nothing else
+writes into `mirror-pending/`: the catch-up sweep only removes from it.
+
+So a batched pin is a pin whose sync is performed after the seal that created
+it, by someone else. What has to be shown is not that N pins can share a sync,
+but that the deferral closes before it matters.
+
+## What the fsync is against
+
+The segment is already durable in `sealed/` when the pin is taken: `seal`
+fsyncs `sealed/` at `lib.rs:885`, 43 lines before the `enqueue` at `:928`. So
+the pin is redundant to `catch_up_sweep` — which discovers candidates from
+`mirror-pending/` and `sealed/` and from nowhere else (`mirror.rs:605`) — until
+something durably retires the sealed name. Four things remove one:
+
+1. `claim_segment` (`lib.rs:2269`) renames `sealed/ → processing/` for the FS
+   drain and fsyncs both directories. After it, only the pin is left in the
+   sweep's discovery set.
+2. `quarantine_stale_wal_dir` (`lib.rs:1122`) moves a dropped incarnation's
+   residents to `stale/<uuid>/` and fsyncs both. The sweep does not scan
+   `stale/` either.
+3. `delete_segment` from the ingester's local sweep
+   (`crates/siglake-cli/src/main.rs:1558`) unlinks a sealed segment outright,
+   but only one the catalog reports committed and settled for 600 s — which in
+   claim mode means the mirror object was the commit source, so the upload
+   succeeded and the pin is already gone.
+4. `sweep_committed_coordinated` and `dispose_orphans_at` delete from
+   `committed/` and `orphans/`, never from `sealed/`.
+
+The pin's fsync therefore exists against (1) and (2) alone, and the invariant is
+exact: **a pin must be durable no later than the removal of the last sealed name
+it stands in for.** Both actors are the compactor, and both make that removal
+durable with an fsync of `sealed/` they issue themselves.
+
+## The crash window a deferral opens
+
+Suppose the writer links and does not sync. The window runs from the `hard_link`
+to whatever fsync eventually persists it. Three crash points:
+
+- **Before the drain claims.** The sealed name is still there and still durable.
+  The restarted ingester's first `catch_up_sweep` pass finds the segment in
+  `sealed/`, PUTs it and registers it. Losing the pin dirent costs nothing.
+- **After the claim rename, before the claim's fsync of `sealed/`.** The removal
+  is not durable, so recovery sees the segment under its sealed name (or under
+  both names, which the sweep dedups by mirror key, `mirror.rs:618`). No hole.
+- **After the claim's fsync of `sealed/`.** Only here does the deferral bite.
+  The segment is now discoverable only through `mirror-pending/`. If the link
+  dirent did not survive, the segment is invisible to every sweep the cluster
+  will ever run, the PUT never happens, and the mirror is permanently missing a
+  sealed segment. Nothing reports it: `catch_up_sweep` repairs "uploaded but not
+  registered" and "sealed but not uploaded", and has no notion of a segment it
+  cannot see. That is #3745's bug with a smaller window, and the loss is the one
+  the mirror exists to prevent — `recover_from_object_store` (`mirror.rs:1003`)
+  restores a lost PVC from the prefix, and what is not in the prefix is not
+  restored.
+
+So a deferral is admissible exactly when the pin's dirent is guaranteed durable
+before the drain's fsync of `sealed/` is. Two ways to guarantee that, both
+refused.
+
+### Journal ordering: not ours to rely on
+
+On ext4 in `data=ordered` with the default journal, an fsync commits the running
+transaction, and that transaction carries every earlier completed metadata
+operation on the filesystem — including a hard link in another directory. The
+drain's fsync of `sealed/` would persist the ingester's link for free, and the
+harmful ordering above could not be produced.
+
+That is an implementation property of one journal mode, not a guarantee POSIX
+makes or that the code may assume. ext4's `fast_commit` feature logs per inode
+rather than committing the whole transaction, precisely to avoid paying for
+unrelated work; XFS's log has its own ordering rules. A durability argument that
+holds only while nobody runs `tune2fs -O fast_commit` is not an argument, and it
+would be invisible when it stopped holding — the failure is a missing object in
+a DR copy nobody reads until they need it.
+
+### A barrier in the drain: the wrong process, on the wrong volume
+
+The explicit form: the writer links without syncing, and the compactor calls
+`sync_dir(mirror-pending)` once before it makes a claim batch durable. One fsync
+per batch of up to 64 segments instead of one per seal, on the compactor rather
+than the writer, establishing the happens-before by construction rather than by
+journal accident. The idle-barrier column says it costs 18–37 µs when there is
+nothing pending, so the compactor would barely feel it.
+
+It fails on the deployed shape. The WAL claim is `ReadWriteMany`
+(`deploy/helm/siglake/values.yaml:800`), EFS on EKS, shared between the ingester
+Deployment and the compactor Deployment — the chart's own comment at `:784`.
+`fsync(dirfd)` in the compactor's process, on its own NFS client, on another
+node, is not a statement about data the ingester's client wrote. It flushes what
+that client has pending, and the ingester's link is not its to flush. The
+barrier would compile, pass every local test on ext4, and mean nothing on the
+volume the chart renders.
+
+Two further costs, either of which would be enough on its own:
+
+- It makes the ingester's mirror directory a dependency of the drain. A pin
+  failure today increments `siglake_wal_mirror_failures_total{reason="pin"}`,
+  logs, and does not block the seal (`mirror.rs:245`). Under the barrier an EIO
+  on `mirror-pending/` has to fail the claim batch, or the barrier is not one.
+- It does not cover the catalog-claim drain, which never touches the ingester's
+  filesystem, or an external WAL consumer reading the same volume
+  (`docs/CONSUMING_SEGMENTS.md`). Each new reader of the directory would have to
+  learn the protocol.
+
+A writer-side deferral — seal K's sync performed by seal K+1 — fails earlier.
+It closes the window against the next seal, and the actor the window is against
+is the compactor, which can claim K between the two seals. At 61 seals/s that
+gap is 16 ms wide, and the drain's claim loop runs continuously.
+
+## What can be given up, and what it is worth
+
+The mirror protocol takes two more directory fsyncs per segment, both on the
+unpin side: `remove_pin` after a successful upload (`mirror.rs:536`) and
+`remove_candidate_pin` per swept candidate (`mirror.rs:783`). Neither carries
+the invariant above — losing an unlink leaves a stale pin, the next
+sweep stats the key, finds the object present, and removes it again
+(`mirror.rs:646`). They are idempotent repairs of cheap work, and they could be
+dropped or batched with no crash-ordering argument at all.
+
+They are also not on the seal path — they run on the mirror worker and the sweep
+task — so removing them recovers no throughput directly. What they do cost is
+another ~380 µs of journal work per uploaded segment, 61 times a second at
+saturation, on the same device the writer is fsyncing. That is a candidate for
+the 0.3 points between the 2.9 % the pin accounts for by arithmetic and the
+3.2 % #3758 measured. Unmeasured here; filed as a follow-up.
+
+## The number this argument does not have
+
+Every figure above is ext4 on local NVMe, and so is #3758's −3.2 %. The volume
+the chart renders is EFS. NFS directory operations are server-side durable
+before the reply — the protocol requires it for `LINK`, unlike `WRITE` — which
+would make `pin_segment`'s `hard_link` carry the durability and its `sync_dir`
+close to free, and the pin's whole measured cost an artifact of the local
+filesystem the bench runs on. That would also mean the README's "0.47–0.58 ms of
+synchronous seal time" is a loopback number that does not transfer to the
+deployed shape. No round has measured a seal histogram on EFS; a follow-up asks
+for one.
+
+That changes the shape of this argument without changing its verdict. The two
+cases arrive at the same place from opposite directions: where the fsync is
+expensive (local ext4) the deferral cannot be closed safely, and where the
+deferral would be unnecessary (a filesystem whose `LINK` returns durable) the
+fsync is already cheap. Whether it can be skipped is a per-mount property —
+which filesystem, which mount options, which server — that the writer cannot
+detect and must not guess, so it pays for the weakest assumption every time.
+That is the sense in which the cost is irreducible: no code in the writer can
+tell when the fsync is buying nothing.
+
+## What this does not measure
+
+- **Any filesystem but ext4.** XFS, NFS/EFS and overlay mounts were not
+  measured. The `fast_commit` claim above is a reason not to depend on journal
+  ordering, not a measurement of what `fast_commit` does.
+- **A non-empty `mirror-pending/`.** The measurement links into a directory that
+  grows to 200 entries. An outage backlog is larger, and neither the link nor
+  the fsync was priced against a directory holding thousands.
+- **The batched arms end to end.** The batch columns price `sync_dir` amortized
+  over N links in one process. No arm ran a writer with a deferred pin, because
+  the argument above says none should ship.
+- **Concurrent drain pressure.** The box ran no compactor; the sealed directory
+  was never being renamed out from under the pin.

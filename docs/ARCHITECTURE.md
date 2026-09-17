@@ -132,7 +132,16 @@ durable `mirror-pending/` hard link before it is queued, and keeps it until the
 remote object is confirmed, so a remote outage grows that local directory
 instead of discarding the only upload source. That link and its directory fsync
 are **0.47–0.58 ms of synchronous seal time** (per-shape medians; 0.48–0.66 ms
-in every one of the ten arms).
+in every one of the ten arms). The fsync is 94 % of that — the lookup and the
+link are 26 µs of it — and it does not batch. One writer owns each lane's
+`mirror-pending/` and seals under its own lock, so the directory never holds two
+unsynced pins to share a sync between; deferring the sync past the seal would
+have to be closed before the compactor retires the sealed name, and the
+compactor is a different process, on the `ReadWriteMany` volume this chart
+renders, whose `fsync` says nothing about a directory entry the ingester's
+client wrote. The measurement that splits the three costs and the crash-ordering
+argument are in `docs/PERF_WAL_MIRROR_2026-09-11.md` ("Can the pin share a
+directory sync?").
 Throughput: a fixed 20K EPS is delivered by both arms with no `503`s — 4.9
 seals/s costs 0.3 % of a writer-second — while the saturation ceiling drops
 **−3.2 %** (256.8K → 248.7K EPS median), five of five pairs and wider than the
