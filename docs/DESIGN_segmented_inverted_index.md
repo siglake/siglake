@@ -202,10 +202,13 @@ contract #4561 is written against:
   returns `Unanswerable`, not the rows it managed to get.
 
 Three things land in `Unanswerable` that a reader has to plan for. A term that
-does not normalize — where v1's `postings` returns `None` and its
-`matching_rows_all` then reads that as "no rows match", so a term too short to
-index licenses skipping every row in the file. A malformed section or a failed
-range read. And a **row-group selection this sidecar cannot serve**: the
+does not normalize, where v1's `postings` returns `None` and its
+`matching_rows_all` then reads that as "no rows match" — a contract hazard the
+shipped path does not reach, because `extract_match_udf_prune` fills
+`RawPruneSpec` from tokenizer output and every token it emits is at least
+`MIN_TOKEN_LEN` and already folded, so it normalizes by construction. A
+malformed section or a failed range read. And a **row-group selection this
+sidecar cannot serve**: the
 indices must be strictly ascending and in range, because an out-of-range index
 means the caller's row-group map and the sidecar disagree, and a repeated one
 would return a group's postings twice — and both `intersect_sorted` and

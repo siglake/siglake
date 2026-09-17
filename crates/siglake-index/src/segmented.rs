@@ -141,9 +141,12 @@ pub fn segmented_index_kv_key(column: &str) -> Cow<'static, str> {
 /// [`InvertedIndex::matching_rows_all`](crate::InvertedIndex::matching_rows_all)
 /// then reads that as "no rows match", a segmented lookup answers
 /// `Unanswerable` and its AND entry point returns `None` — an unindexable term
-/// constrains nothing, so it must not license skipping rows. And where the v1
-/// decoder's failure is confined to `from_bytes`, a partial reader can fail
-/// per lookup, which is why the third case has to exist at all.
+/// constrains nothing, so it must not license skipping rows. (The shipped
+/// reader does not reach that hazard: it fills `RawPruneSpec` from tokenizer
+/// output, which normalizes by construction. This format does not rely on the
+/// caller for it.) And where the v1 decoder's failure is confined to
+/// `from_bytes`, a partial reader can fail per lookup, which is why the third
+/// case has to exist at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup {
     /// Ascending **file-physical** row ordinals containing the term.
