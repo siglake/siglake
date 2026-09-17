@@ -18238,6 +18238,33 @@ impl IcebergContext {
         Ok(config.doc_mapping.timestamp_field == "timestamp")
     }
 
+    /// Whether `index_id` names a managed index of this context's namespace —
+    /// the query server's gate on whether a single-table query may fan out.
+    ///
+    /// Answers exactly what [`crate::index_manager`]'s `get_index(..).is_some()`
+    /// answers (`false` for a name that is not a table here, `false` for a
+    /// namespace table carrying no doc mapping such as `webhook_dlq`, `true`
+    /// for the canonical `events` table), but reads the bounded-staleness
+    /// table cache instead of `load_table`. The uncached lookup re-reads the
+    /// (bloated) metadata.json per query, which is the read
+    /// [`Self::register_index_with_datafusion`] was changed to avoid — a gate
+    /// that keeps it merely moves the same read one step earlier.
+    ///
+    /// The config itself is deliberately not returned: a caller that needs the
+    /// mapping's contents rather than its existence should say which freshness
+    /// it needs (see `index_table_uuid` for one that must not be cached).
+    pub async fn is_managed_index(&self, index_id: &str) -> Result<bool> {
+        let table_ident = self.index_table_ident(index_id);
+        // A single catalog-DB row lookup, and the only part of `get_index` that
+        // has to be fresh: a dropped index stops existing here at once, so a
+        // cache entry for the old incarnation can never resurrect it.
+        if !self.catalog().table_exists(&table_ident).await? {
+            return Ok(false);
+        }
+        let cached = self.cached_table_entry(&table_ident).await?;
+        Ok(crate::index_manager::index_config_from_table(index_id, &cached.table)?.is_some())
+    }
+
     /// Register every managed index table (skipping `events`, which the
     /// caller registers through the canonical WS-6-aware path). Used by the
     /// register-everything fallback when a query's table set can't be parsed.

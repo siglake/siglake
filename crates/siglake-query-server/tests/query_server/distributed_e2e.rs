@@ -2553,3 +2553,130 @@ async fn scan_detail_attributes_the_read() {
         "Tier-1 answers must stay visibly scan-free: {body}"
     );
 }
+
+/// #4074: the fan-out gate classified `FROM "idx"` with `get_index`, an
+/// UNCACHED `load_table` — the per-query metadata.json read that
+/// `register_index_with_datafusion` had already been changed to avoid. Keeping
+/// it on the classification just moved the same read one step earlier in the
+/// request.
+///
+/// The proof is a negative control, not a cache-hit count: registration warms
+/// the same cache, so hits alone cannot separate a cached read from a cached
+/// read plus a redundant uncached one. Here the index table's metadata.json
+/// files are deleted once the cluster is warm — the catalog row that
+/// `table_exists` reads survives, the data files and `.avro` manifests survive,
+/// and only a genuine `load_table` breaks. On the old gate that error was
+/// swallowed into "not distributable" and the warm query silently stopped
+/// fanning out.
+#[tokio::test]
+async fn a_warm_index_query_classifies_without_reading_metadata() {
+    require_loopback!();
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = tmp.path().join("warehouse");
+
+    let config = siglake_core::index_config::IndexConfig {
+        index_id: "gate-idx".into(),
+        doc_mapping: siglake_core::index_config::IndexConfig::builtin_events().doc_mapping,
+        retention: None,
+        index_at_flush: None,
+    };
+    {
+        let writer = IcebergContext::open(&warehouse).await.unwrap();
+        writer.create_index(&config).await.unwrap();
+        let base = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        for file in 0..2 {
+            let events: Vec<Event> = (0..15)
+                .map(|j| {
+                    let mut e = Event::now(format!("gate row {}", file * 15 + j));
+                    e.host = format!("h{}", j % 3);
+                    e.timestamp = base + Duration::seconds(file * 15 + j);
+                    e
+                })
+                .collect();
+            let batch = siglake_core::events_to_record_batch(&events).unwrap();
+            let mapped = siglake_core::map_carrier_batch(&batch, &config).unwrap();
+            writer
+                .append_to_table(&writer.index_table_ident("gate-idx"), mapped, &[])
+                .await
+                .unwrap();
+        }
+    }
+
+    // Result caches off on both pods: the second query below re-classifies and
+    // re-executes, instead of being answered from the first one's entry.
+    let no_result_cache = || async {
+        Arc::new(IcebergContext::open(&warehouse).await.unwrap().with_tuning(
+            siglake_storage::iceberg::IcebergTuning {
+                result_caches: Some(false),
+                ..Default::default()
+            },
+        ))
+    };
+    let (url_a, _url_b, _ha, _hb) =
+        two_peer_cluster(no_result_cache().await, no_result_cache().await).await;
+    let client = reqwest::Client::new();
+    // A filtered aggregate: Tier-1 cannot serve a predicate on `raw`, so this
+    // shape genuinely reaches both workers.
+    let request = serde_json::json!({
+        "query": "SELECT count(*) AS n FROM \"gate-idx\" WHERE raw LIKE '%gate row%'"
+    });
+
+    let warm: serde_json::Value = client
+        .post(format!("{url_a}/api/v1/sql"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(warm["rows"][0]["n"].as_i64(), Some(30), "{warm}");
+    assert_eq!(
+        shard_walls(&warm),
+        Some(2),
+        "first query must fan out: {warm}"
+    );
+
+    let removed = strip_table_metadata(&warehouse, "gate-idx");
+    assert!(
+        removed > 0,
+        "the fixture must actually remove the index table's metadata, or it proves nothing"
+    );
+
+    let after: serde_json::Value = client
+        .post(format!("{url_a}/api/v1/sql"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["rows"][0]["n"].as_i64(), Some(30), "{after}");
+    assert_eq!(
+        shard_walls(&after),
+        Some(2),
+        "warm classification must not need a metadata read: {after}"
+    );
+}
+
+/// Delete every metadata.json of `index_id`'s table under `warehouse`, leaving
+/// the catalog row, the data files and the `.avro` manifests in place. Returns
+/// how many files went.
+fn strip_table_metadata(warehouse: &std::path::Path, index_id: &str) -> usize {
+    let mut removed = 0;
+    for namespace in std::fs::read_dir(warehouse).unwrap() {
+        let table_metadata = namespace.unwrap().path().join(index_id).join("metadata");
+        if !table_metadata.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&table_metadata).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                std::fs::remove_file(&path).unwrap();
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
