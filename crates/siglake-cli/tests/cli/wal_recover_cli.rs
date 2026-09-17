@@ -379,3 +379,82 @@ fn recover_refuses_a_sealed_directory_as_the_target() {
         );
     }
 }
+
+/// #5077, the card's own repro, run as the binary an operator runs. A
+/// filesystem-backed mirror is a real configuration — the chart's
+/// `--warehouse-url file://…`, the kind and compose arms — and opendal's `fs`
+/// writer creates the target in place with no `atomic_write_dir`, so an
+/// `_active/` object is listable, and stat-able at zero bytes, before its body
+/// lands. The apply used to publish those bytes under a sealed name and print
+/// `pulled 1`; `read_segment` on the result fails with "Expected schema
+/// message, found empty stream", so the operator was told a restore had
+/// finished and the drain found a hole.
+///
+/// Against the pre-fix binary the apply arm prints `pulled 2 segments` with no
+/// mention of the torn object, and leaves a zero-byte `.arrow` in
+/// `widgets/sealed/`.
+#[test]
+fn recover_refuses_an_unreadable_active_object_and_says_so_in_both_forms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mirror = tmp
+        .path()
+        .join("store")
+        .join("warehouse")
+        .join("wal-mirror");
+    let good = seal_one(&tmp.path().join("src"), "acme-events");
+    let name = good.file_name().unwrap().to_str().unwrap().to_string();
+    place(&mirror, &format!("acme/{name}"), &good);
+    // The uploader's PUT, interrupted: the key exists, the body does not.
+    let torn = mirror
+        .join("_active")
+        .join("widgets")
+        .join("s.arrow.partial");
+    std::fs::create_dir_all(torn.parent().unwrap()).unwrap();
+    std::fs::write(&torn, b"").unwrap();
+
+    let from = format!("file://{}", mirror.display());
+    let wal = tmp.path().join("wal");
+
+    // The plan names it BEFORE the apply, and proposes only the one segment.
+    let (stdout, stderr, ok) = recover(&from, &wal);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(
+        stdout.contains("UNREADABLE: `_active/widgets/s.arrow.partial`")
+            && stdout.contains("1 unreadable"),
+        "the plan has to name the object: {stdout}"
+    );
+    assert!(
+        stdout.contains("totals: 1 segments"),
+        "and propose only what it would write: {stdout}"
+    );
+
+    let (stdout, stderr, ok) = recover_apply(&from, &wal);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(
+        stdout.contains("pulled 1 segments") && stdout.contains("1 unreadable"),
+        "the report separates the two: {stdout}"
+    );
+    assert!(
+        wal.join("acme").join(SEALED_DIR).join(&name).exists(),
+        "the readable segment still restores: {stdout}"
+    );
+    assert!(
+        !wal.join("widgets").exists(),
+        "nothing is created for a body that does not decode: {stdout}"
+    );
+    for dir in [wal.join("acme"), wal.clone()] {
+        for entry in std::fs::read_dir(dir.join(SEALED_DIR))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            assert_eq!(
+                entry.path().extension().and_then(|e| e.to_str()),
+                Some("arrow"),
+                "a refused candidate leaves no `.tmp` behind"
+            );
+        }
+    }
+    // Refuse-and-count, not quarantine: the command writes only under `--to`.
+    assert!(torn.exists(), "the mirror object is left where it is");
+}

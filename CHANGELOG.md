@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **CLI (fix)**: `siglake wal-recover` refuses a mirror object that is not a
+  WAL segment instead of restoring it as one. An `_active/` object is listable,
+  and stat-able at zero bytes, before its body lands — opendal's `fs` writer
+  creates the target in place with no `atomic_write_dir`, so a
+  filesystem-backed mirror and any interrupted uploader leave the same state —
+  and the apply published whatever it read under a sealed name and counted it
+  pulled. The drain then failed to read a zero-byte sealed segment the restore
+  had reported as done. Every candidate now has to decode to at least one row,
+  sealed and active alike; the ones that do not are counted in `unreadable`
+  rather than `pulled`, named with their reason in the plan an operator reads
+  before `--apply` as well as in the report, charged to
+  `siglake_wal_recover_unreadable_total`, and left in the mirror — a refused
+  candidate creates no `.tmp`, no `sealed/` and no tenant discovery directory.
+  A flushed prefix whose last Arrow IPC message is torn still restores, which
+  is what the active mirror is for. The check costs the plan one GET per
+  candidate it would write; an already-present destination is not read, so a
+  re-run does not re-download the mirror. (#5077)
+
 - **Ingest (fix)**: `wal.mirror.activeIntervalSecs` /
   `--wal-active-mirror-interval-secs` uploads the segments ingest is writing.
   The loop was handed the ingester's root `WalWriter`, and every request lands

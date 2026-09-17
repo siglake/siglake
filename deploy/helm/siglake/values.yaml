@@ -850,7 +850,10 @@ wal:
   # to the namespace and table it came from. `--from` must name the mirror
   # root, not the warehouse URL above it: where the mirror has an `_active/`
   # object or an `owner` marker the command catches that itself, and where it
-  # has neither the plan is the check.
+  # has neither the plan is the check. A candidate whose body does not decode
+  # as a WAL segment — an `_active/` object caught mid-PUT is the usual one —
+  # is refused, reported as `unreadable` rather than `pulled` in both the plan
+  # and the report, and left in the mirror for you to look at.
   #
   # ON by default since 2026-09-11: without it the WAL volume is the only copy
   # of everything acknowledged but not yet committed, and losing it loses that
