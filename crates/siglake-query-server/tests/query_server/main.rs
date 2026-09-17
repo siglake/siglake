@@ -1,4 +1,5 @@
 mod audit;
+mod auto_promotion_bounds;
 mod batch;
 mod coordinator;
 mod cost;
