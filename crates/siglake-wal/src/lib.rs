@@ -3125,9 +3125,10 @@ enum IpcStreamExtent {
     /// holds. In a sealed or legacy segment that is corruption; in a recovered
     /// PARTIAL frame it is the append the crash cut short.
     Truncated { offset: usize, detail: String },
-    /// The message starting at `offset` cannot be read at all: a negative
-    /// length, or metadata the flatbuffer verifier rejects. Never a torn tail —
-    /// the bytes are all present and still do not describe a message.
+    /// The message starting at `offset` cannot be read at all: a length no
+    /// `usize` can hold, or metadata the flatbuffer verifier rejects. Never a
+    /// torn tail — the bytes are all present and still do not describe a
+    /// message.
     Malformed { offset: usize, detail: String },
 }
 
@@ -3186,7 +3187,7 @@ fn ipc_stream_extent(bytes: &[u8]) -> IpcStreamExtent {
         let Ok(body_len) = usize::try_from(declared_body) else {
             return IpcStreamExtent::Malformed {
                 offset: start,
-                detail: format!("declares a negative body length {declared_body}"),
+                detail: format!("declares a body length {declared_body} no segment can hold"),
             };
         };
         let remaining = bytes.len() - pos;
