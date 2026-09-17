@@ -749,14 +749,26 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   long as the cluster ingests. The DR copy retains every sealed segment: the
   asynchronous uploader holds a durable `mirror-pending/` link across local
   compaction and retention, and the catch-up sweep resumes pins left by an
-  outage or process exit. Nothing expires remote objects. Give
-  `<wal.mirror.prefix>/` an object-store lifecycle expiry longer
-  than your worst-case drain backlog (the Terraform module adds one for the
-  warehouse prefix, not for this one), or run the claim drain
-  (`compactor.catalogClaim.enabled`), which purges what it commits. Turning
-  the mirror off (`wal.mirror.enabled: false`, or an empty
+  outage or process exit. Nothing expires remote objects, and the
+  `wal_segments` row the ingester writes for each uploaded object is never
+  purged either: retention only deletes `committed` rows, and under the local
+  drain no row reaches that state. At the 20K EPS / 4,096-event roll measured in
+  `docs/PERF_WAL_MIRROR_2026-09-11.md` that is 421,632 objects, 37.3 GB and the
+  same number of catalog rows per day. Give the mirror prefix an object-store
+  lifecycle expiry longer than your worst-case drain backlog, or run the claim
+  drain (`compactor.catalogClaim.enabled`), which purges what it commits.
+  Turning the mirror off (`wal.mirror.enabled: false`, or an empty
   `SIGLAKE_WAL_MIRROR_PREFIX`) is the third option, and gives up the
-  off-volume copy.
+  off-volume copy. Two things to get right when writing that rule. The prefix to
+  match is `<s3.warehousePrefix>/<wal.mirror.prefix>/`: the uploader's object
+  store is rooted at the warehouse URL, so mirror keys sit under the warehouse
+  prefix rather than beside it. And the Terraform module adds no current-object
+  expiry for any prefix — `deploy/terraform/aws/s3.tf` has one optional rule,
+  gated on `warehouse_lifecycle_days_to_glacier`, that transitions the whole
+  bucket to `GLACIER_IR` and expires noncurrent versions; when it is on it
+  already covers mirror objects, transitioning them rather than removing them.
+  `docs/DESIGN_wal_mirror_reclamation.md` prices this against a commit-proven
+  reclaimer for the local drain.
 - **The embedded compactor is a single-process shape, and the chart refuses
   it.** `ingest-server --with-compactor` runs the drain and the maintenance
   loop inside the ingester; the dev quickstart and the bench scripts use it.
