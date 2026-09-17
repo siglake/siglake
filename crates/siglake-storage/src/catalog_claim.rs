@@ -3528,3 +3528,122 @@ mod crash_window_tests {
         assert_eq!(c.requeue_claims(&["s4".to_string()]).await.unwrap(), 0);
     }
 }
+
+#[cfg(test)]
+mod local_commit_mark_tests {
+    use super::*;
+
+    async fn fresh() -> (SqlSegmentClaim, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("sqlite://{}/c.db?mode=rwc", tmp.path().display());
+        let c = SqlSegmentClaim::connect(&uri, "t".to_string())
+            .await
+            .unwrap();
+        (c, tmp)
+    }
+
+    fn local(id: &str) -> LocalCommittedSegment {
+        LocalCommittedSegment {
+            id: id.to_string(),
+            tenant: "default".to_string(),
+            index_id: String::new(),
+            segment_url: format!("wal-mirror/{id}.arrow"),
+            bytes: 7,
+        }
+    }
+
+    async fn row(c: &SqlSegmentClaim, id: &str) -> Option<(String, Option<i64>, String)> {
+        sqlx::query_as::<_, (String, Option<i64>, String)>(
+            "SELECT status, committed_at_ms, segment_url FROM wal_segments WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&c.pool)
+        .await
+        .unwrap()
+    }
+
+    /// #4913: the local drain's mark transitions the row the INGESTER wrote,
+    /// keeping the key the uploader used, and inserts one where the upload has
+    /// not registered yet — so a late `ON CONFLICT DO NOTHING` registration
+    /// cannot take the object back out of retention's reach.
+    #[tokio::test]
+    async fn the_local_mark_upserts_sealed_rows_and_absent_ones() {
+        let (c, _t) = fresh().await;
+        c.register("reg", "default", "", "wal-mirror/reg.arrow", 11, 3)
+            .await
+            .unwrap();
+        let marked = c
+            .mark_committed_local(&[local("reg"), local("absent")])
+            .await
+            .unwrap();
+        assert_eq!(marked, vec!["reg".to_string(), "absent".to_string()]);
+        let (status, committed_at, url) = row(&c, "reg").await.unwrap();
+        assert_eq!(status, "committed");
+        assert!(committed_at.is_some());
+        assert_eq!(url, "wal-mirror/reg.arrow", "the uploader's key is the key");
+        assert_eq!(row(&c, "absent").await.unwrap().0, "committed");
+        // The late registration loses, as `register` is insert-ignore.
+        assert!(!c
+            .register("absent", "default", "", "wal-mirror/absent.arrow", 1, 1)
+            .await
+            .unwrap());
+        assert_eq!(row(&c, "absent").await.unwrap().0, "committed");
+        // Both are now purgeable by the unchanged retention pass.
+        let purgeable = c.purgeable_committed(Duration::ZERO, 10).await.unwrap();
+        let keys: Vec<&str> = purgeable.iter().map(|(_, k)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["wal-mirror/reg.arrow", "wal-mirror/absent.arrow"]
+        );
+    }
+
+    /// The mark runs every cycle for as long as the file is in `committed/`.
+    /// Re-stamping `committed_at_ms` would push retention's clock forward each
+    /// time and the object would never come due.
+    #[tokio::test]
+    async fn re_marking_preserves_the_first_committed_timestamp() {
+        let (c, _t) = fresh().await;
+        c.mark_committed_local(&[local("s")]).await.unwrap();
+        let first = row(&c, "s").await.unwrap().1.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let marked = c.mark_committed_local(&[local("s")]).await.unwrap();
+        assert_eq!(
+            marked,
+            vec!["s".to_string()],
+            "idempotent, and still durable"
+        );
+        assert_eq!(row(&c, "s").await.unwrap().1.unwrap(), first);
+    }
+
+    /// A claim-mode drain owns its `processing` rows. The local mark must not
+    /// take one over — that drain will mark it with its own claimer guard, and
+    /// its consumed-proof watermark depends on the transition.
+    #[tokio::test]
+    async fn the_local_mark_leaves_claimed_rows_alone() {
+        let (c, _t) = fresh().await;
+        c.register("held", "default", "", "wal-mirror/held.arrow", 1, 1)
+            .await
+            .unwrap();
+        c.try_claim(1).await.unwrap();
+        let marked = c.mark_committed_local(&[local("held")]).await.unwrap();
+        assert!(
+            marked.is_empty(),
+            "a claimed segment's local evidence must be held, not released"
+        );
+        assert_eq!(row(&c, "held").await.unwrap().0, "processing");
+    }
+
+    /// There are no claims to reclaim on this path, so the mark writes no
+    /// consumed-proof boundary: a watermark written without a terminal claim
+    /// transition is exactly the unproved acknowledgement #2889 refuses.
+    #[tokio::test]
+    async fn the_local_mark_writes_no_consumed_proof_watermark() {
+        let (c, _t) = fresh().await;
+        c.mark_committed_local(&[local("s")]).await.unwrap();
+        assert!(c
+            .consumed_proof_watermark("default", "")
+            .await
+            .unwrap()
+            .is_none());
+    }
+}

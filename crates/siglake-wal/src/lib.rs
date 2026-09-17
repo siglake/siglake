@@ -3179,6 +3179,55 @@ mod consumer_watermark_tests {
         assert_eq!(n, 1);
     }
 
+    /// #4913: with a mark gate, a file whose remote evidence is not durable
+    /// stays, however old the consumers say it may go.
+    #[test]
+    fn mark_gate_holds_unmarked_committed_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        touch_committed(dir, "s-a.arrow");
+        touch_committed(dir, "s-b.arrow");
+        let marked = std::collections::BTreeSet::from(["s-a.arrow".to_string()]);
+        let swept = sweep_committed_gated(dir, ZERO, HUGE, HUGE, Some(&marked)).unwrap();
+        assert_eq!(swept.deleted, 1);
+        assert_eq!(swept.unmarked, 0);
+        assert_eq!(committed_names(dir), vec!["s-b.arrow"]);
+        // The mark arriving later releases it, with no leak charged.
+        let marked = std::collections::BTreeSet::from(["s-b.arrow".to_string()]);
+        let swept = sweep_committed_gated(dir, ZERO, HUGE, HUGE, Some(&marked)).unwrap();
+        assert_eq!(swept.deleted, 1);
+        assert_eq!(swept.unmarked, 0);
+        assert!(committed_names(dir).is_empty());
+    }
+
+    /// The ceiling still wins over the mark gate — a catalog outage must cost a
+    /// bounded leak, not an unbounded WAL volume — and says so in `unmarked`.
+    #[test]
+    fn hard_ceiling_overrides_the_mark_gate_and_counts_the_leak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        touch_committed(dir, "s-a.arrow");
+        let empty = std::collections::BTreeSet::new();
+        let swept = sweep_committed_gated(dir, ZERO, ZERO, HUGE, Some(&empty)).unwrap();
+        assert_eq!(swept.deleted, 1);
+        assert_eq!(
+            swept.unmarked, 1,
+            "the unreclaimable object must be counted"
+        );
+        assert!(committed_names(dir).is_empty());
+    }
+
+    /// No gate is the pre-#4913 behaviour, byte for byte.
+    #[test]
+    fn no_gate_sweeps_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        touch_committed(dir, "s-a.arrow");
+        let swept = sweep_committed_gated(dir, ZERO, HUGE, HUGE, None).unwrap();
+        assert_eq!(swept.deleted, 1);
+        assert_eq!(swept.unmarked, 0);
+    }
+
     /// No consumers at all ⇒ pure time-based (back-compat with sweep_committed).
     #[test]
     fn no_consumers_is_time_based() {

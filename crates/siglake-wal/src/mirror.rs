@@ -1615,6 +1615,54 @@ mod tests {
         assert_eq!(counts.writes.load(Ordering::Relaxed), 1);
     }
 
+    /// #4913: the same race, one rename further on. A candidate the local
+    /// drain has COMMITTED is not uploaded: its rows are in Iceberg without
+    /// the mirror, and ledger-driven reclamation may already have deleted the
+    /// key that rename marks. Re-uploading it here would recreate an object no
+    /// later pass revisits, which is the leak the mark gate exists to close.
+    #[tokio::test]
+    async fn catch_up_does_not_upload_a_candidate_the_drain_committed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        let store = tmp.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+
+        let mut writer = crate::WalWriter::with_thresholds(
+            &root,
+            "ing-test",
+            2,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let segment = writer
+            .append_events(&[synth_event(1), synth_event(2)])
+            .unwrap()
+            .expect("seal");
+        drop(writer);
+
+        let committed = root
+            .join(crate::COMMITTED_DIR)
+            .join(segment.path.file_name().unwrap());
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        let counts = RequestCounts::default();
+        *counts.move_on_stat.lock().unwrap() = Some((segment.path.clone(), committed.clone()));
+        let op = counting_fs_op(&store, counts.clone());
+
+        let recovered = catch_up_sweep(&op, "wal-mirror", &root).await.unwrap();
+        assert!(
+            recovered.is_empty(),
+            "a locally-committed segment must not be registered by the sweep"
+        );
+        assert!(committed.exists(), "the stat hook must exercise the race");
+        assert_eq!(
+            counts.writes.load(Ordering::Relaxed),
+            0,
+            "no PUT may recreate the reclaimed key"
+        );
+        assert_eq!(counts.lists.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.stats.load(Ordering::Relaxed), 1);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_permission_denied_stat_keeps_prior_registrations() {
