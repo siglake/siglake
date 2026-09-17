@@ -1342,8 +1342,16 @@ impl Compactor {
     /// maintenance would be far worse than duplicating it). Iceberg's CAS
     /// remains the correctness backstop either way -- this is about wasted work,
     /// not about safety.
+    ///
+    /// Deliberately reads the CLAIM config, not [`Self::retention_cfg`]: a
+    /// filesystem drain that opted into ledger mirror reclamation (#4913) gets
+    /// a claim-store connection for retention's sake, and electing its
+    /// reclustering, expiry and delete sweeps through it would let another
+    /// compactor's lease silently stop maintenance that runs unelected today.
+    /// The object-first retention delete has its own exclusion, which does
+    /// cover that mode: [`Self::acquire_mirror_reconciliation_lease`].
     async fn maintenance_lease(&self, purpose: &str) -> bool {
-        let Some(cfg) = self.retention_cfg() else {
+        let Some(cfg) = self.catalog.as_ref() else {
             return true;
         };
         let ttl = maintenance_lease_ttl();
