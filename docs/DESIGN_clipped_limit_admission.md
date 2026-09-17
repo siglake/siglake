@@ -79,6 +79,15 @@ outright, which matters for more than symmetry: a `SortPreservingMerge` polls
 every partition for a first batch before it can emit anything, so gating one
 would deadlock rather than slow down.
 
+Which requests reach the ramp at all: `clipping_scan_limit` and the implicit
+newest-first rewrite read the same shape test (`default_order_target_table`),
+and a rewritten query is ordered, so it leaves the ramp by the exclusion above.
+What is left is the shape that qualifies for the hint and is not rewritten —
+`default_order=false`, `Priority::Batch`, or a table whose index does not order
+by canonical `timestamp` (`sql.rs::resolve_default_order_index`). The capture
+this card was filed from is one of those: its per-partition profiles are an
+unordered plan.
+
 Liveness for the unordered case: if tickets are waiting then `admitted <
 partitions`, the tickets below `admitted` are all registered, and each pays at
 least the credit it owes by ending. Tickets are handed out modulo the partition
