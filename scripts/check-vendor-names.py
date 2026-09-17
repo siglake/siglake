@@ -323,8 +323,12 @@ def run_fixtures() -> int:
     if allowed != 1:
         raise AssertionError("fixture: the allow-listed mention was not counted")
 
-    # A path that names a vendor, with no such line inside the file.
-    named_path, _ = file_problems("docs/datadog-comparison.md", "nothing in here\n")
+    # A path that names a vendor, with no such line inside the file. Not a
+    # `docs/<name>.md` one: check-public-tree.py's rule 5 requires every such
+    # path in a shipping file to be a file that ships, and a fixture is not.
+    named_path, _ = file_problems(
+        "crates/siglake-ingest/src/datadog_exporter.rs", "nothing in here\n"
+    )
     if not named_path:
         raise AssertionError("fixture: a vendor-named path was not reported")
 
