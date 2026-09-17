@@ -1043,6 +1043,13 @@ The experimental decoded-file cache
 project packages) is the one read cache whose entry is a whole file's decoded
 batches, which is why it fills only from a scan that reads a file to its end and
 returns nothing to a log UI's browses (#4494, [`LIMITATIONS.md`](LIMITATIONS.md)).
+An entry is keyed by file and projection and holds rows read under no predicate,
+so that any later query can reuse it. A task that carries a converted predicate
+therefore bypasses population rather than be read with its predicate stripped,
+which cost 2.8x a cache-disabled read on a page-prunable browse (#4891); it can
+still be served from an entry a predicate-free scan left, and the provider
+declares exact-capable filters `Inexact` while the cache is on, so the residual
+filter re-applies the predicate to those rows.
 Per-row-group population, which a clipped read can leave behind, is qualified
 against that policy and against no cache at all in
 `docs/DESIGN_row_group_decoded_cache_qualification.md` — a local prototype

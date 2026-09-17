@@ -250,16 +250,23 @@ async fn limit_clipped_scans_never_populate_the_decoded_file_cache() {
         "after one drained pass the limited repeat hits: {after_drain:?}"
     );
 
-    // Phase 4: one miss per PARTITION, none of them a population attempt —
-    // the rounds' per-execution miss count. The label shapes keep a residual
-    // `FilterExec` above the scan when the cache is on (see
+    // Phase 4: one cache request per PARTITION, none of them a population
+    // attempt — the rounds' per-execution count. The label shapes keep a
+    // residual `FilterExec` above the scan when the cache is on (see
     // `exact_filter_file_cache.rs`), so DataFusion cannot push their LIMIT into
     // the scan and every partition opens its first task before the global limit
     // is satisfied. Four one-file partitions, a LIMIT filled from the first
-    // batch: four misses, nothing read to end-of-stream, nothing inserted.
+    // batch: four requests, nothing read to end-of-stream, nothing inserted.
     // The rounds' 448 is that count — 12 executions x 16 partitions for
     // `label_filter`, 12 x 8 for `label_filter_last25`, 10 x 16 for
     // `multi_label_and` — not 448 populations that failed to stick.
+    //
+    // Those 448 were charged `miss`, because the populate path then read the
+    // file with the predicate stripped. Since #4891 a task carrying a converted
+    // predicate takes the `bypass` arm instead and reads with its predicate, so
+    // the same shape now reads FEWER pages and opens no population at all: four
+    // bypasses, no `miss` and no `abandoned`. Phase 5 keeps the
+    // tasks-opened-not-populations reading on the shape that still misses.
     siglake_storage::configure_query_scan_tuning(QueryScanTuning {
         file_cache_max_bytes: Some(BENCH_CACHE_MAX_BYTES),
         file_cache_max_entries: Some(BENCH_CACHE_MAX_ENTRIES),
@@ -293,16 +300,42 @@ async fn limit_clipped_scans_never_populate_the_decoded_file_cache() {
         .await,
         1
     );
-    let partitioned = outcomes_settling(&snapshotter, |o| o.abandoned >= 4).await;
+    let partitioned = outcomes_settling(&snapshotter, |o| o.bypass >= 4).await;
     assert_eq!(
         partitioned,
         Outcomes {
-            miss: 4,
-            abandoned: 4,
+            bypass: 4,
             ..Default::default()
         },
-        "one miss per partition that opened its first task, no population, and \
-         one abandoned population per miss"
+        "one bypass per partition that opened its first task, and no population \
+         of a predicate task to abandon"
+    );
+
+    // Phase 5: the same four-partition clipped scan with no predicate at all —
+    // the shape that still reaches the populate path. One miss per partition
+    // that opened its first task and one abandoned population per miss, with
+    // nothing inserted: `miss` counts tasks opened, not populations attempted.
+    let bare_root = tmp.path().join("bare");
+    let bare = IcebergContext::open(&bare_root)
+        .await
+        .unwrap()
+        .with_table_cache_ttl(std::time::Duration::ZERO);
+    for _ in 0..4 {
+        bare.append_events(&events(file_rows)).await.unwrap();
+    }
+    let bare_ctx = siglake_storage::session_context_with_target_partitions(Some(4));
+    bare.register_with_datafusion(&bare_ctx).await.unwrap();
+    let _ = outcomes(&snapshotter);
+    assert_eq!(rows(&bare_ctx, "SELECT raw FROM events LIMIT 1").await, 1);
+    let bare_outcomes = outcomes_settling(&snapshotter, |o| o.abandoned >= o.miss.max(1)).await;
+    eprintln!("PREDICATE-FREE CLIPPED SCAN, 4 partitions: {bare_outcomes:?}");
+    assert!(
+        bare_outcomes.miss >= 1
+            && bare_outcomes.abandoned == bare_outcomes.miss
+            && bare_outcomes.insert == 0
+            && bare_outcomes.bypass == 0,
+        "a clipped predicate-free scan must charge one abandoned population per \
+         miss and insert nothing: {bare_outcomes:?}"
     );
 
     siglake_storage::configure_query_scan_tuning(QueryScanTuning::default());
