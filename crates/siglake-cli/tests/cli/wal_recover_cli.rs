@@ -19,7 +19,7 @@ use siglake_wal::{list_sealed, WalWriter, SEALED_DIR};
 
 /// Seal one real segment under `dir` and return its path. The bytes matter:
 /// what recovery writes has to be a segment the ordinary drain will read.
-fn seal_one(dir: &Path, body: &str) -> PathBuf {
+pub(crate) fn seal_one(dir: &Path, body: &str) -> PathBuf {
     let mut w =
         WalWriter::with_thresholds(dir, "ing-1", 1, std::time::Duration::from_secs(60)).unwrap();
     w.append_events(&[Event::now(body.to_string())])
@@ -30,14 +30,14 @@ fn seal_one(dir: &Path, body: &str) -> PathBuf {
 
 /// Copy `src` to `<mirror>/<key>`, creating the intermediate directories —
 /// the mirror layout as the uploader writes it.
-fn place(mirror: &Path, key: &str, src: &Path) -> String {
+pub(crate) fn place(mirror: &Path, key: &str, src: &Path) -> String {
     let dest = mirror.join(key);
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     std::fs::copy(src, &dest).unwrap();
     key.to_string()
 }
 
-fn recover(from: &str, to: &Path) -> (String, String, bool) {
+pub(crate) fn recover(from: &str, to: &Path) -> (String, String, bool) {
     let out = Command::new(env!("CARGO_BIN_EXE_siglake"))
         .args(["wal-recover", "--from", from, "--to", to.to_str().unwrap()])
         // `--from` also reads this env var; the caller's environment must not
