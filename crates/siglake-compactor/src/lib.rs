@@ -5884,18 +5884,6 @@ impl Compactor {
     }
 }
 
-/// List the WAL mirror bucket and INSERT IGNORE each new
-/// `<prefix>/[<tenant>/]<filename>.arrow` object into `wal_segments`.
-/// Two layouts are tolerated:
-///
-/// - **Flat** (legacy / single-tenant): `<prefix>/<id>.arrow` →
-///   registered with tenant `"default"`.
-/// - **Per-tenant**: `<prefix>/<tenant>/<id>.arrow` →
-///   registered with the path-derived tenant.
-///
-/// The compactor calls this at the start of every cycle so an
-/// ingester crash between upload-to-S3 and register-in-catalog
-/// doesn't leave segments invisible to claim.
 /// Least share of the sample a key must hold to be promotable at all.
 ///
 /// The sample is bounded ([`AUTO_PROMOTE_SAMPLE_FILES`] files ×
@@ -6514,6 +6502,18 @@ async fn list_mirror_sync_page(
     })
 }
 
+/// List the WAL mirror bucket and INSERT IGNORE each new
+/// `<prefix>/[<tenant>/]<filename>.arrow` object into `wal_segments`.
+/// Two layouts are tolerated:
+///
+/// - **Flat** (legacy / single-tenant): `<prefix>/<id>.arrow` →
+///   registered with tenant `"default"`.
+/// - **Per-tenant**: `<prefix>/<tenant>/<id>.arrow` →
+///   registered with the path-derived tenant.
+///
+/// The compactor calls this at the start of every cycle so an
+/// ingester crash between upload-to-S3 and register-in-catalog
+/// doesn't leave segments invisible to claim.
 async fn sync_mirror_to_catalog(
     store: &Operator,
     prefix: &str,
