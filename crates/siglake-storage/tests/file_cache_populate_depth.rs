@@ -17,11 +17,13 @@
 //!    handed over — far below the 131,072 floor for a fixture this size, and
 //!    NOT the rows the query returned;
 //! 3. a predicate shape observes nothing at all and counts `bypass` instead
-//!    (#4891). The per-request `file_cache_bypasses` counter is what tells that
-//!    apart from a shape that decoded zero rows;
-//! 4. the per-request `file_cache_populate_rows` counter equals the depth the
-//!    process histogram saw for the same execution, so a round can attribute
-//!    depth to a shape without isolating the process.
+//!    (#4891), which is what tells that apart from a shape that decoded zero
+//!    rows.
+//!
+//! The per-request twins of these (`stats.scan.file_cache_populate_rows` and
+//! `stats.scan.file_cache_bypasses`, how a round attributes depth to a shape
+//! without isolating the process) are pinned through the real router by
+//! `crates/siglake-query-server/tests/file_cache_populate_depth_stats.rs`.
 //!
 //! Isolated in its own test binary: the query-scan tuning, the file batch cache
 //! and the global metrics recorder are all process-wide.
