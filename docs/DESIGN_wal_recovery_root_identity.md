@@ -18,10 +18,14 @@ the mirror prefix, the command prints `pulled N segments` and exits 0.
 This document records what a `file://` qualification measured, shows why no
 rule reading only the keys can fix it, prices four remedies and recommends one.
 The evidence is
-`crates/siglake-cli/tests/cli/wal_recover_root_identity.rs` — ten hermetic
-cases, all green. None asserts a fix for root identity; two of them were
-rewritten on #4972, which fixed the unrelated discovery-dir defect this
-qualification turned up (see "Defects found while reading this path").
+`crates/siglake-cli/tests/cli/wal_recover_root_identity.rs`, hermetic
+`file://` cases that ran the real binary. They measured the behaviour
+described below; #4973 rewrote them onto the shipped contract, so they now
+assert the refusal where a marker is misplaced and the plan-and-no-write
+where none is, and they still pin the legitimate installs no key can
+distinguish from the mistake. Two of them came from #4972, which fixed the
+unrelated discovery-dir defect this qualification turned up (see "Defects
+found while reading this path").
 
 ## Why one component, and why it is the likely mistake
 
@@ -249,23 +253,28 @@ segment is then admitted or quarantined on its own frame identity
 Synthesising a marker from a mirror key would vouch for segments on the
 strength of the same key shape this document is about.
 
-## What the implementation card must carry
+## What the implementation carried (#4973)
 
-1. The plan/apply split, with `--apply` the only path that writes.
-2. The per-`(tenant, index)` plan, with counts, bytes and reconstructed
-   destinations, and the skip count #4928 already reports.
-3. The marker verdict, and `--apply` refusing a contradicted root without
-   `--force`.
-4. Hermetic `file://` CLI tests: one component above a mirror WITH `_active/`
-   fails and names the right directory; one component above a bare mirror
-   writes nothing without `--apply` and prints a plan naming the invented
-   tenant; the legitimate tenant called `wal-mirror` still restores under
-   `--apply`; `--apply` twice is still idempotent; and the #4928 all-skipped
-   exit status is unchanged. The ten cases in
-   `crates/siglake-cli/tests/cli/wal_recover_root_identity.rs` are the before
-   picture and should be updated in the same commit rather than deleted.
-5. `docs/ARCHITECTURE.md:91` and `docs/LIMITATIONS.md` move with the contract,
-   and a siglake-docs follow-up for the DR runbook.
+1. The plan/apply split, with `--apply` the only path that writes:
+   `plan_recovery` and `apply_plan` in `crates/siglake-wal/src/mirror.rs`,
+   one LIST per invocation.
+2. The per-`(tenant, index)` plan, with counts, reconstructed destinations, a
+   sample key and the skip and already-present counts #4928 added. Bytes come
+   from the listing, so a store that reports no size in a listing (opendal's
+   `fs` and in-memory services; S3 does report it) prints `size unknown`
+   rather than a per-object stat the plan's cost claim does not allow.
+3. The marker verdict, `--apply` refusing a contradicted root, and no
+   `--force`. The refusal happens before `create_wal_dir`, so a contradicted
+   apply leaves the volume as it found it.
+4. Hermetic `file://` CLI tests in
+   `crates/siglake-cli/tests/cli/wal_recover_root_identity.rs`, updated rather
+   than deleted, plus unit tests for the plan and the verdict in
+   `mirror.rs`. The refusals were A/B'd against the pre-change binary: both
+   marker fixtures exited 0 and restored into the invented tenant before, and
+   exit nonzero with `--to` never created after.
+5. `docs/ARCHITECTURE.md`, `docs/LIMITATIONS.md`, the chart's DR recipe and
+   the alert runbook line moved with the contract; siglake-docs #4995 carries
+   the DR runbook.
 
 ## Decisions (settled 2026-09-17)
 
