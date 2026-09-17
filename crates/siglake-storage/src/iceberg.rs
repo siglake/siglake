@@ -21959,6 +21959,35 @@ async fn raw_page_load_metadata(input: &InputFile) -> Result<ParquetMetaData> {
         .with_context(|| format!("finish parquet metadata {}", input.location()))
 }
 
+/// Per-row-group `(rows, compressed_size)` for a data file, in file order, read
+/// from its Parquet footer.
+///
+/// #4847's row-group-cache prototype needs two things the scan stream does not
+/// carry: how many rows each row group holds (to know where a decoded prefix
+/// ends on a group boundary) and how many compressed bytes it occupies (to
+/// address a suffix of groups through a derived `FileScanTask` byte range, which
+/// is the only row-group selector the reader exposes). Both come from the
+/// footer, and this reads it with the page/column/offset indexes skipped.
+pub(crate) async fn row_group_layout_from_footer(
+    file_io: &FileIO,
+    path: &str,
+) -> Result<Vec<(u64, u64)>> {
+    let input = file_io
+        .new_input(path)
+        .with_context(|| format!("open {path} for its row-group layout"))?;
+    let metadata = raw_page_load_metadata(&input).await?;
+    Ok(metadata
+        .row_groups()
+        .iter()
+        .map(|group| {
+            (
+                group.num_rows().max(0) as u64,
+                group.compressed_size() as u64,
+            )
+        })
+        .collect())
+}
+
 fn raw_page_column_index(metadata: &ParquetMetaData, column: &str) -> Option<usize> {
     metadata
         .file_metadata()

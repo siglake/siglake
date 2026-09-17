@@ -470,6 +470,9 @@ async fn run() -> Result<()> {
         file_cache_max_bytes: query_scan.file_cache_max_bytes,
         file_cache_max_entries: query_scan.file_cache_max_entries,
         ordered_drain_buffer_bytes: query_scan.ordered_drain_buffer_bytes,
+        // #4847's row-group population is a local prototype with no operator
+        // surface; the server never turns it on.
+        file_cache_row_group_prototype: false,
     });
     tracing::info!(
         target_partitions = query_scan.target_partitions,

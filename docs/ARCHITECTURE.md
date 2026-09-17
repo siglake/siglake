@@ -1038,6 +1038,17 @@ returns to fetching and deserializing per query; setting the blob byte bound to
 memory pool like every other read cache and published on
 `siglake_cache_budget_bytes{kind="text_index"}`.
 
+The experimental decoded-file cache
+(`SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_{BYTES,ENTRIES}`, both `0` everywhere the
+project packages) is the one read cache whose entry is a whole file's decoded
+batches, which is why it fills only from a scan that reads a file to its end and
+returns nothing to a log UI's browses (#4494, [`LIMITATIONS.md`](LIMITATIONS.md)).
+Per-row-group population, which a clipped read can leave behind, is qualified
+against that policy and against no cache at all in
+`docs/DESIGN_row_group_decoded_cache_qualification.md` — a local prototype
+reachable only in-process, with the recorded disposition and what would change
+it, so nothing in this section changes until it is adopted.
+
 **Which budget a process gets is its role.** The query server derives both from
 its pod's limit. The `siglake` binary resolves its own at startup, and for the
 maintenance roles — the compactor pod, the ingest server, the sweeps and the
