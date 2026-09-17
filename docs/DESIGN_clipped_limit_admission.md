@@ -104,17 +104,22 @@ LIKE '%queen%' LIMIT 20`, 16 partitions. One layout; the arms differ only in the
 interleaved pairs, counters read after `settle_scan_partitions` so the cancelled
 partitions' folds are included.
 
-| pair | gated files_read | gated decoded_bytes | ungated files_read | ungated decoded_bytes |
-| --- | --- | --- | --- | --- |
-| 0 | 4 | 284,912 | 8 | 569,824 |
-| 1 | 4 | 284,912 | 5 | 569,824 |
-| 2 | 4 | 284,912 | 5 | 569,824 |
+| pair | gated files_read | gated decoded_bytes | gated drain | ungated files_read | ungated decoded_bytes | ungated drain |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | 4 | 284,912 | 3.92 ms | 10 | 569,824 | 3.12 ms |
+| 1 | 4 | 284,912 | 3.14 ms | 5 | 569,824 | 3.43 ms |
+| 2 | 3 | 284,912 | 3.25 ms | 6 | 569,824 | 3.16 ms |
 
 The gated arm decoded exactly two batches in every pair; the ungated arm
-decoded four. Decoded bytes are the metric the assertion uses, not files read: a
+decoded four. `drain` is the wall time to drain the root stream, taken before
+the settle so it covers only what a caller waits for. The two arms are
+indistinguishable on it and the card's acceptance is not argued from it: at
+three thousand rows a file a partition's whole read is one batch, so the drain
+is dominated by planning. It is recorded because both arms' latency was asked
+for. Decoded bytes are the metric the assertion uses, not files read: a
 file counts as read the moment its footer lands, so `files_read` measures how
 many partitions won a scheduling race with the root stream closing, and it
-varied 7/4/5 across three otherwise identical ungated pairs on this box.
+varied 10/5/6 in the run tabulated above and 7/4/5 in another on this box.
 `bytes_scanned` is the vendored reader's fetched-byte counter over a `file://`
 store and is reported for the pair comparison only — it is not S3 traffic.
 

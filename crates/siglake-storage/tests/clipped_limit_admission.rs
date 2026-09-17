@@ -119,6 +119,14 @@ struct Work {
 struct Run {
     rows: Vec<String>,
     work: Work,
+    /// Wall time to drain the root stream, i.e. what the caller waits for —
+    /// measured BEFORE the settle, which waits on cancelled partitions the
+    /// caller never sees. Reported because the card asks both arms' latency to
+    /// be retained; nothing asserts on it. At this fixture's size a partition's
+    /// whole read is one batch, so this is dominated by planning and is not a
+    /// latency qualification of the fix. See the design doc's "Not measured
+    /// here".
+    drain: Duration,
 }
 
 /// Plan, drain and settle one arm, then read the scan node's counters. The
@@ -140,6 +148,7 @@ async fn run_arm(ctx: &SessionContext, sql: &str, column: &str) -> Run {
         .output_partitioning()
         .partition_count();
 
+    let drain_started = std::time::Instant::now();
     let rows = {
         // The shared runtime and nothing else: the session options under test
         // are already on `ctx`.
@@ -159,6 +168,7 @@ async fn run_arm(ctx: &SessionContext, sql: &str, column: &str) -> Run {
         }
         rows
     };
+    let drain = drain_started.elapsed();
 
     let settle = siglake_storage::settle_scan_partitions(&plan, Duration::from_secs(30)).await;
     assert!(
@@ -175,6 +185,7 @@ async fn run_arm(ctx: &SessionContext, sql: &str, column: &str) -> Run {
     };
     Run {
         rows,
+        drain,
         work: Work {
             partitions,
             files_read: sum("files_read"),
@@ -225,8 +236,8 @@ async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit()
         let gated = run_arm(&gated_ctx, &sql, "raw").await;
         let ungated = run_arm(&ungated_ctx, &sql, "raw").await;
         eprintln!(
-            "CLIPPED-ADMISSION pair={pair} gated={:?} ungated={:?}",
-            gated.work, ungated.work
+            "CLIPPED-ADMISSION pair={pair} gated={:?} drain={:?} ungated={:?} drain={:?}",
+            gated.work, gated.drain, ungated.work, ungated.drain
         );
 
         assert!(
@@ -268,7 +279,7 @@ async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit()
     );
     // Decoded bytes, not files read: a file counts as read the moment its
     // footer lands, so `files_read` measures how many partitions won a
-    // scheduling race with the root stream closing (7/4/5 across three
+    // scheduling race with the root stream closing (10/5/6 and 7/4/5 across three
     // otherwise identical ungated pairs on this box). Decoded bytes count the
     // batches that were actually built, which is the cost the card is about and
     // which the ramp bounds directly — the gated arm decoded exactly two
