@@ -1152,10 +1152,23 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   was never drained — is fixed (#4972): the restore rebuilds
   `<tenant>/sealed/`, and re-running the command with `--apply` repairs a WAL
   root restored before that.
-- **Attribute auto-promotion is opt-in** — hot-key sampling and promotion of
-  OTLP attributes to typed columns ships default-off
-  (`SIGLAKE_AUTO_PROMOTE_MIN_PCT`); promoted keys can also be listed
-  explicitly per table.
+- **Attribute auto-promotion is opt-in, and it mutates schemas on its own.**
+  Hot-key sampling and promotion of OTLP attributes to typed columns ships
+  default-off (`SIGLAKE_AUTO_PROMOTE_MIN_PCT`, zero); promoted keys can also be
+  listed explicitly per table. Turned on, the compactor samples a bounded slice
+  of the newest files every 300 s and calls `declare_promotions_for` for every
+  key that clears the threshold — which records the promotion property and
+  widens the table's schema, with no operator in the loop and no way back:
+  nothing in the product drops a column. That is the opposite arrangement from
+  the schema migration the Helm hook and the operator's Job run, which is
+  request-driven (it runs when a chart upgrade or a `spec.schemaVersion` change
+  asks for it, and the operator only records what it observed). The bounds are
+  the safety story and they are documented, measured and tested in
+  [`DESIGN_auto_promotion_qualification.md`](DESIGN_auto_promotion_qualification.md):
+  a threshold floor of 1% of the sample, a hard ceiling of 64 promoted columns
+  per table, a sample bounded in files × rows, and a 4096-key census cap.
+  Leaving it off is still the shipped answer — qualifying the bounds is not a
+  decision to turn it on.
 - **Tier-1 group counts serve only columns present since the table's first
   commit.** The serving guard is `column_total(column) == record_count`, so a
   column that starts accumulating mid-life — a typed column on a table created
