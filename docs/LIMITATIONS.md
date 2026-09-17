@@ -1339,7 +1339,22 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   holds ~157 MB of survivors, and a narrow GDPR delete leaves nearly every row a
   survivor. What a 256 MiB cold-target candidate costs a compactor packaged at
   1Gi is not established: the measurement is net heap growth on fixtures three
-  orders of magnitude smaller.
+  orders of magnitude smaller. The merge path's side of the same question is
+  measured in `docs/DESIGN_row_group_target_qualification.md`.
+- **The packaged compactor's row-group target is qualified locally and nowhere
+  else.** `TARGET_ROW_GROUP_UNCOMPRESSED_BYTES` is 256 MiB and the packaged
+  compactor limit is 1Gi (`deploy/helm/siglake/values.yaml:325`); #4772 measured
+  the pair on this box and left both alone. What it found, over 2 M corpus-shaped
+  rows merged as one bin: at the default target the merge forms row groups of
+  574,808 rows and takes the process to 625-659 MB resident, against 412-413 MB
+  at a 64 MiB target, for +0.4% file bytes and no change in merge throughput
+  (`crates/siglake-storage/tests/row_group_target_qualification.rs`). That is one
+  `file://` process on one corpus, without S3, concurrent bins or a WAL drain,
+  so it does not say the default is unsafe at 1Gi, and 64 MiB is a
+  candidate for 0.2.0 rather than a decision. The target is also priced in
+  sampled extent (468 B/row here) and paid in Arrow buffers (874 B/row), so a
+  target of N bytes holds close to 2N; and it does nothing below the 128 Ki-row
+  floor, which on a wide-row corpus binds before 64 MiB does.
 - **Streamed rewrite output carries no inline inverted index.** Every rewrite
   past the in-RAM caps — a leveled compaction merge, a re-clustering pass, or
   a delete task's large candidates (16 MiB compressed / 128 Ki rows) — is
