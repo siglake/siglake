@@ -35,9 +35,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   that gap at any cap a query pod can afford, which is why the format itself is
   the open item rather than the budget. The reader can now read a segmented
   sidecar in part (#4561, `SIGLAKE_SEGMENTED_INDEX_READS`), which holds a
-  directory instead of a parsed index — but nothing writes one, nothing caches
-  an opened reader between queries, and the format has not been measured
-  end-to-end, so neither budget above changes. Whether the
+  directory instead of a parsed index, and holds it between queries under a
+  byte budget of its own (#5006,
+  `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`) — but nothing writes
+  one and the format has not been measured end-to-end, so neither budget above
+  changes, and with the prototype off nothing is retained under the new one
+  either. Whether the
   serialized copy earns its share at all is a separate open question: since a
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no
