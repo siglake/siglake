@@ -9,11 +9,15 @@
 //! layout. Real segments are then restored under a tenant named after the
 //! mirror prefix, nothing is skipped on that key, and the command exits 0.
 //!
-//! These tests RECORD current behaviour; none of them asserts a fix. They are
-//! the evidence behind `docs/DESIGN_wal_recovery_root_identity.md`, and the
-//! thing that design has to keep true: cases 2, 3 and 4 are legitimate installs
-//! whose keys are byte-identical to the misplacement in case 1, so no rule
-//! reading only the key can separate them.
+//! These tests RECORD current behaviour; none of them asserts a fix for root
+//! identity. They are the evidence behind
+//! `docs/DESIGN_wal_recovery_root_identity.md`, and the thing that design has
+//! to keep true: cases 2, 3 and 4 are legitimate installs whose keys are
+//! byte-identical to the misplacement in case 1, so no rule reading only the
+//! key can separate them.
+//!
+//! The last two cases do assert a fix, for the unrelated defect this
+//! qualification turned up: #4972, the tenant discovery dir a restore left out.
 
 use std::path::{Path, PathBuf};
 
@@ -282,9 +286,10 @@ fn a_custom_prefix_misreads_the_same_way_under_a_different_name() {
 ///   end: the rows commit into `tenant_wal-mirror`, and the namespace they
 ///   belong to stays empty. The wrong-table commit is real, for this
 ///   population.
-/// - `<prefix>/<tenant>/<seg>` and `<prefix>/<tenant>/<index>/<seg>` never
-///   reach `ensure_index`:
-///   `a_misplaced_index_restore_is_invisible_to_the_drain` below.
+/// - `<prefix>/<tenant>/<seg>` and `<prefix>/<tenant>/<index>/<seg>` stop AT
+///   `ensure_index`, with the real tenant name read as the index:
+///   `a_misplaced_index_restore_is_walked_and_refused_at_the_index_gate` below.
+///   Before #4972 they never reached it at all.
 #[tokio::test]
 async fn a_misplaced_flat_restore_commits_rows_into_an_invented_namespace() {
     use std::sync::Arc;
