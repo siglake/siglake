@@ -552,7 +552,8 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   exist yet: the local evidence is hermetic fixtures
   (`crates/siglake-storage/tests/file_cache_populate_depth.rs`,
   `crates/siglake-query-server/tests/file_cache_populate_depth_stats.rs`), and
-  nothing here authorizes row-group adoption or a default change.
+  nothing here authorizes row-group adoption or a default change. The fleet
+  reading is #4938.
 - **Query scales by REPLICATION, not by fan-out, for ordinary log search.**
   Adding query replicas multiplies throughput — measured 705 QPS on one
   replica and 2,269 on three (3.22x), with browse p50 flat at 13–21ms through

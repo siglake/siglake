@@ -329,7 +329,10 @@ per-request fields through the router, and
 `scripts/check-file-cache-populate-depth-reader.sh` pins the reader against
 fixture exports. None of it is fleet evidence: the rounds' `label_filter`,
 `label_filter_last25` and `multi_label_and` numbers still need a prepared normal
-round, and until they exist reason (1) is measurable but unmeasured.
+round, and until they exist reason (1) is measurable but unmeasured. That round
+is #4938 (held for the next prepared normal round, isolated per shape, with the
+cache overrides and footer geometry recorded); the round-collector work it needs
+is siglake-benchmarks #4939.
 
 ## Reproduce
 
