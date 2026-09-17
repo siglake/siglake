@@ -68,8 +68,8 @@ The load-bearing primitive: a query can be told to scan only a deterministic
 - Injected per-request as a DataFusion `SessionConfig` extension; the Iceberg
   table provider reads it in `SiglakeIcebergTableScan::try_new` and filters the
   planned file tasks before the usual per-core split.
-- API: `POST /api/v1/sql` and `/api/v1/spl` accept
-  `"shard": {"index": i, "count": n}`. A whole-table scan is the default.
+- API: `POST /api/v1/sql` accepts `"shard": {"index": i, "count": n}`.
+  A whole-table scan is the default.
 
 Gates: `scan_shards_partition_files_disjointly_and_cover` (pure: disjoint +
 covering over a 200-file set), `sharded_scans_partition_rows_and_union_to_full`
@@ -115,9 +115,9 @@ the dominant log-analytics ones:
 | `avg`, aggregate `DISTINCT`, aggregate over a subquery | **not mergeable by the classifier → run single-pod (fallback)** |
 | **JOIN**, window funcs, global `DISTINCT` on high cardinality | **not** shard-mergeable without a shuffle → run single-pod (fallback) |
 
-The coordinator parses the query (already have the DataFusion logical plan +
-the SPL pipeline), classifies it, and either fans out + merges or falls back to
-a local whole-table scan. `count(*)`-without-predicate is answered from Iceberg
+The coordinator parses the query (already have the DataFusion logical plan),
+classifies it, and either fans out + merges or falls back to a local
+whole-table scan. `count(*)`-without-predicate is answered from Iceberg
 metadata directly (no fan-out needed) — sharding matters for *scanning* queries.
 
 ### Transport
