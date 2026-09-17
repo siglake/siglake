@@ -3,7 +3,7 @@ use std::sync::Arc;
 use chrono::{Duration, NaiveTime, TimeZone, Utc};
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::SessionContext;
-use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use siglake_core::Event;
 use siglake_storage::iceberg::IcebergContext;
 use siglake_storage::OrderedMergeGlobalBudget;
@@ -14,6 +14,21 @@ type SnapshotVec = Vec<(
     Option<metrics::SharedString>,
     DebugValue,
 )>;
+
+const MERGE_PARTITIONS: &str = "siglake_query_scan_ordered_merge_partitions_total";
+
+/// One recorder per process — `install` refuses a second — and one planned
+/// query at a time under it: both tests here plan ordered scans over the same
+/// fixture shape, and the over-budget one asserts a counter stays at ZERO, so
+/// the sibling's advertised merge must not be in flight. `Snapshotter::snapshot`
+/// drains the registry, so the snapshot a gate holder takes is its own.
+static METRICS: std::sync::LazyLock<(tokio::sync::Mutex<()>, Snapshotter)> =
+    std::sync::LazyLock::new(|| {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        recorder.install().expect("install debugging recorder");
+        (tokio::sync::Mutex::new(()), snapshotter)
+    });
 
 fn counter_sum(snapshot: &SnapshotVec, name: &str, label: Option<(&str, &str)>) -> u64 {
     snapshot
@@ -80,9 +95,9 @@ async fn overlap_fixture() -> (tempfile::TempDir, chrono::DateTime<Utc>, Iceberg
 
 #[tokio::test]
 async fn overlapping_partitions_over_global_budget_refuse_ordering_and_stay_correct() {
-    let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    recorder.install().expect("install debugging recorder");
+    let (gate, snapshotter) = &*METRICS;
+    let _held = gate.lock().await;
+    snapshotter.snapshot();
 
     let (_tmp, base, ice) = overlap_fixture().await;
     let ctx = context_with_global_budget(3, 4);
@@ -120,6 +135,14 @@ async fn overlapping_partitions_over_global_budget_refuse_ordering_and_stay_corr
         ) > 0,
         "global fan-in refusal should increment the dedicated outcome metric"
     );
+    // #4366: the arrangement this scan built was discarded by the gate above,
+    // so no overlap partition was ever merged. Pre-fix the counter was charged
+    // while the arrangement was built and read 1 here.
+    assert_eq!(
+        counter_sum(&snapshot, MERGE_PARTITIONS, None),
+        0,
+        "a plan refused on the global fan-in budget must not report an overlap merge"
+    );
 }
 
 #[tokio::test]
@@ -129,6 +152,10 @@ async fn overlapping_partitions_within_global_budget_still_advertise_ordering() 
     // they split across partitions, so "within budget" means a budget >= 6
     // (a budget of 4 correctly refuses under the depth model — that is the
     // over-budget test's job).
+    let (gate, snapshotter) = &*METRICS;
+    let _held = gate.lock().await;
+    snapshotter.snapshot();
+
     let (_tmp, base, ice) = overlap_fixture().await;
     let ctx = context_with_global_budget(4, 8);
     ice.register_with_datafusion(&ctx).await.unwrap();
@@ -159,4 +186,11 @@ async fn overlapping_partitions_within_global_budget_still_advertise_ordering() 
         })
         .collect();
     assert_eq!(collect_ts(df.collect().await.unwrap()), want);
+
+    // Positive control for the over-budget zero above: an advertised plan does
+    // charge one increment per overlap partition it merges.
+    assert!(
+        counter_sum(&snapshotter.snapshot().into_vec(), MERGE_PARTITIONS, None) > 0,
+        "an advertised overlap arrangement must report its merge partitions"
+    );
 }
