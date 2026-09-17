@@ -56,7 +56,7 @@ mod metadata;
 pub use metadata::{BlobMetadata, CREATED_BY_PROPERTY, FileMetadata};
 
 mod reader;
-pub use reader::PuffinReader;
+pub use reader::{BlobRangeReader, PuffinReader};
 
 mod writer;
 pub use writer::PuffinWriter;
