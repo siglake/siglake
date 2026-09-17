@@ -313,37 +313,50 @@ impl SegmentedWriter {
 
     /// Finish: append the directory and the fixed trailer.
     pub fn finish(mut self) -> Vec<u8> {
-        let dir_offset = self.out.len() as u64;
-        let mut dir = Vec::new();
-        write_varint(&mut dir, u64::from(self.next_row));
-        write_varint(&mut dir, self.groups.len() as u64);
-        for group in &self.groups {
-            write_varint(&mut dir, u64::from(group.first_row));
-            write_varint(&mut dir, u64::from(group.n_rows));
-            write_varint(&mut dir, group.dict_offset);
-            write_varint(&mut dir, group.dict_len);
-            write_varint(&mut dir, group.postings_offset);
-            write_varint(&mut dir, group.postings_len);
-            write_varint(&mut dir, group.blocks.len() as u64);
-            for block in &group.blocks {
-                write_varint(&mut dir, block.first_term.len() as u64);
-                dir.extend_from_slice(block.first_term.as_bytes());
-                write_varint(&mut dir, u64::from(block.offset));
-                write_varint(&mut dir, u64::from(block.len));
-                write_varint(&mut dir, block.postings_base);
-                dir.extend_from_slice(&block.crc.to_le_bytes());
-            }
-        }
-        let dir_len = dir.len() as u64;
-        let dir_crc = crc32(&dir);
-        self.out.extend_from_slice(&dir);
-        self.out.extend_from_slice(&dir_offset.to_le_bytes());
-        self.out.extend_from_slice(&dir_len.to_le_bytes());
-        self.out.extend_from_slice(&dir_crc.to_le_bytes());
-        self.out.push(SEGMENTED_VERSION);
-        self.out.extend_from_slice(SEGMENTED_MAGIC);
+        let dir = encode_directory(self.next_row, &self.groups);
+        append_directory_and_trailer(&mut self.out, &dir);
         self.out
     }
+}
+
+/// The directory body, as the trailer's `dir_offset`/`dir_len`/`dir_crc`
+/// describe it. Factored out of [`SegmentedWriter::finish`] so the
+/// malformed-directory fixtures re-encode a *real* directory through the
+/// writer's own encoder rather than a second copy of it that can drift.
+fn encode_directory(n_rows: u32, groups: &[GroupEntry]) -> Vec<u8> {
+    let mut dir = Vec::new();
+    write_varint(&mut dir, u64::from(n_rows));
+    write_varint(&mut dir, groups.len() as u64);
+    for group in groups {
+        write_varint(&mut dir, u64::from(group.first_row));
+        write_varint(&mut dir, u64::from(group.n_rows));
+        write_varint(&mut dir, group.dict_offset);
+        write_varint(&mut dir, group.dict_len);
+        write_varint(&mut dir, group.postings_offset);
+        write_varint(&mut dir, group.postings_len);
+        write_varint(&mut dir, group.blocks.len() as u64);
+        for block in &group.blocks {
+            write_varint(&mut dir, block.first_term.len() as u64);
+            dir.extend_from_slice(block.first_term.as_bytes());
+            write_varint(&mut dir, u64::from(block.offset));
+            write_varint(&mut dir, u64::from(block.len));
+            write_varint(&mut dir, block.postings_base);
+            dir.extend_from_slice(&block.crc.to_le_bytes());
+        }
+    }
+    dir
+}
+
+/// Append `dir` at the current end of `out` and stamp the trailer that
+/// addresses it.
+fn append_directory_and_trailer(out: &mut Vec<u8>, dir: &[u8]) {
+    let dir_offset = out.len() as u64;
+    out.extend_from_slice(dir);
+    out.extend_from_slice(&dir_offset.to_le_bytes());
+    out.extend_from_slice(&(dir.len() as u64).to_le_bytes());
+    out.extend_from_slice(&crc32(dir).to_le_bytes());
+    out.push(SEGMENTED_VERSION);
+    out.extend_from_slice(SEGMENTED_MAGIC);
 }
 
 /// Encode one dictionary block: `n_terms`, then per term the shared prefix with
@@ -526,6 +539,9 @@ impl<S: RangeSource> SegmentedReader<S> {
         }
         let mut groups: Vec<GroupEntry> = Vec::with_capacity(n_groups);
         let mut expected_first_row = 0u32;
+        // The body between the header and the directory, which the sections
+        // must tile exactly (see below).
+        let mut body_cursor = 5u64;
         for _ in 0..n_groups {
             let first_row = u32::try_from(c.varint()?).ok()?;
             let group_rows = u32::try_from(c.varint()?).ok()?;
@@ -540,16 +556,25 @@ impl<S: RangeSource> SegmentedReader<S> {
                 return None;
             }
             expected_first_row = expected_first_row.checked_add(group_rows)?;
-            if !range_inside(dict_offset, group_dict_len, dir_offset)
-                || !range_inside(postings_offset, postings_len, dir_offset)
+            // The body is tiled exactly, in the order the one-forward-pass
+            // writer emits: group `i`'s postings, then its dictionary, from the
+            // end of the header to the start of the directory. Bounding each
+            // range against `dir_offset` alone would accept sections that
+            // overlap each other, and a block is bounded only by its own
+            // group's `dict_len` — so an inflated one could address a
+            // neighbouring group's postings as a dictionary block.
+            if postings_offset != body_cursor
+                || dict_offset != postings_offset.checked_add(postings_len)?
             {
                 return None;
             }
+            body_cursor = dict_offset.checked_add(group_dict_len)?;
             if n_blocks > c.remaining() {
                 return None;
             }
             let mut blocks: Vec<BlockEntry> = Vec::with_capacity(n_blocks);
             let mut previous_term: Option<Box<str>> = None;
+            let mut previous_base: Option<u64> = None;
             for _ in 0..n_blocks {
                 let term_len = usize::try_from(c.varint()?).ok()?;
                 let first_term: Box<str> = std::str::from_utf8(c.take(term_len)?).ok()?.into();
@@ -558,17 +583,29 @@ impl<S: RangeSource> SegmentedReader<S> {
                 let postings_base = c.varint()?;
                 let crc = u32::from_le_bytes(c.take(4)?.try_into().ok()?);
                 // Blocks partition the group's dictionary in term order, and
-                // their postings bases march forward inside its postings.
+                // their postings bases march forward inside its postings: the
+                // first block's first term starts the section, every block
+                // holds at least one term and every term at least one posting
+                // byte, so the bases begin at 0, strictly ascend, and all sit
+                // before the section's end. Checking only `<= postings_len`
+                // would accept a base pointing anywhere inside it, which reads
+                // one term's postings out of another's bytes.
                 match &previous_term {
                     Some(previous) if previous.as_ref() >= first_term.as_ref() => return None,
                     _ => {}
                 }
+                let base_marches_forward = match previous_base {
+                    None => postings_base == 0,
+                    Some(previous) => postings_base > previous,
+                };
                 if u64::from(offset).checked_add(u64::from(len))? > group_dict_len
-                    || postings_base > postings_len
+                    || !base_marches_forward
+                    || postings_base >= postings_len
                 {
                     return None;
                 }
                 previous_term = Some(first_term.clone());
+                previous_base = Some(postings_base);
                 blocks.push(BlockEntry {
                     first_term,
                     offset,
@@ -587,7 +624,7 @@ impl<S: RangeSource> SegmentedReader<S> {
                 blocks,
             });
         }
-        if c.remaining() != 0 || expected_first_row != n_rows {
+        if c.remaining() != 0 || expected_first_row != n_rows || body_cursor != dir_offset {
             return None;
         }
         Some(Self {
@@ -956,13 +993,6 @@ fn scan_block(
         return Err(());
     }
     Ok(())
-}
-
-fn range_inside(offset: u64, len: u64, limit: u64) -> bool {
-    match offset.checked_add(len) {
-        Some(end) => offset >= 5 && end <= limit,
-        None => false,
-    }
 }
 
 /// CRC-32 (IEEE 802.3), bytewise. Hand-rolled to keep this crate's dependency
@@ -1498,6 +1528,243 @@ mod tests {
                 let _ = reader.rows_containing("ueen");
             }
         }
+    }
+
+    /// A blob with several blocks per group, so the block-order and
+    /// block-range fixtures have more than one block to get wrong.
+    fn multi_block_blob(rows: &[String], group_rows: usize) -> Vec<u8> {
+        let mut writer = SegmentedWriter::new(256);
+        for chunk in rows.chunks(group_rows) {
+            writer.push_group_rows(chunk.iter().map(String::as_str));
+        }
+        writer.finish()
+    }
+
+    fn trailer_dir_offset(blob: &[u8]) -> usize {
+        let at = blob.len() - SEGMENTED_TRAILER_LEN;
+        u64::from_le_bytes(blob[at..at + 8].try_into().unwrap()) as usize
+    }
+
+    /// Re-encode a blob's directory after `edit` has changed the structure the
+    /// reader parses, and re-stamp the trailer's length and CRC.
+    ///
+    /// Every fixture that mutates directory *bytes* is refused for one reason —
+    /// the `dir_crc` no longer matches — so the directory parser's own checks
+    /// (groups tiling the row domain, ranges inside the blob, blocks in term
+    /// order with bounded offsets) are never reached by one. Recomputing the
+    /// CRC is what makes those checks reachable: each case arrives at `open`
+    /// with a directory that is internally consistent as bytes and wrong as a
+    /// structure, which is also the shape a writer bug produces.
+    fn with_directory(blob: &[u8], edit: impl FnOnce(&mut u32, &mut Vec<GroupEntry>)) -> Vec<u8> {
+        let reader = SegmentedReader::open(SliceSource::new(blob.to_vec()))
+            .expect("a fixture starts from a well-formed blob");
+        let mut n_rows = reader.n_rows;
+        let mut groups = reader.groups.clone();
+        edit(&mut n_rows, &mut groups);
+        let mut out = blob[..trailer_dir_offset(blob)].to_vec();
+        append_directory_and_trailer(&mut out, &encode_directory(n_rows, &groups));
+        out
+    }
+
+    /// The same, with the directory body written by hand — for the claims no
+    /// `GroupEntry` list can express (a count larger than the bytes behind it,
+    /// a truncated entry, a term that is not UTF-8).
+    fn with_directory_bytes(blob: &[u8], dir: Vec<u8>) -> Vec<u8> {
+        let mut out = blob[..trailer_dir_offset(blob)].to_vec();
+        append_directory_and_trailer(&mut out, &dir);
+        out
+    }
+
+    #[test]
+    fn a_directory_that_is_consistent_and_lies_about_the_structure_is_refused() {
+        let rows = corpus(1_000);
+        let blob = multi_block_blob(&rows, 250);
+        let reader = open(blob.clone());
+        assert_eq!(reader.n_groups(), 4);
+        assert!(
+            reader.groups.iter().all(|group| group.blocks.len() > 2),
+            "the fixture needs several blocks per group: {:?}",
+            reader.group_rows()
+        );
+
+        // Positive control: re-encoding the directory unchanged reproduces the
+        // blob byte for byte. Without it, every case below could be passing
+        // because the harness breaks the blob rather than because a check
+        // fires.
+        assert_eq!(with_directory(&blob, |_, _| {}), blob);
+        assert!(
+            SegmentedReader::open(SliceSource::new(with_directory(&blob, |_, _| {}))).is_some()
+        );
+
+        type Edit = fn(&mut u32, &mut Vec<GroupEntry>);
+        let cases: [(&str, Edit); 15] = [
+            ("a gap between two groups", |_, groups| {
+                groups[1].first_row += 1;
+            }),
+            ("overlapping groups", |_, groups| {
+                groups[1].first_row -= 1;
+            }),
+            ("groups that do not sum to n_rows", |_, groups| {
+                groups[3].n_rows -= 1;
+            }),
+            ("n_rows past the tiled groups", |n_rows, _| {
+                *n_rows += 1;
+            }),
+            ("a dictionary overrunning its group", |_, groups| {
+                groups[0].dict_len += 1;
+            }),
+            ("a section not where the previous one ended", |_, groups| {
+                groups[1].postings_offset += 1;
+            }),
+            ("a gap before the directory", |_, groups| {
+                groups[3].dict_len -= 1;
+            }),
+            ("postings starting inside the header", |_, groups| {
+                groups[0].postings_offset = 0;
+            }),
+            ("a block reaching past its dictionary", |_, groups| {
+                groups[0].blocks[0].len += groups[0].dict_len as u32;
+            }),
+            ("a postings base past the group's postings", |_, groups| {
+                groups[0].blocks[0].postings_base = groups[0].postings_len + 1;
+            }),
+            ("a postings base not starting the section", |_, groups| {
+                groups[0].blocks[0].postings_base += 1;
+            }),
+            ("postings bases out of order", |_, groups| {
+                let blocks = &mut groups[0].blocks;
+                let (first, second) = (blocks[1].postings_base, blocks[2].postings_base);
+                blocks[1].postings_base = second;
+                blocks[2].postings_base = first;
+            }),
+            ("a postings base at the end of the section", |_, groups| {
+                let last = groups[0].blocks.len() - 1;
+                groups[0].blocks[last].postings_base = groups[0].postings_len;
+            }),
+            ("blocks out of term order", |_, groups| {
+                let first = groups[0].blocks[0].first_term.clone();
+                let second = groups[0].blocks[1].first_term.clone();
+                groups[0].blocks[0].first_term = second;
+                groups[0].blocks[1].first_term = first;
+            }),
+            ("a repeated block term", |_, groups| {
+                groups[0].blocks[1].first_term = groups[0].blocks[0].first_term.clone();
+            }),
+        ];
+        for (name, edit) in cases {
+            let corrupt = with_directory(&blob, edit);
+            assert!(
+                SegmentedReader::open(SliceSource::new(corrupt)).is_none(),
+                "{name} must be refused at open"
+            );
+        }
+
+        // Hand-written directory bodies: a count that cannot be backed by the
+        // bytes behind it must never be allocated from, and a body the reader
+        // does not consume exactly is corrupt.
+        let group = &reader.groups[0];
+        let mut group_header = Vec::new();
+        write_varint(&mut group_header, u64::from(group.first_row));
+        write_varint(&mut group_header, u64::from(group.n_rows));
+        write_varint(&mut group_header, group.dict_offset);
+        write_varint(&mut group_header, group.dict_len);
+        write_varint(&mut group_header, group.postings_offset);
+        write_varint(&mut group_header, group.postings_len);
+
+        let mut huge_groups = Vec::new();
+        write_varint(&mut huge_groups, 1_000);
+        write_varint(&mut huge_groups, u64::MAX / 2);
+
+        let mut huge_blocks = Vec::new();
+        write_varint(&mut huge_blocks, 1_000);
+        write_varint(&mut huge_blocks, 1);
+        huge_blocks.extend_from_slice(&group_header);
+        write_varint(&mut huge_blocks, u64::MAX / 2);
+
+        let mut truncated = Vec::new();
+        write_varint(&mut truncated, 1_000);
+        write_varint(&mut truncated, 2);
+        truncated.extend_from_slice(&group_header);
+
+        let mut trailing = encode_directory(reader.n_rows, &reader.groups);
+        trailing.push(0);
+
+        let mut not_utf8 = encode_directory(reader.n_rows, &reader.groups);
+        let term = reader.groups[0].blocks[0].first_term.as_bytes();
+        let at = not_utf8
+            .windows(term.len())
+            .position(|window| window == term)
+            .expect("the directory carries the block's first term");
+        not_utf8[at] = 0xff;
+
+        for (name, dir) in [
+            ("a group count past the directory", huge_groups),
+            ("a block count past the directory", huge_blocks),
+            ("a directory ending mid-group", truncated),
+            ("a trailing byte after the last group", trailing),
+            ("a block term that is not UTF-8", not_utf8),
+        ] {
+            let corrupt = with_directory_bytes(&blob, dir);
+            assert!(
+                SegmentedReader::open(SliceSource::new(corrupt)).is_none(),
+                "{name} must be refused at open"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_that_misaddresses_a_block_is_unanswerable_not_absent() {
+        // The two mutations that survive every structural check: both ranges
+        // stay inside the group, the blocks stay in term order, and the
+        // directory's own CRC is recomputed — so `open` accepts and the
+        // per-block CRC and the document-frequency cross-check are the only
+        // things standing between a writer bug and a silently short answer.
+        let rows = corpus(1_000);
+        let blob = multi_block_blob(&rows, 250);
+        let reader = open(blob.clone());
+        let term = reader.groups[0].blocks[0].first_term.to_string();
+        assert!(matches!(reader.postings(&term), Lookup::Rows(_)));
+
+        // Two blocks' byte ranges swapped: each block's recorded CRC now
+        // belongs to the other one's payload.
+        let swapped = with_directory(&blob, |_, groups| {
+            let (first, second) = (groups[0].blocks[0].clone(), groups[0].blocks[1].clone());
+            groups[0].blocks[0].offset = second.offset;
+            groups[0].blocks[0].len = second.len;
+            groups[0].blocks[1].offset = first.offset;
+            groups[0].blocks[1].len = first.len;
+        });
+        let swapped = SegmentedReader::open(SliceSource::new(swapped))
+            .expect("a swap inside the group's dictionary still opens");
+        assert_eq!(swapped.postings(&term), Lookup::Unanswerable);
+
+        // A middle block's postings base moved by one byte: it still ascends
+        // from its predecessor and still sits inside the section, so the
+        // directory's checks pass, the block itself verifies, and the term's
+        // postings are decoded from the wrong offset. This is the residual the
+        // format knowingly carries — only a checksum over the postings
+        // themselves sees it, at 4 bytes per term
+        // (`docs/DESIGN_segmented_inverted_index.md`, "Integrity").
+        let middle = reader.groups[0].blocks[1].first_term.to_string();
+        let Lookup::Rows(middle_truth) = reader.postings(&middle) else {
+            panic!("the block's own first term is present");
+        };
+        let shifted = with_directory(&blob, |_, groups| {
+            groups[0].blocks[1].postings_base += 1;
+        });
+        let shifted = SegmentedReader::open(SliceSource::new(shifted))
+            .expect("a one-byte shift inside the group's postings still opens");
+        let answer = shifted.postings(&middle);
+        assert_ne!(
+            answer,
+            Lookup::Absent,
+            "a misaddressed posting range must not report a present term absent"
+        );
+        assert_ne!(
+            answer,
+            Lookup::Rows(middle_truth),
+            "the fixture is meant to address the wrong bytes"
+        );
     }
 
     #[test]
