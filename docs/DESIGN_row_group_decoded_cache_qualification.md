@@ -210,8 +210,12 @@ It does not, on this evidence, earn adoption:
    read, which no counter distinguishes.
 
 So: keep option (a) as shipped, keep this prototype behind its in-process gate
-as the qualification record, and re-open the choice when (1) has a number. The
-follow-ups that would produce it are filed against this card.
+as the qualification record, and re-open the choice when (1) has a number.
+Reason (1) is filed as #4890 (measure rows decoded per clipped browse on the
+SHIPPED populate path, against the 131,072-row floor) and reason (2) as #4891
+(the stripped predicate, which costs a cache-enabled install 2.8x on a
+page-prunable browse at either granularity). Reason (3) is work only an
+adoption would owe, so it is recorded here rather than filed.
 
 ## Reproduce
 
