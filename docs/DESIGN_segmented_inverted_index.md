@@ -432,7 +432,12 @@ Four things this deliberately does not do:
   `siglake_iceberg_segmented_index_directory_cache_bytes` /
   `_max_bytes` and
   `_lookups_total{outcome}` / `_evictions_total{reason}`, and
-  `segmented_directory_cache_footprint()` for a harness.
+  `segmented_directory_cache_footprint()` for a harness. What an entry costs
+  is the directory plus its key: 135,316 bytes for the 1M-row file below,
+  against the 135,222 the resident-byte histogram reports. At the 7.34M-row
+  scale that is ~1.0 MiB per file, so the 64 MiB default holds a 14-file text
+  plan's directories sixty times over and the byte bound does not bind at any
+  scale this prototype has been measured at.
 
 **The prototype is instrumented apart from the v1 path.** A file answered by a
 segmented sidecar increments
@@ -486,29 +491,32 @@ already gates this path along with the v1 one.
 Puffin container. Release build, 1,000,000 rows in 8 row groups, a 12,127,530-byte
 segmented blob against a 74,284,630-byte parsed v1 index:
 
-| shape | rows | reads | fetched | ÷ blob |
-|---|---:|---:|---:|---:|
-| rare | 1,004 | 18 | 65,481 | 0.540% |
-| rare_last25 | 251 | 6 | 58,108 | 0.479% |
-| keyword | 20,000 | 18 | 83,475 | 0.688% |
-| unique_token | 1 | 4 | 57,415 | 0.473% |
-| and_rare_keyword | 21 | 34 | 93,296 | 0.769% |
-| or_rare_unique | 1,005 | 20 | 67,236 | 0.554% |
-| substring_sweep | 20,000 | 2,938 | 5,207,615 | 42.940% |
+`cold` is a lookup that opens the sidecar; `warm` is the same lookup with the
+directory held (#5006), which is what a file costs after its first query.
 
-Resident state is 135,238 bytes for every row — the directory, 549x smaller
-than the parsed v1 index of the same file. Every row's answer is asserted equal
-to the whole-file index's, restricted to the groups the shape kept, before any
-cost is reported.
+| shape | rows | cold reads | cold fetched | ÷ blob | warm reads | warm fetched | ÷ blob |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| rare | 1,004 | 18 | 65,481 | 0.540% | 16 | 9,821 | 0.081% |
+| rare_last25 | 251 | 6 | 58,108 | 0.479% | 4 | 2,448 | 0.020% |
+| keyword | 20,000 | 18 | 83,475 | 0.688% | 16 | 27,815 | 0.229% |
+| unique_token | 1 | 4 | 57,415 | 0.473% | 2 | 1,755 | 0.014% |
+| and_rare_keyword | 21 | 34 | 93,296 | 0.769% | 32 | 37,636 | 0.310% |
+| or_rare_unique | 1,005 | 20 | 67,236 | 0.554% | 18 | 11,576 | 0.095% |
+| substring_sweep | 20,000 | 2,938 | 5,207,615 | 42.940% | 2,936 | 5,151,955 | 42.481% |
 
-**Every row of that table includes the cold open**: two reads and 55,660 bytes
-of trailer and directory, which is most of what every point shape fetches
-here. At the 7.34M-row scale that read is 474.9 KiB. #5006 added the warm
-columns beside them — the same shape with the directory held, which is the
-deployed cost once a file has been queried once, and what the codec-level
-table's warm column measures without the Puffin container. The numbers above
-are #4561's run and predate those columns; re-running
-`report_segmented_reader_read_cost` prints both.
+Resident state is 135,222 bytes for every row — the directory, 549x smaller
+than the parsed v1 index of the same file. (#4561 reported 135,238 for the
+same directory: the 16 bytes are the reader's own `size_of`, which moved to
+`SegmentedDirectory` when #5006 split them.) Every row's answer is asserted
+equal to the whole-file index's, restricted to the groups the shape kept,
+before any cost is reported, cold and warm alike.
+
+**The cold columns are the open**: two reads and 55,660 bytes of trailer and
+directory, which is most of what every point shape fetches, and the whole
+difference between the two halves of the table. At the 7.34M-row scale that
+read is 474.9 KiB. `unique_token` is where it dominates — 57,415 bytes cold
+against 1,755 warm, 33x — and `substring_sweep` is where it disappears into
+the dictionary sweep the format does not help.
 
 `and_rare_keyword` reads both terms' postings here — `rareneedle` and `queen`
 are both in every row group, so the intersection never empties early — and its
@@ -737,7 +745,10 @@ cargo test --release --lib report_segmented_reader_read_cost -- --ignored --noca
 ```
 
 sized by `SIGLAKE_SEG_READER_ROWS` (1,000,000) and `SIGLAKE_SEG_READER_GROUPS`
-(8).
+(8), 5.3 s at those values. It prints the cold and warm columns and the
+directory cache's footprint; running it under
+`SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES=0` is the negative control,
+where the warm columns come back equal to the cold ones.
 
 The codec's own fixtures run in the crate's normal test pass
 (`cargo test -p siglake-index`): v1 equivalence term by term, group-straddling
