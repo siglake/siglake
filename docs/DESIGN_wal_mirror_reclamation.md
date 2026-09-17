@@ -149,7 +149,7 @@ works with SQLite installs and with no catalog at all.
 | | |
 |---|---|
 | Effort | ~3–5 days: a new durable on-disk format, rotation, crash-truncation recovery, its own retention pass, metrics, alerts, tests. |
-| Bound | `committedRetentionSecs`, honestly. |
+| Bound | `committedRetentionSecs`, measured from the commit. |
 | Proof | Yes — the journal entry is written after the Iceberg commit. |
 | Cost | ~30 MB/day of journal at 20K EPS; one append+fsync per commit batch on the commit path, not the seal path. |
 
