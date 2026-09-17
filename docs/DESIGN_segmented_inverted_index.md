@@ -870,8 +870,8 @@ parsed cache's 0/42/41. What it costs is the difference between the two formats.
 Re-reading a 565 KiB directory costs milliseconds, so `rare_scan` stays at
 135.2 ms and 0.08x the scan; re-decoding a 534 MiB parsed index costs seconds,
 which is how the same pressure puts v1 at 22.1x. A thrashing directory cache
-degrades to the unretained cost and no further, and the unretained cost is still
-11x better than the scan.
+degrades to the unretained cost and no further, and unretained is still 12.7x
+better than that pass's own scan control (138.9 ms against 1,761.1 ms).
 
 Retention shows up in bytes rather than latency: 35,592 bytes per execution held
 against 7,954,450 unretained, **223x**, for a 33% difference in read count and
