@@ -301,9 +301,12 @@ impl InvertedIndex {
     /// `0..n_rows` — because the reader turns postings straight into a Parquet
     /// `RowSelection` and cannot tell a corrupt ordinal from a real one. What
     /// this cannot catch is a flipped bit inside a delta that leaves the
-    /// ordinals ordered and in range; there is no checksum in v1 (recorded
-    /// under "Integrity" in `docs/DESIGN_segmented_inverted_index.md`), which
-    /// is why the reader also checks the row domain against the file.
+    /// ordinals ordered and in range; there is no checksum in v1, which is why
+    /// the reader also checks the row domain against the file. What that
+    /// residual costs a query depends on where the blob is stored — a Puffin
+    /// sidecar's Zstd frame covers it, a Parquet footer value does not —
+    /// measured in `docs/DESIGN_inverted_index.md` under "Which storage path
+    /// carries that residual".
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut c = Cursor::new(bytes);
         if c.take(4)? != INDEX_MAGIC {
