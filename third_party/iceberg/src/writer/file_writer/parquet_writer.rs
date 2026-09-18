@@ -302,8 +302,10 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             time_bucket_nulls: 0,
             time_bucket_disabled: false,
             sort_order_id: self.sort_order_id,
-            segmented: self.segmented_index.as_ref().map(|request| {
-                SegmentedIndexState {
+            segmented: self
+                .segmented_index
+                .as_ref()
+                .map(|request| SegmentedIndexState {
                     writers: request
                         .columns
                         .iter()
@@ -321,8 +323,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
                     sink: Arc::clone(&request.sink),
                     disabled: false,
                     rows: 0,
-                }
-            }),
+                }),
         })
     }
 }
@@ -1017,7 +1018,11 @@ impl ParquetWriter {
                     break;
                 };
                 for i in 0..values.len() {
-                    builder.push_row(if values.is_null(i) { "" } else { values.value(i) });
+                    builder.push_row(if values.is_null(i) {
+                        ""
+                    } else {
+                        values.value(i)
+                    });
                 }
                 pushed += values.len();
             }
