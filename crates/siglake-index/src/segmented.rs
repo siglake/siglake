@@ -161,6 +161,21 @@ pub enum Lookup {
     Unanswerable,
 }
 
+/// Result of a clipped point-term lookup whose posting work is admitted by
+/// summed document frequency.
+///
+/// [`OverBudget`](Self::OverBudget) is definitive policy, not an index
+/// failure: every term needed for the estimate was located, but fetching its
+/// postings would cost more document occurrences than the caller allowed.
+/// [`Unanswerable`](Self::Unanswerable) means the estimate or the eventual
+/// posting read could not be completed and the caller must scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClippedLookup {
+    Rows(Vec<u32>),
+    OverBudget,
+    Unanswerable,
+}
+
 impl Lookup {
     /// The rows, or `None` when nothing can be concluded (`Unanswerable`).
     /// `Absent` becomes an empty list — a definitive no-match.
@@ -1154,6 +1169,140 @@ impl<S: RangeSource> SegmentedReader<S> {
         Some(rows)
     }
 
+    /// Match point terms only when their summed document frequency is at most
+    /// `max_document_frequency`.
+    ///
+    /// Every term is located across every selected group before the first
+    /// posting section is fetched. That makes the decision useful to a
+    /// clipped `LIMIT`: dictionary blocks (and a cold reader's directory) are
+    /// paid to obtain the estimate, while an over-budget lookup stops before
+    /// the much larger posting spans. The returned rows have the same
+    /// `(all_terms) AND (any_terms)` meaning as the reader integration's
+    /// ordinary point-term path.
+    pub fn matching_point_rows_with_df_limit_in_groups(
+        &self,
+        all_terms: &[&str],
+        any_terms: &[&str],
+        groups: Option<&[usize]>,
+        max_document_frequency: u64,
+    ) -> ClippedLookup {
+        type Located = (usize, u64, u32, u32);
+
+        let Some(indices) = self.group_indices(groups) else {
+            return ClippedLookup::Unanswerable;
+        };
+        if all_terms.is_empty() && any_terms.is_empty() {
+            return ClippedLookup::Unanswerable;
+        }
+        let normalize = |terms: &[&str]| -> Option<Vec<String>> {
+            terms
+                .iter()
+                .map(|term| normalize_query_term(term))
+                .collect()
+        };
+        let Some(all_terms) = normalize(all_terms) else {
+            return ClippedLookup::Unanswerable;
+        };
+        let Some(any_terms) = normalize(any_terms) else {
+            return ClippedLookup::Unanswerable;
+        };
+
+        // `None` for an ALL plan means one required term was absent, so the
+        // group's result is definitively empty. An empty ANY plan likewise
+        // means no disjunct occurs in the group.
+        let mut prepared: Vec<(Option<Vec<Located>>, Vec<Located>)> =
+            Vec::with_capacity(indices.len());
+        let mut summed_df = 0_u64;
+        for index in indices {
+            let group = &self.directory.groups[index];
+            let mut all = Vec::with_capacity(all_terms.len());
+            let mut group_df = 0_u64;
+            let mut all_present = true;
+            for term in &all_terms {
+                match self.locate_term(group, term) {
+                    Ok(Some(hit)) => {
+                        group_df = group_df.saturating_add(u64::from(hit.3));
+                        all.push(hit);
+                    }
+                    Ok(None) => {
+                        all_present = false;
+                        break;
+                    }
+                    Err(()) => return ClippedLookup::Unanswerable,
+                }
+            }
+
+            let mut any = Vec::with_capacity(any_terms.len());
+            // When ALL is already empty the conjunction is empty without
+            // locating or fetching an OR term.
+            if all_present {
+                for term in &any_terms {
+                    match self.locate_term(group, term) {
+                        Ok(Some(hit)) => {
+                            group_df = group_df.saturating_add(u64::from(hit.3));
+                            any.push(hit);
+                        }
+                        Ok(None) => {}
+                        Err(()) => return ClippedLookup::Unanswerable,
+                    }
+                }
+            }
+            let group_can_match = all_present && (any_terms.is_empty() || !any.is_empty());
+            let all = group_can_match.then_some(all);
+            if group_can_match {
+                summed_df = summed_df.saturating_add(group_df);
+                if summed_df > max_document_frequency {
+                    return ClippedLookup::OverBudget;
+                }
+            }
+            prepared.push((all, any));
+        }
+
+        let mut rows = Vec::new();
+        for (index, (all, any)) in prepared.into_iter().enumerate() {
+            let Some(mut all) = all else {
+                continue;
+            };
+            let group_index = match groups {
+                Some(groups) => groups[index],
+                None => index,
+            };
+            let group = &self.directory.groups[group_index];
+            all.sort_by_key(|(_, _, _, df)| *df);
+            let mut group_rows: Option<Vec<u32>> = None;
+            for (block_index, offset, len, df) in all {
+                let Ok(list) = self.read_postings(group, block_index, offset, len, df) else {
+                    return ClippedLookup::Unanswerable;
+                };
+                group_rows = Some(match group_rows {
+                    Some(previous) => intersect_sorted(&previous, &list),
+                    None => list,
+                });
+                if group_rows.as_ref().is_some_and(Vec::is_empty) {
+                    break;
+                }
+            }
+            if group_rows.as_ref().is_some_and(Vec::is_empty) {
+                continue;
+            }
+            if !any_terms.is_empty() {
+                let mut any_rows = Vec::new();
+                for (block_index, offset, len, df) in any {
+                    let Ok(list) = self.read_postings(group, block_index, offset, len, df) else {
+                        return ClippedLookup::Unanswerable;
+                    };
+                    any_rows = union_sorted(&any_rows, &list);
+                }
+                group_rows = Some(match group_rows {
+                    Some(all_rows) => intersect_sorted(&all_rows, &any_rows),
+                    None => any_rows,
+                });
+            }
+            rows.extend(group_rows.unwrap_or_default());
+        }
+        ClippedLookup::Rows(rows)
+    }
+
     /// Rows matching `raw LIKE '%substr%'` under the same argument v1's
     /// [`InvertedIndex::rows_containing`] makes, or `None` when the substring
     /// is not index-answerable.
@@ -1938,6 +2087,54 @@ mod tests {
             and_bytes < common_bytes,
             "the conjunction fetched {and_bytes} bytes against {common_bytes} \
              for one of its common terms alone"
+        );
+    }
+
+    #[test]
+    fn clipped_point_lookup_estimates_df_before_fetching_postings() {
+        let rows = corpus(20_000);
+        let v1 = InvertedIndex::from_rows(rows.iter().map(String::as_str));
+        let blob = encoded_v2(&rows, 5_000);
+        let reader = open(blob);
+
+        reader.source().reset_counters();
+        let rare =
+            reader.matching_point_rows_with_df_limit_in_groups(&["rareneedle"], &[], None, 100);
+        assert_eq!(
+            rare,
+            ClippedLookup::Rows(v1.matching_rows_all(&["rareneedle"])),
+            "a df below the clip keeps the segmented lookup"
+        );
+        let admitted_bytes = reader.source().bytes_read();
+
+        reader.source().reset_counters();
+        let common = reader.matching_point_rows_with_df_limit_in_groups(&["queen"], &[], None, 100);
+        let declined_bytes = reader.source().bytes_read();
+        assert_eq!(common, ClippedLookup::OverBudget);
+        assert!(
+            declined_bytes > 0,
+            "the document frequency costs a dictionary-block read"
+        );
+        assert!(
+            declined_bytes < admitted_bytes,
+            "the over-budget lookup fetched {declined_bytes} estimate bytes, \
+             but the admitted lookup fetched only {admitted_bytes} including postings"
+        );
+
+        let all = ["checkout"];
+        let any = ["queen", "absentterm"];
+        let expected_any = v1.postings("queen").unwrap().to_vec();
+        let expected = intersect_sorted(&v1.matching_rows_all(&all), &expected_any);
+        assert_eq!(
+            reader
+                .matching_point_rows_with_df_limit_in_groups(&all, &any, Some(&[1, 2]), u64::MAX,),
+            ClippedLookup::Rows(
+                expected
+                    .into_iter()
+                    .filter(|row| (5_000..15_000).contains(row))
+                    .collect()
+            ),
+            "the admitted path preserves ALL/ANY and row-group semantics"
         );
     }
 

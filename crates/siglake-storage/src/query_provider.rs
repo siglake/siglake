@@ -1822,11 +1822,11 @@ async fn global_timestamp_bounds(
 /// Whether this scan may load a per-file inverted index for its text
 /// predicate, and if not, the reason to attribute the refusal to.
 ///
-/// The index is a WHOLE-FILE structure: touching it at all costs a
+/// The v1 index is a WHOLE-FILE structure: touching it at all costs a
 /// deserialization proportional to the file's rows (~40 bytes of parsed index
 /// per indexed row), independent of how many rows the query ends up wanting.
-/// Both declines below are the same argument from opposite ends of the plan —
-/// the query wants a handful of rows and the index charges for all of them:
+/// Both v1 declines below are the same argument from opposite ends of the plan
+/// — the query wants a handful of rows and the index charges for all of them:
 ///
 /// - `ordered_limit`: an index RowSelection batches by SELECTED rows, so sparse
 ///   postings span most of a large file before the first batch is emitted,
@@ -1839,13 +1839,11 @@ async fn global_timestamp_bounds(
 ///   scanned, `substring_scan` 813.1 ms against 4.5 ms
 ///   (`docs/DESIGN_inverted_index.md`).
 ///
-/// Neither is a selectivity estimate, because the planner has none: a term's
-/// document frequency lives inside the index it is deciding whether to load.
-/// The cost of being wrong is bounded and asymmetric — a declined rare term
-/// pays a scan it would have skipped, an accepted common term pays a
-/// whole-file decode per planned file. Reaching sparse postings without
-/// materializing a whole file's index is #4376's segmented format, not a
-/// threshold to guess here.
+/// The segmented reader can now estimate point-term document frequency before
+/// it fetches postings. A clipped execution therefore carries its limit into
+/// `RawPruneSpec`: v1 remains declined, while seg2 admits terms whose summed df
+/// is no larger than the clip (#5040). Ordered scans retain the unconditional
+/// decline because sparse postings still defeat their contiguous early stop.
 ///
 /// Correctness does not turn on this: the index only ever produces a
 /// superset RowSelection, and the engine re-evaluates the exact predicate
@@ -1891,6 +1889,12 @@ impl SiglakeIcebergTableScan {
             .map(|config| text_field_tokenizers(&config))
             .unwrap_or_default();
         let mut raw_prune_spec = extract_raw_prune_spec(filters, &text_tokenizers)?;
+        let clipped_limit = limit.or_else(|| {
+            state
+                .config()
+                .get_extension::<ClippedScanLimit>()
+                .map(|limit| limit.limit)
+        });
         let text_index_decline = text_index_decline_reason(
             raw_prune_spec.is_some(),
             state
@@ -1898,13 +1902,17 @@ impl SiglakeIcebergTableScan {
                 .get_extension::<PreferredScanOrder>()
                 .is_some()
                 && state.config().get_extension::<OrderedScanLimit>().is_some(),
-            limit.is_some() || state.config().get_extension::<ClippedScanLimit>().is_some(),
+            clipped_limit.is_some(),
         );
         if let Some(reason) = text_index_decline {
-            raw_prune_spec
+            let spec = raw_prune_spec
                 .as_mut()
-                .expect("a reason is only returned for a text spec")
-                .inverted_index_row_selection = false;
+                .expect("a reason is only returned for a text spec");
+            if reason == "ordered_limit" {
+                spec.inverted_index_row_selection = false;
+            } else {
+                spec.segmented_clipped_limit = clipped_limit;
+            }
             metrics::counter!(
                 "siglake_query_inverted_index_declined_total",
                 "reason" => reason

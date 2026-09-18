@@ -547,6 +547,8 @@ exact scan otherwise:
 | `row_group_order` | the scan's kept-group list is not strictly ascending, so the sidecar and the selection would cover different groups |
 | `unanswerable` | a term that does not normalize, a malformed section, or a failed range read |
 | `no_hints` | the prune spec carries nothing this index can answer |
+| `clipped_document_frequency` | point terms' summed df exceeds the clipped query's row limit |
+| `clipped_estimate_unavailable` | a clipped substring would require a full dictionary sweep rather than a point estimate |
 
 Two entry points changed in `siglake_index::segmented` for this, both
 reader-side policy the codec deliberately left open:
@@ -555,9 +557,12 @@ reader-side policy the codec deliberately left open:
   group's dictionary before any postings are fetched — the block read a point
   lookup pays anyway — and the postings are then read in ascending document
   frequency, stopping as soon as the running intersection empties. A group
-  missing one of the terms reads no posting section at all. The df the policy
-  needs is in the directory; the v1 index has no equivalent, since it has
-  already decoded everything by the time it could use one.
+  missing one of the terms reads no posting section at all. The df is in that
+  dictionary block, beside the term's posting length; the directory carries
+  the block's location and first term. A point estimate therefore costs one
+  dictionary-block range read per group after the cold trailer and directory
+  reads. The v1 index has no useful equivalent, since it has already decoded
+  everything by the time it can read a df.
 - **OR has an entry point at all.** `RawPruneSpec::any_terms` had none: the v1
   path unions `postings` per term and skips a term it cannot answer, which is
   safe only because `extract_match_udf_prune` fills the spec from tokenizer
@@ -827,8 +832,10 @@ had kept the whole-file index. The segmented format answers it in 47.6 ms,
 **11.1x faster than the scan**, and `seg_policy` declines it anyway and pays
 550.4 ms. The decline exists because loading an index is a whole-file cost. That
 premise does not hold for this format, so #4375's rule has to become
-document-frequency aware before #4377's format can pay off on clipped shapes;
-the df it needs is already in the directory.
+document-frequency aware before #4377's format can pay off on clipped shapes.
+The directory narrows the lookup to one dictionary block per group; reading
+that block supplies the df and posting length before any posting span is
+fetched.
 
 **The clipped high-df shapes still need the decline.** `keyword` (2% density) is
 4.46x the scan and `keyword_last5` 6.03x: a scan that stops at 100 rows reads a
@@ -1068,6 +1075,42 @@ index. The three high-document-frequency clipped shapes and the substring
 sweep still require the decline. These are local `file://` results, not an
 object-store, distributed or HTTP qualification.
 
+### 2026-09-18 document-frequency policy rerun (#5040)
+
+The retained writer-produced seg2 fixture was queried again after carrying the
+bare clip into the reader and setting the per-file point-term budget to
+`summed df <= clip`. The whole-file v1 and ordered-limit declines did not
+change. Five executions per shape used the same deployed cache budgets; every
+exact-answer and clipped membership check passed.
+
+| shape | scan p50 | seg2 p50 | df policy p50 | policy / scan | policy disposition |
+|---|---:|---:|---:|---:|---|
+| `keyword` | 7.1 ms | 49.3 ms | 6.8 ms | 0.95x | `clipped_document_frequency` |
+| `keyword_last25` | 16.2 ms | 28.7 ms | 17.8 ms | 1.10x | `clipped_document_frequency` |
+| `keyword_last5` | 10.4 ms | 78.5 ms | 10.6 ms | 1.01x | `clipped_document_frequency` |
+| `substring_scan` | 5.9 ms | 915.4 ms | 4.0 ms | 0.67x | `clipped_estimate_unavailable` |
+| `rare_scan` | 1,714.2 ms | 165.3 ms | 162.9 ms | 0.10x | admitted, unclipped |
+| `rare_scan_last25` | 646.9 ms | 46.0 ms | 45.0 ms | 0.07x | admitted, unclipped |
+| `rare_keyword` | 558.7 ms | 79.9 ms | **56.6 ms** | **0.10x** | admitted, summed df at or below 100 |
+
+The decision's own reads were retained, including cold setup. `keyword`'s
+first policy execution opened directories and stopped after 17 reads / 2.27
+MiB; its four warm executions averaged 10.5 reads / 2.1 KiB. The windowed
+common terms each proved over budget with one 200-205 byte dictionary-block
+read per answered file once their directories were warm. The substring arm
+read nothing below the held directory. `rare_keyword` paid 66 reads / 26,989
+bytes cold and averaged 63 reads / 25,303 bytes warm, including its posting
+spans. Thus the cold directory and dictionary work is visible in the same
+range-read/fetched-byte accounting as admitted postings; a policy decline no
+longer reports that estimate as free.
+
+The clipped scan controls are small enough that scheduler variation is visible:
+the two closest rows landed at 1.01x and 1.10x in this five-run pass, while the
+ordinary whole-file policy controls landed at 1.04x and 1.27x. The categorical
+result is unchanged: all four high-cost shapes declined, and the rare clipped
+shape retained seg2 and recovered the measured scan loss. This remains a local
+`file://` measurement, with no HTTP, distributed or object-store latency.
+
 ## Disposition for #4377: proceed, with two revisions
 
 **Proceed.** The format does the thing it was designed for, measured through the
@@ -1080,7 +1123,7 @@ instead of 22x it (0 hits and 125 evictions at 4 MiB, the parsed cache's failure
 mode on a cache whose miss costs milliseconds). No cache sizing reaches that
 result with the shipped format.
 
-Two revisions belong in #4377's scope rather than after it:
+Both revisions identified by #4562 are now in code:
 
 1. **#4988's per-block compression prerequisite is complete.** As prototyped
    the sidecar is 5.59x the on-disk bytes of the v1 one it replaces (87.19 MiB
@@ -1088,13 +1131,12 @@ Two revisions belong in #4377's scope rather than after it:
    7.34M-row scale and settles the posting-span checksum at the same block
    granularity. #4377 can build the versioned format without carrying seg1's
    storage regression into every compacted file.
-2. **#4375's decline has to become document-frequency aware.** Its rule declines
-   any clipped `LIMIT`, which is right for a whole-file decode and wrong for this
-   format: it costs `rare_keyword` an 11.1x win (47.6 ms against 550.4 ms) while
-   correctly saving `keyword` and `substring_scan` from 4.5-174x losses. The
-   directory carries each term's df, so the rule can ask what the postings would
-   cost before deciding. Until it does, the format's clipped-shape behaviour is
-   the scan's.
+2. **#5040 makes #4375's decline document-frequency aware for seg2.** A clipped
+   whole-file v1 index still declines. Seg2 locates point terms in the dictionary
+   blocks named by the directory, sums their df across selected groups, and
+   fetches postings only when that sum is no larger than the clip. This moves
+   `rare_keyword` to 56.6 ms while the high-df and substring shapes keep their
+   scan fallbacks. The table and cost accounting above are the retained result.
 
 **Not blocking, and still open:** the substring sweep reads the whole dictionary
 and stays a decline; the directory cache's value is measured in bytes and
@@ -1142,13 +1184,13 @@ What remains, in order:
    `report_segmented_writer_build_cost`), and the same-snapshot registration
    gap above (#5228). Neither blocks the format staying off by default, and
    both block any proposal to turn it on.
-6. **An open question for #4561**: the substring sweep reads the whole
-   dictionary, and `keyword`-class terms with millions of postings read megabytes
-   of posting bytes. Both are regimes where partial reads buy little, and #4375's
-   per-execution policy is the place to decline them. The document frequency a
-   policy would want is now in the directory — a 474.9 KiB read per file — which
-   is the cheapest selectivity estimate this design makes available and did not
-   exist before it.
+6. ~~**#5040**~~ — done: the bare clipped limit is carried into the reader.
+   Point terms are located across the selected groups before any posting span
+   is fetched and are admitted when their summed df is no larger than the
+   clip. The cold directory and dictionary-block reads are charged to the
+   estimate. Common terms decline as `clipped_document_frequency`; a substring
+   declines as `clipped_estimate_unavailable` without sweeping the dictionary.
+   Whole-file v1 and ordered-limit declines are unchanged.
 
 ## Reproduce
 
