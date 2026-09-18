@@ -494,6 +494,18 @@ window has moved the edge to its own append and nothing here improves on that
 to the edge leaves it alone: ancestry that is gone is never bridged, and equal
 row totals are not evidence.
 
+The same elected expiry pass bounds Iceberg's `statistics` array. After
+snapshot removal it walks the alive data-file union of the retained snapshots
+and issues `RemoveStatistics` for an entry only when all of its blobs are
+Siglake inverted indexes with `data_file` properties and none of those paths
+is live. One live blob keeps a mixed entry whole; an unowned blob type or a
+missing reference keeps the entry untouched. The statistics commit makes the
+Puffin path unreachable, after which the ordinary orphan sweep applies its
+`min_age` gate before deleting the object. Removed entries are counted by
+`siglake_iceberg_statistics_removed_total`; `siglake gc-orphans` reports the
+eligible, removed, live-kept and conservatively skipped counts beside reclaimed
+bytes.
+
 A publication carries counts that exist nowhere else, so a failed one is
 retried with the same deltas on the delta write's budget — four attempts, 250,
 500 and 750 ms apart — in both the inline and the write-behind arm. The retry

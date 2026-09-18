@@ -110,6 +110,17 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   partial reader fetches one term's postings and can verify only what it
   fetched, and seg2 closes its own residual with a CRC per block's posting
   span. Neither applies to a blob that is read whole.
+- **Statistics-file retirement is whole-entry and limited to Siglake-owned
+  inverted indexes.** The snapshot-expiry and orphan-GC maintenance paths
+  remove an Iceberg statistics entry only when every blob has a `data_file`
+  property, every blob type is one of Siglake's v1 or segmented inverted-index
+  types, and none of those files is alive in any retained snapshot. An entry
+  with one live blob and one retired blob stays whole; Siglake does not rewrite
+  the Puffin file to split it. An entry containing another engine's blob type,
+  or an owned blob without `data_file`, also stays untouched because Siglake
+  cannot prove its lifetime. Keeping a mixed file costs metadata and object
+  storage until its last live reference retires, but preserves the Iceberg
+  interoperability boundary.
 - **A maintenance process's cache budgets are readable at startup, not on
   `/metrics`.** The compactor, the ingest server and the `siglake` maintenance
   subcommands resolve their own budgets now — zero for the two text-index

@@ -17,6 +17,17 @@ Listing/deletion go through a warehouse-scoped `opendal::Operator` — the Fs
 `gc_orphans_respects_min_age_safety_window`. Scheduling is operator-side
 (CronJob running the CLI), matching `audit-rotate`.
 
+Statistics entries are retired before the physical sweep. The elected snapshot
+expiry transaction evaluates them after applying snapshot removal, and a direct
+`gc-orphans --apply` run performs the same maintenance step. An entry is
+eligible only when every blob is a Siglake-owned inverted-index type, every
+blob names `data_file`, and no named file is alive in any retained snapshot.
+Entries with one live reference stay whole; foreign or incomplete entries are
+left untouched. Once `RemoveStatistics` commits, the Puffin object leaves the
+reachable set and the existing `min_age` rule controls deletion. The GC report
+includes the retirement classification, and
+`siglake_iceberg_statistics_removed_total` counts committed removals.
+
 ## Why hand-rolled
 
 We own the vendored `iceberg` fork and do **not** wait on an upstream
@@ -41,6 +52,8 @@ over every retained snapshot of:
 3. every **alive data file** in those manifests — entries with
    `ManifestStatus::{Added,Existing}` (`ManifestEntry::is_alive()`),
    via `entry.data_file().file_path()`.
+4. every statistics-file path whose metadata entry remains registered after
+   the conservative retirement rule above.
 
 **`is_alive()` filtering is required, not optional.** A re-cluster rewrite
 marks the old file `Deleted` in the new snapshot's manifest while a *pre-

@@ -3302,7 +3302,15 @@ async fn run_gc_orphans(
 
     let mode = if apply { "APPLY" } else { "dry-run" };
     println!(
-        "[{mode}] {ident}: scanned={} reachable={} orphans={} ({:.1} MiB) skipped_recent={} deleted={}",
+        "[{mode}] {ident}: statistics_eligible={} statistics_removed={} \
+         statistics_kept_live={} statistics_skipped_unowned={} \
+         statistics_skipped_missing_data_file={} scanned={} reachable={} \
+         orphans={} ({:.1} MiB) skipped_recent={} deleted={}",
+        report.statistics_entries_eligible,
+        report.statistics_entries_removed,
+        report.statistics_entries_kept_live,
+        report.statistics_entries_skipped_unowned,
+        report.statistics_entries_skipped_missing_data_file,
         report.scanned,
         report.reachable,
         report.orphans,

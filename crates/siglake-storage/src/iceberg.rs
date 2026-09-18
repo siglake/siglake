@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,8 @@ use iceberg::spec::{
 };
 use iceberg::table::Table;
 use iceberg::transaction::{
-    ApplyTransactionAction, ExpireSnapshotsAction, Transaction, UpdateSchemaAction,
+    ActionCommit, ApplyTransactionAction, ExpireSnapshotsAction, Transaction, TransactionAction,
+    UpdateSchemaAction,
 };
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -50,7 +51,7 @@ use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{
     Catalog, CatalogBuilder, ErrorKind as IcebergErrorKind, NamespaceIdent, TableCreation,
-    TableIdent,
+    TableIdent, TableRequirement, TableUpdate,
 };
 use iceberg_catalog_sql::{SqlBindStyle, SqlCatalogBuilder};
 use iceberg_storage_opendal::{CustomAwsCredentialLoader, OpenDalStorageFactory};
@@ -881,6 +882,20 @@ impl Default for GcOptions {
 /// Outcome of an orphan-GC pass. See [`IcebergContext::gc_orphans`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GcReport {
+    /// Siglake-owned statistics entries that referenced no retained live data
+    /// file and were eligible for removal before the orphan walk.
+    pub statistics_entries_eligible: usize,
+    /// Eligible statistics entries removed from table metadata (0 in dry-run).
+    pub statistics_entries_removed: usize,
+    /// Statistics entries kept because at least one blob references a retained
+    /// live data file. Mixed live/retired entries are counted here.
+    pub statistics_entries_kept_live: usize,
+    /// Entries left untouched because they contain a blob type Siglake does
+    /// not own.
+    pub statistics_entries_skipped_unowned: usize,
+    /// Entries left untouched because an owned blob has no `data_file`
+    /// property.
+    pub statistics_entries_skipped_missing_data_file: usize,
     /// In-scope files listed under `data/` + `metadata/` (excludes
     /// `*.metadata.json`).
     pub scanned: usize,
@@ -894,6 +909,21 @@ pub struct GcReport {
     pub skipped_recent: usize,
     /// Files actually deleted (0 in dry-run).
     pub deleted: usize,
+}
+
+/// Outcome of deciding which Iceberg statistics entries Siglake may retire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatisticsRetirementReport {
+    /// Owned entries whose blobs all reference retired data files.
+    pub eligible: usize,
+    /// Entries actually removed from table metadata (0 in dry-run).
+    pub removed: usize,
+    /// Entries kept whole because at least one blob still references live data.
+    pub kept_live: usize,
+    /// Entries containing at least one blob type Siglake does not own.
+    pub skipped_unowned: usize,
+    /// Owned entries containing a blob without a `data_file` property.
+    pub skipped_missing_data_file: usize,
 }
 
 /// Which of the three merge implementations a re-cluster bin actually took.
@@ -10283,6 +10313,264 @@ async fn create_namespace_tolerating_existing(
     }
 }
 
+#[derive(Debug, Default)]
+struct StatisticsRetirementObservation {
+    eligible: AtomicUsize,
+    kept_live: AtomicUsize,
+    skipped_unowned: AtomicUsize,
+    skipped_missing_data_file: AtomicUsize,
+}
+
+impl StatisticsRetirementObservation {
+    fn store(&self, report: StatisticsRetirementReport) {
+        self.eligible.store(report.eligible, Ordering::Relaxed);
+        self.kept_live.store(report.kept_live, Ordering::Relaxed);
+        self.skipped_unowned
+            .store(report.skipped_unowned, Ordering::Relaxed);
+        self.skipped_missing_data_file
+            .store(report.skipped_missing_data_file, Ordering::Relaxed);
+    }
+
+    fn report(&self, applied: bool) -> StatisticsRetirementReport {
+        let eligible = self.eligible.load(Ordering::Relaxed);
+        StatisticsRetirementReport {
+            eligible,
+            removed: usize::from(applied) * eligible,
+            kept_live: self.kept_live.load(Ordering::Relaxed),
+            skipped_unowned: self.skipped_unowned.load(Ordering::Relaxed),
+            skipped_missing_data_file: self.skipped_missing_data_file.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct RetireObsoleteStatisticsAction {
+    observation: Arc<StatisticsRetirementObservation>,
+}
+
+impl RetireObsoleteStatisticsAction {
+    fn new() -> (Self, Arc<StatisticsRetirementObservation>) {
+        let observation = Arc::new(StatisticsRetirementObservation::default());
+        (
+            Self {
+                observation: Arc::clone(&observation),
+            },
+            observation,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl TransactionAction for RetireObsoleteStatisticsAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        if table.metadata().statistics_iter().next().is_none() {
+            self.observation
+                .store(StatisticsRetirementReport::default());
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+        let live_data_files = retained_live_data_file_paths(table).await?;
+        let (report, snapshot_ids, _) =
+            statistics_retirement_plan(table.metadata(), &live_data_files);
+        self.observation.store(report);
+        if snapshot_ids.is_empty() {
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+        Ok(ActionCommit::new(
+            snapshot_ids
+                .into_iter()
+                .map(|snapshot_id| TableUpdate::RemoveStatistics { snapshot_id })
+                .collect(),
+            vec![TableRequirement::UuidMatch {
+                uuid: table.metadata().uuid(),
+            }],
+        ))
+    }
+}
+
+fn siglake_owned_statistics_blob(blob_type: &str) -> bool {
+    matches!(
+        blob_type,
+        SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE
+            | siglake_index::segmented::SEGMENTED_BLOB_TYPE
+            | siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatisticsDisposition {
+    Retire,
+    KeepLive,
+    SkipUnowned,
+    SkipMissingDataFile,
+}
+
+fn statistics_disposition(
+    statistics: &StatisticsFile,
+    live_data_files: &HashSet<String>,
+) -> StatisticsDisposition {
+    if statistics
+        .blob_metadata
+        .iter()
+        .any(|blob| !siglake_owned_statistics_blob(&blob.r#type))
+    {
+        return StatisticsDisposition::SkipUnowned;
+    }
+    if statistics.blob_metadata.is_empty()
+        || statistics
+            .blob_metadata
+            .iter()
+            .any(|blob| !blob.properties.contains_key("data_file"))
+    {
+        return StatisticsDisposition::SkipMissingDataFile;
+    }
+    if statistics.blob_metadata.iter().any(|blob| {
+        live_data_files.contains(
+            blob.properties
+                .get("data_file")
+                .expect("presence checked above"),
+        )
+    }) {
+        StatisticsDisposition::KeepLive
+    } else {
+        StatisticsDisposition::Retire
+    }
+}
+
+fn statistics_retirement_plan(
+    metadata: &iceberg::spec::TableMetadata,
+    live_data_files: &HashSet<String>,
+) -> (StatisticsRetirementReport, Vec<i64>, Vec<String>) {
+    let mut report = StatisticsRetirementReport::default();
+    let mut snapshot_ids = Vec::new();
+    let mut statistics_paths = Vec::new();
+    for statistics in metadata.statistics_iter() {
+        match statistics_disposition(statistics, live_data_files) {
+            StatisticsDisposition::Retire => {
+                report.eligible += 1;
+                snapshot_ids.push(statistics.snapshot_id);
+                statistics_paths.push(statistics.statistics_path.clone());
+            }
+            StatisticsDisposition::KeepLive => report.kept_live += 1,
+            StatisticsDisposition::SkipUnowned => report.skipped_unowned += 1,
+            StatisticsDisposition::SkipMissingDataFile => {
+                report.skipped_missing_data_file += 1;
+            }
+        }
+    }
+    (report, snapshot_ids, statistics_paths)
+}
+
+async fn retained_live_data_file_paths(table: &Table) -> iceberg::Result<HashSet<String>> {
+    let metadata = table.metadata_ref();
+    let mut live = HashSet::new();
+    let mut visited_manifests = HashSet::new();
+    for snapshot in metadata.snapshots() {
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), &metadata)
+            .await?;
+        for manifest_file in manifest_list.entries() {
+            if !visited_manifests.insert(manifest_file.manifest_path.clone()) {
+                continue;
+            }
+            let manifest = manifest_file.load_manifest(table.file_io()).await?;
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    live.insert(entry.data_file().file_path().to_string());
+                }
+            }
+        }
+    }
+    Ok(live)
+}
+
+fn record_statistics_retirement(report: StatisticsRetirementReport) {
+    metrics::counter!("siglake_iceberg_statistics_removed_total").increment(report.removed as u64);
+    metrics::counter!(
+        "siglake_iceberg_statistics_retirement_skipped_total",
+        "reason" => "unowned_blob_type"
+    )
+    .increment(report.skipped_unowned as u64);
+    metrics::counter!(
+        "siglake_iceberg_statistics_retirement_skipped_total",
+        "reason" => "missing_data_file"
+    )
+    .increment(report.skipped_missing_data_file as u64);
+}
+
+#[cfg(test)]
+mod statistics_retirement_tests {
+    use super::*;
+
+    fn blob(blob_type: &str, data_file: Option<&str>) -> StatisticsBlobMetadata {
+        StatisticsBlobMetadata {
+            r#type: blob_type.to_string(),
+            snapshot_id: 7,
+            sequence_number: 7,
+            fields: vec![1],
+            properties: data_file
+                .map(|path| HashMap::from([("data_file".to_string(), path.to_string())]))
+                .unwrap_or_default(),
+        }
+    }
+
+    fn statistics(blobs: Vec<StatisticsBlobMetadata>) -> StatisticsFile {
+        StatisticsFile {
+            snapshot_id: 7,
+            statistics_path: "file:///warehouse/metadata/index.puffin".to_string(),
+            file_size_in_bytes: 100,
+            file_footer_size_in_bytes: 10,
+            key_metadata: None,
+            blob_metadata: blobs,
+        }
+    }
+
+    #[test]
+    fn an_entry_with_any_live_blob_stays_whole() {
+        let live = HashSet::from(["file:///warehouse/data/live.parquet".to_string()]);
+        let entry = statistics(vec![
+            blob(
+                SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE,
+                Some("file:///warehouse/data/retired.parquet"),
+            ),
+            blob(
+                siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE,
+                Some("file:///warehouse/data/live.parquet"),
+            ),
+        ]);
+        assert_eq!(
+            statistics_disposition(&entry, &live),
+            StatisticsDisposition::KeepLive
+        );
+    }
+
+    #[test]
+    fn only_owned_entries_with_complete_retired_references_are_removed() {
+        let live = HashSet::new();
+        let retired = statistics(vec![blob(
+            siglake_index::segmented::SEGMENTED_BLOB_TYPE,
+            Some("file:///warehouse/data/retired.parquet"),
+        )]);
+        assert_eq!(
+            statistics_disposition(&retired, &live),
+            StatisticsDisposition::Retire
+        );
+
+        let unowned = statistics(vec![blob(
+            "apache-datasketches-theta-v1",
+            Some("file:///warehouse/data/retired.parquet"),
+        )]);
+        assert_eq!(
+            statistics_disposition(&unowned, &live),
+            StatisticsDisposition::SkipUnowned
+        );
+
+        let missing = statistics(vec![blob(SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE, None)]);
+        assert_eq!(
+            statistics_disposition(&missing, &live),
+            StatisticsDisposition::SkipMissingDataFile
+        );
+    }
+}
+
 impl IcebergContext {
     /// Open (or create) a siglake catalog rooted at `warehouse_dir`.
     ///
@@ -14008,11 +14296,21 @@ impl IcebergContext {
             action = action.older_than(cutoff);
         }
         let tx = action.apply(tx).context("ExpireSnapshotsAction::apply")?;
+        // This action runs after expiry against the transaction's updated
+        // table, and is re-evaluated against a refreshed base on every CAS
+        // retry. A statistics entry becomes removable only when no retained
+        // snapshot has an alive reference to any data file it names.
+        let (retire_action, retirement_observation) = RetireObsoleteStatisticsAction::new();
+        let tx = retire_action
+            .apply(tx)
+            .context("RetireObsoleteStatisticsAction::apply")?;
         tx.commit(self.catalog.as_ref())
             .await
             .context("expire_snapshots commit")?;
+        let retirement = retirement_observation.report(true);
         self.invalidate_cached_table(table_ident).await;
         metrics::counter!("siglake_iceberg_snapshots_expired_total").increment(n as u64);
+        record_statistics_retirement(retirement);
         if let Some((proven, target)) = reroot {
             // After the commit, not before: an append that lands in this window
             // builds its link against the shrunken metadata, so its parent is
@@ -14939,6 +15237,59 @@ impl IcebergContext {
         self.execute_all_delete_tasks_inner(false).await
     }
 
+    /// Remove statistics entries that Siglake can prove describe no data file
+    /// reachable through a retained snapshot. Only entries made entirely of
+    /// Siglake inverted-index blob types, with a `data_file` property on every
+    /// blob, are eligible. A mixed live/retired entry stays whole.
+    ///
+    /// `apply=false` reports the classification without committing. The
+    /// action is re-evaluated against the transaction's refreshed table on a
+    /// catalog conflict, so a newly retained live reference cannot be removed
+    /// from a stale plan.
+    pub async fn retire_obsolete_statistics(
+        &self,
+        table_ident: &TableIdent,
+        apply: bool,
+    ) -> Result<StatisticsRetirementReport> {
+        Ok(self
+            .retire_obsolete_statistics_inner(table_ident, apply)
+            .await?
+            .0)
+    }
+
+    async fn retire_obsolete_statistics_inner(
+        &self,
+        table_ident: &TableIdent,
+        apply: bool,
+    ) -> Result<(StatisticsRetirementReport, Vec<String>)> {
+        let table = self
+            .catalog
+            .load_table(table_ident)
+            .await
+            .with_context(|| format!("load_table {table_ident}"))?;
+        if !apply {
+            let live_data_files = retained_live_data_file_paths(&table)
+                .await
+                .context("retained live data files for statistics retirement")?;
+            let (report, _, paths) = statistics_retirement_plan(table.metadata(), &live_data_files);
+            return Ok((report, paths));
+        }
+
+        let (action, observation) = RetireObsoleteStatisticsAction::new();
+        let tx = action
+            .apply(Transaction::new(&table))
+            .context("RetireObsoleteStatisticsAction::apply")?;
+        tx.commit(self.catalog.as_ref())
+            .await
+            .context("retire obsolete statistics commit")?;
+        let report = observation.report(true);
+        if report.removed > 0 {
+            self.invalidate_cached_table(table_ident).await;
+        }
+        record_statistics_retirement(report);
+        Ok((report, Vec::new()))
+    }
+
     /// All object-store paths reachable from the table's **retained**
     /// snapshots: every snapshot's manifest-list avro, every manifest avro in
     /// those lists, and every *alive* (`Added`/`Existing`) data file. This is
@@ -15003,8 +15354,22 @@ impl IcebergContext {
     pub async fn gc_orphans(&self, table_ident: &TableIdent, opts: GcOptions) -> Result<GcReport> {
         use futures::StreamExt;
 
+        // Removing a metadata entry and deleting its Puffin object are one
+        // maintenance sequence. Dry-run classifies the entries without
+        // changing reachability; apply commits RemoveStatistics first, then
+        // the ordinary age gate decides whether the object may be deleted.
+        let (statistics, dry_run_retired_paths) = self
+            .retire_obsolete_statistics_inner(table_ident, opts.apply)
+            .await?;
+
         // 1. The live set (full iceberg paths).
-        let reachable = self.reachable_files(table_ident).await?;
+        let mut reachable = self.reachable_files(table_ident).await?;
+        // Predict the same candidates apply mode creates without mutating the
+        // catalog. Their bytes and age therefore appear in the dry-run report
+        // instead of first appearing only when the operator applies it.
+        for path in dry_run_retired_paths {
+            reachable.remove(&path);
+        }
 
         // 2. Key the live set by path-relative-to-table-location. Bail if any
         //    reachable path is not under the location — never risk deleting a
@@ -15044,6 +15409,11 @@ impl IcebergContext {
         let now_secs = chrono::Utc::now().timestamp();
         let min_age_secs = opts.min_age.as_secs();
         let mut report = GcReport {
+            statistics_entries_eligible: statistics.eligible,
+            statistics_entries_removed: statistics.removed,
+            statistics_entries_kept_live: statistics.kept_live,
+            statistics_entries_skipped_unowned: statistics.skipped_unowned,
+            statistics_entries_skipped_missing_data_file: statistics.skipped_missing_data_file,
             reachable: reachable_rel.len(),
             ..Default::default()
         };
