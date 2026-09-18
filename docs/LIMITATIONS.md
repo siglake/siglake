@@ -1196,7 +1196,8 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   siglake measures none of them, so ext4 or xfs on a node-attached volume is
   the substrate the power-loss claim is made for.
 - **`siglake wal-recover` can only tell the mirror root from its parent where
-  the mirror has a marker.** #4928 made a restore that recognised no key exit
+  the mirror has a marker, or where `--catalog` is given.** #4928 made a
+  restore that recognised no key exit
   nonzero, which catches `--from` two or more components too high. One
   component too high fits the layout: the shallowest mirror keys shift into
   the `<tenant>[/<index>]/<segment>` shape recovery routes on, so segments
@@ -1212,27 +1213,62 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   settles it: at its own depth the marker confirms the root, one component
   deeper it refuses the run and names the directory to pass instead.
 
-  What remains is the mirror with neither marker — no managed index and no
-  active mirroring, which is the default install. Its listing one component up
-  is indistinguishable from a legitimate mirror whose first tenant happens to
-  be named after a prefix, so the verdict is `unverified` and the plan is the
-  whole check: an operator who reads it and passes `--apply` anyway restores
-  into the invented tenant, and a legacy flat mirror then commits into
-  `tenant_<prefix>` while any other layout stops at `ensure_index` with the
-  segments in `sealed/` under a counted backlog and
+  What remains without a catalog is the mirror with neither marker — no
+  managed index and no active mirroring, which is the default install. Its
+  listing one component up is indistinguishable from a legitimate mirror whose
+  first tenant happens to be named after a prefix, so the verdict is
+  `unverified` and the plan is the whole check: an operator who reads it and
+  passes `--apply` anyway restores into the invented tenant, and a legacy flat
+  mirror then commits into `tenant_<prefix>` while any other layout stops at
+  `ensure_index` with the segments in `sealed/` under a counted backlog and
   `siglake_compactor_index_unresolved_total`.
-  `docs/DESIGN_wal_recovery_root_identity.md` has the measured cases, and
-  names the remaining exact answer as its own slice: `--catalog <uri>`, which
-  reads the true `(tenant, index_id)` and prefix out of `wal_segments`. That
-  slice is designed and locally qualified but NOT shipped, so the limitation
-  above is the shipped behaviour;
-  `docs/DESIGN_wal_recovery_ledger_identity.md` (#4974) has the rules and the
-  measured read-only, partial-match and cost results the flag would carry.
-  The second defect that document records — a correct restore of a tenant with
-  only index segments omitted the tenant discovery dir the ingester writes and
-  was never drained — is fixed (#4972): the restore rebuilds
-  `<tenant>/sealed/`, and re-running the command with `--apply` repairs a WAL
-  root restored before that.
+  `docs/DESIGN_wal_recovery_root_identity.md` has the measured cases.
+
+  `--catalog <uri>` (#4997) is the exact answer for that population where the
+  catalog survived too, and its limits are their own list.
+  `docs/DESIGN_wal_recovery_ledger_identity.md` has the rules and the
+  measurements. It looks the listed segment ids up in `wal_segments`
+  read-only, compares the routing each KEY implies against the
+  `(tenant, index_id)` the uploader recorded, and refuses the restore whole on
+  any disagreement. What it does not do:
+
+  - **It certifies only the objects it matched.** Retention deletes a row as
+    soon as its object is gone, so a partial match is the ordinary case. One
+    agreeing row settles where `--from` points — the root is a property of
+    `--from`, not of an object — and every unmatched object keeps the routing
+    its key implies, exactly as it would with no `--catalog` at all. The plan
+    prints the uncertified count. A listing whose matched objects are a genuine
+    mirror and whose unmatched objects came from somewhere else is confirmed,
+    and the unmatched ones are restored on their key evidence.
+  - **It never reroutes and never overrides.** A disagreement reports both
+    routings and applies neither. A marker that contradicts the root still
+    refuses whatever the catalog says, for the reason `--force` was settled
+    against: the way past a contradicted root is to pass the directory the
+    refusal names.
+  - **The catalog is a second failure domain, and an unreadable one is a hard
+    error.** `--catalog` on a catalog that cannot be read fails the run rather
+    than falling back to the marker verdict; the remedy is to drop the flag.
+    A WAL-journal SQLite catalog on a read-only mount cannot be opened at all
+    without `immutable=1` in the URI — SQLite creates a `-shm` beside it even
+    for a SELECT — and `immutable=1` reads around the `-wal` sidecar, so it is
+    exact only for a catalog nothing is still writing. siglake's own SQLite
+    catalogs are rollback-journal and need none of this.
+  - **One false refusal is known.** `mark_committed_local` composes
+    `segment_url` from the prefix in the LIVE config rather than from the key
+    the object was written under, so a deployment whose `wal.mirror.prefix`
+    changed after some objects had been uploaded can hold rows claiming two
+    prefixes for one mirror. The check reads that as a union of two mirrors and
+    refuses, naming both prefixes; the way past it is to drop `--catalog`.
+  - **There is no Postgres arm under test.** The reader fences Postgres with
+    `START TRANSACTION READ ONLY` and its statements are parse-gated in the
+    Postgres dialect, but no live Postgres runs them: the hermetic cases are
+    SQLite.
+
+  The second defect `docs/DESIGN_wal_recovery_ledger_identity.md` records — a
+  correct restore of a tenant with only index segments omitted the tenant
+  discovery dir the ingester writes and was never drained — is fixed (#4972):
+  the restore rebuilds `<tenant>/sealed/`, and re-running the command with
+  `--apply` repairs a WAL root restored before that.
 - **Attribute auto-promotion is opt-in, and it mutates schemas on its own.**
   Hot-key sampling and promotion of OTLP attributes to typed columns ships
   default-off (`SIGLAKE_AUTO_PROMOTE_MIN_PCT`, zero); promoted keys can also be

@@ -14,11 +14,6 @@ experimental-exact-point-rollup = []
 [dev-dependencies]
 arrow-array = { workspace = true }
 chrono = { workspace = true }
-# #4974's ledger-identity prototype compares the routing a mirror KEY implies
-# against the routing the catalog recorded, and it has to infer that routing the
-# way the WAL mirror's own parser does rather than with a private copy. Dev-only:
-# siglake-wal does not depend on this crate, and nothing in `src/` uses it.
-siglake-wal = { workspace = true }
 metrics-util = "0.20"
 proptest = { workspace = true }
 tempfile = "3"
@@ -32,6 +27,12 @@ tracing-subscriber = { workspace = true }
 siglake-core = { workspace = true }
 siglake-bloom = { workspace = true }
 siglake-index = { workspace = true }
+# `wal_ledger`: the read-only `wal_segments` lookup behind `wal-recover
+# --catalog` returns the row type the pure verdict consumes
+# (`siglake_wal::mirror::LedgerRow`) rather than a second spelling of the same
+# three columns for the CLI to copy across by hand. The edge goes one way:
+# siglake-wal has no catalog dependency and gains none.
+siglake-wal = { workspace = true }
 
 anyhow = { workspace = true }
 arrow = { workspace = true }

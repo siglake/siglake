@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- **Recovery (feature)**: `siglake wal-recover --catalog <uri>` settles
+  whether `--from` is the mirror root from the catalog instead of from a
+  marker. A mirror with no managed index and no active mirroring — the default
+  install — carries neither of the markers #4973 reads, and its listing one
+  component too high is indistinguishable from a legitimate mirror whose first
+  tenant is named after a prefix; a restore of that listing invents a tenant
+  named after the mirror prefix. The uploader recorded
+  `(tenant, index_id, segment_url)` for every object it PUT and none of the
+  `UPDATE`s in the claim path touch those three columns, so the listed segment
+  ids can be looked up and the routing each KEY implies compared against the
+  routing the ledger recorded. The lookup runs on the plan's own listing,
+  including the ids of keys recovery refuses on their layout — which is the
+  whole of a deep mirror listed one component up, and turns the generic
+  "restored nothing" bail into a refusal naming the directory to pass instead.
+  Only the TAIL of `segment_url` is compared with the listed key, never its
+  head against `--from`, so a mirror copied into another bucket is a legitimate
+  source; the leftover above the key is the mirror prefix, and an empty
+  leftover is the signal that `--from` already carries it. One agreeing match
+  confirms the root, since the root is a property of `--from` rather than of an
+  object; a disagreement, or two matches claiming different prefixes, refuses
+  the restore whole, reports both routings and reroutes nothing. Objects with
+  no row — retention deletes a row as soon as its object is gone, so this is
+  the ordinary case — keep the routing their key implies and are counted as
+  uncertified in the plan. Read-only mechanically rather than by discipline:
+  SQLite is opened `mode=ro` and Postgres runs its SELECTs inside
+  `START TRANSACTION READ ONLY`, so the reader cannot reach the `ensure_schema`
+  that connecting through `SqlSegmentClaim` would have run against the catalog
+  a plan is inspecting. The flag adds evidence and removes no refusal: a
+  contradicting marker still refuses whatever the catalog says, and a catalog
+  that cannot be read fails the run rather than falling back to the marker
+  verdict — the remedy is to drop the flag, and the message says so. No env
+  default, no new requirement, and a mirror with no `--catalog` behaves exactly
+  as before. `docs/LIMITATIONS.md` has what it does not certify, including the
+  one known false refusal (a `wal.mirror.prefix` changed mid-life) and the
+  absence of a live Postgres arm. (#4997)
+
 - **Text indexes (docs)**: the documented integrity gap in a v1 inverted-index
   blob is the **footer-KV** path only. An index stored as hex in a Parquet
   footer — the path taken per column while that column's serialized index fits

@@ -1252,6 +1252,399 @@ fn root_evidence(suffix: &str) -> Option<RootEvidence> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Ledger-backed root identity (#4997, option D of
+// `docs/DESIGN_wal_recovery_root_identity.md`; rules and measurements in
+// `docs/DESIGN_wal_recovery_ledger_identity.md`).
+//
+// Pure arithmetic over a listing and the `wal_segments` rows its ids matched.
+// The rows are READ by `siglake-storage`'s `WalLedgerReader` and handed in:
+// this crate has neither a catalog dependency nor a reason to grow one, and
+// keeping the verdict pure is what lets every rule below be tested without a
+// database.
+// ---------------------------------------------------------------------------
+
+/// The routing the ledger spells, and the routing a mirror KEY implies, in one
+/// vocabulary. `index_id` is `""` for a tenant's events lane — the way
+/// `wal_segments` stores it — not `None` as [`PlanGroup::index`] carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerRoute {
+    pub tenant: String,
+    pub index_id: String,
+}
+
+/// The identity columns of one `wal_segments` row.
+///
+/// Write-once: every `UPDATE wal_segments` in `catalog_claim.rs` sets `status`,
+/// `claimer`, `claimed_at_ms`, `committed_at_ms`, `attempts` or
+/// `not_before_ms`, and none of them names `tenant`, `index_id` or
+/// `segment_url`. A row's identity is therefore whatever `register` (the
+/// uploader) or `mark_committed_local` (the filesystem drain) inserted,
+/// whatever the segment's lifecycle has done since — which is why the check
+/// reads no lifecycle column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerRow {
+    pub tenant: String,
+    /// `""` for the built-in events table, as stored.
+    pub index_id: String,
+    /// Root-relative `<mirror prefix>/<tenant>[/<index>]/<id>.arrow`.
+    pub segment_url: String,
+}
+
+/// One listed object as the ledger check sees it: the join key, and the
+/// routing the plan would give it.
+///
+/// Retained for keys the plan SKIPPED as well as for its candidates. A
+/// refused key's id is as good as any other, and a deep-layout mirror listed
+/// one component too high has no candidates at all — the generic "restored
+/// nothing" bail is exactly the case the ledger can make definite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedSegment {
+    /// Key relative to the listing prefix, i.e. to `--from`.
+    pub key: String,
+    /// Segment id: the basename with `.arrow` (and any `.partial`) removed.
+    pub id: String,
+    /// The routing [`recovery_target`] gives this key, or `None` for a key
+    /// whose layout recovery refuses.
+    pub route: Option<LedgerRoute>,
+}
+
+/// Why one listed object's row contradicts its key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerConflict {
+    /// The key routes to a different `(tenant, index)` than the row records.
+    Routing,
+    /// The registered url does not end in the listed key at all.
+    UrlTail,
+    /// The listed key already carries the mirror prefix, so `--from` is above
+    /// the mirror root.
+    KeyCarriesPrefix,
+    /// Another listed segment is registered under a different mirror prefix:
+    /// the listing is a union of two mirrors and a restore cannot be right for
+    /// both.
+    PrefixSplit { expected: String, found: String },
+}
+
+impl LedgerConflict {
+    fn phrase(&self) -> String {
+        match self {
+            Self::Routing => "the key routes somewhere else".to_string(),
+            Self::UrlTail => "the registered url does not end in the listed key".to_string(),
+            Self::KeyCarriesPrefix => {
+                "the listed key already carries the mirror prefix, so --from is above it"
+                    .to_string()
+            }
+            Self::PrefixSplit { expected, found } => format!(
+                "two listed segments are registered under different mirror prefixes, \
+                 `{expected}` and `{found}`"
+            ),
+        }
+    }
+}
+
+/// One listed object whose ledger row contradicts its key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerDisagreement {
+    /// The listed key, verbatim.
+    pub key: String,
+    /// What the key says. `None` for a key the plan refuses on its layout.
+    pub inferred: Option<LedgerRoute>,
+    /// What the ledger says.
+    pub ledger: LedgerRow,
+    pub conflict: LedgerConflict,
+}
+
+/// What `wal_segments` says about `--from`, on top of [`RootVerdict`]'s
+/// marker reading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerVerdict {
+    /// Every matched object's row agrees with its key, and the matches agree
+    /// with each other about the mirror prefix.
+    ///
+    /// Certification is PER OBJECT: the `uncertified` ones had no row, keep
+    /// the routing their key implies — the routing they would have had with no
+    /// `--catalog` at all — and are vouched for by nothing. The root is a
+    /// property of `--from` rather than of an object, so one agreeing match
+    /// settles it.
+    Confirmed {
+        matched: usize,
+        uncertified: usize,
+        /// One uncertified key, verbatim, so the count has something behind it.
+        sample_uncertified: Option<String>,
+        /// The mirror prefix the rows recorded, as seen from `--from`.
+        prefix: String,
+        /// One matching key, verbatim.
+        evidence: String,
+    },
+    /// At least one matched object's row contradicts its key. The restore is
+    /// refused WHOLE: the objects that did agree are not a licence to write
+    /// the ones that did not, and nothing is rerouted onto what the ledger
+    /// claims.
+    Contradicted {
+        disagreements: Vec<LedgerDisagreement>,
+        agreed: usize,
+        uncertified: usize,
+        /// The directory under `--from` to pass instead, when the listing
+        /// says so.
+        directory: Option<String>,
+    },
+    /// The ledger was read and no listed object matched a row. Not evidence:
+    /// this is the retention-purged mirror and another deployment's mirror
+    /// alike, so [`RootVerdict`] and the plan stand unchanged.
+    Silent { listed: usize },
+    /// The ledger could not be opened, or has no `wal_segments`. Reported,
+    /// never downgraded to [`Self::Silent`]: an operator who asked for exact
+    /// evidence and silently got a plan is the failure `--catalog` exists to
+    /// avoid.
+    Unavailable { reason: String },
+}
+
+/// An index id for a human: the ledger stores the events lane as `""`, and an
+/// empty string in a refusal reads as a missing value rather than as the
+/// tenant's own events table.
+fn spell_index(index_id: &str) -> &str {
+    if index_id.is_empty() {
+        "<events>"
+    } else {
+        index_id
+    }
+}
+
+impl LedgerVerdict {
+    /// One line for the operator, in the register of [`RootVerdict::line`].
+    pub fn line(&self) -> String {
+        match self {
+            Self::Confirmed {
+                matched,
+                uncertified,
+                sample_uncertified,
+                prefix,
+                evidence,
+            } => {
+                let root = if prefix.is_empty() {
+                    "at the warehouse root".to_string()
+                } else {
+                    format!("under the mirror prefix `{prefix}`")
+                };
+                format!(
+                    "root confirmed by the catalog: {matched} listed segment(s) match a \
+                     wal_segments row and every one routes as its key does, {root} (e.g. \
+                     `{evidence}`). {uncertified} listed segment(s) have no row and keep the \
+                     routing their key implies{}",
+                    sample_uncertified
+                        .as_deref()
+                        .map(|k| format!(" (e.g. `{k}`)"))
+                        .unwrap_or_default()
+                )
+            }
+            Self::Contradicted {
+                disagreements,
+                agreed,
+                directory,
+                ..
+            } => {
+                let first = &disagreements[0];
+                // Both routings, always: the whole refusal is that two
+                // sources disagree, and an operator cannot see which is
+                // theirs from one of them. The key's routing is what a
+                // restore WOULD have used, and it is the one that stays in
+                // force for the plan.
+                let inferred = first
+                    .inferred
+                    .as_ref()
+                    .map(|r| format!("tenant={} index={}", r.tenant, spell_index(&r.index_id)))
+                    .unwrap_or_else(|| {
+                        "nothing — its layout is deeper than recovery routes".to_string()
+                    });
+                format!(
+                    "root CONTRADICTED by the catalog: `{}` is registered as tenant={} index={} \
+                     at `{}`, and its key routes to {inferred} ({}), so --from is not the \
+                     mirror root. {agreed} other listed segment(s) did agree; the restore is \
+                     refused whole and nothing is rerouted.{}",
+                    first.key,
+                    first.ledger.tenant,
+                    spell_index(&first.ledger.index_id),
+                    first.ledger.segment_url,
+                    first.conflict.phrase(),
+                    directory
+                        .as_deref()
+                        .map(|d| format!(" Pass the `{d}` directory under it instead."))
+                        .unwrap_or_default()
+                )
+            }
+            Self::Silent { listed } => format!(
+                "catalog reachable and silent: none of the {listed} listed object(s) has a \
+                 wal_segments row, so the catalog adds nothing. Read the plan"
+            ),
+            Self::Unavailable { reason } => format!("catalog could not be read: {reason}"),
+        }
+    }
+
+    /// Whether this verdict refuses the restore on its own.
+    pub fn refuses(&self) -> bool {
+        matches!(self, Self::Contradicted { .. } | Self::Unavailable { .. })
+    }
+}
+
+/// The SEALED form of a listed key: the shape `segment_url` is always written
+/// in.
+///
+/// The active mirror's `_active/` component and `.partial` tail are the
+/// uploader's staging spelling, and the staged copy has no row of its own —
+/// `register` runs on the sealed upload — so a `.partial` key can only be
+/// compared against a row in this form. Getting it wrong would turn every
+/// active-mirror object into a disagreement.
+fn sealed_form(key: &str) -> String {
+    let body = key.trim_matches('/');
+    let body = body.strip_prefix("_active/").unwrap_or(body);
+    body.strip_suffix(".partial").unwrap_or(body).to_string()
+}
+
+/// Segment id of a listed key, or `None` for a key that is not a segment at
+/// all (an `owner` marker, a stray `README.md`).
+fn segment_id(key: &str) -> Option<String> {
+    let name = key.trim_matches('/').rsplit('/').next()?;
+    Some(
+        name.strip_suffix(".arrow.partial")
+            .or_else(|| name.strip_suffix(".arrow"))?
+            .to_string(),
+    )
+}
+
+/// The components of a root-relative `segment_url` that sit ABOVE the listed
+/// key — the mirror prefix, as seen from `--from`.
+///
+/// This is the whole normalization between the two spellings. `--from` is a
+/// full URL and the store is rooted at it, so a listed key is relative to the
+/// mirror root; `segment_url` is relative to the WAREHOUSE root and therefore
+/// carries the prefix. Neither string can be compared with the other directly,
+/// and the url's head must not be compared with `--from` at all: restoring
+/// from a COPY of the mirror in another bucket is a legitimate DR shape, and a
+/// url match would refuse it.
+///
+/// `Some("")` means the url IS the key — `--from` is at or above the warehouse
+/// root, one or more components too high — and `None` means the url does not
+/// end in the key, so the row and the object disagree about where the object
+/// is.
+fn prefix_above(segment_url: &str, key: &str) -> Option<String> {
+    let url = segment_url.trim_matches('/');
+    let key = sealed_form(key);
+    if url == key {
+        return Some(String::new());
+    }
+    Some(
+        url.strip_suffix(&key)?
+            .strip_suffix('/')?
+            .trim_matches('/')
+            .to_string(),
+    )
+}
+
+/// The ledger check: pure arithmetic over a listing and the rows its ids
+/// matched.
+///
+/// `rows` is keyed by segment id, which is a uuid7 basename, so two objects
+/// cannot share one. If they ever did, `ON CONFLICT(id) DO NOTHING` means the
+/// ledger keeps the first row and the second object's key disagrees with it —
+/// a refusal, not a reroute.
+pub fn ledger_verdict(
+    listed: &[ListedSegment],
+    rows: &std::collections::HashMap<String, LedgerRow>,
+) -> LedgerVerdict {
+    let mut disagreements: Vec<LedgerDisagreement> = Vec::new();
+    // (key, prefix) per agreeing match. Bounded by the MATCHED set, which is
+    // the intersection of the listing and the retained ledger.
+    let mut agreed: Vec<(String, String)> = Vec::new();
+    let mut uncertified = 0usize;
+    let mut sample_uncertified: Option<String> = None;
+    for item in listed {
+        let Some(row) = rows.get(&item.id) else {
+            uncertified += 1;
+            sample_uncertified.get_or_insert_with(|| item.key.clone());
+            continue;
+        };
+        let prefix = prefix_above(&row.segment_url, &item.key);
+        let route_disagrees = item
+            .route
+            .as_ref()
+            .is_some_and(|r| r.tenant != row.tenant || r.index_id != row.index_id);
+        let conflict = match (&prefix, route_disagrees) {
+            (_, true) => Some(LedgerConflict::Routing),
+            (None, _) => Some(LedgerConflict::UrlTail),
+            (Some(p), _) if p.is_empty() => Some(LedgerConflict::KeyCarriesPrefix),
+            _ => None,
+        };
+        match conflict {
+            Some(conflict) => disagreements.push(LedgerDisagreement {
+                key: item.key.clone(),
+                inferred: item.route.clone(),
+                ledger: row.clone(),
+                conflict,
+            }),
+            None => agreed.push((item.key.clone(), prefix.expect("checked above"))),
+        }
+    }
+    if !disagreements.is_empty() {
+        return LedgerVerdict::Contradicted {
+            directory: directory_to_pass(&disagreements),
+            agreed: agreed.len(),
+            uncertified,
+            disagreements,
+        };
+    }
+    let Some((first_key, first_prefix)) = agreed.first().cloned() else {
+        return LedgerVerdict::Silent {
+            listed: listed.len(),
+        };
+    };
+    // Two agreeing objects that disagree about the prefix are not one mirror.
+    if let Some((key, found)) = agreed.iter().find(|(_, p)| *p != first_prefix) {
+        let row = rows
+            .get(&segment_id(key).unwrap_or_default())
+            .cloned()
+            .unwrap_or(LedgerRow {
+                tenant: String::new(),
+                index_id: String::new(),
+                segment_url: found.clone(),
+            });
+        return LedgerVerdict::Contradicted {
+            disagreements: vec![LedgerDisagreement {
+                key: key.clone(),
+                inferred: None,
+                ledger: row,
+                conflict: LedgerConflict::PrefixSplit {
+                    expected: first_prefix.clone(),
+                    found: found.clone(),
+                },
+            }],
+            agreed: agreed.len(),
+            uncertified,
+            directory: None,
+        };
+    }
+    LedgerVerdict::Confirmed {
+        matched: agreed.len(),
+        uncertified,
+        sample_uncertified,
+        prefix: first_prefix,
+        evidence: first_key,
+    }
+}
+
+/// The directory under `--from` to pass instead: the first component of a
+/// contradicting key, which the ledger just proved sits one level deeper than
+/// `--from` claimed. A single-component key has no directory to name, and the
+/// refusal says so by omitting the sentence.
+fn directory_to_pass(disagreements: &[LedgerDisagreement]) -> Option<String> {
+    disagreements
+        .iter()
+        .find_map(|d| {
+            let parts: Vec<&str> = d.key.trim_matches('/').split('/').collect();
+            (parts.len() > 1).then(|| parts[0].to_string())
+        })
+        .filter(|d| !d.is_empty())
+}
+
 /// Rows in `body` read as a WAL segment, or the reason it is not one.
 ///
 /// The check a candidate has to pass before it is written onto the WAL root
@@ -1344,8 +1737,21 @@ pub struct RecoveryPlan {
     pub unreadable: Vec<UnreadableCandidate>,
     /// What the listing says about `--from` being the mirror root.
     pub verdict: RootVerdict,
+    /// Every listed object that is SHAPED like a segment, candidates and keys
+    /// refused on their layout alike, in listing order: the join keys
+    /// `--catalog` looks up (#4997). Keys that are not segments at all — an
+    /// `owner` marker, a stray file — are not here.
+    ///
+    /// A segment present both sealed and `_active/` appears twice, once per
+    /// object: the plan restores one of them, and each object's routing is
+    /// certified on its own.
+    pub listed: Vec<ListedSegment>,
     /// The objects to fetch, keyed by store key — an apply's work list.
     candidates: Vec<(String, RecoveryTarget)>,
+    /// What `wal_segments` said about this listing, when the caller passed
+    /// `--catalog` and looked the ids up. `None` is the shipped no-catalog
+    /// path, byte for byte.
+    ledger: Option<LedgerVerdict>,
 }
 
 impl RecoveryPlan {
@@ -1366,16 +1772,68 @@ impl RecoveryPlan {
         (total > 0).then_some(total)
     }
 
+    /// The ids of every segment-shaped listed object, for a `--catalog`
+    /// lookup. Listing order, duplicates included where one segment is
+    /// present both sealed and active.
+    pub fn listed_ids(&self) -> Vec<String> {
+        self.listed.iter().map(|l| l.id.clone()).collect()
+    }
+
+    /// Run the ledger check against `rows` and record the result on the plan,
+    /// so [`apply_plan`] refuses a contradicted listing the way it refuses a
+    /// contradicted marker.
+    ///
+    /// The ledger never OVERTURNS a marker refusal, only adds to it: this
+    /// records a second verdict, and both are reported.
+    pub fn attach_ledger(&mut self, verdict: LedgerVerdict) {
+        self.ledger = Some(verdict);
+    }
+
+    /// What `wal_segments` said, when a caller looked it up.
+    pub fn ledger(&self) -> Option<&LedgerVerdict> {
+        self.ledger.as_ref()
+    }
+
+    /// Whether either verdict refuses this listing.
+    pub fn refused(&self) -> bool {
+        matches!(self.verdict, RootVerdict::Contradicted { .. })
+            || self.ledger.as_ref().is_some_and(LedgerVerdict::refuses)
+    }
+
+    /// Every reason this listing is refused, in one line.
+    ///
+    /// Both verdicts are reported when both speak. A marker `Contradicted`
+    /// with a ledger `Confirmed` still refuses: the way past a contradicted
+    /// root is to pass the directory the refusal names, and a ledger that
+    /// confirms a listing whose marker contradicts is itself a contradiction —
+    /// so the confirmation is reported alongside the refusal rather than
+    /// resolving it.
+    pub fn refusal_line(&self) -> Option<String> {
+        if !self.refused() {
+            return None;
+        }
+        let mut reasons = Vec::new();
+        if matches!(self.verdict, RootVerdict::Contradicted { .. }) {
+            reasons.push(self.verdict.line());
+        }
+        match self.ledger.as_ref() {
+            Some(l) if l.refuses() => reasons.push(l.line()),
+            Some(l @ LedgerVerdict::Confirmed { .. }) => reasons.push(l.line()),
+            _ => {}
+        }
+        // Callers punctuate: both of them continue the sentence with what was
+        // NOT touched, and a line that already ended in a full stop read
+        // `instead.. Nothing under …`.
+        Some(reasons.join(" -- and ").trim_end_matches('.').to_string())
+    }
+
     /// The error an apply owes the operator when the listing contradicts the
-    /// root. Separate from [`RootVerdict::line`] because it has to name the
+    /// root. Separate from [`Self::refusal_line`] because it has to name the
     /// destination it did NOT touch.
     fn refusal(&self, wal_root: &Path) -> Option<anyhow::Error> {
-        let RootVerdict::Contradicted { .. } = self.verdict else {
-            return None;
-        };
+        let reasons = self.refusal_line()?;
         Some(anyhow::anyhow!(
-            "refusing to restore: {}. Nothing under {} was created or changed.",
-            self.verdict.line(),
+            "refusing to restore: {reasons}. Nothing under {} was created or changed.",
             wal_root.display()
         ))
     }
@@ -1426,6 +1884,7 @@ pub async fn plan_recovery(op: &Operator, prefix: &str, wal_root: &Path) -> Resu
     let mut sample_skipped_key: Option<String> = None;
     let mut at_root: Option<String> = None;
     let mut one_deeper: Option<(String, String)> = None;
+    let mut listed: Vec<ListedSegment> = Vec::new();
     while let Some(entry) = listing.next().await {
         let entry = entry.context("list entry")?;
         let path = entry.path().to_string();
@@ -1450,7 +1909,23 @@ pub async fn plan_recovery(op: &Operator, prefix: &str, wal_root: &Path) -> Resu
             None => {}
         }
         let bytes = entry.metadata().content_length();
-        let Some(target) = recovery_target(suffix) else {
+        let target = recovery_target(suffix);
+        // Every segment-shaped key becomes a ledger join key, whether or not
+        // recovery will route it: the keys refused on their LAYOUT are the
+        // ones a deep mirror listed one component too high consists of, and
+        // looking them up is what turns the generic "restored nothing" bail
+        // into a proof with a directory in it (#4997).
+        if let Some(id) = segment_id(suffix) {
+            listed.push(ListedSegment {
+                key: suffix.to_string(),
+                id,
+                route: target.as_ref().map(|t| LedgerRoute {
+                    tenant: t.tenant.clone(),
+                    index_id: t.index.clone().unwrap_or_default(),
+                }),
+            });
+        }
+        let Some(target) = target else {
             skipped += 1;
             sample_skipped_key.get_or_insert_with(|| path.clone());
             tracing::warn!(key = %path, "wal-recover: unrecognised key, skipped");
@@ -1543,7 +2018,9 @@ pub async fn plan_recovery(op: &Operator, prefix: &str, wal_root: &Path) -> Resu
         sample_skipped_key,
         unreadable,
         verdict,
+        listed,
         candidates: work,
+        ledger: None,
     })
 }
 
@@ -2934,6 +3411,504 @@ mod tests {
         assert!(msg.contains("wal-mirror"), "{msg}");
         assert!(msg.contains("one component above the mirror root"), "{msg}");
         assert!(!root.exists(), "{} was created", root.display());
+    }
+
+    /// `--catalog`'s arithmetic (#4997), under the rules
+    /// `docs/DESIGN_wal_recovery_ledger_identity.md` settled: complete,
+    /// partial, absent and conflicting id matches, the normalization between a
+    /// full `--from` URL and a root-relative `segment_url`, and the precedence
+    /// against the marker verdict.
+    ///
+    /// Pure — no catalog here, by design. The reader that produces `rows` is
+    /// `siglake_storage::wal_ledger`, and its own cases (read-only open modes,
+    /// chunking cost, the composition with a real `file://` mirror) are in
+    /// `siglake-storage/tests/wal_ledger_reader.rs`.
+    mod ledger_identity {
+        use super::*;
+        use std::collections::HashMap;
+
+        /// The listing a plan hands the check.
+        fn listing(keys: &[&str]) -> Vec<ListedSegment> {
+            keys.iter()
+                .filter_map(|key| {
+                    Some(ListedSegment {
+                        key: (*key).to_string(),
+                        id: segment_id(key)?,
+                        route: recovery_target(key).map(|t| LedgerRoute {
+                            tenant: t.tenant,
+                            index_id: t.index.unwrap_or_default(),
+                        }),
+                    })
+                })
+                .collect()
+        }
+
+        fn rows(rows: &[(&str, &str, &str, &str)]) -> HashMap<String, LedgerRow> {
+            rows.iter()
+                .map(|(id, tenant, index_id, url)| {
+                    (
+                        (*id).to_string(),
+                        LedgerRow {
+                            tenant: (*tenant).to_string(),
+                            index_id: (*index_id).to_string(),
+                            segment_url: (*url).to_string(),
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        /// COMPLETE match, correct root: every listed segment has a row, every
+        /// row agrees with its key, and the prefix the rows carry is uniform.
+        #[test]
+        fn a_complete_match_at_the_mirror_root_confirms_it() {
+            let listed = listing(&["acme/s1.arrow", "acme/orders/s2.arrow", "s3.arrow"]);
+            let verdict = ledger_verdict(
+                &listed,
+                &rows(&[
+                    ("s1", "acme", "", "wal-mirror/acme/s1.arrow"),
+                    ("s2", "acme", "orders", "wal-mirror/acme/orders/s2.arrow"),
+                    // The legacy flat key is the one no store-side marker can
+                    // vouch for, and it is confirmed on the same evidence.
+                    ("s3", "default", "", "wal-mirror/s3.arrow"),
+                ]),
+            );
+            let LedgerVerdict::Confirmed {
+                matched,
+                uncertified,
+                prefix,
+                ..
+            } = &verdict
+            else {
+                panic!("a complete agreeing match must confirm: {verdict:?}");
+            };
+            assert_eq!(*matched, 3);
+            assert_eq!(*uncertified, 0);
+            assert_eq!(prefix, "wal-mirror", "{}", verdict.line());
+        }
+
+        /// The headline refusal: a LEGACY FLAT mirror listed one component up,
+        /// whose report before #4973 was character-for-character a correct
+        /// restore and whose listing carries no marker at all.
+        #[test]
+        fn a_flat_mirror_one_component_up_is_refused_by_the_ledger() {
+            let listed = listing(&["wal-mirror/s1.arrow", "wal-mirror/s2.arrow"]);
+            assert_eq!(
+                listed[0].route.as_ref().unwrap().tenant,
+                "wal-mirror",
+                "the key alone says the tenant is the prefix — that is the whole defect"
+            );
+            let verdict = ledger_verdict(
+                &listed,
+                &rows(&[
+                    ("s1", "default", "", "wal-mirror/s1.arrow"),
+                    ("s2", "default", "", "wal-mirror/s2.arrow"),
+                ]),
+            );
+            let LedgerVerdict::Contradicted {
+                disagreements,
+                agreed,
+                directory,
+                ..
+            } = &verdict
+            else {
+                panic!("a ledger that routes these elsewhere must refuse: {verdict:?}");
+            };
+            assert_eq!(disagreements.len(), 2);
+            assert_eq!(*agreed, 0);
+            assert_eq!(
+                directory.as_deref(),
+                Some("wal-mirror"),
+                "{}",
+                verdict.line()
+            );
+            assert!(
+                verdict.line().contains("nothing is rerouted"),
+                "{}",
+                verdict.line()
+            );
+        }
+
+        /// The collision no key can resolve, resolved: a tenant legitimately
+        /// CALLED `wal-mirror`, whose keys and whose correct restore are
+        /// byte-identical to the case above.
+        #[test]
+        fn a_tenant_named_after_the_prefix_is_confirmed_not_refused() {
+            let verdict = ledger_verdict(
+                &listing(&["wal-mirror/s1.arrow", "wal-mirror/s2.arrow"]),
+                &rows(&[
+                    ("s1", "wal-mirror", "", "wal-mirror/wal-mirror/s1.arrow"),
+                    ("s2", "wal-mirror", "", "wal-mirror/wal-mirror/s2.arrow"),
+                ]),
+            );
+            let LedgerVerdict::Confirmed {
+                matched, prefix, ..
+            } = &verdict
+            else {
+                panic!("the legitimate install must be confirmed, not refused: {verdict:?}");
+            };
+            assert_eq!(*matched, 2);
+            assert_eq!(prefix, "wal-mirror");
+        }
+
+        /// A mirror one component up whose keys are the DEEP layout. Recovery
+        /// refuses those keys on their depth and the command bails with a
+        /// generic "restored nothing" guess; the ledger makes it definite and
+        /// names the directory, from a key that is not a candidate at all.
+        #[test]
+        fn a_deep_mirror_one_component_up_is_refused_from_keys_the_plan_skipped() {
+            let listed = listing(&["wal-mirror/acme/orders/s1.arrow"]);
+            assert!(
+                listed[0].route.is_none(),
+                "the plan skips this key on its depth"
+            );
+            let verdict = ledger_verdict(
+                &listed,
+                &rows(&[("s1", "acme", "orders", "wal-mirror/acme/orders/s1.arrow")]),
+            );
+            let LedgerVerdict::Contradicted { directory, .. } = &verdict else {
+                panic!("the url alone settles this one: {verdict:?}");
+            };
+            assert_eq!(directory.as_deref(), Some("wal-mirror"));
+        }
+
+        /// PARTIAL match: retention purges a `committed` row as soon as its
+        /// object is gone, so a mirror routinely holds objects with no row. The
+        /// matched set confirms the ROOT — a property of `--from`, not of the
+        /// object — and the unmatched objects are counted, keep the routing
+        /// their key implies, and are certified by nothing.
+        #[test]
+        fn a_partial_match_confirms_the_root_and_certifies_only_what_it_matched() {
+            let listed = listing(&["acme/s1.arrow", "acme/s2.arrow", "widgets/s3.arrow"]);
+            let verdict = ledger_verdict(
+                &listed,
+                &rows(&[("s1", "acme", "", "wal-mirror/acme/s1.arrow")]),
+            );
+            let LedgerVerdict::Confirmed {
+                matched,
+                uncertified,
+                sample_uncertified,
+                ..
+            } = &verdict
+            else {
+                panic!("one agreeing row pins the root: {verdict:?}");
+            };
+            assert_eq!(*matched, 1);
+            assert_eq!(*uncertified, 2);
+            assert_eq!(sample_uncertified.as_deref(), Some("acme/s2.arrow"));
+            // The routing of an uncertified object is the key's, unchanged:
+            // the ledger matched nothing for it and says nothing about it.
+            assert_eq!(
+                listed[2].route.as_ref().unwrap(),
+                &LedgerRoute {
+                    tenant: "widgets".to_string(),
+                    index_id: String::new(),
+                }
+            );
+            assert!(
+                verdict.line().contains("2 listed segment(s) have no row"),
+                "{}",
+                verdict.line()
+            );
+        }
+
+        /// CONFLICTING match: some rows agree, one does not. Contradiction
+        /// wins, and the agreeing rows are reported rather than spent as a
+        /// licence to write the one that disagreed.
+        #[test]
+        fn one_disagreeing_row_refuses_a_listing_the_rest_of_which_agrees() {
+            let verdict = ledger_verdict(
+                &listing(&["acme/s1.arrow", "acme/s2.arrow", "acme/s3.arrow"]),
+                &rows(&[
+                    ("s1", "acme", "", "wal-mirror/acme/s1.arrow"),
+                    ("s2", "acme", "", "wal-mirror/acme/s2.arrow"),
+                    // Registered under a DIFFERENT tenant than its key claims.
+                    ("s3", "widgets", "", "wal-mirror/widgets/s3.arrow"),
+                ]),
+            );
+            let LedgerVerdict::Contradicted {
+                disagreements,
+                agreed,
+                ..
+            } = &verdict
+            else {
+                panic!("a conflict must refuse whole: {verdict:?}");
+            };
+            assert_eq!(*agreed, 2, "the agreement is reported, not spent");
+            assert_eq!(disagreements.len(), 1);
+            assert_eq!(disagreements[0].key, "acme/s3.arrow");
+            assert_eq!(
+                disagreements[0].ledger.tenant, "widgets",
+                "the refusal names the routing the ledger recorded, and does not apply it"
+            );
+            assert_eq!(
+                disagreements[0].inferred.as_ref().unwrap().tenant,
+                "acme",
+                "and the routing the key implies, which stays in force for the plan"
+            );
+        }
+
+        /// ABSENT match: the ledger is readable and has no row for anything
+        /// listed. That is a mirror whose rows retention purged, and another
+        /// deployment's mirror, and it must read as "no evidence" rather than
+        /// as either a confirmation or a refusal. An EMPTY ledger is the same
+        /// verdict: a fully-drained mirror is the healthy deployment.
+        #[test]
+        fn a_reachable_ledger_with_no_matching_row_says_nothing() {
+            let listed = listing(&["acme/s1.arrow", "wal-mirror/s2.arrow"]);
+            let verdict = ledger_verdict(
+                &listed,
+                &rows(&[("other", "acme", "", "wal-mirror/acme/other.arrow")]),
+            );
+            assert_eq!(verdict, LedgerVerdict::Silent { listed: 2 });
+            assert!(
+                verdict.line().contains("Read the plan"),
+                "{}",
+                verdict.line()
+            );
+            assert_eq!(
+                ledger_verdict(&listed, &HashMap::new()),
+                LedgerVerdict::Silent { listed: 2 },
+                "an empty ledger is silent, not unavailable"
+            );
+        }
+
+        /// The DR shape a url STRING comparison would refuse: the mirror has
+        /// been copied into another bucket and another path, and `--from`
+        /// names the copy. The rows still carry the original
+        /// warehouse-relative url, the routing still agrees, and the root is
+        /// confirmed.
+        #[test]
+        fn a_relocated_mirror_copy_is_confirmed_because_only_the_tail_is_compared() {
+            let verdict = ledger_verdict(
+                &listing(&["acme/orders/s1.arrow"]),
+                &rows(&[("s1", "acme", "orders", "lake/m/acme/orders/s1.arrow")]),
+            );
+            let LedgerVerdict::Confirmed { prefix, .. } = &verdict else {
+                panic!("a copy of the mirror is a legitimate --from: {verdict:?}");
+            };
+            assert_eq!(
+                prefix, "lake/m",
+                "the prefix reported is the one the ledger recorded, multi-component and all"
+            );
+        }
+
+        /// Two listed segments registered under DIFFERENT mirror prefixes: the
+        /// routing agrees for both and the listing is still not one mirror
+        /// root. Refused, with both prefixes named — a `wal.mirror.prefix`
+        /// changed mid-life is the one false-refusal source, and an operator
+        /// can only recognise their own prefix change from the names.
+        #[test]
+        fn two_prefixes_in_one_listing_are_refused_even_though_the_routing_agrees() {
+            let verdict = ledger_verdict(
+                &listing(&["acme/s1.arrow", "acme/s2.arrow"]),
+                &rows(&[
+                    ("s1", "acme", "", "wal-mirror/acme/s1.arrow"),
+                    ("s2", "acme", "", "other-mirror/acme/s2.arrow"),
+                ]),
+            );
+            assert!(
+                matches!(verdict, LedgerVerdict::Contradicted { .. }),
+                "{verdict:?}"
+            );
+            let line = verdict.line();
+            assert!(line.contains("different mirror prefixes"), "{line}");
+            assert!(line.contains("wal-mirror"), "{line}");
+            assert!(line.contains("other-mirror"), "{line}");
+        }
+
+        /// An `_active/` object's key has no ledger row of its own —
+        /// `register` runs on the SEALED upload — so it is compared in its
+        /// sealed form. Getting that wrong would turn every active-mirror
+        /// object into a disagreement and refuse the one population #4973 can
+        /// already confirm.
+        #[test]
+        fn an_active_mirror_object_is_compared_in_its_sealed_form() {
+            let listed = listing(&["_active/acme/s1.arrow.partial"]);
+            assert_eq!(listed[0].id, "s1");
+            assert_eq!(listed[0].route.as_ref().unwrap().tenant, "acme");
+            let verdict = ledger_verdict(
+                &listed,
+                &rows(&[("s1", "acme", "", "wal-mirror/acme/s1.arrow")]),
+            );
+            let LedgerVerdict::Confirmed { prefix, .. } = &verdict else {
+                panic!("the sealed row vouches for its own active prefix: {verdict:?}");
+            };
+            assert_eq!(prefix, "wal-mirror");
+        }
+
+        /// The registered url does not end in the listed key at all: the row
+        /// and the object disagree about where the object is, which is neither
+        /// a prefix problem nor a routing one.
+        #[test]
+        fn a_row_whose_url_does_not_end_in_the_key_is_refused() {
+            let verdict = ledger_verdict(
+                &listing(&["acme/s1.arrow"]),
+                &rows(&[("s1", "acme", "", "wal-mirror/acme/renamed.arrow")]),
+            );
+            let LedgerVerdict::Contradicted { disagreements, .. } = &verdict else {
+                panic!("{verdict:?}");
+            };
+            assert_eq!(disagreements[0].conflict, LedgerConflict::UrlTail);
+        }
+
+        /// Precedence against the marker verdict, which is where Todd's
+        /// no-`--force` decision lands: `--catalog` may not overturn a marker
+        /// refusal, and the two sources disagreeing is itself a refusal.
+        #[tokio::test]
+        async fn the_catalog_never_overturns_a_marker_refusal() {
+            async fn plan_one_component_up() -> RecoveryPlan {
+                let op = memory_op();
+                for key in [
+                    "warehouse/wal-mirror/acme/s1.arrow",
+                    "warehouse/wal-mirror/_active/acme/s2.arrow.partial",
+                ] {
+                    op.write(key, sealed_body(2)).await.unwrap();
+                }
+                let tmp = tempfile::tempdir().unwrap();
+                plan_recovery(&op, "warehouse", &tmp.path().join("wal"))
+                    .await
+                    .unwrap()
+            }
+
+            // The marker refuses. A catalog that CONFIRMS the same listing is
+            // itself part of the contradiction: both lines, and still refused.
+            let mut plan = plan_one_component_up().await;
+            assert!(matches!(plan.verdict, RootVerdict::Contradicted { .. }));
+            plan.attach_ledger(LedgerVerdict::Confirmed {
+                matched: 1,
+                uncertified: 0,
+                sample_uncertified: None,
+                prefix: "wal-mirror".to_string(),
+                evidence: "wal-mirror/acme/s1.arrow".to_string(),
+            });
+            assert!(plan.refused(), "a marker refusal is final");
+            let line = plan.refusal_line().expect("refused");
+            assert!(line.contains("root CONTRADICTED:"), "{line}");
+            assert!(line.contains("root confirmed by the catalog"), "{line}");
+
+            // And the apply refuses it, creating nothing.
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("wal");
+            let op = memory_op();
+            let err = apply_plan(&op, plan, &root)
+                .await
+                .expect_err("both verdicts on screen, still refused");
+            assert!(format!("{err:#}").contains("root confirmed by the catalog"));
+            assert!(!root.exists(), "{} was created", root.display());
+
+            // A marker that CONFIRMS and a catalog that contradicts refuses
+            // too: both markers are conclusive where they appear and the
+            // ledger is exact, so a listing they disagree about is not one
+            // mirror root.
+            let op = memory_op();
+            op.write("m/_active/acme/s2.arrow.partial", sealed_body(2))
+                .await
+                .unwrap();
+            op.write("m/acme/s1.arrow", sealed_body(2)).await.unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let mut plan = plan_recovery(&op, "m", &tmp.path().join("wal"))
+                .await
+                .unwrap();
+            assert!(matches!(plan.verdict, RootVerdict::Confirmed { .. }));
+            assert!(!plan.refused(), "the marker alone permits this one");
+            plan.attach_ledger(LedgerVerdict::Contradicted {
+                disagreements: vec![LedgerDisagreement {
+                    key: "acme/s1.arrow".to_string(),
+                    inferred: None,
+                    ledger: LedgerRow {
+                        tenant: "widgets".to_string(),
+                        index_id: String::new(),
+                        segment_url: "wal-mirror/widgets/s1.arrow".to_string(),
+                    },
+                    conflict: LedgerConflict::Routing,
+                }],
+                agreed: 0,
+                uncertified: 0,
+                directory: None,
+            });
+            assert!(plan.refused());
+        }
+
+        /// An UNAVAILABLE ledger refuses rather than falling back, and is
+        /// never downgraded to [`LedgerVerdict::Silent`]: an operator who
+        /// asked for exact evidence and silently got a plan is the failure the
+        /// flag was split out to avoid.
+        #[test]
+        fn an_unavailable_ledger_refuses_and_is_not_downgraded() {
+            let v = LedgerVerdict::Unavailable {
+                reason: "no such file".to_string(),
+            };
+            assert!(v.refuses());
+            assert!(v.line().contains("could not be read"), "{}", v.line());
+            // Silent does not refuse: a drained mirror is the healthy case.
+            assert!(!LedgerVerdict::Silent { listed: 3 }.refuses());
+        }
+
+        /// The plan retains the join keys the check needs — the ones it
+        /// SKIPPED included, which is the whole of a deep mirror listed one
+        /// component too high — and routes each one exactly as the plan's own
+        /// groups do.
+        #[tokio::test]
+        async fn the_plan_retains_every_segment_shaped_key_with_its_routing() {
+            let op = memory_op();
+            for key in [
+                "m/acme/s1.arrow",
+                "m/acme/orders/s2.arrow",
+                "m/a/b/c/s3.arrow",
+                "m/_active/acme/s4.arrow.partial",
+            ] {
+                op.write(key, sealed_body(2)).await.unwrap();
+            }
+            // Not segments: no id, so no lookup and no evidence.
+            op.write("m/acme/orders/owner", bytes::Bytes::from_static(b"uuid"))
+                .await
+                .unwrap();
+            op.write("m/README.md", bytes::Bytes::from_static(b"hi"))
+                .await
+                .unwrap();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let plan = plan_recovery(&op, "m", &tmp.path().join("wal"))
+                .await
+                .unwrap();
+            let mut ids = plan.listed_ids();
+            ids.sort();
+            assert_eq!(ids, vec!["s1", "s2", "s3", "s4"]);
+            assert_eq!(
+                plan.skipped, 3,
+                "the deep key plus the two non-segments: `skipped` counts every key \
+                 `recovery_target` refuses, and only the deep one is a join key"
+            );
+            let skipped = plan
+                .listed
+                .iter()
+                .find(|l| l.id == "s3")
+                .expect("a skipped key is still a join key");
+            assert!(skipped.route.is_none());
+            // Every routed key agrees with the group the plan would write it
+            // to.
+            let mut from_listing: Vec<(String, String)> = plan
+                .listed
+                .iter()
+                .filter_map(|l| l.route.clone())
+                .map(|r| (r.tenant, r.index_id))
+                .collect();
+            from_listing.sort();
+            from_listing.dedup();
+            let mut from_groups: Vec<(String, String)> = plan
+                .groups
+                .iter()
+                .map(|g| (g.tenant.clone(), g.index.clone().unwrap_or_default()))
+                .collect();
+            from_groups.sort();
+            assert_eq!(from_listing, from_groups);
+            assert!(
+                plan.ledger().is_none(),
+                "no catalog was passed, so the plan carries no ledger verdict"
+            );
+            assert!(!plan.refused());
+        }
     }
 
     /// Legacy flat keys predate tenancy, so they mean the default tenant.
