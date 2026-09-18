@@ -15,8 +15,8 @@ named after a prefix. `wal_segments` can distinguish them, because the uploader
 recorded where each object belongs before the volume was lost.
 
 The evidence is `crates/siglake-storage/tests/wal_ledger_identity_prototype.rs`
-— 19 hermetic cases against a SQLite ledger, one of which drives the shipped
-`plan_recovery` over a real `file://` mirror.
+— 19 hermetic cases, each against a SQLite ledger it builds itself, one of
+them driving the shipped `plan_recovery` over a real `file://` mirror.
 
 ## What the ledger knows, and why it is exact
 
@@ -181,9 +181,9 @@ Resident is the lookup table's own string bytes plus its fixed per-entry cost,
 counted rather than sampled from RSS. The chunked form is the one to ship: the
 whole-ledger scan is one query whatever the listing, and holds the whole ledger
 to do it, and the ledger is the side a restore does not bound — a fleet's
-backlog is not limited by the objects one `--from` happens to list. At 428 B of
-resident per matched row, a million-row backlog is ~430 MB in the scan form and
-the size of the listing's intersection in the chunked one.
+backlog is not limited by the objects one `--from` happens to list. At 214 B of
+resident per row, a million-row backlog is ~214 MB in the scan form and the
+size of the listing's intersection in the chunked one.
 
 Against the plan's own cost the lookup disappears: the plan already pays one
 LIST plus one GET per candidate it would write (#5077). A mirror of 20,000
