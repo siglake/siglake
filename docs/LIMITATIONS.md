@@ -70,9 +70,13 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   uses neither. The readable seg1 prototype costs 5.59x the v1 sidecar's bytes
   on disk. The separate seg2 codec (#4988) closes that format cost with
   independently addressable Zstd blocks (16.7 MiB on the 7.34M-row fixture)
-  and a CRC per block's posting span, but production discovery still names
-  seg1 and no merge writer emits either format. A seg2 production writer and
-  discovery adoption remain part of #4377. Whether the
+  and a CRC per block's posting span. A streaming re-cluster can now build seg2
+  one Parquet row group at a time and register its Puffin statistics file in
+  the rewrite transaction (#4377), but only when
+  `SIGLAKE_SEGMENTED_INDEX_WRITES=1`; production discovery prefers seg2 while
+  preserving seg1 reads, but remains behind the separate
+  `SIGLAKE_SEGMENTED_INDEX_READS=1` opt-in. Both defaults stay off until AWS
+  qualification. Whether the
   serialized copy earns its share at all is a separate open question: since a
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no
