@@ -922,16 +922,42 @@ so read the counts and bytes from them rather than the milliseconds — their
 - **Is not** a writer benchmark. The construction numbers are sequential local
   fixture building, and the Parquet-decode half of them is an artifact of
   building sidecars after the fact.
-- **Carries one attribution defect.** A clipped `LIMIT` returns before the
-  partitions it cancelled have finished loading their indexes, so a few of the
-  `on` arm's decodes land in the next arm's counter window and its per-execution
-  millisecond columns swing by 3-10x between runs of the same shape (`keyword`:
-  12,566 / 6,222 / 6,031 / 10.5 / 16.1 ms). The `on` arm's cold column and its
-  summed decode counts are sound; its p50 for a clipped shape is an
-  overestimate of what one execution costs and an underestimate for whichever
-  arm ran next. Nothing in the `seg` arm's own numbers depends on it — that
-  fixture carries no v1 index to decode — and the disposition below turns on
-  ratios of 10x and more.
+- **The 2026-09-16 evidence carried one attribution defect; #5041 closes it.**
+  A clipped `LIMIT` returned before its cancelled partitions finished loading
+  indexes, so the original `on` samples included `keyword` at 12,566 / 6,222 /
+  6,031 / 10.5 / 16.1 ms, and a later counter window could include their
+  decodes. The original cold column, summed `on` decodes and disposition remain
+  the dated evidence above. The claim that `substring_scan,seg`'s eight decodes
+  came from the adjacent `policy` arm was too strong: that policy arm declines
+  v1 loads, and adjacency does not identify which earlier execution started
+  process-global work. Draining the segmented recorder per execution did not
+  isolate its window either.
+
+  `time_ab_shape` now retains the physical plan, stops the latency clock after
+  result collection, and requires every scan partition to settle before it
+  samples either the decode counters or the segmented recorder. The wait is
+  outside query latency; a 30-second timeout aborts the measurement before the
+  next arm starts.
+
+  A 2026-09-18 rerun used the same retained 14 x 7.34M-row fixture with both v1
+  caches at zero, so prior cache state could not make an execution warm. The
+  five clipped `on` samples were:
+
+  | shape | milliseconds |
+  |---|---|
+  | `keyword` | 8,272.0 / 10,365.1 / 10,835.9 / 10,759.2 / 10,568.6 |
+  | `keyword_last25` | 3,481.9 / 3,502.7 / 3,560.6 / 3,589.2 / 3,522.1 |
+  | `keyword_last5` | 3,696.4 / 3,471.1 / 3,382.0 / 3,805.2 / 3,444.9 |
+  | `substring_scan` | 11,684.4 / 11,127.6 / 11,219.8 / 11,222.4 / 11,291.6 |
+  | `rare_keyword` | 10,488.6 / 10,464.2 / 10,536.0 / 10,393.8 / 10,462.7 |
+
+  Each row's maximum is less than 1.4x its minimum. Every `off`, `policy`,
+  `seg` and `seg_policy` row reported `decodes=0`, including
+  `substring_scan,seg`. A companion rerun at the deployed 1 GiB / 256 MiB
+  budgets also gave every one of those arms zero decodes. Its two narrow-window
+  `on` shapes each retained one fast sample and reported one cache hit; that is
+  the mixed warm/cold state the cache is meant to create, separate from work
+  arriving after settlement.
 
 ## Disposition for #4377: proceed, with two revisions
 
