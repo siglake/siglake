@@ -1409,6 +1409,10 @@ fn unordered_text_context() -> SessionContext {
 
 async fn raw_column(ctx: &SessionContext, sql: &str) -> Vec<String> {
     let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    raw_column_from_batches(&batches)
+}
+
+fn raw_column_from_batches(batches: &[arrow_array::RecordBatch]) -> Vec<String> {
     let mut rows: Vec<String> = batches
         .iter()
         .flat_map(|batch| {
@@ -1795,6 +1799,129 @@ async fn clipped_text_limit_shapes_decline_the_whole_file_index() {
         decodes() - before_decodes,
         TEXT_SHAPE_FILES as u64,
         "the unclipped scan selects its rows from each planned file's index"
+    );
+}
+
+/// #5041: the measurement interleaves indexed and unindexed arms. A bare
+/// clipped LIMIT can return while cancelled partitions are still completing
+/// whole-file index loads, so the helper must settle its retained plan before
+/// it snapshots counters or lets the next arm start.
+#[tokio::test]
+async fn a_settled_clipped_index_query_cannot_charge_the_next_unindexed_arm() {
+    use chrono::{Duration, TimeZone, Utc};
+
+    const CANCELLED_FILES: usize = 4;
+    const ROWS_PER_FILE: usize = 10_000;
+    let _gate = PUFFIN_QUERY_GATE.lock().await;
+    let base = Utc.timestamp_opt(1_700_006_400, 0).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let indexed = sized_bench_fixture(
+        &tmp.path().join("indexed"),
+        true,
+        base,
+        CANCELLED_FILES,
+        ROWS_PER_FILE,
+        usize::MAX,
+    )
+    .await;
+    let unindexed = sized_bench_fixture(
+        &tmp.path().join("unindexed"),
+        false,
+        base,
+        CANCELLED_FILES,
+        ROWS_PER_FILE,
+        usize::MAX,
+    )
+    .await;
+    let unindexed_table = unindexed
+        .catalog()
+        .load_table(unindexed.events_table_ident())
+        .await
+        .unwrap();
+    for file in unindexed
+        .live_data_files(unindexed.events_table_ident())
+        .await
+        .unwrap()
+    {
+        assert!(
+            !puffin_indexes_file(&unindexed_table, &file)
+                && !footer_has_raw_index(&unindexed_table, &file).await,
+            "the second arm must carry no v1 index"
+        );
+    }
+
+    let indexed_ctx = unordered_text_context();
+    indexed
+        .register_with_datafusion(&indexed_ctx)
+        .await
+        .unwrap();
+    let unindexed_ctx = unordered_text_context();
+    unindexed
+        .register_with_datafusion(&unindexed_ctx)
+        .await
+        .unwrap();
+
+    // Warm one file only. The full-table LIMIT below can then return from that
+    // parsed index while the other partitions are still loading cold ones,
+    // making the cancellation window deterministic without a timing hook.
+    let warm_end = (base + Duration::days(1)).to_rfc3339();
+    let warm_sql = format!(
+        "SELECT timestamp, raw FROM events WHERE match_terms(raw, 'queen') \
+         AND timestamp < TIMESTAMP '{warm_end}'"
+    );
+    let before_warm = iceberg::arrow::inverted_index_decode_counts();
+    assert!(!raw_column(&indexed_ctx, &warm_sql).await.is_empty());
+    assert_eq!(
+        iceberg::arrow::inverted_index_decode_counts().0 - before_warm.0,
+        1,
+        "the setup must warm exactly one file's parsed index"
+    );
+
+    let shape = AbShape {
+        name: "cancelled_keyword",
+        sql: "SELECT timestamp, raw FROM events WHERE match_terms(raw, 'queen') LIMIT 1"
+            .to_string(),
+        term: "queen",
+        window_floor: 0,
+        corpus_matches: (CANCELLED_FILES * ROWS_PER_FILE / 50) as i64,
+        exact: false,
+        clip: Some(1),
+    };
+
+    let (_, indexed_rows, indexed_delta, _) =
+        time_ab_shape(&shape, "indexed", &indexed_ctx, true, None).await;
+    assert_eq!(indexed_rows.len(), 1, "the LIMIT must stop the root early");
+    assert!(
+        indexed_delta.0 > 0,
+        "the indexed arm must perform a whole-file decode"
+    );
+    assert_eq!(
+        indexed_delta,
+        ((CANCELLED_FILES - 1) as u64, 1),
+        "settlement must charge every cold load and the warm handout to this execution"
+    );
+
+    let after_settle = iceberg::arrow::inverted_index_decode_counts();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        iceberg::arrow::inverted_index_decode_counts(),
+        after_settle,
+        "an index decode landed after the indexed plan reported complete settlement"
+    );
+
+    let (_, unindexed_rows, unindexed_delta, _) =
+        time_ab_shape(&shape, "unindexed", &unindexed_ctx, true, None).await;
+    assert_eq!(unindexed_rows.len(), 1);
+    assert_eq!(
+        unindexed_delta,
+        (0, 0),
+        "an arm whose fixture carries no v1 index received leaked index work"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        iceberg::arrow::inverted_index_decode_counts(),
+        after_settle,
+        "the indexed arm changed the process counters after the unindexed arm finished"
     );
 }
 
@@ -3245,8 +3372,29 @@ async fn time_ab_shape(
     // Clear the recorder so what it holds after the query is this execution's.
     let _ = drain_segmented_cost(snapshotter);
     let started = std::time::Instant::now();
-    let found = raw_column(ctx, &shape.sql).await;
+    let dataframe = ctx.sql(&shape.sql).await.unwrap();
+    let plan = ctx
+        .state()
+        .create_physical_plan(dataframe.logical_plan())
+        .await
+        .unwrap();
+    let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+        .await
+        .unwrap();
+    let found = raw_column_from_batches(&batches);
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+
+    // Collection has dropped the root stream, but a clipped LIMIT can leave
+    // cancelled partition pumps finishing their index loads on other workers.
+    // Keep that wait outside the timed boundary, and refuse to open another
+    // arm's attribution window until every partition from this one is idle.
+    let settle =
+        siglake_storage::settle_scan_partitions(&plan, std::time::Duration::from_secs(30)).await;
+    assert!(
+        settle.complete,
+        "{}/{label}: scan partitions did not settle before the attribution deadline: {settle:?}",
+        shape.name
+    );
     let segmented = drain_segmented_cost(snapshotter);
     let after = iceberg::arrow::inverted_index_decode_counts();
     let name = shape.name;
