@@ -366,8 +366,12 @@ Parquet row group at a time when `SIGLAKE_SEGMENTED_INDEX_WRITES=1`: each
 finished output file contributes one uncompressed Puffin blob whose interior
 contains independently compressed dictionary and posting blocks, and the
 statistics registration is committed in the same transaction as the data-file
-rewrite. The ordinary post-commit v1 rebuild recognizes that registration and
-does not decode the output file again. Production discovery recognizes seg2;
+rewrite. On every transaction attempt the Puffin registration runs after the
+rewrite has derived its snapshot from the refreshed base, so the committed
+snapshot, statistics metadata and physical Puffin footer carry the same
+sequence number across stale bases and CAS retries. The ordinary post-commit v1
+rebuild recognizes that registration and does not decode the output file again.
+Production discovery recognizes seg2;
 the unreleased seg1 prototype remains decodable by its pinned codec test but is
 ignored by query selection and does not suppress a whole-file v1 rebuild. Files
 carrying neither v1 nor seg2 use the exact scan. Reads and writes are separate

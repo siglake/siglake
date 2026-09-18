@@ -2,8 +2,9 @@
 
 Status (2026-09-18): **seg2 streaming writer landed on its hermetic suite and
 its 14 x 7.34M-row build cost is measured; production read/write adoption
-remains off by default.** #5228 carries one known registration gap
-(see [Writer integration](#writer-integration-4377)).
+remains off by default.** The same-snapshot registration and concurrent-commit
+sequence boundaries are closed (#5228, #5260; see
+[Writer integration](#writer-integration-4377)).
 The query-path report now builds its segmented arm through that writer and
 retains the older seg1 tables as dated history (#5230). Production discovery
 recognizes seg2 only; seg1 remains a codec fixture.
@@ -361,10 +362,15 @@ footer it actually wrote, and hands one seg2 blob per `(data file, column)` to
 the rewrite. The rolling writer shares one sink across its output files;
 intermediate tier files receive no sink because no snapshot will contain them.
 
-Before committing, the rewrite reserves its snapshot id, writes one Puffin
-statistics file containing the completed blobs, and applies the data-file swap
-and statistics registration in one transaction. A refused transaction can
-leave an unreferenced object for orphan GC, but no table metadata names it. The
+Before committing, the rewrite reserves its snapshot id, then a transaction
+action writes one Puffin statistics file containing the completed blobs and
+applies its registration with the data-file swap. The action runs after the
+rewrite action on every commit attempt, so it stamps the snapshot id and
+sequence number from the refreshed base into the table statistics metadata and
+physical Puffin footer (#5260). A stale first base or a failed CAS writes
+another Puffin container from the already-built seg2 bytes; the Parquet output
+is neither decoded nor rewritten. A refused transaction can leave an
+unreferenced object for orphan GC, but no table metadata names it. The
 post-commit v1 rebuild treats v1 and seg2 registrations as equivalent coverage
 for `(data file, column)`, so it performs no full-file decode for the new output
 and a repeated rebuild is a no-op. Retired seg1 metadata does not suppress that
@@ -1202,17 +1208,19 @@ What remains, in order:
    the decoded posting span before slicing a term. Seg1 bytes are pinned by a
    fixture and remain readable. The 7.34M-row report writes 16.7 MiB and records
    fetched bytes for all six shapes.
-5. **#4377 / #5233 / #5234** — the code and local measurement are in: the
+5. ~~**#4377 / #5233 / #5234 / #5228 / #5260**~~ — done: the
    streaming Parquet writer builds one seg2 group per row group, registers all
    completed output blobs in the rewrite transaction, and leaves the
    post-commit v1 rebuild no file to decode. The hermetic suite covers rolling output, separate partition
    rewrites, failed transactions, repeated rebuild, exact answers and
    row-group-bounded parsed index state, and passes. Reads and writes remain
    separate opt-ins. The 14 x 7.34M build time and peak heap are recorded in
-   [Writer integration](#writer-integration-4377). **The remaining piece of
-   #4377's acceptance is the same-snapshot registration gap above (#5228).**
-   It does not block the format staying off by default, and it blocks any
-   proposal to turn it on.
+   [Writer integration](#writer-integration-4377). #5228 preserves the rewrite's
+   statistics entry when a later v1 rebuild finds an uncovered sibling. #5260
+   derives the Puffin sequence from the rewrite snapshot on each refreshed
+   transaction attempt; deterministic stale-base and failed-CAS regressions
+   compare the snapshot, table metadata and physical footer. Both defaults stay
+   off pending AWS qualification.
 6. ~~**#5040**~~ — done: the bare clipped limit is carried into the reader.
    Point terms are located across the selected groups before any posting span
    is fetched and are admitted when their summed df is no larger than the

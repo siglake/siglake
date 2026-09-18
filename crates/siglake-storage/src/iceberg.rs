@@ -52,8 +52,8 @@ use iceberg::writer::file_writer::{
 };
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{
-    Catalog, CatalogBuilder, ErrorKind as IcebergErrorKind, NamespaceIdent, TableCreation,
-    TableIdent, TableRequirement, TableUpdate,
+    Catalog, CatalogBuilder, Error as IcebergError, ErrorKind as IcebergErrorKind, NamespaceIdent,
+    TableCreation, TableIdent, TableRequirement, TableUpdate,
 };
 use iceberg_catalog_sql::{SqlBindStyle, SqlCatalogBuilder};
 use iceberg_storage_opendal::{CustomAwsCredentialLoader, OpenDalStorageFactory};
@@ -9253,7 +9253,7 @@ async fn write_segmented_puffin_sidecar(
     table: &Table,
     snapshot_id: i64,
     sequence_number: i64,
-    blobs: Vec<SegmentedIndexBlob>,
+    blobs: &[SegmentedIndexBlob],
 ) -> Result<StatisticsFile> {
     let statistics_path = next_puffin_sidecar_path(table)?;
     let output_file = table
@@ -9288,7 +9288,7 @@ async fn write_segmented_puffin_sidecar(
                     .fields(vec![field_id])
                     .snapshot_id(snapshot_id)
                     .sequence_number(sequence_number)
-                    .data(blob.bytes)
+                    .data(blob.bytes.clone())
                     .properties(properties.clone())
                     .build(),
                 PuffinCompressionCodec::None,
@@ -9318,6 +9318,57 @@ async fn write_segmented_puffin_sidecar(
         key_metadata: None,
         blob_metadata: statistics_blob_metadata,
     })
+}
+
+/// Registers a rewrite's already-built seg2 blobs against the snapshot the
+/// rewrite action produced on this transaction attempt.
+///
+/// Transaction retries re-apply actions after refreshing their base. Writing
+/// the Puffin file here, after `RewriteFilesAction`, gives both its physical
+/// footer and its table metadata the refreshed snapshot's sequence number.
+/// The immutable Parquet output and seg2 bytes are reused; a Puffin file from a
+/// failed CAS attempt remains unreferenced and is reclaimed as an orphan.
+struct PublishSegmentedStatisticsAction {
+    snapshot_id: i64,
+    blobs: Vec<SegmentedIndexBlob>,
+}
+
+#[async_trait::async_trait]
+impl TransactionAction for PublishSegmentedStatisticsAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        let snapshot = table.metadata().current_snapshot().ok_or_else(|| {
+            IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "segmented statistics action found no rewrite snapshot",
+            )
+        })?;
+        if snapshot.snapshot_id() != self.snapshot_id {
+            return Err(IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "segmented statistics action did not follow its rewrite snapshot",
+            )
+            .with_context("expected_snapshot_id", self.snapshot_id.to_string())
+            .with_context("found_snapshot_id", snapshot.snapshot_id().to_string()));
+        }
+        let statistics = write_segmented_puffin_sidecar(
+            table,
+            snapshot.snapshot_id(),
+            snapshot.sequence_number(),
+            &self.blobs,
+        )
+        .await
+        .map_err(|err| {
+            IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "failed to write segmented index sidecar",
+            )
+            .with_source(err)
+        })?;
+        Ok(ActionCommit::new(
+            vec![TableUpdate::SetStatistics { statistics }],
+            vec![],
+        ))
+    }
 }
 
 async fn write_puffin_sidecar(
@@ -17916,26 +17967,15 @@ impl IcebergContext {
             }
         };
 
-        // #4377: publish the segmented sidecars WITH the rewrite. The Puffin
-        // object is written now, under a snapshot id reserved for the commit
-        // below, and `set_statistics` rides the same transaction — so the
-        // snapshot that first exposes these data files already carries their
-        // index, and a commit that fails leaves an unreferenced object rather
-        // than a discoverable partial index. Nothing here can be skipped and
-        // retried later, which is the post-commit rebuild this replaces.
+        // #4377: publish the segmented sidecars WITH the rewrite. Reserve the
+        // snapshot id now, but write the Puffin object from the transaction
+        // action after the rewrite has been re-applied to the attempt's current
+        // base. That keeps the physical footer's sequence aligned across a
+        // stale first base and every CAS retry (#5260). The immutable Parquet
+        // output and completed seg2 bytes are reused on every attempt.
         let segmented_blobs = segmented_sink.map(|sink| sink.take()).unwrap_or_default();
-        let segmented_statistics = if segmented_blobs.is_empty() {
-            None
-        } else {
-            let reserved = iceberg::transaction::reserve_snapshot_id(&table);
-            let sequence_number = table.metadata().next_sequence_number();
-            Some((
-                reserved,
-                write_segmented_puffin_sidecar(&table, reserved, sequence_number, segmented_blobs)
-                    .await
-                    .context("write segmented index sidecar")?,
-            ))
-        };
+        let segmented_snapshot_id = (!segmented_blobs.is_empty())
+            .then(|| iceberg::transaction::reserve_snapshot_id(&table));
 
         let tx = Transaction::new(&table);
         let mut action = tx
@@ -17953,20 +17993,20 @@ impl IcebergContext {
                 REWRITE_COMMIT_PROP.to_string(),
                 "recluster".to_string(),
             )]));
-        if let Some((reserved, _)) = segmented_statistics.as_ref() {
-            action = action.with_snapshot_id(*reserved);
+        if let Some(reserved) = segmented_snapshot_id {
+            action = action.with_snapshot_id(reserved);
         }
         // B.1.1: ALL per-snapshot aggregates now live in the fixed-path side object,
         // which persists across the recluster (rows unchanged → still valid against
         // total-records). No summary carry-forward needed anymore.
         let tx = action.apply(tx).context("RewriteFilesAction::apply")?;
-        let tx = match segmented_statistics {
-            Some((_, statistics)) => {
-                let register = tx.update_statistics().set_statistics(statistics);
-                register
-                    .apply(tx)
-                    .context("UpdateStatisticsAction::apply")?
+        let tx = match segmented_snapshot_id {
+            Some(snapshot_id) => PublishSegmentedStatisticsAction {
+                snapshot_id,
+                blobs: segmented_blobs,
             }
+            .apply(tx)
+            .context("PublishSegmentedStatisticsAction::apply")?,
             None => tx,
         };
         {
@@ -20124,6 +20164,16 @@ impl IcebergContext {
     /// Borrow the underlying catalog.
     pub fn catalog(&self) -> &Arc<dyn Catalog> {
         &self.catalog
+    }
+
+    /// Replace the catalog with a delegating test catalog.
+    ///
+    /// This is public only so integration regressions can choose catalog-CAS
+    /// interleavings with [`test_catalog::TestCatalog`].
+    #[doc(hidden)]
+    pub fn with_catalog_for_test(mut self, catalog: Arc<dyn Catalog>) -> Self {
+        self.catalog = catalog;
+        self
     }
 
     /// Namespace for all siglake tables.
@@ -29562,8 +29612,8 @@ pub struct GroupCountRebuiltColumn {
     pub over_cap: Option<usize>,
 }
 
-#[cfg(test)]
-pub(crate) mod test_catalog {
+#[doc(hidden)]
+pub mod test_catalog {
     //! One delegating [`Catalog`] for the regressions that need a chosen
     //! interleaving instead of a raced one.
     //!
@@ -29606,7 +29656,7 @@ pub(crate) mod test_catalog {
     /// Pass-through catalog with per-method hooks. Build with
     /// [`TestCatalog::new`], attach hooks, and finish with
     /// [`TestCatalog::shared`] — `Catalog` is only ever held behind an `Arc`.
-    pub(crate) struct TestCatalog {
+    pub struct TestCatalog {
         inner: Arc<dyn Catalog>,
         after_load_table: Option<Hook>,
         gate: Mutex<Option<Gate>>,
@@ -29631,7 +29681,7 @@ pub(crate) mod test_catalog {
     }
 
     impl TestCatalog {
-        pub(crate) fn new(inner: Arc<dyn Catalog>) -> Self {
+        pub fn new(inner: Arc<dyn Catalog>) -> Self {
             Self {
                 inner,
                 after_load_table: None,
@@ -29643,7 +29693,7 @@ pub(crate) mod test_catalog {
 
         /// Await `hook` after *every* `load_table`, i.e. once the caller's
         /// metadata is in hand but before it has it.
-        pub(crate) fn after_load_table<F, Fut>(mut self, hook: F) -> Self
+        pub fn after_load_table<F, Fut>(mut self, hook: F) -> Self
         where
             F: Fn() -> Fut + Send + Sync + 'static,
             Fut: Future<Output = ()> + Send + 'static,
@@ -29656,7 +29706,7 @@ pub(crate) mod test_catalog {
         /// the CAS window of one attempt: the conditional UPDATE that follows
         /// runs against whatever the hook left behind. [`Self::fired`] reports
         /// whether it ran.
-        pub(crate) fn before_first_update_with_base<F, Fut>(mut self, hook: F) -> Self
+        pub fn before_first_update_with_base<F, Fut>(mut self, hook: F) -> Self
         where
             F: Fn() -> Fut + Send + Sync + 'static,
             Fut: Future<Output = ()> + Send + 'static,
@@ -29665,7 +29715,7 @@ pub(crate) mod test_catalog {
             self
         }
 
-        pub(crate) fn shared(self) -> Arc<Self> {
+        pub fn shared(self) -> Arc<Self> {
             Arc::new(self)
         }
 
@@ -29673,7 +29723,7 @@ pub(crate) mod test_catalog {
         /// next `load_table` has its (by then possibly stale) metadata in hand,
         /// and sending on `release` lets it return. Exactly one load is gated
         /// per arming, so the test's own calls run unimpeded.
-        pub(crate) fn arm(
+        pub fn arm(
             &self,
         ) -> (
             tokio::sync::oneshot::Receiver<()>,
@@ -29686,7 +29736,7 @@ pub(crate) mod test_catalog {
         }
 
         /// Whether the [`Self::before_first_update_with_base`] hook has run.
-        pub(crate) fn fired(&self) -> bool {
+        pub fn fired(&self) -> bool {
             self.fired.load(Ordering::SeqCst)
         }
     }
@@ -29791,6 +29841,7 @@ pub(crate) mod test_catalog {
     /// re-pointed root cannot pass by scanning nothing, and every hand-written
     /// `Catalog` impl site as `(path relative to the root, 1-based line, byte
     /// offset)`.
+    #[cfg(test)]
     struct CatalogImplScan {
         scanned: usize,
         sites: Vec<(String, usize, usize)>,
@@ -29799,6 +29850,7 @@ pub(crate) mod test_catalog {
     /// Every hand-written pass-through `Catalog` impl under `root`, found by
     /// reading the sources rather than by listing modules, so a file added
     /// later is inside the guard without editing the tests below.
+    #[cfg(test)]
     fn scan_for_catalog_impls(root: &std::path::Path) -> CatalogImplScan {
         /// Every `.rs` file under `dir`, recursively.
         fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -29897,10 +29949,8 @@ pub(crate) mod test_catalog {
 
     /// #2588 — the same fence around this crate's integration tests, which the
     /// `src/` walk above never reached. An integration test cannot call
-    /// [`TestCatalog`] (it is `pub(crate)` behind `cfg(test)`), so the only way
-    /// for one to choose an interleaving is a fresh copy of the pass-through —
-    /// the shape #2569 collapsed. There is no consumer waiting on a public
-    /// test-support surface, so the guard says where the test belongs instead.
+    /// [`TestCatalog`], so the only reason to add a fresh copy of the
+    /// pass-through would be missing this shared support.
     #[test]
     fn no_hand_written_catalog_impl_under_integration_tests() {
         let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"));
@@ -29918,12 +29968,7 @@ pub(crate) mod test_catalog {
         assert!(
             sites.is_empty(),
             "hand-written pass-through `Catalog` impl under tests/: {sites:?}. The decorator for \
-             a chosen interleaving is `iceberg::test_catalog::TestCatalog`, but it is \
-             `pub(crate)` behind `#[cfg(test)]`, so an integration test cannot reach it and \
-             there is nothing here to import. Put the interleaving test in this crate's own \
-             unit tests, where `TestCatalog` is in scope; if it truly needs a separate test \
-             binary, lift the shared test-only support out from behind `cfg(test)` first and \
-             widen this guard with it."
+             a chosen interleaving is `iceberg::test_catalog::TestCatalog`; import it instead."
         );
     }
 
