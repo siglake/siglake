@@ -76,7 +76,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `SIGLAKE_SEGMENTED_INDEX_WRITES=1`; production discovery prefers seg2 while
   preserving seg1 reads, but remains behind the separate
   `SIGLAKE_SEGMENTED_INDEX_READS=1` opt-in. Both defaults stay off until AWS
-  qualification. Whether the
+  qualification, and two pieces of the writer's acceptance are still open: its
+  build time and peak heap at 14 x 7.34M rows are unmeasured (#5234), and with
+  the write opt-in and `SIGLAKE_INDEX_REBUILD=1` both on, a file whose sidecar
+  the writer refuses makes the post-commit v1 rebuild register a second
+  statistics file against the rewrite's own snapshot, which replaces the entry
+  and silently drops that rewrite's other seg2 blobs — queries fall back to a
+  scan and answer correctly, and #5228 carries the fix
+  ([`DESIGN_segmented_inverted_index.md`](DESIGN_segmented_inverted_index.md),
+  "The gap beside the refusals"). Whether the
   serialized copy earns its share at all is a separate open question: since a
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no

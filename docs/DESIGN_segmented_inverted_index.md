@@ -1,7 +1,10 @@
 # Design — row-group-addressable inverted-index sidecars (#4376 prototype)
 
-Status (2026-09-18): **seg2 streaming writer complete; production read/write
-adoption remains off by default.**
+Status (2026-09-18): **seg2 streaming writer landed on its hermetic suite; its
+build time and peak heap are not yet measured, and production read/write
+adoption remains off by default.** The 14 x 7.34M report the writer's
+acceptance asks for is #5234, and #5228 carries one known registration gap
+(see [Writer integration](#writer-integration-4377)).
 The codec and its reader are `siglake_index::segmented`, and the reader
 integration (#4561) is behind `SIGLAKE_SEGMENTED_INDEX_READS` — see
 [Reader integration](#reader-integration-4561). A streaming re-cluster emits
@@ -367,7 +370,44 @@ new output and a repeated rebuild is a no-op.
 `crates/siglake-storage/tests/segmented_index_writer.rs` holds the single-file,
 rolled-output, two-partition, failed-transaction, idempotence, exact-query and
 row-group-memory cases. Reads prefer seg2 and retain seg1 discovery; the knobs
-for writing and reading are separate and both remain off by default.
+for writing and reading are separate and both remain off by default. What the
+suite does not hold is the writer's build time and peak heap at the acceptance's
+14 x 7.34M rows: `report_segmented_writer_build_cost` in that file is the
+`#[ignore]`d harness for it, and #5234 runs it.
+
+#### The gap beside the refusals
+
+`publish_segmented_sidecars` publishes nothing for a file whose finished
+sidecar disagrees with the footer it wrote, counting the reason on
+`siglake_iceberg_segmented_index_writes_total{outcome="refused"}`:
+
+| reason | what disagreed |
+|---|---|
+| `column` | a row group whose text column could not be indexed, so the sidecar has no group for it |
+| `file_rows` | the sidecar's total rows are not the data file's |
+| `row_domain` | the sidecar's per-group rows are not the footer's row groups |
+
+Silence is safe on its own — an unregistered file is read the way an unindexed
+one is. It is not safe for the file's *siblings*, and that is a known gap,
+not a decided behaviour:
+
+A rewrite registers every output blob in **one** `StatisticsFile` under the
+snapshot id it reserved, and `set_statistics` inserts by snapshot id
+(`third_party/iceberg/src/spec/table_metadata_builder.rs:589`), so a second
+statistics file written against that snapshot replaces the first rather than
+merging into it. With `SIGLAKE_INDEX_REBUILD=1` as well, a refused file is
+uncovered, so the post-commit `rebuild_inverted_indexes_for_files` over the
+rewrite's output builds a v1 blob for it and registers it under the same
+snapshot — dropping every seg2 blob the rewrite just published. Their Puffin
+path leaves `reachable_files` and orphan GC deletes the object; the query path
+falls back to a scan and answers correctly, so nothing reports the loss.
+
+Both opt-ins and a refusal are needed to reach it. The disposition is
+refuse-and-count rather than merge, and #5228 implements it;
+`a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs` in the suite
+above is the `#[ignore]`d reproduction, reaching the same second registration
+with a live uncovered file because a refusal has no seam to drive it from a
+test.
 
 ### What per-section compression would recover
 
@@ -1045,12 +1085,17 @@ What remains, in order:
    the decoded posting span before slicing a term. Seg1 bytes are pinned by a
    fixture and remain readable. The 7.34M-row report writes 16.7 MiB and records
    fetched bytes for all six shapes.
-5. ~~**#4377**~~ — done: the streaming Parquet writer builds one seg2 group per
-   row group, registers all completed output blobs in the rewrite transaction,
-   and leaves the post-commit v1 rebuild no file to decode. The acceptance
-   suite covers rolling output, separate partition rewrites, failed
-   transactions, repeated rebuild, exact answers and row-group-bounded parsed
-   index state. Reads and writes remain separate opt-ins.
+5. **#4377 / #5233** — the code is in: the streaming Parquet writer builds one
+   seg2 group per row group, registers all completed output blobs in the
+   rewrite transaction, and leaves the post-commit v1 rebuild no file to
+   decode. The hermetic suite covers rolling output, separate partition
+   rewrites, failed transactions, repeated rebuild, exact answers and
+   row-group-bounded parsed index state, and passes. Reads and writes remain
+   separate opt-ins. **Two pieces of #4377's acceptance are still open**: the
+   14 x 7.34M build time and peak heap (#5234, the `#[ignore]`d
+   `report_segmented_writer_build_cost`), and the same-snapshot registration
+   gap above (#5228). Neither blocks the format staying off by default, and
+   both block any proposal to turn it on.
 6. **An open question for #4561**: the substring sweep reads the whole
    dictionary, and `keyword`-class terms with millions of postings read megabytes
    of posting bytes. Both are regimes where partial reads buy little, and #4375's

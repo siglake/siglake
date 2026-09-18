@@ -665,6 +665,85 @@ fn a_failed_rewrite_commit_leaves_no_discoverable_index() {
     });
 }
 
+/// A v1 registration against the snapshot a seg2 rewrite committed must leave
+/// that rewrite's sidecars discoverable. It does not: this test fails, and
+/// #5228 carries the fix.
+///
+/// `set_statistics` inserts by snapshot id
+/// (`third_party/iceberg/src/spec/table_metadata_builder.rs:589`), so the
+/// second `StatisticsFile` written against a snapshot REPLACES the first
+/// rather than merging into it. The rewrite registers every output blob in one
+/// entry under its reserved id S; anything that registers again under S drops
+/// them all, their Puffin path leaves `reachable_files` and orphan GC deletes
+/// the object.
+///
+/// In production the second registration is the mixed rewrite: with both
+/// `SIGLAKE_SEGMENTED_INDEX_WRITES=1` and `SIGLAKE_INDEX_REBUILD=1`, one output
+/// file whose sidecar `publish_segmented_sidecars` refuses
+/// (`refused{column|file_rows|row_domain}`) is uncovered, so the post-commit
+/// `rebuild_inverted_indexes_for_files` over the rewrite's output builds a v1
+/// blob for it and registers it under S — silently losing the *other* output
+/// files' indexes. A refusal is an internal invariant break with no seam to
+/// drive it from a test, so this reaches the same call with an uncovered file
+/// the rewrite never saw: appends leave no index here, so the day the rewrite
+/// did not touch is live, uncovered, and rebuilt against S.
+#[test]
+#[ignore = "known gap, #5228: a same-snapshot v1 registration replaces the rewrite's seg2 entry"]
+fn a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs() {
+    serialized(|_snapshotter| async move {
+        let tmp = tempfile::tempdir().unwrap();
+        const ROWS_HERE: usize = 150_000;
+
+        let ice = IcebergContext::open(&tmp.path().join("mixed"))
+            .await
+            .unwrap()
+            .with_inverted_index(true)
+            .with_table_cache_ttl(std::time::Duration::ZERO)
+            .with_tuning(IcebergTuning {
+                segmented_index_writes: Some(true),
+                index_rebuild: Some(true),
+                // No append-time index, so the day the rewrite skips stays a
+                // live file the rebuild has real work to do for.
+                index_at_flush: Some(false),
+                target_row_group_bytes: Some(1),
+                ..Default::default()
+            });
+        let ident = ice.events_table_ident().clone();
+
+        let unindexed = append_rows(&ice, 0..ROWS_HERE, ROWS_HERE, RARE_EVERY).await;
+        let fresh = append_rows(&ice, ROWS_HERE..2 * ROWS_HERE, ROWS_HERE, RARE_EVERY).await;
+        rewrite_fresh(&ice, fresh).await;
+
+        let table = ice.catalog().load_table(&ident).await.unwrap();
+        let registered = registered_seg2_blobs(&table);
+        assert_eq!(
+            registered.len(),
+            1,
+            "the rewrite registered its own sidecar: {registered:?}"
+        );
+
+        // The second registration against the same snapshot.
+        assert_eq!(
+            ice.rebuild_inverted_indexes_for_files(&ident, &unindexed)
+                .await
+                .unwrap(),
+            1,
+            "the uncovered day is rebuilt"
+        );
+
+        let table = ice.catalog().load_table(&ident).await.unwrap();
+        assert_eq!(
+            registered_seg2_blobs(&table),
+            registered,
+            "a v1 registration under the snapshot the rewrite committed must not drop that \
+             rewrite's seg2 blobs"
+        );
+        for (statistics_path, data_file, column) in &registered {
+            assert_sidecar_describes_file(&table, statistics_path, data_file, column).await;
+        }
+    });
+}
+
 /// The post-commit full-file decode does not run for a column the rewrite
 /// already indexed, and asking again rebuilds nothing.
 ///
