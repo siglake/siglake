@@ -77,12 +77,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   preserving seg1 reads, but remains behind the separate
   `SIGLAKE_SEGMENTED_INDEX_READS=1` opt-in. Both defaults stay off until AWS
   qualification, and two pieces of the writer's acceptance are still open: its
-  build time and peak heap at 14 x 7.34M rows are unmeasured (#5234), and with
-  the write opt-in and `SIGLAKE_INDEX_REBUILD=1` both on, a file whose sidecar
-  the writer refuses makes the post-commit v1 rebuild register a second
-  statistics file against the rewrite's own snapshot, which replaces the entry
-  and silently drops that rewrite's other seg2 blobs — queries fall back to a
-  scan and answer correctly, and #5228 carries the fix
+  build time and peak heap at 14 x 7.34M rows are unmeasured (#5234). With the
+  write opt-in and `SIGLAKE_INDEX_REBUILD=1` both on, a file whose sidecar the
+  writer refuses stays unindexed until a later rewrite or a CLI rebuild at a
+  later snapshot: Iceberg permits one statistics file per snapshot, so Siglake
+  preserves the rewrite's registered seg2 blobs and counts the deferred v1
+  registration instead of replacing them
   ([`DESIGN_segmented_inverted_index.md`](DESIGN_segmented_inverted_index.md),
   "The gap beside the refusals"). Whether the
   serialized copy earns its share at all is a separate open question: since a

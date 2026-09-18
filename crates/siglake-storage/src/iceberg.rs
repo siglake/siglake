@@ -14330,9 +14330,32 @@ impl IcebergContext {
         table: &Table,
         blobs: Vec<PuffinSidecarBlobSpec>,
         snapshot_id: i64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if blobs.is_empty() {
-            return Ok(());
+            return Ok(false);
+        }
+        if table
+            .metadata()
+            .statistics_for_snapshot(snapshot_id)
+            .is_some()
+        {
+            let deferred_files: std::collections::BTreeSet<&str> = blobs
+                .iter()
+                .map(|blob| blob.data_file_path.as_str())
+                .collect();
+            metrics::counter!(
+                "siglake_index_registration_deferred_total",
+                "reason" => "snapshot_has_statistics"
+            )
+            .increment(1);
+            tracing::warn!(
+                table = %table.identifier(),
+                snapshot_id,
+                files = deferred_files.len(),
+                deferred_files = ?deferred_files,
+                "deferred Puffin index registration because the snapshot already has a statistics file"
+            );
+            return Ok(false);
         }
         let snapshot = table
             .metadata()
@@ -14351,7 +14374,7 @@ impl IcebergContext {
         tx.commit(self.catalog.as_ref())
             .await
             .context("update_statistics Transaction::commit")?;
-        Ok(())
+        Ok(true)
     }
 
     pub async fn rebuild_inverted_indexes_for_files(
@@ -14403,8 +14426,12 @@ impl IcebergContext {
         if blobs.is_empty() {
             return Ok(0);
         }
-        self.register_puffin_sidecar_for_snapshot(&table, blobs, snapshot_id)
-            .await?;
+        if !self
+            .register_puffin_sidecar_for_snapshot(&table, blobs, snapshot_id)
+            .await?
+        {
+            return Ok(0);
+        }
         let tenant = tenant_metric_label(self.namespace());
         let table_name = table_ident.name().to_string();
         metrics::counter!(

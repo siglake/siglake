@@ -62,6 +62,13 @@ outputs use the normal writer: an index at or below
 larger one still requires Puffin registration. Before decoding a file, the
 rebuild checks each configured column against registered Puffin blobs and the
 file footer. A second pass therefore registers no duplicate statistics file.
+Iceberg permits only one statistics file per snapshot. If a rebuild finds
+missing coverage on a snapshot that already has one, Siglake preserves the
+registered file and defers the new blobs; it logs their data-file paths and
+increments
+`siglake_index_registration_deferred_total{reason="snapshot_has_statistics"}`.
+The uncovered files remain scan-readable and can gain an index from a later
+rewrite or a CLI rebuild after a later snapshot.
 
 #### The local on/off measurement (2026-09-14)
 

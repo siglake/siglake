@@ -19,12 +19,18 @@
 //! run one at a time.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use arrow_array::builder::BooleanBuilder;
 use arrow_array::Array;
 use chrono::{DateTime, TimeZone, Utc};
+use datafusion::common::ScalarValue;
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
 use datafusion::prelude::SessionContext;
 use iceberg::spec::DataFile;
 use iceberg::table::Table;
@@ -435,17 +441,107 @@ async fn count(ctx: &SessionContext, sql: &str) -> i64 {
         .value(0)
 }
 
+/// The query server's `match_terms` UDF cannot be a storage dependency. This
+/// test stub gives DataFusion the same function name and literal shape so the
+/// storage reader can extract and push the predicate into its index path.
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct MatchTermsUdf {
+    signature: Signature,
+}
+
+impl MatchTermsUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::exact(
+                vec![
+                    datafusion::arrow::datatypes::DataType::Utf8,
+                    datafusion::arrow::datatypes::DataType::Utf8,
+                ],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl ScalarUDFImpl for MatchTermsUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "match_terms"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(
+        &self,
+        _arg_types: &[datafusion::arrow::datatypes::DataType],
+    ) -> datafusion::error::Result<datafusion::arrow::datatypes::DataType> {
+        Ok(datafusion::arrow::datatypes::DataType::Boolean)
+    }
+
+    fn invoke_with_args(
+        &self,
+        args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let cells = match &args.args[0] {
+            ColumnarValue::Array(array) => array.clone(),
+            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(rows)?,
+        };
+        let cells = cells
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution("lhs must be Utf8".into())
+            })?
+            .clone();
+        let query = match &args.args[1] {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(query)))
+            | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(query)))
+            | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(query))) => query.clone(),
+            _ => {
+                return Err(datafusion::error::DataFusionError::Execution(
+                    "query must be a Utf8 literal".into(),
+                ));
+            }
+        };
+        let tokens: Vec<String> = query
+            .split_whitespace()
+            .map(|token| token.to_ascii_lowercase())
+            .collect();
+        let mut builder = BooleanBuilder::with_capacity(rows);
+        for row in 0..rows {
+            if cells.is_null(row) {
+                builder.append_value(false);
+                continue;
+            }
+            let haystack = cells.value(row).to_ascii_lowercase();
+            builder.append_value(tokens.iter().all(|token| haystack.contains(token)));
+        }
+        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
+}
+
 async fn text_counts(ice: &IcebergContext) -> (i64, i64, i64) {
     let ctx = SessionContext::new();
+    ctx.register_udf(ScalarUDF::from(MatchTermsUdf::new()));
     ice.register_with_datafusion(&ctx).await.unwrap();
     (
         count(&ctx, "SELECT count(*) FROM events").await,
         count(
             &ctx,
-            "SELECT count(*) FROM events WHERE raw LIKE '%rareneedle%'",
+            "SELECT count(*) FROM events WHERE match_terms(raw, 'rareneedle')",
         )
         .await,
-        count(&ctx, "SELECT count(*) FROM events WHERE raw LIKE '%queen%'").await,
+        count(
+            &ctx,
+            "SELECT count(*) FROM events WHERE match_terms(raw, 'queen')",
+        )
+        .await,
     )
 }
 
@@ -677,22 +773,20 @@ fn a_failed_rewrite_commit_leaves_no_discoverable_index() {
 /// them all, their Puffin path leaves `reachable_files` and orphan GC deletes
 /// the object.
 ///
-/// In production the second registration is the mixed rewrite: with both
+/// In production the second registration can follow a mixed rewrite: with both
 /// `SIGLAKE_SEGMENTED_INDEX_WRITES=1` and `SIGLAKE_INDEX_REBUILD=1`, one output
 /// file whose sidecar `publish_segmented_sidecars` refuses
 /// (`refused{column|file_rows|row_domain}`) is uncovered, so the post-commit
 /// `rebuild_inverted_indexes_for_files` over the rewrite's output builds a v1
 /// blob for it and registers it under S — silently losing the *other* output
-/// files' indexes. A refusal is an internal invariant break with no seam to
-/// drive it from a test, so this reaches the same call with an uncovered file
-/// the rewrite never saw: appends leave no index here, so the day the rewrite
-/// did not touch is live, uncovered, and rebuilt against S.
+/// files' indexes. This drives the registration boundary with the same mixed
+/// coverage: appends leave one day unindexed, the rewrite publishes seg2 for
+/// the other, and the v1 rebuild tries to register the uncovered day against S.
 #[test]
-#[ignore = "known gap, #5228: a same-snapshot v1 registration replaces the rewrite's seg2 entry"]
 fn a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs() {
-    serialized(|_snapshotter| async move {
+    serialized(|snapshotter| async move {
         let tmp = tempfile::tempdir().unwrap();
-        const ROWS_HERE: usize = 150_000;
+        const ROWS_HERE: usize = 300_000;
 
         let ice = IcebergContext::open(&tmp.path().join("mixed"))
             .await
@@ -706,6 +800,7 @@ fn a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs() {
                 // live file the rebuild has real work to do for.
                 index_at_flush: Some(false),
                 target_row_group_bytes: Some(1),
+                merge_target_file_bytes: Some(1 << 20),
                 ..Default::default()
             });
         let ident = ice.events_table_ident().clone();
@@ -716,10 +811,9 @@ fn a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs() {
 
         let table = ice.catalog().load_table(&ident).await.unwrap();
         let registered = registered_seg2_blobs(&table);
-        assert_eq!(
-            registered.len(),
-            1,
-            "the rewrite registered its own sidecar: {registered:?}"
+        assert!(
+            registered.len() > 1,
+            "the rolled rewrite must register several sidecars: {registered:?}"
         );
 
         // The second registration against the same snapshot.
@@ -727,8 +821,8 @@ fn a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs() {
             ice.rebuild_inverted_indexes_for_files(&ident, &unindexed)
                 .await
                 .unwrap(),
-            1,
-            "the uncovered day is rebuilt"
+            0,
+            "the uncovered day is deferred rather than replacing the snapshot's statistics"
         );
 
         let table = ice.catalog().load_table(&ident).await.unwrap();
@@ -741,6 +835,40 @@ fn a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs() {
         for (statistics_path, data_file, column) in &registered {
             assert_sidecar_describes_file(&table, statistics_path, data_file, column).await;
         }
+        let reachable = ice.reachable_files(&ident).await.unwrap();
+        for (statistics_path, _, _) in &registered {
+            assert!(
+                reachable.contains(statistics_path),
+                "the retained seg2 statistics file must remain protected from orphan GC: \
+                 {statistics_path}"
+            );
+        }
+        assert_eq!(
+            text_counts(&ice).await,
+            (2 * ROWS_HERE as i64, 60, 12_000),
+            "the retained seg2 reader must answer exact match_terms counts across both days"
+        );
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_sum(
+                &snapshot,
+                "siglake_index_registration_deferred_total",
+                Some(("reason", "snapshot_has_statistics"))
+            ),
+            1,
+            "one same-snapshot registration is deferred"
+        );
+        assert_eq!(
+            counter_sum(&snapshot, "siglake_index_rebuild_files_total", None),
+            0,
+            "deferred files are not reported as rebuilt"
+        );
+        assert_eq!(
+            counter_sum(&snapshot, "siglake_index_rebuild_bytes_total", None),
+            0,
+            "deferred bytes are not reported as rebuilt"
+        );
     });
 }
 

@@ -402,12 +402,14 @@ snapshot — dropping every seg2 blob the rewrite just published. Their Puffin
 path leaves `reachable_files` and orphan GC deletes the object; the query path
 falls back to a scan and answers correctly, so nothing reports the loss.
 
-Both opt-ins and a refusal are needed to reach it. The disposition is
-refuse-and-count rather than merge, and #5228 implements it;
-`a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs` in the suite
-above is the `#[ignore]`d reproduction, reaching the same second registration
-with a live uncovered file because a refusal has no seam to drive it from a
-test.
+Both opt-ins and a refusal are needed to reach it. Registration now refuses a
+second statistics file for the same snapshot, counts the deferral with the
+bounded `reason="snapshot_has_statistics"` label and logs the uncovered data
+files. It reports none of those files or bytes as rebuilt. The first statistics
+file remains discoverable and reachable to orphan GC; uncovered files stay on
+the exact scan path until a later snapshot can carry their rebuilt index.
+`a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs` drives that
+mixed-coverage boundary and checks the retained seg2 reader's exact answers.
 
 ### What per-section compression would recover
 
