@@ -1266,9 +1266,9 @@ budget cannot cover, and nothing more. Both bounds apply to every entry, so a
 per-file index sized by its row count cannot push the cache past the byte
 ceiling the way the entry count alone allowed. Setting the entry count to `0`
 turns both caches off and returns to fetching and deserializing per query;
-setting the blob byte bound to `0` drops only the serialized copy. Both budgets are subtracted from the query
-memory pool like every other read cache and published on
-`siglake_cache_budget_bytes{kind="text_index"}`.
+setting the blob byte bound to `0` drops only the serialized copy. Both
+budgets are subtracted from the query memory pool like every other read cache
+and published on `siglake_cache_budget_bytes{kind="text_index"}`.
 
 The experimental decoded-file cache
 (`SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_{BYTES,ENTRIES}`, both `0` everywhere the
