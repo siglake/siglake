@@ -58,14 +58,14 @@
 //!   bytes can answer with the wrong rows
 //!   (`a_directory_that_is_consistent_and_lies_about_the_structure_is_refused`).
 //!
-//! The format is deliberately **not** wired into the writer, the reader or any
-//! default: it carries its own magic, its own footer-KV key
-//! ([`SEGMENTED_INDEX_KV_KEY`]) and its own Puffin blob type
-//! ([`SEGMENTED_BLOB_TYPE`]), so a 0.1.x reader looking for
+//! Seg2 is wired into the streaming writer and reader behind separate opt-ins.
+//! Its magic, footer-KV key and Puffin blob type remain distinct from
 //! [`INVERTED_INDEX_KV_KEY`](crate::INVERTED_INDEX_KV_KEY) /
-//! `siglake-inverted-v1` does not see a segmented sidecar at all and scans
-//! exactly as it does for an unindexed file. v1 blobs stay readable by v1 code,
-//! unchanged.
+//! `siglake-inverted-v1`, so v1 blobs stay readable by v1 code. The seg1 blob
+//! type ([`SEGMENTED_BLOB_TYPE`]) names historical codec fixtures only:
+//! production discovery retired it before
+//! 0.2.0 because no released reader promised seg1 and no production writer
+//! emitted it (#5230).
 //!
 //! Seg1 sections stay **uncompressed**, preserving its experimental fixtures.
 //! Seg2 stores one Zstd-3 frame per dictionary block and one per block's posting
@@ -98,29 +98,14 @@ pub const SEGMENTED_TRAILER_LEN: usize = 8 + 8 + 4 + 1 + 4;
 pub const SEGMENTED_BLOB_TYPE: &str = "siglake-inverted-seg-v1";
 /// Puffin blob type for the block-compressed layout.
 pub const SEGMENTED_V2_BLOB_TYPE: &str = "siglake-inverted-seg-v2";
-/// Value for the sidecar's `format` property, beside the `v1` the shipped
-/// writer stamps.
-pub const SEGMENTED_FORMAT_PROPERTY: &str = "seg1";
 /// `format` property for the block-compressed layout.
 pub const SEGMENTED_V2_FORMAT_PROPERTY: &str = "seg2";
-/// Footer-KV key a segmented blob would use. Distinct from
-/// [`INVERTED_INDEX_KV_KEY`](crate::INVERTED_INDEX_KV_KEY) for the same reason.
-pub const SEGMENTED_INDEX_KV_KEY: &str = "siglake.inverted_index.seg1";
 /// Footer-KV key for the block-compressed layout.
 pub const SEGMENTED_V2_INDEX_KV_KEY: &str = "siglake.inverted_index.seg2";
 /// Dictionary-block target size. A lookup reads one whole block, and the
 /// directory holds one entry per block, so this trades the resident directory
 /// against the bytes one point lookup fetches.
 pub const DEFAULT_TARGET_BLOCK_BYTES: usize = 4096;
-
-/// Footer-KV key for `column`'s segmented blob.
-pub fn segmented_index_kv_key(column: &str) -> Cow<'static, str> {
-    if column == "raw" {
-        Cow::Borrowed(SEGMENTED_INDEX_KV_KEY)
-    } else {
-        Cow::Owned(format!("{SEGMENTED_INDEX_KV_KEY}.{column}"))
-    }
-}
 
 /// Footer-KV key for `column`'s block-compressed segmented blob.
 pub fn segmented_v2_index_kv_key(column: &str) -> Cow<'static, str> {
@@ -908,7 +893,7 @@ impl SegmentedDirectory {
     /// The metadata `format` value for this directory's byte layout.
     pub fn format_property(&self) -> &'static str {
         match self.format {
-            SegmentedFormat::Seg1 => SEGMENTED_FORMAT_PROPERTY,
+            SegmentedFormat::Seg1 => "seg1",
             SegmentedFormat::Seg2 => SEGMENTED_V2_FORMAT_PROPERTY,
         }
     }

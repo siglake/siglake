@@ -1815,9 +1815,14 @@ async fn a_settled_clipped_index_query_cannot_charge_the_next_unindexed_arm() {
     let _gate = PUFFIN_QUERY_GATE.lock().await;
     let base = Utc.timestamp_opt(1_700_006_400, 0).unwrap();
     let tmp = tempfile::tempdir().unwrap();
+    let block_bytes = siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES;
     let indexed = sized_bench_fixture(
         &tmp.path().join("indexed"),
-        true,
+        BenchFixtureIndexing {
+            rebuild: true,
+            segmented: false,
+            segmented_block_bytes: block_bytes,
+        },
         base,
         CANCELLED_FILES,
         ROWS_PER_FILE,
@@ -1826,7 +1831,11 @@ async fn a_settled_clipped_index_query_cannot_charge_the_next_unindexed_arm() {
     .await;
     let unindexed = sized_bench_fixture(
         &tmp.path().join("unindexed"),
-        false,
+        BenchFixtureIndexing {
+            rebuild: false,
+            segmented: false,
+            segmented_block_bytes: block_bytes,
+        },
         base,
         CANCELLED_FILES,
         ROWS_PER_FILE,
@@ -2184,13 +2193,20 @@ fn ab_shaped_event(
 /// generator marked.
 const AB_RARE_TERM: &str = "rareneedle";
 
+#[derive(Clone, Copy)]
+struct BenchFixtureIndexing {
+    rebuild: bool,
+    segmented: bool,
+    segmented_block_bytes: usize,
+}
+
 /// One round per file, appended in bounded chunks so a multi-million-row arm
 /// does not hold its corpus in memory, then a streaming rewrite of exactly
-/// that round's output. `rebuild` is the only difference between the two arms
-/// of the measurement below.
+/// that round's output. `indexing` selects the whole-file rebuild or streaming
+/// segmented writer assigned to the measurement arm.
 async fn sized_bench_fixture(
     path: &std::path::Path,
-    rebuild: bool,
+    indexing: BenchFixtureIndexing,
     base: chrono::DateTime<chrono::Utc>,
     files: usize,
     rows_per_file: usize,
@@ -2198,7 +2214,7 @@ async fn sized_bench_fixture(
 ) -> IcebergContext {
     const APPEND_CHUNK: usize = 250_000;
 
-    let ice = open_sized_bench_fixture(path, rebuild).await;
+    let ice = open_sized_bench_fixture(path, indexing).await;
     let ident = ice.events_table_ident().clone();
     let blooms = ice.events_bloom_columns();
     let bloom_refs: Vec<&str> = blooms.iter().map(String::as_str).collect();
@@ -2241,14 +2257,19 @@ async fn sized_bench_fixture(
 
 /// Open one arm with the same read settings whether this process just built it
 /// or is re-timing a completed large fixture after an interrupted cache pass.
-async fn open_sized_bench_fixture(path: &std::path::Path, rebuild: bool) -> IcebergContext {
+async fn open_sized_bench_fixture(
+    path: &std::path::Path,
+    indexing: BenchFixtureIndexing,
+) -> IcebergContext {
     IcebergContext::open(path)
         .await
         .unwrap()
         .with_inverted_index(true)
         .with_table_cache_ttl(std::time::Duration::ZERO)
         .with_tuning(IcebergTuning {
-            index_rebuild: Some(rebuild),
+            index_rebuild: Some(indexing.rebuild),
+            segmented_index_writes: Some(indexing.segmented),
+            segmented_index_block_bytes: Some(indexing.segmented_block_bytes),
             ..Default::default()
         })
 }
@@ -2277,7 +2298,7 @@ fn segmented_reads_knob_resolves_without_process_environment() {
 fn puffin_segmented_indexes_file(table: &Table, file: &DataFile) -> bool {
     table.metadata().statistics_iter().any(|stats_file| {
         stats_file.blob_metadata.iter().any(|blob| {
-            blob.r#type == siglake_index::segmented::SEGMENTED_BLOB_TYPE
+            blob.r#type == siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE
                 && blob
                     .properties
                     .get("data_file")
@@ -2286,182 +2307,111 @@ fn puffin_segmented_indexes_file(table: &Table, file: &DataFile) -> bool {
     })
 }
 
-/// What building one arm's segmented sidecars cost, reported apart from any
-/// query latency: #4562 prices the codec separately from the read path.
-struct SegmentedBuildReport {
-    files: usize,
-    groups: usize,
-    /// Encode time only — reading the Parquet back is charged to `decode_s`.
-    encode_s: f64,
-    decode_s: f64,
-    blob_bytes: u64,
-    statistics_bytes: i64,
+/// Reject a retained #4562 prototype and pin the writer's registration
+/// contract: every live file has exactly one seg2 blob for the events table's
+/// only text-index column, with no live seg1 registration left to mislabel the
+/// measurement.
+fn assert_writer_seg2_fixture(table: &Table, data_files: &[DataFile], label: &str) {
+    let live: std::collections::HashSet<&str> =
+        data_files.iter().map(|file| file.file_path()).collect();
+    let mut seg2: std::collections::BTreeMap<(String, String), usize> = Default::default();
+    for statistics in table.metadata().statistics_iter() {
+        for blob in &statistics.blob_metadata {
+            let Some(data_file) = blob.properties.get("data_file") else {
+                continue;
+            };
+            if !live.contains(data_file.as_str()) {
+                continue;
+            }
+            assert_ne!(
+                blob.r#type,
+                siglake_index::segmented::SEGMENTED_BLOB_TYPE,
+                "arm {label} contains retired seg1 fixture data; rebuild this retained arm"
+            );
+            if blob.r#type != siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE {
+                continue;
+            }
+            assert_eq!(
+                blob.properties.get("format").map(String::as_str),
+                Some(siglake_index::segmented::SEGMENTED_V2_FORMAT_PROPERTY),
+                "arm {label} has a seg2 blob without the seg2 format discriminator"
+            );
+            let column = blob
+                .properties
+                .get("column")
+                .expect("seg2 registration carries its column")
+                .clone();
+            *seg2.entry((data_file.clone(), column)).or_default() += 1;
+        }
+    }
+    assert_eq!(
+        seg2.len(),
+        data_files.len(),
+        "arm {label} must carry one seg2 registration per live file and text column: {seg2:?}"
+    );
+    for file in data_files {
+        assert_eq!(
+            seg2.get(&(file.file_path().to_string(), "raw".to_string())),
+            Some(&1),
+            "arm {label} must carry exactly one writer-produced seg2 blob for raw in {}",
+            file.file_path()
+        );
+    }
 }
 
-/// #4562's third arm needs sidecars in the segmented format and no writer
-/// produces one for a real table — that is #4377, which this measurement is
-/// the input to. So the harness writes them: one blob per live data file whose
-/// groups **are** that file's Parquet row groups (the identity
-/// `docs/DESIGN_segmented_inverted_index.md` requires, and the reader's
-/// `matches_row_groups` enforces), all of them in one uncompressed Puffin file
-/// registered on the current snapshot.
-///
-/// Uncompressed is not a choice: a codec leaves the blob with no addressable
-/// interior and the reader declines it (`reason="compressed"`).
-async fn write_segmented_sidecars(
-    ice: &IcebergContext,
-    block_bytes: usize,
-) -> SegmentedBuildReport {
-    use iceberg::puffin::{Blob as PuffinBlob, CompressionCodec, PuffinReader, PuffinWriter};
-    use iceberg::spec::{BlobMetadata as StatisticsBlobMetadata, StatisticsFile};
-    use iceberg::transaction::{ApplyTransactionAction, Transaction};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+#[tokio::test]
+async fn the_measurement_segmented_fixture_comes_from_the_streaming_seg2_writer() {
+    use chrono::{TimeZone, Utc};
 
-    let ident = ice.events_table_ident().clone();
-    let table = ice.catalog().load_table(&ident).await.unwrap();
-    let data_files = ice.live_data_files(&ident).await.unwrap();
-    let snapshot = table.metadata().current_snapshot().unwrap().clone();
-    let field_id = table
-        .metadata()
-        .current_schema()
-        .field_id_by_name("raw")
-        .unwrap_or_default();
-
-    let mut report = SegmentedBuildReport {
-        files: data_files.len(),
-        groups: 0,
-        encode_s: 0.0,
-        decode_s: 0.0,
-        blob_bytes: 0,
-        statistics_bytes: 0,
-    };
-    let mut blobs: Vec<(String, Vec<u8>, usize)> = Vec::with_capacity(data_files.len());
-    for data_file in &data_files {
-        let bytes = table
-            .file_io()
-            .new_input(data_file.file_path())
-            .unwrap()
-            .read()
-            .await
-            .unwrap();
-        let metadata = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
-            .unwrap()
-            .metadata()
-            .clone();
-        let row_group_size = metadata
-            .row_groups()
-            .iter()
-            .map(|group| group.num_rows() as usize)
-            .max()
-            .unwrap_or(0);
-        let mut writer = siglake_index::segmented::SegmentedWriter::new(block_bytes)
-            .with_tokenizer(siglake_bloom::Tokenizer::Default);
-        for group in 0..metadata.row_groups().len() {
-            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
-                .unwrap()
-                .with_row_groups(vec![group])
-                .build()
-                .unwrap();
-            // One group's index, built from that group's rows in physical
-            // order, so the blob's group `i` is the file's row group `i`.
-            let decode = std::time::Instant::now();
-            let mut builder =
-                siglake_index::IndexBuilder::with_tokenizer(siglake_bloom::Tokenizer::Default);
-            for batch in reader {
-                let batch = batch.unwrap();
-                let column = batch.schema().index_of("raw").unwrap();
-                let raw = batch
-                    .column(column)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                for value in raw.iter() {
-                    builder.push_row(value.unwrap_or(""));
-                }
-            }
-            let index = builder.build();
-            report.decode_s += decode.elapsed().as_secs_f64();
-            let encode = std::time::Instant::now();
-            writer.push_group_index(&index);
-            report.encode_s += encode.elapsed().as_secs_f64();
-            report.groups += 1;
-        }
-        let encode = std::time::Instant::now();
-        let blob = writer.finish();
-        report.encode_s += encode.elapsed().as_secs_f64();
-        report.blob_bytes += blob.len() as u64;
-        blobs.push((data_file.file_path().to_string(), blob, row_group_size));
-    }
-
-    let statistics_path = format!(
-        "{}/siglake-index-seg-{}.puffin",
-        table
-            .metadata_location_result()
-            .unwrap()
-            .rsplit_once('/')
-            .unwrap()
-            .0,
-        uuid::Uuid::now_v7()
+    let tmp = tempfile::tempdir().unwrap();
+    let base = Utc.timestamp_opt(1_700_006_400, 0).unwrap();
+    let block_bytes = siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES;
+    let off = sized_bench_fixture(
+        &tmp.path().join("off"),
+        BenchFixtureIndexing {
+            rebuild: false,
+            segmented: false,
+            segmented_block_bytes: block_bytes,
+        },
+        base,
+        2,
+        2_000,
+        997,
+    )
+    .await;
+    let seg = sized_bench_fixture(
+        &tmp.path().join("seg"),
+        BenchFixtureIndexing {
+            rebuild: false,
+            segmented: true,
+            segmented_block_bytes: block_bytes,
+        },
+        base,
+        2,
+        2_000,
+        997,
+    )
+    .await;
+    let ident = seg.events_table_ident().clone();
+    let files = seg.live_data_files(&ident).await.unwrap();
+    let table = seg.catalog().load_table(&ident).await.unwrap();
+    assert_writer_seg2_fixture(&table, &files, "seg");
+    assert!(
+        files.iter().all(|file| !puffin_indexes_file(&table, file)),
+        "the seg arm must not carry whole-file v1 sidecars"
     );
-    let output_file = table.file_io().new_output(&statistics_path).unwrap();
-    let mut writer = PuffinWriter::new(&output_file, std::collections::HashMap::new(), false)
+    let off_rows: Vec<u64> = off
+        .live_data_files(off.events_table_ident())
         .await
-        .unwrap();
-    let mut blob_metadata = Vec::with_capacity(blobs.len());
-    for (data_file_path, blob, row_group_size) in blobs {
-        let properties = std::collections::HashMap::from([
-            ("data_file".to_string(), data_file_path),
-            ("column".to_string(), "raw".to_string()),
-            ("tokenizer".to_string(), "default".to_string()),
-            ("row_group_size".to_string(), row_group_size.to_string()),
-            ("format".to_string(), "seg1".to_string()),
-        ]);
-        writer
-            .add(
-                PuffinBlob::builder()
-                    .r#type(siglake_index::segmented::SEGMENTED_BLOB_TYPE.to_string())
-                    .fields(vec![field_id])
-                    .snapshot_id(snapshot.snapshot_id())
-                    .sequence_number(snapshot.sequence_number())
-                    .data(blob)
-                    .properties(properties.clone())
-                    .build(),
-                // The interior has to stay addressable; see above.
-                CompressionCodec::None,
-            )
-            .await
-            .unwrap();
-        blob_metadata.push(StatisticsBlobMetadata {
-            r#type: siglake_index::segmented::SEGMENTED_BLOB_TYPE.to_string(),
-            snapshot_id: snapshot.snapshot_id(),
-            sequence_number: snapshot.sequence_number(),
-            fields: vec![field_id],
-            properties,
-        });
-    }
-    writer.close().await.unwrap();
-    let input = output_file.to_input_file();
-    report.statistics_bytes = input.metadata().await.unwrap().size as i64;
-    let footer_size = PuffinReader::new(input)
-        .footer_size_in_bytes()
-        .await
-        .unwrap() as i64;
-    let statistics = StatisticsFile {
-        snapshot_id: snapshot.snapshot_id(),
-        statistics_path,
-        file_size_in_bytes: report.statistics_bytes,
-        file_footer_size_in_bytes: footer_size,
-        key_metadata: None,
-        blob_metadata,
-    };
-    let tx = Transaction::new(&table);
-    let tx = tx
-        .update_statistics()
-        .set_statistics(statistics)
-        .apply(tx)
-        .unwrap();
-    tx.commit(ice.catalog().as_ref()).await.unwrap();
-    report
+        .unwrap()
+        .iter()
+        .map(|file| file.record_count())
+        .collect();
+    let seg_rows: Vec<u64> = files.iter().map(|file| file.record_count()).collect();
+    assert_eq!(
+        off_rows, seg_rows,
+        "enabling the streaming seg2 writer must preserve the measurement's Parquet layout"
+    );
 }
 
 fn median(samples: &[f64]) -> f64 {
@@ -2684,9 +2634,10 @@ struct AbShape {
 ///     report_rebuild_on_off_text_shapes -- --ignored --nocapture
 ///
 /// #4562 adds the third FORMAT, `seg` (and its policy twin `seg_policy`): the
-/// same corpus with no whole-file sidecar and a segmented one per file, which
-/// the harness writes because no writer produces the format for a real table —
-/// that is #4377, and this measurement is its input. The arm exists only when
+/// same corpus with no whole-file sidecar and a segmented one per file. #5230
+/// moved that fixture onto the streaming rewrite's seg2 writer: each day is
+/// appended and rewritten on its own, through the same opt-in production path
+/// as `SIGLAKE_SEGMENTED_INDEX_WRITES=1`. The arm exists only when
 /// `SIGLAKE_SEGMENTED_INDEX_READS` is set in the environment the process
 /// started in, since the reader resolves that knob once; without it the run is
 /// the four-arm one #4375 left. Its costs are reported apart from the
@@ -2704,7 +2655,7 @@ struct AbShape {
 ///                                     budgets: `name=parsed:blob`, comma-separated
 ///   SIGLAKE_REBUILD_AB_REUSE_DIR      fixture root with off/, on/ and seg/;
 ///                                     an arm it does not carry is built and kept
-///   SIGLAKE_REBUILD_AB_SEG_BLOCK_BYTES  segmented dictionary block target (4,096)
+///   SIGLAKE_SEGMENTED_INDEX_BLOCK_BYTES segmented dictionary block target (4,096)
 ///   SIGLAKE_SEGMENTED_INDEX_READS     the reader's own knob; the `seg` arms
 ///                                     exist only when it is set
 ///   SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES  the segmented arm's own
@@ -2784,7 +2735,10 @@ async fn report_rebuild_on_off_text_shapes() {
             .ok()
             .as_deref(),
     );
-    let seg_block_bytes = knob("SIGLAKE_REBUILD_AB_SEG_BLOCK_BYTES", 4_096);
+    let seg_block_bytes = knob(
+        "SIGLAKE_SEGMENTED_INDEX_BLOCK_BYTES",
+        siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES,
+    );
     // Per-execution segmented cost is histogram-shaped, so the arm needs a
     // recorder. `DebuggingRecorder` reports every read as a delta, which is
     // exactly the per-execution attribution this wants; a run that cannot
@@ -2962,41 +2916,30 @@ async fn report_rebuild_on_off_text_shapes() {
     for (label, rebuild, segmented) in fixtures {
         let warehouse = fixture_root.join(label);
         let build = Instant::now();
+        let indexing = BenchFixtureIndexing {
+            rebuild,
+            segmented,
+            segmented_block_bytes: seg_block_bytes,
+        };
         // A reuse root that does not carry this arm yet is BUILT into and
         // kept, which is what lets a second process re-measure the same
         // corpus — a run with a different cache or reader configuration is a
         // different measurement, not a different fixture.
         let ice = if reuse_dir.is_some() && warehouse.exists() {
-            open_sized_bench_fixture(&warehouse, rebuild).await
+            open_sized_bench_fixture(&warehouse, indexing).await
         } else {
-            sized_bench_fixture(&warehouse, rebuild, base, files, rows_per_file, rare_every).await
+            sized_bench_fixture(&warehouse, indexing, base, files, rows_per_file, rare_every).await
         };
         let build_s = build.elapsed().as_secs_f64();
         let ident = ice.events_table_ident().clone();
-        let mut table = ice.catalog().load_table(&ident).await.unwrap();
+        let table = ice.catalog().load_table(&ident).await.unwrap();
         let data_files = ice.live_data_files(&ident).await.unwrap();
         assert!(
             !data_files.is_empty(),
             "arm {label} has no data files — a reused fixture root is missing {label}/"
         );
-        if segmented
-            && !data_files
-                .iter()
-                .all(|file| puffin_segmented_indexes_file(&table, file))
-        {
-            // Construction cost, reported apart from every latency below.
-            let report = write_segmented_sidecars(&ice, seg_block_bytes).await;
-            println!(
-                "arm={label} seg_build files={} groups={} encode_s={:.1} parquet_decode_s={:.1} \
-                 blob_bytes={} statistics_bytes={} block_bytes={seg_block_bytes}",
-                report.files,
-                report.groups,
-                report.encode_s,
-                report.decode_s,
-                report.blob_bytes,
-                report.statistics_bytes
-            );
-            table = ice.catalog().load_table(&ident).await.unwrap();
+        if segmented {
+            assert_writer_seg2_fixture(&table, &data_files, label);
         }
         let indexed = data_files
             .iter()

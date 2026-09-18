@@ -9082,27 +9082,30 @@ fn tenant_metric_label(namespace: &NamespaceIdent) -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
-/// Every `(data file, column)` a registered Puffin text sidecar already covers,
-/// in any of the three formats.
+/// Every `(data file, column)` a registered production Puffin text sidecar
+/// already covers.
 ///
 /// This is what makes a rebuild idempotent, and since #4377 it is also what
 /// keeps the post-commit full-file decode away from a file a rewrite already
-/// indexed: a segmented sidecar is registered with the rewrite that wrote it,
-/// so the maintenance rebuild sees the column covered and reads nothing. A
-/// segmented blob and a v1 blob are alternative answers for the same column,
-/// not layers — the reader takes whichever it finds.
+/// indexed: a seg2 sidecar is registered with the rewrite that wrote it, so the
+/// maintenance rebuild sees the column covered and reads nothing. A seg2 blob
+/// and a whole-file v1 blob are alternative answers for the same column.
+/// Prototype seg1 never shipped and no longer suppresses a production rebuild
+/// (#5230).
+fn puffin_blob_suppresses_rebuild(blob_type: &str) -> bool {
+    matches!(
+        blob_type,
+        SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE | siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE
+    )
+}
+
 fn existing_puffin_index_columns(
     metadata: &iceberg::spec::TableMetadata,
 ) -> HashSet<(String, String)> {
-    const TEXT_BLOB_TYPES: [&str; 3] = [
-        SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE,
-        siglake_index::segmented::SEGMENTED_BLOB_TYPE,
-        siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE,
-    ];
     metadata
         .statistics_iter()
         .flat_map(|stats| stats.blob_metadata.iter())
-        .filter(|blob| TEXT_BLOB_TYPES.contains(&blob.r#type.as_str()))
+        .filter(|blob| puffin_blob_suppresses_rebuild(&blob.r#type))
         .filter_map(|blob| {
             Some((
                 blob.properties.get("data_file")?.to_string(),
@@ -9110,6 +9113,24 @@ fn existing_puffin_index_columns(
             ))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod rebuild_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn only_production_text_sidecars_suppress_a_rebuild() {
+        assert!(puffin_blob_suppresses_rebuild(
+            SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE
+        ));
+        assert!(puffin_blob_suppresses_rebuild(
+            siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE
+        ));
+        assert!(!puffin_blob_suppresses_rebuild(
+            siglake_index::segmented::SEGMENTED_BLOB_TYPE
+        ));
+    }
 }
 
 async fn parquet_footer_has_index(path: &str, file_io: &FileIO, column: &str) -> bool {
