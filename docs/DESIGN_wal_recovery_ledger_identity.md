@@ -1,9 +1,9 @@
 # Ledger-backed root identity for `siglake wal-recover` (task #4974)
 
-**Status:** design and local qualification. **PROCEED with revisions** — the
-rules below are settled and measured, and the production `--catalog` slice is
-its own card. Nothing in this document is shipped: `wal-recover` behaves
-exactly as #4973 left it. **Date:** 2026-09-18.
+**Status:** SHIPPED. The rules below are settled and measured, and #4997 built
+them: `siglake wal-recover --catalog <uri>` reads the ledger, and the
+production code carries every case this qualification made. **Date:**
+2026-09-18.
 
 Option D of `docs/DESIGN_wal_recovery_root_identity.md`. #4973 shipped option
 C: the command plans unless it is given `--apply`, and the same listing carries
@@ -14,9 +14,20 @@ mirror root is indistinguishable from a legitimate mirror whose first tenant is
 named after a prefix. `wal_segments` can distinguish them, because the uploader
 recorded where each object belongs before the volume was lost.
 
-The evidence is `crates/siglake-storage/tests/wal_ledger_identity_prototype.rs`
-— 19 hermetic cases, each against a SQLite ledger it builds itself, one of
-them driving the shipped `plan_recovery` over a real `file://` mirror.
+The evidence was `crates/siglake-storage/tests/wal_ledger_identity_prototype.rs`
+— 19 hermetic cases against a private copy of the check, before the flag
+existed. #4997 retired that file and carried its cases onto the shipped code,
+keeping the names this document cites: the verdict arithmetic is pure and its
+cases are `siglake-wal/src/mirror.rs::tests::ledger_identity`, and the reader's
+— open modes, the no-DDL A/B, the chunked lookup's cost, the composition with
+`plan_recovery` over a real `file://` mirror — are
+`crates/siglake-storage/tests/wal_ledger_reader.rs`. Two prototype cases have
+no successor by name: `an_empty_ledger_is_silent_not_unavailable` is folded
+into `a_reachable_ledger_with_no_matching_row_says_nothing`, and
+`the_prototype_infers_the_same_routing_as_the_shipped_parser` is moot — the
+shipped check routes with `recovery_target` itself, and
+`the_plan_retains_every_segment_shaped_key_with_its_routing` holds the listing's
+routing against the plan's own groups.
 
 ## What the ledger knows, and why it is exact
 
@@ -239,10 +250,10 @@ segments is 79 SELECTs next to 20,000 GETs.
 
 ## Disposition
 
-**PROCEED with revisions.** Every rule the card left open is settled above and
-measured, the cost is negligible against the plan's, and the read-only
-constraint holds mechanically rather than by discipline. The revisions relative
-to the card's sketch:
+**PROCEEDED with revisions**, and #4997 shipped it. Every rule the card left
+open is settled above and measured, the cost is negligible against the plan's,
+and the read-only constraint holds mechanically rather than by discipline. The
+revisions relative to the card's sketch:
 
 - the verdict rests on ROUTING agreement, not on matching `segment_url` against
   the `--from` URL, so a relocated mirror copy is not refused;
@@ -255,3 +266,36 @@ The production slice is a separate card, blocked on this document. What it does
 not need is another qualification: the arithmetic is pinned by 19 hermetic
 cases, and the only thing a round could add is a Postgres arm, which the
 compose step is the place for.
+
+## What shipped (#4997)
+
+`siglake wal-recover --catalog <uri>`, no env default: a deployment with a
+catalog URI in its environment must not have the check turned on behind its
+back, and the card's contract was to add no default change.
+
+- The reader is `siglake_storage::wal_ledger::WalLedgerReader`. It returns
+  `siglake_wal::mirror::LedgerRow` directly rather than a second spelling of
+  the same three columns, which cost one crate edge — `siglake-storage`
+  depends on `siglake-wal` where it used to dev-depend on it — and removed a
+  hand conversion in the CLI that nothing could have gate-checked. The edge
+  goes one way: `siglake-wal` gains neither sqlx nor a catalog.
+- The plan exposes the ids, which is the first of the two options item 2 above
+  left open. `RecoveryPlan::listed` retains every segment-shaped listed key
+  with the routing `recovery_target` gives it, so the lookup runs on the
+  plan's own single LIST; `plan_recovery` taking a pre-resolved map would have
+  cost a second listing, and an apply has to decide on the listing it writes
+  from.
+- The verdict is attached to the plan (`attach_ledger`), so `apply_plan`
+  refuses a ledger-contradicted listing through the same path it refuses a
+  marker-contradicted one, rather than by the CLI remembering to check.
+- One cost the ordering imposes: the ledger check runs AFTER the plan, so a
+  listing the marker permits and the ledger refuses has already paid the
+  plan's one GET per candidate. A marker refusal still skips those reads.
+- `immutable=1` is not a flag, as decided, and it is not blocked either: the
+  URI's other parameters pass through, so an operator who needs it writes
+  `?immutable=1` and the reader's own failure message names it as one of two
+  remedies. Only `mode=` is overridden.
+- Measured again on the shipped reader, debug build, file-backed SQLite:
+  a 2,000-object listing against a 200-row ledger is 8 queries, 200 rows read,
+  42.8 kB resident, 5.6 ms; the inverse (200 listed against 2,000 rows) is 1
+  query and the same 200 rows. The numbers the design was chosen on hold.

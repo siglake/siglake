@@ -2,7 +2,9 @@
 
 **Status:** option C is SHIPPED (#4973, 2026-09-17): `wal-recover` plans unless
 it is given `--apply`, and the listing carries the root verdict. No `--force`,
-no 0.1.1 default change, and `--catalog` (option D) is still a follow-on slice.
+no 0.1.1 default change. Option D shipped after it as `--catalog` (#4974's
+rules, #4997's implementation — see
+`docs/DESIGN_wal_recovery_ledger_identity.md`).
 The sections below are the investigation that chose it; the measured behaviour
 in "What the restore does, measured" is the PRE-#4973 picture, kept because it
 is what the remedy is priced against. **Date:** 2026-09-17.

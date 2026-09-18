@@ -139,11 +139,13 @@ written down.
   index costs about 40 bytes per indexed row, and at 50 GB-class layouts the
   sidecar path landed above the text-search ceilings that were measured on the
   scan path.
-  Whether a query uses an index it finds is decided per execution: a text
-  predicate under a `LIMIT` — ordered or bare — reads a sliver of the first
-  file and would pay a whole file's postings to do it, so it stays on the scan
-  path, while an unclipped text scan keeps the index. A missing or declined
-  index costs pruning, never correctness. What a text query spends before its
+  Whether a query uses an index it finds is decided per execution. Ordered
+  `LIMIT` shapes and bare clipped shapes decline a whole-file v1 index. The
+  experimental segmented reader may keep a bare clipped point-term lookup when
+  its summed document frequency is no larger than the clip; common terms and
+  substring sweeps stay on the scan path. An unclipped text scan keeps the
+  index. A missing or declined index costs pruning, never correctness. What a
+  text query spends before its
   first batch is attributable per stage rather than as one number:
   `siglake_iceberg_text_index_startup_seconds{stage}` separates the load queue
   from the blob read, the decode and the selection, and the parsed-index

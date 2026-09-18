@@ -90,12 +90,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   Both defaults stay off until AWS qualification. The writer's local
   build-cost acceptance is recorded now: on 14 x 7.34M rows, seg2 averaged
   282.77 seconds of rewrite time and 251.4 MiB peak tracked heap, 12.0% faster
-  and 80.8% smaller than the post-commit v1 rebuild it replaces (#5234). With
-  the write opt-in and `SIGLAKE_INDEX_REBUILD=1` both on, a file whose sidecar
-  the writer refuses stays unindexed until a later rewrite or a CLI rebuild at
-  a later snapshot: Iceberg permits one statistics file per snapshot, so
-  Siglake preserves the rewrite's registered seg2 blobs and counts the deferred
-  v1 registration instead of replacing them (#5228)
+  and 80.8% smaller than the post-commit v1 rebuild it replaces (#5234). The
+  same-snapshot registration and concurrent-commit sequence boundaries are
+  closed (#5228, #5260). With the write opt-in and
+  `SIGLAKE_INDEX_REBUILD=1` both on, a file whose sidecar the writer refuses
+  stays unindexed until a later rewrite or a CLI rebuild at a later snapshot:
+  Iceberg permits one statistics file per snapshot, so Siglake
+  preserves the rewrite's registered seg2 blobs and counts the deferred v1
+  registration instead of replacing them
   ([`DESIGN_segmented_inverted_index.md`](DESIGN_segmented_inverted_index.md),
   "Registration beside the refusals"). Whether the
   serialized copy earns its share at all is a separate open question: since a

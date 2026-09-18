@@ -10,6 +10,8 @@
 //!   per file, addressed to the right one;
 //! - a rewrite whose commit fails leaves nothing discoverable — the Puffin
 //!   object is written before the commit, and discovery is by registration;
+//! - an append before the first commit attempt and one that forces a CAS retry
+//!   leave the rewrite snapshot, table metadata and Puffin footer in agreement;
 //! - the post-commit full-file decode does not run for a column the rewrite
 //!   already indexed, and a second rebuild call is a no-op;
 //! - the index state the rewrite holds is one row group's, not the file's.
@@ -19,12 +21,18 @@
 //! run one at a time.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use arrow_array::builder::BooleanBuilder;
 use arrow_array::Array;
 use chrono::{DateTime, TimeZone, Utc};
+use datafusion::common::ScalarValue;
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
 use datafusion::prelude::SessionContext;
 use iceberg::spec::DataFile;
 use iceberg::table::Table;
@@ -32,6 +40,7 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use siglake_core::Event;
 use siglake_index::segmented::{SegmentedReader, SliceSource, SEGMENTED_V2_BLOB_TYPE};
 use siglake_index::InvertedIndex;
+use siglake_storage::iceberg::test_catalog::TestCatalog;
 use siglake_storage::iceberg::{IcebergContext, IcebergTuning, ReclusterMergeOptions};
 
 /// Peak live heap bytes between [`start_tracking`] and [`peak_tracked`], the
@@ -188,20 +197,32 @@ async fn open_fixture(
     row_group_bytes: Option<usize>,
     target_file_bytes: Option<usize>,
 ) -> IcebergContext {
+    open_fixture_with_tuning(
+        path,
+        IcebergTuning {
+            segmented_index_writes: Some(segmented),
+            // The hermetic cases keep the post-commit v1 rebuild ON, so "the
+            // rewrite already indexed this column" is what stops it rather
+            // than the knob.
+            index_rebuild: Some(true),
+            target_row_group_bytes: row_group_bytes,
+            merge_target_file_bytes: target_file_bytes,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// A fixture whose storage knobs are explicit. The build-cost report uses
+/// this to keep append indexing and Parquet layout matched while varying only
+/// the two rewrite-index settings under measurement.
+async fn open_fixture_with_tuning(path: &std::path::Path, tuning: IcebergTuning) -> IcebergContext {
     IcebergContext::open(path)
         .await
         .unwrap()
         .with_inverted_index(true)
         .with_table_cache_ttl(std::time::Duration::ZERO)
-        .with_tuning(IcebergTuning {
-            segmented_index_writes: Some(segmented),
-            // The post-commit v1 rebuild ON, so "the rewrite already indexed
-            // this column" is the thing that stops it rather than the knob.
-            index_rebuild: Some(true),
-            target_row_group_bytes: row_group_bytes,
-            merge_target_file_bytes: target_file_bytes,
-            ..Default::default()
-        })
+        .with_tuning(tuning)
 }
 
 const APPEND_CHUNK: usize = 250_000;
@@ -425,6 +446,47 @@ async fn assert_sidecar_describes_file(
     );
 }
 
+/// Assert the three copies of a seg2 blob's snapshot identity: the snapshot,
+/// the table's `StatisticsFile` entry and the physical Puffin footer.
+async fn assert_current_seg2_sequence_agreement(table: &Table) {
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("the rewrite committed a snapshot");
+    let statistics = table
+        .metadata()
+        .statistics_iter()
+        .find(|statistics| statistics.snapshot_id == snapshot.snapshot_id())
+        .expect("the rewrite snapshot registered statistics");
+    let table_blobs: Vec<_> = statistics
+        .blob_metadata
+        .iter()
+        .filter(|blob| blob.r#type == SEGMENTED_V2_BLOB_TYPE)
+        .collect();
+    assert!(!table_blobs.is_empty(), "the statistics entry carries seg2");
+    for blob in table_blobs {
+        assert_eq!(blob.snapshot_id, snapshot.snapshot_id());
+        assert_eq!(blob.sequence_number, snapshot.sequence_number());
+    }
+
+    let input = table
+        .file_io()
+        .new_input(&statistics.statistics_path)
+        .unwrap();
+    let reader = iceberg::puffin::PuffinReader::new(input);
+    let physical = reader.file_metadata().await.unwrap();
+    let physical_blobs: Vec<_> = physical
+        .blobs()
+        .iter()
+        .filter(|blob| blob.blob_type() == SEGMENTED_V2_BLOB_TYPE)
+        .collect();
+    assert_eq!(physical_blobs.len(), statistics.blob_metadata.len());
+    for blob in physical_blobs {
+        assert_eq!(blob.snapshot_id(), snapshot.snapshot_id());
+        assert_eq!(blob.sequence_number(), snapshot.sequence_number());
+    }
+}
+
 async fn count(ctx: &SessionContext, sql: &str) -> i64 {
     let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
     batches[0]
@@ -435,17 +497,107 @@ async fn count(ctx: &SessionContext, sql: &str) -> i64 {
         .value(0)
 }
 
+/// The query server's `match_terms` UDF cannot be a storage dependency. This
+/// test stub gives DataFusion the same function name and literal shape so the
+/// storage reader can extract and push the predicate into its index path.
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct MatchTermsUdf {
+    signature: Signature,
+}
+
+impl MatchTermsUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::exact(
+                vec![
+                    datafusion::arrow::datatypes::DataType::Utf8,
+                    datafusion::arrow::datatypes::DataType::Utf8,
+                ],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl ScalarUDFImpl for MatchTermsUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "match_terms"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(
+        &self,
+        _arg_types: &[datafusion::arrow::datatypes::DataType],
+    ) -> datafusion::error::Result<datafusion::arrow::datatypes::DataType> {
+        Ok(datafusion::arrow::datatypes::DataType::Boolean)
+    }
+
+    fn invoke_with_args(
+        &self,
+        args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let cells = match &args.args[0] {
+            ColumnarValue::Array(array) => array.clone(),
+            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(rows)?,
+        };
+        let cells = cells
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution("lhs must be Utf8".into())
+            })?
+            .clone();
+        let query = match &args.args[1] {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(query)))
+            | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(query)))
+            | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(query))) => query.clone(),
+            _ => {
+                return Err(datafusion::error::DataFusionError::Execution(
+                    "query must be a Utf8 literal".into(),
+                ));
+            }
+        };
+        let tokens: Vec<String> = query
+            .split_whitespace()
+            .map(|token| token.to_ascii_lowercase())
+            .collect();
+        let mut builder = BooleanBuilder::with_capacity(rows);
+        for row in 0..rows {
+            if cells.is_null(row) {
+                builder.append_value(false);
+                continue;
+            }
+            let haystack = cells.value(row).to_ascii_lowercase();
+            builder.append_value(tokens.iter().all(|token| haystack.contains(token)));
+        }
+        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
+}
+
 async fn text_counts(ice: &IcebergContext) -> (i64, i64, i64) {
     let ctx = SessionContext::new();
+    ctx.register_udf(ScalarUDF::from(MatchTermsUdf::new()));
     ice.register_with_datafusion(&ctx).await.unwrap();
     (
         count(&ctx, "SELECT count(*) FROM events").await,
         count(
             &ctx,
-            "SELECT count(*) FROM events WHERE raw LIKE '%rareneedle%'",
+            "SELECT count(*) FROM events WHERE match_terms(raw, 'rareneedle')",
         )
         .await,
-        count(&ctx, "SELECT count(*) FROM events WHERE raw LIKE '%queen%'").await,
+        count(
+            &ctx,
+            "SELECT count(*) FROM events WHERE match_terms(raw, 'queen')",
+        )
+        .await,
     )
 }
 
@@ -515,6 +667,123 @@ fn a_streaming_rewrite_publishes_a_sidecar_that_describes_its_output() {
             text_counts(&on).await,
             text_counts(&off).await,
             "the rewrite's rows must not depend on whether it built an index beside them"
+        );
+    });
+}
+
+/// A foreign append lands after the rewrite read its base but before the
+/// transaction's first commit attempt reloads it. The first attempt therefore
+/// builds directly on the newer base, without needing a failed CAS to expose
+/// the stale pre-write sequence-number capture.
+#[test]
+fn an_append_before_the_first_commit_attempt_refreshes_seg2_sequence_metadata() {
+    serialized(|_snapshotter| async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("stale-first-base");
+        let mut rewrite = open_fixture(&warehouse, true, Some(1), None).await;
+        let fresh = append_rows(&rewrite, 0..150_000, 150_000, RARE_EVERY).await;
+        let before = rewrite
+            .catalog()
+            .load_table(rewrite.events_table_ident())
+            .await
+            .unwrap()
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+
+        let appender = IcebergContext::open(&warehouse).await.unwrap();
+        let appended = Arc::new(AtomicBool::new(false));
+        let gated = TestCatalog::new(rewrite.catalog().clone())
+            .after_load_table({
+                let appended = appended.clone();
+                move || {
+                    let appender = appender.clone();
+                    let appended = appended.clone();
+                    async move {
+                        if !appended.swap(true, Ordering::SeqCst) {
+                            appender
+                                .append_events(&[Event::now("intervening-before-attempt")])
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+            })
+            .shared();
+        rewrite = rewrite.with_catalog_for_test(gated);
+
+        let live = rewrite_fresh(&rewrite, fresh).await;
+        assert!(appended.load(Ordering::SeqCst), "the append hook fired");
+        assert_eq!(
+            live.iter().map(DataFile::record_count).sum::<u64>(),
+            150_001,
+            "the append and rewrite publish atomically without losing either file"
+        );
+        let table = rewrite
+            .catalog()
+            .load_table(rewrite.events_table_ident())
+            .await
+            .unwrap();
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .sequence_number(),
+            before + 2
+        );
+        assert_current_seg2_sequence_agreement(&table).await;
+    });
+}
+
+/// A foreign append lands in the first attempt's CAS window. That attempt's
+/// Puffin file stays unreferenced; the retry reuses the written Parquet output
+/// and seg2 bytes, and stamps a new Puffin footer from the refreshed base.
+#[test]
+fn an_append_during_a_forced_cas_retry_refreshes_seg2_sequence_metadata() {
+    serialized(|_snapshotter| async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("cas-retry");
+        let mut rewrite = open_fixture(&warehouse, true, Some(1), None).await;
+        let fresh = append_rows(&rewrite, 0..150_000, 150_000, RARE_EVERY).await;
+
+        let appender = IcebergContext::open(&warehouse).await.unwrap();
+        let gated = TestCatalog::new(rewrite.catalog().clone())
+            .before_first_update_with_base(move || {
+                let appender = appender.clone();
+                async move {
+                    appender
+                        .append_events(&[Event::now("intervening-in-cas-window")])
+                        .await
+                        .unwrap();
+                }
+            })
+            .shared();
+        rewrite = rewrite.with_catalog_for_test(gated.clone());
+
+        let live = rewrite_fresh(&rewrite, fresh).await;
+        assert!(gated.fired(), "the forced-CAS hook fired");
+        assert_eq!(
+            live.iter().map(DataFile::record_count).sum::<u64>(),
+            150_001,
+            "the successful retry retains both the append and rewritten rows"
+        );
+        let table = rewrite
+            .catalog()
+            .load_table(rewrite.events_table_ident())
+            .await
+            .unwrap();
+        assert_current_seg2_sequence_agreement(&table).await;
+        assert_eq!(
+            registered_seg2_blobs(&table).len(),
+            1,
+            "the failed attempt's Puffin object is not discoverable"
+        );
+        let indexed_file = &registered_seg2_blobs(&table)[0].1;
+        assert!(
+            live.iter().any(|file| file.file_path() == indexed_file),
+            "the retry registers the Parquet output already written by the rewrite"
         );
     });
 }
@@ -661,6 +930,117 @@ fn a_failed_rewrite_commit_leaves_no_discoverable_index() {
             text_counts(&ice).await,
             before,
             "the refused rewrite must not have changed the table's rows"
+        );
+    });
+}
+
+/// A v1 registration against the snapshot a seg2 rewrite committed must leave
+/// that rewrite's sidecars discoverable. It does not: this test fails, and
+/// #5228 carries the fix.
+///
+/// `set_statistics` inserts by snapshot id
+/// (`third_party/iceberg/src/spec/table_metadata_builder.rs:589`), so the
+/// second `StatisticsFile` written against a snapshot REPLACES the first
+/// rather than merging into it. The rewrite registers every output blob in one
+/// entry under its reserved id S; anything that registers again under S drops
+/// them all, their Puffin path leaves `reachable_files` and orphan GC deletes
+/// the object.
+///
+/// In production the second registration can follow a mixed rewrite: with both
+/// `SIGLAKE_SEGMENTED_INDEX_WRITES=1` and `SIGLAKE_INDEX_REBUILD=1`, one output
+/// file whose sidecar `publish_segmented_sidecars` refuses
+/// (`refused{column|file_rows|row_domain}`) is uncovered, so the post-commit
+/// `rebuild_inverted_indexes_for_files` over the rewrite's output builds a v1
+/// blob for it and registers it under S — silently losing the *other* output
+/// files' indexes. This drives the registration boundary with the same mixed
+/// coverage: appends leave one day unindexed, the rewrite publishes seg2 for
+/// the other, and the v1 rebuild tries to register the uncovered day against S.
+#[test]
+fn a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs() {
+    serialized(|snapshotter| async move {
+        let tmp = tempfile::tempdir().unwrap();
+        const ROWS_HERE: usize = 300_000;
+
+        let ice = IcebergContext::open(&tmp.path().join("mixed"))
+            .await
+            .unwrap()
+            .with_inverted_index(true)
+            .with_table_cache_ttl(std::time::Duration::ZERO)
+            .with_tuning(IcebergTuning {
+                segmented_index_writes: Some(true),
+                index_rebuild: Some(true),
+                // No append-time index, so the day the rewrite skips stays a
+                // live file the rebuild has real work to do for.
+                index_at_flush: Some(false),
+                target_row_group_bytes: Some(1),
+                merge_target_file_bytes: Some(1 << 20),
+                ..Default::default()
+            });
+        let ident = ice.events_table_ident().clone();
+
+        let unindexed = append_rows(&ice, 0..ROWS_HERE, ROWS_HERE, RARE_EVERY).await;
+        let fresh = append_rows(&ice, ROWS_HERE..2 * ROWS_HERE, ROWS_HERE, RARE_EVERY).await;
+        rewrite_fresh(&ice, fresh).await;
+
+        let table = ice.catalog().load_table(&ident).await.unwrap();
+        let registered = registered_seg2_blobs(&table);
+        assert!(
+            registered.len() > 1,
+            "the rolled rewrite must register several sidecars: {registered:?}"
+        );
+
+        // The second registration against the same snapshot.
+        assert_eq!(
+            ice.rebuild_inverted_indexes_for_files(&ident, &unindexed)
+                .await
+                .unwrap(),
+            0,
+            "the uncovered day is deferred rather than replacing the snapshot's statistics"
+        );
+
+        let table = ice.catalog().load_table(&ident).await.unwrap();
+        assert_eq!(
+            registered_seg2_blobs(&table),
+            registered,
+            "a v1 registration under the snapshot the rewrite committed must not drop that \
+             rewrite's seg2 blobs"
+        );
+        for (statistics_path, data_file, column) in &registered {
+            assert_sidecar_describes_file(&table, statistics_path, data_file, column).await;
+        }
+        let reachable = ice.reachable_files(&ident).await.unwrap();
+        for (statistics_path, _, _) in &registered {
+            assert!(
+                reachable.contains(statistics_path),
+                "the retained seg2 statistics file must remain protected from orphan GC: \
+                 {statistics_path}"
+            );
+        }
+        assert_eq!(
+            text_counts(&ice).await,
+            (2 * ROWS_HERE as i64, 60, 12_000),
+            "the retained seg2 reader must answer exact match_terms counts across both days"
+        );
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_sum(
+                &snapshot,
+                "siglake_index_registration_deferred_total",
+                Some(("reason", "snapshot_has_statistics"))
+            ),
+            1,
+            "one same-snapshot registration is deferred"
+        );
+        assert_eq!(
+            counter_sum(&snapshot, "siglake_index_rebuild_files_total", None),
+            0,
+            "deferred files are not reported as rebuilt"
+        );
+        assert_eq!(
+            counter_sum(&snapshot, "siglake_index_rebuild_bytes_total", None),
+            0,
+            "deferred bytes are not reported as rebuilt"
         );
     });
 }
@@ -898,17 +1278,20 @@ fn histogram_samples(snapshot: &SnapshotVec, name: &str) -> Vec<f64> {
 ///   report_segmented_writer_build_cost -- --ignored --nocapture
 /// ```
 ///
-/// Two arms over the same corpus, one file (one day) at a time, each a fresh
-/// append plus a streaming rewrite of exactly that day's output: the control
-/// with segmented writes off, then the same with them on. Reported per arm:
-/// wall time for the appends and rewrites, peak live heap, and the registered
-/// sidecar bytes. Sized by `SIGLAKE_SEG_WRITER_FILES` (1),
+/// Five arms over the same corpus, one file (one day) at a time, each a fresh
+/// append plus a streaming rewrite of exactly that day's output: two repeated
+/// no-index/seg2-in-merge pairs, then a post-commit v1 rebuild. Reported per
+/// arm: separate append and rewrite wall times, their total, peak live heap,
+/// and the registered sidecar bytes for live files. Sized by
+/// `SIGLAKE_SEG_WRITER_FILES` (1),
 /// `SIGLAKE_SEG_WRITER_ROWS_PER_FILE` (300,000) and
 /// `SIGLAKE_SEG_WRITER_RARE_EVERY` (100,000).
 #[test]
 #[ignore = "measurement; sized by SIGLAKE_SEG_WRITER_*"]
 fn report_segmented_writer_build_cost() {
     serialized(|_snapshotter| async move {
+        const V1_BLOB_TYPE: &str = "siglake-inverted-v1";
+
         fn knob(name: &str, default: usize) -> usize {
             std::env::var(name)
                 .ok()
@@ -921,22 +1304,53 @@ fn report_segmented_writer_build_cost() {
 
         let tmp = tempfile::tempdir().unwrap();
         println!(
-            "corpus: {files} files x {rows_per_file} rows = {} rows",
-            files * rows_per_file
+            "corpus: {files} files x {rows_per_file} rows = {} rows; append indexing=true, \
+             target_row_group_bytes=1, streaming rewrite=true",
+            files * rows_per_file,
         );
 
-        for (label, segmented) in [("off", false), ("on", true)] {
-            let ice = open_fixture(&tmp.path().join(label), segmented, Some(1), None).await;
+        let arms = [
+            ("off-1", false, false, None),
+            ("on-1", true, false, Some(SEGMENTED_V2_BLOB_TYPE)),
+            ("off-2", false, false, None),
+            ("on-2", true, false, Some(SEGMENTED_V2_BLOB_TYPE)),
+            ("v1-rebuild", false, true, Some(V1_BLOB_TYPE)),
+        ];
+        for (label, segmented, rebuild, expected_blob_type) in arms {
+            let loadavg = std::fs::read_to_string("/proc/loadavg").unwrap();
+            println!("{label}: loadavg before arm: {}", loadavg.trim());
+            println!(
+                "{label}: effective settings segmented_index_writes={segmented}, \
+                 index_rebuild={rebuild}, index_at_flush=true"
+            );
+            let ice = open_fixture_with_tuning(
+                &tmp.path().join(label),
+                IcebergTuning {
+                    segmented_index_writes: Some(segmented),
+                    index_rebuild: Some(rebuild),
+                    index_at_flush: Some(true),
+                    target_row_group_bytes: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await;
             let started = std::time::Instant::now();
+            let mut append_wall = std::time::Duration::ZERO;
+            let mut rewrite_wall = std::time::Duration::ZERO;
             start_tracking();
             for file in 0..files {
-                append_and_rewrite(
+                let append_started = std::time::Instant::now();
+                let fresh = append_rows(
                     &ice,
                     file * rows_per_file..(file + 1) * rows_per_file,
                     rows_per_file,
                     rare_every,
                 )
                 .await;
+                append_wall += append_started.elapsed();
+                let rewrite_started = std::time::Instant::now();
+                rewrite_fresh(&ice, fresh).await;
+                rewrite_wall += rewrite_started.elapsed();
             }
             let peak = peak_tracked();
             let wall = started.elapsed();
@@ -946,27 +1360,49 @@ fn report_segmented_writer_build_cost() {
                 .load_table(ice.events_table_ident())
                 .await
                 .unwrap();
+            let live = ice.live_data_files(ice.events_table_ident()).await.unwrap();
+            let live_paths: Vec<&str> = live.iter().map(|file| file.file_path()).collect();
+            let registered_types = registered_blob_types_for(&table, &live);
+            assert_eq!(
+                registered_types
+                    .get(SEGMENTED_V2_BLOB_TYPE)
+                    .copied()
+                    .unwrap_or(0),
+                usize::from(segmented) * live.len(),
+                "{label}: unexpected seg2 coverage"
+            );
+            assert_eq!(
+                registered_types.get(V1_BLOB_TYPE).copied().unwrap_or(0),
+                usize::from(rebuild) * live.len(),
+                "{label}: unexpected v1 coverage"
+            );
+
             let mut sidecar_bytes = 0i64;
             let mut sidecars = 0usize;
             for statistics in table.metadata().statistics_iter() {
-                if statistics
+                let matching = statistics
                     .blob_metadata
                     .iter()
-                    .any(|blob| blob.r#type == SEGMENTED_V2_BLOB_TYPE)
-                {
+                    .filter(|blob| {
+                        expected_blob_type == Some(blob.r#type.as_str())
+                            && blob
+                                .properties
+                                .get("data_file")
+                                .is_some_and(|path| live_paths.contains(&path.as_str()))
+                    })
+                    .count();
+                if matching > 0 {
                     sidecar_bytes += statistics.file_size_in_bytes;
-                    sidecars += statistics
-                        .blob_metadata
-                        .iter()
-                        .filter(|blob| blob.r#type == SEGMENTED_V2_BLOB_TYPE)
-                        .count();
+                    sidecars += matching;
                 }
             }
-            let live = ice.live_data_files(ice.events_table_ident()).await.unwrap();
             let data_bytes: u64 = live.iter().map(|f| f.file_size_in_bytes()).sum();
             println!(
-                "{label}: wall {:.2} s, peak live heap {} B ({:.1} MiB), {sidecars} sidecars in \
-             {sidecar_bytes} B against {data_bytes} B of data ({:.2}%), {} live files",
+                "{label}: append wall {:.2} s, rewrite wall {:.2} s, total wall {:.2} s, peak \
+             live heap {} B ({:.1} MiB), {sidecars} live sidecars in {sidecar_bytes} B against \
+             {data_bytes} B of data ({:.2}%), {} live files",
+                append_wall.as_secs_f64(),
+                rewrite_wall.as_secs_f64(),
                 wall.as_secs_f64(),
                 peak,
                 peak as f64 / (1024.0 * 1024.0),
@@ -982,9 +1418,11 @@ fn report_segmented_writer_build_cost() {
                 (files * rows_per_file) as i64,
                 "{label} arm lost rows"
             );
-            if segmented {
-                assert_eq!(sidecars, live.len(), "one sidecar per live file");
-            }
+            assert_eq!(
+                sidecars,
+                usize::from(expected_blob_type.is_some()) * live.len(),
+                "{label}: one sidecar per live file when indexing is enabled"
+            );
         }
     });
 }

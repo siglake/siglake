@@ -18,6 +18,7 @@ pub mod merge;
 mod query_provider;
 pub mod schema_version;
 pub mod subscribe;
+pub mod wal_ledger;
 
 pub use query_provider::{
     clear_decoded_file_cache, clear_row_group_layout_cache, decoded_file_cache_footprint,

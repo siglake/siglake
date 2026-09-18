@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,8 @@ use iceberg::spec::{
 };
 use iceberg::table::Table;
 use iceberg::transaction::{
-    ApplyTransactionAction, ExpireSnapshotsAction, Transaction, UpdateSchemaAction,
+    ActionCommit, ApplyTransactionAction, ExpireSnapshotsAction, Transaction, TransactionAction,
+    UpdateSchemaAction,
 };
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -51,8 +52,8 @@ use iceberg::writer::file_writer::{
 };
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{
-    Catalog, CatalogBuilder, ErrorKind as IcebergErrorKind, NamespaceIdent, TableCreation,
-    TableIdent,
+    Catalog, CatalogBuilder, Error as IcebergError, ErrorKind as IcebergErrorKind, NamespaceIdent,
+    TableCreation, TableIdent, TableRequirement, TableUpdate,
 };
 use iceberg_catalog_sql::{SqlBindStyle, SqlCatalogBuilder};
 use iceberg_storage_opendal::{CustomAwsCredentialLoader, OpenDalStorageFactory};
@@ -883,6 +884,20 @@ impl Default for GcOptions {
 /// Outcome of an orphan-GC pass. See [`IcebergContext::gc_orphans`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GcReport {
+    /// Siglake-owned statistics entries that referenced no retained live data
+    /// file and were eligible for removal before the orphan walk.
+    pub statistics_entries_eligible: usize,
+    /// Eligible statistics entries removed from table metadata (0 in dry-run).
+    pub statistics_entries_removed: usize,
+    /// Statistics entries kept because at least one blob references a retained
+    /// live data file. Mixed live/retired entries are counted here.
+    pub statistics_entries_kept_live: usize,
+    /// Entries left untouched because they contain a blob type Siglake does
+    /// not own.
+    pub statistics_entries_skipped_unowned: usize,
+    /// Entries left untouched because an owned blob has no `data_file`
+    /// property.
+    pub statistics_entries_skipped_missing_data_file: usize,
     /// In-scope files listed under `data/` + `metadata/` (excludes
     /// `*.metadata.json`).
     pub scanned: usize,
@@ -896,6 +911,21 @@ pub struct GcReport {
     pub skipped_recent: usize,
     /// Files actually deleted (0 in dry-run).
     pub deleted: usize,
+}
+
+/// Outcome of deciding which Iceberg statistics entries Siglake may retire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatisticsRetirementReport {
+    /// Owned entries whose blobs all reference retired data files.
+    pub eligible: usize,
+    /// Entries actually removed from table metadata (0 in dry-run).
+    pub removed: usize,
+    /// Entries kept whole because at least one blob still references live data.
+    pub kept_live: usize,
+    /// Entries containing at least one blob type Siglake does not own.
+    pub skipped_unowned: usize,
+    /// Owned entries containing a blob without a `data_file` property.
+    pub skipped_missing_data_file: usize,
 }
 
 /// Which of the three merge implementations a re-cluster bin actually took.
@@ -9052,27 +9082,30 @@ fn tenant_metric_label(namespace: &NamespaceIdent) -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
-/// Every `(data file, column)` a registered Puffin text sidecar already covers,
-/// in any of the three formats.
+/// Every `(data file, column)` a registered production Puffin text sidecar
+/// already covers.
 ///
 /// This is what makes a rebuild idempotent, and since #4377 it is also what
 /// keeps the post-commit full-file decode away from a file a rewrite already
-/// indexed: a segmented sidecar is registered with the rewrite that wrote it,
-/// so the maintenance rebuild sees the column covered and reads nothing. A
-/// segmented blob and a v1 blob are alternative answers for the same column,
-/// not layers — the reader takes whichever it finds.
+/// indexed: a seg2 sidecar is registered with the rewrite that wrote it, so the
+/// maintenance rebuild sees the column covered and reads nothing. A seg2 blob
+/// and a whole-file v1 blob are alternative answers for the same column.
+/// Prototype seg1 never shipped and no longer suppresses a production rebuild
+/// (#5230).
+fn puffin_blob_suppresses_rebuild(blob_type: &str) -> bool {
+    matches!(
+        blob_type,
+        SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE | siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE
+    )
+}
+
 fn existing_puffin_index_columns(
     metadata: &iceberg::spec::TableMetadata,
 ) -> HashSet<(String, String)> {
-    const TEXT_BLOB_TYPES: [&str; 3] = [
-        SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE,
-        siglake_index::segmented::SEGMENTED_BLOB_TYPE,
-        siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE,
-    ];
     metadata
         .statistics_iter()
         .flat_map(|stats| stats.blob_metadata.iter())
-        .filter(|blob| TEXT_BLOB_TYPES.contains(&blob.r#type.as_str()))
+        .filter(|blob| puffin_blob_suppresses_rebuild(&blob.r#type))
         .filter_map(|blob| {
             Some((
                 blob.properties.get("data_file")?.to_string(),
@@ -9080,6 +9113,24 @@ fn existing_puffin_index_columns(
             ))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod rebuild_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn only_production_text_sidecars_suppress_a_rebuild() {
+        assert!(puffin_blob_suppresses_rebuild(
+            SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE
+        ));
+        assert!(puffin_blob_suppresses_rebuild(
+            siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE
+        ));
+        assert!(!puffin_blob_suppresses_rebuild(
+            siglake_index::segmented::SEGMENTED_BLOB_TYPE
+        ));
+    }
 }
 
 async fn parquet_footer_has_index(path: &str, file_io: &FileIO, column: &str) -> bool {
@@ -9202,7 +9253,7 @@ async fn write_segmented_puffin_sidecar(
     table: &Table,
     snapshot_id: i64,
     sequence_number: i64,
-    blobs: Vec<SegmentedIndexBlob>,
+    blobs: &[SegmentedIndexBlob],
 ) -> Result<StatisticsFile> {
     let statistics_path = next_puffin_sidecar_path(table)?;
     let output_file = table
@@ -9237,7 +9288,7 @@ async fn write_segmented_puffin_sidecar(
                     .fields(vec![field_id])
                     .snapshot_id(snapshot_id)
                     .sequence_number(sequence_number)
-                    .data(blob.bytes)
+                    .data(blob.bytes.clone())
                     .properties(properties.clone())
                     .build(),
                 PuffinCompressionCodec::None,
@@ -9267,6 +9318,57 @@ async fn write_segmented_puffin_sidecar(
         key_metadata: None,
         blob_metadata: statistics_blob_metadata,
     })
+}
+
+/// Registers a rewrite's already-built seg2 blobs against the snapshot the
+/// rewrite action produced on this transaction attempt.
+///
+/// Transaction retries re-apply actions after refreshing their base. Writing
+/// the Puffin file here, after `RewriteFilesAction`, gives both its physical
+/// footer and its table metadata the refreshed snapshot's sequence number.
+/// The immutable Parquet output and seg2 bytes are reused; a Puffin file from a
+/// failed CAS attempt remains unreferenced and is reclaimed as an orphan.
+struct PublishSegmentedStatisticsAction {
+    snapshot_id: i64,
+    blobs: Vec<SegmentedIndexBlob>,
+}
+
+#[async_trait::async_trait]
+impl TransactionAction for PublishSegmentedStatisticsAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        let snapshot = table.metadata().current_snapshot().ok_or_else(|| {
+            IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "segmented statistics action found no rewrite snapshot",
+            )
+        })?;
+        if snapshot.snapshot_id() != self.snapshot_id {
+            return Err(IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "segmented statistics action did not follow its rewrite snapshot",
+            )
+            .with_context("expected_snapshot_id", self.snapshot_id.to_string())
+            .with_context("found_snapshot_id", snapshot.snapshot_id().to_string()));
+        }
+        let statistics = write_segmented_puffin_sidecar(
+            table,
+            snapshot.snapshot_id(),
+            snapshot.sequence_number(),
+            &self.blobs,
+        )
+        .await
+        .map_err(|err| {
+            IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "failed to write segmented index sidecar",
+            )
+            .with_source(err)
+        })?;
+        Ok(ActionCommit::new(
+            vec![TableUpdate::SetStatistics { statistics }],
+            vec![],
+        ))
+    }
 }
 
 async fn write_puffin_sidecar(
@@ -10472,6 +10574,264 @@ async fn create_namespace_tolerating_existing(
             }
             _ => Err(anyhow::Error::new(err).context(format!("create namespace {namespace}"))),
         },
+    }
+}
+
+#[derive(Debug, Default)]
+struct StatisticsRetirementObservation {
+    eligible: AtomicUsize,
+    kept_live: AtomicUsize,
+    skipped_unowned: AtomicUsize,
+    skipped_missing_data_file: AtomicUsize,
+}
+
+impl StatisticsRetirementObservation {
+    fn store(&self, report: StatisticsRetirementReport) {
+        self.eligible.store(report.eligible, Ordering::Relaxed);
+        self.kept_live.store(report.kept_live, Ordering::Relaxed);
+        self.skipped_unowned
+            .store(report.skipped_unowned, Ordering::Relaxed);
+        self.skipped_missing_data_file
+            .store(report.skipped_missing_data_file, Ordering::Relaxed);
+    }
+
+    fn report(&self, applied: bool) -> StatisticsRetirementReport {
+        let eligible = self.eligible.load(Ordering::Relaxed);
+        StatisticsRetirementReport {
+            eligible,
+            removed: usize::from(applied) * eligible,
+            kept_live: self.kept_live.load(Ordering::Relaxed),
+            skipped_unowned: self.skipped_unowned.load(Ordering::Relaxed),
+            skipped_missing_data_file: self.skipped_missing_data_file.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct RetireObsoleteStatisticsAction {
+    observation: Arc<StatisticsRetirementObservation>,
+}
+
+impl RetireObsoleteStatisticsAction {
+    fn new() -> (Self, Arc<StatisticsRetirementObservation>) {
+        let observation = Arc::new(StatisticsRetirementObservation::default());
+        (
+            Self {
+                observation: Arc::clone(&observation),
+            },
+            observation,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl TransactionAction for RetireObsoleteStatisticsAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        if table.metadata().statistics_iter().next().is_none() {
+            self.observation
+                .store(StatisticsRetirementReport::default());
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+        let live_data_files = retained_live_data_file_paths(table).await?;
+        let (report, snapshot_ids, _) =
+            statistics_retirement_plan(table.metadata(), &live_data_files);
+        self.observation.store(report);
+        if snapshot_ids.is_empty() {
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+        Ok(ActionCommit::new(
+            snapshot_ids
+                .into_iter()
+                .map(|snapshot_id| TableUpdate::RemoveStatistics { snapshot_id })
+                .collect(),
+            vec![TableRequirement::UuidMatch {
+                uuid: table.metadata().uuid(),
+            }],
+        ))
+    }
+}
+
+fn siglake_owned_statistics_blob(blob_type: &str) -> bool {
+    matches!(
+        blob_type,
+        SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE
+            | siglake_index::segmented::SEGMENTED_BLOB_TYPE
+            | siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatisticsDisposition {
+    Retire,
+    KeepLive,
+    SkipUnowned,
+    SkipMissingDataFile,
+}
+
+fn statistics_disposition(
+    statistics: &StatisticsFile,
+    live_data_files: &HashSet<String>,
+) -> StatisticsDisposition {
+    if statistics
+        .blob_metadata
+        .iter()
+        .any(|blob| !siglake_owned_statistics_blob(&blob.r#type))
+    {
+        return StatisticsDisposition::SkipUnowned;
+    }
+    if statistics.blob_metadata.is_empty()
+        || statistics
+            .blob_metadata
+            .iter()
+            .any(|blob| !blob.properties.contains_key("data_file"))
+    {
+        return StatisticsDisposition::SkipMissingDataFile;
+    }
+    if statistics.blob_metadata.iter().any(|blob| {
+        live_data_files.contains(
+            blob.properties
+                .get("data_file")
+                .expect("presence checked above"),
+        )
+    }) {
+        StatisticsDisposition::KeepLive
+    } else {
+        StatisticsDisposition::Retire
+    }
+}
+
+fn statistics_retirement_plan(
+    metadata: &iceberg::spec::TableMetadata,
+    live_data_files: &HashSet<String>,
+) -> (StatisticsRetirementReport, Vec<i64>, Vec<String>) {
+    let mut report = StatisticsRetirementReport::default();
+    let mut snapshot_ids = Vec::new();
+    let mut statistics_paths = Vec::new();
+    for statistics in metadata.statistics_iter() {
+        match statistics_disposition(statistics, live_data_files) {
+            StatisticsDisposition::Retire => {
+                report.eligible += 1;
+                snapshot_ids.push(statistics.snapshot_id);
+                statistics_paths.push(statistics.statistics_path.clone());
+            }
+            StatisticsDisposition::KeepLive => report.kept_live += 1,
+            StatisticsDisposition::SkipUnowned => report.skipped_unowned += 1,
+            StatisticsDisposition::SkipMissingDataFile => {
+                report.skipped_missing_data_file += 1;
+            }
+        }
+    }
+    (report, snapshot_ids, statistics_paths)
+}
+
+async fn retained_live_data_file_paths(table: &Table) -> iceberg::Result<HashSet<String>> {
+    let metadata = table.metadata_ref();
+    let mut live = HashSet::new();
+    let mut visited_manifests = HashSet::new();
+    for snapshot in metadata.snapshots() {
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), &metadata)
+            .await?;
+        for manifest_file in manifest_list.entries() {
+            if !visited_manifests.insert(manifest_file.manifest_path.clone()) {
+                continue;
+            }
+            let manifest = manifest_file.load_manifest(table.file_io()).await?;
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    live.insert(entry.data_file().file_path().to_string());
+                }
+            }
+        }
+    }
+    Ok(live)
+}
+
+fn record_statistics_retirement(report: StatisticsRetirementReport) {
+    metrics::counter!("siglake_iceberg_statistics_removed_total").increment(report.removed as u64);
+    metrics::counter!(
+        "siglake_iceberg_statistics_retirement_skipped_total",
+        "reason" => "unowned_blob_type"
+    )
+    .increment(report.skipped_unowned as u64);
+    metrics::counter!(
+        "siglake_iceberg_statistics_retirement_skipped_total",
+        "reason" => "missing_data_file"
+    )
+    .increment(report.skipped_missing_data_file as u64);
+}
+
+#[cfg(test)]
+mod statistics_retirement_tests {
+    use super::*;
+
+    fn blob(blob_type: &str, data_file: Option<&str>) -> StatisticsBlobMetadata {
+        StatisticsBlobMetadata {
+            r#type: blob_type.to_string(),
+            snapshot_id: 7,
+            sequence_number: 7,
+            fields: vec![1],
+            properties: data_file
+                .map(|path| HashMap::from([("data_file".to_string(), path.to_string())]))
+                .unwrap_or_default(),
+        }
+    }
+
+    fn statistics(blobs: Vec<StatisticsBlobMetadata>) -> StatisticsFile {
+        StatisticsFile {
+            snapshot_id: 7,
+            statistics_path: "file:///warehouse/metadata/index.puffin".to_string(),
+            file_size_in_bytes: 100,
+            file_footer_size_in_bytes: 10,
+            key_metadata: None,
+            blob_metadata: blobs,
+        }
+    }
+
+    #[test]
+    fn an_entry_with_any_live_blob_stays_whole() {
+        let live = HashSet::from(["file:///warehouse/data/live.parquet".to_string()]);
+        let entry = statistics(vec![
+            blob(
+                SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE,
+                Some("file:///warehouse/data/retired.parquet"),
+            ),
+            blob(
+                siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE,
+                Some("file:///warehouse/data/live.parquet"),
+            ),
+        ]);
+        assert_eq!(
+            statistics_disposition(&entry, &live),
+            StatisticsDisposition::KeepLive
+        );
+    }
+
+    #[test]
+    fn only_owned_entries_with_complete_retired_references_are_removed() {
+        let live = HashSet::new();
+        let retired = statistics(vec![blob(
+            siglake_index::segmented::SEGMENTED_BLOB_TYPE,
+            Some("file:///warehouse/data/retired.parquet"),
+        )]);
+        assert_eq!(
+            statistics_disposition(&retired, &live),
+            StatisticsDisposition::Retire
+        );
+
+        let unowned = statistics(vec![blob(
+            "apache-datasketches-theta-v1",
+            Some("file:///warehouse/data/retired.parquet"),
+        )]);
+        assert_eq!(
+            statistics_disposition(&unowned, &live),
+            StatisticsDisposition::SkipUnowned
+        );
+
+        let missing = statistics(vec![blob(SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE, None)]);
+        assert_eq!(
+            statistics_disposition(&missing, &live),
+            StatisticsDisposition::SkipMissingDataFile
+        );
     }
 }
 
@@ -14042,9 +14402,32 @@ impl IcebergContext {
         table: &Table,
         blobs: Vec<PuffinSidecarBlobSpec>,
         snapshot_id: i64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if blobs.is_empty() {
-            return Ok(());
+            return Ok(false);
+        }
+        if table
+            .metadata()
+            .statistics_for_snapshot(snapshot_id)
+            .is_some()
+        {
+            let deferred_files: std::collections::BTreeSet<&str> = blobs
+                .iter()
+                .map(|blob| blob.data_file_path.as_str())
+                .collect();
+            metrics::counter!(
+                "siglake_index_registration_deferred_total",
+                "reason" => "snapshot_has_statistics"
+            )
+            .increment(1);
+            tracing::warn!(
+                table = %table.identifier(),
+                snapshot_id,
+                files = deferred_files.len(),
+                deferred_files = ?deferred_files,
+                "deferred Puffin index registration because the snapshot already has a statistics file"
+            );
+            return Ok(false);
         }
         let snapshot = table
             .metadata()
@@ -14063,7 +14446,7 @@ impl IcebergContext {
         tx.commit(self.catalog.as_ref())
             .await
             .context("update_statistics Transaction::commit")?;
-        Ok(())
+        Ok(true)
     }
 
     pub async fn rebuild_inverted_indexes_for_files(
@@ -14115,8 +14498,12 @@ impl IcebergContext {
         if blobs.is_empty() {
             return Ok(0);
         }
-        self.register_puffin_sidecar_for_snapshot(&table, blobs, snapshot_id)
-            .await?;
+        if !self
+            .register_puffin_sidecar_for_snapshot(&table, blobs, snapshot_id)
+            .await?
+        {
+            return Ok(0);
+        }
         let tenant = tenant_metric_label(self.namespace());
         let table_name = table_ident.name().to_string();
         metrics::counter!(
@@ -14222,11 +14609,21 @@ impl IcebergContext {
             action = action.older_than(cutoff);
         }
         let tx = action.apply(tx).context("ExpireSnapshotsAction::apply")?;
+        // This action runs after expiry against the transaction's updated
+        // table, and is re-evaluated against a refreshed base on every CAS
+        // retry. A statistics entry becomes removable only when no retained
+        // snapshot has an alive reference to any data file it names.
+        let (retire_action, retirement_observation) = RetireObsoleteStatisticsAction::new();
+        let tx = retire_action
+            .apply(tx)
+            .context("RetireObsoleteStatisticsAction::apply")?;
         tx.commit(self.catalog.as_ref())
             .await
             .context("expire_snapshots commit")?;
+        let retirement = retirement_observation.report(true);
         self.invalidate_cached_table(table_ident).await;
         metrics::counter!("siglake_iceberg_snapshots_expired_total").increment(n as u64);
+        record_statistics_retirement(retirement);
         if let Some((proven, target)) = reroot {
             // After the commit, not before: an append that lands in this window
             // builds its link against the shrunken metadata, so its parent is
@@ -15153,6 +15550,59 @@ impl IcebergContext {
         self.execute_all_delete_tasks_inner(false).await
     }
 
+    /// Remove statistics entries that Siglake can prove describe no data file
+    /// reachable through a retained snapshot. Only entries made entirely of
+    /// Siglake inverted-index blob types, with a `data_file` property on every
+    /// blob, are eligible. A mixed live/retired entry stays whole.
+    ///
+    /// `apply=false` reports the classification without committing. The
+    /// action is re-evaluated against the transaction's refreshed table on a
+    /// catalog conflict, so a newly retained live reference cannot be removed
+    /// from a stale plan.
+    pub async fn retire_obsolete_statistics(
+        &self,
+        table_ident: &TableIdent,
+        apply: bool,
+    ) -> Result<StatisticsRetirementReport> {
+        Ok(self
+            .retire_obsolete_statistics_inner(table_ident, apply)
+            .await?
+            .0)
+    }
+
+    async fn retire_obsolete_statistics_inner(
+        &self,
+        table_ident: &TableIdent,
+        apply: bool,
+    ) -> Result<(StatisticsRetirementReport, Vec<String>)> {
+        let table = self
+            .catalog
+            .load_table(table_ident)
+            .await
+            .with_context(|| format!("load_table {table_ident}"))?;
+        if !apply {
+            let live_data_files = retained_live_data_file_paths(&table)
+                .await
+                .context("retained live data files for statistics retirement")?;
+            let (report, _, paths) = statistics_retirement_plan(table.metadata(), &live_data_files);
+            return Ok((report, paths));
+        }
+
+        let (action, observation) = RetireObsoleteStatisticsAction::new();
+        let tx = action
+            .apply(Transaction::new(&table))
+            .context("RetireObsoleteStatisticsAction::apply")?;
+        tx.commit(self.catalog.as_ref())
+            .await
+            .context("retire obsolete statistics commit")?;
+        let report = observation.report(true);
+        if report.removed > 0 {
+            self.invalidate_cached_table(table_ident).await;
+        }
+        record_statistics_retirement(report);
+        Ok((report, Vec::new()))
+    }
+
     /// All object-store paths reachable from the table's **retained**
     /// snapshots: every snapshot's manifest-list avro, every manifest avro in
     /// those lists, and every *alive* (`Added`/`Existing`) data file. This is
@@ -15217,8 +15667,22 @@ impl IcebergContext {
     pub async fn gc_orphans(&self, table_ident: &TableIdent, opts: GcOptions) -> Result<GcReport> {
         use futures::StreamExt;
 
+        // Removing a metadata entry and deleting its Puffin object are one
+        // maintenance sequence. Dry-run classifies the entries without
+        // changing reachability; apply commits RemoveStatistics first, then
+        // the ordinary age gate decides whether the object may be deleted.
+        let (statistics, dry_run_retired_paths) = self
+            .retire_obsolete_statistics_inner(table_ident, opts.apply)
+            .await?;
+
         // 1. The live set (full iceberg paths).
-        let reachable = self.reachable_files(table_ident).await?;
+        let mut reachable = self.reachable_files(table_ident).await?;
+        // Predict the same candidates apply mode creates without mutating the
+        // catalog. Their bytes and age therefore appear in the dry-run report
+        // instead of first appearing only when the operator applies it.
+        for path in dry_run_retired_paths {
+            reachable.remove(&path);
+        }
 
         // 2. Key the live set by path-relative-to-table-location. Bail if any
         //    reachable path is not under the location — never risk deleting a
@@ -15258,6 +15722,11 @@ impl IcebergContext {
         let now_secs = chrono::Utc::now().timestamp();
         let min_age_secs = opts.min_age.as_secs();
         let mut report = GcReport {
+            statistics_entries_eligible: statistics.eligible,
+            statistics_entries_removed: statistics.removed,
+            statistics_entries_kept_live: statistics.kept_live,
+            statistics_entries_skipped_unowned: statistics.skipped_unowned,
+            statistics_entries_skipped_missing_data_file: statistics.skipped_missing_data_file,
             reachable: reachable_rel.len(),
             ..Default::default()
         };
@@ -17498,26 +17967,15 @@ impl IcebergContext {
             }
         };
 
-        // #4377: publish the segmented sidecars WITH the rewrite. The Puffin
-        // object is written now, under a snapshot id reserved for the commit
-        // below, and `set_statistics` rides the same transaction — so the
-        // snapshot that first exposes these data files already carries their
-        // index, and a commit that fails leaves an unreferenced object rather
-        // than a discoverable partial index. Nothing here can be skipped and
-        // retried later, which is the post-commit rebuild this replaces.
+        // #4377: publish the segmented sidecars WITH the rewrite. Reserve the
+        // snapshot id now, but write the Puffin object from the transaction
+        // action after the rewrite has been re-applied to the attempt's current
+        // base. That keeps the physical footer's sequence aligned across a
+        // stale first base and every CAS retry (#5260). The immutable Parquet
+        // output and completed seg2 bytes are reused on every attempt.
         let segmented_blobs = segmented_sink.map(|sink| sink.take()).unwrap_or_default();
-        let segmented_statistics = if segmented_blobs.is_empty() {
-            None
-        } else {
-            let reserved = iceberg::transaction::reserve_snapshot_id(&table);
-            let sequence_number = table.metadata().next_sequence_number();
-            Some((
-                reserved,
-                write_segmented_puffin_sidecar(&table, reserved, sequence_number, segmented_blobs)
-                    .await
-                    .context("write segmented index sidecar")?,
-            ))
-        };
+        let segmented_snapshot_id = (!segmented_blobs.is_empty())
+            .then(|| iceberg::transaction::reserve_snapshot_id(&table));
 
         let tx = Transaction::new(&table);
         let mut action = tx
@@ -17535,20 +17993,20 @@ impl IcebergContext {
                 REWRITE_COMMIT_PROP.to_string(),
                 "recluster".to_string(),
             )]));
-        if let Some((reserved, _)) = segmented_statistics.as_ref() {
-            action = action.with_snapshot_id(*reserved);
+        if let Some(reserved) = segmented_snapshot_id {
+            action = action.with_snapshot_id(reserved);
         }
         // B.1.1: ALL per-snapshot aggregates now live in the fixed-path side object,
         // which persists across the recluster (rows unchanged → still valid against
         // total-records). No summary carry-forward needed anymore.
         let tx = action.apply(tx).context("RewriteFilesAction::apply")?;
-        let tx = match segmented_statistics {
-            Some((_, statistics)) => {
-                let register = tx.update_statistics().set_statistics(statistics);
-                register
-                    .apply(tx)
-                    .context("UpdateStatisticsAction::apply")?
+        let tx = match segmented_snapshot_id {
+            Some(snapshot_id) => PublishSegmentedStatisticsAction {
+                snapshot_id,
+                blobs: segmented_blobs,
             }
+            .apply(tx)
+            .context("PublishSegmentedStatisticsAction::apply")?,
             None => tx,
         };
         {
@@ -19706,6 +20164,16 @@ impl IcebergContext {
     /// Borrow the underlying catalog.
     pub fn catalog(&self) -> &Arc<dyn Catalog> {
         &self.catalog
+    }
+
+    /// Replace the catalog with a delegating test catalog.
+    ///
+    /// This is public only so integration regressions can choose catalog-CAS
+    /// interleavings with [`test_catalog::TestCatalog`].
+    #[doc(hidden)]
+    pub fn with_catalog_for_test(mut self, catalog: Arc<dyn Catalog>) -> Self {
+        self.catalog = catalog;
+        self
     }
 
     /// Namespace for all siglake tables.
@@ -23347,6 +23815,28 @@ mod env_knob_resolver_tests {
         assert!(!index_rebuild_enabled_from(Some("true")));
         assert!(!index_rebuild_enabled_from(Some("junk")));
         assert!(index_rebuild_enabled_from(Some("1")));
+    }
+
+    #[test]
+    fn segmented_index_writes_default_off_and_only_literal_one_enables_them() {
+        assert!(!segmented_index_writes_enabled_from(None));
+        assert!(!segmented_index_writes_enabled_from(Some("0")));
+        assert!(!segmented_index_writes_enabled_from(Some("true")));
+        assert!(!segmented_index_writes_enabled_from(Some("junk")));
+        assert!(segmented_index_writes_enabled_from(Some("1")));
+    }
+
+    #[test]
+    fn segmented_index_block_bytes_keeps_the_codec_default_unless_given_a_size() {
+        let codec_default = siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES;
+        assert_eq!(segmented_index_block_bytes_from(None), codec_default);
+        assert_eq!(segmented_index_block_bytes_from(Some("0")), codec_default);
+        assert_eq!(
+            segmented_index_block_bytes_from(Some("4 KiB")),
+            codec_default
+        );
+        assert_eq!(segmented_index_block_bytes_from(Some("-1")), codec_default);
+        assert_eq!(segmented_index_block_bytes_from(Some("16384")), 16_384);
     }
 }
 
@@ -29122,8 +29612,8 @@ pub struct GroupCountRebuiltColumn {
     pub over_cap: Option<usize>,
 }
 
-#[cfg(test)]
-pub(crate) mod test_catalog {
+#[doc(hidden)]
+pub mod test_catalog {
     //! One delegating [`Catalog`] for the regressions that need a chosen
     //! interleaving instead of a raced one.
     //!
@@ -29166,7 +29656,7 @@ pub(crate) mod test_catalog {
     /// Pass-through catalog with per-method hooks. Build with
     /// [`TestCatalog::new`], attach hooks, and finish with
     /// [`TestCatalog::shared`] — `Catalog` is only ever held behind an `Arc`.
-    pub(crate) struct TestCatalog {
+    pub struct TestCatalog {
         inner: Arc<dyn Catalog>,
         after_load_table: Option<Hook>,
         gate: Mutex<Option<Gate>>,
@@ -29191,7 +29681,7 @@ pub(crate) mod test_catalog {
     }
 
     impl TestCatalog {
-        pub(crate) fn new(inner: Arc<dyn Catalog>) -> Self {
+        pub fn new(inner: Arc<dyn Catalog>) -> Self {
             Self {
                 inner,
                 after_load_table: None,
@@ -29203,7 +29693,7 @@ pub(crate) mod test_catalog {
 
         /// Await `hook` after *every* `load_table`, i.e. once the caller's
         /// metadata is in hand but before it has it.
-        pub(crate) fn after_load_table<F, Fut>(mut self, hook: F) -> Self
+        pub fn after_load_table<F, Fut>(mut self, hook: F) -> Self
         where
             F: Fn() -> Fut + Send + Sync + 'static,
             Fut: Future<Output = ()> + Send + 'static,
@@ -29216,7 +29706,7 @@ pub(crate) mod test_catalog {
         /// the CAS window of one attempt: the conditional UPDATE that follows
         /// runs against whatever the hook left behind. [`Self::fired`] reports
         /// whether it ran.
-        pub(crate) fn before_first_update_with_base<F, Fut>(mut self, hook: F) -> Self
+        pub fn before_first_update_with_base<F, Fut>(mut self, hook: F) -> Self
         where
             F: Fn() -> Fut + Send + Sync + 'static,
             Fut: Future<Output = ()> + Send + 'static,
@@ -29225,7 +29715,7 @@ pub(crate) mod test_catalog {
             self
         }
 
-        pub(crate) fn shared(self) -> Arc<Self> {
+        pub fn shared(self) -> Arc<Self> {
             Arc::new(self)
         }
 
@@ -29233,7 +29723,7 @@ pub(crate) mod test_catalog {
         /// next `load_table` has its (by then possibly stale) metadata in hand,
         /// and sending on `release` lets it return. Exactly one load is gated
         /// per arming, so the test's own calls run unimpeded.
-        pub(crate) fn arm(
+        pub fn arm(
             &self,
         ) -> (
             tokio::sync::oneshot::Receiver<()>,
@@ -29246,7 +29736,7 @@ pub(crate) mod test_catalog {
         }
 
         /// Whether the [`Self::before_first_update_with_base`] hook has run.
-        pub(crate) fn fired(&self) -> bool {
+        pub fn fired(&self) -> bool {
             self.fired.load(Ordering::SeqCst)
         }
     }
@@ -29351,6 +29841,7 @@ pub(crate) mod test_catalog {
     /// re-pointed root cannot pass by scanning nothing, and every hand-written
     /// `Catalog` impl site as `(path relative to the root, 1-based line, byte
     /// offset)`.
+    #[cfg(test)]
     struct CatalogImplScan {
         scanned: usize,
         sites: Vec<(String, usize, usize)>,
@@ -29359,6 +29850,7 @@ pub(crate) mod test_catalog {
     /// Every hand-written pass-through `Catalog` impl under `root`, found by
     /// reading the sources rather than by listing modules, so a file added
     /// later is inside the guard without editing the tests below.
+    #[cfg(test)]
     fn scan_for_catalog_impls(root: &std::path::Path) -> CatalogImplScan {
         /// Every `.rs` file under `dir`, recursively.
         fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -29457,10 +29949,8 @@ pub(crate) mod test_catalog {
 
     /// #2588 — the same fence around this crate's integration tests, which the
     /// `src/` walk above never reached. An integration test cannot call
-    /// [`TestCatalog`] (it is `pub(crate)` behind `cfg(test)`), so the only way
-    /// for one to choose an interleaving is a fresh copy of the pass-through —
-    /// the shape #2569 collapsed. There is no consumer waiting on a public
-    /// test-support surface, so the guard says where the test belongs instead.
+    /// [`TestCatalog`], so the only reason to add a fresh copy of the
+    /// pass-through would be missing this shared support.
     #[test]
     fn no_hand_written_catalog_impl_under_integration_tests() {
         let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"));
@@ -29478,12 +29968,7 @@ pub(crate) mod test_catalog {
         assert!(
             sites.is_empty(),
             "hand-written pass-through `Catalog` impl under tests/: {sites:?}. The decorator for \
-             a chosen interleaving is `iceberg::test_catalog::TestCatalog`, but it is \
-             `pub(crate)` behind `#[cfg(test)]`, so an integration test cannot reach it and \
-             there is nothing here to import. Put the interleaving test in this crate's own \
-             unit tests, where `TestCatalog` is in scope; if it truly needs a separate test \
-             binary, lift the shared test-only support out from behind `cfg(test)` first and \
-             widen this guard with it."
+             a chosen interleaving is `iceberg::test_catalog::TestCatalog`; import it instead."
         );
     }
 

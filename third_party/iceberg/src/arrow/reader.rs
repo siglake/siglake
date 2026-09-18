@@ -786,6 +786,11 @@ pub struct RawPruneSpec {
     /// postings into a row selection. File and row-group bloom pruning stay
     /// active when this is false.
     pub inverted_index_row_selection: bool,
+    /// A bare clipped `LIMIT` whose whole-file v1 index remains declined, but
+    /// whose segmented point lookup may be admitted when its summed document
+    /// frequency is no larger than the clip. `None` for unclipped and ordered
+    /// scans.
+    pub segmented_clipped_limit: Option<usize>,
 }
 
 impl Default for RawPruneSpec {
@@ -798,6 +803,7 @@ impl Default for RawPruneSpec {
             index_substrings: Vec::new(),
             fts_udf: false,
             inverted_index_row_selection: true,
+            segmented_clipped_limit: None,
         }
     }
 }
@@ -813,6 +819,7 @@ impl RawPruneSpec {
             index_substrings: vec![substr],
             fts_udf: false,
             inverted_index_row_selection: true,
+            segmented_clipped_limit: None,
         })
     }
 
@@ -2428,20 +2435,24 @@ impl ArrowReader {
             let input = file_io.new_input(path)?;
             let reader = PuffinReader::new(input);
             let blob = reader.blob(&blob_metadata).await?;
+            PUFFIN_BLOB_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             record_text_index_stage(
                 TEXT_INDEX_STAGE_BLOB_FETCH,
                 TEXT_INDEX_STORAGE_PUFFIN,
                 fetched.elapsed(),
             );
-            if !cache_bypass {
+            // Decode first, then keep the bytes: the blob cache's eviction
+            // reads which files the parsed cache holds (#4182), and this file
+            // has to be one of them before it can be told apart from the
+            // entries whose parsed twin has already gone. A blob that did not
+            // decode — or whose index does not cover `file_rows` — is not kept
+            // at all: it would occupy the budget as a re-parse source for a
+            // parse that is rejected again.
+            let index = Self::decode_and_cache_index(key, blob.data(), cache_bypass, file_rows);
+            if !cache_bypass && index.is_some() {
                 puffin_blob_cache_put(path, offset, blob.data());
             }
-            return Ok(Self::decode_and_cache_index(
-                key,
-                blob.data(),
-                cache_bypass,
-                file_rows,
-            ));
+            return Ok(index);
         }
         Ok(None)
     }
@@ -2762,16 +2773,10 @@ impl ArrowReader {
     /// if the file carries one, and otherwise on an exact scan. There is no
     /// partial answer — a lookup that read one row group and could not read
     /// the next declines the whole file
-    /// ([`siglake_index::segmented::Lookup`]). The two formats are discovered
-    /// independently, by blob type, so a table may carry either or both, per
-    /// file, with no migration.
-    ///
-    /// Both segmented generations are discovered, seg2 first (#4377): a file
-    /// carrying both is answered from the compressed one, and a file carrying
-    /// only the prototype's seg1 blob still reads. The order is a preference,
-    /// not a fallback — a seg2 blob that declines declines the file, exactly as
-    /// it would have if the seg1 one were not there, because both describe the
-    /// same rows.
+    /// ([`siglake_index::segmented::Lookup`]). Production discovery recognizes
+    /// only seg2. Seg1 was an unreleased harness prototype that no production
+    /// writer emitted; its codec remains readable for the pinned compatibility
+    /// fixture, but its blob type does not select this query path (#5230).
     ///
     /// Bounded reading is the point, so the cost is recorded per file:
     /// `siglake_iceberg_segmented_index_range_reads` /
@@ -2786,13 +2791,9 @@ impl ArrowReader {
         spec: &RawPruneSpec,
         cache_bypass: bool,
     ) -> Result<Option<RowSelection>> {
-        // Preference order: the compressed generation first.
-        let blob_types = [
-            siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE,
-            siglake_index::segmented::SEGMENTED_BLOB_TYPE,
-        ];
+        let blob_type = siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE;
         if !task.statistics_blobs.iter().any(|stats_blob| {
-            blob_types.contains(&stats_blob.blob_type.as_str())
+            stats_blob.blob_type == blob_type
                 && stats_blob
                     .properties
                     .get("column")
@@ -2810,16 +2811,11 @@ impl ArrowReader {
             Self::record_segmented_decline("row_group_order");
             return Ok(None);
         }
-        let mut candidates: Vec<(&str, &crate::scan::StatisticsBlobReference)> = Vec::new();
-        for blob_type in blob_types {
-            for stats_blob in &task.statistics_blobs {
-                if stats_blob.blob_type == blob_type {
-                    candidates.push((blob_type, stats_blob));
-                }
-            }
-        }
         let mut selection = None;
-        for (blob_type, stats_blob) in candidates {
+        for stats_blob in &task.statistics_blobs {
+            if stats_blob.blob_type != blob_type {
+                continue;
+            }
             let path = stats_blob.statistics_path.as_str();
             let Some(blob_metadata) = Self::puffin_blob_metadata(
                 file_io,
@@ -2848,6 +2844,14 @@ impl ArrowReader {
                 cache_bypass,
             )
             .await?;
+            // A policy decline has already paid to open a cold directory and
+            // locate enough terms to prove their summed df is over budget.
+            // Charge that work too; otherwise the estimate would look free
+            // and the clipped cold/warm comparison would omit its setup cost.
+            metrics::histogram!("siglake_iceberg_segmented_index_range_reads")
+                .record(cost.reads as f64);
+            metrics::histogram!("siglake_iceberg_segmented_index_fetched_bytes")
+                .record(cost.bytes as f64);
             let (rows, resident_bytes) = match outcome {
                 SegmentedOutcome::Matching {
                     rows,
@@ -2863,10 +2867,6 @@ impl ArrowReader {
                 "source" => Self::prune_source_label(spec)
             )
             .increment(1);
-            metrics::histogram!("siglake_iceberg_segmented_index_range_reads")
-                .record(cost.reads as f64);
-            metrics::histogram!("siglake_iceberg_segmented_index_fetched_bytes")
-                .record(cost.bytes as f64);
             metrics::histogram!("siglake_iceberg_segmented_index_resident_bytes")
                 .record(resident_bytes as f64);
             metrics::histogram!("siglake_iceberg_segmented_index_selected_rows")
@@ -2994,6 +2994,12 @@ impl ArrowReader {
             .await?
         {
             return Ok(Some(selection));
+        }
+        // A clipped execution may admit a segmented point lookup after its df
+        // estimate, but never changes the whole-file v1 decision: if seg2 was
+        // absent, declined or unavailable, the exact fallback is the scan.
+        if spec.segmented_clipped_limit.is_some() {
+            return Ok(None);
         }
         // The load bounds its own concurrency (`index_load_semaphore`), around
         // the blob fetch and decode only; a warm parsed index takes no permit.
@@ -3729,40 +3735,69 @@ fn segmented_lookup(
     let resident_bytes = index.resident_bytes();
     let mut matching: Option<Vec<u32>> = None;
 
-    if !spec.all_terms.is_empty() {
-        let terms: Vec<&str> = spec.all_terms.iter().map(String::as_str).collect();
-        let Some(rows) = index.matching_rows_all_in_groups(&terms, groups) else {
-            return (SegmentedOutcome::Declined("unanswerable"), parsed);
+    if let Some(clip) = spec.segmented_clipped_limit {
+        // A substring has no point estimate: answering it requires sweeping
+        // every dictionary block. Keep #4375's scan fallback without paying
+        // that sweep merely to rediscover that it is expensive.
+        if !spec.index_substrings.is_empty() {
+            return (
+                SegmentedOutcome::Declined("clipped_estimate_unavailable"),
+                parsed,
+            );
+        }
+        let all_terms: Vec<&str> = spec.all_terms.iter().map(String::as_str).collect();
+        let any_terms: Vec<&str> = spec.any_terms.iter().map(String::as_str).collect();
+        matching = match index.matching_point_rows_with_df_limit_in_groups(
+            &all_terms,
+            &any_terms,
+            groups,
+            clip as u64,
+        ) {
+            siglake_index::segmented::ClippedLookup::Rows(rows) => Some(rows),
+            siglake_index::segmented::ClippedLookup::OverBudget => {
+                return (
+                    SegmentedOutcome::Declined("clipped_document_frequency"),
+                    parsed,
+                );
+            }
+            siglake_index::segmented::ClippedLookup::Unanswerable => {
+                return (SegmentedOutcome::Declined("unanswerable"), parsed);
+            }
         };
-        matching = Some(rows);
-    }
+    } else {
+        if !spec.all_terms.is_empty() {
+            let terms: Vec<&str> = spec.all_terms.iter().map(String::as_str).collect();
+            let Some(rows) = index.matching_rows_all_in_groups(&terms, groups) else {
+                return (SegmentedOutcome::Declined("unanswerable"), parsed);
+            };
+            matching = Some(rows);
+        }
 
-    if !spec.any_terms.is_empty() {
-        let terms: Vec<&str> = spec.any_terms.iter().map(String::as_str).collect();
-        // Where the v1 path unions per term and silently skips one it cannot
-        // answer, a skipped term here would license skipping rows it might
-        // have matched: the whole disjunction declines instead.
-        let Some(rows) = index.matching_rows_any_in_groups(&terms, groups) else {
-            return (SegmentedOutcome::Declined("unanswerable"), parsed);
-        };
-        matching = Some(match matching {
-            Some(existing) => ArrowReader::intersect_sorted_u32(&existing, &rows),
-            None => rows,
-        });
-    }
+        if !spec.any_terms.is_empty() {
+            let terms: Vec<&str> = spec.any_terms.iter().map(String::as_str).collect();
+            // Where the v1 path unions per term and silently skips one it cannot
+            // answer, a skipped term here would license skipping rows it might
+            // have matched: the whole disjunction declines instead.
+            let Some(rows) = index.matching_rows_any_in_groups(&terms, groups) else {
+                return (SegmentedOutcome::Declined("unanswerable"), parsed);
+            };
+            matching = Some(match matching {
+                Some(existing) => ArrowReader::intersect_sorted_u32(&existing, &rows),
+                None => rows,
+            });
+        }
 
-    // The regime the format does not help: a substring sweep reads every
-    // dictionary block, which is most of the blob. It is answered exactly and
-    // its cost is recorded like any other lookup's; declining it is a
-    // per-execution policy decision and belongs with #4375's, not here.
-    for substr in &spec.index_substrings {
-        let Some(rows) = index.rows_containing_in_groups(substr, groups) else {
-            return (SegmentedOutcome::Declined("unanswerable"), parsed);
-        };
-        matching = Some(match matching {
-            Some(existing) => ArrowReader::intersect_sorted_u32(&existing, &rows),
-            None => rows,
-        });
+        // The regime the format does not help: a substring sweep reads every
+        // dictionary block, which is most of the blob.
+        for substr in &spec.index_substrings {
+            let Some(rows) = index.rows_containing_in_groups(substr, groups) else {
+                return (SegmentedOutcome::Declined("unanswerable"), parsed);
+            };
+            matching = Some(match matching {
+                Some(existing) => ArrowReader::intersect_sorted_u32(&existing, &rows),
+                None => rows,
+            });
+        }
     }
 
     let outcome = match matching {
@@ -4668,42 +4703,148 @@ async fn puffin_file_metadata_cached(
 /// deserialization (242 ms for a 7.3M-row file) without the object-store fetch
 /// that precedes it (81 MB for the same file). That is only worth the memory if
 /// the two caches cover the same files, which is what the byte bound below is
-/// sized for.
+/// sized for — and what [`blob_cache_victim`] enforces when they cannot both
+/// cover the plan.
 #[derive(Default)]
 struct PuffinBlobCacheInner {
     order: std::collections::VecDeque<(String, u64)>,
-    map: std::collections::HashMap<(String, u64), Arc<[u8]>>,
+    map: std::collections::HashMap<(String, u64), PuffinBlobEntry>,
     bytes: usize,
+    /// Blobs this cache has admitted: its own clock, which ticks with the work
+    /// it is there to avoid. [`blob_cache_victim`] measures an entry's age on
+    /// it, so a cache that nothing is inserting into ages nothing out.
+    admitted: u64,
+}
+
+struct PuffinBlobEntry {
+    blob: Arc<[u8]>,
+    /// The `admitted` count when this entry last did something — entered the
+    /// cache, or handed its bytes to a decode.
+    active: u64,
 }
 
 impl PuffinBlobCacheInner {
-    fn get(&self, key: &(String, u64)) -> Option<Arc<[u8]>> {
-        self.map.get(key).cloned()
+    /// A read renews the entry: this is the one event that proves a blob was
+    /// worth keeping, and eviction reads it back through
+    /// [`PuffinBlobEntry::active`].
+    fn get(&mut self, key: &(String, u64)) -> Option<Arc<[u8]>> {
+        let admitted = self.admitted;
+        self.map.get_mut(key).map(|entry| {
+            entry.active = admitted;
+            Arc::clone(&entry.blob)
+        })
     }
 
-    /// Insert under both bounds. Eviction is first-in-first-out: a blob's value
-    /// does not grow with use the way a parsed index's does, and re-reading one
-    /// costs a fetch, not a decode.
-    fn put(&mut self, key: (String, u64), blob: Arc<[u8]>, max_bytes: usize, max_entries: usize) {
+    /// Insert under both bounds, dropping whatever [`blob_cache_victim`] names
+    /// until the incoming blob fits.
+    ///
+    /// Room is made BEFORE the insert, so the incoming blob is never a
+    /// candidate victim. It could not be a good one: its parsed twin was just
+    /// admitted, which is precisely the state in which a blob cannot be read.
+    fn put(
+        &mut self,
+        key: (String, u64),
+        blob: Arc<[u8]>,
+        max_bytes: usize,
+        max_entries: usize,
+        parsed_twins: &std::collections::HashMap<(String, u64), usize>,
+    ) {
         let size = blob.len();
         // A blob larger than the whole budget would evict everything else and
         // then be evicted itself: leave it to be fetched per decode.
-        if size > max_bytes || self.map.contains_key(&key) {
+        if max_entries == 0 || size > max_bytes || self.map.contains_key(&key) {
             return;
         }
-        self.map.insert(key.clone(), blob);
-        self.order.push_back(key);
-        self.bytes += size;
-        while self.order.len() > max_entries || self.bytes > max_bytes {
-            let Some(evicted) = self.order.pop_front() else {
+        while self.order.len() + 1 > max_entries || self.bytes + size > max_bytes {
+            let Some(position) =
+                blob_cache_victim(&self.order, &self.map, parsed_twins, self.admitted)
+            else {
                 break;
             };
-            if let Some(blob) = self.map.remove(&evicted) {
-                self.bytes -= blob.len();
+            let Some(evicted) = self.order.remove(position) else {
+                break;
+            };
+            if let Some(entry) = self.map.remove(&evicted) {
+                self.bytes -= entry.blob.len();
             }
         }
+        self.admitted += 1;
+        self.map.insert(key.clone(), PuffinBlobEntry {
+            blob,
+            active: self.admitted,
+        });
+        self.order.push_back(key);
+        self.bytes += size;
     }
 }
+
+/// Which entry this cache should drop to make room, as a position in `order`.
+///
+/// WHY NOT FIRST-IN-FIRST-OUT (#4182). A warm query is served by the parsed
+/// cache and never looks here, so a blob whose parsed twin is resident cannot
+/// be read at all — it is dead weight until its twin is evicted. FIFO ignored
+/// that, and a blob's turn at the front of the queue is exactly when its twin
+/// has just left the parsed cache: run #81's `keyword_and_label` plan, 14
+/// indexed files against caches holding about seven each, re-fetched every
+/// blob on every execution (4.60 GB over 183 index-phase reads, against 0.50
+/// GB over 73 for the same plan under the entry bound this byte bound
+/// replaced). A blob was evicted one step before the query that wanted it.
+///
+/// So, in order of preference:
+///
+/// 1. A blob nothing has read while this cache turned over
+///    [`BLOB_PROTECTION_TURNOVERS`] times. Its file has left the working set —
+///    compacted away, or simply not queried — and protecting it is how "keep
+///    what the parsed cache dropped" turns into a cache pinned to dead files.
+///    Nothing here can see that a file is gone, so the only available proof is
+///    that the blob has been readable for that many turnovers and no decode
+///    wanted it. A read renews the entry, so a file the plan keeps reading is
+///    never stale: it is read once per pass, and a pass admits fewer blobs
+///    than the cache holds for as long as the cache covers any of the plan.
+/// 2. A blob whose parsed twin is resident, and among those the one whose twin
+///    sits furthest from the parsed cache's eviction end — the one that stays
+///    unreadable longest. `parsed_twins` maps each resident Puffin entry to its
+///    position in the parsed LRU queue, 0 being the next eviction.
+/// 3. Failing both — every resident blob live and recent, which is what a
+///    parsed budget far below this one or a disabled parsed cache leaves —
+///    first-in-first-out, as every eviction used to be.
+///
+/// It never declines the incoming blob. A cache that refuses to evict cannot
+/// follow a working set at all, and the fetch has already been paid by the time
+/// this is asked.
+fn blob_cache_victim(
+    order: &std::collections::VecDeque<(String, u64)>,
+    entries: &std::collections::HashMap<(String, u64), PuffinBlobEntry>,
+    parsed_twins: &std::collections::HashMap<(String, u64), usize>,
+    admitted: u64,
+) -> Option<usize> {
+    let turnover = BLOB_PROTECTION_TURNOVERS * order.len().max(1) as u64;
+    let stale = order.iter().position(|key| {
+        entries
+            .get(key)
+            .is_some_and(|entry| admitted.saturating_sub(entry.active) >= turnover)
+    });
+    let redundant = || {
+        order
+            .iter()
+            .enumerate()
+            .filter_map(|(position, key)| parsed_twins.get(key).map(|rank| (*rank, position)))
+            .max()
+            .map(|(_, position)| position)
+    };
+    stale
+        .or_else(redundant)
+        .or_else(|| (!order.is_empty()).then_some(0))
+}
+
+/// How many of its own turnovers a blob keeps its protection for, with nothing
+/// reading it. The gap between a blob being cached and the next execution
+/// reaching its file is one pass of the plan, which admits one blob per file
+/// the cache does not hold — so this covers a plan up to about three times the
+/// blob budget, and past that the pair is simply too small for the plan (#4102)
+/// and protection lapses into first-in-first-out. Measured over the plan sizes
+/// in `a_plan_larger_than_both_caches_stops_refetching_every_blob`.
+const BLOB_PROTECTION_TURNOVERS: u64 = 4;
 
 static PUFFIN_BLOB_CACHE: std::sync::OnceLock<std::sync::Mutex<PuffinBlobCacheInner>> =
     std::sync::OnceLock::new();
@@ -4844,8 +4985,8 @@ pub fn puffin_blob_cache_stats(path_substring: &str) -> (usize, usize, usize) {
         .map
         .iter()
         .filter(|((path, _), _)| path.contains(path_substring))
-        .fold((0, 0), |(entries, bytes), (_, blob)| {
-            (entries + 1, bytes + blob.len())
+        .fold((0, 0), |(entries, bytes), (_, entry)| {
+            (entries + 1, bytes + entry.blob.len())
         });
     (entries, bytes, cache.bytes)
 }
@@ -4854,10 +4995,14 @@ fn puffin_blob_cache_get(path: &str, offset: u64) -> Option<Arc<[u8]>> {
     if puffin_blob_cache_max_entries() == 0 || puffin_blob_cache_max_bytes() == 0 {
         return None;
     }
-    puffin_blob_cache()
+    let hit = puffin_blob_cache()
         .lock()
         .unwrap()
-        .get(&(path.to_string(), offset))
+        .get(&(path.to_string(), offset));
+    if hit.is_some() {
+        PUFFIN_BLOB_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    hit
 }
 
 fn puffin_blob_cache_put(path: &str, offset: u64, bytes: &[u8]) {
@@ -4868,12 +5013,37 @@ fn puffin_blob_cache_put(path: &str, offset: u64, bytes: &[u8]) {
     if max_entries == 0 || max_bytes == 0 || bytes.len() > max_bytes {
         return;
     }
+    let parsed_twins = parsed_index_puffin_twin_ranks();
     puffin_blob_cache().lock().unwrap().put(
         (path.to_string(), offset),
         Arc::<[u8]>::from(bytes),
         max_bytes,
         max_entries,
+        &parsed_twins,
     );
+}
+
+/// Which Puffin entries the parsed-index cache holds, and where each sits in
+/// its LRU queue (0 = next to be evicted). What [`blob_cache_victim`] reads.
+///
+/// Taken while the blob cache is UNLOCKED, and released before it is locked:
+/// the two caches' locks are never held at once, in either order, so coupling
+/// their eviction adds no lock cycle. A footer-KV entry is not listed — it has
+/// no blob here to be redundant with. The clone costs one pass over at most
+/// `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_ENTRIES` keys, on a path that has just paid
+/// an object-store fetch.
+fn parsed_index_puffin_twin_ranks() -> std::collections::HashMap<(String, u64), usize> {
+    parsed_index_cache()
+        .lock()
+        .unwrap()
+        .order
+        .iter()
+        .enumerate()
+        .filter_map(|(rank, key)| match key {
+            ParsedIndexKey::Puffin { path, offset } => Some(((path.clone(), *offset), rank)),
+            ParsedIndexKey::FooterKv { .. } => None,
+        })
+        .collect()
 }
 
 /// Which write-once identity a parsed index is held under. Both storage shapes
@@ -5153,6 +5323,28 @@ fn parsed_index_cache() -> &'static std::sync::Mutex<ParsedIndexCacheInner> {
 static INVERTED_INDEX_DECODES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static INVERTED_INDEX_CACHE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+static PUFFIN_BLOB_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PUFFIN_BLOB_CACHE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many index blobs this process has read from object storage, and how many
+/// decodes were handed bytes the blob cache still held instead.
+///
+/// The second number is what the blob cache exists for, and the first is what
+/// it is meant to stop growing: a plan whose indexed files exceed the parsed
+/// budget re-parses per execution either way, but it should not re-FETCH per
+/// execution (#4182). Diagnostics for tests and local measurement — not a
+/// metric, and not exported; a round reads the same fact off
+/// `siglake_object_store_read_bytes_total{phase="index"}` against
+/// `siglake_iceberg_parsed_index_cache_lookups_total{outcome="miss"}`.
+pub fn puffin_blob_fetch_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PUFFIN_BLOB_FETCHES.load(Relaxed),
+        PUFFIN_BLOB_CACHE_HITS.load(Relaxed),
+    )
+}
 
 /// How many whole per-file inverted indexes this process has deserialized, and
 /// how many query-time lookups were served from the parsed-index cache instead.
@@ -5766,7 +5958,10 @@ mod tests {
         segmented_directory_cache_max_bytes_from, segmented_directory_cache_put,
         segmented_directory_cache_stats, segmented_index_reads_from,
     };
-    use siglake_index::segmented::{SEGMENTED_BLOB_TYPE, SEGMENTED_FORMAT_PROPERTY};
+    use siglake_index::segmented::{
+        DEFAULT_TARGET_BLOCK_BYTES, SEGMENTED_V2_BLOB_TYPE, SEGMENTED_V2_FORMAT_PROPERTY,
+        SegmentedWriter,
+    };
     use crate::arrow::{ArrowReader, ArrowReaderBuilder};
     use crate::delete_vector::DeleteVector;
     use crate::expr::visitors::bound_predicate_visitor::visit;
@@ -6686,17 +6881,22 @@ message schema {
     /// An index blob is data-sized — 81 MB for a 7.3M-row file — so the entry
     /// count alone never bounded what this holds. Bytes and entries both cap
     /// it, and the byte total tracks insertions and evictions exactly.
+    ///
+    /// Every insert here passes an empty twin map: with the parsed cache
+    /// holding none of these files, [`blob_cache_victim`] is first-in-
+    /// first-out, which is the rule these bounds were written against.
     #[test]
     fn puffin_blob_cache_honours_both_bounds() {
         use crate::arrow::reader::PuffinBlobCacheInner;
 
         let blob = |size: usize| Arc::<[u8]>::from(vec![7u8; size]);
         let key = |n: u64| (format!("s3://bucket/stats-{n}.puffin"), n);
+        let no_twins = std::collections::HashMap::new();
 
         // Byte bound: room for two 100-byte blobs, the third evicts the first.
         let mut cache = PuffinBlobCacheInner::default();
         for n in 0..3 {
-            cache.put(key(n), blob(100), 200, 128);
+            cache.put(key(n), blob(100), 200, 128, &no_twins);
         }
         assert!(cache.get(&key(0)).is_none(), "oldest entry evicted");
         assert!(cache.get(&key(1)).is_some());
@@ -6704,7 +6904,7 @@ message schema {
         assert_eq!(cache.bytes, 200);
 
         // One oversized blob does not evict the entries that fit.
-        cache.put(key(3), blob(201), 200, 128);
+        cache.put(key(3), blob(201), 200, 128, &no_twins);
         assert!(cache.get(&key(3)).is_none(), "oversized blob refused");
         assert!(cache.get(&key(1)).is_some(), "survivors kept");
         assert_eq!(cache.bytes, 200);
@@ -6712,7 +6912,7 @@ message schema {
         // Entry bound, independent of bytes.
         let mut cache = PuffinBlobCacheInner::default();
         for n in 0..3 {
-            cache.put(key(n), blob(100), usize::MAX, 2);
+            cache.put(key(n), blob(100), usize::MAX, 2, &no_twins);
         }
         assert!(cache.get(&key(0)).is_none());
         assert!(cache.get(&key(1)).is_some());
@@ -6721,14 +6921,308 @@ message schema {
         // A repeat insert neither duplicates nor double-counts, and eviction
         // returns the bytes it took.
         let mut cache = PuffinBlobCacheInner::default();
-        cache.put(key(0), blob(100), usize::MAX, 2);
-        cache.put(key(0), blob(100), usize::MAX, 2);
+        cache.put(key(0), blob(100), usize::MAX, 2, &no_twins);
+        cache.put(key(0), blob(100), usize::MAX, 2, &no_twins);
         assert_eq!(cache.order.len(), 1);
         assert_eq!(cache.bytes, 100);
-        cache.put(key(1), blob(50), usize::MAX, 2);
-        cache.put(key(2), blob(50), usize::MAX, 2);
+        cache.put(key(1), blob(50), usize::MAX, 2, &no_twins);
+        cache.put(key(2), blob(50), usize::MAX, 2, &no_twins);
         assert_eq!(cache.bytes, 100, "evicting the 100-byte entry frees 100");
         assert!(cache.get(&key(0)).is_none());
+    }
+
+    /// Which entry a full blob cache drops, entry by entry.
+    #[test]
+    fn blob_cache_victim_spares_the_blobs_the_parsed_cache_has_dropped() {
+        use crate::arrow::reader::{PuffinBlobEntry, blob_cache_victim};
+
+        let key = |n: u64| (format!("s3://bucket/stats-{n}.puffin"), n);
+        let order: std::collections::VecDeque<(String, u64)> = (0..4).map(key).collect();
+        // Four entries, each active at a different tick; `admitted` = 4 leaves
+        // all of them inside the `BLOB_PROTECTION_TURNOVERS` turnovers
+        // protection lasts.
+        let entries: std::collections::HashMap<(String, u64), PuffinBlobEntry> = (0..4)
+            .map(|n| {
+                (key(n), PuffinBlobEntry {
+                    blob: Arc::<[u8]>::from(vec![7u8; 8]),
+                    active: n + 1,
+                })
+            })
+            .collect();
+        let no_twins = std::collections::HashMap::new();
+        let victim = |twins: &std::collections::HashMap<(String, u64), usize>, admitted| {
+            blob_cache_victim(&order, &entries, twins, admitted)
+        };
+
+        // Nothing resident and nothing stale: first-in-first-out, as before
+        // #4182.
+        assert_eq!(victim(&no_twins, 4), Some(0));
+        assert_eq!(
+            blob_cache_victim(
+                &std::collections::VecDeque::new(),
+                &entries,
+                &[(key(0), 0)].into(),
+                4
+            ),
+            None,
+            "an empty cache has nothing to drop"
+        );
+
+        // Entries 1 and 3 are covered by a parsed entry and cannot be read
+        // while it lives; 3's twin is furthest from the parsed cache's
+        // eviction end, so 3 is the one that stays unreadable longest.
+        assert_eq!(victim(&[(key(1), 0), (key(3), 1)].into(), 4), Some(3));
+
+        // With only the front entry covered, FIFO and this rule agree.
+        assert_eq!(victim(&[(key(0), 5)].into(), 4), Some(0));
+
+        // Every entry live: there is no redundant blob to drop and the rule
+        // falls back to FIFO rather than declining to cache anything.
+        assert_eq!(victim(&[(key(9), 0)].into(), 4), Some(0));
+
+        // `BLOB_PROTECTION_TURNOVERS` turnovers of the four entries with
+        // nothing reading entry 0: its file has left the working set, and it
+        // goes before the blob a resident parsed entry is merely covering.
+        let turnovers = crate::arrow::reader::BLOB_PROTECTION_TURNOVERS * order.len() as u64;
+        assert_eq!(
+            victim(&[(key(1), 0), (key(3), 1)].into(), turnovers + 1),
+            Some(0)
+        );
+        assert_eq!(
+            victim(&[(key(1), 0), (key(3), 1)].into(), turnovers),
+            Some(3),
+            "one tick short of the protection window is not yet stale"
+        );
+    }
+
+    /// Both caches and the two arms' worth of budget, for replaying a fixed
+    /// text plan through them.
+    ///
+    /// `coupled` is the arm switch. `false` is the pre-#4182 path — the blob
+    /// cached before its parsed twin is admitted, and evicted first-in-
+    /// first-out — reached through the same code by handing the eviction an
+    /// empty twin map.
+    struct ReplayedCaches {
+        parsed: crate::arrow::reader::ParsedIndexCacheInner,
+        blobs: crate::arrow::reader::PuffinBlobCacheInner,
+        index: Arc<siglake_index::InvertedIndex>,
+        parsed_max_bytes: usize,
+        blob_max_bytes: usize,
+        blob_len: usize,
+        coupled: bool,
+    }
+
+    impl ReplayedCaches {
+        fn new(index: &Arc<siglake_index::InvertedIndex>, held: usize, coupled: bool) -> Self {
+            // Round-81 proportions: a blob is about a quarter of its parsed
+            // form, and each cache holds `held` of them.
+            let parsed_size = index.heap_size_bytes();
+            let blob_len = parsed_size / 4;
+            Self {
+                parsed: Default::default(),
+                blobs: Default::default(),
+                index: Arc::clone(index),
+                parsed_max_bytes: parsed_size * held,
+                blob_max_bytes: blob_len * held,
+                blob_len,
+                coupled,
+            }
+        }
+
+        fn pass(&mut self, files: u64) -> usize {
+            self.pass_from(0, files)
+        }
+
+        /// One pass of a plan over `files` indexed files starting at `offset`,
+        /// driven the way `puffin_inverted_index` drives these caches: parsed
+        /// lookup, then the blob cache, then a fetch. Returns the fetches the
+        /// pass paid. A different `offset` is a different set of files — the
+        /// plan moving on, as compaction moves it.
+        fn pass_from(&mut self, offset: u64, files: u64) -> usize {
+            use crate::arrow::reader::ParsedIndexKey;
+
+            let mut fetches = 0;
+            for file in offset..offset + files {
+                let path = format!("s3://bucket/stats-{file}.puffin");
+                let parsed_key = ParsedIndexKey::puffin(&path, file);
+                if self.parsed.get(&parsed_key).is_some() {
+                    continue;
+                }
+                let blob_key = (path, file);
+                let had_blob = self.blobs.get(&blob_key).is_some();
+                if !had_blob {
+                    fetches += 1;
+                }
+                let blob = Arc::<[u8]>::from(vec![7u8; self.blob_len]);
+                let keep_blob = |caches: &mut Self| {
+                    if !had_blob {
+                        let twins = caches.twin_ranks();
+                        caches
+                            .blobs
+                            .put(blob_key, blob, caches.blob_max_bytes, 128, &twins);
+                    }
+                };
+                if self.coupled {
+                    self.parsed.put(
+                        parsed_key,
+                        Arc::clone(&self.index),
+                        self.parsed_max_bytes,
+                        128,
+                    );
+                    keep_blob(self);
+                } else {
+                    keep_blob(self);
+                    self.parsed.put(
+                        parsed_key,
+                        Arc::clone(&self.index),
+                        self.parsed_max_bytes,
+                        128,
+                    );
+                }
+            }
+            fetches
+        }
+
+        /// `parsed_index_puffin_twin_ranks` over these caches, or the empty map
+        /// the uncoupled arm evicts against.
+        fn twin_ranks(&self) -> std::collections::HashMap<(String, u64), usize> {
+            use crate::arrow::reader::ParsedIndexKey;
+
+            if !self.coupled {
+                return std::collections::HashMap::new();
+            }
+            self.parsed
+                .order
+                .iter()
+                .enumerate()
+                .filter_map(|(rank, key)| match key {
+                    ParsedIndexKey::Puffin { path, offset } => {
+                        Some(((path.clone(), *offset), rank))
+                    }
+                    ParsedIndexKey::FooterKv { .. } => None,
+                })
+                .collect()
+        }
+    }
+
+    /// #4182: a text plan whose indexed files exceed BOTH caches re-fetched
+    /// every index blob on every execution — run #81's `keyword_and_label`
+    /// read 4.60 GB over 183 index-phase reads where the same plan had read
+    /// 0.50 GB over 73.
+    ///
+    /// THE DEFECT THIS GUARDS. The blob cache is a re-parse source: it is read
+    /// only when the parsed twin is gone. Evicting first-in-first-out dropped
+    /// each blob one step BEFORE the execution that wanted it, because a
+    /// blob's turn at the front of the queue is when its twin has just left
+    /// the parsed cache. Replay a fixed plan — the same files in the same
+    /// order, as a repeat text suite does — and count the fetches per pass.
+    ///
+    /// The first arm is the negative control: it is the rule this replaced, and
+    /// it pays a fetch for every file on every pass. Both arms decode every
+    /// file every pass; that is the parsed budget's business (#4102), not this
+    /// one's.
+    #[test]
+    fn a_plan_larger_than_both_caches_stops_refetching_every_blob() {
+        let index = Arc::new(siglake_index::InvertedIndex::from_rows([
+            "database timeout on shard four",
+            "request complete in 41ms",
+            "cache eviction chose a live blob",
+        ]));
+        let held = 7;
+
+        // Measured 2026-09-16 over six passes, `held` = 7 of each form. What a
+        // repeat pass fetches, coupled, is the plan's excess over the blob
+        // budget and nothing more — the budget's nominal coverage, which FIFO
+        // delivered none of once the plan outgrew it:
+        //
+        // | indexed files | 4 | 7 | 8 | 10 | 14 | 18 | 24 | 28 |
+        // |---|---|---|---|---|---|---|---|---|
+        // | FIFO (before) | 0 | 0 | 8 | 10 | 14 | 18 | 24 | 28 |
+        // | coupled       | 0 | 0 | 1 |  3 |  7 | 11 | 17 | 21 |
+        //
+        // Zero is reached only while the plan fits the PARSED budget (the first
+        // two columns), which is the sizing question on #4102; both arms decode
+        // every file on every pass beyond it.
+        for files in [4u64, 7, 8, 10, 14, 18, 24, 28] {
+            let excess = files as usize - (files as usize).min(held);
+            for coupled in [false, true] {
+                let mut caches = ReplayedCaches::new(&index, held, coupled);
+                let passes: Vec<usize> = (0..6).map(|_| caches.pass(files)).collect();
+                assert_eq!(
+                    passes[0], files as usize,
+                    "files={files} coupled={coupled}: the first pass is cold"
+                );
+                assert!(
+                    caches.blobs.bytes <= caches.blob_max_bytes
+                        && caches.parsed.bytes <= caches.parsed_max_bytes,
+                    "files={files} coupled={coupled}: both caches stay inside their \
+                     budgets ({} B of blobs, {} B parsed)",
+                    caches.blobs.bytes,
+                    caches.parsed.bytes
+                );
+                let repeats: Vec<usize> = passes[1..].to_vec();
+                let expected = if coupled || excess == 0 {
+                    excess
+                } else {
+                    files as usize
+                };
+                assert!(
+                    repeats.iter().all(|fetches| *fetches == expected),
+                    "files={files} coupled={coupled}: every repeat pass must fetch \
+                     {expected}, not {repeats:?}"
+                );
+            }
+        }
+    }
+
+    /// #4182, the other half: protection that never lapses is a cache pinned to
+    /// dead files.
+    ///
+    /// THE DEFECT THIS GUARDS. "Keep the blob whose parsed twin was evicted"
+    /// says nothing about a file the plan has stopped reading — compaction
+    /// rewrites files, and the blob of a file nothing queries is live forever
+    /// by that rule. The first attempt at this fix held those blobs against
+    /// every new one, which cost the measured warehouse of
+    /// `text_index_blob_refetch.rs` all but one of its three blob slots. So a
+    /// blob keeps its protection for `BLOB_PROTECTION_TURNOVERS` of this
+    /// cache's own turnover and no longer; move the plan to a disjoint set of
+    /// files and the cache must reach the same steady state it had before.
+    #[test]
+    fn the_blobs_of_a_plan_that_moved_on_lose_their_protection() {
+        let index = Arc::new(siglake_index::InvertedIndex::from_rows([
+            "database timeout on shard four",
+            "request complete in 41ms",
+        ]));
+        let (held, files) = (7, 14u64);
+        let mut caches = ReplayedCaches::new(&index, held, true);
+        let warm: Vec<usize> = (0..4).map(|_| caches.pass(files)).collect();
+        assert_eq!(
+            warm[1..],
+            [files as usize - held; 3],
+            "the first plan must reach its steady state before the plan moves"
+        );
+
+        // A disjoint set of files, as a compaction leaves: none of the retained
+        // blobs can serve it, and none of them will ever be read again.
+        let moved: Vec<usize> = (0..8).map(|_| caches.pass_from(1_000, files)).collect();
+        assert_eq!(
+            moved[0], files as usize,
+            "the new plan's first pass is cold"
+        );
+        let settled = &moved[3..];
+        assert!(
+            settled.contains(&(files as usize - held))
+                && settled
+                    .iter()
+                    .all(|fetches| *fetches <= files as usize - held + 1),
+            "the new plan must end up as well served as the old one, within the \
+             pass the protection window costs back: {moved:?}"
+        );
+        assert!(
+            caches.blobs.order.iter().all(|(_, file)| *file >= 1_000),
+            "no blob of the abandoned plan may still be resident: {:?}",
+            caches.blobs.order
+        );
     }
 
     /// #3896 replaced "complement of the matches as a delete vector" with a
@@ -9918,10 +10412,9 @@ message schema {
             .collect()
     }
 
-    /// A Puffin statistics file carrying **both** sidecar formats for the same
-    /// data file and column: the segmented one uncompressed (its interior has
-    /// to be addressable) beside a Zstd v1 blob, which is how a table would
-    /// carry a mixture while the prototype is being measured.
+    /// A Puffin statistics file carrying both production sidecar formats for
+    /// the same data file and column: seg2 uncompressed (its interior has to be
+    /// addressable) beside a Zstd whole-file v1 blob.
     async fn write_mixed_sidecar(
         dir: &TempDir,
         rows: &[String],
@@ -9950,19 +10443,20 @@ message schema {
         let mut segmented_properties = properties.clone();
         segmented_properties.insert(
             "format".to_string(),
-            SEGMENTED_FORMAT_PROPERTY.to_string(),
+            SEGMENTED_V2_FORMAT_PROPERTY.to_string(),
         );
+        let mut segmented = SegmentedWriter::new_v2(DEFAULT_TARGET_BLOCK_BYTES);
+        for group in rows.chunks(group_rows as usize) {
+            segmented.push_group_rows(group.iter().map(String::as_str));
+        }
         writer
             .add(
                 crate::puffin::Blob::builder()
-                    .r#type(SEGMENTED_BLOB_TYPE.to_string())
+                    .r#type(SEGMENTED_V2_BLOB_TYPE.to_string())
                     .fields(vec![1])
                     .snapshot_id(1)
                     .sequence_number(1)
-                    .data(siglake_index::segmented::encode_from_rows(
-                        rows.iter().map(String::as_str),
-                        group_rows,
-                    ))
+                    .data(segmented.finish())
                     .properties(segmented_properties)
                     .build(),
                 crate::puffin::CompressionCodec::None,
@@ -10047,7 +10541,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(20_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 5_000).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let blob_len = blob.length();
         let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
@@ -10080,12 +10574,12 @@ message schema {
             v1.heap_size_bytes()
         );
         assert!(
-            cost.bytes * 20 < blob_len,
+            cost.bytes * 5 < blob_len,
             "a point lookup fetched {} of {blob_len} bytes",
             cost.bytes
         );
         assert!(
-            (resident_bytes as u64) * 10 < blob_len,
+            (resident_bytes as u64) * 5 < blob_len,
             "the reader kept {resident_bytes} bytes of a {blob_len}-byte blob"
         );
         assert!(
@@ -10126,6 +10620,88 @@ message schema {
         );
     }
 
+    #[tokio::test]
+    async fn clipped_segmented_lookup_keeps_rare_terms_and_declines_common_ones() {
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(20_000);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, 5_000).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE).await;
+        let counts = row_counts(20_000, 5_000);
+
+        let clipped = |term: &str| RawPruneSpec {
+            all_terms: vec![term.to_string()],
+            segmented_clipped_limit: Some(100),
+            ..RawPruneSpec::default()
+        };
+        let (rare, rare_cost) = ArrowReader::segmented_matching_rows(
+            &file_io,
+            &path,
+            &blob,
+            &counts,
+            None,
+            &clipped("rareneedle"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&rare, SegmentedOutcome::Matching { rows, .. } if rows.len() == 21),
+            "the sparse term stays on seg2: {rare:?}"
+        );
+
+        let (common, common_cost) = ArrowReader::segmented_matching_rows(
+            &file_io,
+            &path,
+            &blob,
+            &counts,
+            None,
+            &clipped("queen"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                common,
+                SegmentedOutcome::Declined("clipped_document_frequency")
+            ),
+            "the common term returns the policy's own decline: {common:?}"
+        );
+        assert!(
+            common_cost.reads > 2,
+            "cold directory plus dictionary reads are charged: {common_cost:?}"
+        );
+        assert!(
+            common_cost.bytes < rare_cost.bytes,
+            "the decline stops before postings: {common_cost:?} vs {rare_cost:?}"
+        );
+
+        let substring = RawPruneSpec {
+            index_substrings: vec!["ueen".to_string()],
+            segmented_clipped_limit: Some(100),
+            ..RawPruneSpec::default()
+        };
+        let (unavailable, unavailable_cost) = ArrowReader::segmented_matching_rows(
+            &file_io,
+            &path,
+            &blob,
+            &counts,
+            None,
+            &substring,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            unavailable,
+            SegmentedOutcome::Declined("clipped_estimate_unavailable")
+        ));
+        assert_eq!(
+            unavailable_cost.reads, 2,
+            "an unavailable point estimate scans no dictionary block"
+        );
+    }
+
     /// The acceptance: a second lookup on the same `(statistics file, blob
     /// offset)` reads neither the trailer nor the directory, and the two
     /// shipped text-index caches are untouched by either lookup.
@@ -10134,7 +10710,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(20_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 5_000).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE).await;
         let counts = row_counts(20_000, 5_000);
         let spec = all_terms_spec(&["rareneedle"]);
 
@@ -10217,8 +10793,8 @@ message schema {
         let second_rows = segmented_corpus(2_000);
         let (first_io, first_path) = write_mixed_sidecar(&first_dir, &first_rows, 1_000).await;
         let (second_io, second_path) = write_mixed_sidecar(&second_dir, &second_rows, 500).await;
-        let first_blob = sidecar_blob(&first_io, &first_path, SEGMENTED_BLOB_TYPE).await;
-        let second_blob = sidecar_blob(&second_io, &second_path, SEGMENTED_BLOB_TYPE).await;
+        let first_blob = sidecar_blob(&first_io, &first_path, SEGMENTED_V2_BLOB_TYPE).await;
+        let second_blob = sidecar_blob(&second_io, &second_path, SEGMENTED_V2_BLOB_TYPE).await;
         let spec = all_terms_spec(&["rareneedle"]);
         let v1_first =
             siglake_index::InvertedIndex::from_rows(first_rows.iter().map(String::as_str));
@@ -10283,7 +10859,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(4_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 1_000).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE).await;
         let counts = row_counts(4_000, 1_000);
         let spec = all_terms_spec(&["rareneedle"]);
         let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
@@ -10403,7 +10979,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(n_rows);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, group_rows as u32).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let counts = row_counts(n_rows, group_rows);
         let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
@@ -10552,7 +11128,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(20_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 5_000).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let counts = row_counts(20_000, 5_000);
         let spec = all_terms_spec(&["queen"]);
@@ -10625,7 +11201,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(4_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 512).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let counts = row_counts(4_000, 512);
         let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
@@ -10701,7 +11277,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(2_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 512).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let counts = row_counts(2_000, 512);
 
@@ -10750,7 +11326,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(2_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 512).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let spec = all_terms_spec(&["queen"]);
 
@@ -10788,7 +11364,7 @@ message schema {
         let segmented = sidecar_blob(
             &file_io,
             &path,
-            SEGMENTED_BLOB_TYPE,
+            SEGMENTED_V2_BLOB_TYPE,
         )
         .await;
         assert_eq!(
@@ -10797,7 +11373,7 @@ message schema {
         );
         assert_eq!(
             segmented.properties().get("format").map(String::as_str),
-            Some(SEGMENTED_FORMAT_PROPERTY)
+            Some(SEGMENTED_V2_FORMAT_PROPERTY)
         );
         assert!(segmented.properties().get("row_group_size").is_none());
 
@@ -10824,7 +11400,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(2_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 512).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let counts = row_counts(2_000, 512);
         let spec = all_terms_spec(&["queen"]);
@@ -10949,7 +11525,7 @@ message schema {
             case_sensitive: false,
             statistics_blobs: vec![crate::scan::StatisticsBlobReference {
                 statistics_path: sidecar.clone(),
-                blob_type: SEGMENTED_BLOB_TYPE.to_string(),
+                blob_type: SEGMENTED_V2_BLOB_TYPE.to_string(),
                 properties: blob_properties.clone(),
             }],
         };
@@ -11004,6 +11580,30 @@ message schema {
             .is_none()
         );
 
+        // Seg1 remains decodable when handed directly to the codec, but its
+        // retired blob type no longer discovers the production query path.
+        let retired_seg1 = FileScanTask {
+            statistics_blobs: vec![crate::scan::StatisticsBlobReference {
+                statistics_path: sidecar.clone(),
+                blob_type: siglake_index::segmented::SEGMENTED_BLOB_TYPE.to_string(),
+                properties: blob_properties.clone(),
+            }],
+            ..task.clone()
+        };
+        assert!(
+            ArrowReader::segmented_index_row_selection(
+                &file_io,
+                &retired_seg1,
+                metadata,
+                &None,
+                &spec,
+                true,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
         // A file whose only registered sidecar is a v1 one is not this path's
         // to answer: it falls through to the whole-file index.
         let legacy = FileScanTask {
@@ -11031,7 +11631,7 @@ message schema {
         let mismatched = FileScanTask {
             statistics_blobs: vec![crate::scan::StatisticsBlobReference {
                 statistics_path: other_sidecar,
-                blob_type: SEGMENTED_BLOB_TYPE.to_string(),
+                blob_type: SEGMENTED_V2_BLOB_TYPE.to_string(),
                 properties: HashMap::from([
                     ("data_file".to_string(), data_file.clone()),
                     ("column".to_string(), "raw".to_string()),

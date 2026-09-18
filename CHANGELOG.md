@@ -56,12 +56,11 @@
   time and 251.4 MiB peak tracked heap, 12.0% faster and 80.8% smaller than the
   post-commit v1 rebuild it replaces. If that rebuild finds an uncovered file
   on the rewrite's snapshot, it preserves the registered seg2 blobs and counts
-  the deferred v1 registration instead of replacing them. The query-path
-  report now builds its segmented fixture through the
-  streaming seg2 rewrite and refuses retained seg1 fixtures. At 14 × 7.34M
-  rows its two rare scans were 0.14x and 0.06x the scan, with exact answers and
-  matching Parquet layouts; the dated seg1 columns remain as history. (#4377,
-  #5228, #5230, #5233, #5234)
+  the deferred v1 registration instead of replacing them. The query-path report
+  now builds its segmented fixture through the streaming seg2 rewrite and
+  refuses retained seg1 fixtures. At 14 × 7.34M rows its two rare scans were
+  0.14x and 0.06x the scan, with exact answers and matching Parquet layouts;
+  the dated seg1 columns remain as history. (#4377, #5228, #5230, #5233, #5234)
 
 - **Text indexes (docs)**: the documented integrity gap in a v1 inverted-index
   blob is the **footer-KV** path only. An index stored as hex in a Parquet

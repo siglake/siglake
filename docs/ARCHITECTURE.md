@@ -143,6 +143,31 @@ unverified, and the plan is the only checkpoint: its keys still fit the layout
 one component up, so an operator who applies it anyway restores under a tenant
 named after the mirror prefix. See `docs/LIMITATIONS.md` and
 `docs/DESIGN_wal_recovery_root_identity.md`.
+
+`--catalog <uri>` settles that unverified case exactly, where the catalog
+survived the volume (#4997). The uploader recorded `(tenant, index_id,
+segment_url)` for every object it PUT, and those three columns are write-once,
+so the listed segment ids can be looked up and the routing each KEY implies
+compared against the routing the ledger recorded. The lookup runs on the plan's
+own listing — the ids of the keys recovery SKIPS on their layout included,
+which is the whole of a deep mirror listed one component too high — and it is
+read-only mechanically: SQLite is opened `mode=ro`, Postgres runs its SELECTs
+inside `START TRANSACTION READ ONLY`, and neither path can reach
+`SqlSegmentClaim::connect`'s `ensure_schema`, which would migrate the catalog a
+plan is inspecting. Only the tail of `segment_url` is compared with the listed
+key, never its head against `--from`, so a mirror copied into another bucket is
+a legitimate source; what is left over above the key is the mirror prefix, and
+an EMPTY leftover means `--from` already carries it. One agreeing match
+confirms the root; any disagreement, or two matches claiming different
+prefixes, refuses the restore whole and reroutes nothing. Objects with no row —
+retention deletes a row as soon as its object is gone — keep the routing their
+key implies and are counted in the plan as uncertified. The flag adds evidence
+and never removes a refusal: a contradicting marker still refuses, and a
+catalog that cannot be read fails the run rather than falling back. Queries
+scale with the listing (one `IN` of 256 ids per chunk) and memory with the
+matched set; against the plan's own LIST plus one GET per candidate the lookup
+disappears. `docs/DESIGN_wal_recovery_ledger_identity.md` has the rules and the
+measurements.
 Multi-pod deployments coordinate through a
 SQL claim table (`wal_segments`, atomic `try_claim`); crash recovery
 quarantines ambiguous `processing/` segments rather than risk double commits.
@@ -329,9 +354,8 @@ land above the ceilings measured on the scan path. Enable it where the working
 set fits, or where pruning is worth more than the decode. That whole-file cost
 is a property of the sidecar format, not of its sizing: a row-group-addressable
 replacement a reader can touch in part is specified and measured in
-`docs/DESIGN_segmented_inverted_index.md`. The seg1 prototype remains behind
-its own magic, footer-KV key and Puffin blob type. The scan path can read one —
-uncompressed, by byte range, through `PuffinReader::blob_range_reader`, with
+`docs/DESIGN_segmented_inverted_index.md`. The scan path can read a seg2 blob —
+by byte range through `PuffinReader::blob_range_reader`, with
 the sidecar's directory checked against the file's actual row groups and
 anything it cannot conclude falling back to the v1 index or an exact scan
 (#4561), and the parsed directory held between lookups under a byte budget of
@@ -342,26 +366,39 @@ Parquet row group at a time when `SIGLAKE_SEGMENTED_INDEX_WRITES=1`: each
 finished output file contributes one uncompressed Puffin blob whose interior
 contains independently compressed dictionary and posting blocks, and the
 statistics registration is committed in the same transaction as the data-file
-rewrite. The ordinary post-commit v1 rebuild recognizes that registration and
-does not decode the output file again. Seg2 discovery is preferred over seg1;
-files carrying the prototype remain readable, and files carrying neither use
-the exact scan. Reads and writes are separate opt-ins, both off by default, so
+rewrite. On every transaction attempt the Puffin registration runs after the
+rewrite has derived its snapshot from the refreshed base, so the committed
+snapshot, statistics metadata and physical Puffin footer carry the same
+sequence number across stale bases and CAS retries. The ordinary post-commit v1
+rebuild recognizes that registration and does not decode the output file again.
+Production discovery recognizes seg2;
+the unreleased seg1 prototype remains decodable by its pinned codec test but is
+ignored by query selection and does not suppress a whole-file v1 rebuild. Files
+carrying neither v1 nor seg2 use the exact scan. Reads and writes are separate
+opt-ins, both off by default, so
 nothing is built or retained under the segmented-directory budget in the
 shipped configuration. The three formats were compared through the query path
-on a 102.76M-row local corpus (#4562): a rare unclipped text predicate is 11.5x
-faster than the scan where the shipped sidecar is 22.4x slower, and the result
-holds with both budgets above at zero. At the same 7.34M-row scale seg2 writes
-16.7 MiB instead of seg1's 85.8 MiB while retaining independent range reads.
+on a 102.76M-row local corpus (#4562). The historical seg1 arm made a rare
+unclipped predicate 11.5x faster than the scan where the shipped sidecar was
+22.4x slower. A 2026-09-18 rerun built the arm through the streaming seg2
+writer: the two rare scans were 0.14x and 0.06x the scan, with one seg2 blob per
+live file, exact answers and matched Parquet layouts (#5230). Its statistics
+cost 17.58 MiB per file at this layout, against 15.59 MiB for whole-file v1.
 
-**Whether to USE an index is decided per execution.** Loading one is a
-whole-file cost, so a query that wants a handful of rows cannot pay it: a text
-predicate under a `LIMIT` stops the scan after a sliver of the first file,
-while the index charges for every row in every planned file. Both forms are
-declined — a `LIMIT` under an `ORDER BY timestamp` (including the implicit
-newest-first one) because an index row selection defeats the ordered drain's
-contiguous tail read, and a bare `LIMIT` because the scan short-circuits
-first. An unclipped text scan keeps the index, which is the regime it wins in.
-The refusal is attributed by
+**Whether to USE an index is decided per execution.** A whole-file v1 index is
+declined for both `LIMIT` forms: under `ORDER BY timestamp` (including the
+implicit newest-first form), its row selection defeats the ordered drain's
+contiguous tail read; under a bare clipped `LIMIT`, its full decode costs more
+than the short-circuiting scan. The experimental seg2 reader treats the bare
+form separately. It opens the directory, locates point terms in their
+dictionary blocks, and keeps the lookup only when the selected groups' summed
+document frequency is no larger than the clip. An over-budget estimate is
+`siglake_iceberg_segmented_index_declined_total{reason="clipped_document_frequency"}`;
+a substring has no bounded point estimate and uses
+`reason="clipped_estimate_unavailable"`. Both fall back to the exact scan,
+never to v1. The directory and dictionary reads spent reaching either decision
+are included in the segmented range-read and fetched-byte histograms. An
+unclipped text scan keeps either format. The v1 refusal is attributed by
 `siglake_query_inverted_index_declined_total{reason}` and named in the scan's
 `EXPLAIN` line (`text_index:[declined:clipped_limit]`), and it never changes a
 result: the index only ever produced a superset row selection, blooms stay
@@ -472,6 +509,18 @@ window has moved the edge to its own append and nothing here improves on that
 (`siglake_inline_coverage_reroot_conflicts_total`). An expiry that cannot walk
 to the edge leaves it alone: ancestry that is gone is never bridged, and equal
 row totals are not evidence.
+
+The same elected expiry pass bounds Iceberg's `statistics` array. After
+snapshot removal it walks the alive data-file union of the retained snapshots
+and issues `RemoveStatistics` for an entry only when all of its blobs are
+Siglake inverted indexes with `data_file` properties and none of those paths
+is live. One live blob keeps a mixed entry whole; an unowned blob type or a
+missing reference keeps the entry untouched. The statistics commit makes the
+Puffin path unreachable, after which the ordinary orphan sweep applies its
+`min_age` gate before deleting the object. Removed entries are counted by
+`siglake_iceberg_statistics_removed_total`; `siglake gc-orphans` reports the
+eligible, removed, live-kept and conservatively skipped counts beside reclaimed
+bytes.
 
 A publication carries counts that exist nowhere else, so a failed one is
 retried with the same deltas on the delta write's budget — four attempts, 250,
@@ -1212,13 +1261,26 @@ the parsed budget — `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES` (1/64 of the limit,
 capped at 256 MiB, a blob being roughly a quarter of its parsed size) and
 `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_ENTRIES` (128), whichever binds first, with a
 blob larger than the whole budget left uncached rather than evicting the
-entries that fit. Both bounds apply to every entry, so a per-file index sized
-by its row count cannot push the cache past the byte ceiling the way the entry
-count alone allowed. Setting the entry count to `0` turns both caches off and
-returns to fetching and deserializing per query; setting the blob byte bound to
-`0` drops only the serialized copy. Both budgets are subtracted from the query
-memory pool like every other read cache and published on
-`siglake_cache_budget_bytes{kind="text_index"}`.
+entries that fit. Which blob it drops follows from what the blob side is for. A
+warm query never reads it, so a blob whose parsed twin is resident cannot be
+read at all: eviction drops one of those first — the one whose twin sits
+furthest from the parsed cache's eviction end — and only then a blob the parsed
+cache has already dropped. Evicting in arrival order instead cost the whole
+budget: a blob reaches the front of that queue at the moment its twin leaves
+the parsed cache, so a plan larger than either cache re-fetched every index
+blob on every execution (4.60 GB over 183 index-phase reads for a 14-file plan
+that had read 0.50 GB over 73). A blob keeps that protection for a bounded
+number of the cache's own turnovers and then becomes an ordinary candidate,
+because nothing here can see that a file has been compacted away and its blob
+would otherwise be retained for the life of the process. What survives is
+arithmetic and measured: a repeat suite re-fetches the indexed files the blob
+budget cannot cover, and nothing more. Both bounds apply to every entry, so a
+per-file index sized by its row count cannot push the cache past the byte
+ceiling the way the entry count alone allowed. Setting the entry count to `0`
+turns both caches off and returns to fetching and deserializing per query;
+setting the blob byte bound to `0` drops only the serialized copy. Both
+budgets are subtracted from the query memory pool like every other read cache
+and published on `siglake_cache_budget_bytes{kind="text_index"}`.
 
 The experimental decoded-file cache
 (`SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_{BYTES,ENTRIES}`, both `0` everywhere the
