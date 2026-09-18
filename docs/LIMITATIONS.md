@@ -92,7 +92,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   282.77 seconds of rewrite time and 251.4 MiB peak tracked heap, 12.0% faster
   and 80.8% smaller than the post-commit v1 rebuild it replaces (#5234). The
   same-snapshot registration and concurrent-commit sequence boundaries are
-  closed (#5228, #5260). With the write opt-in and
+  closed (#5228 for a registration that follows the first, #5298 for two
+  concurrent registrants — the check is re-made inside the registration's own
+  transaction action against the base of every attempt, so a refresh or a lost
+  CAS cannot turn it into a replacement; #5260 for the sequence metadata). With
+  the write opt-in and
   `SIGLAKE_INDEX_REBUILD=1` both on, a file whose sidecar the writer refuses
   stays unindexed until a later rewrite or a CLI rebuild at a later snapshot:
   Iceberg permits one statistics file per snapshot, so Siglake

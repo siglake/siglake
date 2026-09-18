@@ -1045,6 +1045,297 @@ fn a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs() {
     });
 }
 
+// ------------------------------- two registrants, one snapshot (#5298)
+
+/// Rows per day for the two-registrant cases: enough for a real index, small
+/// enough to run two full-file decodes per test.
+const REBUILD_ROWS: usize = 150_000;
+
+/// A warehouse whose appends register no index at all — no Puffin sidecar and
+/// no footer index — so each live file is one a rebuild has real work for and
+/// two registrants can be aimed at disjoint halves of the same snapshot.
+async fn open_two_registrant_fixture(path: &std::path::Path) -> IcebergContext {
+    open_fixture_with_tuning(
+        path,
+        IcebergTuning {
+            segmented_index_writes: Some(false),
+            index_rebuild: Some(true),
+            index_at_flush: Some(false),
+            target_row_group_bytes: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Every registered v1 text blob, as `(statistics path, data file, column)`.
+fn registered_v1_blobs(table: &Table) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for statistics in table.metadata().statistics_iter() {
+        for blob in &statistics.blob_metadata {
+            if blob.r#type != "siglake-inverted-v1" {
+                continue;
+            }
+            out.push((
+                statistics.statistics_path.clone(),
+                blob.properties
+                    .get("data_file")
+                    .cloned()
+                    .unwrap_or_default(),
+                blob.properties.get("column").cloned().unwrap_or_default(),
+            ));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Every `.puffin` object under the warehouse, registered or not.
+fn puffin_objects(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "puffin") {
+                out.push(format!("file://{}", path.display()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The state both #5298 regressions end in: the registration that got there
+/// first is the only one in metadata, it still describes the file it was built
+/// for, its Puffin object is the only reachable one, and the deferred caller's
+/// object is an orphan.
+async fn assert_first_registration_survived(
+    warehouse: &std::path::Path,
+    ident: &iceberg::TableIdent,
+    winner: &DataFile,
+) {
+    let reader = open_two_registrant_fixture(warehouse).await;
+    let table = reader.catalog().load_table(ident).await.unwrap();
+    let registered = registered_v1_blobs(&table);
+    assert_eq!(
+        registered.len(),
+        1,
+        "one snapshot carries one statistics file: {registered:?}"
+    );
+    let (statistics_path, data_file, column) = registered[0].clone();
+    assert_eq!(
+        (data_file.as_str(), column.as_str()),
+        (winner.file_path(), "raw"),
+        "the registration that arrived first is the one metadata names"
+    );
+
+    let reachable = reader.reachable_files(ident).await.unwrap();
+    assert!(
+        reachable.contains(&statistics_path),
+        "the winning statistics file must stay protected from orphan GC: {statistics_path}"
+    );
+    let objects = puffin_objects(warehouse);
+    assert_eq!(
+        objects.len(),
+        2,
+        "both registrants wrote their sidecar before deciding: {objects:?}"
+    );
+    let orphans: Vec<&String> = objects
+        .iter()
+        .filter(|path| !reachable.contains(*path))
+        .collect();
+    assert_eq!(
+        orphans.len(),
+        1,
+        "the deferred caller's sidecar is left for orphan GC, and only it: {orphans:?}"
+    );
+
+    assert_eq!(
+        text_counts(&reader).await,
+        (2 * REBUILD_ROWS as i64, 30, 6_000),
+        "both days answer exactly, indexed or not"
+    );
+}
+
+/// Metric readings shared by the two #5298 regressions: the deferral is counted
+/// once, and only the winner's file and bytes are reported as rebuilt.
+fn assert_one_deferral_and_only_the_winner_rebuilt(snapshot: &SnapshotVec, winner: &DataFile) {
+    assert_eq!(
+        counter_sum(
+            snapshot,
+            "siglake_index_registration_deferred_total",
+            Some(("reason", "snapshot_has_statistics"))
+        ),
+        1,
+        "one deferral, whatever the attempt count: retries are the same deferral seen again"
+    );
+    assert_eq!(
+        counter_sum(snapshot, "siglake_index_rebuild_files_total", None),
+        1,
+        "the winner's file only — a deferred caller reports no rebuilt file"
+    );
+    assert_eq!(
+        counter_sum(snapshot, "siglake_index_rebuild_bytes_total", None),
+        winner.file_size_in_bytes(),
+        "the winner's bytes only — a deferred caller reports no rebuilt bytes"
+    );
+}
+
+/// A competing registration lands after this caller loaded its table but
+/// before the transaction's first commit attempt refreshed its base.
+///
+/// Both callers start from a snapshot with no statistics file and cover
+/// disjoint files, so neither pre-write check sees the other. The check that
+/// decides has to be the one inside the action, against the base the attempt
+/// was re-applied to: without it the first attempt commits an unconditional
+/// replacement onto the refreshed base and the other registrant's blobs leave
+/// metadata (#5298).
+#[test]
+fn a_competing_registration_before_the_refresh_keeps_the_first_statistics_file() {
+    serialized(|snapshotter| async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("pre-refresh");
+        let mut ours = open_two_registrant_fixture(&warehouse).await;
+        let ident = ours.events_table_ident().clone();
+        let theirs = append_rows(&ours, 0..REBUILD_ROWS, REBUILD_ROWS, RARE_EVERY).await;
+        let mine = append_rows(
+            &ours,
+            REBUILD_ROWS..2 * REBUILD_ROWS,
+            REBUILD_ROWS,
+            RARE_EVERY,
+        )
+        .await;
+        assert_eq!(
+            (theirs.len(), mine.len()),
+            (1, 1),
+            "one file per day, and the two registrants take one each"
+        );
+
+        let rival = Arc::new(open_two_registrant_fixture(&warehouse).await);
+        let raced = Arc::new(AtomicBool::new(false));
+        let gated = TestCatalog::new(ours.catalog().clone())
+            .after_load_table({
+                let raced = raced.clone();
+                let ident = ident.clone();
+                let theirs = Arc::new(theirs.clone());
+                move || {
+                    let rival = rival.clone();
+                    let raced = raced.clone();
+                    let ident = ident.clone();
+                    let theirs = theirs.clone();
+                    async move {
+                        // Once, on the load this caller computes its blobs
+                        // from — before the transaction reloads the table.
+                        if raced.swap(true, Ordering::SeqCst) {
+                            return;
+                        }
+                        assert_eq!(
+                            rival
+                                .rebuild_inverted_indexes_for_files(&ident, &theirs)
+                                .await
+                                .unwrap(),
+                            1,
+                            "the rival reaches the statistics-free snapshot first"
+                        );
+                    }
+                }
+            })
+            .shared();
+        ours = ours.with_catalog_for_test(gated);
+
+        assert_eq!(
+            ours.rebuild_inverted_indexes_for_files(&ident, &mine)
+                .await
+                .unwrap(),
+            0,
+            "the second registrant defers rather than replacing the first's statistics file"
+        );
+        assert!(
+            raced.load(Ordering::SeqCst),
+            "the competing registration ran"
+        );
+
+        assert_first_registration_survived(&warehouse, &ident, &theirs[0]).await;
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_one_deferral_and_only_the_winner_rebuilt(&snapshot, &theirs[0]);
+    });
+}
+
+/// A competing registration lands in the first attempt's CAS window: the
+/// conditional catalog UPDATE finds the pointer moved, and the retry re-applies
+/// the action against a base that now carries the rival's statistics file.
+///
+/// This is the half a pre-transaction check cannot reach at all. Both callers
+/// passed their own absence check, and on the pre-#5298 path the retry
+/// re-applied an unconditional replacement and won on the second attempt.
+#[test]
+fn a_competing_registration_in_the_cas_window_keeps_the_first_statistics_file() {
+    serialized(|snapshotter| async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("cas-window");
+        let mut ours = open_two_registrant_fixture(&warehouse).await;
+        let ident = ours.events_table_ident().clone();
+        let theirs = append_rows(&ours, 0..REBUILD_ROWS, REBUILD_ROWS, RARE_EVERY).await;
+        let mine = append_rows(
+            &ours,
+            REBUILD_ROWS..2 * REBUILD_ROWS,
+            REBUILD_ROWS,
+            RARE_EVERY,
+        )
+        .await;
+
+        let rival = Arc::new(open_two_registrant_fixture(&warehouse).await);
+        let gated = TestCatalog::new(ours.catalog().clone())
+            .before_first_update_with_base({
+                let ident = ident.clone();
+                let theirs = Arc::new(theirs.clone());
+                move || {
+                    let rival = rival.clone();
+                    let ident = ident.clone();
+                    let theirs = theirs.clone();
+                    async move {
+                        assert_eq!(
+                            rival
+                                .rebuild_inverted_indexes_for_files(&ident, &theirs)
+                                .await
+                                .unwrap(),
+                            1,
+                            "the rival commits inside this attempt's CAS window"
+                        );
+                    }
+                }
+            })
+            .shared();
+        ours = ours.with_catalog_for_test(gated.clone());
+
+        assert_eq!(
+            ours.rebuild_inverted_indexes_for_files(&ident, &mine)
+                .await
+                .unwrap(),
+            0,
+            "the attempt that lost the CAS defers on the refreshed base instead of retrying \
+             the replacement"
+        );
+        assert!(gated.fired(), "the forced-CAS hook fired");
+
+        assert_first_registration_survived(&warehouse, &ident, &theirs[0]).await;
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_one_deferral_and_only_the_winner_rebuilt(&snapshot, &theirs[0]);
+        assert_eq!(
+            counter_sum(
+                &snapshot,
+                "siglake_catalog_cas_total",
+                Some(("outcome", "conflict"))
+            ),
+            1,
+            "exactly one lost CAS — the deferral is decided on the retry's base, not raced"
+        );
+    });
+}
+
 /// The post-commit full-file decode does not run for a column the rewrite
 /// already indexed, and asking again rebuilds nothing.
 ///
