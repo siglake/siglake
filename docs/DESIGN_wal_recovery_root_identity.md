@@ -218,6 +218,16 @@ directions. It is additive to C and should be its own slice: the DB is a second
 failure domain, the ids have to be matched against a listing that may be much
 larger than the ledger, and a partial match needs a rule of its own.
 
+> Designed and qualified on #4974:
+> `docs/DESIGN_wal_recovery_ledger_identity.md` settles those rules against a
+> hermetic SQLite ledger and dispositions the slice PROCEED with revisions. The
+> revisions matter to anyone reading the sketch above: the verdict rests on
+> ROUTING agreement rather than on matching `segment_url` against the `--from`
+> URL (so a mirror copied into another bucket is not refused), a partial match
+> confirms the root and certifies only the objects it matched, and `--catalog`
+> never overturns a marker refusal. Nothing is shipped; the flag is its own
+> card.
+
 ## Recommendation
 
 Ship C. Take D as a follow-on slice. Do not ship A, and do not ship B.
@@ -296,7 +306,8 @@ strength of the same key shape this document is about.
   directory the refusal names.
 - **`--catalog` is a later slice**, not this release. It is the only exact
   answer, and it is the answer for the population that has a catalog but no
-  markers.
+  markers. Its rules are settled on #4974
+  (`docs/DESIGN_wal_recovery_ledger_identity.md`).
 
 ## Defects found while reading this path
 
