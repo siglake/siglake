@@ -232,6 +232,11 @@ bounded leak, counted in `siglake_compactor_mirror_unreclaimed_total`, rather
 than an unbounded WAL volume. Objects no local drain ever committed (a dropped
 incarnation's quarantined segments, an ingester whose volume was lost) are
 deliberately left to an operator-side lifecycle rule.
+Operator-managed filesystem drains use the cluster-wide
+`spec.extraEnv: [{name: SIGLAKE_MIRROR_LEDGER_RECLAIM, value: "1"}]` route;
+only the compactor command consumes that variable, and omitting it keeps the
+off default. The operator recipe and its catalog, warehouse and mirror-prefix
+prerequisites are in `deploy/helm/siglake-operator/README.md`.
 `docs/DESIGN_wal_mirror_reclamation.md` prices the three options and
 `docs/LIMITATIONS.md` states what remains uncollected.
 

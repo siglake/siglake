@@ -146,6 +146,41 @@ unchanged. The compactor logs a warning when `spec.extraEnv` raises
 `SIGLAKE_COMPACTOR_BIN_CONCURRENCY` past what its effective memory limit
 can hold.
 
+## Mirror ledger reclamation
+
+The single-replica filesystem drain leaves uploaded WAL mirror objects and
+their `wal_segments` rows behind by default. Opt it into the compactor's
+ledger-backed reclamation path with the existing `spec.extraEnv` escape hatch:
+
+```yaml
+spec:
+  warehouseUrl: s3://acme-prod/warehouse
+  catalogUri: postgres://siglake:secret@postgres.siglake-system:5432/siglake
+  autoscaling:
+    compactor:
+      min: 1
+      max: 1
+      target: 5.0
+  extraEnv:
+    - name: SIGLAKE_WAL_MIRROR_PREFIX
+      value: wal-mirror
+    - name: SIGLAKE_MIRROR_LEDGER_RECLAIM
+      value: "1"
+```
+
+The catalog URI, object-store warehouse URL and non-empty mirror prefix are
+all required. The prefix must be the one the ingester writes; `wal-mirror` is
+the operator default shown explicitly above. If a prerequisite is missing, the
+compactor warns, keeps draining and leaves the mirror objects in place.
+
+`spec.extraEnv` is cluster-wide, so both variables above appear on every data
+plane tier. Only the compactor command reads
+`SIGLAKE_MIRROR_LEDGER_RECLAIM`; leaving it out keeps reclamation off. A
+catalog-claim compactor (`spec.autoscaling.compactor.max` above 1) already
+reclaims the objects it claims and does not need this opt-in. See
+[`docs/LIMITATIONS.md`](../../../docs/LIMITATIONS.md) for the mirror-object
+populations that neither drain reclaims.
+
 ## Adopting a Helm release
 
 ```bash

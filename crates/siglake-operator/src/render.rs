@@ -2514,6 +2514,39 @@ mod tests {
         assert_eq!(effective(&opted_in), "1");
     }
 
+    /// Mirror-ledger reclamation remains off when the operator does not name
+    /// the long-tail knob. A filesystem-drain cluster opts in through
+    /// `spec.extraEnv`; the binary's pure resolver owns the accepted values.
+    #[test]
+    fn compactor_reclaims_the_mirror_ledger_only_when_extra_env_opts_in() {
+        let effective = |cr: &SiglakeCluster| {
+            compactor_deployment(cr, 1)
+                .spec
+                .unwrap()
+                .template
+                .spec
+                .unwrap()
+                .containers[0]
+                .env
+                .clone()
+                .unwrap()
+                .iter()
+                .rfind(|entry| entry.name == "SIGLAKE_MIRROR_LEDGER_RECLAIM")
+                .and_then(|entry| entry.value.clone())
+        };
+
+        let mut defaulted = sample_cr();
+        defaulted.spec.autoscaling.compactor.max = 1;
+        assert_eq!(effective(&defaulted), None);
+
+        let mut opted_in = defaulted;
+        opted_in.spec.extra_env = vec![crate::crd::ExtraEnvVar {
+            name: "SIGLAKE_MIRROR_LEDGER_RECLAIM".into(),
+            value: "1".into(),
+        }];
+        assert_eq!(effective(&opted_in), Some("1".into()));
+    }
+
     /// The batch-job store is the catalog Postgres, for every replica count:
     /// a per-pod store 404s a job the other pod is running, with no restart
     /// involved. A non-Postgres catalog has no store to share, and
