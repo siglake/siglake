@@ -2436,6 +2436,7 @@ impl ArrowReader {
             let reader = PuffinReader::new(input);
             let blob = reader.blob(&blob_metadata).await?;
             PUFFIN_BLOB_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            record_puffin_blob_fetch();
             record_text_index_stage(
                 TEXT_INDEX_STAGE_BLOB_FETCH,
                 TEXT_INDEX_STORAGE_PUFFIN,
@@ -4756,7 +4757,7 @@ impl PuffinBlobCacheInner {
             return;
         }
         while self.order.len() + 1 > max_entries || self.bytes + size > max_bytes {
-            let Some(position) =
+            let Some((position, reason)) =
                 blob_cache_victim(&self.order, &self.map, parsed_twins, self.admitted)
             else {
                 break;
@@ -4766,6 +4767,10 @@ impl PuffinBlobCacheInner {
             };
             if let Some(entry) = self.map.remove(&evicted) {
                 self.bytes -= entry.blob.len();
+                // Counted where the entry actually leaves, so the reason the
+                // rule selected is charged once per eviction and not once per
+                // pass of this loop.
+                record_puffin_blob_evicted(reason);
             }
         }
         self.admitted += 1;
@@ -4778,7 +4783,10 @@ impl PuffinBlobCacheInner {
     }
 }
 
-/// Which entry this cache should drop to make room, as a position in `order`.
+/// Which entry this cache should drop to make room, as a position in `order`
+/// and the reason that position was chosen — one of
+/// [`PUFFIN_BLOB_CACHE_DROP_REASONS`], charged by the caller once the entry is
+/// gone.
 ///
 /// WHY NOT FIRST-IN-FIRST-OUT (#4182). A warm query is served by the parsed
 /// cache and never looks here, so a blob whose parsed twin is resident cannot
@@ -4817,24 +4825,27 @@ fn blob_cache_victim(
     entries: &std::collections::HashMap<(String, u64), PuffinBlobEntry>,
     parsed_twins: &std::collections::HashMap<(String, u64), usize>,
     admitted: u64,
-) -> Option<usize> {
+) -> Option<(usize, &'static str)> {
     let turnover = BLOB_PROTECTION_TURNOVERS * order.len().max(1) as u64;
-    let stale = order.iter().position(|key| {
-        entries
-            .get(key)
-            .is_some_and(|entry| admitted.saturating_sub(entry.active) >= turnover)
-    });
+    let stale = order
+        .iter()
+        .position(|key| {
+            entries
+                .get(key)
+                .is_some_and(|entry| admitted.saturating_sub(entry.active) >= turnover)
+        })
+        .map(|position| (position, PUFFIN_BLOB_DROP_STALE));
     let redundant = || {
         order
             .iter()
             .enumerate()
             .filter_map(|(position, key)| parsed_twins.get(key).map(|rank| (*rank, position)))
             .max()
-            .map(|(_, position)| position)
+            .map(|(_, position)| (position, PUFFIN_BLOB_DROP_REDUNDANT))
     };
     stale
         .or_else(redundant)
-        .or_else(|| (!order.is_empty()).then_some(0))
+        .or_else(|| (!order.is_empty()).then_some((0, PUFFIN_BLOB_DROP_FIFO)))
 }
 
 /// How many of its own turnovers a blob keeps its protection for, with nothing
@@ -4845,6 +4856,66 @@ fn blob_cache_victim(
 /// and protection lapses into first-in-first-out. Measured over the plan sizes
 /// in `a_plan_larger_than_both_caches_stops_refetching_every_blob`.
 const BLOB_PROTECTION_TURNOVERS: u64 = 4;
+
+const PUFFIN_BLOB_CACHE_HIT: &str = "hit";
+const PUFFIN_BLOB_CACHE_MISS: &str = "miss";
+
+/// Both `outcome` values of
+/// `siglake_iceberg_puffin_blob_cache_lookups_total`. A lookup happens once per
+/// file a text query decodes an index for and only while both bounds are
+/// positive: with either at 0 the cache is off and every decode is preceded by
+/// a fetch, which is what `siglake_iceberg_puffin_blob_fetches_total` says on
+/// its own.
+pub const PUFFIN_BLOB_CACHE_OUTCOMES: &[&str] = &[PUFFIN_BLOB_CACHE_HIT, PUFFIN_BLOB_CACHE_MISS];
+
+const PUFFIN_BLOB_DROP_STALE: &str = "stale";
+const PUFFIN_BLOB_DROP_REDUNDANT: &str = "redundant";
+const PUFFIN_BLOB_DROP_FIFO: &str = "fifo";
+
+/// Every `reason` value of `siglake_iceberg_puffin_blob_cache_evictions_total`,
+/// which is `blob_cache_victim`'s three arms: `stale` for a blob nothing read
+/// while the cache turned over `BLOB_PROTECTION_TURNOVERS` times, `redundant`
+/// for one whose parsed twin is resident and which therefore cannot be read at
+/// all, and `fifo` for the fallback when neither applies. Which arm is running
+/// is the difference between a cache following the working set and the
+/// pre-#4182 rule that evicted a blob one step before the query that wanted it.
+pub const PUFFIN_BLOB_CACHE_DROP_REASONS: &[&str] = &[
+    PUFFIN_BLOB_DROP_STALE,
+    PUFFIN_BLOB_DROP_REDUNDANT,
+    PUFFIN_BLOB_DROP_FIFO,
+];
+
+/// Whether a decode was handed bytes this cache still held. One outcome per
+/// lookup, recorded beside the parsed cache's own
+/// (`siglake_iceberg_parsed_index_cache_lookups_total`): a parsed miss is what
+/// brings a query here, so the two families read together say whether a
+/// re-decode also had to re-fetch.
+fn record_puffin_blob_lookup(outcome: &'static str) {
+    metrics::counter!(
+        "siglake_iceberg_puffin_blob_cache_lookups_total",
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+/// An index blob read from object storage — what the cache exists to stop
+/// growing. Charged on every fetch, including the ones no lookup preceded (a
+/// cache-bypassing read, or either bound at 0), so `fetches` above `miss` is
+/// how much of the index phase never consulted the cache at all.
+fn record_puffin_blob_fetch() {
+    metrics::counter!("siglake_iceberg_puffin_blob_fetches_total").increment(1);
+}
+
+/// A blob this cache dropped, by which of [`blob_cache_victim`]'s three arms
+/// chose it. `reason` is one of three literals — the dashboard groups by it
+/// rather than matching on it.
+fn record_puffin_blob_evicted(reason: &'static str) {
+    metrics::counter!(
+        "siglake_iceberg_puffin_blob_cache_evictions_total",
+        "reason" => reason
+    )
+    .increment(1);
+}
 
 static PUFFIN_BLOB_CACHE: std::sync::OnceLock<std::sync::Mutex<PuffinBlobCacheInner>> =
     std::sync::OnceLock::new();
@@ -5002,6 +5073,11 @@ fn puffin_blob_cache_get(path: &str, offset: u64) -> Option<Arc<[u8]>> {
     if hit.is_some() {
         PUFFIN_BLOB_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    record_puffin_blob_lookup(if hit.is_some() {
+        PUFFIN_BLOB_CACHE_HIT
+    } else {
+        PUFFIN_BLOB_CACHE_MISS
+    });
     hit
 }
 
@@ -5334,10 +5410,11 @@ static PUFFIN_BLOB_CACHE_HITS: std::sync::atomic::AtomicU64 =
 /// The second number is what the blob cache exists for, and the first is what
 /// it is meant to stop growing: a plan whose indexed files exceed the parsed
 /// budget re-parses per execution either way, but it should not re-FETCH per
-/// execution (#4182). Diagnostics for tests and local measurement — not a
-/// metric, and not exported; a round reads the same fact off
-/// `siglake_object_store_read_bytes_total{phase="index"}` against
-/// `siglake_iceberg_parsed_index_cache_lookups_total{outcome="miss"}`.
+/// execution (#4182). Process-wide since the process started, for tests and
+/// local measurement; a deployment reads the same two facts as
+/// `siglake_iceberg_puffin_blob_fetches_total` and
+/// `siglake_iceberg_puffin_blob_cache_lookups_total{outcome="hit"}` (#4718),
+/// which a round can rate and attribute to a pod where these cannot.
 pub fn puffin_blob_fetch_counts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
@@ -6955,8 +7032,9 @@ message schema {
         };
 
         // Nothing resident and nothing stale: first-in-first-out, as before
-        // #4182.
-        assert_eq!(victim(&no_twins, 4), Some(0));
+        // #4182. Each arm names itself, and the name is the `reason` label of
+        // `siglake_iceberg_puffin_blob_cache_evictions_total` (#4718).
+        assert_eq!(victim(&no_twins, 4), Some((0, "fifo")));
         assert_eq!(
             blob_cache_victim(
                 &std::collections::VecDeque::new(),
@@ -6971,14 +7049,18 @@ message schema {
         // Entries 1 and 3 are covered by a parsed entry and cannot be read
         // while it lives; 3's twin is furthest from the parsed cache's
         // eviction end, so 3 is the one that stays unreadable longest.
-        assert_eq!(victim(&[(key(1), 0), (key(3), 1)].into(), 4), Some(3));
+        assert_eq!(
+            victim(&[(key(1), 0), (key(3), 1)].into(), 4),
+            Some((3, "redundant"))
+        );
 
-        // With only the front entry covered, FIFO and this rule agree.
-        assert_eq!(victim(&[(key(0), 5)].into(), 4), Some(0));
+        // With only the front entry covered, FIFO and this rule agree on the
+        // position — and the reason still says which rule chose it.
+        assert_eq!(victim(&[(key(0), 5)].into(), 4), Some((0, "redundant")));
 
         // Every entry live: there is no redundant blob to drop and the rule
         // falls back to FIFO rather than declining to cache anything.
-        assert_eq!(victim(&[(key(9), 0)].into(), 4), Some(0));
+        assert_eq!(victim(&[(key(9), 0)].into(), 4), Some((0, "fifo")));
 
         // `BLOB_PROTECTION_TURNOVERS` turnovers of the four entries with
         // nothing reading entry 0: its file has left the working set, and it
@@ -6986,12 +7068,19 @@ message schema {
         let turnovers = crate::arrow::reader::BLOB_PROTECTION_TURNOVERS * order.len() as u64;
         assert_eq!(
             victim(&[(key(1), 0), (key(3), 1)].into(), turnovers + 1),
-            Some(0)
+            Some((0, "stale"))
         );
         assert_eq!(
             victim(&[(key(1), 0), (key(3), 1)].into(), turnovers),
-            Some(3),
+            Some((3, "redundant")),
             "one tick short of the protection window is not yet stale"
+        );
+
+        // The literals above are the exported vocabulary, in the order the
+        // rule prefers them.
+        assert_eq!(
+            crate::arrow::reader::PUFFIN_BLOB_CACHE_DROP_REASONS,
+            ["stale", "redundant", "fifo"]
         );
     }
 

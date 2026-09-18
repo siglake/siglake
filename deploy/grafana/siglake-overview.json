@@ -1642,6 +1642,45 @@
    "description": "The parsed working set against the bound that evicts it. Both are published where the bounds are enforced — on admission to the cache — so neither exists before the pod's first indexed text query and both hold their last value while no text query runs; read them with the eviction arms beside them, not on their own. Resident pinned at the budget with byte_bound drops beside it is the case for raising SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES (or the query pod's memory limit, which the resolved budget follows when it is set)."
   },
   {
+   "id": 165,
+   "type": "timeseries",
+   "title": "Puffin blob cache fetches / hits / evictions",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 146
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(siglake_iceberg_puffin_blob_fetches_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "fetch",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (outcome) (rate(siglake_iceberg_puffin_blob_cache_lookups_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "lookup {{outcome}}",
+     "refId": "B"
+    },
+    {
+     "expr": "sum by (reason) (rate(siglake_iceberg_puffin_blob_cache_evictions_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "dropped {{reason}}",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "min": 0
+    }
+   },
+   "description": "Whether a re-decode also had to re-read the blob. fetch is the object-store read this cache exists to stop; lookup hit is a decode handed bytes the cache still held and lookup miss is one that had to fetch. Every arm is pre-registered at 0 on the query server, so a tier serving no text query charts zero rather than No data. Read it beside the parsed-index panel: a parsed miss is what brings a query here at all, so hits climbing with parsed misses is a working set past the parsed budget but inside the blob budget, which costs a decode and no read. A fetch rate that tracks the parsed miss rate is the #4182 shape — every execution re-reading every blob — and it was inferred from index-phase bytes and first_batch_ms for a whole round before these counters existed. fetch above miss is index reading that consulted no cache: a rebuild that bypasses it, or a pod with SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES or _MAX_ENTRIES at 0. The dropped arms name the eviction rule that chose each victim: redundant is a blob whose parsed twin is resident, which cannot be read until that twin goes, stale is one nothing read while the cache turned over four times (its file has left the plan), and fifo is the fallback for a cache holding nothing live and recent — a steady fifo rate beside a fetch rate is the pre-#4182 behaviour, which dropped a blob one step before the query that wanted it. On run #81's keyword_and_label plan that difference was 4.60 GB over 183 index-phase reads against 0.50 GB over 73."
+  },
+  {
    "id": 162,
    "type": "timeseries",
    "title": "Decoded-file cache populations (abandoned = decoded, then dropped)",
@@ -1653,7 +1692,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 146
+    "y": 154
    },
    "targets": [
     {
@@ -1678,7 +1717,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 154
+    "y": 162
    },
    "collapsed": false
   },
@@ -1694,7 +1733,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 155
+    "y": 163
    },
    "targets": [
     {
@@ -1741,7 +1780,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 155
+    "y": 163
    },
    "targets": [
     {
@@ -1772,7 +1811,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 155
+    "y": 163
    },
    "targets": [
     {
@@ -1806,7 +1845,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 163
+    "y": 171
    },
    "collapsed": false
   },
@@ -1822,7 +1861,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 164
+    "y": 172
    },
    "targets": [
     {
@@ -1850,7 +1889,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 164
+    "y": 172
    },
    "targets": [
     {
@@ -1883,7 +1922,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 172
+    "y": 180
    },
    "targets": [
     {
@@ -1917,7 +1956,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 180
+    "y": 188
    },
    "targets": [
     {
@@ -1946,7 +1985,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 188
+    "y": 196
    },
    "targets": [
     {

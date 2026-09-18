@@ -2018,15 +2018,20 @@ def check_dashboard(path: pathlib.Path, exported: "Exported") -> list[str]:
 OVERVIEW_DASHBOARD = DASHBOARD_DIR / "siglake-overview.json"
 # #3969's text-index families and the dimension each panel must GROUP BY rather
 # than match on: the stage of a per-file index load, the parsed-index cache's
-# lookup outcome, and which bound dropped an entry. The vocabularies are the
-# reader's, exported from the Iceberg fork
+# lookup outcome, and which bound dropped an entry. #4718 adds the blob cache's
+# two labelled families on the same terms. The vocabularies are the reader's,
+# exported from the Iceberg fork
 # (`TEXT_INDEX_STARTUP_STAGES`, `PARSED_INDEX_CACHE_OUTCOMES`,
-# `PARSED_INDEX_CACHE_DROP_REASONS`) and held to these panels by
-# `text_index_startup_series_are_preregistered` in siglake-storage.
+# `PARSED_INDEX_CACHE_DROP_REASONS`, `PUFFIN_BLOB_CACHE_OUTCOMES`,
+# `PUFFIN_BLOB_CACHE_DROP_REASONS`) and held to these panels by
+# `text_index_startup_series_are_preregistered` and
+# `puffin_blob_cache_series_are_preregistered` in siglake-storage.
 TEXT_INDEX_GROUPINGS = {
     "siglake_iceberg_text_index_startup_seconds": "stage",
     "siglake_iceberg_parsed_index_cache_lookups_total": "outcome",
     "siglake_iceberg_parsed_index_cache_evictions_total": "reason",
+    "siglake_iceberg_puffin_blob_cache_lookups_total": "outcome",
+    "siglake_iceberg_puffin_blob_cache_evictions_total": "reason",
 }
 # "Text-index startup by stage (p50 / p99)".
 TEXT_INDEX_STARTUP_PANEL = 159
