@@ -13,8 +13,8 @@
 //!
 //! ```text
 //! [magic "KIDS"][version u8]              header, for offline sniffing only
-//! group 0: postings section               per-term delta-varint lists, group-relative
-//! group 0: dictionary blocks              sorted, prefix-compressed, ~4 KiB each
+//! group 0: postings section               delta-varint lists (per-block Zstd in seg2)
+//! group 0: dictionary blocks              prefix-compressed (per-block Zstd in seg2)
 //! group 1: ...
 //! directory                               one range read: groups, per-block first terms + CRCs
 //! trailer                                 fixed 25 bytes at EOF, with the directory's CRC
@@ -45,10 +45,9 @@
 //!   no-match. Partial reads make this load-bearing in a way v1 never faced:
 //!   a flipped byte in a dictionary block would otherwise make a term look
 //!   *absent* in one row group and silently drop its rows, so the directory
-//!   carries a CRC per block and its own CRC sits in the trailer. Posting
-//!   sections are covered by their stated document frequency only; the residual
-//!   that leaves is measured and priced in
-//!   `docs/DESIGN_segmented_inverted_index.md`.
+//!   carries a CRC per block and its own CRC sits in the trailer. Seg2 also
+//!   fetches and verifies the whole posting span behind that dictionary block;
+//!   seg1 keeps its original document-frequency-only check.
 //! - **The directory cannot address bytes that are not its own.** The body is
 //!   tiled exactly by the sections — group `i`'s postings, then its dictionary,
 //!   in group order, from the header to the directory — and a block's postings
@@ -68,10 +67,10 @@
 //! exactly as it does for an unindexed file. v1 blobs stay readable by v1 code,
 //! unchanged.
 //!
-//! Sections are stored **uncompressed**: the shipped v1 sidecar is one
-//! Zstd-compressed Puffin blob, which is why it can only be read whole. A
-//! per-section codec byte is a later version's concern; the byte ranges this
-//! directory addresses do not change shape when one arrives.
+//! Seg1 sections stay **uncompressed**, preserving its experimental fixtures.
+//! Seg2 stores one Zstd-3 frame per dictionary block and one per block's posting
+//! span, so both remain independently range-addressable. The directory records
+//! stored and decoded lengths and a CRC of each decoded posting span.
 //!
 //! This module carries its own varint reader rather than sharing the v1
 //! decoder's, so #4558's hardening of that decoder and this prototype do not
@@ -89,17 +88,26 @@ pub const SEGMENTED_MAGIC: &[u8; 4] = b"KIDS";
 /// Version of the segmented layout. Bumped when the byte layout changes; a
 /// reader refuses any other value, which is the unknown-version fallback.
 pub const SEGMENTED_VERSION: u8 = 1;
+/// Version of the block-compressed layout. Version 1 bytes and discovery
+/// names remain separate and readable.
+pub const SEGMENTED_V2_VERSION: u8 = 2;
 /// `dir_offset: u64 | dir_len: u64 | dir_crc: u32 | version: u8 | magic: [u8; 4]`.
 pub const SEGMENTED_TRAILER_LEN: usize = 8 + 8 + 4 + 1 + 4;
 /// Puffin blob type a segmented sidecar would be registered under. Distinct
 /// from `siglake-inverted-v1`, so an existing reader skips it.
 pub const SEGMENTED_BLOB_TYPE: &str = "siglake-inverted-seg-v1";
+/// Puffin blob type for the block-compressed layout.
+pub const SEGMENTED_V2_BLOB_TYPE: &str = "siglake-inverted-seg-v2";
 /// Value for the sidecar's `format` property, beside the `v1` the shipped
 /// writer stamps.
 pub const SEGMENTED_FORMAT_PROPERTY: &str = "seg1";
+/// `format` property for the block-compressed layout.
+pub const SEGMENTED_V2_FORMAT_PROPERTY: &str = "seg2";
 /// Footer-KV key a segmented blob would use. Distinct from
 /// [`INVERTED_INDEX_KV_KEY`](crate::INVERTED_INDEX_KV_KEY) for the same reason.
 pub const SEGMENTED_INDEX_KV_KEY: &str = "siglake.inverted_index.seg1";
+/// Footer-KV key for the block-compressed layout.
+pub const SEGMENTED_V2_INDEX_KV_KEY: &str = "siglake.inverted_index.seg2";
 /// Dictionary-block target size. A lookup reads one whole block, and the
 /// directory holds one entry per block, so this trades the resident directory
 /// against the bytes one point lookup fetches.
@@ -111,6 +119,15 @@ pub fn segmented_index_kv_key(column: &str) -> Cow<'static, str> {
         Cow::Borrowed(SEGMENTED_INDEX_KV_KEY)
     } else {
         Cow::Owned(format!("{SEGMENTED_INDEX_KV_KEY}.{column}"))
+    }
+}
+
+/// Footer-KV key for `column`'s block-compressed segmented blob.
+pub fn segmented_v2_index_kv_key(column: &str) -> Cow<'static, str> {
+    if column == "raw" {
+        Cow::Borrowed(SEGMENTED_V2_INDEX_KV_KEY)
+    } else {
+        Cow::Owned(format!("{SEGMENTED_V2_INDEX_KV_KEY}.{column}"))
     }
 }
 
@@ -192,6 +209,37 @@ struct BlockEntry {
     /// verifying it costs no extra bytes — and without it a flipped term byte
     /// reads as "this group does not have the term".
     crc: u32,
+    /// Present only for seg2, keeping seg1's resident block entry close to its
+    /// original size instead of charging every cached seg1 directory for
+    /// fields that its bytes do not carry.
+    v2: Option<Box<V2BlockEntry>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct V2BlockEntry {
+    /// Decoded dictionary-block length (`BlockEntry::len` is stored length).
+    raw_len: u32,
+    /// Stored posting-span range relative to the group's postings section.
+    postings_offset: u64,
+    postings_len: u32,
+    postings_raw_len: u32,
+    /// CRC-32 of the decoded posting span.
+    postings_crc: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SegmentedFormat {
+    Seg1,
+    Seg2,
+}
+
+impl SegmentedFormat {
+    fn version(self) -> u8 {
+        match self {
+            Self::Seg1 => SEGMENTED_VERSION,
+            Self::Seg2 => SEGMENTED_V2_VERSION,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,6 +261,7 @@ pub struct SegmentedWriter {
     next_row: u32,
     target_block_bytes: usize,
     tokenizer: Tokenizer,
+    format: SegmentedFormat,
 }
 
 impl Default for SegmentedWriter {
@@ -223,15 +272,26 @@ impl Default for SegmentedWriter {
 
 impl SegmentedWriter {
     pub fn new(target_block_bytes: usize) -> Self {
+        Self::with_format(target_block_bytes, SegmentedFormat::Seg1)
+    }
+
+    /// Build a seg2 blob: each dictionary block and its posting span is an
+    /// independent Zstd-3 frame, and the posting span carries its own CRC.
+    pub fn new_v2(target_block_bytes: usize) -> Self {
+        Self::with_format(target_block_bytes, SegmentedFormat::Seg2)
+    }
+
+    fn with_format(target_block_bytes: usize, format: SegmentedFormat) -> Self {
         let mut out = Vec::new();
         out.extend_from_slice(SEGMENTED_MAGIC);
-        out.push(SEGMENTED_VERSION);
+        out.push(format.version());
         Self {
             out,
             groups: Vec::new(),
             next_row: 0,
             target_block_bytes: target_block_bytes.max(64),
             tokenizer: Tokenizer::Default,
+            format,
         }
     }
 
@@ -249,6 +309,13 @@ impl SegmentedWriter {
     /// Append one row group from an index built over exactly that group's rows
     /// (its ordinals are group-relative, `0..group.n_rows()`).
     pub fn push_group_index(&mut self, group: &InvertedIndex) {
+        match self.format {
+            SegmentedFormat::Seg1 => self.push_group_index_v1(group),
+            SegmentedFormat::Seg2 => self.push_group_index_v2(group),
+        }
+    }
+
+    fn push_group_index_v1(&mut self, group: &InvertedIndex) {
         let postings_offset = self.out.len() as u64;
         // Postings first: a term's byte length is only known once written, and
         // the dictionary stores lengths.
@@ -306,6 +373,91 @@ impl SegmentedWriter {
         self.next_row += group.n_rows();
     }
 
+    fn push_group_index_v2(&mut self, group: &InvertedIndex) {
+        let mut raw_postings = Vec::new();
+        let mut entries: Vec<(&str, u32, u32)> = Vec::with_capacity(group.terms().len());
+        for (term, rows) in group.terms() {
+            let start = raw_postings.len();
+            let mut prev = 0u32;
+            for &row in rows {
+                write_varint(&mut raw_postings, u64::from(row - prev));
+                prev = row;
+            }
+            entries.push((term, rows.len() as u32, (raw_postings.len() - start) as u32));
+        }
+
+        // Form dictionary blocks first: their term boundaries also define the
+        // posting spans that can be fetched, decompressed and verified alone.
+        let mut raw_blocks: Vec<(Vec<u8>, u64, u64)> = Vec::new();
+        let mut block = Vec::new();
+        let mut block_terms: Vec<(&str, u32, u32)> = Vec::new();
+        let mut postings_cursor = 0u64;
+        let mut block_postings_base = 0u64;
+        for entry in entries {
+            block_terms.push(entry);
+            postings_cursor += u64::from(entry.2);
+            let estimate = block_terms
+                .iter()
+                .map(|(term, _, _)| term.len() + 6)
+                .sum::<usize>()
+                + 2;
+            if estimate >= self.target_block_bytes {
+                encode_block(&mut block, &block_terms);
+                raw_blocks.push((block.clone(), block_postings_base, postings_cursor));
+                block_terms.clear();
+                block_postings_base = postings_cursor;
+            }
+        }
+        if !block_terms.is_empty() {
+            encode_block(&mut block, &block_terms);
+            raw_blocks.push((block.clone(), block_postings_base, postings_cursor));
+        }
+
+        let postings_offset = self.out.len() as u64;
+        let mut blocks = Vec::with_capacity(raw_blocks.len());
+        for (raw_dict, raw_start, raw_end) in &raw_blocks {
+            let raw_span = &raw_postings[*raw_start as usize..*raw_end as usize];
+            let compressed = zstd::bulk::compress(raw_span, 3).expect("zstd compression");
+            let relative = self.out.len() as u64 - postings_offset;
+            self.out.extend_from_slice(&compressed);
+            blocks.push(BlockEntry {
+                first_term: first_term_of(raw_dict).into(),
+                offset: 0,
+                len: 0,
+                postings_base: 0,
+                crc: crc32(raw_dict),
+                v2: Some(Box::new(V2BlockEntry {
+                    raw_len: raw_dict.len() as u32,
+                    postings_offset: relative,
+                    postings_len: compressed.len() as u32,
+                    postings_raw_len: raw_span.len() as u32,
+                    postings_crc: crc32(raw_span),
+                })),
+            });
+        }
+        let postings_len = self.out.len() as u64 - postings_offset;
+
+        let dict_offset = self.out.len() as u64;
+        for ((raw_dict, _, _), entry) in raw_blocks.iter().zip(&mut blocks) {
+            let compressed = zstd::bulk::compress(raw_dict, 3).expect("zstd compression");
+            entry.offset = (self.out.len() as u64 - dict_offset) as u32;
+            entry.len = compressed.len() as u32;
+            self.out.extend_from_slice(&compressed);
+        }
+        let dict_len = self.out.len() as u64 - dict_offset;
+
+        self.groups.push(GroupEntry {
+            first_row: self.next_row,
+            n_rows: group.n_rows(),
+            dict_offset,
+            dict_len,
+            postings_offset,
+            postings_len,
+            blocks,
+        });
+        self.next_row += group.n_rows();
+    }
+
     fn flush_block(&mut self, block: &[u8], dict_offset: u64, postings_base: u64) -> BlockEntry {
         let offset = (self.out.len() as u64 - dict_offset) as u32;
         self.out.extend_from_slice(block);
@@ -317,6 +469,7 @@ impl SegmentedWriter {
             len: block.len() as u32,
             postings_base,
             crc: crc32(block),
+            v2: None,
         }
     }
 
@@ -327,8 +480,8 @@ impl SegmentedWriter {
 
     /// Finish: append the directory and the fixed trailer.
     pub fn finish(mut self) -> Vec<u8> {
-        let dir = encode_directory(self.next_row, &self.groups);
-        append_directory_and_trailer(&mut self.out, &dir);
+        let dir = encode_directory(self.next_row, &self.groups, self.format);
+        append_directory_and_trailer(&mut self.out, &dir, self.format.version());
         self.out
     }
 }
@@ -337,7 +490,7 @@ impl SegmentedWriter {
 /// describe it. Factored out of [`SegmentedWriter::finish`] so the
 /// malformed-directory fixtures re-encode a *real* directory through the
 /// writer's own encoder rather than a second copy of it that can drift.
-fn encode_directory(n_rows: u32, groups: &[GroupEntry]) -> Vec<u8> {
+fn encode_directory(n_rows: u32, groups: &[GroupEntry], format: SegmentedFormat) -> Vec<u8> {
     let mut dir = Vec::new();
     write_varint(&mut dir, u64::from(n_rows));
     write_varint(&mut dir, groups.len() as u64);
@@ -354,8 +507,21 @@ fn encode_directory(n_rows: u32, groups: &[GroupEntry]) -> Vec<u8> {
             dir.extend_from_slice(block.first_term.as_bytes());
             write_varint(&mut dir, u64::from(block.offset));
             write_varint(&mut dir, u64::from(block.len));
-            write_varint(&mut dir, block.postings_base);
-            dir.extend_from_slice(&block.crc.to_le_bytes());
+            match format {
+                SegmentedFormat::Seg1 => {
+                    write_varint(&mut dir, block.postings_base);
+                    dir.extend_from_slice(&block.crc.to_le_bytes());
+                }
+                SegmentedFormat::Seg2 => {
+                    let v2 = block.v2.as_ref().expect("seg2 block metadata");
+                    write_varint(&mut dir, u64::from(v2.raw_len));
+                    write_varint(&mut dir, v2.postings_offset);
+                    write_varint(&mut dir, u64::from(v2.postings_len));
+                    write_varint(&mut dir, u64::from(v2.postings_raw_len));
+                    dir.extend_from_slice(&v2.postings_crc.to_le_bytes());
+                    dir.extend_from_slice(&block.crc.to_le_bytes());
+                }
+            }
         }
     }
     dir
@@ -363,13 +529,13 @@ fn encode_directory(n_rows: u32, groups: &[GroupEntry]) -> Vec<u8> {
 
 /// Append `dir` at the current end of `out` and stamp the trailer that
 /// addresses it.
-fn append_directory_and_trailer(out: &mut Vec<u8>, dir: &[u8]) {
+fn append_directory_and_trailer(out: &mut Vec<u8>, dir: &[u8], version: u8) {
     let dir_offset = out.len() as u64;
     out.extend_from_slice(dir);
     out.extend_from_slice(&dir_offset.to_le_bytes());
     out.extend_from_slice(&(dir.len() as u64).to_le_bytes());
     out.extend_from_slice(&crc32(dir).to_le_bytes());
-    out.push(SEGMENTED_VERSION);
+    out.push(version);
     out.extend_from_slice(SEGMENTED_MAGIC);
 }
 
@@ -472,8 +638,8 @@ impl SliceSource {
     }
 
     /// Bytes served since [`Self::reset_counters`] — the fetched-byte column of
-    /// the accounting, and (in this prototype) also the decoded-byte column,
-    /// since every fetched byte is parsed by the lookup that asked for it.
+    /// the accounting. For seg2 these are compressed bytes; decoded bytes are
+    /// bounded separately by each directory entry's raw length.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -517,6 +683,7 @@ impl RangeSource for SliceSource {
 pub struct SegmentedDirectory {
     groups: Vec<GroupEntry>,
     n_rows: u32,
+    format: SegmentedFormat,
     /// Blob length the directory was parsed against. A source of a different
     /// length is not this blob, whatever the caller keyed it under.
     blob_len: u64,
@@ -536,9 +703,11 @@ impl SegmentedDirectory {
         if &trailer[SEGMENTED_TRAILER_LEN - 4..] != SEGMENTED_MAGIC {
             return None;
         }
-        if trailer[SEGMENTED_TRAILER_LEN - 5] != SEGMENTED_VERSION {
-            return None;
-        }
+        let format = match trailer[SEGMENTED_TRAILER_LEN - 5] {
+            SEGMENTED_VERSION => SegmentedFormat::Seg1,
+            SEGMENTED_V2_VERSION => SegmentedFormat::Seg2,
+            _ => return None,
+        };
         let dir_offset = u64::from_le_bytes(trailer[0..8].try_into().ok()?);
         let dir_len = u64::from_le_bytes(trailer[8..16].try_into().ok()?);
         let dir_crc = u32::from_le_bytes(trailer[16..20].try_into().ok()?);
@@ -597,13 +766,41 @@ impl SegmentedDirectory {
             let mut blocks: Vec<BlockEntry> = Vec::with_capacity(n_blocks);
             let mut previous_term: Option<Box<str>> = None;
             let mut previous_base: Option<u64> = None;
+            let mut dict_cursor = 0u64;
+            let mut postings_cursor = 0u64;
             for _ in 0..n_blocks {
                 let term_len = usize::try_from(c.varint()?).ok()?;
                 let first_term: Box<str> = std::str::from_utf8(c.take(term_len)?).ok()?.into();
                 let offset = u32::try_from(c.varint()?).ok()?;
                 let len = u32::try_from(c.varint()?).ok()?;
-                let postings_base = c.varint()?;
-                let crc = u32::from_le_bytes(c.take(4)?.try_into().ok()?);
+                let (
+                    raw_len,
+                    postings_base,
+                    postings_offset,
+                    block_postings_len,
+                    postings_raw_len,
+                    postings_crc,
+                    crc,
+                ) = match format {
+                    SegmentedFormat::Seg1 => (
+                        len,
+                        c.varint()?,
+                        0,
+                        0,
+                        0,
+                        0,
+                        u32::from_le_bytes(c.take(4)?.try_into().ok()?),
+                    ),
+                    SegmentedFormat::Seg2 => (
+                        u32::try_from(c.varint()?).ok()?,
+                        0,
+                        c.varint()?,
+                        u32::try_from(c.varint()?).ok()?,
+                        u32::try_from(c.varint()?).ok()?,
+                        u32::from_le_bytes(c.take(4)?.try_into().ok()?),
+                        u32::from_le_bytes(c.take(4)?.try_into().ok()?),
+                    ),
+                };
                 // Blocks partition the group's dictionary in term order, and
                 // their postings bases march forward inside its postings: the
                 // first block's first term starts the section, every block
@@ -616,25 +813,57 @@ impl SegmentedDirectory {
                     Some(previous) if previous.as_ref() >= first_term.as_ref() => return None,
                     _ => {}
                 }
-                let base_marches_forward = match previous_base {
-                    None => postings_base == 0,
-                    Some(previous) => postings_base > previous,
-                };
-                if u64::from(offset).checked_add(u64::from(len))? > group_dict_len
-                    || !base_marches_forward
-                    || postings_base >= postings_len
-                {
-                    return None;
+                match format {
+                    SegmentedFormat::Seg1 => {
+                        let base_marches_forward = match previous_base {
+                            None => postings_base == 0,
+                            Some(previous) => postings_base > previous,
+                        };
+                        if u64::from(offset).checked_add(u64::from(len))? > group_dict_len
+                            || !base_marches_forward
+                            || postings_base >= postings_len
+                        {
+                            return None;
+                        }
+                        previous_base = Some(postings_base);
+                    }
+                    SegmentedFormat::Seg2 => {
+                        if len == 0
+                            || raw_len == 0
+                            || block_postings_len == 0
+                            || postings_raw_len == 0
+                            || u64::from(offset) != dict_cursor
+                            || postings_offset != postings_cursor
+                        {
+                            return None;
+                        }
+                        dict_cursor = dict_cursor.checked_add(u64::from(len))?;
+                        postings_cursor =
+                            postings_cursor.checked_add(u64::from(block_postings_len))?;
+                    }
                 }
                 previous_term = Some(first_term.clone());
-                previous_base = Some(postings_base);
                 blocks.push(BlockEntry {
                     first_term,
                     offset,
                     len,
                     postings_base,
                     crc,
+                    v2: (format == SegmentedFormat::Seg2).then(|| {
+                        Box::new(V2BlockEntry {
+                            raw_len,
+                            postings_offset,
+                            postings_len: block_postings_len,
+                            postings_raw_len,
+                            postings_crc,
+                        })
+                    }),
                 });
+            }
+            if format == SegmentedFormat::Seg2
+                && (dict_cursor != group_dict_len || postings_cursor != postings_len)
+            {
+                return None;
             }
             groups.push(GroupEntry {
                 first_row,
@@ -652,6 +881,7 @@ impl SegmentedDirectory {
         Some(Self {
             groups,
             n_rows,
+            format,
             blob_len: total,
         })
     }
@@ -673,6 +903,14 @@ impl SegmentedDirectory {
     /// The blob length this directory was parsed against.
     pub fn blob_len(&self) -> u64 {
         self.blob_len
+    }
+
+    /// The metadata `format` value for this directory's byte layout.
+    pub fn format_property(&self) -> &'static str {
+        match self.format {
+            SegmentedFormat::Seg1 => SEGMENTED_FORMAT_PROPERTY,
+            SegmentedFormat::Seg2 => SEGMENTED_V2_FORMAT_PROPERTY,
+        }
     }
 
     /// Whether this sidecar describes exactly the given Parquet row groups.
@@ -705,7 +943,14 @@ impl SegmentedDirectory {
                         + group
                             .blocks
                             .iter()
-                            .map(|block| BLOCK + block.first_term.len())
+                            .map(|block| {
+                                BLOCK
+                                    + block.first_term.len()
+                                    + block
+                                        .v2
+                                        .as_ref()
+                                        .map_or(0, |_| std::mem::size_of::<V2BlockEntry>())
+                            })
                             .sum::<usize>()
                 })
                 .sum::<usize>()
@@ -859,7 +1104,7 @@ impl<S: RangeSource> SegmentedReader<S> {
         let mut rows: Vec<u32> = Vec::new();
         for index in indices {
             let group = &self.directory.groups[index];
-            let mut located: Vec<(u64, u32, u32)> = Vec::with_capacity(normalized.len());
+            let mut located: Vec<(usize, u64, u32, u32)> = Vec::with_capacity(normalized.len());
             for term in &normalized {
                 match self.locate_term(group, term) {
                     Ok(Some(hit)) => located.push(hit),
@@ -872,10 +1117,12 @@ impl<S: RangeSource> SegmentedReader<S> {
             if located.len() != normalized.len() {
                 continue;
             }
-            located.sort_by_key(|(_, _, df)| *df);
+            located.sort_by_key(|(_, _, _, df)| *df);
             let mut acc: Option<Vec<u32>> = None;
-            for (offset, len, df) in located {
-                let list = self.read_postings(group, offset, len, df).ok()?;
+            for (block_index, offset, len, df) in located {
+                let list = self
+                    .read_postings(group, block_index, offset, len, df)
+                    .ok()?;
                 acc = Some(match acc {
                     None => list,
                     Some(previous) => intersect_sorted(&previous, &list),
@@ -946,15 +1193,19 @@ impl<S: RangeSource> SegmentedReader<S> {
         let mut rows: Vec<u32> = Vec::new();
         for index in indices {
             let group = &self.directory.groups[index];
-            let mut matches: Vec<(u64, u32, u32)> = Vec::new();
-            for block in &group.blocks {
+            let mut matches: Vec<(usize, u64, u32, u32)> = Vec::new();
+            for (block_index, block) in group.blocks.iter().enumerate() {
                 let bytes = self.read_block(group, block)?;
-                let walked = scan_block(&bytes, block.postings_base, |term, df, offset, len| {
+                let postings_base = match self.directory.format {
+                    SegmentedFormat::Seg1 => block.postings_base,
+                    SegmentedFormat::Seg2 => 0,
+                };
+                let walked = scan_block(&bytes, postings_base, |term, df, offset, len| {
                     if std::str::from_utf8(term)
                         .map(|term| term.contains(&normalized))
                         .unwrap_or(false)
                     {
-                        matches.push((offset, len, df));
+                        matches.push((block_index, offset, len, df));
                     }
                     true
                 });
@@ -962,8 +1213,10 @@ impl<S: RangeSource> SegmentedReader<S> {
                     return None;
                 }
             }
-            for (offset, len, df) in matches {
-                let group_rows = self.read_postings(group, offset, len, df).ok()?;
+            for (block_index, offset, len, df) in matches {
+                let group_rows = self
+                    .read_postings(group, block_index, offset, len, df)
+                    .ok()?;
                 rows = union_sorted(&rows, &group_rows);
             }
         }
@@ -978,7 +1231,8 @@ impl<S: RangeSource> SegmentedReader<S> {
         Some(row_selection_runs(&matching, self.directory.n_rows))
     }
 
-    /// Total dictionary bytes — what a substring sweep reads.
+    /// Total stored dictionary bytes — what a substring sweep fetches. Seg2
+    /// expands each block only after fetching it.
     pub fn dictionary_bytes(&self) -> u64 {
         self.directory
             .groups
@@ -987,8 +1241,8 @@ impl<S: RangeSource> SegmentedReader<S> {
             .sum()
     }
 
-    /// Total postings bytes — what a v1 decode reads in full and a point lookup
-    /// reads a slice of.
+    /// Total stored postings bytes. Seg1 point lookups fetch one term's slice;
+    /// seg2 fetches one compressed block span.
     pub fn postings_bytes(&self) -> u64 {
         self.directory
             .groups
@@ -1025,7 +1279,9 @@ impl<S: RangeSource> SegmentedReader<S> {
     fn group_postings(&self, group: &GroupEntry, normalized: &str) -> Result<Option<Vec<u32>>, ()> {
         match self.locate_term(group, normalized)? {
             None => Ok(None),
-            Some((offset, len, df)) => self.read_postings(group, offset, len, df).map(Some),
+            Some((block_index, offset, len, df)) => self
+                .read_postings(group, block_index, offset, len, df)
+                .map(Some),
         }
     }
 
@@ -1039,7 +1295,7 @@ impl<S: RangeSource> SegmentedReader<S> {
         &self,
         group: &GroupEntry,
         normalized: &str,
-    ) -> Result<Option<(u64, u32, u32)>, ()> {
+    ) -> Result<Option<(usize, u64, u32, u32)>, ()> {
         // Pick the one block whose term range can hold the term. No block read
         // at all when the term sorts before the group's first term.
         let block_index = group
@@ -1051,7 +1307,11 @@ impl<S: RangeSource> SegmentedReader<S> {
         let block = &group.blocks[block_index - 1];
         let bytes = self.read_block(group, block).ok_or(())?;
         let mut hit: Option<(u64, u32, u32)> = None;
-        scan_block(&bytes, block.postings_base, |term, df, offset, len| {
+        let postings_base = match self.directory.format {
+            SegmentedFormat::Seg1 => block.postings_base,
+            SegmentedFormat::Seg2 => 0,
+        };
+        scan_block(&bytes, postings_base, |term, df, offset, len| {
             match term.cmp(normalized.as_bytes()) {
                 std::cmp::Ordering::Less => true,
                 std::cmp::Ordering::Equal => {
@@ -1062,16 +1322,30 @@ impl<S: RangeSource> SegmentedReader<S> {
                 std::cmp::Ordering::Greater => false,
             }
         })?;
-        Ok(hit)
+        Ok(hit.map(|(offset, len, df)| (block_index - 1, offset, len, df)))
     }
 
     /// Fetch and verify one dictionary block. `None` — not "the term is not
     /// here" — when the bytes do not match the CRC the directory recorded.
     fn read_block(&self, group: &GroupEntry, block: &BlockEntry) -> Option<Vec<u8>> {
-        let bytes = self.source.read(
+        let stored = self.source.read(
             group.dict_offset + u64::from(block.offset),
             block.len as usize,
         )?;
+        let bytes = match self.directory.format {
+            SegmentedFormat::Seg1 => stored,
+            SegmentedFormat::Seg2 => {
+                let v2 = block.v2.as_ref()?;
+                zstd::bulk::decompress(&stored, v2.raw_len as usize).ok()?
+            }
+        };
+        let raw_len = block
+            .v2
+            .as_ref()
+            .map_or(block.len as usize, |v2| v2.raw_len as usize);
+        if bytes.len() != raw_len {
+            return None;
+        }
         if crc32(&bytes) != block.crc {
             return None;
         }
@@ -1088,17 +1362,43 @@ impl<S: RangeSource> SegmentedReader<S> {
     fn read_postings(
         &self,
         group: &GroupEntry,
+        block_index: usize,
         offset: u64,
         len: u32,
         df: u32,
     ) -> Result<Vec<u32>, ()> {
-        if offset + u64::from(len) > group.postings_len {
-            return Err(());
-        }
-        let bytes = self
-            .source
-            .read(group.postings_offset + offset, len as usize)
-            .ok_or(())?;
+        let bytes = match self.directory.format {
+            SegmentedFormat::Seg1 => {
+                if offset + u64::from(len) > group.postings_len {
+                    return Err(());
+                }
+                self.source
+                    .read(group.postings_offset + offset, len as usize)
+                    .ok_or(())?
+            }
+            SegmentedFormat::Seg2 => {
+                let block = group.blocks.get(block_index).ok_or(())?;
+                let v2 = block.v2.as_ref().ok_or(())?;
+                if offset + u64::from(len) > u64::from(v2.postings_raw_len) {
+                    return Err(());
+                }
+                let stored = self
+                    .source
+                    .read(
+                        group.postings_offset + v2.postings_offset,
+                        v2.postings_len as usize,
+                    )
+                    .ok_or(())?;
+                let span = zstd::bulk::decompress(&stored, v2.postings_raw_len as usize)
+                    .map_err(|_| ())?;
+                if span.len() != v2.postings_raw_len as usize || crc32(&span) != v2.postings_crc {
+                    return Err(());
+                }
+                span.get(offset as usize..(offset + u64::from(len)) as usize)
+                    .ok_or(())?
+                    .to_vec()
+            }
+        };
         let mut c = Reader::new(&bytes);
         let mut rows = Vec::new();
         let mut previous = 0u32;
@@ -1347,6 +1647,110 @@ mod tests {
 
     fn encoded(rows: &[String], group_rows: u32) -> Vec<u8> {
         encode_from_rows(rows.iter().map(String::as_str), group_rows)
+    }
+
+    fn encoded_v2(rows: &[String], group_rows: u32) -> Vec<u8> {
+        let mut writer = SegmentedWriter::new_v2(DEFAULT_TARGET_BLOCK_BYTES);
+        for chunk in rows.chunks(group_rows as usize) {
+            writer.push_group_rows(chunk.iter().map(String::as_str));
+        }
+        writer.finish()
+    }
+
+    #[test]
+    fn seg1_bytes_stay_stable_when_seg2_is_added() {
+        let mut writer = SegmentedWriter::new(256);
+        writer.push_group_rows(["alpha beta", "beta gamma"]);
+        let bytes = writer.finish();
+        let actual = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            actual,
+            "4b4944530100000101030005616c70686101010004626574610202000567616d6d61010102010002091b05040105616c706861001b00a2ce799f24000000000000001600000000000000fa744f28014b494453"
+        );
+    }
+
+    #[test]
+    fn seg2_answers_exactly_what_seg1_answers() {
+        let rows = corpus(20_000);
+        let seg1 = open(encoded(&rows, 5_000));
+        let seg2_blob = encoded_v2(&rows, 5_000);
+        let seg2 = open(seg2_blob.clone());
+        assert_eq!(seg2.directory.format, SegmentedFormat::Seg2);
+        assert_eq!(seg2.directory().format_property(), "seg2");
+        assert_eq!(seg2_blob[4], SEGMENTED_V2_VERSION);
+        assert_eq!(
+            seg2_blob[seg2_blob.len() - 5],
+            SEGMENTED_V2_VERSION,
+            "header and trailer carry the same version"
+        );
+        assert_eq!(segmented_v2_index_kv_key("raw"), SEGMENTED_V2_INDEX_KV_KEY);
+        assert_eq!(
+            segmented_v2_index_kv_key("message"),
+            "siglake.inverted_index.seg2.message"
+        );
+        assert_eq!(seg2.group_rows(), seg1.group_rows());
+        assert!(
+            seg2_blob.len() < seg1.source().len() as usize,
+            "block compression must reduce the fixture: {} against {}",
+            seg2_blob.len(),
+            seg1.source().len()
+        );
+
+        for term in [
+            "rareneedle",
+            "queen",
+            "checkout",
+            "status",
+            "000001",
+            "019999",
+            "absentterm",
+        ] {
+            assert_eq!(seg2.postings(term), seg1.postings(term), "term {term}");
+        }
+        assert_eq!(
+            seg2.matching_rows_all(&["queen", "checkout"]),
+            seg1.matching_rows_all(&["queen", "checkout"])
+        );
+        assert_eq!(
+            seg2.matching_rows_any(&["rareneedle", "000001"]),
+            seg1.matching_rows_any(&["rareneedle", "000001"])
+        );
+        assert_eq!(
+            seg2.rows_containing("needle"),
+            seg1.rows_containing("needle")
+        );
+    }
+
+    #[test]
+    fn seg2_corrupt_posting_spans_are_unanswerable() {
+        let rows = corpus(5_000);
+        let blob = encoded_v2(&rows, 5_000);
+        let reader = open(blob.clone());
+        let group = &reader.directory.groups[0];
+        let term = group.blocks[0].first_term.to_string();
+        assert!(matches!(reader.postings(&term), Lookup::Rows(_)));
+
+        // Corrupt the stored span. Whether Zstd itself or the raw-span CRC
+        // notices first, the present term must never become absent or wrong.
+        let block = &group.blocks[0];
+        let v2 = block.v2.as_ref().unwrap();
+        let at =
+            (group.postings_offset + v2.postings_offset) as usize + v2.postings_len as usize / 2;
+        let mut corrupt = blob.clone();
+        corrupt[at] ^= 0x40;
+        let corrupt = open(corrupt);
+        assert_eq!(corrupt.postings(&term), Lookup::Unanswerable);
+
+        // A valid frame with a directory checksum that does not describe its
+        // decoded bytes reaches the explicit posting-span CRC check.
+        let bad_crc = with_directory(&blob, |_, groups| {
+            groups[0].blocks[0].v2.as_mut().unwrap().postings_crc ^= 1;
+        });
+        let bad_crc = open(bad_crc);
+        assert_eq!(bad_crc.postings(&term), Lookup::Unanswerable);
     }
 
     #[test]
@@ -1797,7 +2201,7 @@ mod tests {
         let rows = corpus(200);
         let mut blob = encoded(&rows, 64);
         let version = blob.len() - 5;
-        blob[version] = SEGMENTED_VERSION + 1;
+        blob[version] = u8::MAX;
         assert!(SegmentedReader::open(SliceSource::new(blob)).is_none());
     }
 
@@ -1886,9 +2290,14 @@ mod tests {
             .expect("a fixture starts from a well-formed blob");
         let mut n_rows = reader.directory.n_rows;
         let mut groups = reader.directory.groups.clone();
+        let format = reader.directory.format;
         edit(&mut n_rows, &mut groups);
         let mut out = blob[..trailer_dir_offset(blob)].to_vec();
-        append_directory_and_trailer(&mut out, &encode_directory(n_rows, &groups));
+        append_directory_and_trailer(
+            &mut out,
+            &encode_directory(n_rows, &groups, format),
+            format.version(),
+        );
         out
     }
 
@@ -1897,7 +2306,7 @@ mod tests {
     /// a truncated entry, a term that is not UTF-8).
     fn with_directory_bytes(blob: &[u8], dir: Vec<u8>) -> Vec<u8> {
         let mut out = blob[..trailer_dir_offset(blob)].to_vec();
-        append_directory_and_trailer(&mut out, &dir);
+        append_directory_and_trailer(&mut out, &dir, SEGMENTED_VERSION);
         out
     }
 
@@ -2016,10 +2425,18 @@ mod tests {
         write_varint(&mut truncated, 2);
         truncated.extend_from_slice(&group_header);
 
-        let mut trailing = encode_directory(reader.directory.n_rows, &reader.directory.groups);
+        let mut trailing = encode_directory(
+            reader.directory.n_rows,
+            &reader.directory.groups,
+            SegmentedFormat::Seg1,
+        );
         trailing.push(0);
 
-        let mut not_utf8 = encode_directory(reader.directory.n_rows, &reader.directory.groups);
+        let mut not_utf8 = encode_directory(
+            reader.directory.n_rows,
+            &reader.directory.groups,
+            SegmentedFormat::Seg1,
+        );
         let term = reader.directory.groups[0].blocks[0].first_term.as_bytes();
         let at = not_utf8
             .windows(term.len())
@@ -2197,7 +2614,11 @@ mod tests {
         let rows = corpus(500);
         let blob = encoded(&rows, 125);
         let reader = open(blob.clone());
-        let directory = encode_directory(reader.n_rows(), &reader.directory.groups);
+        let directory = encode_directory(
+            reader.n_rows(),
+            &reader.directory.groups,
+            reader.directory.format,
+        );
         assert_eq!(crc32(&directory), crc32_reference(&directory));
         for group in &reader.directory.groups {
             for block in &group.blocks {
@@ -2345,7 +2766,11 @@ mod tests {
         let blob = writer.finish();
         let blob_len = blob.len() as u64;
         let reader = open(blob.clone());
-        let directory = encode_directory(reader.n_rows(), &reader.directory.groups);
+        let directory = encode_directory(
+            reader.n_rows(),
+            &reader.directory.groups,
+            reader.directory.format,
+        );
         let n_blocks: usize = reader
             .directory
             .groups

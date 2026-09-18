@@ -329,8 +329,8 @@ land above the ceilings measured on the scan path. Enable it where the working
 set fits, or where pruning is worth more than the decode. That whole-file cost
 is a property of the sidecar format, not of its sizing: a row-group-addressable
 replacement a reader can touch in part is specified and measured in
-`docs/DESIGN_segmented_inverted_index.md`. It is a prototype behind its own
-magic, footer-KV key and Puffin blob type. The scan path can read one —
+`docs/DESIGN_segmented_inverted_index.md`. The seg1 prototype remains behind
+its own magic, footer-KV key and Puffin blob type. The scan path can read one —
 uncompressed, by byte range, through `PuffinReader::blob_range_reader`, with
 the sidecar's directory checked against the file's actual row groups and
 anything it cannot conclude falling back to the v1 index or an exact scan
@@ -342,8 +342,12 @@ default, and nothing is retained under the new budget either. The three
 formats have been compared through the query path on a 102.76M-row local
 corpus (#4562): a rare unclipped text predicate is 11.5x faster than the scan
 where the shipped sidecar is 22.4x slower, and the result holds with both
-budgets above at zero. The format is 5.59x the shipped sidecar's bytes on disk
-until its blocks are compressed, which is what stands between it and a writer.
+budgets above at zero. The seg2 codec compresses each dictionary block and its
+posting span as separate Zstd-3 frames and verifies a CRC over the decoded
+posting span. At the same 7.34M-row scale it writes 16.7 MiB instead of seg1's
+85.8 MiB while retaining independent range reads. Production discovery still
+names seg1 and no merge writer emits either format, so this changes no shipped
+read or write default.
 
 **Whether to USE an index is decided per execution.** Loading one is a
 whole-file cost, so a query that wants a handful of rows cannot pay it: a text

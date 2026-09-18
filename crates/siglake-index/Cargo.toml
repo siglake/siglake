@@ -8,8 +8,6 @@ description = "Per-file inverted index (term → row-ordinal postings) for exact
 [dependencies]
 siglake-bloom = { workspace = true }
 crc32fast = { workspace = true }
-
-[dev-dependencies]
 zstd = { workspace = true }
 
 [lints]

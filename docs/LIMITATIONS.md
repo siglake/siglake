@@ -67,9 +67,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   from 7.3-22.4x slower than a scan to 11.5-17.4x faster, with 15.95 MiB of
   resident directory for the same fourteen files and no eviction, and the
   result does not move when the two budgets above are zero, because that path
-  uses neither. It costs 5.59x the v1 sidecar's bytes on disk as prototyped
-  (the interior must stay uncompressed to be addressable), so per-block
-  compression (#4988) comes before a writer (#4377). Whether the
+  uses neither. The readable seg1 prototype costs 5.59x the v1 sidecar's bytes
+  on disk. The separate seg2 codec (#4988) closes that format cost with
+  independently addressable Zstd blocks (16.7 MiB on the 7.34M-row fixture)
+  and a CRC per block's posting span, but production discovery still names
+  seg1 and no merge writer emits either format. A seg2 production writer and
+  discovery adoption remain part of #4377. Whether the
   serialized copy earns its share at all is a separate open question: since a
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no
@@ -87,14 +90,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   exact predicate runs above the scan — so the exposure is a dropped match, and
   only for a file whose index is corrupt on disk rather than absent. Closing it
   means a checksum over the postings, and
-  `DESIGN_segmented_inverted_index.md` now prices the granularities: 4 bytes
+  `DESIGN_segmented_inverted_index.md` prices the granularities: 4 bytes
   per term is about a third of a *segmented* blob, because a partial reader
   fetches one term's postings and can only verify what it fetched, while a CRC
   per block's posting span is a thousandth of it. Neither figure is this
   format's, which is read whole — what that costs, and which storage path is
   exposed at all once the Puffin sidecar's Zstd frame checksum is accounted
-  for, is #4991. Still the trade to revisit when postings feed an answer
-  directly instead of a superset selection.
+  for, is #4991. Seg2 closes this residual for its own posting spans; seg1 and
+  v1 remain unchanged, so #4991 still owns the shipped v1 boundary.
 - **A maintenance process's cache budgets are readable at startup, not on
   `/metrics`.** The compactor, the ingest server and the `siglake` maintenance
   subcommands resolve their own budgets now — zero for the two text-index
