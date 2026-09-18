@@ -532,6 +532,9 @@ fn remove_pin(segment: &WalSegment) -> Result<()> {
     };
     match std::fs::remove_file(&pending) {
         Ok(()) => {
+            // Keep the unlink durable: if it rolled back after remote
+            // retention collected the object, catch-up would upload the
+            // already-committed segment again (#4919).
             let dir = pending.parent().context("mirror pin has no parent")?;
             crate::durability::sync_dir(dir).context("persist mirror unpin")
         }
@@ -808,6 +811,9 @@ fn list_pending(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 
 fn remove_candidate_pin(path: &Path) {
     let result = std::fs::remove_file(path).and_then(|()| {
+        // The same stale-pin/reclaimed-object race as `remove_pin` applies
+        // here. One sync per sweep would only narrow the crash window; it
+        // would not remove it (#4919).
         let parent = path.parent().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "pin has no parent")
         })?;

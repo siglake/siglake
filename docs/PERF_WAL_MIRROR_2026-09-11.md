@@ -490,11 +490,16 @@ tell when the fsync is buying nothing.
 
 # What the unpin fsync costs, and why it stays (task #4919)
 
-**Date:** 2026-09-18 · **Evidence:** `report_unpin_cost_breakdown`
-(`crates/siglake-wal/src/mirror.rs`, `#[ignore]`d), three runs; and a
-source-versus-candidate loopback A/B, `results/wal-mirror-unpin-2026-09-18/`,
-harness `unpin-ab.sh` and `unpin-report.py` beside the arms.
-**Verdict: PLACEHOLDER-VERDICT**
+**Date:** 2026-09-18 · **Source:** `dfd0541` · **Evidence:**
+`report_unpin_cost_breakdown` (`crates/siglake-wal/src/mirror.rs`,
+`#[ignore]`d), three runs, plus an interleaved loopback A/B.
+**Verdict: KEEP both unpin directory syncs.** One sync costs 384–448 µs on
+this ext4 volume and about one journal transaction. The 20K-EPS/default-roll
+shape delivered the same rate with and without it. Saturation runs were too
+variable to establish a benefit at the shipped roll; one quiet 512-event-roll
+block measured a 4.6 % candidate gain, but its repeat did not establish a
+stable magnitude. A rolled-back unlink can also recreate an object after mirror
+reclamation, so deleting or batching the barrier has a correctness cost.
 
 #3787's follow-up said the mirror takes two more directory fsyncs per segment on
 the unpin side and that both could go, because a lost unlink costs one stat the
@@ -529,10 +534,120 @@ also frees its blocks. The unlink is 6–9 µs of that — under 2.5 %. The
 proportion is the pin's: the fsync is the cost, and it amortizes almost linearly,
 down to 2.4 µs per unpin at one sync per 200.
 
-So the arithmetic in the premise holds: ~390 µs per uploaded segment, at the
-60.6 seals/s of #3758's saturation arm, is 24 ms of journal work per second on
-the device the writer is fsyncing. What it is not is seal time. `remove_pin`
-runs on the mirror worker after `notify_uploaded` (`mirror.rs:361`), and
-`remove_candidate_pin` on the sweep task. Whether 24 ms/s of somebody else's
-journal work reaches delivered throughput is not arithmetic, and that is what
-the A/B is for.
+At the 60.6 seals/s of #3758's saturation arm, ~390 µs per uploaded segment is
+24 ms of journal work per second on the device the writer is fsyncing.
+`remove_pin` runs on the mirror worker after `notify_uploaded`
+(`mirror.rs:361`), and `remove_candidate_pin` runs on the sweep task. The A/B
+below measures whether that concurrent work reaches delivered throughput.
+
+## A/B method and identities
+
+The source and candidate both enabled the mirror against a `file://` warehouse
+on the same ext4 volume as the WAL. The only candidate changes removed the
+`sync_dir` calls from `remove_pin` and `remove_candidate_pin`; pin creation and
+every other durability barrier stayed in place. Each arm started a fresh
+ingest server and data directory in the default durable acknowledgement mode,
+with 16 load workers and 50 events per request. Pair order alternated. Fixed
+arms ran at 20,000 EPS for 60 seconds; saturation arms ran for 30 seconds.
+
+| artifact | identity |
+|---|---|
+| unchanged binary | `425b8f985c809493f28d7dbe16c7ec34461d982e34d9c31624d68f23b4f5e403` |
+| no-unpin-sync candidate | `1fa201e030c27af9e1d005d007a5c605d42deacc1b126b9ec4666a3baba3fd79` |
+| load generator | `fd1e098cd898aa987a2bf1e21a2d3b3ab5cc8ebd85b13d81016dfec547683250` |
+
+The raw arm files were written under the ignored
+`results/wal-mirror-unpin-2026-09-18/` directory. The identities, counts and
+spread needed for the disposition are retained here. No candidate production
+change remains in the tree.
+
+## Throughput results
+
+| roll / load | complete pairs | observed seal rate | delivered-rate result |
+|---|---:|---:|---|
+| 4096 / 20K EPS | 5 | 4.9/s | source and candidate 20,007–20,009 EPS; 0 errors and 0 `503`s |
+| 4096 / saturation | 8 | 48.2–60.6/s | unresolved: paired deltas −19.1 % to +21.4 % |
+| 1024 / saturation | 6 | 137.0–176.1/s | unresolved: paired deltas −18.3 % to +27.0 % |
+| 512 / saturation | 6 | 207.3–255.5/s | candidate median +4.6 %; five pairs +3.5 % to +5.3 %, one −14.3 % |
+| 512 / saturation repeat | 4 | 206.4–250.8/s | candidate arm median +0.9 %; paired deltas −16.5 % to +19.0 % |
+
+The default-roll saturation session overlapped other work: one-minute load
+average entering its arms rose from 2.1 to 16.1, and same-arm throughput spans
+exceeded 21 %. The 1024-event point had the same failure mode, including one
+source arm 20 % below the other source arms. Those sessions give no useful
+throughput bound.
+
+The first 512-event block was quieter. Its six source arms spanned 2.3 %, and
+five candidate arms ran above their paired sources. Across those five, mean
+seal time fell by 0.14 ms and mean request time by 0.24 ms; the one candidate
+outlier fell 14.3 % below its source. The repeat encountered two opposite-arm
+outliers and then two close pairs at +1.5 % and +0.7 %. The saved journal work
+can reach ingest at roughly eight times the shipped seal rate, while the size
+of that effect did not reproduce on this shared host. At the shipped roll and
+20K EPS, the measured throughput effect is zero.
+
+## The mechanism is measurable
+
+`/proc/fs/jbd2/dm-1-8/info` was sampled around every saturation arm. This
+counter is device-wide, so unrelated activity adds transactions. Normalizing
+by each arm's sealed count still showed the same direction in every pair:
+
+| roll | pairs | source transactions/seal | candidate transactions/seal | mean saved/seal |
+|---|---:|---:|---:|---:|
+| 4096 | 8 | 20.557–21.065 | 19.637–20.016 | 0.868 |
+| 1024 | 6 | 9.327–9.467 | 8.484–8.603 | 0.830 |
+| 512 | 6 | 7.417–7.434 | 6.508–6.600 | 0.898 |
+| 512 repeat | 4 | 7.415–7.498 | 6.515–6.584 | 0.902 |
+
+Final scrapes in every complete arm had
+`siglake_wal_mirror_segments_total{outcome="ok"}` equal to
+`siglake_wal_segments_sealed_total`. The resulting successful upload /
+`remove_pin` unlink / unpin-sync counts were:
+
+| roll / load | source | candidate |
+|---|---:|---:|
+| 4096 / 20K EPS | 1,460 / 1,460 / 1,460 | 1,460 / 1,460 / 0 |
+| 4096 / saturation | 13,502 / 13,502 / 13,502 | 13,060 / 13,060 / 0 |
+| 1024 / saturation | 29,626 / 29,626 / 29,626 | 28,778 / 28,778 / 0 |
+| 512 / saturation | 43,648 / 43,648 / 43,648 | 44,209 / 44,209 / 0 |
+| 512 repeat, four complete pairs | 28,518 / 28,518 / 28,518 | 28,652 / 28,652 / 0 |
+| **total** | **116,754 / 116,754 / 116,754** | **116,159 / 116,159 / 0** |
+
+`remove_candidate_pin` performed zero successful unlinks in these healthy
+arms: no sweep ran and `sweep_unpin` recorded no failure. The one pin found
+after each server stopped belongs to the shutdown seal emitted after the final
+metrics scrape.
+
+## Crash and reclamation disposition
+
+Two tests cover both states a rolled-back unlink can expose. With the remote
+object present, `catch_up_sweep` stats it, returns its registration and removes
+the pin without a second PUT. If mirror reclamation has already deleted the
+object, the same stale pin is the segment's last local name: the sweep reads
+it, uploads the object again and returns a fresh `sealed` registration for a
+segment already committed to Iceberg.
+
+That second state conflicts with the reclamation order in
+`DESIGN_wal_mirror_reclamation.md`: the local mark skips a live pin, then
+retention deletes only after the pin is gone. An acknowledged unlink without a
+directory sync can appear gone to the mark and return after a crash. One sync
+at the end of a candidate sweep reduces the number of names exposed during the
+pass, but a crash before that sync leaves the same state. Batching upload-side
+unpins leaves each completed upload exposed until the later batch barrier.
+
+The two current barriers stay. This accepts about one ext4 journal transaction
+per uploaded segment in exchange for keeping the reclamation proof intact. A
+future removal needs durable tombstone or ordering machinery that prevents a
+resurrected pin from uploading a collected key; the throughput measurements
+alone do not justify that machinery.
+
+## Limits of this measurement
+
+- The storage path was local ext4 with a `file://` object store. EFS, S3, XFS
+  and overlay filesystems were not measured.
+- The shared host was quiet for only part of the run. The paired spread is
+  reported instead of turning noisy medians into a throughput claim.
+- The 512- and 1024-event rolls are stress points. The shipped default remains
+  4096 events.
+- No retention worker ran during the load arms. The recovery tests construct
+  the present-object and reclaimed-object states directly.
