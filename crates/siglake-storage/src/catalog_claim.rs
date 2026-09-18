@@ -3811,11 +3811,18 @@ mod local_commit_mark_postgres {
         Fut: std::future::Future<Output = Result<()>>,
     {
         let scratch = Scratch::create(admin, base).await?;
-        let outcome = async {
-            let claim = scratch.connect().await?;
-            case(claim).await
-        }
-        .await;
+        // The store's pool is closed before the schema goes, so four cases do
+        // not leave four pools' worth of idle sessions on a compose Postgres
+        // that has its own ingest, compactor and query server connected.
+        let outcome = match scratch.connect().await {
+            Ok(claim) => {
+                let pool = claim.pool.clone();
+                let outcome = case(claim).await;
+                pool.close().await;
+                outcome
+            }
+            Err(e) => Err(e),
+        };
         scratch.drop_schema(admin).await;
         outcome
     }
