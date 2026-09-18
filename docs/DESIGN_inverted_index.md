@@ -356,7 +356,11 @@ histograms, and — since #3969 —
 `siglake_iceberg_text_index_startup_seconds{stage,storage}` around the four
 sections of that work separately (`permit_wait`, `blob_fetch`, `decode`,
 `selection`), with the parsed-index cache's lookup outcomes and eviction
-reasons beside it. One total could not say which section a regression was in:
+reasons beside it — and, since #4718, the blob cache's own
+(`siglake_iceberg_puffin_blob_fetches_total`,
+`siglake_iceberg_puffin_blob_cache_lookups_total{outcome}`,
+`siglake_iceberg_puffin_blob_cache_evictions_total{reason}`), so a re-decode
+that also re-read the blob is a reading rather than an inference. One total could not say which section a regression was in:
 run #73 measured about 30 ns per file row before a first batch and the round's
 artifacts could not attribute it. Differential storage test
 (`tests/inverted_index.rs`) asserts ground-truth-correct counts across
