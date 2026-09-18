@@ -4,21 +4,21 @@ Three coordinated architectural changes, approved 2026-06-06. They reinforce
 each other: one query language + one ingest protocol = a smaller surface and a
 cleaner autoscaling story, all feeding the WS-7 OTel/dynamic-schema direction.
 
-## 1. Remove SPL — full removal, SQL-only query
+## 1. Remove SPL — full removal, SQL-only query <!-- vendor-name-ok: dated removal record, see #4601 -->
 
-The detection pipeline does **not** use SPL. It survives only in the query layer
-(`/api/v1/spl`) and as a boolean `search`-expression filter in two spots: the SSE
+The detection pipeline does **not** use SPL. It survives only in the query layer <!-- vendor-name-ok: dated removal record, see #4601 -->
+(`/api/v1/spl`) and as a boolean `search`-expression filter in two spots: the SSE <!-- vendor-name-ok: dated removal record, see #4601 -->
 stream `?filter=` and the dispatcher webhook filter. Standardizing on DataFusion
 SQL, we remove it entirely, sequenced so nothing breaks:
 
-1. **Query layer** — remove the `/api/v1/spl` endpoint, `query-server/src/spl.rs`,
-   the SQL/SPL split, the CLI `spl` command, and the `splReverseTimeDefault`
+1. **Query layer** — remove the `/api/v1/spl` endpoint, `query-server/src/spl.rs`, <!-- vendor-name-ok: dated removal record, see #4601 -->
+   the SQL/SPL split, the CLI `spl` command, and the `splReverseTimeDefault` <!-- vendor-name-ok: dated removal record, see #4601 -->
    plumbing.
 2. **Filter sites** — replace the SSE `?filter=` + dispatcher webhook filter with
    a small SQL boolean-predicate evaluator (compile a SQL `WHERE`-style expr,
    evaluate against a single-row `RecordBatch`), or drop the SSE filter (debug
    convenience).
-3. **Crate** — delete `siglake-spl` and its workspace/dep references.
+3. **Crate** — delete `siglake-spl` and its workspace/dep references. <!-- vendor-name-ok: dated removal record, see #4601 -->
 
 ## 2. OTel-only ingest (transport swap first)
 
@@ -62,5 +62,5 @@ Then: KEDA `ScaledObject`s for ingest + query.
 
 ## Sequence
 
-SPL removal (1) → OTel-only (2) → autoscaling primitives + KEDA (3). Small,
+SPL removal (1) → OTel-only (2) → autoscaling primitives + KEDA (3). Small, <!-- vendor-name-ok: dated removal record, see #4601 -->
 tested, committed increments throughout (the Phase A/B cadence).
