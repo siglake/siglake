@@ -46,7 +46,7 @@ SIGLAKE_DOWN_MODE=all EMPTY_WAREHOUSE=1 deploy/aws/down.sh
 | `smoke.sh`          | `kubectl port-forward` to ingester + query-server, POST N events, poll `/api/v1/sql` until the row count matches, then run a `GROUP BY host` over `/api/v1/sql` and assert the per-host counts sum to that row count (cross-shard merge check). |
 | `query-bench.sh`    | Creates a temporary in-cluster runner pod, executes tab-separated SQL timing cases against `siglake-query`, writes serial/concurrency TSVs, and captures query pod stats, metrics, and logs. |
 | `operator-smoke.sh` | Templates `deploy/operator/sample-cluster.smoke.yaml` against `terraform output -raw {ecr_repository_url, warehouse_bucket, rds_endpoint, rds_secret_arn}` + the postgres password from Secrets Manager. Creates the ingest token Secrets + applies the CR. Waits for the operator-rendered `example-{ingester,compactor,query}` Deployments to roll out. Run *after* `up.sh` *and* `helm install siglake-op deploy/helm/siglake-operator …`. |
-| `down.sh`           | `helm uninstall`, delete PVCs + namespace, then destroy either app-only AWS resources (default, keeps EKS warm) or the full terraform stack (`SIGLAKE_DOWN_MODE=all`). With `EMPTY_WAREHOUSE=1` it also `aws s3 rm` the warehouse bucket first.              |
+| `down.sh`           | `helm uninstall`, delete PVCs + namespace, then destroy either app-only AWS resources (default, keeps EKS warm) or the full terraform stack (`SIGLAKE_DOWN_MODE=all`). With `EMPTY_WAREHOUSE=1` it also `aws s3 rm` the warehouse bucket first. The Helm and `kubectl` steps are best-effort; a failed `terraform destroy` exits with terraform's status and prints no `down complete`. |
 
 ## Environment overrides
 

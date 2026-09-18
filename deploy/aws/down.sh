@@ -6,7 +6,9 @@
 # so subsequent smoke runs can skip the longest apply steps. Use
 # SIGLAKE_DOWN_MODE=all for a full terraform destroy.
 #
-# Steps (best-effort; each command logs but doesn't bail on the next):
+# Steps 1-3 are best-effort; each command logs but doesn't bail on the next.
+# Step 4 is not: a failed destroy exits nonzero and "down complete" is only
+# printed after terraform succeeded.
 #   1. helm uninstall
 #   2. drop the chart-managed Postgres Secret
 #   3. drop PVCs + namespace
@@ -137,6 +139,7 @@ fi
 # 3. terraform destroy
 # ---------------------------------------------------------------------------
 cd "$TF_DIR" || { echo "ERROR: TF_DIR=$TF_DIR not found" >&2; exit 1; }
+destroy_rc=0
 case "$DOWN_MODE" in
   cluster)
     log "terraform: destroy app resources, keep EKS/VPC/EFS/ECR warm"
@@ -144,16 +147,26 @@ case "$DOWN_MODE" in
     for target in "${KEEP_CLUSTER_TARGETS[@]}"; do
       args+=("-target=$target")
     done
-    terraform "${args[@]}"
+    terraform "${args[@]}" || destroy_rc=$?
     ;;
   all)
     log "terraform: full destroy"
-    terraform destroy -input=false -auto-approve
+    terraform destroy -input=false -auto-approve || destroy_rc=$?
     ;;
   *)
     echo "ERROR: SIGLAKE_DOWN_MODE must be 'cluster' or 'all' (got '$DOWN_MODE')" >&2
     exit 1
     ;;
 esac
+
+# The Helm and kubectl steps above are best-effort on purpose; the destroy is
+# not. Without this the script's status was the final `log`, so a destroy that
+# left RDS, the warehouse bucket and the IAM role running and billing still
+# exited 0 and the caller read the teardown as finished.
+if [ "$destroy_rc" -ne 0 ]; then
+  echo "ERROR: terraform destroy failed (exit $destroy_rc) in SIGLAKE_DOWN_MODE=$DOWN_MODE;" \
+       "AWS resources are still up -- re-run after fixing the cause" >&2
+  exit "$destroy_rc"
+fi
 
 log "down complete"
