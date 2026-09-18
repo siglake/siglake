@@ -423,9 +423,10 @@ charges every shape at 1M rows, 474.9 KiB per file at 7.34M.
 
 Four things this deliberately does not do:
 
-- **It holds no per-lookup state.** The channel, the counters and the
+- **It holds no per-lookup state.** The staged source, the counters and the
   `BlobRangeReader` are built per lookup and the cost reported
-  (`_range_reads`, `_fetched_bytes`) is that lookup's alone, warm or cold. The
+  (`_range_reads`, `_fetched_bytes`, and since #5007 `_stages` and
+  `_reader_reads`) is that lookup's alone, warm or cold. The
   resident-byte histogram is recorded on a warm lookup too: the memory a warm
   arm spends is the thing #4562 is comparing, and it must not vanish from the
   report because it was paid once.
@@ -478,6 +479,7 @@ exact scan otherwise:
 | `row_group_order` | the scan's kept-group list is not strictly ascending, so the sidecar and the selection would cover different groups |
 | `unanswerable` | a term that does not normalize, a malformed section, or a failed range read |
 | `no_hints` | the prune spec carries nothing this index can answer |
+| `stages` | the staged rounds did not converge inside their budget (#5007) — unreachable for this reader, and a bound rather than an expected outcome |
 
 Two entry points changed in `siglake_index::segmented` for this, both
 reader-side policy the codec deliberately left open:

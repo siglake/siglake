@@ -10880,7 +10880,7 @@ message schema {
         // The latency claim, against the shape it replaces: a source serving
         // one range at a time costs a round trip per read, and these eight
         // lookups took fewer than half of one file's worth of those.
-        let serial = std::time::Duration::from_millis((solo_cost.reads * DELAY_MS as u64) as u64);
+        let serial = std::time::Duration::from_millis(solo_cost.reads * DELAY_MS as u64);
         assert!(
             elapsed * 2 < serial * FILES as u32,
             "{FILES} files took {elapsed:?}; one file's reads served one at a time is {serial:?}"
