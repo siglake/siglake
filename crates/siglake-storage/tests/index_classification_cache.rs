@@ -21,6 +21,12 @@ fn index_config(index_id: &str) -> IndexConfig {
     }
 }
 
+fn index_config_with_defaults(index_id: &str, fields: &[&str]) -> IndexConfig {
+    let mut config = index_config(index_id);
+    config.doc_mapping.default_search_fields = fields.iter().map(|field| (*field).into()).collect();
+    config
+}
+
 /// Delete every metadata file of `index_id`'s table, so a `load_table` for it
 /// can only fail. Returns how many files went.
 fn strip_table_metadata(warehouse: &std::path::Path, index_id: &str) -> usize {
@@ -100,4 +106,107 @@ async fn classification_matches_get_index_on_the_cases_that_are_not_indexes() {
     // cache entry within its TTL can resurrect it.
     assert!(ice.delete_index("present").await.unwrap());
     assert!(!ice.is_managed_index("present").await.unwrap());
+}
+
+#[tokio::test]
+async fn cached_config_is_tenant_scoped_and_tracks_mapping_commits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = IcebergContext::open(&tmp.path().join("warehouse"))
+        .await
+        .unwrap()
+        .with_table_cache_ttl(std::time::Duration::from_secs(3600));
+    let tenant_a = root.for_namespace("tenant_a").await.unwrap();
+    let tenant_b = root.for_namespace("tenant_b").await.unwrap();
+    tenant_a
+        .create_index(&index_config_with_defaults("shared", &["raw"]))
+        .await
+        .unwrap();
+    tenant_b
+        .create_index(&index_config_with_defaults("shared", &["host"]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tenant_a
+            .cached_index_config("shared")
+            .await
+            .unwrap()
+            .unwrap()
+            .doc_mapping
+            .default_search_fields,
+        ["raw"]
+    );
+    assert_eq!(
+        tenant_b
+            .cached_index_config("shared")
+            .await
+            .unwrap()
+            .unwrap()
+            .doc_mapping
+            .default_search_fields,
+        ["host"]
+    );
+
+    let updated = index_config_with_defaults("shared", &["raw", "host"]);
+    tenant_a.update_index(&updated).await.unwrap();
+    assert_eq!(
+        tenant_a
+            .cached_index_config("shared")
+            .await
+            .unwrap()
+            .unwrap()
+            .doc_mapping
+            .default_search_fields,
+        ["raw", "host"],
+        "the mapping commit must invalidate the cached config"
+    );
+    assert_eq!(
+        tenant_b
+            .cached_index_config("shared")
+            .await
+            .unwrap()
+            .unwrap()
+            .doc_mapping
+            .default_search_fields,
+        ["host"],
+        "one tenant's invalidation must not change another tenant's mapping"
+    );
+}
+
+#[tokio::test]
+async fn cached_config_does_not_resurrect_a_dropped_incarnation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+        .await
+        .unwrap()
+        .with_table_cache_ttl(std::time::Duration::from_secs(3600));
+    ice.create_index(&index_config_with_defaults("replace-me", &["raw"]))
+        .await
+        .unwrap();
+    assert!(ice
+        .cached_index_config("replace-me")
+        .await
+        .unwrap()
+        .is_some());
+
+    assert!(ice.delete_index("replace-me").await.unwrap());
+    assert!(ice
+        .cached_index_config("replace-me")
+        .await
+        .unwrap()
+        .is_none());
+
+    ice.create_index(&index_config_with_defaults("replace-me", &["host"]))
+        .await
+        .unwrap();
+    assert_eq!(
+        ice.cached_index_config("replace-me")
+            .await
+            .unwrap()
+            .unwrap()
+            .doc_mapping
+            .default_search_fields,
+        ["host"],
+        "the replacement must not reuse the dropped incarnation's cached mapping"
+    );
 }

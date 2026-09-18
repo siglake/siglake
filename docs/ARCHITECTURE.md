@@ -1110,7 +1110,12 @@ before anything is dispatched — is answered from the catalog row plus the
 bounded-staleness table-metadata cache, never an uncached `load_table`: that is
 the per-query metadata.json read table registration was already changed to
 avoid, and a gate holding it merely moved the same read one step earlier in the
-request. A worker
+request. Mapping-dependent query preparation follows the same policy: the
+`search()` rewrite reads `default_search_fields` and Jaeger validates its trace
+columns from the cached table entry. Mapping commits invalidate that entry;
+the fresh catalog-row check keeps a dropped index from resolving through an
+old cache entry. UUID and incarnation-sensitive maintenance reads remain
+uncached. A worker
 fragment carries the same one-budget-per-request rule as the local path,
 anchored when the shard request arrives: preparation (tenant resolution, table
 registration, generation pin, planning) spends the same clock as the scan, so a
