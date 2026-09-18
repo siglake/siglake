@@ -61,6 +61,7 @@ use crate::{Error, ErrorKind, Result};
 /// live, so a re-clustering rewrite can never silently duplicate or drop rows.
 pub struct RewriteFilesAction {
     check_duplicate: bool,
+    snapshot_id: Option<i64>,
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
@@ -72,6 +73,7 @@ impl RewriteFilesAction {
     pub(crate) fn new() -> Self {
         Self {
             check_duplicate: true,
+            snapshot_id: None,
             commit_uuid: None,
             key_metadata: None,
             snapshot_properties: HashMap::default(),
@@ -95,6 +97,20 @@ impl RewriteFilesAction {
     /// Mark data files for removal in the snapshot (the original time-overlapping files).
     pub fn delete_files(mut self, data_files: impl IntoIterator<Item = DataFile>) -> Self {
         self.removed_data_files.extend(data_files);
+        self
+    }
+
+    /// FORK ADDITION (siglake #4377). Commit under a snapshot id the caller
+    /// reserved with [`reserve_snapshot_id`](crate::transaction::reserve_snapshot_id),
+    /// so a Puffin statistics file written for that id can be registered in
+    /// the same transaction as the rewrite.
+    ///
+    /// Unset, the id is generated inside the commit as before. Set, the commit
+    /// fails — without retrying — if the id is present on the base the attempt
+    /// re-applies against, because the sidecar already names it and a second
+    /// snapshot cannot take it.
+    pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id = Some(snapshot_id);
         self
     }
 
@@ -127,13 +143,24 @@ impl TransactionAction for RewriteFilesAction {
             ));
         }
 
-        let mut snapshot_producer = SnapshotProducer::new(
-            table,
-            self.commit_uuid.unwrap_or_else(Uuid::now_v7),
-            self.key_metadata.clone(),
-            self.snapshot_properties.clone(),
-            self.added_data_files.clone(),
-        );
+        let commit_uuid = self.commit_uuid.unwrap_or_else(Uuid::now_v7);
+        let mut snapshot_producer = match self.snapshot_id {
+            Some(snapshot_id) => SnapshotProducer::new_with_snapshot_id(
+                table,
+                snapshot_id,
+                commit_uuid,
+                self.key_metadata.clone(),
+                self.snapshot_properties.clone(),
+                self.added_data_files.clone(),
+            )?,
+            None => SnapshotProducer::new(
+                table,
+                commit_uuid,
+                self.key_metadata.clone(),
+                self.snapshot_properties.clone(),
+                self.added_data_files.clone(),
+            ),
+        };
         snapshot_producer.set_removed_data_files(self.removed_data_files.clone());
 
         // Validate the new files (partition spec, content type).

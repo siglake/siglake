@@ -38,6 +38,20 @@
   one known false refusal (a `wal.mirror.prefix` changed mid-life) and the
   absence of a live Postgres arm. (#4997)
 
+- **Text indexes (feature)**: an opted-in streaming re-cluster builds the
+  compressed segmented inverted index (`seg2`) as it emits Parquet row groups,
+  then registers the completed Puffin statistics file in the same transaction
+  as the data-file rewrite. The writer holds one row group's parsed postings at
+  a time, validates the sidecar's group rows against the Parquet footer, and
+  produces one blob per output file and indexed column when a rolling rewrite
+  splits. A failed transaction leaves no discoverable index, and the existing
+  post-commit rebuild recognizes seg2 coverage instead of decoding the output
+  file again. Query discovery prefers seg2 while retaining the prototype seg1
+  path and existing v1 reads. `SIGLAKE_SEGMENTED_INDEX_WRITES=1` and the
+  separate `SIGLAKE_SEGMENTED_INDEX_READS=1` are both required to build and use
+  the format; both remain off by default pending AWS qualification. (#4377,
+  #5233)
+
 - **Text indexes (docs)**: the documented integrity gap in a v1 inverted-index
   blob is the **footer-KV** path only. An index stored as hex in a Parquet
   footer — the path taken per column while that column's serialized index fits
