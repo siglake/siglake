@@ -108,6 +108,7 @@ WORD_BOUNDED_VENDORS = (
     "better stack",
     "devo",
     "observe inc",
+    "spl",
 )
 
 # `datadog` must match `api.datadoghq.com`; `devo` must not match `devops`. The
@@ -260,6 +261,7 @@ RED = [
     "honeycomb's trace sampling",
     "axiom.co/docs",
     "Observe Inc. charges per",
+    "an SPL query",
 ]
 GREEN = [
     "the devops runbook lives in deploy/",
@@ -276,6 +278,8 @@ GREEN = [
     "instantaneous rate over the window",
     "gray logging of the audit trail",
     "an axiom. Consistency follows from it",
+    "split the batch at the boundary",
+    "a spline interpolation",
 ]
 
 # A whole file, so the line walk, the marker and the reason requirement are
@@ -283,8 +287,8 @@ GREEN = [
 FIXTURE_FILE = """\
 // The ingest handlers accept exactly one authorization scheme.
 let scheme = "Splunk";
-// as Datadog does (vendor-name-ok: named once in the removal record)
-let other = "Datadog";  // vendor-name-ok
+let compatible = "SPL";  // vendor-name-ok: retained for artifact compatibility
+let stale = "SPL";  // vendor-name-ok
 let fine = "Bearer";
 """
 
@@ -321,7 +325,7 @@ def run_fixtures() -> int:
     if "vendor-name-ok" not in problems[-1][1]:
         raise AssertionError("fixture: the reasonless marker was not named as such")
     if allowed != 1:
-        raise AssertionError("fixture: the allow-listed mention was not counted")
+        raise AssertionError("fixture: the allow-listed SPL mention was not counted")
 
     # A path that names a vendor, with no such line inside the file. Not a
     # `docs/<name>.md` one: check-public-tree.py's rule 5 requires every such

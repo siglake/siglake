@@ -9,7 +9,7 @@ Three artifacts, materialized into a single directory:
 | File                   | What it carries                                                |
 |------------------------|---------------------------------------------------------------|
 | `events.ndjson`        | One deterministic source JSON object per line; `load` converts it to OTLP/HTTP JSON and posts it to `/v1/logs`. |
-| `queries.json`         | An array of `{id, description, sql, spl, expected}` — `verify` executes only `sql`; the unused `spl` member remains for artifact compatibility. Every entry has a closed-form expected result computed during generation. |
+| `queries.json`         | An array of `{id, description, sql, spl, expected}` — `verify` executes only `sql`; the unused `spl` member remains for artifact compatibility. Every entry has a closed-form expected result computed during generation. <!-- vendor-name-ok: artifact compatibility, see #4601 --> |
 | `manifest.json`        | `{seed, events, start_time, window_hours, distribution_version}`. Carries everything needed to regenerate `events.ndjson` byte-for-byte. |
 
 The pair `(seed, events, start_time, window_hours)` is the corpus's content address. Same inputs → same `events.ndjson` bytes → same `queries.json` expecteds.
