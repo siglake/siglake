@@ -49,8 +49,15 @@
   file again. Query discovery prefers seg2 while retaining the prototype seg1
   path and existing v1 reads. `SIGLAKE_SEGMENTED_INDEX_WRITES=1` and the
   separate `SIGLAKE_SEGMENTED_INDEX_READS=1` are both required to build and use
-  the format; both remain off by default pending AWS qualification. (#4377,
-  #5233)
+  the format; both remain off by default pending AWS qualification. Two pieces
+  of the acceptance stay open behind those defaults: the writer's build time
+  and peak heap at 14 x 7.34M rows are unmeasured, and with
+  `SIGLAKE_INDEX_REBUILD=1` on as well, a file whose sidecar the writer refuses
+  makes the post-commit rebuild register a second statistics file against the
+  rewrite's own snapshot, which replaces the entry and drops that rewrite's
+  other seg2 blobs — queries fall back to a scan and answer correctly.
+  `docs/LIMITATIONS.md` and `docs/DESIGN_segmented_inverted_index.md` carry
+  both. (#4377, #5233)
 
 - **Text indexes (docs)**: the documented integrity gap in a v1 inverted-index
   blob is the **footer-KV** path only. An index stored as hex in a Parquet
