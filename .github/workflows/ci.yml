@@ -777,8 +777,8 @@ jobs:
       contents: read
     env:
       ECR_PUSH: ${{ github.event_name == 'push' && secrets.AWS_ROLE_ARN != '' }}
-      # Two cargo suites run below, so this job links Rust like `test` does and
-      # installs mold for the same reason. Both halves or neither -- see the
+      # Three cargo suites run below, so this job links Rust like `test` does
+      # and installs mold for the same reason. Both halves or neither -- see the
       # note under the workflow `env:` block.
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
