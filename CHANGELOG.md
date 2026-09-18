@@ -353,7 +353,7 @@
 
 ## 0.1.1
 
-Twelve changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
+Thirteen changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
 surface moves, and a 0.1.0 warehouse is read and written unchanged: one values
 key and six environment knobs are added, and no flag or values key is removed.
 Two defaults move. The audit worker now gives each append 30 s instead of
@@ -398,6 +398,21 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   needs a drained, non-order-preserving scan carrying no convertible predicate,
   which on a log-UI workload is close to nothing (`docs/LIMITATIONS.md`).
   (#4891)
+- **Query**: a text query over more indexed files than the text-index caches
+  hold no longer re-reads every index blob from object storage on every
+  execution. The two caches sit on either side of one decode, and only the
+  parsed side serves a warm query, so a cached blob is read exactly when its
+  parsed twin has been evicted — which is also the moment arrival-order
+  eviction dropped it. A 14-file plan on the 50G benchmark round read 4.60 GB
+  over 183 index-phase reads where the same plan had read 0.50 GB over 73.
+  Eviction now drops the blobs the parsed cache still covers, which cannot be
+  read at all, and keeps the ones it has dropped, for a bounded number of the
+  cache's turnovers so that a compacted-away file's blob is not retained for
+  the life of the process. What remains is arithmetic: a repeat text suite
+  re-fetches the indexed files the blob budget cannot cover and nothing more —
+  measured as exactly `files - blobs held` per pass over plans from 8 to 28
+  files, against the whole plan before. No budget or default changes, and no
+  answer changes: a blob-cache miss costs a fetch, never a row. (#4182)
 - **Query**: whether to *use* a text index a file already carries is now
   decided per execution. Loading one costs a deserialization proportional to
   the file's rows, and a text predicate under a bare `LIMIT` stops the scan
