@@ -97,6 +97,16 @@ routing agrees for both
 (`two_prefixes_in_one_listing_are_refused_even_though_the_routing_agrees`): the
 listing is a union of two mirrors, and a restore cannot be right for both.
 
+That rule has one known false-refusal source, and it is worth naming because a
+refusal has no override. `mark_committed_local` composes `segment_url` from the
+prefix in the LIVE config rather than from the key the object was written under
+(`crates/siglake-compactor/src/lib.rs:2906-2918`), so a deployment whose
+`wal.mirror.prefix` was changed after some objects had been uploaded can hold
+rows claiming two prefixes for one mirror. The check reads that as a union of
+two mirrors and refuses. The refusal prints both prefixes, which is enough for
+an operator to recognise their own prefix change, and the way past it is to drop
+`--catalog` — the same escape hatch a contradicted marker has.
+
 ## Partial matches
 
 Retention deletes a row as soon as its object is gone
