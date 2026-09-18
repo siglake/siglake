@@ -558,9 +558,14 @@
      "expr": "sum(siglake_compactor_segments_poisoned{namespace=~\"$namespace\"})",
      "legendFormat": "poison/ set-aside",
      "refId": "B"
+    },
+    {
+     "expr": "sum by (namespace, tenant) (siglake_compactor_orphans_held{namespace=~\"$namespace\"})",
+     "legendFormat": "orphans/ held {{namespace}}/{{tenant}}",
+     "refId": "C"
     }
    ],
-   "description": "Set aside and not draining without intervention: repeated drain failures (usually an index that does not exist), or a mirrored segment refused because it cannot be placed in the table its index resolves to now, which is set aside on the first cycle. Durable and unqueryable until requeued. The second line is the local filesystem drain's equivalent (#3143): a segment that failed to read on every attempt is held under `<wal>/poison/` with a note saying why, and `siglake wal-requeue --wal <wal-root>` is the way back once its cause is fixed. `siglake_compactor_segments_poisoned_total` is the event arm — a set-aside that is requeued and set aside again counts twice there and once here."
+   "description": "Set aside and not draining without intervention: repeated drain failures (usually an index that does not exist), or a mirrored segment refused because it cannot be placed in the table its index resolves to now, which is set aside on the first cycle. Durable and unqueryable until requeued. The second line is the local filesystem drain's equivalent (#3143): a segment that failed to read on every attempt is held under `<wal>/poison/` with a note saying why, and `siglake wal-requeue --wal <wal-root>` is the way back once its cause is fixed. `siglake_compactor_segments_poisoned_total` is the event arm — a set-aside that is requeued and set aside again counts twice there and once here. The third line is what `SiglakeCompactorOrphansHeld` pages on (#3267): quarantined segments under `<wal>/orphans/` that automatic disposition could not settle, because the names are absent from the table's consumed set and the snapshot that would prove whether they were committed is no longer retained. Their commit status is UNKNOWN and the files must be preserved — the rows may already be in the table or may exist nowhere else, so deleting one can lose rows and requeueing one can duplicate them, and either needs evidence from your own retention and ingest history first. Broken out by tenant, unlike the two summed lines, because the hold is per tenant and the answer to 'whose?' is the first thing the page needs; a rising line is a hold that is still growing. It is a filesystem-drain observation only: the catalog-claim drain publishes no reading at all, so no line here does not establish that a former WAL PVC has no orphans left under it."
   },
   {
    "id": 117,
