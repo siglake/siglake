@@ -18,7 +18,7 @@
 //! The module contains the file writer for parquet file format.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use bytes::Bytes;
@@ -45,6 +45,114 @@ use crate::spec::{
 use crate::transform::create_transform_function;
 use crate::writer::{CurrentFileStatus, DataFile};
 use crate::{Error, ErrorKind, Result};
+
+/// siglake extension (#4377): one text column to build a **segmented**
+/// (`seg2`) inverted-index sidecar for, as the writer emits row groups.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentedIndexColumn {
+    /// The Utf8 column the postings are built over.
+    pub column: String,
+    /// Tokenization, which must be the tokenization the reader normalizes a
+    /// query term under.
+    pub tokenizer: siglake_bloom::Tokenizer,
+}
+
+/// A finished segmented sidecar and the output file it describes.
+///
+/// `group_rows` is the sidecar's own account of its groups, in group order, so
+/// the caller can check the sidecar against the written file's Parquet row
+/// groups before registering it — the format states every group's row count
+/// rather than one stamped `row_group_size`
+/// (`docs/DESIGN_segmented_inverted_index.md`).
+#[derive(Clone, Debug)]
+pub struct SegmentedIndexBlob {
+    /// The data file whose rows these postings address.
+    pub data_file_path: String,
+    /// The indexed column.
+    pub column: String,
+    /// The tokenization the terms were folded under.
+    pub tokenizer: siglake_bloom::Tokenizer,
+    /// Rows per sidecar group, in group order.
+    pub group_rows: Vec<u32>,
+    /// The blob, complete through its trailer.
+    pub bytes: Vec<u8>,
+}
+
+/// Where a write leaves its finished segmented sidecars.
+///
+/// Every [`ParquetWriter`] a rolling write builds shares one sink, so a
+/// rewrite that splits its output across several data files publishes one
+/// sidecar per (output file, column) and the caller registers them together.
+/// Nothing is pushed until a writer closes with a complete blob: a sidecar is
+/// never in the sink for a file that was not written.
+#[derive(Default)]
+pub struct SegmentedIndexSink {
+    blobs: Mutex<Vec<SegmentedIndexBlob>>,
+}
+
+impl SegmentedIndexSink {
+    /// An empty sink.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Remove and return everything written so far.
+    pub fn take(&self) -> Vec<SegmentedIndexBlob> {
+        let mut blobs = self
+            .blobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut blobs)
+    }
+
+    fn push(&self, blob: SegmentedIndexBlob) {
+        self.blobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(blob);
+    }
+}
+
+impl std::fmt::Debug for SegmentedIndexSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = self
+            .blobs
+            .try_lock()
+            .map(|blobs| blobs.len())
+            .ok()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        f.debug_struct("SegmentedIndexSink")
+            .field("blobs", &held)
+            .finish()
+    }
+}
+
+/// What [`ParquetWriterBuilder::with_segmented_index`] was handed.
+#[derive(Clone, Debug)]
+struct SegmentedIndexRequest {
+    columns: Vec<SegmentedIndexColumn>,
+    target_block_bytes: usize,
+    sink: Arc<SegmentedIndexSink>,
+}
+
+/// One output file's in-progress segmented sidecars.
+struct SegmentedIndexState {
+    /// Per column: the request, the encoder, and the row count of every group
+    /// pushed into it.
+    writers: Vec<(
+        SegmentedIndexColumn,
+        siglake_index::segmented::SegmentedWriter,
+        Vec<u32>,
+    )>,
+    sink: Arc<SegmentedIndexSink>,
+    /// A column that could not be indexed for one row group makes the whole
+    /// file's sidecar set unpublishable: a sidecar's groups must line up with
+    /// the file's row groups one for one, and a gap cannot be expressed.
+    disabled: bool,
+    /// Rows pushed into the encoders, which must equal the file's rows at close.
+    rows: u64,
+}
 
 /// ParquetWriterBuilder is used to builder a [`ParquetWriter`]
 #[derive(Clone, Debug)]
@@ -77,6 +185,11 @@ pub struct ParquetWriterBuilder {
     /// physical layout to the order it was written under — the per-file basis
     /// for the query gate's direction check during a sort-order migration.
     sort_order_id: Option<i32>,
+    /// siglake extension (#4377): build a segmented (`seg2`) inverted-index
+    /// sidecar for these columns as the row groups are emitted, and leave the
+    /// finished blobs in the shared sink. `None` = no segmented sidecar, which
+    /// is every caller that has not opted in.
+    segmented_index: Option<SegmentedIndexRequest>,
 }
 
 impl ParquetWriterBuilder {
@@ -101,6 +214,7 @@ impl ParquetWriterBuilder {
             group_count_cap: 0,
             time_bucket_column: None,
             sort_order_id: None,
+            segmented_index: None,
         }
     }
 
@@ -134,6 +248,33 @@ impl ParquetWriterBuilder {
         self.sort_order_id = Some(id);
         self
     }
+
+    /// siglake extension (#4377): build a segmented (`seg2`) inverted-index
+    /// sidecar for `columns` while the file is written, one sidecar group per
+    /// Parquet row group, and leave the finished blobs in `sink`.
+    ///
+    /// The writer takes control of row-group formation (as the row-group bloom
+    /// does), so sidecar group `i` **is** row group `i` — the identity the
+    /// format's reject path and row-domain check rest on. Peak index state is
+    /// one row group's postings and dictionary, never the file's, plus the
+    /// encoded blob itself, which seg2 compresses per block.
+    ///
+    /// Nothing is registered here: the caller takes the blobs out of the sink
+    /// and publishes them, which is how a failed commit leaves no discoverable
+    /// index.
+    pub fn with_segmented_index(
+        mut self,
+        columns: Vec<SegmentedIndexColumn>,
+        target_block_bytes: usize,
+        sink: Arc<SegmentedIndexSink>,
+    ) -> Self {
+        self.segmented_index = (!columns.is_empty()).then_some(SegmentedIndexRequest {
+            columns,
+            target_block_bytes,
+            sink,
+        });
+        self
+    }
 }
 
 impl FileWriterBuilder for ParquetWriterBuilder {
@@ -161,6 +302,27 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             time_bucket_nulls: 0,
             time_bucket_disabled: false,
             sort_order_id: self.sort_order_id,
+            segmented: self.segmented_index.as_ref().map(|request| {
+                SegmentedIndexState {
+                    writers: request
+                        .columns
+                        .iter()
+                        .map(|column| {
+                            (
+                                column.clone(),
+                                siglake_index::segmented::SegmentedWriter::new_v2(
+                                    request.target_block_bytes,
+                                )
+                                .with_tokenizer(column.tokenizer),
+                                Vec::new(),
+                            )
+                        })
+                        .collect(),
+                    sink: Arc::clone(&request.sink),
+                    disabled: false,
+                    rows: 0,
+                }
+            }),
         })
     }
 }
@@ -323,6 +485,10 @@ pub struct ParquetWriter {
     time_bucket_disabled: bool,
     /// See [`ParquetWriterBuilder::sort_order_id`].
     sort_order_id: Option<i32>,
+    // siglake per-row-group segmented inverted index (#4377), inactive when
+    // `None`. Active, it forms row groups explicitly for the same reason the
+    // row-group bloom does, and pushes one sidecar group per row group.
+    segmented: Option<SegmentedIndexState>,
 }
 
 /// Used to aggregate min and max value of each column.
@@ -812,6 +978,130 @@ impl ParquetWriter {
         ))
     }
 
+    /// siglake (#4377): push these batches — exactly one row group's rows — as
+    /// one group of each configured column's segmented sidecar.
+    ///
+    /// The index is built over the group's rows and handed to the encoder,
+    /// which serializes it and drops it, so the live index state is one row
+    /// group's and not the file's. Every physical row contributes an ordinal,
+    /// including a null one (as no text), because the ordinals returned to a
+    /// reader are file-physical positions.
+    ///
+    /// A column that is absent or not Utf8 disables the whole file's sidecar
+    /// set: the groups have to line up with the file's row groups one for one,
+    /// and a skipped group cannot be expressed. That is the same "publish
+    /// nothing rather than something misaligned" rule the row-group bloom list
+    /// follows.
+    fn push_segmented_groups(&mut self, batches: &[arrow_array::RecordBatch]) {
+        use arrow_array::Array;
+
+        let Some(segmented) = self.segmented.as_mut() else {
+            return;
+        };
+        if segmented.disabled {
+            return;
+        }
+        let group_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        for (column, writer, rows) in &mut segmented.writers {
+            let mut builder = siglake_index::IndexBuilder::with_tokenizer(column.tokenizer);
+            let mut pushed = 0usize;
+            for batch in batches {
+                let Some(idx) = batch.schema().index_of(column.column.as_str()).ok() else {
+                    break;
+                };
+                let Some(values) = batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                else {
+                    break;
+                };
+                for i in 0..values.len() {
+                    builder.push_row(if values.is_null(i) { "" } else { values.value(i) });
+                }
+                pushed += values.len();
+            }
+            if pushed != group_rows {
+                segmented.disabled = true;
+                segmented.writers.clear();
+                return;
+            }
+            let index = builder.build();
+            writer.push_group_index(&index);
+            rows.push(index.n_rows());
+        }
+        segmented.rows += group_rows as u64;
+    }
+
+    /// siglake (#4377): finish each column's sidecar and hand it to the sink,
+    /// or publish nothing.
+    ///
+    /// Three ways to publish nothing, all of them "the sidecar would describe a
+    /// file layout this file does not have":
+    ///
+    /// - a row group whose text column could not be indexed (`disabled`);
+    /// - a sidecar whose group count or per-group rows differ from the footer's
+    ///   row groups;
+    /// - a sidecar whose total rows differ from the file's.
+    ///
+    /// Silence is the safe outcome: with no sidecar registered the reader
+    /// scans, which is what it does for an unindexed file.
+    fn publish_segmented_sidecars(
+        segmented: SegmentedIndexState,
+        row_counts: &[u32],
+        file_rows: u64,
+        data_file_path: &str,
+    ) {
+        if segmented.disabled {
+            Self::record_segmented_write("refused", "column");
+            return;
+        }
+        if segmented.rows != file_rows {
+            Self::record_segmented_write("refused", "file_rows");
+            return;
+        }
+        let sink = segmented.sink;
+        let mut finished = Vec::with_capacity(segmented.writers.len());
+        for (column, writer, group_rows) in segmented.writers {
+            if group_rows != row_counts {
+                Self::record_segmented_write("refused", "row_domain");
+                return;
+            }
+            finished.push(SegmentedIndexBlob {
+                data_file_path: data_file_path.to_string(),
+                column: column.column,
+                tokenizer: column.tokenizer,
+                group_rows,
+                bytes: writer.finish(),
+            });
+        }
+        for blob in finished {
+            metrics::histogram!("siglake_iceberg_segmented_index_written_bytes")
+                .record(blob.bytes.len() as f64);
+            sink.push(blob);
+            Self::record_segmented_write("written", "none");
+        }
+    }
+
+    /// One sidecar's outcome at close: `written`, or `refused` with the reason
+    /// the sidecar would not have described this file's layout.
+    fn record_segmented_write(outcome: &'static str, reason: &'static str) {
+        metrics::counter!(
+            "siglake_iceberg_segmented_index_writes_total",
+            "outcome" => outcome,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Whether this writer forms row groups itself rather than letting the
+    /// inner writer do it. Both siglake per-row-group artifacts need it: a
+    /// token bloom and a segmented sidecar group each have to cover exactly one
+    /// row group.
+    fn forms_row_groups(&self) -> bool {
+        self.rowgroup_bloom_column.is_some() || self.segmented.is_some()
+    }
+
     /// Write `batch` as exactly one row group, recording its token bloom. When
     /// `flush` is true the row group is sealed immediately (`AsyncArrowWriter::flush`);
     /// the final row group at close is sealed by `finish()` instead.
@@ -820,6 +1110,7 @@ impl ParquetWriter {
         batches: &[arrow_array::RecordBatch],
         flush: bool,
     ) -> Result<()> {
+        self.push_segmented_groups(batches);
         if !self.rowgroup_bloom_disabled {
             match self.compute_rowgroup_bloom(batches) {
                 Some(bloom) => self.rowgroup_blooms.push(bloom),
@@ -918,9 +1209,9 @@ impl FileWriter for ParquetWriter {
         self.nan_value_count_visitor
             .compute(self.schema.clone(), batch_c)?;
 
-        if self.rowgroup_bloom_column.is_some() {
-            // Take control of row-group formation so each token bloom covers
-            // exactly one row group.
+        if self.forms_row_groups() {
+            // Take control of row-group formation so each token bloom and each
+            // segmented sidecar group covers exactly one row group.
             self.pending.push(batch.clone());
             self.pending_rows += batch.num_rows();
             self.drain_full_row_groups().await?;
@@ -948,7 +1239,7 @@ impl FileWriter for ParquetWriter {
     async fn close(mut self) -> Result<Vec<DataFileBuilder>> {
         // Bloom path: seal any buffered remainder as the final row group (finish()
         // below seals it, so no explicit flush), recording its bloom in order.
-        if self.rowgroup_bloom_column.is_some() && self.pending_rows > 0 {
+        if self.forms_row_groups() && self.pending_rows > 0 {
             let last = std::mem::take(&mut self.pending);
             self.pending_rows = 0;
             self.emit_row_group(&last, false).await?;
@@ -1011,6 +1302,26 @@ impl FileWriter for ParquetWriter {
             Ok(vec![])
         } else {
             let parquet_metadata = Arc::new(metadata);
+
+            // siglake (#4377): finish this file's segmented sidecars and leave
+            // them in the sink, against the row groups the footer we just wrote
+            // actually declares. A mismatch publishes nothing rather than a
+            // sidecar whose groups address a layout the file does not have —
+            // the failure the shipped format's stamped `row_group_size` cannot
+            // see.
+            if let Some(segmented) = self.segmented.take() {
+                let row_counts: Vec<u32> = parquet_metadata
+                    .row_groups()
+                    .iter()
+                    .map(|row_group| row_group.num_rows() as u32)
+                    .collect();
+                Self::publish_segmented_sidecars(
+                    segmented,
+                    &row_counts,
+                    self.current_row_num as u64,
+                    self.output_file.location(),
+                );
+            }
 
             let mut builder = Self::parquet_to_data_file_builder(
                 self.schema,

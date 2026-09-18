@@ -34,6 +34,27 @@ use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
 
+/// FORK ADDITION (siglake #4377). Choose the snapshot id a rewrite will commit
+/// under, before it commits.
+///
+/// A Puffin statistics file names the snapshot it describes, and the id is
+/// otherwise generated inside the commit — so registering a sidecar with the
+/// data it indexes takes two commits, and the window between them is a
+/// committed rewrite whose index is not yet discoverable. Reserving the id
+/// lets one transaction carry both the [`RewriteFilesAction`] and the
+/// [`UpdateStatisticsAction`] that registers the sidecar written for it.
+///
+/// The id is random over the whole `i64` range and checked against the table's
+/// snapshots here and again when the action commits
+/// ([`RewriteFilesAction::with_snapshot_id`]), which is where a collision with
+/// a concurrent writer's snapshot is refused rather than duplicated.
+///
+/// [`RewriteFilesAction`]: crate::transaction::RewriteFilesAction
+/// [`UpdateStatisticsAction`]: crate::transaction::UpdateStatisticsAction
+pub fn reserve_snapshot_id(table: &Table) -> i64 {
+    SnapshotProducer::generate_unique_snapshot_id(table)
+}
+
 /// A trait that defines how different table operations produce new snapshots.
 ///
 /// `SnapshotProduceOperation` is used by [`SnapshotProducer`] to customize snapshot creation
@@ -211,6 +232,44 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         Ok(())
+    }
+
+    /// Build a producer for a snapshot id the CALLER already chose
+    /// ([`reserve_snapshot_id`]).
+    ///
+    /// Refuses an id the table already holds. On a re-applied commit attempt
+    /// the base has been refreshed, so this is where a reserved id that a
+    /// concurrent writer has since taken is caught — rather than producing a
+    /// second snapshot under the same id.
+    pub(crate) fn new_with_snapshot_id(
+        table: &'a Table,
+        snapshot_id: i64,
+        commit_uuid: Uuid,
+        key_metadata: Option<Vec<u8>>,
+        snapshot_properties: HashMap<String, String>,
+        added_data_files: Vec<DataFile>,
+    ) -> Result<Self> {
+        if table
+            .metadata()
+            .snapshots()
+            .any(|s| s.snapshot_id() == snapshot_id)
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("reserved snapshot id {snapshot_id} is already present on the table"),
+            )
+            .with_retryable(false));
+        }
+        Ok(Self {
+            table,
+            snapshot_id,
+            commit_uuid,
+            key_metadata,
+            snapshot_properties,
+            added_data_files,
+            removed_data_files: Vec::new(),
+            manifest_counter: (0..),
+        })
     }
 
     fn generate_unique_snapshot_id(table: &Table) -> i64 {
