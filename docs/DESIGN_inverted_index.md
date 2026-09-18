@@ -399,6 +399,123 @@ from 28,050 to 99,019, answers that came back wrong from 142 to 120, ordinals
 outside the row domain from 22 to **0**, and a present term reported absent
 from 135 to 29. The 120 are the residual.
 
+### Which storage path carries that residual, and what closing it costs (2026-09-18, #4991)
+
+The residual above is a property of the *format*. What a query does with a
+corrupt blob depends on how the blob is stored, and the two paths differ:
+
+- **Footer KV** — hex under `siglake.inverted_index.v1[.column]`, taken when a
+  file's serialized indexes fit `SIGLAKE_INDEX_FOOTER_MAX_BYTES` (1 MiB by
+  default), so it carries the small and freshly written files. Parquet
+  checksums data pages, not footer metadata, and hex is an encoding rather
+  than a check. Nothing covers these bytes.
+- **Puffin sidecar** — the spillover above that threshold, so it carries the
+  large compacted files. `crates/siglake-storage/src/iceberg.rs` registers the
+  blob with `PuffinCompressionCodec::Zstd`, and the fork's encoder sets
+  `include_checksum(true)` (`third_party/iceberg/src/compression.rs`). A
+  corrupt stored byte hits the frame's content checksum first.
+
+Single-bit sweep of each stored form, 1,000 rows / 1,010 terms, classified
+against both of #4558's layers
+(`siglake-index/tests/v1_integrity_measure.rs::report_stored_byte_corruption_by_path`).
+"Lost a match" is any `(term, row)` the sound blob named and the corrupt one
+does not; the last column is the narrower per-query view #4560 reported, for
+one probe term:
+
+| stored form | bytes | flips | refused decoding | refused row domain | absorbed | lost a match | lost the probe term's rows |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| v1 payload, uncompressed | 14,023 | 112,184 | 98,969 | 8 | 0 | 13,207 | 149 |
+| footer KV, hex as stored | 28,046 | 224,368 | 212,897 | 4 | 1,035 | 10,432 | 125 |
+| Puffin sidecar, zstd-3 frame as stored | 2,486 | 19,888 | 19,878 | 0 | 10 | **0** | **0** |
+| control: the same frame, content checksum off | 2,482 | 19,856 | 13,958 | 5 | 10 | 5,883 | 20 |
+
+The control row is what the four checksum bytes buy: zstd framing alone lets
+29.6% of flips through as a different index. Hex refuses 94.9% of flips by
+alphabet — a flipped high bit usually leaves `[0-9a-f]` — and the 1,035
+absorbed are letter-case flips, which `to_digit(16)` accepts. Neither is a
+check: the flips that stay in the alphabet are nibble corruptions of the blob
+and reach the decoder.
+
+A term whose *characters* were flipped is why "lost a match" is two orders of
+magnitude above the per-probe column. `matching_rows_all` reads an absent term
+as a definitive "no rows match" (`crates/siglake-index/src/lib.rs`), so a
+renamed dictionary entry costs the query **every** row of that term in that
+file, not one ordinal.
+
+The reader's disposition, per path, on a 400-row / 4-row-group file whose index
+names four matching rows
+(`siglake-storage/tests/inverted_index_integrity.rs`):
+
+| arm | query | rows decoded | matches lost |
+|---|---|---:|---:|
+| no index (control) | succeeds | 400 | 0 |
+| footer KV, sound | succeeds | 4 | 0 |
+| footer KV, the needle's term flipped | **succeeds, answers empty** | 0 | 4 of 4 |
+| footer KV, the needle's postings flipped | **succeeds, answers short** | 4 | 3 of 4 |
+| Puffin sidecar (Zstd), one flipped stored bit | **fails**: `Restored data doesn't match checksum` | — | — |
+| Puffin sidecar with `CompressionCodec::None` | succeeds, answers short | 4 | 3 of 4 |
+
+So the Puffin path's failure mode is a failed query, not a fallback and not a
+short answer: `PuffinReader::blob` returns the decompression error and
+`ArrowReader` propagates it (`third_party/iceberg/src/arrow/reader.rs`). No
+writer selects `CompressionCodec::None` for an inverted-index blob, so that arm
+prices the cover rather than describing a shipped state — and it is the reason
+the cover is worth a guard if the codec is ever made configurable.
+
+Warm, neither path re-verifies anything: the parsed-index cache is keyed by
+`(data file, column)` or `(sidecar path, blob offset)` on the write-once
+identity of the file, so a blob that rots after a query warmed it keeps
+answering from the parse until the entry is evicted, and the cold read of the
+same file then behaves as the table above
+(`a_warm_parsed_index_does_not_see_a_corruption_that_lands_after_it`).
+
+**What one CRC-32 over the whole blob would cost.** Four bytes raw, eight hex
+characters in a footer value, plus whatever names it. Against a 29.68 MiB
+payload (2M rows, release, this box,
+`report_whole_blob_checksum_cost`): `crc32fast` runs at 10.3-11.1 GiB/s, so the
+sum is **2.881 ms against a 703.4 ms `from_bytes` (+0.41%)** and 76.0 ms of
+`to_bytes` (+3.79%); `to_hex` alone costs 180.4 ms. Extrapolated to the
+compacted 85.8 MiB blob `DESIGN_segmented_inverted_index.md` measures: about
+8 ms of checksum against about two seconds of decode. The decoder already
+walks every byte the sum would cover, which is what makes the granularity
+question moot here — 4 bytes per *term* is a third of a segmented blob only
+because a segmented point lookup fetches a median of 3 bytes and can verify
+nothing else.
+
+**Placement, and what a 0.1.x reader does with each.** `from_bytes` consumes a
+well-formed blob exactly and refuses trailing payload, so nothing can be
+appended invisibly (`the_shipped_decoder_refuses_both_checksum_placements`):
+
+1. **Trailing CRC, version byte still 1** — refused by the shipped decoder at
+   the trailing-payload check.
+2. **Trailing CRC under version byte 2** — refused at the version check. Both
+   refusals are safe (no index, exact scan, right answer) and both cost a
+   mixed-version fleet all index pruning on newly written files until every
+   reader is upgraded. Old blobs keep reading either way: the version byte is
+   what selects the layout.
+3. **A sibling footer-KV key** (`siglake.inverted_index.v1.crc32[.column]`,
+   eight hex characters) — leaves the blob bytes and the version byte alone. An
+   old reader ignores an unknown footer key and keeps pruning; a new reader
+   verifies when the key is present and falls back to an exact scan when the
+   sum disagrees.
+
+**Measured recommendation**: (3), and leave the Puffin path on its codec. It
+covers the only path the sweep found exposed, at eight hex characters per file
+per column, with no format version, no compatibility cliff and no change to any
+blob already on disk — and it is checked in the one place that already reads
+the whole blob. It leaves two things to carry with it: a guard that an
+inverted-index blob is never registered with `CompressionCodec::None` (the
+cover is the codec, and nothing asserts the choice today), and the fact that a
+sibling key shares the footer it checks, so a corruption large enough to take
+both is undetected. Options (1) and (2) buy one thing (3) does not: a blob that
+carries its own integrity wherever it is stored, including a future path that
+is neither of these two. Any of the three is a production format change and
+belongs to its own 0.2.0 card; this one changed no format, API or default.
+
+What these numbers do not cover: object storage, AWS, or any incidence rate.
+The sweep is a uniform single-bit model of what a corrupt byte *does*, not how
+often storage delivers one, and every timing here is one local box.
+
 ### Slice C — AWS validation (remaining)
 
 `scripts/ws5-validate.sh`: with `compactor.invertedIndex.enabled=true`, ingest a
