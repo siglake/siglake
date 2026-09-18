@@ -28,7 +28,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use arrow_array::builder::BooleanBuilder;
@@ -42,40 +42,48 @@ use datafusion::prelude::SessionContext;
 use iceberg::spec::DataFile;
 use iceberg::table::Table;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+use siglake_core::index_config::{DocMapping, FieldMapping, FieldType, IndexConfig, MappingMode};
 use siglake_core::Event;
 use siglake_index::segmented::{SegmentedReader, SliceSource, SEGMENTED_V2_BLOB_TYPE};
 use siglake_index::InvertedIndex;
 use siglake_storage::iceberg::test_catalog::TestCatalog;
 use siglake_storage::iceberg::{IcebergContext, IcebergTuning, ReclusterMergeOptions};
 
-/// Peak live heap bytes between [`start_tracking`] and [`peak_tracked`], the
-/// same test-only wrapper `delete_task_size_gate.rs` uses. Tracking is off
-/// unless a test turns it on, and every test here holds [`WRITER_TESTS`] while
-/// it does, so the number belongs to one arm of one A/B.
+/// Live heap bytes, counted from process start, and their peak over a
+/// measurement window.
+///
+/// `LIVE` is maintained unconditionally so that a window has a real starting
+/// live-heap figure to measure against. The earlier version of this tracker
+/// (and the copy in `delete_task_size_gate.rs`) counted only while tracking was
+/// on, from a reset-to-zero counter: allocations already live when the window
+/// opened were invisible while their frees still decremented it, so its "peak"
+/// was neither the process's live heap nor an exact delta above it. Every test
+/// here holds [`WRITER_TESTS`] while it measures, so a window belongs to one arm
+/// of one A/B.
 struct PeakTracking;
 
 static TRACKING: AtomicBool = AtomicBool::new(false);
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
+static LIVE: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicIsize = AtomicIsize::new(0);
 
 unsafe impl GlobalAlloc for PeakTracking {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() && TRACKING.load(Ordering::Relaxed) {
-            let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK.fetch_max(live, Ordering::Relaxed);
+        if !ptr.is_null() {
+            let size = layout.size() as isize;
+            let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
+            if TRACKING.load(Ordering::Relaxed) {
+                PEAK.fetch_max(live, Ordering::Relaxed);
+            }
         }
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if TRACKING.load(Ordering::Relaxed) {
-            // Saturating: tracking starts mid-process, so some of what is freed
-            // here was allocated before LIVE existed.
-            let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
-                Some(live.saturating_sub(layout.size()))
-            });
-        }
+        // Signed, and never clamped: every allocation this process makes passes
+        // through `alloc` above first, so the counter is symmetric. A clamp
+        // would silently absorb the one thing that would prove it is not.
+        LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -83,15 +91,43 @@ unsafe impl GlobalAlloc for PeakTracking {
 #[global_allocator]
 static ALLOCATOR: PeakTracking = PeakTracking;
 
-fn start_tracking() {
-    LIVE.store(0, Ordering::Relaxed);
-    PEAK.store(0, Ordering::Relaxed);
-    TRACKING.store(true, Ordering::Relaxed);
+/// An open live-heap measurement window: what was live when it opened.
+#[derive(Clone, Copy, Debug)]
+struct HeapWindow {
+    baseline: isize,
 }
 
-fn peak_tracked() -> usize {
-    TRACKING.store(false, Ordering::Relaxed);
-    PEAK.load(Ordering::Relaxed)
+/// What one window saw.
+#[derive(Clone, Copy, Debug)]
+struct HeapReading {
+    /// Live heap when the window opened — the state the measured work started
+    /// from, not zero.
+    baseline: u64,
+    /// The largest live heap seen inside the window.
+    peak: u64,
+    /// `peak - baseline`: what the measured work added over what was already
+    /// live. Zero when the window only freed.
+    above_baseline: u64,
+}
+
+/// Open a window over the live heap as it is now.
+fn start_tracking() -> HeapWindow {
+    let baseline = LIVE.load(Ordering::Relaxed);
+    PEAK.store(baseline, Ordering::Relaxed);
+    TRACKING.store(true, Ordering::Relaxed);
+    HeapWindow { baseline }
+}
+
+impl HeapWindow {
+    fn finish(self) -> HeapReading {
+        TRACKING.store(false, Ordering::Relaxed);
+        let peak = PEAK.load(Ordering::Relaxed);
+        HeapReading {
+            baseline: self.baseline.max(0) as u64,
+            peak: peak.max(0) as u64,
+            above_baseline: (peak - self.baseline).max(0) as u64,
+        }
+    }
 }
 
 static WRITER_TESTS: Mutex<()> = Mutex::new(());
@@ -268,10 +304,21 @@ async fn rewrite_fresh(ice: &IcebergContext, fresh: Vec<DataFile>) -> Vec<DataFi
     let ident = ice.events_table_ident().clone();
     let blooms = ice.events_bloom_columns();
     let bloom_refs: Vec<&str> = blooms.iter().map(String::as_str).collect();
+    rewrite_fresh_in(ice, &ident, fresh, &bloom_refs).await
+}
+
+/// [`rewrite_fresh`] against any table in the context — the managed-index
+/// tables the multi-column cases build.
+async fn rewrite_fresh_in(
+    ice: &IcebergContext,
+    ident: &iceberg::TableIdent,
+    fresh: Vec<DataFile>,
+    bloom_columns: &[&str],
+) -> Vec<DataFile> {
     ice.recluster_files_with(
-        &ident,
+        ident,
         fresh,
-        &bloom_refs,
+        bloom_columns,
         &ReclusterMergeOptions {
             force_streaming: Some(true),
             ..Default::default()
@@ -279,7 +326,7 @@ async fn rewrite_fresh(ice: &IcebergContext, fresh: Vec<DataFile>) -> Vec<DataFi
     )
     .await
     .unwrap();
-    ice.live_data_files(&ident).await.unwrap()
+    ice.live_data_files(ident).await.unwrap()
 }
 
 /// Append `rows` of the corpus, then stream-rewrite exactly that day's output.
@@ -378,6 +425,12 @@ fn local_path(data_file: &str) -> String {
 /// The file's row groups and its `raw` column, read straight off the local
 /// object — the ground truth the sidecar is checked against.
 fn parquet_rows_and_row_groups(data_file: &str) -> (Vec<u32>, Vec<String>) {
+    parquet_rows_and_row_groups_of(data_file, "raw")
+}
+
+/// [`parquet_rows_and_row_groups`] for any text column, which the multi-column
+/// rolled cases need.
+fn parquet_rows_and_row_groups_of(data_file: &str, column: &str) -> (Vec<u32>, Vec<String>) {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let file = std::fs::File::open(local_path(data_file)).unwrap();
@@ -391,7 +444,7 @@ fn parquet_rows_and_row_groups(data_file: &str) -> (Vec<u32>, Vec<String>) {
     let mut rows = Vec::new();
     for batch in builder.with_batch_size(8192).build().unwrap() {
         let batch = batch.unwrap();
-        let idx = batch.schema().index_of("raw").unwrap();
+        let idx = batch.schema().index_of(column).unwrap();
         let column = batch
             .column(idx)
             .as_any()
@@ -417,7 +470,7 @@ async fn assert_sidecar_describes_file(
     column: &str,
 ) {
     let bytes = seg2_blob_bytes(table, statistics_path, data_file, column).await;
-    let (row_groups, rows) = parquet_rows_and_row_groups(data_file);
+    let (row_groups, rows) = parquet_rows_and_row_groups_of(data_file, column);
     let reader = SegmentedReader::open(SliceSource::new(bytes)).expect("sidecar opens");
     let counts: Vec<u64> = row_groups.iter().map(|rows| u64::from(*rows)).collect();
     assert!(
@@ -1578,7 +1631,12 @@ fn histogram_samples(snapshot: &SnapshotVec, name: &str) -> Vec<f64> {
 /// append plus a streaming rewrite of exactly that day's output: two repeated
 /// no-index/seg2-in-merge pairs, then a post-commit v1 rebuild. Reported per
 /// arm: separate append and rewrite wall times, their total, peak live heap,
-/// and the registered sidecar bytes for live files. Sized by
+/// and the registered sidecar bytes for live files.
+///
+/// The heap figure covers **append plus every rewrite together** and holds one
+/// rewrite's output at a time, so it says nothing about what a rewrite retains
+/// while it rolls several outputs — that is
+/// [`report_rolled_rewrite_sink_heap`] (#5299). Sized by
 /// `SIGLAKE_SEG_WRITER_FILES` (1),
 /// `SIGLAKE_SEG_WRITER_ROWS_PER_FILE` (300,000) and
 /// `SIGLAKE_SEG_WRITER_RARE_EVERY` (100,000).
@@ -1633,7 +1691,7 @@ fn report_segmented_writer_build_cost() {
             let started = std::time::Instant::now();
             let mut append_wall = std::time::Duration::ZERO;
             let mut rewrite_wall = std::time::Duration::ZERO;
-            start_tracking();
+            let window = start_tracking();
             for file in 0..files {
                 let append_started = std::time::Instant::now();
                 let fresh = append_rows(
@@ -1648,7 +1706,7 @@ fn report_segmented_writer_build_cost() {
                 rewrite_fresh(&ice, fresh).await;
                 rewrite_wall += rewrite_started.elapsed();
             }
-            let peak = peak_tracked();
+            let heap = window.finish();
             let wall = started.elapsed();
 
             let table = ice
@@ -1695,13 +1753,17 @@ fn report_segmented_writer_build_cost() {
             let data_bytes: u64 = live.iter().map(|f| f.file_size_in_bytes()).sum();
             println!(
                 "{label}: append wall {:.2} s, rewrite wall {:.2} s, total wall {:.2} s, peak \
-             live heap {} B ({:.1} MiB), {sidecars} live sidecars in {sidecar_bytes} B against \
+             live heap {} B ({:.1} MiB) over a {} B baseline, so {} B ({:.1} MiB) above it, \
+             {sidecars} live sidecars in {sidecar_bytes} B against \
              {data_bytes} B of data ({:.2}%), {} live files",
                 append_wall.as_secs_f64(),
                 rewrite_wall.as_secs_f64(),
                 wall.as_secs_f64(),
-                peak,
-                peak as f64 / (1024.0 * 1024.0),
+                heap.peak,
+                heap.peak as f64 / (1024.0 * 1024.0),
+                heap.baseline,
+                heap.above_baseline,
+                heap.above_baseline as f64 / (1024.0 * 1024.0),
                 if data_bytes == 0 {
                     0.0
                 } else {
@@ -1719,6 +1781,521 @@ fn report_segmented_writer_build_cost() {
                 usize::from(expected_blob_type.is_some()) * live.len(),
                 "{label}: one sidecar per live file when indexing is enabled"
             );
+        }
+    });
+}
+
+// ------------------ many rolled outputs in one rewrite, one partition (#5299)
+//
+// The cases above establish that a rolling rewrite addresses one sidecar to
+// each output file. What they do not establish is what holding those sidecars
+// together costs: a rewrite hands every finished blob to one shared
+// `SegmentedIndexSink` (`third_party/iceberg/.../parquet_writer.rs`) and takes
+// them out only after the merge is done, so the retained set grows with the
+// output, while the parsed state each column's `SegmentedWriter` holds stays
+// one row group's. These arms separate the two, at a fixed row-group size and
+// a fixed file target, with the output volume and the indexed column count as
+// the only things that vary.
+
+/// The rolling file target the rolled arms use, far below the production
+/// default (512 MiB) and below one row group's compressed bytes on this corpus,
+/// so the writer closes a file at every row-group boundary. That is the stress
+/// case for the shared sink: it is the most sidecars the output can carry per
+/// row, since a file cannot hold fewer than one row group.
+const ROLL_TARGET_BYTES: usize = 64 << 10;
+
+/// The text columns the rolled arms index, in the order a config adds them.
+/// Every one carries the same row text, so column count multiplies identical
+/// index work instead of varying the corpus.
+///
+/// The first is `raw` on purpose: the row-group token bloom is built for a
+/// column of that name (`raw_rowgroup_bloom_column_for_schema`), and it is what
+/// makes the writer form row groups itself. Without it the control arm has no
+/// reason to form them and rolls on the inner writer's in-progress bytes
+/// instead, which at this target gives the two arms different output layouts —
+/// 38 files against 3 on the first run of this measurement. With it, both arms
+/// close a file at the same row-group boundary, as they do for `events`.
+const ROLLED_COLUMNS: [&str; 3] = ["raw", "message", "title"];
+
+/// A managed index with `columns` indexed text columns and a day-partitioned
+/// event-time column. The `events` table's spec is fixed at one column
+/// (`raw`), so a multi-column rewrite has to go through a managed index.
+///
+/// The event-time column has to be called `timestamp`: the streaming merge
+/// resolves its merge key by that name and refuses a table without it
+/// (`crates/siglake-storage/src/iceberg.rs`,
+/// `declared_timestamp_merge_direction`). With no `timestamp_ns` sibling the
+/// merge compares `timestamp` itself, and the corpus gives every row its own
+/// microsecond, so the merge key is still a total order.
+fn rolled_index_config(index_id: &str, columns: usize) -> IndexConfig {
+    let mut field_mappings = vec![FieldMapping {
+        name: "timestamp".to_string(),
+        field_type: FieldType::Datetime,
+        required: true,
+    }];
+    for column in &ROLLED_COLUMNS[..columns] {
+        field_mappings.push(FieldMapping {
+            name: (*column).to_string(),
+            field_type: FieldType::Text {
+                tokenizer: Some("default".to_string()),
+            },
+            required: false,
+        });
+    }
+    IndexConfig {
+        index_id: index_id.to_string(),
+        doc_mapping: DocMapping {
+            mode: MappingMode::Dynamic,
+            field_mappings,
+            timestamp_field: "timestamp".to_string(),
+            tag_fields: Vec::new(),
+            default_search_fields: ROLLED_COLUMNS[..columns]
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect(),
+        },
+        retention: None,
+        index_at_flush: None,
+    }
+}
+
+/// One append's rows, in the managed index's schema: `ts`, one copy of the
+/// shaped text per indexed column, and the residual-attributes column the
+/// schema always carries.
+fn rolled_index_batch(
+    config: &IndexConfig,
+    rows: std::ops::Range<usize>,
+    rows_per_day: usize,
+    rare_every: usize,
+) -> arrow_array::RecordBatch {
+    let base = fixture_base();
+    let mut timestamps = Vec::with_capacity(rows.len());
+    let mut text = Vec::with_capacity(rows.len());
+    for row in rows.clone() {
+        let event = shaped_event(row, rows_per_day, base, rare_every);
+        timestamps.push(event.timestamp.timestamp_micros());
+        text.push(event.raw);
+    }
+    let columns = config.doc_mapping.field_mappings.len() - 1;
+    let mut arrays: Vec<arrow_array::ArrayRef> = vec![Arc::new(
+        arrow_array::TimestampMicrosecondArray::from(timestamps)
+            .with_timezone(siglake_core::TIMESTAMP_TZ),
+    )];
+    for _ in 0..columns {
+        arrays.push(Arc::new(arrow_array::StringArray::from(text.clone())));
+    }
+    arrays.push(Arc::new(arrow_array::StringArray::new_null(text.len())));
+    arrow_array::RecordBatch::try_new(config.to_arrow_schema(), arrays).unwrap()
+}
+
+/// Append `rows` of the corpus to a managed index, in [`APPEND_CHUNK`]-row
+/// batches. Returns the data files the appends added — the single-partition bin
+/// one rewrite then merges.
+async fn append_rolled_rows(
+    ice: &IcebergContext,
+    ident: &iceberg::TableIdent,
+    config: &IndexConfig,
+    rows: std::ops::Range<usize>,
+    rows_per_day: usize,
+    rare_every: usize,
+) -> Vec<DataFile> {
+    let before: Vec<String> = ice
+        .live_data_files(ident)
+        .await
+        .unwrap()
+        .iter()
+        .map(|file| file.file_path().to_string())
+        .collect();
+    for chunk in rows.clone().step_by(APPEND_CHUNK) {
+        let batch = rolled_index_batch(
+            config,
+            chunk..(chunk + APPEND_CHUNK).min(rows.end),
+            rows_per_day,
+            rare_every,
+        );
+        ice.append_to_table(ident, batch, &[]).await.unwrap();
+    }
+    ice.live_data_files(ident)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|file| !before.contains(&file.file_path().to_string()))
+        .collect()
+}
+
+/// The managed index's row count and, per indexed column, its `rareneedle`
+/// count — the exact answers every arm has to give, indexed or not.
+async fn rolled_text_counts(ice: &IcebergContext, index_id: &str, columns: usize) -> Vec<i64> {
+    let ctx = SessionContext::new();
+    ctx.register_udf(ScalarUDF::from(MatchTermsUdf::new()));
+    assert!(
+        ice.register_index_with_datafusion(&ctx, index_id)
+            .await
+            .unwrap(),
+        "the managed index registers with DataFusion"
+    );
+    let mut out = vec![count(&ctx, &format!("SELECT count(*) FROM {index_id}")).await];
+    for column in &ROLLED_COLUMNS[..columns] {
+        out.push(
+            count(
+                &ctx,
+                &format!(
+                    "SELECT count(*) FROM {index_id} WHERE match_terms({column}, 'rareneedle')"
+                ),
+            )
+            .await,
+        );
+    }
+    out
+}
+
+/// What one rewrite of one partition into several rolled files cost.
+#[derive(Debug)]
+struct RolledRewriteArm {
+    /// Data files the one rewrite produced — the sidecars the sink held
+    /// together, per column.
+    outputs: usize,
+    /// Row groups across those files: the number of per-group index builds.
+    row_groups: usize,
+    /// Registered `(file, column)` seg2 blobs after the commit.
+    blobs: usize,
+    heap: HeapReading,
+    rewrite: std::time::Duration,
+    /// Serialized sidecar bytes the sink accumulated over the rewrite: every
+    /// finished blob is retained until `take()` runs after the merge.
+    retained_sidecar_bytes: u64,
+    /// The largest parsed per-group index the writer held live, and the sum of
+    /// them — the sum is *not* held at once, and reporting both is the point.
+    largest_group_index_bytes: u64,
+    total_group_index_bytes: u64,
+    /// Puffin statistics bytes registered for the live output.
+    registered_bytes: u64,
+    /// Parquet bytes of the live output, for scale.
+    data_bytes: u64,
+}
+
+/// Run one arm: append `rows` into a single day partition, then rewrite that
+/// whole bin in one streaming call. Everything but `segmented` and `columns` is
+/// held fixed, so an on/off pair is matched and a volume pair differs only in
+/// how many outputs the same rolling target produces.
+#[allow(clippy::too_many_arguments)]
+async fn rolled_rewrite_arm(
+    snapshotter: &Snapshotter,
+    root: &std::path::Path,
+    label: &str,
+    rows: usize,
+    columns: usize,
+    segmented: bool,
+    target_file_bytes: usize,
+    rare_every: usize,
+) -> RolledRewriteArm {
+    let ice = open_fixture_with_tuning(
+        &root.join(label),
+        IcebergTuning {
+            segmented_index_writes: Some(segmented),
+            // Both off in every arm: the control must differ from the seg2 arm
+            // only in the rewrite's own index build, and an append-time index
+            // would put its allocations inside nothing but the baseline.
+            index_rebuild: Some(false),
+            index_at_flush: Some(false),
+            target_row_group_bytes: Some(1),
+            merge_target_file_bytes: Some(target_file_bytes),
+            ..Default::default()
+        },
+    )
+    .await;
+    let index_id = "rolled";
+    let config = rolled_index_config(index_id, columns);
+    let ident = ice.create_index(&config).await.unwrap();
+    // `rows_per_day = rows` keeps the whole corpus inside one day partition, so
+    // the streaming merge takes the entire bin in one call.
+    let fresh = append_rolled_rows(&ice, &ident, &config, 0..rows, rows, rare_every).await;
+    assert!(
+        fresh.len() > 1,
+        "{label}: the bin has to hold several input files"
+    );
+
+    // Drain what the appends recorded, so the histograms below are the
+    // rewrite's alone.
+    let _ = snapshotter.snapshot();
+    let started = std::time::Instant::now();
+    let window = start_tracking();
+    let live = rewrite_fresh_in(&ice, &ident, fresh, &[]).await;
+    let heap = window.finish();
+    let rewrite = started.elapsed();
+    let snapshot = snapshotter.snapshot().into_vec();
+
+    let data_bytes: u64 = live.iter().map(|file| file.file_size_in_bytes()).sum();
+    assert!(
+        live.len() > 1,
+        "{label}: one rewrite has to roll into several output files, not {}: \
+         {data_bytes} B of output against a {target_file_bytes} B rolling target",
+        live.len()
+    );
+    let row_groups: usize = live
+        .iter()
+        .map(|file| {
+            parquet_rows_and_row_groups_of(file.file_path(), ROLLED_COLUMNS[0])
+                .0
+                .len()
+        })
+        .sum();
+
+    let per_group = histogram_samples(
+        &snapshot,
+        "siglake_iceberg_segmented_index_group_index_bytes",
+    );
+    let written = histogram_samples(&snapshot, "siglake_iceberg_segmented_index_written_bytes");
+    let expected_blobs = usize::from(segmented) * live.len() * columns;
+    assert_eq!(
+        written.len(),
+        expected_blobs,
+        "{label}: one finished sidecar per output file and column"
+    );
+    assert_eq!(
+        per_group.len(),
+        usize::from(segmented) * row_groups * columns,
+        "{label}: one parsed index per row group and column, over {row_groups} row groups"
+    );
+
+    let table = ice.catalog().load_table(&ident).await.unwrap();
+    let blobs = registered_seg2_blobs(&table);
+    let live_paths: Vec<&str> = live.iter().map(|file| file.file_path()).collect();
+    let mut expected: Vec<(String, String)> = Vec::new();
+    for path in &live_paths {
+        for column in &ROLLED_COLUMNS[..columns] {
+            expected.push(((*path).to_string(), (*column).to_string()));
+        }
+    }
+    expected.sort();
+    let mut registered: Vec<(String, String)> = blobs
+        .iter()
+        .map(|(_, file, column)| (file.clone(), column.clone()))
+        .collect();
+    registered.sort();
+    assert_eq!(
+        registered,
+        if segmented { expected } else { Vec::new() },
+        "{label}: every output file and column is registered, and only those"
+    );
+
+    let mut registered_bytes = 0u64;
+    for statistics in table.metadata().statistics_iter() {
+        let names_live = statistics.blob_metadata.iter().any(|blob| {
+            blob.properties
+                .get("data_file")
+                .is_some_and(|path| live_paths.contains(&path.as_str()))
+        });
+        if names_live {
+            registered_bytes += statistics.file_size_in_bytes as u64;
+        }
+    }
+
+    let counts = rolled_text_counts(&ice, index_id, columns).await;
+    let rare = ((rows - 1) / rare_every + 1) as i64;
+    let mut want = vec![rows as i64];
+    want.extend(std::iter::repeat_n(rare, columns));
+    assert_eq!(
+        counts, want,
+        "{label}: the rewrite's rows and every indexed column's term answer exactly"
+    );
+
+    let arm = RolledRewriteArm {
+        outputs: live.len(),
+        row_groups,
+        blobs: blobs.len(),
+        heap,
+        rewrite,
+        retained_sidecar_bytes: written.iter().sum::<f64>() as u64,
+        largest_group_index_bytes: per_group.iter().copied().fold(0f64, f64::max) as u64,
+        total_group_index_bytes: per_group.iter().sum::<f64>() as u64,
+        registered_bytes,
+        data_bytes,
+    };
+    println!(
+        "{label}: rows={rows} columns={columns} segmented={segmented} \
+         outputs={} row_groups={} blobs={} rewrite={:.2} s | heap: baseline {} B, peak {} B, \
+         above baseline {} B ({:.1} MiB) | retained sidecars {} B ({:.1} MiB) | parsed group \
+         index: largest {} B, sum {} B | registered {} B against {} B of data",
+        arm.outputs,
+        arm.row_groups,
+        arm.blobs,
+        arm.rewrite.as_secs_f64(),
+        arm.heap.baseline,
+        arm.heap.peak,
+        arm.heap.above_baseline,
+        arm.heap.above_baseline as f64 / (1024.0 * 1024.0),
+        arm.retained_sidecar_bytes,
+        arm.retained_sidecar_bytes as f64 / (1024.0 * 1024.0),
+        arm.largest_group_index_bytes,
+        arm.total_group_index_bytes,
+        arm.registered_bytes,
+        arm.data_bytes,
+    );
+    arm
+}
+
+/// One rewrite, one partition, several rolled outputs, several indexed columns:
+/// every output file and column is registered, each sidecar describes its own
+/// file, and the answers are exact.
+///
+/// The bounded hermetic half of #5299 — the numbers are
+/// [`report_rolled_rewrite_sink_heap`].
+#[test]
+fn one_rewrite_rolling_many_outputs_registers_every_file_and_column() {
+    serialized(|snapshotter| async move {
+        let tmp = tempfile::tempdir().unwrap();
+        const COLUMNS: usize = 2;
+
+        let arm = rolled_rewrite_arm(
+            snapshotter,
+            tmp.path(),
+            "rolled-multi",
+            ROWS,
+            COLUMNS,
+            true,
+            ROLL_TARGET_BYTES,
+            RARE_EVERY,
+        )
+        .await;
+        assert_eq!(
+            arm.blobs,
+            arm.outputs * COLUMNS,
+            "one sidecar per output file and column: {arm:?}"
+        );
+        assert!(
+            arm.retained_sidecar_bytes > 0 && arm.largest_group_index_bytes > 0,
+            "both quantities have to be measurable or the report means nothing: {arm:?}"
+        );
+
+        // The sidecars themselves, read back out of the Puffin objects the
+        // rewrite registered: the arm proved they are addressed to the right
+        // file and column, this proves each one answers for that file's rows.
+        let ice = open_fixture_with_tuning(
+            &tmp.path().join("rolled-multi"),
+            IcebergTuning {
+                segmented_index_writes: Some(true),
+                index_rebuild: Some(false),
+                index_at_flush: Some(false),
+                target_row_group_bytes: Some(1),
+                merge_target_file_bytes: Some(ROLL_TARGET_BYTES),
+                ..Default::default()
+            },
+        )
+        .await;
+        let ident = ice.index_table_ident("rolled");
+        let table = ice.catalog().load_table(&ident).await.unwrap();
+        let blobs = registered_seg2_blobs(&table);
+        assert_eq!(blobs.len(), arm.blobs);
+        for (statistics_path, data_file, column) in blobs {
+            assert_sidecar_describes_file(&table, &statistics_path, &data_file, &column).await;
+        }
+
+        // And the matched control: the same corpus and the same rolling target
+        // with the writer off registers nothing and answers the same.
+        let off = rolled_rewrite_arm(
+            snapshotter,
+            tmp.path(),
+            "rolled-multi-off",
+            ROWS,
+            COLUMNS,
+            false,
+            ROLL_TARGET_BYTES,
+            RARE_EVERY,
+        )
+        .await;
+        assert_eq!(off.blobs, 0, "the knob is off in the control arm");
+        assert_eq!(
+            (off.outputs, off.row_groups),
+            (arm.outputs, arm.row_groups),
+            "the writer builds an index beside the output, it does not change it"
+        );
+    });
+}
+
+/// What one rewrite retains while it rolls several outputs, against the output
+/// volume and the indexed column count.
+///
+/// ```text
+/// SIGLAKE_SEG_ROLL_ROWS=1310720,2621440 SIGLAKE_SEG_ROLL_COLUMNS=1,2 \
+///   cargo test -p siglake-storage --release --test segmented_index_writer \
+///   report_rolled_rewrite_sink_heap -- --ignored --nocapture
+/// ```
+///
+/// Each arm is ONE streaming rewrite of one day partition, at a fixed row-group
+/// target (the 128 Ki-row floor) and a fixed rolling file target, so growing
+/// `SIGLAKE_SEG_ROLL_ROWS` grows the number of output files whose sidecars the
+/// shared sink holds at once. Every `(rows, columns)` shape runs with segmented
+/// writes on and off, and the two are otherwise identical.
+///
+/// Reported per arm, separately on purpose: the rewrite-only peak live heap
+/// above the live heap the rewrite started from; the serialized sidecar bytes
+/// the sink accumulated; and the parsed per-group index bytes (largest, and the
+/// sum that is never live at once). Sized by `SIGLAKE_SEG_ROLL_ROWS`
+/// (300,000), `SIGLAKE_SEG_ROLL_COLUMNS` (1,2),
+/// `SIGLAKE_SEG_ROLL_FILE_BYTES` (64 KiB, one output file per row group) and
+/// `SIGLAKE_SEG_ROLL_RARE_EVERY` (10,000).
+#[test]
+#[ignore = "measurement; sized by SIGLAKE_SEG_ROLL_*"]
+fn report_rolled_rewrite_sink_heap() {
+    serialized(|snapshotter| async move {
+        fn list(name: &str, default: &[usize]) -> Vec<usize> {
+            match std::env::var(name) {
+                Ok(raw) => raw
+                    .split(',')
+                    .filter_map(|item| item.trim().parse().ok())
+                    .collect(),
+                Err(_) => default.to_vec(),
+            }
+        }
+        fn knob(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|raw| raw.parse().ok())
+                .unwrap_or(default)
+        }
+
+        let volumes = list("SIGLAKE_SEG_ROLL_ROWS", &[ROWS]);
+        let column_counts = list("SIGLAKE_SEG_ROLL_COLUMNS", &[1, 2]);
+        let target_file_bytes = knob("SIGLAKE_SEG_ROLL_FILE_BYTES", ROLL_TARGET_BYTES);
+        let rare_every = knob("SIGLAKE_SEG_ROLL_RARE_EVERY", RARE_EVERY);
+        assert!(
+            column_counts
+                .iter()
+                .all(|columns| (1..=ROLLED_COLUMNS.len()).contains(columns)),
+            "SIGLAKE_SEG_ROLL_COLUMNS must name between 1 and {} columns",
+            ROLLED_COLUMNS.len()
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        println!(
+            "one same-partition rewrite per arm; rolling file target {target_file_bytes} B, \
+             target_row_group_bytes=1 (128 Ki-row floor), append indexing off, v1 rebuild off"
+        );
+        for rows in &volumes {
+            for columns in &column_counts {
+                for segmented in [false, true] {
+                    let label = format!(
+                        "r{rows}-c{columns}-{}",
+                        if segmented { "on" } else { "off" }
+                    );
+                    println!(
+                        "{label}: loadavg before arm: {}",
+                        std::fs::read_to_string("/proc/loadavg").unwrap().trim()
+                    );
+                    rolled_rewrite_arm(
+                        snapshotter,
+                        tmp.path(),
+                        &label,
+                        *rows,
+                        *columns,
+                        segmented,
+                        target_file_bytes,
+                        rare_every,
+                    )
+                    .await;
+                }
+            }
         }
     });
 }

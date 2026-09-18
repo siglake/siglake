@@ -328,10 +328,14 @@ The whole layout is arranged so a merge can write it in **one forward pass**:
 
 - Postings and dictionary for group `i` are written when group `i` closes, and
   nothing already written is patched. The directory and trailer come last.
-- Peak writer memory is one row group's postings plus its dictionary entries —
-  not the file's. `SegmentedWriter::push_group_index` takes an index built over
-  exactly one group's rows, which is what a merge already has in hand when it
-  flushes a row group.
+- Peak **parsed** index state is one row group's postings plus its dictionary
+  entries — not the file's. `SegmentedWriter::push_group_index` takes an index
+  built over exactly one group's rows, which is what a merge already has in hand
+  when it flushes a row group. That bound is about the parsed state alone; the
+  encoded blob accumulates behind it (`SegmentedWriter::out`), and a rewrite
+  holds every finished blob until it publishes them. The three quantities are
+  measured apart in [Many rolled outputs in one
+  rewrite](#many-rolled-outputs-in-one-rewrite-5299).
 - The blob is complete only once the trailer lands, so a partial upload is not
   mistakable for an index: the reader looks for the trailer's magic at a fixed
   offset from the end, and a truncated blob does not have it.
@@ -377,8 +381,8 @@ and a repeated rebuild is a no-op. Retired seg1 metadata does not suppress that
 rebuild.
 
 `crates/siglake-storage/tests/segmented_index_writer.rs` holds the single-file,
-rolled-output, two-partition, failed-transaction, idempotence, exact-query and
-row-group-memory cases. Reads discover seg2 only; the knobs
+rolled-output, multi-column, two-partition, failed-transaction, idempotence,
+exact-query and row-group-memory cases. Reads discover seg2 only; the knobs
 for writing and reading are separate and both remain off by default. The
 writer's build-time and peak-heap report is an `#[ignore]`d release test in
 that file because its acceptance corpus is 14 x 7.34M rows.
@@ -389,6 +393,18 @@ and streaming rewrites in every arm. Only `segmented_index_writes` and
 `index_rebuild` changed. The allocator
 figures are peak tracked live bytes during append plus rewrite, not process RSS.
 `/proc/loadavg` was read immediately before each arm.
+
+Its scope is one arm's **append plus all fourteen of its rewrites**, one file
+per rewrite, so at any moment the sink held one output file's sidecar. It says
+nothing about a rewrite that rolls many outputs, which is the measurement in
+[Many rolled outputs in one
+rewrite](#many-rolled-outputs-in-one-rewrite-5299). Its heap column is also
+the pre-#5299 tracker's: a counter reset to zero when the window opened, which
+allocations already live were invisible to while their frees still decremented
+it. That is a lower bound on the window's growth, not the process's live heap
+and not an exact delta above a baseline. The arms are paired and each opens its
+window on the same empty-warehouse state, so the comparison between them
+stands.
 
 | arm | load average (1/5/15m) | segmented writes / v1 rebuild | append | rewrite | total | peak live heap | registered sidecar / data | live files |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -413,6 +429,88 @@ continuation reran off-2 immediately before on-2, then ran v1-rebuild; all
 coverage assertions passed, including zero registered blobs for each off arm,
 one live seg2 blob per file for each on arm and one live v1 blob per file for
 the rebuild arm.
+
+#### Many rolled outputs in one rewrite (#5299)
+
+The #5234 arms rewrite one day at a time, so the shared `SegmentedIndexSink`
+never holds more than one output file's sidecars. `report_rolled_rewrite_sink_heap`
+asks the other question: one streaming rewrite of **one partition** whose output
+rolls into many files, so every finished blob is retained together until the
+transaction publishes them. It separates the three quantities the bound above
+is easy to conflate — the parsed per-group index, the serialized bytes the sink
+accumulates, and the rewrite's total peak heap.
+
+Each arm: a managed index with one or two indexed text columns carrying the
+same text, all rows in one day partition, appended with no index, then one
+forced streaming rewrite of the whole bin. `target_row_group_bytes=1` (the
+128 Ki-row floor) and a 64 KiB rolling target are fixed across every arm, so a
+file closes at each row-group boundary and the output volume alone sets how
+many sidecars the sink holds. Every shape runs with `segmented_index_writes`
+on and off, identical otherwise. Heap is peak tracked live bytes **above the
+live heap the rewrite started from**, measured over the rewrite only; the
+appends are outside the window.
+
+```text
+SIGLAKE_SEG_ROLL_ROWS=327680,1310720,2621440,5242880 SIGLAKE_SEG_ROLL_COLUMNS=1,2 \
+  cargo test -p siglake-storage --release --test segmented_index_writer \
+  report_rolled_rewrite_sink_heap -- --ignored --nocapture
+```
+
+The 1-minute load average read before each arm fell from 7.27 to 3.00 over the
+run, which bounds the wall times below but not the allocator figures.
+
+| rows | outputs | row groups | indexed columns | rewrite off | rewrite on | peak above baseline, off | on | seg2 delta | sink retained at publish | largest parsed group index |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 327,680 | 3 | 4 | 1 | 0.36 s | 0.81 s | 19,779,511 B | 33,000,197 B | **13,220,686 B** | 784,001 B | 9,972,574 B |
+| 1,310,720 | 10 | 14 | 1 | 1.54 s | 3.28 s | 27,855,750 B | 41,080,916 B | **13,225,166 B** | 3,148,010 B | 9,972,574 B |
+| 2,621,440 | 20 | 30 | 1 | 2.94 s | 6.70 s | 38,022,297 B | 51,247,455 B | **13,225,158 B** | 6,293,316 B | 9,972,574 B |
+| 5,242,880 | 40 | 60 | 1 | 5.86 s | 13.20 s | 58,282,520 B | 71,507,657 B | **13,225,137 B** | 12,586,628 B | 9,972,574 B |
+| 327,680 | 3 | 4 | 2 | 0.42 s | 1.35 s | 33,312,294 B | 41,935,190 B | **8,622,896 B** | 1,568,002 B | 9,972,574 B |
+| 1,310,720 | 10 | 14 | 2 | 1.59 s | 5.31 s | 48,746,822 B | 57,369,709 B | **8,622,887 B** | 6,296,020 B | 9,972,574 B |
+| 2,621,440 | 20 | 30 | 2 | 3.30 s | 10.76 s | 68,153,074 B | 76,775,952 B | **8,622,878 B** | 12,586,632 B | 9,972,574 B |
+| 5,242,880 | 40 | 60 | 2 | 6.46 s | 21.47 s | 106,816,746 B | 115,439,602 B | **8,622,856 B** | 25,173,256 B | 9,972,574 B |
+
+**Sixteen times the output volume does not move the rewrite's index cost.**
+From 3 to 40 rolled outputs the seg2 delta over its matched control changes by
+under 300 bytes in either column count, while what the sink holds at publish
+grows 16x with it. The peak is set elsewhere: the merge's own decode buffers
+(which grow with the output, in both arms) plus one parsed row-group index. A
+repeat of both arms of all eight shapes reproduced every `above baseline`
+figure to within 6 bytes, so these are not noisy readings.
+
+The three quantities, apart:
+
+- **Parsed per-group index.** 9,972,574 B for a 131,072-row group of this
+  corpus, identical in all eight seg2 arms — a pure function of the group's
+  rows, as
+  `the_index_state_a_rewrite_holds_is_one_row_groups` asserts. The *sum* over
+  groups reaches 797,826,276 B in the largest arm and is never live at once.
+- **Serialized sidecars the sink retains.** 2.40 B per row per indexed column,
+  and that is per *row*, not per file: the rolling target decides how the bytes
+  are split, not how many there are. One rewrite of N rows over C indexed
+  columns ends holding about 2.4·N·C bytes until its transaction publishes them.
+- **Total rewrite peak.** Dominated by the merge, in both arms, and growing
+  with the output volume in both.
+
+So the boundary is a row count per transaction, not a file count. Retention
+passes one group's parsed index at about 4.2M rows per indexed column, and
+reaches the merge's own working set on this box (50–110 MiB) at roughly
+20–48M rows per column. At the production 512 MiB rolling target the same rows
+produce far fewer, larger files and exactly the same retention: a 100M-row
+rewrite would hold ~240 MB per indexed column at publish. That is the figure a
+spilling decision would be about. #5299 measures the boundary and leaves the
+behaviour where it found it: spilling and the writer's defaults were out of its
+scope.
+
+What the numbers do not settle: the corpus's sidecar is larger than its Parquet
+output (25,205,726 B registered against 11,132,269 B of data in the largest
+arm) because almost every term is unique to one row while the columns
+themselves dictionary-compress nearly to nothing — the ratio on real text is
+#5234's 35.44%. The seg2 delta is also not additive per column at the peak
+(13.2 MB for one column, 8.6 MB for two): each arm peaks at a different
+instant, and the two-column control is already carrying a second decoded text
+column. And a rewrite of 40 outputs on this box is not one against S3, where a
+slower publish holds the same bytes for longer.
 
 #### Registration beside the refusals
 
