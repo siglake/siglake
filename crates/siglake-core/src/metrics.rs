@@ -267,6 +267,25 @@ pub const INGESTER_ALERTED_COUNTERS: &[AlertedCounter] = &[
 /// case the alert exists for. Its `_nonterminal` gauge sibling is deliberately
 /// absent: gauges are not pre-registered, and that one is dashboard-only.
 pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
+    // Statistics retirement runs inside the elected snapshot-expiry pass.
+    // Register every outcome before that first pass so a clean table reads 0
+    // rather than absent; the reclaimed-byte sibling is emitted by the
+    // age-gated orphan sweep that consumes the retired Puffin objects.
+    AlertedCounter {
+        name: "siglake_iceberg_statistics_removed_total",
+        series: UNLABELLED,
+    },
+    AlertedCounter {
+        name: "siglake_iceberg_statistics_retirement_skipped_total",
+        series: &[
+            &[("reason", "unowned_blob_type")],
+            &[("reason", "missing_data_file")],
+        ],
+    },
+    AlertedCounter {
+        name: "siglake_gc_bytes_reclaimed_total",
+        series: UNLABELLED,
+    },
     AlertedCounter {
         name: "siglake_consumed_proof_cap_refusals_total",
         series: UNLABELLED,
