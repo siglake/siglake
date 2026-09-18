@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9371,6 +9371,118 @@ impl TransactionAction for PublishSegmentedStatisticsAction {
     }
 }
 
+/// What the last-evaluated transaction base said about the target snapshot's
+/// statistics entry.
+///
+/// One `bool` rather than a counter: `Transaction::do_commit` re-applies its
+/// actions per attempt, so the value is overwritten on every refreshed base and
+/// the last write is the outcome the caller committed (or deferred) under. A
+/// deferral ends the transaction — it produces neither updates nor
+/// requirements, so `do_commit` returns without a catalog write and no further
+/// attempt can follow it.
+#[derive(Debug, Default)]
+struct FirstStatisticsRegistrationObservation {
+    deferred: AtomicBool,
+}
+
+impl FirstStatisticsRegistrationObservation {
+    fn store(&self, deferred: bool) {
+        self.deferred.store(deferred, Ordering::Relaxed);
+    }
+
+    fn deferred(&self) -> bool {
+        self.deferred.load(Ordering::Relaxed)
+    }
+}
+
+/// Registers an already-written Puffin statistics file against a committed
+/// snapshot, and only while that snapshot still carries none.
+///
+/// A snapshot holds at most one statistics file and `set_statistics` inserts by
+/// snapshot id, so a second registration REPLACES the first rather than merging
+/// into it (#5228). Registration is therefore first-writer-wins, and the loser
+/// defers: it leaves the winning file registered and its blobs discoverable.
+///
+/// The absence check belongs here, inside the action, because that is the only
+/// place it sees the base the commit will actually land on.
+/// `Transaction::do_commit` loads the table at the top of every attempt and
+/// re-applies each action against it, so a check made against the caller's own
+/// handle says nothing about the first attempt's refreshed base, and nothing at
+/// all about the base of an attempt that follows a lost CAS (#5298). The
+/// caller's pre-write check stays as a cheap short-circuit; this one decides.
+struct RegisterFirstStatisticsAction {
+    snapshot_id: i64,
+    /// Written before the transaction and re-referenced unchanged on every
+    /// attempt: the target snapshot is already committed, so both the entry's
+    /// snapshot id and the sequence number stamped into the Puffin footer are
+    /// immutable for the life of the transaction. (A rewrite's sidecar is the
+    /// other case — its snapshot is reserved and not yet committed, so #5260
+    /// writes that one per attempt.)
+    statistics: StatisticsFile,
+    observation: Arc<FirstStatisticsRegistrationObservation>,
+}
+
+#[async_trait::async_trait]
+impl TransactionAction for RegisterFirstStatisticsAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        if table.metadata().snapshot_by_id(self.snapshot_id).is_none() {
+            // The snapshot the blobs are addressed to left the table between
+            // the caller's load and this attempt's base. Registering against it
+            // would describe rows no reader can reach through it.
+            return Err(IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "index registration target snapshot is not on the transaction base",
+            )
+            .with_context("snapshot_id", self.snapshot_id.to_string()));
+        }
+        if table
+            .metadata()
+            .statistics_for_snapshot(self.snapshot_id)
+            .is_some()
+        {
+            self.observation.store(true);
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+        self.observation.store(false);
+        Ok(ActionCommit::new(
+            vec![TableUpdate::SetStatistics {
+                statistics: self.statistics.clone(),
+            }],
+            vec![TableRequirement::UuidMatch {
+                uuid: table.metadata().uuid(),
+            }],
+        ))
+    }
+}
+
+/// Count and log one deferred index registration.
+///
+/// Called once per registration call, never once per commit attempt: a retry is
+/// the same deferral seen again, and counting attempts would make the rate of
+/// this bounded series a function of catalog contention.
+fn record_registration_deferral(
+    table_ident: &TableIdent,
+    snapshot_id: i64,
+    deferred_files: &BTreeSet<String>,
+    written_sidecar: Option<&str>,
+) {
+    metrics::counter!(
+        "siglake_index_registration_deferred_total",
+        "reason" => "snapshot_has_statistics"
+    )
+    .increment(1);
+    tracing::warn!(
+        table = %table_ident,
+        snapshot_id,
+        files = deferred_files.len(),
+        deferred_files = ?deferred_files,
+        // Present when the deferral was decided after the sidecar was already
+        // written: the object is unreferenced and `gc_orphans` reclaims it.
+        orphaned_sidecar = written_sidecar,
+        "deferred Puffin index registration because the snapshot already has a statistics file"
+    );
+}
+
 async fn write_puffin_sidecar(
     table: &Table,
     snapshot: &iceberg::spec::Snapshot,
@@ -14406,27 +14518,18 @@ impl IcebergContext {
         if blobs.is_empty() {
             return Ok(false);
         }
+        let covered_files: BTreeSet<String> = blobs
+            .iter()
+            .map(|blob| blob.data_file_path.clone())
+            .collect();
         if table
             .metadata()
             .statistics_for_snapshot(snapshot_id)
             .is_some()
         {
-            let deferred_files: std::collections::BTreeSet<&str> = blobs
-                .iter()
-                .map(|blob| blob.data_file_path.as_str())
-                .collect();
-            metrics::counter!(
-                "siglake_index_registration_deferred_total",
-                "reason" => "snapshot_has_statistics"
-            )
-            .increment(1);
-            tracing::warn!(
-                table = %table.identifier(),
-                snapshot_id,
-                files = deferred_files.len(),
-                deferred_files = ?deferred_files,
-                "deferred Puffin index registration because the snapshot already has a statistics file"
-            );
+            // Already lost on the caller's own handle: nothing was written, so
+            // there is no sidecar to orphan.
+            record_registration_deferral(table.identifier(), snapshot_id, &covered_files, None);
             return Ok(false);
         }
         let snapshot = table
@@ -14437,15 +14540,31 @@ impl IcebergContext {
                 anyhow::anyhow!("snapshot {snapshot_id} not present on committed table")
             })?;
         let statistics = write_puffin_sidecar(table, snapshot, blobs).await?;
+        let statistics_path = statistics.statistics_path.clone();
+        let observation = Arc::new(FirstStatisticsRegistrationObservation::default());
         let tx = Transaction::new(table);
-        let tx = tx
-            .update_statistics()
-            .set_statistics(statistics)
-            .apply(tx)
-            .context("UpdateStatisticsAction::apply")?;
+        let tx = RegisterFirstStatisticsAction {
+            snapshot_id,
+            statistics,
+            observation: Arc::clone(&observation),
+        }
+        .apply(tx)
+        .context("RegisterFirstStatisticsAction::apply")?;
         tx.commit(self.catalog.as_ref())
             .await
-            .context("update_statistics Transaction::commit")?;
+            .context("register_statistics Transaction::commit")?;
+        if observation.deferred() {
+            // A competing registration reached this snapshot first — either
+            // before this transaction's own base refresh or inside the CAS
+            // window of a lost attempt. The written sidecar is unreferenced.
+            record_registration_deferral(
+                table.identifier(),
+                snapshot_id,
+                &covered_files,
+                Some(statistics_path.as_str()),
+            );
+            return Ok(false);
+        }
         Ok(true)
     }
 

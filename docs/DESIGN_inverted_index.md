@@ -70,6 +70,15 @@ increments
 The uncovered files remain scan-readable and can gain an index from a later
 rewrite or a CLI rebuild after a later snapshot.
 
+The registration is first-writer-wins under concurrency too. The absence check
+is made by `RegisterFirstStatisticsAction` inside the registration
+transaction, so it is re-made against the base of every commit attempt: a
+competitor that arrives between the caller's load and the transaction's
+refresh, or inside a lost attempt's CAS window, defers the caller instead of
+replacing what the competitor registered. A deferral is counted once per
+registration call, not once per attempt, and the sidecar the deferred caller
+had already uploaded is left unreferenced for `gc_orphans`.
+
 #### The local on/off measurement (2026-09-14)
 
 `report_rebuild_on_off_text_shapes` in `tests/puffin_rebuild.rs` writes the

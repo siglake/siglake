@@ -3,7 +3,7 @@
 Status (2026-09-18): **seg2 streaming writer landed on its hermetic suite and
 its 14 x 7.34M-row build cost is measured; production read/write adoption
 remains off by default.** The same-snapshot registration and concurrent-commit
-sequence boundaries are closed (#5228, #5260; see
+sequence boundaries are closed (#5228, #5260, #5298; see
 [Writer integration](#writer-integration-4377)).
 The query-path report now builds its segmented arm through that writer and
 retains the older seg1 tables as dated history (#5230). Production discovery
@@ -448,6 +448,36 @@ file remains discoverable and reachable to orphan GC; uncovered files stay on
 the exact scan path until a later snapshot can carry their rebuilt index.
 `a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs` drives that
 mixed-coverage boundary and checks the retained seg2 reader's exact answers.
+
+#### Which base the refusal is decided on
+
+#5228 decided it on the caller's own table handle, which settles the sequential
+case and no other. `Transaction::do_commit` loads the table at the top of every
+attempt and re-applies each action against that base, so a check made before
+the transaction says nothing about the base the commit lands on. Two
+registrants starting from a statistics-free snapshot both passed it, and the
+Iceberg `UpdateStatisticsAction` they used emits an unconditional replacement
+(`third_party/iceberg/src/transaction/update_statistics.rs:79`) — so the second
+one to commit dropped the first's blobs anyway, exactly as before the guard.
+
+Since #5298 the Siglake registration path owns the action.
+`RegisterFirstStatisticsAction` re-reads `statistics_for_snapshot` on every
+attempt and emits its `SetStatistics` only while the snapshot still carries
+none; a base that already has one yields no updates and no requirements, which
+ends the transaction without a catalog write. The general Iceberg replacement
+contract is unchanged — the fork's own action still replaces, and the rewrite
+path's `PublishSegmentedStatisticsAction` still registers against the snapshot
+it reserved. The deferral is counted once per registration call rather than
+once per attempt: a retry is the same deferral seen again. The Puffin object
+the deferred caller had already written is unreferenced and `gc_orphans`
+reclaims it; the warning names it. The two deterministic boundaries are
+`a_competing_registration_before_the_refresh_keeps_the_first_statistics_file`
+(the rival commits between the caller's load and the first attempt's refresh)
+and `a_competing_registration_in_the_cas_window_keeps_the_first_statistics_file`
+(the rival commits inside the first attempt's CAS window, so the decision is
+made on the retry's base). Both register disjoint files, and both assert the
+winner's entry, its reachability, one deferral and the deferred caller's zero
+rebuilt files and bytes.
 
 ### What per-section compression would recover
 
@@ -1207,7 +1237,7 @@ What remains, in order:
    the decoded posting span before slicing a term. Seg1 bytes are pinned by a
    fixture and remain readable. The 7.34M-row report writes 16.7 MiB and records
    fetched bytes for all six shapes.
-5. ~~**#4377 / #5233 / #5234 / #5228 / #5260**~~ — done: the
+5. ~~**#4377 / #5233 / #5234 / #5228 / #5260 / #5298**~~ — done: the
    streaming Parquet writer builds one seg2 group per row group, registers all
    completed output blobs in the rewrite transaction, and leaves the
    post-commit v1 rebuild no file to decode. The hermetic suite covers rolling output, separate partition
@@ -1215,7 +1245,11 @@ What remains, in order:
    row-group-bounded parsed index state, and passes. Reads and writes remain
    separate opt-ins. The 14 x 7.34M build time and peak heap are recorded in
    [Writer integration](#writer-integration-4377). #5228 preserves the rewrite's
-   statistics entry when a later v1 rebuild finds an uncovered sibling. #5260
+   statistics entry when a later v1 rebuild finds an uncovered sibling, for a
+   registration that follows the first one; #5298 moves that decision into the
+   registration's own transaction action, so it is re-made against the base of
+   every attempt and holds for two concurrent registrants — see [Which base the
+   refusal is decided on](#which-base-the-refusal-is-decided-on). #5260
    derives the Puffin sequence from the rewrite snapshot on each refreshed
    transaction attempt; deterministic stale-base and failed-CAS regressions
    compare the snapshot, table metadata and physical footer. Both defaults stay
