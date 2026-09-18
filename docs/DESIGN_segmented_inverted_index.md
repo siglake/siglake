@@ -296,9 +296,13 @@ uncompressed sidecar at 5.59x the shipped sidecar's on-disk bytes:
 - **Registering uncompressed removes a checksum that exists today.** The v1
   sidecar travels inside a Zstd frame written with `include_checksum(true)`
   (`third_party/iceberg/src/compression.rs`), so in deployment a flipped bit
-  anywhere in it fails decompression and the file is scanned. An uncompressed
-  segmented blob has no such cover, and its posting sections are then the only
-  part of it no checksum spans.
+  anywhere in it fails decompression. What follows is a **failed query**, not a
+  scan: the error propagates out of `PuffinReader::blob` through the reader
+  (#4991, measured in
+  [`DESIGN_inverted_index.md`](DESIGN_inverted_index.md), "Which storage path
+  carries that residual"). A v1 index in a Parquet footer has no cover at all
+  and answers short. An uncompressed segmented blob has no cover either, and
+  its posting sections are then the only part of it no checksum spans.
 - **Per-block compression uses the same granularity** (see
   [Publication semantics](#publication-semantics-what-4377-needs)), so a
   compressed version gets the checksum without another read — the span is

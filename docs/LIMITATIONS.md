@@ -77,27 +77,39 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no
   measurement against a real store has settled. Both are kept for now.
-- **A v1 inverted-index blob has no checksum over its postings.** #4558 made
-  the decoder validate everything the format can check itself — the serialized
-  lengths against the bytes behind them, the narrowing conversions, the varint
-  range, the dictionary's ascent, and each posting's ascent and place inside
-  `n_rows` — and made the reader match the index's row domain against the
-  Parquet file before either a warm or a cold index prunes it. What is left is
-  a bit flip inside a posting delta that leaves the ordinals ascending and in
-  range: 120 of 112,304 single-bit flips of a 14 KB blob
-  (`report_single_bit_corruption_rates`), where an ordinal the scan should have
-  selected is replaced by one it should not. Extra rows are harmless — the
-  exact predicate runs above the scan — so the exposure is a dropped match, and
-  only for a file whose index is corrupt on disk rather than absent. Closing it
-  means a checksum over the postings, and
-  `DESIGN_segmented_inverted_index.md` prices the granularities: 4 bytes
-  per term is about a third of a *segmented* blob, because a partial reader
-  fetches one term's postings and can only verify what it fetched, while a CRC
-  per block's posting span is a thousandth of it. Neither figure is this
-  format's, which is read whole — what that costs, and which storage path is
-  exposed at all once the Puffin sidecar's Zstd frame checksum is accounted
-  for, is #4991. Seg2 closes this residual for its own posting spans; seg1 and
-  v1 remain unchanged, so #4991 still owns the shipped v1 boundary.
+- **A v1 inverted-index blob in a Parquet footer has no checksum; the Puffin
+  sidecar's Zstd frame has one.** #4558 made the decoder validate everything
+  the format can check itself — the serialized lengths against the bytes behind
+  them, the narrowing conversions, the varint range, the dictionary's ascent,
+  and each posting's ascent and place inside `n_rows` — and made the reader
+  match the index's row domain against the Parquet file before either a warm or
+  a cold index prunes it. What is left is a corruption that decodes and still
+  covers the file, and #4991 measured what a query then does, per storage path
+  ([`DESIGN_inverted_index.md`](DESIGN_inverted_index.md), "Which storage path
+  carries that residual"). The **footer-KV** path — hex in the Parquet footer,
+  taken per column while that column's serialized index fits
+  `SIGLAKE_INDEX_FOOTER_MAX_BYTES` (1 MiB), so the small and freshly written
+  files — is the exposed one: Parquet
+  checksums data pages, not footer metadata, and the query succeeds while
+  answering short. Of 224,368 single-bit flips of a 28 KB hex value, 125 cost
+  one probe term rows and 10,432 cost some term rows; a flip inside a term's
+  *characters* costs that term every row in the file, because an absent term is
+  a definitive "no rows match". The **Puffin sidecar** — the spillover above
+  that threshold, so the large compacted files — is covered by the codec it is
+  written with (`Zstd`, `include_checksum(true)`): none of 19,888 flips of the
+  stored frame produced a wrong answer, against 5,883 of 19,856 with the
+  content checksum off. Its failure mode is a failed query (`Restored data
+  doesn't match checksum`), not a fallback to a scan. Warm, neither path
+  re-verifies: a cached parsed index answers from the parse until it is
+  evicted. Closing the footer exposure costs 4 bytes, eight hex characters in a
+  footer value, and 0.41% of the decode the reader already pays — the
+  recommendation, the placements a 0.1.x reader refuses, and what that would
+  cost a mixed-version fleet are in the design document; the shipped format,
+  API and defaults are unchanged. The segmented figures are a different
+  question: 4 bytes per term is about a third of a *segmented* blob because a
+  partial reader fetches one term's postings and can verify only what it
+  fetched, and seg2 closes its own residual with a CRC per block's posting
+  span. Neither applies to a blob that is read whole.
 - **A maintenance process's cache budgets are readable at startup, not on
   `/metrics`.** The compactor, the ingest server and the `siglake` maintenance
   subcommands resolve their own budgets now — zero for the two text-index

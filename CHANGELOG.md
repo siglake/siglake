@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Text indexes (docs)**: the documented integrity gap in a v1 inverted-index
+  blob is the **footer-KV** path only. An index stored as hex in a Parquet
+  footer — the path taken per column while that column's serialized index fits
+  `SIGLAKE_INDEX_FOOTER_MAX_BYTES` (1 MiB), so the small and freshly written
+  files — has nothing covering its stored bytes, and a corruption that still
+  decodes and still covers the file's rows prunes with it: the query succeeds
+  and answers short. The Puffin sidecar above that threshold, which carries the
+  large compacted files, is covered by the codec it is written with: none of
+  19,888 single-bit flips of the stored frame produced a wrong answer, against
+  5,883 of 19,856 with the frame's content checksum off, and its failure mode
+  is a failed query rather than a fallback to a scan. Warm, neither path
+  re-verifies: a cached parsed index answers from the parse until it is
+  evicted. `docs/LIMITATIONS.md` now states the exposure per path, and
+  `docs/DESIGN_inverted_index.md` carries the sweep, the reader's disposition
+  per arm, the measured price of one whole-blob CRC-32 (4 bytes, +0.41% of the
+  decode) and what a 0.1.x reader does with each placement. No format, API or
+  default changed. (#4991)
+
 - **Alerting (feature)**: `SiglakeCompactorOrphansHeld` (critical, `for: 15m`,
   `siglake.stalled`) pages on the one WAL orphan disposition that needs a
   person. A compactor killed mid-commit leaves its segment under
