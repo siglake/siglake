@@ -1,19 +1,21 @@
 # Design — row-group-addressable inverted-index sidecars (#4376 prototype)
 
-Status (2026-09-18): **seg2 codec complete; production read/write adoption is
-still off.**
+Status (2026-09-18): **seg2 streaming writer landed on its hermetic suite; its
+build time and peak heap are not yet measured, and production read/write
+adoption remains off by default.** The 14 x 7.34M report the writer's
+acceptance asks for is #5234, and #5228 carries one known registration gap
+(see [Writer integration](#writer-integration-4377)).
 The codec and its reader are `siglake_index::segmented`, and the reader
 integration (#4561) is behind `SIGLAKE_SEGMENTED_INDEX_READS` — see
-[Reader integration](#reader-integration-4561). The production writer is
-untouched: nothing emits a segmented sidecar into a table, so with the knob
-unset every default
-behaves exactly as it did. This document is the format decision #4377 needs
-ahead of building postings during a streaming merge, and the specification the
-remaining slices implement: #4560 (the codec, its fixtures and the format's
+[Reader integration](#reader-integration-4561). A streaming re-cluster emits
+seg2 only under `SIGLAKE_SEGMENTED_INDEX_WRITES=1`, registering the sidecar in
+the rewrite transaction; with both opt-ins unset every default behaves exactly
+as it did. This document records the format decision and implementation:
+#4560 (the codec, its fixtures and the format's
 open questions — settled below), #4561 (reader integration and bounded partial
 reads — below), #5006 (the directory held between lookups — below), #4562 (the
 measured proceed/revise/reject disposition), and #4988 (block compression plus
-posting-span integrity — complete below).
+posting-span integrity), followed by #4377's writer and atomic publication.
 
 It exists because the shipped format has one property that cannot be fixed by
 sizing a cache: **it is only readable whole.**
@@ -347,6 +349,65 @@ needs a sub-range read against the statistics file rather than
 `PuffinReader::blob`. The cost of that is visible in the measurement: 85.8 MiB
 uncompressed against the ~16 MiB per file the Zstd'd v1 sidecar occupies on disk
 (#4329: 229 MB of statistics increment over 14 files).
+
+### Writer integration (#4377)
+
+The streaming rewrite now follows those semantics behind
+`SIGLAKE_SEGMENTED_INDEX_WRITES=1`. The Parquet writer closes the index group
+beside each row group, compares the finished sidecar's group rows with the
+footer it actually wrote, and hands one seg2 blob per `(data file, column)` to
+the rewrite. The rolling writer shares one sink across its output files;
+intermediate tier files receive no sink because no snapshot will contain them.
+
+Before committing, the rewrite reserves its snapshot id, writes one Puffin
+statistics file containing the completed blobs, and applies the data-file swap
+and statistics registration in one transaction. A refused transaction can
+leave an unreferenced object for orphan GC, but no table metadata names it. The
+post-commit v1 rebuild treats v1, seg1 and seg2 registrations as equivalent
+coverage for `(data file, column)`, so it performs no full-file decode for the
+new output and a repeated rebuild is a no-op.
+
+`crates/siglake-storage/tests/segmented_index_writer.rs` holds the single-file,
+rolled-output, two-partition, failed-transaction, idempotence, exact-query and
+row-group-memory cases. Reads prefer seg2 and retain seg1 discovery; the knobs
+for writing and reading are separate and both remain off by default. What the
+suite does not hold is the writer's build time and peak heap at the acceptance's
+14 x 7.34M rows: `report_segmented_writer_build_cost` in that file is the
+`#[ignore]`d harness for it, and #5234 runs it.
+
+#### The gap beside the refusals
+
+`publish_segmented_sidecars` publishes nothing for a file whose finished
+sidecar disagrees with the footer it wrote, counting the reason on
+`siglake_iceberg_segmented_index_writes_total{outcome="refused"}`:
+
+| reason | what disagreed |
+|---|---|
+| `column` | a row group whose text column could not be indexed, so the sidecar has no group for it |
+| `file_rows` | the sidecar's total rows are not the data file's |
+| `row_domain` | the sidecar's per-group rows are not the footer's row groups |
+
+Silence is safe on its own — an unregistered file is read the way an unindexed
+one is. It is not safe for the file's *siblings*, and that is a known gap,
+not a decided behaviour:
+
+A rewrite registers every output blob in **one** `StatisticsFile` under the
+snapshot id it reserved, and `set_statistics` inserts by snapshot id
+(`third_party/iceberg/src/spec/table_metadata_builder.rs:589`), so a second
+statistics file written against that snapshot replaces the first rather than
+merging into it. With `SIGLAKE_INDEX_REBUILD=1` as well, a refused file is
+uncovered, so the post-commit `rebuild_inverted_indexes_for_files` over the
+rewrite's output builds a v1 blob for it and registers it under the same
+snapshot — dropping every seg2 blob the rewrite just published. Their Puffin
+path leaves `reachable_files` and orphan GC deletes the object; the query path
+falls back to a scan and answers correctly, so nothing reports the loss.
+
+Both opt-ins and a refusal are needed to reach it. The disposition is
+refuse-and-count rather than merge, and #5228 implements it;
+`a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs` in the suite
+above is the `#[ignore]`d reproduction, reaching the same second registration
+with a live uncovered file because a refusal has no seam to drive it from a
+test.
 
 ### What per-section compression would recover
 
@@ -705,7 +766,8 @@ shape, interleaved per execution:
 | `seg` | no v1 sidecar; one segmented sidecar per file, groups identical to the file's Parquet row groups |
 | `seg_policy` | the `seg` warehouse under the same #4375 rule |
 
-No writer produces the segmented format, so the harness writes the sidecars
+At the time of this measurement no writer produced the segmented format, so
+the harness wrote the sidecars
 (`write_segmented_sidecars`): one uncompressed blob per live data file,
 registered as one Puffin statistics file on the current snapshot. The arms exist
 only under `SIGLAKE_SEGMENTED_INDEX_READS`, which the reader resolves once per
@@ -917,8 +979,9 @@ so read the counts and bytes from them rather than the milliseconds — their
   reads of ~2.5 KiB would be 84 GETs, against the shipped path's fourteen large
   ones. Whether that trade holds at per-request latency is a prepared round's
   question and nothing here qualifies an AWS result.
-- **Is not** a defaults change. `SIGLAKE_SEGMENTED_INDEX_READS` stays off, no
-  writer produces the format, and neither shipped budget moves.
+- **Is not** a defaults change. `SIGLAKE_SEGMENTED_INDEX_READS` stayed off, the
+  measurement harness produced its own sidecars, and neither shipped budget
+  moved.
 - **Is not** a writer benchmark. The construction numbers are sequential local
   fixture building, and the Parquet-decode half of them is an artifact of
   building sidecars after the fact.
@@ -993,7 +1056,7 @@ requests, not local latency, so what it is worth depends on an object-store
 round; and the sync/async seam still holds a blocking thread for a whole lookup,
 which one process at 14 files does not stress.
 
-## What the acceptance still needs
+## Acceptance sequence
 
 #4376's acceptance — "the rare full scan beats OFF under a 1 GiB parsed /
 256 MiB blob budget while the four LIMIT shapes are not regressed" — is an
@@ -1008,8 +1071,8 @@ What remains, in order:
 2. ~~**#5006**~~ — done, see [Holding the directory between
    lookups](#holding-the-directory-between-lookups-5006): a repeat lookup on a
    blob reads no trailer and no directory, under a byte budget of its own.
-   What is still left for #4562: no writer produces a sidecar for a real
-   table, so the harness builds one.
+   At that point no writer produced a sidecar for a real table, so #4562's
+   harness built one.
 3. ~~**#4562**~~ — done, see [Through the query
    path](#through-the-query-path-scan-whole-file-segmented-4562) and the
    [disposition](#disposition-for-4377-proceed-with-two-revisions): the
@@ -1022,7 +1085,18 @@ What remains, in order:
    the decoded posting span before slicing a term. Seg1 bytes are pinned by a
    fixture and remain readable. The 7.34M-row report writes 16.7 MiB and records
    fetched bytes for all six shapes.
-5. **An open question for #4561**: the substring sweep reads the whole
+5. **#4377 / #5233** — the code is in: the streaming Parquet writer builds one
+   seg2 group per row group, registers all completed output blobs in the
+   rewrite transaction, and leaves the post-commit v1 rebuild no file to
+   decode. The hermetic suite covers rolling output, separate partition
+   rewrites, failed transactions, repeated rebuild, exact answers and
+   row-group-bounded parsed index state, and passes. Reads and writes remain
+   separate opt-ins. **Two pieces of #4377's acceptance are still open**: the
+   14 x 7.34M build time and peak heap (#5234, the `#[ignore]`d
+   `report_segmented_writer_build_cost`), and the same-snapshot registration
+   gap above (#5228). Neither blocks the format staying off by default, and
+   both block any proposal to turn it on.
+6. **An open question for #4561**: the substring sweep reads the whole
    dictionary, and `keyword`-class terms with millions of postings read megabytes
    of posting bytes. Both are regimes where partial reads buy little, and #4375's
    per-execution policy is the place to decline them. The document frequency a
@@ -1039,6 +1113,10 @@ cargo test -p siglake-index --release --test segmented_measure \
   report_single_bit_corruption_rates -- --ignored --nocapture
 cargo test -p siglake-index --release --lib \
   report_posting_checksum_and_compression_options -- --ignored --nocapture
+cargo test -p siglake-storage --test segmented_index_writer -- --test-threads=1
+SIGLAKE_SEG_WRITER_FILES=14 SIGLAKE_SEG_WRITER_ROWS_PER_FILE=7340000 \
+  cargo test -p siglake-storage --release --test segmented_index_writer \
+  report_segmented_writer_build_cost -- --ignored --nocapture
 ```
 
 The first two are sized by `SIGLAKE_SEG_ROWS_PER_FILE` (7,340,000 above), `SIGLAKE_SEG_GROUP_ROWS`

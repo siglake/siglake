@@ -362,17 +362,21 @@ anything it cannot conclude falling back to the v1 index or an exact scan
 (#4561), and the parsed directory held between lookups under a byte budget of
 its own (#5006, `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`, separate
 from the two budgets above) — but only when `SIGLAKE_SEGMENTED_INDEX_READS` is
-set, and no writer produces one, so nothing in this section changes by
-default, and nothing is retained under the new budget either. The three
-formats have been compared through the query path on a 102.76M-row local
-corpus (#4562): a rare unclipped text predicate is 11.5x faster than the scan
-where the shipped sidecar is 22.4x slower, and the result holds with both
-budgets above at zero. The seg2 codec compresses each dictionary block and its
-posting span as separate Zstd-3 frames and verifies a CRC over the decoded
-posting span. At the same 7.34M-row scale it writes 16.7 MiB instead of seg1's
-85.8 MiB while retaining independent range reads. Production discovery still
-names seg1 and no merge writer emits either format, so this changes no shipped
-read or write default.
+set. A streaming re-cluster can build the compressed seg2 generation one
+Parquet row group at a time when `SIGLAKE_SEGMENTED_INDEX_WRITES=1`: each
+finished output file contributes one uncompressed Puffin blob whose interior
+contains independently compressed dictionary and posting blocks, and the
+statistics registration is committed in the same transaction as the data-file
+rewrite. The ordinary post-commit v1 rebuild recognizes that registration and
+does not decode the output file again. Seg2 discovery is preferred over seg1;
+files carrying the prototype remain readable, and files carrying neither use
+the exact scan. Reads and writes are separate opt-ins, both off by default, so
+nothing is built or retained under the segmented-directory budget in the
+shipped configuration. The three formats were compared through the query path
+on a 102.76M-row local corpus (#4562): a rare unclipped text predicate is 11.5x
+faster than the scan where the shipped sidecar is 22.4x slower, and the result
+holds with both budgets above at zero. At the same 7.34M-row scale seg2 writes
+16.7 MiB instead of seg1's 85.8 MiB while retaining independent range reads.
 
 **Whether to USE an index is decided per execution.** Loading one is a
 whole-file cost, so a query that wants a handful of rows cannot pay it: a text

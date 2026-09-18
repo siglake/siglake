@@ -47,7 +47,9 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::{
+    ParquetWriterBuilder, SegmentedIndexBlob, SegmentedIndexColumn, SegmentedIndexSink,
+};
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{
     Catalog, CatalogBuilder, ErrorKind as IcebergErrorKind, NamespaceIdent, TableCreation,
@@ -987,6 +989,11 @@ struct LazyMergeOutputWriter<'a> {
     bloom_columns: &'a [&'a str],
     with_footers: bool,
     rewrite_gen: u32,
+    /// Where this merge's segmented sidecars land (#4377), or `None` when the
+    /// writer builds none. One sink per rewrite, shared by every output file
+    /// the rolling writer opens, so a partition-split rewrite leaves one
+    /// sidecar per output file and the caller registers them together.
+    segmented_sink: Option<Arc<SegmentedIndexSink>>,
     inner: Option<Box<dyn IcebergWriter>>,
 }
 
@@ -1002,6 +1009,7 @@ impl LazyMergeOutputWriter<'_> {
                         self.with_footers,
                         self.rewrite_gen,
                         Some(&batch),
+                        self.segmented_sink.clone(),
                     )
                     .await?,
             );
@@ -8363,6 +8371,39 @@ fn tokenizer_name(tokenizer: siglake_bloom::Tokenizer) -> &'static str {
     }
 }
 
+/// The text columns a rewrite builds a segmented (`seg2`) sidecar for: the
+/// table's inverted-index specs, restricted to the columns the output schema
+/// actually carries as Utf8.
+///
+/// The same specs the v1 sidecar is built from, so a file's segmented sidecar
+/// covers the columns its v1 one would have and the reader's per-column
+/// discovery finds one or the other. A spec naming a column the schema does not
+/// carry as text is dropped here rather than in the writer, which would
+/// otherwise refuse the whole file's sidecar set for it.
+fn segmented_index_columns_for_table(
+    table: &Table,
+    arrow_schema: &arrow_schema::Schema,
+    inverted_index_enabled: bool,
+) -> Result<Vec<SegmentedIndexColumn>> {
+    Ok(
+        inverted_index_spec_for_table(table, None, inverted_index_enabled)?
+            .into_iter()
+            .filter(|spec| {
+                matches!(
+                    arrow_schema
+                        .field_with_name(spec.column.as_str())
+                        .map(|field| field.data_type()),
+                    Ok(arrow_schema::DataType::Utf8)
+                )
+            })
+            .map(|spec| SegmentedIndexColumn {
+                column: spec.column,
+                tokenizer: spec.tokenizer,
+            })
+            .collect(),
+    )
+}
+
 fn record_batch_inverted_indexes(
     batch: &RecordBatch,
     specs: &[InvertedIndexSpec],
@@ -8649,6 +8690,21 @@ pub struct IcebergTuning {
     pub delete_rewrite_inram_max_bytes: Option<u64>,
     /// Row cap for the same decision.
     pub delete_rewrite_inram_max_rows: Option<u64>,
+    /// Whether a re-clustering rewrite builds a segmented (`seg2`)
+    /// inverted-index sidecar for its output as it merges. `None` = as
+    /// `SIGLAKE_SEGMENTED_INDEX_WRITES` says, which is off.
+    pub segmented_index_writes: Option<bool>,
+    /// Dictionary-block byte target for that sidecar. `None` = as
+    /// `SIGLAKE_SEGMENTED_INDEX_BLOCK_BYTES` says, which is the codec's 4 KiB.
+    pub segmented_index_block_bytes: Option<usize>,
+    /// Compressed-byte target at which a merge's rolling writer opens another
+    /// output file. `None` = Iceberg's `write.target-file-size-bytes` default,
+    /// which is what production uses.
+    ///
+    /// Exists so a test can exercise a rewrite that splits its output across
+    /// several data files — one sidecar per output file (#4377) — without
+    /// writing half a gigabyte to get there.
+    pub merge_target_file_bytes: Option<usize>,
 }
 
 /// Decide whether a re-cluster bin is merged via the memory-bounded streaming
@@ -9026,13 +9082,27 @@ fn tenant_metric_label(namespace: &NamespaceIdent) -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// Every `(data file, column)` a registered Puffin text sidecar already covers,
+/// in any of the three formats.
+///
+/// This is what makes a rebuild idempotent, and since #4377 it is also what
+/// keeps the post-commit full-file decode away from a file a rewrite already
+/// indexed: a segmented sidecar is registered with the rewrite that wrote it,
+/// so the maintenance rebuild sees the column covered and reads nothing. A
+/// segmented blob and a v1 blob are alternative answers for the same column,
+/// not layers — the reader takes whichever it finds.
 fn existing_puffin_index_columns(
     metadata: &iceberg::spec::TableMetadata,
 ) -> HashSet<(String, String)> {
+    const TEXT_BLOB_TYPES: [&str; 3] = [
+        SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE,
+        siglake_index::segmented::SEGMENTED_BLOB_TYPE,
+        siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE,
+    ];
     metadata
         .statistics_iter()
         .flat_map(|stats| stats.blob_metadata.iter())
-        .filter(|blob| blob.r#type == SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE)
+        .filter(|blob| TEXT_BLOB_TYPES.contains(&blob.r#type.as_str()))
         .filter_map(|blob| {
             Some((
                 blob.properties.get("data_file")?.to_string(),
@@ -9137,6 +9207,96 @@ async fn build_puffin_index_blobs_for_file(
             })
         })
         .collect())
+}
+
+/// Write one Puffin statistics file holding the segmented (`seg2`) sidecars a
+/// rewrite just built, for a snapshot id the caller reserved and has not
+/// committed yet (#4377).
+///
+/// Two things differ from [`write_puffin_sidecar`], and both are the format:
+///
+/// - **The blobs are registered with no codec.** A compressed blob has no
+///   addressable interior, and the reader refuses one
+///   (`BlobRangeReader`/`declined{reason="compressed"}`). Seg2 compresses each
+///   dictionary block and posting span itself, so the container does not have
+///   to.
+/// - **No `row_group_size` property.** The directory states every group's row
+///   count, so the reader validates the sidecar against the file's own Parquet
+///   metadata rather than against a stamped number that can agree by accident.
+///
+/// The object is written before the rewrite commits. That is deliberate: the
+/// statistics file has to exist for the transaction to reference it, and an
+/// object no metadata points at is not discoverable — a failed commit leaves an
+/// orphan for `gc_orphans`, never a partial index.
+async fn write_segmented_puffin_sidecar(
+    table: &Table,
+    snapshot_id: i64,
+    sequence_number: i64,
+    blobs: Vec<SegmentedIndexBlob>,
+) -> Result<StatisticsFile> {
+    let statistics_path = next_puffin_sidecar_path(table)?;
+    let output_file = table
+        .file_io()
+        .new_output(&statistics_path)
+        .with_context(|| format!("new_output {statistics_path}"))?;
+    let mut writer = PuffinWriter::new(&output_file, HashMap::new(), false)
+        .await
+        .context("PuffinWriter::new")?;
+    let schema = table.metadata().current_schema();
+    let mut statistics_blob_metadata = Vec::with_capacity(blobs.len());
+    for blob in blobs {
+        let field_id = schema
+            .field_id_by_name(blob.column.as_str())
+            .unwrap_or_default();
+        let properties = HashMap::from([
+            ("data_file".to_string(), blob.data_file_path.clone()),
+            ("column".to_string(), blob.column.clone()),
+            (
+                "tokenizer".to_string(),
+                tokenizer_name(blob.tokenizer).to_string(),
+            ),
+            (
+                "format".to_string(),
+                siglake_index::segmented::SEGMENTED_V2_FORMAT_PROPERTY.to_string(),
+            ),
+        ]);
+        writer
+            .add(
+                PuffinBlob::builder()
+                    .r#type(siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE.to_string())
+                    .fields(vec![field_id])
+                    .snapshot_id(snapshot_id)
+                    .sequence_number(sequence_number)
+                    .data(blob.bytes)
+                    .properties(properties.clone())
+                    .build(),
+                PuffinCompressionCodec::None,
+            )
+            .await
+            .context("PuffinWriter::add")?;
+        statistics_blob_metadata.push(StatisticsBlobMetadata {
+            r#type: siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE.to_string(),
+            snapshot_id,
+            sequence_number,
+            fields: vec![field_id],
+            properties,
+        });
+    }
+    writer.close().await.context("PuffinWriter::close")?;
+    let input = output_file.to_input_file();
+    let file_size_in_bytes = input.metadata().await?.size as i64;
+    let file_footer_size_in_bytes = PuffinReader::new(input)
+        .footer_size_in_bytes()
+        .await
+        .context("PuffinReader::footer_size_in_bytes")? as i64;
+    Ok(StatisticsFile {
+        snapshot_id,
+        statistics_path,
+        file_size_in_bytes,
+        file_footer_size_in_bytes,
+        key_metadata: None,
+        blob_metadata: statistics_blob_metadata,
+    })
 }
 
 async fn write_puffin_sidecar(
@@ -10266,6 +10426,38 @@ fn index_rebuild_enabled_from(configured: Option<&str>) -> bool {
     configured == Some("1")
 }
 
+/// Whether a re-clustering rewrite builds a **segmented** (`seg2`)
+/// inverted-index sidecar for its output while it merges, from the raw
+/// `SIGLAKE_SEGMENTED_INDEX_WRITES` value (`None` = unset).
+///
+/// OFF unless the value is the explicit `"1"` opt-in (#4377). #4562 measured
+/// the format through the query path and the disposition is to proceed
+/// (`docs/DESIGN_segmented_inverted_index.md`), but the reads it would feed are
+/// themselves behind `SIGLAKE_SEGMENTED_INDEX_READS` and neither has been
+/// qualified on an AWS round. With the knob unset a rewrite writes what it
+/// wrote before, byte for byte: no sidecar is built, nothing is registered, and
+/// the output carries no new footer key.
+///
+/// Pure so the deployment default and the opt-in are testable without mutating
+/// the process environment.
+fn segmented_index_writes_enabled_from(configured: Option<&str>) -> bool {
+    configured == Some("1")
+}
+
+/// Dictionary-block byte target for a segmented sidecar built during a rewrite,
+/// from the raw `SIGLAKE_SEGMENTED_INDEX_BLOCK_BYTES` value.
+///
+/// The block size trades the resident directory against the bytes one lookup
+/// fetches, and every measurement in the design was taken at the codec's 4 KiB
+/// default. An unparseable or zero value keeps that default; the codec floors
+/// whatever it is given at 64 bytes.
+fn segmented_index_block_bytes_from(configured: Option<&str>) -> usize {
+    configured
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES)
+}
+
 /// Idempotent namespace bootstrap: check, create, and treat a lost creation
 /// race as success.
 ///
@@ -10823,6 +11015,28 @@ impl IcebergContext {
     fn index_rebuild_enabled(&self) -> bool {
         self.tuning.index_rebuild.unwrap_or_else(|| {
             index_rebuild_enabled_from(std::env::var("SIGLAKE_INDEX_REBUILD").ok().as_deref())
+        })
+    }
+
+    /// See [`segmented_index_writes_enabled_from`]. Off unless opted in.
+    fn segmented_index_writes_enabled(&self) -> bool {
+        self.tuning.segmented_index_writes.unwrap_or_else(|| {
+            segmented_index_writes_enabled_from(
+                std::env::var("SIGLAKE_SEGMENTED_INDEX_WRITES")
+                    .ok()
+                    .as_deref(),
+            )
+        })
+    }
+
+    /// See [`segmented_index_block_bytes_from`].
+    fn segmented_index_block_bytes(&self) -> usize {
+        self.tuning.segmented_index_block_bytes.unwrap_or_else(|| {
+            segmented_index_block_bytes_from(
+                std::env::var("SIGLAKE_SEGMENTED_INDEX_BLOCK_BYTES")
+                    .ok()
+                    .as_deref(),
+            )
         })
     }
 
@@ -16078,7 +16292,14 @@ impl IcebergContext {
         // it still answers the question the guard below asks: would this
         // rewrite conserve the file's rows?
         let mut writer = apply.then(|| {
-            self.lazy_merge_output_writer(table, std::slice::from_ref(file), bloom_columns, true, 0)
+            self.lazy_merge_output_writer(
+                table,
+                std::slice::from_ref(file),
+                bloom_columns,
+                true,
+                0,
+                None,
+            )
         });
         let mut survivor_rows = 0u64;
         while let Some(batch) = survivors.next().await {
@@ -16610,6 +16831,7 @@ impl IcebergContext {
     /// WI-200G fix) while bounding open decoders (so a 600-file day can't OOM).
     /// Intermediate files are written to the table's data dir and deleted once the
     /// next tier consumes them (never committed to the table).
+    #[allow(clippy::too_many_arguments)]
     async fn merge_files_streaming(
         &self,
         table: &Table,
@@ -16618,10 +16840,22 @@ impl IcebergContext {
         rewrite_gen: u32,
         fanin: usize,
         merge: &ReclusterMergeOptions,
+        // One sink for the whole merge, whichever path runs and however many
+        // output files it opens (#4377). Intermediate tier files pass `None`:
+        // they are re-read and discarded, so a sidecar for one would be
+        // registered against a file no snapshot ever holds.
+        segmented_sink: Option<Arc<SegmentedIndexSink>>,
     ) -> Result<(Vec<DataFile>, usize, MergePathKind)> {
         if files.len() <= fanin {
             let (added, rows) = self
-                .merge_file_slice_streaming(table, files, bloom_columns, true, rewrite_gen)
+                .merge_file_slice_streaming(
+                    table,
+                    files,
+                    bloom_columns,
+                    true,
+                    rewrite_gen,
+                    segmented_sink,
+                )
                 .await?;
             return Ok((added, rows, MergePathKind::SliceStreaming));
         }
@@ -16645,6 +16879,7 @@ impl IcebergContext {
                         .merge_chunk_rows
                         .map(|rows| rows.max(1024))
                         .unwrap_or_else(Self::merge_chunk_rows),
+                    segmented_sink,
                 ),
             )
             .await?;
@@ -16655,7 +16890,14 @@ impl IcebergContext {
         loop {
             if tier.len() <= fanin {
                 let (added, rows) = self
-                    .merge_file_slice_streaming(table, &tier, bloom_columns, true, rewrite_gen)
+                    .merge_file_slice_streaming(
+                        table,
+                        &tier,
+                        bloom_columns,
+                        true,
+                        rewrite_gen,
+                        segmented_sink.clone(),
+                    )
                     .await?;
                 if tier_is_intermediate {
                     self.delete_intermediate_files(table, &tier).await;
@@ -16665,7 +16907,14 @@ impl IcebergContext {
             let mut next: Vec<DataFile> = Vec::new();
             for chunk in tier.chunks(fanin) {
                 let (added, _) = self
-                    .merge_file_slice_streaming(table, chunk, bloom_columns, false, rewrite_gen)
+                    .merge_file_slice_streaming(
+                        table,
+                        chunk,
+                        bloom_columns,
+                        false,
+                        rewrite_gen,
+                        None,
+                    )
                     .await?;
                 next.extend(added);
             }
@@ -16773,6 +17022,7 @@ impl IcebergContext {
         bloom_columns: &'a [&'a str],
         with_footers: bool,
         rewrite_gen: u32,
+        segmented_sink: Option<Arc<SegmentedIndexSink>>,
     ) -> LazyMergeOutputWriter<'a> {
         LazyMergeOutputWriter {
             ctx: self,
@@ -16781,6 +17031,7 @@ impl IcebergContext {
             bloom_columns,
             with_footers,
             rewrite_gen,
+            segmented_sink,
             inner: None,
         }
     }
@@ -16794,6 +17045,7 @@ impl IcebergContext {
     /// files are transient sorted Parquet the next tier re-reads + discards, so
     /// footers there are wasted work, and they stay unmarked (gen 0) so only
     /// final output carries the rewrite generation.
+    #[allow(clippy::too_many_arguments)]
     async fn build_merge_output_writer(
         &self,
         table: &Table,
@@ -16808,6 +17060,9 @@ impl IcebergContext {
         // through `lazy_merge_output_writer`, which holds the build until it
         // has a batch.
         sample: Option<&RecordBatch>,
+        // Where the output files' segmented sidecars land (#4377). `None` is
+        // every caller that did not opt in, and then the writer builds none.
+        segmented_sink: Option<Arc<SegmentedIndexSink>>,
         // Boxed rather than `impl IcebergWriter`: an opaque return here makes
         // every future up the compactor call chain trip rustc's
         // higher-ranked-lifetime `Send` limitation at `tokio::spawn`.
@@ -16854,6 +17109,24 @@ impl IcebergContext {
             if let Some(col) = raw_rowgroup_bloom_column_for_schema(&arrow_schema) {
                 parquet_builder = parquet_builder.with_raw_rowgroup_bloom_column(col);
             }
+            // #4377: build the segmented sidecar in this same forward pass,
+            // one group per row group. Only on final output — an intermediate
+            // tier file is re-read and discarded, so a sidecar for it would be
+            // registered against a file that never reaches a snapshot.
+            if let Some(sink) = segmented_sink {
+                let columns = segmented_index_columns_for_table(
+                    table,
+                    &arrow_schema,
+                    self.inverted_index_enabled(),
+                )?;
+                if !columns.is_empty() {
+                    parquet_builder = parquet_builder.with_segmented_index(
+                        columns,
+                        self.segmented_index_block_bytes(),
+                        sink,
+                    );
+                }
+            }
         }
         let location_gen = DefaultLocationGenerator::new(table.metadata().clone())
             .context("default location generator")?;
@@ -16862,12 +17135,21 @@ impl IcebergContext {
             None,
             DataFileFormat::Parquet,
         );
-        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-            parquet_builder,
-            table.file_io().clone(),
-            location_gen,
-            name_gen,
-        );
+        let rolling = match self.tuning.merge_target_file_bytes {
+            Some(target) => RollingFileWriterBuilder::new(
+                parquet_builder,
+                target,
+                table.file_io().clone(),
+                location_gen,
+                name_gen,
+            ),
+            None => RollingFileWriterBuilder::new_with_default_file_size(
+                parquet_builder,
+                table.file_io().clone(),
+                location_gen,
+                name_gen,
+            ),
+        };
         let data_file_builder = DataFileWriterBuilder::new(rolling);
 
         let spec = table.metadata().default_partition_spec();
@@ -16902,6 +17184,7 @@ impl IcebergContext {
         bloom_columns: &[&str],
         with_footers: bool,
         rewrite_gen: u32,
+        segmented_sink: Option<Arc<SegmentedIndexSink>>,
     ) -> Result<(Vec<DataFile>, usize)> {
         use futures::StreamExt;
         use iceberg::arrow::ArrowFileReader;
@@ -16943,8 +17226,14 @@ impl IcebergContext {
             sources.push(stream);
         }
 
-        let mut writer =
-            self.lazy_merge_output_writer(table, files, bloom_columns, with_footers, rewrite_gen);
+        let mut writer = self.lazy_merge_output_writer(
+            table,
+            files,
+            bloom_columns,
+            with_footers,
+            rewrite_gen,
+            segmented_sink,
+        );
 
         let mut merge =
             crate::merge::TimestampKwayMerge::new(sources, merge_col, MERGE_BATCH_ROWS, descending);
@@ -17027,6 +17316,7 @@ impl IcebergContext {
         bloom_columns: &[&str],
         rewrite_gen: u32,
         chunk_rows: usize,
+        segmented_sink: Option<Arc<SegmentedIndexSink>>,
     ) -> Result<(Vec<DataFile>, usize)> {
         use arrow::compute::interleave_record_batch;
         use futures::{StreamExt, TryStreamExt};
@@ -17186,8 +17476,14 @@ impl IcebergContext {
             inflight.push_back(spawn_fetch(ci, args));
         }
 
-        let mut writer =
-            self.lazy_merge_output_writer(table, files, bloom_columns, true, rewrite_gen);
+        let mut writer = self.lazy_merge_output_writer(
+            table,
+            files,
+            bloom_columns,
+            true,
+            rewrite_gen,
+            segmented_sink,
+        );
         let mut rows_written = 0usize;
         let mut fetch_total_nanos = 0u64;
         loop {
@@ -17469,6 +17765,16 @@ impl IcebergContext {
             .unwrap_or(0)
             .saturating_add(1);
 
+        // #4377: the segmented sidecars this rewrite's streaming output builds
+        // as it emits row groups, collected here and registered in the same
+        // transaction as the rewrite below. `None` unless the writer is opted
+        // in, and then nothing about the output changes. The in-RAM arm keeps
+        // its inline v1 index and contributes nothing here (it holds the whole
+        // bin decoded, which is the case the format's bounded build is not for).
+        let segmented_sink = self
+            .segmented_index_writes_enabled()
+            .then(|| Arc::new(SegmentedIndexSink::new()));
+
         // Produce the re-clustered output files + the row count carried through.
         // Two paths: the bounded streaming k-way merge (for bins too large for an
         // in-RAM concat, or when forced), or the whole-bin in-RAM concat + sort.
@@ -17506,8 +17812,16 @@ impl IcebergContext {
                 .merge_fanin
                 .map(|n| n.max(2))
                 .unwrap_or_else(Self::recluster_merge_fanin);
-            self.merge_files_streaming(&table, &files, bloom_columns, out_gen, fanin, merge)
-                .await?
+            self.merge_files_streaming(
+                &table,
+                &files,
+                bloom_columns,
+                out_gen,
+                fanin,
+                merge,
+                segmented_sink.clone(),
+            )
+            .await?
         } else {
             // The set is bounded by the caller, so an in-memory concat is OK.
             let combined = self.read_files_concatenated(&table, &files).await?;
@@ -17554,8 +17868,29 @@ impl IcebergContext {
             }
         };
 
+        // #4377: publish the segmented sidecars WITH the rewrite. The Puffin
+        // object is written now, under a snapshot id reserved for the commit
+        // below, and `set_statistics` rides the same transaction — so the
+        // snapshot that first exposes these data files already carries their
+        // index, and a commit that fails leaves an unreferenced object rather
+        // than a discoverable partial index. Nothing here can be skipped and
+        // retried later, which is the post-commit rebuild this replaces.
+        let segmented_blobs = segmented_sink.map(|sink| sink.take()).unwrap_or_default();
+        let segmented_statistics = if segmented_blobs.is_empty() {
+            None
+        } else {
+            let reserved = iceberg::transaction::reserve_snapshot_id(&table);
+            let sequence_number = table.metadata().next_sequence_number();
+            Some((
+                reserved,
+                write_segmented_puffin_sidecar(&table, reserved, sequence_number, segmented_blobs)
+                    .await
+                    .context("write segmented index sidecar")?,
+            ))
+        };
+
         let tx = Transaction::new(&table);
-        let action = tx
+        let mut action = tx
             .rewrite_files()
             // Unique per-writer UUID filenames ⇒ a merged output can't collide with
             // an existing file; skip the O(live files)-per-commit duplicate scan
@@ -17570,10 +17905,22 @@ impl IcebergContext {
                 REWRITE_COMMIT_PROP.to_string(),
                 "recluster".to_string(),
             )]));
+        if let Some((reserved, _)) = segmented_statistics.as_ref() {
+            action = action.with_snapshot_id(*reserved);
+        }
         // B.1.1: ALL per-snapshot aggregates now live in the fixed-path side object,
         // which persists across the recluster (rows unchanged → still valid against
         // total-records). No summary carry-forward needed anymore.
         let tx = action.apply(tx).context("RewriteFilesAction::apply")?;
+        let tx = match segmented_statistics {
+            Some((_, statistics)) => {
+                let register = tx.update_statistics().set_statistics(statistics);
+                register
+                    .apply(tx)
+                    .context("UpdateStatisticsAction::apply")?
+            }
+            None => tx,
+        };
         {
             let _commit_guard = self
                 .table_commit_lock
@@ -23371,6 +23718,28 @@ mod env_knob_resolver_tests {
         assert!(!index_rebuild_enabled_from(Some("junk")));
         assert!(index_rebuild_enabled_from(Some("1")));
     }
+
+    #[test]
+    fn segmented_index_writes_default_off_and_only_literal_one_enables_them() {
+        assert!(!segmented_index_writes_enabled_from(None));
+        assert!(!segmented_index_writes_enabled_from(Some("0")));
+        assert!(!segmented_index_writes_enabled_from(Some("true")));
+        assert!(!segmented_index_writes_enabled_from(Some("junk")));
+        assert!(segmented_index_writes_enabled_from(Some("1")));
+    }
+
+    #[test]
+    fn segmented_index_block_bytes_keeps_the_codec_default_unless_given_a_size() {
+        let codec_default = siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES;
+        assert_eq!(segmented_index_block_bytes_from(None), codec_default);
+        assert_eq!(segmented_index_block_bytes_from(Some("0")), codec_default);
+        assert_eq!(
+            segmented_index_block_bytes_from(Some("4 KiB")),
+            codec_default
+        );
+        assert_eq!(segmented_index_block_bytes_from(Some("-1")), codec_default);
+        assert_eq!(segmented_index_block_bytes_from(Some("16384")), 16_384);
+    }
 }
 
 #[cfg(test)]
@@ -27534,6 +27903,7 @@ mod streaming_recluster_tests {
                 1,
                 IcebergContext::recluster_merge_fanin(),
                 &ReclusterMergeOptions::default(),
+                None,
             )
             .await
             .unwrap();
@@ -27643,11 +28013,11 @@ mod streaming_recluster_tests {
         let table = ice.catalog().load_table(&ident).await.unwrap();
 
         let (streamed, streamed_rows) = ice
-            .merge_file_slice_streaming(&table, &files, BLOOM_FILTER_COLUMNS, true, 1)
+            .merge_file_slice_streaming(&table, &files, BLOOM_FILTER_COLUMNS, true, 1, None)
             .await
             .unwrap();
         let (paged, paged_rows) = ice
-            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 1, 4)
+            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 1, 4, None)
             .await
             .unwrap();
         assert_eq!(streamed_rows, 25);
@@ -27694,7 +28064,7 @@ mod streaming_recluster_tests {
         let table = ice.catalog().load_table(&ident).await.unwrap();
 
         let (added, rows) = ice
-            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 2, 1 << 20)
+            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 2, 1 << 20, None)
             .await
             .unwrap();
         assert_eq!(rows, 6);

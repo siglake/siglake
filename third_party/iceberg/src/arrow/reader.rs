@@ -2766,6 +2766,13 @@ impl ArrowReader {
     /// independently, by blob type, so a table may carry either or both, per
     /// file, with no migration.
     ///
+    /// Both segmented generations are discovered, seg2 first (#4377): a file
+    /// carrying both is answered from the compressed one, and a file carrying
+    /// only the prototype's seg1 blob still reads. The order is a preference,
+    /// not a fallback — a seg2 blob that declines declines the file, exactly as
+    /// it would have if the seg1 one were not there, because both describe the
+    /// same rows.
+    ///
     /// Bounded reading is the point, so the cost is recorded per file:
     /// `siglake_iceberg_segmented_index_range_reads` /
     /// `_fetched_bytes` are what the lookup asked the object store for, and
@@ -2779,9 +2786,13 @@ impl ArrowReader {
         spec: &RawPruneSpec,
         cache_bypass: bool,
     ) -> Result<Option<RowSelection>> {
-        let blob_type = siglake_index::segmented::SEGMENTED_BLOB_TYPE;
+        // Preference order: the compressed generation first.
+        let blob_types = [
+            siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE,
+            siglake_index::segmented::SEGMENTED_BLOB_TYPE,
+        ];
         if !task.statistics_blobs.iter().any(|stats_blob| {
-            stats_blob.blob_type == blob_type
+            blob_types.contains(&stats_blob.blob_type.as_str())
                 && stats_blob
                     .properties
                     .get("column")
@@ -2799,11 +2810,16 @@ impl ArrowReader {
             Self::record_segmented_decline("row_group_order");
             return Ok(None);
         }
-        let mut selection = None;
-        for stats_blob in &task.statistics_blobs {
-            if stats_blob.blob_type != blob_type {
-                continue;
+        let mut candidates: Vec<(&str, &crate::scan::StatisticsBlobReference)> = Vec::new();
+        for blob_type in blob_types {
+            for stats_blob in &task.statistics_blobs {
+                if stats_blob.blob_type == blob_type {
+                    candidates.push((blob_type, stats_blob));
+                }
             }
+        }
+        let mut selection = None;
+        for (blob_type, stats_blob) in candidates {
             let path = stats_blob.statistics_path.as_str();
             let Some(blob_metadata) = Self::puffin_blob_metadata(
                 file_io,

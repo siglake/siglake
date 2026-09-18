@@ -25,7 +25,10 @@ use crate::Result;
 use crate::spec::DataFileBuilder;
 
 mod parquet_writer;
-pub use parquet_writer::{ParquetWriter, ParquetWriterBuilder};
+pub use parquet_writer::{
+    ParquetWriter, ParquetWriterBuilder, SegmentedIndexBlob, SegmentedIndexColumn,
+    SegmentedIndexSink,
+};
 
 use crate::io::OutputFile;
 
