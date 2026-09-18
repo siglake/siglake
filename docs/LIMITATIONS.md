@@ -80,7 +80,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   ignored and does not suppress a v1 rebuild. The writer-produced 14 × 7.34M
   rerun kept both rare scans faster than the scan (0.14x and 0.06x), with
   27,883,741 bytes holding all fourteen directories and 17.58 MiB of statistics
-  per file; the historical seg1 columns remain in the design record. Both
+  per file; the historical seg1 columns remain in the design record. The
+  clipped policy now reads point-term document frequency from dictionary
+  blocks before fetching postings and admits a file when summed df is no
+  larger than the query's clip (#5040). On the same retained fixture,
+  `rare_keyword` moved from the 545.9 ms scan fallback to 56.6 ms p50, while
+  the four ordinary clipped shapes declined and measured 0.67-1.10x their scan
+  controls. Substring sweeps still decline without reading the dictionary.
+  Both
   defaults stay off until AWS
   qualification, and two pieces of the writer's acceptance are still open: its
   build time and peak heap at 14 x 7.34M rows are unmeasured (#5234). With the

@@ -381,15 +381,20 @@ writer: the two rare scans were 0.14x and 0.06x the scan, with one seg2 blob per
 live file, exact answers and matched Parquet layouts (#5230). Its statistics
 cost 17.58 MiB per file at this layout, against 15.59 MiB for whole-file v1.
 
-**Whether to USE an index is decided per execution.** Loading one is a
-whole-file cost, so a query that wants a handful of rows cannot pay it: a text
-predicate under a `LIMIT` stops the scan after a sliver of the first file,
-while the index charges for every row in every planned file. Both forms are
-declined — a `LIMIT` under an `ORDER BY timestamp` (including the implicit
-newest-first one) because an index row selection defeats the ordered drain's
-contiguous tail read, and a bare `LIMIT` because the scan short-circuits
-first. An unclipped text scan keeps the index, which is the regime it wins in.
-The refusal is attributed by
+**Whether to USE an index is decided per execution.** A whole-file v1 index is
+declined for both `LIMIT` forms: under `ORDER BY timestamp` (including the
+implicit newest-first form), its row selection defeats the ordered drain's
+contiguous tail read; under a bare clipped `LIMIT`, its full decode costs more
+than the short-circuiting scan. The experimental seg2 reader treats the bare
+form separately. It opens the directory, locates point terms in their
+dictionary blocks, and keeps the lookup only when the selected groups' summed
+document frequency is no larger than the clip. An over-budget estimate is
+`siglake_iceberg_segmented_index_declined_total{reason="clipped_document_frequency"}`;
+a substring has no bounded point estimate and uses
+`reason="clipped_estimate_unavailable"`. Both fall back to the exact scan,
+never to v1. The directory and dictionary reads spent reaching either decision
+are included in the segmented range-read and fetched-byte histograms. An
+unclipped text scan keeps either format. The v1 refusal is attributed by
 `siglake_query_inverted_index_declined_total{reason}` and named in the scan's
 `EXPLAIN` line (`text_index:[declined:clipped_limit]`), and it never changes a
 result: the index only ever produced a superset row selection, blooms stay
