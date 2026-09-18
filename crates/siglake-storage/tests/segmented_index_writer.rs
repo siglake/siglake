@@ -10,6 +10,8 @@
 //!   per file, addressed to the right one;
 //! - a rewrite whose commit fails leaves nothing discoverable — the Puffin
 //!   object is written before the commit, and discovery is by registration;
+//! - an append before the first commit attempt and one that forces a CAS retry
+//!   leave the rewrite snapshot, table metadata and Puffin footer in agreement;
 //! - the post-commit full-file decode does not run for a column the rewrite
 //!   already indexed, and a second rebuild call is a no-op;
 //! - the index state the rewrite holds is one row group's, not the file's.
@@ -38,6 +40,7 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use siglake_core::Event;
 use siglake_index::segmented::{SegmentedReader, SliceSource, SEGMENTED_V2_BLOB_TYPE};
 use siglake_index::InvertedIndex;
+use siglake_storage::iceberg::test_catalog::TestCatalog;
 use siglake_storage::iceberg::{IcebergContext, IcebergTuning, ReclusterMergeOptions};
 
 /// Peak live heap bytes between [`start_tracking`] and [`peak_tracked`], the
@@ -443,6 +446,47 @@ async fn assert_sidecar_describes_file(
     );
 }
 
+/// Assert the three copies of a seg2 blob's snapshot identity: the snapshot,
+/// the table's `StatisticsFile` entry and the physical Puffin footer.
+async fn assert_current_seg2_sequence_agreement(table: &Table) {
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("the rewrite committed a snapshot");
+    let statistics = table
+        .metadata()
+        .statistics_iter()
+        .find(|statistics| statistics.snapshot_id == snapshot.snapshot_id())
+        .expect("the rewrite snapshot registered statistics");
+    let table_blobs: Vec<_> = statistics
+        .blob_metadata
+        .iter()
+        .filter(|blob| blob.r#type == SEGMENTED_V2_BLOB_TYPE)
+        .collect();
+    assert!(!table_blobs.is_empty(), "the statistics entry carries seg2");
+    for blob in table_blobs {
+        assert_eq!(blob.snapshot_id, snapshot.snapshot_id());
+        assert_eq!(blob.sequence_number, snapshot.sequence_number());
+    }
+
+    let input = table
+        .file_io()
+        .new_input(&statistics.statistics_path)
+        .unwrap();
+    let reader = iceberg::puffin::PuffinReader::new(input);
+    let physical = reader.file_metadata().await.unwrap();
+    let physical_blobs: Vec<_> = physical
+        .blobs()
+        .iter()
+        .filter(|blob| blob.blob_type() == SEGMENTED_V2_BLOB_TYPE)
+        .collect();
+    assert_eq!(physical_blobs.len(), statistics.blob_metadata.len());
+    for blob in physical_blobs {
+        assert_eq!(blob.snapshot_id(), snapshot.snapshot_id());
+        assert_eq!(blob.sequence_number(), snapshot.sequence_number());
+    }
+}
+
 async fn count(ctx: &SessionContext, sql: &str) -> i64 {
     let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
     batches[0]
@@ -623,6 +667,123 @@ fn a_streaming_rewrite_publishes_a_sidecar_that_describes_its_output() {
             text_counts(&on).await,
             text_counts(&off).await,
             "the rewrite's rows must not depend on whether it built an index beside them"
+        );
+    });
+}
+
+/// A foreign append lands after the rewrite read its base but before the
+/// transaction's first commit attempt reloads it. The first attempt therefore
+/// builds directly on the newer base, without needing a failed CAS to expose
+/// the stale pre-write sequence-number capture.
+#[test]
+fn an_append_before_the_first_commit_attempt_refreshes_seg2_sequence_metadata() {
+    serialized(|_snapshotter| async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("stale-first-base");
+        let mut rewrite = open_fixture(&warehouse, true, Some(1), None).await;
+        let fresh = append_rows(&rewrite, 0..150_000, 150_000, RARE_EVERY).await;
+        let before = rewrite
+            .catalog()
+            .load_table(rewrite.events_table_ident())
+            .await
+            .unwrap()
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+
+        let appender = IcebergContext::open(&warehouse).await.unwrap();
+        let appended = Arc::new(AtomicBool::new(false));
+        let gated = TestCatalog::new(rewrite.catalog().clone())
+            .after_load_table({
+                let appended = appended.clone();
+                move || {
+                    let appender = appender.clone();
+                    let appended = appended.clone();
+                    async move {
+                        if !appended.swap(true, Ordering::SeqCst) {
+                            appender
+                                .append_events(&[Event::now("intervening-before-attempt")])
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+            })
+            .shared();
+        rewrite = rewrite.with_catalog_for_test(gated);
+
+        let live = rewrite_fresh(&rewrite, fresh).await;
+        assert!(appended.load(Ordering::SeqCst), "the append hook fired");
+        assert_eq!(
+            live.iter().map(DataFile::record_count).sum::<u64>(),
+            150_001,
+            "the append and rewrite publish atomically without losing either file"
+        );
+        let table = rewrite
+            .catalog()
+            .load_table(rewrite.events_table_ident())
+            .await
+            .unwrap();
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .sequence_number(),
+            before + 2
+        );
+        assert_current_seg2_sequence_agreement(&table).await;
+    });
+}
+
+/// A foreign append lands in the first attempt's CAS window. That attempt's
+/// Puffin file stays unreferenced; the retry reuses the written Parquet output
+/// and seg2 bytes, and stamps a new Puffin footer from the refreshed base.
+#[test]
+fn an_append_during_a_forced_cas_retry_refreshes_seg2_sequence_metadata() {
+    serialized(|_snapshotter| async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("cas-retry");
+        let mut rewrite = open_fixture(&warehouse, true, Some(1), None).await;
+        let fresh = append_rows(&rewrite, 0..150_000, 150_000, RARE_EVERY).await;
+
+        let appender = IcebergContext::open(&warehouse).await.unwrap();
+        let gated = TestCatalog::new(rewrite.catalog().clone())
+            .before_first_update_with_base(move || {
+                let appender = appender.clone();
+                async move {
+                    appender
+                        .append_events(&[Event::now("intervening-in-cas-window")])
+                        .await
+                        .unwrap();
+                }
+            })
+            .shared();
+        rewrite = rewrite.with_catalog_for_test(gated.clone());
+
+        let live = rewrite_fresh(&rewrite, fresh).await;
+        assert!(gated.fired(), "the forced-CAS hook fired");
+        assert_eq!(
+            live.iter().map(DataFile::record_count).sum::<u64>(),
+            150_001,
+            "the successful retry retains both the append and rewritten rows"
+        );
+        let table = rewrite
+            .catalog()
+            .load_table(rewrite.events_table_ident())
+            .await
+            .unwrap();
+        assert_current_seg2_sequence_agreement(&table).await;
+        assert_eq!(
+            registered_seg2_blobs(&table).len(),
+            1,
+            "the failed attempt's Puffin object is not discoverable"
+        );
+        let indexed_file = &registered_seg2_blobs(&table)[0].1;
+        assert!(
+            live.iter().any(|file| file.file_path() == indexed_file),
+            "the retry registers the Parquet output already written by the rewrite"
         );
     });
 }
