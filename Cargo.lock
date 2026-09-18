@@ -6319,6 +6319,7 @@ dependencies = [
  "siglake-bloom",
  "siglake-core",
  "siglake-index",
+ "siglake-wal",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",

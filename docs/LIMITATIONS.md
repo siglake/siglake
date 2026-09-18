@@ -1208,7 +1208,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `siglake_compactor_index_unresolved_total`.
   `docs/DESIGN_wal_recovery_root_identity.md` has the measured cases, and
   names the remaining exact answer as its own slice: `--catalog <uri>`, which
-  reads the true `(tenant, index_id)` and prefix out of `wal_segments`.
+  reads the true `(tenant, index_id)` and prefix out of `wal_segments`. That
+  slice is designed and locally qualified but NOT shipped, so the limitation
+  above is the shipped behaviour;
+  `docs/DESIGN_wal_recovery_ledger_identity.md` (#4974) has the rules and the
+  measured read-only, partial-match and cost results the flag would carry.
   The second defect that document records — a correct restore of a tenant with
   only index segments omitted the tenant discovery dir the ingester writes and
   was never drained — is fixed (#4972): the restore rebuilds
