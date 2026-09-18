@@ -487,3 +487,52 @@ tell when the fsync is buying nothing.
   the argument above says none should ship.
 - **Concurrent drain pressure.** The box ran no compactor; the sealed directory
   was never being renamed out from under the pin.
+
+# What the unpin fsync costs, and why it stays (task #4919)
+
+**Date:** 2026-09-18 · **Evidence:** `report_unpin_cost_breakdown`
+(`crates/siglake-wal/src/mirror.rs`, `#[ignore]`d), three runs; and a
+source-versus-candidate loopback A/B, `results/wal-mirror-unpin-2026-09-18/`,
+harness `unpin-ab.sh` and `unpin-report.py` beside the arms.
+**Verdict: PLACEHOLDER-VERDICT**
+
+#3787's follow-up said the mirror takes two more directory fsyncs per segment on
+the unpin side and that both could go, because a lost unlink costs one stat the
+next sweep pass repeats. The premise was wrong twice over. The two call sites are
+alternatives, not a pair: `remove_pin` after a confirmed upload
+(`mirror.rs:529`) and `remove_candidate_pin` per swept candidate
+(`mirror.rs:809`) both unlink one pin, and a healthy writer reaches the first
+once per uploaded segment and the second never — so the cost is one unpin fsync
+per segment, not two. And the repair is not always a repeated stat: once the
+mirror-ledger reclamation of `docs/DESIGN_wal_mirror_reclamation.md` is on, a
+resurrected pin can put a collected object back.
+
+## One unpin, priced
+
+The same shape as #3787's pin table, turned around: 200 segments sealed the way
+`WalWriter::seal` leaves them and pinned, then unpinned, `TMPDIR` on the ext4
+`/home` volume, three runs. Microseconds per unpin, means:
+
+| batch | `remove_file` | `sync_dir` per unpin | unpin total | idle barrier |
+|---|---|---|---|---|
+| 1 | 8.3–9.3 | 379.2–433.4 | 387.4–442.7 | 4.9–5.7 |
+| 2 | 7.0–7.8 | 191.3–195.6 | 198.2–203.5 | 4.3–6.2 |
+| 4 | 6.3–6.9 | 94.7–99.0 | 101.0–105.8 | 4.0–6.1 |
+| 8 | 6.1–6.4 | 48.3–51.9 | 54.5–58.3 | 4.2–5.9 |
+| 16 | 6.2–6.4 | 24.5–25.2 | 30.7–31.6 | 4.1–5.3 |
+| 64 | 6.0–6.1 | 6.3–6.6 | 12.3–12.6 | 4.3–6.6 |
+| 200 | 5.9–6.0 | 2.4 | 8.3–8.4 | 4.6–13.5 |
+
+Whole `remove_pin`, same runs: 384–391 µs mean with the sealed name still
+present, 431–448 µs when the pin is the segment's last local name and the unlink
+also frees its blocks. The unlink is 6–9 µs of that — under 2.5 %. The
+proportion is the pin's: the fsync is the cost, and it amortizes almost linearly,
+down to 2.4 µs per unpin at one sync per 200.
+
+So the arithmetic in the premise holds: ~390 µs per uploaded segment, at the
+60.6 seals/s of #3758's saturation arm, is 24 ms of journal work per second on
+the device the writer is fsyncing. What it is not is seal time. `remove_pin`
+runs on the mirror worker after `notify_uploaded` (`mirror.rs:361`), and
+`remove_candidate_pin` on the sweep task. Whether 24 ms/s of somebody else's
+journal work reaches delivered throughput is not arithmetic, and that is what
+the A/B is for.
