@@ -1,16 +1,19 @@
 # Design — row-group-addressable inverted-index sidecars (#4376 prototype)
 
-Status (2026-09-17): **prototype; the scan path can read one, off by default.**
+Status (2026-09-18): **seg2 codec complete; production read/write adoption is
+still off.**
 The codec and its reader are `siglake_index::segmented`, and the reader
 integration (#4561) is behind `SIGLAKE_SEGMENTED_INDEX_READS` — see
-[Reader integration](#reader-integration-4561). The writer is untouched:
-nothing produces a segmented sidecar, so with the knob unset every default
+[Reader integration](#reader-integration-4561). The production writer is
+untouched: nothing emits a segmented sidecar into a table, so with the knob
+unset every default
 behaves exactly as it did. This document is the format decision #4377 needs
 ahead of building postings during a streaming merge, and the specification the
 remaining slices implement: #4560 (the codec, its fixtures and the format's
 open questions — settled below), #4561 (reader integration and bounded partial
 reads — below), #5006 (the directory held between lookups — below), #4562 (the
-measured proceed/revise/reject disposition).
+measured proceed/revise/reject disposition), and #4988 (block compression plus
+posting-span integrity — complete below).
 
 It exists because the shipped format has one property that cannot be fixed by
 sizing a cache: **it is only readable whole.**
@@ -139,10 +142,17 @@ Four separate discriminators, so no reader ever has to guess:
 4. **Its own `format` property** on the registered blob, `seg1`, beside the `v1`
    the shipped writer stamps.
 
-A table may carry both kinds at once, per file, with no migration and no
-in-place conversion: the two keys and two blob types do not collide, and a file
-with neither is scanned. That is the compatibility rule — **the format is
-per-file metadata, never table state.**
+Seg2 repeats the external discriminators as
+`siglake-inverted-seg-v2`, `siglake.inverted_index.seg2` and `format: seg2`,
+with version 2 in its header and trailer. `SegmentedReader` decodes both byte
+layouts once handed a range source; production discovery still selects only
+the seg1 blob type, so adding the codec does not make an existing query choose
+seg2.
+
+A table may carry v1, seg1 and seg2 at once, per file, with no migration and no
+in-place conversion: their keys and blob types do not collide, and a file with
+none is scanned. That is the compatibility rule — **the format is per-file
+metadata, never table state.**
 
 Nothing here touches the Parquet or Iceberg v2 contract. A segmented sidecar is
 a Puffin blob registered as a statistics file exactly as the v1 sidecar is, or a
@@ -255,7 +265,8 @@ correct answer by everything the format checks.
 
 ### Do posting sections need their own checksum?
 
-Not in `seg1`, on these numbers. Measured at the per-file scale above
+Seg1 keeps its original bytes without one. Seg2 adopts a CRC per block's
+posting span, coupled to block compression. Measured at the per-file scale above
 (`report_posting_checksum_and_compression_options`):
 
 | option | cost on disk | median bytes a point lookup fetches per row group | catches the residual |
@@ -273,9 +284,14 @@ lookup fetches that span (a median 945 B) instead of the term's slice. Against
 the 1,618 B dictionary block it fetches anyway, that is 1.58x the bytes per
 group and still thousandths of a percent of the blob.
 
-The prototype takes neither, because nothing reads it yet and the exposure
-equals the shipped format's at the codec level. Two things should reopen it,
-and both belong to #4562's disposition rather than here:
+The seg2 reader fetches one compressed posting-span frame, bounds decompression
+by the directory's raw length, verifies the decoded length and CRC, and only
+then slices out the named term. A frame error, length mismatch or CRC mismatch
+is `Unanswerable`. This closes both the single-bit residual and a directory
+whose otherwise-valid offsets address the wrong span.
+
+The decision was taken because #4562 retained the format and measured the
+uncompressed sidecar at 5.59x the shipped sidecar's on-disk bytes:
 
 - **Registering uncompressed removes a checksum that exists today.** The v1
   sidecar travels inside a Zstd frame written with `include_checksum(true)`
@@ -283,10 +299,10 @@ and both belong to #4562's disposition rather than here:
   anywhere in it fails decompression and the file is scanned. An uncompressed
   segmented blob has no such cover, and its posting sections are then the only
   part of it no checksum spans.
-- **Per-block compression wants the same granularity** (see
+- **Per-block compression uses the same granularity** (see
   [Publication semantics](#publication-semantics-what-4377-needs)), so a
-  version that compresses per block gets the checksum at no additional read
-  cost — the span is already the fetch unit.
+  compressed version gets the checksum without another read — the span is
+  already the fetch unit.
 
 The checksum itself is IEEE CRC-32 from `crc32fast`, which the tree already
 carried behind flate2. The prototype's bytewise table ran at 0.531 GB/s against
@@ -312,7 +328,8 @@ The whole layout is arranged so a merge can write it in **one forward pass**:
   offset from the end, and a truncated blob does not have it.
 
 For registration, a segmented sidecar should carry the properties the v1 one
-does (`data_file`, `column`, `tokenizer`) plus `format: seg1`, and should **not**
+does (`data_file`, `column`, `tokenizer`) plus its versioned `format` (`seg1` or
+`seg2`), and should **not**
 carry `row_group_size`: the directory states every group's row count, so the
 reader validates against the Parquet metadata itself. A merge that emits row
 groups of unequal size is then representable, which the stamped-size check
@@ -329,9 +346,10 @@ uncompressed against the ~16 MiB per file the Zstd'd v1 sidecar occupies on disk
 
 ### What per-section compression would recover
 
-`seg1` stores every section uncompressed. That is a prototype decision the
-layout does not require. Measured on the same file, at the zstd level Puffin
-uses (3):
+`seg1` stores every section uncompressed. Seg2 compresses every dictionary
+block and every block's posting span as independent Zstd-3 frames. Its
+directory carries each frame's stored and raw lengths; posting entries also
+carry the CRC of the raw span. Measured on the same file:
 
 | | bytes | ratio |
 |---|---:|---:|
@@ -339,21 +357,17 @@ uses (3):
 | zstd over the whole blob (what a v1 sidecar pays, and what a range reader cannot use) | 16.3 MiB | 0.19x |
 | zstd per dictionary block | 2.5 MiB of 35.9 | 0.07x |
 | zstd per block posting span | 13.4 MiB of 49.4 | 0.27x |
-| per-block total, directory uncompressed | **16.4 MiB** | **0.19x** |
+| projected per-block total, directory uncompressed | **16.4 MiB** | **0.19x** |
+| seg2 codec output, including its larger directory | **16.7 MiB** | **0.19x** |
 
-Compressing at block granularity recovers the whole storage gap — 16.4 MiB
-against 16.3 MiB for whole-blob zstd, within 0.6% — while every section stays
-reachable by a range read. It is the same trade the per-block posting checksum
-asks for and for the same reason: the block's span becomes the unit the reader
-fetches whole, since nothing can be sliced out of a compressed block. A
-directory field per block would carry the compressed and raw lengths; the byte
-ranges the directory addresses do not change shape.
-
-That is a `seg2` question, deliberately left to #4562's disposition: it costs a
-decompression per lookup, the 1.58x fetched bytes above, and a format field that
-`seg1` has no reader for. What the measurement settles is that "85.8 MiB against
-16 MiB" is not an argument against the layout — it is the cost of this
-prototype's simplest choice.
+Compressing at block granularity recovers the storage gap while every section
+stays reachable by a range read. The measured codec is 0.3 MiB above the
+projection because seg2 records four lengths and two CRCs per block and each
+section is its own frame. On the six query shapes, one warm file fetched 5.7
+KiB for full-file point lookups, 1.6 KiB for last-quarter lookups, 638 B for a
+unique token, and 2.7 MiB for the whole-dictionary substring sweep. Those are
+stored bytes after compression; the earlier 1.58x figure prices the raw span
+the codec has to decode and checksum.
 
 ## Reader integration (#4561)
 
@@ -929,13 +943,12 @@ result with the shipped format.
 
 Two revisions belong in #4377's scope rather than after it:
 
-1. **#4988's per-block compression is a prerequisite, not a follow-on.** As
-   prototyped the sidecar is 5.59x the on-disk bytes of the v1 one it replaces
-   (87.19 MiB against 15.59 MiB per file), because the interior has to stay
-   addressable. #4988 projects 16.4 MiB per file with per-block compression,
-   which is parity, and it settles the posting-span checksum in the same
-   decision. Building the format into the merge at 5.59x storage would ship a
-   regression the compaction path pays on every file.
+1. **#4988's per-block compression prerequisite is complete.** As prototyped
+   the sidecar is 5.59x the on-disk bytes of the v1 one it replaces (87.19 MiB
+   against 15.59 MiB per file). Seg2 writes 16.7 MiB at the codec fixture's
+   7.34M-row scale and settles the posting-span checksum at the same block
+   granularity. #4377 can build the versioned format without carrying seg1's
+   storage regression into every compacted file.
 2. **#4375's decline has to become document-frequency aware.** Its rule declines
    any clipped `LIMIT`, which is right for a whole-file decode and wrong for this
    format: it costs `rare_keyword` an 11.1x win (47.6 ms against 550.4 ms) while
@@ -974,15 +987,11 @@ What remains, in order:
    parsed / 256 MiB blob and again with both off, plus the OFF control.
    **Proceed, with two revisions** — #4988 first, and a df-aware decline in
    #4375's rule.
-4. **A `seg2` question #4562's disposition promotes to a prerequisite** (#4988):
-   per-block compression and a
-   per-block posting checksum, which are one decision — both need the block's
-   posting span to be the unit the reader fetches whole, and the measured price
-   of that is 1.58x the bytes a point lookup fetches per group. What they buy is
-   16.4 MiB per file instead of 85.8, and the end of the residual above. #4562
-   measured the format 5.59x the v1 sidecar's bytes **on disk**, where the v1
-   blob is Zstd-compressed and this one cannot be, which is why it now blocks
-   #4377 rather than following it.
+4. ~~**#4988**~~ — done: seg2 compresses the dictionary block and its posting
+   span independently, records stored and raw lengths, and verifies a CRC over
+   the decoded posting span before slicing a term. Seg1 bytes are pinned by a
+   fixture and remain readable. The 7.34M-row report writes 16.7 MiB and records
+   fetched bytes for all six shapes.
 5. **An open question for #4561**: the substring sweep reads the whole
    dictionary, and `keyword`-class terms with millions of postings read megabytes
    of posting bytes. Both are regimes where partial reads buy little, and #4375's
@@ -1009,7 +1018,8 @@ The first two are sized by `SIGLAKE_SEG_ROWS_PER_FILE` (7,340,000 above), `SIGLA
 are the values every table above was taken at; the run takes 14 minutes, almost
 all of it the v1 arm's 42 re-decodes per shape.
 
-The third is the checksum and compression table: 14 s, sized by
+The third is the seg1 checksum and compression projection retained as the
+decision's baseline: 14 s, sized by
 `SIGLAKE_SEG_ROWS` (7,340,000), `SIGLAKE_SEG_GROUP_ROWS` (1,048,576),
 `SIGLAKE_SEG_RARE_EVERY` (100,000) and `SIGLAKE_SEG_BLOCK_BYTES` (4,096). Its
 byte counts reproduce the per-file section's exactly, which is what makes the

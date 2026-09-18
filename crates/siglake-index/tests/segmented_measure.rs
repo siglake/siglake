@@ -1,5 +1,5 @@
 //! #4376 prototype measurement: the shipped whole-file index against the
-//! experimental segmented layout, at the compacted 50G layout's per-file scale.
+//! block-compressed seg2 layout, at the compacted 50G layout's per-file scale.
 //!
 //! `report_segmented_vs_whole_file` is `#[ignore]`d — it builds a multi-million
 //! row index and holds a 1 GiB cache. What it reports, and why each column is
@@ -221,7 +221,7 @@ fn report_segmented_vs_whole_file() {
     let block_bytes = knob("SIGLAKE_SEG_BLOCK_BYTES", DEFAULT_TARGET_BLOCK_BYTES);
 
     println!(
-        "\n# segmented sidecar prototype (#4376)\n\
+        "\n# segmented sidecar seg2 (#4988)\n\
          rows/file={rows_per_file} group_rows={group_rows} files={files} runs={runs} \
          rare_every={rare_every} parsed_budget={} block_bytes={block_bytes}",
         mib(parsed_bytes as u64)
@@ -238,7 +238,7 @@ fn report_segmented_vs_whole_file() {
     let v1_bytes = whole.to_bytes();
 
     let built = Instant::now();
-    let mut writer = SegmentedWriter::new(block_bytes);
+    let mut writer = SegmentedWriter::new_v2(block_bytes);
     let mut group_start = 0usize;
     while group_start < rows_per_file {
         let group_end = (group_start + group_rows).min(rows_per_file);
@@ -268,7 +268,7 @@ fn report_segmented_vs_whole_file() {
          | format | build | serialized | parse/open | resident |\n\
          |---|---:|---:|---:|---:|\n\
          | whole-file v1 | {:?} | {} | {:?} | {} |\n\
-         | segmented | {:?} | {} | {:?} | {} |\n\
+         | seg2 | {:?} | {} | {:?} | {} |\n\
          \nserialized ratio {:.2}x · resident ratio {:.0}x smaller · \
          dictionary {} · postings {} · directory {}",
         whole.n_rows(),
@@ -491,7 +491,7 @@ fn report_segmented_vs_whole_file() {
         );
     }
     println!(
-        "\nv1 resident working set for {files} files: {} · segmented: {}",
+        "\nv1 resident working set for {files} files: {} · seg2: {}",
         mib((whole.heap_size_bytes() * files) as u64),
         mib((reader.resident_bytes() * files) as u64),
     );
