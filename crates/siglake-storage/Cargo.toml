@@ -14,6 +14,11 @@ experimental-exact-point-rollup = []
 [dev-dependencies]
 arrow-array = { workspace = true }
 chrono = { workspace = true }
+# #4974's ledger-identity prototype compares the routing a mirror KEY implies
+# against the routing the catalog recorded, and it has to infer that routing the
+# way the WAL mirror's own parser does rather than with a private copy. Dev-only:
+# siglake-wal does not depend on this crate, and nothing in `src/` uses it.
+siglake-wal = { workspace = true }
 metrics-util = "0.20"
 proptest = { workspace = true }
 tempfile = "3"
