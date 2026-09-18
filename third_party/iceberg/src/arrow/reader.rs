@@ -4761,15 +4761,15 @@ impl PuffinBlobCacheInner {
 ///
 /// So, in order of preference:
 ///
-/// 1. A blob nothing has read while this cache turned over twice. Its file has
-///    left the working set — compacted away, or simply not queried — and
-///    protecting it is how "keep what the parsed cache dropped" turns into a
-///    cache pinned to dead files. Nothing here can see that a file is gone, so
-///    the only available proof is that the blob has been readable for two
-///    turnovers and no decode wanted it. A read renews the entry, so a file the
-///    plan keeps reading is never stale: it is read once per pass, and a pass
-///    admits fewer blobs than the cache holds for as long as the cache covers
-///    any of the plan.
+/// 1. A blob nothing has read while this cache turned over
+///    [`BLOB_PROTECTION_TURNOVERS`] times. Its file has left the working set —
+///    compacted away, or simply not queried — and protecting it is how "keep
+///    what the parsed cache dropped" turns into a cache pinned to dead files.
+///    Nothing here can see that a file is gone, so the only available proof is
+///    that the blob has been readable for that many turnovers and no decode
+///    wanted it. A read renews the entry, so a file the plan keeps reading is
+///    never stale: it is read once per pass, and a pass admits fewer blobs
+///    than the cache holds for as long as the cache covers any of the plan.
 /// 2. A blob whose parsed twin is resident, and among those the one whose twin
 ///    sits furthest from the parsed cache's eviction end — the one that stays
 ///    unreadable longest. `parsed_twins` maps each resident Puffin entry to its
@@ -4781,15 +4781,6 @@ impl PuffinBlobCacheInner {
 /// It never declines the incoming blob. A cache that refuses to evict cannot
 /// follow a working set at all, and the fetch has already been paid by the time
 /// this is asked.
-/// How many of its own turnovers a blob keeps its protection for, with nothing
-/// reading it. The gap between a blob being cached and the next execution
-/// reaching its file is one pass of the plan, which admits one blob per file
-/// the cache does not hold — so this covers a plan up to about three times the
-/// blob budget, and past that the pair is simply too small for the plan (#4102)
-/// and protection lapses into first-in-first-out. Measured over the plan sizes
-/// in `a_plan_larger_than_both_caches_stops_refetching_every_blob`.
-const BLOB_PROTECTION_TURNOVERS: u64 = 4;
-
 fn blob_cache_victim(
     order: &std::collections::VecDeque<(String, u64)>,
     entries: &std::collections::HashMap<(String, u64), PuffinBlobEntry>,
@@ -4814,6 +4805,15 @@ fn blob_cache_victim(
         .or_else(redundant)
         .or_else(|| (!order.is_empty()).then_some(0))
 }
+
+/// How many of its own turnovers a blob keeps its protection for, with nothing
+/// reading it. The gap between a blob being cached and the next execution
+/// reaching its file is one pass of the plan, which admits one blob per file
+/// the cache does not hold — so this covers a plan up to about three times the
+/// blob budget, and past that the pair is simply too small for the plan (#4102)
+/// and protection lapses into first-in-first-out. Measured over the plan sizes
+/// in `a_plan_larger_than_both_caches_stops_refetching_every_blob`.
+const BLOB_PROTECTION_TURNOVERS: u64 = 4;
 
 static PUFFIN_BLOB_CACHE: std::sync::OnceLock<std::sync::Mutex<PuffinBlobCacheInner>> =
     std::sync::OnceLock::new();
@@ -6905,7 +6905,8 @@ message schema {
         let key = |n: u64| (format!("s3://bucket/stats-{n}.puffin"), n);
         let order: std::collections::VecDeque<(String, u64)> = (0..4).map(key).collect();
         // Four entries, each active at a different tick; `admitted` = 4 leaves
-        // all of them inside the two turnovers protection lasts.
+        // all of them inside the `BLOB_PROTECTION_TURNOVERS` turnovers
+        // protection lasts.
         let entries: std::collections::HashMap<(String, u64), PuffinBlobEntry> = (0..4)
             .map(|n| {
                 (key(n), PuffinBlobEntry {
