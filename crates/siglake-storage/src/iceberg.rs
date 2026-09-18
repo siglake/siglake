@@ -8667,6 +8667,14 @@ pub struct IcebergTuning {
     /// Dictionary-block byte target for that sidecar. `None` = as
     /// `SIGLAKE_SEGMENTED_INDEX_BLOCK_BYTES` says, which is the codec's 4 KiB.
     pub segmented_index_block_bytes: Option<usize>,
+    /// Compressed-byte target at which a merge's rolling writer opens another
+    /// output file. `None` = Iceberg's `write.target-file-size-bytes` default,
+    /// which is what production uses.
+    ///
+    /// Exists so a test can exercise a rewrite that splits its output across
+    /// several data files — one sidecar per output file (#4377) — without
+    /// writing half a gigabyte to get there.
+    pub merge_target_file_bytes: Option<usize>,
 }
 
 /// Decide whether a re-cluster bin is merged via the memory-bounded streaming
@@ -16757,12 +16765,21 @@ impl IcebergContext {
             None,
             DataFileFormat::Parquet,
         );
-        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-            parquet_builder,
-            table.file_io().clone(),
-            location_gen,
-            name_gen,
-        );
+        let rolling = match self.tuning.merge_target_file_bytes {
+            Some(target) => RollingFileWriterBuilder::new(
+                parquet_builder,
+                target,
+                table.file_io().clone(),
+                location_gen,
+                name_gen,
+            ),
+            None => RollingFileWriterBuilder::new_with_default_file_size(
+                parquet_builder,
+                table.file_io().clone(),
+                location_gen,
+                name_gen,
+            ),
+        };
         let data_file_builder = DataFileWriterBuilder::new(rolling);
 
         let spec = table.metadata().default_partition_spec();

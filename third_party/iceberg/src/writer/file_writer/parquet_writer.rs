@@ -1032,6 +1032,13 @@ impl ParquetWriter {
                 return;
             }
             let index = builder.build();
+            // The bound this design rests on, recorded per group rather than
+            // inferred: what the writer holds live is THIS group's postings and
+            // dictionary, dropped at the end of this iteration. A file-
+            // proportional build would show the same series growing group by
+            // group.
+            metrics::histogram!("siglake_iceberg_segmented_index_group_index_bytes")
+                .record(index.heap_size_bytes() as f64);
             writer.push_group_index(&index);
             rows.push(index.n_rows());
         }
