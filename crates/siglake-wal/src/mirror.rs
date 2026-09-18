@@ -2029,6 +2029,109 @@ mod tests {
         assert!(!pinned.exists(), "catch-up must release a recovered pin");
     }
 
+    /// #4919: what a pin that outlived its upload costs, with the object
+    /// present. `remove_pin` fsyncs `mirror-pending/` after the unlink; if
+    /// that sync were dropped, a crash inside the journal's commit window
+    /// would bring the dirent back. This is the state it comes back to: the
+    /// next sweep stats the key, finds the object, re-registers it (the
+    /// insert is `ON CONFLICT DO NOTHING`, `catalog_claim.rs`) and unlinks the
+    /// pin again, without a second PUT.
+    #[tokio::test]
+    async fn a_stale_pin_over_a_present_object_costs_one_stat_and_one_unlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        let mut writer = crate::WalWriter::with_thresholds(
+            &root,
+            "ing-test",
+            2,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let op = memory_op();
+        let (mirror, handle) = WalMirror::new(op.clone(), "wal-mirror");
+        writer.set_mirror_handle(Some(handle));
+        let segment = writer
+            .append_events(&[synth_event(1), synth_event(2)])
+            .unwrap()
+            .expect("seal");
+        drop(writer);
+        mirror.run().await;
+
+        let key = format!("wal-mirror/{}", segment.mirror_key_suffix);
+        let pinned = pending_path(&segment).unwrap();
+        assert!(!pinned.exists(), "the upload released its pin");
+
+        // The unlink did not survive the crash: the dirent is back, over an
+        // object that is present and correct.
+        pin_segment(&segment).unwrap();
+        op.write(&key, "sentinel").await.unwrap();
+
+        let recovered = catch_up_sweep(&op, "wal-mirror", &root).await.unwrap();
+        assert_eq!(recovered.len(), 1, "the stale pin is re-registered");
+        assert_eq!(
+            op.read(&key).await.unwrap().to_bytes(),
+            "sentinel".as_bytes(),
+            "a present object must not be re-uploaded"
+        );
+        assert!(!pinned.exists(), "the repair unlinks the stale pin again");
+    }
+
+    /// #4919: the same stale pin after mirror reclamation collected its key
+    /// is not a repeat of cheap work. The segment committed locally, the mark
+    /// and retention deleted the object and its row
+    /// (`docs/DESIGN_wal_mirror_reclamation.md`, which skips pinned segments
+    /// precisely so this cannot happen while a pin is live), and the pin is
+    /// the segment's only remaining local name. The sweep now reads it and
+    /// PUTs it back: a reclaimed object returns, and its registration is a
+    /// fresh `sealed` row for a segment that is already committed.
+    #[tokio::test]
+    async fn a_stale_pin_recreates_a_key_reclamation_collected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        let mut writer = crate::WalWriter::with_thresholds(
+            &root,
+            "ing-test",
+            2,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let op = memory_op();
+        let (mirror, handle) = WalMirror::new(op.clone(), "wal-mirror");
+        writer.set_mirror_handle(Some(handle));
+        let segment = writer
+            .append_events(&[synth_event(1), synth_event(2)])
+            .unwrap()
+            .expect("seal");
+        drop(writer);
+        mirror.run().await;
+
+        let key = format!("wal-mirror/{}", segment.mirror_key_suffix);
+        let pinned = pending_path(&segment).unwrap();
+        pin_segment(&segment).unwrap();
+
+        // The local drain commits and retention reaps every local name but
+        // the resurrected pin.
+        let processing = crate::claim_segment(&segment.path).unwrap();
+        crate::finish_segment(&processing).unwrap();
+        crate::sweep_committed(&root, std::time::Duration::ZERO).unwrap();
+        assert!(pinned.exists(), "the pin is the last local name");
+
+        // Mirror reclamation collects the committed key and its row.
+        op.delete(&key).await.unwrap();
+
+        let recovered = catch_up_sweep(&op, "wal-mirror", &root).await.unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "the pin re-registers a committed segment as sealed"
+        );
+        assert!(
+            op.stat(&key).await.is_ok(),
+            "a reclaimed object came back from the stale pin"
+        );
+        assert!(!pinned.exists());
+    }
+
     #[tokio::test]
     async fn a_missing_local_source_skips_the_retry_backoff() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3660,11 +3763,46 @@ mod upload_retry_tests {
     }
 }
 
-/// Task #3787's measurement of what `pin_segment` costs a seal, part by part.
+/// Task #3787's measurement of what `pin_segment` costs a seal, part by part,
+/// and task #4919's of what the unpin side costs.
 #[cfg(test)]
 mod pin_cost_tests {
     use super::*;
     use crate::SEALED_DIR;
+    use std::time::Instant;
+
+    fn knob(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Mean / p50 / p90, in microseconds. Consumes the order.
+    fn stats(samples: &mut [f64]) -> (f64, f64, f64) {
+        samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN durations"));
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let at = |p: f64| samples[(((samples.len() - 1) as f64) * p).round() as usize];
+        (mean, at(0.5), at(0.9))
+    }
+
+    fn since(t: Instant) -> f64 {
+        t.elapsed().as_secs_f64() * 1e6
+    }
+
+    /// Lay a sealed segment down exactly as the seal path leaves it.
+    fn seal_one(sealed: &Path, name: &str, body: &[u8]) -> PathBuf {
+        let final_path = sealed.join(name);
+        let tmp_path = sealed.join(format!("{name}.tmp"));
+        {
+            let mut f = std::fs::File::create(&tmp_path).unwrap();
+            std::io::Write::write_all(&mut f, body).unwrap();
+            crate::durability::sync_file(&f, &tmp_path).unwrap();
+        }
+        crate::durability::rename(&tmp_path, &final_path).unwrap();
+        crate::durability::sync_dir(sealed).unwrap();
+        final_path
+    }
 
     /// #3787: where does the seal path's pin cost go, and what would batching
     /// the directory fsync recover?
@@ -3691,41 +3829,6 @@ mod pin_cost_tests {
     #[test]
     #[ignore = "measurement, not a gate"]
     fn report_pin_cost_breakdown() {
-        use std::time::Instant;
-
-        fn knob(name: &str, default: usize) -> usize {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default)
-        }
-
-        /// Mean / p50 / p90, in microseconds. Consumes the order.
-        fn stats(samples: &mut [f64]) -> (f64, f64, f64) {
-            samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN durations"));
-            let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-            let at = |p: f64| samples[(((samples.len() - 1) as f64) * p).round() as usize];
-            (mean, at(0.5), at(0.9))
-        }
-
-        fn since(t: Instant) -> f64 {
-            t.elapsed().as_secs_f64() * 1e6
-        }
-
-        /// Lay a sealed segment down exactly as the seal path leaves it.
-        fn seal_one(sealed: &Path, name: &str, body: &[u8]) -> PathBuf {
-            let final_path = sealed.join(name);
-            let tmp_path = sealed.join(format!("{name}.tmp"));
-            {
-                let mut f = std::fs::File::create(&tmp_path).unwrap();
-                std::io::Write::write_all(&mut f, body).unwrap();
-                crate::durability::sync_file(&f, &tmp_path).unwrap();
-            }
-            crate::durability::rename(&tmp_path, &final_path).unwrap();
-            crate::durability::sync_dir(sealed).unwrap();
-            final_path
-        }
-
         let iters = knob("PIN_COST_ITERS", 200);
         let seg_bytes = knob("PIN_COST_SEGMENT_BYTES", 90 * 1024);
         // 164.8 MB over 1,819 segments in the saturation arm: ~90 KiB each.
@@ -3815,6 +3918,142 @@ mod pin_cost_tests {
             println!(
                 "{batch:>5}  {lookup_mean:>10.1}  {link_mean:>10.1}  {sync_mean:>12.1}  {:>12.1}  {idle_mean:>12.1}",
                 lookup_mean + link_mean + sync_mean
+            );
+        }
+        println!();
+    }
+
+    /// #4919: what does the unpin side cost, and what would batching its
+    /// directory fsync recover?
+    ///
+    /// Two call sites unlink a pin and fsync `mirror-pending/`: `remove_pin`
+    /// after a confirmed upload, and `remove_candidate_pin` per pinned sweep
+    /// candidate. A healthy writer reaches the first one once per uploaded
+    /// segment and the second one never, so this prices one unpin per upload
+    /// and, separately, a sweep pass that unpins a whole backlog.
+    ///
+    /// Neither site is on the seal path — the first runs on a mirror worker,
+    /// the second on the sweep task — so what these microseconds buy or cost
+    /// is journal work on the device the writer is fsyncing, not synchronous
+    /// seal time. The A/B in `docs/PERF_WAL_MIRROR_2026-09-11.md` is what says
+    /// whether that contention reaches ingest throughput.
+    ///
+    /// The unlink is priced in both states it meets: with the sealed name
+    /// still present (the pin is one of two links, so the unlink drops a
+    /// dirent and `i_nlink`) and with the pin as the last link (the drain
+    /// already reaped `sealed/`, so the unlink also frees the segment's
+    /// blocks). The directory shrinks through each arm here, where
+    /// `report_pin_cost_breakdown`'s grows.
+    ///
+    ///     TMPDIR=/var/tmp cargo test -p siglake-wal --lib \
+    ///         report_unpin_cost_breakdown -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement, not a gate"]
+    fn report_unpin_cost_breakdown() {
+        let iters = knob("PIN_COST_ITERS", 200);
+        let seg_bytes = knob("PIN_COST_SEGMENT_BYTES", 90 * 1024);
+        let body = vec![0x5au8; seg_bytes];
+
+        println!(
+            "\n#4919 unpin cost: {iters} unpins x {seg_bytes} B, tmpdir {} (fsync must reach a device)",
+            std::env::temp_dir().display()
+        );
+        println!("all figures microseconds per unpin\n");
+
+        /// Seal `iters` segments and pin each one the way the seal path does.
+        fn seal_and_pin(
+            root: &Path,
+            iters: usize,
+            seg_bytes: usize,
+            body: &[u8],
+        ) -> Vec<WalSegment> {
+            let sealed = root.join(SEALED_DIR);
+            std::fs::create_dir_all(&sealed).unwrap();
+            let mut segments = Vec::with_capacity(iters);
+            for i in 0..iters {
+                let name = format!("ing-{i:06}.arrow");
+                let path = seal_one(&sealed, &name, body);
+                let segment = WalSegment {
+                    path,
+                    rows: 1,
+                    bytes: seg_bytes as u64,
+                    mirror_key_suffix: name,
+                };
+                pin_segment(&segment).unwrap();
+                segments.push(segment);
+            }
+            segments
+        }
+
+        // Arm 0: the whole `remove_pin`, in each of the two link states.
+        for last_link in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let segments = seal_and_pin(tmp.path(), iters, seg_bytes, &body);
+            let mut whole = Vec::with_capacity(iters);
+            for segment in &segments {
+                if last_link {
+                    std::fs::remove_file(&segment.path).unwrap();
+                    crate::durability::sync_dir(segment.path.parent().unwrap()).unwrap();
+                }
+                let t = Instant::now();
+                remove_pin(segment).unwrap();
+                whole.push(since(t));
+            }
+            let (mean, p50, p90) = stats(&mut whole);
+            let state = if last_link {
+                "pin is last link"
+            } else {
+                "sealed name kept"
+            };
+            println!(
+                "remove_pin, whole ({state:16}):  mean {mean:8.1}  p50 {p50:8.1}  p90 {p90:8.1}"
+            );
+        }
+
+        // The sweep policy is the batch column read at `batch = iters`: one
+        // fsync for a whole pass instead of one per candidate.
+        let batches: Vec<usize> = [1usize, 2, 4, 8, 16, 64, iters]
+            .into_iter()
+            .filter(|b| *b <= iters)
+            .collect();
+        println!(
+            "\n{:>5}  {:>10}  {:>14}  {:>12}  {:>12}",
+            "batch", "unlink", "sync_dir/unpin", "unpin total", "idle barrier"
+        );
+        for batch in batches {
+            let tmp = tempfile::tempdir().unwrap();
+            let segments = seal_and_pin(tmp.path(), iters, seg_bytes, &body);
+            let pending = tmp.path().join(MIRROR_PENDING_DIR);
+
+            let mut unlink = Vec::with_capacity(iters);
+            let mut sync = Vec::with_capacity(iters / batch + 1);
+            let mut idle = Vec::with_capacity(iters / batch + 1);
+            let mut unsynced = 0usize;
+            for segment in &segments {
+                let pin = pending_path(segment).unwrap();
+                let t = Instant::now();
+                std::fs::remove_file(&pin).unwrap();
+                unlink.push(since(t));
+
+                unsynced += 1;
+                if unsynced == batch {
+                    let t = Instant::now();
+                    crate::durability::sync_dir(&pending).unwrap();
+                    sync.push(since(t) / batch as f64);
+                    // Same directory, nothing pending: what a deferred sync
+                    // costs the task that ends up carrying it.
+                    let t = Instant::now();
+                    crate::durability::sync_dir(&pending).unwrap();
+                    idle.push(since(t));
+                    unsynced = 0;
+                }
+            }
+            let (unlink_mean, ..) = stats(&mut unlink);
+            let (sync_mean, ..) = stats(&mut sync);
+            let (idle_mean, ..) = stats(&mut idle);
+            println!(
+                "{batch:>5}  {unlink_mean:>10.1}  {sync_mean:>14.1}  {:>12.1}  {idle_mean:>12.1}",
+                unlink_mean + sync_mean
             );
         }
         println!();
