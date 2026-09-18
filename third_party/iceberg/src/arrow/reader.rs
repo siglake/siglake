@@ -2851,6 +2851,14 @@ impl ArrowReader {
                 .record(cost.reads as f64);
             metrics::histogram!("siglake_iceberg_segmented_index_fetched_bytes")
                 .record(cost.bytes as f64);
+            // #5007: what the staged shape costs and buys. `_stages` is the
+            // rounds of store waits the lookup took, against the `_range_reads`
+            // a serial source would have waited for one at a time;
+            // `_reader_reads` is what a stage re-decodes on its way past the
+            // ranges the lookup already holds.
+            metrics::histogram!("siglake_iceberg_segmented_index_stages").record(cost.stages as f64);
+            metrics::histogram!("siglake_iceberg_segmented_index_reader_reads")
+                .record(cost.requests as f64);
             metrics::histogram!("siglake_iceberg_segmented_index_resident_bytes")
                 .record(resident_bytes as f64);
             metrics::histogram!("siglake_iceberg_segmented_index_selected_rows")
@@ -2865,11 +2873,22 @@ impl ArrowReader {
         Ok(selection)
     }
 
-    /// One segmented lookup over one blob: the range reads run on a blocking
-    /// thread ([`siglake_index::segmented::RangeSource`] is synchronous) and
-    /// are served from here, one at a time, by
-    /// [`crate::puffin::BlobRangeReader`]. The reader holds a directory and
-    /// asks for what a term needs.
+    /// One segmented lookup over one blob, driven in **stages** (#5007): the
+    /// lookup itself is synchronous and runs on this task, decoding only the
+    /// ranges it already holds and recording the ones it does not
+    /// ([`siglake_index::segmented::StagedSource`]); this then fetches that
+    /// stage's ranges together, through [`crate::puffin::BlobRangeReader`],
+    /// and runs the lookup again. A store wait happens between two runs of the
+    /// lookup, never inside one, so it holds no thread of tokio's blocking
+    /// pool — where #4561 held one for the whole of a file's lookup, IO waits
+    /// included, per file a fanned-out scan was looking up in.
+    ///
+    /// The stages are the trailer, the directory, the dictionary blocks the
+    /// terms name and their posting sections: four rounds of store waits for
+    /// any shape, whatever its read count, plus one per additional term of a
+    /// conjunction (whose postings are fetched rarest-first and stop as soon as
+    /// the intersection empties). The ranges *within* a stage go out together,
+    /// bounded by [`segmented_range_concurrency`].
     ///
     /// The directory itself is held between lookups (#5006,
     /// [`segmented_directory_cache_get`]), so a repeat lookup on the same
@@ -2900,51 +2919,86 @@ impl ArrowReader {
                 ));
             }
         };
-        let counters = Arc::new(SegmentedReadCounters::default());
-        let (requests, mut inbox) = tokio::sync::mpsc::channel::<SegmentedRangeRequest>(1);
-        let source = PuffinRangeSource {
-            len: range_reader.len(),
-            requests,
-            counters: Arc::clone(&counters),
-        };
+        let source = siglake_index::segmented::StagedSource::new(range_reader.len());
         let offset = blob_metadata.offset();
         let held = if cache_bypass {
             None
         } else {
             segmented_directory_cache_get(statistics_path, offset)
         };
-        let row_counts = row_counts.to_vec();
-        let groups = groups.map(<[usize]>::to_vec);
-        let spec = spec.clone();
-        let lookup = tokio::task::spawn_blocking(move || {
-            segmented_lookup(source, &row_counts, groups.as_deref(), &spec, held)
-        });
-        // Serve the lookup's reads until it drops the source, which it does by
-        // returning — so this ends whether it answered, declined or panicked.
-        while let Some((offset, len, reply)) = inbox.recv().await {
-            let bytes = range_reader
-                .read_at(offset, len as u64)
-                .await
-                .ok()
-                .map(|bytes| bytes.to_vec());
-            let _ = reply.send(bytes);
+        // Termination does not rest on this: a stage fills every range it
+        // asked for, an unreadable one included, so the held set only grows
+        // and a blob has finitely many ranges. It bounds a future reader that
+        // asked for ranges some other way.
+        let stage_budget = 8 + 4
+            * (spec.all_terms.len() + spec.any_terms.len() + spec.index_substrings.len()).max(1);
+        let concurrency = segmented_range_concurrency();
+        let mut stages = 0u64;
+        // The directory the first stage that could parse it parsed. Carried
+        // into the later stages so that a replay re-decodes dictionary blocks
+        // and not the whole directory (474.9 KiB on the 7.34M-row file), and
+        // held apart from the round's own return so the entry still reaches
+        // the cache when the answering round opened on it.
+        let mut parsed_here: Option<Arc<SegmentedDirectory>> = None;
+        let mut directory = held;
+        loop {
+            let (outcome, parsed) = segmented_lookup(
+                source.clone(),
+                row_counts,
+                groups,
+                spec,
+                directory.as_ref().map(Arc::clone),
+            );
+            if let Some(parsed) = parsed {
+                parsed_here = Some(Arc::clone(&parsed));
+                directory = Some(parsed);
+            }
+            let misses = source.take_misses();
+            if misses.is_empty() {
+                // A directory this lookup parsed is kept whatever the outcome:
+                // the parse is what the next lookup on this blob should not
+                // repeat, and a decline over one file's row groups says
+                // nothing about the next query's.
+                if !cache_bypass
+                    && let Some(directory) = parsed_here
+                {
+                    segmented_directory_cache_put(statistics_path, offset, directory);
+                }
+                return Ok((outcome, segmented_cost(&source, stages)));
+            }
+            stages += 1;
+            if stages > stage_budget as u64 {
+                return Ok((
+                    SegmentedOutcome::Declined("stages"),
+                    segmented_cost(&source, stages),
+                ));
+            }
+            // This stage's ranges, together. A range the store refuses is
+            // filled as unreadable, which the reader reads as the failed range
+            // read it is — `Unanswerable`, never a wrong answer — and which
+            // keeps the next run from asking for it again.
+            let reader = &range_reader;
+            futures::stream::iter(misses.into_iter().map(|(offset, len)| async move {
+                (
+                    offset,
+                    len,
+                    reader
+                        .read_at(offset, len as u64)
+                        .await
+                        .ok()
+                        .map(|bytes| bytes.to_vec()),
+                )
+            }))
+            .buffer_unordered(concurrency)
+            .for_each(|(offset, len, bytes)| {
+                match bytes {
+                    Some(bytes) => source.fill(offset, len, bytes),
+                    None => source.fill_unreadable(offset, len),
+                }
+                std::future::ready(())
+            })
+            .await;
         }
-        let (outcome, parsed) = lookup.await.map_err(|err| {
-            Error::new(
-                ErrorKind::Unexpected,
-                format!("segmented index lookup: {err}"),
-            )
-        })?;
-        // A directory this lookup parsed is kept whatever the outcome: the
-        // parse is what the next lookup on this blob should not repeat, and a
-        // decline over one file's row groups says nothing about the next
-        // query's.
-        if !cache_bypass
-            && let Some(directory) = parsed
-        {
-            segmented_directory_cache_put(statistics_path, offset, directory);
-        }
-        Ok((outcome, counters.cost()))
     }
 
     fn record_segmented_decline(reason: &'static str) {
@@ -3588,65 +3642,55 @@ fn segmented_index_reads_from(raw: Option<&str>) -> bool {
     )
 }
 
-/// siglake (#4561): one range read a segmented lookup asked for, and where to
-/// put the bytes.
-type SegmentedRangeRequest = (u64, usize, tokio::sync::oneshot::Sender<Option<Vec<u8>>>);
+/// siglake (#5007): how many of a stage's ranges a segmented lookup fetches at
+/// once. Default [`DEFAULT_RANGE_FETCH_CONCURRENCY`], the bound the scan's own
+/// merged-range reader uses;
+/// `SIGLAKE_SEGMENTED_INDEX_RANGE_CONCURRENCY` overrides it.
+fn segmented_range_concurrency() -> usize {
+    static CONCURRENCY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CONCURRENCY.get_or_init(|| {
+        segmented_range_concurrency_from(
+            std::env::var("SIGLAKE_SEGMENTED_INDEX_RANGE_CONCURRENCY")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn segmented_range_concurrency_from(raw: Option<&str>) -> usize {
+    raw.map(str::trim)
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&concurrency| concurrency > 0)
+        .unwrap_or(DEFAULT_RANGE_FETCH_CONCURRENCY)
+}
 
 /// What one segmented lookup fetched — the evidence that it read a sliver of
 /// the blob rather than the whole of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SegmentedReadCost {
+    /// Ranges the store served — and, within a rounding of the dedupe below,
+    /// the sequential round trips a source serving one range at a time would
+    /// have taken. A range the reader asked for twice (two terms in one
+    /// dictionary block, a later stage re-reading an earlier one) is fetched
+    /// once and counted once.
     pub(crate) reads: u64,
     pub(crate) bytes: u64,
+    /// Reads the reader made, across every stage. Against
+    /// [`Self::reads`] this is what the staged shape re-decodes: a range read
+    /// again is served from what the lookup already holds, but its block is
+    /// verified and walked again.
+    pub(crate) requests: u64,
+    /// Rounds of store waits: the trailer, the directory, the dictionary
+    /// blocks, the posting sections.
+    pub(crate) stages: u64,
 }
 
-#[derive(Default)]
-struct SegmentedReadCounters {
-    reads: std::sync::atomic::AtomicU64,
-    bytes: std::sync::atomic::AtomicU64,
-}
-
-impl SegmentedReadCounters {
-    fn cost(&self) -> SegmentedReadCost {
-        use std::sync::atomic::Ordering::Relaxed;
-        SegmentedReadCost {
-            reads: self.reads.load(Relaxed),
-            bytes: self.bytes.load(Relaxed),
-        }
-    }
-}
-
-/// siglake (#4561): the segmented reader's byte source, backed by a Puffin
-/// blob. [`siglake_index::segmented::RangeSource`] is synchronous and the
-/// object store is not, so the lookup runs on a blocking thread and hands each
-/// range to the async side over a channel. A read the async side could not
-/// serve comes back as `None`, which the segmented reader turns into
-/// `Unanswerable` — a scan, never a wrong answer.
-///
-/// Cloneable so one lookup can hand the same channel to a second open of the
-/// same blob (#5006's fallback when a held directory turns out not to be this
-/// blob's). Both clones read over the one channel and charge the one set of
-/// counters, so the cost stays the lookup's.
-#[derive(Clone)]
-struct PuffinRangeSource {
-    len: u64,
-    requests: tokio::sync::mpsc::Sender<SegmentedRangeRequest>,
-    counters: Arc<SegmentedReadCounters>,
-}
-
-impl siglake_index::segmented::RangeSource for PuffinRangeSource {
-    fn len(&self) -> u64 {
-        self.len
-    }
-
-    fn read(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let (reply, answer) = tokio::sync::oneshot::channel();
-        self.requests.blocking_send((offset, len, reply)).ok()?;
-        let bytes = answer.blocking_recv().ok()??;
-        self.counters.reads.fetch_add(1, Relaxed);
-        self.counters.bytes.fetch_add(bytes.len() as u64, Relaxed);
-        Some(bytes)
+fn segmented_cost(source: &siglake_index::segmented::StagedSource, stages: u64) -> SegmentedReadCost {
+    SegmentedReadCost {
+        reads: source.fetched_reads(),
+        bytes: source.fetched_bytes(),
+        requests: source.requests(),
+        stages,
     }
 }
 
@@ -3662,7 +3706,8 @@ pub(crate) enum SegmentedOutcome {
     Declined(&'static str),
 }
 
-/// siglake (#4561): the whole per-file policy, on a blocking thread.
+/// siglake (#4561): the whole per-file policy, synchronous, over whatever
+/// ranges the source holds.
 ///
 /// The three-outcome contract is what makes this safe to run ahead of the
 /// scan: only a definitive answer prunes rows, and anything the index cannot
@@ -3673,8 +3718,13 @@ pub(crate) enum SegmentedOutcome {
 /// reader opens on it and reads neither the trailer nor the directory. The
 /// second return is a directory this call parsed, for the caller to hold —
 /// `None` when it opened on `held`.
+///
+/// Called once per stage (#5007). A range the source does not hold is a
+/// recorded miss and reads as a failed read, so a run that is missing one
+/// declines; `segmented_matching_rows` fetches what the run recorded and calls
+/// this again, and only a run that recorded nothing is the lookup's answer.
 fn segmented_lookup(
-    source: PuffinRangeSource,
+    source: siglake_index::segmented::StagedSource,
     row_counts: &[u64],
     groups: Option<&[usize]>,
     spec: &RawPruneSpec,
@@ -5742,13 +5792,14 @@ mod tests {
     use crate::ErrorKind;
 
     use crate::arrow::reader::{
-        CollectFieldIdVisitor, DEFAULT_SEGMENTED_DIRECTORY_CACHE_MAX_BYTES,
-        PARQUET_FIELD_ID_META_KEY, ParquetReadOptions, RawPruneSpec, SegmentedDirectory,
-        SegmentedDirectoryCacheInner, SegmentedOutcome, SegmentedReadCost,
-        parsed_inverted_index_cache_stats, puffin_blob_cache_stats,
-        segmented_directory_cache_footprint,
+        CollectFieldIdVisitor, DEFAULT_RANGE_FETCH_CONCURRENCY,
+        DEFAULT_SEGMENTED_DIRECTORY_CACHE_MAX_BYTES, PARQUET_FIELD_ID_META_KEY,
+        ParquetReadOptions, RawPruneSpec, SegmentedDirectory, SegmentedDirectoryCacheInner,
+        SegmentedOutcome, SegmentedReadCost, parsed_inverted_index_cache_stats,
+        puffin_blob_cache_stats, segmented_directory_cache_footprint,
         segmented_directory_cache_max_bytes_from, segmented_directory_cache_put,
         segmented_directory_cache_stats, segmented_index_reads_from,
+        segmented_range_concurrency_from,
     };
     use siglake_index::segmented::{SEGMENTED_BLOB_TYPE, SEGMENTED_FORMAT_PROPERTY};
     use crate::arrow::{ArrowReader, ArrowReaderBuilder};
@@ -10452,13 +10503,19 @@ message schema {
             ),
         ];
 
+        // #5007's columns, printed as a second table below: the rounds of
+        // store waits against the reads a serial source would have waited for
+        // one at a time, and what the replay re-decodes on the way.
+        let mut staged: Vec<(&str, SegmentedReadCost, SegmentedReadCost, u128, u128)> = Vec::new();
         for (name, spec, groups) in shapes {
+            let started = std::time::Instant::now();
             let (outcome, cost) =
                 ArrowReader::segmented_matching_rows(
                 &file_io, &path, &blob, &counts, groups, &spec, true,
             )
             .await
             .unwrap();
+            let cold_micros = started.elapsed().as_micros();
             let SegmentedOutcome::Matching {
                 rows: matching,
                 resident_bytes,
@@ -10492,12 +10549,15 @@ message schema {
             // it, the second runs on the held one. Both answer the same rows
             // as the cold arm, which is asserted before either is reported.
             let mut warm = SegmentedReadCost::default();
+            let mut warm_micros = 0u128;
             for _ in 0..2 {
+                let started = std::time::Instant::now();
                 let (outcome, cost) = ArrowReader::segmented_matching_rows(
                     &file_io, &path, &blob, &counts, groups, &spec, false,
                 )
                 .await
                 .unwrap();
+                warm_micros = started.elapsed().as_micros();
                 let SegmentedOutcome::Matching {
                     rows: warm_rows, ..
                 } = outcome
@@ -10518,6 +10578,25 @@ message schema {
                 100.0 * warm.bytes as f64 / blob.length() as f64,
                 resident_bytes
             );
+            staged.push((name, cost, warm, cold_micros, warm_micros));
+        }
+        println!(
+            "\nstaged reading (#5007): stages are the rounds of store waits; reader reads are \
+             what each round re-decodes\nshape                 cold stages  cold reads  \
+             cold reader reads  cold µs  warm stages  warm reads  warm reader reads  warm µs"
+        );
+        for (name, cold, warm, cold_micros, warm_micros) in staged {
+            println!(
+                "{name:<20} {:>12} {:>11} {:>18} {:>8} {:>12} {:>11} {:>18} {:>8}",
+                cold.stages,
+                cold.reads,
+                cold.requests,
+                cold_micros,
+                warm.stages,
+                warm.reads,
+                warm.requests,
+                warm_micros
+            );
         }
         let footprint = segmented_directory_cache_footprint();
         println!(
@@ -10529,6 +10608,322 @@ message schema {
             footprint.evictions,
             footprint.oversized_skips
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // siglake #5007: the store waits happen between runs of the synchronous
+    // reader, so a lookup holds no thread of tokio's blocking pool.
+    // ----------------------------------------------------------------------
+
+    /// An in-memory store whose every range read takes `delay_millis` and which
+    /// records how many reads were in flight at once — the two things the
+    /// staged shape has to be measured against. It serves bytes per path, so
+    /// one of these stands in for a fanned-out scan's several sidecars.
+    #[derive(Debug, Default)]
+    struct DelayedStorageState {
+        files: std::sync::Mutex<HashMap<String, Bytes>>,
+        delay_millis: AtomicUsize,
+        reads: AtomicUsize,
+        in_flight: AtomicUsize,
+        peak_in_flight: AtomicUsize,
+    }
+
+    fn default_delayed_storage_state() -> Arc<DelayedStorageState> {
+        Arc::new(DelayedStorageState::default())
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct DelayedStorageFactory {
+        #[serde(skip, default = "default_delayed_storage_state")]
+        state: Arc<DelayedStorageState>,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct DelayedStorage {
+        #[serde(skip, default = "default_delayed_storage_state")]
+        state: Arc<DelayedStorageState>,
+    }
+
+    #[typetag::serde]
+    impl StorageFactory for DelayedStorageFactory {
+        fn build(&self, _config: &StorageConfig) -> crate::Result<Arc<dyn Storage>> {
+            Ok(Arc::new(DelayedStorage {
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct DelayedFileRead {
+        state: Arc<DelayedStorageState>,
+        path: String,
+    }
+
+    #[async_trait]
+    impl FileRead for DelayedFileRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            let in_flight = self.state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state
+                .peak_in_flight
+                .fetch_max(in_flight, Ordering::SeqCst);
+            self.state.reads.fetch_add(1, Ordering::SeqCst);
+            let delay = self.state.delay_millis.load(Ordering::SeqCst) as u64;
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            self.state.in_flight.fetch_sub(1, Ordering::SeqCst);
+            let files = self.state.files.lock().unwrap();
+            let data = files.get(&self.path).ok_or_else(|| {
+                crate::Error::new(ErrorKind::DataInvalid, format!("no file {}", self.path))
+            })?;
+            Ok(data.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    #[async_trait]
+    #[typetag::serde]
+    impl Storage for DelayedStorage {
+        async fn exists(&self, path: &str) -> crate::Result<bool> {
+            Ok(self.state.files.lock().unwrap().contains_key(path))
+        }
+
+        async fn metadata(&self, path: &str) -> crate::Result<FileMetadata> {
+            let files = self.state.files.lock().unwrap();
+            let data = files.get(path).ok_or_else(|| {
+                crate::Error::new(ErrorKind::DataInvalid, format!("no file {path}"))
+            })?;
+            Ok(FileMetadata {
+                size: data.len() as u64,
+            })
+        }
+
+        async fn read(&self, path: &str) -> crate::Result<Bytes> {
+            let files = self.state.files.lock().unwrap();
+            files.get(path).cloned().ok_or_else(|| {
+                crate::Error::new(ErrorKind::DataInvalid, format!("no file {path}"))
+            })
+        }
+
+        async fn reader(&self, path: &str) -> crate::Result<Box<dyn FileRead>> {
+            Ok(Box::new(DelayedFileRead {
+                state: Arc::clone(&self.state),
+                path: path.to_string(),
+            }))
+        }
+
+        async fn write(&self, path: &str, bs: Bytes) -> crate::Result<()> {
+            self.state
+                .files
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), bs);
+            Ok(())
+        }
+
+        async fn writer(&self, _path: &str) -> crate::Result<Box<dyn FileWrite>> {
+            Err(crate::Error::new(
+                ErrorKind::FeatureUnsupported,
+                "this store is seeded, not written to",
+            ))
+        }
+
+        async fn delete(&self, path: &str) -> crate::Result<()> {
+            self.state.files.lock().unwrap().remove(path);
+            Ok(())
+        }
+
+        async fn delete_prefix(&self, _path: &str) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn new_input(&self, path: &str) -> crate::Result<InputFile> {
+            Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+
+        fn new_output(&self, path: &str) -> crate::Result<OutputFile> {
+            Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+    }
+
+    /// #5007's acceptance, whole: eight files' lookups, each range read
+    /// delayed, run to an answer on a runtime whose **entire** blocking pool
+    /// is occupied for the duration. #4561's shape cannot: it ran each lookup
+    /// on a blocking thread and served its ranges from the async side, so with
+    /// the pool held it could not start, and with a pool of *n* threads it
+    /// could not have more than *n* files in flight however small each read
+    /// was. (Checked the other way round while #5007 was written: with the
+    /// blocking-thread lookup restored, this test times out.)
+    ///
+    /// The answers, the three outcomes and the fetched-byte accounting are the
+    /// same ones the tests above pin; what this adds is where the waits went.
+    #[test]
+    fn a_segmented_lookup_waits_on_the_store_without_a_blocking_thread() {
+        const FILES: usize = 8;
+        const DELAY_MS: usize = 10;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // The sidecar bytes, written once through the filesystem store (which
+        // does use the blocking pool) before anything occupies it.
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(4_000);
+        let (blob, sidecar) = runtime.block_on(async {
+            let (file_io, path) = write_mixed_sidecar(&dir, &rows, 1_000).await;
+            let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+            (blob, Bytes::from(std::fs::read(&path).unwrap()))
+        });
+        let state = Arc::new(DelayedStorageState::default());
+        state.delay_millis.store(DELAY_MS, Ordering::SeqCst);
+        let paths: Vec<String> = (0..FILES)
+            .map(|file| format!("memory://seg-5007-{file}.puffin"))
+            .collect();
+        {
+            let mut files = state.files.lock().unwrap();
+            for path in &paths {
+                files.insert(path.clone(), sidecar.clone());
+            }
+        }
+        let file_io = FileIOBuilder::new(Arc::new(DelayedStorageFactory {
+            state: Arc::clone(&state),
+        }))
+        .build();
+        let counts = row_counts(4_000, 1_000);
+        let spec = all_terms_spec(&["rareneedle"]);
+        let expected = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str))
+            .postings("rareneedle")
+            .unwrap()
+            .to_vec();
+
+        // Hold the whole blocking pool, and prove it is held before the
+        // lookups start rather than assuming the task was picked up.
+        let (release, wait_for_release) = std::sync::mpsc::channel::<()>();
+        let (held, wait_until_held) = std::sync::mpsc::channel::<()>();
+        runtime.spawn_blocking(move || {
+            held.send(()).unwrap();
+            let _ = wait_for_release.recv();
+        });
+        wait_until_held
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the one blocking thread is occupied");
+
+        // One file first: its peak in-flight reads are this lookup's own, so
+        // they say whether a stage's ranges went out together.
+        let solo = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                ArrowReader::segmented_matching_rows(
+                    &file_io, &paths[0], &blob, &counts, None, &spec, true,
+                ),
+            )
+            .await
+            .expect("a lookup that waited on a blocking thread could not finish here")
+            .unwrap()
+        });
+        let (solo_outcome, solo_cost) = solo;
+        let SegmentedOutcome::Matching { rows: solo_rows, .. } = solo_outcome else {
+            panic!("the term is in the sidecar: {solo_outcome:?}");
+        };
+        assert_eq!(solo_rows, expected);
+        let solo_peak = state.peak_in_flight.load(Ordering::SeqCst);
+        assert!(
+            solo_peak > 1,
+            "one lookup's stage should fetch its ranges together, peak {solo_peak}"
+        );
+        assert!(
+            solo_cost.stages <= 5,
+            "{} stages for {} store reads",
+            solo_cost.stages,
+            solo_cost.reads
+        );
+        assert!(solo_cost.reads > solo_cost.stages);
+        assert!(solo_cost.requests >= solo_cost.reads);
+
+        // Then the fan-out: eight files at once, still under the held pool.
+        state.reads.store(0, Ordering::SeqCst);
+        state.peak_in_flight.store(0, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let answers = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                futures::future::join_all(paths.iter().map(|path| {
+                    let file_io = file_io.clone();
+                    let blob = blob.clone();
+                    let counts = counts.clone();
+                    let spec = spec.clone();
+                    async move {
+                        ArrowReader::segmented_matching_rows(
+                            &file_io, path, &blob, &counts, None, &spec, true,
+                        )
+                        .await
+                        .unwrap()
+                    }
+                })),
+            )
+            .await
+            .expect("eight lookups that each held a blocking thread could not finish here")
+        });
+        let elapsed = started.elapsed();
+        release.send(()).ok();
+
+        for (path, (outcome, cost)) in paths.iter().zip(&answers) {
+            let SegmentedOutcome::Matching { rows, .. } = outcome else {
+                panic!("{path}: {outcome:?}");
+            };
+            assert_eq!(rows, &expected, "{path}");
+            assert_eq!(cost.stages, solo_cost.stages, "{path}");
+            assert_eq!(cost.reads, solo_cost.reads, "{path}");
+            assert_eq!(cost.bytes, solo_cost.bytes, "{path}");
+        }
+        // The latency claim, against the shape it replaces: a source serving
+        // one range at a time costs a round trip per read, and these eight
+        // lookups took fewer than half of one file's worth of those.
+        let serial = std::time::Duration::from_millis((solo_cost.reads * DELAY_MS as u64) as u64);
+        assert!(
+            elapsed * 2 < serial * FILES as u32,
+            "{FILES} files took {elapsed:?}; one file's reads served one at a time is {serial:?}"
+        );
+        println!(
+            "one lookup: {} stages, {} store reads, {} reader reads, {} bytes, peak {solo_peak} \
+             in flight\n{FILES} files: {elapsed:?} at {DELAY_MS} ms a read, peak {} in flight, \
+             {} store reads (serial, one file: {serial:?})",
+            solo_cost.stages,
+            solo_cost.reads,
+            solo_cost.requests,
+            solo_cost.bytes,
+            state.peak_in_flight.load(Ordering::SeqCst),
+            state.reads.load(Ordering::SeqCst),
+        );
+    }
+
+    #[test]
+    fn the_range_concurrency_is_resolved_from_its_own_knob() {
+        // Unset, empty or unparseable is the scan's own merged-range bound,
+        // and `0` is not "no concurrency at all" — a stage with no fetches in
+        // flight never completes.
+        assert_eq!(
+            segmented_range_concurrency_from(None),
+            DEFAULT_RANGE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            segmented_range_concurrency_from(Some("")),
+            DEFAULT_RANGE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            segmented_range_concurrency_from(Some("plenty")),
+            DEFAULT_RANGE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            segmented_range_concurrency_from(Some("-4")),
+            DEFAULT_RANGE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            segmented_range_concurrency_from(Some("0")),
+            DEFAULT_RANGE_FETCH_CONCURRENCY
+        );
+        assert_eq!(segmented_range_concurrency_from(Some(" 3 ")), 3);
     }
 
     #[tokio::test]

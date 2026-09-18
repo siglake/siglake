@@ -363,7 +363,13 @@ anything it cannot conclude falling back to the v1 index or an exact scan
 its own (#5006, `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`, separate
 from the two budgets above) — but only when `SIGLAKE_SEGMENTED_INDEX_READS` is
 set, and no writer produces one, so nothing in this section changes by
-default, and nothing is retained under the new budget either. The three
+default, and nothing is retained under the new budget either. A lookup reads in
+stages: the synchronous reader runs over the ranges it holds and records the
+ones it does not, and the caller fetches a stage's ranges together
+(`SIGLAKE_SEGMENTED_INDEX_RANGE_CONCURRENCY`, default 10) between runs, so a
+store wait never holds a thread of the blocking pool and a shape's rounds of
+waits are its stages — four, or two on a held directory — rather than its
+reads, which run from 4 to 2,938 per file (#5007). The three
 formats have been compared through the query path on a 102.76M-row local
 corpus (#4562): a rare unclipped text predicate is 11.5x faster than the scan
 where the shipped sidecar is 22.4x slower, and the result holds with both
