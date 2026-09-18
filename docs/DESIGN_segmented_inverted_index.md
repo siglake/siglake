@@ -1,9 +1,8 @@
 # Design — row-group-addressable inverted-index sidecars (#4376 prototype)
 
-Status (2026-09-18): **seg2 streaming writer landed on its hermetic suite; its
-build time and peak heap are not yet measured, and production read/write
-adoption remains off by default.** The 14 x 7.34M report the writer's
-acceptance asks for is #5234, and #5228 carries one known registration gap
+Status (2026-09-18): **seg2 streaming writer landed on its hermetic suite and
+its 14 x 7.34M-row build cost is measured; production read/write adoption
+remains off by default.** #5228 carries one known registration gap
 (see [Writer integration](#writer-integration-4377)).
 The query-path report now builds its segmented arm through that writer and
 retains the older seg1 tables as dated history (#5230). Production discovery
@@ -374,10 +373,39 @@ rebuild.
 `crates/siglake-storage/tests/segmented_index_writer.rs` holds the single-file,
 rolled-output, two-partition, failed-transaction, idempotence, exact-query and
 row-group-memory cases. Reads discover seg2 only; the knobs
-for writing and reading are separate and both remain off by default. What the
-suite does not hold is the writer's build time and peak heap at the acceptance's
-14 x 7.34M rows: `report_segmented_writer_build_cost` in that file is the
-`#[ignore]`d harness for it, and #5234 runs it.
+for writing and reading are separate and both remain off by default. The
+writer's build-time and peak-heap report is an `#[ignore]`d release harness in
+that file because its acceptance corpus is 14 x 7.34M rows.
+
+The #5234 run used 14 files of 7,340,000 rows (102,760,000 rows total), with
+append indexing on, a one-MiB row-group target and streaming rewrites in every
+arm. Only `segmented_index_writes` and `index_rebuild` changed. The allocator
+figures are peak tracked live bytes during append plus rewrite, not process RSS.
+`/proc/loadavg` was read immediately before each arm.
+
+| arm | load average (1/5/15m) | segmented writes / v1 rebuild | append | rewrite | total | peak live heap | registered sidecar / data | live files |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| off-1 | 5.63 / 4.82 / 4.87 | off / off | 451.81 s | 142.61 s | 594.41 s | 251.4 MiB | 0 / 697,883,148 B (0.00%) | 14 |
+| on-1 | 4.20 / 3.66 / 4.09 | on / off | 454.52 s | 283.44 s | 737.96 s | 251.2 MiB | 247,359,225 / 697,883,148 B (35.44%) | 14 |
+| off-2 | 9.08 / 5.34 / 5.28 | off / off | 448.18 s | 142.28 s | 590.46 s | 251.5 MiB | 0 / 697,883,148 B (0.00%) | 14 |
+| on-2 | 4.20 / 3.39 / 4.16 | on / off | 446.41 s | 282.09 s | 728.50 s | 251.6 MiB | 247,359,226 / 697,883,148 B (35.44%) | 14 |
+| v1-rebuild | 4.21 / 2.99 / 3.39 | off / on | 438.21 s | 321.35 s | 759.56 s | 1,309.4 MiB | 224,141,786 / 697,883,148 B (32.12%) | 14 |
+
+Seg2 added 140.83 and 139.81 seconds to the rewrite arms over no index
+(98.8% and 98.3%), or 24.2% and 23.4% to append plus rewrite. Peak tracked
+heap stayed within 0.2 MiB of each paired control. Against the post-commit v1
+rebuild it replaces, seg2 averaged 282.77 seconds of rewrite time and 733.23
+seconds total: 12.0% and 3.5% below the v1 arm. It used 80.8% less peak tracked
+heap and 10.36% more registered sidecar bytes. The v1 comparison is one arm,
+while the seg2/no-index result is the requested repeated pair; the load readings
+above bound what this local timing says.
+
+The first run was interrupted after off-1, on-1 and off-2 had completed. Its
+stdout and stderr were retained under the run-owned TMPDIR. A release
+continuation reran off-2 immediately before on-2, then ran v1-rebuild; all
+coverage assertions passed, including zero registered blobs for each off arm,
+one live seg2 blob per file for each on arm and one live v1 blob per file for
+the rebuild arm.
 
 #### The gap beside the refusals
 
@@ -1131,17 +1159,17 @@ What remains, in order:
    the decoded posting span before slicing a term. Seg1 bytes are pinned by a
    fixture and remain readable. The 7.34M-row report writes 16.7 MiB and records
    fetched bytes for all six shapes.
-5. **#4377 / #5233** — the code is in: the streaming Parquet writer builds one
+5. **#4377 / #5233 / #5234** — the code and local measurement are in: the streaming Parquet writer builds one
    seg2 group per row group, registers all completed output blobs in the
    rewrite transaction, and leaves the post-commit v1 rebuild no file to
    decode. The hermetic suite covers rolling output, separate partition
    rewrites, failed transactions, repeated rebuild, exact answers and
    row-group-bounded parsed index state, and passes. Reads and writes remain
-   separate opt-ins. **Two pieces of #4377's acceptance are still open**: the
-   14 x 7.34M build time and peak heap (#5234, the `#[ignore]`d
-   `report_segmented_writer_build_cost`), and the same-snapshot registration
-   gap above (#5228). Neither blocks the format staying off by default, and
-   both block any proposal to turn it on.
+   separate opt-ins. The 14 x 7.34M build time and peak heap are recorded in
+   [Writer integration](#writer-integration-4377). **The remaining piece of
+   #4377's acceptance is the same-snapshot registration gap above (#5228).**
+   It does not block the format staying off by default, and it blocks any
+   proposal to turn it on.
 6. **An open question for #4561**: the substring sweep reads the whole
    dictionary, and `keyword`-class terms with millions of postings read megabytes
    of posting bytes. Both are regimes where partial reads buy little, and #4375's
