@@ -23718,6 +23718,28 @@ mod env_knob_resolver_tests {
         assert!(!index_rebuild_enabled_from(Some("junk")));
         assert!(index_rebuild_enabled_from(Some("1")));
     }
+
+    #[test]
+    fn segmented_index_writes_default_off_and_only_literal_one_enables_them() {
+        assert!(!segmented_index_writes_enabled_from(None));
+        assert!(!segmented_index_writes_enabled_from(Some("0")));
+        assert!(!segmented_index_writes_enabled_from(Some("true")));
+        assert!(!segmented_index_writes_enabled_from(Some("junk")));
+        assert!(segmented_index_writes_enabled_from(Some("1")));
+    }
+
+    #[test]
+    fn segmented_index_block_bytes_keeps_the_codec_default_unless_given_a_size() {
+        let codec_default = siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES;
+        assert_eq!(segmented_index_block_bytes_from(None), codec_default);
+        assert_eq!(segmented_index_block_bytes_from(Some("0")), codec_default);
+        assert_eq!(
+            segmented_index_block_bytes_from(Some("4 KiB")),
+            codec_default
+        );
+        assert_eq!(segmented_index_block_bytes_from(Some("-1")), codec_default);
+        assert_eq!(segmented_index_block_bytes_from(Some("16384")), 16_384);
+    }
 }
 
 #[cfg(test)]
