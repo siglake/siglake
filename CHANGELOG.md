@@ -74,7 +74,16 @@
   now builds its segmented fixture through the streaming seg2 rewrite and
   refuses retained seg1 fixtures. At 14 × 7.34M rows its two rare scans were
   0.14x and 0.06x the scan, with exact answers and matching Parquet layouts;
-  the dated seg1 columns remain as history. (#4377, #5228, #5230, #5233, #5234)
+  the dated seg1 columns remain as history. A rewrite that rolls its output
+  into many files holds every finished sidecar until its transaction publishes
+  them: measured over one same-partition rewrite from 3 to 40 rolled outputs,
+  against a matched control with the writer off, that retention moved the
+  rewrite's peak live heap by under 300 bytes. The peak is the merge's own
+  buffers plus one row group's parsed index, and the retained bytes track rows
+  rather than files — 2.40 B per row per indexed column, whatever the rolling
+  target. The heap figures above are peak tracked live bytes over append plus
+  every rewrite in an arm.
+  (#4377, #5228, #5230, #5233, #5234, #5299)
 
 - **Text indexes (docs)**: the documented integrity gap in a v1 inverted-index
   blob is the **footer-KV** path only. An index stored as hex in a Parquet
