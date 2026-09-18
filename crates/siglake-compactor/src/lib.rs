@@ -130,10 +130,21 @@ struct CommitOutcome {
 /// per-tenant, summed over the same directories, and clobberable in exactly
 /// the same way, so it is counted and published here rather than `set` by each
 /// directory in turn.
+///
+/// So does `siglake_compactor_orphans_held{tenant}` (#3267), which
+/// `SiglakeCompactorOrphansHeld` pages on. It was written by
+/// [`Compactor::dispose_orphans_at`] once per directory, with the two failure
+/// modes an alert cannot live with: a directory with no orphans returned
+/// before writing anything, so a resolved hold kept its last non-zero reading
+/// forever, and a tenant's events pass and index passes overwrote each other's
+/// value, so one held orphan was hidden by any later directory that had none.
+/// Counted and published here it is the tenant's whole total, and it reaches 0
+/// on the cycle after the last orphan is resolved.
 #[derive(Default)]
 struct SealedBacklog {
     by_tenant: BTreeMap<String, usize>,
     poisoned_by_tenant: BTreeMap<String, usize>,
+    orphans_held_by_tenant: BTreeMap<String, usize>,
 }
 
 impl SealedBacklog {
@@ -164,6 +175,23 @@ impl SealedBacklog {
             .or_default() += poisoned;
     }
 
+    /// Add the quarantined orphans one directory is holding for an operator.
+    ///
+    /// Called for every directory the sweep visits, with zero where
+    /// disposition found nothing to hold: the published value is a level, and a
+    /// tenant whose last hold was resolved has to be able to reach 0 without
+    /// the pod restarting. The two paths that `continue` past disposition —
+    /// an index name that resolves to no table, and a WAL directory whose
+    /// owner marker refuses the drain — report whatever `orphans/` still holds,
+    /// because nothing classified those files this cycle and nothing will while
+    /// the directory stays in that state.
+    fn observe_orphans_held(&mut self, tenant_label: &str, held: usize) {
+        *self
+            .orphans_held_by_tenant
+            .entry(tenant_label.to_string())
+            .or_default() += held;
+    }
+
     /// Publish one reading per tenant label seen this sweep, plus zero for
     /// labels that disappeared after the previous complete sweep.
     fn publish(&self, previously_published: &mut BTreeSet<String>) {
@@ -179,6 +207,11 @@ impl SealedBacklog {
                 "tenant" => tenant.clone()
             )
             .set(0.0);
+            metrics::gauge!(
+                "siglake_compactor_orphans_held",
+                "tenant" => tenant.clone()
+            )
+            .set(0.0);
         }
         for (tenant, sealed) in &self.by_tenant {
             metrics::gauge!(
@@ -191,9 +224,29 @@ impl SealedBacklog {
                 "tenant" => tenant.clone()
             )
             .set(self.poisoned_by_tenant.get(tenant).copied().unwrap_or(0) as f64);
+            metrics::gauge!(
+                "siglake_compactor_orphans_held",
+                "tenant" => tenant.clone()
+            )
+            .set(
+                self.orphans_held_by_tenant
+                    .get(tenant)
+                    .copied()
+                    .unwrap_or(0) as f64,
+            );
         }
         *previously_published = published_this_sweep;
     }
+}
+
+/// What one directory's orphan disposition proved and acted on. Held is
+/// deliberately absent: it is the remainder, so a disposition that fails
+/// partway counts everything it never reached as held rather than as resolved
+/// (see [`Compactor::dispose_orphans_at`]).
+#[derive(Default)]
+struct OrphanDisposition {
+    deleted: usize,
+    requeued: usize,
 }
 
 enum CommitTarget {
@@ -848,12 +901,73 @@ impl Compactor {
     /// orphans predate this process: no concurrent commit can be adding the
     /// segment while we reason about it. The catalog-claim path never uses
     /// `processing/`, so its dirs are always empty here.
+    ///
+    /// The third disposition is the one that needs a person, so what it
+    /// reports is what `SiglakeCompactorOrphansHeld` pages on: the count goes
+    /// into `backlog` rather than straight onto the gauge, which is what makes
+    /// it a tenant's whole total and lets it come back down (see
+    /// [`SealedBacklog`]).
     async fn dispose_orphans_at(
         &self,
         dir: &Path,
         tenant_label: &str,
         ice: &Arc<IcebergContext>,
         target: &CommitTarget,
+        backlog: &mut SealedBacklog,
+    ) -> Result<()> {
+        let orphans = list_orphaned(dir).context("listing orphaned segments")?;
+        if orphans.is_empty() {
+            // An observation of zero, not the absence of one. This early
+            // return used to leave the gauge alone, which kept a resolved
+            // hold's last reading exported for the life of the process.
+            backlog.observe_orphans_held(tenant_label, 0);
+            return Ok(());
+        }
+        let quarantined = orphans.len();
+        let mut disposed = OrphanDisposition::default();
+        let outcome = self
+            .classify_orphans(orphans, dir, ice, target, &mut disposed)
+            .await;
+        // Every orphan is deleted, requeued or held, so held is the remainder
+        // — and a classification that failed partway leaves the rest
+        // unclassified, which is the same situation for an operator and must
+        // not report as zero.
+        let held = quarantined - disposed.deleted - disposed.requeued;
+        backlog.observe_orphans_held(tenant_label, held);
+        for (action, n) in [
+            ("deleted", disposed.deleted),
+            ("requeued", disposed.requeued),
+        ] {
+            if n > 0 {
+                metrics::counter!(
+                    "siglake_compactor_orphans_disposed_total",
+                    "action" => action,
+                    "tenant" => tenant_label.to_string()
+                )
+                .increment(n as u64);
+            }
+        }
+        tracing::info!(
+            deleted = disposed.deleted,
+            requeued = disposed.requeued,
+            held,
+            dir = %dir.display(),
+            table = target.index_label(),
+            "orphan auto-disposition"
+        );
+        outcome
+    }
+
+    /// One directory's orphans, classified and acted on, recording what it
+    /// disposed of in `disposed` as it goes so the caller can tell held from
+    /// unclassified on an error.
+    async fn classify_orphans(
+        &self,
+        orphans: Vec<PathBuf>,
+        dir: &Path,
+        ice: &Arc<IcebergContext>,
+        target: &CommitTarget,
+        disposed: &mut OrphanDisposition,
     ) -> Result<()> {
         /// Absorbs clock skew between the sealing writer's filesystem mtime
         /// and the committing process's snapshot timestamps (both NTP-synced
@@ -861,10 +975,6 @@ impl Compactor {
         /// margin would permanently hold orphans sealed shortly after a young
         /// table's first commit (the floor only moves forward via expiry).
         const HISTORY_SKEW_MARGIN_MS: i64 = 5_000;
-        let orphans = list_orphaned(dir).context("listing orphaned segments")?;
-        if orphans.is_empty() {
-            return Ok(());
-        }
         let (consumed, floor_ms) = ice
             .consumed_segments_and_history_floor(target.index_label())
             .await
@@ -872,7 +982,6 @@ impl Compactor {
         let sealed_dir = dir.join(siglake_wal::SEALED_DIR);
         std::fs::create_dir_all(&sealed_dir)
             .with_context(|| format!("creating {}", sealed_dir.display()))?;
-        let (mut deleted, mut requeued, mut held) = (0u64, 0u64, 0u64);
         for path in orphans {
             let Some(name) = path.file_name().and_then(|f| f.to_str()).map(String::from) else {
                 continue;
@@ -880,7 +989,7 @@ impl Compactor {
             if consumed.contains(&name) {
                 std::fs::remove_file(&path)
                     .with_context(|| format!("deleting committed orphan {}", path.display()))?;
-                deleted += 1;
+                disposed.deleted += 1;
                 continue;
             }
             let sealed_at_ms = path
@@ -894,43 +1003,20 @@ impl Compactor {
                 (Some(floor), Some(sealed_at)) => floor + HISTORY_SKEW_MARGIN_MS <= sealed_at,
                 (Some(_), None) => false, // unreadable mtime: stay ambiguous
             };
-            if covered {
-                let dest = sealed_dir.join(&name);
-                if dest.exists() {
-                    held += 1; // never clobber a live sealed segment
-                    continue;
-                }
-                std::fs::rename(&path, &dest)
-                    .with_context(|| format!("requeue orphan {} -> sealed/", path.display()))?;
-                requeued += 1;
-            } else {
-                held += 1;
+            // Everything this loop leaves in `orphans/` is held: expiry may
+            // have dropped the snapshot that would prove the segment's commit
+            // status, or a live sealed segment already owns the name it would
+            // be requeued under.
+            if !covered {
+                continue;
             }
-        }
-        for (action, n) in [("deleted", deleted), ("requeued", requeued)] {
-            if n > 0 {
-                metrics::counter!(
-                    "siglake_compactor_orphans_disposed_total",
-                    "action" => action,
-                    "tenant" => tenant_label.to_string()
-                )
-                .increment(n);
+            let dest = sealed_dir.join(&name);
+            if dest.exists() {
+                continue; // never clobber a live sealed segment
             }
-        }
-        metrics::gauge!(
-            "siglake_compactor_orphans_held",
-            "tenant" => tenant_label.to_string()
-        )
-        .set(held as f64);
-        if deleted + requeued + held > 0 {
-            tracing::info!(
-                deleted,
-                requeued,
-                held,
-                dir = %dir.display(),
-                table = target.index_label(),
-                "orphan auto-disposition"
-            );
+            std::fs::rename(&path, &dest)
+                .with_context(|| format!("requeue orphan {} -> sealed/", path.display()))?;
+            disposed.requeued += 1;
         }
         Ok(())
     }
@@ -2399,6 +2485,12 @@ impl Compactor {
                     // too, so leaving them out of the tenant's total is how a
                     // stuck index becomes invisible to the HPA.
                     backlog.observe_dir(&tenant, &index_dir, pending.len());
+                    // Disposition is downstream of this exit, so whatever
+                    // `orphans/` holds here is unclassified and stays that way
+                    // on every later cycle for as long as the index does not
+                    // resolve. Reporting zero would clear the page that says
+                    // so.
+                    backlog.observe_orphans_held(&tenant, orphaned);
                     // The fifth exit, and the one the sweep-on-every-cycle
                     // change missed. Lower stakes than the other four — this
                     // path has pending work and means an index that cannot be
@@ -2440,6 +2532,11 @@ impl Compactor {
                         // next cycle drains.
                         let kept = list_sealed(&index_dir).map(|v| v.len()).unwrap_or(0);
                         backlog.observe_dir(&tenant, &index_dir, kept);
+                        // Same as the unresolved exit above: the quarantine
+                        // sweep does not touch `orphans/`, and nothing past
+                        // this point will classify what is in it while the
+                        // directory's owner marker refuses the drain.
+                        backlog.observe_orphans_held(&tenant, orphaned);
                         self.sweep_retention_at(&index_dir, &tenant).await;
                         continue;
                     }
@@ -2905,9 +3002,11 @@ impl Compactor {
         let cycle_start = std::time::Instant::now();
         // #81: auto-dispose quarantined orphans before listing — a requeued
         // segment re-enters sealed/ and commits in this same cycle.
-        // Best-effort: a disposition error leaves the quarantine untouched.
+        // Best-effort: a disposition error leaves the quarantine untouched,
+        // and reports everything it did not classify as held (#3267) rather
+        // than as resolved.
         if let Err(e) = self
-            .dispose_orphans_at(dir, tenant_label, ice, target)
+            .dispose_orphans_at(dir, tenant_label, ice, target, backlog)
             .await
         {
             tracing::warn!(error = %e, dir = %dir.display(), "orphan auto-disposition failed");
