@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Alerting (feature)**: `SiglakeCompactorOrphansHeld` (critical, `for: 15m`,
+  `siglake.stalled`) pages on the one WAL orphan disposition that needs a
+  person. A compactor killed mid-commit leaves its segment under
+  `<wal>/orphans/`; the drain deletes it when the table's consumed-segment set
+  proves the rows are committed and requeues it when the retained history
+  proves they are not, but a name absent from that set while snapshot expiry
+  may already have dropped the proving snapshot is neither, so the file is held
+  and its rows stay uncommitted and unqueryable until an operator settles it.
+  Nothing read the gauge, and the gauge was not worth reading: it was written
+  once per directory, so a tenant's events pass and its index passes overwrote
+  each other's value, and a directory with no orphans returned before writing
+  anything, so a resolved hold kept its last non-zero reading for the life of
+  the process. It is now the tenant's total over every directory the sweep
+  visits, including the two that exit before disposition runs (an index name
+  that resolves to no table, a WAL directory whose owner marker refuses the
+  drain) and a disposition that fails partway, where what it never classified
+  counts as held rather than as resolved. The alert preserves the tenant, pod
+  and namespace labels; its action is to preserve the files and establish
+  commit status from the operator's own evidence, and it says outright that
+  raising `compactor.snapshotExpire.retainLast` protects the proof for future
+  orphans without restoring history that has already expired. (#3267)
+
 - **CLI (fix)**: `siglake wal-recover` refuses a mirror object that is not a
   WAL segment instead of restoring it as one. An `_active/` object is listable,
   and stat-able at zero bytes, before its body lands — opendal's `fs` writer

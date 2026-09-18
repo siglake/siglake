@@ -897,3 +897,62 @@ tests:
       - eval_time: 14m
         alertname: SiglakeSegmentsQuarantined
         exp_alerts: []
+
+  # #3267: the disposition that needs a person. The hold is a level, so these
+  # three cases are the whole lifecycle an operator sees: the window holding
+  # before it pages, the page itself with the tenant on it, and the reading
+  # coming back down on its own once the orphan is settled.
+  - name: a held orphan pages once it has been held for the whole window
+    interval: 1m
+    input_series:
+      # Held from 1m to 25m, then settled by an operator and swept.
+      - series: 'siglake_compactor_orphans_held{namespace="logs",pod="compactor-0",tenant="acme"}'
+        values: '0 1+0x24 0+0x10'
+    alert_rule_test:
+      # Pending, not firing: ten minutes of a fifteen-minute hold.
+      - eval_time: 10m
+        alertname: SiglakeCompactorOrphansHeld
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: SiglakeCompactorOrphansHeld
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              tenant: acme
+              severity: critical
+            exp_annotations:
+              summary: Quarantined WAL segments are held for an operator and no cycle will resolve them
+              description: >-
+                1 quarantined WAL segment(s) for tenant acme are held under
+                `<wal>/orphans/` on compactor-0 with their commit status
+                unknown: the names are absent from the table's consumed set and
+                the snapshot that would prove whether they were committed is no
+                longer retained. Automatic disposition cannot settle them and
+                no later cycle will. PRESERVE THE FILES. Their rows may already
+                be in the table or may exist nowhere else, so deleting one can
+                lose rows and requeueing one can duplicate them: establish
+                which from your own evidence — the compactor's "orphan
+                auto-disposition" INFO line names the directory and table, and
+                the segment's rows can be read and compared against the table —
+                before moving anything back into `sealed/` or deleting it.
+                Raising compactor.snapshotExpire.retainLast protects the proof
+                for FUTURE orphans; it does not restore history that has
+                already expired, so it will not clear this hold.
+      # The gauge is a level the drain republishes every cycle, so a settled
+      # orphan clears the page without anyone restarting a compactor. Nothing
+      # else in this rule file depends on that, and #3267 was exactly the
+      # reading that could not reach zero.
+      - eval_time: 27m
+        alertname: SiglakeCompactorOrphansHeld
+        exp_alerts: []
+
+  - name: a compactor holding no orphans stays silent
+    interval: 1m
+    input_series:
+      - series: 'siglake_compactor_orphans_held{namespace="logs",pod="compactor-0",tenant="default"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: SiglakeCompactorOrphansHeld
+        exp_alerts: []

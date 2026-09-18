@@ -1459,7 +1459,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   query tier is reached through SQL over HTTP and the Elasticsearch- and
   Jaeger-compatible shims. What does ship for operations: a starter Grafana
   dashboard (`deploy/grafana/siglake-overview.json` — import it yourself, the
-  chart does not render it) and a `PrometheusRule` with 34 alerts grouped by
+  chart does not render it) and a `PrometheusRule` with 36 alerts grouped by
   what an operator should do (data-loss, stalled, refusing, saturation),
   rendered when `prometheusRule.enabled` is set (default off). No metrics
   downsampling; retention is file/day-granular (no row-level retention).

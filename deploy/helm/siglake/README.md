@@ -577,6 +577,29 @@ column; with it off the alert and the compactor's WARN line — which names the
 columns — point at
 `siglake rebuild-group-counts --namespace <ns> --table <table>`.
 
+`SiglakeCompactorOrphansHeld` (critical) is the one alert whose remedy is a
+person rather than a command. A compactor killed mid-commit leaves its claimed
+segment quarantined under `<wal>/orphans/`, and the next drain cycle settles it
+against the table's cumulative consumed-segment set: named there, the rows are
+provably committed and the file is deleted; absent from it with the retained
+history covering the segment's whole life, the rows are provably uncommitted and
+the file goes back into `sealed/` to be re-committed. Both resolve themselves.
+The third case does not: the name is absent *and* snapshot expiry may already
+have dropped the snapshot that carried the proof, so commit status cannot be
+established from the warehouse, and the compactor holds the file instead of
+guessing. It reports the level as
+`siglake_compactor_orphans_held{tenant}` — the tenant's whole WAL layout, its
+events directory and every managed index summed, republished every cycle so a
+settled hold clears the page without a restart — and the alert fires after 15
+minutes above zero. **Preserve the files.** Their rows may already be in the
+table or may exist nowhere else, so deleting one can lose rows and requeueing
+one can duplicate them; establish which from your own evidence (the compactor's
+`orphan auto-disposition` INFO line names the directory and table, and the
+segment is a readable Arrow stream) before moving anything. Raising
+`compactor.snapshotExpire.retainLast` keeps the proof available for orphans a
+future crash creates; it cannot restore history that has already expired and
+will not clear an existing hold.
+
 The starter Grafana dashboard `deploy/grafana/siglake-overview.json`
 groups panels the same way and filters on `namespace` (the label
 Prometheus Operator sets on every target). It does *not* need a `role`

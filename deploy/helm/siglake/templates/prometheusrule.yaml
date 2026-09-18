@@ -417,6 +417,60 @@ spec:
               `.poison.json` note saying why; the `segment SET ASIDE` log line names the
               file. Fix what made it unreadable, then `siglake wal-requeue --wal
               <wal-root>`.
+        - alert: SiglakeCompactorOrphansHeld
+          # The one orphan disposition that cannot be automated (#3267). A
+          # compactor killed mid-commit leaves a segment under
+          # `<wal>/orphans/`; the drain classifies it against the table's
+          # cumulative consumed set and either deletes it (provably committed)
+          # or requeues it (provably not), and both resolve themselves. This is
+          # the third case: the name is absent from the consumed set AND
+          # snapshot expiry may already have dropped the snapshot that would
+          # have carried the proof, so commit status is unknowable from here.
+          # The compactor holds the file rather than guessing, which is right —
+          # deleting could lose rows, requeueing could duplicate them — and
+          # nothing in any later cycle changes the verdict. Critical, not
+          # warning: it needs a person, and the rows stay uncommitted and
+          # unqueryable until it gets one.
+          #
+          # The gauge is a level published by the drain sweep, per tenant,
+          # summed over the tenant's events directory and every managed index
+          # (crates/siglake-compactor/src/lib.rs, `SealedBacklog`). A `> 0`
+          # rule on a sweep-published gauge is safe in the direction that
+          # matters: a compactor that stops sweeping retains its last reading,
+          # which for this rule is stale-BAD and pages, not stale-healthy —
+          # the same reason SiglakeSegmentsQuarantined reads
+          # siglake_compactor_segments_poisoned directly. Nothing is
+          # aggregated away, so the alert carries the tenant beside the
+          # namespace and pod.
+          #
+          # 15m is hundreds of cycles at the chart's compactor.intervalSecs of
+          # 1. The hold is a steady state, so the window costs nothing and
+          # keeps a reading taken while disposition was still moving files —
+          # an orphan already proven uncommitted and on its way back into
+          # `sealed/` — from paging on a resolution in progress.
+          expr: siglake_compactor_orphans_held > 0
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: Quarantined WAL segments are held for an operator and no cycle will resolve them
+            description: >-
+              {{ "{{ $value }}" }} quarantined WAL segment(s) for tenant
+              {{ "{{ $labels.tenant }}" }} are held under `<wal>/orphans/` on
+              {{ "{{ $labels.pod }}" }} with their commit status unknown: the
+              names are absent from the table's consumed set and the snapshot
+              that would prove whether they were committed is no longer
+              retained. Automatic disposition cannot settle them and no later
+              cycle will. PRESERVE THE FILES. Their rows may already be in the
+              table or may exist nowhere else, so deleting one can lose rows
+              and requeueing one can duplicate them: establish which from your
+              own evidence — the compactor's "orphan auto-disposition" INFO
+              line names the directory and table, and the segment's rows can
+              be read and compared against the table — before moving anything
+              back into `sealed/` or deleting it. Raising
+              compactor.snapshotExpire.retainLast protects the proof for
+              FUTURE orphans; it does not restore history that has already
+              expired, so it will not clear this hold.
         - alert: SiglakeMirrorReconciliationErrors
           # The bounded-page activity counter advances before reconciliation
           # lists the mirror. A listing or registration failure can therefore

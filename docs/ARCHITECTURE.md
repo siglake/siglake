@@ -258,6 +258,20 @@ first) once the cause is fixed. The set-asides are counted by
 alongside the catalog-claim path's own quarantine. The rows in a set-aside
 segment are acknowledged and not queryable, which is the point: the alternative
 is a queue that never drains.
+`orphans/` is disposed of every cycle, with one residue that is not. Each file
+is settled against the target table's cumulative consumed-segment set: named
+there, its rows are provably committed and the file is deleted; absent from it
+with the retained history covering the segment's whole life, its rows are
+provably uncommitted and the file returns to `sealed/` and re-commits the same
+cycle. A name that is absent while snapshot expiry may already have dropped the
+snapshot carrying the proof is neither, so the drain holds the file and levels
+the count per tenant in `siglake_compactor_orphans_held` — summed over the
+tenant's events directory and every managed index, and republished every cycle
+so a settled hold comes back to zero. `SiglakeCompactorOrphansHeld` pages on it
+after 15 minutes, critical: raising `retainLast` protects the proof for future
+orphans but cannot restore expired history, so the way out is an operator
+establishing commit status from their own evidence before requeueing or
+deleting anything.
 Every other failure is retried inside the pass, bounded per segment: a pass
 makes at most three claims on the same segment and then leaves it in `sealed/`
 for the next cycle, counting it under
