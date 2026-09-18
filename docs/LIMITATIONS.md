@@ -27,6 +27,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   visible rather than inferred: every acquisition is a `miss` on
   `siglake_iceberg_parsed_index_cache_lookups_total` with no eviction beside it,
   which is the shape the "Text-index startup" panels were added for (#3969).
+  With a zero blob budget the blob cache is off as well, and the floor pod says
+  so the same way: one `siglake_iceberg_puffin_blob_fetches_total` per
+  acquisition, and `siglake_iceberg_puffin_blob_cache_lookups_total` flat at the
+  zero it was pre-registered at, since a disabled cache is never consulted
+  (#4718).
   The caps that bind above 16Gi were chosen as policy; the parsed one has since
   been timed against a budget eight times its size and kept at 1 GiB on that
   evidence (#4102, below). The working set beneath them has been sized too, and
