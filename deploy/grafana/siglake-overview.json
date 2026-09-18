@@ -1933,6 +1933,35 @@
     "overrides": []
    },
    "description": "Whole audit rows lost without changing query responses. Oversized is a single row above the byte ceiling; row_limit and byte_limit are retained-budget saturation; channel_full is a transient sender/worker race; worker_shutdown means no audit receiver remains. Those five are refusals at submit. append_deadline is the other kind: a storage append outlived its service deadline and the batch it held was abandoned, so it counts one per row already accepted, and its commit may or may not have landed."
+  },
+  {
+   "id": 164,
+   "type": "timeseries",
+   "title": "Index registrations deferred",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 188
+   },
+   "targets": [
+    {
+     "expr": "sum by (reason) (increase(siglake_index_registration_deferred_total{namespace=~\"$namespace\"}[1h]))",
+     "legendFormat": "{{reason}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "description": "Puffin index registrations refused because the target snapshot already carries a statistics file. The existing file stays discoverable; the warning log names data files left on the scan path until a later snapshot."
   }
  ]
 }
