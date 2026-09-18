@@ -70,7 +70,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   on disk. The separate seg2 codec (#4988) closes that format cost with
   independently addressable Zstd blocks (16.7 MiB on the 7.34M-row fixture)
   and a CRC per block's posting span. A streaming re-cluster now builds seg2
-  one Parquet row group at a time and register its Puffin statistics file in
+  one Parquet row group at a time and registers its Puffin statistics file in
   the rewrite transaction (#4377), but only when
   `SIGLAKE_SEGMENTED_INDEX_WRITES=1`; production discovery recognizes seg2 and
   preserves whole-file v1 reads, behind the separate

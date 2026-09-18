@@ -1029,7 +1029,7 @@ so read the counts and bytes from them rather than the milliseconds — their
 
 ### 2026-09-18 writer-produced seg2 rerun (#5230)
 
-The same 14 × 7.34M corpus was rerun after replacing the harness-built seg1
+The same 14 × 7.34M corpus was rerun after replacing the report-built seg1
 arm with the streaming rewrite's seg2 output. Each day was appended in bounded
 chunks and rewritten on its own with segmented writes enabled. The fixture
 asserted one `siglake-inverted-seg-v2` blob for `raw` on every live file, no

@@ -1815,11 +1815,14 @@ async fn a_settled_clipped_index_query_cannot_charge_the_next_unindexed_arm() {
     let _gate = PUFFIN_QUERY_GATE.lock().await;
     let base = Utc.timestamp_opt(1_700_006_400, 0).unwrap();
     let tmp = tempfile::tempdir().unwrap();
+    let block_bytes = siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES;
     let indexed = sized_bench_fixture(
         &tmp.path().join("indexed"),
-        true,
-        false,
-        siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES,
+        BenchFixtureIndexing {
+            rebuild: true,
+            segmented: false,
+            segmented_block_bytes: block_bytes,
+        },
         base,
         CANCELLED_FILES,
         ROWS_PER_FILE,
@@ -1828,9 +1831,11 @@ async fn a_settled_clipped_index_query_cannot_charge_the_next_unindexed_arm() {
     .await;
     let unindexed = sized_bench_fixture(
         &tmp.path().join("unindexed"),
-        false,
-        false,
-        siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES,
+        BenchFixtureIndexing {
+            rebuild: false,
+            segmented: false,
+            segmented_block_bytes: block_bytes,
+        },
         base,
         CANCELLED_FILES,
         ROWS_PER_FILE,
@@ -2188,15 +2193,20 @@ fn ab_shaped_event(
 /// generator marked.
 const AB_RARE_TERM: &str = "rareneedle";
 
-/// One round per file, appended in bounded chunks so a multi-million-row arm
-/// does not hold its corpus in memory, then a streaming rewrite of exactly
-/// that round's output. `rebuild` is the only difference between the two arms
-/// of the measurement below.
-async fn sized_bench_fixture(
-    path: &std::path::Path,
+#[derive(Clone, Copy)]
+struct BenchFixtureIndexing {
     rebuild: bool,
     segmented: bool,
     segmented_block_bytes: usize,
+}
+
+/// One round per file, appended in bounded chunks so a multi-million-row arm
+/// does not hold its corpus in memory, then a streaming rewrite of exactly
+/// that round's output. `indexing` selects the whole-file rebuild or streaming
+/// segmented writer assigned to the measurement arm.
+async fn sized_bench_fixture(
+    path: &std::path::Path,
+    indexing: BenchFixtureIndexing,
     base: chrono::DateTime<chrono::Utc>,
     files: usize,
     rows_per_file: usize,
@@ -2204,7 +2214,7 @@ async fn sized_bench_fixture(
 ) -> IcebergContext {
     const APPEND_CHUNK: usize = 250_000;
 
-    let ice = open_sized_bench_fixture(path, rebuild, segmented, segmented_block_bytes).await;
+    let ice = open_sized_bench_fixture(path, indexing).await;
     let ident = ice.events_table_ident().clone();
     let blooms = ice.events_bloom_columns();
     let bloom_refs: Vec<&str> = blooms.iter().map(String::as_str).collect();
@@ -2249,9 +2259,7 @@ async fn sized_bench_fixture(
 /// or is re-timing a completed large fixture after an interrupted cache pass.
 async fn open_sized_bench_fixture(
     path: &std::path::Path,
-    rebuild: bool,
-    segmented: bool,
-    segmented_block_bytes: usize,
+    indexing: BenchFixtureIndexing,
 ) -> IcebergContext {
     IcebergContext::open(path)
         .await
@@ -2259,9 +2267,9 @@ async fn open_sized_bench_fixture(
         .with_inverted_index(true)
         .with_table_cache_ttl(std::time::Duration::ZERO)
         .with_tuning(IcebergTuning {
-            index_rebuild: Some(rebuild),
-            segmented_index_writes: Some(segmented),
-            segmented_index_block_bytes: Some(segmented_block_bytes),
+            index_rebuild: Some(indexing.rebuild),
+            segmented_index_writes: Some(indexing.segmented),
+            segmented_index_block_bytes: Some(indexing.segmented_block_bytes),
             ..Default::default()
         })
 }
@@ -2360,9 +2368,11 @@ async fn the_measurement_segmented_fixture_comes_from_the_streaming_seg2_writer(
     let block_bytes = siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES;
     let off = sized_bench_fixture(
         &tmp.path().join("off"),
-        false,
-        false,
-        block_bytes,
+        BenchFixtureIndexing {
+            rebuild: false,
+            segmented: false,
+            segmented_block_bytes: block_bytes,
+        },
         base,
         2,
         2_000,
@@ -2371,9 +2381,11 @@ async fn the_measurement_segmented_fixture_comes_from_the_streaming_seg2_writer(
     .await;
     let seg = sized_bench_fixture(
         &tmp.path().join("seg"),
-        false,
-        true,
-        block_bytes,
+        BenchFixtureIndexing {
+            rebuild: false,
+            segmented: true,
+            segmented_block_bytes: block_bytes,
+        },
         base,
         2,
         2_000,
@@ -2904,24 +2916,19 @@ async fn report_rebuild_on_off_text_shapes() {
     for (label, rebuild, segmented) in fixtures {
         let warehouse = fixture_root.join(label);
         let build = Instant::now();
+        let indexing = BenchFixtureIndexing {
+            rebuild,
+            segmented,
+            segmented_block_bytes: seg_block_bytes,
+        };
         // A reuse root that does not carry this arm yet is BUILT into and
         // kept, which is what lets a second process re-measure the same
         // corpus — a run with a different cache or reader configuration is a
         // different measurement, not a different fixture.
         let ice = if reuse_dir.is_some() && warehouse.exists() {
-            open_sized_bench_fixture(&warehouse, rebuild, segmented, seg_block_bytes).await
+            open_sized_bench_fixture(&warehouse, indexing).await
         } else {
-            sized_bench_fixture(
-                &warehouse,
-                rebuild,
-                segmented,
-                seg_block_bytes,
-                base,
-                files,
-                rows_per_file,
-                rare_every,
-            )
-            .await
+            sized_bench_fixture(&warehouse, indexing, base, files, rows_per_file, rare_every).await
         };
         let build_s = build.elapsed().as_secs_f64();
         let ident = ice.events_table_ident().clone();
