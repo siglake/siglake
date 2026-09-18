@@ -10,7 +10,9 @@
 //! the LEDGER recorded. The rules, the partial-match policy and the
 //! measurements are in `docs/DESIGN_wal_recovery_ledger_identity.md`; the
 //! arithmetic is [`siglake_wal::mirror::ledger_verdict`], and this module is
-//! only the reader.
+//! only the reader — it returns that verdict's own [`LedgerRow`] rather than a
+//! second spelling of the same three columns for a caller to copy across by
+//! hand.
 //!
 //! Two constraints shape it, and neither is a matter of discipline:
 //!
@@ -34,26 +36,13 @@ use sqlx::pool::PoolConnection;
 use sqlx::{Any, AnyPool, Row};
 use tokio::sync::Mutex;
 
+use siglake_wal::mirror::LedgerRow;
+
 use crate::catalog_claim::Dialect;
 
 /// Conservative `IN (...)` width, the same one `purge_committed_ids` uses:
 /// well under SQLite's variable limit and under Postgres's 65535 bind cap.
 pub const LOOKUP_CHUNK: usize = 256;
-
-/// The identity columns of one `wal_segments` row, as read.
-///
-/// Mirrors [`siglake_wal::mirror::LedgerRow`], which is the type the pure
-/// verdict consumes. They are separate because `siglake-wal` has no catalog
-/// dependency and no reason to grow one; the caller that has both crates —
-/// `siglake-cli` — converts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WalSegmentIdentity {
-    pub tenant: String,
-    /// `""` for the built-in events table, as stored.
-    pub index_id: String,
-    /// Root-relative `<mirror prefix>/<tenant>[/<index>]/<id>.arrow`.
-    pub segment_url: String,
-}
 
 /// The `SELECT` issued per chunk of ids. The only statement shape the lookup
 /// runs, and it reads no lifecycle column: a row's identity is write-once, so
@@ -123,7 +112,10 @@ impl WalLedgerReader {
     /// The error is the operator's whole diagnosis, so it names the remedies:
     /// a WAL-journal catalog on a read-only mount needs SQLite to create a
     /// `-shm` beside it, which the mount refuses even though every statement
-    /// is a SELECT.
+    /// is a SELECT. That failure arrives at the PROBE rather than at the
+    /// connect — sqlx's pool connects lazily, so nothing touches the file
+    /// until the first statement — which is why every step here is diagnosed
+    /// through the same [`open_error`].
     pub async fn open(uri: &str) -> Result<Self> {
         sqlx::any::install_default_drivers();
         let dialect = Dialect::from_uri(uri);
@@ -135,26 +127,21 @@ impl WalLedgerReader {
             .max_connections(1)
             .connect(&read_only)
             .await
-            .map_err(|e| open_error(uri, dialect, &e))?;
+            .map_err(|e| open_error(uri, dialect, Stage::Connect, &e))?;
         let mut conn = pool
             .acquire()
             .await
-            .map_err(|e| open_error(uri, dialect, &e))?;
+            .map_err(|e| open_error(uri, dialect, Stage::Connect, &e))?;
         if dialect == Dialect::Postgres {
             sqlx::query(PG_READ_ONLY_BEGIN)
                 .execute(&mut *conn)
                 .await
-                .with_context(|| format!("{PG_READ_ONLY_BEGIN} on {uri}"))?;
+                .map_err(|e| open_error(uri, dialect, Stage::Fence, &e))?;
         }
         sqlx::query(PROBE_SQL)
             .fetch_optional(&mut *conn)
             .await
-            .with_context(|| {
-                format!(
-                    "wal_segments is not readable in {uri}: this is a database, but not a \
-                     siglake catalog"
-                )
-            })?;
+            .map_err(|e| open_error(uri, dialect, Stage::Probe, &e))?;
         Ok(Self {
             pool,
             conn: Mutex::new(conn),
@@ -166,7 +153,7 @@ impl WalLedgerReader {
 
     /// Look the listed ids up, [`LOOKUP_CHUNK`] at a time. Duplicate ids cost
     /// nothing beyond their bind slot; the result is keyed by id.
-    pub async fn lookup(&self, ids: &[String]) -> Result<HashMap<String, WalSegmentIdentity>> {
+    pub async fn lookup(&self, ids: &[String]) -> Result<HashMap<String, LedgerRow>> {
         let mut out = HashMap::new();
         let mut conn = self.conn.lock().await;
         for chunk in ids.chunks(LOOKUP_CHUNK) {
@@ -184,7 +171,7 @@ impl WalLedgerReader {
             for row in rows {
                 out.insert(
                     row.get::<String, _>("id"),
-                    WalSegmentIdentity {
+                    LedgerRow {
                         tenant: row.get("tenant"),
                         index_id: row.get("index_id"),
                         segment_url: row.get("segment_url"),
@@ -213,12 +200,54 @@ impl WalLedgerReader {
     }
 }
 
+/// The filesystem path a SQLite URI names, for the "it is not there" check.
+/// `None` for Postgres, for `:memory:`, and for any spelling this does not
+/// recognise — in which case the diagnosis falls back to the driver's own
+/// words rather than guessing.
+fn sqlite_path(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri
+        .strip_prefix("sqlite://")
+        .or_else(|| uri.strip_prefix("sqlite:"))?;
+    let path = rest.split('?').next().unwrap_or(rest);
+    if path.is_empty() || path.contains(":memory:") {
+        return None;
+    }
+    Some(std::path::PathBuf::from(path))
+}
+
+/// Which step of the open failed. Only used to word the diagnosis: a database
+/// that is not a siglake catalog and a database that cannot be read at all are
+/// different problems with different remedies.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Stage {
+    Connect,
+    Fence,
+    Probe,
+}
+
 /// Turn a failed open into the line an operator reads during a restore.
-fn open_error(uri: &str, dialect: Dialect, e: &sqlx::Error) -> anyhow::Error {
+fn open_error(uri: &str, dialect: Dialect, stage: Stage, e: &sqlx::Error) -> anyhow::Error {
     let text = e.to_string();
-    let wal_mode = dialect == Dialect::Sqlite
+    // A file that is not there is the DR run's first failure domain — the
+    // catalog did not survive the volume — and it reports `unable to open`,
+    // the same string a read-only mount reports. Separated before the mount
+    // advice, or an operator whose catalog is gone is told to copy its
+    // sidecars somewhere writable.
+    if let Some(path) = sqlite_path(uri) {
+        if !path.exists() {
+            return anyhow::anyhow!(
+                "open {uri} read-only: no such database file ({}). A recovery reads the \
+                 catalog and never creates one, so this is the catalog not having survived \
+                 the volume.",
+                path.display()
+            );
+        }
+    }
+    // Checked before the stage, because SQLite reports it at whichever step
+    // first touches the file — the PROBE, with a lazily-connecting pool.
+    let needs_immutable = dialect == Dialect::Sqlite
         && (text.contains("readonly database") || text.contains("unable to open"));
-    if wal_mode {
+    if needs_immutable {
         return anyhow::anyhow!(
             "open {uri} read-only: {text}. A WAL-journal SQLite catalog needs a `-shm` file \
              created beside it, which a read-only mount refuses even though every statement \
@@ -228,7 +257,14 @@ fn open_error(uri: &str, dialect: Dialect, e: &sqlx::Error) -> anyhow::Error {
              writing."
         );
     }
-    anyhow::anyhow!("open {uri} read-only: {text}")
+    match stage {
+        Stage::Probe => anyhow::anyhow!(
+            "wal_segments is not readable in {uri}: this is a database, but not a siglake \
+             catalog: {text}"
+        ),
+        Stage::Fence => anyhow::anyhow!("{PG_READ_ONLY_BEGIN} on {uri}: {text}"),
+        Stage::Connect => anyhow::anyhow!("open {uri} read-only: {text}"),
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +310,22 @@ mod tests {
             let parsed = Parser::parse_sql(&PostgreSqlDialect {}, sql)
                 .unwrap_or_else(|e| panic!("does not parse as Postgres: {e}\n{sql}"));
             assert_eq!(parsed.len(), 1, "one statement per execute(): {sql}");
+        }
+    }
+
+    #[test]
+    fn a_sqlite_uri_yields_the_file_the_missing_catalog_check_stats() {
+        assert_eq!(
+            sqlite_path("sqlite:///var/lib/siglake/catalog.db?mode=ro"),
+            Some(std::path::PathBuf::from("/var/lib/siglake/catalog.db"))
+        );
+        assert_eq!(
+            sqlite_path("sqlite:catalog.db"),
+            Some(std::path::PathBuf::from("catalog.db"))
+        );
+        // No path to stat: the driver's own words are the diagnosis.
+        for uri in ["postgres://u@h/db", "sqlite::memory:", "sqlite://"] {
+            assert_eq!(sqlite_path(uri), None, "{uri}");
         }
     }
 

@@ -143,6 +143,31 @@ unverified, and the plan is the only checkpoint: its keys still fit the layout
 one component up, so an operator who applies it anyway restores under a tenant
 named after the mirror prefix. See `docs/LIMITATIONS.md` and
 `docs/DESIGN_wal_recovery_root_identity.md`.
+
+`--catalog <uri>` settles that unverified case exactly, where the catalog
+survived the volume (#4997). The uploader recorded `(tenant, index_id,
+segment_url)` for every object it PUT, and those three columns are write-once,
+so the listed segment ids can be looked up and the routing each KEY implies
+compared against the routing the ledger recorded. The lookup runs on the plan's
+own listing — the ids of the keys recovery SKIPS on their layout included,
+which is the whole of a deep mirror listed one component too high — and it is
+read-only mechanically: SQLite is opened `mode=ro`, Postgres runs its SELECTs
+inside `START TRANSACTION READ ONLY`, and neither path can reach
+`SqlSegmentClaim::connect`'s `ensure_schema`, which would migrate the catalog a
+plan is inspecting. Only the tail of `segment_url` is compared with the listed
+key, never its head against `--from`, so a mirror copied into another bucket is
+a legitimate source; what is left over above the key is the mirror prefix, and
+an EMPTY leftover means `--from` already carries it. One agreeing match
+confirms the root; any disagreement, or two matches claiming different
+prefixes, refuses the restore whole and reroutes nothing. Objects with no row —
+retention deletes a row as soon as its object is gone — keep the routing their
+key implies and are counted in the plan as uncertified. The flag adds evidence
+and never removes a refusal: a contradicting marker still refuses, and a
+catalog that cannot be read fails the run rather than falling back. Queries
+scale with the listing (one `IN` of 256 ids per chunk) and memory with the
+matched set; against the plan's own LIST plus one GET per candidate the lookup
+disappears. `docs/DESIGN_wal_recovery_ledger_identity.md` has the rules and the
+measurements.
 Multi-pod deployments coordinate through a
 SQL claim table (`wal_segments`, atomic `try_claim`); crash recovery
 quarantines ambiguous `processing/` segments rather than risk double commits.
