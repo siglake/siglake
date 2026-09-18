@@ -655,6 +655,36 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
             &[("reason", "oversized")],
         ],
     },
+    // #4718's blob-cache half of the same panel, and here for the same reason:
+    // a pod whose blob cache is re-fetching every blob per execution charts a
+    // rising `fetches` beside a flat `hit`, and both readings need the arms to
+    // exist from startup — the one #4182 hid for a round was a zero hit rate,
+    // which is indistinguishable from "no text query yet" while the series is
+    // absent. The eviction reasons say which rule is running: `redundant` and
+    // `stale` are the #4182 rule following the working set, a `fifo` rate is
+    // the pre-#4182 fallback, which is what re-fetched a blob one step before
+    // the query that wanted it.
+    //
+    // Recorded from the Iceberg fork with variable label values
+    // (`PUFFIN_BLOB_CACHE_OUTCOMES`, `PUFFIN_BLOB_CACHE_DROP_REASONS`), so
+    // `puffin_blob_cache_series_are_preregistered` in siglake-storage holds
+    // this catalog to them where check-chart.py cannot.
+    AlertedCounter {
+        name: "siglake_iceberg_puffin_blob_fetches_total",
+        series: UNLABELLED,
+    },
+    AlertedCounter {
+        name: "siglake_iceberg_puffin_blob_cache_lookups_total",
+        series: &[&[("outcome", "hit")], &[("outcome", "miss")]],
+    },
+    AlertedCounter {
+        name: "siglake_iceberg_puffin_blob_cache_evictions_total",
+        series: &[
+            &[("reason", "stale")],
+            &[("reason", "redundant")],
+            &[("reason", "fifo")],
+        ],
+    },
     // #4846's "Decoded-file cache populations" panel. No alert reads these
     // either; they are here for the same reason as the two above, and with one
     // more edge — the cache is OFF by default, so on most deployments every

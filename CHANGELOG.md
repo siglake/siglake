@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Query observability (feature)**: the Puffin blob cache reports what it is
+  doing on `/metrics`. `siglake_iceberg_puffin_blob_fetches_total` counts the
+  index blobs a process read from object storage,
+  `siglake_iceberg_puffin_blob_cache_lookups_total{outcome}` the decodes handed
+  bytes it still held against those that had to read, and
+  `siglake_iceberg_puffin_blob_cache_evictions_total{reason}` which arm of the
+  eviction rule chose each victim — `redundant` for a blob whose parsed twin is
+  resident and which therefore cannot be read until that twin goes, `stale` for
+  one nothing read while the cache turned over four times, `fifo` for the
+  fallback the coupled rule replaced. All three were process-wide diagnostics
+  readable only from a test, so a deployment could infer the blob cache's
+  behaviour only from index-phase object-store bytes against the parsed cache's
+  miss rate: that is how #4182's refetch regression — every execution re-reading
+  every blob of a 14-file plan, 4.60 GB over 183 index-phase reads against 0.50
+  GB over 73 — stayed invisible for a round, and why the miss rates in its
+  report had to be inferred from `first_batch_ms`. Every series is
+  pre-registered at 0 on the query server, so a tier that has served no text
+  query charts zero rather than "No data", and the "Puffin blob cache fetches /
+  hits / evictions" panel reads them beside the parsed cache's own. Eviction
+  behaviour, both cache defaults and the diagnostics are unchanged; the counters
+  are additive. (#4718)
+
 - **AWS reference deployment (fix)**: `deploy/aws/down.sh` settles
   `SIGLAKE_DOWN_MODE` before it writes to the cluster. The check sat on the
   destroy's own `case`, after the `helm uninstall`, the Postgres Secret, PVC

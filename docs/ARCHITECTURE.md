@@ -1349,6 +1349,19 @@ resident set is charted against its bound on
 `siglake_iceberg_parsed_index_cache_bytes` and
 `siglake_iceberg_parsed_index_cache_max_bytes`, both published where the bounds
 are enforced and therefore absent until the pod's first indexed text query.
+The blob side reports the same way (#4718):
+`siglake_iceberg_puffin_blob_fetches_total` counts the index blobs a process
+read from object storage,
+`siglake_iceberg_puffin_blob_cache_lookups_total{outcome}` the decodes handed
+bytes the cache still held against those that had to read, and
+`siglake_iceberg_puffin_blob_cache_evictions_total{reason}` which of the
+eviction rule's three arms chose each victim — `redundant` for a blob whose
+parsed twin is resident (and which therefore cannot be read at all until that
+twin goes), `stale` for one nothing read while the cache turned over four
+times, and `fifo` for the fallback the coupled rule replaced. A fetch rate that
+tracks the parsed miss rate is #4182's regression, which had to be inferred
+from index-phase object-store bytes and `first_batch_ms` for a round because
+these three were process diagnostics and nothing exported them.
 The startup cost itself is split by stage on
 `siglake_iceberg_text_index_startup_seconds{stage,storage}`: `permit_wait` for
 the load semaphore, `blob_fetch` for the Puffin read, `decode` for
@@ -1357,9 +1370,9 @@ row-selection runs. `decode` is recorded only on a miss and `selection` on
 every file the index prunes, so the two sample counts together say how much of
 a plan started warm — run #73 could not tell those four apart from a round's
 artifacts, which is what the split is for. The "Text-index startup" panels of
-`deploy/grafana/siglake-overview.json` read all of it, and the two counters are
-pre-registered at 0 on the query server so a tier serving no text query charts
-zero rather than no data. They are also the last claim
+`deploy/grafana/siglake-overview.json` read all of it, and the five counters
+are pre-registered at 0 on the query server so a tier serving no text query
+charts zero rather than no data. They are also the last claim
 on the limit: the derivation gives them only what is left once the pool can
 still reserve one compacted file's decode working set, so the packaged 4Gi pod
 — where that reservation is the whole remainder — caches no text indexes unless
