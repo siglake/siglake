@@ -194,13 +194,13 @@ fn now_millis() -> i64 {
 /// "syntax error at or near ?" or end up unbound. We detect the
 /// underlying backend at connect time and rewrite the queries.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Dialect {
+pub(crate) enum Dialect {
     Sqlite,
     Postgres,
 }
 
 impl Dialect {
-    fn from_uri(uri: &str) -> Self {
+    pub(crate) fn from_uri(uri: &str) -> Self {
         if uri.starts_with("postgres:") || uri.starts_with("postgresql:") {
             Self::Postgres
         } else {
@@ -212,7 +212,7 @@ impl Dialect {
     /// matters: `$1` first, `$2` second, ... The number of `?`s in
     /// the input must equal the number of bound parameters at call
     /// time.
-    fn rewrite(self, sql: &str) -> String {
+    pub(crate) fn rewrite(self, sql: &str) -> String {
         match self {
             Self::Sqlite => sql.to_string(),
             Self::Postgres => {

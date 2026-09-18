@@ -372,6 +372,10 @@ enum Command {
     /// mirror root, and both forms then exit nonzero naming the directory to
     /// pass instead. Both also exit nonzero when every key was skipped and
     /// there is nothing to restore.
+    ///
+    /// `--catalog <uri>` adds the exact answer for a mirror that carries
+    /// neither marker — the default install — by looking the listed segment
+    /// ids up in `wal_segments`, read-only. See the flag's own help.
     WalRecover {
         /// Full source URL (e.g. `s3://bucket/wal-mirror`).
         #[arg(long, env = "SIGLAKE_WAL_MIRROR_URL")]
@@ -386,6 +390,35 @@ enum Command {
         /// writes nothing — not one segment, and not `--to` itself.
         #[arg(long)]
         apply: bool,
+        /// Catalog URI to settle the root identity against, read-only
+        /// (`sqlite:///var/lib/siglake/catalog.db`, `postgres://…`).
+        ///
+        /// The uploader recorded the true `(tenant, index_id)` and the mirror
+        /// prefix for every object it PUT, so the listed segment ids can be
+        /// looked up and the routing each KEY implies compared against the
+        /// routing the ledger recorded. One agreeing row settles where
+        /// `--from` points; a disagreement refuses the restore WHOLE, naming
+        /// both routings, and never reroutes an object onto what the ledger
+        /// claims. Objects with no row — retention deletes a row as soon as
+        /// its object is gone, so this is the ordinary case — keep the routing
+        /// their key implies and are counted as uncertified in the plan.
+        ///
+        /// Read-only mechanically, not by convention: SQLite is opened
+        /// `mode=ro` and Postgres runs its SELECTs inside a read-only
+        /// transaction, so no schema is created or migrated in a catalog a
+        /// plan is inspecting. Nothing is written to the catalog either way.
+        ///
+        /// It never OVERTURNS a refusal: a marker that contradicts the root
+        /// still refuses, and the way past that is to pass the directory the
+        /// refusal names. A catalog that cannot be read is a hard error rather
+        /// than a downgrade to the marker verdict — an operator who asked for
+        /// exact evidence must not silently get a plan instead. Drop the flag
+        /// to restore without it.
+        ///
+        /// No env default on purpose: a deployment with a catalog URI in its
+        /// environment must not have this check turned on behind its back.
+        #[arg(long)]
+        catalog: Option<String>,
     },
 
     /// Return segments the drain set aside under `<wal>/poison/` to `sealed/`,
@@ -1224,7 +1257,12 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Command::WalRecover { from, to, apply } => run_wal_recover(&from, &to, apply).await,
+        Command::WalRecover {
+            from,
+            to,
+            apply,
+            catalog,
+        } => run_wal_recover(&from, &to, apply, catalog.as_deref()).await,
         Command::WalRequeue {
             wal,
             segment,
@@ -2843,9 +2881,76 @@ fn print_recovery_plan(plan: &siglake_wal::mirror::RecoveryPlan, from: &str, to:
         }),
     );
     println!("  {}", plan.verdict.line());
+    // Both verdicts, when the operator asked for both. The marker line stays
+    // first: it is the one that is always there, and the catalog line is read
+    // against it.
+    if let Some(ledger) = plan.ledger() {
+        println!("  {}", ledger.line());
+    }
 }
 
-async fn run_wal_recover(from: &str, to: &std::path::Path, apply: bool) -> Result<()> {
+/// Look the plan's listed segment ids up in `wal_segments` and record what the
+/// ledger says on the plan (#4997).
+///
+/// Never returns an error for a catalog that answered: an unreadable one
+/// becomes [`LedgerVerdict::Unavailable`] so the plan can be PRINTED with the
+/// reason on it before the run bails. The bail itself is the caller's.
+async fn attach_catalog_verdict(plan: &mut siglake_wal::mirror::RecoveryPlan, uri: &str) {
+    use siglake_wal::mirror::{LedgerRow, LedgerVerdict};
+
+    let reader = match siglake_storage::wal_ledger::WalLedgerReader::open(uri).await {
+        Ok(reader) => reader,
+        Err(e) => {
+            plan.attach_ledger(LedgerVerdict::Unavailable {
+                reason: format!("{e:#}"),
+            });
+            return;
+        }
+    };
+    let ids = plan.listed_ids();
+    let rows = match reader.lookup(&ids).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            reader.close().await;
+            plan.attach_ledger(LedgerVerdict::Unavailable {
+                reason: format!("{e:#}"),
+            });
+            return;
+        }
+    };
+    tracing::info!(
+        listed = ids.len(),
+        matched = rows.len(),
+        queries = reader.queries(),
+        "wal-recover: looked the listed segment ids up in wal_segments, read-only"
+    );
+    reader.close().await;
+    // The two crates keep their own spelling of a row — `siglake-wal` has no
+    // catalog dependency — so the three identity columns are named across
+    // here, once.
+    let rows = rows
+        .into_iter()
+        .map(|(id, row)| {
+            (
+                id,
+                LedgerRow {
+                    tenant: row.tenant,
+                    index_id: row.index_id,
+                    segment_url: row.segment_url,
+                },
+            )
+        })
+        .collect();
+    let verdict = siglake_wal::mirror::ledger_verdict(&plan.listed, &rows);
+    plan.attach_ledger(verdict);
+}
+
+async fn run_wal_recover(
+    from: &str,
+    to: &std::path::Path,
+    apply: bool,
+    catalog: Option<&str>,
+) -> Result<()> {
     url::Url::parse(from).with_context(|| format!("parse --from URL: {from}"))?;
     // `--to` used to mean `<wal>/sealed` (recovery flattened everything into
     // one directory). It now means the WAL ROOT, and the layout is rebuilt
@@ -2872,16 +2977,33 @@ async fn run_wal_recover(from: &str, to: &std::path::Path, apply: bool) -> Resul
     // earlier plan run saw. The plan also reads the body of each candidate it
     // would write, because a candidate that is not a WAL segment has to be
     // refused and named before the apply, not after it (#5077).
-    let plan = siglake_wal::mirror::plan_recovery(&store, "", to).await?;
+    let mut plan = siglake_wal::mirror::plan_recovery(&store, "", to).await?;
+    // The ledger check runs on the plan's OWN listing — the same single LIST —
+    // and covers exactly the gap the marker verdict leaves. It reads the ids
+    // of the keys the plan skipped as well as its candidates, which is what
+    // makes a deep mirror listed one component too high a proof with a
+    // directory in it rather than a generic bail.
+    if let Some(uri) = catalog {
+        attach_catalog_verdict(&mut plan, uri).await;
+    }
     print_recovery_plan(&plan, from, to);
-    let contradicted = matches!(
-        plan.verdict,
-        siglake_wal::mirror::RootVerdict::Contradicted { .. }
-    );
+    let refused = plan.refused();
+    // An unreadable catalog is a hard error, not a downgrade to the marker
+    // verdict: an operator who asked for exact evidence and silently got a
+    // plan is the failure `--catalog` was split out to avoid. The remedy is to
+    // drop the flag, and the message says so.
+    if let Some(siglake_wal::mirror::LedgerVerdict::Unavailable { reason }) = plan.ledger() {
+        anyhow::bail!(
+            "--catalog was given and the catalog could not be read: {reason}. Nothing under {} \
+             was created or changed. Re-run without --catalog to restore on the listing's own \
+             evidence.",
+            to.display()
+        );
+    }
     // The plan is printed first either way, then the run bails: the counts an
     // operator needs to see the mistake are on stdout before the diagnostic
     // that names it.
-    if plan.segments() == 0 && plan.skipped > 0 && !contradicted {
+    if plan.segments() == 0 && plan.skipped > 0 && !refused {
         anyhow::bail!(
             "restored nothing: all {} keys under --from have a layout recovery will not guess \
              at{}. --from must name the MIRROR ROOT — the directory holding \
@@ -2896,12 +3018,12 @@ async fn run_wal_recover(from: &str, to: &std::path::Path, apply: bool) -> Resul
         );
     }
     if !apply {
-        if contradicted {
+        if let Some(reasons) = plan.refusal_line() {
             // A plan that cannot be applied says so in its exit status, so a
             // runbook that plans before it applies stops here.
             anyhow::bail!(
-                "{}. Nothing under {} was created or changed; --apply would refuse the same way.",
-                plan.verdict.line(),
+                "{reasons}. Nothing under {} was created or changed; --apply would refuse the \
+                 same way.",
                 to.display()
             );
         }
