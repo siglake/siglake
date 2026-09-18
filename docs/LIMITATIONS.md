@@ -55,32 +55,72 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   override as a sizing option for a deployment that has both the query shape
   and the memory to spare; the derivation, its 1 GiB cap and the packaged 4Gi
   limit stay as they are.
-  The reader can now read a segmented sidecar in part (#4561,
+  The reader can now read a seg2 sidecar in part (#4561,
   `SIGLAKE_SEGMENTED_INDEX_READS`), which holds a directory instead of a
   parsed index, and holds it between queries under a
   byte budget of its own (#5006,
-  `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`) — but nothing writes
-  one, so neither budget above changes, and with the prototype off nothing is
-  retained under the new one either. That format has now been measured through
-  the query path against both the scan and the shipped sidecar at these
-  budgets and again with both of them off (#4562): the rare unclipped shapes go
+  `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`). The seg1 prototype was
+  measured through the query path against both the scan and the shipped
+  sidecar at these budgets and again with both of them off (#4562): the rare
+  unclipped shapes go
   from 7.3-22.4x slower than a scan to 11.5-17.4x faster, with 15.95 MiB of
   resident directory for the same fourteen files and no eviction, and the
   result does not move when the two budgets above are zero, because that path
   uses neither. The readable seg1 prototype costs 5.59x the v1 sidecar's bytes
   on disk. The separate seg2 codec (#4988) closes that format cost with
   independently addressable Zstd blocks (16.7 MiB on the 7.34M-row fixture)
-  and a CRC per block's posting span. A streaming re-cluster can now build seg2
-  one Parquet row group at a time and register its Puffin statistics file in
+  and a CRC per block's posting span. A streaming re-cluster now builds seg2
+  one Parquet row group at a time and registers its Puffin statistics file in
   the rewrite transaction (#4377), but only when
-  `SIGLAKE_SEGMENTED_INDEX_WRITES=1`; production discovery prefers seg2 while
-  preserving seg1 reads, but remains behind the separate
-  `SIGLAKE_SEGMENTED_INDEX_READS=1` opt-in. Both defaults stay off until AWS
-  qualification. Whether the
+  `SIGLAKE_SEGMENTED_INDEX_WRITES=1`; production discovery recognizes seg2 and
+  preserves whole-file v1 reads, behind the separate
+  `SIGLAKE_SEGMENTED_INDEX_READS=1` opt-in. Seg1 discovery was retired before
+  0.2.0 because no released reader promised it and no production writer emitted
+  it; its decode-only codec fixture remains, while registered seg1 metadata is
+  ignored and does not suppress a v1 rebuild. The writer-produced 14 × 7.34M
+  rerun kept both rare scans faster than the scan (0.14x and 0.06x), with
+  27,883,741 bytes holding all fourteen directories and 17.58 MiB of statistics
+  per file; the historical seg1 columns remain in the design record. The
+  clipped policy now reads point-term document frequency from dictionary
+  blocks before fetching postings and admits a file when summed df is no
+  larger than the query's clip (#5040). On the same retained fixture,
+  `rare_keyword` moved from the 545.9 ms scan fallback to 56.6 ms p50, while
+  the four ordinary clipped shapes declined and measured 0.67-1.10x their scan
+  controls. Substring sweeps still decline without reading the dictionary.
+  Both defaults stay off until AWS qualification. The writer's local
+  build-cost acceptance is recorded now: on 14 x 7.34M rows, seg2 averaged
+  282.77 seconds of rewrite time and 251.4 MiB peak tracked heap, 12.0% faster
+  and 80.8% smaller than the post-commit v1 rebuild it replaces (#5234). With
+  the write opt-in and `SIGLAKE_INDEX_REBUILD=1` both on, a file whose sidecar
+  the writer refuses stays unindexed until a later rewrite or a CLI rebuild at
+  a later snapshot: Iceberg permits one statistics file per snapshot, so
+  Siglake preserves the rewrite's registered seg2 blobs and counts the deferred
+  v1 registration instead of replacing them (#5228)
+  ([`DESIGN_segmented_inverted_index.md`](DESIGN_segmented_inverted_index.md),
+  "Registration beside the refusals"). Whether the
   serialized copy earns its share at all is a separate open question: since a
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no
   measurement against a real store has settled. Both are kept for now.
+- **A text plan larger than both caches still re-fetches its excess index
+  blobs, once per execution.** Eviction no longer drops the blobs the pair does
+  hold — that was #4182, where a 14-file plan against caches for about seven
+  re-read every blob on every execution — but the residue is arithmetic: a
+  repeat suite fetches the indexed files the blob budget cannot cover, measured
+  as exactly `files - blobs held` per pass over plans from 8 to 28 files
+  (`a_plan_larger_than_both_caches_stops_refetching_every_blob` in the fork).
+  Removing the fetches means covering the plan, and the budgets stay where they
+  are: #4102 timed the parsed side against eight times its budget and kept the
+  1 GiB cap, leaving the paired hand-set override above as the deployment-level
+  answer, and blob retention against a real store is still #4054's. What the
+  split between the two forms costs is measurable locally: on the six-file
+  fixture of `crates/siglake-storage/tests/text_index_blob_refetch.rs`, holding
+  all six as serialized blobs cost 65 kB against 188 kB for the parsed form,
+  for the same zero fetches and a decode per file per query. A blob also keeps
+  its protection from eviction for a bounded number of the cache's own
+  turnovers rather than for as long as its file is planned, which is the
+  approximation that keeps a compacted-away file's blob from being retained
+  forever; the plan-level signal that would replace it does not exist.
 - **A v1 inverted-index blob in a Parquet footer has no checksum; the Puffin
   sidecar's Zstd frame has one.** #4558 made the decoder validate everything
   the format can check itself — the serialized lengths against the bytes behind
@@ -114,6 +154,17 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   partial reader fetches one term's postings and can verify only what it
   fetched, and seg2 closes its own residual with a CRC per block's posting
   span. Neither applies to a blob that is read whole.
+- **Statistics-file retirement is whole-entry and limited to Siglake-owned
+  inverted indexes.** The snapshot-expiry and orphan-GC maintenance paths
+  remove an Iceberg statistics entry only when every blob has a `data_file`
+  property, every blob type is one of Siglake's v1 or segmented inverted-index
+  types, and none of those files is alive in any retained snapshot. An entry
+  with one live blob and one retired blob stays whole; Siglake does not rewrite
+  the Puffin file to split it. An entry containing another engine's blob type,
+  or an owned blob without `data_file`, also stays untouched because Siglake
+  cannot prove its lifetime. Keeping a mixed file costs metadata and object
+  storage until its last live reference retires, but preserves the Iceberg
+  interoperability boundary.
 - **A maintenance process's cache budgets are readable at startup, not on
   `/metrics`.** The compactor, the ingest server and the `siglake` maintenance
   subcommands resolve their own budgets now — zero for the two text-index
@@ -1200,7 +1251,8 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   siglake measures none of them, so ext4 or xfs on a node-attached volume is
   the substrate the power-loss claim is made for.
 - **`siglake wal-recover` can only tell the mirror root from its parent where
-  the mirror has a marker.** #4928 made a restore that recognised no key exit
+  the mirror has a marker, or where `--catalog` is given.** #4928 made a
+  restore that recognised no key exit
   nonzero, which catches `--from` two or more components too high. One
   component too high fits the layout: the shallowest mirror keys shift into
   the `<tenant>[/<index>]/<segment>` shape recovery routes on, so segments
@@ -1216,27 +1268,62 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   settles it: at its own depth the marker confirms the root, one component
   deeper it refuses the run and names the directory to pass instead.
 
-  What remains is the mirror with neither marker — no managed index and no
-  active mirroring, which is the default install. Its listing one component up
-  is indistinguishable from a legitimate mirror whose first tenant happens to
-  be named after a prefix, so the verdict is `unverified` and the plan is the
-  whole check: an operator who reads it and passes `--apply` anyway restores
-  into the invented tenant, and a legacy flat mirror then commits into
-  `tenant_<prefix>` while any other layout stops at `ensure_index` with the
-  segments in `sealed/` under a counted backlog and
+  What remains without a catalog is the mirror with neither marker — no
+  managed index and no active mirroring, which is the default install. Its
+  listing one component up is indistinguishable from a legitimate mirror whose
+  first tenant happens to be named after a prefix, so the verdict is
+  `unverified` and the plan is the whole check: an operator who reads it and
+  passes `--apply` anyway restores into the invented tenant, and a legacy flat
+  mirror then commits into `tenant_<prefix>` while any other layout stops at
+  `ensure_index` with the segments in `sealed/` under a counted backlog and
   `siglake_compactor_index_unresolved_total`.
-  `docs/DESIGN_wal_recovery_root_identity.md` has the measured cases, and
-  names the remaining exact answer as its own slice: `--catalog <uri>`, which
-  reads the true `(tenant, index_id)` and prefix out of `wal_segments`. That
-  slice is designed and locally qualified but NOT shipped, so the limitation
-  above is the shipped behaviour;
-  `docs/DESIGN_wal_recovery_ledger_identity.md` (#4974) has the rules and the
-  measured read-only, partial-match and cost results the flag would carry.
-  The second defect that document records — a correct restore of a tenant with
-  only index segments omitted the tenant discovery dir the ingester writes and
-  was never drained — is fixed (#4972): the restore rebuilds
-  `<tenant>/sealed/`, and re-running the command with `--apply` repairs a WAL
-  root restored before that.
+  `docs/DESIGN_wal_recovery_root_identity.md` has the measured cases.
+
+  `--catalog <uri>` (#4997) is the exact answer for that population where the
+  catalog survived too, and its limits are their own list.
+  `docs/DESIGN_wal_recovery_ledger_identity.md` has the rules and the
+  measurements. It looks the listed segment ids up in `wal_segments`
+  read-only, compares the routing each KEY implies against the
+  `(tenant, index_id)` the uploader recorded, and refuses the restore whole on
+  any disagreement. What it does not do:
+
+  - **It certifies only the objects it matched.** Retention deletes a row as
+    soon as its object is gone, so a partial match is the ordinary case. One
+    agreeing row settles where `--from` points — the root is a property of
+    `--from`, not of an object — and every unmatched object keeps the routing
+    its key implies, exactly as it would with no `--catalog` at all. The plan
+    prints the uncertified count. A listing whose matched objects are a genuine
+    mirror and whose unmatched objects came from somewhere else is confirmed,
+    and the unmatched ones are restored on their key evidence.
+  - **It never reroutes and never overrides.** A disagreement reports both
+    routings and applies neither. A marker that contradicts the root still
+    refuses whatever the catalog says, for the reason `--force` was settled
+    against: the way past a contradicted root is to pass the directory the
+    refusal names.
+  - **The catalog is a second failure domain, and an unreadable one is a hard
+    error.** `--catalog` on a catalog that cannot be read fails the run rather
+    than falling back to the marker verdict; the remedy is to drop the flag.
+    A WAL-journal SQLite catalog on a read-only mount cannot be opened at all
+    without `immutable=1` in the URI — SQLite creates a `-shm` beside it even
+    for a SELECT — and `immutable=1` reads around the `-wal` sidecar, so it is
+    exact only for a catalog nothing is still writing. siglake's own SQLite
+    catalogs are rollback-journal and need none of this.
+  - **One false refusal is known.** `mark_committed_local` composes
+    `segment_url` from the prefix in the LIVE config rather than from the key
+    the object was written under, so a deployment whose `wal.mirror.prefix`
+    changed after some objects had been uploaded can hold rows claiming two
+    prefixes for one mirror. The check reads that as a union of two mirrors and
+    refuses, naming both prefixes; the way past it is to drop `--catalog`.
+  - **There is no Postgres arm under test.** The reader fences Postgres with
+    `START TRANSACTION READ ONLY` and its statements are parse-gated in the
+    Postgres dialect, but no live Postgres runs them: the hermetic cases are
+    SQLite.
+
+  The second defect `docs/DESIGN_wal_recovery_ledger_identity.md` records — a
+  correct restore of a tenant with only index segments omitted the tenant
+  discovery dir the ingester writes and was never drained — is fixed (#4972):
+  the restore rebuilds `<tenant>/sealed/`, and re-running the command with
+  `--apply` repairs a WAL root restored before that.
 - **Attribute auto-promotion is opt-in, and it mutates schemas on its own.**
   Hot-key sampling and promotion of OTLP attributes to typed columns ships
   default-off (`SIGLAKE_AUTO_PROMOTE_MIN_PCT`, zero); promoted keys can also be

@@ -1,7 +1,13 @@
 # Design — row-group-addressable inverted-index sidecars (#4376 prototype)
 
-Status (2026-09-18): **seg2 streaming writer complete; production read/write
-adoption remains off by default.**
+Status (2026-09-18): **seg2 streaming writer landed on its hermetic suite and
+its 14 x 7.34M-row build cost is measured; production read/write adoption
+remains off by default.** The same-snapshot registration repair in #5228
+completes the writer's local acceptance (see
+[Writer integration](#writer-integration-4377)).
+The query-path report now builds its segmented arm through that writer and
+retains the older seg1 tables as dated history (#5230). Production discovery
+recognizes seg2 only; seg1 remains a codec fixture.
 The codec and its reader are `siglake_index::segmented`, and the reader
 integration (#4561) is behind `SIGLAKE_SEGMENTED_INDEX_READS` — see
 [Reader integration](#reader-integration-4561). A streaming re-cluster emits
@@ -132,10 +138,8 @@ Four separate discriminators, so no reader ever has to guess:
    trailer and in the header. A reader that does not know the version refuses
    the blob and the caller scans. Each decoder refuses the other's bytes:
    `a_v1_blob_and_a_segmented_blob_are_not_confusable`.
-2. **Its own Puffin blob type**, `siglake-inverted-seg-v1`. The shipped reader
-   matches `blob_type == "siglake-inverted-v1"` exactly
-   (`third_party/iceberg/src/arrow/reader.rs`), so it skips a segmented sidecar
-   and takes the scan path — the same path it takes for an unindexed file.
+2. **Its own Puffin blob type**, `siglake-inverted-seg-v1`. This was the
+   prototype discovery name.
 3. **Its own footer-KV key**, `siglake.inverted_index.seg1`, with the same
    per-column suffixing rule `inverted_index_kv_key` uses.
 4. **Its own `format` property** on the registered blob, `seg1`, beside the `v1`
@@ -144,14 +148,16 @@ Four separate discriminators, so no reader ever has to guess:
 Seg2 repeats the external discriminators as
 `siglake-inverted-seg-v2`, `siglake.inverted_index.seg2` and `format: seg2`,
 with version 2 in its header and trailer. `SegmentedReader` decodes both byte
-layouts once handed a range source; production discovery still selects only
-the seg1 blob type, so adding the codec does not make an existing query choose
-seg2.
+layouts once handed a range source. Production discovery selects only the seg2
+blob type. Seg1 discovery was retired before 0.2.0 (#5230): no released reader
+promised it and no production writer emitted it. Its pinned codec fixture still
+decodes the historical bytes, while a registered seg1 blob is ignored by query
+selection and does not suppress a whole-file v1 rebuild.
 
-A table may carry v1, seg1 and seg2 at once, per file, with no migration and no
-in-place conversion: their keys and blob types do not collide, and a file with
-none is scanned. That is the compatibility rule — **the format is per-file
-metadata, never table state.**
+A table may carry v1, retired seg1 and seg2 metadata at once because their keys
+and blob types do not collide. The production reader uses v1 or seg2 and scans
+a file with neither; seg1 metadata alone is treated as unindexed. The format is
+per-file metadata, never table state.
 
 Nothing here touches the Parquet or Iceberg v2 contract. A segmented sidecar is
 a Puffin blob registered as a statistics file exactly as the v1 sidecar is, or a
@@ -360,14 +366,83 @@ Before committing, the rewrite reserves its snapshot id, writes one Puffin
 statistics file containing the completed blobs, and applies the data-file swap
 and statistics registration in one transaction. A refused transaction can
 leave an unreferenced object for orphan GC, but no table metadata names it. The
-post-commit v1 rebuild treats v1, seg1 and seg2 registrations as equivalent
-coverage for `(data file, column)`, so it performs no full-file decode for the
-new output and a repeated rebuild is a no-op.
+post-commit v1 rebuild treats v1 and seg2 registrations as equivalent coverage
+for `(data file, column)`, so it performs no full-file decode for the new output
+and a repeated rebuild is a no-op. Retired seg1 metadata does not suppress that
+rebuild.
 
 `crates/siglake-storage/tests/segmented_index_writer.rs` holds the single-file,
 rolled-output, two-partition, failed-transaction, idempotence, exact-query and
-row-group-memory cases. Reads prefer seg2 and retain seg1 discovery; the knobs
-for writing and reading are separate and both remain off by default.
+row-group-memory cases. Reads discover seg2 only; the knobs
+for writing and reading are separate and both remain off by default. The
+writer's build-time and peak-heap report is an `#[ignore]`d release test in
+that file because its acceptance corpus is 14 x 7.34M rows.
+
+The #5234 run used 14 files of 7,340,000 rows (102,760,000 rows total), with
+append indexing on, `target_row_group_bytes=1` (clamped to 128 Ki-row groups)
+and streaming rewrites in every arm. Only `segmented_index_writes` and
+`index_rebuild` changed. The allocator
+figures are peak tracked live bytes during append plus rewrite, not process RSS.
+`/proc/loadavg` was read immediately before each arm.
+
+| arm | load average (1/5/15m) | segmented writes / v1 rebuild | append | rewrite | total | peak live heap | registered sidecar / data | live files |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| off-1 | 5.63 / 4.82 / 4.87 | off / off | 451.81 s | 142.61 s | 594.41 s | 251.4 MiB | 0 / 697,883,148 B (0.00%) | 14 |
+| on-1 | 4.20 / 3.66 / 4.09 | on / off | 454.52 s | 283.44 s | 737.96 s | 251.2 MiB | 247,359,225 / 697,883,148 B (35.44%) | 14 |
+| off-2 | 9.08 / 5.34 / 5.28 | off / off | 448.18 s | 142.28 s | 590.46 s | 251.5 MiB | 0 / 697,883,148 B (0.00%) | 14 |
+| on-2 | 4.20 / 3.39 / 4.16 | on / off | 446.41 s | 282.09 s | 728.50 s | 251.6 MiB | 247,359,226 / 697,883,148 B (35.44%) | 14 |
+| v1-rebuild | 4.21 / 2.99 / 3.39 | off / on | 438.21 s | 321.35 s | 759.56 s | 1,309.4 MiB | 224,141,786 / 697,883,148 B (32.12%) | 14 |
+
+Seg2 added 140.83 and 139.81 seconds to the rewrite arms over no index
+(98.8% and 98.3%), or 24.2% and 23.4% to append plus rewrite. Peak tracked
+heap stayed within 0.2 MiB of each paired control. Against the post-commit v1
+rebuild it replaces, seg2 averaged 282.77 seconds of rewrite time and 733.23
+seconds total: 12.0% and 3.5% below the v1 arm. It used 80.8% less peak tracked
+heap and 10.36% more registered sidecar bytes. The v1 comparison is one arm,
+while the seg2/no-index result is the requested repeated pair; the load readings
+above bound what this local timing says.
+
+The first run was interrupted after off-1, on-1 and off-2 had completed. Its
+stdout and stderr were retained under the run-owned TMPDIR. A release
+continuation reran off-2 immediately before on-2, then ran v1-rebuild; all
+coverage assertions passed, including zero registered blobs for each off arm,
+one live seg2 blob per file for each on arm and one live v1 blob per file for
+the rebuild arm.
+
+#### Registration beside the refusals
+
+`publish_segmented_sidecars` publishes nothing for a file whose finished
+sidecar disagrees with the footer it wrote, counting the reason on
+`siglake_iceberg_segmented_index_writes_total{outcome="refused"}`:
+
+| reason | what disagreed |
+|---|---|
+| `column` | a row group whose text column could not be indexed, so the sidecar has no group for it |
+| `file_rows` | the sidecar's total rows are not the data file's |
+| `row_domain` | the sidecar's per-group rows are not the footer's row groups |
+
+Silence is safe on its own — an unregistered file is read the way an unindexed
+one is. Before #5228 it was unsafe for the file's *siblings*:
+
+A rewrite registers every output blob in **one** `StatisticsFile` under the
+snapshot id it reserved, and `set_statistics` inserts by snapshot id
+(`third_party/iceberg/src/spec/table_metadata_builder.rs:589`), so a second
+statistics file written against that snapshot replaces the first rather than
+merging into it. With `SIGLAKE_INDEX_REBUILD=1` as well, a refused file is
+uncovered, so the post-commit `rebuild_inverted_indexes_for_files` over the
+rewrite's output builds a v1 blob for it and registers it under the same
+snapshot — dropping every seg2 blob the rewrite just published. Their Puffin
+path leaves `reachable_files` and orphan GC deletes the object; the query path
+falls back to a scan and answers correctly, so nothing reports the loss.
+
+Both opt-ins and a refusal are needed to reach it. Registration now refuses a
+second statistics file for the same snapshot, counts the deferral with the
+bounded `reason="snapshot_has_statistics"` label and logs the uncovered data
+files. It reports none of those files or bytes as rebuilt. The first statistics
+file remains discoverable and reachable to orphan GC; uncovered files stay on
+the exact scan path until a later snapshot can carry their rebuilt index.
+`a_v1_rebuild_against_the_rewrites_snapshot_keeps_its_seg2_blobs` drives that
+mixed-coverage boundary and checks the retained seg2 reader's exact answers.
 
 ### What per-section compression would recover
 
@@ -501,6 +576,8 @@ exact scan otherwise:
 | `row_group_order` | the scan's kept-group list is not strictly ascending, so the sidecar and the selection would cover different groups |
 | `unanswerable` | a term that does not normalize, a malformed section, or a failed range read |
 | `no_hints` | the prune spec carries nothing this index can answer |
+| `clipped_document_frequency` | point terms' summed df exceeds the clipped query's row limit |
+| `clipped_estimate_unavailable` | a clipped substring would require a full dictionary sweep rather than a point estimate |
 
 Two entry points changed in `siglake_index::segmented` for this, both
 reader-side policy the codec deliberately left open:
@@ -509,9 +586,12 @@ reader-side policy the codec deliberately left open:
   group's dictionary before any postings are fetched — the block read a point
   lookup pays anyway — and the postings are then read in ascending document
   frequency, stopping as soon as the running intersection empties. A group
-  missing one of the terms reads no posting section at all. The df the policy
-  needs is in the directory; the v1 index has no equivalent, since it has
-  already decoded everything by the time it could use one.
+  missing one of the terms reads no posting section at all. The df is in that
+  dictionary block, beside the term's posting length; the directory carries
+  the block's location and first term. A point estimate therefore costs one
+  dictionary-block range read per group after the cold trailer and directory
+  reads. The v1 index has no useful equivalent, since it has already decoded
+  everything by the time it can read a df.
 - **OR has an entry point at all.** `RawPruneSpec::any_terms` had none: the v1
   path unions `postings` per term and skips a term it cannot answer, which is
   safe only because `extract_match_udf_prune` fills the spec from tokenizer
@@ -726,8 +806,8 @@ shape, interleaved per execution:
 | `seg` | no v1 sidecar; one segmented sidecar per file, groups identical to the file's Parquet row groups |
 | `seg_policy` | the `seg` warehouse under the same #4375 rule |
 
-At the time of this measurement no writer produced the segmented format, so
-the harness wrote the sidecars
+The 2026-09-16 measurement below predates the writer and is labeled seg1. The
+harness wrote those sidecars
 (`write_segmented_sidecars`): one uncompressed blob per live data file,
 registered as one Puffin statistics file on the current snapshot. The arms exist
 only under `SIGLAKE_SEGMENTED_INDEX_READS`, which the reader resolves once per
@@ -748,7 +828,7 @@ reporting the scan's numbers under its label. All three runs below passed every
 one of those assertions, in every arm, on every shape. The format returned no
 wrong row and no missing row anywhere in this measurement.
 
-### Latency, under the deployed 1 GiB parsed / 256 MiB blob budgets
+### Historical seg1 latency, under the deployed 1 GiB parsed / 256 MiB blob budgets
 
 The segmented arm's directory cache is at its own 64 MiB default, which is not
 one of those two budgets and is not derived from a pod's memory (#5006).
@@ -781,8 +861,10 @@ had kept the whole-file index. The segmented format answers it in 47.6 ms,
 **11.1x faster than the scan**, and `seg_policy` declines it anyway and pays
 550.4 ms. The decline exists because loading an index is a whole-file cost. That
 premise does not hold for this format, so #4375's rule has to become
-document-frequency aware before #4377's format can pay off on clipped shapes;
-the df it needs is already in the directory.
+document-frequency aware before #4377's format can pay off on clipped shapes.
+The directory narrows the lookup to one dictionary block per group; reading
+that block supplies the df and posting length before any posting span is
+fetched.
 
 **The clipped high-df shapes still need the decline.** `keyword` (2% density) is
 4.46x the scan and `keyword_last5` 6.03x: a scan that stops at 100 rows reads a
@@ -939,22 +1021,124 @@ so read the counts and bytes from them rather than the milliseconds — their
   reads of ~2.5 KiB would be 84 GETs, against the shipped path's fourteen large
   ones. Whether that trade holds at per-request latency is a prepared round's
   question and nothing here qualifies an AWS result.
-- **Is not** a defaults change. `SIGLAKE_SEGMENTED_INDEX_READS` stayed off, the
-  measurement harness produced its own sidecars, and neither shipped budget
-  moved.
+- **Was not** a defaults change. The 2026-09-16 measurement harness produced
+  its own seg1 sidecars, and neither shipped budget moved.
 - **Is not** a writer benchmark. The construction numbers are sequential local
   fixture building, and the Parquet-decode half of them is an artifact of
   building sidecars after the fact.
-- **Carries one attribution defect.** A clipped `LIMIT` returns before the
-  partitions it cancelled have finished loading their indexes, so a few of the
-  `on` arm's decodes land in the next arm's counter window and its per-execution
-  millisecond columns swing by 3-10x between runs of the same shape (`keyword`:
-  12,566 / 6,222 / 6,031 / 10.5 / 16.1 ms). The `on` arm's cold column and its
-  summed decode counts are sound; its p50 for a clipped shape is an
-  overestimate of what one execution costs and an underestimate for whichever
-  arm ran next. Nothing in the `seg` arm's own numbers depends on it — that
-  fixture carries no v1 index to decode — and the disposition below turns on
-  ratios of 10x and more.
+- **The 2026-09-16 evidence carried one attribution defect; #5041 closes it.**
+  A clipped `LIMIT` returned before its cancelled partitions finished loading
+  indexes, so the original `on` samples included `keyword` at 12,566 / 6,222 /
+  6,031 / 10.5 / 16.1 ms, and a later counter window could include their
+  decodes. The original cold column, summed `on` decodes and disposition remain
+  the dated evidence above. The claim that `substring_scan,seg`'s eight decodes
+  came from the adjacent `policy` arm was too strong: that policy arm declines
+  v1 loads, and adjacency does not identify which earlier execution started
+  process-global work. Draining the segmented recorder per execution did not
+  isolate its window either.
+
+  `time_ab_shape` now retains the physical plan, stops the latency clock after
+  result collection, and requires every scan partition to settle before it
+  samples either the decode counters or the segmented recorder. The wait is
+  outside query latency; a 30-second timeout aborts the measurement before the
+  next arm starts.
+
+  A 2026-09-18 rerun used the same retained 14 x 7.34M-row fixture with both v1
+  caches at zero, so prior cache state could not make an execution warm. The
+  five clipped `on` samples were:
+
+  | shape | milliseconds |
+  |---|---|
+  | `keyword` | 8,272.0 / 10,365.1 / 10,835.9 / 10,759.2 / 10,568.6 |
+  | `keyword_last25` | 3,481.9 / 3,502.7 / 3,560.6 / 3,589.2 / 3,522.1 |
+  | `keyword_last5` | 3,696.4 / 3,471.1 / 3,382.0 / 3,805.2 / 3,444.9 |
+  | `substring_scan` | 11,684.4 / 11,127.6 / 11,219.8 / 11,222.4 / 11,291.6 |
+  | `rare_keyword` | 10,488.6 / 10,464.2 / 10,536.0 / 10,393.8 / 10,462.7 |
+
+  Each row's maximum is less than 1.4x its minimum. Every `off`, `policy`,
+  `seg` and `seg_policy` row reported `decodes=0`, including
+  `substring_scan,seg`. A companion rerun at the deployed 1 GiB / 256 MiB
+  budgets also gave every one of those arms zero decodes. Its two narrow-window
+  `on` shapes each retained one fast sample and reported one cache hit; that is
+  the mixed warm/cold state the cache is meant to create, separate from work
+  arriving after settlement.
+
+### 2026-09-18 writer-produced seg2 rerun (#5230)
+
+The same 14 × 7.34M corpus was rerun after replacing the report-built seg1
+arm with the streaming rewrite's seg2 output. Each day was appended in bounded
+chunks and rewritten on its own with segmented writes enabled. The fixture
+asserted one `siglake-inverted-seg-v2` blob for `raw` on every live file, no
+whole-file v1 blob in that arm, and no live seg1 registration. All three arms
+again had fourteen 7,340,000-row files and 92,325,000 Parquet bytes. Every
+exact-answer and per-row clipped-answer check passed, every segmented lookup
+reported no decline, and #5041's partition settlement ran before each counter
+sample.
+
+Five executions per shape used the deployed 1 GiB parsed / 256 MiB blob
+budgets and the 64 MiB segmented-directory default. `seg2 ÷ off` compares the
+two p50 columns from this run; the 2026-09-16 seg1 columns above remain the
+prototype history.
+
+| shape | off p50 | v1 p50 | policy p50 | seg2 p50 | seg2 ÷ off | seg2 policy p50 |
+|---|---:|---:|---:|---:|---:|---:|
+| `keyword` | 6.8 ms | 16,102.3 ms | 6.0 ms | 42.7 ms | 6.26x | 6.8 ms |
+| `keyword_last25` | 15.8 ms | 39.0 ms | 17.8 ms | 32.9 ms | 2.08x | 18.8 ms |
+| `keyword_last5` | 9.6 ms | 3,658.7 ms | 10.1 ms | 65.3 ms | 6.80x | 9.6 ms |
+| `substring_scan` | 5.4 ms | 15,559.5 ms | 4.5 ms | 831.0 ms | 154.77x | 4.7 ms |
+| `rare_scan` | 1,619.0 ms | 22,614.9 ms | 22,377.5 ms | 220.7 ms | **0.14x** | 161.2 ms |
+| `rare_scan_last25` | 680.5 ms | 4,877.6 ms | 4,506.2 ms | 44.0 ms | **0.06x** | 41.0 ms |
+| `rare_keyword` | 531.2 ms | 17,170.9 ms | 538.0 ms | 69.9 ms | **0.13x** | 545.9 ms |
+
+The writer built the fresh seg2 arm in 725.7 s, including append, Parquet
+rewrite and sidecar construction. Its registered statistics totaled
+482,548,759 bytes against the off arm's 224,474,617 bytes: 17.58 MiB per file,
+1.13x the whole-file v1 arm's 15.59 MiB per file. The segmented-directory cache
+held all fourteen parsed directories in 27,883,741 bytes with zero evictions.
+A warm `rare_scan` fetched 33,854 bytes in 84 reads; its cold execution fetched
+5,409,847 bytes while opening the directories.
+
+The format conclusion holds with the writer's bytes: both unclipped rare scans
+beat the scan, and the clipped rare term would beat it if policy retained the
+index. The three high-document-frequency clipped shapes and the substring
+sweep still require the decline. These are local `file://` results, not an
+object-store, distributed or HTTP qualification.
+
+### 2026-09-18 document-frequency policy rerun (#5040)
+
+The retained writer-produced seg2 fixture was queried again after carrying the
+bare clip into the reader and setting the per-file point-term budget to
+`summed df <= clip`. The whole-file v1 and ordered-limit declines did not
+change. Five executions per shape used the same deployed cache budgets; every
+exact-answer and clipped membership check passed.
+
+| shape | scan p50 | seg2 p50 | df policy p50 | policy / scan | policy disposition |
+|---|---:|---:|---:|---:|---|
+| `keyword` | 7.1 ms | 49.3 ms | 6.8 ms | 0.95x | `clipped_document_frequency` |
+| `keyword_last25` | 16.2 ms | 28.7 ms | 17.8 ms | 1.10x | `clipped_document_frequency` |
+| `keyword_last5` | 10.4 ms | 78.5 ms | 10.6 ms | 1.01x | `clipped_document_frequency` |
+| `substring_scan` | 5.9 ms | 915.4 ms | 4.0 ms | 0.67x | `clipped_estimate_unavailable` |
+| `rare_scan` | 1,714.2 ms | 165.3 ms | 162.9 ms | 0.10x | admitted, unclipped |
+| `rare_scan_last25` | 646.9 ms | 46.0 ms | 45.0 ms | 0.07x | admitted, unclipped |
+| `rare_keyword` | 558.7 ms | 79.9 ms | **56.6 ms** | **0.10x** | admitted, summed df at or below 100 |
+
+The decision's own reads were retained, including cold setup. `keyword`'s
+first policy execution opened directories and stopped after 17 reads / 2.27
+MiB; its four warm executions averaged 10.5 reads / 2.1 KiB. The windowed
+common terms each proved over budget with one 200-205 byte dictionary-block
+read per answered file once their directories were warm. The substring arm
+read nothing below the held directory. `rare_keyword` paid 66 reads / 26,989
+bytes cold and averaged 63 reads / 25,303 bytes warm, including its posting
+spans. Thus the cold directory and dictionary work is visible in the same
+range-read/fetched-byte accounting as admitted postings; a policy decline no
+longer reports that estimate as free.
+
+The clipped scan controls are small enough that scheduler variation is visible:
+the two closest rows landed at 1.01x and 1.10x in this five-run pass, while the
+ordinary whole-file policy controls landed at 1.04x and 1.27x. The categorical
+result is unchanged: all four high-cost shapes declined, and the rare clipped
+shape retained seg2 and recovered the measured scan loss. This remains a local
+`file://` measurement, with no HTTP, distributed or object-store latency.
 
 ## Disposition for #4377: proceed, with two revisions
 
@@ -968,7 +1152,7 @@ instead of 22x it (0 hits and 125 evictions at 4 MiB, the parsed cache's failure
 mode on a cache whose miss costs milliseconds). No cache sizing reaches that
 result with the shipped format.
 
-Two revisions belong in #4377's scope rather than after it:
+Both revisions identified by #4562 are now in code:
 
 1. **#4988's per-block compression prerequisite is complete.** As prototyped
    the sidecar is 5.59x the on-disk bytes of the v1 one it replaces (87.19 MiB
@@ -976,13 +1160,12 @@ Two revisions belong in #4377's scope rather than after it:
    7.34M-row scale and settles the posting-span checksum at the same block
    granularity. #4377 can build the versioned format without carrying seg1's
    storage regression into every compacted file.
-2. **#4375's decline has to become document-frequency aware.** Its rule declines
-   any clipped `LIMIT`, which is right for a whole-file decode and wrong for this
-   format: it costs `rare_keyword` an 11.1x win (47.6 ms against 550.4 ms) while
-   correctly saving `keyword` and `substring_scan` from 4.5-174x losses. The
-   directory carries each term's df, so the rule can ask what the postings would
-   cost before deciding. Until it does, the format's clipped-shape behaviour is
-   the scan's.
+2. **#5040 makes #4375's decline document-frequency aware for seg2.** A clipped
+   whole-file v1 index still declines. Seg2 locates point terms in the dictionary
+   blocks named by the directory, sums their df across selected groups, and
+   fetches postings only when that sum is no larger than the clip. This moves
+   `rare_keyword` to 56.6 ms while the high-df and substring shapes keep their
+   scan fallbacks. The table and cost accounting above are the retained result.
 
 **Not blocking, and still open:** the substring sweep reads the whole dictionary
 and stays a decline; the directory cache's value is measured in bytes and
@@ -1019,19 +1202,25 @@ What remains, in order:
    the decoded posting span before slicing a term. Seg1 bytes are pinned by a
    fixture and remain readable. The 7.34M-row report writes 16.7 MiB and records
    fetched bytes for all six shapes.
-5. ~~**#4377**~~ — done: the streaming Parquet writer builds one seg2 group per
-   row group, registers all completed output blobs in the rewrite transaction,
-   and leaves the post-commit v1 rebuild no file to decode. The acceptance
-   suite covers rolling output, separate partition rewrites, failed
-   transactions, repeated rebuild, exact answers and row-group-bounded parsed
-   index state. Reads and writes remain separate opt-ins.
-6. **An open question for #4561**: the substring sweep reads the whole
-   dictionary, and `keyword`-class terms with millions of postings read megabytes
-   of posting bytes. Both are regimes where partial reads buy little, and #4375's
-   per-execution policy is the place to decline them. The document frequency a
-   policy would want is now in the directory — a 474.9 KiB read per file — which
-   is the cheapest selectivity estimate this design makes available and did not
-   exist before it.
+5. ~~**#4377 / #5233 / #5234**~~ — done: the code and local measurement are in.
+   The
+   streaming Parquet writer builds one seg2 group per row group, registers all
+   completed output blobs in the rewrite transaction, and leaves the
+   post-commit v1 rebuild no file to decode. The hermetic suite covers rolling
+   output, separate partition rewrites, failed transactions, repeated rebuild,
+   exact answers and
+   row-group-bounded parsed index state, and passes. Reads and writes remain
+   separate opt-ins. The 14 x 7.34M build time and peak heap are recorded in
+   [Writer integration](#writer-integration-4377). #5228 closes the
+   same-snapshot registration case by preserving the rewrite's statistics file
+   and counting the deferred rebuild.
+6. ~~**#5040**~~ — done: the bare clipped limit is carried into the reader.
+   Point terms are located across the selected groups before any posting span
+   is fetched and are admitted when their summed df is no larger than the
+   clip. The cold directory and dictionary-block reads are charged to the
+   estimate. Common terms decline as `clipped_document_frequency`; a substring
+   declines as `clipped_estimate_unavailable` without sweeping the dictionary.
+   Whole-file v1 and ordered-limit declines are unchanged.
 
 ## Reproduce
 
@@ -1094,14 +1283,15 @@ process starts in — the reader resolves it once — and
 
 ```
 export SIGLAKE_SEGMENTED_INDEX_READS=1
+export SIGLAKE_SEGMENTED_INDEX_WRITES=1
 export SIGLAKE_REBUILD_AB_FILES=14 SIGLAKE_REBUILD_AB_ROWS_PER_FILE=7340000
 export SIGLAKE_REBUILD_AB_RARE_EVERY=100000
 export SIGLAKE_REBUILD_AB_PARSED_BYTES=1073741824
 export SIGLAKE_REBUILD_AB_BLOB_BYTES=268435456
 export SIGLAKE_REBUILD_AB_REUSE_DIR=$TMPDIR/4562/fixture
 
-# deployed budgets + the packaged cache-off pass, 28 min (first run builds the
-# fixture: ~9 min more, and the segmented sidecars another ~3)
+# deployed budgets + the packaged cache-off pass (a fresh writer-produced seg2
+# arm took 12.1 min to append and rewrite on the 2026-09-18 run)
 SIGLAKE_REBUILD_AB_RUNS=5 SIGLAKE_REBUILD_AB_PASSES=packaged=0:0 \
   cargo test -p siglake-storage --release --test puffin_rebuild \
   report_rebuild_on_off_text_shapes -- --ignored --nocapture
@@ -1113,6 +1303,13 @@ SIGLAKE_REBUILD_AB_RUNS=3 SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES=0 \
 SIGLAKE_REBUILD_AB_RUNS=3 SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES=4194304 \
   cargo test …
 ```
+
+The `seg` arm is accepted only when every live file has exactly one seg2 blob
+for `raw`. A retained seg1 arm is refused with a request to rebuild it, so an
+old #4562 fixture cannot be reported under the seg2 label. The controls set the
+per-context writer override off while the segmented arm sets it on; the
+`SIGLAKE_SEGMENTED_INDEX_WRITES=1` export documents the production opt-in whose
+path the arm exercises.
 
 Without `SIGLAKE_SEGMENTED_INDEX_READS` the run is #4375's four-arm one, which
 is the negative control for the arm's existence: the `seg` arms disappear rather

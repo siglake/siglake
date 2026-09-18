@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- **Recovery (feature)**: `siglake wal-recover --catalog <uri>` settles
+  whether `--from` is the mirror root from the catalog instead of from a
+  marker. A mirror with no managed index and no active mirroring — the default
+  install — carries neither of the markers #4973 reads, and its listing one
+  component too high is indistinguishable from a legitimate mirror whose first
+  tenant is named after a prefix; a restore of that listing invents a tenant
+  named after the mirror prefix. The uploader recorded
+  `(tenant, index_id, segment_url)` for every object it PUT and none of the
+  `UPDATE`s in the claim path touch those three columns, so the listed segment
+  ids can be looked up and the routing each KEY implies compared against the
+  routing the ledger recorded. The lookup runs on the plan's own listing,
+  including the ids of keys recovery refuses on their layout — which is the
+  whole of a deep mirror listed one component up, and turns the generic
+  "restored nothing" bail into a refusal naming the directory to pass instead.
+  Only the TAIL of `segment_url` is compared with the listed key, never its
+  head against `--from`, so a mirror copied into another bucket is a legitimate
+  source; the leftover above the key is the mirror prefix, and an empty
+  leftover is the signal that `--from` already carries it. One agreeing match
+  confirms the root, since the root is a property of `--from` rather than of an
+  object; a disagreement, or two matches claiming different prefixes, refuses
+  the restore whole, reports both routings and reroutes nothing. Objects with
+  no row — retention deletes a row as soon as its object is gone, so this is
+  the ordinary case — keep the routing their key implies and are counted as
+  uncertified in the plan. Read-only mechanically rather than by discipline:
+  SQLite is opened `mode=ro` and Postgres runs its SELECTs inside
+  `START TRANSACTION READ ONLY`, so the reader cannot reach the `ensure_schema`
+  that connecting through `SqlSegmentClaim` would have run against the catalog
+  a plan is inspecting. The flag adds evidence and removes no refusal: a
+  contradicting marker still refuses whatever the catalog says, and a catalog
+  that cannot be read fails the run rather than falling back to the marker
+  verdict — the remedy is to drop the flag, and the message says so. No env
+  default, no new requirement, and a mirror with no `--catalog` behaves exactly
+  as before. `docs/LIMITATIONS.md` has what it does not certify, including the
+  one known false refusal (a `wal.mirror.prefix` changed mid-life) and the
+  absence of a live Postgres arm. (#4997)
+
 - **Text indexes (feature)**: an opted-in streaming re-cluster builds the
   compressed segmented inverted index (`seg2`) as it emits Parquet row groups,
   then registers the completed Puffin statistics file in the same transaction
@@ -10,10 +46,22 @@
   produces one blob per output file and indexed column when a rolling rewrite
   splits. A failed transaction leaves no discoverable index, and the existing
   post-commit rebuild recognizes seg2 coverage instead of decoding the output
-  file again. Query discovery prefers seg2 while retaining the prototype seg1
-  path and existing v1 reads. `SIGLAKE_SEGMENTED_INDEX_WRITES=1` and the
+  file again. Query discovery recognizes seg2 and retains existing whole-file
+  v1 reads. The unreleased seg1 prototype is no longer discovered and no longer
+  suppresses a rebuild; its pinned bytes remain a decode-only codec test.
+  `SIGLAKE_SEGMENTED_INDEX_WRITES=1` and the
   separate `SIGLAKE_SEGMENTED_INDEX_READS=1` are both required to build and use
-  the format; both remain off by default pending AWS qualification. (#4377)
+  the format; both remain off by default pending AWS qualification. On the
+  14 x 7.34M-row acceptance corpus, seg2 averaged 282.77 seconds of rewrite
+  time and 251.4 MiB peak tracked heap, 12.0% faster and 80.8% smaller than the
+  post-commit v1 rebuild it replaces. If that rebuild finds an uncovered file
+  on the rewrite's snapshot, it preserves the registered seg2 blobs and counts
+  the deferred v1 registration instead of replacing them. The query-path
+  report now builds its segmented fixture through the
+  streaming seg2 rewrite and refuses retained seg1 fixtures. At 14 × 7.34M
+  rows its two rare scans were 0.14x and 0.06x the scan, with exact answers and
+  matching Parquet layouts; the dated seg1 columns remain as history. (#4377,
+  #5228, #5230, #5233, #5234)
 
 - **Text indexes (docs)**: the documented integrity gap in a v1 inverted-index
   blob is the **footer-KV** path only. An index stored as hex in a Parquet
@@ -309,7 +357,7 @@
 
 ## 0.1.1
 
-Twelve changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
+Thirteen changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
 surface moves, and a 0.1.0 warehouse is read and written unchanged: one values
 key and six environment knobs are added, and no flag or values key is removed.
 Two defaults move. The audit worker now gives each append 30 s instead of
@@ -354,6 +402,21 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   needs a drained, non-order-preserving scan carrying no convertible predicate,
   which on a log-UI workload is close to nothing (`docs/LIMITATIONS.md`).
   (#4891)
+- **Query**: a text query over more indexed files than the text-index caches
+  hold no longer re-reads every index blob from object storage on every
+  execution. The two caches sit on either side of one decode, and only the
+  parsed side serves a warm query, so a cached blob is read exactly when its
+  parsed twin has been evicted — which is also the moment arrival-order
+  eviction dropped it. A 14-file plan on the 50G benchmark round read 4.60 GB
+  over 183 index-phase reads where the same plan had read 0.50 GB over 73.
+  Eviction now drops the blobs the parsed cache still covers, which cannot be
+  read at all, and keeps the ones it has dropped, for a bounded number of the
+  cache's turnovers so that a compacted-away file's blob is not retained for
+  the life of the process. What remains is arithmetic: a repeat text suite
+  re-fetches the indexed files the blob budget cannot cover and nothing more —
+  measured as exactly `files - blobs held` per pass over plans from 8 to 28
+  files, against the whole plan before. No budget or default changes, and no
+  answer changes: a blob-cache miss costs a fetch, never a row. (#4182)
 - **Query**: whether to *use* a text index a file already carries is now
   decided per execution. Loading one costs a deserialization proportional to
   the file's rows, and a text predicate under a bare `LIMIT` stops the scan
