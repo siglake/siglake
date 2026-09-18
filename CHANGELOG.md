@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **AWS reference deployment (fix)**: `deploy/aws/down.sh` exits with
+  terraform's status when the destroy fails. The script runs without errexit
+  and ended with `log "down complete"`, so its status was that log call: a
+  failed `terraform destroy` — targeted in the default keep-EKS mode, or the
+  full stack under `SIGLAKE_DOWN_MODE=all` — exited 0 with RDS, the warehouse
+  bucket and the IAM role still running and billing, and the caller read the
+  teardown as finished. AWS rounds have already hit `VcpuLimitExceeded` from
+  instances an earlier teardown left behind. The `helm uninstall` and
+  `kubectl delete` steps before the destroy stay best-effort, and the
+  resource selection in both modes is unchanged;
+  `scripts/check-aws-down-destroy.sh` covers the six cases under stub
+  binaries, including a run whose cleanup fails at every step and still
+  reaches the destroy. (#5309)
+
 - **Recovery (feature)**: `siglake wal-recover --catalog <uri>` settles
   whether `--from` is the mirror root from the catalog instead of from a
   marker. A mirror with no managed index and no active mirroring — the default
