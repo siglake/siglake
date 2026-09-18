@@ -371,6 +371,12 @@ rewrite has derived its snapshot from the refreshed base, so the committed
 snapshot, statistics metadata and physical Puffin footer carry the same
 sequence number across stale bases and CAS retries. The ordinary post-commit v1
 rebuild recognizes that registration and does not decode the output file again.
+A rewrite whose output rolls into many files holds every finished sidecar until
+that transaction publishes them, but its peak heap is set by the merge and by
+one row group's parsed index rather than by the retained set: from 3 to 40
+rolled outputs the measured cost over a matched writes-off control did not
+move (#5299). What the retained bytes track is rows, not files — about 2.4 B
+per row per indexed column on the measured corpus.
 Production discovery recognizes seg2;
 the unreleased seg1 prototype remains decodable by its pinned codec test but is
 ignored by query selection and does not suppress a whole-file v1 rebuild. Files
