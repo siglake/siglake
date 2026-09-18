@@ -1176,9 +1176,12 @@ fn header_journal(path: &Path) -> &'static str {
 
 /// Make `dir` unwritable and report whether the mode bits are enforced: root
 /// ignores them, and so does a filesystem mounted without permission support.
-fn deny_writes(dir: &Path) -> (bool, std::fs::Permissions) {
-    let restore = std::fs::metadata(dir).unwrap().permissions();
-    let mut perms = restore.clone();
+fn deny_writes(dir: &Path) -> (bool, Restore) {
+    let restore = Restore {
+        dir: dir.to_path_buf(),
+        perms: std::fs::metadata(dir).unwrap().permissions(),
+    };
+    let mut perms = restore.perms.clone();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1186,6 +1189,20 @@ fn deny_writes(dir: &Path) -> (bool, std::fs::Permissions) {
     }
     std::fs::set_permissions(dir, perms).unwrap();
     (std::fs::write(dir.join("probe"), b"x").is_err(), restore)
+}
+
+/// Puts the mode bits back on drop, panic included: a `TempDir` whose
+/// directory is still 0555 when the harness tears it down cannot be removed,
+/// and the leftover needs a `chmod` by hand.
+struct Restore {
+    dir: std::path::PathBuf,
+    perms: std::fs::Permissions,
+}
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.dir, self.perms.clone());
+    }
 }
 
 /// A rescued catalog on a READ-ONLY mount, which is the DR shape `mode=ro` is
@@ -1219,9 +1236,8 @@ async fn a_read_only_mount_reads_a_rollback_catalog_but_needs_immutable_for_a_wa
         "rollback",
         "sqlx leaves journal_mode alone, so this is what a siglake SQLite catalog is"
     );
-    let (enforced, restore_a) = deny_writes(&dir_a);
+    let (enforced, _restore_a) = deny_writes(&dir_a);
     if !enforced {
-        std::fs::set_permissions(&dir_a, restore_a).unwrap();
         return;
     }
     let reader = LedgerReader::open_sqlite_read_only(&db_a)
@@ -1229,7 +1245,6 @@ async fn a_read_only_mount_reads_a_rollback_catalog_but_needs_immutable_for_a_wa
         .expect("a rollback-journal catalog reads off a read-only mount");
     assert_eq!(reader.lookup(&["s1".to_string()]).await.unwrap().len(), 1);
     reader.pool.close().await;
-    std::fs::set_permissions(&dir_a, restore_a).unwrap();
 
     // Arm B: WAL mode, and no `-shm` left behind by an earlier writable open.
     let dir_b = tmp.path().join("wal-mode");
@@ -1277,9 +1292,8 @@ async fn a_read_only_mount_reads_a_rollback_catalog_but_needs_immutable_for_a_wa
             .map(|e| e.file_name())
             .collect::<Vec<_>>()
     );
-    let (enforced, restore_b) = deny_writes(&dir_b);
+    let (enforced, _restore_b) = deny_writes(&dir_b);
     if !enforced {
-        std::fs::set_permissions(&dir_b, restore_b).unwrap();
         return;
     }
     let err = LedgerReader::open_sqlite_read_only(&db_b)
@@ -1298,7 +1312,6 @@ async fn a_read_only_mount_reads_a_rollback_catalog_but_needs_immutable_for_a_wa
         .unwrap();
     assert_eq!(got.get::<String, _>("tenant"), "acme");
     pool.close().await;
-    std::fs::set_permissions(&dir_b, restore_b).unwrap();
 }
 
 /// The prototype's own routing inference must agree with the shipped parser
