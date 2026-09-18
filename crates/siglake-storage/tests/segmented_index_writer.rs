@@ -194,20 +194,32 @@ async fn open_fixture(
     row_group_bytes: Option<usize>,
     target_file_bytes: Option<usize>,
 ) -> IcebergContext {
+    open_fixture_with_tuning(
+        path,
+        IcebergTuning {
+            segmented_index_writes: Some(segmented),
+            // The hermetic cases keep the post-commit v1 rebuild ON, so "the
+            // rewrite already indexed this column" is what stops it rather
+            // than the knob.
+            index_rebuild: Some(true),
+            target_row_group_bytes: row_group_bytes,
+            merge_target_file_bytes: target_file_bytes,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// A fixture whose storage knobs are explicit. The build-cost report uses
+/// this to keep append indexing and Parquet layout matched while varying only
+/// the two rewrite-index settings under measurement.
+async fn open_fixture_with_tuning(path: &std::path::Path, tuning: IcebergTuning) -> IcebergContext {
     IcebergContext::open(path)
         .await
         .unwrap()
         .with_inverted_index(true)
         .with_table_cache_ttl(std::time::Duration::ZERO)
-        .with_tuning(IcebergTuning {
-            segmented_index_writes: Some(segmented),
-            // The post-commit v1 rebuild ON, so "the rewrite already indexed
-            // this column" is the thing that stops it rather than the knob.
-            index_rebuild: Some(true),
-            target_row_group_bytes: row_group_bytes,
-            merge_target_file_bytes: target_file_bytes,
-            ..Default::default()
-        })
+        .with_tuning(tuning)
 }
 
 const APPEND_CHUNK: usize = 250_000;
@@ -1105,17 +1117,20 @@ fn histogram_samples(snapshot: &SnapshotVec, name: &str) -> Vec<f64> {
 ///   report_segmented_writer_build_cost -- --ignored --nocapture
 /// ```
 ///
-/// Two arms over the same corpus, one file (one day) at a time, each a fresh
-/// append plus a streaming rewrite of exactly that day's output: the control
-/// with segmented writes off, then the same with them on. Reported per arm:
-/// wall time for the appends and rewrites, peak live heap, and the registered
-/// sidecar bytes. Sized by `SIGLAKE_SEG_WRITER_FILES` (1),
+/// Five arms over the same corpus, one file (one day) at a time, each a fresh
+/// append plus a streaming rewrite of exactly that day's output: two repeated
+/// no-index/seg2-in-merge pairs, then a post-commit v1 rebuild. Reported per
+/// arm: separate append and rewrite wall times, their total, peak live heap,
+/// and the registered sidecar bytes for live files. Sized by
+/// `SIGLAKE_SEG_WRITER_FILES` (1),
 /// `SIGLAKE_SEG_WRITER_ROWS_PER_FILE` (300,000) and
 /// `SIGLAKE_SEG_WRITER_RARE_EVERY` (100,000).
 #[test]
 #[ignore = "measurement; sized by SIGLAKE_SEG_WRITER_*"]
 fn report_segmented_writer_build_cost() {
     serialized(|_snapshotter| async move {
+        const V1_BLOB_TYPE: &str = "siglake-inverted-v1";
+
         fn knob(name: &str, default: usize) -> usize {
             std::env::var(name)
                 .ok()
@@ -1128,22 +1143,53 @@ fn report_segmented_writer_build_cost() {
 
         let tmp = tempfile::tempdir().unwrap();
         println!(
-            "corpus: {files} files x {rows_per_file} rows = {} rows",
-            files * rows_per_file
+            "corpus: {files} files x {rows_per_file} rows = {} rows; append indexing=true, \
+             target_row_group_bytes=1, streaming rewrite=true",
+            files * rows_per_file,
         );
 
-        for (label, segmented) in [("off", false), ("on", true)] {
-            let ice = open_fixture(&tmp.path().join(label), segmented, Some(1), None).await;
+        let arms = [
+            ("off-1", false, false, None),
+            ("on-1", true, false, Some(SEGMENTED_V2_BLOB_TYPE)),
+            ("off-2", false, false, None),
+            ("on-2", true, false, Some(SEGMENTED_V2_BLOB_TYPE)),
+            ("v1-rebuild", false, true, Some(V1_BLOB_TYPE)),
+        ];
+        for (label, segmented, rebuild, expected_blob_type) in arms {
+            let loadavg = std::fs::read_to_string("/proc/loadavg").unwrap();
+            println!("{label}: loadavg before arm: {}", loadavg.trim());
+            println!(
+                "{label}: effective settings segmented_index_writes={segmented}, \
+                 index_rebuild={rebuild}, index_at_flush=true"
+            );
+            let ice = open_fixture_with_tuning(
+                &tmp.path().join(label),
+                IcebergTuning {
+                    segmented_index_writes: Some(segmented),
+                    index_rebuild: Some(rebuild),
+                    index_at_flush: Some(true),
+                    target_row_group_bytes: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await;
             let started = std::time::Instant::now();
+            let mut append_wall = std::time::Duration::ZERO;
+            let mut rewrite_wall = std::time::Duration::ZERO;
             start_tracking();
             for file in 0..files {
-                append_and_rewrite(
+                let append_started = std::time::Instant::now();
+                let fresh = append_rows(
                     &ice,
                     file * rows_per_file..(file + 1) * rows_per_file,
                     rows_per_file,
                     rare_every,
                 )
                 .await;
+                append_wall += append_started.elapsed();
+                let rewrite_started = std::time::Instant::now();
+                rewrite_fresh(&ice, fresh).await;
+                rewrite_wall += rewrite_started.elapsed();
             }
             let peak = peak_tracked();
             let wall = started.elapsed();
@@ -1153,27 +1199,49 @@ fn report_segmented_writer_build_cost() {
                 .load_table(ice.events_table_ident())
                 .await
                 .unwrap();
+            let live = ice.live_data_files(ice.events_table_ident()).await.unwrap();
+            let live_paths: Vec<&str> = live.iter().map(|file| file.file_path()).collect();
+            let registered_types = registered_blob_types_for(&table, &live);
+            assert_eq!(
+                registered_types
+                    .get(SEGMENTED_V2_BLOB_TYPE)
+                    .copied()
+                    .unwrap_or(0),
+                usize::from(segmented) * live.len(),
+                "{label}: unexpected seg2 coverage"
+            );
+            assert_eq!(
+                registered_types.get(V1_BLOB_TYPE).copied().unwrap_or(0),
+                usize::from(rebuild) * live.len(),
+                "{label}: unexpected v1 coverage"
+            );
+
             let mut sidecar_bytes = 0i64;
             let mut sidecars = 0usize;
             for statistics in table.metadata().statistics_iter() {
-                if statistics
+                let matching = statistics
                     .blob_metadata
                     .iter()
-                    .any(|blob| blob.r#type == SEGMENTED_V2_BLOB_TYPE)
-                {
+                    .filter(|blob| {
+                        expected_blob_type == Some(blob.r#type.as_str())
+                            && blob
+                                .properties
+                                .get("data_file")
+                                .is_some_and(|path| live_paths.contains(&path.as_str()))
+                    })
+                    .count();
+                if matching > 0 {
                     sidecar_bytes += statistics.file_size_in_bytes;
-                    sidecars += statistics
-                        .blob_metadata
-                        .iter()
-                        .filter(|blob| blob.r#type == SEGMENTED_V2_BLOB_TYPE)
-                        .count();
+                    sidecars += matching;
                 }
             }
-            let live = ice.live_data_files(ice.events_table_ident()).await.unwrap();
             let data_bytes: u64 = live.iter().map(|f| f.file_size_in_bytes()).sum();
             println!(
-                "{label}: wall {:.2} s, peak live heap {} B ({:.1} MiB), {sidecars} sidecars in \
-             {sidecar_bytes} B against {data_bytes} B of data ({:.2}%), {} live files",
+                "{label}: append wall {:.2} s, rewrite wall {:.2} s, total wall {:.2} s, peak \
+             live heap {} B ({:.1} MiB), {sidecars} live sidecars in {sidecar_bytes} B against \
+             {data_bytes} B of data ({:.2}%), {} live files",
+                append_wall.as_secs_f64(),
+                rewrite_wall.as_secs_f64(),
                 wall.as_secs_f64(),
                 peak,
                 peak as f64 / (1024.0 * 1024.0),
@@ -1189,9 +1257,11 @@ fn report_segmented_writer_build_cost() {
                 (files * rows_per_file) as i64,
                 "{label} arm lost rows"
             );
-            if segmented {
-                assert_eq!(sidecars, live.len(), "one sidecar per live file");
-            }
+            assert_eq!(
+                sidecars,
+                usize::from(expected_blob_type.is_some()) * live.len(),
+                "{label}: one sidecar per live file when indexing is enabled"
+            );
         }
     });
 }
