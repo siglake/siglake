@@ -51,19 +51,16 @@
   suppresses a rebuild; its pinned bytes remain a decode-only codec test.
   `SIGLAKE_SEGMENTED_INDEX_WRITES=1` and the
   separate `SIGLAKE_SEGMENTED_INDEX_READS=1` are both required to build and use
-  the format; both remain off by default pending AWS qualification. Two pieces
-  of the acceptance stay open behind those defaults: the writer's build time
-  and peak heap at 14 x 7.34M rows are unmeasured, and with
-  `SIGLAKE_INDEX_REBUILD=1` on as well, a file whose sidecar the writer refuses
-  makes the post-commit rebuild register a second statistics file against the
-  rewrite's own snapshot, which replaces the entry and drops that rewrite's
-  other seg2 blobs — queries fall back to a scan and answer correctly.
-  `docs/LIMITATIONS.md` and `docs/DESIGN_segmented_inverted_index.md` carry
-  both. The query-path report now builds its segmented fixture through the
-  streaming seg2 rewrite and refuses retained seg1 fixtures. At 14 × 7.34M
-  rows its two rare scans were 0.14x and 0.06x the scan, with exact answers and
-  matching Parquet layouts; the dated seg1 columns remain as history. (#4377,
-  #5230, #5233)
+  the format; both remain off by default pending AWS qualification. On the
+  14 x 7.34M-row acceptance corpus, seg2 averaged 282.77 seconds of rewrite
+  time and 251.4 MiB peak tracked heap, 12.0% faster and 80.8% smaller than the
+  post-commit v1 rebuild it replaces. If that rebuild finds an uncovered file
+  on the rewrite's snapshot, it preserves the registered seg2 blobs and counts
+  the deferred v1 registration instead of replacing them. The query-path report
+  now builds its segmented fixture through the streaming seg2 rewrite and
+  refuses retained seg1 fixtures. At 14 × 7.34M rows its two rare scans were
+  0.14x and 0.06x the scan, with exact answers and matching Parquet layouts;
+  the dated seg1 columns remain as history. (#4377, #5228, #5230, #5233, #5234)
 
 - **Text indexes (docs)**: the documented integrity gap in a v1 inverted-index
   blob is the **footer-KV** path only. An index stored as hex in a Parquet

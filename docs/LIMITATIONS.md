@@ -99,7 +99,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   preserves the rewrite's registered seg2 blobs and counts the deferred v1
   registration instead of replacing them
   ([`DESIGN_segmented_inverted_index.md`](DESIGN_segmented_inverted_index.md),
-  "The gap beside the refusals"). Whether the
+  "Registration beside the refusals"). Whether the
   serialized copy earns its share at all is a separate open question: since a
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no

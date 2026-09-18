@@ -414,7 +414,7 @@ coverage assertions passed, including zero registered blobs for each off arm,
 one live seg2 blob per file for each on arm and one live v1 blob per file for
 the rebuild arm.
 
-#### The gap beside the refusals
+#### Registration beside the refusals
 
 `publish_segmented_sidecars` publishes nothing for a file whose finished
 sidecar disagrees with the footer it wrote, counting the reason on
@@ -427,8 +427,7 @@ sidecar disagrees with the footer it wrote, counting the reason on
 | `row_domain` | the sidecar's per-group rows are not the footer's row groups |
 
 Silence is safe on its own — an unregistered file is read the way an unindexed
-one is. It is not safe for the file's *siblings*, and that is a known gap,
-not a decided behaviour:
+one is. Before #5228 it was unsafe for the file's *siblings*:
 
 A rewrite registers every output blob in **one** `StatisticsFile` under the
 snapshot id it reserved, and `set_statistics` inserts by snapshot id
@@ -436,12 +435,12 @@ snapshot id it reserved, and `set_statistics` inserts by snapshot id
 statistics file written against that snapshot replaces the first rather than
 merging into it. With `SIGLAKE_INDEX_REBUILD=1` as well, a refused file is
 uncovered, so the post-commit `rebuild_inverted_indexes_for_files` over the
-rewrite's output builds a v1 blob for it and registers it under the same
-snapshot — dropping every seg2 blob the rewrite just published. Their Puffin
-path leaves `reachable_files` and orphan GC deletes the object; the query path
-falls back to a scan and answers correctly, so nothing reports the loss.
+rewrite's output built a v1 blob for it and registered it under the same
+snapshot — dropping every seg2 blob the rewrite had just published. Their
+Puffin path left `reachable_files` and orphan GC deleted the object; the query
+path fell back to a scan and answered correctly, so nothing reported the loss.
 
-Both opt-ins and a refusal are needed to reach it. Registration now refuses a
+Both opt-ins and a refusal were needed to reach it. Registration now refuses a
 second statistics file for the same snapshot, counts the deferral with the
 bounded `reason="snapshot_has_statistics"` label and logs the uncovered data
 files. It reports none of those files or bytes as rebuilt. The first statistics
