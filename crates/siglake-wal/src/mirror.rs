@@ -1821,7 +1821,10 @@ impl RecoveryPlan {
             Some(l @ LedgerVerdict::Confirmed { .. }) => reasons.push(l.line()),
             _ => {}
         }
-        Some(reasons.join(" -- and "))
+        // Callers punctuate: both of them continue the sentence with what was
+        // NOT touched, and a line that already ended in a full stop read
+        // `instead.. Nothing under …`.
+        Some(reasons.join(" -- and ").trim_end_matches('.').to_string())
     }
 
     /// The error an apply owes the operator when the listing contradicts the
