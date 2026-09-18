@@ -374,12 +374,13 @@ rebuild.
 rolled-output, two-partition, failed-transaction, idempotence, exact-query and
 row-group-memory cases. Reads discover seg2 only; the knobs
 for writing and reading are separate and both remain off by default. The
-writer's build-time and peak-heap report is an `#[ignore]`d release harness in
+writer's build-time and peak-heap report is an `#[ignore]`d release test in
 that file because its acceptance corpus is 14 x 7.34M rows.
 
 The #5234 run used 14 files of 7,340,000 rows (102,760,000 rows total), with
-append indexing on, a one-MiB row-group target and streaming rewrites in every
-arm. Only `segmented_index_writes` and `index_rebuild` changed. The allocator
+append indexing on, `target_row_group_bytes=1` (clamped to 128 Ki-row groups)
+and streaming rewrites in every arm. Only `segmented_index_writes` and
+`index_rebuild` changed. The allocator
 figures are peak tracked live bytes during append plus rewrite, not process RSS.
 `/proc/loadavg` was read immediately before each arm.
 

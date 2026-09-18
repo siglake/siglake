@@ -82,8 +82,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   27,883,741 bytes holding all fourteen directories and 17.58 MiB of statistics
   per file; the historical seg1 columns remain in the design record. Both
   defaults stay off until AWS
-  qualification, and two pieces of the writer's acceptance are still open: its
-  build time and peak heap at 14 x 7.34M rows are unmeasured (#5234). With the
+  qualification. The writer's local build-cost acceptance is recorded now:
+  on 14 x 7.34M rows, seg2 averaged 282.77 seconds of rewrite time and 251.4
+  MiB peak tracked heap, 12.0% faster and 80.8% smaller than the post-commit v1
+  rebuild it replaces (#5234). The same-snapshot registration gap remains
+  open (#5228). With the
   write opt-in and `SIGLAKE_INDEX_REBUILD=1` both on, a file whose sidecar the
   writer refuses stays unindexed until a later rewrite or a CLI rebuild at a
   later snapshot: Iceberg permits one statistics file per snapshot, so Siglake
