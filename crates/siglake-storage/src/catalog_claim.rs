@@ -3962,6 +3962,39 @@ mod local_commit_mark_postgres {
         Ok(())
     }
 
+    /// Both gates run this module by NAME, and a filter that matches nothing
+    /// runs zero tests and exits 0 — so a rename here would take the Postgres
+    /// coverage out of the compose step in both files and still report green.
+    /// Same argument as `scripts/check-shell-job-parity.py`, one level down.
+    #[test]
+    fn both_gates_run_this_module_by_name() {
+        let module = module_path!().rsplit("::").next().expect("module name");
+        for rel in [".github/workflows/ci.yml", "scripts/ci-local.sh"] {
+            let path =
+                std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).join(rel);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            // The filter is compared as a whole token: a filter that is nearly
+            // this module's name is exactly the case that matches zero tests.
+            let filters: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains("cargo test -p siglake-storage --lib"))
+                .filter_map(|line| {
+                    let mut words = line.split_whitespace().skip_while(|w| *w != "--lib");
+                    words.next();
+                    words.next()
+                })
+                .collect();
+            assert!(
+                filters.contains(&module),
+                "{rel} runs no `cargo test -p siglake-storage --lib {module}`, so the \
+                 compose step's Postgres coverage matches zero tests; its --lib filters \
+                 are {filters:?}"
+            );
+            assert!(text.contains(URI_VAR), "{rel} must give that run {URI_VAR}");
+        }
+    }
+
     /// The isolation rests on sqlx turning `options[search_path]` into the
     /// startup parameter Postgres reads as `-c search_path=…`. That much needs
     /// no server, and getting it wrong silently puts the scratch tables — and
