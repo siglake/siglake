@@ -431,18 +431,27 @@ one probe term:
 | Puffin sidecar, zstd-3 frame as stored | 2,486 | 19,888 | 19,878 | 0 | 10 | **0** | **0** |
 | control: the same frame, content checksum off | 2,482 | 19,856 | 13,958 | 5 | 10 | 5,883 | 20 |
 
-The control row is what the four checksum bytes buy: zstd framing alone lets
-29.6% of flips through as a different index. Hex refuses 94.9% of flips by
-alphabet — a flipped high bit usually leaves `[0-9a-f]` — and the 1,035
-absorbed are letter-case flips, which `to_digit(16)` accepts. Neither is a
-check: the flips that stay in the alphabet are nibble corruptions of the blob
-and reach the decoder.
+The report prints one more column, dropped here because it was zero on all
+four forms: a corruption that decoded to a *superset* — a different index that
+still names every `(term, row)` the sound one did. The encoding is dense enough
+that a flip surviving the decoder always costs something.
 
-A term whose *characters* were flipped is why "lost a match" is two orders of
-magnitude above the per-probe column. `matching_rows_all` reads an absent term
-as a definitive "no rows match" (`crates/siglake-index/src/lib.rs`), so a
-renamed dictionary entry costs the query **every** row of that term in that
-file, not one ordinal.
+The control row is what the four checksum bytes buy: zstd framing alone lets
+29.6% of flips through as a different index. The hex form refuses 94.9%
+(212,897 of 224,368), most of them by alphabet — a flipped high bit usually
+leaves `[0-9a-f]` — and the rest by the decoder, as the payload row's are. The
+1,035 absorbed flips can only be letter case: `from_hex` reads a digit with
+`to_digit(16)`, which accepts `A-F` though `to_hex` writes lowercase, and any
+flip that changes a *nibble* changes the blob. So the doubling is an encoding,
+not a check — the flips that stay in the alphabet are nibble corruptions and
+reach the decoder.
+
+"Lost a match" covers the whole dictionary and the last column one term of
+1,010, which is most of the gap between them. The worst of the class is a flip
+inside a term's *characters*: `matching_rows_all` reads an absent term as a
+definitive "no rows match" (`crates/siglake-index/src/lib.rs`), so a renamed
+dictionary entry costs a query for that term **every** row it has in the file,
+not one ordinal.
 
 The reader's disposition, per path, on a 400-row / 4-row-group file whose index
 names four matching rows
@@ -477,8 +486,8 @@ payload (2M rows, release, this box,
 `report_whole_blob_checksum_cost`): `crc32fast` runs at 10.3-11.1 GiB/s, so the
 sum is **2.881 ms against a 703.4 ms `from_bytes` (+0.41%)** and 76.0 ms of
 `to_bytes` (+3.79%); `to_hex` alone costs 180.4 ms. Extrapolated to the
-compacted 85.8 MiB blob `DESIGN_segmented_inverted_index.md` measures: about
-8 ms of checksum against about two seconds of decode. The decoder already
+compacted 85.8 MiB blob `DESIGN_segmented_inverted_index.md` measures, at
+these rates: about 8 ms of checksum against about two seconds of decode. The decoder already
 walks every byte the sum would cover, which is what makes the granularity
 question moot here — 4 bytes per *term* is a third of a segmented blob only
 because a segmented point lookup fetches a median of 3 bytes and can verify

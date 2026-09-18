@@ -301,6 +301,7 @@ fn the_hex_footer_form_refuses_flips_by_alphabet_not_by_checking() {
     let sample = knob("SIGLAKE_V1_INTEGRITY_SAMPLE", 2_000);
     let mut refused = 0usize;
     let mut decoded = 0usize;
+    let mut absorbed = 0usize;
     for (byte, bit) in flips(bytes.len(), sample) {
         let mut corrupt = bytes.to_vec();
         corrupt[byte] ^= 1 << bit;
@@ -310,12 +311,28 @@ fn the_hex_footer_form_refuses_flips_by_alphabet_not_by_checking() {
         };
         match classify_hex(&corrupt, &sound).disposition {
             Disposition::Refused => refused += 1,
+            // A flip the hex form absorbs can only be a digit's case: every
+            // other flip that stays in the alphabet changes a nibble, and so
+            // the blob. `from_hex` reads digits with `to_digit(16)`, which
+            // takes `A-F` although `to_hex` writes lowercase.
+            Disposition::Identical => {
+                absorbed += 1;
+                let (was, now) = (bytes[byte] as char, corrupt.as_bytes()[byte] as char);
+                assert!(
+                    was.is_ascii_alphabetic()
+                        && now.is_ascii_alphabetic()
+                        && was.eq_ignore_ascii_case(&now),
+                    "an absorbed flip has to be a case flip, not {was:?} -> {now:?}"
+                );
+                decoded += 1;
+            }
             _ => decoded += 1,
         }
     }
     assert!(
-        decoded > 0,
-        "some flips of the hex form reach the decoder; {refused} refused"
+        decoded > absorbed,
+        "some flips of the hex form reach the decoder as a different index; \
+         {refused} refused, {absorbed} absorbed as a case flip"
     );
     assert!(
         refused > decoded,
@@ -404,7 +421,22 @@ fn report_stored_byte_corruption_by_path() {
         corrupt[byte] ^= 1 << bit;
         match String::from_utf8(corrupt) {
             Err(_) => classify(None, &sound),
-            Ok(corrupt) => classify_hex(&corrupt, &sound),
+            Ok(corrupt) => {
+                let outcome = classify_hex(&corrupt, &sound);
+                // The absorbed column is a digit's case and nothing else; see
+                // `the_hex_footer_form_refuses_flips_by_alphabet_not_by_checking`.
+                if outcome.disposition == Disposition::Identical {
+                    let (was, now) = (
+                        hex.as_bytes()[byte] as char,
+                        corrupt.as_bytes()[byte] as char,
+                    );
+                    assert!(
+                        was.is_ascii_alphabetic() && was.eq_ignore_ascii_case(&now),
+                        "an absorbed flip has to be a case flip, not {was:?} -> {now:?}"
+                    );
+                }
+                outcome
+            }
         }
     });
     let sidecar = tally(frame.len(), &|byte, bit| {
