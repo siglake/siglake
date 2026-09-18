@@ -16,6 +16,11 @@
 //!   already indexed, and a second rebuild call is a no-op;
 //! - the index state the rewrite holds is one row group's, not the file's.
 //!
+//! Registration against a snapshot that already has a statistics file is here
+//! too, because that is where the rewrite's blobs are lost: #5228's sequential
+//! case, and #5298's two concurrent registrants — one racing the transaction's
+//! base refresh, one racing its CAS window.
+//!
 //! Its own test binary: it installs a process-global metrics recorder and a
 //! global allocator, both process state, so the tests take [`WRITER_TESTS`] and
 //! run one at a time.
