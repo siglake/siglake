@@ -404,13 +404,15 @@ from 135 to 29. The 120 are the residual.
 The residual above is a property of the *format*. What a query does with a
 corrupt blob depends on how the blob is stored, and the two paths differ:
 
-- **Footer KV** — hex under `siglake.inverted_index.v1[.column]`, taken when a
-  file's serialized indexes fit `SIGLAKE_INDEX_FOOTER_MAX_BYTES` (1 MiB by
-  default), so it carries the small and freshly written files. Parquet
+- **Footer KV** — hex under `siglake.inverted_index.v1[.column]`, taken per
+  column while that column's serialized index fits
+  `SIGLAKE_INDEX_FOOTER_MAX_BYTES` (1 MiB by default), so it carries the small
+  and freshly written files. Parquet
   checksums data pages, not footer metadata, and hex is an encoding rather
   than a check. Nothing covers these bytes.
 - **Puffin sidecar** — the spillover above that threshold, so it carries the
-  large compacted files. `crates/siglake-storage/src/iceberg.rs` registers the
+  large compacted files (and nothing at all for a rolled write, whose
+  spillover `sidecar_blob_specs_for_data_files` declines). `crates/siglake-storage/src/iceberg.rs` registers the
   blob with `PuffinCompressionCodec::Zstd`, and the fork's encoder sets
   `include_checksum(true)` (`third_party/iceberg/src/compression.rs`). A
   corrupt stored byte hits the frame's content checksum first.

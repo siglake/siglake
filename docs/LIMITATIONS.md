@@ -87,8 +87,9 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   covers the file, and #4991 measured what a query then does, per storage path
   ([`DESIGN_inverted_index.md`](DESIGN_inverted_index.md), "Which storage path
   carries that residual"). The **footer-KV** path — hex in the Parquet footer,
-  taken while a file's serialized indexes fit `SIGLAKE_INDEX_FOOTER_MAX_BYTES`
-  (1 MiB), so the small and freshly written files — is the exposed one: Parquet
+  taken per column while that column's serialized index fits
+  `SIGLAKE_INDEX_FOOTER_MAX_BYTES` (1 MiB), so the small and freshly written
+  files — is the exposed one: Parquet
   checksums data pages, not footer metadata, and the query succeeds while
   answering short. Of 224,368 single-bit flips of a 28 KB hex value, 125 cost
   one probe term rows and 10,432 cost some term rows; a flip inside a term's

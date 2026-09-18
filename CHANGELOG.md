@@ -4,7 +4,7 @@
 
 - **Text indexes (docs)**: the documented integrity gap in a v1 inverted-index
   blob is the **footer-KV** path only. An index stored as hex in a Parquet
-  footer — the path taken while a file's serialized indexes fit
+  footer — the path taken per column while that column's serialized index fits
   `SIGLAKE_INDEX_FOOTER_MAX_BYTES` (1 MiB), so the small and freshly written
   files — has nothing covering its stored bytes, and a corruption that still
   decodes and still covers the file's rows prunes with it: the query succeeds
