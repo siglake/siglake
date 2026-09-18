@@ -62,7 +62,7 @@ All three scripts honor the same set of vars:
 | `SIGLAKE_QUERY_CASES_FILE` | _empty_                                   | TSV input file for `query-bench.sh` (`label<TAB>expected<TAB>sql<TAB>tags`). |
 | `SIGLAKE_QUERY_BENCH_OUTDIR` | `/tmp/siglake-query-bench-<ts>`         | Output directory for `query-bench.sh` artifacts.            |
 | `SIGLAKE_QUERY_CONCURRENCY_SPECS` | `all:20:40`                        | Comma list of `tag:concurrency:requests` specs for `query-bench.sh`. |
-| `SIGLAKE_DOWN_MODE`   | `cluster`                                      | `cluster` keeps EKS/VPC/EFS/ECR warm; `all` fully destroys terraform-managed AWS resources. |
+| `SIGLAKE_DOWN_MODE`   | `cluster`                                      | `cluster` keeps EKS/VPC/EFS/ECR warm; `all` fully destroys terraform-managed AWS resources. Any other value is rejected before `down.sh` touches the cluster. |
 | `TF_DIR`             | `deploy/terraform/aws`                         | Terraform working directory.                                |
 | `EMPTY_WAREHOUSE`    | `1` in `cluster` mode, else `0`                | When `1`, `down.sh` empties the S3 warehouse before destroy.|
 

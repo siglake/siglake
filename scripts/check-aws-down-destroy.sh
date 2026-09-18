@@ -95,9 +95,11 @@ STUB
   chmod +x "$stub_dir/terraform" "$stub_dir/aws" "$stub_dir/kubectl" "$stub_dir/helm"
 }
 
-# run_case <name> <SIGLAKE_DOWN_MODE> <destroy rc> <cleanup rc>; echoes the case dir.
+# run_case <name> <SIGLAKE_DOWN_MODE> <destroy rc> <cleanup rc> [EMPTY_WAREHOUSE];
+# echoes the case dir. An empty EMPTY_WAREHOUSE is what down.sh reads as unset,
+# so the cases that pass nothing exercise the script's own default for the mode.
 run_case() {
-  local name=$1 mode=$2 destroy_rc=$3 cleanup_rc=$4
+  local name=$1 mode=$2 destroy_rc=$3 cleanup_rc=$4 empty_warehouse=${5:-}
   local case_dir="$TEST_ROOT/$name"
   local stub_dir="$case_dir/bin"
   local rc=0
@@ -110,6 +112,7 @@ run_case() {
   STUB_DESTROY_RC="$destroy_rc" \
   STUB_CLEANUP_RC="$cleanup_rc" \
   SIGLAKE_DOWN_MODE="$mode" \
+  EMPTY_WAREHOUSE="$empty_warehouse" \
   TF_DIR="$case_dir/tf" \
   PATH="$stub_dir:$PATH" \
     "$ROOT/deploy/aws/down.sh" > "$case_dir/output" 2>&1 || rc=$?
@@ -194,13 +197,33 @@ cleanup_then_destroy_fail=$(run_case cluster-cleanup-and-destroy-fail cluster 5 
   || fail "cluster-cleanup-and-destroy-fail: exited $(case_rc "$cleanup_then_destroy_fail"), want 5"
 assert_silent_on_failure cluster-cleanup-and-destroy-fail "$cleanup_then_destroy_fail"
 
-# --- an unknown mode destroys nothing ----------------------------------------
-bad_mode=$(run_case unknown-mode sideways 0 0)
-[[ "$(case_rc "$bad_mode")" -ne 0 ]] \
-  || fail "unknown-mode: down.sh accepted SIGLAKE_DOWN_MODE=sideways"
-if grep -q '^terraform <destroy>' "$bad_mode/commands.log"; then
-  fail "unknown-mode: terraform destroy ran for an unknown mode"
-fi
-assert_silent_on_failure unknown-mode "$bad_mode"
+# --- an unknown mode touches nothing -----------------------------------------
+# The mode used to be settled by the destroy's own `case`, after the uninstall,
+# the namespace delete and the warehouse sweep had already run: a typo took the
+# workload out of the cluster, destroyed nothing in AWS and exited 1 (#5332).
+# The bucket survived only because EMPTY_WAREHOUSE defaults to 0 outside
+# cluster mode, so the EMPTY_WAREHOUSE=1 arm below carries the sweep too.
+assert_rejected_mode() {
+  local name=$1 case_dir=$2
+  [[ "$(case_rc "$case_dir")" -ne 0 ]] \
+    || fail "$name: down.sh accepted SIGLAKE_DOWN_MODE=sideways"
+  grep -q "SIGLAKE_DOWN_MODE must be 'cluster' or 'all' (got 'sideways')" \
+    "$case_dir/output" \
+    || fail "$name: the rejected mode was not named on stderr"
+  assert_silent_on_failure "$name" "$case_dir"
 
-printf 'ok: aws down exits nonzero on a failed destroy and reports completion only on success\n'
+  local forbidden
+  for forbidden in '^helm ' '^kubectl .*<delete>' '^aws ' '^terraform <destroy>'; do
+    if grep -qE "$forbidden" "$case_dir/commands.log"; then
+      fail "$name: a command matching $forbidden ran for an unknown mode"
+    fi
+  done
+}
+
+bad_mode=$(run_case unknown-mode sideways 0 0)
+assert_rejected_mode unknown-mode "$bad_mode"
+
+bad_mode_sweep=$(run_case unknown-mode-empty-warehouse sideways 0 0 1)
+assert_rejected_mode unknown-mode-empty-warehouse "$bad_mode_sweep"
+
+printf 'ok: aws down rejects an unknown mode before it writes, exits nonzero on a failed destroy and reports completion only on success\n'
