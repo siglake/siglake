@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **AWS reference deployment (fix)**: `deploy/aws/down.sh` settles
+  `SIGLAKE_DOWN_MODE` before it writes to the cluster. The check sat on the
+  destroy's own `case`, after the `helm uninstall`, the Postgres Secret, PVC
+  and namespace deletes and the optional warehouse sweep had run, so a typo'd
+  mode took the workload out of the cluster, destroyed nothing in AWS and
+  exited 1 — the smoke run gone and the billing resources still up. An
+  unrecognised mode now exits 1 naming the value, having run no `helm`, no
+  `kubectl delete`, no `aws s3` and no `terraform destroy`. `cluster` and `all`
+  behave as before, including their resource selection and the destroy's exit
+  status; `scripts/check-aws-down-destroy.sh` covers the rejection with the
+  default warehouse handling and with `EMPTY_WAREHOUSE=1`, which is the arm
+  that carried the sweep. (#5332)
+
 - **AWS reference deployment (fix)**: `deploy/aws/down.sh` exits with
   terraform's status when the destroy fails. The script runs without errexit
   and ended with `log "down complete"`, so its status was that log call: a
