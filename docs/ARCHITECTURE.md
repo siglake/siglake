@@ -354,9 +354,8 @@ land above the ceilings measured on the scan path. Enable it where the working
 set fits, or where pruning is worth more than the decode. That whole-file cost
 is a property of the sidecar format, not of its sizing: a row-group-addressable
 replacement a reader can touch in part is specified and measured in
-`docs/DESIGN_segmented_inverted_index.md`. The seg1 prototype remains behind
-its own magic, footer-KV key and Puffin blob type. The scan path can read one —
-uncompressed, by byte range, through `PuffinReader::blob_range_reader`, with
+`docs/DESIGN_segmented_inverted_index.md`. The scan path can read a seg2 blob —
+by byte range through `PuffinReader::blob_range_reader`, with
 the sidecar's directory checked against the file's actual row groups and
 anything it cannot conclude falling back to the v1 index or an exact scan
 (#4561), and the parsed directory held between lookups under a byte budget of
@@ -368,15 +367,19 @@ finished output file contributes one uncompressed Puffin blob whose interior
 contains independently compressed dictionary and posting blocks, and the
 statistics registration is committed in the same transaction as the data-file
 rewrite. The ordinary post-commit v1 rebuild recognizes that registration and
-does not decode the output file again. Seg2 discovery is preferred over seg1;
-files carrying the prototype remain readable, and files carrying neither use
-the exact scan. Reads and writes are separate opt-ins, both off by default, so
+does not decode the output file again. Production discovery recognizes seg2;
+the unreleased seg1 prototype remains decodable by its pinned codec test but is
+ignored by query selection and does not suppress a whole-file v1 rebuild. Files
+carrying neither v1 nor seg2 use the exact scan. Reads and writes are separate
+opt-ins, both off by default, so
 nothing is built or retained under the segmented-directory budget in the
 shipped configuration. The three formats were compared through the query path
-on a 102.76M-row local corpus (#4562): a rare unclipped text predicate is 11.5x
-faster than the scan where the shipped sidecar is 22.4x slower, and the result
-holds with both budgets above at zero. At the same 7.34M-row scale seg2 writes
-16.7 MiB instead of seg1's 85.8 MiB while retaining independent range reads.
+on a 102.76M-row local corpus (#4562). The historical seg1 arm made a rare
+unclipped predicate 11.5x faster than the scan where the shipped sidecar was
+22.4x slower. A 2026-09-18 rerun built the arm through the streaming seg2
+writer: the two rare scans were 0.14x and 0.06x the scan, with one seg2 blob per
+live file, exact answers and matched Parquet layouts (#5230). Its statistics
+cost 17.58 MiB per file at this layout, against 15.59 MiB for whole-file v1.
 
 **Whether to USE an index is decided per execution.** Loading one is a
 whole-file cost, so a query that wants a handful of rows cannot pay it: a text

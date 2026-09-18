@@ -46,8 +46,10 @@
   produces one blob per output file and indexed column when a rolling rewrite
   splits. A failed transaction leaves no discoverable index, and the existing
   post-commit rebuild recognizes seg2 coverage instead of decoding the output
-  file again. Query discovery prefers seg2 while retaining the prototype seg1
-  path and existing v1 reads. `SIGLAKE_SEGMENTED_INDEX_WRITES=1` and the
+  file again. Query discovery recognizes seg2 and retains existing whole-file
+  v1 reads. The unreleased seg1 prototype is no longer discovered and no longer
+  suppresses a rebuild; its pinned bytes remain a decode-only codec test.
+  `SIGLAKE_SEGMENTED_INDEX_WRITES=1` and the
   separate `SIGLAKE_SEGMENTED_INDEX_READS=1` are both required to build and use
   the format; both remain off by default pending AWS qualification. Two pieces
   of the acceptance stay open behind those defaults: the writer's build time
@@ -57,7 +59,11 @@
   rewrite's own snapshot, which replaces the entry and drops that rewrite's
   other seg2 blobs — queries fall back to a scan and answer correctly.
   `docs/LIMITATIONS.md` and `docs/DESIGN_segmented_inverted_index.md` carry
-  both. (#4377, #5233)
+  both. The query-path report now builds its segmented fixture through the
+  streaming seg2 rewrite and refuses retained seg1 fixtures. At 14 × 7.34M
+  rows its two rare scans were 0.14x and 0.06x the scan, with exact answers and
+  matching Parquet layouts; the dated seg1 columns remain as history. (#4377,
+  #5230, #5233)
 
 - **Text indexes (docs)**: the documented integrity gap in a v1 inverted-index
   blob is the **footer-KV** path only. An index stored as hex in a Parquet

@@ -2766,16 +2766,10 @@ impl ArrowReader {
     /// if the file carries one, and otherwise on an exact scan. There is no
     /// partial answer — a lookup that read one row group and could not read
     /// the next declines the whole file
-    /// ([`siglake_index::segmented::Lookup`]). The two formats are discovered
-    /// independently, by blob type, so a table may carry either or both, per
-    /// file, with no migration.
-    ///
-    /// Both segmented generations are discovered, seg2 first (#4377): a file
-    /// carrying both is answered from the compressed one, and a file carrying
-    /// only the prototype's seg1 blob still reads. The order is a preference,
-    /// not a fallback — a seg2 blob that declines declines the file, exactly as
-    /// it would have if the seg1 one were not there, because both describe the
-    /// same rows.
+    /// ([`siglake_index::segmented::Lookup`]). Production discovery recognizes
+    /// only seg2. Seg1 was an unreleased harness prototype that no production
+    /// writer emitted; its codec remains readable for the pinned compatibility
+    /// fixture, but its blob type does not select this query path (#5230).
     ///
     /// Bounded reading is the point, so the cost is recorded per file:
     /// `siglake_iceberg_segmented_index_range_reads` /
@@ -2790,13 +2784,9 @@ impl ArrowReader {
         spec: &RawPruneSpec,
         cache_bypass: bool,
     ) -> Result<Option<RowSelection>> {
-        // Preference order: the compressed generation first.
-        let blob_types = [
-            siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE,
-            siglake_index::segmented::SEGMENTED_BLOB_TYPE,
-        ];
+        let blob_type = siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE;
         if !task.statistics_blobs.iter().any(|stats_blob| {
-            blob_types.contains(&stats_blob.blob_type.as_str())
+            stats_blob.blob_type == blob_type
                 && stats_blob
                     .properties
                     .get("column")
@@ -2814,16 +2804,11 @@ impl ArrowReader {
             Self::record_segmented_decline("row_group_order");
             return Ok(None);
         }
-        let mut candidates: Vec<(&str, &crate::scan::StatisticsBlobReference)> = Vec::new();
-        for blob_type in blob_types {
-            for stats_blob in &task.statistics_blobs {
-                if stats_blob.blob_type == blob_type {
-                    candidates.push((blob_type, stats_blob));
-                }
-            }
-        }
         let mut selection = None;
-        for (blob_type, stats_blob) in candidates {
+        for stats_blob in &task.statistics_blobs {
+            if stats_blob.blob_type != blob_type {
+                continue;
+            }
             let path = stats_blob.statistics_path.as_str();
             let Some(blob_metadata) = Self::puffin_blob_metadata(
                 file_io,
@@ -5927,7 +5912,10 @@ mod tests {
         segmented_directory_cache_max_bytes_from, segmented_directory_cache_put,
         segmented_directory_cache_stats, segmented_index_reads_from,
     };
-    use siglake_index::segmented::{SEGMENTED_BLOB_TYPE, SEGMENTED_FORMAT_PROPERTY};
+    use siglake_index::segmented::{
+        DEFAULT_TARGET_BLOCK_BYTES, SEGMENTED_V2_BLOB_TYPE, SEGMENTED_V2_FORMAT_PROPERTY,
+        SegmentedWriter,
+    };
     use crate::arrow::{ArrowReader, ArrowReaderBuilder};
     use crate::delete_vector::DeleteVector;
     use crate::expr::visitors::bound_predicate_visitor::visit;
@@ -10378,10 +10366,9 @@ message schema {
             .collect()
     }
 
-    /// A Puffin statistics file carrying **both** sidecar formats for the same
-    /// data file and column: the segmented one uncompressed (its interior has
-    /// to be addressable) beside a Zstd v1 blob, which is how a table would
-    /// carry a mixture while the prototype is being measured.
+    /// A Puffin statistics file carrying both production sidecar formats for
+    /// the same data file and column: seg2 uncompressed (its interior has to be
+    /// addressable) beside a Zstd whole-file v1 blob.
     async fn write_mixed_sidecar(
         dir: &TempDir,
         rows: &[String],
@@ -10410,19 +10397,20 @@ message schema {
         let mut segmented_properties = properties.clone();
         segmented_properties.insert(
             "format".to_string(),
-            SEGMENTED_FORMAT_PROPERTY.to_string(),
+            SEGMENTED_V2_FORMAT_PROPERTY.to_string(),
         );
+        let mut segmented = SegmentedWriter::new_v2(DEFAULT_TARGET_BLOCK_BYTES);
+        for group in rows.chunks(group_rows as usize) {
+            segmented.push_group_rows(group.iter().map(String::as_str));
+        }
         writer
             .add(
                 crate::puffin::Blob::builder()
-                    .r#type(SEGMENTED_BLOB_TYPE.to_string())
+                    .r#type(SEGMENTED_V2_BLOB_TYPE.to_string())
                     .fields(vec![1])
                     .snapshot_id(1)
                     .sequence_number(1)
-                    .data(siglake_index::segmented::encode_from_rows(
-                        rows.iter().map(String::as_str),
-                        group_rows,
-                    ))
+                    .data(segmented.finish())
                     .properties(segmented_properties)
                     .build(),
                 crate::puffin::CompressionCodec::None,
@@ -10507,7 +10495,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(20_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 5_000).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let blob_len = blob.length();
         let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
@@ -10540,12 +10528,12 @@ message schema {
             v1.heap_size_bytes()
         );
         assert!(
-            cost.bytes * 20 < blob_len,
+            cost.bytes * 5 < blob_len,
             "a point lookup fetched {} of {blob_len} bytes",
             cost.bytes
         );
         assert!(
-            (resident_bytes as u64) * 10 < blob_len,
+            (resident_bytes as u64) * 5 < blob_len,
             "the reader kept {resident_bytes} bytes of a {blob_len}-byte blob"
         );
         assert!(
@@ -10594,7 +10582,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(20_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 5_000).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE).await;
         let counts = row_counts(20_000, 5_000);
         let spec = all_terms_spec(&["rareneedle"]);
 
@@ -10677,8 +10665,8 @@ message schema {
         let second_rows = segmented_corpus(2_000);
         let (first_io, first_path) = write_mixed_sidecar(&first_dir, &first_rows, 1_000).await;
         let (second_io, second_path) = write_mixed_sidecar(&second_dir, &second_rows, 500).await;
-        let first_blob = sidecar_blob(&first_io, &first_path, SEGMENTED_BLOB_TYPE).await;
-        let second_blob = sidecar_blob(&second_io, &second_path, SEGMENTED_BLOB_TYPE).await;
+        let first_blob = sidecar_blob(&first_io, &first_path, SEGMENTED_V2_BLOB_TYPE).await;
+        let second_blob = sidecar_blob(&second_io, &second_path, SEGMENTED_V2_BLOB_TYPE).await;
         let spec = all_terms_spec(&["rareneedle"]);
         let v1_first =
             siglake_index::InvertedIndex::from_rows(first_rows.iter().map(String::as_str));
@@ -10743,7 +10731,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(4_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 1_000).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE).await;
         let counts = row_counts(4_000, 1_000);
         let spec = all_terms_spec(&["rareneedle"]);
         let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
@@ -10863,7 +10851,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(n_rows);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, group_rows as u32).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let counts = row_counts(n_rows, group_rows);
         let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
@@ -11012,7 +11000,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(20_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 5_000).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let counts = row_counts(20_000, 5_000);
         let spec = all_terms_spec(&["queen"]);
@@ -11085,7 +11073,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(4_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 512).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let counts = row_counts(4_000, 512);
         let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
@@ -11161,7 +11149,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(2_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 512).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let counts = row_counts(2_000, 512);
 
@@ -11210,7 +11198,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(2_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 512).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let spec = all_terms_spec(&["queen"]);
 
@@ -11248,7 +11236,7 @@ message schema {
         let segmented = sidecar_blob(
             &file_io,
             &path,
-            SEGMENTED_BLOB_TYPE,
+            SEGMENTED_V2_BLOB_TYPE,
         )
         .await;
         assert_eq!(
@@ -11257,7 +11245,7 @@ message schema {
         );
         assert_eq!(
             segmented.properties().get("format").map(String::as_str),
-            Some(SEGMENTED_FORMAT_PROPERTY)
+            Some(SEGMENTED_V2_FORMAT_PROPERTY)
         );
         assert!(segmented.properties().get("row_group_size").is_none());
 
@@ -11284,7 +11272,7 @@ message schema {
         let dir = TempDir::new().unwrap();
         let rows = segmented_corpus(2_000);
         let (file_io, path) = write_mixed_sidecar(&dir, &rows, 512).await;
-        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE)
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE)
             .await;
         let counts = row_counts(2_000, 512);
         let spec = all_terms_spec(&["queen"]);
@@ -11409,7 +11397,7 @@ message schema {
             case_sensitive: false,
             statistics_blobs: vec![crate::scan::StatisticsBlobReference {
                 statistics_path: sidecar.clone(),
-                blob_type: SEGMENTED_BLOB_TYPE.to_string(),
+                blob_type: SEGMENTED_V2_BLOB_TYPE.to_string(),
                 properties: blob_properties.clone(),
             }],
         };
@@ -11464,6 +11452,30 @@ message schema {
             .is_none()
         );
 
+        // Seg1 remains decodable when handed directly to the codec, but its
+        // retired blob type no longer discovers the production query path.
+        let retired_seg1 = FileScanTask {
+            statistics_blobs: vec![crate::scan::StatisticsBlobReference {
+                statistics_path: sidecar.clone(),
+                blob_type: siglake_index::segmented::SEGMENTED_BLOB_TYPE.to_string(),
+                properties: blob_properties.clone(),
+            }],
+            ..task.clone()
+        };
+        assert!(
+            ArrowReader::segmented_index_row_selection(
+                &file_io,
+                &retired_seg1,
+                metadata,
+                &None,
+                &spec,
+                true,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
         // A file whose only registered sidecar is a v1 one is not this path's
         // to answer: it falls through to the whole-file index.
         let legacy = FileScanTask {
@@ -11491,7 +11503,7 @@ message schema {
         let mismatched = FileScanTask {
             statistics_blobs: vec![crate::scan::StatisticsBlobReference {
                 statistics_path: other_sidecar,
-                blob_type: SEGMENTED_BLOB_TYPE.to_string(),
+                blob_type: SEGMENTED_V2_BLOB_TYPE.to_string(),
                 properties: HashMap::from([
                     ("data_file".to_string(), data_file.clone()),
                     ("column".to_string(), "raw".to_string()),

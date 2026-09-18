@@ -55,27 +55,33 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   override as a sizing option for a deployment that has both the query shape
   and the memory to spare; the derivation, its 1 GiB cap and the packaged 4Gi
   limit stay as they are.
-  The reader can now read a segmented sidecar in part (#4561,
+  The reader can now read a seg2 sidecar in part (#4561,
   `SIGLAKE_SEGMENTED_INDEX_READS`), which holds a directory instead of a
   parsed index, and holds it between queries under a
   byte budget of its own (#5006,
-  `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`) — but nothing writes
-  one, so neither budget above changes, and with the prototype off nothing is
-  retained under the new one either. That format has now been measured through
-  the query path against both the scan and the shipped sidecar at these
-  budgets and again with both of them off (#4562): the rare unclipped shapes go
+  `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`). The seg1 prototype was
+  measured through the query path against both the scan and the shipped
+  sidecar at these budgets and again with both of them off (#4562): the rare
+  unclipped shapes go
   from 7.3-22.4x slower than a scan to 11.5-17.4x faster, with 15.95 MiB of
   resident directory for the same fourteen files and no eviction, and the
   result does not move when the two budgets above are zero, because that path
   uses neither. The readable seg1 prototype costs 5.59x the v1 sidecar's bytes
   on disk. The separate seg2 codec (#4988) closes that format cost with
   independently addressable Zstd blocks (16.7 MiB on the 7.34M-row fixture)
-  and a CRC per block's posting span. A streaming re-cluster can now build seg2
+  and a CRC per block's posting span. A streaming re-cluster now builds seg2
   one Parquet row group at a time and register its Puffin statistics file in
   the rewrite transaction (#4377), but only when
-  `SIGLAKE_SEGMENTED_INDEX_WRITES=1`; production discovery prefers seg2 while
-  preserving seg1 reads, but remains behind the separate
-  `SIGLAKE_SEGMENTED_INDEX_READS=1` opt-in. Both defaults stay off until AWS
+  `SIGLAKE_SEGMENTED_INDEX_WRITES=1`; production discovery recognizes seg2 and
+  preserves whole-file v1 reads, behind the separate
+  `SIGLAKE_SEGMENTED_INDEX_READS=1` opt-in. Seg1 discovery was retired before
+  0.2.0 because no released reader promised it and no production writer emitted
+  it; its decode-only codec fixture remains, while registered seg1 metadata is
+  ignored and does not suppress a v1 rebuild. The writer-produced 14 × 7.34M
+  rerun kept both rare scans faster than the scan (0.14x and 0.06x), with
+  27,883,741 bytes holding all fourteen directories and 17.58 MiB of statistics
+  per file; the historical seg1 columns remain in the design record. Both
+  defaults stay off until AWS
   qualification, and two pieces of the writer's acceptance are still open: its
   build time and peak heap at 14 x 7.34M rows are unmeasured (#5234). With the
   write opt-in and `SIGLAKE_INDEX_REBUILD=1` both on, a file whose sidecar the
