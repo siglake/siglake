@@ -786,6 +786,11 @@ pub struct RawPruneSpec {
     /// postings into a row selection. File and row-group bloom pruning stay
     /// active when this is false.
     pub inverted_index_row_selection: bool,
+    /// A bare clipped `LIMIT` whose whole-file v1 index remains declined, but
+    /// whose segmented point lookup may be admitted when its summed document
+    /// frequency is no larger than the clip. `None` for unclipped and ordered
+    /// scans.
+    pub segmented_clipped_limit: Option<usize>,
 }
 
 impl Default for RawPruneSpec {
@@ -798,6 +803,7 @@ impl Default for RawPruneSpec {
             index_substrings: Vec::new(),
             fts_udf: false,
             inverted_index_row_selection: true,
+            segmented_clipped_limit: None,
         }
     }
 }
@@ -813,6 +819,7 @@ impl RawPruneSpec {
             index_substrings: vec![substr],
             fts_udf: false,
             inverted_index_row_selection: true,
+            segmented_clipped_limit: None,
         })
     }
 
@@ -2837,6 +2844,14 @@ impl ArrowReader {
                 cache_bypass,
             )
             .await?;
+            // A policy decline has already paid to open a cold directory and
+            // locate enough terms to prove their summed df is over budget.
+            // Charge that work too; otherwise the estimate would look free
+            // and the clipped cold/warm comparison would omit its setup cost.
+            metrics::histogram!("siglake_iceberg_segmented_index_range_reads")
+                .record(cost.reads as f64);
+            metrics::histogram!("siglake_iceberg_segmented_index_fetched_bytes")
+                .record(cost.bytes as f64);
             let (rows, resident_bytes) = match outcome {
                 SegmentedOutcome::Matching {
                     rows,
@@ -2852,10 +2867,6 @@ impl ArrowReader {
                 "source" => Self::prune_source_label(spec)
             )
             .increment(1);
-            metrics::histogram!("siglake_iceberg_segmented_index_range_reads")
-                .record(cost.reads as f64);
-            metrics::histogram!("siglake_iceberg_segmented_index_fetched_bytes")
-                .record(cost.bytes as f64);
             metrics::histogram!("siglake_iceberg_segmented_index_resident_bytes")
                 .record(resident_bytes as f64);
             metrics::histogram!("siglake_iceberg_segmented_index_selected_rows")
@@ -2983,6 +2994,12 @@ impl ArrowReader {
             .await?
         {
             return Ok(Some(selection));
+        }
+        // A clipped execution may admit a segmented point lookup after its df
+        // estimate, but never changes the whole-file v1 decision: if seg2 was
+        // absent, declined or unavailable, the exact fallback is the scan.
+        if spec.segmented_clipped_limit.is_some() {
+            return Ok(None);
         }
         // The load bounds its own concurrency (`index_load_semaphore`), around
         // the blob fetch and decode only; a warm parsed index takes no permit.
@@ -3718,40 +3735,69 @@ fn segmented_lookup(
     let resident_bytes = index.resident_bytes();
     let mut matching: Option<Vec<u32>> = None;
 
-    if !spec.all_terms.is_empty() {
-        let terms: Vec<&str> = spec.all_terms.iter().map(String::as_str).collect();
-        let Some(rows) = index.matching_rows_all_in_groups(&terms, groups) else {
-            return (SegmentedOutcome::Declined("unanswerable"), parsed);
+    if let Some(clip) = spec.segmented_clipped_limit {
+        // A substring has no point estimate: answering it requires sweeping
+        // every dictionary block. Keep #4375's scan fallback without paying
+        // that sweep merely to rediscover that it is expensive.
+        if !spec.index_substrings.is_empty() {
+            return (
+                SegmentedOutcome::Declined("clipped_estimate_unavailable"),
+                parsed,
+            );
+        }
+        let all_terms: Vec<&str> = spec.all_terms.iter().map(String::as_str).collect();
+        let any_terms: Vec<&str> = spec.any_terms.iter().map(String::as_str).collect();
+        matching = match index.matching_point_rows_with_df_limit_in_groups(
+            &all_terms,
+            &any_terms,
+            groups,
+            clip as u64,
+        ) {
+            siglake_index::segmented::ClippedLookup::Rows(rows) => Some(rows),
+            siglake_index::segmented::ClippedLookup::OverBudget => {
+                return (
+                    SegmentedOutcome::Declined("clipped_document_frequency"),
+                    parsed,
+                );
+            }
+            siglake_index::segmented::ClippedLookup::Unanswerable => {
+                return (SegmentedOutcome::Declined("unanswerable"), parsed);
+            }
         };
-        matching = Some(rows);
-    }
+    } else {
+        if !spec.all_terms.is_empty() {
+            let terms: Vec<&str> = spec.all_terms.iter().map(String::as_str).collect();
+            let Some(rows) = index.matching_rows_all_in_groups(&terms, groups) else {
+                return (SegmentedOutcome::Declined("unanswerable"), parsed);
+            };
+            matching = Some(rows);
+        }
 
-    if !spec.any_terms.is_empty() {
-        let terms: Vec<&str> = spec.any_terms.iter().map(String::as_str).collect();
-        // Where the v1 path unions per term and silently skips one it cannot
-        // answer, a skipped term here would license skipping rows it might
-        // have matched: the whole disjunction declines instead.
-        let Some(rows) = index.matching_rows_any_in_groups(&terms, groups) else {
-            return (SegmentedOutcome::Declined("unanswerable"), parsed);
-        };
-        matching = Some(match matching {
-            Some(existing) => ArrowReader::intersect_sorted_u32(&existing, &rows),
-            None => rows,
-        });
-    }
+        if !spec.any_terms.is_empty() {
+            let terms: Vec<&str> = spec.any_terms.iter().map(String::as_str).collect();
+            // Where the v1 path unions per term and silently skips one it cannot
+            // answer, a skipped term here would license skipping rows it might
+            // have matched: the whole disjunction declines instead.
+            let Some(rows) = index.matching_rows_any_in_groups(&terms, groups) else {
+                return (SegmentedOutcome::Declined("unanswerable"), parsed);
+            };
+            matching = Some(match matching {
+                Some(existing) => ArrowReader::intersect_sorted_u32(&existing, &rows),
+                None => rows,
+            });
+        }
 
-    // The regime the format does not help: a substring sweep reads every
-    // dictionary block, which is most of the blob. It is answered exactly and
-    // its cost is recorded like any other lookup's; declining it is a
-    // per-execution policy decision and belongs with #4375's, not here.
-    for substr in &spec.index_substrings {
-        let Some(rows) = index.rows_containing_in_groups(substr, groups) else {
-            return (SegmentedOutcome::Declined("unanswerable"), parsed);
-        };
-        matching = Some(match matching {
-            Some(existing) => ArrowReader::intersect_sorted_u32(&existing, &rows),
-            None => rows,
-        });
+        // The regime the format does not help: a substring sweep reads every
+        // dictionary block, which is most of the blob.
+        for substr in &spec.index_substrings {
+            let Some(rows) = index.rows_containing_in_groups(substr, groups) else {
+                return (SegmentedOutcome::Declined("unanswerable"), parsed);
+            };
+            matching = Some(match matching {
+                Some(existing) => ArrowReader::intersect_sorted_u32(&existing, &rows),
+                None => rows,
+            });
+        }
     }
 
     let outcome = match matching {
@@ -10571,6 +10617,88 @@ message schema {
         assert_eq!(
             segmented_directory_cache_max_bytes_from(Some(" 1048576 ")),
             1024 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn clipped_segmented_lookup_keeps_rare_terms_and_declines_common_ones() {
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(20_000);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, 5_000).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_V2_BLOB_TYPE).await;
+        let counts = row_counts(20_000, 5_000);
+
+        let clipped = |term: &str| RawPruneSpec {
+            all_terms: vec![term.to_string()],
+            segmented_clipped_limit: Some(100),
+            ..RawPruneSpec::default()
+        };
+        let (rare, rare_cost) = ArrowReader::segmented_matching_rows(
+            &file_io,
+            &path,
+            &blob,
+            &counts,
+            None,
+            &clipped("rareneedle"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&rare, SegmentedOutcome::Matching { rows, .. } if rows.len() == 21),
+            "the sparse term stays on seg2: {rare:?}"
+        );
+
+        let (common, common_cost) = ArrowReader::segmented_matching_rows(
+            &file_io,
+            &path,
+            &blob,
+            &counts,
+            None,
+            &clipped("queen"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                common,
+                SegmentedOutcome::Declined("clipped_document_frequency")
+            ),
+            "the common term returns the policy's own decline: {common:?}"
+        );
+        assert!(
+            common_cost.reads > 2,
+            "cold directory plus dictionary reads are charged: {common_cost:?}"
+        );
+        assert!(
+            common_cost.bytes < rare_cost.bytes,
+            "the decline stops before postings: {common_cost:?} vs {rare_cost:?}"
+        );
+
+        let substring = RawPruneSpec {
+            index_substrings: vec!["ueen".to_string()],
+            segmented_clipped_limit: Some(100),
+            ..RawPruneSpec::default()
+        };
+        let (unavailable, unavailable_cost) = ArrowReader::segmented_matching_rows(
+            &file_io,
+            &path,
+            &blob,
+            &counts,
+            None,
+            &substring,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            unavailable,
+            SegmentedOutcome::Declined("clipped_estimate_unavailable")
+        ));
+        assert_eq!(
+            unavailable_cost.reads, 2,
+            "an unavailable point estimate scans no dictionary block"
         );
     }
 
