@@ -1244,7 +1244,11 @@ async fn rewrite_search_if_needed(
     let Some(index_id) = object_name_tail(&table_name) else {
         return Err(ApiError::bad_request(SEARCH_GUIDANCE));
     };
-    let Some(config) = ice.get_index(index_id).await.map_err(ApiError::internal)? else {
+    let Some(config) = ice
+        .cached_index_config(index_id)
+        .await
+        .map_err(ApiError::internal)?
+    else {
         return Err(ApiError::bad_request(SEARCH_GUIDANCE));
     };
     if config.doc_mapping.default_search_fields.is_empty() {
@@ -10002,6 +10006,27 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
+    fn strip_table_metadata_for_test(warehouse: &std::path::Path, index_id: &str) -> usize {
+        let mut removed = 0;
+        for namespace in std::fs::read_dir(warehouse).unwrap() {
+            let metadata = namespace.unwrap().path().join(index_id).join("metadata");
+            let Ok(entries) = std::fs::read_dir(metadata) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    std::fs::remove_file(path).unwrap();
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
     /// Result-cache counts SINCE THE LAST CALL (`snapshot()` drains), by
     /// `outcome`, omitting the outcomes that did not move. Read the whole map
     /// when a test needs to assert that ONE outcome moved and its siblings did
@@ -11028,6 +11053,38 @@ mod tests {
         .unwrap();
         assert!(rewritten.contains("match_terms(message, 'timeout')"));
         assert!(rewritten.contains("OR match_terms(title, 'timeout')"));
+    }
+
+    #[tokio::test]
+    async fn warm_search_rewrite_does_not_reload_table_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("warehouse");
+        let ice = IcebergContext::open(&warehouse)
+            .await
+            .unwrap()
+            .with_table_cache_ttl(std::time::Duration::from_secs(3600))
+            .with_tuning(siglake_storage::iceberg::IcebergTuning {
+                result_caches: Some(false),
+                ..Default::default()
+            });
+        ice.create_index(&logs_config(vec!["message", "title"]))
+            .await
+            .unwrap();
+        let query = "SELECT * FROM logs WHERE search('timeout')";
+        let warm = rewrite_search_if_needed(&ice, query).await.unwrap();
+
+        let removed = strip_table_metadata_for_test(&warehouse, "logs");
+        assert!(removed > 0, "the fixture removed no metadata.json files");
+        assert!(
+            ice.get_index("logs").await.is_err(),
+            "the uncached control did not reach metadata storage"
+        );
+
+        assert_eq!(
+            rewrite_search_if_needed(&ice, query).await.unwrap(),
+            warm,
+            "the warm rewrite must use the cached mapping"
+        );
     }
 
     #[tokio::test]

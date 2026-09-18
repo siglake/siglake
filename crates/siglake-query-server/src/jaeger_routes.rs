@@ -729,7 +729,7 @@ impl TraceQueryContext {
             .await
             .map_err(ApiError::internal)?;
         let config = ice
-            .get_index(index_id)
+            .cached_index_config(index_id)
             .await
             .map_err(ApiError::from_index_manager)?
             .ok_or_else(|| {
@@ -1777,6 +1777,27 @@ mod tests {
         (crate::router(state), ice, tmp)
     }
 
+    fn strip_table_metadata(warehouse: &std::path::Path, index_id: &str) -> usize {
+        let mut removed = 0;
+        for namespace in std::fs::read_dir(warehouse).unwrap() {
+            let metadata = namespace.unwrap().path().join(index_id).join("metadata");
+            let Ok(entries) = std::fs::read_dir(metadata) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    std::fs::remove_file(path).unwrap();
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
     async fn append_trace_fixture(ice: &IcebergContext, index_id: &str) {
         let config = IndexConfig {
             index_id: index_id.to_string(),
@@ -2294,6 +2315,38 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("is not a traces index"));
+    }
+
+    #[tokio::test]
+    async fn warm_jaeger_render_does_not_reload_table_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("warehouse");
+        let ice = Arc::new(
+            IcebergContext::open(&warehouse)
+                .await
+                .unwrap()
+                .with_table_cache_ttl(std::time::Duration::from_secs(3600))
+                .with_tuning(siglake_storage::iceberg::IcebergTuning {
+                    result_caches: Some(false),
+                    ..Default::default()
+                }),
+        );
+        append_trace_fixture(&ice, "siglake-traces-default").await;
+        let app = crate::router(crate::AppState::new(ice.clone(), crate::AuthConfig::open()));
+        let path = "/api/v1/jaeger/siglake-traces-default/api/services";
+        let (status, body) = request_json(&app, path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let removed = strip_table_metadata(&warehouse, "siglake-traces-default");
+        assert!(removed > 0, "the fixture removed no metadata.json files");
+        assert!(
+            ice.get_index("siglake-traces-default").await.is_err(),
+            "the uncached control did not reach metadata storage"
+        );
+
+        let (status, after) = request_json(&app, path).await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        assert_eq!(after, body, "the warm request must use the cached mapping");
     }
 
     // ---- #2096: one interactive request lifecycle on the Jaeger routes ----

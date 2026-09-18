@@ -18616,6 +18616,24 @@ impl IcebergContext {
         Ok(config.doc_mapping.timestamp_field == "timestamp")
     }
 
+    /// One managed index's stored configuration for a query-time mapping read.
+    ///
+    /// The catalog-row existence check stays fresh, so a dropped index stops
+    /// resolving immediately. The mapping itself follows the query table
+    /// cache's bounded-staleness policy and its commit-driven invalidation:
+    /// search rewrites and Jaeger validation can reuse metadata already loaded
+    /// for table registration instead of re-reading `metadata.json` on every
+    /// request. Incarnation-sensitive callers must keep using an uncached
+    /// accessor such as [`Self::index_table_uuid`].
+    pub async fn cached_index_config(&self, index_id: &str) -> Result<Option<IndexConfig>> {
+        let table_ident = self.index_table_ident(index_id);
+        if !self.catalog().table_exists(&table_ident).await? {
+            return Ok(None);
+        }
+        let cached = self.cached_table_entry(&table_ident).await?;
+        crate::index_manager::index_config_from_table(index_id, &cached.table)
+    }
+
     /// Whether `index_id` names a managed index of this context's namespace —
     /// the query server's gate on whether a single-table query may fan out.
     ///
