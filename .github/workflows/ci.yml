@@ -840,7 +840,7 @@ jobs:
           cache-from: type=gha,scope=siglake-operator
           cache-to: type=gha,scope=siglake-operator,mode=max
 
-      # Both suites need the compose stack, so they share one lifecycle.
+      # All three suites need the compose stack, so they share one lifecycle.
       # The second is SQL that no hermetic test can reach: shared-store batch
       # job ownership (#1845), where getting it wrong destroys a live
       # replica's job result on every query scale-out, and the cancellation
@@ -849,7 +849,14 @@ jobs:
       # (#1852). compose's Postgres is the only one CI starts, so these run
       # here or nowhere. Recovery is fleet-wide, so the tests sharing this
       # scratch database must be serialized.
-      - name: Native S3 mirror pagination against MinIO, two-store job ownership against Postgres
+      #
+      # The third is the same argument for the local drain's mirror-reclamation
+      # mark (#4913, #4956): it decides which mirror objects retention may
+      # delete, the deployed catalog is Postgres, and its hermetic cases all run
+      # on SQLite. It creates a schema per case, so it neither sees nor moves
+      # the rows compose's own ingest and compactor keep in the public schema,
+      # and it needs no serialization against the suite above.
+      - name: MinIO mirror pagination, and job ownership plus the local commit mark against Postgres
         env:
           SIGLAKE_TEST_S3_ENDPOINT: http://localhost:9000
           SIGLAKE_TEST_JOBS_POSTGRES_URI: postgres://siglake:siglake@localhost:5433/siglake
@@ -859,6 +866,8 @@ jobs:
           cargo test -p siglake-compactor --test s3_mirror_pagination -- --ignored --nocapture
           cargo test -p siglake-query-server --test jobs_postgres_ownership -- \
             --ignored --nocapture --test-threads=1
+          cargo test -p siglake-storage --lib local_commit_mark_postgres -- \
+            --ignored --nocapture
 
       # Same reason as the `test` job's report: the builder stage's release
       # target measured 4.1 GiB on 2026-09-04, which should fit a standard

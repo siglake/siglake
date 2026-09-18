@@ -3558,7 +3558,7 @@ mod local_commit_mark_tests {
         (c, tmp)
     }
 
-    fn local(id: &str) -> LocalCommittedSegment {
+    pub(super) fn local(id: &str) -> LocalCommittedSegment {
         LocalCommittedSegment {
             id: id.to_string(),
             tenant: "default".to_string(),
@@ -3568,14 +3568,21 @@ mod local_commit_mark_tests {
         }
     }
 
-    async fn row(c: &SqlSegmentClaim, id: &str) -> Option<(String, Option<i64>, String)> {
-        sqlx::query_as::<_, (String, Option<i64>, String)>(
-            "SELECT status, committed_at_ms, segment_url FROM wal_segments WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&c.pool)
-        .await
-        .unwrap()
+    /// Readback through the store's own dialect, so the Postgres arm of these
+    /// cases (`local_commit_mark_postgres`) gets `$1` rather than a `?` the
+    /// backend rejects.
+    pub(super) async fn row(
+        c: &SqlSegmentClaim,
+        id: &str,
+    ) -> Option<(String, Option<i64>, String)> {
+        let q = c
+            .dialect
+            .rewrite("SELECT status, committed_at_ms, segment_url FROM wal_segments WHERE id = ?");
+        sqlx::query_as::<_, (String, Option<i64>, String)>(&q)
+            .bind(id)
+            .fetch_optional(&c.pool)
+            .await
+            .unwrap()
     }
 
     /// #4913: the local drain's mark transitions the row the INGESTER wrote,
@@ -3697,5 +3704,340 @@ mod local_commit_mark_tests {
             .await
             .unwrap()
             .is_none());
+    }
+}
+
+/// The four `local_commit_mark_tests` cases, run against a live Postgres.
+///
+/// [`SqlSegmentClaim::mark_committed_local`] decides which mirror objects
+/// retention may delete, the deployed catalog is Postgres, and every hermetic
+/// test of it runs on SQLite. Two of its properties are backend behaviour that
+/// no parser check establishes: `ON CONFLICT(id) DO NOTHING` reporting zero
+/// `rows_affected` for the row it skipped, and `COALESCE(committed_at_ms, $1)`
+/// keeping the first stamp so retention's clock does not restart every cycle.
+///
+/// `#[ignore]`d, and wired into the compose lifecycle that already starts a
+/// Postgres for the query server's job-ownership suite
+/// (`.github/workflows/ci.yml`, `scripts/ci-local.sh`):
+///
+/// ```text
+/// SIGLAKE_TEST_JOBS_POSTGRES_URI=postgres://siglake:siglake@localhost:5433/siglake \
+///   cargo test -p siglake-storage --lib local_commit_mark_postgres -- --ignored --nocapture
+/// ```
+///
+/// Each case gets its own Postgres schema. compose points its own ingest and
+/// compactor at this database (`deploy/docker-compose.yml`
+/// `SIGLAKE_CATALOG_URI`), so a claim run in the public schema would take live
+/// rows and strand them in `processing`.
+#[cfg(test)]
+mod local_commit_mark_postgres {
+    use super::local_commit_mark_tests::{local, row};
+    use super::*;
+    use anyhow::ensure;
+    use std::collections::BTreeSet;
+
+    const URI_VAR: &str = "SIGLAKE_TEST_JOBS_POSTGRES_URI";
+
+    /// A disposable schema and the URI that makes it this store's whole world.
+    /// sqlx passes `options[...]` through to the Postgres startup packet as
+    /// `-c search_path=…`, so `ensure_schema`'s `CREATE TABLE IF NOT EXISTS`
+    /// lands here rather than next to compose's own `wal_segments`.
+    struct Scratch {
+        name: String,
+        uri: String,
+    }
+
+    /// `base` with the scratch schema pinned as the whole `search_path`.
+    /// Pure, so the one part of the isolation that does not need a server is
+    /// checked by an ordinary test (`the_scratch_uri_pins_the_search_path`).
+    fn scratch_uri(base: &str, schema: &str) -> String {
+        let sep = if base.contains('?') { '&' } else { '?' };
+        format!("{base}{sep}options[search_path]={schema}")
+    }
+
+    impl Scratch {
+        async fn create(admin: &AnyPool, base: &str) -> Result<Self> {
+            let name = format!("siglake_local_mark_{}", uuid::Uuid::new_v4().simple());
+            sqlx::query(&format!("CREATE SCHEMA {name}"))
+                .execute(admin)
+                .await
+                .with_context(|| format!("create scratch schema {name}"))?;
+            let uri = scratch_uri(base, &name);
+            Ok(Self { name, uri })
+        }
+
+        async fn connect(&self) -> Result<SqlSegmentClaim> {
+            let claim = SqlSegmentClaim::connect(&self.uri, "pg-local-mark".to_string()).await?;
+            ensure!(
+                claim.dialect == Dialect::Postgres,
+                "{URI_VAR} must name a Postgres, not a {:?} URI",
+                claim.dialect
+            );
+            // The isolation is the premise of the claim case below, so check it
+            // instead of trusting it: the schema this store just created its
+            // table in has to be the scratch one.
+            let here: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = $1 AND table_name = 'wal_segments'",
+            )
+            .bind(&self.name)
+            .fetch_one(&claim.pool)
+            .await
+            .context("look up the scratch schema's wal_segments")?;
+            ensure!(
+                here == 1,
+                "search_path did not take: no wal_segments in schema {}",
+                self.name
+            );
+            Ok(claim)
+        }
+
+        async fn drop_schema(self, admin: &AnyPool) {
+            if let Err(e) = sqlx::query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.name))
+                .execute(admin)
+                .await
+            {
+                eprintln!("warning: leaked scratch schema {}: {e}", self.name);
+            }
+        }
+    }
+
+    /// Run one case in a fresh schema and drop the schema either way. The cases
+    /// return `Result` rather than asserting so that a failure still cleans up
+    /// and still names which of the four went wrong.
+    async fn in_scratch<F, Fut>(admin: &AnyPool, base: &str, case: F) -> Result<()>
+    where
+        F: FnOnce(SqlSegmentClaim) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let scratch = Scratch::create(admin, base).await?;
+        let outcome = async {
+            let claim = scratch.connect().await?;
+            case(claim).await
+        }
+        .await;
+        scratch.drop_schema(admin).await;
+        outcome
+    }
+
+    /// `purgeable_committed` takes rows strictly older than its cutoff, and the
+    /// two stamps this case writes can share a millisecond with the read. Poll
+    /// for the end state instead of asserting on the first attempt; the claim is
+    /// that both rows come due, not that the clock ticked in between. Order is
+    /// deliberately not asserted either — equal stamps leave `ORDER BY
+    /// committed_at_ms` nothing to break the tie with.
+    async fn purgeable_keys(claim: &SqlSegmentClaim, want: usize) -> Result<BTreeSet<String>> {
+        let mut keys = BTreeSet::new();
+        for _ in 0..50 {
+            keys = claim
+                .purgeable_committed(Duration::ZERO, 10)
+                .await?
+                .into_iter()
+                .map(|(_, key)| key)
+                .collect();
+            if keys.len() >= want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(keys)
+    }
+
+    /// The mark transitions the row the ingester wrote, keeping the key the
+    /// uploader used, and inserts one where the upload has not registered yet.
+    /// The late registration must then lose: on Postgres as on SQLite, a
+    /// skipped `ON CONFLICT DO NOTHING` insert reports no rows affected.
+    async fn upserts_sealed_rows_and_absent_ones(claim: SqlSegmentClaim) -> Result<()> {
+        ensure!(
+            claim
+                .register("reg", "default", "", "wal-mirror/reg.arrow", 11, 3)
+                .await?,
+            "registering a fresh id inserts a row"
+        );
+        let marked = claim
+            .mark_committed_local(&[local("reg"), local("absent")])
+            .await?;
+        ensure!(
+            marked == vec!["reg".to_string(), "absent".to_string()],
+            "both ids must come back durable, got {marked:?}"
+        );
+        let (status, committed_at, url) = row(&claim, "reg").await.context("reg row")?;
+        ensure!(status == "committed", "reg is {status}, not committed");
+        ensure!(committed_at.is_some(), "reg has no committed_at_ms");
+        ensure!(
+            url == "wal-mirror/reg.arrow",
+            "the uploader's key is the key, got {url}"
+        );
+        let absent = row(&claim, "absent").await.context("absent row")?;
+        ensure!(absent.0 == "committed", "absent is {}", absent.0);
+        ensure!(
+            !claim
+                .register("absent", "default", "", "wal-mirror/absent.arrow", 1, 1)
+                .await?,
+            "a late registration must report zero rows affected, or the caller \
+             would read it as a fresh insert"
+        );
+        let after = row(&claim, "absent").await.context("absent row")?;
+        ensure!(
+            after.0 == "committed",
+            "the late registration took the object back out of retention's \
+             reach: absent is {}",
+            after.0
+        );
+        let keys = purgeable_keys(&claim, 2).await?;
+        ensure!(
+            keys == BTreeSet::from([
+                "wal-mirror/absent.arrow".to_string(),
+                "wal-mirror/reg.arrow".to_string(),
+            ]),
+            "retention must see both objects, got {keys:?}"
+        );
+        Ok(())
+    }
+
+    /// The mark runs every cycle for as long as the file is in `committed/`, so
+    /// `COALESCE(committed_at_ms, $1)` has to preserve the first stamp. Getting
+    /// the Postgres marker numbering wrong here re-stamps the row, and the
+    /// object never comes due. The sleep makes the second stamp a different
+    /// millisecond, so a re-stamp is visible.
+    async fn re_marking_preserves_the_first_timestamp(claim: SqlSegmentClaim) -> Result<()> {
+        claim.mark_committed_local(&[local("s")]).await?;
+        let first = row(&claim, "s")
+            .await
+            .context("stamped row")?
+            .1
+            .context("first committed_at_ms")?;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let marked = claim.mark_committed_local(&[local("s")]).await?;
+        ensure!(
+            marked == vec!["s".to_string()],
+            "idempotent, and still durable, got {marked:?}"
+        );
+        let again = row(&claim, "s")
+            .await
+            .context("re-marked row")?
+            .1
+            .context("second committed_at_ms")?;
+        ensure!(
+            again == first,
+            "re-marking re-stamped the row: {first} -> {again}"
+        );
+        Ok(())
+    }
+
+    /// A claim-mode drain owns its `processing` rows. `status IN ('sealed',
+    /// 'committed')` must hold one back here; the claiming drain marks it with
+    /// its own claimer guard, and its consumed-proof watermark depends on that
+    /// transition.
+    async fn leaves_claimed_rows_alone(claim: SqlSegmentClaim) -> Result<()> {
+        claim
+            .register("held", "default", "", "wal-mirror/held.arrow", 1, 1)
+            .await?;
+        let claimed = claim.try_claim(1).await?;
+        let ids: Vec<&str> = claimed.iter().map(|c| c.id.as_str()).collect();
+        ensure!(
+            ids == vec!["held"],
+            "the claim must see this case's row and nothing else, got {ids:?}"
+        );
+        let marked = claim.mark_committed_local(&[local("held")]).await?;
+        ensure!(
+            marked.is_empty(),
+            "a claimed segment's local evidence must be held, not released: {marked:?}"
+        );
+        let held = row(&claim, "held").await.context("held row")?;
+        ensure!(held.0 == "processing", "held is {}", held.0);
+        Ok(())
+    }
+
+    /// There are no claims to reclaim on this path, so the mark writes no
+    /// consumed-proof boundary: a watermark written without a terminal claim
+    /// transition is the unproved acknowledgement #2889 refuses.
+    async fn writes_no_consumed_proof_watermark(claim: SqlSegmentClaim) -> Result<()> {
+        claim.mark_committed_local(&[local("s")]).await?;
+        let watermark = claim.consumed_proof_watermark("default", "").await?;
+        ensure!(
+            watermark.is_none(),
+            "the local mark established a boundary: {watermark:?}"
+        );
+        Ok(())
+    }
+
+    /// The isolation rests on sqlx turning `options[search_path]` into the
+    /// startup parameter Postgres reads as `-c search_path=…`. That much needs
+    /// no server, and getting it wrong silently puts the scratch tables — and
+    /// this store's claim — in the public schema compose's own ingest and
+    /// compactor are using.
+    #[test]
+    fn the_scratch_uri_pins_the_search_path() {
+        use sqlx::postgres::PgConnectOptions;
+        use std::str::FromStr;
+
+        for base in [
+            "postgres://siglake:siglake@localhost:5433/siglake",
+            "postgres://siglake:siglake@localhost:5433/siglake?sslmode=disable",
+        ] {
+            let uri = scratch_uri(base, "siglake_local_mark_deadbeef");
+            let opts = PgConnectOptions::from_str(&uri).expect(&uri);
+            assert_eq!(
+                opts.get_options(),
+                Some("-c search_path=siglake_local_mark_deadbeef"),
+                "{uri}"
+            );
+            assert_eq!(opts.get_database(), Some("siglake"), "{uri}");
+            assert_eq!(opts.get_port(), 5433, "{uri}");
+            assert_eq!(
+                Dialect::from_uri(&uri),
+                Dialect::Postgres,
+                "the store must still rewrite markers as $N: {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn the_local_mark_behaves_the_same_against_postgres() {
+        // Skipping when the variable is absent keeps `--ignored` runnable
+        // wherever there is no Postgres. The compose step that sets it also
+        // runs `jobs_postgres_ownership`, which panics on an unset variable, so
+        // a dropped variable in CI still fails the gate there.
+        let base = match std::env::var(URI_VAR) {
+            Ok(uri) if !uri.trim().is_empty() => uri,
+            _ => {
+                eprintln!("skipped: {URI_VAR} is unset; nothing was verified");
+                return;
+            }
+        };
+        sqlx::any::install_default_drivers();
+        let admin = AnyPool::connect(&base)
+            .await
+            .unwrap_or_else(|e| panic!("connect {URI_VAR}: {e}"));
+
+        let outcomes = [
+            (
+                "sealed and absent rows upsert, and a late registration loses",
+                in_scratch(&admin, &base, upserts_sealed_rows_and_absent_ones).await,
+            ),
+            (
+                "re-marking preserves the first committed timestamp",
+                in_scratch(&admin, &base, re_marking_preserves_the_first_timestamp).await,
+            ),
+            (
+                "a claimed row is left to its claim-mode drain",
+                in_scratch(&admin, &base, leaves_claimed_rows_alone).await,
+            ),
+            (
+                "the mark writes no consumed-proof watermark",
+                in_scratch(&admin, &base, writes_no_consumed_proof_watermark).await,
+            ),
+        ];
+        let failed: Vec<String> = outcomes
+            .into_iter()
+            .filter_map(|(case, outcome)| outcome.err().map(|e| format!("- {case}: {e:#}")))
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "the local mark behaves differently on Postgres:\n{}",
+            failed.join("\n")
+        );
     }
 }

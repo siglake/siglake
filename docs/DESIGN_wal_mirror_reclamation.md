@@ -282,6 +282,15 @@ What the implementation adds, against the shape above:
   it writes no consumed-proof watermark, it stamps `committed_at_ms` once and
   preserves it across the per-cycle re-mark, and it leaves a `processing`,
   `released` or quarantined row untouched.
+- The four cases above also run against a live Postgres (#4956). The hermetic
+  ones are SQLite, and two of the properties are backend behaviour a parser
+  check cannot establish: the zero `rows_affected` that makes a late
+  `ON CONFLICT(id) DO NOTHING` registration lose, and `COALESCE(committed_at_ms,
+  $1)` keeping the first stamp. `local_commit_mark_postgres` is `#[ignore]`d,
+  takes `SIGLAKE_TEST_JOBS_POSTGRES_URI`, and runs in the compose step that
+  already starts a Postgres for the query server's job-ownership suite. Each
+  case gets its own schema, because compose points its own ingest and compactor
+  at that database and an unscoped claim would take their rows.
 - The mark runs inside the per-directory retention sweep, so every cycle shape
   that sweeps also marks, and the gate is computed from the same listing.
 - `catch_up_sweep` no longer uploads a candidate whose only remaining local

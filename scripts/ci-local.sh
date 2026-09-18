@@ -846,6 +846,16 @@ if [ "$WITH_HEAVY" = 1 ]; then
         SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
           cargo test -p siglake-query-server --test jobs_postgres_ownership -- \
             --ignored --nocapture --test-threads=1 >>"$dlog" 2>&1 || dk_ok=0
+        # Same argument for the local drain's mirror-reclamation mark (#4913,
+        # #4956): it decides which mirror objects retention may delete, the
+        # deployed catalog is Postgres, and its hermetic cases run on SQLite.
+        # `ON CONFLICT(id) DO NOTHING`'s rows_affected and the preserved
+        # `COALESCE(committed_at_ms, $1)` stamp are backend behaviour the
+        # parse-gate cannot establish. Each case gets its own Postgres schema,
+        # so its claim never takes a row compose's ingest registered.
+        SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
+          cargo test -p siglake-storage --lib local_commit_mark_postgres -- \
+            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
       else
         dk_ok=0
       fi
