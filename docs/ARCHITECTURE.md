@@ -1339,6 +1339,14 @@ takes its share: at the chart's 4Gi floor that spends the one-file decode
 reservation the floor exists to hold. Measured locally, the cache is 5-7x faster
 warm when the budget covers the working set and within noise of no cache when it
 covers half of it.
+`siglake_query_scan_file_cache_requests_total{outcome}` reports each cache
+decision. The overview dashboard charts
+`insert_skipped_contended / (insert + insert_skipped_contended)` per query pod:
+the skipped arm is a completed population that lost the cache's `try_lock`, so
+the entry remains rebuildable but the next reader pays another miss and decode.
+An idle pod reads 0% beside zero raw insert rates. There is no alert threshold;
+#3053's representative cache measurements must supply one and its sustain
+window.
 
 **Which budget a process gets is its role.** The query server derives both from
 its pod's limit. The `siglake` binary resolves its own at startup, and for the

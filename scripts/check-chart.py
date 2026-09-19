@@ -42,6 +42,11 @@ shared queue reported by every claim worker and a per-tenant local count under
 the filesystem drain, and one expression has to chart both without multiplying
 the backlog by the replica count (#3692).
 
+It evaluates the decoded-file cache's contended-insert fraction per query pod,
+including missing outcome arms and the explicit zero used for an idle pod, so a
+PromQL edit cannot silently turn the diagnostic into a fleet-wide rate or NaN
+(#3086).
+
 It evaluates the four index-build panels too. In particular, the summary
 quantiles stay as one sample per compactor — percentiles cannot be averaged —
 while the rebuild counters add the same table across compactors and retain a
@@ -2177,6 +2182,10 @@ TEXT_INDEX_STARTUP_EXPECTED = {
     "0.50": {"decode": 0.05 + (0.5 - 0.05) * 0.5, "permit_wait": 0.0025 * 0.5},
     "0.99": {"decode": 0.05 + (0.5 - 0.05) * 0.99, "permit_wait": 0.0025 * 0.99},
 }
+# The decoded-file cache's contended-insert fraction, kept separate from panel
+# 162's raw outcome rates because the units differ.
+FILE_CACHE_CONTENTION_PANEL = 172
+FILE_CACHE_REQUESTS_METRIC = "siglake_query_scan_file_cache_requests_total"
 # #5231's four index-build panels. Every target is named so moving or deleting
 # one fails instead of leaving its promtool check evaluating a smaller set.
 INDEX_BUILD_PANELS = (167, 168, 169, 170)
@@ -2259,6 +2268,114 @@ DRAIN_BACKLOG_SERIES = {
         ],
     },
 }
+
+
+def file_cache_contention_expr(dashboard: dict) -> str | None:
+    """Panel 172's one shipped expression, or None if its shape changed."""
+    for panel in dashboard_panels(dashboard):
+        if panel.get("id") != FILE_CACHE_CONTENTION_PANEL:
+            continue
+        targets = panel.get("targets") or []
+        if len(targets) != 1 or targets[0].get("refId") != "A":
+            return None
+        expr = targets[0].get("expr")
+        return expr if isinstance(expr, str) else None
+    return None
+
+
+def file_cache_contention_fixture(expr: str) -> str:
+    """A promtool fixture for the contended-insert fraction per query pod.
+
+    query-0 has both outcomes and a known 25% fraction. query-1 lacks the skip
+    outcome and must still read 0%; query-2 lacks insert and must read 100%.
+    query-idle has both pre-registered series at zero and must take the panel's
+    explicit zero fallback instead of producing NaN.
+    """
+    series = (
+        ("query-0", "insert", "0+3x6"),
+        ("query-0", "insert_skipped_contended", "0+1x6"),
+        ("query-1", "insert", "0+2x6"),
+        ("query-2", "insert_skipped_contended", "0+2x6"),
+        ("query-idle", "insert", "0x7"),
+        ("query-idle", "insert_skipped_contended", "0x7"),
+    )
+    out = (
+        "evaluation_interval: 1m\n"
+        "fuzzy_compare: true\n"
+        "tests:\n"
+        "  - name: decoded-file cache contention per query pod\n"
+        "    interval: 1m\n"
+        "    input_series:\n"
+    )
+    for pod, outcome, values in series:
+        out += (
+            f"      - series: '{FILE_CACHE_REQUESTS_METRIC}{{namespace=\"logs\","
+            f'app_kubernetes_io_component="query",pod="{pod}",'
+            f'outcome="{outcome}"}}\'\n'
+            f"        values: '{values}'\n"
+        )
+    out += "    promql_expr_test:\n"
+    out += f"      - expr: '{expr.replace('$namespace', '.*')}'\n"
+    out += "        eval_time: 6m\n        exp_samples:\n"
+    for pod, value in (
+        ("query-0", "0.25"),
+        ("query-1", "0"),
+        ("query-2", "1"),
+        ("query-idle", "0"),
+    ):
+        out += (
+            f"          - labels: '{{namespace=\"logs\",pod=\"{pod}\"}}'\n"
+            f"            value: {value}\n"
+        )
+    return out
+
+
+def check_file_cache_contention_panel(
+    require_promtool: bool = False,
+) -> tuple[list[str], bool]:
+    """Evaluate panel 172's shipped fraction with Prometheus' own engine."""
+    try:
+        dashboard = json.loads(OVERVIEW_DASHBOARD.read_text())
+    except (OSError, ValueError) as e:
+        return [f"{OVERVIEW_DASHBOARD}: not readable as JSON ({e})"], False
+    expr = file_cache_contention_expr(dashboard)
+    if expr is None or FILE_CACHE_REQUESTS_METRIC not in expr:
+        return [
+            f"{OVERVIEW_DASHBOARD}: panel {FILE_CACHE_CONTENTION_PANEL} no longer "
+            f"has one target A reading {FILE_CACHE_REQUESTS_METRIC}; re-point "
+            "FILE_CACHE_CONTENTION_PANEL rather than leaving this check partial"
+        ], False
+    if "'" in expr:
+        return [
+            f"{OVERVIEW_DASHBOARD}: panel {FILE_CACHE_CONTENTION_PANEL} expression "
+            "needs YAML escaping"
+        ], False
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = pathlib.Path(tmp_dir)
+        name = "file-cache-contention.test.yaml"
+        (tmp_path / name).write_text(file_cache_contention_fixture(expr))
+        try:
+            subprocess.run(
+                ["promtool", "test", "rules", name],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=tmp_path,
+            )
+        except FileNotFoundError:
+            problem = (
+                "promtool not installed; the decoded-file cache contention panel "
+                "expression was not evaluated"
+            )
+            return ([problem] if require_promtool else []), True
+        except subprocess.CalledProcessError as e:
+            output = "\n".join(s for s in (e.stdout.strip(), e.stderr.strip()) if s)
+            return [
+                f"{OVERVIEW_DASHBOARD}: panel {FILE_CACHE_CONTENTION_PANEL} does "
+                "not read the contended-insert fraction per query pod:"
+                + (f"\n{output}" if output else "")
+            ], False
+    return [], False
 
 
 def drain_backlog_exprs(dashboard: dict) -> dict[str, str]:
@@ -3310,13 +3427,19 @@ def source_checks(
     # The dashboard needs no render, so it is checked before any and still
     # reports when helm itself is unavailable.
     count, problems = check_dashboards(exported)
+    contention_problems, contention_skipped = check_file_cache_contention_panel(
+        require_promtool
+    )
+    problems.extend(contention_problems)
     panel_problems, panel_skipped = check_drain_backlog_panel(require_promtool)
     problems.extend(panel_problems)
     startup_problems, startup_skipped = check_text_index_startup_panel(require_promtool)
     problems.extend(startup_problems)
     index_problems, index_skipped = check_index_build_panels(require_promtool)
     problems.extend(index_problems)
-    panel_skipped = panel_skipped or startup_skipped or index_skipped
+    panel_skipped = (
+        contention_skipped or panel_skipped or startup_skipped or index_skipped
+    )
     if problems:
         failed = True
         for p in problems:
@@ -3325,7 +3448,8 @@ def source_checks(
         panel_result = (
             "; panel expressions skipped (promtool not installed)"
             if panel_skipped
-            else f"; panels {DRAIN_BACKLOG_PANEL}, {DRAIN_AGE_PANEL}, "
+            else f"; panels {FILE_CACHE_CONTENTION_PANEL}, "
+            f"{DRAIN_BACKLOG_PANEL}, {DRAIN_AGE_PANEL}, "
             f"{TEXT_INDEX_STARTUP_PANEL}, "
             f"{', '.join(str(panel) for panel in INDEX_BUILD_PANELS)} passed promtool"
         )

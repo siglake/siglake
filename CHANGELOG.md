@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Query observability (feature)**: the starter dashboard charts decoded-file
+  cache lock contention per query pod as `insert_skipped_contended / (insert +
+  insert_skipped_contended)`. A skipped insert is safe but leaves the next
+  reader to repeat the miss and decode, so this shows a cache that seldom fills
+  even when it has a positive budget. The panel handles either missing outcome
+  and renders an idle pod as 0% beside the raw zero insert rates. Its shipped
+  PromQL is evaluated with promtool against all four shapes. No alert is set;
+  #3053's representative measurements must supply a threshold and sustain
+  window. (#3086)
+
 - **Query tenancy (feature)**: `query.allowedTenants` and
   `SIGLAKE_QUERY_ALLOWED_TENANTS` add an opt-in exact allow-list for verified
   query tenant claims. The default remains unrestricted, and query admission

@@ -1729,7 +1729,7 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 24,
+    "w": 18,
     "x": 0,
     "y": 154
    },
@@ -1746,7 +1746,37 @@
      "min": 0
     }
    },
-   "description": "Decoded-file cache populations, by what happened to each one. The cache is experimental and OFF by default (SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_BYTES and _MAX_ENTRIES are 0 in the chart, the compose file and the operator), so a flat zero on every arm is the expected reading for most deployments; all eight arms are pre-registered on the query server, so zero charts as zero rather than No data. abandoned is the arm to read when it IS on (#4846): a population that decoded batches, buffered them and was dropped before the end-of-stream arm could insert them — a LIMIT satisfied from the first batches, or a cancelled query. It cannot be read off miss, which is charged when a partition OPENS its first task, once per partition: the 2026-09-15 50G rounds exported 448 miss and no insert at 8 GiB, and #4494 had to establish from four ABSENT series that those were opens rather than populations that failed to stick. abandoned at the miss rate with insert at zero is that same shape, stated directly: the budget is subtracted from the query memory pool and nothing is ever kept. insert against abandoned is therefore the readout of whether the cache is earning its bytes on this workload. The other arms: bypass is a scan with a raw-text or promoted-column predicate, which reads through the pruning reader by design and never populates; skip_oversized is one file's decoded batches crossing a quarter of the budget; insert_skipped_contended is the deliberate degrade when a finished population loses the cache lock — one skip costs one future miss, and its rate against insert is #3086; evict is the LRU bound biting. The arms do not partition miss: miss is charged before the populate stream is built, and hit and bypass never build one."
+   "description": "Decoded-file cache populations, by what happened to each one. The cache is experimental and OFF by default (SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_BYTES and _MAX_ENTRIES are 0 in the chart, the compose file and the operator), so a flat zero on every arm is the expected reading for most deployments; all eight arms are pre-registered on the query server, so zero charts as zero rather than No data. abandoned is the arm to read when it IS on (#4846): a population that decoded batches, buffered them and was dropped before the end-of-stream arm could insert them — a LIMIT satisfied from the first batches, or a cancelled query. It cannot be read off miss, which is charged when a partition OPENS its first task, once per partition: the 2026-09-15 50G rounds exported 448 miss and no insert at 8 GiB, and #4494 had to establish from four ABSENT series that those were opens rather than populations that failed to stick. abandoned at the miss rate with insert at zero is that same shape, stated directly: the budget is subtracted from the query memory pool and nothing is ever kept. insert against abandoned is therefore the readout of whether the cache is earning its bytes on this workload. The other arms: bypass is a scan with a raw-text or promoted-column predicate, which reads through the pruning reader by design and never populates; skip_oversized is one file's decoded batches crossing a quarter of the budget; insert_skipped_contended is the deliberate degrade when a finished population loses the cache lock — one skip costs one future miss, and the panel beside this one shows its share of completed insert attempts per query pod; evict is the LRU bound biting. The arms do not partition miss: miss is charged before the populate stream is built, and hit and bypass never build one."
+  },
+  {
+   "id": 172,
+   "type": "timeseries",
+   "title": "Decoded-file cache contended-insert share",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 18,
+    "y": 154
+   },
+   "targets": [
+    {
+     "expr": "((sum by (namespace, pod) (rate(siglake_query_scan_file_cache_requests_total{namespace=~\"$namespace\",outcome=\"insert_skipped_contended\"}[5m])) or sum by (namespace, pod) (rate(siglake_query_scan_file_cache_requests_total{namespace=~\"$namespace\",outcome=~\"insert|insert_skipped_contended\"}[5m])) * 0) / (sum by (namespace, pod) (rate(siglake_query_scan_file_cache_requests_total{namespace=~\"$namespace\",outcome=~\"insert|insert_skipped_contended\"}[5m])) > 0)) or sum by (namespace, pod) (rate(siglake_query_scan_file_cache_requests_total{namespace=~\"$namespace\",outcome=~\"insert|insert_skipped_contended\"}[5m])) * 0",
+     "legendFormat": "{{namespace}} / {{pod}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "min": 0,
+     "max": 1
+    }
+   },
+   "description": "The share of completed decoded-file cache insert attempts that lost the cache's try_lock, per query pod: insert_skipped_contended / (insert + insert_skipped_contended). A skip is safe because another reader can rebuild the entry, but it costs that future miss and decode. A sustained high share means contention is preventing the cache from filling; no alert is set until #3053 supplies a representative threshold and sustain window. The two outcome series are pre-registered at zero. An idle pod is rendered as 0%; confirm that the raw insert arms beside it are active before interpreting the percentage."
   },
   {
    "id": 166,
