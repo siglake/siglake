@@ -658,7 +658,7 @@ the postings work), the parsed-index cache's lookup outcomes beside the
 bound that dropped an entry, and its resident bytes against that bound.
 
 Four panels close that row with what the indexes those queries read cost
-to build, which until now was emitted and charted nowhere. The first two
+to build, which was emitted but charted nowhere. The first two
 are the segmented (`seg2`) sidecar writer, which builds a sidecar as a
 compaction rewrite emits row groups: one arm per `(outcome, reason)` a
 sidecar close records, and the sidecar's encoded bytes beside the heap
@@ -672,9 +672,10 @@ flat zeros rather than "No data". The byte panel cannot be: quantiles
 have nothing to pre-register, and it is charted **per pod** rather than
 summed — these are each compactor's own summary quantiles over the
 exporter's rolling window, and averaging percentiles across a fleet
-produces a number no pod measured. Label the `group index` arm for what
-it is: one row group's parsed-index allocation, not the writer's peak
-heap. The other two panels are the opt-in post-rewrite v1 rebuild
+produces a number no pod measured. Read the `group index` arm for what
+it is: one row group's parsed-index allocation, dropped at the end of
+that group, not the writer's peak process heap. The other two panels are
+the opt-in post-rewrite v1 rebuild
 (`compactor.indexRebuild`), which reads a committed data file back whole:
 the files it rebuilt per hour with those files' own size on the right
 axis, and the pass duration as a fleet histogram quantile. The rebuild
