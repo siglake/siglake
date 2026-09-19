@@ -1367,7 +1367,15 @@ bytes the cache still held against those that had to read, and
 eviction rule's three arms chose each victim — `redundant` for a blob whose
 parsed twin is resident (and which therefore cannot be read at all until that
 twin goes), `stale` for one nothing read while the cache turned over four
-times, and `fifo` for the fallback the coupled rule replaced. A fetch rate that
+times, and `fifo` for the fallback the coupled rule replaced. That family
+carries a fourth reason which is not the rule at all: `oversized`, for a blob
+refused outright because one file's index exceeds the whole byte budget, so
+that file re-reads on every decode and the cache holds it never (#5373, the
+parsed side's own `oversized`). A budget one blob short of the plan's per-file
+index charts a rising fetch rate with no eviction and no hit otherwise, which
+is what a cold cache and a switched-off one chart. A zero bound is not charged
+there — a disabled cache is never consulted, and its flat lookup series says
+so. A fetch rate that
 tracks the parsed miss rate is #4182's regression, which had to be inferred
 from index-phase object-store bytes and `first_batch_ms` for a round because
 these three were process diagnostics and nothing exported them.

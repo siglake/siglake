@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Query observability (feature)**: a Puffin index blob the cache refuses
+  outright is counted, as
+  `siglake_iceberg_puffin_blob_cache_evictions_total{reason="oversized"}`. One
+  file whose index blob alone exceeds `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES` is
+  never admitted, so it is read from object storage on every decode and the
+  cache is inert for it — a pod one blob short of its plan's per-file index
+  used to chart a rising `siglake_iceberg_puffin_blob_fetches_total` with no
+  eviction and no hit, which is also what a cold cache and a switched-off one
+  chart. The arm is pre-registered at 0 beside #4718's three, so the healthy
+  reading is a flat line rather than no data, and panel 165 ("Puffin blob cache
+  fetches / hits / evictions") already groups by `reason`. A zero bound is not
+  charged there: a disabled cache is never consulted and its flat lookup series
+  says so. Admission is unchanged — the refusal is counted before the blob is
+  copied and evicts nothing, and a key the cache already holds is
+  deduplication, not a refusal. (#5373)
+
 - **Operations (docs)**: moving a release from the filesystem drain to the
   catalog claim is documented as a migration step for the segments the
   filesystem drain held. A quarantined segment under `<wal>/**/orphans/` whose
