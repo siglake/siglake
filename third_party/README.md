@@ -26,6 +26,11 @@ A 2026-09-05 sizing put the upstream 0.10.1 rebase at 8–13 focused
 engineering days plus an AWS validation round. It recommends doing that work
 after launch and re-checking upstream no later than 2026-10-15.
 
+The staged 0.10.1 candidate is isolated from production dependency resolution.
+Slice 1 replaces the candidate copies of the local schema-update and
+snapshot-expiry actions with upstream actions plus caller adapters. The
+shipping 0.9.1 forks retain both local actions until the final adoption slice.
+
 ## `iceberg/` — fork of `apache/iceberg-rust` (`iceberg` crate)
 
 Upstream base: 0.9.x. Key divergences:
