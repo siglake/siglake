@@ -598,7 +598,12 @@ one can duplicate them; establish which from your own evidence (the compactor's
 segment is a readable Arrow stream) before moving anything. Raising
 `compactor.snapshotExpire.retainLast` keeps the proof available for orphans a
 future crash creates; it cannot restore history that has already expired and
-will not clear an existing hold.
+will not clear an existing hold. The level is charted per tenant on the
+"Segments quarantined" panel of the starter dashboard, beside the two other
+set-aside series, so the page's first two questions — one tenant or the fleet,
+steady or growing — are answered without an ad-hoc query. Only the filesystem
+drain publishes it: under the catalog claim the series is absent, which says
+nothing about what a former WAL PVC still holds.
 
 The starter Grafana dashboard `deploy/grafana/siglake-overview.json`
 groups panels the same way and filters on `namespace` (the label
