@@ -842,7 +842,7 @@ jobs:
           cache-from: type=gha,scope=siglake-operator
           cache-to: type=gha,scope=siglake-operator,mode=max
 
-      # All three suites need the compose stack, so they share one lifecycle.
+      # All four suites need the compose stack, so they share one lifecycle.
       # The second is SQL that no hermetic test can reach: shared-store batch
       # job ownership (#1845), where getting it wrong destroys a live
       # replica's job result on every query scale-out, and the cancellation
@@ -858,7 +858,12 @@ jobs:
       # on SQLite. It creates a schema per case, so it neither sees nor moves
       # the rows compose's own ingest and compactor keep in the public schema,
       # and it needs no serialization against the suite above.
-      - name: MinIO mirror pagination, and job ownership plus the local commit mark against Postgres
+      #
+      # The fourth exercises wal-recover's read-only catalog connection at the
+      # two Postgres boundaries SQLite cannot cover: the 256-wide `$N` rewrite
+      # and the server-enforced read-only transaction. It also keeps a missing
+      # wal_segments table distinct from an existing empty ledger.
+      - name: MinIO pagination and the Postgres catalog suites
         env:
           SIGLAKE_TEST_S3_ENDPOINT: http://localhost:9000
           SIGLAKE_TEST_JOBS_POSTGRES_URI: postgres://siglake:siglake@localhost:5433/siglake
@@ -869,6 +874,8 @@ jobs:
           cargo test -p siglake-query-server --test jobs_postgres_ownership -- \
             --ignored --nocapture --test-threads=1
           cargo test -p siglake-storage --lib local_commit_mark_postgres -- \
+            --ignored --nocapture
+          cargo test -p siglake-storage --lib wal_ledger_postgres -- \
             --ignored --nocapture
 
       # Same reason as the `test` job's report: the builder stage's release
