@@ -77,6 +77,14 @@ SCALE_COOLDOWN_SECONDS=30
 # only a live round can show it is there -- and only a round with TWO scraped
 # ingester pods, each publishing more than one series, can tell the per-pod
 # mean apart from the fleet total and the per-series average.
+# The live reading has been retained, so ordinary rounds no longer pay for the
+# scale-out and traffic window. Set this only on a round explicitly tasked with
+# collecting the per-pod label evidence again.
+INGESTER_POD_LABEL_CAPTURE="${INGESTER_POD_LABEL_CAPTURE:-0}"
+[[ "$INGESTER_POD_LABEL_CAPTURE" == 0 || "$INGESTER_POD_LABEL_CAPTURE" == 1 ]] || {
+  printf 'ERROR: INGESTER_POD_LABEL_CAPTURE must be 0 or 1\n' >&2
+  exit 1
+}
 #
 # WHY THE FLOOR AND NOT THE THRESHOLD. Lowering
 # `keda.ingester.requestsPerSecondTarget` for the round is the smaller edit, but
@@ -1633,8 +1641,10 @@ fi
 # constants at the top give: this is the one step that changes a tier's replica
 # count outside the query-scaling window, so nothing the round already measured
 # can have been taken across it.
-log "capture the ingester tier's per-pod request series"
-capture_ingester_pod_labels "$next_event" || true
+if [[ "$INGESTER_POD_LABEL_CAPTURE" == 1 ]]; then
+  log "run the opt-in ingester per-pod request-series capture"
+  capture_ingester_pod_labels "$next_event" || true
+fi
 
 log "dashboard panel evidence"
 printf 'PANEL_TABLE_BEGIN\n'

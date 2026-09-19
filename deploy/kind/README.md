@@ -18,6 +18,8 @@ scripts/kind-up.sh         # kind create cluster + apply manifests + helm instal
 scripts/kind-smoke.sh      # POST events → poll query-server → assert
 scripts/kind-round.sh      # Prometheus + KEDA load/evidence round (~6 minutes of load,
                            # plus up to 5 more for the 2→4→2 query scale step)
+INGESTER_POD_LABEL_CAPTURE=1 scripts/kind-round.sh  # scale the ingester and retain
+                                                    # per-pod label evidence
 POSTGRES_OUTAGE_PROBE=1 scripts/kind-round.sh  # additionally measure persistent-job
                                               # backlog through a bounded PG pause
 scripts/kind-down.sh       # helm uninstall + kind delete cluster
@@ -115,8 +117,10 @@ same check runs the probe's three remote readers against a synthetic `/proc`
 and psql stand-ins, and drives the probe end to end against recording stand-ins
 for `kubectl` and `curl`. No cluster is involved.
 
-After every other observation, and before the panel and ScaledObject evidence,
-the round raises the ingester ScaledObject's `minReplicaCount` to 2, drives OTLP
+Only rounds launched with `INGESTER_POD_LABEL_CAPTURE=1` collect the ingester
+per-pod label evidence; ordinary rounds leave the phase off. After every other
+observation, and before the panel and ScaledObject evidence, an enabled round
+raises the ingester ScaledObject's `minReplicaCount` to 2, drives OTLP
 logs and traces at the tier for 90 seconds so both pods carry traffic on more
 than one series, and captures four Prometheus answers at one evaluation
 timestamp: the raw `siglake_ingest_requests_total` series with their label sets,
@@ -136,9 +140,10 @@ the per-pod mean are not distinguishable. The grader marks a capture
 two pods carried a nonzero rate, when every pod published one series, or when
 the operator's value is not the mean of the per-pod sums.
 `scripts/check-kind-ingester-pod-labels.sh` (CI's `shell` job and the local
-gate) pins the captured expression against `prom.rs`, drives the capture
-function against stand-in `kubectl`, `curl` and `git`, and runs the grader over
-one passing fixture and seven mutations of it; no cluster is involved.
+gate) pins the captured expression against `prom.rs`, drives both the
+default-off path and the enabled capture against stand-in `kubectl`, `curl` and
+`git`, and runs the grader over one passing fixture and eight mutations of it;
+no cluster is involved.
 
 The command exits non-zero when required panel/trigger data is absent or a
 ScaledObject is unhealthy. Before the cluster is deleted the script prints the
