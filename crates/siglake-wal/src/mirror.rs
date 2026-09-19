@@ -1695,7 +1695,7 @@ pub struct PlanGroup {
     /// Distinct segments (a sealed key and its active prefix are one).
     pub segments: usize,
     /// Bytes the listing reported for them, or `None` when the store does not
-    /// report sizes in a listing (opendal's in-memory service does not).
+    /// report sizes in a listing.
     pub bytes: Option<u64>,
     /// One key, verbatim, so the operator can see what the layout looked like.
     pub sample_key: String,
@@ -3286,13 +3286,15 @@ mod tests {
     #[tokio::test]
     async fn plan_groups_by_destination_and_writes_nothing() {
         let op = memory_op();
+        let body = sealed_body(1);
+        let body_bytes = body.len() as u64;
         for key in [
             "wal-mirror/acme/a.arrow",
             "wal-mirror/acme/b.arrow",
             "wal-mirror/acme/orders/c.arrow",
             "wal-mirror/flat.arrow",
         ] {
-            op.write(key, sealed_body(1)).await.unwrap();
+            op.write(key, body.clone()).await.unwrap();
         }
         op.write("wal-mirror/README.md", bytes::Bytes::from_static(b"BODY"))
             .await
@@ -3336,10 +3338,9 @@ mod tests {
                 ("default", None, 1, format!("default/{SEALED_DIR}")),
             ]
         );
-        // opendal's in-memory service reports no size in a listing, and a
-        // plan pays one LIST and no per-object request, so it says so rather
-        // than inventing a total.
-        assert_eq!(plan.bytes(), None);
+        // OpenDAL 0.57's in-memory service reports sizes in its listing, so
+        // the plan can total them without paying for per-object requests.
+        assert_eq!(plan.bytes(), Some(body_bytes * 4));
 
         // After the apply, a second plan counts what is there instead of
         // proposing it again.
