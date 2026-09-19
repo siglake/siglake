@@ -16,8 +16,10 @@
 //! 4. Owner-local reconciliation resolves only this incarnation's parked
 //!    jobs, gives them a TTL without marking them recovered, and preserves a
 //!    cancellation that already won.
+//! 5. A second replica's HTTP status and result routes serve the exact rows
+//!    computed by the first replica through their shared Postgres table.
 //!
-//! and, in the second test, the other half of the same shared-store problem:
+//! Another case covers the other half of the same shared-store problem:
 //! a cancellation persisted by store B reaches the future store A is
 //! executing, over the real backend and on the real timer — not a hand-driven
 //! sweep. The status write alone releases nothing, because the admission
@@ -34,8 +36,14 @@
 //!   cargo test -p siglake-query-server --test jobs_postgres_ownership -- --ignored --nocapture
 //! ```
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::{to_bytes, Body};
+use axum::http::{header, Method, Request, StatusCode};
+use axum::Router;
+use chrono::Utc;
+use siglake_core::Event;
 use siglake_query_server::cost::{ComplexityClass, CostReport};
 use siglake_query_server::format::RecordsResponse;
 use siglake_query_server::jobs::{
@@ -43,8 +51,11 @@ use siglake_query_server::jobs::{
     OrphanReason, ParkOutcome, ReconcileOutcome, RecoveryDecision,
 };
 use siglake_query_server::limits::Priority;
+use siglake_query_server::{router, AppState, AuthConfig, ServerLimits};
+use siglake_storage::iceberg::IcebergContext;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use tower::util::ServiceExt;
 
 const TTL: Duration = Duration::from_secs(600);
 
@@ -96,6 +107,153 @@ fn records(marker: &str) -> RecordsResponse {
         stats: None,
         approximation: None,
     }
+}
+
+async fn send_http(
+    app: &Router,
+    method: Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(path);
+    let body = match body {
+        Some(json) => {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            Body::from(serde_json::to_vec(&json).expect("encode request"))
+        }
+        None => Body::empty(),
+    };
+    app.clone()
+        .oneshot(builder.body(body).expect("build request"))
+        .await
+        .expect("route request")
+}
+
+async fn http_json(response: axum::response::Response) -> serde_json::Value {
+    serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body"),
+    )
+    .expect("decode JSON response")
+}
+
+async fn http_warehouse() -> (tempfile::TempDir, Arc<IcebergContext>) {
+    let tmp = tempfile::tempdir().expect("temporary warehouse");
+    let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+        .await
+        .expect("open warehouse");
+    let events: Vec<Event> = (0..4)
+        .map(|i| Event {
+            timestamp: Utc::now(),
+            host: format!("host-{i}"),
+            source: "postgres-peer-http".into(),
+            sourcetype: "app:json".into(),
+            index: "main".into(),
+            raw: format!("event {i}"),
+            attributes: None,
+        })
+        .collect();
+    ice.append_events(&events).await.expect("append events");
+    (tmp, Arc::new(ice))
+}
+
+fn http_state(ice: Arc<IcebergContext>, jobs: JobStore) -> AppState {
+    AppState::new(ice, AuthConfig::open())
+        .with_limits(ServerLimits::default())
+        .with_jobs(jobs)
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_peer_replica_serves_http_status_and_result_from_postgres() {
+    let uri = std::env::var("SIGLAKE_TEST_JOBS_POSTGRES_URI").expect(
+        "SIGLAKE_TEST_JOBS_POSTGRES_URI must name a scratch Postgres, e.g. \
+         postgres://siglake:siglake@localhost:5433/siglake from scripts/up.sh",
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&uri)
+        .await
+        .expect("connect cleanup pool");
+    let (_tmp, ice) = http_warehouse().await;
+
+    let jobs_a = JobStore::new_postgres(&uri, 1, TTL, policy())
+        .await
+        .expect("open store A");
+    let state_a = http_state(ice.clone(), jobs_a);
+    let app_a = router(state_a.clone());
+
+    let submitted = send_http(
+        &app_a,
+        Method::POST,
+        "/api/v1/sql",
+        Some(serde_json::json!({
+            "query": "SELECT count(*) AS n FROM events",
+            "priority": "batch"
+        })),
+    )
+    .await;
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+    let job_id = http_json(submitted).await["job_id"]
+        .as_str()
+        .expect("submit response carries job_id")
+        .to_string();
+
+    // B has an independently opened store and router. Open authentication
+    // gives both requests the same anonymous caller identity.
+    let jobs_b = JobStore::new_postgres(&uri, 1, TTL, policy())
+        .await
+        .expect("open store B");
+    let state_b = http_state(ice, jobs_b);
+    let app_b = router(state_b.clone());
+
+    let status = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let response =
+                send_http(&app_b, Method::GET, &format!("/api/v1/jobs/{job_id}"), None).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "replica B lost replica A's job"
+            );
+            let body = http_json(response).await;
+            if matches!(
+                body["status"].as_str(),
+                Some("succeeded" | "failed" | "cancelled" | "timeout")
+            ) {
+                break body;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("batch job never finished");
+    assert_eq!(status["status"], "succeeded", "executor failed: {status}");
+
+    let result = send_http(
+        &app_b,
+        Method::GET,
+        &format!("/api/v1/jobs/{job_id}/result"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        result.status(),
+        StatusCode::OK,
+        "replica B did not serve replica A's result"
+    );
+    let result = http_json(result).await;
+    assert_eq!(result["columns"], serde_json::json!(["n"]));
+    assert_eq!(result["rows"], serde_json::json!([{ "n": 4 }]));
+
+    sqlx::query("DELETE FROM siglake_query_jobs WHERE job_id = $1")
+        .bind(&job_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup job row");
+    state_a.jobs.shutdown().await.expect("shutdown store A");
+    state_b.jobs.shutdown().await.expect("shutdown store B");
 }
 
 async fn status_of(pool: &PgPool, id: JobId) -> String {
