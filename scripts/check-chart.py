@@ -42,6 +42,11 @@ shared queue reported by every claim worker and a per-tenant local count under
 the filesystem drain, and one expression has to chart both without multiplying
 the backlog by the replica count (#3692).
 
+It evaluates the four index-build panels too. In particular, the summary
+quantiles stay as one sample per compactor — percentiles cannot be averaged —
+while the rebuild counters add the same table across compactors and retain a
+separate line for every other table (#5231).
+
 It also holds the README to the PrometheusRule: the "No built-in UI" bullet
 states how many alerts the rule ships, and that number is counted from the
 template source here so it cannot drift as alerts are added.
@@ -2150,6 +2155,28 @@ TEXT_INDEX_STARTUP_EXPECTED = {
     "0.50": {"decode": 0.05 + (0.5 - 0.05) * 0.5, "permit_wait": 0.0025 * 0.5},
     "0.99": {"decode": 0.05 + (0.5 - 0.05) * 0.99, "permit_wait": 0.0025 * 0.99},
 }
+# #5231's four index-build panels. Every target is named so moving or deleting
+# one fails instead of leaving its promtool check evaluating a smaller set.
+INDEX_BUILD_PANELS = (167, 168, 169, 170)
+INDEX_BUILD_TARGETS = {
+    (167, "A"): "siglake_iceberg_segmented_index_writes_total",
+    (168, "A"): "siglake_iceberg_segmented_index_written_bytes",
+    (168, "B"): "siglake_iceberg_segmented_index_written_bytes",
+    (168, "C"): "siglake_iceberg_segmented_index_group_index_bytes",
+    (168, "D"): "siglake_iceberg_segmented_index_group_index_bytes",
+    (169, "A"): "siglake_index_rebuild_files_total",
+    (169, "B"): "siglake_index_rebuild_bytes_total",
+    (170, "A"): "siglake_index_rebuild_seconds_bucket",
+    (170, "B"): "siglake_index_rebuild_seconds_bucket",
+}
+INDEX_BUILD_QUANTILES = {
+    (168, "A"): "0.5",
+    (168, "B"): "0.99",
+    (168, "C"): "0.5",
+    (168, "D"): "0.99",
+    (170, "A"): "0.50",
+    (170, "B"): "0.99",
+}
 # "Drain backlog (segments + bytes)" and the "Oldest unclaimed segment age"
 # panel an operator is told to read beside it, as `metric -> (panel, reduction)`.
 # The reduction is what the namespace's own number is: depth adds a tenant's
@@ -2495,6 +2522,210 @@ def check_text_index_startup_panel(require_promtool: bool = False) -> tuple[list
             return [
                 f"{OVERVIEW_DASHBOARD}: panel {TEXT_INDEX_STARTUP_PANEL} does not read "
                 f"one latency per stage:" + (f"\n{output}" if output else "")
+            ], False
+    return [], False
+
+
+def index_build_exprs(dashboard: dict) -> dict[tuple[int, str], str]:
+    """Panels 167--170's expressions, keyed by panel and target reference."""
+    out: dict[tuple[int, str], str] = {}
+    for panel in dashboard_panels(dashboard):
+        panel_id = panel.get("id")
+        if panel_id not in INDEX_BUILD_PANELS:
+            continue
+        for target in panel.get("targets") or []:
+            ref_id = target.get("refId")
+            expr = target.get("expr")
+            if isinstance(ref_id, str) and isinstance(expr, str):
+                out.setdefault((panel_id, ref_id), expr)
+    return out
+
+
+def index_build_fixture(exprs: dict[tuple[int, str], str]) -> str:
+    """A promtool fixture over panels 167--170's shipped expressions.
+
+    Panel 168's two compactor values must remain two fully labelled samples;
+    the explicit average and sum controls show that the fixture distinguishes
+    the invalid fleet reductions. Panel 169 has the inverse shape: two pods'
+    counters for one table must become one line while another table remains
+    separate; its ungrouped-sum control shows the otherwise plausible bad
+    reading. Panels 167 and 170 are evaluated with their own labelled counter
+    and histogram inputs before the dashboard success line names them.
+    """
+    out = "evaluation_interval: 1m\nfuzzy_compare: true\ntests:\n"
+    for key, expr in sorted(exprs.items()):
+        panel, ref_id = key
+        metric = INDEX_BUILD_TARGETS[key]
+        out += f"  - name: index build panel {panel} target {ref_id}\n"
+        if panel in (167, 169):
+            out += "    interval: 10m\n    input_series:\n"
+            if panel == 167:
+                series = (
+                    ("compactor-0", 'outcome="written",reason="none"', 10),
+                    ("compactor-1", 'outcome="written",reason="none"', 5),
+                    ("compactor-0", 'outcome="refused",reason="column"', 2),
+                )
+            else:
+                series = (
+                    ("compactor-0", 'table="events"', 10),
+                    ("compactor-1", 'table="events"', 5),
+                    ("compactor-0", 'table="audit"', 2),
+                )
+            for pod, labels, observations in series:
+                out += (
+                    f"      - series: '{metric}{{namespace=\"logs\","
+                    f'app_kubernetes_io_instance="siglake",'
+                    f'app_kubernetes_io_component="compactor",pod="{pod}",'
+                    f"{labels}}}'\n        values: '0+{observations}x6'\n"
+                )
+            out += "    promql_expr_test:\n"
+            out += f"      - expr: '{expr.replace('$namespace', '.*')}'\n"
+            out += "        eval_time: 1h\n        exp_samples:\n"
+            if panel == 167:
+                out += (
+                    '          - labels: \'{outcome="refused",reason="column"}\'\n'
+                    "            value: 12\n"
+                    '          - labels: \'{outcome="written",reason="none"}\'\n'
+                    "            value: 90\n"
+                )
+            else:
+                out += (
+                    '          - labels: \'{table="audit"}\'\n'
+                    "            value: 12\n"
+                    '          - labels: \'{table="events"}\'\n'
+                    "            value: 90\n"
+                    f"      - expr: 'sum(increase({metric}[1h]))'\n"
+                    "        eval_time: 1h\n        exp_samples:\n"
+                    "          - labels: '{}'\n            value: 102\n"
+                )
+        elif panel == 168:
+            quantile = INDEX_BUILD_QUANTILES[key]
+            out += "    input_series:\n"
+            for pod, value in (("compactor-0", 1000), ("compactor-1", 9000)):
+                out += (
+                    f"      - series: '{metric}{{namespace=\"logs\","
+                    f'app_kubernetes_io_instance="siglake",'
+                    f'app_kubernetes_io_component="compactor",pod="{pod}",'
+                    f'quantile="{quantile}"}}\'\n'
+                    f"        values: '{value}'\n"
+                )
+            selector = f'{metric}{{namespace=~".*", quantile="{quantile}"}}'
+            out += "    promql_expr_test:\n"
+            out += f"      - expr: '{expr.replace('$namespace', '.*')}'\n"
+            out += "        exp_samples:\n"
+            for pod, value in (("compactor-0", 1000), ("compactor-1", 9000)):
+                out += (
+                    "          - labels: "
+                    f"'{{__name__=\"{metric}\",namespace=\"logs\","
+                    f"app_kubernetes_io_instance=\"siglake\","
+                    f"app_kubernetes_io_component=\"compactor\",pod=\"{pod}\","
+                    f"quantile=\"{quantile}\"}}'\n"
+                    f"            value: {value}\n"
+                )
+            out += (
+                f"      - expr: 'avg({selector})'\n"
+                "        exp_samples:\n"
+                "          - labels: '{}'\n            value: 5000\n"
+                f"      - expr: 'sum({selector})'\n"
+                "        exp_samples:\n"
+                "          - labels: '{}'\n            value: 10000\n"
+            )
+        else:
+            quantile = float(INDEX_BUILD_QUANTILES[key])
+            out += "    interval: 1m\n    input_series:\n"
+            histogram_series = (
+                ("compactor-0", "events", "100", 0),
+                ("compactor-0", "events", "1000", 10),
+                ("compactor-0", "events", "+Inf", 10),
+                ("compactor-1", "events", "100", 0),
+                ("compactor-1", "events", "1000", 5),
+                ("compactor-1", "events", "+Inf", 5),
+                ("compactor-0", "audit", "100", 2),
+                ("compactor-0", "audit", "1000", 2),
+                ("compactor-0", "audit", "+Inf", 2),
+            )
+            for pod, table, le, observations in histogram_series:
+                out += (
+                    f"      - series: '{metric}{{namespace=\"logs\","
+                    f'app_kubernetes_io_instance="siglake",'
+                    f'app_kubernetes_io_component="compactor",pod="{pod}",'
+                    f'table="{table}",le="{le}"}}\'\n'
+                    f"        values: '0+{observations}x6'\n"
+                )
+            out += "    promql_expr_test:\n"
+            out += f"      - expr: '{expr.replace('$namespace', '.*')}'\n"
+            out += "        eval_time: 6m\n        exp_samples:\n"
+            out += (
+                '          - labels: \'{table="audit"}\'\n'
+                f"            value: {100 * quantile}\n"
+                '          - labels: \'{table="events"}\'\n'
+                f"            value: {100 + 900 * quantile}\n"
+            )
+    return out
+
+
+def check_index_build_panels(require_promtool: bool = False) -> tuple[list[str], bool]:
+    """Evaluate panels 167--170's expressions with Prometheus' own engine."""
+    try:
+        dashboard = json.loads(OVERVIEW_DASHBOARD.read_text())
+    except (OSError, ValueError) as e:
+        return [f"{OVERVIEW_DASHBOARD}: not readable as JSON ({e})"], False
+    exprs = index_build_exprs(dashboard)
+    missing = sorted(set(INDEX_BUILD_TARGETS) - set(exprs))
+    unexpected = sorted(set(exprs) - set(INDEX_BUILD_TARGETS))
+    if missing or unexpected:
+        detail = []
+        if missing:
+            detail.append(
+                "missing " + ", ".join(f"{panel}/{ref}" for panel, ref in missing)
+            )
+        if unexpected:
+            detail.append(
+                "unexpected "
+                + ", ".join(f"{panel}/{ref}" for panel, ref in unexpected)
+            )
+        return [
+            f"{OVERVIEW_DASHBOARD}: index-build panel targets changed "
+            f"({'; '.join(detail)}); "
+            "re-point INDEX_BUILD_TARGETS rather than leaving this check partial"
+        ], False
+    for key, metric in INDEX_BUILD_TARGETS.items():
+        expr = exprs[key]
+        if metric not in expr:
+            return [
+                f"{OVERVIEW_DASHBOARD}: panel {key[0]} target {key[1]} no longer "
+                f"reads {metric}; re-point INDEX_BUILD_TARGETS"
+            ], False
+        if "'" in expr:
+            return [
+                f"{OVERVIEW_DASHBOARD}: panel {key[0]} target {key[1]} expression "
+                "needs YAML escaping"
+            ], False
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = pathlib.Path(tmp_dir)
+        name = "index-build-panels.test.yaml"
+        (tmp_path / name).write_text(index_build_fixture(exprs))
+        try:
+            subprocess.run(
+                ["promtool", "test", "rules", name],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=tmp_path,
+            )
+        except FileNotFoundError:
+            problem = (
+                "promtool not installed; the index-build panel expressions were "
+                "not evaluated"
+            )
+            return ([problem] if require_promtool else []), True
+        except subprocess.CalledProcessError as e:
+            output = "\n".join(s for s in (e.stdout.strip(), e.stderr.strip()) if s)
+            return [
+                f"{OVERVIEW_DASHBOARD}: panels "
+                f"{', '.join(str(panel) for panel in INDEX_BUILD_PANELS)} do not "
+                "preserve per-pod summary quantiles and per-table rebuild totals:"
+                + (f"\n{output}" if output else "")
             ], False
     return [], False
 
@@ -3061,7 +3292,9 @@ def source_checks(
     problems.extend(panel_problems)
     startup_problems, startup_skipped = check_text_index_startup_panel(require_promtool)
     problems.extend(startup_problems)
-    panel_skipped = panel_skipped or startup_skipped
+    index_problems, index_skipped = check_index_build_panels(require_promtool)
+    problems.extend(index_problems)
+    panel_skipped = panel_skipped or startup_skipped or index_skipped
     if problems:
         failed = True
         for p in problems:
@@ -3070,8 +3303,9 @@ def source_checks(
         panel_result = (
             "; panel expressions skipped (promtool not installed)"
             if panel_skipped
-            else f"; panels {DRAIN_BACKLOG_PANEL}, {DRAIN_AGE_PANEL} and "
-            f"{TEXT_INDEX_STARTUP_PANEL} passed promtool"
+            else f"; panels {DRAIN_BACKLOG_PANEL}, {DRAIN_AGE_PANEL}, "
+            f"{TEXT_INDEX_STARTUP_PANEL}, "
+            f"{', '.join(str(panel) for panel in INDEX_BUILD_PANELS)} passed promtool"
         )
         print(
             f"ok   [dashboard] {count} dashboard(s) under {DASHBOARD_DIR}{panel_result}",
