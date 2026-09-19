@@ -521,7 +521,7 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
+    "w": 4,
     "x": 0,
     "y": 39
    },
@@ -545,7 +545,7 @@
    "gridPos": {
     "h": 8,
     "w": 6,
-    "x": 6,
+    "x": 4,
     "y": 39
    },
    "targets": [
@@ -577,8 +577,8 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
-    "x": 12,
+    "w": 4,
+    "x": 10,
     "y": 39
    },
    "targets": [
@@ -591,6 +591,40 @@
    "description": "The snapshots proving whether a segment was already committed had expired, so requeueing it may duplicate rows. Widen snapshot retention."
   },
   {
+   "id": 171,
+   "type": "timeseries",
+   "title": "Orphan dispositions",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 14,
+    "y": 39
+   },
+   "targets": [
+    {
+     "expr": "sum by (action) (increase(siglake_compactor_orphans_disposed_total{namespace=~\"$namespace\"}[30m]))",
+     "legendFormat": "{{action}} / 30m",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (action) (siglake_compactor_orphans_disposed_total{namespace=~\"$namespace\"})",
+     "legendFormat": "{{action}} (cumulative)",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "description": "Filesystem-drain-only dispositions of quarantined files under `<wal>/orphans/`. deleted means proven committed and removed; requeued means proven uncommitted and returned to sealed/ for draining. The 30-minute increase shows recent decisions. The cumulative companion preserves first-event visibility because each action and tenant series is registered only on its first positive disposition; absence or a flat increase does not prove that no files were settled. The catalog-claim drain does not visit WAL orphan directories or publish this counter."
+  },
+  {
    "id": 118,
    "type": "timeseries",
    "title": "Commit p99 latency",
@@ -600,8 +634,8 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
-    "x": 18,
+    "w": 4,
+    "x": 20,
     "y": 39
    },
    "targets": [
