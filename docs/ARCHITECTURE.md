@@ -843,8 +843,13 @@ candidate mirrors compiled against Arrow/Parquet 58, DataFusion 53.1, OpenDAL
 0.57 and reqsign 3 while production continues to select the 0.9.1 forks.
 Candidate caller adapters use upstream's schema and snapshot-expiry
 transactions, retaining Siglake's replay-safe optional additions, exact dry-run
-counts and no-op commit suppression. Later slices port the remaining fork
-behavior before the production dependency selection changes.
+counts and no-op commit suppression. The second slice ports commit reload
+elision, atomic rewrites and Parquet footer extensions. The third ports the
+multipart controls, separate drain/compaction upload permits, jittered retry
+policy and the static-key → IRSA → ECS → IMDSv2 credential chain to OpenDAL
+0.57 and reqsign 3. Candidate metadata providers have a three-second bound and
+do not fall through after a configured provider fails. Later slices port the
+reader and index behavior before the production dependency selection changes.
 
 ## Compaction
 
