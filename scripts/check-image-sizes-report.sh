@@ -212,13 +212,20 @@ done
 # The block has to land in the run's own log directory, which survives EXIT and
 # which a caller can point at its own run record with --log-dir: the card this
 # file comes from was filed because the measurement was nearly lost to a log
-# that the next run overwrote.
+# that the next run overwrote. Cleanup may remove the run's scratch directory
+# and active-run pointer, but nothing else from the caller-owned log directory.
 if ! grep -Fq 'dlog="$LOG_DIR/docker.log"' scripts/ci-local.sh; then
   echo "FAIL: the docker job no longer writes its log into \$LOG_DIR" >&2
   failures=$((failures + 1))
 fi
-if ! grep -Fq "trap 'rm -rf -- \"\$LOG_DIR/tmp\"' EXIT" scripts/ci-local.sh; then
-  echo "FAIL: the EXIT trap no longer removes only \$LOG_DIR/tmp" >&2
+expected_cleanup='cleanup_ci_local() {
+  rm -rf -- "$LOG_DIR/tmp"
+  [ -z "$run_pointer" ] || rm -f -- "$run_pointer"
+}'
+actual_cleanup=$(sed -n '/^cleanup_ci_local() {$/,/^}$/p' scripts/ci-local.sh)
+if [ "$actual_cleanup" != "$expected_cleanup" ] \
+  || ! grep -Fqx 'trap cleanup_ci_local EXIT' scripts/ci-local.sh; then
+  echo "FAIL: the EXIT trap no longer removes only \$LOG_DIR/tmp and the run pointer" >&2
   failures=$((failures + 1))
 fi
 
