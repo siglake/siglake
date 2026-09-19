@@ -242,7 +242,11 @@ impl WalMirrorHandle {
     /// Non-blocking send. On send failure (receiver gone) the durable pin stays
     /// for catch-up and the failure counter records the dead worker.
     pub fn enqueue(&self, segment: WalSegment) {
-        if let Err(e) = pin_segment(&segment) {
+        let pin_started = std::time::Instant::now();
+        let pin_result = pin_segment(&segment);
+        metrics::histogram!("siglake_wal_mirror_pin_duration_seconds")
+            .record(pin_started.elapsed().as_secs_f64());
+        if let Err(e) = pin_result {
             metrics::counter!("siglake_wal_mirror_failures_total",
                 "reason" => "pin")
             .increment(1);
@@ -293,6 +297,7 @@ impl WalMirror {
         let queued = Arc::new(AtomicUsize::new(0));
         let prefix = prefix.into().trim_matches('/').to_string();
         metrics::gauge!("siglake_wal_mirror_queue_depth").set(0.0);
+        let _ = metrics::histogram!("siglake_wal_mirror_pin_duration_seconds");
         (
             Self {
                 rx,
@@ -2402,15 +2407,31 @@ mod tests {
         )
         .unwrap();
 
+        let recorder = siglake_core::metrics::builder()
+            .expect("metrics builder")
+            .build_recorder();
         let op = memory_op();
-        let (mirror, handle) = WalMirror::new(op.clone(), "wal-mirror");
+        let (mirror, handle) =
+            metrics::with_local_recorder(&recorder, || WalMirror::new(op.clone(), "wal-mirror"));
+        let before = recorder.handle().render();
+        assert!(
+            before.contains("siglake_wal_mirror_pin_duration_seconds_count 0"),
+            "pin histogram was not pre-registered:\n{before}"
+        );
         let mirror_task = tokio::spawn(mirror.run());
 
         writer.set_mirror_handle(Some(handle));
-        let sealed = writer
-            .append_events(&[synth_event(1), synth_event(2)])
-            .unwrap()
-            .expect("seal");
+        let sealed = metrics::with_local_recorder(&recorder, || {
+            writer
+                .append_events(&[synth_event(1), synth_event(2)])
+                .unwrap()
+                .expect("seal")
+        });
+        let after = recorder.handle().render();
+        assert!(
+            after.contains("siglake_wal_mirror_pin_duration_seconds_count 1"),
+            "sealing did not record one pin duration:\n{after}"
+        );
         drop(writer);
         mirror_task.await.unwrap();
 

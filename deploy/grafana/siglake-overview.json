@@ -231,7 +231,7 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
+    "w": 5,
     "x": 0,
     "y": 14
    },
@@ -254,8 +254,8 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
-    "x": 6,
+    "w": 5,
+    "x": 5,
     "y": 14
    },
    "targets": [
@@ -273,6 +273,39 @@
    "description": "Abandoned means the PVC is now the only copy of those rows."
   },
   {
+   "id": 173,
+   "type": "timeseries",
+   "title": "WAL mirror pin duration",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 5,
+    "x": 10,
+    "y": 14
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(siglake_wal_mirror_pin_duration_seconds_sum{namespace=~\"$namespace\"}[5m])) / sum(rate(siglake_wal_mirror_pin_duration_seconds_count{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "average",
+     "refId": "A"
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(siglake_wal_mirror_pin_duration_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p99",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    }
+   },
+   "description": "Synchronous seal time for the whole mirror pin operation, including local lookup, hard-link creation and the mirror-pending directory fsync. The metric does not attribute those components separately."
+  },
+  {
    "id": 108,
    "type": "timeseries",
    "title": "WAL recovery / integrity",
@@ -282,8 +315,8 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
-    "x": 12,
+    "w": 4,
+    "x": 15,
     "y": 14
    },
    "targets": [
@@ -315,8 +348,8 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
-    "x": 18,
+    "w": 5,
+    "x": 19,
     "y": 14
    },
    "targets": [
