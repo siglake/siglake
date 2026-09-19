@@ -10,7 +10,7 @@ registry holding only `v0.1.0` -- an ImagePullBackOff on the first release. The
 kind scripts always pass `image.tag` explicitly, so the default was never
 exercised against a registry.
 
-Five questions, all answered from tracked files with no registry and no helm:
+Six questions, all answered from tracked files with no registry and no helm:
 
 1. The workflow's tag-resolution step, evaluated over `v<workspace version>`,
    produces the workspace version. The step's shell body is EXECUTED, not
@@ -26,6 +26,9 @@ Five questions, all answered from tracked files with no registry and no helm:
 5. Every version-shaped image tag pinned in `deploy/` (the operator sample, the
    install examples and the AWS image defaults) is that same version, with no
    `v` prefix.
+6. Compose and kind pin the same MinIO server and client releases, including
+   compose's Garage readiness client, and every reference uses MinIO's quay.io
+   registry rather than Docker Hub.
 
 Stdlib only and no helm: this runs in the `shell` job, which installs nothing,
 and in the local gate's shell block, which must answer the same question. The
@@ -58,6 +61,8 @@ CHARTS = (
 # Tracked trees whose literal image tags ship to a user: operator samples,
 # launchers and install examples.
 PINNED_TAG_ROOT = pathlib.PurePath("deploy")
+COMPOSE_YML = pathlib.PurePath("deploy/docker-compose.yml")
+KIND_MINIO_YML = pathlib.PurePath("deploy/kind/manifests/minio.yaml")
 
 # `version = "0.1.0"` under `[workspace.package]`.
 TOML_SECTION = re.compile(r"^\[(?P<name>[^\]]+)\]\s*$")
@@ -89,6 +94,22 @@ SIGLAKE_IMAGE_TAG_DEFAULTS = (
     re.compile(r"SIGLAKE_IMAGE_TAG:-(?P<tag>[A-Za-z0-9._-]+)"),
     re.compile(r"SIGLAKE_IMAGE_TAG[^\n]*?\bdefault:\s*`?(?P<tag>[A-Za-z0-9._-]+)"),
     re.compile(r"SIGLAKE_IMAGE_TAG`?\s*\|\s*`?(?P<tag>[A-Za-z0-9._-]+)"),
+)
+
+# These roles are intentionally named rather than inferred from whatever
+# MinIO references remain in the files. Deleting or replacing an image field
+# must fail instead of shrinking the set the parity check compares.
+COMPOSE_MINIO_ROLES = {
+    "minio": "minio",
+    "minio-init": "mc",
+    "garage-init": "mc",
+}
+KIND_MINIO_ROLES = {
+    "minio": "minio",
+    "mc": "mc",
+}
+QUAY_MINIO_REF = re.compile(
+    r"^quay\.io/minio/(?P<image>minio|mc):(?P<tag>[A-Za-z0-9._-]+)$"
 )
 
 # A release version inside a tag: `0.1.0`, `0.1.0-rc.1`. Prefixed and suffixed
@@ -401,6 +422,92 @@ def pinned_tag_problems(path: str, text: str, version: str) -> list[str]:
     return problems
 
 
+def compose_service_images(text: str) -> dict[str, list[str]]:
+    """Literal `image` values keyed by compose service name."""
+    images: dict[str, list[str]] = {}
+    in_services = False
+    service: str | None = None
+    for line in text.splitlines():
+        if line == "services:":
+            in_services = True
+            service = None
+            continue
+        if in_services and line and not line[0].isspace():
+            break
+        service_match = re.match(r"^  (?P<name>[A-Za-z0-9_-]+):\s*$", line)
+        if service_match:
+            service = service_match.group("name")
+            continue
+        image_match = re.match(r"^    image:\s*(?P<value>\S.*?)\s*$", line)
+        if service is not None and image_match:
+            images.setdefault(service, []).append(
+                image_match.group("value").strip("\"'")
+            )
+    return images
+
+
+def named_list_item_images(text: str) -> dict[str, list[str]]:
+    """Literal `image` values keyed by a YAML list item's `name`."""
+    lines = text.splitlines()
+    images: dict[str, list[str]] = {}
+    for i, line in enumerate(lines):
+        item = re.match(r"^(?P<indent>\s*)- name:\s*(?P<name>\S+)\s*$", line)
+        if not item:
+            continue
+        item_indent = len(item.group("indent"))
+        for nested in lines[i + 1 :]:
+            if nested.strip() and len(nested) - len(nested.lstrip()) <= item_indent:
+                break
+            image = re.match(r"^\s+image:\s*(?P<value>\S.*?)\s*$", nested)
+            if image:
+                images.setdefault(item.group("name"), []).append(
+                    image.group("value").strip("\"'")
+                )
+                break
+    return images
+
+
+def minio_image_problems(compose: str, kind: str) -> list[str]:
+    """MinIO roles exist, use quay.io and pin matching server/client tags."""
+    sources = (
+        (str(COMPOSE_YML), compose_service_images(compose), COMPOSE_MINIO_ROLES),
+        (str(KIND_MINIO_YML), named_list_item_images(kind), KIND_MINIO_ROLES),
+    )
+    problems: list[str] = []
+    tags: dict[str, list[tuple[str, str, str]]] = {"minio": [], "mc": []}
+    for path, images, roles in sources:
+        for role, expected_image in roles.items():
+            declarations = images.get(role, [])
+            if not declarations:
+                problems.append(f"{path}: `{role}` has no image declaration")
+                continue
+            if len(declarations) != 1:
+                problems.append(
+                    f"{path}: `{role}` has {len(declarations)} image declarations; expected one"
+                )
+                continue
+            reference = declarations[0]
+            match = QUAY_MINIO_REF.fullmatch(reference)
+            if not match or match.group("image") != expected_image:
+                problems.append(
+                    f"{path}: `{role}` image `{reference}` must be "
+                    f"`quay.io/minio/{expected_image}:<pinned-tag>`"
+                )
+                continue
+            tags[expected_image].append((path, role, match.group("tag")))
+
+    for image, pins in tags.items():
+        distinct = {tag for _, _, tag in pins}
+        if len(distinct) > 1:
+            rendered = ", ".join(
+                f"{path} `{role}`={tag}" for path, role, tag in pins
+            )
+            problems.append(
+                f"MinIO `{image}` tags differ between deployment roles: {rendered}"
+            )
+    return problems
+
+
 # --- fixtures ----------------------------------------------------------------
 
 # The workflow as it shipped before this gate: the git tag straight through.
@@ -549,6 +656,84 @@ IMAGE_TAG="${SIGLAKE_IMAGE_TAG:-0.1.0}"
         raise AssertionError("fixture: release prose was treated as a pinned image")
     checked += 1
 
+    compose_minio = """\
+services:
+  minio:
+    image: quay.io/minio/minio:SERVER-1
+  minio-init:
+    image: quay.io/minio/mc:CLIENT-1
+  garage-init:
+    image: quay.io/minio/mc:CLIENT-1
+  unrelated:
+    image: example.invalid/other:latest
+"""
+    kind_minio = """\
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:SERVER-1
+---
+apiVersion: batch/v1
+kind: Job
+spec:
+  template:
+    spec:
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:CLIENT-1
+"""
+    if minio_image_problems(compose_minio, kind_minio):
+        raise AssertionError("fixture: matching MinIO pins were reported")
+    checked += 1
+    if not minio_image_problems(
+        compose_minio, kind_minio.replace("minio:SERVER-1", "minio:SERVER-2")
+    ):
+        raise AssertionError("fixture: a kind MinIO server tag mismatch passed")
+    checked += 1
+    if not minio_image_problems(
+        compose_minio, kind_minio.replace("mc:CLIENT-1", "mc:CLIENT-2")
+    ):
+        raise AssertionError("fixture: a kind MinIO client tag mismatch passed")
+    checked += 1
+    if not minio_image_problems(
+        compose_minio.replace(
+            "garage-init:\n    image: quay.io/minio/mc:CLIENT-1",
+            "garage-init:\n    image: quay.io/minio/mc:CLIENT-2",
+        ),
+        kind_minio,
+    ):
+        raise AssertionError("fixture: compose's Garage client tag mismatch passed")
+    checked += 1
+    for role, declaration in (
+        ("compose minio", "    image: quay.io/minio/minio:SERVER-1\n"),
+        ("compose minio-init", "    image: quay.io/minio/mc:CLIENT-1\n"),
+        (
+            "compose garage-init",
+            "  garage-init:\n    image: quay.io/minio/mc:CLIENT-1\n",
+        ),
+        ("kind minio", "          image: quay.io/minio/minio:SERVER-1\n"),
+        ("kind mc", "          image: quay.io/minio/mc:CLIENT-1\n"),
+    ):
+        compose_fixture = compose_minio
+        kind_fixture = kind_minio
+        if role.startswith("compose"):
+            compose_fixture = compose_fixture.replace(declaration, "", 1)
+        else:
+            kind_fixture = kind_fixture.replace(declaration, "", 1)
+        if not minio_image_problems(compose_fixture, kind_fixture):
+            raise AssertionError(f"fixture: missing {role} image declaration passed")
+        checked += 1
+    for registry in ("minio/minio", "docker.io/minio/minio"):
+        if not minio_image_problems(
+            compose_minio.replace("quay.io/minio/minio", registry, 1), kind_minio
+        ):
+            raise AssertionError(f"fixture: `{registry}` MinIO server reference passed")
+        checked += 1
+
     for name, text, extract in (
         ("Cargo.toml without a workspace version", "[package]\nversion = \"9.9.9\"\n", workspace_version),
         ("a workflow with no TAG step", "jobs:\n  p:\n    steps:\n      - run: true\n", tag_resolution_step),
@@ -600,6 +785,10 @@ def main(argv: list[str]) -> int:
                 str(chart),
             )
             problems += chart_problems(str(chart), default_tag, version)
+        problems += minio_image_problems(
+            (root / COMPOSE_YML).read_text(),
+            (root / KIND_MINIO_YML).read_text(),
+        )
         pinned = subprocess.run(
             ["git", "ls-files", "-z", str(PINNED_TAG_ROOT)],
             cwd=root,
@@ -636,7 +825,7 @@ def main(argv: list[str]) -> int:
         print(f"publish tag for v{version}: {evaluate_tag(tag_resolution_step(publish), f'v{version}')}")
     print(
         f"ok   changelog, {len(CHARTS)} charts and {len(pinned_files)} deploy files "
-        f"agree on release version {version}; {fixtures} fixtures"
+        f"agree on release version {version}; MinIO pins agree; {fixtures} fixtures"
     )
     return 0
 
