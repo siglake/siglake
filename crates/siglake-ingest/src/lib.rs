@@ -2241,6 +2241,12 @@ async fn ingest_batch(
                     "Service Unavailable: ingester backlog full",
                 ));
             }
+            backpressure::SubmitOutcome::LaneCapRefused { max_lanes } => {
+                return Err(ApiError::service_unavailable_without_retry(format!(
+                    "Service Unavailable: ingester lane limit reached ({max_lanes} lanes); \
+                     route this key to an ingester with capacity or raise --ingest-max-lanes"
+                )));
+            }
             backpressure::SubmitOutcome::Failed(e) => return Err(ApiError::internal(e)),
         };
         wait_for_force_commit(
@@ -2534,9 +2540,12 @@ fn mem_breaker_response(endpoint: &'static str) -> Response {
         (status = 429, description = "Rate limited.", body = RateLimitBody,
          headers(("retry-after" = u64, description = "Seconds to wait before retrying."))),
         (status = 503, description = "Shedding load: the memory circuit breaker \
-            tripped, or the backpressure queue is full. Retry the batch verbatim.",
+            tripped, the backpressure queue is full, or a novel tenant/index key \
+            reached the persistent lane cap. Retry-After is omitted for the lane \
+            cap because recovery requires routing or operator action.",
          body = SiglakeErrorBody,
-         headers(("retry-after" = u64, description = "Seconds to wait before retrying."))),
+         headers(("retry-after" = u64, description = "Seconds to wait before retrying; \
+            present for transient shedding and absent for a lane-cap refusal."))),
         (status = 504, description = "`commit=force` did not complete in time. The \
             rows may still land; re-sending risks duplicates.", body = SiglakeErrorBody),
         (status = 500, description = "Internal error.", body = SiglakeErrorBody),
@@ -2673,9 +2682,12 @@ async fn post_otlp_logs(
             (env-tunable, 16 MiB by default)."),
         (status = 429, description = "Rate limited.", body = RateLimitBody,
          headers(("retry-after" = u64, description = "Seconds to wait before retrying."))),
-        (status = 503, description = "Shedding load. Retry the batch verbatim.",
+        (status = 503, description = "Transient load shedding, or a novel \
+            tenant/index key past the persistent lane cap. The lane-cap response \
+            has no Retry-After header because recovery requires routing or operator action.",
          body = SiglakeErrorBody,
-         headers(("retry-after" = u64, description = "Seconds to wait before retrying."))),
+         headers(("retry-after" = u64, description = "Seconds to wait before retrying; \
+            absent for a lane-cap refusal."))),
         (status = 504, description = "`commit=force` did not complete in time.",
          body = SiglakeErrorBody),
         (status = 500, description = "Internal error.", body = SiglakeErrorBody),
@@ -3319,9 +3331,12 @@ fn es_not_implemented(reason: impl Into<String>) -> ApiError {
             (env-tunable, 16 MiB by default)."),
         (status = 429, description = "Rate limited.", body = RateLimitBody,
          headers(("retry-after" = u64, description = "Seconds to wait before retrying."))),
-        (status = 503, description = "Shedding load. Retry the batch verbatim.",
+        (status = 503, description = "Transient load shedding, or a novel \
+            tenant/index key past the persistent lane cap. The lane-cap response \
+            has no Retry-After header because recovery requires routing or operator action.",
          body = SiglakeErrorBody,
-         headers(("retry-after" = u64, description = "Seconds to wait before retrying."))),
+         headers(("retry-after" = u64, description = "Seconds to wait before retrying; \
+            absent for a lane-cap refusal."))),
         (status = 504, description = "`commit=force` did not complete in time.",
          body = SiglakeErrorBody),
         (status = 500, description = "Internal error.", body = SiglakeErrorBody),
@@ -3392,9 +3407,12 @@ async fn post_es_bulk(
         (status = 413, description = "Body exceeds the ingest body cap."),
         (status = 429, description = "Rate limited.", body = RateLimitBody,
          headers(("retry-after" = u64, description = "Seconds to wait before retrying."))),
-        (status = 503, description = "Shedding load. Retry the batch verbatim.",
+        (status = 503, description = "Transient load shedding, or a novel \
+            tenant/index key past the persistent lane cap. The lane-cap response \
+            has no Retry-After header because recovery requires routing or operator action.",
          body = SiglakeErrorBody,
-         headers(("retry-after" = u64, description = "Seconds to wait before retrying."))),
+         headers(("retry-after" = u64, description = "Seconds to wait before retrying; \
+            absent for a lane-cap refusal."))),
         (status = 504, description = "`commit=force` did not complete in time.",
          body = SiglakeErrorBody),
         (status = 500, description = "Internal error.", body = SiglakeErrorBody),
@@ -3798,6 +3816,14 @@ impl ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             msg: msg.into(),
             retry_after_secs: Some(retry_after_secs),
+        }
+    }
+
+    fn service_unavailable_without_retry(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            msg: msg.into(),
+            retry_after_secs: None,
         }
     }
 

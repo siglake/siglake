@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Ingest admission (breaking)**: a novel `(tenant, index)` key past
+  `ingester.maxLanes` now receives HTTP `503` or gRPC `Unavailable`, rather
+  than sharing the `500` / `Internal` mapping for genuine writer failures.
+  The persistent refusal has no HTTP `Retry-After`, plain gRPC `retry-after`
+  metadata or `RetryInfo`: recovery needs different routing or operator action,
+  and bounded client retries can still expire. Existing lanes keep accepting
+  at the cap; transient queue backpressure and its retry hint are unchanged.
+  (#5531)
+
 - **Query observability (feature)**: the starter dashboard charts decoded-file
   cache lock contention per query pod as `insert_skipped_contended / (insert +
   insert_skipped_contended)`. A skipped insert is safe but leaves the next

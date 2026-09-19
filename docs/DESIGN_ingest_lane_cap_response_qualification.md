@@ -1,9 +1,8 @@
 # Ingest lane-cap response qualification
 
-*2026-09-19 (#3878). Status: qualification only. The HTTP `500` without
-`Retry-After` and the gRPC `Internal` response stay unchanged. This record does
-not authorize a wire change; that decision and the user-facing docs belong to
-0.2.0.*
+*2026-09-19 (#3878 qualification, #5531 implementation). Status: implemented
+for 0.2.0. A typed lane-cap refusal maps to HTTP `503` / gRPC `Unavailable`
+without a retry hint. Genuine writer failures keep `500` / `Internal`.*
 
 ## The refusal is persistent
 
@@ -14,11 +13,10 @@ empty. Only `BackpressureRouter::shutdown` drains the map, on process shutdown.
 
 This is separate from a full lane queue. A full queue is transient and already
 returns HTTP `503` with `Retry-After: 1`, or gRPC `Unavailable` with the plain
-`retry-after` metadata. The lane-cardinality refusal enters
-`SubmitOutcome::Failed` along with WAL conversion, writer and reply-channel
-failures, so it currently becomes HTTP `500` or gRPC `Internal`, with no retry
-hint. Translating every `SubmitOutcome::Failed` would misclassify those writer
-failures.
+`retry-after` metadata. The lane-cardinality refusal now enters
+`SubmitOutcome::LaneCapRefused`, while WAL conversion, writer and reply-channel
+failures remain `SubmitOutcome::Failed`. The former maps to hintless HTTP `503`
+or gRPC `Unavailable`; the latter stays HTTP `500` or gRPC `Internal`.
 
 An empty queue cannot make a refused key admissible. These operator actions can:
 
@@ -77,42 +75,26 @@ This is one exporter implementation, pinned to one release. It is enough to
 disprove transport parity and the premise that a status change makes every
 exporter retry correctly. It is not a census of SDKs, collectors or agents.
 
-## Candidate consequences
+## Decision and implementation for 0.2.0
 
-**Keep `500` / `Internal`.** This preserves the released contract but keeps a
-transport split in the tested retry-enabled client: HTTP retries and gRPC drops.
-It also leaves the lane cap indistinguishable from a genuine writer failure to
-the handler and to the client.
+The selected contract is HTTP `503` / gRPC `Unavailable` for the typed lane-cap
+outcome. It carries no HTTP `Retry-After`, plain gRPC `retry-after` metadata or
+`google.rpc.RetryInfo`. Logs and traces use the same mapping on HTTP and gRPC;
+both Elasticsearch bulk routes use the HTTP mapping. A request for an existing
+lane still succeeds after the cap is full. The queue-full path keeps its
+transient retry hint, and genuine lane-creation or writer failures keep
+`500` / `Internal`.
 
-**Use `429` / `ResourceExhausted`.** A cardinality quota fits this code better
-than transient service health. Without a delay hint, the tested HTTP client
-retries while its gRPC peer drops. Adding the two standard hints makes both
-retry, but no duration is justified by the lane lifecycle. Any fixed value
-would claim timed recovery that the server cannot cause.
-
-**Use `503` / `Unavailable`.** The tested retry-enabled clients agree that it
-is retryable on both transports. They would spend their bounded retry budget
-against a condition that stays true until routing or operator action changes.
-The status would also make this persistent quota look like the existing
-transient full-queue refusal.
-
-## Decision gate for 0.2.0
-
-Do not choose a code by translating generic `SubmitOutcome::Failed`. First give
-the lane cap its own typed outcome, then make one HTTP/gRPC decision around that
-outcome. The merge-gated change must cover logs and traces on both transports,
-the Elasticsearch bulk HTTP routes, generated OpenAPI, and the docs site's
-multi-tenancy and performance-tuning pages.
-
-No `Retry-After` value has a defensible basis while lanes live until shutdown.
-A future decision can either make the refusal explicitly non-retryable, or pair
-a retryable response with a reclamation mechanism whose bound the server can
-state. Until that choice is made, the current wire behavior remains deliberate.
+This status makes retry-enabled versions of the pinned exporter agree across
+transports, accepting that a bounded retry policy can exhaust itself while the
+same pod remains full. Recovery still needs routing or operator action. No lane
+default, lifecycle, reclamation rule or exporter retry feature changed.
 
 ## Scope not measured
 
 - No collector, agent or non-Rust SDK was run.
 - No load balancer was used, so retry routing across pods was not measured.
-- No response code was changed, and no live export was sent to an ingester.
+- No live exporter was sent to an ingester after the response change; handler
+  integration tests cover the selected HTTP and gRPC mapping directly.
 - Exporter classification tests cover the code-selection behavior; they do not
   time the randomized backoff.
