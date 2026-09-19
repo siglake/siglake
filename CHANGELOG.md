@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Query tenancy (feature)**: `query.allowedTenants` and
+  `SIGLAKE_QUERY_ALLOWED_TENANTS` add an opt-in exact allow-list for verified
+  query tenant claims. The default remains unrestricted, and query admission
+  stays independent of `ingester.allowedTenants`, so retained data can remain
+  readable after writes stop. Direct requests and coordinator-authenticated
+  shard requests return `403` before tenant namespace/context creation when a
+  claim is absent from the set; mixed-worker refusals propagate through the
+  coordinator. The `not_allowed` metric series is pre-registered at zero and
+  `SiglakeQueryTenantsDenied` distinguishes allow-list refusals from missing or
+  unusable claims. A non-empty list without OIDC claim routing is refused by
+  both the binary and Helm chart. (#5489)
+
 - **Index management (feature)**: `GET /api/v1/indexes/{id}` and successful
   index `PUT`s return a strong mapping ETag, and `PUT` accepts optional
   `If-Match`. A false condition returns RFC 9110 `412 Precondition Failed` with

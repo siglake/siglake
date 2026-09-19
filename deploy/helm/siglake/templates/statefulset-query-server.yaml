@@ -31,6 +31,9 @@
   of $oidcOn, which is the answer this makes trustworthy.
 */ -}}
 {{- include "siglake.oidcGuard" (list "query" $oidcIssuer $oidcAudience $oidcClaim) -}}
+{{- if and .Values.query.allowedTenants (not $oidcClaim) -}}
+{{- fail "query.allowedTenants is non-empty but query.oidc.tenantClaim is unset: the allow-list matches verified named tenant claims and cannot bound open or static-token routing. Set query.oidc.issuer, query.oidc.audience and query.oidc.tenantClaim, or clear query.allowedTenants." -}}
+{{- end -}}
 {{- $oidcOn := include "siglake.oidcOn" (list $oidcIssuer $oidcAudience) -}}
 {{- $authOn := include "siglake.queryAuthOn" . -}}
 {{- /*
@@ -216,6 +219,10 @@ spec:
             - name: SIGLAKE_OIDC_TENANT_CLAIM
               value: {{ $oidcClaim | quote }}
             {{- end }}
+            {{- end }}
+            {{- with .Values.query.allowedTenants }}
+            - name: SIGLAKE_QUERY_ALLOWED_TENANTS
+              value: {{ join "," . | quote }}
             {{- end }}
             {{- if .Values.query.jobs.persistent }}
             # Default ON: the batch-job store is the catalog Postgres these

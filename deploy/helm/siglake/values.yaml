@@ -695,6 +695,12 @@ query:
     existingSecret: ""
     secretKey: tokens
     list: []
+  # Exact verified tenant claims this query tier accepts. Empty preserves the
+  # unrestricted compatibility default. This list is query-specific and does
+  # not inherit `ingester.allowedTenants`, so reads can outlive write
+  # admission. A non-empty list requires `query.oidc.tenantClaim` and the
+  # complete issuer/audience pair below.
+  allowedTenants: []
   # OIDC bearer-token verification. Takes precedence over `tokens`
   # when both `issuer` and `audience` are non-empty.
   #

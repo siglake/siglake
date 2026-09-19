@@ -467,6 +467,15 @@ A complete `query.oidc` block is authentication, so it needs
 `query.distributed.coordinatorToken` wherever fan-out is reachable, exactly as
 a token allow-list does.
 
+`query.allowedTenants` is an optional exact allow-list for verified query
+tenant claims. Empty keeps query admission unrestricted. A non-empty list
+requires the complete `query.oidc` block including `tenantClaim`; the chart
+refuses an allow-list that has no claim routing to match. The setting is
+independent of `ingester.allowedTenants`, so removing a tenant from write
+admission does not remove access to retained data. Each worker checks its own
+list before opening the forwarded tenant namespace, and a mismatched worker's
+`403` is returned through the coordinator.
+
 ## Ingress
 
 ClusterIP only by default. Customers typically expose the query-server

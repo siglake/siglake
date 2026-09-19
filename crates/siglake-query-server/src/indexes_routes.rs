@@ -38,7 +38,8 @@ use crate::AppState;
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 409, description = "An index with this id already exists.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
@@ -76,7 +77,8 @@ pub async fn create(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
     ),
@@ -110,7 +112,8 @@ pub async fn list(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 404, description = "No such index.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
@@ -160,7 +163,8 @@ pub async fn get(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 404, description = "No such index.", body = ApiErrorBody),
         (status = 412, description = "The supplied If-Match condition is false. `current` and ETag come from the exact rejecting commit base; another writer may replace them before this response arrives.",
@@ -320,7 +324,8 @@ fn skip_ows(input: &[u8], mut pos: usize) -> usize {
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 404, description = "No such index.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
@@ -365,7 +370,8 @@ pub async fn delete(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
     ),
@@ -407,7 +413,8 @@ pub async fn list_templates(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
     ),
@@ -448,7 +455,8 @@ pub async fn put_template(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 404, description = "No such template.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),

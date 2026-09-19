@@ -819,6 +819,155 @@ async fn shard_takes_its_tenant_from_the_coordinator_but_only_from_the_coordinat
     idp.abort();
 }
 
+/// The opt-in query list is an admission boundary, not a post-resolution
+/// filter: a refused verified claim must leave both the registry and catalog
+/// untouched, while a listed claim and the unrestricted default keep working.
+#[tokio::test]
+async fn query_allow_list_refuses_before_namespace_creation() {
+    require_loopback!();
+    let (issuer, idp) = spawn_fake_idp().await;
+    let aud = "siglake-audience";
+    let tmp = tempfile::tempdir().unwrap();
+    let default_ice = Arc::new(
+        IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap(),
+    );
+
+    let verifier = OidcVerifier::from_issuer(issuer.clone(), aud.into())
+        .await
+        .unwrap()
+        .with_tenant_claim("tenant");
+    let state = AppState::new(default_ice.clone(), AuthConfig::from_oidc(verifier))
+        .with_tenants(TenantRegistry::new(default_ice.clone()))
+        .with_allowed_tenants(["acme"]);
+    let app = router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let qs = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let intruder = issue_jwt_with_tenant(&issuer, aud, "u1", "intruder");
+    let response = client
+        .post(format!("{base}/api/v1/sql"))
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {intruder}"))
+        .json(&json!({"query": "SELECT count(*) AS n FROM events"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403, "unlisted tenant was admitted");
+    let namespaces = default_ice.catalog().list_namespaces(None).await.unwrap();
+    assert!(
+        namespaces
+            .iter()
+            .all(|namespace| namespace.to_string() != "tenant_intruder"),
+        "denial created the tenant_intruder namespace: {namespaces:?}"
+    );
+
+    let acme = issue_jwt_with_tenant(&issuer, aud, "u2", "acme");
+    let response = client
+        .post(format!("{base}/api/v1/sql"))
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {acme}"))
+        .json(&json!({"query": "SELECT count(*) AS n FROM events"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "listed tenant was refused: {}",
+        response.text().await.unwrap()
+    );
+
+    qs.abort();
+    idp.abort();
+}
+
+/// During a rolling configuration change, one worker can carry a different
+/// list from the coordinator and its peers. Its deliberate 403 must stop the
+/// mixed fan-out and reach the caller unchanged.
+#[tokio::test]
+async fn mixed_worker_allow_list_refusal_propagates_through_coordinator() {
+    require_loopback!();
+    let (issuer, idp) = spawn_fake_idp().await;
+    let aud = "siglake-audience";
+    let coordinator_token = "coordinator-service-token";
+    let tmp = tempfile::tempdir().unwrap();
+    let default_ice = Arc::new(
+        IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap(),
+    );
+    let acme_ice = default_ice.for_namespace("tenant_acme").await.unwrap();
+    for i in 0..4 {
+        acme_ice
+            .append_batch(events_to_record_batch(&[ev(&format!("acme-{i}"))]).unwrap())
+            .await
+            .unwrap();
+    }
+
+    // B trusts the coordinator credential but carries a mismatched list.
+    let worker_registry = TenantRegistry::new(default_ice.clone());
+    let worker_state = AppState::new(default_ice.clone(), AuthConfig::open())
+        .with_tenants(worker_registry.clone())
+        .with_allowed_tenants(["widgets"])
+        .with_coordinator(vec![], Some(coordinator_token.to_string()));
+    let worker_app = router(worker_state);
+    let worker_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let worker_url = format!("http://{}", worker_listener.local_addr().unwrap());
+    let worker =
+        tokio::spawn(async move { axum::serve(worker_listener, worker_app).await.unwrap() });
+
+    // A accepts acme and coordinates over itself plus B.
+    let verifier = OidcVerifier::from_issuer(issuer.clone(), aud.into())
+        .await
+        .unwrap()
+        .with_tenant_claim("tenant");
+    let coordinator_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let coordinator_url = format!("http://{}", coordinator_listener.local_addr().unwrap());
+    let coordinator_state = AppState::new(default_ice.clone(), AuthConfig::from_oidc(verifier))
+        .with_tenants(TenantRegistry::new(default_ice))
+        .with_allowed_tenants(["acme"])
+        .with_coordinator(
+            vec![coordinator_url.clone(), worker_url],
+            Some(coordinator_token.to_string()),
+        );
+    let coordinator_app = router(coordinator_state);
+    let coordinator = tokio::spawn(async move {
+        axum::serve(coordinator_listener, coordinator_app)
+            .await
+            .unwrap()
+    });
+
+    let token = issue_jwt_with_tenant(&issuer, aud, "u1", "acme");
+    let response = reqwest::Client::new()
+        .post(format!("{coordinator_url}/api/v1/sql/distributed"))
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .json(&json!({
+            "query": "SELECT count(*) AS n FROM events WHERE host LIKE 'acme-%'"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, 403, "worker refusal was not propagated: {body}");
+    assert!(
+        body.contains("not in this query server's allowed tenant set"),
+        "worker's refusal explanation was lost: {body}"
+    );
+    assert_eq!(
+        worker_registry.cached_tenant_count().await,
+        0,
+        "the refusing worker resolved and retained the forwarded tenant"
+    );
+
+    coordinator.abort();
+    worker.abort();
+    idp.abort();
+}
+
 /// A verified signature is not a tenant authorization.
 ///
 /// THE DEFECT THIS GUARDS. With `--oidc-tenant-claim` configured, the query

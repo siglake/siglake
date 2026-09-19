@@ -523,6 +523,32 @@ tests:
         alertname: SiglakeTenantsDenied
         exp_alerts: []
 
+  - name: a query allow-list refusal raises the query tenancy alert
+    interval: 1m
+    input_series:
+      - series: 'siglake_query_tenant_denied_total{namespace="logs",pod="query-0",reason="not_allowed"}'
+        values: '0 0 3 6 9 12 15 18 21 24 27 30 33 36 39'
+      - series: 'siglake_query_tenant_denied_total{namespace="logs",pod="query-0",reason="claim_missing"}'
+        values: '0x14'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: SiglakeQueryTenantsDenied
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: query-0
+              reason: not_allowed
+              severity: warning
+            exp_annotations:
+              summary: Query is denying tenants
+              description: >-
+                Query tenants are being refused with 403 before a namespace is
+                opened. The reason label says which: not_allowed is a usable
+                verified claim absent from query.allowedTenants; claim_missing
+                or claim_invalid means the IDP is not minting a usable
+                query.oidc.tenantClaim value or the configured claim name is
+                wrong.
+
   # #3067: header_not_trusted is the single-tenant default refusing a routing
   # X-Scope-OrgID (crates/siglake-ingest/src/lib.rs), and it reads through the
   # same reason-unfiltered rule as every other refusal rather than a rule of
