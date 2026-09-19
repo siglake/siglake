@@ -341,6 +341,132 @@ snapshot expiry retains the registered statistics metadata in the current
 implementation, so the Puffin sidecar stays discoverable and a later rebuild
 remains a no-op.
 
+#### Deferred registration: reuse at a later snapshot (2026-09-19, #5319)
+
+Qualification of whether a deferred caller can recover its coverage from the
+work it already did, instead of leaving the files on the scan path until a
+later rewrite or a CLI rebuild. Local design and measurement; nothing here is
+implemented.
+
+**Two deferrals, two payloads.** The early refusal
+(`iceberg.rs:14536`) fires when the caller's own handle already shows a
+statistics file on the target snapshot. Nothing has been written: the raw
+blobs are still owned by the call and there is no object to orphan. The
+post-upload deferral (`iceberg.rs:14565`) fires when
+`RegisterFirstStatisticsAction` sees a competitor on the attempt's own base.
+By then `write_puffin_sidecar` has consumed the raw blobs and uploaded the
+sidecar, so what the caller holds is the `StatisticsFile` it returned — path,
+sizes and blob metadata — and what is on the store is an unreferenced object.
+
+**Which snapshot a retry may address.** Discovery is not snapshot-scoped:
+`existing_puffin_index_columns` and the fork's `statistics_blobs_by_file`
+(`third_party/iceberg/src/scan/mod.rs:67`) both walk `statistics_iter()` over
+every entry in table metadata and key on the blob's `data_file` property, so a
+blob registered against snapshot M covers a file added at snapshot N for every
+scan while that file is live. Retirement follows the same key:
+`statistics_disposition` retires an entry only when none of its blobs names a
+live data file, `reachable_files` protects every registered statistics path,
+and snapshot expiry keeps the entries. The rule is therefore not "the next
+snapshot" but **the current snapshot on the retry attempt's own base, when it
+carries no statistics file, and never one older than the snapshot the blobs
+were computed from**. Addressing the newest eligible snapshot is also the
+durable choice, because an older one is the first to be expired; addressing
+one older than the computed-from snapshot would attach an entry describing
+files that snapshot never held.
+
+**One attempt promises nothing.** A statistics update creates no snapshot, so
+at the instant of a deferral the current snapshot is the one the winner just
+took. An eligible target exists only if a data commit landed between the
+caller's load and its deferral — likely while an ingesting table is being
+rebuilt over a large file, impossible on a quiet one. Bounded reuse is an
+opportunistic recovery; the scan-path fallback stays the contract.
+
+**Measured cost.** `report_deferred_registration_reuse_cost` in
+`tests/segmented_index_writer.rs` starts from the state #5298's two-registrant
+regressions leave behind, appends past the occupied snapshot, and re-addresses
+the orphaned sidecar to a later statistics-free one. Release build, this box:
+
+| rows/day (files) | deferred data files | sidecar object | retained payload | bytes the reuse moves | re-decode + register | reuse commit |
+|---|---|---|---|---|---|---|
+| 150,000 (1) | 968,438 B | 328,657 B | 637 B | 0 | 0.370 s | 0.005 s |
+| 1,200,000 (5) | 7,286,010 B | 2,625,244 B | 2,092 B | 0 | 1.804 s | 0.002 s |
+
+The retained payload is that `StatisticsFile` serialized: it grows with the
+number of covered `(file, column)` pairs, not with rows. The reuse moves no
+blob bytes — the entry is re-addressed in the catalog and the object is left
+exactly as the deferral wrote it, which the report asserts by object count and
+mtime. `re-decode + register` is the alternative it displaces, timed on a
+comparable file in the same warehouse.
+
+The recovery holds, and takes no second Parquet decode: after the commit the
+deferred file appears in `registered_v1_blobs`, `reachable_files` contains the
+object it reuses (it is no longer an orphan), all four days answer exactly, the
+Puffin index fires at read time, and a rebuild over the recovered file returns
+0 with no deferral counted and no new object — that last pair is the proof,
+since a decode would have produced a sidecar and a second deferral.
+
+```
+cargo test -p siglake-storage --release --test segmented_index_writer \
+  report_deferred_registration_reuse_cost -- --ignored --nocapture
+```
+
+`SIGLAKE_REUSE_ROWS_PER_FILE` sizes it (default 150,000; above `APPEND_CHUNK` a
+day becomes several files, which is the second row).
+
+**What re-addressing does not keep identical.** The Puffin footer's
+`snapshot-id` and `sequence-number` keep naming the snapshot the blobs were
+computed from, while the catalog entry names the snapshot they are attached
+to. The fork documents those as different fields — "ID of the Iceberg table's
+snapshot the blob was computed from"
+(`third_party/iceberg/src/puffin/metadata.rs:64`) against "The snapshot id of
+the statistics file" (`third_party/iceberg/src/spec/statistic_file.rs:28`) — so
+under that reading the two values differing is the two fields saying what they
+mean. No Siglake reader compares them: `ArrowReader::puffin_blob_metadata`
+matches on blob type, `data_file` and `column`, and `puffin_inverted_index`
+adds `row_group_size`. It would still be the first entry Siglake writes where
+they differ. The seg2 writer's three-copy agreement
+(`assert_current_seg2_sequence_agreement`, #5260) is a different case: there
+the blobs were computed from the snapshot they are attached to, so all three
+have to match, and that assertion stays as it is. The alternative — rewriting
+the sidecar from the orphan's blob bytes so all three agree — costs a full read
+and a full write of the index (328 KB and 2.6 MB in the two rows above, tens of
+MB at 7.34M-row width) and leaves a second orphan, to buy agreement between
+fields that mean different things. Re-address; do not rewrite.
+
+**Retry owner.** The caller, inline, one extra transaction inside
+`register_puffin_sidecar_for_snapshot`, with the payload's lifetime bounded by
+that function call. The two rejected owners: a compactor pass that sweeps
+uncovered live files is a background retry service, which this design does not
+introduce; retaining the payload on the `IcebergContext` until the table's next
+commit gives the retention no bound in time and no owner at shutdown. Waiting
+inside the call for a commit to arrive would block a compactor thread on
+another party's progress.
+
+**What an implementation has to hold.** First-writer-wins is unchanged: the
+retry is a second `RegisterFirstStatisticsAction`, so the absence check is
+re-made against the base of each of its attempts and a second competitor defers
+it again. Before committing, re-check live-file and column coverage on that
+base — a file rewritten or deleted since the deferral must not gain an entry,
+and a column another registrant has since covered must not gain a duplicate.
+Exactly one retry: two deferrals of the same call count one deferral, the way
+attempts already do. The deterministic cases are no later snapshot (the retry
+finds the current snapshot occupied and stops), an occupied later snapshot, a
+competing registration inside the retry's own CAS window, and files rewritten
+or deleted before the retry. The early-refusal path is the cheaper half and
+worth doing on its own: the blobs are unconsumed, so one reload and a write to
+the current statistics-free snapshot wastes nothing at all.
+
+**Verdict.** Bounded reuse earns its cost as designed — kilobytes retained for
+the length of one call, no blob bytes moved, a 2-5 ms commit against a decode
+that is seconds at fixture width and tens of seconds at 7.34M rows — and it is
+filed as an implementation card. It is not urgent: the deferral needs two
+registrants on one table, and the two registrants that exist are the append
+path under `index_at_flush` and the post-rewrite rebuild under
+`SIGLAKE_INDEX_REBUILD`, which defaults off. Schedule it behind a nonzero
+`siglake_index_registration_deferred_total` from a round or a deployment;
+until then the exact scan is the documented fallback
+(`docs/LIMITATIONS.md`).
+
 ### Slice B — consume at query time ✅
 
 `Reader::inverted_index_row_selection` (in the vendored `arrow/reader.rs`):
