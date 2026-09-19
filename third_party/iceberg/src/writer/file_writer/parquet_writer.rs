@@ -46,6 +46,30 @@ use crate::transform::create_transform_function;
 use crate::writer::{CurrentFileStatus, DataFile};
 use crate::{Error, ErrorKind, Result};
 
+const SEGMENTED_WRITE_WRITTEN: &str = "written";
+const SEGMENTED_WRITE_REFUSED: &str = "refused";
+const SEGMENTED_REASON_NONE: &str = "none";
+const SEGMENTED_REASON_COLUMN: &str = "column";
+const SEGMENTED_REASON_FILE_ROWS: &str = "file_rows";
+const SEGMENTED_REASON_ROW_DOMAIN: &str = "row_domain";
+
+/// Every `(outcome, reason)` pair
+/// `siglake_iceberg_segmented_index_writes_total` is recorded under, which is
+/// the whole vocabulary of [`ParquetWriter::publish_segmented_sidecars`]: one
+/// `written` arm and the three ways a sidecar would have described a file
+/// layout the file does not have.
+///
+/// The emitter passes both label values through a variable, so a dashboard
+/// check that reads literals at call sites cannot hold a pre-registration
+/// catalog to them; `segmented_index_write_series_are_preregistered` in
+/// siglake-storage does, against this list.
+pub const SEGMENTED_INDEX_WRITE_SERIES: &[(&str, &str)] = &[
+    (SEGMENTED_WRITE_WRITTEN, SEGMENTED_REASON_NONE),
+    (SEGMENTED_WRITE_REFUSED, SEGMENTED_REASON_COLUMN),
+    (SEGMENTED_WRITE_REFUSED, SEGMENTED_REASON_FILE_ROWS),
+    (SEGMENTED_WRITE_REFUSED, SEGMENTED_REASON_ROW_DOMAIN),
+];
+
 /// siglake extension (#4377): one text column to build a **segmented**
 /// (`seg2`) inverted-index sidecar for, as the writer emits row groups.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1065,18 +1089,18 @@ impl ParquetWriter {
         data_file_path: &str,
     ) {
         if segmented.disabled {
-            Self::record_segmented_write("refused", "column");
+            Self::record_segmented_write(SEGMENTED_WRITE_REFUSED, SEGMENTED_REASON_COLUMN);
             return;
         }
         if segmented.rows != file_rows {
-            Self::record_segmented_write("refused", "file_rows");
+            Self::record_segmented_write(SEGMENTED_WRITE_REFUSED, SEGMENTED_REASON_FILE_ROWS);
             return;
         }
         let sink = segmented.sink;
         let mut finished = Vec::with_capacity(segmented.writers.len());
         for (column, writer, group_rows) in segmented.writers {
             if group_rows != row_counts {
-                Self::record_segmented_write("refused", "row_domain");
+                Self::record_segmented_write(SEGMENTED_WRITE_REFUSED, SEGMENTED_REASON_ROW_DOMAIN);
                 return;
             }
             finished.push(SegmentedIndexBlob {
@@ -1091,7 +1115,7 @@ impl ParquetWriter {
             metrics::histogram!("siglake_iceberg_segmented_index_written_bytes")
                 .record(blob.bytes.len() as f64);
             sink.push(blob);
-            Self::record_segmented_write("written", "none");
+            Self::record_segmented_write(SEGMENTED_WRITE_WRITTEN, SEGMENTED_REASON_NONE);
         }
     }
 

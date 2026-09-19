@@ -2128,6 +2128,10 @@ TEXT_INDEX_GROUPINGS = {
     "siglake_iceberg_parsed_index_cache_evictions_total": "reason",
     "siglake_iceberg_puffin_blob_cache_lookups_total": "outcome",
     "siglake_iceberg_puffin_blob_cache_evictions_total": "reason",
+    # #5231's seg2 writer on the same terms: the panel exists to say WHY a
+    # sidecar was refused, and a fourth refusal reason added to the writer has
+    # to reach it without anyone editing the dashboard.
+    "siglake_iceberg_segmented_index_writes_total": "reason",
 }
 # "Text-index startup by stage (p50 / p99)".
 TEXT_INDEX_STARTUP_PANEL = 159

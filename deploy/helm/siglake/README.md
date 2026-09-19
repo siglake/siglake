@@ -656,6 +656,31 @@ text-index panels: a text query's per-file startup split by stage
 says whether a slowdown is the load queue, object storage, the decode or
 the postings work), the parsed-index cache's lookup outcomes beside the
 bound that dropped an entry, and its resident bytes against that bound.
+
+Four panels close that row with what the indexes those queries read cost
+to build, which until now was emitted and charted nowhere. The first two
+are the segmented (`seg2`) sidecar writer, which builds a sidecar as a
+compaction rewrite emits row groups: one arm per `(outcome, reason)` a
+sidecar close records, and the sidecar's encoded bytes beside the heap
+one row group's postings and dictionary occupy while they are built.
+Read the refusal arms first — `column`, `file_rows` and `row_domain` are
+the three ways a sidecar would have described a layout the output file
+does not have, and each one leaves that file on the scan path with no
+index. All four arms are created at 0 on every compactor, so a release
+that has not set `SIGLAKE_SEGMENTED_INDEX_WRITES=1` (the default) charts
+flat zeros rather than "No data". The byte panel cannot be: quantiles
+have nothing to pre-register, and it is charted **per pod** rather than
+summed — these are each compactor's own summary quantiles over the
+exporter's rolling window, and averaging percentiles across a fleet
+produces a number no pod measured. Label the `group index` arm for what
+it is: one row group's parsed-index allocation, not the writer's peak
+heap. The other two panels are the opt-in post-rewrite v1 rebuild
+(`compactor.indexRebuild`), which reads a committed data file back whole:
+the files it rebuilt per hour with those files' own size on the right
+axis, and the pass duration as a fleet histogram quantile. The rebuild
+counters carry the tenant and table, known only at the increment, so
+they are absent rather than zero until a rebuild commits.
+
 `scripts/check-chart.py` verifies
 that every `siglake_*` series a panel or template variable names is one
 the code emits — `crates/` and the owned forks under `third_party/`,

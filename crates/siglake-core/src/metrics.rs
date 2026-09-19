@@ -279,6 +279,31 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
     // Register every outcome before that first pass so a clean table reads 0
     // rather than absent; the reclaimed-byte sibling is emitted by the
     // age-gated orphan sweep that consumes the retired Puffin objects.
+    // #5231: what a rewrite's seg2 sidecar writer decided, per sidecar. No
+    // alert reads it; it is here for the other half of the pre-registration
+    // argument. The panel's reading is `refused` — a compactor writing files
+    // whose sidecars describe a layout the file does not have, which leaves
+    // those files on the scan path — and on a compactor that refuses nothing
+    // the `refused` arms are exactly the series that would be absent, so the
+    // healthy chart would be indistinguishable from a writer that is not
+    // running at all. The writer is opt-in
+    // (`SIGLAKE_SEGMENTED_INDEX_WRITES=1`), so with the knob unset every arm
+    // including `written` stays flat at 0, which is the correct reading of a
+    // default install.
+    //
+    // Both label values reach the emitter through a variable, so
+    // `check-chart.py` sees a dynamic site and cannot hold this catalog to the
+    // call sites; `segmented_index_write_series_are_preregistered` in
+    // siglake-storage does, against the fork's `SEGMENTED_INDEX_WRITE_SERIES`.
+    AlertedCounter {
+        name: "siglake_iceberg_segmented_index_writes_total",
+        series: &[
+            &[("outcome", "written"), ("reason", "none")],
+            &[("outcome", "refused"), ("reason", "column")],
+            &[("outcome", "refused"), ("reason", "file_rows")],
+            &[("outcome", "refused"), ("reason", "row_domain")],
+        ],
+    },
     AlertedCounter {
         name: "siglake_iceberg_statistics_removed_total",
         series: UNLABELLED,
@@ -896,6 +921,12 @@ mod tests {
             "siglake_catalog_metadata_snapshots",
             "siglake_wal_seal_bytes",
             "siglake_wal_seal_rows",
+            // #5231's two index-build byte distributions. The dashboard reads
+            // them through a `quantile=` selector rather than
+            // `histogram_quantile()`, which only holds while they stay
+            // unbucketed here.
+            "siglake_iceberg_segmented_index_written_bytes",
+            "siglake_iceberg_segmented_index_group_index_bytes",
         ];
         let out = render_with(|| {
             for name in summary_names {
