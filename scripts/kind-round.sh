@@ -105,6 +105,25 @@ INGESTER_POD_LABEL_SECONDS=90
 INGESTER_POD_LABEL_GRACE_SECONDS=300
 INGESTER_POD_LABEL_BATCH=48
 INGESTER_POD_LABEL_TRACES=8
+# #4151: unlike the ingester signal, the catalog-claim compactor gauge is a
+# copy of one shared queue on every replica. This opt-in installs TWO compactors
+# only after the round's ordinary evidence is complete, holds newly sealed rows
+# below a deliberately unreachable commit-batch threshold, and retains two
+# successive Prometheus scrape generations which agree on the queue depth.
+# Ordinary rounds keep the chart's one-compactor kind value.
+COMPACTOR_POD_LABEL_CAPTURE="${COMPACTOR_POD_LABEL_CAPTURE:-0}"
+[[ "$COMPACTOR_POD_LABEL_CAPTURE" == 0 || "$COMPACTOR_POD_LABEL_CAPTURE" == 1 ]] || {
+  printf 'ERROR: COMPACTOR_POD_LABEL_CAPTURE must be 0 or 1\n' >&2
+  exit 1
+}
+COMPACTOR_SCALE_TARGET=2
+COMPACTOR_POD_LABEL_LOAD_SECONDS=15
+COMPACTOR_POD_LABEL_GRACE_SECONDS=120
+COMPACTOR_POD_LABEL_BATCH=500
+COMPACTOR_INTERVAL_SECONDS=1
+COMPACTOR_SCRAPE_INTERVAL_SECONDS=15
+COMPACTOR_CAPTURE_BATCH_TARGET_MB=1024
+COMPACTOR_CAPTURE_BATCH_MAX_AGE_SECONDS=300
 # The Helm release, restated for the operator expression the capture evaluates:
 # `app_kubernetes_io_instance` is the release name.
 RELEASE=siglake
@@ -122,6 +141,11 @@ INGESTER_RAW_JSON="$RESULTS_DIR/ingester-pod-labels-raw.json"
 INGESTER_PER_SERIES_JSON="$RESULTS_DIR/ingester-pod-labels-per-series.json"
 INGESTER_PER_POD_JSON="$RESULTS_DIR/ingester-pod-labels-per-pod.json"
 INGESTER_EXPRESSION_JSON="$RESULTS_DIR/ingester-pod-labels-expression.json"
+COMPACTOR_POD_LABEL_JSON="$RESULTS_DIR/compactor-pod-labels.json"
+COMPACTOR_RAW_JSON="$RESULTS_DIR/compactor-pod-labels-raw.json"
+COMPACTOR_SAMPLE_TIMES_JSON="$RESULTS_DIR/compactor-pod-labels-sample-times.json"
+COMPACTOR_PER_POD_JSON="$RESULTS_DIR/compactor-pod-labels-per-pod.json"
+COMPACTOR_EXPRESSION_JSON="$RESULTS_DIR/compactor-pod-labels-expression.json"
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/siglake-kind-round.XXXXXX")"
 KIND_CLUSTER_OWNERSHIP_FILE="$TMP_DIR/kind-cluster-owned"
@@ -1422,6 +1446,307 @@ PY
   ((INGESTER_POD_LABEL_FAILURE == 0))
 }
 
+# --- #4151: shared catalog-claim queue on every compactor -------------------
+COMPACTOR_POD_LABEL_FAILURE=0
+compactor_pod_label_failure() {
+  COMPACTOR_POD_LABEL_FAILURE=1
+  printf 'COMPACTOR_POD_LABEL_FAILURE %s\n' "$*"
+}
+
+compactor_selector() {
+  printf 'namespace="%s",app_kubernetes_io_instance="%s",app_kubernetes_io_component="compactor"' \
+    "$NAMESPACE" "$RELEASE"
+}
+compactor_raw_expression() {
+  printf 'siglake_compactor_sealed_pending{%s}' "$(compactor_selector)"
+}
+compactor_sample_times_expression() {
+  printf 'timestamp(siglake_compactor_sealed_pending{%s})' "$(compactor_selector)"
+}
+compactor_per_pod_expression() {
+  printf 'sum by (pod) (siglake_compactor_sealed_pending{%s})' "$(compactor_selector)"
+}
+# Character for character the operator's query in prom.rs. The offline check
+# compares the two format strings, so this cannot drift into evidence for a
+# query the reconciler does not run.
+compactor_operator_expression() {
+  printf 'avg(sum by (pod) (siglake_compactor_sealed_pending{%s}))' "$(compactor_selector)"
+}
+
+ready_compactor_pods() {
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get pods \
+    -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=compactor" \
+    --sort-by=.metadata.name -o json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    items = json.load(sys.stdin).get("items", [])
+except ValueError:
+    raise SystemExit(0)
+for item in items:
+    meta, status = item["metadata"], item.get("status", {})
+    if meta.get("deletionTimestamp"):
+        continue
+    conditions = {c.get("type"): c.get("status") for c in status.get("conditions", [])}
+    if conditions.get("Ready") == "True":
+        print(meta["name"])
+'
+}
+
+# The queue changes while the mirror registers freshly sealed segments, and
+# each compactor refreshes its own gauge. One unequal scrape is therefore not
+# evidence of a sharded queue. Accept only after two successive scrape
+# generations cover the same ready pods, carry the same positive total on each
+# pod, and advance every pod's source-sample timestamp. The final raw and
+# timestamp() responses are still retained verbatim below.
+compactor_capture_settled() {
+  local raw=$1 times=$2 expected=$3 candidate=$4 settled=$5
+  python3 - "$raw" "$times" "$expected" "$candidate" "$settled" \
+    "$COMPACTOR_SCRAPE_INTERVAL_SECONDS" <<'PY'
+import json
+import math
+import pathlib
+import sys
+
+raw_path, times_path, expected_path, candidate_path, settled_path, interval = sys.argv[1:]
+interval = float(interval)
+
+
+def vector(path):
+    try:
+        response = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if response.get("status") != "success":
+        return []
+    data = response.get("data", {})
+    return data.get("result", []) if data.get("resultType") == "vector" else []
+
+
+expected = {line.strip() for line in open(expected_path, encoding="utf-8") if line.strip()}
+values = {}
+for row in vector(raw_path):
+    labels = row.get("metric", {})
+    pod = labels.get("pod", "").strip()
+    if not pod or labels.get("tenant") != "default":
+        continue
+    try:
+        value = float(row["value"][1])
+    except (KeyError, IndexError, TypeError, ValueError):
+        continue
+    if math.isfinite(value):
+        values[pod] = values.get(pod, 0.0) + value
+
+sample_times = {}
+for row in vector(times_path):
+    pod = row.get("metric", {}).get("pod", "").strip()
+    try:
+        stamp = float(row["value"][1])
+    except (KeyError, IndexError, TypeError, ValueError):
+        continue
+    if pod and math.isfinite(stamp):
+        sample_times[pod] = max(sample_times.get(pod, stamp), stamp)
+
+valid = (
+    len(expected) >= 2
+    and set(values) == expected
+    and set(sample_times) == expected
+    and min(values.values(), default=0.0) > 0.0
+    and len({round(value, 9) for value in values.values()}) == 1
+    and max(sample_times.values(), default=0.0) - min(sample_times.values(), default=0.0)
+        <= interval
+)
+candidate = pathlib.Path(candidate_path)
+if not valid:
+    candidate.unlink(missing_ok=True)
+    raise SystemExit(1)
+
+current = {
+    "pods": [
+        {"pod": pod, "value": values[pod], "sample_time": sample_times[pod]}
+        for pod in sorted(expected)
+    ]
+}
+try:
+    previous = json.loads(candidate.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    previous = None
+if previous:
+    old = {row["pod"]: row for row in previous.get("pods", [])}
+    new = {row["pod"]: row for row in current["pods"]}
+    if (
+        set(old) == set(new)
+        and all(math.isclose(old[p]["value"], new[p]["value"], rel_tol=1e-9) for p in new)
+        and all(new[p]["sample_time"] > old[p]["sample_time"] for p in new)
+    ):
+        pathlib.Path(settled_path).write_text(
+            json.dumps([previous, current], indent=2) + "\n", encoding="utf-8"
+        )
+        raise SystemExit(0)
+candidate.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+raise SystemExit(1)
+PY
+}
+
+capture_compactor_pod_labels() {
+  local next=$1 deadline at pods=() rc=0 settled=0
+  local candidate="$TMP_DIR/compactor-settling-candidate.json"
+  local settling="$TMP_DIR/compactor-settling.json"
+  mkdir -p "$RESULTS_DIR"
+
+  # This Helm upgrade is the live installability check the card asks for. It
+  # uses the round's existing mirror + catalog claim, changes no HPA guard, and
+  # runs after the ordinary evidence. The large/old batch gate keeps the queue
+  # still long enough for two independently scraped gauges to converge.
+  log "install ${COMPACTOR_SCALE_TARGET} catalog-claim compactors for the shared-queue capture"
+  if ! helm --kube-context "$KUBE_CONTEXT" upgrade "$RELEASE" \
+    "$ROOT/deploy/helm/siglake" --namespace "$NAMESPACE" --reuse-values \
+    --set compactor.replicas="$COMPACTOR_SCALE_TARGET" \
+    --set compactor.commitBatch.targetMb="$COMPACTOR_CAPTURE_BATCH_TARGET_MB" \
+    --set compactor.commitBatch.maxAgeSecs="$COMPACTOR_CAPTURE_BATCH_MAX_AGE_SECONDS" \
+    --wait --timeout 10m; then
+    compactor_pod_label_failure "the chart did not install a two-compactor catalog-claim tier"
+    return 1
+  fi
+
+  deadline=$((SECONDS + COMPACTOR_POD_LABEL_GRACE_SECONDS))
+  while ((SECONDS < deadline)); do
+    mapfile -t pods < <(ready_compactor_pods)
+    ((${#pods[@]} < COMPACTOR_SCALE_TARGET)) || break
+    sleep 5
+  done
+  mapfile -t pods < <(ready_compactor_pods)
+  printf 'COMPACTOR_POD_LABEL_PODS count=%s pods=%s\n' "${#pods[@]}" "${pods[*]:-none}"
+  if ((${#pods[@]} != COMPACTOR_SCALE_TARGET)); then
+    compactor_pod_label_failure "found ${#pods[@]} ready compactor pods, expected ${COMPACTOR_SCALE_TARGET}"
+    return 1
+  fi
+  printf '%s\n' "${pods[@]}" >"$TMP_DIR/compactor-expected-pods"
+
+  log "drive sealed-WAL load for ${COMPACTOR_POD_LABEL_LOAD_SECONDS}s"
+  local traffic_deadline=$((SECONDS + COMPACTOR_POD_LABEL_LOAD_SECONDS))
+  while ((SECONDS < traffic_deadline)); do
+    ingest_events "$next" "$COMPACTOR_POD_LABEL_BATCH" || true
+    next=$((next + COMPACTOR_POD_LABEL_BATCH))
+    sleep 1
+  done
+
+  # Poll Prometheus, not the pods directly: this is the label and arithmetic
+  # path the operator consumes. timestamp(metric) retains the source scrape
+  # time behind each gauge rather than the query evaluation time.
+  while ((SECONDS < deadline)); do
+    at="$(date -u +%s)"
+    prometheus_capture "$(compactor_raw_expression)" "$at" "$COMPACTOR_RAW_JSON" || true
+    prometheus_capture "$(compactor_sample_times_expression)" "$at" \
+      "$COMPACTOR_SAMPLE_TIMES_JSON" || true
+    if compactor_capture_settled "$COMPACTOR_RAW_JSON" "$COMPACTOR_SAMPLE_TIMES_JSON" \
+      "$TMP_DIR/compactor-expected-pods" "$candidate" "$settling"; then
+      settled=1
+      break
+    fi
+    sleep 2
+  done
+  if ((settled == 0)); then
+    compactor_pod_label_failure "the two compactor gauges did not converge across two scrape generations"
+  fi
+
+  at="${at:-$(date -u +%s)}"
+  prometheus_capture "$(compactor_per_pod_expression)" "$at" "$COMPACTOR_PER_POD_JSON" ||
+    compactor_pod_label_failure "the grouped compactor query failed"
+  prometheus_capture "$(compactor_operator_expression)" "$at" "$COMPACTOR_EXPRESSION_JSON" ||
+    compactor_pod_label_failure "the operator compactor expression failed"
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get pods \
+    -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=compactor" \
+    --sort-by=.metadata.name -o json >"$TMP_DIR/compactor-pods.json" 2>/dev/null || true
+
+  python3 - "$TMP_DIR/compactor-capture.json" "$at" "$NAMESPACE" "$RELEASE" \
+    "$(iso_now)" "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)" \
+    "$TMP_DIR/compactor-pods.json" "$TMP_DIR/compactor-expected-pods" "$settling" \
+    "$COMPACTOR_SCALE_TARGET" "$COMPACTOR_POD_LABEL_LOAD_SECONDS" \
+    "$COMPACTOR_INTERVAL_SECONDS" "$COMPACTOR_SCRAPE_INTERVAL_SECONDS" \
+    "$COMPACTOR_CAPTURE_BATCH_TARGET_MB" "$COMPACTOR_CAPTURE_BATCH_MAX_AGE_SECONDS" \
+    "$(compactor_raw_expression)" "$COMPACTOR_RAW_JSON" \
+    "$(compactor_sample_times_expression)" "$COMPACTOR_SAMPLE_TIMES_JSON" \
+    "$(compactor_per_pod_expression)" "$COMPACTOR_PER_POD_JSON" \
+    "$(compactor_operator_expression)" "$COMPACTOR_EXPRESSION_JSON" <<'PY' || rc=$?
+import json
+import sys
+
+(
+    out_path, at, namespace, release, generated_at, commit, pods_path, expected_path,
+    settling_path, target, load_seconds, compactor_interval, scrape_interval,
+    batch_target, batch_max_age, raw_expression, raw_path, times_expression,
+    times_path, per_pod_expression, per_pod_path, operator_expression, operator_path,
+) = sys.argv[1:]
+
+
+def response(path):
+    try:
+        return json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"status": "error", "data": {"resultType": "vector", "result": []}}
+
+
+try:
+    items = json.load(open(pods_path, encoding="utf-8")).get("items", [])
+except (OSError, ValueError):
+    items = []
+revisions = []
+for item in items:
+    for container in item.get("status", {}).get("containerStatuses", []):
+        revisions.append({
+            "pod": item["metadata"]["name"],
+            "container": container.get("name"),
+            "image": container.get("image"),
+            "image_id": container.get("imageID"),
+        })
+expected = [line.strip() for line in open(expected_path, encoding="utf-8") if line.strip()]
+try:
+    settling = json.load(open(settling_path, encoding="utf-8"))
+except (OSError, ValueError):
+    settling = []
+document = {
+    "schema_version": 1,
+    "generated_at": generated_at,
+    "evaluated_at": int(at),
+    "revisions": {"repository_commit": commit, "compactor_pods": revisions},
+    "settings": {
+        "namespace": namespace,
+        "release": release,
+        "scale_path": "helm_upgrade_reuse_values",
+        "compactor_replicas": int(target),
+        "load_seconds": int(load_seconds),
+        "compactor_interval_seconds": int(compactor_interval),
+        "scrape_interval_seconds": int(scrape_interval),
+        "commit_batch_target_mb": int(batch_target),
+        "commit_batch_max_age_seconds": int(batch_max_age),
+    },
+    "expected_pods": expected,
+    "settling_samples": settling,
+    "queries": {
+        "raw": {"expression": raw_expression, "time": int(at), "response": response(raw_path)},
+        "sample_times": {
+            "expression": times_expression, "time": int(at), "response": response(times_path),
+        },
+        "per_pod": {
+            "expression": per_pod_expression, "time": int(at), "response": response(per_pod_path),
+        },
+        "operator_expression": {
+            "expression": operator_expression, "time": int(at), "response": response(operator_path),
+        },
+    },
+}
+json.dump(document, open(out_path, "w", encoding="utf-8"), indent=2)
+open(out_path, "a", encoding="utf-8").write("\n")
+PY
+  if ((rc != 0)); then
+    compactor_pod_label_failure "could not assemble the compactor capture document"
+  elif ! python3 "$ROOT/scripts/grade-kind-compactor-pod-labels.py" \
+    "$TMP_DIR/compactor-capture.json" --output "$COMPACTOR_POD_LABEL_JSON"; then
+    compactor_pod_label_failure "the capture did not grade verified; see ${COMPACTOR_POD_LABEL_JSON#"$ROOT/"}"
+  fi
+  ((COMPACTOR_POD_LABEL_FAILURE == 0))
+}
+
 log "bring up the base kind deployment"
 KIND_CLUSTER_NAME="$CLUSTER_NAME" \
   KIND_CLUSTER_OWNERSHIP_FILE="$KIND_CLUSTER_OWNERSHIP_FILE" \
@@ -1717,8 +2042,17 @@ if [[ "$SCHEMA_ROLLBACK_PROBE" == 1 ]]; then
     "$ROOT/scripts/kind-schema-rollback-probe.sh"
 fi
 
+# Last because the capture deliberately raises the compactor replica floor and
+# commit-batch hold. Nothing from the ordinary round is measured across that
+# temporary evidence-only configuration, and teardown follows its verdict.
+if [[ "$COMPACTOR_POD_LABEL_CAPTURE" == 1 ]]; then
+  log "run the opt-in compactor shared-queue per-pod capture"
+  capture_compactor_pod_labels "$next_event" || true
+fi
+
 [[ "$PANEL_FAILURES" -eq 0 ]] || die "one or more required panel/trigger queries returned zero series"
 [[ "$SCALE_FAILURES" -eq 0 ]] || die "the ${QUERY_SCALE_BASE} -> ${QUERY_SCALE_TARGET} -> ${QUERY_SCALE_BASE} query scaling step failed; see the SCALE_FAILURE lines and ${SCALE_JSON#"$ROOT/"}"
 [[ "$POSTGRES_OUTAGE_FAILURE" -eq 0 ]] || die "the requested Postgres outage probe failed with exit status ${POSTGRES_OUTAGE_FAILURE}; see POSTGRES_OUTAGE_EVIDENCE and POSTGRES_OUTAGE_PROBE above"
 [[ "$INGESTER_POD_LABEL_FAILURE" -eq 0 ]] || die "the ingester per-pod label capture failed; see the INGESTER_POD_LABEL_FAILURE lines and ${INGESTER_POD_LABEL_JSON#"$ROOT/"}"
+[[ "$COMPACTOR_POD_LABEL_FAILURE" -eq 0 ]] || die "the compactor shared-queue capture failed; see the COMPACTOR_POD_LABEL_FAILURE lines and ${COMPACTOR_POD_LABEL_JSON#"$ROOT/"}"
 log "kind evidence round passed"

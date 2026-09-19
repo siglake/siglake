@@ -278,6 +278,13 @@ jobs:
       # arithmetic mismatch. No cluster.
       - name: ingester per-pod label capture keeps labels and arithmetic
         run: scripts/check-kind-ingester-pod-labels.sh
+      # The catalog-claim backlog is one shared queue copied onto every
+      # compactor. This pins the operator expression, keeps the chart's claim
+      # and mirror guards intact, exercises the two-generation settling rule,
+      # and rejects unequal copies, stale sample times and fleet sums. No
+      # cluster, helm or kubectl is used.
+      - name: compactor per-pod capture proves one shared queue
+        run: scripts/check-kind-compactor-pod-labels.sh
       # A failed round's diagnostics dump every not-Ready pod's logs except the
       # ones already carried by a Job dump above them. That membership test used
       # to be `printf '%s\n' "${jobs[@]}" | grep -qx`, where `grep -q` exits at

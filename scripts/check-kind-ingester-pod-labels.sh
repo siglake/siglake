@@ -81,7 +81,8 @@ contains "$round_body" 'capture_ingester_pod_labels "$next_event"' ||
 # are four unrelated numbers, and the arithmetic over them means nothing.
 contains "$round_body" '--data-urlencode "time=$at"' ||
   fail "$ROUND does not pin the capture's evaluation timestamp"
-capture_calls=$(printf '%s\n' "$round_body" | grep -c 'prometheus_capture "' || true)
+capture_calls=$(sed -n '/^capture_ingester_pod_labels()/,/^}/p' "$ROUND" |
+  grep -c 'prometheus_capture "' || true)
 [[ "$capture_calls" == 4 ]] ||
   fail "$ROUND makes $capture_calls retained Prometheus captures, expected the raw, per-series, per-pod and operator four"
 

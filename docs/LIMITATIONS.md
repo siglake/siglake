@@ -271,6 +271,18 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   carry no `pod`, one where fewer than two pods carried traffic, and one whose
   operator value is not the mean of the per-pod sums. No round has supplied
   that capture yet (#3647).
+- **No live Prometheus has confirmed that every claim compactor exports one
+  shared sealed queue.** The catalog query behind
+  `siglake_compactor_sealed_pending` has no worker filter, and the operator
+  reads `avg(sum by (pod) (...))`, so two replicas should each export the same
+  total rather than one share. The chart permits that two-pod tier only with
+  the catalog claim and WAL mirror on; its claim-mode Pods custom metric stays
+  refused. `COMPACTOR_POD_LABEL_CAPTURE=1 scripts/kind-round.sh` now exercises
+  the permitted install after the ordinary round, holds a positive queue, and
+  retains two advancing scrape generations plus the raw labels, source sample
+  times, grouped answer and operator expression. The offline grader accounts
+  for independently refreshed gauges and rejects a sum of the replicas'
+  copies, but no kind round has supplied the live capture yet (#5548).
 - **No tier can be scaled to zero.** Every `spec.autoscaling.<component>.min`
   must be 1 or more; `0` is refused with `InvalidSpec=True` /
   `AutoscalingZeroFloorUnsupported` before the operator touches a child
