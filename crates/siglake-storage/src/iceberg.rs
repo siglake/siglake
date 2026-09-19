@@ -447,6 +447,10 @@ mod alerted_counter_catalog_tests {
 }
 
 const SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE: &str = "siglake-inverted-v1";
+/// The v1 sidecar's integrity cover is the Zstd frame content checksum enabled
+/// by the fork's `CompressionCodec::Zstd` implementation. Keep the choice
+/// explicit and pinned by `v1_puffin_sidecars_keep_the_checksummed_codec`.
+const SIGLAKE_PUFFIN_INVERTED_CODEC: PuffinCompressionCodec = PuffinCompressionCodec::Zstd;
 const DEFAULT_SIGLAKE_INDEX_FOOTER_MAX_BYTES: usize = 1024 * 1024;
 const DELETE_TASKS_CONFIG_DIR: &str = "_siglake/config/delete_tasks";
 
@@ -8455,6 +8459,7 @@ fn split_footer_and_puffin_indexes(
     let mut puffin = Vec::new();
     for blob in serialized {
         if blob.bytes.len() <= threshold {
+            let checksum = format!("{:08x}", siglake_index::inverted_index_crc32(&blob.bytes));
             let mut hex = String::with_capacity(blob.bytes.len() * 2);
             for b in &blob.bytes {
                 hex.push(char::from_digit((b >> 4) as u32, 16).unwrap());
@@ -8463,6 +8468,10 @@ fn split_footer_and_puffin_indexes(
             footer.push((
                 siglake_index::inverted_index_kv_key(blob.column.as_str()).into_owned(),
                 hex,
+            ));
+            footer.push((
+                siglake_index::inverted_index_crc32_kv_key(blob.column.as_str()).into_owned(),
+                checksum,
             ));
         } else {
             puffin.push(blob);
@@ -9525,7 +9534,7 @@ async fn write_puffin_sidecar(
                     .data(blob.bytes)
                     .properties(properties.clone())
                     .build(),
-                PuffinCompressionCodec::Zstd,
+                SIGLAKE_PUFFIN_INVERTED_CODEC,
             )
             .await
             .context("PuffinWriter::add")?;
@@ -23925,6 +23934,36 @@ mod env_knob_resolver_tests {
         assert!(inverted_index_enabled_from(Some("true")));
         assert!(inverted_index_enabled_from(Some("junk")));
         assert!(!inverted_index_enabled_from(Some("0")));
+    }
+
+    #[test]
+    fn footer_indexes_carry_a_collision_safe_sibling_checksum() {
+        let bytes = siglake_index::InvertedIndex::from_rows(["needle haystack"]).to_bytes();
+        let expected_checksum = format!("{:08x}", siglake_index::inverted_index_crc32(&bytes));
+        let (footer, puffin) = split_footer_and_puffin_indexes(
+            vec![SerializedInvertedIndex {
+                column: "crc32".to_string(),
+                tokenizer: siglake_bloom::Tokenizer::Default,
+                bytes,
+            }],
+            usize::MAX,
+        );
+        assert!(puffin.is_empty());
+        let footer: HashMap<_, _> = footer.into_iter().collect();
+        assert!(footer.contains_key("siglake.inverted_index.v1.crc32"));
+        assert_eq!(
+            footer.get("siglake.inverted_index.crc32.v1.crc32"),
+            Some(&expected_checksum)
+        );
+    }
+
+    #[test]
+    fn v1_puffin_sidecars_keep_the_checksummed_codec() {
+        assert_eq!(
+            SIGLAKE_PUFFIN_INVERTED_CODEC,
+            PuffinCompressionCodec::Zstd,
+            "CompressionCodec::Zstd writes a frame content checksum; changing the v1 sidecar codec needs another integrity cover"
+        );
     }
 
     #[test]

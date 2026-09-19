@@ -524,7 +524,7 @@ appended invisibly (`the_shipped_decoder_refuses_both_checksum_placements`):
    mixed-version fleet all index pruning on newly written files until every
    reader is upgraded. Old blobs keep reading either way: the version byte is
    what selects the layout.
-3. **A sibling footer-KV key** (`siglake.inverted_index.v1.crc32[.column]`,
+3. **A sibling footer-KV key** (`siglake.inverted_index.crc32.v1[.column]`,
    eight hex characters) — leaves the blob bytes and the version byte alone. An
    old reader ignores an unknown footer key and keeps pruning; a new reader
    verifies when the key is present and falls back to an exact scan when the
@@ -542,6 +542,33 @@ both is undetected. Options (1) and (2) buy one thing (3) does not: a blob that
 carries its own integrity wherever it is stored, including a future path that
 is neither of these two. Any of the three is a production format change and
 belongs to its own 0.2.0 card; this one changed no format, API or default.
+
+### Footer CRC implementation (2026-09-19, #5204)
+
+The writer now emits option (3). The implemented namespace differs from the
+one proposed above because `siglake.inverted_index.v1.crc32` was already the
+blob key for a column named `crc32`; putting `crc32` before `v1` makes the
+checksum namespace disjoint without changing any blob key or column suffix.
+The sum covers the serialized blob bytes and is written as exactly eight
+lowercase hex characters.
+
+`ArrowReader::resolve_inverted_index` verifies a present sibling before a
+parsed-cache lookup or decode. A malformed sibling, malformed stored hex, or
+CRC disagreement increments
+`siglake_index_footer_checksum_refused_total{reason="malformed"|"mismatch"}`
+and follows the existing decoder-refusal path: try a valid Puffin index, then
+scan exactly. The dashboard's "Footer text-index checksum refusals" panel
+reads both zero-pre-registered reasons. An absent sibling keeps legacy reads
+and pruning; an old reader ignores the unknown sibling and reads the unchanged
+v1 blob.
+
+The v1 Puffin writer uses a single pinned
+`SIGLAKE_PUFFIN_INVERTED_CODEC = Zstd` choice, guarded by a regression test;
+the fork's Zstd encoder enables its frame content checksum. Generic Puffin
+codecs remain unrestricted. A checksum and its blob still share one Parquet
+footer, so damage that changes both consistently is outside this cover. A CRC
+inside the blob would close that boundary at the mixed-version pruning cost
+measured above.
 
 What these numbers do not cover: object storage, AWS, or any incidence rate.
 The sweep is a uniform single-bit model of what a corrupt byte *does*, not how

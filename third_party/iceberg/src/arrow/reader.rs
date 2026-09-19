@@ -2304,6 +2304,65 @@ impl ArrowReader {
         })
     }
 
+    /// Verify a footer-KV index when its sibling CRC is present. Legacy files
+    /// have no sibling and remain readable. Any malformed value or mismatch is
+    /// a decoder refusal: the caller tries Puffin and otherwise scans exactly.
+    fn footer_inverted_index_checksum_allows(
+        metadata: &ParquetMetaData,
+        column: &str,
+        hex: &str,
+    ) -> bool {
+        let checksum_key = siglake_index::inverted_index_crc32_kv_key(column);
+        let checksum_entry = metadata
+            .file_metadata()
+            .key_value_metadata()
+            .and_then(|kv| {
+                kv.iter()
+                    .find(|entry| entry.key == checksum_key.as_ref())
+            });
+        let Some(checksum_entry) = checksum_entry else {
+            return true;
+        };
+        let Some(checksum) = checksum_entry.value.as_deref() else {
+            metrics::counter!(
+                "siglake_index_footer_checksum_refused_total",
+                "reason" => "malformed"
+            )
+            .increment(1);
+            return false;
+        };
+        let expected = if checksum.len() == 8 {
+            u32::from_str_radix(checksum, 16).ok()
+        } else {
+            None
+        };
+        let Some(expected) = expected else {
+            metrics::counter!(
+                "siglake_index_footer_checksum_refused_total",
+                "reason" => "malformed"
+            )
+            .increment(1);
+            return false;
+        };
+        let Some(actual) = siglake_index::inverted_index_hex_crc32(hex) else {
+            metrics::counter!(
+                "siglake_index_footer_checksum_refused_total",
+                "reason" => "malformed"
+            )
+            .increment(1);
+            return false;
+        };
+        if actual != expected {
+            metrics::counter!(
+                "siglake_index_footer_checksum_refused_total",
+                "reason" => "mismatch"
+            )
+            .increment(1);
+            return false;
+        }
+        true
+    }
+
     fn stamped_row_group_size_matches(metadata: &ParquetMetaData, stamped: usize) -> bool {
         let row_groups = metadata.row_groups();
         if row_groups.is_empty() {
@@ -2576,6 +2635,20 @@ impl ArrowReader {
         file_rows: u64,
     ) -> Result<Option<(Arc<siglake_index::InvertedIndex>, &'static str)>> {
         if let Some(hex) = Self::footer_inverted_index_hex(metadata, column) {
+            // Verify before a warm cache lookup: a cached parse must not hide a
+            // footer whose sibling now disagrees with the stored blob.
+            if !Self::footer_inverted_index_checksum_allows(metadata, column, hex) {
+                return Ok(Self::puffin_inverted_index(
+                    file_io,
+                    task,
+                    metadata,
+                    column,
+                    cache_bypass,
+                    file_rows,
+                )
+                .await?
+                .map(|index| (index, "puffin")));
+            }
             // A data file is written once, so `(data file, column)` names this
             // blob for the file's life and the parsed form is reusable across
             // queries exactly as the Puffin one is (#3965). Warm lookups happen

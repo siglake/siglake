@@ -1715,6 +1715,35 @@
    "description": "Decoded-file cache populations, by what happened to each one. The cache is experimental and OFF by default (SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_BYTES and _MAX_ENTRIES are 0 in the chart, the compose file and the operator), so a flat zero on every arm is the expected reading for most deployments; all eight arms are pre-registered on the query server, so zero charts as zero rather than No data. abandoned is the arm to read when it IS on (#4846): a population that decoded batches, buffered them and was dropped before the end-of-stream arm could insert them — a LIMIT satisfied from the first batches, or a cancelled query. It cannot be read off miss, which is charged when a partition OPENS its first task, once per partition: the 2026-09-15 50G rounds exported 448 miss and no insert at 8 GiB, and #4494 had to establish from four ABSENT series that those were opens rather than populations that failed to stick. abandoned at the miss rate with insert at zero is that same shape, stated directly: the budget is subtracted from the query memory pool and nothing is ever kept. insert against abandoned is therefore the readout of whether the cache is earning its bytes on this workload. The other arms: bypass is a scan with a raw-text or promoted-column predicate, which reads through the pruning reader by design and never populates; skip_oversized is one file's decoded batches crossing a quarter of the budget; insert_skipped_contended is the deliberate degrade when a finished population loses the cache lock — one skip costs one future miss, and its rate against insert is #3086; evict is the LRU bound biting. The arms do not partition miss: miss is charged before the populate stream is built, and hit and bypass never build one."
   },
   {
+   "id": 166,
+   "type": "timeseries",
+   "title": "Footer text-index checksum refusals",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 162
+   },
+   "targets": [
+    {
+     "expr": "sum by (reason) (increase(siglake_index_footer_checksum_refused_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{reason}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "min": 0
+    }
+   },
+   "description": "Footer-KV inverted indexes refused before pruning because their sibling CRC-32 is malformed or disagrees with the stored blob. The reader falls back to Puffin when present and otherwise scans the file exactly, so a rising rate means correctness was preserved at the cost of scan work. Both reasons are pre-registered at zero on query pods."
+  },
+  {
    "id": 137,
    "type": "row",
    "title": "Cache warmer",
@@ -1722,7 +1751,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 162
+    "y": 170
    },
    "collapsed": false
   },
@@ -1738,7 +1767,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 163
+    "y": 171
    },
    "targets": [
     {
@@ -1785,7 +1814,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 163
+    "y": 171
    },
    "targets": [
     {
@@ -1816,7 +1845,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 163
+    "y": 171
    },
    "targets": [
     {
@@ -1850,7 +1879,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 171
+    "y": 179
    },
    "collapsed": false
   },
@@ -1866,7 +1895,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 172
+    "y": 180
    },
    "targets": [
     {
@@ -1894,7 +1923,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 172
+    "y": 180
    },
    "targets": [
     {
@@ -1927,7 +1956,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 180
+    "y": 188
    },
    "targets": [
     {
@@ -1961,7 +1990,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 188
+    "y": 196
    },
    "targets": [
     {
@@ -1990,7 +2019,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 196
+    "y": 204
    },
    "targets": [
     {
