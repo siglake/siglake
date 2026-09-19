@@ -15,11 +15,11 @@
 #      exact collapse the card is about -- `sum by (pod)` over unlabelled series
 #      returning ONE group holding the fleet total -- grades verified.
 #
-# So this file pins the expression against the Rust source, drives the round's
-# own capture function against stand-in `kubectl`, `curl` and `git` (no cluster,
-# no container runtime, no network), and runs the grader over one passing
-# fixture and seven mutations of it, each of which must be caught for its own
-# stated reason.
+# So this file pins the expression against the Rust source, drives both the
+# default-off path and the enabled capture against stand-in `kubectl`, `curl`
+# and `git` (no cluster, no container runtime, no network), and runs the grader
+# over one passing fixture and eight mutations of it, each of which must be
+# caught for its own stated reason.
 
 set -euo pipefail
 
@@ -45,6 +45,8 @@ done
 # Full-line comments and blanks removed: the round's prose explains the very
 # lines this reads, and a commented-out line is not a line it runs.
 round_body=$(grep -vE '^[[:space:]]*(#|$)' "$ROUND")
+contains "$round_body" 'INGESTER_POD_LABEL_CAPTURE="${INGESTER_POD_LABEL_CAPTURE:-0}"' ||
+  fail "$ROUND does not default INGESTER_POD_LABEL_CAPTURE off"
 
 # --- the round's constants and installed range -------------------------------
 base=$(printf '%s\n' "$round_body" | sed -n 's/^INGESTER_SCALE_BASE=\([0-9][0-9]*\)$/\1/p')
@@ -89,8 +91,17 @@ python3 - "$ROUND" <<'PY' || fail "$ROUND does not defer the capture verdict unt
 import sys
 
 lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+guard = [i for i, line in enumerate(lines)
+         if line == 'if [[ "$INGESTER_POD_LABEL_CAPTURE" == 1 ]]; then']
+if len(guard) != 1:
+    raise SystemExit(f"expected one per-pod capture opt-in block, found {guard}")
+opens = guard[0]
+closes = next(i for i, line in enumerate(lines[opens + 1:], opens + 1)
+              if line == "fi")
 call = next(i for i, line in enumerate(lines)
-            if line.startswith('capture_ingester_pod_labels "$next_event"'))
+            if line.strip().startswith('capture_ingester_pod_labels "$next_event"'))
+if not (opens < call < closes):
+    raise SystemExit("the capture call is outside INGESTER_POD_LABEL_CAPTURE's enabled arm")
 if not lines[call].endswith("|| true"):
     raise SystemExit("the capture call is not deferred; a failure would exit the round early")
 panel = next(i for i, line in enumerate(lines) if line == 'log "dashboard panel evidence"')
@@ -300,19 +311,31 @@ items = [
 json.dump({"items": items}, open(out, "w", encoding="utf-8"))
 PY
 
-cat >"$sandbox/scripts/drive.bash" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-# shellcheck source=/dev/null
-source "$(dirname "${BASH_SOURCE[0]}")/prelude.bash"
-# The round's own cleanup would tear down a cluster this sandbox never built.
-trap - EXIT INT TERM
-INGESTER_POD_LABEL_SECONDS=${DRIVE_LOAD_SECONDS:-1}
-INGESTER_POD_LABEL_GRACE_SECONDS=${DRIVE_GRACE_SECONDS:-5}
-capture_ingester_pod_labels 900000 || true
-printf 'DRIVE_FAILURE=%s\n' "$INGESTER_POD_LABEL_FAILURE"
-rm -rf -- "$TMP_DIR"
-EOF
+python3 - "$ROUND" "$sandbox/scripts/drive.bash" <<'PY'
+import pathlib
+import sys
+
+source, output = map(pathlib.Path, sys.argv[1:])
+lines = source.read_text(encoding="utf-8").splitlines()
+opens = next(i for i, line in enumerate(lines)
+             if line == 'if [[ "$INGESTER_POD_LABEL_CAPTURE" == 1 ]]; then')
+closes = next(i for i, line in enumerate(lines[opens + 1:], opens + 1)
+              if line == "fi")
+script = [
+    "#!/usr/bin/env bash",
+    "set -euo pipefail",
+    '# shellcheck source=/dev/null',
+    'source "$(dirname "${BASH_SOURCE[0]}")/prelude.bash"',
+    "trap - EXIT INT TERM",
+    'INGESTER_POD_LABEL_SECONDS=${DRIVE_LOAD_SECONDS:-1}',
+    'INGESTER_POD_LABEL_GRACE_SECONDS=${DRIVE_GRACE_SECONDS:-5}',
+    "next_event=900000",
+    *lines[opens:closes + 1],
+    "printf 'DRIVE_FAILURE=%s\\n' \"$INGESTER_POD_LABEL_FAILURE\"",
+    'rm -rf -- "$TMP_DIR"',
+]
+output.write_text("\n".join(script) + "\n", encoding="utf-8")
+PY
 chmod +x "$sandbox/scripts/drive.bash"
 
 expression=$("$sandbox/scripts/print-expressions.bash" 2>/dev/null | head -1)
@@ -325,12 +348,28 @@ but $PROM_SOURCE runs
 
 fixtures=0
 
-# --- arm 1: the capture, end to end, against the stand-ins -------------------
+# --- arm 1: the default path does not enter the capture ----------------------
 calls="$sandbox/calls.log"
 : >"$calls"
 env -i PATH="$sandbox/bin:/usr/bin:/bin" HOME="$HOME" \
   TMPDIR="$sandbox/tmp" SANDBOX="$sandbox" CALLS="$calls" \
-  RESULTS_DIR="$sandbox/results" \
+  RESULTS_DIR="$sandbox/results-default-off" \
+  FIXTURE_CAPTURE="$PWD/$FIXTURE" FIXTURE_INGESTER_PODS="$sandbox/ingester-pods.json" \
+  "$sandbox/scripts/drive.bash" >"$sandbox/default-off.out" 2>&1 ||
+  fail "the default-off arm exited nonzero: $(<"$sandbox/default-off.out")"
+default_off=$(<"$sandbox/default-off.out")
+contains "$default_off" 'DRIVE_FAILURE=0' ||
+  fail "the default-off arm recorded a capture failure: $default_off"
+[[ ! -s "$calls" ]] || fail "the default-off arm reached the capture stand-ins: $(<"$calls")"
+[[ ! -e "$sandbox/results-default-off/ingester-pod-labels.json" ]] ||
+  fail "the default-off arm wrote per-pod capture evidence"
+fixtures=$((fixtures + 1))
+
+# --- arm 2: opt-in capture, end to end, against the stand-ins ----------------
+: >"$calls"
+env -i PATH="$sandbox/bin:/usr/bin:/bin" HOME="$HOME" \
+  TMPDIR="$sandbox/tmp" SANDBOX="$sandbox" CALLS="$calls" \
+  INGESTER_POD_LABEL_CAPTURE=1 RESULTS_DIR="$sandbox/results" \
   FIXTURE_CAPTURE="$PWD/$FIXTURE" FIXTURE_INGESTER_PODS="$sandbox/ingester-pods.json" \
   "$sandbox/scripts/drive.bash" >"$sandbox/drive.out" 2>&1 ||
   fail "the capture arm exited nonzero: $(<"$sandbox/drive.out")"
@@ -367,7 +406,7 @@ if graded["evidence"]["grade"] != "verified":
 PY
 fixtures=$((fixtures + 1))
 
-# --- arm 2: one ready ingester pod -------------------------------------------
+# --- arm 3: one ready ingester pod -------------------------------------------
 # The capture must refuse rather than retain a one-pod reading, in which the
 # fleet total and the per-pod mean are the same number.
 python3 - "$sandbox/ingester-pods.json" "$sandbox/one-ingester-pod.json" <<'PY'
@@ -382,7 +421,8 @@ PY
 : >"$calls"
 env -i PATH="$sandbox/bin:/usr/bin:/bin" HOME="$HOME" \
   TMPDIR="$sandbox/tmp" SANDBOX="$sandbox" CALLS="$calls" \
-  DRIVE_GRACE_SECONDS=1 RESULTS_DIR="$sandbox/results-one-pod" \
+  INGESTER_POD_LABEL_CAPTURE=1 DRIVE_GRACE_SECONDS=1 \
+  RESULTS_DIR="$sandbox/results-one-pod" \
   FIXTURE_CAPTURE="$PWD/$FIXTURE" FIXTURE_INGESTER_PODS="$sandbox/one-ingester-pod.json" \
   "$sandbox/scripts/drive.bash" >"$sandbox/one-pod.out" 2>&1 ||
   fail "the one-pod arm exited nonzero: $(<"$sandbox/one-pod.out")"
@@ -395,7 +435,7 @@ contains "$(<"$calls")" 'minReplicaCount":1' ||
   fail "the one-pod arm left the ingester floor raised"
 fixtures=$((fixtures + 1))
 
-# --- the grader, on the passing fixture and seven mutations ------------------
+# --- the grader, on the passing fixture and eight mutations ------------------
 verified="$sandbox/verified.json"
 python3 "$GRADER" "$FIXTURE" --output "$verified" 2>"$sandbox/verified.log" ||
   fail "the verified fixture did not pass: $(<"$sandbox/verified.log")"
