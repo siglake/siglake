@@ -857,6 +857,13 @@ if [ "$WITH_HEAVY" = 1 ]; then
         SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
           cargo test -p siglake-storage --lib local_commit_mark_postgres -- \
             --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+        # wal-recover's catalog reader uses the same deployed backend and has
+        # three properties a parser or SQLite cannot establish: all 256 `$N`
+        # binds work, the server refuses a write on the reader's own fenced
+        # connection, and a missing table differs from an empty ledger.
+        SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
+          cargo test -p siglake-storage --lib wal_ledger_postgres -- \
+            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
       else
         dk_ok=0
       fi

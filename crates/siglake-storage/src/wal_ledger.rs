@@ -335,3 +335,305 @@ mod tests {
         assert_eq!(lookup_sql(LOOKUP_CHUNK).matches('?').count(), LOOKUP_CHUNK);
     }
 }
+
+/// The reader's Postgres-only properties, run against compose's live server.
+///
+/// `#[ignore]`d, and wired into the compose lifecycle that already runs the
+/// catalog claim's Postgres cases (`.github/workflows/ci.yml` and
+/// `scripts/ci-local.sh`):
+///
+/// ```text
+/// SIGLAKE_TEST_JOBS_POSTGRES_URI=postgres://siglake:siglake@localhost:5433/siglake \
+///   cargo test -p siglake-storage --lib wal_ledger_postgres -- --ignored --nocapture
+/// ```
+///
+/// Every case gets its own schema. The schema is pinned through Postgres's
+/// startup `search_path`, so neither the reader nor its setup can see the
+/// compose stack's own `wal_segments` in `public`.
+#[cfg(test)]
+mod wal_ledger_postgres {
+    use super::*;
+    use anyhow::{ensure, Context};
+    use sqlx::AnyPool;
+
+    const URI_VAR: &str = "SIGLAKE_TEST_JOBS_POSTGRES_URI";
+
+    struct Scratch {
+        name: String,
+        uri: String,
+    }
+
+    fn scratch_uri(base: &str, schema: &str) -> String {
+        let sep = if base.contains('?') { '&' } else { '?' };
+        format!("{base}{sep}options[search_path]={schema}")
+    }
+
+    impl Scratch {
+        async fn create(admin: &AnyPool, base: &str, case: &str) -> Result<Self> {
+            let name = format!(
+                "siglake_wal_reader_{case}_{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            sqlx::query(&format!("CREATE SCHEMA {name}"))
+                .execute(admin)
+                .await
+                .with_context(|| format!("create scratch schema {name}"))?;
+            let uri = scratch_uri(base, &name);
+            Ok(Self { name, uri })
+        }
+
+        async fn connect(&self) -> Result<AnyPool> {
+            AnyPoolOptions::new()
+                .max_connections(1)
+                .connect(&self.uri)
+                .await
+                .with_context(|| format!("connect to scratch schema {}", self.name))
+        }
+
+        async fn drop_schema(self, admin: &AnyPool) {
+            if let Err(e) = sqlx::query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.name))
+                .execute(admin)
+                .await
+            {
+                eprintln!("warning: leaked scratch schema {}: {e}", self.name);
+            }
+        }
+    }
+
+    async fn create_ledger_table(pool: &AnyPool) -> Result<()> {
+        sqlx::query(
+            "CREATE TABLE wal_segments (
+                id TEXT PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                index_id TEXT NOT NULL,
+                segment_url TEXT NOT NULL
+            )",
+        )
+        .execute(pool)
+        .await
+        .context("create wal_segments")?;
+        Ok(())
+    }
+
+    fn require_read_only_transaction(err: sqlx::Error) -> Result<()> {
+        let text = err.to_string();
+        let sqlx::Error::Database(database) = err else {
+            anyhow::bail!("UPDATE failed outside the server: {text}");
+        };
+        ensure!(
+            database.code().as_deref() == Some("25006"),
+            "UPDATE was not refused as a read-only SQL transaction (SQLSTATE {:?}): {text}",
+            database.code()
+        );
+        Ok(())
+    }
+
+    async fn chunk_and_fence_case(admin: &AnyPool, base: &str) -> Result<()> {
+        let scratch = Scratch::create(admin, base, "lookup").await?;
+        let outcome = async {
+            let setup = scratch.connect().await?;
+            create_ledger_table(&setup).await?;
+            sqlx::query(
+                "CREATE TABLE write_probe (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)",
+            )
+            .execute(&setup)
+            .await
+            .context("create the ordinary table used by the write probe")?;
+            sqlx::query("INSERT INTO write_probe (id, value) VALUES (1, 7)")
+                .execute(&setup)
+                .await
+                .context("seed the write probe")?;
+
+            let count = LOOKUP_CHUNK + 3;
+            for i in 0..count {
+                let id = format!("seg-{i:03}");
+                sqlx::query(
+                    "INSERT INTO wal_segments (id, tenant, index_id, segment_url) \
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(&id)
+                .bind(format!("tenant-{i}"))
+                .bind(if i % 2 == 0 { "" } else { "orders" })
+                .bind(format!("wal-mirror/{id}.arrow"))
+                .execute(&setup)
+                .await
+                .with_context(|| format!("seed {id}"))?;
+            }
+            setup.close().await;
+
+            let listed: Vec<String> = (0..count).map(|i| format!("seg-{i:03}")).collect();
+            let reader = WalLedgerReader::open(&scratch.uri).await?;
+            let matched = reader.lookup(&listed).await?;
+            ensure!(
+                reader.queries() == 2,
+                "259 ids took {} queries",
+                reader.queries()
+            );
+            ensure!(
+                matched.len() == count,
+                "matched {} of {count}",
+                matched.len()
+            );
+            for i in [0, LOOKUP_CHUNK - 1, LOOKUP_CHUNK, count - 1] {
+                let id = format!("seg-{i:03}");
+                let row = matched.get(&id).with_context(|| format!("missing {id}"))?;
+                ensure!(
+                    row.tenant == format!("tenant-{i}"),
+                    "wrong row for {id}: {row:?}"
+                );
+                ensure!(
+                    row.segment_url == format!("wal-mirror/{id}.arrow"),
+                    "wrong URL for {id}: {row:?}"
+                );
+            }
+
+            // This is the reader's fenced connection, not a second pool. The
+            // target is an ordinary table that the setup connection just
+            // created and updated, so SQLSTATE 25006 proves the transaction
+            // is what refused the write.
+            let write_error = {
+                let mut conn = reader.conn.lock().await;
+                sqlx::query("UPDATE write_probe SET value = value + 1 WHERE id = 1")
+                    .execute(&mut **conn)
+                    .await
+                    .expect_err("the reader connection must be read-only")
+            };
+            require_read_only_transaction(write_error)?;
+            reader.close().await;
+
+            let verify = scratch.connect().await?;
+            let value: i64 = sqlx::query_scalar("SELECT value FROM write_probe WHERE id = 1")
+                .fetch_one(&verify)
+                .await
+                .context("read the write probe after the refused UPDATE")?;
+            verify.close().await;
+            ensure!(
+                value == 7,
+                "the refused UPDATE changed write_probe to {value}"
+            );
+            Ok(())
+        }
+        .await;
+        scratch.drop_schema(admin).await;
+        outcome
+    }
+
+    async fn absent_and_empty_case(admin: &AnyPool, base: &str) -> Result<()> {
+        let scratch = Scratch::create(admin, base, "absence").await?;
+        let outcome = async {
+            let err = WalLedgerReader::open(&scratch.uri)
+                .await
+                .expect_err("an absent wal_segments table must be unavailable");
+            let text = format!("{err:#}");
+            ensure!(
+                text.contains("not a siglake catalog"),
+                "wrong absence error: {text}"
+            );
+
+            let setup = scratch.connect().await?;
+            let tables: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = $1 AND table_name = 'wal_segments'",
+            )
+            .bind(&scratch.name)
+            .fetch_one(&setup)
+            .await
+            .context("check that the reader did not create wal_segments")?;
+            ensure!(tables == 0, "the failed reader created wal_segments");
+
+            create_ledger_table(&setup).await?;
+            setup.close().await;
+            let reader = WalLedgerReader::open(&scratch.uri).await?;
+            let rows = reader.lookup(&["absent-id".to_string()]).await?;
+            ensure!(rows.is_empty(), "an empty ledger returned {rows:?}");
+            reader.close().await;
+            Ok(())
+        }
+        .await;
+        scratch.drop_schema(admin).await;
+        outcome
+    }
+
+    #[test]
+    fn the_scratch_uri_pins_the_search_path() {
+        use sqlx::postgres::PgConnectOptions;
+        use std::str::FromStr;
+
+        let uri = scratch_uri(
+            "postgres://siglake:siglake@localhost:5433/siglake?sslmode=disable",
+            "siglake_wal_reader_deadbeef",
+        );
+        let options = PgConnectOptions::from_str(&uri).expect(&uri);
+        assert_eq!(
+            options.get_options(),
+            Some("-c search_path=siglake_wal_reader_deadbeef")
+        );
+        assert_eq!(Dialect::from_uri(&uri), Dialect::Postgres);
+    }
+
+    #[test]
+    fn both_gates_run_this_module_by_name() {
+        let module = module_path!().rsplit("::").next().expect("module name");
+        for rel in [".github/workflows/ci.yml", "scripts/ci-local.sh"] {
+            let path =
+                std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).join(rel);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let filters: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains("cargo test -p siglake-storage --lib"))
+                .filter_map(|line| {
+                    let mut words = line.split_whitespace().skip_while(|w| *w != "--lib");
+                    words.next();
+                    words.next()
+                })
+                .collect();
+            assert!(
+                filters.contains(&module),
+                "{rel} runs no `cargo test -p siglake-storage --lib {module}`; filters: {filters:?}"
+            );
+            assert!(text.contains(URI_VAR), "{rel} must give that run {URI_VAR}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn the_reader_behaves_read_only_against_postgres() {
+        let base = match std::env::var(URI_VAR) {
+            Ok(uri) if !uri.trim().is_empty() => uri,
+            _ => {
+                eprintln!("skipped: {URI_VAR} is unset; nothing was verified");
+                return;
+            }
+        };
+        assert!(
+            Dialect::from_uri(&base) == Dialect::Postgres,
+            "{URI_VAR} must name Postgres"
+        );
+        sqlx::any::install_default_drivers();
+        let admin = AnyPool::connect(&base)
+            .await
+            .unwrap_or_else(|e| panic!("connect {URI_VAR}: {e}"));
+
+        let outcomes = [
+            (
+                "a full 256-id chunk and its successor return the right rows, and writes fail",
+                chunk_and_fence_case(&admin, &base).await,
+            ),
+            (
+                "an absent wal_segments is unavailable while an empty one is readable",
+                absent_and_empty_case(&admin, &base).await,
+            ),
+        ];
+        admin.close().await;
+        let failed: Vec<String> = outcomes
+            .into_iter()
+            .filter_map(|(case, outcome)| outcome.err().map(|e| format!("- {case}: {e:#}")))
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "Postgres reader cases failed:\n{}",
+            failed.join("\n")
+        );
+    }
+}
