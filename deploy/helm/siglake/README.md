@@ -202,6 +202,37 @@ metric still renders in filesystem mode, where each pod's sealed count is its
 own — but the refusal above holds that mode at `maxReplicas: 1`, so it scales
 nothing there either.
 
+### Switching an existing filesystem-drain release to the claim
+
+The upgrade re-renders the compactor onto that `emptyDir` and changes nothing
+on the volume. The PVC stays — the ingester still mounts it at
+`/var/lib/siglake/wal` — but the compactor stops reading it, so anything the
+filesystem drain had set aside there is unattended and unreported from then
+on.
+
+Held orphans are the case to settle before you switch. A segment the drain
+quarantined under `<wal>/**/orphans/` and could not settle is held, counted by
+`siglake_compactor_orphans_held{tenant}` and paged by
+`SiglakeCompactorOrphansHeld` (see the alert list below). Both readings come
+from the filesystem sweep; the claim drain publishes neither, and the pod that
+would census the directory no longer has the volume. An absent series after
+the switch is therefore not evidence that the old volume is clear.
+
+So, in order: inventory `<wal>/**/orphans/` on the PVC first — from an
+ingester pod, which mounts the same claim before and after — and record what
+is there. Keep the files. A held orphan's commit status is UNKNOWN, which is
+why it was held and not a finding that its rows are missing: they may already
+be in the table or may exist nowhere else, so deleting one can lose rows and
+requeueing one can duplicate them. Establish which from your own retention and
+ingest history before moving anything. The way back changes too: the claim
+drain never reads `sealed/`, so a file moved there afterwards reaches the
+table by way of the ingester's mirror catch-up sweep and the claim drain's
+mirror sync, not the local rename the filesystem drain used.
+
+`siglake-operator` refuses this handover rather than performing it
+(`DrainModeHandoverRequired`, `docs/LIMITATIONS.md`); the chart does not
+refuse it, which is why the inventory is yours to do.
+
 ### The ingester does not compact
 
 `ingest-server --with-compactor` gives one process an in-process compactor.
@@ -603,7 +634,9 @@ will not clear an existing hold. The level is charted per tenant on the
 set-aside series, so the page's first two questions — one tenant or the fleet,
 steady or growing — are answered without an ad-hoc query. Only the filesystem
 drain publishes it: under the catalog claim the series is absent, which says
-nothing about what a former WAL PVC still holds.
+nothing about what a former WAL PVC still holds — "Switching an existing
+filesystem-drain release to the claim" above is what to do about that before
+the switch.
 
 The starter Grafana dashboard `deploy/grafana/siglake-overview.json`
 groups panels the same way and filters on `namespace` (the label

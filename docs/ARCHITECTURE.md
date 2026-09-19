@@ -301,7 +301,10 @@ so a settled hold comes back to zero. `SiglakeCompactorOrphansHeld` pages on it
 after 15 minutes, critical: raising `retainLast` protects the proof for future
 orphans but cannot restore expired history, so the way out is an operator
 establishing commit status from their own evidence before requeueing or
-deleting anything.
+deleting anything. Both the disposition and the level belong to this drain
+alone — the catalog-claim path visits no WAL directory — so a deployment
+moving between the two settles its held orphans as a migration step
+(`docs/LIMITATIONS.md`).
 Every other failure is retried inside the pass, bounded per segment: a pass
 makes at most three claims on the same segment and then leaves it in `sealed/`
 for the next cycle, counting it under
