@@ -647,10 +647,12 @@ spec:
           annotations:
             summary: Query is denying tenants
             description: >-
-              Verified tokens are arriving without a usable
-              query.oidc.tenantClaim value, so their queries are refused with
-              403 rather than routed to the default namespace. Either the IDP
-              is not minting the claim or the configured claim name is wrong.
+              Query tenants are being refused with 403 before a namespace is
+              opened. The reason label says which: not_allowed is a usable
+              verified claim absent from query.allowedTenants; claim_missing
+              or claim_invalid means the IDP is not minting a usable
+              query.oidc.tenantClaim value or the configured claim name is
+              wrong.
 
     - name: siglake.saturation
       rules:

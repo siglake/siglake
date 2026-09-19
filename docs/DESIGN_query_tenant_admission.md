@@ -1,8 +1,6 @@
 # Query tenant admission qualification
 
-Status: qualified on 2026-09-19. Proceed with the query-specific, opt-in
-allow-list in #5489. This document records the contract; it does not add the
-setting.
+Status: implemented on 2026-09-19 in #5489 after qualification in #3068.
 
 ## Finding
 
@@ -66,7 +64,7 @@ claims able to create catalog state forever. The measured cost does not justify
 a default cap or a release hold; it does justify an opt-in exact set for
 deployments whose tenants are known.
 
-## Contract for #5489
+## Implemented contract
 
 - Add `query.allowedTenants` and the matching query-server CLI/environment
   input. An empty value emits no restriction and preserves current behaviour.

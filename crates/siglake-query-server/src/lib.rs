@@ -262,6 +262,11 @@ pub struct AppState {
     /// Per-request tenant routing. `None` ⇒ every request routes
     /// through `ice` (the v0 single-tenant behavior).
     pub tenants: Option<TenantRegistry>,
+    /// Exact set of named tenants this query process admits. `None` keeps the
+    /// compatibility default: every verified, usable tenant claim is allowed.
+    /// This is deliberately independent of ingest admission so a tenant whose
+    /// writes have stopped can remain readable through its retention window.
+    pub allowed_tenants: Option<Arc<std::collections::HashSet<String>>>,
     /// Query scan tuning for per-request SessionContext creation.
     pub query_scan: QueryScanConfig,
     /// Where distributed-query membership comes from (#7 part 2b, #967): a
@@ -324,6 +329,7 @@ impl AppState {
             jobs: Arc::new(JobStore::default()),
             audit: None,
             tenants: None,
+            allowed_tenants: None,
             query_scan: QueryScanConfig::default(),
             peers: None,
             coordinator_token: None,
@@ -402,6 +408,37 @@ impl AppState {
     pub fn with_tenants(mut self, tenants: TenantRegistry) -> Self {
         self.tenants = Some(tenants);
         self
+    }
+
+    pub fn with_allowed_tenants<I, S>(mut self, tenants: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let tenants: std::collections::HashSet<_> = tenants.into_iter().map(Into::into).collect();
+        self.allowed_tenants = (!tenants.is_empty()).then(|| Arc::new(tenants));
+        self
+    }
+
+    /// Refuse a named tenant outside this process's query allow-list.
+    ///
+    /// Callers must invoke this only after the tenant identifier has passed
+    /// [`crate::tenants::validate`]. It intentionally admits `None`: the list
+    /// bounds verified named claims and does not create a routing mode for
+    /// open or static-token authentication.
+    pub fn authorize_tenant(&self, identity: &CallerIdentity) -> Result<(), ApiError> {
+        let (Some(allowed), Some(tenant)) = (&self.allowed_tenants, identity.tenant.as_deref())
+        else {
+            return Ok(());
+        };
+        if allowed.contains(tenant) {
+            return Ok(());
+        }
+        metrics::counter!("siglake_query_tenant_denied_total", "reason" => "not_allowed")
+            .increment(1);
+        Err(ApiError::forbidden(
+            "tenant is not in this query server's allowed tenant set",
+        ))
     }
 
     pub fn with_query_scan(mut self, query_scan: QueryScanConfig) -> Self {

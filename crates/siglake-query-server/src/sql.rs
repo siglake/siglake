@@ -3873,7 +3873,8 @@ pub(crate) async fn plan_client_sql(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 413, description = "Two distinct cases. Either the row cap was hit \
             while rendering — the body is then a `RecordsResponse` with \
@@ -4039,7 +4040,8 @@ pub async fn handle(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 413, description = "Row cap hit (body is a truncated \
             `RecordsResponse`) or the mid-flight breaker tripped (body is an error).",
@@ -6232,7 +6234,8 @@ fn batch_failed(err: &anyhow::Error, cost: CostReport) -> BatchOutcome {
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 422, description = "Unprocessable request body: a key inside \
             `limits` is not a known per-request limit. The commonest case is \
@@ -14745,7 +14748,8 @@ pub struct ShardPin {
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 413, description = "The mid-flight rows-scanned breaker tripped.",
          body = ApiErrorBody),
@@ -14851,6 +14855,11 @@ pub async fn shard(
         }
         false => identity,
     };
+    // A worker may be more restrictive than the coordinator during a rolling
+    // configuration change. Enforce its own policy against the authenticated,
+    // forwarded tenant before `resolve_ice` can create a namespace or context;
+    // the coordinator preserves this deliberate 403 for the caller.
+    state.authorize_tenant(&identity)?;
     // Resolving the tenant context can create and open a catalog; the `SEARCH`
     // rewrite reads the index config behind it. Catalog work, on this request's
     // clock like everything else.
@@ -15212,7 +15221,8 @@ pub async fn shard(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 413, description = "Row cap hit, or the mid-flight rows-scanned \
             breaker tripped.",

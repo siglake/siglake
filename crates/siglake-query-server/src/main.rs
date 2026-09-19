@@ -88,6 +88,13 @@ struct Cli {
     #[arg(long, env = "SIGLAKE_OIDC_TENANT_CLAIM")]
     oidc_tenant_claim: Option<String>,
 
+    /// Exact tenant claims this query server accepts, comma-separated. Empty
+    /// or unset keeps query admission unrestricted. Requires
+    /// `--oidc-tenant-claim`; this setting never reads or inherits the ingest
+    /// allow-list.
+    #[arg(long, env = "SIGLAKE_QUERY_ALLOWED_TENANTS")]
+    allowed_tenants: Option<String>,
+
     /// Server-side cap on rows returned per query. NDJSON streams stop
     /// at the cap and emit a truncation marker; records responses
     /// truncate, flip the `truncated` flag, and return 413.
@@ -371,6 +378,22 @@ async fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
+    // Resolve and validate the admission configuration before opening a
+    // catalog or contacting OIDC discovery. A configured list without claim
+    // routing could never match a named tenant and must not start as though it
+    // were enforcing a boundary.
+    let oidc_tenant_claim = oidc_tenant_claim_from(cli.oidc_tenant_claim.as_deref());
+    let allowed_tenants = allowed_tenants_from(cli.allowed_tenants.as_deref())
+        .map_err(|message| anyhow::anyhow!(message))?;
+    if let Some(message) = query_tenant_config_error(
+        cli.oidc_issuer.as_deref(),
+        cli.oidc_audience.as_deref(),
+        oidc_tenant_claim,
+        allowed_tenants.is_some(),
+    ) {
+        anyhow::bail!(message);
+    }
+
     let read_caches = siglake_storage::resolve_query_read_cache_config(
         siglake_storage::iceberg::cgroup_memory_limit_bytes(),
         cli.query_object_cache_max_bytes,
@@ -419,11 +442,6 @@ async fn run() -> Result<()> {
         &cli.tenant_namespace,
     )
     .await?;
-
-    // Resolved once and read at all three sites below (the verifier, the
-    // no-OIDC refusal, the tenant registry), so none of them can disagree
-    // about whether this process derives tenancy from a claim.
-    let oidc_tenant_claim = oidc_tenant_claim_from(cli.oidc_tenant_claim.as_deref());
 
     let auth = match (cli.oidc_issuer.as_deref(), cli.oidc_audience.as_deref()) {
         (Some(issuer), Some(audience)) => {
@@ -594,6 +612,10 @@ async fn run() -> Result<()> {
     if oidc_tenant_claim.is_some() {
         state = state.with_tenants(siglake_query_server::TenantRegistry::new(ice.clone()));
     }
+    if let Some(allowed) = allowed_tenants {
+        tracing::info!(tenants = allowed.len(), "query tenant allow-list enabled");
+        state = state.with_allowed_tenants(allowed);
+    }
 
     if !cli.audit_disabled {
         let (service, writer) = AuditService::with_defaults(ice.clone());
@@ -750,9 +772,62 @@ fn oidc_tenant_claim_from(raw: Option<&str>) -> Option<&str> {
     raw.map(str::trim).filter(|claim| !claim.is_empty())
 }
 
+/// Resolve the comma-delimited CLI values to the exact normalized tenant ids
+/// used by request admission. Blank entries are the unrestricted default;
+/// every non-blank entry must satisfy the same identifier rule as a claim.
+fn allowed_tenants_from(
+    raw: Option<&str>,
+) -> std::result::Result<Option<std::collections::HashSet<String>>, String> {
+    let mut allowed = std::collections::HashSet::new();
+    for configured in raw.unwrap_or_default().split(',') {
+        if configured.trim().is_empty() {
+            continue;
+        }
+        let Some(tenant) = siglake_query_server::tenants::validate(configured) else {
+            return Err(format!(
+                "--allowed-tenants contains an unusable tenant identifier ({})",
+                siglake_core::tenant::TENANT_ID_RULE
+            ));
+        };
+        allowed.insert(tenant);
+    }
+    Ok((!allowed.is_empty()).then_some(allowed))
+}
+
+/// Report a query tenancy configuration the server cannot enforce.
+///
+/// Pure so tests cover every combination without mutating process environment
+/// or contacting an identity provider.
+fn query_tenant_config_error(
+    oidc_issuer: Option<&str>,
+    oidc_audience: Option<&str>,
+    oidc_tenant_claim: Option<&str>,
+    has_allowed_tenants: bool,
+) -> Option<&'static str> {
+    match (oidc_issuer, oidc_audience) {
+        (Some(_), Some(_)) => {}
+        (Some(_), None) | (None, Some(_)) => {
+            return Some("--oidc-issuer and --oidc-audience must both be set (or both unset)");
+        }
+        (None, None) if oidc_tenant_claim.is_some() => {
+            return Some("--oidc-tenant-claim requires --oidc-issuer + --oidc-audience");
+        }
+        (None, None) => {}
+    }
+    if has_allowed_tenants && oidc_tenant_claim.is_none() {
+        return Some(
+            "--allowed-tenants requires --oidc-tenant-claim: the allow-list matches verified named tenant claims",
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{jobs_store_uri_from, oidc_tenant_claim_from, Cli, OidcVerifier};
+    use super::{
+        allowed_tenants_from, jobs_store_uri_from, oidc_tenant_claim_from,
+        query_tenant_config_error, Cli, OidcVerifier,
+    };
     use clap::{CommandFactory, Parser};
     use siglake_storage::resolve_query_read_cache_config;
 
@@ -964,6 +1039,50 @@ mod tests {
             resolved(&["siglake-query-server", "--oidc-tenant-claim", " org "]),
             Some("org".to_string())
         );
+    }
+
+    #[test]
+    fn query_allow_list_is_opt_in_and_uses_validated_tenant_ids() {
+        assert_eq!(allowed_tenants_from(None).unwrap(), None);
+        assert_eq!(allowed_tenants_from(Some("")).unwrap(), None);
+        assert_eq!(allowed_tenants_from(Some(" ,   ")).unwrap(), None);
+
+        let cli = Cli::try_parse_from([
+            "siglake-query-server",
+            "--allowed-tenants",
+            " acme,widgets,acme ",
+        ])
+        .expect("allow-list parses");
+        let allowed = allowed_tenants_from(cli.allowed_tenants.as_deref())
+            .unwrap()
+            .expect("nonempty list");
+        assert_eq!(allowed.len(), 2);
+        assert!(allowed.contains("acme"));
+        assert!(allowed.contains("widgets"));
+
+        let err = allowed_tenants_from(Some("acme.corp")).unwrap_err();
+        assert!(err.contains(siglake_core::tenant::TENANT_ID_RULE));
+    }
+
+    #[test]
+    fn query_allow_list_requires_verified_claim_routing() {
+        assert_eq!(query_tenant_config_error(None, None, None, false), None);
+        assert_eq!(
+            query_tenant_config_error(Some("issuer"), Some("audience"), None, false),
+            None
+        );
+        assert_eq!(
+            query_tenant_config_error(Some("issuer"), Some("audience"), Some("org"), true),
+            None
+        );
+        assert!(
+            query_tenant_config_error(Some("issuer"), Some("audience"), None, true)
+                .unwrap()
+                .contains("--oidc-tenant-claim")
+        );
+        assert!(query_tenant_config_error(None, None, Some("org"), true)
+            .unwrap()
+            .contains("--oidc-issuer"));
     }
 
     /// The resolved value is what reaches the verifier, so a whitespace-only

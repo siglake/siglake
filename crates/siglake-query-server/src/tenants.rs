@@ -67,6 +67,13 @@ impl TenantRegistry {
         self.default.clone()
     }
 
+    /// Number of retained tenant contexts. Public only for integration tests
+    /// that prove admission refusals happen before registry resolution.
+    #[doc(hidden)]
+    pub async fn cached_tenant_count(&self) -> usize {
+        self.cache.read().await.len()
+    }
+
     /// Resolve the per-tenant context for `tenant`, opening the
     /// namespace lazily on first use.
     ///

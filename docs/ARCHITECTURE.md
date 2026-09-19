@@ -1637,8 +1637,8 @@ not tenant authorization. Identifiers are validated, never repaired: `acme.corp`
 is a refusal rather than a rewrite to `acmecorp`, so two claims cannot alias
 onto one namespace and an all-invalid claim cannot fall back to the default
 one. Refusals are counted by `siglake_query_tenant_denied_total` and
-`siglake_ingest_tenant_denied_total`. Query currently emits
-`reason="claim_missing"` / `"claim_invalid"`; ingest also emits
+`siglake_ingest_tenant_denied_total`. Query emits `reason="claim_missing"` /
+`"claim_invalid"` / `"not_allowed"`; ingest also emits
 `"header_mismatch"` / `"header_not_trusted"` / `"not_allowed"` /
 `"at_capacity"`.
 
@@ -1648,6 +1648,16 @@ namespace. `ingester.allowedTenants` bounds that when the tenant set is known �
 checked against the tenant actually resolved, so it bounds a JWT claim as well
 as a trusted header; `ingester.maxTenants` and `ingester.maxLanes` are the
 backstop when it is not. All default to unbounded.
+
+`query.allowedTenants` separately bounds verified query claims before the
+tenant registry opens a namespace or retains a context. Empty is unrestricted,
+and a non-empty set requires `query.oidc.tenantClaim`; it does not turn open or
+static-token authentication into tenant routing. The query set never inherits
+`ingester.allowedTenants`: read access can remain after write admission ends.
+Coordinator-authenticated `/api/v1/sql/shard` requests carry the caller's
+tenant, and every worker checks its own query set before resolution. A worker
+whose set differs during a rollout returns `403`, which the coordinator
+preserves for the caller.
 
 `ingester.maxTenants` counts distinct resolved tenants, not `(tenant, index)`
 lanes — one tenant writing to twelve indexes is one tenant, and
@@ -1660,16 +1670,15 @@ per process: it starts empty on restart, and each pod holds its own, so a
 cap was inert until #4240** — parsed, passed to the ingester and never read, so
 an operator whose only bound was `maxTenants` had none.
 
-**Query admission remains unrestricted.** A valid claim currently creates the
-tenant namespace and its empty tables on first resolution and leaves a context
-in the process registry. The contexts share one catalog pool and the common
-caches. A bounded local run through 100 novel claims retained 69–76 KiB of
-heap and added 334 KiB of SQLite/Iceberg metadata in 200 files. The qualified
-extension is a separate, default-off query allow-list. A tenant can then remain
-readable after it stops accepting writes. Its direct and distributed admission
-contract and the measurement are in
-[`DESIGN_query_tenant_admission.md`](DESIGN_query_tenant_admission.md); #5489
-tracks implementation.
+**Query admission is unrestricted by default and exactly bounded on request.**
+A valid claim creates the tenant namespace and its empty tables on first
+resolution and leaves a context in the process registry. The contexts share
+one catalog pool and the common caches. A bounded local run through 100 novel
+claims retained 69–76 KiB of heap and added 334 KiB of SQLite/Iceberg metadata
+in 200 files. `query.allowedTenants` prevents claims outside a known set from
+reaching that creation path while preserving compatibility for deployments
+that leave it empty. The direct and distributed contract and measurement are
+in [`DESIGN_query_tenant_admission.md`](DESIGN_query_tenant_admission.md).
 
 ## Observability (OpenTelemetry emission)
 

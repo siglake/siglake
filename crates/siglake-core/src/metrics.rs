@@ -636,6 +636,7 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
     AlertedCounter {
         name: "siglake_query_tenant_denied_total",
         series: &[
+            &[("reason", "not_allowed")],
             &[("reason", "claim_missing")],
             &[("reason", "claim_invalid")],
         ],

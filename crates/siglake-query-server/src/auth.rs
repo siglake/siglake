@@ -216,6 +216,9 @@ pub async fn middleware(
             }
         }
     };
+    if let Err(refusal) = state.authorize_tenant(&identity) {
+        return refusal.into_response();
+    }
     request.extensions_mut().insert(identity);
     next.run(request).await
 }

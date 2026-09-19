@@ -1587,6 +1587,28 @@ def check_oidc_env(docs: list[dict], expected: dict[str, dict[str, str]]) -> lis
     return problems
 
 
+def check_query_allowed_tenants_env(
+    docs: list[dict], expected: str | None
+) -> list[str]:
+    """The query allow-list reaches query pods only on the configured arm."""
+    value = None
+    for doc in docs:
+        if doc.get("kind") != "StatefulSet":
+            continue
+        for container in doc["spec"]["template"]["spec"].get("containers", []):
+            if container.get("name") != QUERY_CONTAINER:
+                continue
+            for env in container.get("env") or []:
+                if env.get("name") == "SIGLAKE_QUERY_ALLOWED_TENANTS":
+                    value = env.get("value")
+    if value != expected:
+        return [
+            "query container renders SIGLAKE_QUERY_ALLOWED_TENANTS "
+            f"as {value!r}; expected {expected!r}"
+        ]
+    return []
+
+
 def check_query_peer_discovery(docs: list[dict]) -> list[str]:
     """#967: hold the four halves of runtime peer discovery together.
 
@@ -3585,6 +3607,7 @@ def main(argv: list[str] | None = None) -> int:
          ["--set", "query.oidc.issuer=https://idp.example/realms/siglake",
           "--set", "query.oidc.audience=siglake-query",
           "--set", "query.oidc.tenantClaim=org_id",
+          "--set", "query.allowedTenants={acme,widgets}",
           "--set", "query.distributed.coordinatorToken.value=coord"]),
         # The single-tenant OIDC configuration on both tiers: issuer and
         # audience with no claim, where SIGLAKE_OIDC_TENANT_CLAIM must be
@@ -3676,6 +3699,9 @@ def main(argv: list[str] | None = None) -> int:
             },
         },
     }
+    expected_query_allowed_tenants = {
+        "oidc-query": "acme,widgets",
+    }
     # #3718: which metrics each HPA may carry, per arm. The compactor's backlog
     # gauge is a per-pod (`Pods`) metric to the autoscaler, so it belongs only
     # on an arm where the reading is one pod's own.
@@ -3741,6 +3767,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         problems.extend(check_hpa_metrics(docs, expected_hpa_metrics.get(label, {})))
         problems.extend(check_oidc_env(docs, expected_oidc.get(label, {})))
+        problems.extend(
+            check_query_allowed_tenants_env(
+                docs, expected_query_allowed_tenants.get(label)
+            )
+        )
         checked_rules, promtool_problems, promtool_skipped = check_prometheus_rules(
             docs, require_promtool=args.require_promtool
         )
@@ -3872,6 +3903,10 @@ def main(argv: list[str] | None = None) -> int:
          ["--set", "query.oidc.issuer=https://idp.example/realms/siglake",
           "--set", "query.oidc.audience=siglake-query"],
          coord_message, coord_allowed),
+        ("query-allowed-tenants-without-claim",
+         ["--set", "query.allowedTenants={acme,widgets}"],
+         "query.allowedTenants is non-empty but query.oidc.tenantClaim is unset",
+         "installing a query allow-list with no verified tenant claim to match"),
         ("query-tokens-eso-plus-inline",
          eso_tokens + ["--set", "query.tokens.list={dev-1,dev-2}"],
          token_source_message, token_source_allowed),
