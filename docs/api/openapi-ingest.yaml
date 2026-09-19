@@ -244,14 +244,14 @@ paths:
               schema:
                 $ref: '#/components/schemas/SiglakeErrorBody'
         '503':
-          description: Shedding load. Retry the batch verbatim.
+          description: Transient load shedding, or a novel tenant/index key past the persistent lane cap. The lane-cap response has no Retry-After header because recovery requires routing or operator action.
           headers:
             retry-after:
               schema:
                 type: integer
                 format: int64
                 minimum: 0
-              description: Seconds to wait before retrying.
+              description: Seconds to wait before retrying; absent for a lane-cap refusal.
           content:
             application/json:
               schema:
@@ -407,14 +407,14 @@ paths:
               schema:
                 $ref: '#/components/schemas/SiglakeErrorBody'
         '503':
-          description: Shedding load. Retry the batch verbatim.
+          description: Transient load shedding, or a novel tenant/index key past the persistent lane cap. The lane-cap response has no Retry-After header because recovery requires routing or operator action.
           headers:
             retry-after:
               schema:
                 type: integer
                 format: int64
                 minimum: 0
-              description: Seconds to wait before retrying.
+              description: Seconds to wait before retrying; absent for a lane-cap refusal.
           content:
             application/json:
               schema:
@@ -681,14 +681,14 @@ paths:
               schema:
                 $ref: '#/components/schemas/SiglakeErrorBody'
         '503':
-          description: 'Shedding load: the memory circuit breaker tripped, or the backpressure queue is full. Retry the batch verbatim.'
+          description: 'Shedding load: the memory circuit breaker tripped, the backpressure queue is full, or a novel tenant/index key reached the persistent lane cap. Retry-After is omitted for the lane cap because recovery requires routing or operator action.'
           headers:
             retry-after:
               schema:
                 type: integer
                 format: int64
                 minimum: 0
-              description: Seconds to wait before retrying.
+              description: Seconds to wait before retrying; present for transient shedding and absent for a lane-cap refusal.
           content:
             application/json:
               schema:
@@ -822,14 +822,14 @@ paths:
               schema:
                 $ref: '#/components/schemas/SiglakeErrorBody'
         '503':
-          description: Shedding load. Retry the batch verbatim.
+          description: Transient load shedding, or a novel tenant/index key past the persistent lane cap. The lane-cap response has no Retry-After header because recovery requires routing or operator action.
           headers:
             retry-after:
               schema:
                 type: integer
                 format: int64
                 minimum: 0
-              description: Seconds to wait before retrying.
+              description: Seconds to wait before retrying; absent for a lane-cap refusal.
           content:
             application/json:
               schema:
