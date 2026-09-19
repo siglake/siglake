@@ -481,9 +481,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `field_mappings` are no longer an extension of what is stored, and only the
   caller knows what it meant to append, so the update is refused and the caller
   must re-read the index and re-send. The refusal is a `400` — there is no
-  version or `If-Match` in the request to answer with a `409`, and no
-  merge-on-append mode. Re-sending an update that is already stored stays a
-  no-op, so an idempotent retry costs nothing.
+  version or `If-Match` in the request, and no merge-on-append mode. Re-sending
+  an update that is already stored stays a no-op, so an idempotent retry costs
+  nothing. An optional mapping-specific ETag has been qualified without
+  changing this behavior; its validator, retry rule and open `412` versus `409`
+  choice are in
+  [`DESIGN_managed_index_put_preconditions.md`](DESIGN_managed_index_put_preconditions.md).
 - **Pre-0.1.0 warehouses are not migrated to the current timestamp contract.**
   Tables written before 2026-09-06 are Iceberg format version 3 with a
   nanosecond `timestamp` and no `timestamp_ns` sibling. siglake still reads
