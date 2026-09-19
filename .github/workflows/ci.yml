@@ -342,21 +342,31 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.95.0
       # THIS JOB DOES NOT FIT A STANDARD GITHUB-HOSTED RUNNER WITHOUT THIS STEP.
-      # `cargo test --workspace` links 124 test binaries (107 of them one per
-      # `tests/*.rs` file, each carrying its own copy of DataFusion, Arrow and
-      # the AWS SDK) and cargo builds all of them before it runs any, so the
-      # peak is the sum. Measured 2026-09-04 from a warm tree with exactly the
-      # env block above: 36.6 GiB of test binaries (median 296 MiB, largest
-      # 461 MiB) plus 4.6 GiB of rlibs, rmeta and build scripts -- 41 GiB before
-      # the toolchain (0.6 GB) and the registry (2 GB). With the default full
-      # debuginfo it is 101 GiB, which is the ENOSPC the env block describes.
+      # The pre-consolidation measurement from 2026-09-04 found 124 test
+      # executables: 36.6 GiB (median 296 MiB, largest 461 MiB), plus 4.6 GiB
+      # of other target files, or 41.2 GiB total. Full debuginfo used 101 GiB.
+      # Preserve those numbers as history; they are not the current baseline.
+      #
+      # Re-measured 2026-09-19 at 19f6a3b2b772 with Rust 1.95.0 and mold 2.42.1.
+      # Each profile got a separate, initially empty CARGO_TARGET_DIR. Both used
+      # CARGO_INCREMENTAL=0, mold, and `cargo test --workspace --no-run
+      # --message-format=json`; only CARGO_PROFILE_{DEV,TEST}_DEBUG changed.
+      # Unique non-null `executable` paths in Cargo's compiler-artifact records
+      # gave the same 110 targets in both profiles (88 tests, 10 libs, 10 bins,
+      # 2 examples). At line-tables-only they occupy 44.0 GiB (median 536 MiB,
+      # largest 637 MiB), while the complete target occupies 47.5 GiB. At full
+      # debuginfo they occupy 101.3 GiB (median 1,153 MiB, largest 1,336 MiB),
+      # while the complete target occupies 106.5 GiB. The old 124 count came
+      # from the pre-consolidation tree; an isolated current build does not
+      # reproduce the later warm-tree report of 78 executables either.
       #
       # The 24.04 image ships roughly 25-30 GB of toolchains nothing here uses
       # (Android SDK, .NET, GHC, CodeQL, Swift, PowerShell modules, Miniconda,
-      # Julia, cached docker images). Deleting them is the difference between
-      # ~21 GB free and ~45-50 GB, which is enough with a margin under 10 GB --
-      # so the `df -h` at the end of this job is the number to read on the first
-      # run in a repo without Depot. If it still dies, the next rung is
+      # Julia, cached docker images). Deleting them raises free space from
+      # ~21 GB to ~45-50 GB. The isolated target alone is 47.5 GiB, so the
+      # `df -h` at the end of this job decides the hosted-runner margin after
+      # its toolchain and registry are included. If it still dies, the next
+      # rung is
       # `CARGO_PROFILE_TEST_DEBUG=0` for these runners only (roughly 22 GiB of
       # test binaries by section arithmetic on the largest one, not measured;
       # the panic message keeps file:line, only backtrace frames lose it), and
