@@ -7,16 +7,15 @@
 #
 # If you are reading this file be aware that the original Cargo.toml
 # will likely look very different (and much more reasonable).
-# The original Cargo.toml is not vendored: the pristine upstream package,
-# Cargo.toml.orig included, is the crates.io copy in the cargo registry.
-# siglake's divergences from it are git history plus third_party/README.md.
+# See Cargo.toml.orig for the original contents.
 
 [package]
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.94"
 name = "iceberg-catalog-sql"
-version = "0.9.1"
+version = "0.10.1"
 build = false
+publish = true
 autolib = false
 autobins = false
 autoexamples = false
@@ -43,7 +42,7 @@ path = "src/lib.rs"
 version = "0.1.89"
 
 [dependencies.iceberg]
-version = "0.9.1"
+version = "0.10.0"
 
 [dependencies.metrics]
 version = "0.24"
@@ -58,6 +57,9 @@ version = "0.27.2"
 
 [dev-dependencies.itertools]
 version = "0.13"
+
+[dev-dependencies.futures]
+version = "0.3"
 
 [dev-dependencies.regex]
 version = "1.11.3"
@@ -76,13 +78,10 @@ default-features = false
 [dev-dependencies.tempfile]
 version = "3.18"
 
-# siglake: test-only tokio features. `macros` for the `#[tokio::test]` and
-# `#[tokio::main]` attributes -- upstream's entry names neither and gets them
-# only when something else in the graph (sqlx's `runtime-tokio`) turns them on
-# -- and `rt-multi-thread` because `#[tokio::main]` defaults to that flavour,
-# which the crate-root doctest needs. Without this entry that doctest does not
-# compile standalone, the gap #2671 found in third_party/iceberg.
 [dev-dependencies.tokio]
 version = "1.47"
-features = ["macros", "rt-multi-thread"]
+features = [
+    "sync",
+    "rt-multi-thread",
+]
 default-features = false

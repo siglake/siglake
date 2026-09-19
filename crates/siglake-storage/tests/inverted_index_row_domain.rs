@@ -104,7 +104,8 @@ fn arrow_schema() -> Arc<ArrowSchema> {
 fn write_data_file(dir: &Path, name: &str, index_hex: Option<&str>) -> (String, u64) {
     let path = dir.join(name);
     let schema = arrow_schema();
-    let mut properties = WriterProperties::builder().set_max_row_group_size(ROW_GROUP_ROWS);
+    let mut properties =
+        WriterProperties::builder().set_max_row_group_row_count(Some(ROW_GROUP_ROWS));
     if let Some(hex) = index_hex {
         properties = properties.set_key_value_metadata(Some(vec![KeyValue::new(
             siglake_index::INVERTED_INDEX_KV_KEY.to_string(),
@@ -138,7 +139,7 @@ fn write_data_file(dir: &Path, name: &str, index_hex: Option<&str>) -> (String, 
 /// values it actually decoded. A rejected index leaves no row selection, so
 /// the whole file comes back and the exact predicate runs above the scan.
 async fn scan_raw_values(path: &str, size: u64) -> Vec<String> {
-    let reader = ArrowReaderBuilder::new(FileIO::new_with_fs())
+    let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), iceberg::Runtime::current())
         .with_row_selection_enabled(true)
         .with_raw_prune_spec(Some(RawPruneSpec {
             column: "raw".to_string(),
@@ -166,6 +167,7 @@ async fn scan_raw_values(path: &str, size: u64) -> Vec<String> {
     let batches = reader
         .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
         .unwrap()
+        .stream()
         .try_collect::<Vec<RecordBatch>>()
         .await
         .unwrap();

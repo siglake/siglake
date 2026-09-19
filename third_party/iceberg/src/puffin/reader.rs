@@ -15,37 +15,276 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::OnceLock;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::OnceCell;
 
 use super::validate_puffin_compression;
-use crate::compression::CompressionCodec;
-use crate::io::read_observability::{
-    ObjectStoreReadPhase, ReadDebouncer, record_object_store_read,
-};
-use crate::io::{FileRead, InputFile};
 use crate::{Error, ErrorKind, Result};
+use crate::compression::CompressionCodec;
+use crate::io::{FileRead, InputFile};
+use crate::io::read_observability::{
+    ObjectStoreReadPhase, ReadDebouncer, record_object_store_reads,
+};
 use crate::puffin::blob::Blob;
 use crate::puffin::metadata::{BlobMetadata, FileMetadata};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct RangeReadKey {
+struct BlobKey {
     path: String,
-    start: u64,
-    end: u64,
+    offset: u64,
 }
 
-fn puffin_blob_debouncer() -> &'static ReadDebouncer<RangeReadKey, std::sync::Arc<[u8]>> {
-    static DEBOUNCER: OnceLock<ReadDebouncer<RangeReadKey, std::sync::Arc<[u8]>>> =
-        OnceLock::new();
+fn metadata_debouncer() -> &'static ReadDebouncer<String, Arc<FileMetadata>> {
+    static DEBOUNCER: OnceLock<ReadDebouncer<String, Arc<FileMetadata>>> = OnceLock::new();
     DEBOUNCER.get_or_init(ReadDebouncer::default)
+}
+
+fn blob_debouncer() -> &'static ReadDebouncer<BlobKey, Arc<[u8]>> {
+    static DEBOUNCER: OnceLock<ReadDebouncer<BlobKey, Arc<[u8]>>> = OnceLock::new();
+    DEBOUNCER.get_or_init(ReadDebouncer::default)
+}
+
+struct MetadataCache {
+    order: VecDeque<String>,
+    entries: HashMap<String, Arc<FileMetadata>>,
+}
+
+fn metadata_cache() -> &'static Mutex<MetadataCache> {
+    static CACHE: OnceLock<Mutex<MetadataCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(MetadataCache {
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+        })
+    })
+}
+
+fn metadata_cache_max_entries() -> usize {
+    std::env::var("SIGLAKE_PUFFIN_FOOTER_CACHE_MAX_ENTRIES")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(128)
+}
+
+fn metadata_cache_get(path: &str) -> Option<Arc<FileMetadata>> {
+    (metadata_cache_max_entries() > 0)
+        .then(|| metadata_cache().lock().unwrap().entries.get(path).cloned())
+        .flatten()
+}
+
+fn metadata_cache_put(path: String, metadata: Arc<FileMetadata>) {
+    let max_entries = metadata_cache_max_entries();
+    if max_entries == 0 {
+        return;
+    }
+    let mut cache = metadata_cache().lock().unwrap();
+    if cache.entries.contains_key(&path) {
+        return;
+    }
+    cache.entries.insert(path.clone(), metadata);
+    cache.order.push_back(path);
+    while cache.order.len() > max_entries {
+        if let Some(evicted) = cache.order.pop_front() {
+            cache.entries.remove(&evicted);
+        }
+    }
+}
+
+#[derive(Default)]
+struct BlobCache {
+    bytes: usize,
+    order: VecDeque<BlobKey>,
+    entries: HashMap<BlobKey, BlobCacheEntry>,
+    admitted: u64,
+}
+
+struct BlobCacheEntry {
+    bytes: Arc<[u8]>,
+    active: u64,
+}
+
+impl BlobCache {
+    fn put(
+        &mut self,
+        key: BlobKey,
+        bytes: Arc<[u8]>,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> bool {
+        if max_entries == 0 || max_bytes == 0 || bytes.len() > max_bytes {
+            return false;
+        }
+        if self.entries.contains_key(&key) {
+            return true;
+        }
+        let parsed_twins = crate::arrow::parsed_index_puffin_twin_ranks();
+        while self.entries.len() + 1 > max_entries || self.bytes + bytes.len() > max_bytes {
+            let Some((position, reason)) = blob_cache_victim(
+                &self.order,
+                &self.entries,
+                &parsed_twins,
+                self.admitted,
+            ) else {
+                break;
+            };
+            let Some(evicted) = self.order.remove(position) else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&evicted) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes.len());
+                record_blob_cache_drop(reason);
+            }
+        }
+        self.admitted += 1;
+        self.bytes += bytes.len();
+        self.entries.insert(key.clone(), BlobCacheEntry {
+            bytes,
+            active: self.admitted,
+        });
+        self.order.push_back(key);
+        true
+    }
+
+    fn get(&mut self, key: &BlobKey) -> Option<Arc<[u8]>> {
+        let admitted = self.admitted;
+        self.entries.get_mut(key).map(|entry| {
+            entry.active = admitted;
+            Arc::clone(&entry.bytes)
+        })
+    }
+}
+
+const BLOB_PROTECTION_TURNOVERS: u64 = 4;
+pub(crate) const PUFFIN_BLOB_CACHE_OUTCOMES: &[&str] = &["hit", "miss"];
+pub(crate) const PUFFIN_BLOB_CACHE_DROP_REASONS: &[&str] =
+    &["stale", "redundant", "fifo", "oversized"];
+
+fn blob_cache_victim(
+    order: &VecDeque<BlobKey>,
+    entries: &HashMap<BlobKey, BlobCacheEntry>,
+    parsed_twins: &HashMap<(String, u64), usize>,
+    admitted: u64,
+) -> Option<(usize, &'static str)> {
+    let turnover = BLOB_PROTECTION_TURNOVERS * order.len().max(1) as u64;
+    let stale = order
+        .iter()
+        .position(|key| {
+            entries
+                .get(key)
+                .is_some_and(|entry| admitted.saturating_sub(entry.active) >= turnover)
+        })
+        .map(|position| (position, "stale"));
+    let redundant = || {
+        order
+            .iter()
+            .enumerate()
+            .filter_map(|(position, key)| {
+                parsed_twins
+                    .get(&(key.path.clone(), key.offset))
+                    .map(|rank| (*rank, position))
+            })
+            .max()
+            .map(|(_, position)| (position, "redundant"))
+    };
+    stale
+        .or_else(redundant)
+        .or_else(|| (!order.is_empty()).then_some((0, "fifo")))
+}
+
+fn record_blob_cache_drop(reason: &'static str) {
+    metrics::counter!(
+        "siglake_iceberg_puffin_blob_cache_evictions_total",
+        "reason" => reason
+    )
+    .increment(1);
+}
+
+static PUFFIN_BLOB_FETCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PUFFIN_BLOB_CACHE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn blob_cache() -> &'static Mutex<BlobCache> {
+    static CACHE: OnceLock<Mutex<BlobCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BlobCache::default()))
+}
+
+fn blob_cache_bounds() -> (usize, usize) {
+    let entries = std::env::var("SIGLAKE_PUFFIN_BLOB_CACHE_MAX_ENTRIES")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(128);
+    let bytes = crate::arrow::puffin_blob_cache_max_bytes();
+    (entries, bytes)
+}
+
+fn blob_cache_get(key: &BlobKey) -> Option<Arc<[u8]>> {
+    let (max_entries, max_bytes) = blob_cache_bounds();
+    if max_entries == 0 || max_bytes == 0 {
+        return None;
+    }
+    let hit = blob_cache().lock().unwrap().get(key);
+    if hit.is_some() {
+        PUFFIN_BLOB_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    metrics::counter!(
+        "siglake_iceberg_puffin_blob_cache_lookups_total",
+        "outcome" => if hit.is_some() { "hit" } else { "miss" }
+    )
+    .increment(1);
+    hit
+}
+
+fn blob_cache_peek(key: &BlobKey) -> Option<Arc<[u8]>> {
+    let (max_entries, max_bytes) = blob_cache_bounds();
+    if max_entries == 0 || max_bytes == 0 {
+        return None;
+    }
+    blob_cache().lock().unwrap().get(key)
+}
+
+fn blob_cache_put(key: BlobKey, bytes: Arc<[u8]>) {
+    let (max_entries, max_bytes) = blob_cache_bounds();
+    if max_entries == 0 || max_bytes == 0 {
+        return;
+    }
+    if bytes.len() > max_bytes {
+        record_blob_cache_drop("oversized");
+        return;
+    }
+    blob_cache()
+        .lock()
+        .unwrap()
+        .put(key, bytes, max_entries, max_bytes);
+}
+
+pub(crate) fn puffin_blob_cache_stats(path_substring: &str) -> (usize, usize, usize) {
+    let cache = blob_cache().lock().unwrap();
+    let (entries, bytes) = cache
+        .entries
+        .iter()
+        .filter(|(key, _)| key.path.contains(path_substring))
+        .fold((0, 0), |(entries, bytes), (_, entry)| {
+            (entries + 1, bytes + entry.bytes.len())
+        });
+    (entries, bytes, cache.bytes)
+}
+
+pub(crate) fn puffin_blob_fetch_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PUFFIN_BLOB_FETCHES.load(Relaxed),
+        PUFFIN_BLOB_CACHE_HITS.load(Relaxed),
+    )
 }
 
 /// Puffin reader
 pub struct PuffinReader {
     input_file: InputFile,
-    file_metadata: OnceCell<FileMetadata>,
+    file_metadata: OnceCell<Arc<FileMetadata>>,
+    cache_bypass: bool,
 }
 
 impl PuffinReader {
@@ -54,28 +293,56 @@ impl PuffinReader {
         Self {
             input_file,
             file_metadata: OnceCell::new(),
+            cache_bypass: false,
         }
+    }
+
+    /// Bypass process-global immutable metadata and blob caches.
+    pub fn with_cache_bypass(mut self, cache_bypass: bool) -> Self {
+        self.cache_bypass = cache_bypass;
+        self
     }
 
     /// Returns file metadata
     pub async fn file_metadata(&self) -> Result<&FileMetadata> {
         self.file_metadata
             .get_or_try_init(|| async {
-                let metadata = FileMetadata::read(&self.input_file).await?;
-                // Puffin footer metadata is a multi-range cold-open path that
-                // doesn't yet expose exact per-range byte accounting here, so
-                // keep it in the explicit catch-all phase while blob payloads
-                // remain index-labeled below.
-                record_object_store_read(ObjectStoreReadPhase::Other, 0);
-                Ok(metadata)
+                let path = self.input_file.location().to_string();
+                if !self.cache_bypass
+                    && let Some(metadata) = metadata_cache_get(&path)
+                {
+                    tokio::task::coop::consume_budget().await;
+                    return Ok(metadata);
+                }
+                let input_file = self.input_file.clone();
+                let cache_path = path.clone();
+                let cache_bypass = self.cache_bypass;
+                metadata_debouncer()
+                    .run(path, "puffin_metadata", move || async move {
+                        if !cache_bypass && let Some(metadata) = metadata_cache_get(&cache_path) {
+                            tokio::task::coop::consume_budget().await;
+                            return Ok(metadata);
+                        }
+                        let metadata = Arc::new(FileMetadata::read(&input_file).await?);
+                        if !cache_bypass {
+                            metadata_cache_put(cache_path, metadata.clone());
+                        }
+                        Ok(metadata)
+                    })
+                    .await
             })
             .await
+            .map(Arc::as_ref)
     }
 
-    /// Returns the size in bytes of the Puffin footer (from the footer magic to EOF).
+    /// Returns the size in bytes of the Puffin footer (from footer magic to EOF).
     pub async fn footer_size_in_bytes(&self) -> Result<u64> {
         let footer_bytes = FileMetadata::footer_size_in_bytes(&self.input_file).await?;
-        record_object_store_read(ObjectStoreReadPhase::Footer, footer_bytes);
+        crate::io::read_observability::record_object_store_reads(
+            crate::io::read_observability::ObjectStoreReadPhase::Footer,
+            1,
+            footer_bytes,
+        );
         Ok(footer_bytes)
     }
 
@@ -85,22 +352,45 @@ impl PuffinReader {
 
         let start = blob_metadata.offset;
         let end = start + blob_metadata.length;
-        let key = RangeReadKey {
+        let key = BlobKey {
             path: self.input_file.location().to_string(),
-            start,
-            end,
+            offset: start,
         };
-        let input_file = self.input_file.clone();
-        let codec = blob_metadata.compression_codec;
-        let data = puffin_blob_debouncer()
-            .run(key, "puffin_blob", move || async move {
-                let file_read = input_file.reader().await?;
-                let bytes = file_read.read(start..end).await?;
-                record_object_store_read(ObjectStoreReadPhase::Index, bytes.len() as u64);
-                let data = codec.decompress(bytes.to_vec())?;
-                Ok(std::sync::Arc::<[u8]>::from(data))
-            })
-            .await?;
+        let data = if !self.cache_bypass
+            && let Some(hit) = blob_cache_get(&key)
+        {
+            tokio::task::coop::consume_budget().await;
+            hit
+        } else {
+            let input_file = self.input_file.clone();
+            let codec = blob_metadata.compression_codec;
+            let cache_key = key.clone();
+            let cache_bypass = self.cache_bypass;
+            blob_debouncer()
+                .run(key, "puffin_blob", move || async move {
+                    if !cache_bypass && let Some(hit) = blob_cache_peek(&cache_key) {
+                        tokio::task::coop::consume_budget().await;
+                        return Ok(hit);
+                    }
+                    let file_read = input_file.reader().await?;
+                    let outcome = file_read.read_with_outcome(start..end).await?;
+                    if outcome.fetched {
+                        PUFFIN_BLOB_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics::counter!("siglake_iceberg_puffin_blob_fetches_total").increment(1);
+                        record_object_store_reads(
+                            ObjectStoreReadPhase::Index,
+                            1,
+                            outcome.bytes.len() as u64,
+                        );
+                    }
+                    let data = Arc::<[u8]>::from(codec.decompress(outcome.bytes.to_vec())?);
+                    if !cache_bypass {
+                        blob_cache_put(cache_key, data.clone());
+                    }
+                    Ok(data)
+                })
+                .await?
+        };
 
         Ok(Blob {
             r#type: blob_metadata.r#type.clone(),
@@ -112,45 +402,27 @@ impl PuffinReader {
         })
     }
 
-    /// siglake: a reader for byte ranges *inside* one blob, for a blob whose
-    /// interior is addressable — the segmented inverted-index sidecar
-    /// (`siglake_index::segmented`), which a lookup reads a few kilobytes of
-    /// rather than whole.
-    ///
-    /// [`Self::blob`] cannot serve that: it reads the blob's entire
-    /// `offset..offset + length` and decompresses it, which is the whole cost
-    /// the segmented format exists to avoid. An interior offset is only
-    /// meaningful in an **uncompressed** blob, so this refuses any other codec
-    /// — a compressed blob has no addressable interior and its reader must
-    /// take the whole-blob path (`docs/DESIGN_segmented_inverted_index.md`).
+    /// Open an addressable reader over one uncompressed blob.
     pub async fn blob_range_reader(&self, blob_metadata: &BlobMetadata) -> Result<BlobRangeReader> {
-        if blob_metadata.compression_codec != CompressionCodec::None {
+        if blob_metadata.compression_codec() != CompressionCodec::None {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
                 format!(
                     "blob {} is {:?}-compressed and cannot be read in part",
-                    blob_metadata.r#type, blob_metadata.compression_codec
+                    blob_metadata.blob_type(),
+                    blob_metadata.compression_codec()
                 ),
             ));
         }
         Ok(BlobRangeReader {
             file_read: self.input_file.reader().await?,
-            start: blob_metadata.offset,
-            len: blob_metadata.length,
+            start: blob_metadata.offset(),
+            len: blob_metadata.length(),
         })
     }
 }
 
-/// siglake: byte ranges inside one uncompressed Puffin blob, over a single
-/// opened file reader ([`PuffinReader::blob_range_reader`]).
-///
-/// Every range is bounded by the blob, not by the file: an offset past the
-/// blob's length is an error rather than a read of whatever follows it. Each
-/// range is charged to [`ObjectStoreReadPhase::Index`], the phase the
-/// whole-blob path charges, so a segmented lookup's fetched bytes land in the
-/// same accounting as the sidecar read it replaces. The count is what the
-/// reader *asked for*: an identical range served again may come from the
-/// object cache (`CachingFileRead`) without reaching storage.
+/// Byte-range reader bounded to one uncompressed Puffin blob.
 pub struct BlobRangeReader {
     file_read: Box<dyn FileRead>,
     start: u64,
@@ -158,17 +430,17 @@ pub struct BlobRangeReader {
 }
 
 impl BlobRangeReader {
-    /// The blob's length — the addressable space of [`Self::read_at`].
+    /// The blob's addressable length.
     pub fn len(&self) -> u64 {
         self.len
     }
 
-    /// Whether the blob has any bytes to address.
+    /// Whether the blob is empty.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// `len` bytes at `offset` within the blob.
+    /// Read `len` bytes at `offset` within the blob.
     pub async fn read_at(&self, offset: u64, len: u64) -> Result<bytes::Bytes> {
         let end = offset
             .checked_add(len)
@@ -183,7 +455,7 @@ impl BlobRangeReader {
             .file_read
             .read(self.start + offset..self.start + end)
             .await?;
-        record_object_store_read(ObjectStoreReadPhase::Index, bytes.len() as u64);
+        record_object_store_reads(ObjectStoreReadPhase::Index, 1, bytes.len() as u64);
         Ok(bytes)
     }
 }
@@ -201,6 +473,21 @@ mod tests {
         java_zstd_compressed_metric_input_file, uncompressed_metric_file_metadata,
         zstd_compressed_metric_file_metadata,
     };
+
+    #[test]
+    fn blob_cache_holds_both_bounds_and_rejects_oversized_entries() {
+        let mut cache = super::BlobCache::default();
+        let key = |offset| super::BlobKey {
+            path: "memory://candidate/cache-1752.puffin".to_string(),
+            offset,
+        };
+        assert!(cache.put(key(0), std::sync::Arc::from(&b"aaaa"[..]), 2, 6));
+        assert!(cache.put(key(4), std::sync::Arc::from(&b"bbbb"[..]), 2, 6));
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.bytes <= 6);
+        assert!(!cache.put(key(8), std::sync::Arc::from(&b"1234567"[..]), 2, 6));
+        assert!(!cache.entries.contains_key(&key(8)));
+    }
 
     #[tokio::test]
     async fn test_puffin_reader_uncompressed_metric_data() {
@@ -266,7 +553,7 @@ mod tests {
             sequence_number: 1,
             offset: 4,
             length: 10,
-            compression_codec: CompressionCodec::Gzip,
+            compression_codec: CompressionCodec::gzip_default(),
             properties: HashMap::new(),
         };
 
@@ -275,7 +562,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(err.to_string().contains("Gzip"));
+        assert!(err.to_string().contains("gzip"));
         assert!(
             err.to_string()
                 .contains("is not supported for Puffin files")

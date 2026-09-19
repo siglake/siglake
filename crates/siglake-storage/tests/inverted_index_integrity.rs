@@ -130,7 +130,8 @@ fn write_data_file(
 ) -> (String, u64) {
     let path = dir.join(name);
     let schema = arrow_schema();
-    let mut properties = WriterProperties::builder().set_max_row_group_size(ROW_GROUP_ROWS);
+    let mut properties =
+        WriterProperties::builder().set_max_row_group_row_count(Some(ROW_GROUP_ROWS));
     let mut key_values = Vec::new();
     if let Some(hex) = index_hex {
         key_values.push(KeyValue::new(
@@ -236,7 +237,7 @@ async fn scan_raw_values(
     statistics_blobs: Vec<StatisticsBlobReference>,
     cache_bypass: bool,
 ) -> Result<Vec<String>, String> {
-    let reader = ArrowReaderBuilder::new(FileIO::new_with_fs())
+    let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), iceberg::Runtime::current())
         .with_row_selection_enabled(true)
         .with_cache_bypass(cache_bypass)
         .with_raw_prune_spec(Some(RawPruneSpec {
@@ -265,6 +266,7 @@ async fn scan_raw_values(
     let batches = reader
         .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
         .map_err(|err| err.to_string())?
+        .stream()
         .try_collect::<Vec<RecordBatch>>()
         .await
         .map_err(|err| err.to_string())?;
@@ -455,7 +457,7 @@ async fn footer_checksums_refuse_corruption_and_zstd_keeps_sidecars_covered() {
         "puffin_sound.puffin",
         &path,
         sound.to_bytes(),
-        CompressionCodec::Zstd,
+        CompressionCodec::zstd_default(),
     )
     .await;
     let decoded = scan_raw_values(&path, size, vec![reference.clone()], true)
@@ -509,7 +511,7 @@ async fn footer_checksums_refuse_corruption_and_zstd_keeps_sidecars_covered() {
         "warm.puffin",
         &path,
         sound.to_bytes(),
-        CompressionCodec::Zstd,
+        CompressionCodec::zstd_default(),
     )
     .await;
 

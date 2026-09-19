@@ -71,6 +71,7 @@ pub use error::{Error, ErrorKind, Result};
 
 mod catalog;
 
+pub use catalog::utils::drop_table_data;
 pub use catalog::*;
 
 pub mod table;
@@ -89,13 +90,16 @@ pub mod transaction;
 pub mod transform;
 
 mod runtime;
+pub use runtime::{Runtime, RuntimeHandle};
 
 pub mod arrow;
 pub(crate) mod delete_file_index;
+pub mod encryption;
 pub mod test_utils;
-mod utils;
 pub mod writer;
 
 mod delete_vector;
 pub mod metadata_columns;
 pub mod puffin;
+/// Utility functions and modules.
+pub mod util;

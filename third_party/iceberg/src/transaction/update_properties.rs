@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::spec::TableProperties;
 use crate::table::Table;
 use crate::transaction::action::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind, Result, TableUpdate};
@@ -83,7 +82,7 @@ impl Default for UpdatePropertiesAction {
 
 #[async_trait]
 impl TransactionAction for UpdatePropertiesAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+    async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
         if let Some(overlapping_key) = self.removals.iter().find(|k| self.updates.contains_key(*k))
         {
             return Err(Error::new(
@@ -92,41 +91,14 @@ impl TransactionAction for UpdatePropertiesAction {
             ));
         }
 
-        // Actions are re-applied against a freshly loaded table after an
-        // optimistic-concurrency conflict. Drop changes that another writer
-        // has already made so an idempotent retry can become a true no-op.
-        // Keep reserved-property operations so the metadata builder still
-        // rejects them exactly as it did before this filtering.
-        let effective_updates = self
-            .updates
-            .iter()
-            .filter(|(key, value)| {
-                TableProperties::RESERVED_PROPERTIES.contains(&key.as_str())
-                    || table.metadata().properties().get(*key) != Some(*value)
-            })
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<HashMap<_, _>>();
-        let effective_removals = self
-            .removals
-            .iter()
-            .filter(|key| {
-                TableProperties::RESERVED_PROPERTIES.contains(&key.as_str())
-                    || table.metadata().properties().contains_key(*key)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let mut updates = Vec::with_capacity(2);
-        if !effective_updates.is_empty() {
-            updates.push(TableUpdate::SetProperties {
-                updates: effective_updates,
-            });
-        }
-        if !effective_removals.is_empty() {
-            updates.push(TableUpdate::RemoveProperties {
-                removals: effective_removals,
-            });
-        }
+        let updates: Vec<TableUpdate> = vec![
+            TableUpdate::SetProperties {
+                updates: self.updates.clone(),
+            },
+            TableUpdate::RemoveProperties {
+                removals: self.removals.clone().into_iter().collect::<Vec<String>>(),
+            },
+        ];
 
         Ok(ActionCommit::new(updates, vec![]))
     }
@@ -135,7 +107,6 @@ impl TransactionAction for UpdatePropertiesAction {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
 
     use as_any::Downcast;
 
@@ -143,8 +114,6 @@ mod tests {
     use crate::transaction::action::ApplyTransactionAction;
     use crate::transaction::tests::make_v2_table;
     use crate::transaction::update_properties::UpdatePropertiesAction;
-    use crate::transaction::TransactionAction;
-    use crate::TableUpdate;
 
     #[test]
     fn test_update_table_property() {
@@ -168,73 +137,5 @@ mod tests {
         );
 
         assert_eq!(action.removals, HashSet::from(["b".to_string()]));
-    }
-
-    #[tokio::test]
-    async fn test_matching_updates_and_missing_removals_are_noop() {
-        let table = make_v2_table();
-        let metadata = table
-            .metadata()
-            .clone()
-            .into_builder(None)
-            .set_properties(HashMap::from([("a".to_string(), "b".to_string())]))
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata;
-        let table = table.with_metadata(Arc::new(metadata));
-
-        let mut commit = Arc::new(
-            UpdatePropertiesAction::new()
-                .set("a".to_string(), "b".to_string())
-                .remove("missing".to_string()),
-        )
-        .commit(&table)
-        .await
-        .unwrap();
-
-        assert!(commit.take_updates().is_empty());
-        assert!(commit.take_requirements().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_changed_updates_and_existing_removals_are_preserved() {
-        let table = make_v2_table();
-        let metadata = table
-            .metadata()
-            .clone()
-            .into_builder(None)
-            .set_properties(HashMap::from([
-                ("change".to_string(), "old".to_string()),
-                ("same".to_string(), "value".to_string()),
-                ("remove".to_string(), "value".to_string()),
-            ]))
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata;
-        let table = table.with_metadata(Arc::new(metadata));
-
-        let mut commit = Arc::new(
-            UpdatePropertiesAction::new()
-                .set("change".to_string(), "new".to_string())
-                .set("same".to_string(), "value".to_string())
-                .remove("remove".to_string()),
-        )
-        .commit(&table)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            commit.take_updates(),
-            vec![
-                TableUpdate::SetProperties {
-                    updates: HashMap::from([("change".to_string(), "new".to_string())]),
-                },
-                TableUpdate::RemoveProperties {
-                    removals: vec!["remove".to_string()],
-                },
-            ]
-        );
     }
 }

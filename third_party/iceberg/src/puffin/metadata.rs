@@ -21,6 +21,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::compression::CompressionCodec;
+use crate::io::read_observability::{ObjectStoreReadPhase, record_object_store_reads};
 use crate::io::{FileRead, InputFile};
 use crate::{Error, ErrorKind, Result};
 
@@ -145,25 +146,25 @@ impl FileMetadata {
     /// We use the term FOOTER_STRUCT to refer to the fixed-length portion of the Footer.
     /// The structure of the Footer specification is illustrated below:
     ///
-    /// ```text                                             
+    /// ```text
     ///        Footer
-    ///        ┌────────────────────┐                 
-    ///        │  Magic (4 bytes)   │                 
-    ///        │                    │                 
-    ///        ├────────────────────┤                 
-    ///        │   FooterPayload    │                 
-    ///        │  (PAYLOAD_LENGTH)  │                 
-    ///        ├────────────────────┤ ◀─┐             
-    ///        │ FooterPayloadSize  │   │             
-    ///        │     (4 bytes)      │   │             
-    ///        ├────────────────────┤                 
-    ///        │  Flags (4 bytes)   │  FOOTER_STRUCT  
-    ///        │                    │                 
-    ///        ├────────────────────┤   │             
-    ///        │  Magic (4 bytes)   │   │             
-    ///        │                    │   │             
-    ///        └────────────────────┘ ◀─┘  
-    /// ```                      
+    ///        ┌────────────────────┐
+    ///        │  Magic (4 bytes)   │
+    ///        │                    │
+    ///        ├────────────────────┤
+    ///        │   FooterPayload    │
+    ///        │  (PAYLOAD_LENGTH)  │
+    ///        ├────────────────────┤ ◀─┐
+    ///        │ FooterPayloadSize  │   │
+    ///        │     (4 bytes)      │   │
+    ///        ├────────────────────┤
+    ///        │  Flags (4 bytes)   │  FOOTER_STRUCT
+    ///        │                    │
+    ///        ├────────────────────┤   │
+    ///        │  Magic (4 bytes)   │   │
+    ///        │                    │   │
+    ///        └────────────────────┘ ◀─┘
+    /// ```
     const FOOTER_STRUCT_PAYLOAD_LENGTH_OFFSET: u8 = 0;
     const FOOTER_STRUCT_PAYLOAD_LENGTH_LENGTH: u8 = 4;
     const FOOTER_STRUCT_FLAGS_OFFSET: u8 = FileMetadata::FOOTER_STRUCT_PAYLOAD_LENGTH_OFFSET
@@ -200,7 +201,11 @@ impl FileMetadata {
     ) -> Result<u32> {
         let start = input_file_length - FileMetadata::FOOTER_STRUCT_LENGTH as u64;
         let end = start + FileMetadata::FOOTER_STRUCT_PAYLOAD_LENGTH_LENGTH as u64;
-        let footer_payload_length_bytes = file_read.read(start..end).await?;
+        let outcome = file_read.read_with_outcome(start..end).await?;
+        if outcome.fetched {
+            record_object_store_reads(ObjectStoreReadPhase::Footer, 1, outcome.bytes.len() as u64);
+        }
+        let footer_payload_length_bytes = outcome.bytes;
         let mut buf = [0; 4];
         buf.copy_from_slice(&footer_payload_length_bytes);
         let footer_payload_length = u32::from_le_bytes(buf);
@@ -217,7 +222,11 @@ impl FileMetadata {
             + FileMetadata::MAGIC_LENGTH as u64;
         let start = input_file_length - footer_length;
         let end = input_file_length;
-        file_read.read(start..end).await
+        let outcome = file_read.read_with_outcome(start..end).await?;
+        if outcome.fetched {
+            record_object_store_reads(ObjectStoreReadPhase::Footer, 1, outcome.bytes.len() as u64);
+        }
+        Ok(outcome.bytes)
     }
 
     fn decode_flags(footer_bytes: &[u8]) -> Result<HashSet<Flag>> {
@@ -280,7 +289,13 @@ impl FileMetadata {
     pub(crate) async fn read(input_file: &InputFile) -> Result<FileMetadata> {
         let file_read = input_file.reader().await?;
 
-        let first_four_bytes = file_read.read(0..FileMetadata::MAGIC_LENGTH.into()).await?;
+        let outcome = file_read
+            .read_with_outcome(0..FileMetadata::MAGIC_LENGTH.into())
+            .await?;
+        if outcome.fetched {
+            record_object_store_reads(ObjectStoreReadPhase::Footer, 1, outcome.bytes.len() as u64);
+        }
+        let first_four_bytes = outcome.bytes;
         FileMetadata::check_magic(&first_four_bytes)?;
 
         let input_file_length = input_file.metadata().await?.size;
@@ -310,11 +325,9 @@ impl FileMetadata {
         let input_file_length = input_file.metadata().await?.size;
         let footer_payload_length =
             FileMetadata::read_footer_payload_length(file_read.as_ref(), input_file_length).await?;
-        Ok(
-            footer_payload_length as u64
-                + FileMetadata::FOOTER_STRUCT_LENGTH as u64
-                + FileMetadata::MAGIC_LENGTH as u64,
-        )
+        Ok(footer_payload_length as u64
+            + FileMetadata::FOOTER_STRUCT_LENGTH as u64
+            + FileMetadata::MAGIC_LENGTH as u64)
     }
 
     /// Reads file_metadata in puffin file with a prefetch hint
@@ -336,7 +349,11 @@ impl FileMetadata {
                 return FileMetadata::read(input_file).await;
             }
 
-            // Read footer based on prefetchi hint
+            // Validate file header magic
+            let first_four_bytes = file_read.read(0..FileMetadata::MAGIC_LENGTH.into()).await?;
+            FileMetadata::check_magic(&first_four_bytes)?;
+
+            // Read footer based on prefetch hint
             let start = input_file_length - prefetch_hint as u64;
             let end = input_file_length;
             let footer_bytes = file_read.read(start..end).await?;
@@ -400,6 +417,7 @@ mod tests {
     use bytes::Bytes;
     use tempfile::TempDir;
 
+    use crate::ErrorKind;
     use crate::io::{FileIO, InputFile};
     use crate::puffin::metadata::{BlobMetadata, CompressionCodec, FileMetadata};
     use crate::puffin::test_utils::{
@@ -971,6 +989,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_with_incorrect_header_magic() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let prefetch_hint: u8 = 64;
+        let mut bytes = vec![];
+        // Invalid header magic
+        bytes.extend([0x00, 0x00, 0x00, 0x00]);
+        // Intentionally keep file size larger than prefetch_hint.
+        bytes.extend(vec![0u8; prefetch_hint as usize]);
+        // Valid footer: magic + payload + footer struct
+        bytes.extend(FileMetadata::MAGIC);
+        bytes.extend(empty_footer_payload_bytes());
+        bytes.extend(empty_footer_payload_bytes_length_bytes());
+        bytes.extend(vec![0, 0, 0, 0]); // flags
+        bytes.extend(FileMetadata::MAGIC);
+
+        let input_file = input_file_with_bytes(&temp_dir, &bytes).await;
+
+        assert_eq!(
+            FileMetadata::read(&input_file).await.unwrap_err().kind(),
+            ErrorKind::DataInvalid,
+        );
+        assert_eq!(
+            FileMetadata::read_with_prefetch(&input_file, prefetch_hint)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::DataInvalid,
+        );
+    }
+
+    #[tokio::test]
     async fn test_gzip_compression_allowed_in_metadata() {
         let temp_dir = TempDir::new().unwrap();
 
@@ -997,6 +1047,9 @@ mod tests {
         assert!(result.is_ok());
         let metadata = result.unwrap();
         assert_eq!(metadata.blobs.len(), 1);
-        assert_eq!(metadata.blobs[0].compression_codec, CompressionCodec::Gzip);
+        assert_eq!(
+            metadata.blobs[0].compression_codec,
+            CompressionCodec::gzip_default()
+        );
     }
 }

@@ -59,7 +59,7 @@ fn the_pool_is_installed_and_refuses_an_oversized_reservation() {
     let ctx = siglake_storage::session_context_with_order(None, None, None);
     let pool = ctx.runtime_env().memory_pool.clone();
 
-    let mut reservation = MemoryConsumer::new("oversized").register(&pool);
+    let reservation = MemoryConsumer::new("oversized").register(&pool);
     let too_big = (POOL_BYTES * 16) as usize;
     let result = reservation.try_grow(too_big);
 
@@ -80,7 +80,7 @@ fn an_ordinary_reservation_still_succeeds() {
     let ctx = siglake_storage::session_context_with_order(None, None, None);
     let pool = ctx.runtime_env().memory_pool.clone();
 
-    let mut reservation = MemoryConsumer::new("ordinary").register(&pool);
+    let reservation = MemoryConsumer::new("ordinary").register(&pool);
     reservation
         .try_grow(1024 * 1024)
         .expect("a 1 MiB reservation must fit in a 64 MiB pool");
@@ -99,12 +99,12 @@ fn all_query_contexts_share_the_same_pool() {
     let pool_b = b.runtime_env().memory_pool.clone();
 
     // Reserve most of the pool through one context...
-    let mut held = MemoryConsumer::new("holder").register(&pool_a);
+    let held = MemoryConsumer::new("holder").register(&pool_a);
     held.try_grow((POOL_BYTES as usize) * 3 / 4)
         .expect("three quarters of the pool must fit");
 
     // ...and the OTHER context must see it gone.
-    let mut other = MemoryConsumer::new("other").register(&pool_b);
+    let other = MemoryConsumer::new("other").register(&pool_b);
     assert!(
         other.try_grow((POOL_BYTES as usize) / 2).is_err(),
         "a second query context could still reserve half the pool while another \
@@ -128,7 +128,7 @@ fn the_executing_task_context_carries_the_bound() {
     let task_ctx = siglake_storage::bounded_task_context();
     let pool = task_ctx.runtime_env().memory_pool.clone();
 
-    let mut reservation = MemoryConsumer::new("exec-path").register(&pool);
+    let reservation = MemoryConsumer::new("exec-path").register(&pool);
     assert!(
         reservation.try_grow((POOL_BYTES * 16) as usize).is_err(),
         "the TaskContext used to EXECUTE plans has an unbounded pool — the bound \
@@ -150,11 +150,11 @@ fn execution_and_session_share_one_pool() {
         .memory_pool
         .clone();
 
-    let mut held = MemoryConsumer::new("via-session").register(&session_pool);
+    let held = MemoryConsumer::new("via-session").register(&session_pool);
     held.try_grow((POOL_BYTES as usize) * 3 / 4)
         .expect("three quarters must fit");
 
-    let mut other = MemoryConsumer::new("via-exec").register(&exec_pool);
+    let other = MemoryConsumer::new("via-exec").register(&exec_pool);
     assert!(
         other.try_grow((POOL_BYTES as usize) / 2).is_err(),
         "execution reserved half the pool while the session held three quarters \
@@ -180,7 +180,7 @@ fn a_held_reservation_is_named_by_the_consumer_report() {
         .memory_pool
         .clone();
 
-    let mut held = MemoryConsumer::new("siglake-test-holder").register(&pool);
+    let held = MemoryConsumer::new("siglake-test-holder").register(&pool);
     held.try_grow(3 * 1024 * 1024)
         .expect("3 MiB must fit in a 64 MiB pool");
 

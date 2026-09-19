@@ -4011,12 +4011,13 @@ pub fn build_opendal_operator(url: &str) -> Result<opendal::Operator> {
             let region = std::env::var("AWS_REGION")
                 .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
                 .unwrap_or_else(|_| "us-east-1".to_string());
+            let chain = reqsign_core::ProvideCredentialChain::new().push(std::sync::Arc::new(
+                siglake_storage::aws_credential::SiglakeAwsLoader::new(),
+            ));
             let mut builder = opendal::services::S3::default()
                 .bucket(bucket)
                 .region(&region)
-                .customized_credential_load(Box::new(
-                    siglake_storage::aws_credential::SiglakeAwsLoader::new(),
-                ));
+                .credential_provider_chain(chain);
             if !root.is_empty() {
                 builder = builder.root(root);
             }

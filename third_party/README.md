@@ -11,7 +11,7 @@ not exist upstream, so we maintain the divergences here and periodically
 rebase against upstream. All retain their original `LICENSE` and `NOTICE`
 files (Apache-2.0).
 
-The divergence surface is git history since the initial 0.9.1 import plus this
+The divergence surface is git history since the 0.10.1 adoption plus this
 file; the pristine upstream is the crates.io package under
 `~/.cargo/registry/src/index.crates.io-*/`, which is what a rebase diffs
 against. The crates.io packaging
@@ -22,18 +22,15 @@ alone long after the fork's manifest needed `rt` and `time`. `.cargo-ok` and
 `.cargo_vcs_info.json` stay — the latter records the upstream commit each fork
 came from.
 
-A 2026-09-05 sizing put the upstream 0.10.1 rebase at 8–13 focused
-engineering days plus an AWS validation round. It recommends doing that work
-after launch and re-checking upstream no later than 2026-10-15.
-
-The staged 0.10.1 candidate is isolated from production dependency resolution.
-Slice 1 replaces the candidate copies of the local schema-update and
-snapshot-expiry actions with upstream actions plus caller adapters. The
-shipping 0.9.1 forks retain both local actions until the final adoption slice.
+The 0.10.1 rebase was adopted atomically on 2026-09-19 after six isolated
+port-and-equivalence slices. The shipping graph is Arrow/Parquet 58,
+DataFusion 53.1, OpenDAL 0.57 and reqsign 3. The temporary candidate forks were
+removed after their sources and regression tests moved into these forks and
+the permanent workspace suites.
 
 ## `iceberg/` — fork of `apache/iceberg-rust` (`iceberg` crate)
 
-Upstream base: 0.9.x. Key divergences:
+Upstream base: 0.10.1. Key divergences:
 
 - **Reader-level scan instrumentation** (`ScanCounters`): files
   planned/read/bloom-pruned, row groups considered/pruned/read, rows pruned
@@ -72,9 +69,11 @@ Upstream base: 0.9.x. Key divergences:
   original table UUID and refuses to reapply actions if the catalog identifier
   has been dropped and recreated. The mismatch is non-retryable and is checked
   before actions can write manifest files for the replacement table.
-- `expire_snapshots` (count- and age-based) — upstream closed
-  `incremental_append_scan` as not-planned, so several maintenance actions
-  live here permanently.
+- Snapshot expiry uses upstream's transaction action plus the public
+  `planned_removals` preview needed for exact dry-run counts, no-op commit
+  suppression and Siglake's coverage re-rooting. Upstream closed
+  `incremental_append_scan` as not-planned, so that table behavior remains
+  local.
 - `Cargo.toml`: tokio with `rt` and `time` where upstream asks only for
   `sync` — `rt` for `tokio::task::coop::consume_budget` in `io/file_io.rs`,
   `time` for the `tokio::time::timeout` around the reversed-chunk in-flight
@@ -115,10 +114,10 @@ What the script sets up, and why, for whoever next has to change it:
    fork's `Cargo.toml` with `[workspace]` appended. That copy then has to carry
    back what the enclosing workspace supplied:
    - `iceberg-catalog-sql` and `iceberg-storage-opendal` both depend on
-     `iceberg = "0.9.1"` from crates.io, and the root manifest's patch does not
+     `iceberg = "0.10.0"` from crates.io, and the root manifest's patch does not
      reach a standalone mirror, so their copies carry a `[patch.crates-io]`
      entry pointing `iceberg` at the fork; the script then checks the resolved
-     lockfile, because a run against upstream 0.9.1 would pass while proving
+     lockfile, because a run against upstream 0.10 would pass while proving
      nothing.
    - `iceberg-storage-opendal` takes `metrics` with `workspace = true`, so its
      copy also gets a `[workspace.dependencies]` block holding the root
@@ -177,8 +176,8 @@ migrating to it and shrinking the fork.
 
 ## `iceberg-storage-opendal`
 
-Vendored 2026-08-08 from 0.9.1, originally for one change: the object-store
-writer's multipart-upload concurrency.
+Originally vendored 2026-08-08 for object-store multipart-upload concurrency;
+rebased to 0.10.1 on 2026-09-19.
 
 Upstream builds every writer as `op.writer(path)` with no options, and opendal's
 `WriteOptions` derives `Default` with `concurrent: 0`, which its `MultipartWrite`
@@ -192,11 +191,11 @@ behaviour unchanged**. It is a knob rather than a new default so a round can
 isolate the change instead of confounding it with whatever else shipped in the
 same image — the mistake made with the throttled-slot A/B on 2026-08-05.
 
-Since then the fork has grown three more divergences, all in `src/lib.rs`. A
-rebase onto a newer upstream must carry every item below. Against a pristine
-0.9.1 only `src/lib.rs` and `Cargo.toml` differ; the per-service modules are
-verbatim, and the crate's own `tests/` were dropped (they require live
-GCS/S3/azdls credentials).
+Since then the fork has grown three more divergences. A
+rebase onto a newer upstream must carry every item below. The upstream
+external-service tests remain named but are feature-gated because their
+published package omits the workspace-only test utility crate and the tests
+require live GCS/S3/Azure credentials.
 
 - **Multipart part size** (2026-08-09): `SIGLAKE_OBJECT_STORE_WRITE_CHUNK_MB`,
   default `0` = opendal's service default (~128 MiB on S3). Only consulted when

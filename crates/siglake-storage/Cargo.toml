@@ -59,7 +59,9 @@ sha2 = { workspace = true }
 # concrete opendal-backed Storage is not vendored). Warehouse-scoped
 # Operator built the same way the WAL mirror builds its S3/Fs backend.
 opendal = { workspace = true }
-reqsign = { workspace = true }
+reqsign-aws-v4 = { workspace = true }
+reqsign-core = { workspace = true }
+http = "1"
 reqwest = { workspace = true }
 # `iceberg-catalog-sql` brings sqlx in transitively but does not enable a
 # runtime feature on it; we depend on sqlx here purely to flip the

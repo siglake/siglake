@@ -224,11 +224,14 @@ written down.
   the exporters and their batch processors are never constructed, and the
   per-request residue is +104 ns against the span layer that was already
   there ([Observability](docs/ARCHITECTURE.md#observability-opentelemetry-emission)).
-- **Iceberg is vendored, not waited for.** `third_party/iceberg` and
-  `third_party/iceberg-catalog-sql` are first-class forks carrying the atomic
+- **Iceberg is vendored, not waited for.** `third_party/iceberg`,
+  `third_party/iceberg-catalog-sql` and `third_party/iceberg-storage-opendal`
+  are first-class 0.10.1 forks carrying the atomic
   `rewrite_files` action, count- and age-based snapshot expiry, commit-reload
   elision, S3 conditional puts and the incremental append scan that table
-  subscriptions need; they are rebased against upstream periodically
+  subscriptions need, plus the OpenDAL upload and AWS credential controls.
+  They ship with Arrow/Parquet 58, DataFusion 53.1 and OpenDAL 0.57 and are
+  rebased against upstream periodically
   ([`third_party/README.md`](third_party/README.md)).
 - **The metrics port is an internal surface, and profiling is off in every
   released binary.** `--metrics-bind` (9100/9101/9105) serves `/metrics` and

@@ -34,6 +34,7 @@ datafusion = { workspace = true }
 iceberg = { workspace = true }
 object_store = { workspace = true }
 opendal = { workspace = true }
+reqsign-core = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 url = "2"

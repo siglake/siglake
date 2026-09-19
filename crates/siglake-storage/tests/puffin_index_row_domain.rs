@@ -117,7 +117,7 @@ async fn a_puffin_index_that_does_not_cover_the_file_falls_back_to_an_exact_scan
                 .data(under_covering.to_bytes())
                 .properties(registered.properties.clone())
                 .build(),
-            CompressionCodec::Zstd,
+            CompressionCodec::zstd_default(),
         )
         .await
         .unwrap();

@@ -1275,7 +1275,7 @@ pub fn default_writer_properties() -> WriterProperties {
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
         .set_dictionary_enabled(true)
         .set_data_page_row_count_limit(20_000)
-        .set_max_row_group_size(1_048_576)
+        .set_max_row_group_row_count(Some(1_048_576))
         .build()
 }
 

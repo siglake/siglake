@@ -50,15 +50,14 @@
 //! - `new_output`: Create output file for writing.
 
 mod file_io;
+/// Object-store read phase attribution and immutable-read single flight.
+pub mod read_observability;
 mod storage;
 
 pub use file_io::*;
 pub use storage::*;
 
 pub(crate) mod object_cache;
-/// Phase-labelled object-store read accounting (siglake extension): lets a
-/// scan report WHAT its fetched bytes were, not merely how many.
-pub mod read_observability;
 
 pub(crate) fn is_truthy(value: &str) -> bool {
     ["true", "t", "1", "on"].contains(&value.to_lowercase().as_str())

@@ -161,9 +161,7 @@ impl<'a> ManifestsTable<'a> {
         let mut partition_summaries = self.partition_summary_builder()?;
 
         if let Some(snapshot) = self.table.metadata().current_snapshot() {
-            let manifest_list = snapshot
-                .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
-                .await?;
+            let manifest_list = self.table.manifest_list_reader(snapshot).load().await?;
             for manifest in manifest_list.entries() {
                 content.append_value(manifest.content as i32);
                 path.append_value(manifest.manifest_path.clone());
@@ -198,20 +196,23 @@ impl<'a> ManifestsTable<'a> {
             }
         }
 
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![
-            Arc::new(content.finish()),
-            Arc::new(path.finish()),
-            Arc::new(length.finish()),
-            Arc::new(partition_spec_id.finish()),
-            Arc::new(added_snapshot_id.finish()),
-            Arc::new(added_data_files_count.finish()),
-            Arc::new(existing_data_files_count.finish()),
-            Arc::new(deleted_data_files_count.finish()),
-            Arc::new(added_delete_files_count.finish()),
-            Arc::new(existing_delete_files_count.finish()),
-            Arc::new(deleted_delete_files_count.finish()),
-            Arc::new(partition_summaries.finish()),
-        ])?;
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(content.finish()),
+                Arc::new(path.finish()),
+                Arc::new(length.finish()),
+                Arc::new(partition_spec_id.finish()),
+                Arc::new(added_snapshot_id.finish()),
+                Arc::new(added_data_files_count.finish()),
+                Arc::new(existing_data_files_count.finish()),
+                Arc::new(deleted_data_files_count.finish()),
+                Arc::new(added_delete_files_count.finish()),
+                Arc::new(existing_delete_files_count.finish()),
+                Arc::new(deleted_delete_files_count.finish()),
+                Arc::new(partition_summaries.finish()),
+            ],
+        )?;
         Ok(stream::iter(vec![Ok(batch)]).boxed())
     }
 
