@@ -39,8 +39,7 @@ use iceberg::spec::{
 };
 use iceberg::table::Table;
 use iceberg::transaction::{
-    ActionCommit, ApplyTransactionAction, ExpireSnapshotsAction, Transaction, TransactionAction,
-    UpdateSchemaAction,
+    ActionCommit, AddColumn, ApplyTransactionAction, Transaction, TransactionAction,
 };
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -450,7 +449,8 @@ const SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE: &str = "siglake-inverted-v1";
 /// The v1 sidecar's integrity cover is the Zstd frame content checksum enabled
 /// by the fork's `CompressionCodec::Zstd` implementation. Keep the choice
 /// explicit and pinned by `v1_puffin_sidecars_keep_the_checksummed_codec`.
-const SIGLAKE_PUFFIN_INVERTED_CODEC: PuffinCompressionCodec = PuffinCompressionCodec::Zstd;
+const SIGLAKE_PUFFIN_INVERTED_CODEC: PuffinCompressionCodec =
+    PuffinCompressionCodec::zstd_default();
 const DEFAULT_SIGLAKE_INDEX_FOOTER_MAX_BYTES: usize = 1024 * 1024;
 const DELETE_TASKS_CONFIG_DIR: &str = "_siglake/config/delete_tasks";
 
@@ -1774,10 +1774,9 @@ pub fn storage_factory_for(warehouse_url: &str) -> Result<Arc<dyn StorageFactory
     Ok(match scheme {
         "file" => Arc::new(LocalFsStorageFactory),
         "s3" | "s3a" => Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: scheme.to_string(),
-            customized_credential_load: Some(CustomAwsCredentialLoader::new(Arc::new(
+            customized_credential_load: Some(CustomAwsCredentialLoader::new(
                 crate::aws_credential::SiglakeAwsLoader::new(),
-            ))),
+            )),
         }),
         "memory" => Arc::new(OpenDalStorageFactory::Memory),
         // gs/gcs/az/azdls would go here once we add those features.
@@ -1817,12 +1816,12 @@ fn warehouse_operator(location: &str) -> Result<opendal::Operator> {
             let region = std::env::var("AWS_REGION")
                 .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
                 .unwrap_or_else(|_| "us-east-1".to_string());
+            let chain = reqsign_core::ProvideCredentialChain::new()
+                .push(Arc::new(crate::aws_credential::SiglakeAwsLoader::new()));
             let mut builder = opendal::services::S3::default()
                 .bucket(bucket)
                 .region(&region)
-                .customized_credential_load(Box::new(
-                    crate::aws_credential::SiglakeAwsLoader::new(),
-                ));
+                .credential_provider_chain(chain);
             if !root.is_empty() {
                 builder = builder.root(root);
             }
@@ -3386,7 +3385,7 @@ fn siglake_writer_properties(
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
         .set_dictionary_enabled(true)
         .set_data_page_row_count_limit(20_000)
-        .set_max_row_group_size(max_row_group_rows)
+        .set_max_row_group_row_count(Some(max_row_group_rows))
         // Datatype-driven encoding for the `timestamp` column (every siglake table
         // is time-ordered, so it's the leading sort column). A dictionary on a
         // near-unique nanosecond INT64 is wasted; DELTA_BINARY_PACKED encodes the
@@ -8061,7 +8060,7 @@ mod pruned_window_tests {
         let ts = arrow_array::TimestampNanosecondArray::from((0..rows).collect::<Vec<_>>());
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ts)]).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(rg_rows)
+            .set_max_row_group_row_count(Some(rg_rows))
             .build();
         let file = std::fs::File::create(path).unwrap();
         let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
@@ -14722,8 +14721,16 @@ impl IcebergContext {
             .load_table(table_ident)
             .await
             .with_context(|| format!("load_table {table_ident}"))?;
-        let expired = ExpireSnapshotsAction::expired_ids_aged(&table, retain_last, older_than_ms);
-        if expired.is_empty() {
+        let tx = Transaction::new(&table);
+        let mut action = tx
+            .expire_snapshots()
+            .retain_last(retain_last.max(1))
+            .retain_statistics_files();
+        action = action.expire_older_than_ms(older_than_ms.unwrap_or(i64::MAX));
+        let (expired, expired_refs) = action
+            .planned_removals(&table)
+            .context("ExpireSnapshotsAction::planned_removals")?;
+        if expired.is_empty() && expired_refs.is_empty() {
             return Ok(0);
         }
         let n = expired.len();
@@ -14731,11 +14738,6 @@ impl IcebergContext {
         // that is the only place the current edge is still provable.
         let expiring: HashSet<i64> = expired.iter().copied().collect();
         let reroot = self.coverage_reroot_for_expiry(&table, &expiring).await;
-        let tx = Transaction::new(&table);
-        let mut action = tx.expire_snapshots().retain_last(retain_last);
-        if let Some(cutoff) = older_than_ms {
-            action = action.older_than(cutoff);
-        }
         let tx = action.apply(tx).context("ExpireSnapshotsAction::apply")?;
         // This action runs after expiry against the transaction's updated
         // table, and is re-evaluated against a refreshed base on every CAS
@@ -14962,11 +14964,13 @@ impl IcebergContext {
         }
         let added = missing.len();
 
-        let mut action = UpdateSchemaAction::new();
-        for f in &missing {
-            action = action.add_optional_column(f.name.as_str(), f.field_type.as_ref().clone());
-        }
         let tx = Transaction::new(&table);
+        let mut action = tx.update_schema();
+        for f in &missing {
+            action = action.add_column(
+                AddColumn::optional(f.name.as_str(), f.field_type.as_ref().clone()).if_not_exists(),
+            );
+        }
         let tx = action.apply(tx).context("UpdateSchemaAction::apply")?;
         tx.commit(self.catalog.as_ref())
             .await
@@ -15038,7 +15042,7 @@ impl IcebergContext {
         let batch = align_batch_to_table_schema(table, batch)?;
         let batch = sort_batch_to_table_order(table, batch)?;
         let sorting_columns = table_sorting_columns(table, batch.schema().as_ref());
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone())
+        let location_gen = DefaultLocationGenerator::new(table.metadata())
             .context("default location generator")?;
         let partition_location_gen = location_gen.clone();
         // Per-commit unique prefix: `DefaultFileNameGenerator`'s internal
@@ -17355,7 +17359,7 @@ impl IcebergContext {
                 }
             }
         }
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone())
+        let location_gen = DefaultLocationGenerator::new(table.metadata())
             .context("default location generator")?;
         let name_gen = DefaultFileNameGenerator::new(
             rewrite_prefix(if with_footers { rewrite_gen } else { 0 }),
@@ -23961,7 +23965,7 @@ mod env_knob_resolver_tests {
     fn v1_puffin_sidecars_keep_the_checksummed_codec() {
         assert_eq!(
             SIGLAKE_PUFFIN_INVERTED_CODEC,
-            PuffinCompressionCodec::Zstd,
+            PuffinCompressionCodec::zstd_default(),
             "CompressionCodec::Zstd writes a frame content checksum; changing the v1 sidecar codec needs another integrity cover"
         );
     }
@@ -29972,6 +29976,10 @@ pub mod test_catalog {
 
         async fn drop_table(&self, table: &TableIdent) -> Result<()> {
             self.inner.drop_table(table).await
+        }
+
+        async fn purge_table(&self, table: &TableIdent) -> Result<()> {
+            self.inner.purge_table(table).await
         }
 
         async fn table_exists(&self, table: &TableIdent) -> Result<bool> {

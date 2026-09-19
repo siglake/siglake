@@ -93,10 +93,9 @@ impl TransactionAction for UpdatePropertiesAction {
         }
 
         // Actions are re-applied against a freshly loaded table after an
-        // optimistic-concurrency conflict. Drop changes that another writer
-        // has already made so an idempotent retry can become a true no-op.
-        // Keep reserved-property operations so the metadata builder still
-        // rejects them exactly as it did before this filtering.
+        // optimistic-concurrency conflict. Drop changes another writer has
+        // already made so an idempotent retry becomes a true no-op. Reserved
+        // operations remain so the metadata builder still rejects them.
         let effective_updates = self
             .updates
             .iter()

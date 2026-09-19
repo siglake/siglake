@@ -86,7 +86,7 @@ impl RecordBatchProjector {
     /// then uses the standard field ID lookup for projection.
     ///
     /// # Arguments
-    /// * `iceberg_schema` - The Iceberg schema for field ID mapping  
+    /// * `iceberg_schema` - The Iceberg schema for field ID mapping
     /// * `target_field_ids` - The field IDs to project
     pub fn from_iceberg_schema(
         iceberg_schema: Arc<IcebergSchema>,

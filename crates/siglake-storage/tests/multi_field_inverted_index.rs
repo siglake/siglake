@@ -237,7 +237,7 @@ async fn custom_indexes_write_per_column_blobs_and_prune_non_raw_queries() {
         case_sensitive: false,
         statistics_blobs: vec![],
     };
-    let reader = ArrowReaderBuilder::new(table.file_io().clone())
+    let reader = ArrowReaderBuilder::new(table.file_io().clone(), iceberg::Runtime::current())
         .with_row_selection_enabled(true)
         .with_raw_prune_spec(Some(RawPruneSpec {
             column: "message".to_string(),
@@ -248,6 +248,7 @@ async fn custom_indexes_write_per_column_blobs_and_prune_non_raw_queries() {
     let batches = reader
         .read(Box::pin(futures::stream::iter(vec![Ok(task)].into_iter())) as FileScanTaskStream)
         .unwrap()
+        .stream()
         .try_collect::<Vec<RecordBatch>>()
         .await
         .unwrap();

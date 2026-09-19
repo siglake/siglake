@@ -144,6 +144,7 @@ async fn collect_scan_batches(
     reader
         .read(tasks)
         .unwrap()
+        .stream()
         .try_collect::<Vec<RecordBatch>>()
         .await
         .unwrap()
@@ -167,7 +168,7 @@ async fn measure_filtered_scan(
     predicate: BoundPredicate,
     row_selection_enabled: bool,
 ) -> (Duration, usize, u64) {
-    let reader = ArrowReaderBuilder::new(file_io)
+    let reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current())
         .with_row_group_filtering_enabled(true)
         .with_row_selection_enabled(row_selection_enabled)
         .build();
@@ -206,7 +207,7 @@ async fn filtered_count_empty_projection_microbench() {
     let predicate = bench_predicate(&schema);
 
     let level_only_batches = collect_scan_batches(
-        ArrowReaderBuilder::new(file_io.clone()).build(),
+        ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build(),
         &file_path,
         schema.clone(),
         file_size,

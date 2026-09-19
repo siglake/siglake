@@ -207,5 +207,9 @@ async fn native_s3_pages_resume_wrap_and_repair_behind_cursor() {
         "an _active object was registered as a sealed segment"
     );
 
-    store.remove_all(&format!("{test_root}/")).await.unwrap();
+    store
+        .delete_with(&format!("{test_root}/"))
+        .recursive(true)
+        .await
+        .unwrap();
 }

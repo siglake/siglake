@@ -19,6 +19,7 @@
 
 pub mod memory;
 mod metadata_location;
+pub(crate) mod utils;
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
@@ -39,6 +40,7 @@ use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
 use crate::io::StorageFactory;
+use crate::runtime::Runtime;
 use crate::spec::{
     EncryptedKey, FormatVersion, PartitionStatisticsFile, Schema, SchemaId, Snapshot,
     SnapshotReference, SortOrder, StatisticsFile, TableMetadata, TableMetadataBuilder,
@@ -98,6 +100,14 @@ pub trait Catalog: Debug + Sync + Send {
     /// Drop a table from the catalog, or returns error if it doesn't exist.
     async fn drop_table(&self, table: &TableIdent) -> Result<()>;
 
+    /// Drop a table from the catalog and delete the underlying table data.
+    ///
+    /// Implementations should load the table metadata, drop the table
+    /// from the catalog, then delete all associated data and metadata files.
+    /// The [`drop_table_data`](utils::drop_table_data) utility function can
+    /// be used for the file cleanup step.
+    async fn purge_table(&self, table: &TableIdent) -> Result<()>;
+
     /// Check if a table exists in the catalog.
     async fn table_exists(&self, table: &TableIdent) -> Result<bool>;
 
@@ -110,20 +120,11 @@ pub trait Catalog: Debug + Sync + Send {
     /// Update a table to the catalog.
     async fn update_table(&self, commit: TableCommit) -> Result<Table>;
 
-    /// Update a table, supplying the base [`Table`] the commit was computed
-    /// against so the catalog can skip re-loading it.
+    /// Update a table using the exact base the commit was computed against.
     ///
-    /// [`Transaction::do_commit`](crate::transaction::Transaction) already loads
-    /// the current table to compute the commit diff, then hands it here. A
-    /// catalog whose `update_table` would otherwise re-read `metadata.json` from
-    /// object storage (e.g. the SQL catalog) can override this to apply the
-    /// commit directly onto `base`, saving one GET + full metadata parse per
-    /// commit. The base also tightens the optimistic-concurrency check: the
-    /// commit is locked against the exact metadata the diff was derived from.
-    ///
-    /// The default implementation ignores `base` and delegates to
-    /// [`Catalog::update_table`], preserving behavior for catalogs that don't
-    /// opt in.
+    /// Catalogs that would otherwise reload table metadata can override this
+    /// method to avoid that redundant read. The default preserves the existing
+    /// catalog contract.
     async fn update_table_with_base(&self, commit: TableCommit, base: Table) -> Result<Table> {
         let _ = base;
         self.update_table(commit).await
@@ -154,13 +155,19 @@ pub trait CatalogBuilder: Default + Debug + Send + Sync {
     ///
     /// let catalog = MyCatalogBuilder::default()
     ///     .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-    ///         configured_scheme: "s3a".to_string(),
     ///         customized_credential_load: None,
     ///     }))
     ///     .load("my_catalog", props)
     ///     .await?;
     /// ```
     fn with_storage_factory(self, storage_factory: Arc<dyn StorageFactory>) -> Self;
+
+    /// Set a custom tokio Runtime to use for spawning async tasks.
+    ///
+    /// When a Runtime is provided, the catalog will propagate it to all tables
+    /// it creates. Tasks such as scan planning and delete file processing
+    /// will be spawned on this runtime.
+    fn with_runtime(self, runtime: Runtime) -> Self;
 
     /// Create a new catalog instance.
     fn load(
@@ -401,13 +408,16 @@ impl TableCommit {
             metadata_builder = update.apply(metadata_builder)?;
         }
 
-        // Bump the version of metadata
+        // Build the new metadata
+        let new_metadata = metadata_builder.build()?.metadata;
+
         let new_metadata_location = MetadataLocation::from_str(current_metadata_location)?
             .with_next_version()
+            .with_new_metadata(&new_metadata)
             .to_string();
 
         Ok(table
-            .with_metadata(Arc::new(metadata_builder.build()?.metadata))
+            .with_metadata(Arc::new(new_metadata))
             .with_metadata_location(new_metadata_location))
     }
 }
@@ -822,7 +832,9 @@ pub(super) mod _serde {
     pub(super) fn deserialize_snapshot<'de, D>(
         deserializer: D,
     ) -> std::result::Result<Snapshot, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         let buf = CatalogSnapshot::deserialize(deserializer)?;
         Ok(buf.into())
     }
@@ -1043,7 +1055,9 @@ mod _serde_set_statistics {
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<StatisticsFile, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         let SetStatistics {
             snapshot_id,
             statistics,
@@ -1084,6 +1098,7 @@ mod tests {
         ViewVersion,
     };
     use crate::table::Table;
+    use crate::test_utils::test_runtime;
     use crate::{
         NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement, TableUpdate,
     };
@@ -2334,7 +2349,7 @@ mod tests {
                 {
                     "action": "remove-schemas",
                     "schema-ids": [1, 2]
-                }        
+                }
             "#,
             TableUpdate::RemoveSchemas {
                 schema_ids: vec![1, 2],
@@ -2356,7 +2371,7 @@ mod tests {
                         "encrypted-key-metadata": "{encoded_key}",
                         "encrypted-by-id": "b"
                     }}
-                }}        
+                }}
             "#
             ),
             TableUpdate::AddEncryptionKey {
@@ -2376,7 +2391,7 @@ mod tests {
                 {
                     "action": "remove-encryption-key",
                     "key-id": "a"
-                }        
+                }
             "#,
             TableUpdate::RemoveEncryptionKey {
                 key_id: "a".to_string(),
@@ -2398,9 +2413,10 @@ mod tests {
 
             Table::builder()
                 .metadata(resp)
-                .metadata_location("s3://bucket/test/location/metadata/00000-8a62c37d-4573-4021-952a-c0baef7d21d0.metadata.json".to_string())
+                .metadata_location("s3://bucket/test/location/metadata/00000-8a62c37d-4573-4021-952a-c0baef7d21d0.metadata.json")
                 .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
                 .file_io(FileIO::new_with_memory())
+                .runtime(test_runtime())
                 .build()
                 .unwrap()
         };

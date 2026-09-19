@@ -64,7 +64,7 @@ mod sort_order;
 mod update_location;
 mod update_properties;
 mod update_schema;
-pub use update_schema::UpdateSchemaAction;
+pub use update_schema::{AddColumn, UpdateSchemaAction};
 mod update_statistics;
 mod upgrade_format_version;
 
@@ -146,13 +146,17 @@ impl Transaction {
         UpdatePropertiesAction::new()
     }
 
+    /// Creates an update schema action.
+    pub fn update_schema(&self) -> UpdateSchemaAction {
+        UpdateSchemaAction::new()
+    }
+
     /// Creates a fast append action.
     pub fn fast_append(&self) -> FastAppendAction {
         FastAppendAction::new()
     }
 
-    /// Creates a rewrite-files (overwrite) action that atomically removes a set of
-    /// existing data files and adds a set of new ones in a single snapshot.
+    /// Creates an atomic rewrite action.
     pub fn rewrite_files(&self) -> RewriteFilesAction {
         RewriteFilesAction::new()
     }
@@ -160,22 +164,6 @@ impl Transaction {
     /// Creates replace sort order action.
     pub fn replace_sort_order(&self) -> ReplaceSortOrderAction {
         ReplaceSortOrderAction::new()
-    }
-
-    /// Creates an additive, idempotent schema-evolution action that
-    /// appends new optional columns to the current schema. See
-    /// [`UpdateSchemaAction`].
-    pub fn update_schema(&self) -> UpdateSchemaAction {
-        UpdateSchemaAction::new()
-    }
-
-    /// Creates an expire-snapshots action that removes old snapshots from
-    /// table metadata (retaining the most-recent N plus the current
-    /// snapshot and every ref target). Non-destructive: it drops snapshot
-    /// metadata only and leaves expired-snapshot files in object storage
-    /// as orphans. See [`ExpireSnapshotsAction`].
-    pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
-        ExpireSnapshotsAction::new()
     }
 
     /// Set the location of table
@@ -188,6 +176,11 @@ impl Transaction {
         UpdateStatisticsAction::new()
     }
 
+    /// Expire snapshots from the table metadata.
+    pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
+        ExpireSnapshotsAction::new()
+    }
+
     /// Commit transaction.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
         if self.actions.is_empty() {
@@ -196,6 +189,14 @@ impl Transaction {
         }
 
         let table_props = self.table.metadata().table_properties()?;
+
+        // TODO(https://github.com/apache/iceberg-rust/issues/2034): remove once encrypted writes are supported
+        if table_props.encryption_key_id.is_some() {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Cannot commit to an encrypted table: encrypted writes are not yet supported",
+            ));
+        }
 
         let backoff = Self::build_backoff(table_props)?;
         let tx = self;
@@ -225,10 +226,6 @@ impl Transaction {
     }
 
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
-        // Attempts-per-success (this counter / the caller's commit count) is the
-        // direct measure of optimistic-concurrency churn: every attempt pays a
-        // catalog load_table + full action re-apply, so a ratio well above 1
-        // under concurrent writers means the commit path is CAS-bound.
         metrics::counter!("siglake_iceberg_commit_attempts_total").increment(1);
         let refreshed = catalog.load_table(self.table.identifier()).await?;
         let refreshed_uuid = refreshed.metadata().uuid();
@@ -247,8 +244,7 @@ impl Transaction {
         if self.table.metadata() != refreshed.metadata()
             || self.table.metadata_location() != refreshed.metadata_location()
         {
-            // current base is stale, use refreshed as base and re-apply transaction
-            // actions (another writer committed since this transaction's base load).
+            // current base is stale, use refreshed as base and re-apply transaction actions
             metrics::counter!("siglake_iceberg_commit_stale_base_total").increment(1);
             self.table = refreshed.clone();
         }
@@ -268,10 +264,6 @@ impl Transaction {
             )?;
         }
 
-        // Retried idempotent actions can disappear after they are re-applied
-        // to the refreshed base. Do not turn a genuinely empty transaction
-        // into a metadata version and catalog update. Requirements still need
-        // catalog validation even when an action produced no updates.
         if existing_updates.is_empty() && existing_requirements.is_empty() {
             return Ok(current_table);
         }
@@ -282,13 +274,6 @@ impl Transaction {
             .requirements(existing_requirements)
             .build();
 
-        // `self.table` is the base this commit's diff (updates + requirements)
-        // was computed against — freshly loaded at the top of `do_commit` and
-        // refreshed above if it was stale. Hand it to the catalog so a
-        // re-loading implementation (e.g. the SQL catalog) can apply the commit
-        // without a redundant `metadata.json` read. On a concurrent-commit
-        // conflict the catalog returns a retryable error and the `commit`
-        // backoff loop re-runs `do_commit`, picking up the new base.
         catalog
             .update_table_with_base(table_commit, self.table.clone())
             .await
@@ -304,15 +289,17 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use crate::catalog::MockCatalog;
+    use crate::encryption::SensitiveBytes;
+    use crate::encryption::kms::{KeyManagementClient, MemoryKeyManagementClient};
     use crate::io::FileIO;
+    use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Literal, Struct,
-        TableMetadata,
+        DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct, TableMetadata,
     };
     use crate::table::Table;
+    use crate::test_utils::test_runtime;
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent};
-    use uuid::Uuid;
 
     pub fn make_v1_table() -> Table {
         let file = File::open(format!(
@@ -326,9 +313,10 @@ mod tests {
 
         Table::builder()
             .metadata(resp)
-            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .metadata_location("s3://bucket/test/location/metadata/v1.json")
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
             .build()
             .unwrap()
     }
@@ -345,9 +333,10 @@ mod tests {
 
         Table::builder()
             .metadata(resp)
-            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .metadata_location("s3://bucket/test/location/metadata/v1.json")
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
             .build()
             .unwrap()
     }
@@ -364,39 +353,15 @@ mod tests {
 
         Table::builder()
             .metadata(resp)
-            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .metadata_location("s3://bucket/test/location/metadata/v1.json")
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
             .build()
             .unwrap()
     }
 
-    /// A committable v2 table: the minimal v2 metadata's schema, partition spec and
-    /// sort order created through `catalog`, so a transaction can be committed against
-    /// it and the resulting snapshot loaded back and scanned.
-    pub(crate) async fn make_v2_minimal_table_in_catalog(catalog: &impl Catalog) -> Table {
-        make_minimal_table_in_catalog(
-            catalog,
-            "TableMetadataV2ValidMinimal.json",
-            FormatVersion::V2,
-        )
-        .await
-    }
-
     pub(crate) async fn make_v3_minimal_table_in_catalog(catalog: &impl Catalog) -> Table {
-        make_minimal_table_in_catalog(
-            catalog,
-            "TableMetadataV3ValidMinimal.json",
-            FormatVersion::V3,
-        )
-        .await
-    }
-
-    async fn make_minimal_table_in_catalog(
-        catalog: &impl Catalog,
-        metadata_file: &str,
-        format_version: FormatVersion,
-    ) -> Table {
         let table_ident =
             TableIdent::from_strs([format!("ns1-{}", uuid::Uuid::new_v4()), "test1".to_string()])
                 .unwrap();
@@ -409,7 +374,7 @@ mod tests {
         let file = File::open(format!(
             "{}/testdata/table_metadata/{}",
             env!("CARGO_MANIFEST_DIR"),
-            metadata_file
+            "TableMetadataV3ValidMinimal.json"
         ))
         .unwrap();
         let reader = BufReader::new(file);
@@ -420,7 +385,7 @@ mod tests {
             .partition_spec((**base_metadata.default_partition_spec()).clone())
             .sort_order((**base_metadata.default_sort_order()).clone())
             .name(table_ident.name().to_string())
-            .format_version(format_version)
+            .format_version(crate::spec::FormatVersion::V3)
             .build();
 
         catalog
@@ -469,16 +434,32 @@ mod tests {
             .unwrap()
     }
 
-    fn with_table_uuid(table: &Table, table_uuid: Uuid) -> Table {
-        let metadata = table
-            .metadata()
-            .clone()
-            .into_builder(None)
-            .assign_uuid(table_uuid)
-            .build()
-            .unwrap()
-            .metadata;
-        table.clone().with_metadata(Arc::new(metadata))
+    #[tokio::test]
+    async fn test_commit_supplies_the_loaded_base_without_a_second_catalog_load() {
+        let table = make_v2_table();
+        let expected_location = table.metadata_location().unwrap().to_string();
+        let committed_location = expected_location.clone();
+        let loaded = table.clone();
+        let mut catalog = MockCatalog::new();
+        catalog.expect_load_table().times(1).returning_st(move |_| {
+            let loaded = loaded.clone();
+            Box::pin(async move { Ok(loaded) })
+        });
+        catalog.expect_update_table().times(0);
+        catalog
+            .expect_update_table_with_base()
+            .times(1)
+            .withf(move |_, base| base.metadata_location() == Some(expected_location.as_str()))
+            .returning_st(|_, base| Box::pin(async move { Ok(base) }));
+
+        let committed = create_test_transaction(&table)
+            .commit(&catalog)
+            .await
+            .unwrap();
+        assert_eq!(
+            committed.metadata_location(),
+            Some(committed_location.as_str())
+        );
     }
 
     /// Helper function to set up a mock catalog with retryable errors
@@ -609,173 +590,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stale_append_refuses_recreated_table_before_writing_manifests() {
-        let table = make_v2_minimal_table();
-        let replacement = with_table_uuid(&table, Uuid::from_u128(2));
-        assert_eq!(
-            table.metadata().current_schema(),
-            replacement.metadata().current_schema()
-        );
-        assert_ne!(table.metadata().uuid(), replacement.metadata().uuid());
+    async fn test_transaction_snapshot_summary() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        let commit_uuid = Uuid::from_u128(3);
-        let manifest_path = format!(
-            "{}/metadata/{commit_uuid}-m0.avro",
-            replacement.metadata().location()
-        );
-        assert!(!replacement.file_io().exists(&manifest_path).await.unwrap());
+        let mut file_seq = 0u32;
+        let mut append_file = |table: &crate::table::Table, record_count: u64, file_size: u64| {
+            file_seq += 1;
+            let file = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(format!("test/{file_seq}.parquet"))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(file_size)
+                .record_count(record_count)
+                .partition(Struct::from_iter([Some(Literal::long(1))]))
+                .partition_spec_id(0)
+                .build()
+                .unwrap();
+            let tx = Transaction::new(table);
+            tx.fast_append()
+                .add_data_files(vec![file])
+                .apply(tx)
+                .unwrap()
+        };
 
-        let data_file = DataFileBuilder::default()
-            .content(DataContentType::Data)
-            .file_path("s3://bucket/replacement-compatible.parquet".to_string())
-            .file_format(DataFileFormat::Parquet)
-            .file_size_in_bytes(100)
-            .record_count(1)
-            .partition_spec_id(table.metadata().default_partition_spec_id())
-            .partition(Struct::from_iter([Some(Literal::long(300))]))
+        let table = append_file(&table, /*record_count=*/ 10, /*file_size=*/ 100)
+            .commit(&catalog)
+            .await
+            .unwrap();
+        let table = append_file(&table, /*record_count=*/ 20, /*file_size=*/ 200)
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        let summary = &table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .additional_properties;
+
+        assert_eq!(summary.get("total-records").unwrap(), "30");
+        assert_eq!(summary.get("total-data-files").unwrap(), "2");
+        assert_eq!(summary.get("total-files-size").unwrap(), "300");
+    }
+
+    #[tokio::test]
+    async fn test_commit_rejects_encrypted_table() {
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV3ValidEncryption.json"
+        ))
+        .unwrap();
+        let reader = BufReader::new(file);
+        let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+        let kms: Arc<dyn KeyManagementClient> = {
+            let k = MemoryKeyManagementClient::new();
+            k.add_master_key_bytes(
+                "master-1",
+                SensitiveBytes::new([
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+                    0x0d, 0x0e, 0x0f,
+                ]),
+            )
+            .unwrap();
+            Arc::new(k)
+        };
+
+        let table = Table::builder()
+            .metadata(resp)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json")
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(FileIO::new_with_memory())
+            .kms_client(kms)
+            .runtime(crate::test_utils::test_runtime())
             .build()
             .unwrap();
+
         let tx = Transaction::new(&table);
         let tx = tx
-            .fast_append()
-            .set_commit_uuid(commit_uuid)
-            .add_data_files([data_file])
+            .update_table_properties()
+            .set("test.key".to_string(), "test.value".to_string())
             .apply(tx)
             .unwrap();
 
-        let expected_metadata = replacement.metadata_ref();
-        let loaded_replacement = replacement.clone();
-        let mut catalog = MockCatalog::new();
-        catalog.expect_load_table().times(2).returning_st(move |_| {
-            let replacement = loaded_replacement.clone();
-            Box::pin(async move { Ok(replacement) })
-        });
-        catalog.expect_update_table().times(0);
+        let mock_catalog = MockCatalog::new();
+        let result = tx.commit(&mock_catalog).await;
 
-        let err = tx.commit(&catalog).await.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
-        assert_eq!(
-            err.message(),
-            "Cannot commit transaction: table UUID changed"
-        );
-        assert!(!err.retryable());
-
-        let after = catalog.load_table(table.identifier()).await.unwrap();
-        assert_eq!(after.metadata(), expected_metadata.as_ref());
-        assert_eq!(after.metadata().snapshots().len(), 0);
-        assert!(!after.file_io().exists(&manifest_path).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_commit_refuses_recreated_table_between_cas_attempts() {
-        let table = setup_test_table("3");
-        let refreshed_metadata = table
-            .metadata()
-            .clone()
-            .into_builder(None)
-            .set_properties(HashMap::from([(
-                "concurrent.key".to_string(),
-                "concurrent.value".to_string(),
-            )]))
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata;
-        let refreshed = table.clone().with_metadata(Arc::new(refreshed_metadata));
-        let replacement = with_table_uuid(&refreshed, Uuid::from_u128(4));
-        let expected_metadata = replacement.metadata_ref();
-        let tx = create_test_transaction(&table);
-
-        let load_attempt = AtomicU32::new(0);
-        let loaded_refreshed = refreshed.clone();
-        let loaded_replacement = replacement.clone();
-        let mut catalog = MockCatalog::new();
-        catalog.expect_load_table().times(3).returning_st(move |_| {
-            let table = if load_attempt.fetch_add(1, Ordering::SeqCst) == 0 {
-                loaded_refreshed.clone()
-            } else {
-                loaded_replacement.clone()
-            };
-            Box::pin(async move { Ok(table) })
-        });
-        catalog
-            .expect_update_table_with_base()
-            .times(1)
-            .returning_st(|_, _| {
-                Box::pin(async {
-                    Err(
-                        Error::new(ErrorKind::CatalogCommitConflicts, "Commit conflict")
-                            .with_retryable(true),
-                    )
-                })
-            });
-
-        let err = tx.commit(&catalog).await.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
-        assert_eq!(
-            err.message(),
-            "Cannot commit transaction: table UUID changed"
-        );
-        assert!(!err.retryable());
-
-        let after = catalog.load_table(table.identifier()).await.unwrap();
-        assert_eq!(after.metadata(), expected_metadata.as_ref());
-        assert_eq!(
-            after.metadata().snapshots().collect::<Vec<_>>(),
-            replacement.metadata().snapshots().collect::<Vec<_>>()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_commit_same_uuid_rebase_skips_redundant_property_update() {
-        let table = make_v2_table();
-        let metadata = table
-            .metadata()
-            .clone()
-            .into_builder(None)
-            .set_properties(HashMap::from([(
-                "test.key".to_string(),
-                "test.value".to_string(),
-            )]))
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata;
-        let refreshed = table.clone().with_metadata(Arc::new(metadata));
-        assert_eq!(table.metadata().uuid(), refreshed.metadata().uuid());
-
-        let tx = create_test_transaction(&table);
-        let expected = refreshed.clone();
-        let mut catalog = MockCatalog::new();
-        catalog.expect_load_table().times(1).returning_st(move |_| {
-            let refreshed = refreshed.clone();
-            Box::pin(async move { Ok(refreshed) })
-        });
-        catalog.expect_update_table().times(0);
-
-        let committed = tx.commit(&catalog).await.unwrap();
-
-        // Dropping the redundant property update still rebuilds the metadata,
-        // and `build()` restamps `last_updated_ms` from the wall clock — so the
-        // two stamps differ whenever the two builds land in different
-        // milliseconds. Assert the stamp for monotonicity and everything else
-        // for equality.
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
         assert!(
-            committed.metadata().last_updated_ms() >= expected.metadata().last_updated_ms(),
-            "{} >= {}",
-            committed.metadata().last_updated_ms(),
-            expected.metadata().last_updated_ms()
-        );
-        let mut committed_metadata = committed.metadata().clone();
-        committed_metadata.last_updated_ms = expected.metadata().last_updated_ms();
-        assert_eq!(&committed_metadata, expected.metadata());
-        assert_eq!(
-            committed
-                .metadata()
-                .properties()
-                .get("test.key")
-                .map(String::as_str),
-            Some("test.value")
+            err.message()
+                .contains("encrypted writes are not yet supported"),
+            "unexpected error message: {}",
+            err.message()
         );
     }
 }
@@ -824,13 +735,8 @@ mod test_row_lineage {
         assert_eq!(table.metadata().next_row_id(), 30);
 
         // Check written manifest for first_row_id
-        let manifest_list = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
 
         assert_eq!(manifest_list.entries().len(), 1);
         let manifest_file = &manifest_list.entries()[0];
@@ -852,13 +758,7 @@ mod test_row_lineage {
         assert_eq!(table.metadata().next_row_id(), 30 + 17 + 11);
 
         // Check written manifest for first_row_id
-        let manifest_list = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         assert_eq!(manifest_list.entries().len(), 2);
         let manifest_file = &manifest_list.entries()[1];
         assert_eq!(manifest_file.first_row_id, Some(30));

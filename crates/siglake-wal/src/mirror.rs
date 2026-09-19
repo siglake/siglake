@@ -1695,7 +1695,7 @@ pub struct PlanGroup {
     /// Distinct segments (a sealed key and its active prefix are one).
     pub segments: usize,
     /// Bytes the listing reported for them, or `None` when the store does not
-    /// report sizes in a listing (opendal's in-memory service does not).
+    /// report sizes in a listing.
     pub bytes: Option<u64>,
     /// One key, verbatim, so the operator can see what the layout looked like.
     pub sample_key: String,
@@ -2243,7 +2243,7 @@ mod tests {
     use super::*;
     use crate::SEALED_DIR;
 
-    use opendal::layers::observe::{MetricLabels, MetricValue, MetricsIntercept, MetricsLayer};
+    use opendal::raw::{Access, Layer, LayeredAccess, OpList, OpRead, OpStat, OpWrite};
     use opendal::services::Memory;
 
     use siglake_core::Event;
@@ -2263,33 +2263,81 @@ mod tests {
         move_on_stat: Arc<Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>>,
     }
 
-    impl MetricsIntercept for RequestCounts {
-        fn observe(&self, labels: MetricLabels, value: MetricValue) {
-            let MetricValue::OperationExecuting(1) = value else {
-                return;
-            };
-            match labels.operation {
-                "list" => {
-                    self.lists.fetch_add(1, Ordering::Relaxed);
-                }
-                "stat" => {
-                    self.stats.fetch_add(1, Ordering::Relaxed);
-                    if let Some((from, to)) = self.move_on_stat.lock().unwrap().take() {
-                        std::fs::rename(from, to).unwrap();
-                    }
-                }
-                "write" => {
-                    self.writes.fetch_add(1, Ordering::Relaxed);
-                }
-                _ => {}
+    #[derive(Clone, Debug)]
+    struct CountingLayer(RequestCounts);
+
+    #[derive(Debug)]
+    struct CountingAccess<A> {
+        inner: A,
+        counts: RequestCounts,
+    }
+
+    impl<A: Access> Layer<A> for CountingLayer {
+        type LayeredAccess = CountingAccess<A>;
+
+        fn layer(&self, inner: A) -> Self::LayeredAccess {
+            CountingAccess {
+                inner,
+                counts: self.0.clone(),
             }
+        }
+    }
+
+    impl<A: Access> LayeredAccess for CountingAccess<A> {
+        type Inner = A;
+        type Reader = A::Reader;
+        type Writer = A::Writer;
+        type Lister = A::Lister;
+        type Deleter = A::Deleter;
+        type Copier = A::Copier;
+
+        fn inner(&self) -> &Self::Inner {
+            &self.inner
+        }
+
+        async fn read(
+            &self,
+            path: &str,
+            args: OpRead,
+        ) -> opendal::Result<(opendal::raw::RpRead, Self::Reader)> {
+            self.inner.read(path, args).await
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<(opendal::raw::RpWrite, Self::Writer)> {
+            self.counts.writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.write(path, args).await
+        }
+
+        async fn stat(&self, path: &str, args: OpStat) -> opendal::Result<opendal::raw::RpStat> {
+            self.counts.stats.fetch_add(1, Ordering::Relaxed);
+            if let Some((from, to)) = self.counts.move_on_stat.lock().unwrap().take() {
+                std::fs::rename(from, to).unwrap();
+            }
+            self.inner.stat(path, args).await
+        }
+
+        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
+            self.inner.delete().await
+        }
+
+        async fn list(
+            &self,
+            path: &str,
+            args: OpList,
+        ) -> opendal::Result<(opendal::raw::RpList, Self::Lister)> {
+            self.counts.lists.fetch_add(1, Ordering::Relaxed);
+            self.inner.list(path, args).await
         }
     }
 
     fn counting_fs_op(root: &Path, counts: RequestCounts) -> Operator {
         Operator::new(opendal::services::Fs::default().root(root.to_str().unwrap()))
             .unwrap()
-            .layer(MetricsLayer::new(counts))
+            .layer(CountingLayer(counts))
             .finish()
     }
 
@@ -3238,13 +3286,15 @@ mod tests {
     #[tokio::test]
     async fn plan_groups_by_destination_and_writes_nothing() {
         let op = memory_op();
+        let body = sealed_body(1);
+        let body_bytes = body.len() as u64;
         for key in [
             "wal-mirror/acme/a.arrow",
             "wal-mirror/acme/b.arrow",
             "wal-mirror/acme/orders/c.arrow",
             "wal-mirror/flat.arrow",
         ] {
-            op.write(key, sealed_body(1)).await.unwrap();
+            op.write(key, body.clone()).await.unwrap();
         }
         op.write("wal-mirror/README.md", bytes::Bytes::from_static(b"BODY"))
             .await
@@ -3288,10 +3338,9 @@ mod tests {
                 ("default", None, 1, format!("default/{SEALED_DIR}")),
             ]
         );
-        // opendal's in-memory service reports no size in a listing, and a
-        // plan pays one LIST and no per-object request, so it says so rather
-        // than inventing a total.
-        assert_eq!(plan.bytes(), None);
+        // OpenDAL 0.57's in-memory service reports sizes in its listing, so
+        // the plan can total them without paying for per-object requests.
+        assert_eq!(plan.bytes(), Some(body_bytes * 4));
 
         // After the apply, a second plan counts what is there instead of
         // proposing it again.

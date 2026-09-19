@@ -7,7 +7,9 @@ use iceberg::arrow::arrow_schema_to_schema;
 use iceberg::io::FileIO;
 use iceberg::spec::Type as IcebergType;
 use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
+use iceberg::transaction::{
+    ActionCommit, AddColumn, ApplyTransactionAction, Transaction, TransactionAction,
+};
 use iceberg::Error as IcebergError;
 use iceberg::ErrorKind as IcebergErrorKind;
 use iceberg::{TableIdent, TableUpdate};
@@ -573,7 +575,8 @@ impl IcebergContext {
             // the creation-time declaration.
             let mut action = tx.update_schema();
             for (name, field_type) in missing_columns {
-                action = action.add_optional_column(name.as_str(), field_type);
+                action = action
+                    .add_column(AddColumn::optional(name.as_str(), field_type).if_not_exists());
             }
             tx = action.apply(tx).context("UpdateSchemaAction::apply")?;
         }

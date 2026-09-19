@@ -28,7 +28,7 @@ use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_writer::AsyncFileWriter as ArrowAsyncFileWriter;
 use parquet::file::metadata::{KeyValue, ParquetMetaData};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{CdcOptions, WriterProperties};
 use parquet::file::statistics::Statistics;
 
 use super::{FileWriter, FileWriterBuilder};
@@ -40,34 +40,18 @@ use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, MapType,
     NestedFieldRef, PartitionSpec, PrimitiveType, Schema, SchemaRef, SchemaVisitor, Struct,
-    StructType, TableMetadata, Type, visit_schema,
+    StructType, TableMetadata, TableProperties, Type, visit_schema,
 };
 use crate::transform::create_transform_function;
 use crate::writer::{CurrentFileStatus, DataFile};
 use crate::{Error, ErrorKind, Result};
 
-const SEGMENTED_WRITE_WRITTEN: &str = "written";
-const SEGMENTED_WRITE_REFUSED: &str = "refused";
-const SEGMENTED_REASON_NONE: &str = "none";
-const SEGMENTED_REASON_COLUMN: &str = "column";
-const SEGMENTED_REASON_FILE_ROWS: &str = "file_rows";
-const SEGMENTED_REASON_ROW_DOMAIN: &str = "row_domain";
-
-/// Every `(outcome, reason)` pair
-/// `siglake_iceberg_segmented_index_writes_total` is recorded under, which is
-/// the whole vocabulary of [`ParquetWriter::publish_segmented_sidecars`]: one
-/// `written` arm and the three ways a sidecar would have described a file
-/// layout the file does not have.
-///
-/// The emitter passes both label values through a variable, so a dashboard
-/// check that reads literals at call sites cannot hold a pre-registration
-/// catalog to them; `segmented_index_write_series_are_preregistered` in
-/// siglake-storage does, against this list.
+/// Label vocabulary emitted by segmented-index publication.
 pub const SEGMENTED_INDEX_WRITE_SERIES: &[(&str, &str)] = &[
-    (SEGMENTED_WRITE_WRITTEN, SEGMENTED_REASON_NONE),
-    (SEGMENTED_WRITE_REFUSED, SEGMENTED_REASON_COLUMN),
-    (SEGMENTED_WRITE_REFUSED, SEGMENTED_REASON_FILE_ROWS),
-    (SEGMENTED_WRITE_REFUSED, SEGMENTED_REASON_ROW_DOMAIN),
+    ("written", "none"),
+    ("refused", "column"),
+    ("refused", "file_rows"),
+    ("refused", "row_domain"),
 ];
 
 /// siglake extension (#4377): one text column to build a **segmented**
@@ -184,30 +168,10 @@ pub struct ParquetWriterBuilder {
     props: WriterProperties,
     schema: SchemaRef,
     match_mode: FieldMatchMode,
-    /// siglake extension: when set, the writer computes a per-row-group token
-    /// bloom over this (Utf8) column and stores the list in footer KV under
-    /// [`siglake_bloom::RAW_TOKEN_ROWGROUP_BLOOM_KV_KEY`], letting the reader prune
-    /// individual row groups for a `raw LIKE` term. `None` = default behavior.
     raw_rowgroup_bloom_column: Option<String>,
-    /// siglake extension: low-cardinality (Utf8) columns to summarize into a
-    /// per-file group-count footer KV ([`siglake_bloom::GROUP_COUNTS_KV_KEY`]) so
-    /// `SELECT <col>, count(*) … GROUP BY <col>` is answered by summing footers
-    /// instead of scanning rows. Counts are accumulated per output file (correct
-    /// under rolling), and a column whose distinct-value count exceeds
-    /// `group_count_cap` for a file is dropped from that file's summary. Empty =
-    /// no group-count footer.
     group_count_columns: Vec<String>,
     group_count_cap: usize,
-    /// siglake extension: when set, the writer counts rows per
-    /// [`siglake_bloom::TIME_BUCKET_BASE_NS`]-aligned bucket of this (Timestamp)
-    /// column and stamps a per-file time-bucket histogram into footer KV
-    /// ([`siglake_bloom::TIME_BUCKETS_KV_KEY`]), so a `date_histogram` re-buckets
-    /// from footers instead of scanning. `None` = no time-bucket footer.
     time_bucket_column: Option<String>,
-    /// siglake extension: stamp this table sort-order id into each produced
-    /// [`DataFile`]'s manifest entry (`sort_order_id`), attributing the file's
-    /// physical layout to the order it was written under — the per-file basis
-    /// for the query gate's direction check during a sort-order migration.
     sort_order_id: Option<i32>,
     /// siglake extension (#4377): build a segmented (`seg2`) inverted-index
     /// sidecar for these columns as the row groups are emitted, and leave the
@@ -219,6 +183,10 @@ pub struct ParquetWriterBuilder {
 impl ParquetWriterBuilder {
     /// Create a new `ParquetWriterBuilder`
     /// To construct the write result, the schema should contain the `PARQUET_FIELD_ID_META_KEY` metadata for each field.
+    ///
+    /// When writing into an existing Iceberg table, prefer
+    /// [`Self::from_table_properties`], which derives `WriterProperties` from
+    /// the table's `write.parquet.*` properties.
     pub fn new(props: WriterProperties, schema: SchemaRef) -> Self {
         Self::new_with_match_mode(props, schema, FieldMatchMode::Id)
     }
@@ -242,32 +210,57 @@ impl ParquetWriterBuilder {
         }
     }
 
-    /// siglake extension: enable per-row-group token blooms over `column` (must be
-    /// a Utf8 column). The writer takes control of row-group boundaries so each
-    /// bloom covers exactly one row group, and writes the hex list to footer KV.
+    /// Build a `ParquetWriterBuilder` from Iceberg table properties and a
+    /// schema, translating `write.parquet.*` settings into `WriterProperties`
+    /// instead of using parquet-rs defaults.
+    ///
+    /// Currently translates the content-defined-chunking keys
+    /// (`write.parquet.content-defined-chunking.*`); other keys fall back to
+    /// parquet-rs defaults.
+    pub fn from_table_properties(table_props: &TableProperties, schema: SchemaRef) -> Self {
+        let cdc = table_props.cdc_enabled.then_some(CdcOptions {
+            min_chunk_size: table_props.cdc_min_chunk_size,
+            max_chunk_size: table_props.cdc_max_chunk_size,
+            norm_level: table_props.cdc_norm_level,
+        });
+        // TODO: translate the remaining write.parquet.* keys (e.g. compression-codec,
+        // row-group-size-bytes, page-size-bytes).
+        // This constructor is intended to be the single place that maps them.
+        let props = WriterProperties::builder()
+            .set_content_defined_chunking(cdc)
+            .build();
+        Self::new_with_match_mode(props, schema, FieldMatchMode::Id)
+    }
+
+    /// Set the field match mode used to map Arrow fields to Iceberg fields.
+    ///
+    /// Defaults to [`FieldMatchMode::Id`]. Use [`FieldMatchMode::Name`] when the
+    /// incoming Arrow schema does not carry Iceberg field-id metadata.
+    pub fn with_match_mode(mut self, match_mode: FieldMatchMode) -> Self {
+        self.match_mode = match_mode;
+        self
+    }
+
+    /// Enable a per-row-group trigram bloom over one Utf8 column.
     pub fn with_raw_rowgroup_bloom_column(mut self, column: impl Into<String>) -> Self {
         self.raw_rowgroup_bloom_column = Some(column.into());
         self
     }
 
-    /// siglake extension: stamp a per-file group-count summary over `columns`
-    /// (the low-cardinality dimensional columns), capping each file's per-column
-    /// distinct values at `cap`. See [`group_count_columns`](Self::group_count_columns).
+    /// Stamp capped per-file group counts for the configured dimensions.
     pub fn with_group_count_columns(mut self, columns: Vec<String>, cap: usize) -> Self {
         self.group_count_columns = columns;
         self.group_count_cap = cap;
         self
     }
 
-    /// siglake extension: stamp a per-file time-bucket histogram over `column`
-    /// (a Timestamp column). See [`time_bucket_column`](Self::time_bucket_column).
+    /// Stamp an epoch-aligned time-bucket histogram for one timestamp column.
     pub fn with_time_bucket_column(mut self, column: impl Into<String>) -> Self {
         self.time_bucket_column = Some(column.into());
         self
     }
 
-    /// siglake extension: stamp `id` as each produced data file's
-    /// `sort_order_id` manifest field. See [`sort_order_id`](Self::sort_order_id).
+    /// Attribute produced data files to the table sort order used to write them.
     pub fn with_sort_order_id(mut self, id: i32) -> Self {
         self.sort_order_id = Some(id);
         self
@@ -326,10 +319,8 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             time_bucket_nulls: 0,
             time_bucket_disabled: false,
             sort_order_id: self.sort_order_id,
-            segmented: self
-                .segmented_index
-                .as_ref()
-                .map(|request| SegmentedIndexState {
+            segmented: self.segmented_index.as_ref().map(|request| {
+                SegmentedIndexState {
                     writers: request
                         .columns
                         .iter()
@@ -347,7 +338,8 @@ impl FileWriterBuilder for ParquetWriterBuilder {
                     sink: Arc::clone(&request.sink),
                     disabled: false,
                     rows: 0,
-                }),
+                }
+            }),
         })
     }
 }
@@ -478,37 +470,19 @@ pub struct ParquetWriter {
     writer_properties: WriterProperties,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
-    // siglake per-row-group token bloom state (inactive when `rowgroup_bloom_column`
-    // is None). When active, the writer forms row groups explicitly (chunk + flush)
-    // so each accumulated bloom in `rowgroup_blooms` covers exactly one row group.
     rowgroup_bloom_column: Option<String>,
     rowgroup_blooms: Vec<siglake_bloom::TokenBloom>,
-    // Set if a bloom couldn't be computed for some row group (e.g. column missing
-    // or non-Utf8): the whole list is then dropped rather than written misaligned.
     rowgroup_bloom_disabled: bool,
-    // Carry buffer of not-yet-sealed rows (a write may not land on a row-group
-    // boundary). Only used on the bloom path.
     pending: Vec<arrow_array::RecordBatch>,
     pending_rows: usize,
-    // siglake per-file group-count summary state (inactive when
-    // `group_count_columns` is empty). Accumulated across every batch written to
-    // THIS file (the rolling writer builds a fresh ParquetWriter per output file,
-    // so counts are naturally per-file), stamped into footer KV at close. A column
-    // is moved to `group_count_dropped` once its distinct values exceed
-    // `group_count_cap` for this file (too high-cardinality to summarize).
     group_count_columns: Vec<String>,
     group_count_cap: usize,
     group_counts: std::collections::BTreeMap<String, siglake_bloom::ColumnCounts>,
     group_count_dropped: std::collections::HashSet<String>,
-    // siglake per-file time-bucket histogram state (inactive when
-    // `time_bucket_column` is None). Accumulated per output file (fresh writer per
-    // rolled file), stamped at close. Disabled if the column is absent or not a
-    // nanosecond Timestamp, so the footer never claims a partial histogram.
     time_bucket_column: Option<String>,
     time_buckets: std::collections::BTreeMap<i64, u64>,
     time_bucket_nulls: u64,
     time_bucket_disabled: bool,
-    /// See [`ParquetWriterBuilder::sort_order_id`].
     sort_order_id: Option<i32>,
     // siglake per-row-group segmented inverted index (#4377), inactive when
     // `None`. Active, it forms row groups explicitly for the same reason the
@@ -768,9 +742,6 @@ impl ParquetWriter {
 
         Ok(partition_struct)
     }
-}
-
-impl ParquetWriter {
     /// siglake: accumulate this batch's per-value row counts for each configured
     /// (still-eligible) Utf8 group-count column. A column whose distinct-value
     /// count exceeds the per-file cap is dropped (too high-cardinality), and any
@@ -794,10 +765,8 @@ impl ParquetWriter {
                 None => {
                     use arrow_schema::DataType;
                     let ty = batch.column(idx).data_type();
-                    let castable = matches!(
-                        ty,
-                        DataType::Int64 | DataType::Float64 | DataType::Boolean
-                    );
+                    let castable =
+                        matches!(ty, DataType::Int64 | DataType::Float64 | DataType::Boolean);
                     let cast_ok = castable
                         .then(|| arrow_cast::cast::cast(batch.column(idx), &DataType::Utf8).ok())
                         .flatten();
@@ -1002,7 +971,6 @@ impl ParquetWriter {
             grams.iter(),
         ))
     }
-
     /// siglake (#4377): push these batches — exactly one row group's rows — as
     /// one group of each configured column's segmented sidecar.
     ///
@@ -1042,11 +1010,7 @@ impl ParquetWriter {
                     break;
                 };
                 for i in 0..values.len() {
-                    builder.push_row(if values.is_null(i) {
-                        ""
-                    } else {
-                        values.value(i)
-                    });
+                    builder.push_row(if values.is_null(i) { "" } else { values.value(i) });
                 }
                 pushed += values.len();
             }
@@ -1056,11 +1020,6 @@ impl ParquetWriter {
                 return;
             }
             let index = builder.build();
-            // The bound this design rests on, recorded per group rather than
-            // inferred: what the writer holds live is THIS group's postings and
-            // dictionary, dropped at the end of this iteration. A file-
-            // proportional build would show the same series growing group by
-            // group.
             metrics::histogram!("siglake_iceberg_segmented_index_group_index_bytes")
                 .record(index.heap_size_bytes() as f64);
             writer.push_group_index(&index);
@@ -1089,18 +1048,18 @@ impl ParquetWriter {
         data_file_path: &str,
     ) {
         if segmented.disabled {
-            Self::record_segmented_write(SEGMENTED_WRITE_REFUSED, SEGMENTED_REASON_COLUMN);
+            Self::record_segmented_write("refused", "column");
             return;
         }
         if segmented.rows != file_rows {
-            Self::record_segmented_write(SEGMENTED_WRITE_REFUSED, SEGMENTED_REASON_FILE_ROWS);
+            Self::record_segmented_write("refused", "file_rows");
             return;
         }
         let sink = segmented.sink;
         let mut finished = Vec::with_capacity(segmented.writers.len());
         for (column, writer, group_rows) in segmented.writers {
             if group_rows != row_counts {
-                Self::record_segmented_write(SEGMENTED_WRITE_REFUSED, SEGMENTED_REASON_ROW_DOMAIN);
+                Self::record_segmented_write("refused", "row_domain");
                 return;
             }
             finished.push(SegmentedIndexBlob {
@@ -1115,7 +1074,7 @@ impl ParquetWriter {
             metrics::histogram!("siglake_iceberg_segmented_index_written_bytes")
                 .record(blob.bytes.len() as f64);
             sink.push(blob);
-            Self::record_segmented_write(SEGMENTED_WRITE_WRITTEN, SEGMENTED_REASON_NONE);
+            Self::record_segmented_write("written", "none");
         }
     }
 
@@ -1165,8 +1124,11 @@ impl ParquetWriter {
         // exactly it.
         for batch in batches {
             writer.write(batch).await.map_err(|err| {
-                Error::new(ErrorKind::Unexpected, "Failed to write using parquet writer.")
-                    .with_source(err)
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to write using parquet writer.",
+                )
+                .with_source(err)
             })?;
         }
         if flush {
@@ -1202,7 +1164,8 @@ impl ParquetWriter {
                 out.push(head);
             } else {
                 out.push(head.slice(0, need));
-                self.pending.insert(0, head.slice(need, head.num_rows() - need));
+                self.pending
+                    .insert(0, head.slice(need, head.num_rows() - need));
                 taken = n;
             }
         }
@@ -1213,7 +1176,10 @@ impl ParquetWriter {
     /// Emit every full (`max_row_group_size`-row) row group buffered so far,
     /// leaving any partial remainder in `pending`.
     async fn drain_full_row_groups(&mut self) -> Result<()> {
-        let chunk = self.writer_properties.max_row_group_size();
+        let chunk = self
+            .writer_properties
+            .max_row_group_row_count()
+            .unwrap_or(parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT);
         if chunk == 0 {
             return Ok(());
         }
@@ -1246,15 +1212,12 @@ impl FileWriter for ParquetWriter {
             .compute(self.schema.clone(), batch_c)?;
 
         if self.forms_row_groups() {
-            // Take control of row-group formation so each token bloom and each
-            // segmented sidecar group covers exactly one row group.
             self.pending.push(batch.clone());
             self.pending_rows += batch.num_rows();
             self.drain_full_row_groups().await?;
             return Ok(());
         }
 
-        // Default path: let the inner writer form row groups.
         self.inner_or_init().await?;
         self.inner_writer
             .as_mut()
@@ -1273,8 +1236,6 @@ impl FileWriter for ParquetWriter {
     }
 
     async fn close(mut self) -> Result<Vec<DataFileBuilder>> {
-        // Bloom path: seal any buffered remainder as the final row group (finish()
-        // below seals it, so no explicit flush), recording its bloom in order.
         if self.forms_row_groups() && self.pending_rows > 0 {
             let last = std::mem::take(&mut self.pending);
             self.pending_rows = 0;
@@ -1286,9 +1247,6 @@ impl FileWriter for ParquetWriter {
             None => return Ok(vec![]),
         };
 
-        // Stamp the per-row-group bloom list into the footer KV before finishing.
-        // Skipped if blooming was disabled (a row group couldn't be indexed) so the
-        // reader never sees a list that doesn't line up with the file's row groups.
         if self.rowgroup_bloom_column.is_some()
             && !self.rowgroup_bloom_disabled
             && !self.rowgroup_blooms.is_empty()
@@ -1300,11 +1258,6 @@ impl FileWriter for ParquetWriter {
             ));
         }
 
-        // Stamp the per-file group-count summary (siglake fast-field term-agg
-        // hedge) into the footer KV before finishing. Per output file: the rolling
-        // writer builds a fresh ParquetWriter per file, so this covers exactly this
-        // file's rows (Σ values + nulls == file rows for every covered column — the
-        // invariant the storage reader's validity guard checks).
         if let Some(blob) = self.group_counts_footer_blob() {
             writer.append_key_value_metadata(KeyValue::new(
                 siglake_bloom::GROUP_COUNTS_KV_KEY.to_string(),
@@ -1312,8 +1265,6 @@ impl FileWriter for ParquetWriter {
             ));
         }
 
-        // Per-file time-bucket histogram (siglake date_histogram hedge): same
-        // per-output-file stamp-at-close pattern as the group-count footer.
         if let Some(json) = self.time_buckets_footer_json() {
             writer.append_key_value_metadata(KeyValue::new(
                 siglake_bloom::TIME_BUCKETS_KV_KEY.to_string(),
@@ -1431,8 +1382,6 @@ impl ArrowAsyncFileWriter for AsyncFileWriter {
 
 #[cfg(test)]
 mod tests {
-
-
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1441,7 +1390,9 @@ mod tests {
     use arrow_array::types::{Float32Type, Int64Type};
     use arrow_array::{
         Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array,
-        Int64Array, ListArray, MapArray, RecordBatch, StructArray,
+        Int64Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
     };
     use arrow_schema::{DataType, Field, Fields, SchemaRef as ArrowSchemaRef};
     use arrow_select::concat::concat_batches;
@@ -1645,7 +1596,7 @@ mod tests {
         // write data
         let mut pw = ParquetWriterBuilder::new(
             WriterProperties::builder()
-                .set_max_row_group_size(128)
+                .set_max_row_group_row_count(Some(128))
                 .build(),
             Arc::new(to_write.schema().as_ref().try_into().unwrap()),
         )
@@ -1834,9 +1785,10 @@ mod tests {
                 ordered,
             )
         }) as ArrayRef;
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            col0, col1, col2, col3, col4, col5,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![col0, col1, col2, col3, col4, col5],
+        )
         .unwrap();
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -2023,10 +1975,13 @@ mod tests {
                 .with_precision_and_scale(38, 5)
                 .unwrap(),
         ) as ArrayRef;
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            col0, col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12, col13,
-            col14, col15, col16,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                col0, col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12,
+                col13, col14, col15, col16,
+            ],
+        )
         .unwrap();
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -2615,10 +2570,10 @@ mod tests {
             None,
         )) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            struct_float_field_col,
-            struct_nested_float_field_col,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![struct_float_field_col, struct_nested_float_field_col],
+        )
         .unwrap();
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -2773,11 +2728,14 @@ mod tests {
             None,
         )) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            list_float_field_col,
-            struct_list_float_field_col,
-            // large_list_float_field_col,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                list_float_field_col,
+                struct_list_float_field_col,
+                // large_list_float_field_col,
+            ],
+        )
         .expect("Could not form record batch");
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -2955,10 +2913,10 @@ mod tests {
             None,
         )) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            map_array,
-            struct_list_float_field_col,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![map_array, struct_list_float_field_col],
+        )
         .expect("Could not form record batch");
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -3103,5 +3061,334 @@ mod tests {
 
         assert_eq!(lower_bounds, HashMap::from([(0, Datum::int(i32::MIN))]));
         assert_eq!(upper_bounds, HashMap::from([(0, Datum::int(i32::MAX))]));
+    }
+
+    // -----------------------------------------------------------------
+    // ParquetWriterBuilder::from_table_properties
+    // -----------------------------------------------------------------
+
+    fn cdc_test_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::required(2, "payload", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn table_props(entries: HashMap<String, String>) -> TableProperties {
+        TableProperties::try_from(&entries).unwrap()
+    }
+
+    #[test]
+    fn test_from_table_properties_no_cdc_by_default() {
+        let tp = table_props(HashMap::new());
+        let builder = ParquetWriterBuilder::from_table_properties(&tp, cdc_test_schema());
+        assert!(builder.props.content_defined_chunking().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_from_table_properties_propagate_to_writer() {
+        // `build()` must carry the translated `WriterProperties` through to the
+        // `ParquetWriter` unchanged — otherwise the `write.parquet.*` settings
+        // derived in `from_table_properties` would never reach parquet-rs.
+        //
+        // Asserting on the writer's `WriterProperties` (rather than re-reading a
+        // written file) keeps this a direct propagation check: every future
+        // `write.parquet.*` option just adds an assertion on its corresponding
+        // `WriterProperties` getter here.
+        let tp = table_props(HashMap::from([
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_ENABLED.to_string(),
+                "true".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE.to_string(),
+                "4096".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE.to_string(),
+                "8192".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_NORM_LEVEL.to_string(),
+                "2".to_string(),
+            ),
+        ]));
+
+        let tmp = TempDir::new().unwrap();
+        let output = FileIO::new_with_fs()
+            .new_output(format!("{}/cdc.parquet", tmp.path().to_str().unwrap()))
+            .unwrap();
+        let writer = ParquetWriterBuilder::from_table_properties(&tp, cdc_test_schema())
+            .build(output)
+            .await
+            .unwrap();
+
+        let cdc = writer
+            .writer_properties
+            .content_defined_chunking()
+            .copied()
+            .expect("CDC should be enabled on the built writer");
+        assert_eq!(cdc.min_chunk_size, 4096);
+        assert_eq!(cdc.max_chunk_size, 8192);
+        assert_eq!(cdc.norm_level, 2);
+    }
+
+    fn footer_extension_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "raw", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(2, "dim", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(3, "status", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(
+                        4,
+                        "timestamp",
+                        Type::Primitive(PrimitiveType::Timestamp),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn siglake_footer_extensions_preserve_rows_and_typed_dimensions() -> Result<()> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let schema = footer_extension_schema();
+        let arrow_schema: ArrowSchemaRef =
+            Arc::new(schema_to_arrow_schema(schema.as_ref()).unwrap());
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "alpha one",
+                    "bravo two",
+                    "charlie three",
+                    "delta four",
+                    "echo five",
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("a"),
+                    None,
+                    Some("b"),
+                    Some("b"),
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    Some(200),
+                    Some(200),
+                    Some(404),
+                    None,
+                    Some(500),
+                ])),
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(-1),
+                    Some(0),
+                    Some(60_000_000),
+                    None,
+                    Some(60_000_001),
+                ])),
+            ],
+        )?;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("extensions.parquet");
+        let output = FileIO::new_with_fs().new_output(path.to_string_lossy())?;
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut writer = ParquetWriterBuilder::new(properties.clone(), schema.clone())
+            .with_raw_rowgroup_bloom_column("raw")
+            .with_group_count_columns(vec!["dim".into(), "status".into(), "raw".into()], 3)
+            .with_time_bucket_column("timestamp")
+            .with_sort_order_id(7)
+            .build(output)
+            .await?;
+        writer.write(&batch).await?;
+        let mut builders = writer.close().await?;
+        let data_file = builders.pop().unwrap().build()?;
+        assert_eq!(data_file.record_count(), 5);
+        assert_eq!(data_file.sort_order_id(), Some(7));
+
+        let reader = SerializedFileReader::new(std::fs::File::open(&path)?)?;
+        let metadata = reader.metadata();
+        assert_eq!(metadata.file_metadata().num_rows(), 5);
+        assert_eq!(metadata.num_row_groups(), 3);
+        let kvs = metadata
+            .file_metadata()
+            .key_value_metadata()
+            .expect("footer key-values");
+        let value = |key: &str| {
+            kvs.iter()
+                .find(|entry| entry.key == key)
+                .and_then(|entry| entry.value.as_deref())
+                .unwrap_or_else(|| panic!("missing footer key {key}"))
+        };
+
+        let blooms = siglake_bloom::rowgroup_blooms_from_hex(value(
+            siglake_bloom::RAW_TRIGRAM_ROWGROUP_BLOOM_KV_KEY,
+        ))
+        .expect("row-group blooms decode");
+        assert_eq!(blooms.len(), 3);
+
+        let counts =
+            siglake_bloom::group_counts::decode_columns(value(siglake_bloom::GROUP_COUNTS_KV_KEY))
+                .expect("group counts decode");
+        assert_eq!(counts["dim"].values.get("a"), Some(&2));
+        assert_eq!(counts["dim"].nulls, 1);
+        assert_eq!(counts["status"].values.get("200"), Some(&2));
+        assert_eq!(counts["status"].nulls, 1);
+        assert!(
+            !counts.contains_key("raw"),
+            "capped dimension must be omitted"
+        );
+
+        let buckets: serde_json::Value =
+            serde_json::from_str(value(siglake_bloom::TIME_BUCKETS_KV_KEY))?;
+        assert_eq!(buckets["nulls"], 1);
+        assert_eq!(buckets["buckets"]["-60000000000"], 1);
+        assert_eq!(buckets["buckets"]["0"], 1);
+        assert_eq!(buckets["buckets"]["60000000000"], 2);
+
+        let decoded: Vec<_> =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?
+                .build()?
+                .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(concat_batches(&batch.schema(), &decoded)?, batch);
+
+        // Append and rewrite use the same writer contract. Produce a second
+        // fixture and require byte-identical footer payloads and decoded rows.
+        let rewrite_path = tmp.path().join("rewrite.parquet");
+        let rewrite_output = FileIO::new_with_fs().new_output(rewrite_path.to_string_lossy())?;
+        let mut rewrite_writer = ParquetWriterBuilder::new(properties, schema)
+            .with_raw_rowgroup_bloom_column("raw")
+            .with_group_count_columns(vec!["dim".into(), "status".into(), "raw".into()], 3)
+            .with_time_bucket_column("timestamp")
+            .with_sort_order_id(7)
+            .build(rewrite_output)
+            .await?;
+        rewrite_writer.write(&batch).await?;
+        let rewrite_file = rewrite_writer.close().await?.pop().unwrap().build()?;
+        assert_eq!(rewrite_file.record_count(), 5);
+        assert_eq!(rewrite_file.sort_order_id(), Some(7));
+
+        let rewrite_reader = SerializedFileReader::new(std::fs::File::open(&rewrite_path)?)?;
+        let rewrite_kvs = rewrite_reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .expect("rewrite footer key-values");
+        for key in [
+            siglake_bloom::RAW_TRIGRAM_ROWGROUP_BLOOM_KV_KEY,
+            siglake_bloom::GROUP_COUNTS_KV_KEY,
+            siglake_bloom::TIME_BUCKETS_KV_KEY,
+        ] {
+            let rewrite_value = rewrite_kvs
+                .iter()
+                .find(|entry| entry.key == key)
+                .and_then(|entry| entry.value.as_deref())
+                .unwrap_or_else(|| panic!("missing rewrite footer key {key}"));
+            assert_eq!(rewrite_value, value(key));
+        }
+        let rewrite_decoded: Vec<_> =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&rewrite_path)?)?
+                .build()?
+                .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(concat_batches(&batch.schema(), &rewrite_decoded)?, batch);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn time_bucket_extension_accepts_every_timestamp_unit() -> Result<()> {
+        let cases: Vec<(DataType, ArrayRef)> = vec![
+            (
+                DataType::Timestamp(arrow_schema::TimeUnit::Second, None),
+                Arc::new(TimestampSecondArray::from(vec![
+                    Some(-1),
+                    Some(0),
+                    Some(60),
+                    None,
+                ])),
+            ),
+            (
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    Some(-1),
+                    Some(0),
+                    Some(60_000),
+                    None,
+                ])),
+            ),
+            (
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(-1),
+                    Some(0),
+                    Some(60_000_000),
+                    None,
+                ])),
+            ),
+            (
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(-1),
+                    Some(0),
+                    Some(60_000_000_000),
+                    None,
+                ])),
+            ),
+            (
+                DataType::Int64,
+                Arc::new(Int64Array::from(vec![
+                    Some(-1),
+                    Some(0),
+                    Some(60_000_000_000),
+                    None,
+                ])),
+            ),
+        ];
+
+        for (index, (data_type, array)) in cases.into_iter().enumerate() {
+            let tmp = TempDir::new()?;
+            let output = FileIO::new_with_fs().new_output(
+                tmp.path()
+                    .join(format!("unit-{index}.parquet"))
+                    .to_string_lossy(),
+            )?;
+            let mut writer = ParquetWriterBuilder::new(
+                WriterProperties::builder().build(),
+                footer_extension_schema(),
+            )
+            .with_time_bucket_column("timestamp")
+            .build(output)
+            .await?;
+            let batch = RecordBatch::try_new(
+                Arc::new(arrow_schema::Schema::new(vec![Field::new(
+                    "timestamp",
+                    data_type,
+                    true,
+                )])),
+                vec![array],
+            )?;
+            writer.accumulate_time_buckets(&batch);
+            let footer: serde_json::Value =
+                serde_json::from_str(&writer.time_buckets_footer_json().unwrap())?;
+            assert_eq!(footer["nulls"], 1);
+            assert_eq!(footer["buckets"]["-60000000000"], 1);
+            assert_eq!(footer["buckets"]["0"], 1);
+            assert_eq!(footer["buckets"]["60000000000"], 1);
+        }
+        Ok(())
     }
 }

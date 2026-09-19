@@ -736,28 +736,22 @@ impl BoundPredicateVisitor for PageIndexEvaluator<'_> {
                 }
 
                 match (min, max) {
-                    (Some(min), Some(max)) => {
+                    (Some(min), Some(max))
                         if literals
                             .iter()
-                            .all(|datum| datum.lt(&min) || datum.gt(&max))
-                        {
-                            // if all values are outside the bounds, rows cannot match.
-                            return Ok(false);
-                        }
+                            .all(|datum| datum.lt(&min) || datum.gt(&max)) =>
+                    {
+                        // if all values are outside the bounds, no rows can match
+                        return Ok(false);
                     }
-                    (Some(min), _) => {
-                        if !literals.iter().any(|datum| datum.ge(&min)) {
-                            // if none of the values are greater than the min bound, rows cant match
-                            return Ok(false);
-                        }
+                    (Some(min), _) if !literals.iter().any(|datum| datum.ge(&min)) => {
+                        // if no values are within the min bound, no rows can match
+                        return Ok(false);
                     }
-                    (_, Some(max)) => {
-                        if !literals.iter().any(|datum| datum.le(&max)) {
-                            // if all values are greater than upper bound, rows cannot match.
-                            return Ok(false);
-                        }
+                    (_, Some(max)) if !literals.iter().any(|datum| datum.le(&max)) => {
+                        // if no values are within the max bound, no rows can match
+                        return Ok(false);
                     }
-
                     _ => {}
                 }
 
@@ -791,7 +785,7 @@ mod tests {
     use parquet::arrow::arrow_reader::{
         ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelector,
     };
-    use parquet::file::metadata::ParquetMetaData;
+    use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
     use parquet::file::properties::WriterProperties;
     use rand::Rng;
     use tempfile::NamedTempFile;
@@ -831,10 +825,13 @@ mod tests {
         string_vals.push(Some("BISON".to_string()));
 
         batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(float_vals)),
+                    Arc::new(StringArray::from(string_vals)),
+                ],
+            )
             .unwrap(),
         );
 
@@ -843,10 +840,13 @@ mod tests {
         let string_vals = vec![Some("DEER".to_string()); 1024];
 
         batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(float_vals)),
+                    Arc::new(StringArray::from(string_vals)),
+                ],
+            )
             .unwrap(),
         );
 
@@ -863,10 +863,13 @@ mod tests {
         }
 
         batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(float_vals)),
+                    Arc::new(StringArray::from(string_vals)),
+                ],
+            )
             .unwrap(),
         );
 
@@ -878,10 +881,13 @@ mod tests {
         let string_vals = vec![Some("HIPPO".to_string()); 1024];
 
         batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(float_vals)),
+                    Arc::new(StringArray::from(string_vals)),
+                ],
+            )
             .unwrap(),
         );
 
@@ -895,7 +901,7 @@ mod tests {
         writer.close().unwrap();
 
         let file = temp_file.reopen().unwrap();
-        let options = ArrowReaderOptions::new().with_page_index(true);
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
         let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options).unwrap();
         let metadata = reader.metadata().clone();
 
@@ -936,7 +942,7 @@ mod tests {
         writer.close().unwrap();
 
         let file = temp_file.reopen().unwrap();
-        let options = ArrowReaderOptions::new().with_page_index(true);
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
         let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options).unwrap();
         let metadata = reader.metadata();
 

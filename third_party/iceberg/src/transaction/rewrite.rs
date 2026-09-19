@@ -63,7 +63,6 @@ pub struct RewriteFilesAction {
     check_duplicate: bool,
     snapshot_id: Option<i64>,
     commit_uuid: Option<Uuid>,
-    key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
     removed_data_files: Vec<DataFile>,
@@ -75,7 +74,6 @@ impl RewriteFilesAction {
             check_duplicate: true,
             snapshot_id: None,
             commit_uuid: None,
-            key_metadata: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
             removed_data_files: vec![],
@@ -120,12 +118,6 @@ impl RewriteFilesAction {
         self
     }
 
-    /// Set key metadata for manifest files.
-    pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
-        self.key_metadata = Some(key_metadata);
-        self
-    }
-
     /// Set snapshot summary properties.
     pub fn set_snapshot_properties(mut self, snapshot_properties: HashMap<String, String>) -> Self {
         self.snapshot_properties = snapshot_properties;
@@ -149,14 +141,12 @@ impl TransactionAction for RewriteFilesAction {
                 table,
                 snapshot_id,
                 commit_uuid,
-                self.key_metadata.clone(),
                 self.snapshot_properties.clone(),
                 self.added_data_files.clone(),
             )?,
             None => SnapshotProducer::new(
                 table,
                 commit_uuid,
-                self.key_metadata.clone(),
                 self.snapshot_properties.clone(),
                 self.added_data_files.clone(),
             ),
@@ -208,11 +198,10 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
             return Ok(vec![]);
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(
-                snapshot_produce.table.file_io(),
-                &snapshot_produce.table.metadata_ref(),
-            )
+        let manifest_list = snapshot_produce
+            .table
+            .manifest_list_reader(snapshot)
+            .load()
             .await?;
 
         Ok(manifest_list
@@ -226,6 +215,8 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use futures::TryStreamExt;
 
     use crate::memory::tests::new_memory_catalog;
@@ -233,7 +224,7 @@ mod tests {
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Operation, Struct,
     };
     use crate::table::Table;
-    use crate::transaction::tests::make_v2_minimal_table_in_catalog;
+    use crate::transaction::tests::make_v3_minimal_table_in_catalog;
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, Result};
 
@@ -289,12 +280,17 @@ mod tests {
     #[tokio::test]
     async fn test_rewrite_with_neither_added_nor_removed_files_is_rejected() {
         let catalog = new_memory_catalog().await;
-        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let table = append(&table, &catalog, vec![data_file("a", 10)]).await;
 
         let tx = Transaction::new(&table);
         let action = tx.rewrite_files();
-        let err = action.apply(tx).unwrap().commit(&catalog).await.unwrap_err();
+        let err = action
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap_err();
         assert!(
             err.message()
                 .contains("requires at least one added or removed data file"),
@@ -308,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_only_rewrite_preserves_existing_files() {
         let catalog = new_memory_catalog().await;
-        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let table = append(
             &table,
             &catalog,
@@ -332,7 +328,12 @@ mod tests {
         assert_eq!(records, 35);
         assert_eq!(total_records(&table), 35);
         assert_eq!(
-            table.metadata().current_snapshot().unwrap().summary().operation,
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .operation,
             Operation::Overwrite
         );
     }
@@ -342,7 +343,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_only_rewrite_without_snapshot_properties() {
         let catalog = new_memory_catalog().await;
-        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let table = append(
             &table,
             &catalog,
@@ -377,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_only_rewrite_rebases_over_intervening_append() {
         let catalog = new_memory_catalog().await;
-        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let table = append(&table, &catalog, vec![data_file("a", 10)]).await;
 
         // Build the rewrite against this base, then let another writer commit first.
@@ -410,7 +411,7 @@ mod tests {
     #[tokio::test]
     async fn test_rewrite_replaces_only_its_own_files() {
         let catalog = new_memory_catalog().await;
-        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let table = append(
             &table,
             &catalog,
@@ -432,5 +433,47 @@ mod tests {
         );
         assert_eq!(records, 30);
         assert_eq!(total_records(&table), 30);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_preserves_caller_markers_beside_computed_totals() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append(&table, &catalog, vec![data_file("a", 10)]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .add_data_files(vec![data_file("b", 10)])
+            .delete_files(vec![data_file("a", 10)])
+            .set_snapshot_properties(HashMap::from([
+                ("siglake.rewrite".to_string(), "recluster".to_string()),
+                (
+                    "siglake.consumed_segments".to_string(),
+                    "segment-a".to_string(),
+                ),
+            ]));
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+        let properties = &table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .additional_properties;
+
+        assert_eq!(
+            properties.get("siglake.rewrite").map(String::as_str),
+            Some("recluster")
+        );
+        assert_eq!(
+            properties
+                .get("siglake.consumed_segments")
+                .map(String::as_str),
+            Some("segment-a")
+        );
+        assert_eq!(
+            properties.get("total-records").map(String::as_str),
+            Some("10")
+        );
     }
 }

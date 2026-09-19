@@ -1683,7 +1683,7 @@ fn schema_with_text_tokenizers_of(
 #[derive(Debug)]
 pub struct SiglakeIcebergTableScan {
     table: Table,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     projection: Option<Vec<String>>,
     projected_columns: Arc<Vec<String>>,
     limit: Option<usize>,
@@ -2149,12 +2149,12 @@ impl SiglakeIcebergTableScan {
             }
             None => EquivalenceProperties::new(output_schema.clone()),
         };
-        let plan_properties = PlanProperties::new(
+        let plan_properties = Arc::new(PlanProperties::new(
             eq_properties,
             Partitioning::UnknownPartitioning(partition_count),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         let decoded_budget_bytes = scan_decoded_budget_bytes();
         let decompression_factor = scan_decompression_factor();
         let aggregate_reader_budget = clamp_aggregate_reader_budget(
@@ -2298,7 +2298,7 @@ impl SiglakeIcebergTableScan {
         &self,
         task: FileScanTask,
         file_io: iceberg::io::FileIO,
-        fetched_byte_counter: Arc<std::sync::atomic::AtomicU64>,
+        _fetched_byte_counter: Arc<std::sync::atomic::AtomicU64>,
         scan_counters: Arc<ScanCounters>,
     ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
         let reader_tuning = self.reader_tuning;
@@ -2314,10 +2314,9 @@ impl SiglakeIcebergTableScan {
         {
             let task_stream: FileScanTaskStream =
                 futures::stream::iter(std::iter::once(Ok(task))).boxed();
-            let mut reader = ArrowReaderBuilder::new(file_io)
+            let mut reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current())
                 .with_data_file_concurrency_limit(1)
                 .with_row_selection_enabled(true)
-                .with_byte_counter(fetched_byte_counter)
                 .with_scan_counters(Some(scan_counters))
                 .with_raw_prune_spec(raw_prune_spec)
                 .with_promoted_prune(promoted_prune);
@@ -2343,6 +2342,7 @@ impl SiglakeIcebergTableScan {
                 .build()
                 .read(task_stream)
                 .map_err(|e| DataFusionError::External(e.into()))?
+                .stream()
                 .map(|result| result.map_err(|e| DataFusionError::External(e.into())))
                 .boxed())
         }
@@ -4165,9 +4165,9 @@ impl SourceMetricsStream {
             .record(self.output_batches as f64);
         metrics::histogram!("siglake_query_scan_partition_decoded_bytes")
             .record(self.decoded_bytes as f64);
-        let fetched_bytes = self
-            .fetched_byte_counter
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let fetched_bytes = self.scan_counters.bytes_read();
+        self.fetched_byte_counter
+            .store(fetched_bytes, std::sync::atomic::Ordering::Relaxed);
         metrics::histogram!("siglake_query_scan_partition_fetched_bytes")
             .record(fetched_bytes as f64);
         // Real read bytes (post-prune) as a DataFusion node metric → per-query
@@ -4342,7 +4342,7 @@ fn open_task_batch_stream_uncached(
     file_io: iceberg::io::FileIO,
     task: FileScanTask,
     reader_tuning: EffectiveReaderTuning,
-    byte_counter: Arc<std::sync::atomic::AtomicU64>,
+    _byte_counter: Arc<std::sync::atomic::AtomicU64>,
     scan_counters: Arc<ScanCounters>,
     raw_prune_spec: Option<RawPruneSpec>,
     promoted_prune: Vec<PromotedPruneSpec>,
@@ -4355,10 +4355,9 @@ fn open_task_batch_stream_uncached(
     // For time-ordered storage a `timestamp` range predicate skips pages whose
     // min/max fall outside the range. The page index is only loaded when a
     // predicate is present, so predicate-free scans pay nothing.
-    let mut reader = ArrowReaderBuilder::new(file_io)
+    let mut reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current())
         .with_data_file_concurrency_limit(1)
         .with_row_selection_enabled(true)
-        .with_byte_counter(byte_counter)
         .with_scan_counters(Some(scan_counters))
         .with_raw_prune_spec(raw_prune_spec)
         .with_promoted_prune(promoted_prune);
@@ -4384,6 +4383,7 @@ fn open_task_batch_stream_uncached(
         .build()
         .read(task_stream)
         .map_err(|e| DataFusionError::External(e.into()))?
+        .stream()
         .map(|result| result.map_err(|e| DataFusionError::External(e.into())))
         .boxed())
 }
@@ -4661,13 +4661,8 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
         Ok(self)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
-    }
-
-    #[allow(deprecated)]
-    fn statistics(&self) -> DFResult<Statistics> {
-        self.partition_statistics(None)
     }
 
     fn execute(
@@ -4923,14 +4918,13 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                 futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
             // We own the read path (vendored iceberg), so the reader reports
             // actual fetched bytes through the per-scan counter below.
-            let mut reader = ArrowReaderBuilder::new(file_io)
+            let mut reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current())
                 .with_data_file_concurrency_limit(execute_file_concurrency_limit)
                 // Page-index row selection (see the single-task reader above):
                 // composes with the raw-bloom + predicate row-group filtering —
                 // those narrow row groups first, then the page index prunes rows
                 // within the survivors.
                 .with_row_selection_enabled(true)
-                .with_byte_counter(fetched_byte_counter.clone())
                 .with_scan_counters(Some(scan_counters.clone()))
                 .with_raw_prune_spec(raw_prune_spec.clone())
                 .with_promoted_prune(self.promoted_prune.clone())
@@ -4959,6 +4953,7 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                 .build()
                 .read(task_stream)
                 .map_err(|e| DataFusionError::External(e.into()))?
+                .stream()
                 .map(|result| result.map_err(|e| DataFusionError::External(e.into())))
                 .boxed()
         };
@@ -5982,7 +5977,7 @@ fn reserve_decode_budget(
     if decoded_per_file == 0 || desired_concurrency == 0 {
         return (desired_concurrency.max(1), None);
     }
-    let mut reservation = MemoryConsumer::new("siglake-scan-decode").register(pool);
+    let reservation = MemoryConsumer::new("siglake-scan-decode").register(pool);
     let mut concurrency = desired_concurrency.max(1);
     loop {
         let want = (concurrency as u64).saturating_mul(decoded_per_file);
@@ -7908,7 +7903,7 @@ mod decode_budget_pool_tests {
     #[test]
     fn a_full_pool_degrades_to_one_file_rather_than_failing() {
         let p = pool(256 * 1024 * 1024);
-        let mut hog = MemoryConsumer::new("hog").register(&p);
+        let hog = MemoryConsumer::new("hog").register(&p);
         hog.try_grow(250 * 1024 * 1024).unwrap();
 
         let (concurrency, reservation) = reserve_decode_budget(&p, 16, PER_FILE);

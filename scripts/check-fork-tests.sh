@@ -49,7 +49,7 @@
 # the enclosing workspace used to supply:
 #
 #   * iceberg-catalog-sql and iceberg-storage-opendal both depend on
-#     `iceberg = "0.9.1"`, which outside the root manifest's patch comes from
+#     `iceberg = "0.10.0"`, which outside the root manifest's patch comes from
 #     crates.io -- the job would then test upstream storage or upstream's
 #     catalog and prove nothing. Their copies get a `[patch.crates-io]` entry
 #     pointing `iceberg` at the owned fork, and the resolved lockfile is
@@ -90,15 +90,14 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 # Fork -> the minimum number of tests that must run. A filter, feature or
 # mirror mistake that selects nothing exits 0 and prints "0 passed", which
-# reads like success; #2651 counted 1171 and 54.
+# reads like success; the adopted 0.10.1 forks count 1410, 37 and 8.
 declare -A MIN_TESTS=(
   [iceberg]=1000
-  [iceberg-catalog-sql]=40
-  # Three resolver tests for SIGLAKE_OBJECT_STORE_WRITE_{CONCURRENCY,CHUNK_MB}
-  # and the upload permits, plus one memory-operator test. src/azdls.rs's module
+  [iceberg-catalog-sql]=37
+  # Resolver, upload-permit and memory-operator tests. src/azdls.rs's module
   # is behind `opendal-azdls`, which is not in `default`, so it is not in this
   # count and this job does not compile it.
-  [iceberg-storage-opendal]=4
+  [iceberg-storage-opendal]=8
 )
 # Fork -> the minimum number of doctests that must pass, for the forks whose
 # doctest target is gated. A fork absent from this table is `--lib` only. The
@@ -257,7 +256,7 @@ ln -s "$ROOT/crates" "$MIRROR/crates" || mirror_setup_failed
 ln -s "$ROOT/third_party" "$MIRROR/third_party" || mirror_setup_failed
 ln -s "$ROOT/rust-toolchain.toml" "$MIRROR/rust-toolchain.toml" || mirror_setup_failed
 
-# The resolved `iceberg` must be the fork, not the registry's 0.9.1: a package
+# The resolved `iceberg` must be the fork, not the registry's 0.10 release: a package
 # resolved from a registry carries a `source =` line, a path dependency does not.
 patch_took() { # <lockfile> <package>
   awk -v want="$2" '

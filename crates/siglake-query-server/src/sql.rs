@@ -1716,6 +1716,7 @@ fn rewrite_remaining_attr_get(
                         kind: CastKind::Cast,
                         expr: Box::new(column),
                         data_type: SqlDataType::Varchar(None),
+                        array: false,
                         format: None,
                     }
                 };
@@ -1999,7 +2000,7 @@ fn default_order_target_table(query: &SqlQuery) -> Option<String> {
         || select.top.is_some()
         || select.into.is_some()
         || select.prewhere.is_some()
-        || select.connect_by.is_some()
+        || !select.connect_by.is_empty()
         || select.value_table_mode.is_some()
     {
         return None;

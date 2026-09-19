@@ -838,18 +838,17 @@ conditional-put primitives, and the incremental append scan Iceberg table
 subscriptions need. Periodically rebased against upstream; feature
 work does not block on upstream releases.
 
-The first 0.10.1 rebase slice stages a non-shipping workspace with pristine
-candidate mirrors compiled against Arrow/Parquet 58, DataFusion 53.1, OpenDAL
-0.57 and reqsign 3 while production continues to select the 0.9.1 forks.
-Candidate caller adapters use upstream's schema and snapshot-expiry
-transactions, retaining Siglake's replay-safe optional additions, exact dry-run
-counts and no-op commit suppression. The second slice ports commit reload
-elision, atomic rewrites and Parquet footer extensions. The third ports the
-multipart controls, separate drain/compaction upload permits, jittered retry
-policy and the static-key → IRSA → ECS → IMDSv2 credential chain to OpenDAL
-0.57 and reqsign 3. Candidate metadata providers have a three-second bound and
-do not fall through after a configured provider fails. Later slices port the
-reader and index behavior before the production dependency selection changes.
+The 0.10.1 rebase shipped through seven bounded slices. The first six staged
+and qualified schema/expiry adapters, commit and writer behavior, OpenDAL
+uploads and credentials, immutable read caches and attribution, exact pruning,
+and ordered/reverse streaming. The seventh adopted the three tested fork trees
+and all seven workspace consumers in one commit. The resulting graph is one
+Arrow/Parquet 58, DataFusion 53.1, OpenDAL 0.57 and reqsign 3 stack. Upstream's
+schema and expiry actions replaced their local predecessors; caller adapters
+retain replay-safe optional additions, exact dry-run counts, no-op commit
+suppression and the static-key → IRSA → ECS → IMDSv2 credential chain with
+bounded metadata requests. The temporary candidate workspace was removed
+after its tests moved into the fork and workspace suites.
 
 ## Compaction
 

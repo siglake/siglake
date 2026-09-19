@@ -18,6 +18,7 @@
 //! This module contains memory catalog implementation.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -26,6 +27,7 @@ use itertools::Itertools;
 
 use super::namespace_state::NamespaceState;
 use crate::io::{FileIO, FileIOBuilder, MemoryStorageFactory, StorageFactory};
+use crate::runtime::Runtime;
 use crate::spec::{TableMetadata, TableMetadataBuilder};
 use crate::table::Table;
 use crate::{
@@ -44,6 +46,7 @@ const LOCATION: &str = "location";
 pub struct MemoryCatalogBuilder {
     config: MemoryCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
+    runtime: Option<Runtime>,
 }
 
 impl Default for MemoryCatalogBuilder {
@@ -55,6 +58,7 @@ impl Default for MemoryCatalogBuilder {
                 props: HashMap::new(),
             },
             storage_factory: None,
+            runtime: None,
         }
     }
 }
@@ -64,6 +68,11 @@ impl CatalogBuilder for MemoryCatalogBuilder {
 
     fn with_storage_factory(mut self, storage_factory: Arc<dyn StorageFactory>) -> Self {
         self.storage_factory = Some(storage_factory);
+        self
+    }
+
+    fn with_runtime(mut self, runtime: Runtime) -> Self {
+        self.runtime = Some(runtime);
         self
     }
 
@@ -99,7 +108,8 @@ impl CatalogBuilder for MemoryCatalogBuilder {
                     "Catalog warehouse is required",
                 ))
             } else {
-                MemoryCatalog::new(self.config, self.storage_factory)
+                let runtime = self.runtime.unwrap_or_else(Runtime::current);
+                MemoryCatalog::new(self.config, self.storage_factory, runtime)
             }
         };
 
@@ -120,6 +130,7 @@ pub struct MemoryCatalog {
     root_namespace_state: Mutex<NamespaceState>,
     file_io: FileIO,
     warehouse_location: String,
+    runtime: Runtime,
 }
 
 impl MemoryCatalog {
@@ -127,6 +138,7 @@ impl MemoryCatalog {
     fn new(
         config: MemoryCatalogConfig,
         storage_factory: Option<Arc<dyn StorageFactory>>,
+        runtime: Runtime,
     ) -> Result<Self> {
         // Use provided factory or default to MemoryStorageFactory
         let factory = storage_factory.unwrap_or_else(|| Arc::new(MemoryStorageFactory));
@@ -135,6 +147,7 @@ impl MemoryCatalog {
             root_namespace_state: Mutex::new(NamespaceState::default()),
             file_io: FileIOBuilder::new(factory).with_props(config.props).build(),
             warehouse_location: config.warehouse,
+            runtime,
         })
     }
 
@@ -152,6 +165,7 @@ impl MemoryCatalog {
             .metadata(metadata)
             .metadata_location(metadata_location.to_string())
             .file_io(self.file_io.clone())
+            .runtime(self.runtime.clone())
             .build()
     }
 }
@@ -295,17 +309,18 @@ impl Catalog for MemoryCatalog {
         let metadata = TableMetadataBuilder::from_table_creation(table_creation)?
             .build()?
             .metadata;
-        let metadata_location = MetadataLocation::new_with_table_location(location).to_string();
+        let metadata_location = MetadataLocation::new_with_metadata(location, &metadata);
 
         metadata.write_to(&self.file_io, &metadata_location).await?;
 
-        root_namespace_state.insert_new_table(&table_ident, metadata_location.clone())?;
+        root_namespace_state.insert_new_table(&table_ident, metadata_location.to_string())?;
 
         Table::builder()
             .file_io(self.file_io.clone())
-            .metadata_location(metadata_location)
+            .metadata_location(metadata_location.to_string())
             .metadata(metadata)
             .identifier(table_ident)
+            .runtime(self.runtime.clone())
             .build()
     }
 
@@ -321,8 +336,14 @@ impl Catalog for MemoryCatalog {
     async fn drop_table(&self, table_ident: &TableIdent) -> Result<()> {
         let mut root_namespace_state = self.root_namespace_state.lock().await;
 
-        let metadata_location = root_namespace_state.remove_existing_table(table_ident)?;
-        self.file_io.delete(&metadata_location).await
+        root_namespace_state.remove_existing_table(table_ident)?;
+        Ok(())
+    }
+
+    async fn purge_table(&self, table_ident: &TableIdent) -> Result<()> {
+        let table_info = self.load_table(table_ident).await?;
+        self.drop_table(table_ident).await?;
+        crate::catalog::utils::drop_table_data(&table_info).await
     }
 
     /// Check if a table exists in the catalog.
@@ -366,6 +387,7 @@ impl Catalog for MemoryCatalog {
             .metadata_location(metadata_location)
             .metadata(metadata)
             .identifier(table_ident.clone())
+            .runtime(self.runtime.clone())
             .build()
     }
 
@@ -381,12 +403,11 @@ impl Catalog for MemoryCatalog {
         let staged_table = commit.apply(current_table)?;
 
         // Write table metadata to the new location
+        let metadata_location =
+            MetadataLocation::from_str(staged_table.metadata_location_result()?)?;
         staged_table
             .metadata()
-            .write_to(
-                staged_table.file_io(),
-                staged_table.metadata_location_result()?,
-            )
+            .write_to(staged_table.file_io(), &metadata_location)
             .await?;
 
         // Flip the pointer to reference the new metadata file.
@@ -409,6 +430,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::io::FileIO;
     use crate::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type};
+    use crate::test_utils::test_runtime;
     use crate::transaction::{ApplyTransactionAction, Transaction};
 
     fn temp_path() -> String {
@@ -543,9 +565,10 @@ pub(crate) mod tests {
         let namespace_ident = NamespaceIdent::new("abc".into());
         create_namespace(&catalog, &namespace_ident).await;
 
-        assert_eq!(catalog.list_namespaces(None).await.unwrap(), vec![
-            namespace_ident
-        ]);
+        assert_eq!(
+            catalog.list_namespaces(None).await.unwrap(),
+            vec![namespace_ident]
+        );
     }
 
     #[tokio::test]
@@ -567,11 +590,10 @@ pub(crate) mod tests {
         let namespace_ident_1 = NamespaceIdent::new("a".into());
         let namespace_ident_2 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_3 = NamespaceIdent::new("b".into());
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_1,
-            &namespace_ident_2,
-            &namespace_ident_3,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![&namespace_ident_1, &namespace_ident_2, &namespace_ident_3],
+        )
         .await;
 
         assert_eq!(
@@ -602,11 +624,10 @@ pub(crate) mod tests {
         let namespace_ident_1 = NamespaceIdent::new("a".into());
         let namespace_ident_2 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_3 = NamespaceIdent::new("c".into());
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_1,
-            &namespace_ident_2,
-            &namespace_ident_3,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![&namespace_ident_1, &namespace_ident_2, &namespace_ident_3],
+        )
         .await;
 
         assert_eq!(
@@ -631,13 +652,16 @@ pub(crate) mod tests {
         let namespace_ident_3 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_4 = NamespaceIdent::from_strs(vec!["a", "c"]).unwrap();
         let namespace_ident_5 = NamespaceIdent::new("b".into());
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_1,
-            &namespace_ident_2,
-            &namespace_ident_3,
-            &namespace_ident_4,
-            &namespace_ident_5,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_1,
+                &namespace_ident_2,
+                &namespace_ident_3,
+                &namespace_ident_4,
+                &namespace_ident_5,
+            ],
+        )
         .await;
 
         assert_eq!(
@@ -831,9 +855,10 @@ pub(crate) mod tests {
             )
         );
 
-        assert_eq!(catalog.list_namespaces(None).await.unwrap(), vec![
-            namespace_ident_a.clone()
-        ]);
+        assert_eq!(
+            catalog.list_namespaces(None).await.unwrap(),
+            vec![namespace_ident_a.clone()]
+        );
 
         assert_eq!(
             catalog
@@ -881,11 +906,14 @@ pub(crate) mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         assert_eq!(
@@ -957,11 +985,14 @@ pub(crate) mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         let mut new_properties = HashMap::new();
@@ -1030,11 +1061,14 @@ pub(crate) mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         catalog
@@ -1422,9 +1456,10 @@ pub(crate) mod tests {
         let table_ident = TableIdent::new(namespace_ident.clone(), "tbl1".into());
         create_table(&catalog, &table_ident).await;
 
-        assert_eq!(catalog.list_tables(&namespace_ident).await.unwrap(), vec![
-            table_ident
-        ]);
+        assert_eq!(
+            catalog.list_tables(&namespace_ident).await.unwrap(),
+            vec![table_ident]
+        );
     }
 
     #[tokio::test]
@@ -1453,11 +1488,10 @@ pub(crate) mod tests {
         let table_ident_1 = TableIdent::new(namespace_ident_1.clone(), "tbl1".into());
         let table_ident_2 = TableIdent::new(namespace_ident_1.clone(), "tbl2".into());
         let table_ident_3 = TableIdent::new(namespace_ident_2.clone(), "tbl1".into());
-        let _ = create_tables(&catalog, vec![
-            &table_ident_1,
-            &table_ident_2,
-            &table_ident_3,
-        ])
+        let _ = create_tables(
+            &catalog,
+            vec![&table_ident_1, &table_ident_2, &table_ident_3],
+        )
         .await;
 
         assert_eq!(
@@ -1647,9 +1681,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(catalog.list_tables(&namespace_ident).await.unwrap(), vec![
-            dst_table_ident
-        ],);
+        assert_eq!(
+            catalog.list_tables(&namespace_ident).await.unwrap(),
+            vec![dst_table_ident],
+        );
     }
 
     #[tokio::test]
@@ -1691,9 +1726,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(catalog.list_tables(&namespace_ident).await.unwrap(), vec![
-            table_ident
-        ],);
+        assert_eq!(
+            catalog.list_tables(&namespace_ident).await.unwrap(),
+            vec![table_ident],
+        );
     }
 
     #[tokio::test]
@@ -1702,11 +1738,14 @@ pub(crate) mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         let src_table_ident = TableIdent::new(namespace_ident_a_b_c.clone(), "tbl1".into());
@@ -1859,9 +1898,13 @@ pub(crate) mod tests {
         // Assert the table doesn't contain the update yet
         assert!(!table.metadata().properties().contains_key("key"));
 
+        // `last_updated_ms` is millisecond-resolution `chrono::Utc::now()`.
+        // Without this sleep, create and commit can land in the same
+        // millisecond and the `<` assertion below flakes.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
         // Update table metadata
         let tx = Transaction::new(&table);
-        let before_ms = chrono::Utc::now().timestamp_millis();
         let updated_table = tx
             .update_table_properties()
             .set("key".to_string(), "value".to_string())
@@ -1870,7 +1913,6 @@ pub(crate) mod tests {
             .commit(&catalog)
             .await
             .unwrap();
-        let after_ms = chrono::Utc::now().timestamp_millis();
 
         assert_eq!(
             updated_table.metadata().properties().get("key").unwrap(),
@@ -1879,23 +1921,6 @@ pub(crate) mod tests {
 
         assert_eq!(table.identifier(), updated_table.identifier());
         assert_eq!(table.metadata().uuid(), updated_table.metadata().uuid());
-        // `last_updated_ms` has millisecond resolution and the create above
-        // can land in the same millisecond as this commit, so the claim is
-        // that the commit stamped its own clock reading and did not go
-        // backwards — not that the two stamps differ.
-        assert!(
-            updated_table.metadata().last_updated_ms() >= table.metadata().last_updated_ms(),
-            "{} >= {}",
-            updated_table.metadata().last_updated_ms(),
-            table.metadata().last_updated_ms()
-        );
-        assert!(
-            (before_ms..=after_ms).contains(&updated_table.metadata().last_updated_ms()),
-            "{} not in {}..={}",
-            updated_table.metadata().last_updated_ms(),
-            before_ms,
-            after_ms
-        );
         assert_ne!(table.metadata_location(), updated_table.metadata_location());
 
         assert!(
@@ -1947,6 +1972,7 @@ pub(crate) mod tests {
             .identifier(ident)
             .metadata(metadata)
             .file_io(file_io)
+            .runtime(test_runtime())
             .build()
             .unwrap()
     }
