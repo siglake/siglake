@@ -108,7 +108,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   preserves the rewrite's registered seg2 blobs and counts the deferred v1
   registration instead of replacing them
   ([`DESIGN_segmented_inverted_index.md`](DESIGN_segmented_inverted_index.md),
-  "Registration beside the refusals"). Whether the
+  "Registration beside the refusals"). The exact scan is the fallback for those
+  files, and reusing the deferred caller's own work at a later snapshot has been
+  qualified rather than built: the retained payload is 637-2,092 bytes, the
+  reuse moves no blob bytes and recovers coverage without a second Parquet
+  decode, but one attempt recovers nothing unless a data commit landed between
+  the caller's load and its deferral, so the fallback stays the contract
+  ([`DESIGN_inverted_index.md`](DESIGN_inverted_index.md), "Deferred
+  registration: reuse at a later snapshot", #5319). Whether the
   serialized copy earns its share at all is a separate open question: since a
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no

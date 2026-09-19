@@ -39,8 +39,9 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion::prelude::SessionContext;
-use iceberg::spec::DataFile;
+use iceberg::spec::{BlobMetadata as StatisticsBlobMetadata, DataFile, StatisticsFile};
 use iceberg::table::Table;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use siglake_core::index_config::{DocMapping, FieldMapping, FieldType, IndexConfig, MappingMode};
 use siglake_core::Event;
@@ -2333,4 +2334,315 @@ fn segmented_index_write_series_are_preregistered() {
         "every (outcome, reason) the sidecar writer records must be created at 0: \
          update COMPACTOR_ALERTED_COUNTERS in siglake_core::metrics"
     );
+}
+
+// ------------- deferred registration: reuse at a later snapshot (#5319)
+
+/// Read an already-written Puffin sidecar's footer back into the
+/// `StatisticsFile` value its writer held, re-addressed to `snapshot_id`.
+///
+/// This is the whole payload a bounded reuse has to keep: the deferred caller
+/// already holds this struct — `write_puffin_sidecar` returns it — so
+/// reconstructing it here measures what an implementation would retain rather
+/// than something it would not. The blob payload is never touched: only the
+/// footer is read, and the object is left byte for byte as the deferral wrote
+/// it.
+async fn statistics_file_from_object(
+    table: &Table,
+    path: &str,
+    snapshot_id: i64,
+) -> StatisticsFile {
+    let file_size_in_bytes = table
+        .file_io()
+        .new_input(path)
+        .unwrap()
+        .metadata()
+        .await
+        .unwrap()
+        .size as i64;
+    let reader = iceberg::puffin::PuffinReader::new(table.file_io().new_input(path).unwrap());
+    let file_footer_size_in_bytes = reader.footer_size_in_bytes().await.unwrap() as i64;
+    let blob_metadata = reader
+        .file_metadata()
+        .await
+        .unwrap()
+        .blobs()
+        .iter()
+        .map(|blob| StatisticsBlobMetadata {
+            r#type: blob.blob_type().to_string(),
+            // Deliberately the snapshot the blob was COMPUTED FROM, which the
+            // reuse does not change (`puffin/metadata.rs`). Only the
+            // `StatisticsFile` the entry hangs off is re-addressed.
+            snapshot_id: blob.snapshot_id(),
+            sequence_number: blob.sequence_number(),
+            fields: blob.fields().to_vec(),
+            properties: blob.properties().clone(),
+        })
+        .collect();
+    StatisticsFile {
+        snapshot_id,
+        statistics_path: path.to_string(),
+        file_size_in_bytes,
+        file_footer_size_in_bytes,
+        key_metadata: None,
+        blob_metadata,
+    }
+}
+
+fn bytes_on_disk(path: &str) -> u64 {
+    std::fs::metadata(local_path(path)).unwrap().len()
+}
+
+/// Rows per day for the reuse report. The point of sizing it is that the
+/// retained payload does not grow with the file while the decode it avoids
+/// does, so the report is run at two widths.
+fn reuse_rows_per_file() -> usize {
+    std::env::var("SIGLAKE_REUSE_ROWS_PER_FILE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(REBUILD_ROWS)
+}
+
+/// #5319: what bounded reuse of a deferred Puffin registration costs, and what
+/// it recovers.
+///
+/// Starts from the state #5298's two-registrant regressions leave behind — one
+/// statistics file registered, one uploaded sidecar orphaned — and re-addresses
+/// the orphan to a later statistics-free snapshot. Reports, against the
+/// alternative of decoding the file again:
+///
+/// - the retained payload (the `StatisticsFile` the deferred caller holds),
+/// - the object-store bytes the reuse moves (none: no blob is read or written),
+/// - the decode the reuse avoids,
+/// - and the one thing it does NOT keep in agreement — the Puffin footer's
+///   `snapshot-id`, which still names the snapshot the blobs were computed
+///   from while the catalog entry names the snapshot they are attached to.
+///
+/// ```
+/// cargo test -p siglake-storage --test segmented_index_writer \
+///   report_deferred_registration_reuse_cost -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "measurement: two full-file index builds plus three appends"]
+fn report_deferred_registration_reuse_cost() {
+    serialized(|snapshotter| async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("reuse");
+        let rows = reuse_rows_per_file();
+        let mut ours = open_two_registrant_fixture(&warehouse).await;
+        let ident = ours.events_table_ident().clone();
+        let theirs = append_rows(&ours, 0..rows, rows, RARE_EVERY).await;
+        let mine = append_rows(&ours, rows..2 * rows, rows, RARE_EVERY).await;
+        assert!(
+            !theirs.is_empty() && !mine.is_empty(),
+            "each day has to produce files for the two registrants to split"
+        );
+
+        // 1. Reproduce the deferral: a rival registers against the snapshot
+        //    this caller is aimed at, between its load and its commit.
+        let rival = Arc::new(open_two_registrant_fixture(&warehouse).await);
+        let raced = Arc::new(AtomicBool::new(false));
+        let gated = TestCatalog::new(ours.catalog().clone())
+            .after_load_table({
+                let raced = raced.clone();
+                let ident = ident.clone();
+                let theirs = Arc::new(theirs.clone());
+                move || {
+                    let rival = rival.clone();
+                    let raced = raced.clone();
+                    let ident = ident.clone();
+                    let theirs = theirs.clone();
+                    async move {
+                        if raced.swap(true, Ordering::SeqCst) {
+                            return;
+                        }
+                        assert_eq!(
+                            rival
+                                .rebuild_inverted_indexes_for_files(&ident, &theirs)
+                                .await
+                                .unwrap(),
+                            theirs.len()
+                        );
+                    }
+                }
+            })
+            .shared();
+        ours = ours.with_catalog_for_test(gated);
+        let deferred_build = std::time::Instant::now();
+        assert_eq!(
+            ours.rebuild_inverted_indexes_for_files(&ident, &mine)
+                .await
+                .unwrap(),
+            0,
+            "the second registrant defers"
+        );
+        let deferred_build = deferred_build.elapsed();
+        drop(ours);
+
+        // 2. Name the orphan the deferral left: the object no retained
+        //    snapshot references.
+        let ice = open_two_registrant_fixture(&warehouse).await;
+        let reachable = ice.reachable_files(&ident).await.unwrap();
+        let orphan = puffin_objects(&warehouse)
+            .into_iter()
+            .find(|path| !reachable.contains(path))
+            .expect("the deferred caller's sidecar");
+        let occupied_snapshot = ice
+            .catalog()
+            .load_table(&ident)
+            .await
+            .unwrap()
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+
+        // 3. The alternative this is measured against: decode a comparable
+        //    file again and register it the ordinary way. Day 2's append also
+        //    moves the table past the occupied snapshot.
+        let day2 = append_rows(&ice, 2 * rows..3 * rows, rows, RARE_EVERY).await;
+        let redecode = std::time::Instant::now();
+        assert_eq!(
+            ice.rebuild_inverted_indexes_for_files(&ident, &day2)
+                .await
+                .unwrap(),
+            day2.len(),
+            "day 2 registers against its own statistics-free snapshot"
+        );
+        let redecode = redecode.elapsed();
+
+        // 4. A later snapshot that carries no statistics file: the only kind
+        //    the reuse is eligible for.
+        append_rows(&ice, 3 * rows..4 * rows, rows, RARE_EVERY).await;
+        let table = ice.catalog().load_table(&ident).await.unwrap();
+        let later_snapshot = table.metadata().current_snapshot().unwrap().snapshot_id();
+        assert!(
+            table
+                .metadata()
+                .statistics_for_snapshot(later_snapshot)
+                .is_none(),
+            "the reuse target must be statistics-free"
+        );
+
+        // 5. Re-address the retained payload and register it. No blob is read
+        //    and none is written.
+        let objects_before = puffin_objects(&warehouse);
+        let orphan_mtime = std::fs::metadata(local_path(&orphan))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let reused = statistics_file_from_object(&table, &orphan, later_snapshot).await;
+        let retained_bytes = serde_json::to_vec(&reused).unwrap().len();
+        let footer_snapshot = reused.blob_metadata[0].snapshot_id;
+        let reuse = std::time::Instant::now();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_statistics()
+            .set_statistics(reused)
+            .apply(tx)
+            .unwrap();
+        tx.commit(ice.catalog().as_ref()).await.unwrap();
+        let reuse = reuse.elapsed();
+
+        // 6. What it bought. Coverage is back, and the object is untouched.
+        assert_eq!(
+            puffin_objects(&warehouse),
+            objects_before,
+            "the reuse writes no new sidecar"
+        );
+        assert_eq!(
+            std::fs::metadata(local_path(&orphan))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            orphan_mtime,
+            "and rewrites none of the one it reuses"
+        );
+        let table = ice.catalog().load_table(&ident).await.unwrap();
+        assert!(
+            registered_v1_blobs(&table)
+                .iter()
+                .any(|(path, data_file, column)| path == &orphan
+                    && data_file == mine[0].file_path()
+                    && column == "raw"),
+            "the deferred file is covered at the later snapshot"
+        );
+        assert!(
+            ice.reachable_files(&ident).await.unwrap().contains(&orphan),
+            "and the object it reuses is no longer an orphan"
+        );
+        let _ = snapshotter.snapshot();
+        assert_eq!(
+            ice.rebuild_inverted_indexes_for_files(&ident, &mine)
+                .await
+                .unwrap(),
+            0,
+            "a rebuild over the recovered file finds it covered"
+        );
+        let after = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_sum(
+                &after,
+                "siglake_index_registration_deferred_total",
+                Some(("reason", "snapshot_has_statistics"))
+            ),
+            0,
+            "covered, not deferred again: the recovered file needs no second decode"
+        );
+        assert_eq!(
+            puffin_objects(&warehouse),
+            objects_before,
+            "and that rebuild decoded nothing"
+        );
+
+        let _ = snapshotter.snapshot();
+        assert_eq!(
+            text_counts(&ice).await,
+            (
+                4 * rows as i64,
+                (4 * rows / RARE_EVERY) as i64,
+                (4 * rows / 50) as i64
+            ),
+            "every day answers exactly"
+        );
+        let reads = snapshotter.snapshot().into_vec();
+        let puffin_used = counter_sum(
+            &reads,
+            "siglake_iceberg_inverted_index_used_total",
+            Some(("storage", "puffin")),
+        );
+
+        let data_bytes: u64 = mine
+            .iter()
+            .map(|file| bytes_on_disk(file.file_path()))
+            .sum();
+        let sidecar_bytes = bytes_on_disk(&orphan);
+        println!(
+            "\n=== #5319 deferred-registration reuse, {rows} rows/day in {} file(s) ===",
+            mine.len()
+        );
+        println!("deferred data files       {data_bytes:>12} B");
+        println!(
+            "sidecar object            {sidecar_bytes:>12} B (already uploaded by the deferral)"
+        );
+        println!("retained payload          {retained_bytes:>12} B (StatisticsFile as JSON)");
+        println!(
+            "bytes moved by the reuse  {:>12} B (footer read only; no blob, no write)",
+            0
+        );
+        println!(
+            "deferred build+upload     {:>12.3} s (includes the rival's own rebuild, gated inside it)",
+            deferred_build.as_secs_f64()
+        );
+        println!(
+            "re-decode + register      {:>12.3} s (the alternative, comparable file)",
+            redecode.as_secs_f64()
+        );
+        println!("reuse commit              {:>12.3} s", reuse.as_secs_f64());
+        println!("puffin index used         {puffin_used:>12} times over the four days");
+        println!(
+            "footer snapshot-id {footer_snapshot} vs statistics entry snapshot-id {later_snapshot} \
+             (computed-from vs attached-to; occupied snapshot was {occupied_snapshot})"
+        );
+    });
 }
