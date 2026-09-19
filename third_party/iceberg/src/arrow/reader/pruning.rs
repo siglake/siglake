@@ -275,12 +275,69 @@ impl ArrowReader {
         )?)
     }
 
-    fn footer_inverted_index(
+    fn footer_inverted_index_hex<'a>(
+        metadata: &'a ParquetMetaData,
+        column: &str,
+    ) -> Option<&'a str> {
+        let key = siglake_index::inverted_index_kv_key(column);
+        Self::metadata_value(metadata, key.as_ref())
+    }
+
+    fn footer_inverted_index_checksum_allows(
         metadata: &ParquetMetaData,
         column: &str,
-    ) -> Option<siglake_index::InvertedIndex> {
-        let key = siglake_index::inverted_index_kv_key(column);
-        siglake_index::InvertedIndex::from_hex(Self::metadata_value(metadata, key.as_ref())?)
+        hex: &str,
+    ) -> bool {
+        let checksum_key = siglake_index::inverted_index_crc32_kv_key(column);
+        let checksum_entry = metadata
+            .file_metadata()
+            .key_value_metadata()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.key == checksum_key.as_ref())
+            });
+        let Some(checksum_entry) = checksum_entry else {
+            return true;
+        };
+        let Some(checksum) = checksum_entry.value.as_deref() else {
+            metrics::counter!(
+                "siglake_index_footer_checksum_refused_total",
+                "reason" => "malformed"
+            )
+            .increment(1);
+            return false;
+        };
+        let expected = if checksum.len() == 8 {
+            u32::from_str_radix(checksum, 16).ok()
+        } else {
+            None
+        };
+        let Some(expected) = expected else {
+            metrics::counter!(
+                "siglake_index_footer_checksum_refused_total",
+                "reason" => "malformed"
+            )
+            .increment(1);
+            return false;
+        };
+        let Some(actual) = siglake_index::inverted_index_hex_crc32(hex) else {
+            metrics::counter!(
+                "siglake_index_footer_checksum_refused_total",
+                "reason" => "malformed"
+            )
+            .increment(1);
+            return false;
+        };
+        if actual != expected {
+            metrics::counter!(
+                "siglake_index_footer_checksum_refused_total",
+                "reason" => "mismatch"
+            )
+            .increment(1);
+            return false;
+        }
+        true
     }
 
     fn stamped_row_group_size_matches(metadata: &ParquetMetaData, stamped: usize) -> bool {
@@ -392,6 +449,12 @@ impl ArrowReader {
         column: &str,
         cache_bypass: bool,
     ) -> Option<Arc<siglake_index::InvertedIndex>> {
+        let hex = Self::footer_inverted_index_hex(metadata, column)?;
+        // Verify before a warm cache lookup so a cached parse cannot hide a
+        // footer whose checksum no longer agrees with the stored blob.
+        if !Self::footer_inverted_index_checksum_allows(metadata, column, hex) {
+            return None;
+        }
         let key = ParsedIndexKey::FooterKv {
             path: task.data_file_path().to_string(),
             column: column.to_string(),
@@ -411,7 +474,7 @@ impl ArrowReader {
                 .then_some(index);
         }
         let decoded = std::time::Instant::now();
-        let index = Self::footer_inverted_index(metadata, column).map(Arc::new);
+        let index = siglake_index::InvertedIndex::from_hex(hex).map(Arc::new);
         record_text_index_stage("decode", TEXT_INDEX_STORAGE_FOOTER_KV, decoded);
         let index = index?;
         INVERTED_INDEX_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -187,6 +187,11 @@ impl ManifestFile {
             }
             None => input.read().await?,
         };
+        crate::io::read_observability::record_object_store_reads(
+            crate::io::read_observability::ObjectStoreReadPhase::Manifest,
+            1,
+            avro.len() as u64,
+        );
 
         let (metadata, mut entries) = Manifest::try_from_avro_bytes(&avro)?;
 

@@ -262,13 +262,47 @@ impl FileScanTaskReader {
         let mut record_batch_stream_builder =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
 
-        // Filter out metadata fields for Parquet projection (they don't exist in files)
-        let project_field_ids_without_metadata: Vec<i32> = task
+        let delete_filter = delete_filter_rx.await.unwrap()?;
+        let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
+
+        // In addition to the optional predicate supplied in the `FileScanTask`,
+        // we also have an optional predicate resulting from equality delete files.
+        // If both are present, we logical-AND them together to form a single filter
+        // predicate that we can pass to the `RecordBatchStreamBuilder`.
+        let final_predicate = match (&task.predicate, delete_predicate) {
+            (None, None) => None,
+            (Some(predicate), None) => Some(predicate.clone()),
+            (None, Some(ref predicate)) => Some(predicate.clone()),
+            (Some(filter_predicate), Some(delete_predicate)) => {
+                Some(filter_predicate.clone().and(delete_predicate))
+            }
+        };
+        let predicate_for_chunks = final_predicate.clone();
+
+        // Filter out metadata fields for Parquet projection (they don't exist in
+        // files). An empty output projection still needs the predicate columns;
+        // otherwise Parquet interprets an empty mask as "all columns".
+        let mut parquet_project_field_ids: Vec<i32> = task
             .project_field_ids
             .iter()
             .filter(|&&id| !is_metadata_field(id))
             .copied()
             .collect();
+        if let Some(predicate) = final_predicate.as_ref() {
+            let (predicate_field_ids, _) = ArrowReader::build_field_id_set_and_map(
+                record_batch_stream_builder.parquet_schema(),
+                record_batch_stream_builder.schema(),
+                predicate,
+                use_position_fallback,
+            )?;
+            let mut predicate_field_ids = predicate_field_ids.into_iter().collect::<Vec<_>>();
+            predicate_field_ids.sort_unstable();
+            for field_id in predicate_field_ids {
+                if !parquet_project_field_ids.contains(&field_id) {
+                    parquet_project_field_ids.push(field_id);
+                }
+            }
+        }
 
         // Create projection mask based on field IDs
         // - If file has embedded IDs: field-ID-based projection
@@ -276,7 +310,7 @@ impl FileScanTaskReader {
         //   mapping assigned to the Arrow schema
         // - Otherwise: position-based fallback projection
         let projection_mask = ArrowReader::get_arrow_projection_mask(
-            &project_field_ids_without_metadata,
+            &parquet_project_field_ids,
             &task.schema,
             record_batch_stream_builder.parquet_schema(),
             record_batch_stream_builder.schema(),
@@ -311,23 +345,6 @@ impl FileScanTaskReader {
         if let Some(batch_size) = self.batch_size {
             record_batch_stream_builder = record_batch_stream_builder.with_batch_size(batch_size);
         }
-
-        let delete_filter = delete_filter_rx.await.unwrap()?;
-        let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
-
-        // In addition to the optional predicate supplied in the `FileScanTask`,
-        // we also have an optional predicate resulting from equality delete files.
-        // If both are present, we logical-AND them together to form a single filter
-        // predicate that we can pass to the `RecordBatchStreamBuilder`.
-        let final_predicate = match (&task.predicate, delete_predicate) {
-            (None, None) => None,
-            (Some(predicate), None) => Some(predicate.clone()),
-            (None, Some(ref predicate)) => Some(predicate.clone()),
-            (Some(filter_predicate), Some(delete_predicate)) => {
-                Some(filter_predicate.clone().and(delete_predicate))
-            }
-        };
-        let predicate_for_chunks = final_predicate.clone();
 
         // There are three possible sources for potential lists of selected RowGroup indices,
         // and two for `RowSelection`s.

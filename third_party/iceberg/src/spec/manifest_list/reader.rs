@@ -66,9 +66,14 @@ impl ManifestListReader {
                 self.file_io
                     .new_input(self.snapshot.manifest_list())?
                     .read()
-                    .await?
+                .await?
             }
         };
+        crate::io::read_observability::record_object_store_reads(
+            crate::io::read_observability::ObjectStoreReadPhase::Manifest,
+            1,
+            manifest_list_content.len() as u64,
+        );
         ManifestList::parse_with_version(
             &manifest_list_content,
             self.table_metadata.format_version(),

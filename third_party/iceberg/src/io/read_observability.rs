@@ -63,7 +63,12 @@ impl ObjectStoreReadPhase {
 }
 
 pub(crate) fn record_object_store_reads(phase: ObjectStoreReadPhase, reads: usize, bytes: u64) {
-    OBJECT_STORE_BYTES_READ.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    // Planning-time manifest reads have their own phase metrics. The cumulative
+    // byte counter is the reader total used by scan tests and excludes them.
+    if phase != ObjectStoreReadPhase::Manifest {
+        OBJECT_STORE_BYTES_READ.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        metrics::counter!("siglake_iceberg_object_store_bytes_read_total").increment(bytes);
+    }
     metrics::counter!("siglake_object_store_reads_total", "phase" => phase.label())
         .increment(reads as u64);
     metrics::counter!("siglake_object_store_read_bytes_total", "phase" => phase.label())

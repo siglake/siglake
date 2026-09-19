@@ -92,7 +92,7 @@ arrow-array = "58"
 arrow-schema = "58"
 parquet = { version = "58", features = ["async", "object_store"] }
 datafusion = "53.1"
-object_store = { version = "0.12", features = ["aws", "gcp", "azure"] }
+object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
 opendal = { version = "0.57", features = ["services-s3", "services-memory", "services-fs"] }
 
 # Iceberg stack — pinned to 0.10 (Apache official).
