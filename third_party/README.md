@@ -71,7 +71,10 @@ Upstream base: 0.10.1. Key divergences:
   before actions can write manifest files for the replacement table.
 - Snapshot expiry uses upstream's transaction action plus the public
   `planned_removals` preview needed for exact dry-run counts, no-op commit
-  suppression and Siglake's coverage re-rooting. Upstream closed
+  suppression and Siglake's coverage re-rooting. Its opt-in
+  `retain_statistics_files` mode leaves statistics metadata for Siglake's
+  live-data-file reachability pass instead of dropping registrations with the
+  snapshot that created them. Upstream closed
   `incremental_append_scan` as not-planned, so that table behavior remains
   local.
 - `Cargo.toml`: tokio with `rt` and `time` where upstream asks only for

@@ -179,7 +179,11 @@ async fn gc_removes_obsolete_entries_then_reclaims_only_their_puffin_objects() {
     // chains the same retirement action in its commit (covered above).
     let table = ice.catalog().load_table(&ident).await.unwrap();
     let tx = Transaction::new(&table);
-    let expire = tx.expire_snapshots().retain_last(1);
+    let expire = tx
+        .expire_snapshots()
+        .retain_last(1)
+        .expire_older_than_ms(i64::MAX)
+        .retain_statistics_files();
     let tx = expire.apply(tx).unwrap();
     tx.commit(ice.catalog().as_ref()).await.unwrap();
     ice.invalidate_cached_table(&ident).await;

@@ -55,6 +55,7 @@ pub struct ExpireSnapshotsAction {
     explicit_ids_to_remove: Vec<i64>,
     older_than_ms: Option<i64>,
     retain_last: Option<usize>,
+    remove_expired_statistics: bool,
 }
 
 impl ExpireSnapshotsAction {
@@ -63,6 +64,7 @@ impl ExpireSnapshotsAction {
             explicit_ids_to_remove: vec![],
             older_than_ms: None,
             retain_last: None,
+            remove_expired_statistics: true,
         }
     }
 
@@ -95,6 +97,17 @@ impl ExpireSnapshotsAction {
     /// [`commit`](TransactionAction::commit) fail.
     pub fn retain_last(mut self, retain_last: usize) -> Self {
         self.retain_last = Some(retain_last);
+        self
+    }
+
+    /// Keep statistics and partition-statistics entries whose snapshot metadata expires.
+    ///
+    /// The default follows Iceberg's snapshot-expiry behavior and removes those entries. A caller
+    /// with a separate reachability-based statistics retirement pass can opt out so statistics
+    /// attached to data files that remain live are not discarded with the snapshot that registered
+    /// them.
+    pub fn retain_statistics_files(mut self) -> Self {
+        self.remove_expired_statistics = false;
         self
     }
 
@@ -338,19 +351,21 @@ impl TransactionAction for ExpireSnapshotsAction {
         // Drop statistics metadata for expired snapshots.
         // This only updates metadata; puffin files are cleaned up separately.
         let mut stats_updates: Vec<TableUpdate> = vec![];
-        for &snapshot_id in &plan.ids_to_remove {
-            stats_updates.extend(
-                metadata
-                    .statistics_for_snapshot(snapshot_id)
-                    .is_some()
-                    .then_some(TableUpdate::RemoveStatistics { snapshot_id }),
-            );
-            stats_updates.extend(
-                metadata
-                    .partition_statistics_for_snapshot(snapshot_id)
-                    .is_some()
-                    .then_some(TableUpdate::RemovePartitionStatistics { snapshot_id }),
-            );
+        if self.remove_expired_statistics {
+            for &snapshot_id in &plan.ids_to_remove {
+                stats_updates.extend(
+                    metadata
+                        .statistics_for_snapshot(snapshot_id)
+                        .is_some()
+                        .then_some(TableUpdate::RemoveStatistics { snapshot_id }),
+                );
+                stats_updates.extend(
+                    metadata
+                        .partition_statistics_for_snapshot(snapshot_id)
+                        .is_some()
+                        .then_some(TableUpdate::RemovePartitionStatistics { snapshot_id }),
+                );
+            }
         }
 
         if !plan.ids_to_remove.is_empty() {
@@ -1116,6 +1131,34 @@ mod tests {
         // Snapshot 1 expires, so its stats entries are dropped; the retained head 2 keeps its stats.
         assert_eq!(removed_statistics(&updates), vec![1]);
         assert_eq!(removed_partition_statistics(&updates), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_statistics_can_be_retained_for_a_separate_reachability_pass() {
+        let table = table_with_stats(
+            vec![
+                snapshot(1, None, 35, TS + 1),
+                snapshot(2, Some(1), 36, TS + 2),
+            ],
+            vec![(MAIN_BRANCH, branch(2, None))],
+            vec![stats_file(1), stats_file(2)],
+            vec![partition_stats_file(1), partition_stats_file(2)],
+        );
+
+        let updates = updates_of(
+            &table,
+            action()
+                .retain_last(1)
+                .expire_older_than_ms(i64::MAX)
+                .retain_statistics_files(),
+        )
+        .await;
+
+        assert!(updates.iter().any(
+            |update| matches!(update, TableUpdate::RemoveSnapshots { snapshot_ids } if snapshot_ids == &[1])
+        ));
+        assert!(removed_statistics(&updates).is_empty());
+        assert!(removed_partition_statistics(&updates).is_empty());
     }
 
     #[tokio::test]

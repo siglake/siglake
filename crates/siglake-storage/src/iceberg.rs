@@ -14722,7 +14722,10 @@ impl IcebergContext {
             .await
             .with_context(|| format!("load_table {table_ident}"))?;
         let tx = Transaction::new(&table);
-        let mut action = tx.expire_snapshots().retain_last(retain_last.max(1));
+        let mut action = tx
+            .expire_snapshots()
+            .retain_last(retain_last.max(1))
+            .retain_statistics_files();
         action = action.expire_older_than_ms(older_than_ms.unwrap_or(i64::MAX));
         let (expired, expired_refs) = action
             .planned_removals(&table)
