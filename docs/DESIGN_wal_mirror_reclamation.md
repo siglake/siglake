@@ -290,7 +290,11 @@ What the implementation adds, against the shape above:
   takes `SIGLAKE_TEST_JOBS_POSTGRES_URI`, and runs in the compose step that
   already starts a Postgres for the query server's job-ownership suite. Each
   case gets its own schema, because compose points its own ingest and compactor
-  at that database and an unscoped claim would take their rows.
+  at that database and an unscoped claim would take their rows. That schema
+  isolation and its cleanup are reused by `eligible_claim_postgres` (#5189),
+  which runs `try_claim_eligible` — a CTE, `FOR UPDATE SKIP LOCKED` and an
+  `UPDATE … FROM agg`, none of which any SQLite case reaches — in the same
+  step.
 - The mark runs inside the per-directory retention sweep, so every cycle shape
   that sweeps also marks, and the gate is computed from the same listing.
 - `catch_up_sweep` no longer uploads a candidate whose only remaining local
