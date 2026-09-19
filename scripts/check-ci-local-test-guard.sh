@@ -83,4 +83,41 @@ if attribution=$(find_concurrent_test_run \
   exit 1
 fi
 
-echo "ok (replacement, never-executed summary, current and stale attribution fixtures)"
+named_log_root="$check_dir/named-ci-local"
+named_log_dir="$check_dir/caller named logs"
+mkdir -p "$named_log_root" "$named_log_dir"
+printf 'checkout: /work/caller-named\n' >"$named_log_dir/test.log"
+touch -d "@$attempt_epoch" "$named_log_dir/test.log"
+named_pointer="$named_log_root/.run-$$-$attempt_epoch.pointer"
+write_ci_local_run_pointer "$named_pointer" "$named_log_dir" "$$" "$attempt_epoch"
+attribution=$(find_concurrent_test_run \
+  "$named_log_root" "$test_log" /work/current "$attempt_epoch" "$attempt_epoch")
+if [[ $attribution != "/work/caller-named ($named_log_dir/test.log)" ]]; then
+  echo "FAIL caller-named log directory was not attributed: $attribution" >&2
+  exit 1
+fi
+
+stale_pointer_dir="$check_dir/stale pointer logs"
+mkdir -p "$stale_pointer_dir"
+printf 'checkout: /work/stale-pointer\n' >"$stale_pointer_dir/test.log"
+touch -d "@$attempt_epoch" "$stale_pointer_dir/test.log"
+stale_pointer="$named_log_root/.run-999999999-$attempt_epoch.pointer"
+write_ci_local_run_pointer \
+  "$stale_pointer" "$stale_pointer_dir" 999999999 "$attempt_epoch"
+rm -f -- "$named_pointer"
+if attribution=$(find_concurrent_test_run \
+  "$named_log_root" "$test_log" /work/current "$attempt_epoch" "$attempt_epoch"); then
+  echo "FAIL stale run pointer was attributed: $attribution" >&2
+  exit 1
+fi
+
+self_pointer="$named_log_root/.run-$$-$attempt_epoch.pointer"
+write_ci_local_run_pointer "$self_pointer" "$check_dir" "$$" "$attempt_epoch"
+touch -d "@$attempt_epoch" "$test_log"
+if attribution=$(find_concurrent_test_run \
+  "$named_log_root" "$test_log" /work/current "$attempt_epoch" "$attempt_epoch"); then
+  echo "FAIL current run pointer was attributed to itself: $attribution" >&2
+  exit 1
+fi
+
+echo "ok (replacement, never-executed summary, physical, caller-named, stale and self-pointer attribution fixtures)"

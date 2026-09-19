@@ -77,6 +77,41 @@ print_test_failure_summary() {
   ' "$1"
 }
 
+write_ci_local_run_pointer() {
+  local pointer=$1 log_dir=$2 pid=$3 started=$4 temporary="${1}.tmp"
+  if ! {
+    printf 'pid: %s\n' "$pid"
+    printf 'started: %s\n' "$started"
+    printf 'log_dir: %s\n' "$log_dir"
+  } >"$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  if ! mv -f -- "$temporary" "$pointer"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
+concurrent_test_logs() {
+  local log_root=$1 attempt_ended=$2 pointer pid started log_dir candidate_mtime
+  find "$log_root" -mindepth 2 -maxdepth 2 -type f -name test.log \
+    -printf '%T@ %p\n' 2>/dev/null
+
+  for pointer in "$log_root"/.run-*.pointer; do
+    [ -f "$pointer" ] || continue
+    pid=$(sed -nE 's/^pid: ([0-9]+)$/\1/p' "$pointer")
+    started=$(sed -nE 's/^started: ([0-9]+)$/\1/p' "$pointer")
+    log_dir=$(sed -nE 's@^log_dir: (/.*)$@\1@p' "$pointer")
+    [[ $pid =~ ^[1-9][0-9]*$ && $started =~ ^[0-9]+$ ]] || continue
+    [ "$started" -le "$attempt_ended" ] || continue
+    kill -0 "$pid" 2>/dev/null || continue
+    [ -f "$log_dir/test.log" ] || continue
+    candidate_mtime=$(stat -c '%Y' -- "$log_dir/test.log" 2>/dev/null) || continue
+    printf '%s %s\n' "$candidate_mtime" "$log_dir/test.log"
+  done
+}
+
 find_concurrent_test_run() {
   local log_root=$1 current_log=$2 current_checkout=$3 attempt_started=$4 attempt_ended=$5
   local candidate_mtime candidate checkout
@@ -101,8 +136,7 @@ find_concurrent_test_run() {
       return 0
     fi
   done < <(
-    find "$log_root" -mindepth 2 -maxdepth 2 -type f -name test.log \
-      -printf '%T@ %p\n' 2>/dev/null | sort -nr
+    concurrent_test_logs "$log_root" "$attempt_ended" | sort -nr
   )
   return 1
 }

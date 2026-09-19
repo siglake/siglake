@@ -88,6 +88,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+caller_named_log_dir=0
+[ -n "$LOG_DIR" ] && caller_named_log_dir=1
+
 total_started=$SECONDS
 
 # One directory per invocation, shared with nobody and emptied by no one.
@@ -109,7 +112,23 @@ case "$LOG_DIR" in /*) ;; *) LOG_DIR="$PWD/$LOG_DIR" ;; esac
 mkdir -p "$LOG_ROOT" "$LOG_DIR"
 export TMPDIR="$LOG_DIR/tmp"
 mkdir -p "$TMPDIR"
-trap 'rm -rf -- "$LOG_DIR/tmp"' EXIT
+run_pointer=
+if [ "$caller_named_log_dir" -eq 1 ]; then
+  # Caller-owned logs can live outside LOG_ROOT, where the contamination guard
+  # cannot discover them by walking for test.log. Publish this run while it is
+  # active; the pointer is diagnostic only and never changes the guard verdict.
+  run_started=$(date +%s)
+  run_pointer="$LOG_ROOT/.run-$$-$run_started.pointer"
+  if ! write_ci_local_run_pointer "$run_pointer" "$LOG_DIR" "$$" "$run_started"; then
+    echo "  warning: could not publish ci-local run pointer: $run_pointer" >&2
+    run_pointer=
+  fi
+fi
+cleanup_ci_local() {
+  rm -rf -- "$LOG_DIR/tmp"
+  [ -z "$run_pointer" ] || rm -f -- "$run_pointer"
+}
+trap cleanup_ci_local EXIT
 # `latest` is for whoever tails the newest run by hand; with two runs in
 # flight it names the one that started last.
 ln -sfn "$LOG_DIR" "$LOG_ROOT/latest" 2>/dev/null || true
