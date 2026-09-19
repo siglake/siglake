@@ -1744,6 +1744,168 @@
    "description": "Footer-KV inverted indexes refused before pruning because their sibling CRC-32 is malformed or disagrees with the stored blob. The reader falls back to Puffin when present and otherwise scans the file exactly, so a rising rate means correctness was preserved at the cost of scan work. Both reasons are pre-registered at zero on query pods."
   },
   {
+   "id": 167,
+   "type": "timeseries",
+   "title": "Index sidecars written / refused by reason",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 170
+   },
+   "targets": [
+    {
+     "expr": "sum by (outcome, reason) (increase(siglake_iceberg_segmented_index_writes_total{namespace=~\"$namespace\"}[1h]))",
+     "legendFormat": "{{outcome}} {{reason}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "min": 0
+    },
+    "overrides": []
+   },
+   "description": "What the sidecar writer decided at the close of a compaction rewrite. written is charged once per (output file, indexed column); a refusal is charged once per output file, because the writer abandons that file's whole sidecar set at the first column it cannot stand behind. written is a segmented (seg2) sidecar handed to the registration; the three refused reasons are the ways a sidecar would have described a file layout the file does not have, and each one leaves that file on the scan path with no index: column is a row group whose text column could not be indexed, file_rows is a sidecar whose total rows disagree with the file's, and row_domain is a sidecar whose per-group rows disagree with the footer's row groups. A refusal is the safe outcome (the reader scans exactly, as it does for an unindexed file), so nothing here is a correctness signal — it is the one place a compactor writing files without indexes is visible. Every arm is pre-registered at 0 on the compactor, so a pod with the writer switched off charts flat zeros rather than No data: the writer is opt-in (SIGLAKE_SEGMENTED_INDEX_WRITES=1) and an all-zero panel is the correct reading of a default install. Read it against the v1 rebuild panels below: a file the writer refused is a file the post-rewrite v1 rebuild has to decode whole, if that is on at all."
+  },
+  {
+   "id": 168,
+   "type": "timeseries",
+   "title": "Index sidecar bytes / per-group index bytes (p50 / p99 per pod)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 170
+   },
+   "targets": [
+    {
+     "expr": "siglake_iceberg_segmented_index_written_bytes{namespace=~\"$namespace\", quantile=\"0.5\"}",
+     "legendFormat": "p50 sidecar {{pod}}",
+     "refId": "A"
+    },
+    {
+     "expr": "siglake_iceberg_segmented_index_written_bytes{namespace=~\"$namespace\", quantile=\"0.99\"}",
+     "legendFormat": "p99 sidecar {{pod}}",
+     "refId": "B"
+    },
+    {
+     "expr": "siglake_iceberg_segmented_index_group_index_bytes{namespace=~\"$namespace\", quantile=\"0.5\"}",
+     "legendFormat": "p50 group index {{pod}}",
+     "refId": "C"
+    },
+    {
+     "expr": "siglake_iceberg_segmented_index_group_index_bytes{namespace=~\"$namespace\", quantile=\"0.99\"}",
+     "legendFormat": "p99 group index {{pod}}",
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "min": 0
+    },
+    "overrides": []
+   },
+   "description": "What a seg2 sidecar costs, in the two units that answer different questions. sidecar is one finished blob's encoded size — the Puffin bytes the rewrite commits and a later text query fetches. group index is the heap one row group's postings and dictionary occupy while the writer builds them, recorded per row group and dropped at the end of that group: it is the bound the streaming design rests on, not the writer's peak live heap, and a series that grows with file size would mean the build had become file-proportional. Both are exported as summaries, so these are each pod's own quantiles over the exporter's rolling window and are charted per pod rather than summed or averaged — a mean of percentiles is not a percentile, and one compactor's outlier rewrite is the reading. Neither series exists before that pod's first sidecar: quantiles cannot be pre-registered, and the writer is opt-in, so No data here means no seg2 sidecar has closed on this pod."
+  },
+  {
+   "id": 169,
+   "type": "timeseries",
+   "title": "v1 index rebuild: files and source bytes",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 178
+   },
+   "targets": [
+    {
+     "expr": "sum by (table) (increase(siglake_index_rebuild_files_total{namespace=~\"$namespace\"}[1h]))",
+     "legendFormat": "files/h {{table}}",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (table) (increase(siglake_index_rebuild_bytes_total{namespace=~\"$namespace\"}[1h]))",
+     "legendFormat": "source bytes/h {{table}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "min": 0
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byFrameRefID",
+       "options": "B"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "bytes"
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "right"
+       }
+      ]
+     }
+    ]
+   },
+   "description": "The opt-in post-rewrite index rebuild (#4162), which reads a committed data file back whole and builds a v1 inverted index for every column the rewrite left without one. files is how many data files one pass rebuilt; source bytes (right axis) is those files' own size, which is the Parquet the pass re-read and decoded — not the index it produced. Both are charged once per pass and only after the registration commits, so a pass that rebuilt nothing, or whose registration was deferred, adds nothing here; the \"Index registrations deferred\" panel is where that second case shows. Neither series is pre-registered — both carry the tenant and table, known only at the increment — so a table that has never been rebuilt is absent rather than zero, and No data on the whole panel means no rebuild has committed on any pod. Rising files with the sidecar panel above flat is the compactor paying for whole-file decodes the seg2 writer would have avoided."
+  },
+  {
+   "id": 170,
+   "type": "timeseries",
+   "title": "v1 index rebuild duration (p50 / p99)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 178
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.50, sum by (le, table) (rate(siglake_index_rebuild_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p50 {{table}}",
+     "refId": "A"
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le, table) (rate(siglake_index_rebuild_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p99 {{table}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "min": 0
+    },
+    "overrides": []
+   },
+   "description": "How long one rebuild pass took, end to end: the footer probe over every candidate file, the whole-file decode of the ones that needed rebuilding, and the Puffin registration. A pass that rebuilt nothing, or whose registration was deferred, records nothing here at all. A classic histogram (siglake-core buckets every _seconds name), so these are quantiles over the fleet's aggregated buckets rather than one pod's — unlike the byte panel beside it. The pass runs inside a compaction cycle and holds it, so a p99 here that approaches the cycle interval is a compactor whose rebuild is the cycle. Read the sample count against the files panel to its left: the same pass can rebuild one file or many, and a p99 that climbs with a flat file rate is per-file decode cost, not more work."
+  },
+  {
    "id": 137,
    "type": "row",
    "title": "Cache warmer",
@@ -1751,7 +1913,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 170
+    "y": 186
    },
    "collapsed": false
   },
@@ -1767,7 +1929,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 171
+    "y": 187
    },
    "targets": [
     {
@@ -1814,7 +1976,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 171
+    "y": 187
    },
    "targets": [
     {
@@ -1845,7 +2007,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 171
+    "y": 187
    },
    "targets": [
     {
@@ -1879,7 +2041,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 179
+    "y": 195
    },
    "collapsed": false
   },
@@ -1895,7 +2057,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 180
+    "y": 196
    },
    "targets": [
     {
@@ -1923,7 +2085,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 180
+    "y": 196
    },
    "targets": [
     {
@@ -1956,7 +2118,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 188
+    "y": 204
    },
    "targets": [
     {
@@ -1990,7 +2152,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 196
+    "y": 212
    },
    "targets": [
     {
@@ -2019,7 +2181,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 204
+    "y": 220
    },
    "targets": [
     {

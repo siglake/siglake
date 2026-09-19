@@ -2299,3 +2299,38 @@ fn report_rolled_rewrite_sink_heap() {
         }
     });
 }
+
+/// #5231's dashboard row reads `siglake_iceberg_segmented_index_writes_total`
+/// through `increase()`, so every `(outcome, reason)` the writer can record has
+/// to exist at 0 on a compactor that has not closed a sidecar yet: a `refused`
+/// arm that is absent and one that is flat at zero are the same chart, and the
+/// second is the reading. The label values are variables at the emitter, so
+/// `scripts/check-chart.py` sees a dynamic site and cannot hold the catalog to
+/// it; the fork's own exported vocabulary can.
+///
+/// Pure — it compares two constants and takes no global state, so it needs no
+/// [`WRITER_TESTS`] turn.
+#[test]
+fn segmented_index_write_series_are_preregistered() {
+    use std::collections::BTreeSet;
+
+    let listed: BTreeSet<BTreeSet<(&str, &str)>> =
+        siglake_core::metrics::COMPACTOR_ALERTED_COUNTERS
+            .iter()
+            .filter(|counter| counter.name == "siglake_iceberg_segmented_index_writes_total")
+            .flat_map(|counter| counter.series.iter())
+            .map(|labels| labels.iter().copied().collect())
+            .collect();
+
+    let recorded: BTreeSet<BTreeSet<(&str, &str)>> =
+        iceberg::writer::file_writer::SEGMENTED_INDEX_WRITE_SERIES
+            .iter()
+            .map(|(outcome, reason)| BTreeSet::from([("outcome", *outcome), ("reason", *reason)]))
+            .collect();
+
+    assert_eq!(
+        listed, recorded,
+        "every (outcome, reason) the sidecar writer records must be created at 0: \
+         update COMPACTOR_ALERTED_COUNTERS in siglake_core::metrics"
+    );
+}
