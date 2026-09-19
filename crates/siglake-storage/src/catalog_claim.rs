@@ -3813,7 +3813,8 @@ mod local_commit_mark_postgres {
 
     /// Run one case in a fresh schema and drop the schema either way. The cases
     /// return `Result` rather than asserting so that a failure still cleans up
-    /// and still names which of the four went wrong.
+    /// and still names which case went wrong. Two suites share it now, so the
+    /// count is theirs, not this helper's.
     pub(super) async fn in_scratch<F, Fut>(
         admin: &AnyPool,
         base: &str,
@@ -3825,8 +3826,8 @@ mod local_commit_mark_postgres {
         Fut: std::future::Future<Output = Result<()>>,
     {
         let scratch = Scratch::create(admin, base, label).await?;
-        // The store's pool is closed before the schema goes, so four cases do
-        // not leave four pools' worth of idle sessions on a compose Postgres
+        // The store's pool is closed before the schema goes, so nine cases do
+        // not leave nine pools' worth of idle sessions on a compose Postgres
         // that has its own ingest, compactor and query server connected.
         let outcome = match scratch.connect().await {
             Ok(claim) => {
