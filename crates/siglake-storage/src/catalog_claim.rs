@@ -3729,6 +3729,10 @@ mod local_commit_mark_tests {
 /// compactor at this database (`deploy/docker-compose.yml`
 /// `SIGLAKE_CATALOG_URI`), so a claim run in the public schema would take live
 /// rows and strand them in `processing`.
+///
+/// [`Scratch`], [`in_scratch`] and [`assert_both_gates_run`] are `pub(super)`
+/// because [`eligible_claim_postgres`] runs in the same compose step and must
+/// reuse this isolation rather than open a second kind of connection (#5189).
 #[cfg(test)]
 mod local_commit_mark_postgres {
     use super::local_commit_mark_tests::{local, row};
@@ -3736,15 +3740,16 @@ mod local_commit_mark_postgres {
     use anyhow::ensure;
     use std::collections::BTreeSet;
 
-    const URI_VAR: &str = "SIGLAKE_TEST_JOBS_POSTGRES_URI";
+    pub(super) const URI_VAR: &str = "SIGLAKE_TEST_JOBS_POSTGRES_URI";
 
     /// A disposable schema and the URI that makes it this store's whole world.
     /// sqlx passes `options[...]` through to the Postgres startup packet as
     /// `-c search_path=…`, so `ensure_schema`'s `CREATE TABLE IF NOT EXISTS`
     /// lands here rather than next to compose's own `wal_segments`.
-    struct Scratch {
+    pub(super) struct Scratch {
         name: String,
         uri: String,
+        label: &'static str,
     }
 
     /// `base` with the scratch schema pinned as the whole `search_path`.
@@ -3756,18 +3761,22 @@ mod local_commit_mark_postgres {
     }
 
     impl Scratch {
-        async fn create(admin: &AnyPool, base: &str) -> Result<Self> {
-            let name = format!("siglake_local_mark_{}", uuid::Uuid::new_v4().simple());
+        /// `label` names the suite in the schema and in the claimer id, so a
+        /// leaked schema or a stranded `processing` row on compose's Postgres
+        /// says which suite left it. The local-mark suite passes `local_mark`,
+        /// keeping the `siglake_local_mark_…` names #5188's reading looked for.
+        async fn create(admin: &AnyPool, base: &str, label: &'static str) -> Result<Self> {
+            let name = format!("siglake_{label}_{}", uuid::Uuid::new_v4().simple());
             sqlx::query(&format!("CREATE SCHEMA {name}"))
                 .execute(admin)
                 .await
                 .with_context(|| format!("create scratch schema {name}"))?;
             let uri = scratch_uri(base, &name);
-            Ok(Self { name, uri })
+            Ok(Self { name, uri, label })
         }
 
         async fn connect(&self) -> Result<SqlSegmentClaim> {
-            let claim = SqlSegmentClaim::connect(&self.uri, "pg-local-mark".to_string()).await?;
+            let claim = SqlSegmentClaim::connect(&self.uri, format!("pg-{}", self.label)).await?;
             ensure!(
                 claim.dialect == Dialect::Postgres,
                 "{URI_VAR} must name a Postgres, not a {:?} URI",
@@ -3805,12 +3814,17 @@ mod local_commit_mark_postgres {
     /// Run one case in a fresh schema and drop the schema either way. The cases
     /// return `Result` rather than asserting so that a failure still cleans up
     /// and still names which of the four went wrong.
-    async fn in_scratch<F, Fut>(admin: &AnyPool, base: &str, case: F) -> Result<()>
+    pub(super) async fn in_scratch<F, Fut>(
+        admin: &AnyPool,
+        base: &str,
+        label: &'static str,
+        case: F,
+    ) -> Result<()>
     where
         F: FnOnce(SqlSegmentClaim) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        let scratch = Scratch::create(admin, base).await?;
+        let scratch = Scratch::create(admin, base, label).await?;
         // The store's pool is closed before the schema goes, so four cases do
         // not leave four pools' worth of idle sessions on a compose Postgres
         // that has its own ingest, compactor and query server connected.
@@ -3969,13 +3983,13 @@ mod local_commit_mark_postgres {
         Ok(())
     }
 
-    /// Both gates run this module by NAME, and a filter that matches nothing
-    /// runs zero tests and exits 0 — so a rename here would take the Postgres
-    /// coverage out of the compose step in both files and still report green.
-    /// Same argument as `scripts/check-shell-job-parity.py`, one level down.
-    #[test]
-    fn both_gates_run_this_module_by_name() {
-        let module = module_path!().rsplit("::").next().expect("module name");
+    /// Both gates run a live-Postgres module by NAME, and a filter that matches
+    /// nothing runs zero tests and exits 0 — so a rename here would take the
+    /// Postgres coverage out of the compose step in both files and still report
+    /// green. Same argument as `scripts/check-shell-job-parity.py`, one level
+    /// down. `pub(super)` so every suite in this file makes the same claim
+    /// about its own name.
+    pub(super) fn assert_both_gates_run(module: &str) {
         for rel in [".github/workflows/ci.yml", "scripts/ci-local.sh"] {
             let path =
                 std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).join(rel);
@@ -4000,6 +4014,11 @@ mod local_commit_mark_postgres {
             );
             assert!(text.contains(URI_VAR), "{rel} must give that run {URI_VAR}");
         }
+    }
+
+    #[test]
+    fn both_gates_run_this_module_by_name() {
+        assert_both_gates_run(module_path!().rsplit("::").next().expect("module name"));
     }
 
     /// The isolation rests on sqlx turning `options[search_path]` into the
@@ -4052,22 +4071,29 @@ mod local_commit_mark_postgres {
             .await
             .unwrap_or_else(|e| panic!("connect {URI_VAR}: {e}"));
 
+        const LABEL: &str = "local_mark";
         let outcomes = [
             (
                 "sealed and absent rows upsert, and a late registration loses",
-                in_scratch(&admin, &base, upserts_sealed_rows_and_absent_ones).await,
+                in_scratch(&admin, &base, LABEL, upserts_sealed_rows_and_absent_ones).await,
             ),
             (
                 "re-marking preserves the first committed timestamp",
-                in_scratch(&admin, &base, re_marking_preserves_the_first_timestamp).await,
+                in_scratch(
+                    &admin,
+                    &base,
+                    LABEL,
+                    re_marking_preserves_the_first_timestamp,
+                )
+                .await,
             ),
             (
                 "a claimed row is left to its claim-mode drain",
-                in_scratch(&admin, &base, leaves_claimed_rows_alone).await,
+                in_scratch(&admin, &base, LABEL, leaves_claimed_rows_alone).await,
             ),
             (
                 "the mark writes no consumed-proof watermark",
-                in_scratch(&admin, &base, writes_no_consumed_proof_watermark).await,
+                in_scratch(&admin, &base, LABEL, writes_no_consumed_proof_watermark).await,
             ),
         ];
         let failed: Vec<String> = outcomes
@@ -4077,6 +4103,436 @@ mod local_commit_mark_postgres {
         assert!(
             failed.is_empty(),
             "the local mark behaves differently on Postgres:\n{}",
+            failed.join("\n")
+        );
+    }
+}
+
+/// [`SqlSegmentClaim::try_claim_eligible`]'s defer/proceed decision, run
+/// against a live Postgres.
+///
+/// The function is Postgres-only by construction — a CTE, `FOR UPDATE SKIP
+/// LOCKED`, and an `UPDATE … FROM agg … RETURNING` — and it returns
+/// `Ok(vec![])` before the statement on any other backend
+/// (`try_claim_eligible`, the dialect check). So no SQLite test executes a line
+/// of it: the two hermetic cases in `eligible_claim_tests` assert the decline
+/// and the zero batch, which is all SQLite can say. What is unproved without a
+/// server is the part the drain depends on: a deferred batch must transition
+/// NOTHING (the `UPDATE … FROM agg` matching no row rather than claiming and
+/// stranding), the aggregate must be over the rows this claimer locked rather
+/// than the table, and a row another session holds must be skipped rather than
+/// waited on.
+///
+/// `#[ignore]`d and wired into the same compose step as
+/// [`local_commit_mark_postgres`], whose schema isolation and cleanup it reuses
+/// (`.github/workflows/ci.yml`, `scripts/ci-local.sh`):
+///
+/// ```text
+/// SIGLAKE_TEST_JOBS_POSTGRES_URI=postgres://siglake:siglake@localhost:5433/siglake \
+///   cargo test -p siglake-storage --lib eligible_claim_postgres -- --ignored --nocapture
+/// ```
+///
+/// It adds no build cost — the same `siglake-storage` lib test binary the step
+/// already links — and prints each case's elapsed time so the next reading can
+/// size the sharded-branch and watermark cases (#5189) from measured numbers
+/// rather than from the job's 521s total.
+#[cfg(test)]
+mod eligible_claim_postgres {
+    use super::local_commit_mark_postgres::{assert_both_gates_run, in_scratch, URI_VAR};
+    use super::*;
+    use anyhow::{anyhow, ensure};
+    use std::collections::BTreeSet;
+
+    /// This suite's schemas and claimer are `siglake_eligible_claim_…` /
+    /// `pg-eligible_claim`, so anything it leaks on compose's Postgres names
+    /// itself.
+    const LABEL: &str = "eligible_claim";
+
+    /// Move a row's registration stamp back, to drive the age arm of the
+    /// eligibility test without sleeping for `max_age`.
+    const BACKDATE_SQL: &str = "UPDATE wal_segments SET registered_at_ms = ? WHERE id = ?";
+
+    /// Hold one row's lock in another session, the state `FOR UPDATE SKIP
+    /// LOCKED` exists to survive.
+    const LOCK_SQL: &str = "SELECT id FROM wal_segments WHERE id = ? FOR UPDATE";
+
+    async fn seed(claim: &SqlSegmentClaim, id: &str, bytes: i64) -> Result<()> {
+        ensure!(
+            claim
+                .register(
+                    id,
+                    "default",
+                    "idx",
+                    &format!("wal-mirror/{id}.arrow"),
+                    bytes,
+                    1
+                )
+                .await?,
+            "seeding {id} must insert a row"
+        );
+        Ok(())
+    }
+
+    /// Read back through the store's own dialect, so the marker arrives as `$1`
+    /// rather than a `?` Postgres rejects.
+    async fn state(claim: &SqlSegmentClaim, id: &str) -> Result<(String, Option<String>)> {
+        let q = claim
+            .dialect
+            .rewrite("SELECT status, claimer FROM wal_segments WHERE id = ?");
+        sqlx::query_as::<_, (String, Option<String>)>(&q)
+            .bind(id)
+            .fetch_optional(&claim.pool)
+            .await
+            .with_context(|| format!("read back {id}"))?
+            .with_context(|| format!("no row {id}"))
+    }
+
+    /// "Nothing was transitioned" is the claim of every defer case, and the
+    /// only honest way to make it is to look at every row.
+    async fn sealed_ids(claim: &SqlSegmentClaim) -> Result<BTreeSet<String>> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT id FROM wal_segments WHERE status = 'sealed'")
+                .fetch_all(&claim.pool)
+                .await
+                .context("list sealed ids")?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn backdate(claim: &SqlSegmentClaim, id: &str, age: Duration) -> Result<()> {
+        let q = claim.dialect.rewrite(BACKDATE_SQL);
+        let affected = sqlx::query(&q)
+            .bind(now_millis() - age.as_millis() as i64)
+            .bind(id)
+            .execute(&claim.pool)
+            .await
+            .context("backdate a registration stamp")?
+            .rows_affected();
+        ensure!(affected == 1, "backdating {id} matched {affected} rows");
+        Ok(())
+    }
+
+    fn ids(claimed: &[ClaimedSegment]) -> BTreeSet<String> {
+        claimed.iter().map(|c| c.id.clone()).collect()
+    }
+
+    /// An hour: long enough that the age arm cannot admit a batch this suite
+    /// just registered, so a defer case tests the bytes arm alone.
+    fn never_by_age() -> Duration {
+        Duration::from_secs(3600)
+    }
+
+    /// A batch below both thresholds is DEFERRED, not claimed — and deferring
+    /// must leave the rows exactly as they were. The failure this rules out is
+    /// the `UPDATE … FROM agg` shape claiming first and filtering after, which
+    /// is what the sharded branch above it got wrong: rows transitioned to
+    /// `processing` and then dropped sit there forever, and no drain ever
+    /// commits them.
+    async fn defers_and_leaves_the_rows_claimable(claim: SqlSegmentClaim) -> Result<()> {
+        seed(&claim, "a", 10).await?;
+        seed(&claim, "b", 10).await?;
+        let deferred = claim
+            .try_claim_eligible(10, 1_000_000, never_by_age())
+            .await?;
+        ensure!(
+            deferred.is_empty(),
+            "20 bytes cleared a 1,000,000-byte target: {:?}",
+            ids(&deferred)
+        );
+        for id in ["a", "b"] {
+            let (status, claimer) = state(&claim, id).await?;
+            ensure!(status == "sealed", "{id} is {status}, not sealed");
+            ensure!(claimer.is_none(), "{id} was stamped by {claimer:?}");
+        }
+        // The point of deferring is that the batch comes back, bigger.
+        let claimed = claim.try_claim(10).await?;
+        ensure!(
+            ids(&claimed) == BTreeSet::from(["a".to_string(), "b".to_string()]),
+            "the deferred rows are no longer claimable: {:?}",
+            ids(&claimed)
+        );
+        Ok(())
+    }
+
+    /// The bytes arm proceeds, and the claim it returns is the row: the caller
+    /// pulls `segment_url` from object storage and commits into `tenant` /
+    /// `index_id`, so a `RETURNING` list in the wrong order would fetch the
+    /// wrong object with no error anywhere.
+    async fn proceeds_when_the_candidate_bytes_reach_the_target(
+        claim: SqlSegmentClaim,
+    ) -> Result<()> {
+        for id in ["s0", "s1", "s2"] {
+            seed(&claim, id, 40).await?;
+        }
+        let claimed = claim.try_claim_eligible(10, 100, never_by_age()).await?;
+        ensure!(
+            ids(&claimed) == BTreeSet::from(["s0".to_string(), "s1".to_string(), "s2".to_string()]),
+            "120 bytes did not clear a 100-byte target: {:?}",
+            ids(&claimed)
+        );
+        for c in &claimed {
+            ensure!(c.tenant == "default", "{}: tenant is {}", c.id, c.tenant);
+            ensure!(c.index_id == "idx", "{}: index is {}", c.id, c.index_id);
+            ensure!(
+                c.segment_url == format!("wal-mirror/{}.arrow", c.id),
+                "{}: url is {}",
+                c.id,
+                c.segment_url
+            );
+            ensure!(c.bytes == 40 && c.rows == 1, "{}: {} bytes", c.id, c.bytes);
+            let (status, claimer) = state(&claim, &c.id).await?;
+            ensure!(status == "processing", "{} is {status}", c.id);
+            ensure!(
+                claimer.as_deref() == Some(claim.claimer.as_str()),
+                "{} is stamped {claimer:?}, not {}",
+                c.id,
+                claim.claimer
+            );
+        }
+        ensure!(
+            sealed_ids(&claim).await?.is_empty(),
+            "a row survived the claim as sealed"
+        );
+        let again = claim.try_claim_eligible(10, 100, never_by_age()).await?;
+        ensure!(
+            again.is_empty(),
+            "a second claim took rows already in processing: {:?}",
+            ids(&again)
+        );
+        Ok(())
+    }
+
+    /// The age arm is what keeps a quiet index from waiting forever for a
+    /// target it will never reach. Same row, same target, only the age moves —
+    /// so a claim here is the age arm and nothing else.
+    async fn proceeds_on_age_when_the_bytes_are_short(claim: SqlSegmentClaim) -> Result<()> {
+        seed(&claim, "quiet", 1).await?;
+        let deferred = claim
+            .try_claim_eligible(10, 1_000_000, Duration::from_secs(60))
+            .await?;
+        ensure!(
+            deferred.is_empty(),
+            "a fresh 1-byte batch was claimed: {:?}",
+            ids(&deferred)
+        );
+        backdate(&claim, "quiet", Duration::from_secs(600)).await?;
+        let claimed = claim
+            .try_claim_eligible(10, 1_000_000, Duration::from_secs(60))
+            .await?;
+        ensure!(
+            ids(&claimed) == BTreeSet::from(["quiet".to_string()]),
+            "a 10-minute-old batch did not clear a 60s max_age: {:?}",
+            ids(&claimed)
+        );
+        let (status, _) = state(&claim, "quiet").await?;
+        ensure!(status == "processing", "quiet is {status}");
+        Ok(())
+    }
+
+    /// The whole reason this exists instead of the fleet-global peek gate: the
+    /// eligibility test is applied to the rows THIS claimer locked, not to the
+    /// table. Four 30-byte rows are 120 bytes in the table and 60 bytes in a
+    /// batch of two, and a 100-byte target must read the second number.
+    async fn the_eligibility_test_is_candidate_local(claim: SqlSegmentClaim) -> Result<()> {
+        let all: BTreeSet<String> = ["c0", "c1", "c2", "c3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for id in &all {
+            seed(&claim, id, 30).await?;
+        }
+        let deferred = claim.try_claim_eligible(2, 100, never_by_age()).await?;
+        ensure!(
+            deferred.is_empty(),
+            "the gate summed the table (120) rather than the batch (60): {:?}",
+            ids(&deferred)
+        );
+        ensure!(
+            sealed_ids(&claim).await? == all,
+            "a deferred candidate did not stay sealed"
+        );
+        let claimed = claim.try_claim_eligible(2, 50, never_by_age()).await?;
+        ensure!(
+            claimed.len() == 2,
+            "a batch of 2 claimed {} rows",
+            claimed.len()
+        );
+        ensure!(
+            sealed_ids(&claim).await?.len() == 2,
+            "the claim reached past its LIMIT"
+        );
+        Ok(())
+    }
+
+    /// `FOR UPDATE SKIP LOCKED` is why two drains decide independently instead
+    /// of queueing behind one another. With a row locked elsewhere, the claim
+    /// must (a) return rather than wait, and (b) leave that row out of the
+    /// aggregate — 100 locked bytes must not admit a 10-byte batch.
+    async fn a_locked_row_is_skipped_not_waited_on(claim: SqlSegmentClaim) -> Result<()> {
+        seed(&claim, "locked", 100).await?;
+        seed(&claim, "free", 10).await?;
+        let mut holder = claim.pool.begin().await.context("open the holding tx")?;
+        let q = claim.dialect.rewrite(LOCK_SQL);
+        sqlx::query(&q)
+            .bind("locked")
+            .fetch_all(&mut *holder)
+            .await
+            .context("lock the held row")?;
+
+        // A claim that waits for the lock never returns, so bound it: the
+        // timeout IS the assertion that SKIP LOCKED is in the statement.
+        let deferred = tokio::time::timeout(
+            Duration::from_secs(10),
+            claim.try_claim_eligible(10, 60, never_by_age()),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "the claim blocked on a row another session holds: SKIP LOCKED is not in effect"
+            )
+        })??;
+        ensure!(
+            deferred.is_empty(),
+            "the locked row's 100 bytes admitted a 10-byte batch: {:?}",
+            ids(&deferred)
+        );
+        for id in ["locked", "free"] {
+            let (status, _) = state(&claim, id).await?;
+            ensure!(status == "sealed", "{id} is {status}, not sealed");
+        }
+
+        holder.rollback().await.context("release the holding tx")?;
+        let claimed = claim.try_claim_eligible(10, 60, never_by_age()).await?;
+        ensure!(
+            ids(&claimed) == BTreeSet::from(["free".to_string(), "locked".to_string()]),
+            "with the lock gone both rows must be candidates: {:?}",
+            ids(&claimed)
+        );
+        Ok(())
+    }
+
+    /// Same argument as the local mark's guard: both gates run this module by
+    /// NAME, and a filter matching nothing runs zero tests and exits 0.
+    #[test]
+    fn both_gates_run_this_module_by_name() {
+        assert_both_gates_run(module_path!().rsplit("::").next().expect("module name"));
+    }
+
+    /// The function under test declines on SQLite, but the suite's scaffolding
+    /// reads and writes ordinary columns, and that much is checkable here. A
+    /// renamed column would otherwise surface only as a red compose step, far
+    /// from the rename.
+    #[tokio::test]
+    async fn the_scaffolding_matches_the_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("sqlite://{}/c.db?mode=rwc", tmp.path().display());
+        let c = SqlSegmentClaim::connect(&uri, "t".to_string())
+            .await
+            .unwrap();
+        seed(&c, "a", 10).await.unwrap();
+        assert_eq!(state(&c, "a").await.unwrap(), ("sealed".to_string(), None));
+        assert_eq!(
+            sealed_ids(&c).await.unwrap(),
+            BTreeSet::from(["a".to_string()])
+        );
+        backdate(&c, "a", Duration::from_secs(600)).await.unwrap();
+        assert_eq!(
+            ids(&c.try_claim(1).await.unwrap()),
+            BTreeSet::from(["a".to_string()])
+        );
+        assert_eq!(
+            state(&c, "a").await.unwrap(),
+            ("processing".to_string(), Some("t".to_string()))
+        );
+        assert!(sealed_ids(&c).await.unwrap().is_empty());
+    }
+
+    /// The suite's own helper statements reach Postgres unparsed by anything
+    /// else, and a typo in one would fail the case it supports for the wrong
+    /// reason — a red suite that says nothing about `try_claim_eligible`.
+    #[test]
+    fn the_helper_statements_parse_as_postgres() {
+        use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+        use datafusion::sql::sqlparser::parser::Parser;
+
+        for sql in [BACKDATE_SQL, LOCK_SQL] {
+            let rendered = Dialect::Postgres.rewrite(sql);
+            assert!(!rendered.contains('?'), "unrewritten marker in {rendered}");
+            let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &rendered)
+                .unwrap_or_else(|e| panic!("does not parse as Postgres: {e}\n{rendered}"));
+            assert_eq!(parsed.len(), 1, "one statement per execute(): {rendered}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn the_eligibility_decision_holds_against_postgres() {
+        // Skipping on an unset variable keeps `--ignored` runnable where there
+        // is no Postgres; the same compose step runs `jobs_postgres_ownership`,
+        // which panics on an unset variable, so a dropped variable still fails
+        // the gate there.
+        let base = match std::env::var(URI_VAR) {
+            Ok(uri) if !uri.trim().is_empty() => uri,
+            _ => {
+                eprintln!("skipped: {URI_VAR} is unset; nothing was verified");
+                return;
+            }
+        };
+        sqlx::any::install_default_drivers();
+        let admin = AnyPool::connect(&base)
+            .await
+            .unwrap_or_else(|e| panic!("connect {URI_VAR}: {e}"));
+
+        let started = std::time::Instant::now();
+        let mut outcomes: Vec<(&str, Result<()>)> = Vec::new();
+        // Each case is a distinct future type, so this is a macro rather than a
+        // loop over an array. It also prints the case's elapsed time, so the
+        // next container-runtime reading can size the sharded-branch and
+        // watermark cases this suite does not cover yet.
+        macro_rules! case {
+            ($name:expr, $body:expr) => {{
+                let case_started = std::time::Instant::now();
+                let outcome = in_scratch(&admin, &base, LABEL, $body).await;
+                eprintln!(
+                    "eligible_claim_postgres: {} in {:?}",
+                    $name,
+                    case_started.elapsed()
+                );
+                outcomes.push(($name, outcome));
+            }};
+        }
+        case!(
+            "a batch below both thresholds defers and stays claimable",
+            defers_and_leaves_the_rows_claimable
+        );
+        case!(
+            "the candidate bytes reach the target and the batch is claimed",
+            proceeds_when_the_candidate_bytes_reach_the_target
+        );
+        case!(
+            "an old batch proceeds on age with the bytes short",
+            proceeds_on_age_when_the_bytes_are_short
+        );
+        case!(
+            "the eligibility test sums the candidates, not the table",
+            the_eligibility_test_is_candidate_local
+        );
+        case!(
+            "a row another session holds is skipped, not waited on",
+            a_locked_row_is_skipped_not_waited_on
+        );
+        eprintln!(
+            "eligible_claim_postgres: {} cases in {:?}",
+            outcomes.len(),
+            started.elapsed()
+        );
+
+        let failed: Vec<String> = outcomes
+            .into_iter()
+            .filter_map(|(case, outcome)| outcome.err().map(|e| format!("- {case}: {e:#}")))
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "the candidate-local eligibility decision is wrong on Postgres:\n{}",
             failed.join("\n")
         );
     }
