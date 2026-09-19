@@ -420,6 +420,11 @@ paths:
       responses:
         '200':
           description: The index configuration.
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Strong validator for this table incarnation's full index configuration.
           content:
             application/json:
               schema:
@@ -464,6 +469,14 @@ paths:
         required: true
         schema:
           type: string
+      - name: If-Match
+        in: header
+        description: Optional RFC 9110 strong entity-tag condition. `*` matches any existing index.
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
       requestBody:
         content:
           application/json:
@@ -473,6 +486,11 @@ paths:
       responses:
         '200':
           description: Updated. Body is the stored configuration.
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Strong validator for the returned configuration.
           content:
             application/json:
               schema:
@@ -501,6 +519,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
+        '412':
+          description: The supplied If-Match condition is false. `current` and ETag come from the exact rejecting commit base; another writer may replace them before this response arrives.
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Strong validator matching `current`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManagedIndexPreconditionErrorBody'
         '500':
           description: Internal error.
           content:
@@ -2359,6 +2388,25 @@ components:
       - failed
       - cancelled
       - timeout
+    ManagedIndexPreconditionErrorBody:
+      type: object
+      description: A failed managed-index `If-Match` condition.
+      required:
+      - error
+      - code
+      - current
+      properties:
+        code:
+          type: integer
+          format: int32
+          description: Always 412.
+          minimum: 0
+        current:
+          $ref: '#/components/schemas/IndexConfig'
+          description: Configuration from the exact commit base that rejected the condition.
+        error:
+          type: string
+          description: Human-readable failure description.
     MappingMode:
       type: string
       description: Behavior for attributes that are not declared in `field_mappings`.

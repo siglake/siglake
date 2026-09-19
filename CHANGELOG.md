@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Index management (feature)**: `GET /api/v1/indexes/{id}` and successful
+  index `PUT`s return a strong mapping ETag, and `PUT` accepts optional
+  `If-Match`. A false condition returns RFC 9110 `412 Precondition Failed` with
+  the exact rejecting-base config and its matching ETag, including after a
+  lost catalog CAS replays the transaction on another writer's mapping. The
+  validator covers the table UUID and full parsed `IndexConfig`, so data-only
+  commits preserve it and delete/recreate changes it. Headerless updates keep
+  their existing additive-only and idempotent behavior. (#5473)
+
 - **Query observability (feature)**: a Puffin index blob the cache refuses
   outright is counted, as
   `siglake_iceberg_puffin_blob_cache_evictions_total{reason="oversized"}`. One

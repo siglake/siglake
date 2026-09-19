@@ -66,6 +66,28 @@ async fn request_json(
     }
 }
 
+async fn request_json_with_if_match(
+    app: &Router,
+    method: Method,
+    path: &str,
+    body: serde_json::Value,
+    if_match: &str,
+) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::IF_MATCH, if_match)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = serde_json::from_slice(&bytes).unwrap();
+    (status, headers, body)
+}
+
 fn field(name: &str, field_type: FieldType, required: bool) -> FieldMapping {
     FieldMapping {
         name: name.to_string(),
@@ -1941,6 +1963,166 @@ async fn indexes_http_lifecycle_round_trips() {
 
     let (status, _) = request_json(&srv.app, Method::GET, "/api/v1/indexes/logs", None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn managed_index_if_match_returns_paired_config_and_etag() {
+    let srv = spawn(AuthConfig::open()).await;
+    let config = logs_config("conditional-logs");
+    let (status, _) = request_json(
+        &srv.app,
+        Method::POST,
+        "/api/v1/indexes",
+        Some(serde_json::to_value(&config).unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let response = srv
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/indexes/conditional-logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let e0 = response
+        .headers()
+        .get(axum::http::header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(e0.starts_with('"') && e0.ends_with('"'));
+
+    let mut winner = config.clone();
+    winner
+        .doc_mapping
+        .field_mappings
+        .push(field("winner", FieldType::Long, false));
+    let (status, headers, body) = request_json_with_if_match(
+        &srv.app,
+        Method::PUT,
+        "/api/v1/indexes/conditional-logs",
+        serde_json::to_value(&winner).unwrap(),
+        &e0,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(serde_json::from_value::<IndexConfig>(body).unwrap(), winner);
+    let e1 = headers
+        .get(axum::http::header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(e1, e0);
+
+    let mut loser = config;
+    loser
+        .doc_mapping
+        .field_mappings
+        .push(field("loser", FieldType::Long, false));
+    let (status, headers, body) = request_json_with_if_match(
+        &srv.app,
+        Method::PUT,
+        "/api/v1/indexes/conditional-logs",
+        serde_json::to_value(&loser).unwrap(),
+        &e0,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_eq!(body["code"], 412);
+    assert_eq!(
+        body["error"],
+        "managed index `conditional-logs` changed since the supplied If-Match value"
+    );
+    assert_eq!(
+        serde_json::from_value::<IndexConfig>(body["current"].clone()).unwrap(),
+        winner
+    );
+    assert_eq!(headers.get(axum::http::header::ETAG).unwrap(), &e1);
+}
+
+#[tokio::test]
+async fn if_match_preserves_invalid_headerless_and_recreated_table_behavior() {
+    let srv = spawn(AuthConfig::open()).await;
+    let config = logs_config("conditional-recreate");
+    let (status, _) = request_json(
+        &srv.app,
+        Method::POST,
+        "/api/v1/indexes",
+        Some(serde_json::to_value(&config).unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let entity = srv
+        .ice
+        .get_index_entity("conditional-recreate")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut invalid = config.clone();
+    invalid.doc_mapping.field_mappings[2].field_type = FieldType::Long;
+    let (status, _, body) = request_json_with_if_match(
+        &srv.app,
+        Method::PUT,
+        "/api/v1/indexes/conditional-recreate",
+        serde_json::to_value(&invalid).unwrap(),
+        &entity.etag,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _) = request_json(
+        &srv.app,
+        Method::PUT,
+        "/api/v1/indexes/conditional-recreate",
+        Some(serde_json::to_value(&invalid).unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = request_json(
+        &srv.app,
+        Method::DELETE,
+        "/api/v1/indexes/conditional-recreate",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = request_json(
+        &srv.app,
+        Method::POST,
+        "/api/v1/indexes",
+        Some(serde_json::to_value(&config).unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, headers, body) = request_json_with_if_match(
+        &srv.app,
+        Method::PUT,
+        "/api/v1/indexes/conditional-recreate",
+        serde_json::to_value(&config).unwrap(),
+        &entity.etag,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_ne!(headers.get(axum::http::header::ETAG).unwrap(), &entity.etag);
+    assert_eq!(
+        serde_json::from_value::<IndexConfig>(body["current"].clone()).unwrap(),
+        config
+    );
 }
 
 #[tokio::test]

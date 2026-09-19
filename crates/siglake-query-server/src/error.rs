@@ -364,10 +364,21 @@ impl ApiError {
 
     /// Map index-management/storage failures into the shared API error body.
     pub fn from_index_manager(err: AnyhowError) -> Self {
+        if let Some(stale @ IndexManagerError::StaleIndexConfig { current, etag, .. }) =
+            chain_downcast_ref::<IndexManagerError>(&err)
+        {
+            let mut out = Self::new(StatusCode::PRECONDITION_FAILED, stale.to_string());
+            out.context = Some(json!({ "current": current }));
+            if let Ok(value) = HeaderValue::from_str(etag) {
+                out.headers.push((header::ETAG, value));
+            }
+            return out;
+        }
         let status = if let Some(err) = chain_downcast_ref::<IndexManagerError>(&err) {
             match err {
                 IndexManagerError::IndexAlreadyExists(_) => StatusCode::CONFLICT,
                 IndexManagerError::IndexNotFound(_) => StatusCode::NOT_FOUND,
+                IndexManagerError::StaleIndexConfig { .. } => StatusCode::PRECONDITION_FAILED,
                 IndexManagerError::NotAnIndex(_)
                 | IndexManagerError::ReservedSystemIndexId(_)
                 | IndexManagerError::FieldMappingsPrefixMismatch { .. }

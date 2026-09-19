@@ -16,6 +16,7 @@ use utoipa::ToSchema;
 
 use crate::cost::CostReport;
 use crate::format::RecordsResponse;
+use siglake_core::index_config::IndexConfig;
 
 /// `GET /healthz` response body.
 #[derive(Debug, Serialize, ToSchema)]
@@ -102,6 +103,17 @@ pub struct ApiErrorBody {
     /// Present when the failure was cost- or time-related.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<CostReport>,
+}
+
+/// A failed managed-index `If-Match` condition.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ManagedIndexPreconditionErrorBody {
+    /// Human-readable failure description.
+    pub error: String,
+    /// Always 412.
+    pub code: u16,
+    /// Configuration from the exact commit base that rejected the condition.
+    pub current: IndexConfig,
 }
 
 // utoipa keys responses by status code, so separate 200 entries would collide;
