@@ -1637,9 +1637,10 @@ not tenant authorization. Identifiers are validated, never repaired: `acme.corp`
 is a refusal rather than a rewrite to `acmecorp`, so two claims cannot alias
 onto one namespace and an all-invalid claim cannot fall back to the default
 one. Refusals are counted by `siglake_query_tenant_denied_total` and
-`siglake_ingest_tenant_denied_total` (`reason="claim_missing"` /
-`"claim_invalid"` / `"header_mismatch"` / `"header_not_trusted"` /
-`"not_allowed"` / `"at_capacity"`).
+`siglake_ingest_tenant_denied_total`. Query currently emits
+`reason="claim_missing"` / `"claim_invalid"`; ingest also emits
+`"header_mismatch"` / `"header_not_trusted"` / `"not_allowed"` /
+`"at_capacity"`.
 
 **Bounding what a header can create.** The tenant and index headers each mint a
 backpressure lane (holding an open file), metric label values, and an Iceberg
@@ -1658,6 +1659,17 @@ per process: it starts empty on restart, and each pod holds its own, so a
 2-pod ingester with `maxTenants: 100` admits up to 100 tenants per pod. **This
 cap was inert until #4240** — parsed, passed to the ingester and never read, so
 an operator whose only bound was `maxTenants` had none.
+
+**Query admission remains unrestricted.** A valid claim currently creates the
+tenant namespace and its empty tables on first resolution and leaves a context
+in the process registry. The contexts share one catalog pool and the common
+caches. A bounded local run through 100 novel claims retained 69–76 KiB of
+heap and added 334 KiB of SQLite/Iceberg metadata in 200 files. The qualified
+extension is a separate, default-off query allow-list. A tenant can then remain
+readable after it stops accepting writes. Its direct and distributed admission
+contract and the measurement are in
+[`DESIGN_query_tenant_admission.md`](DESIGN_query_tenant_admission.md); #5489
+tracks implementation.
 
 ## Observability (OpenTelemetry emission)
 

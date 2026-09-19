@@ -1609,6 +1609,16 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   all — and a refusal whose rows fit under the fetch does not improve at all,
   because the producer bound is in rows and the ceiling that binds there is in
   bytes. Concurrently buffered batches are outside all of it.
+- **Verified query tenant claims are not bounded by an operator allow-list.**
+  Every usable claim reaches the tenant registry, which creates the namespace
+  and its empty tables on first use and retains a context for the process
+  lifetime. All contexts share the catalog pool and caches. A local 100-tenant
+  measurement retained 69–76 KiB of heap and added 334 KiB of catalog/Iceberg
+  metadata. The qualified extension is a separate `query.allowedTenants` set,
+  default unrestricted, because tenants may need read access after write
+  admission ends. Its contract, including distributed shard checks, is in
+  [`DESIGN_query_tenant_admission.md`](DESIGN_query_tenant_admission.md) and
+  implementation is #5489.
 - **No built-in UI.** There is no bundled query or alerting front-end; the
   query tier is reached through SQL over HTTP and the Elasticsearch- and
   Jaeger-compatible shims. What does ship for operations: a starter Grafana
