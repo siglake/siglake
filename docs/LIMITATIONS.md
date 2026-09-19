@@ -7,6 +7,17 @@ moved here from the README on 2026-09-15; the docs site's
 user-facing summary of the same list. The mechanisms named below are described
 in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
+- **The persistent ingest lane cap still uses the generic writer-failure
+  response.** Once `ingester.maxLanes` admits a `(tenant, index)` lane, an empty
+  queue does not release its slot; only process shutdown drains the map. A novel
+  key past the cap receives HTTP `500` or gRPC `Internal`, with no retry hint,
+  because lane creation failures still share `SubmitOutcome::Failed` with real
+  WAL writer failures. Changing every generic failure would misclassify those
+  errors. A 0.2.0 response decision must separate the outcome first and cover
+  both transports; no `Retry-After` duration is justified without a timed
+  reclamation mechanism. The exporter evidence and candidate consequences are
+  in
+  [`DESIGN_ingest_lane_cap_response_qualification.md`](DESIGN_ingest_lane_cap_response_qualification.md).
 - **The implicit newest-first ordering only knows the column name
   `timestamp`.** An index whose doc mapping names some other
   `timestamp_field` browses in file order unless the query writes its own

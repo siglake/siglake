@@ -47,7 +47,7 @@ design.
 
 | Role | Responsibility |
 |---|---|
-| **Ingester** (`siglake ingest-server`) | OTLP/HTTP on 8088 and OTLP/gRPC on 4317, plus bulk endpoints → WAL segments. Backpressure router with bounded per-tenant lanes (full lane ⇒ fast `503` + `Retry-After`), token-bucket rate budgets (in-memory or Redis-backed shared across replicas), WAL mirroring to object storage, force-seals the WAL on SIGTERM for safe scale-down. Can run the compactor in-process (`--with-compactor`) for single-process dev and bench runs; the Helm chart refuses that flag, because the embedded compactor takes no catalog claim. |
+| **Ingester** (`siglake ingest-server`) | OTLP/HTTP on 8088 and OTLP/gRPC on 4317, plus bulk endpoints → WAL segments. Backpressure router with bounded per-tenant queues (full queue ⇒ fast `503` + `Retry-After`) and an optional persistent tenant/index lane cap, token-bucket rate budgets (in-memory or Redis-backed shared across replicas), WAL mirroring to object storage, force-seals the WAL on SIGTERM for safe scale-down. Can run the compactor in-process (`--with-compactor`) for single-process dev and bench runs; the Helm chart refuses that flag, because the embedded compactor takes no catalog claim. |
 | **Compactor / drain** (`siglake compactor`) | Drains sealed WAL segments into Iceberg commits — continuous dispatch with N commits in flight, commit-accumulation batching — and runs **leveled compaction**, snapshot expiry, retention/delete sweeps, and orphan GC on the same budgeted loop, so maintenance never starves the commit path. Multi-pod-safe via SQL catalog claims. |
 | **Query** (`siglake-query-server`) | Distributed SQL: replicas behind a headless Service with stable DNS; any replica transparently coordinates (file-shard fan-out, two-phase merge, Arrow IPC transport). Replicas add throughput; fan-out engages for large scans, while small-`LIMIT` browses and Tier-1 aggregates are answered locally by design (see [`LIMITATIONS.md`](LIMITATIONS.md)). A process-wide memory pool bounds every sort, aggregate and join; when it refuses (rather than spills) the client gets `503` + `Retry-After`, the same capacity answer the ingester gives, forwarded from a worker rather than re-run on the coordinator. Serves uncommitted WAL data for `events` and for every managed user index a query references, via the real-time buffer (`--query-wal-buffer-dir`) plus hot last-value caches. |
 | **Operator** (`siglake-operator`) | `SiglakeCluster` CRD → renders the deployment; leader-elected; reports `observedGeneration` + schema versions. |
@@ -1676,6 +1676,14 @@ per process: it starts empty on restart, and each pod holds its own, so a
 2-pod ingester with `maxTenants: 100` admits up to 100 tenants per pod. **This
 cap was inert until #4240** — parsed, passed to the ingester and never read, so
 an operator whose only bound was `maxTenants` had none.
+
+The lane cap is a different refusal. An admitted `(tenant, index)` lane remains
+in the map after its queue empties and leaves only at process shutdown. A novel
+key past `ingester.maxLanes` currently receives HTTP `500` or gRPC `Internal`,
+without a retry hint; this preserves the 0.1.x wire contract while the 0.2.0
+response is decided. The client behavior, recovery paths and transport mismatch
+are recorded in
+[`DESIGN_ingest_lane_cap_response_qualification.md`](DESIGN_ingest_lane_cap_response_qualification.md).
 
 **Query admission is unrestricted by default and exactly bounded on request.**
 A valid claim creates the tenant namespace and its empty tables on first
