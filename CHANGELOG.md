@@ -114,8 +114,13 @@
   produces one blob per output file and indexed column when a rolling rewrite
   splits. A failed transaction leaves no discoverable index, and the existing
   post-commit rebuild recognizes seg2 coverage instead of decoding the output
-  file again. Query discovery recognizes seg2 and retains existing whole-file
-  v1 reads. The unreleased seg1 prototype is no longer discovered and no longer
+  file again. The registration is a transaction action that runs after the
+  rewrite's, so the snapshot id and sequence number it stamps into the table
+  statistics metadata and into the Puffin footer come from the base each
+  attempt refreshed to. A stale first base or a lost CAS writes another Puffin
+  container from the already-built seg2 bytes; the Parquet output is neither
+  decoded nor rewritten. Query discovery recognizes seg2 and retains existing
+  whole-file v1 reads. The unreleased seg1 prototype is no longer discovered and no longer
   suppresses a rebuild; its pinned bytes remain a decode-only codec test.
   `SIGLAKE_SEGMENTED_INDEX_WRITES=1` and the
   separate `SIGLAKE_SEGMENTED_INDEX_READS=1` are both required to build and use
@@ -137,7 +142,7 @@
   rather than files — 2.40 B per row per indexed column, whatever the rolling
   target. The heap figures above are peak tracked live bytes over append plus
   every rewrite in an arm.
-  (#4377, #5228, #5230, #5233, #5234, #5299)
+  (#4377, #5228, #5230, #5233, #5234, #5260, #5299)
 
 - **Text indexes (docs)**: the documented integrity gap in a v1 inverted-index
   blob is the **footer-KV** path only. An index stored as hex in a Parquet
