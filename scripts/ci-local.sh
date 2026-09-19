@@ -857,20 +857,21 @@ if [ "$WITH_HEAVY" = 1 ]; then
         SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
           cargo test -p siglake-storage --lib local_commit_mark_postgres -- \
             --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
-        # The candidate-local claim gate (#5189) is Postgres-only by
-        # construction — a CTE, FOR UPDATE SKIP LOCKED and an UPDATE ... FROM
-        # agg — and returns an empty vec before the statement on SQLite, so no
-        # hermetic case runs a line of it. Same binary, same scratch-schema
-        # isolation as the suite above.
-        SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
-          cargo test -p siglake-storage --lib eligible_claim_postgres -- \
-            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
         # wal-recover's catalog reader uses the same deployed backend and has
         # three properties a parser or SQLite cannot establish: all 256 `$N`
         # binds work, the server refuses a write on the reader's own fenced
         # connection, and a missing table differs from an empty ledger.
         SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
           cargo test -p siglake-storage --lib wal_ledger_postgres -- \
+            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+        # The candidate-local claim gate (#5189) is Postgres-only by
+        # construction — a CTE, FOR UPDATE SKIP LOCKED and an UPDATE ... FROM
+        # agg — and returns an empty vec before the statement on SQLite, so no
+        # hermetic case runs a line of it. Same binary and same scratch-schema
+        # isolation as the local mark above; same order as ci.yml, so the two
+        # logs read alike.
+        SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
+          cargo test -p siglake-storage --lib eligible_claim_postgres -- \
             --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
       else
         dk_ok=0
