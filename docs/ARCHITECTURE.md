@@ -335,6 +335,11 @@ Footer inverted indexes are enabled by default. Set
 User-index mappings still select the indexed text columns and tokenizers;
 whole-string `raw` tokenizers keep using Parquet blooms instead of duplicating
 their tokens in an inverted index.
+Each footer blob is accompanied by an eight-hex-character CRC-32 under the
+disjoint `siglake.inverted_index.crc32.v1[.<column>]` namespace. A new reader
+refuses a malformed or mismatching sibling before consulting the parsed cache
+and scans exactly; an absent sibling identifies a legacy file and remains
+readable. Puffin v1 sidecars stay on checksummed Zstd frames.
 
 Post-rewrite Puffin rebuild is **off** by default (opt-in). Set
 `SIGLAKE_INDEX_REBUILD=1`, Helm `compactor.indexRebuild: true`, or operator
@@ -461,8 +466,9 @@ reclustering completes (`docs/DESIGN_time_ordered_storage.md`).
 **Search acceleration, self-describing in the files:**
 - a **file-level trigram bloom** + **per-row-group token blooms** over `raw`
   for arbitrary `LIKE '%substr%'` pruning;
-- **inverted indexes** per configured text column: small blobs ride the Parquet
-  footer KV, large ones live in **Puffin sidecars** registered to the snapshot;
+- **inverted indexes** per configured text column: small blobs and sibling
+  CRC-32 values ride the Parquet footer KV, while large ones live in
+  checksummed-Zstd **Puffin sidecars** registered to the snapshot;
 - per-file **group-count** and **time-bucket** footers powering the aggregate
   fast paths — group counts use a compact front-coded binary encoding a query
   can read one column out of without touching the rest

@@ -132,39 +132,23 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   turnovers rather than for as long as its file is planned, which is the
   approximation that keeps a compacted-away file's blob from being retained
   forever; the plan-level signal that would replace it does not exist.
-- **A v1 inverted-index blob in a Parquet footer has no checksum; the Puffin
-  sidecar's Zstd frame has one.** #4558 made the decoder validate everything
-  the format can check itself — the serialized lengths against the bytes behind
-  them, the narrowing conversions, the varint range, the dictionary's ascent,
-  and each posting's ascent and place inside `n_rows` — and made the reader
-  match the index's row domain against the Parquet file before either a warm or
-  a cold index prunes it. What is left is a corruption that decodes and still
-  covers the file, and #4991 measured what a query then does, per storage path
-  ([`DESIGN_inverted_index.md`](DESIGN_inverted_index.md), "Which storage path
-  carries that residual"). The **footer-KV** path — hex in the Parquet footer,
-  taken per column while that column's serialized index fits
-  `SIGLAKE_INDEX_FOOTER_MAX_BYTES` (1 MiB), so the small and freshly written
-  files — is the exposed one: Parquet
-  checksums data pages, not footer metadata, and the query succeeds while
-  answering short. Of 224,368 single-bit flips of a 28 KB hex value, 125 cost
-  one probe term rows and 10,432 cost some term rows; a flip inside a term's
-  *characters* costs that term every row in the file, because an absent term is
-  a definitive "no rows match". The **Puffin sidecar** — the spillover above
-  that threshold, so the large compacted files — is covered by the codec it is
-  written with (`Zstd`, `include_checksum(true)`): none of 19,888 flips of the
-  stored frame produced a wrong answer, against 5,883 of 19,856 with the
-  content checksum off. Its failure mode is a failed query (`Restored data
-  doesn't match checksum`), not a fallback to a scan. Warm, neither path
-  re-verifies: a cached parsed index answers from the parse until it is
-  evicted. Closing the footer exposure costs 4 bytes, eight hex characters in a
-  footer value, and 0.41% of the decode the reader already pays — the
-  recommendation, the placements a 0.1.x reader refuses, and what that would
-  cost a mixed-version fleet are in the design document; the shipped format,
-  API and defaults are unchanged. The segmented figures are a different
-  question: 4 bytes per term is about a third of a *segmented* blob because a
-  partial reader fetches one term's postings and can verify only what it
-  fetched, and seg2 closes its own residual with a CRC per block's posting
-  span. Neither applies to a blob that is read whole.
+- **A footer inverted index's CRC-32 shares the Parquet footer it checks.** New
+  files carry the blob under `siglake.inverted_index.v1[.<column>]` and its
+  eight-hex-character CRC under the disjoint
+  `siglake.inverted_index.crc32.v1[.<column>]` namespace. A malformed or
+  mismatching sibling is refused before either a cold decode or warm parsed
+  cache handout, then the reader tries Puffin and otherwise scans exactly.
+  Legacy blobs without a sibling keep pruning so rolling upgrades do not lose
+  all footer-index acceleration; old readers ignore the new key. The remaining
+  boundary is footer-wide damage that changes both values consistently. An
+  in-blob checksum would cover that case but makes every 0.1.x reader refuse
+  every newly written index until the fleet finishes upgrading. The measured
+  corruption rates, 0.41% verification cost and placement comparison are in
+  [`DESIGN_inverted_index.md`](DESIGN_inverted_index.md), "Which storage path
+  carries that residual". Large v1 indexes remain protected by the Puffin
+  writer's pinned checksummed-Zstd codec; its corrupt-frame behavior is still a
+  query error rather than scan fallback. Seg2 uses a CRC per addressable block
+  and is a separate format boundary.
 - **Statistics-file retirement is whole-entry and limited to Siglake-owned
   inverted indexes.** The snapshot-expiry and orphan-GC maintenance paths
   remove an Iceberg statistics entry only when every blob has a `data_file`

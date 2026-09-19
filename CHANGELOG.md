@@ -157,6 +157,19 @@
   decode) and what a 0.1.x reader does with each placement. No format, API or
   default changed. (#4991)
 
+- **Text indexes (fix)**: newly written footer-KV v1 indexes carry an
+  eight-hex-character CRC-32 under the collision-safe
+  `siglake.inverted_index.crc32.v1[.<column>]` namespace. The reader verifies a
+  present sibling before a parsed-cache handout or decode; a malformed value or
+  disagreement tries a valid Puffin index and otherwise scans exactly. Legacy
+  blobs without the sibling keep pruning, and old readers ignore the new key,
+  so rolling upgrades retain index coverage. Refusals are counted by reason in
+  `siglake_index_footer_checksum_refused_total` and shown on the overview
+  dashboard. The v1 Puffin writer's checksummed-Zstd codec is now a pinned,
+  tested choice. A checksum still shares the Parquet footer with its blob, so
+  footer-wide damage that changes both consistently remains outside this
+  cover. (#5204)
+
 - **Alerting (feature)**: `SiglakeCompactorOrphansHeld` (critical, `for: 15m`,
   `siglake.stalled`) pages on the one WAL orphan disposition that needs a
   person. A compactor killed mid-commit leaves its segment under

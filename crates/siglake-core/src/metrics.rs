@@ -623,6 +623,13 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
         name: "siglake_wal_partial_tail_dropped_total",
         series: UNLABELLED,
     },
+    // A footer checksum refusal is query-correctness protection taking the
+    // exact-scan fallback. Both reasons feed the dashboard panel; create them
+    // at zero so its first observed refusal is a delta rather than No data.
+    AlertedCounter {
+        name: "siglake_index_footer_checksum_refused_total",
+        series: &[&[("reason", "malformed")], &[("reason", "mismatch")]],
+    },
     // #3969's "Text-index startup" panels. Neither counter is alerted on; they
     // are here for the other half of the pre-registration argument — a panel
     // over a series that does not exist yet renders "No data", which reads the

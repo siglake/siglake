@@ -36,6 +36,12 @@ const INDEX_VERSION: u8 = 1;
 /// mirrors `siglake_bloom::RAW_TRIGRAM_BLOOM_KV_KEY`).
 pub const INVERTED_INDEX_KV_KEY: &str = "siglake.inverted_index.v1";
 
+/// Parquet `key_value_metadata` namespace for the CRC-32 of a footer-KV
+/// inverted-index blob. This is deliberately not below [`INVERTED_INDEX_KV_KEY`]:
+/// `siglake.inverted_index.v1.crc32` is already the blob key for a column named
+/// `crc32`.
+pub const INVERTED_INDEX_CRC32_KV_KEY: &str = "siglake.inverted_index.crc32.v1";
+
 /// Footer-KV key for `column`'s inverted-index blob. `raw` keeps the original
 /// key for on-disk back-compat; other columns use a per-column suffix.
 pub fn inverted_index_kv_key(column: &str) -> Cow<'static, str> {
@@ -44,6 +50,36 @@ pub fn inverted_index_kv_key(column: &str) -> Cow<'static, str> {
     } else {
         Cow::Owned(format!("{INVERTED_INDEX_KV_KEY}.{column}"))
     }
+}
+
+/// Footer-KV key for `column`'s inverted-index CRC-32. `raw` mirrors the
+/// legacy unsuffixed blob key; other column names are preserved as suffixes.
+pub fn inverted_index_crc32_kv_key(column: &str) -> Cow<'static, str> {
+    if column == "raw" {
+        Cow::Borrowed(INVERTED_INDEX_CRC32_KV_KEY)
+    } else {
+        Cow::Owned(format!("{INVERTED_INDEX_CRC32_KV_KEY}.{column}"))
+    }
+}
+
+/// CRC-32 of the serialized bytes carried by a footer-KV inverted index.
+pub fn inverted_index_crc32(bytes: &[u8]) -> u32 {
+    crc32fast::hash(bytes)
+}
+
+/// CRC-32 of a hex-encoded footer-KV blob, without allocating its decoded
+/// bytes. `None` means the footer value is not even-length hexadecimal.
+pub fn inverted_index_hex_crc32(hex: &str) -> Option<u32> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    for pair in hex.as_bytes().chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        hasher.update(&[((hi << 4) | lo) as u8]);
+    }
+    Some(hasher.finalize())
 }
 
 /// An immutable inverted index over one file's rows. Terms are normalized exactly
@@ -657,6 +693,37 @@ mod tests {
             InvertedIndex::from_hex(&InvertedIndex::default().to_hex()),
             Some(InvertedIndex::default())
         );
+    }
+
+    #[test]
+    fn footer_checksum_keys_cannot_collide_with_blob_keys() {
+        for column in ["raw", "crc32", "message", "crc32.message", ""] {
+            assert_ne!(
+                inverted_index_kv_key(column),
+                inverted_index_crc32_kv_key(column),
+                "column {column:?}"
+            );
+        }
+        assert_eq!(
+            inverted_index_kv_key("crc32"),
+            "siglake.inverted_index.v1.crc32"
+        );
+        assert_eq!(
+            inverted_index_crc32_kv_key("crc32"),
+            "siglake.inverted_index.crc32.v1.crc32"
+        );
+    }
+
+    #[test]
+    fn footer_checksum_covers_the_blob_bytes_encoded_as_hex() {
+        let bytes = idx().to_bytes();
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(
+            inverted_index_hex_crc32(&hex),
+            Some(inverted_index_crc32(&bytes))
+        );
+        assert_eq!(inverted_index_hex_crc32("abc"), None);
+        assert_eq!(inverted_index_hex_crc32("zz"), None);
     }
 
     #[test]
