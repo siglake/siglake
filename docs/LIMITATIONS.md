@@ -16,6 +16,13 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   is something else would stamp an order that is not a time order, and the
   safe half (the shipped templates and every bulk-created index, all of which
   declare `timestamp`) covers what users actually have.
+- **A managed-index ETag is an optimistic validator, not a lock.** A failed
+  `If-Match` returns `current` and the ETag derived from the exact commit base
+  that rejected the update, but another writer can replace that mapping before
+  the response arrives. A client that rebases onto the returned config can
+  therefore receive another `412` and must repeat the merge. The validator is
+  deliberately mapping-specific: data appends and maintenance commits do not
+  change it, while deleting and recreating the index does.
 - **A pod at the 4Gi floor caches no text indexes by default.** Both caches now
   derive from the pod's memory limit and are subtracted from the query pool, so
   they are inside the budget rather than beside it — and what they get is what
@@ -1164,11 +1171,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   (`_siglake/config/index_templates/<namespace>/<template_id>.json`), so a PUT
   or DELETE of one id never touches another id's key — that is what makes two
   replicas' acknowledged edits both survive. Two writers of the same id in one
-  namespace are still last-write-wins: there is no CAS, no conditional PUT, and
-  no version in the request. A DELETE leaves a tombstone record rather than
-  removing the object, because an older record may remain read-only underneath;
-  tombstones are never garbage-collected. Listing costs one LIST plus one GET
-  per template, which is fine at the handful-of-templates scale this is for.
+  namespace are still last-write-wins: template PUT has no CAS, conditional
+  header or version in the request. A DELETE leaves a tombstone record rather
+  than removing the object, because an older record may remain read-only
+  underneath; tombstones are never garbage-collected. Listing costs one LIST
+  plus one GET per template, which is fine at the handful-of-templates scale
+  this is for.
   Builds before 0.1.0 stored templates at the warehouse root. Those records are
   still read only by the configured default namespace and are never rewritten
   or deleted; named tenants must re-PUT their templates after upgrading and do

@@ -1,16 +1,17 @@
 # Design: optional managed-index PUT preconditions (#2567)
 
-Status (2026-09-19): **qualified, contract status still open.** This document
-defines the validator, its transaction-retry boundary and the race responses.
-It does not choose between `412 Precondition Failed` and the previously
-proposed `409 Conflict`. No HTTP or storage behavior changes on #2567.
+Status (2026-09-19): **implemented by #5473.** A false `If-Match` returns
+`412 Precondition Failed`, including when the condition becomes false after a
+lost catalog CAS and transaction replay. This supersedes the earlier `409
+Conflict` proposal; headerless mapping conflicts keep their existing status.
 
 ## Current behavior and scope
 
 `PUT /api/v1/indexes/{id}` replaces the full `IndexConfig`, subject to the
-additive mapping rules. A request carries no version today. If another writer
-changes the mapping after the caller reads it, `SetIndexMappingAction`
-re-validates the body against every Iceberg commit base and refuses an
+additive mapping rules. A request without `If-Match` carries no version. If
+another writer changes the mapping after the caller reads it,
+`SetIndexMappingAction` re-validates the body against every Iceberg commit
+base and refuses an
 incompatible body. The HTTP response is `400`, because the server cannot tell
 whether the client intended to condition the update on the older mapping.
 
@@ -100,7 +101,7 @@ an invalid update (`400`), not evidence that the mapping precondition failed.
 
 ## Conditional-failure response
 
-Both candidate status codes use the same response contract:
+The `412 Precondition Failed` response contract is:
 
 ```json
 {
@@ -129,17 +130,16 @@ current when the client receives it: a third writer may commit after the
 refusal. Retrying with the returned ETag can therefore receive another
 conditional failure.
 
-The two status choices are:
+The implementation decision was:
 
 | status | fit | cost |
 | --- | --- | --- |
 | `412 Precondition Failed` | RFC 9110 section 13.1.1 defines this exact answer when `If-Match` is false. Generic HTTP clients and middleware already understand it. | It changes #2567's original `409` acceptance and adds a status not otherwise used by this route. |
-| `409 Conflict` | It matches the original proposal and reads as an application-level conflict beside index-create's existing `409`. | It gives standard `If-Match` a nonstandard false-condition response; clients must know this route's special rule. |
+| `409 Conflict` (rejected) | It matched the original proposal and reads as an application-level conflict beside index-create's existing `409`. | It gives standard `If-Match` a nonstandard false-condition response; clients must know this route's special rule. |
 
 `428 Precondition Required` does not apply because the header remains optional.
-This qualification leaves the `412`/`409` choice for the implementation card's
-approval. The chosen status must be used for both an initial mismatch and one
-detected after a transaction retry.
+Task #5473 chose `412` for both an initial mismatch and one detected after a
+transaction retry.
 
 ## Race qualification
 
@@ -148,15 +148,14 @@ windows. `a_stale_retention_edit_is_refused_after_a_concurrent_column_addition`
 puts the winner between preparation and commit.
 `a_retried_attempt_is_revalidated_against_the_base_it_lost_to` injects the
 winner after the losing attempt has built its update but before its catalog
-compare-and-swap, forcing action replay on the winner's base. These prove the
-location where the optional precondition must run; they do not claim that an
-HTTP precondition exists today.
+compare-and-swap, forcing action replay on the winner's base. #5473 extends
+that seam with the typed conditional refusal and route-level response.
 
 The implementation acceptance matrix is:
 
 | interleaving | required result |
 | --- | --- |
-| A and B read E0; A appends `a` with E0; B appends `b` with E0 after A commits | A returns `200`/E1. B returns the chosen conditional-failure status with A's config and E1. Only `a` is stored. |
+| A and B read E0; A appends `a` with E0; B appends `b` with E0 after A commits | A returns `200`/E1. B returns `412` with A's config and E1. Only `a` is stored. |
 | B's first commit attempt checks E0, then A wins the catalog CAS | B is replayed on E1 and fails there. It must not commit from its first check. |
 | A commits data only between B's read and B's mapping PUT | B's E0 still matches and B commits. |
 | B sends E0 and a non-additive body while E0 is current | `400`; the body is invalid rather than stale. |
@@ -172,15 +171,16 @@ churn.
 
 ## Implementation slice (#5473)
 
-One follow-on slice owns the public contract and its generated artifacts:
+The implementation slice completed the public contract and its generated
+artifacts:
 
-1. Add the validator/config pair and typed precondition failure to the storage
+1. Added the validator/config pair and typed precondition failure to the storage
    index manager, including the action replay check.
-2. Add GET/PUT ETag headers, `If-Match` parsing and the chosen response status
+2. Added GET/PUT ETag headers, `If-Match` parsing and the `412` response status
    and body to the query server.
-3. Add the race matrix's storage and route tests.
-4. Regenerate `docs/api`, update `ARCHITECTURE.md` and `LIMITATIONS.md`, and
-   file the merge-gated siglake-docs contract update.
+3. Added the race matrix's storage and route tests.
+4. Regenerated `docs/api`, updated `ARCHITECTURE.md` and `LIMITATIONS.md`, and
+   filed the merge-gated siglake-docs contract update.
 
 No metric belongs in that slice until a named dashboard, alert or operator
 workflow will read it.
