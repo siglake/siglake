@@ -695,7 +695,9 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
     // absent. The eviction reasons say which rule is running: `redundant` and
     // `stale` are the #4182 rule following the working set, a `fifo` rate is
     // the pre-#4182 fallback, which is what re-fetched a blob one step before
-    // the query that wanted it.
+    // the query that wanted it. `oversized` is the one arm that is not the rule
+    // at all: a blob the cache refused because it alone exceeds the budget, and
+    // a pod one blob short of its plan's per-file index emits nothing else.
     //
     // Recorded from the Iceberg fork with variable label values
     // (`PUFFIN_BLOB_CACHE_OUTCOMES`, `PUFFIN_BLOB_CACHE_DROP_REASONS`), so
@@ -715,6 +717,10 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
             &[("reason", "stale")],
             &[("reason", "redundant")],
             &[("reason", "fifo")],
+            // A blob refused outright, the way the parsed cache charges its own
+            // `oversized` (#5373): one file's index alone over the byte budget,
+            // so that file re-fetches per decode and the cache holds it never.
+            &[("reason", "oversized")],
         ],
     },
     // #4846's "Decoded-file cache populations" panel. No alert reads these

@@ -86,8 +86,9 @@ async fn count(ctx: &SessionContext, sql: &str) -> i64 {
 
 /// Two executions with the parsed cache refusing every index, then a third
 /// warehouse queried against a blob budget that cannot hold it beside the
-/// first — the three readings the panel is built on, in one process so the
-/// cache state each phase starts from is known.
+/// first, then two more against a budget one byte short of a single blob and
+/// against no budget at all — the readings the panel is built on, in one
+/// process so the cache state each phase starts from is known.
 #[tokio::test]
 async fn a_text_query_reports_its_blob_fetches_hits_and_the_rule_that_evicted() {
     let recorder = DebuggingRecorder::new();
@@ -130,6 +131,12 @@ async fn a_text_query_reports_its_blob_fetches_hits_and_the_rule_that_evicted() 
         counter_sum(&cold, EVICTIONS_TOTAL, None),
         0,
         "64 MiB holds this fixture's blobs many times over"
+    );
+    assert_eq!(
+        counter_sum(&cold, EVICTIONS_TOTAL, Some(("reason", "oversized"))),
+        0,
+        "a budget that holds the blobs refuses none of them: the healthy zero \
+         this arm has to be able to sit at"
     );
 
     assert_eq!(count(&held_ctx, SQL).await, 4, "warm result diverged");
@@ -194,6 +201,102 @@ async fn a_text_query_reports_its_blob_fetches_hits_and_the_rule_that_evicted() 
         counter_sum(&crowded, FETCHES_TOTAL, None),
         2,
         "a warehouse this cache has never seen costs one read per file"
+    );
+
+    // Phase 3. A budget one byte short of a single blob, which is the pod this
+    // counter exists for: every bound is positive, the cache is consulted, and
+    // nothing is ever admitted. Parsed indexes are refused again so each
+    // execution really decodes and really tries the admission.
+    siglake_storage::configure_text_index_caches(siglake_storage::TextIndexCacheConfig {
+        parsed_index_max_bytes: 1,
+        puffin_blob_max_bytes: (blob - 1) as u64,
+    });
+    let refused = puffin_indexed_warehouse(&tmp.path().join("refused"), 2).await;
+    let refused_ctx = SessionContext::new();
+    refused
+        .register_with_datafusion(&refused_ctx)
+        .await
+        .unwrap();
+    let _ = snapshotter.snapshot();
+    assert_eq!(count(&refused_ctx, SQL).await, 4, "refused result");
+    let refused_once = snapshotter.snapshot().into_vec();
+
+    assert_eq!(
+        counter_sum(
+            &refused_once,
+            EVICTIONS_TOTAL,
+            Some(("reason", "oversized"))
+        ),
+        2,
+        "one refusal per file whose blob alone exceeds the budget, charged once \
+         each — without it this execution is a rising fetch rate with no \
+         eviction and no hit, which is also what a cold cache draws"
+    );
+    assert_eq!(
+        counter_sum(&refused_once, EVICTIONS_TOTAL, None),
+        2,
+        "a refusal evicts nothing: the resident blobs are not disturbed to make \
+         room for a blob that cannot fit"
+    );
+    let (held_entries, held_bytes, _) = iceberg::arrow::puffin_blob_cache_stats("held");
+    assert_eq!(
+        (held_entries, held_bytes),
+        (2, bytes),
+        "and the entries admitted under the larger budget are still resident"
+    );
+    assert_eq!(
+        iceberg::arrow::puffin_blob_cache_stats("refused").0,
+        0,
+        "while the warehouse that was refused is held not at all"
+    );
+
+    assert_eq!(count(&refused_ctx, SQL).await, 4, "second refused result");
+    let refused_twice = snapshotter.snapshot().into_vec();
+    assert_eq!(
+        counter_sum(
+            &refused_twice,
+            EVICTIONS_TOTAL,
+            Some(("reason", "oversized"))
+        ),
+        2,
+        "the cache is inert for these files, so the next decode refuses again: \
+         the rate is per admission attempt, not per file"
+    );
+    assert_eq!(
+        counter_sum(&refused_twice, FETCHES_TOTAL, None),
+        2,
+        "and re-reads both blobs, which is the cost the counter attributes"
+    );
+
+    // Phase 4. The same query with the cache switched off. A disabled cache
+    // refuses every blob of every file, which the absent lookup series already
+    // says (#4718); charging that as a refusal would make `oversized` track the
+    // fetch rate and stop meaning "this pod is one blob short".
+    siglake_storage::configure_text_index_caches(siglake_storage::TextIndexCacheConfig {
+        parsed_index_max_bytes: 1,
+        puffin_blob_max_bytes: 0,
+    });
+    let off = puffin_indexed_warehouse(&tmp.path().join("off"), 2).await;
+    let off_ctx = SessionContext::new();
+    off.register_with_datafusion(&off_ctx).await.unwrap();
+    let _ = snapshotter.snapshot();
+    assert_eq!(count(&off_ctx, SQL).await, 4, "disabled result");
+    let disabled = snapshotter.snapshot().into_vec();
+
+    assert_eq!(
+        counter_sum(&disabled, FETCHES_TOTAL, None),
+        2,
+        "a disabled cache reads every blob it is asked for"
+    );
+    assert_eq!(
+        counter_sum(&disabled, LOOKUPS_TOTAL, None),
+        0,
+        "and is never consulted"
+    );
+    assert_eq!(
+        counter_sum(&disabled, EVICTIONS_TOTAL, None),
+        0,
+        "a zero bound is not a refusal this family charges"
     );
 
     iceberg::arrow::clear_text_index_cache_max_bytes();

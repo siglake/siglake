@@ -4825,7 +4825,11 @@ impl PuffinBlobCacheInner {
     ) {
         let size = blob.len();
         // A blob larger than the whole budget would evict everything else and
-        // then be evicted itself: leave it to be fetched per decode.
+        // then be evicted itself: leave it to be fetched per decode. The
+        // refusal is charged by `puffin_blob_cache_put` one step earlier, where
+        // the copy is still avoidable; this arm is the same rule restated for
+        // a direct caller, and counting it again here would double it. A key
+        // already held is deduplication, not a refusal, and is charged nothing.
         if max_entries == 0 || size > max_bytes || self.map.contains_key(&key) {
             return;
         }
@@ -4944,18 +4948,29 @@ pub const PUFFIN_BLOB_CACHE_OUTCOMES: &[&str] = &[PUFFIN_BLOB_CACHE_HIT, PUFFIN_
 const PUFFIN_BLOB_DROP_STALE: &str = "stale";
 const PUFFIN_BLOB_DROP_REDUNDANT: &str = "redundant";
 const PUFFIN_BLOB_DROP_FIFO: &str = "fifo";
+const PUFFIN_BLOB_DROP_OVERSIZED: &str = "oversized";
 
-/// Every `reason` value of `siglake_iceberg_puffin_blob_cache_evictions_total`,
-/// which is `blob_cache_victim`'s three arms: `stale` for a blob nothing read
-/// while the cache turned over `BLOB_PROTECTION_TURNOVERS` times, `redundant`
-/// for one whose parsed twin is resident and which therefore cannot be read at
-/// all, and `fifo` for the fallback when neither applies. Which arm is running
-/// is the difference between a cache following the working set and the
-/// pre-#4182 rule that evicted a blob one step before the query that wanted it.
+/// Every `reason` value of `siglake_iceberg_puffin_blob_cache_evictions_total`.
+///
+/// Three are `blob_cache_victim`'s arms: `stale` for a blob nothing read while
+/// the cache turned over `BLOB_PROTECTION_TURNOVERS` times, `redundant` for one
+/// whose parsed twin is resident and which therefore cannot be read at all, and
+/// `fifo` for the fallback when neither applies. Which arm is running is the
+/// difference between a cache following the working set and the pre-#4182 rule
+/// that evicted a blob one step before the query that wanted it.
+///
+/// The fourth, `oversized`, is a blob that never entered: one file's index
+/// alone exceeds the whole byte budget, so the cache is inert for that file
+/// while both bounds are positive. It sits on this family for the reason the
+/// parsed cache's own `oversized` does (#5373) — otherwise a budget one blob
+/// short of the plan's per-file index charts a rising
+/// `siglake_iceberg_puffin_blob_fetches_total` with no eviction and no hit,
+/// which is the chart of a cold cache and of a disabled one.
 pub const PUFFIN_BLOB_CACHE_DROP_REASONS: &[&str] = &[
     PUFFIN_BLOB_DROP_STALE,
     PUFFIN_BLOB_DROP_REDUNDANT,
     PUFFIN_BLOB_DROP_FIFO,
+    PUFFIN_BLOB_DROP_OVERSIZED,
 ];
 
 /// Whether a decode was handed bytes this cache still held. One outcome per
@@ -4979,9 +4994,10 @@ fn record_puffin_blob_fetch() {
     metrics::counter!("siglake_iceberg_puffin_blob_fetches_total").increment(1);
 }
 
-/// A blob this cache dropped, by which of [`blob_cache_victim`]'s three arms
-/// chose it. `reason` is one of three literals — the dashboard groups by it
-/// rather than matching on it.
+/// A blob this cache would not keep: dropped by one of [`blob_cache_victim`]'s
+/// three arms, or never admitted because it alone exceeds the byte budget.
+/// `reason` is one of four literals — the dashboard groups by it rather than
+/// matching on it.
 fn record_puffin_blob_evicted(reason: &'static str) {
     metrics::counter!(
         "siglake_iceberg_puffin_blob_cache_evictions_total",
@@ -5159,7 +5175,18 @@ fn puffin_blob_cache_put(path: &str, offset: u64, bytes: &[u8]) {
     let max_bytes = puffin_blob_cache_max_bytes();
     // Decide before copying: a rejected blob must not cost an 81 MB allocation
     // on the way to being dropped.
-    if max_entries == 0 || max_bytes == 0 || bytes.len() > max_bytes {
+    if max_entries == 0 || max_bytes == 0 {
+        // A disabled cache is not charged a refusal: it refuses every blob of
+        // every file, so the counter would track the fetch rate and say
+        // nothing the absent lookup series does not already say (#4718).
+        return;
+    }
+    if bytes.len() > max_bytes {
+        // Counted here, before the copy and before the lock: with both bounds
+        // positive the cache is inert for this one file — every decode of it
+        // fetches — and that reads as a cold cache unless it is charged. The
+        // blobs that do fit are not disturbed; this path evicts nothing.
+        record_puffin_blob_evicted(PUFFIN_BLOB_DROP_OVERSIZED);
         return;
     }
     let parsed_twins = parsed_index_puffin_twin_ranks();
@@ -7053,7 +7080,10 @@ message schema {
         assert!(cache.get(&key(2)).is_some());
         assert_eq!(cache.bytes, 200);
 
-        // One oversized blob does not evict the entries that fit.
+        // One oversized blob does not evict the entries that fit. What it costs
+        // is charged a step earlier, by `puffin_blob_cache_put`, as
+        // `reason="oversized"` — see `puffin_blob_cache_metrics.rs` in
+        // siglake-storage, which reads the emitted series.
         cache.put(key(3), blob(201), 200, 128, &no_twins);
         assert!(cache.get(&key(3)).is_none(), "oversized blob refused");
         assert!(cache.get(&key(1)).is_some(), "survivors kept");
@@ -7149,11 +7179,14 @@ message schema {
             "one tick short of the protection window is not yet stale"
         );
 
-        // The literals above are the exported vocabulary, in the order the
-        // rule prefers them.
+        // The literals above are this rule's arms, in the order it prefers
+        // them, and they open the exported vocabulary. `oversized` closes it
+        // and is the one reason the rule never returns: a blob refused
+        // admission is charged in `puffin_blob_cache_put`, before there is a
+        // victim to choose (#5373).
         assert_eq!(
             crate::arrow::reader::PUFFIN_BLOB_CACHE_DROP_REASONS,
-            ["stale", "redundant", "fifo"]
+            ["stale", "redundant", "fifo", "oversized"]
         );
     }
 
