@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Operations (docs)**: moving a release from the filesystem drain to the
+  catalog claim is documented as a migration step for the segments the
+  filesystem drain held. A quarantined segment under `<wal>/**/orphans/` whose
+  commit status the drain could not establish is held, counted by
+  `siglake_compactor_orphans_held{tenant}` and paged by
+  `SiglakeCompactorOrphansHeld` — both from the filesystem sweep alone, and
+  with `compactor.catalogClaim.enabled: true` the compactor's WAL mount is an
+  `emptyDir`, so the pod cannot census the claim it used to read. An absent
+  series after the switch is not evidence the volume is clear. The chart README
+  ("Switching an existing filesystem-drain release to the claim") and
+  `docs/LIMITATIONS.md` now say to inventory that directory first, keep the
+  files (a held orphan's commit status is unknown, so deleting one can lose
+  rows and requeueing one can duplicate them), reach it from an ingester pod,
+  which mounts the same claim in both modes, and expect the way back to run
+  through the mirror rather than a local rename. `scripts/check-chart.py` holds
+  both documents to the rendered claim-mode volume and to the operator's
+  `DrainModeHandoverRequired`. No behaviour, mount or drain protocol changes.
+  (#5150)
+
 - **Query observability (feature)**: the Puffin blob cache reports what it is
   doing on `/metrics`. `siglake_iceberg_puffin_blob_fetches_total` counts the
   index blobs a process read from object storage,

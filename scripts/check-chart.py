@@ -73,6 +73,16 @@ survive: a bounded page counter and the durable rotation-generation gauge.
 Either arm alone is not a stall — pages running is normal, and no rotation
 completing is also what a deliberately disabled reconciliation looks like.
 
+The compactor's WAL volume is held to its drain mode, and the migration
+guidance to both: a container running `--catalog-claim` must have an
+`emptyDir` there and the filesystem drain a `persistentVolumeClaim`, while the
+ingester keeps the claim in both modes. That volume is why a held orphan does
+not survive the switch — the claim-mode pod cannot census the directory it sat
+in and publishes no `siglake_compactor_orphans_held` — so the chart README and
+`docs/LIMITATIONS.md` have to keep carrying the inventory step, and the
+operator's `DrainModeHandoverRequired` has to keep existing for them to name
+(#5150).
+
 Finally, every Helm hook Job must carry the object-store credentials used by
 any Deployment or StatefulSet in the same render. Hook Jobs run before the new
 workloads and otherwise fail only at upgrade time, as the kind schema-migration
@@ -216,6 +226,28 @@ DEFAULT_FILE_CACHE_ENV = {
 INGEST_CONTAINER = "ingester"
 COMPACTOR_CONTAINER = "compactor"
 INDEX_REBUILD_ENV = "SIGLAKE_INDEX_REBUILD"
+# The claim-mode WAL volume and the migration guidance written around it
+# (#5150). A compactor running `--catalog-claim` gets an `emptyDir` so the
+# replicas are not pinned to the (possibly RWO) WAL claim's node, which means
+# it cannot see a held orphan the filesystem drain left under `<wal>/orphans/`
+# on that claim — and publishes no `siglake_compactor_orphans_held` to say so.
+# The docs below are the whole mitigation, so they are held to the render.
+CLAIM_ARG = "--catalog-claim"
+WAL_VOLUME = "wal"
+CHART_README = pathlib.Path("deploy/helm/siglake/README.md")
+LIMITATIONS = pathlib.Path("docs/LIMITATIONS.md")
+COMPACTOR_TEMPLATE = pathlib.Path(
+    "deploy/helm/siglake/templates/deployment-compactor.yaml"
+)
+# Where the operator refuses the same handover. The docs send an operator to
+# this reason string; a rename must fail here rather than leave them looking
+# for a condition nothing reports.
+RECONCILER = pathlib.Path("crates/siglake-operator/src/reconciler.rs")
+HANDOVER_REASON = "DrainModeHandoverRequired"
+ORPHAN_MIGRATION_HEADING = (
+    "### Switching an existing filesystem-drain release to the claim"
+)
+ORPHANS_HELD_GAUGE = "siglake_compactor_orphans_held"
 WAL_MIRROR_ENV = "SIGLAKE_WAL_MIRROR_PREFIX"
 DEFAULT_WAL_MIRROR_PREFIX = "wal-mirror"
 # #4273: the token allow-list, and the three values that can name its Secret.
@@ -918,6 +950,7 @@ def check(
     problems.extend(check_otlp_grpc(docs, expected_otlp_grpc_port))
     problems.extend(check_jobs_store(docs, persistent_jobs))
     problems.extend(check_compactor_index_rebuild(docs, expected_index_rebuild))
+    problems.extend(check_claim_mode_wal_volume(docs))
 
     return problems
 
@@ -951,6 +984,68 @@ def check_compactor_index_rebuild(docs: list[dict], expected: str) -> list[str]:
             f"{INDEX_REBUILD_ENV}={values[-1]!r}; expected {expected!r}"
         ]
     return []
+
+
+def wal_volume(doc: dict) -> dict | None:
+    """The pod spec's `wal` volume, or None when it declares no such volume."""
+    for volume in doc["spec"]["template"]["spec"].get("volumes") or []:
+        if volume.get("name") == WAL_VOLUME:
+            return volume
+    return None
+
+
+def check_claim_mode_wal_volume(docs: list[dict]) -> list[str]:
+    """Hold the migration guidance to the volumes the render actually gives out.
+
+    Two facts carry the guidance in `deploy/helm/siglake/README.md` and
+    `docs/LIMITATIONS.md`: a claim-mode compactor has an `emptyDir` where the
+    WAL claim used to be, so neither it nor any check inside it can census the
+    orphans the filesystem drain held there; and the ingester keeps the claim
+    mounted in both modes, which is what makes the directory reachable after
+    the switch. Each is read off the compactor's own `--catalog-claim` arg, so
+    this passes or fails per render arm rather than on a parameter.
+    """
+    problems: list[str] = []
+    for doc in docs:
+        if doc.get("kind") != "Deployment":
+            continue
+        containers = doc["spec"]["template"]["spec"].get("containers", [])
+        names = {c.get("name") for c in containers}
+        if COMPACTOR_CONTAINER in names:
+            claimed = any(
+                CLAIM_ARG in (c.get("args") or [])
+                for c in containers
+                if c.get("name") == COMPACTOR_CONTAINER
+            )
+            volume = wal_volume(doc)
+            if volume is None:
+                problems.append(
+                    f"Deployment/{doc['metadata']['name']} declares no '{WAL_VOLUME}' "
+                    f"volume; both modes mount one"
+                )
+            elif claimed and "emptyDir" not in volume:
+                problems.append(
+                    f"Deployment/{doc['metadata']['name']} runs {CLAIM_ARG} with a "
+                    f"'{WAL_VOLUME}' volume that is not an emptyDir ({sorted(volume)}); "
+                    f"the migration guidance in {CHART_README} and {LIMITATIONS} says a "
+                    f"claim-mode compactor cannot reach the old WAL claim's orphans/"
+                )
+            elif not claimed and "persistentVolumeClaim" not in volume:
+                problems.append(
+                    f"Deployment/{doc['metadata']['name']} runs the filesystem drain "
+                    f"with a '{WAL_VOLUME}' volume that is not a persistentVolumeClaim "
+                    f"({sorted(volume)}); that drain reads sealed/, processing/ and "
+                    f"orphans/ off the claim"
+                )
+        if INGEST_CONTAINER in names:
+            volume = wal_volume(doc)
+            if volume is None or "persistentVolumeClaim" not in volume:
+                problems.append(
+                    f"Deployment/{doc['metadata']['name']} does not mount the WAL "
+                    f"persistentVolumeClaim; {CHART_README} tells an operator to "
+                    f"inventory the held orphans from an ingester pod after the switch"
+                )
+    return problems
 
 
 def promql_exprs(doc: dict) -> list[tuple[str, str]]:
@@ -2450,6 +2545,53 @@ def check_alert_count_files() -> tuple[int, list[str]]:
     return alert_count(template), check_alert_count(template, readme)
 
 
+def check_orphan_handover_docs() -> list[str]:
+    """The filesystem-to-claim migration guidance, held to what it describes.
+
+    Documentation is the whole answer to a held orphan surviving the switch
+    (#5150): nothing censuses the old claim, nothing pages, and the chart
+    performs the switch without refusing it the way the operator does. So the
+    two places that carry the guidance have to keep carrying it, and the three
+    things it names — the claim-mode `emptyDir`, the gauge that is absent
+    afterwards, and the operator's refusal — have to keep existing. The render
+    matrix checks the volume itself; this runs from the tree, so it reports on
+    a box without helm too.
+    """
+    required = {
+        CHART_README: [
+            (ORPHAN_MIGRATION_HEADING, "the migration section an operator is sent to"),
+            ("orphans/", "the directory to inventory before switching"),
+            (ORPHANS_HELD_GAUGE, "the reading that disappears with the switch"),
+            ("emptyDir", "why the claim-mode pod cannot census it"),
+            (HANDOVER_REASON, "the operator's refusal, which the chart does not make"),
+        ],
+        LIMITATIONS: [
+            ("orphans/", "the directory to inventory before switching"),
+            (ORPHANS_HELD_GAUGE, "the reading that disappears with the switch"),
+            ("emptyDir", "why the claim-mode pod cannot census it"),
+            (COMPACTOR_TEMPLATE.name, "where that volume is rendered"),
+            (HANDOVER_REASON, "the operator's refusal, which the chart does not make"),
+        ],
+        COMPACTOR_TEMPLATE: [
+            ("emptyDir", "the claim-mode WAL volume the guidance is written around"),
+        ],
+        RECONCILER: [
+            (HANDOVER_REASON, "the condition reason both documents name"),
+        ],
+    }
+    problems: list[str] = []
+    for path, phrases in required.items():
+        try:
+            text = path.read_text()
+        except OSError as e:
+            problems.append(f"cannot read {e.filename}: {e.strerror}")
+            continue
+        for phrase, why in phrases:
+            if phrase not in text:
+                problems.append(f"{path} no longer says '{phrase}' — {why}")
+    return problems
+
+
 class ExpositionRuleError(Exception):
     """metrics.rs no longer carries its bucket configuration in a shape this
     script can read. The check must be re-pointed, not left to guess: a
@@ -2952,6 +3094,20 @@ def source_checks(
     else:
         print(
             f"ok   [alerts] {count} `- alert:` rules in {RULE_TEMPLATE}; {README} agrees",
+            flush=True,
+        )
+    # Same: the filesystem-to-claim migration guidance reads the tree, and it
+    # is the only handling a held orphan gets across that switch.
+    problems = check_orphan_handover_docs()
+    if problems:
+        failed = True
+        for p in problems:
+            print(f"FAIL [handover] {p}", file=sys.stderr)
+    else:
+        print(
+            f"ok   [handover] {CHART_README} and {LIMITATIONS} carry the held-orphan "
+            f"migration step, against {COMPACTOR_TEMPLATE.name}'s claim-mode emptyDir "
+            f"and {RECONCILER.name}'s {HANDOVER_REASON}",
             flush=True,
         )
     return failed, exported, env_catalog

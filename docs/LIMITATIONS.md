@@ -197,6 +197,37 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   segments, then delete both Deployments so the operator can create them in
   the selected mode. The handover does not automatically convert or delete
   local WAL, mirror objects, or catalog rows.
+- **A held orphan on the WAL volume does not survive the move to the
+  catalog claim, and nothing pages about it afterwards.** The filesystem
+  drain settles quarantined segments under `<wal>/**/orphans/` every cycle
+  and holds the ones whose commit status it cannot establish — the name is
+  absent from the table's consumed set and the snapshot that would prove
+  the rows were committed has expired. That hold is the level
+  `siglake_compactor_orphans_held{tenant}` and the alert
+  `SiglakeCompactorOrphansHeld`, and both come from the filesystem sweep
+  alone: with a catalog configured the cycle hands off to the claim path,
+  which claims rows and fetches bytes from the mirror and visits no WAL
+  directory. The chart goes further — with
+  `compactor.catalogClaim.enabled: true` the compactor's `wal` volume
+  renders as an `emptyDir`
+  (`deploy/helm/siglake/templates/deployment-compactor.yaml`), so the pod
+  cannot read the old claim even to census it. The operator keeps the claim
+  mounted on the compactor in both modes, and refuses the conversion
+  outright (`DrainModeHandoverRequired`, the entry above) rather than
+  migrating anything; what neither deployment surface has after the switch
+  is a reading. The series is absent, and absence is not a reading: it says
+  nothing about what the volume still holds. So inventory
+  `<wal>/**/orphans/` before switching ownership and keep the files. Each
+  one's commit status is UNKNOWN — that is why it was held, not a
+  finding that its rows are missing — so deleting one can lose rows and
+  requeueing one can duplicate them, and either needs evidence from your
+  own retention and ingest history first. The chart keeps the WAL PVC
+  rendered in claim mode for the ingester, which still mounts it at
+  `/var/lib/siglake/wal`, so the inventory is reachable from an ingester
+  pod after the switch as well as before it. What changes is the way back:
+  the compactor no longer reads `sealed/` on that volume, and a file moved
+  there reaches the table only through the ingester's mirror catch-up
+  sweep and the claim drain's mirror sync.
 - **The Helm chart cannot scale the compactor on its backlog.** Backlog-driven
   compactor scaling is `siglake-operator`'s only. The chart's HPA renders
   `siglake_compactor_sealed_pending` as a `type: Pods` metric, and that
