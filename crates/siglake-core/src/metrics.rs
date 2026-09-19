@@ -48,6 +48,13 @@ pub const LATENCY_BUCKETS_SECONDS: &[f64] = &[
     120.0, 300.0, 600.0, 1800.0,
 ];
 
+/// Pinning a sealed WAL segment is one hard link plus a directory fsync and
+/// normally completes below the generic latency histogram's 1 ms floor.
+pub const WAL_MIRROR_PIN_DURATION_BUCKETS_SECONDS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.00075, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+    2.5, 5.0, 10.0, 25.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
+];
+
 /// Whole mirror rotations include the one-minute gaps between bounded pages,
 /// so a 24-hour retained prefix needs hour-to-day buckets without adding those
 /// series to every request-latency histogram.
@@ -132,6 +139,11 @@ pub fn builder() -> Result<PrometheusBuilder> {
             .with_context(|| format!("count buckets for {name}"))?;
     }
     builder
+        .set_buckets_for_metric(
+            Matcher::Full("siglake_wal_mirror_pin_duration_seconds".to_string()),
+            WAL_MIRROR_PIN_DURATION_BUCKETS_SECONDS,
+        )
+        .context("WAL mirror pin duration buckets")?
         .set_buckets_for_metric(
             Matcher::Full("siglake_compactor_mirror_sync_rotation_duration_seconds".to_string()),
             MIRROR_ROTATION_DURATION_BUCKETS_SECONDS,
@@ -921,6 +933,26 @@ mod tests {
     }
 
     #[test]
+    fn wal_mirror_pin_histogram_exports_sub_millisecond_buckets() {
+        let out = render_with(|| {
+            metrics::histogram!("siglake_wal_mirror_pin_duration_seconds").record(0.0006);
+            metrics::histogram!("siglake_test_request_duration_seconds").record(0.0006);
+        });
+        assert!(
+            out.contains("siglake_wal_mirror_pin_duration_seconds_bucket{le=\"0.0005\"} 0"),
+            "{out}"
+        );
+        assert!(
+            out.contains("siglake_wal_mirror_pin_duration_seconds_bucket{le=\"0.00075\"} 1"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("siglake_test_request_duration_seconds_bucket{le=\"0.00075\"}"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn unbucketed_histograms_deliberately_render_as_summaries() {
         let summary_names = [
             "siglake_query_scan_partition_decoded_bytes",
@@ -965,6 +997,7 @@ mod tests {
     fn bucket_layouts_are_sorted_and_distinct() {
         for buckets in [
             LATENCY_BUCKETS_SECONDS,
+            WAL_MIRROR_PIN_DURATION_BUCKETS_SECONDS,
             COUNT_BUCKETS,
             MIRROR_ROTATION_DURATION_BUCKETS_SECONDS,
             MIRROR_ROTATION_OBJECT_BUCKETS,
