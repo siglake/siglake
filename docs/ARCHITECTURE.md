@@ -838,14 +838,13 @@ conditional-put primitives, and the incremental append scan Iceberg table
 subscriptions need. Periodically rebased against upstream; feature
 work does not block on upstream releases.
 
-The 0.10.1 rebase is staged outside the shipping workspace at
-`bench/fork-rebase/`. Its first slice compiles pristine candidate mirrors with
-Arrow/Parquet 58, DataFusion 53.1, OpenDAL 0.57 and reqsign 3 while production
-continues to select the 0.9.1 forks. Candidate caller adapters use upstream's
-schema and snapshot-expiry transactions, retaining Siglake's replay-safe
-optional additions, exact dry-run counts and no-op commit suppression. Later
-slices port the remaining fork behavior before the production dependency
-selection changes.
+The first 0.10.1 rebase slice stages a non-shipping workspace with pristine
+candidate mirrors compiled against Arrow/Parquet 58, DataFusion 53.1, OpenDAL
+0.57 and reqsign 3 while production continues to select the 0.9.1 forks.
+Candidate caller adapters use upstream's schema and snapshot-expiry
+transactions, retaining Siglake's replay-safe optional additions, exact dry-run
+counts and no-op commit suppression. Later slices port the remaining fork
+behavior before the production dependency selection changes.
 
 ## Compaction
 
