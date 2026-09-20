@@ -78,27 +78,32 @@ if not (closes < panel < scaledobject < verdict):
     )
 PY
 
-# PID 1 is only the postmaster in the postgres image. Established sessions
-# run in child processes, so both the normal and trap paths must use the same
-# exact-name scan that stops and continues those backends as well.
+# PID 1 ignores SIGSTOP from its own PID namespace. The probe must resolve the
+# current CRI container through its owning kind node and signal the exact
+# postmaster/backend identities from that ancestor namespace.
 contains "$probe_body" 'pause_postgres_processes()' ||
   fail "$PROBE has no bounded Postgres pause helper"
 contains "$probe_body" 'continue_postgres_processes()' ||
   fail "$PROBE has no bounded Postgres continuation helper"
-contains "$probe_body" '[ "$(cat /proc/1/comm)" = postgres ]' ||
-  fail "$PROBE does not positively identify the Postgres container"
-contains "$probe_body" 'for comm_path in /proc/[0-9]*/comm; do' ||
-  fail "$PROBE does not enumerate established Postgres backends"
-contains "$probe_body" '[ "$(cat "$comm_path" 2>/dev/null || true)" = postgres ]' ||
-  fail "$PROBE does not limit backend signals to exact postgres process names"
-contains "$probe_body" 'kill -STOP "$pid"' ||
-  fail "$PROBE does not stop established Postgres backends"
-contains "$probe_body" 'kill -CONT "$pid" 2>/dev/null || true' ||
-  fail "$PROBE does not continue every surviving Postgres backend"
+contains "$probe_body" 'docker exec "$POSTGRES_NODE" crictl inspect "$POSTGRES_CONTAINER_ID"' ||
+  fail "$PROBE does not resolve the current CRI container on its owning kind node"
+contains "$probe_body" 'docker exec "$POSTGRES_NODE" sh -eu -c "$POSTGRES_NODE_SIGNAL_SNIPPET"' ||
+  fail "$PROBE does not signal from the kind node PID namespace"
+contains "$probe_body" 'io.kubernetes.pod.uid' ||
+  fail "$PROBE does not bind the CRI container to the selected pod UID"
+contains "$probe_body" 'pid_namespace=$(readlink "/proc/$init_pid/ns/pid")' ||
+  fail "$PROBE does not bind backends to the Postgres PID namespace"
+contains "$probe_body" 'grep -Fq -- "$container_id" "/proc/$pid/cgroup"' ||
+  fail "$PROBE does not bind signalled processes to the current container cgroup"
+contains "$probe_body" 'PID $pid did not reach the state required by $signal' ||
+  fail "$PROBE does not reject an ineffective STOP"
 contains "$probe_body" 'continue_postgres_processes >/dev/null 2>&1 || true' ||
   fail "$PROBE trap cleanup does not restore the backend process set"
 [[ $(grep -c '^continue_postgres_processes >/dev/null$' "$PROBE") -eq 1 ]] ||
   fail "$PROBE normal path does not restore through the shared continuation helper"
+if grep -A30 '^pause_postgres_processes()' "$PROBE" | grep -q 'kubectl .*exec'; then
+  fail "$PROBE still sends STOP from inside the Postgres container namespace"
+fi
 if contains "$probe_body" 'kill -STOP -1'; then
   fail "$PROBE must not treat kill -STOP -1 as a targeted process-group signal"
 fi
@@ -189,6 +194,10 @@ trap 'rm -rf -- "$fixture_dir"' EXIT
 extract_snippet state-snippet "$fixture_dir/state.sh"
 extract_snippet write-probe-snippet "$fixture_dir/write-probe.sh"
 extract_snippet commit-times-snippet "$fixture_dir/commit-times.sh"
+extract_snippet node-process-list-snippet "$fixture_dir/node-process-list.sh"
+extract_snippet node-signal-snippet "$fixture_dir/node-signal.sh"
+sh -n "$fixture_dir/node-process-list.sh" "$fixture_dir/node-signal.sh" ||
+  fail "the kind-node process snippets are not valid POSIX shell"
 
 # `pid:comm:state:starttime` per process. Field 3 of /proc/<pid>/stat is the
 # state and field 22 the start time; the reader has to find both by position
@@ -293,9 +302,9 @@ fixtures=$((fixtures + 1))
 
 # Drive the whole probe once against recording stand-ins, so the retained
 # document's shape is proven by the script that writes it rather than by a
-# fixture someone kept in step by hand. The `kubectl` stand-in runs only the two
-# read-only snippets, by allowlist: the pause and continuation snippets signal
-# real processes and must never run outside a throwaway container.
+# fixture someone kept in step by hand. The `kubectl` stand-in runs only the
+# read-only in-container snippets. The recording `docker` stand-in proves that
+# STOP/CONT target the owning kind node and supplies controlled process states.
 standin_dir="$fixture_dir/bin"
 mkdir -p "$standin_dir"
 cat >"$standin_dir/kubectl" <<'STANDIN'
@@ -324,16 +333,6 @@ case "$command" in
       fi
     done
     text=${body[3]:-}
-    # Record the pause the round would have taken, so the write stand-in can
-    # answer the way a stopped postmaster does.
-    if [[ "$text" == *"kill -STOP"* ]]; then
-      : >"$STANDIN_STATE/paused"
-    elif [[ "$text" == *"kill -CONT"* ]]; then
-      rm -f "$STANDIN_STATE/paused"
-    fi
-    if [[ "$text" == *"kill -STOP"* || "$text" == *"kill -CONT"* ]]; then
-      exit 0
-    fi
     if [[ "$text" == *PROC_ROOT* || "$text" == *WRITE_PROBE_PSQL* \
       || "$text" == *COMMIT_TIMES_PSQL* ]]; then
       exec "${body[@]}"
@@ -350,6 +349,59 @@ case "$command" in
     else
       cat "$STANDIN_STATE/postgres-pod.json"
     fi
+    ;;
+  *) exit 64 ;;
+esac
+STANDIN
+cat >"$standin_dir/docker" <<'STANDIN'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == inspect ]]; then
+  printf 'true\tfixture\tcontrol-plane\t/fixture-control-plane\n'
+  exit 0
+fi
+[[ "${1:-}" == exec && "${2:-}" == fixture-control-plane ]] || exit 64
+shift 2
+if [[ "${1:-}" == crictl && "${2:-}" == inspect ]]; then
+  cat <<JSON
+{"status":{"id":"${3}","metadata":{"name":"postgres"},"state":"CONTAINER_RUNNING","labels":{"io.kubernetes.pod.uid":"pod-uid-3f1b"}},"info":{"pid":100}}
+JSON
+  exit 0
+fi
+action=
+action_index=0
+for ((i = 1; i <= $#; i++)); do
+  case "${!i}" in
+    node-process-list|node-signal) action=${!i}; action_index=$i; break ;;
+  esac
+done
+case "$action" in
+  node-process-list)
+    for pid in 100 142 143; do
+      state=S
+      [[ -e "$STANDIN_STATE/stopped-$pid" ]] && state=T
+      printf '%s\t%s\t%s\tpid:[4026533000]\n' "$pid" "$state" "$((700 + pid))"
+    done
+    ;;
+  node-signal)
+    signal_index=$((action_index + 1))
+    pid_index=$((action_index + 2))
+    signal=${!signal_index}
+    pid=${!pid_index}
+    printf '%s %s\n' "$signal" "$pid" >>"$STANDIN_STATE/signals"
+    if [[ "$signal" == STOP ]]; then
+      if [[ "${STANDIN_STOP_MODE:-working}" == partial && "$pid" == 142 ]]; then
+        exit 17
+      fi
+      if [[ "${STANDIN_STOP_MODE:-working}" != ineffective ]]; then
+        : >"$STANDIN_STATE/stopped-$pid"
+        : >"$STANDIN_STATE/paused"
+      fi
+    else
+      rm -f "$STANDIN_STATE/stopped-$pid"
+      [[ "$pid" == 100 ]] && rm -f "$STANDIN_STATE/paused"
+    fi
+    exit 0
     ;;
   *) exit 64 ;;
 esac
@@ -400,7 +452,7 @@ printf '{"metric":{"pod":"siglake-query-0"},"value":[%s,"%s"]},' "$(date +%s)" "
 printf '{"metric":{"pod":"siglake-query-1"},"value":[%s,"%s"]}' "$(date +%s)" "$value"
 printf ']}}'
 STANDIN
-chmod +x "$standin_dir/kubectl" "$standin_dir/curl"
+chmod +x "$standin_dir/kubectl" "$standin_dir/docker" "$standin_dir/curl"
 
 standin_state="$fixture_dir/state"
 mkdir -p "$standin_state/results"
@@ -412,11 +464,14 @@ import sys
 state = pathlib.Path(sys.argv[1])
 def pod(name, image_id):
     return {
-        "metadata": {"name": name},
-        "spec": {"containers": [{"image": "siglake:kind"}]},
+        "metadata": {"name": name, "uid": f"uid-{name}"},
+        "spec": {
+            "nodeName": "fixture-control-plane",
+            "containers": [{"name": name, "image": "siglake:kind"}],
+        },
         "status": {
             "conditions": [{"type": "Ready", "status": "True"}],
-            "containerStatuses": [{"imageID": image_id}],
+            "containerStatuses": [{"name": name, "imageID": image_id}],
         },
     }
 
@@ -424,7 +479,11 @@ def pod(name, image_id):
     "items": [pod("siglake-query-0", "sha256:query0"), pod("siglake-query-1", "sha256:query1")]
 }), encoding="utf-8")
 postgres = pod("postgres-0", "sha256:postgres")
+postgres["metadata"]["uid"] = "pod-uid-3f1b"
 postgres["spec"]["containers"][0]["image"] = "postgres:16-alpine"
+postgres["spec"]["containers"][0]["name"] = "postgres"
+postgres["status"]["containerStatuses"][0]["name"] = "postgres"
+postgres["status"]["containerStatuses"][0]["containerID"] = "containerd://" + "a" * 64
 (state / "postgres-pod.json").write_text(json.dumps(postgres), encoding="utf-8")
 PY
 paused_tree="$fixture_dir/proc-paused"
@@ -465,7 +524,7 @@ PATH="$standin_dir:$PATH" \
   COMMIT_TIMES_PSQL="$fixture_dir/psql-commit-standin" \
   COMMIT_TIMES_ERRORS="$fixture_dir/standin-commit.err" \
   COMMIT_TIMES_ROWS="$fixture_dir/standin-commit.rows" \
-  KUBE_CONTEXT=fixture NAMESPACE=fixture PROM_URL=http://fixture.invalid \
+  KUBE_CONTEXT=kind-fixture NAMESPACE=fixture PROM_URL=http://fixture.invalid \
   RESULTS_DIR="$standin_state/results" \
   POSTGRES_OUTAGE_JOBS=2 POSTGRES_OUTAGE_SECONDS=4 \
   POSTGRES_OUTAGE_SAMPLE_INTERVAL_SECONDS=1 \
@@ -496,8 +555,64 @@ assert summary["outage_samples_with_process_state"] >= 1, summary
 assert summary["max_observation_lag_seconds"] is not None, summary
 assert summary["write_probe_outcomes"]["outage"] == ["blocked"], summary
 assert summary["write_probe_outcomes"]["baseline"] == ["completed"], summary
+target = document["fault_target"]
+assert target["node"] == "fixture-control-plane", target
+assert target["container_id"] == "a" * 64, target
+assert target["container_init_pid"] == 100, target
+assert [row["node_pid"] for row in target["processes"]] == [100, 142, 143], target
 PY
   fail "the stand-in probe run did not retain the evidence the grader needs: $(<"$fixture_dir/standin.log")"
+fixtures=$((fixtures + 1))
+
+signals=$(<"$standin_state/signals")
+[[ "$signals" == $'STOP 100\nSTOP 142\nSTOP 143\nCONT 142\nCONT 143\nCONT 100' ]] ||
+  fail "the recording path did not stop the postmaster first and continue it last: $signals"
+fixtures=$((fixtures + 1))
+
+# An exec that returns success without changing process state is the original
+# defect's shape. The post-signal rescan must reject it, then cleanup must still
+# CONT every recorded identity.
+rm -f "$standin_state"/{backlog-calls,job-ids,paused,signals,stopped-*}
+ineffective_rc=0
+PATH="$standin_dir:$PATH" STANDIN_STATE="$standin_state" \
+  STANDIN_STOP_MODE=ineffective PROC_ROOT="$paused_tree" \
+  WRITE_PROBE_PSQL="$fixture_dir/psql-standin" \
+  COMMIT_TIMES_PSQL="$fixture_dir/psql-commit-standin" \
+  KUBE_CONTEXT=kind-fixture NAMESPACE=fixture PROM_URL=http://fixture.invalid \
+  RESULTS_DIR="$standin_state/results" POSTGRES_OUTAGE_JOBS=1 \
+  POSTGRES_OUTAGE_SECONDS=4 POSTGRES_OUTAGE_SAMPLE_INTERVAL_SECONDS=1 \
+  POSTGRES_OUTAGE_DRAIN_TIMEOUT_SECONDS=1 POSTGRES_OUTAGE_WRITE_PROBE_SECONDS=1 \
+  "$PROBE" >"$fixture_dir/ineffective.log" 2>&1 || ineffective_rc=$?
+[[ "$ineffective_rc" -ne 0 ]] || fail "an ineffective STOP was accepted"
+contains "$(<"$fixture_dir/ineffective.log")" \
+  'the Postgres process set was not wholly stopped and unchanged' ||
+  fail "an ineffective STOP failed for the wrong reason: $(<"$fixture_dir/ineffective.log")"
+contains "$(<"$standin_state/signals")" $'CONT 142\nCONT 143\nCONT 100' ||
+  fail "ineffective-stop cleanup did not continue the recorded process set"
+fixtures=$((fixtures + 1))
+
+# If one backend STOP fails after the postmaster was stopped, the pre-recorded
+# process list must let the EXIT trap restore that postmaster and attempt every
+# other candidate without restarting the container.
+rm -f "$standin_state"/{backlog-calls,job-ids,paused,signals,stopped-*}
+partial_rc=0
+PATH="$standin_dir:$PATH" STANDIN_STATE="$standin_state" \
+  STANDIN_STOP_MODE=partial PROC_ROOT="$paused_tree" \
+  WRITE_PROBE_PSQL="$fixture_dir/psql-standin" \
+  COMMIT_TIMES_PSQL="$fixture_dir/psql-commit-standin" \
+  KUBE_CONTEXT=kind-fixture NAMESPACE=fixture PROM_URL=http://fixture.invalid \
+  RESULTS_DIR="$standin_state/results" POSTGRES_OUTAGE_JOBS=1 \
+  POSTGRES_OUTAGE_SECONDS=4 POSTGRES_OUTAGE_SAMPLE_INTERVAL_SECONDS=1 \
+  POSTGRES_OUTAGE_DRAIN_TIMEOUT_SECONDS=1 POSTGRES_OUTAGE_WRITE_PROBE_SECONDS=1 \
+  "$PROBE" >"$fixture_dir/partial.log" 2>&1 || partial_rc=$?
+[[ "$partial_rc" -ne 0 ]] || fail "a partial STOP failure was accepted"
+partial_signals=$(<"$standin_state/signals")
+contains "$partial_signals" $'STOP 100\nSTOP 142' ||
+  fail "the partial-failure arm did not stop the postmaster before failing: $partial_signals"
+contains "$partial_signals" $'CONT 142\nCONT 143\nCONT 100' ||
+  fail "partial-failure cleanup did not attempt every recorded process: $partial_signals"
+[[ ! -e "$standin_state/stopped-100" ]] ||
+  fail "partial-failure cleanup left the postmaster stopped"
 fixtures=$((fixtures + 1))
 
 # These values are retained as the effective fixed settings in every trace.
