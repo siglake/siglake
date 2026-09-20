@@ -53,7 +53,15 @@ if [ "$SIGLAKE_OBJECT_STORE" = garage ]; then
 fi
 
 echo "==> docker compose up (build + start)"
-docker compose -p "$SIGLAKE_COMPOSE_PROJECT" -f "$COMPOSE" up --build -d
+if docker compose -p "$SIGLAKE_COMPOSE_PROJECT" -f "$COMPOSE" up --build -d; then
+  :
+else
+  compose_rc=$?
+  echo "  docker compose startup failed; recent service logs:" >&2
+  docker compose -p "$SIGLAKE_COMPOSE_PROJECT" -f "$COMPOSE" logs --tail 50 \
+    || true
+  exit "$compose_rc"
+fi
 
 echo "==> waiting for ingest server to become healthy"
 for i in $(seq 1 60); do
