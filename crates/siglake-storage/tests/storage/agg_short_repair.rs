@@ -639,22 +639,22 @@ async fn a_recorded_column_is_skipped_without_reading_any_file() {
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
-/// What the two halves cost, which is what the cadence and the per-pass budget
-/// are set from. Run it:
+/// What the two halves cost, plus the end-to-end cost of the existing durable
+/// marker PUT used as the proxy for a pre-attempt marker (#4628). Run it:
 ///
 /// ```text
 /// cargo test --release -p siglake-storage --test storage \
-///     agg_short_repair::measure -- --ignored --nocapture
+///     agg_short_repair::measure_census_and_repair_cost -- --ignored --nocapture
 /// ```
 ///
 /// The census must be cheap enough to run on a timer over every table, and the
-/// repair must be expensive enough to justify budgeting it. Recorded 2026-09-16
+/// repair must be expensive enough to justify budgeting it. Recorded 2026-09-20
 /// on the dev box (release, local filesystem warehouse, 8 commits, one
 /// dimension column, one distinct value per row):
 ///
 /// ```text
-/// rows=40000  census=12.3ms  repair=64.4ms   5x  161ms/100k rows
-/// rows=400000 census=139.3ms repair=849.4ms  6x  212ms/100k rows
+/// rows=40000  census=14.6ms  marker_put=1.1ms  marker_bytes=60  repair=65.1ms
+/// rows=400000 census=145.4ms marker_put=1.3ms  marker_bytes=60  repair=876.5ms
 /// ```
 ///
 /// Both halves are linear in the column's distinct values — the census walks
@@ -710,6 +710,21 @@ async fn measure_one(rows_per_commit: i64) {
         "{census:?}"
     );
 
+    // The selected design reuses this marker writer's incarnation-scoped
+    // OpenDAL PUT and retry policy, with a different body and filename. The
+    // test helper includes one catalog load, so this is a conservative local
+    // measurement of the extra write rather than a raw filesystem syscall.
+    let started = std::time::Instant::now();
+    ice.write_group_count_rebuild_marker_for_test(&ident, COMMITS, &[("host", 4_194_304)], &[])
+        .await
+        .unwrap();
+    let marker_ms = started.elapsed().as_secs_f64() * 1e3;
+    let marker = aggregate_artifacts(&wh)
+        .into_iter()
+        .find(|p| p.to_string_lossy().ends_with(".rebuild.json"))
+        .expect("durable marker was written");
+    let marker_bytes = std::fs::metadata(marker).unwrap().len();
+
     ice.invalidate_cached_table(&ident).await;
     let started = std::time::Instant::now();
     let repair = ice.repair_short_group_count_aggregates(1).await.unwrap();
@@ -725,9 +740,86 @@ async fn measure_one(rows_per_commit: i64) {
     let rows = (COMMITS * rows_per_commit) as f64;
     println!(
         "rows={rows:.0} commits={COMMITS} census={census_ms:.1}ms \
+         marker_put={marker_ms:.1}ms marker_bytes={marker_bytes} \
          repair={repair_ms:.1}ms ratio={:.0}x repair_per_100k_rows={:.0}ms",
         repair_ms / census_ms.max(f64::MIN_POSITIVE),
         repair_ms / rows * 100_000.0
+    );
+}
+
+/// Local reproduction for #4628: cancel the same census+repair future the
+/// compactor watchdog wraps, then create a new context (the restart) and prove
+/// both that the aggregate CAS published nothing and that the next pass sees
+/// the same table as repairable again.
+///
+/// The timeout is derived from a census-only reading of this exact fixture. It
+/// is longer than that metadata phase and shorter than its Tier-2 repair, so
+/// the cancellation lands during the file scan rather than while discovering
+/// the deficit.
+#[tokio::test]
+#[ignore = "local cancellation/restart reproduction, not a correctness gate"]
+async fn reproduce_watchdog_cancelled_repair_restart() {
+    const COMMITS: i64 = 8;
+    const ROWS_PER_COMMIT: i64 = 50_000;
+    let tmp = tempfile::tempdir().unwrap();
+    let wh = tmp.path().join("warehouse");
+    let ice = open(&wh).await;
+    let cfg = index_config("watchdog");
+    ice.create_index(&cfg).await.unwrap();
+    let ident = ice.index_table_ident("watchdog");
+
+    for n in 0..COMMITS {
+        ice.append_to_table(&ident, wide_batch(&cfg, n, ROWS_PER_COMMIT), &["host"])
+            .await
+            .unwrap();
+    }
+    let mut deltas: Vec<std::path::PathBuf> = aggregate_artifacts(&wh)
+        .into_iter()
+        .filter(|p| p.to_string_lossy().contains("siglake-agg-deltas"))
+        .collect();
+    deltas.sort();
+    std::fs::remove_file(&deltas[0]).unwrap();
+    ice.fold_group_count_deltas(1).await.unwrap();
+    ice.invalidate_cached_table(&ident).await;
+
+    let census_started = std::time::Instant::now();
+    let census = ice.repair_short_group_count_aggregates(0).await.unwrap();
+    let census_elapsed = census_started.elapsed();
+    assert!(matches!(
+        census.first().map(|(_, outcome)| outcome),
+        Some(ShortAggregateOutcome::Detected { .. })
+    ));
+    let before = std::fs::read(wide_path(&wh)).unwrap();
+
+    ice.invalidate_cached_table(&ident).await;
+    let timeout = (census_elapsed * 2).max(std::time::Duration::from_millis(50));
+    let repair_started = std::time::Instant::now();
+    let cut = tokio::time::timeout(timeout, ice.repair_short_group_count_aggregates(1)).await;
+    let cut_elapsed = repair_started.elapsed();
+    assert!(cut.is_err(), "fixture repair completed inside {timeout:?}");
+    assert_eq!(
+        std::fs::read(wide_path(&wh)).unwrap(),
+        before,
+        "a cancelled repair must not publish a partial aggregate"
+    );
+    drop(ice);
+
+    let restarted = open(&wh).await;
+    let after_restart = restarted
+        .repair_short_group_count_aggregates(0)
+        .await
+        .unwrap();
+    assert!(matches!(
+        after_restart.first().map(|(_, outcome)| outcome),
+        Some(ShortAggregateOutcome::Detected { .. })
+    ));
+    println!(
+        "rows={} census={:.1}ms timeout={:.1}ms cut_after={:.1}ms \
+         aggregate_unchanged=true restart_outcome=detected",
+        COMMITS * ROWS_PER_COMMIT,
+        census_elapsed.as_secs_f64() * 1e3,
+        timeout.as_secs_f64() * 1e3,
+        cut_elapsed.as_secs_f64() * 1e3,
     );
 }
 

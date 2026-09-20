@@ -636,10 +636,15 @@ pre-registered at 0: a tenant namespace, an index table and a base namespace
 moved off the default by `SIGLAKE_TENANT_NAMESPACE` are known only at the
 increment. Rebuilding automatically is **opt-in**
 (`SIGLAKE_AGG_SHORT_REPAIR=1`, `compactor.shortAggregateRepair` in the chart):
-the repair is one Tier-2 query per maintained column — measured ~9 minutes per
-column per 250M rows on a local filesystem, so a wide table is hours and the
-compactor's 600 s watchdog cuts it (a cut repair publishes nothing and the next
-pass retries). With it on, one table per pass is rebuilt
+the repair is one Tier-2 query per maintained column. The ~9 minutes per column
+at 250M rows is a linear extrapolation from 40k/400k local-filesystem fixtures,
+not a measured large-table timeout; the compactor's 600 s cooperative watchdog
+can cut that scan. A cut repair publishes no partial aggregate and currently
+retries on the next pass or process restart. The 0.2.0 design records attempts
+under the table-incarnation aggregate prefix, applies bounded durable backoff
+and keeps the final aggregate CAS as the only success record
+([`DESIGN_short_aggregate_repair_backoff.md`](DESIGN_short_aggregate_repair_backoff.md)).
+With repair on, one table per pass is rebuilt
 (`SIGLAKE_AGG_SHORT_REPAIR_MAX_TABLES`), because every table upgraded across the
 prefix change is short at once. On a table that size the operator's
 `rebuild-group-counts` remains the tool.
