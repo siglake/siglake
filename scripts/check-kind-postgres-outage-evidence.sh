@@ -126,6 +126,8 @@ for phase in baseline outage recovery; do
 done
 contains "$probe_body" '"postgres_container": {' ||
   fail "$PROBE does not retain the Postgres container identity across the window"
+contains "$probe_body" 'iso_now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }' ||
+  fail "$PROBE does not retain millisecond precision for its local observations"
 
 # A counter cannot say when a row was written, so the row itself has to be
 # dated. The commit-time reading is taken after the bounded recovery window --
@@ -753,6 +755,15 @@ def pre_restoration_drain():
     for row in sample["completions"]:
         row["value"] += 1
 
+def subsecond_boundaries():
+    document["timestamps"].update({
+        "outage_started_at": "2026-09-07T12:00:03.100Z",
+        "pause_applied_at": "2026-09-07T12:00:03.200Z",
+        "restoration_started_at": "2026-09-07T12:00:48.100Z",
+        "restoration_applied_at": "2026-09-07T12:00:48.200Z",
+        "postgres_ready_at": "2026-09-07T12:00:48.300Z",
+    })
+
 if mutation == "missing-series":
     document["samples"][1]["backlog"] = []
 elif mutation == "no-rise":
@@ -781,6 +792,24 @@ elif mutation == "commit-at-pause-edge":
     commit_row("job-b")["committed_at"] = "2026-09-07 12:00:04.412000+00"
 elif mutation == "commit-at-restoration-edge":
     commit_row("job-b")["committed_at"] = "2026-09-07 12:00:48.114000+00"
+elif mutation == "subsecond-clear-placements":
+    subsecond_boundaries()
+    commit_row("job-a")["committed_at"] = "2026-09-07 12:00:03.050000+00"
+    commit_row("job-b")["committed_at"] = "2026-09-07 12:00:20.551200+00"
+    document["job_commit_times"]["rows"].append({
+        "job_id": "job-after-restoration",
+        "status": "succeeded",
+        "submitted_at": "2026-09-07 11:59:00+00",
+        "ended_at": "2026-09-07 12:00:48.300000+00",
+        "recovered_at": None,
+        "committed_at": "2026-09-07 12:00:48.300000+00",
+    })
+elif mutation == "subsecond-pause-transition":
+    subsecond_boundaries()
+    commit_row("job-b")["committed_at"] = "2026-09-07 12:00:03.150000+00"
+elif mutation == "subsecond-restoration-transition":
+    subsecond_boundaries()
+    commit_row("job-b")["committed_at"] = "2026-09-07 12:00:48.150000+00"
 elif mutation == "amended-job-row":
     pre_restoration_drain()
     commit_row("job-a")["recovered_at"] = "2026-09-07 12:00:51.000000+00"
@@ -891,6 +920,43 @@ PY
   fixtures=$((fixtures + 1))
 }
 
+# One subsecond trace exercises all three placements that are separated from
+# the transition bounds. The inside commit makes the grade red, while the
+# summary still has to put the other two on the correct sides of the pause.
+subsecond_placements_input="$fixture_dir/subsecond-clear-placements.input.json"
+subsecond_placements_output="$fixture_dir/subsecond-clear-placements.output.json"
+mutate subsecond-clear-placements "$subsecond_placements_input"
+subsecond_placements_rc=0
+python3 "$GRADER" "$subsecond_placements_input" \
+  --output "$subsecond_placements_output" 2>"$fixture_dir/subsecond-clear-placements.log" ||
+  subsecond_placements_rc=$?
+[[ "$subsecond_placements_rc" -eq 1 ]] ||
+  fail "subsecond clear placements exited $subsecond_placements_rc, expected 1"
+python3 - "$subsecond_placements_output" <<'PY' ||
+import json, sys
+commits = json.load(open(sys.argv[1], encoding="utf-8"))["evidence"]["summary"]["job_commit_times"]
+assert commits["committed_before_pause"] == 1, commits
+assert commits["committed_in_pause"] == ["job-b"], commits
+assert commits["committed_after_restoration"] == 1, commits
+assert commits["unplaceable_commits"] == [], commits
+assert commits["signal_boundaries"] == {
+    "pause_transition": {
+        "earliest": "2026-09-07T12:00:03.100000+00:00",
+        "latest": "2026-09-07T12:00:03.201000+00:00",
+    },
+    "proven_stopped": {
+        "earliest": "2026-09-07T12:00:03.201000+00:00",
+        "latest": "2026-09-07T12:00:48.100000+00:00",
+    },
+    "restoration_transition": {
+        "earliest": "2026-09-07T12:00:48.100000+00:00",
+        "latest": "2026-09-07T12:00:48.201000+00:00",
+    },
+}, commits
+PY
+  fail "subsecond commits were not placed against the proven signal bounds"
+fixtures=$((fixtures + 1))
+
 expect_unverified missing-series 'no usable backlog observation'
 expect_unverified no-rise 'no observed unreconciled backlog'
 expect_unverified no-drain 'did not drain after restoration'
@@ -898,16 +964,18 @@ expect_unverified missing-revision 'missing pinned repository revision'
 expect_resolved pre-restoration-drain
 expect_unverified pre-restoration-drain-undated 'shows zero backlog with completions up by 2 before restoration'
 expect_unverified pre-restoration-drain-undated 'no job row for accepted job job-b'
-expect_unverified commit-inside-pause 'job job-b committed at 2026-09-07T12:00:20.551200+00:00, inside the pause window'
+expect_unverified commit-inside-pause 'job job-b committed at 2026-09-07T12:00:20.551200+00:00, inside the proven stopped window'
 expect_unverified commit-inside-pause 'shows zero backlog with completions up by 2 before restoration'
-expect_unverified commit-at-pause-edge 'within 1s of the pause applied at 2026-09-07T12:00:04+00:00'
-expect_unverified commit-at-restoration-edge 'within 1s of restoration at 2026-09-07T12:00:48+00:00'
+expect_unverified commit-at-pause-edge 'overlapping the pause transition bounded by 2026-09-07T12:00:03+00:00 (1s precision) and 2026-09-07T12:00:05+00:00 (1s precision)'
+expect_unverified commit-at-restoration-edge 'overlapping the restoration transition bounded by 2026-09-07T12:00:48+00:00 (1s precision) and 2026-09-07T12:00:50+00:00 (1s precision)'
+expect_unverified subsecond-pause-transition 'overlapping the pause transition bounded by 2026-09-07T12:00:03.100000+00:00 (1ms precision) and 2026-09-07T12:00:03.201000+00:00 (1ms precision)'
+expect_unverified subsecond-restoration-transition 'overlapping the restoration transition bounded by 2026-09-07T12:00:48.100000+00:00 (1ms precision) and 2026-09-07T12:00:48.201000+00:00 (1ms precision)'
 expect_unverified amended-job-row 'may be an amendment of an earlier terminal write'
 expect_unverified amended-job-row 'the pause window is unexplained'
 expect_unverified null-commit-time 'job job-b has no usable commit timestamp'
 expect_unverified nonterminal-job-row "job job-b is 'running' after the recovery window"
 expect_unverified uncorrelated-job-row 'no job row for accepted job job-b'
-expect_unverified stray-in-pause-commit 'job job-from-an-earlier-round committed at 2026-09-07T12:00:21.330000+00:00, inside the pause window'
+expect_unverified stray-in-pause-commit 'job job-from-an-earlier-round committed at 2026-09-07T12:00:21.330000+00:00, inside the proven stopped window'
 expect_unverified commit-tracking-off "track_commit_timestamp='off'"
 expect_unverified commit-query-failed 'the job-row commit-time query did not run'
 expect_unverified missing-commit-times 'missing job-row commit-time observations'

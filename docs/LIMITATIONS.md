@@ -930,10 +930,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   reading is bounded: the commit timestamp dates the row version visible at
   collection, not every status transition, so a recovered row — which the
   amendment path can rewrite after it went terminal — a missing row, a NULL
-  timestamp, a nonterminal job, or a commit inside the second the probe's own
-  stamps are truncated to all leave the observation unexplained. No live round
-  has supplied a dated trace yet, so what happened in run #76 is still
-  unexplained; nothing here establishes a persistence failure.
+  timestamp, a nonterminal job, or a commit overlapping either signal
+  transition all leave the observation unexplained. The probe now retains its
+  local observations to the millisecond and the grader derives uncertainty
+  from each timestamp's recorded precision; historical second-only traces keep
+  their full one-second uncertainty. A commit is a stopped-window failure only
+  when its own interval lies after the verified pause and before restoration
+  starts. No live round has supplied a dated trace with these boundaries yet,
+  so what happened in run #76 is still unexplained; nothing here establishes a
+  persistence failure.
 - **The query server's `/healthz` is a constant 200, so no probe acts on the
   one known query degradation.** `/healthz` answers `ok` for as long as the
   process is serving and `/readyz` only round-trips the catalog. The still-open

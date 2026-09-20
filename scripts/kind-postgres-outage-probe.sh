@@ -32,7 +32,7 @@ POSTGRES_PROCESSES_FILE="$TMP_DIR/postgres-processes.tsv"
 
 log() { printf '==> postgres-outage: %s\n' "$*" >&2; }
 die() { printf 'ERROR: postgres-outage: %s\n' "$*" >&2; exit 1; }
-iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+iso_now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
 
 restore_postgres() {
   [[ "$POSTGRES_PAUSED" -eq 1 ]] || return 0
@@ -585,11 +585,9 @@ OUTAGE_STARTED_AT=$(iso_now)
 log "pause only $POSTGRES_POD for ${OUTAGE_SECONDS}s"
 POSTGRES_PAUSED=1
 pause_postgres_processes >/dev/null
-# The signal lands somewhere between these two stamps, both truncated to the
-# second, so a commit timestamp is only inside the pause once it is past
-# `pause_applied_at` by more than that truncation. The grader holds anything
-# closer to the edge as unplaceable rather than calling it a write during the
-# pause.
+# The signal transition is bounded by OUTAGE_STARTED_AT and this stamp. The
+# grader also accounts for each stamp's retained millisecond precision, so a
+# commit that overlaps the transition remains unplaceable.
 PAUSE_APPLIED_AT=$(iso_now)
 
 observed_positive=0
