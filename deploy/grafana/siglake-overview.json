@@ -2264,7 +2264,7 @@
     },
     "overrides": []
    },
-   "description": "Whole audit rows lost without changing query responses. Oversized is a single row above the byte ceiling; row_limit and byte_limit are retained-budget saturation; channel_full is a transient sender/worker race; worker_shutdown means no audit receiver remains. Those five are refusals at submit. append_deadline is the other kind: a storage append outlived its service deadline and the batch it held was abandoned, so it counts one per row already accepted, and its commit may or may not have landed."
+   "description": "Whole audit rows lost without changing query responses. Oversized is a single row above the byte ceiling; row_limit and byte_limit are retained-budget saturation; channel_full is a transient sender/worker race; worker_shutdown means no audit receiver remains. Those five are refusals at submit. append means a storage append returned an error and its whole batch was dropped without retry, counted once per row. append_deadline means an append outlived its service deadline and its batch was abandoned, counted once per row; its commit may or may not have landed."
   },
   {
    "id": 164,

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Query audit (fix)**: a storage append that returns an error now charges
+  `siglake_query_audit_dropped_total{reason="append"}` for every row in the
+  abandoned batch, beside the existing single append-failure increment. The
+  batch remains best-effort and is not retried. (#4669)
+
 - **Ingest admission (breaking)**: a novel `(tenant, index)` key past
   `ingester.maxLanes` now receives HTTP `503` or gRPC `Unavailable`, rather
   than sharing the `500` / `Internal` mapping for genuine writer failures.

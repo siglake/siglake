@@ -308,7 +308,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   stopped tier's missing series also holds the two healthy ones at their
   current size. An activation signal that outlives the stopped pods (a
   catalog-side backlog probe, a request-driven wake-up) is not implemented.
-- **An audit batch can be lost at its append deadline.** Query responses never
+- **An audit batch can be lost at append.** Query responses never
   wait for the best-effort audit worker, its retained rows and conversion
   working set are bounded by count and charged bytes, and each append is
   bounded by a service deadline (30 s;
@@ -320,7 +320,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   and nothing re-submits them. They are not retried on purpose. The deadline
   cuts the worker's await, not the append's effects — a commit whose catalog
   write had already gone out can land unseen — so a retry would duplicate the
-  rows it did persist rather than recover the ones it did not. Rows submitted
+  rows it did persist rather than recover the ones it did not. A storage append
+  that returns an error also abandons its whole batch without retry. Its rows
+  increment `siglake_query_audit_dropped_total{reason="append"}`, while
+  `siglake_query_audit_failures_total{reason="append"}` increments once for the
+  batch. Rows submitted
   while an append is still running are dropped whole once the bounded capacity
   is full, as before. Per-row delivery is therefore best-effort in both
   directions: the `query_audit` table is an operational record, not an
