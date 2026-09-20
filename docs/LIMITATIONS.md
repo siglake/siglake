@@ -1448,15 +1448,20 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `SiglakeGroupCountAggregateShort`; rebuilding it is opt-in
   (`SIGLAKE_AGG_SHORT_REPAIR=1`, `compactor.shortAggregateRepair`) and budgeted
   at one table per pass, because the rebuild is one Tier-2 query per maintained
-  column — ~9 minutes per column per 250M rows measured on a local filesystem.
+  column. The ~9 minutes per column per 250M rows is extrapolated from local
+  40k/400k-row fixtures, not measured at that size.
   Three gaps follow from that shape. A table wide or large enough for the
-  rebuild to exceed the compactor's watchdog (600 s) has it cut, publishes
-  nothing, and retries on the next pass with no durable backoff, so a
-  persistently trippable table needs the knob off and
+  rebuild to exceed the compactor's cooperative watchdog (600 s) has it cut,
+  publishes no partial aggregate, and retries on the next pass or process
+  restart with no durable backoff. A persistently trippable table needs the
+  knob off and
   `siglake rebuild-group-counts --namespace <ns> --table <t>` run once by
   hand;
   `siglake_compactor_watchdog_trips_total{stage="agg_short_repair"}` is the
-  signal. A shortfall the coverage rules cannot bridge to the current snapshot —
+  signal. Durable attempt records and bounded retry are designed for 0.2.0 in
+  [`DESIGN_short_aggregate_repair_backoff.md`](DESIGN_short_aggregate_repair_backoff.md)
+  and tracked by #5576; they are not implemented in 0.1.1. A shortfall the
+  coverage rules cannot bridge to the current snapshot —
   a foreign overwrite or a delete task as the newest commit — is never censused,
   because that state is indistinguishable from a contribution still in flight.
   And a table with no exact map at all (every column sketched, or no aggregate

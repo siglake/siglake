@@ -171,15 +171,20 @@ column represented both ways is reconciled by demoting the exact side, which
 would undo the repair. The marker path, which does recompute sketches from the
 files, is unchanged.
 
-Measured 2026-09-16 (release, local filesystem, one dimension column): census
-12.3ms / repair 64.4ms at 40k rows, 139.3ms / 849.4ms at 400k. Both are linear
-in the column's distinct values and the repair is ~6× the census per column, so
-the census is unconditional and the repair is opt-in
+Measured again 2026-09-20 (release, local filesystem, one dimension column):
+census 14.6ms / repair 65.1ms at 40k rows, 145.4ms / 876.5ms at 400k. Both are
+linear in the column's distinct values and the repair is ~6× the census per
+column, so the census is unconditional and the repair is opt-in
 (`SIGLAKE_AGG_SHORT_REPAIR=1`) and budgeted at one table per pass
 (`SIGLAKE_AGG_SHORT_REPAIR_MAX_TABLES`). At the 1TB shape the extrapolation is
-~9 minutes per column per 250M rows, which the compactor's 600s watchdog cuts —
-safely, since the rebuild publishes in one write at the end — and that is why a
-table that size stays the operator's to rebuild.
+~9 minutes per column per 250M rows; no large-table timeout was measured. The
+compactor's cooperative 600s watchdog can cut that repair safely because the
+rebuild publishes in one write at the end. A local cancellation at a requested
+286.3ms returned at the scan's next yield, 830.5ms, published nothing, and was
+detected again after reopening the warehouse. The durable 0.2.0 retry decision,
+including the 1.3ms local marker-path measurement, is in
+[`DESIGN_short_aggregate_repair_backoff.md`](DESIGN_short_aggregate_repair_backoff.md).
+Until it is implemented, a table that size stays the operator's to rebuild.
 
 The rebuild takes its column set from the aggregate, not the schema: it repairs
 what a table was maintaining, and inventing columns would change what the table
