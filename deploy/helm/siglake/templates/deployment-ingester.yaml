@@ -126,10 +126,7 @@ spec:
             - name: SIGLAKE_WAL_ACTIVE_MIRROR_INTERVAL_SECS
               value: {{ .Values.wal.mirror.activeIntervalSecs | quote }}
             {{- end }}
-            {{- $authSecret := .Values.ingester.auth.existingSecret -}}
-            {{- if and (not $authSecret) .Values.ingester.auth.list -}}
-            {{- $authSecret = include "siglake.componentName" (list . "auth-tokens") -}}
-            {{- end }}
+            {{- $authSecret := include "siglake.ingestTokensSecret" . -}}
             {{- if $authSecret }}
             - name: SIGLAKE_AUTH_TOKENS
               valueFrom:
