@@ -55,7 +55,8 @@ use siglake_storage::consumed_proof::{ConsumedProofEntry, ConsumedProofRead, Rec
 use siglake_storage::iceberg::{
     AppendIncarnationMismatch, DeleteTaskState, IcebergContext, LevelPolicy, LeveledPassOptions,
     NonTerminalDeleteTask, NonTerminalDeleteTaskObservation, ObservedDeleteTaskClaim,
-    ProofMaintenanceIncarnationMismatch, ReclusterPolicy, ShortAggregateOutcome,
+    ProofMaintenanceIncarnationMismatch, ReclusterPolicy, ShortAggregateAttemptReason,
+    ShortAggregateAttemptStart, ShortAggregateOutcome,
 };
 use siglake_wal::{
     claim_segment, finish_segment, list_committed, list_index_dirs, list_orphaned, list_poisoned,
@@ -2140,33 +2141,80 @@ impl Compactor {
     /// name the table, nothing reads the files. The budget is global across
     /// namespaces, so a fleet-wide first enable cannot turn one pass into a
     /// whole-warehouse Tier-2 scan.
-    async fn run_agg_short_repair_once(&self, max_repairs: usize) {
-        let mut budget = max_repairs;
+    async fn run_agg_short_repair_once(&self, max_repairs: usize, watchdog: Option<Duration>) {
+        let mut census = Vec::new();
         for ice in self.aggregate_contexts("short group-count repair").await {
             let namespace = ice.namespace().to_string();
-            match ice.repair_short_group_count_aggregates(budget).await {
-                Ok(outcomes) => {
-                    for (table, outcome) in outcomes {
-                        if matches!(
-                            outcome,
-                            ShortAggregateOutcome::Repaired { .. } | ShortAggregateOutcome::Failed
-                        ) {
-                            budget = budget.saturating_sub(1);
-                        }
-                        tracing::debug!(
-                            namespace,
-                            table,
-                            outcome = ?outcome,
-                            "short group-count aggregate census"
-                        );
-                    }
-                }
+            match ice.census_short_group_count_aggregates().await {
+                Ok(items) => census.extend(items.into_iter().map(|item| (ice.clone(), item))),
                 Err(e) => tracing::warn!(
                     namespace,
                     error = ?e,
                     "short group-count aggregate census failed"
                 ),
             }
+        }
+        let mut budget = max_repairs;
+        for (ice, item) in census {
+            let table = item.table.clone();
+            let mut outcome = item.outcome.clone();
+            if matches!(outcome, ShortAggregateOutcome::Detected { .. }) && budget > 0 {
+                match ice
+                    .prepare_short_group_count_repair(
+                        &item,
+                        watchdog.unwrap_or(Duration::from_secs(DRAIN_WATCHDOG_DEFAULT_SECS)),
+                    )
+                    .await
+                {
+                    Ok(ShortAggregateAttemptStart::Ready(attempt)) => {
+                        budget -= 1;
+                        outcome =
+                            match bounded(watchdog, ice.execute_short_group_count_repair(&attempt))
+                                .await
+                            {
+                                Some(outcome) => outcome,
+                                None => {
+                                    metrics::counter!("siglake_compactor_watchdog_trips_total",
+                                    "stage" => "agg_short_repair")
+                                    .increment(1);
+                                    match ice
+                                        .record_short_group_count_attempt(
+                                            &attempt,
+                                            ShortAggregateAttemptReason::Watchdog,
+                                        )
+                                        .await
+                                    {
+                                        Ok(outcome) => outcome,
+                                        Err(error) => {
+                                            tracing::error!(
+                                                ?error,
+                                                table,
+                                                "short-repair watchdog marker overwrite failed"
+                                            );
+                                            ShortAggregateOutcome::MarkerFailed {
+                                                columns: match &item.outcome {
+                                                    ShortAggregateOutcome::Detected { columns } => {
+                                                        columns.clone()
+                                                    }
+                                                    _ => Vec::new(),
+                                                },
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                    }
+                    Ok(ShortAggregateAttemptStart::Outcome(other)) => outcome = other,
+                    Err(error) => tracing::warn!(?error, table, "short-repair preparation failed"),
+                }
+            }
+            ice.report_short_group_count_outcome(&table, &outcome);
+            tracing::debug!(
+                namespace = %ice.namespace(),
+                table,
+                outcome = ?outcome,
+                "short group-count aggregate census"
+            );
         }
     }
 
@@ -3644,21 +3692,7 @@ impl Compactor {
                         } else {
                             0
                         };
-                        if bounded(drain_watchdog, self.run_agg_short_repair_once(budget))
-                            .await
-                            .is_none()
-                        {
-                            // Safe to cut: the rebuild publishes in one CAS at
-                            // the end, so a cancelled one leaves the aggregate
-                            // exactly as short as it was and the next pass
-                            // retries. What it costs is the reads it had done.
-                            tracing::error!(
-                                "short group-count aggregate repair exceeded the watchdog ceiling"
-                            );
-                            metrics::counter!("siglake_compactor_watchdog_trips_total",
-                                "stage" => "agg_short_repair")
-                            .increment(1);
-                        }
+                        self.run_agg_short_repair_once(budget, drain_watchdog).await;
                     }
                 }
                 // The inline object's coverage census (#4674), on the same
@@ -7162,7 +7196,7 @@ mod agg_fold_tests {
         let compactor = Compactor::new(tmp.path().join("wal"), base);
         // A census with no budget reports and reads nothing — the default
         // install, where the counter and the alert are the whole output.
-        compactor.run_agg_short_repair_once(0).await;
+        compactor.run_agg_short_repair_once(0, None).await;
         assert!(
             !walk_files(&warehouse).iter().any(|path| path
                 .file_name()
@@ -7170,7 +7204,7 @@ mod agg_fold_tests {
             "a census with no repair budget must not write a base object"
         );
 
-        compactor.run_agg_short_repair_once(1).await;
+        compactor.run_agg_short_repair_once(1, None).await;
         // This handle is a different `IcebergContext` from the one the pass
         // opened for the namespace, and holds its own memo of the folded base —
         // as a query pod in another process would.

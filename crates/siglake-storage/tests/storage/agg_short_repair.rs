@@ -24,8 +24,8 @@ use siglake_core::index_config::{DocMapping, FieldMapping, FieldType, IndexConfi
 use siglake_core::Event;
 use siglake_storage::iceberg::{
     ColumnGroupCounts, ColumnSketch, FileGroupCounts, GroupCountDelta, GroupCountSketches,
-    IcebergContext, IcebergTuning, ShortAggregateOutcome, ShortAggregateRepair, WideGroupCounts,
-    GROUP_COUNT_SKETCH_VERSION,
+    IcebergContext, IcebergTuning, ShortAggregateAttemptReason, ShortAggregateAttemptStart,
+    ShortAggregateOutcome, ShortAggregateRepair, WideGroupCounts, GROUP_COUNT_SKETCH_VERSION,
 };
 use std::collections::BTreeMap;
 
@@ -192,6 +192,28 @@ fn counts(column: &str, rows: u64) -> FileGroupCounts {
     FileGroupCounts { columns }
 }
 
+async fn make_short(ice: &IcebergContext, id: &str) {
+    let cfg = index_config(id);
+    ice.create_index(&cfg).await.unwrap();
+    let ident = ice.index_table_ident(id);
+    ice.append_to_table(&ident, batch(&cfg, 0), &["host"])
+        .await
+        .unwrap();
+    let table = ice.catalog().load_table(&ident).await.unwrap();
+    let location = table.metadata().location().to_string();
+    let dir = std::path::Path::new(location.strip_prefix("file://").unwrap_or(&location));
+    let delta = walk(dir)
+        .into_iter()
+        .find(|path| path.to_string_lossy().contains("siglake-agg-deltas"))
+        .expect("first delta");
+    std::fs::remove_file(delta).unwrap();
+    ice.append_to_table(&ident, batch(&cfg, 1), &["host"])
+        .await
+        .unwrap();
+    ice.fold_group_count_deltas(1).await.unwrap();
+    ice.invalidate_cached_table(&ident).await;
+}
+
 /// How `GROUP BY host` is being served right now, and its total.
 async fn served(ice: &IcebergContext, index: &str) -> (String, u64) {
     let g = ice
@@ -279,6 +301,12 @@ async fn an_aggregate_short_since_an_empty_prefix_is_rebuilt_from_the_files() {
         served(&ice, "upgraded").await,
         ("tier1_wide".to_string(), rows),
         "the cheap tier is back, and still exact"
+    );
+    assert!(
+        !aggregate_artifacts(&wh)
+            .iter()
+            .any(|path| path.to_string_lossy().contains(".short-repair.")),
+        "the successful aggregate CAS must clear its attempt marker"
     );
 
     // Repeated pass: nothing is short, so nothing is rebuilt. A repair that
@@ -699,7 +727,7 @@ async fn a_column_the_rebuild_cannot_cover_is_recorded_and_not_retried() {
         ice.repair_short_group_count_aggregates(1).await.unwrap(),
         vec![(
             "residue".to_string(),
-            ShortAggregateOutcome::Suppressed {
+            ShortAggregateOutcome::Unrestored {
                 columns: vec!["absent_dim".to_string()]
             }
         )],
@@ -748,7 +776,7 @@ async fn a_recorded_column_is_skipped_without_reading_any_file() {
         ice.repair_short_group_count_aggregates(1).await.unwrap(),
         vec![(
             "recorded".to_string(),
-            ShortAggregateOutcome::Suppressed {
+            ShortAggregateOutcome::Unrestored {
                 columns: vec!["host".to_string()]
             }
         )]
@@ -983,16 +1011,120 @@ async fn reproduce_watchdog_cancelled_repair_restart() {
         .unwrap();
     assert!(matches!(
         after_restart.first().map(|(_, outcome)| outcome),
-        Some(ShortAggregateOutcome::Detected { .. })
+        Some(ShortAggregateOutcome::BackedOff {
+            reason: ShortAggregateAttemptReason::Started,
+            ..
+        })
     ));
     println!(
         "rows={} census={:.1}ms timeout={:.1}ms cut_after={:.1}ms \
-         aggregate_unchanged=true restart_outcome=detected",
+         aggregate_unchanged=true restart_outcome=backed_off_started",
         COMMITS * ROWS_PER_COMMIT,
         census_elapsed.as_secs_f64() * 1e3,
         timeout.as_secs_f64() * 1e3,
         cut_elapsed.as_secs_f64() * 1e3,
     );
+}
+
+#[tokio::test]
+async fn a_started_attempt_blocks_a_second_compactor_past_the_maintenance_lease() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wh = tmp.path().join("warehouse");
+    let ice = open(&wh).await;
+    make_short(&ice, "concurrent").await;
+    let item = ice
+        .census_short_group_count_aggregates()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.table == "concurrent")
+        .unwrap();
+    let first = ice
+        .prepare_short_group_count_repair(&item, std::time::Duration::from_secs(600))
+        .await
+        .unwrap();
+    assert!(matches!(first, ShortAggregateAttemptStart::Ready(_)));
+
+    // The catalog maintenance lease is 300 seconds. The durable attempt's
+    // 600-second watchdog remains the exclusion record after that lease can be
+    // acquired by another compactor.
+    let second = ice
+        .prepare_short_group_count_repair(&item, std::time::Duration::from_secs(600))
+        .await
+        .unwrap();
+    assert!(matches!(
+        second,
+        ShortAggregateAttemptStart::Outcome(ShortAggregateOutcome::BackedOff {
+            attempts: 1,
+            reason: ShortAggregateAttemptReason::Started,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn restart_turns_an_expired_started_attempt_into_durable_interrupted_backoff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wh = tmp.path().join("warehouse");
+    let ice = open(&wh).await;
+    make_short(&ice, "restart").await;
+    let item = ice
+        .census_short_group_count_aggregates()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.table == "restart")
+        .unwrap();
+    assert!(matches!(
+        ice.prepare_short_group_count_repair(&item, std::time::Duration::ZERO)
+            .await
+            .unwrap(),
+        ShortAggregateAttemptStart::Ready(_)
+    ));
+    drop(ice);
+
+    let restarted = open(&wh).await;
+    let outcome = restarted
+        .census_short_group_count_aggregates()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.table == "restart")
+        .map(|item| item.outcome)
+        .unwrap();
+    assert!(matches!(
+        &outcome,
+        ShortAggregateOutcome::BackedOff {
+            attempts: 1,
+            reason: ShortAggregateAttemptReason::Interrupted,
+            ..
+        }
+    ));
+
+    let cfg = index_config("restart");
+    let ident = restarted.index_table_ident("restart");
+    restarted
+        .append_to_table(&ident, batch(&cfg, 2), &["host"])
+        .await
+        .unwrap();
+    restarted.fold_group_count_deltas(1).await.unwrap();
+    restarted.invalidate_cached_table(&ident).await;
+    let after_snapshot_advance = restarted
+        .census_short_group_count_aggregates()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.table == "restart")
+        .map(|item| item.outcome)
+        .unwrap();
+    assert!(matches!(
+        after_snapshot_advance,
+        ShortAggregateOutcome::BackedOff {
+            attempts: 1,
+            reason: ShortAggregateAttemptReason::Interrupted,
+            ..
+        }
+    ));
 }
 
 /// The per-pass budget. Every table upgraded across #2919 is short at once, and
