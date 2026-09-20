@@ -1,7 +1,7 @@
 rule_files:
   - prometheusrule.rules.yaml
 
-evaluation_interval: 1m
+evaluation_interval: 5s
 
 tests:
   - name: a torn recovered WAL tail raises its warning
@@ -206,8 +206,8 @@ tests:
 
   # A store outage the executor IS reconciling through: rows are parked, the
   # same conditional write is retried every 5s, and the gauge tracks the
-  # backlog. No operator action, so no page.
-  - name: a deferred terminal write being reconciled does not page
+  # backlog. It does not fire the critical abandonment page.
+  - name: a deferred terminal write being reconciled does not page as abandoned
     interval: 1m
     input_series:
       - series: 'siglake_query_job_terminal_conflict_total{namespace="logs",pod="query-0",attempted="succeeded",actual="unknown",cause="write_deferred"}'
@@ -223,6 +223,51 @@ tests:
       - eval_time: 20m
         alertname: SiglakeBatchCompletionRejectedByRecovery
         exp_alerts: []
+
+  # #5615's verified run #129 peaked at 3/4 parked rows across its two pods and
+  # bounded restoration-to-drain at 13.19887s. At one-second fixture precision,
+  # keeping those peaks through t=13 and clearing them at t=14 is the measured
+  # upper-bound case; the 15-second warning must stay quiet.
+  - name: the measured Postgres recovery backlog drains before warning
+    interval: 1s
+    input_series:
+      - series: 'siglake_query_jobs_unreconciled{namespace="logs",pod="query-0"}'
+        values: '3+0x13 0+0x2'
+      - series: 'siglake_query_jobs_unreconciled{namespace="logs",pod="query-1"}'
+        values: '4+0x13 0+0x2'
+    alert_rule_test:
+      - eval_time: 15s
+        alertname: SiglakeBatchReconciliationBacklogStalled
+        exp_alerts: []
+
+  - name: a persistent batch reconciliation backlog warns
+    interval: 1s
+    input_series:
+      - series: 'siglake_query_jobs_unreconciled{namespace="logs",pod="query-0"}'
+        values: '4+0x16'
+    alert_rule_test:
+      - eval_time: 14s
+        alertname: SiglakeBatchReconciliationBacklogStalled
+        exp_alerts: []
+      - eval_time: 15s
+        alertname: SiglakeBatchReconciliationBacklogStalled
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: query-0
+              severity: warning
+            exp_annotations:
+              summary: A query pod's batch reconciliation backlog is not draining
+              description: >-
+                4 finished batch job(s) on query-0 have remained without a
+                persisted terminal state beyond the 15-second recovery bound
+                selected from the verified Postgres outage trace (peak 7, 3/4
+                per pod; drained within 13.2 seconds after restoration). The
+                executor is still retrying these rows, so restore the shared
+                job store and inspect its query-server WARN lines before the
+                1024-row bookkeeping cap is reached. This warning does not mean
+                rows were abandoned; SiglakeBatchRowStrandedNonTerminal reports
+                that separate failure.
 
   - name: shard pin misses start from the pre-registered zero baseline
     interval: 1m
