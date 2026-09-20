@@ -443,7 +443,7 @@ fi
 # One baseline call, then the outage samples, then the drained recovery sample.
 value=0
 if [[ "$expression" == timestamp* ]]; then
-  value=$(( $(date +%s) - 1 ))
+  value=$(date +%s.%N)
 elif [[ "$expression" == *jobs_total* ]]; then
   if [[ ! -e "$STANDIN_STATE/paused" ]] && ((calls >= 4)); then value=2; fi
 elif ((calls >= 2 && calls <= 3)); then
@@ -724,7 +724,13 @@ document = json.load(open(sys.argv[1], encoding="utf-8"))
 evidence = document["evidence"]
 assert evidence["grade"] == "verified"
 assert evidence["summary"]["peak_backlog_total"] == 3
-assert evidence["summary"]["time_to_drain_seconds"] == 14
+assert evidence["summary"]["time_to_drain_seconds"] == {
+    "lower_bound": 0.0,
+    "upper_bound": 11.0,
+    "restoration_boundary": "restoration_applied_at",
+    "last_positive_scrape_at": "2026-09-07T12:00:50Z",
+    "all_pods_zero_by_scrape_at": "2026-09-07T12:01:00Z",
+}
 assert evidence["summary"]["completion_delta"] == 3
 PY
 
@@ -755,6 +761,15 @@ def pre_restoration_drain():
     for row in sample["completions"]:
         row["value"] += 1
 
+def zero_before_positive():
+    """Run #126's shape: an early zero/completion observation precedes the
+    positive backlog episode whose later recovery drain is measured."""
+    for row in document["samples"][1]["backlog"]:
+        row["value"] = 0
+    for sample in document["samples"][1:]:
+        for row in sample["completions"]:
+            row["value"] += 1
+
 def subsecond_boundaries():
     document["timestamps"].update({
         "outage_started_at": "2026-09-07T12:00:03.100Z",
@@ -774,10 +789,31 @@ elif mutation == "no-drain":
     for sample in document["samples"]:
         if sample["phase"] == "recovery":
             sample["backlog"][0]["value"] = 1
+elif mutation == "duplicate-scrape-generations":
+    duplicate = json.loads(json.dumps(document["samples"][3]))
+    duplicate["at"] = "2026-09-07T12:00:57Z"
+    document["samples"].insert(4, duplicate)
+elif mutation == "staggered-pod-scrapes":
+    document["samples"][3]["backlog"][0]["sample_time"] = 1788782451.0
+    document["samples"][3]["backlog"][1]["sample_time"] = 1788782449.0
+    document["samples"][4]["backlog"][0]["sample_time"] = 1788782458.0
+    document["samples"][4]["backlog"][1]["sample_time"] = 1788782459.0
+elif mutation == "missing-drain-pod":
+    document["samples"][4]["backlog"].pop()
 elif mutation == "missing-revision":
     del document["revisions"]["repository_commit"]
 elif mutation == "pre-restoration-drain":
     pre_restoration_drain()
+elif mutation == "zero-before-positive":
+    zero_before_positive()
+    # Run #126's retained generations place the last positive scrape about
+    # five seconds after restoration_applied_at and every pod at zero by
+    # twenty seconds after it. Preserve that relationship in fixed UTC time.
+    document["timestamps"]["restoration_applied_at"] = "2026-09-07T12:00:49.000Z"
+    document["samples"][3]["backlog"][0]["sample_time"] = 1788782454.001
+    for row in document["samples"][4]["backlog"]:
+        row["sample_time"] = 1788782469.0
+    document["samples"][4]["at"] = "2026-09-07T12:01:10Z"
 elif mutation == "pre-restoration-drain-undated":
     pre_restoration_drain()
     document["job_commit_times"]["rows"] = [
@@ -914,6 +950,7 @@ resolution = drain["resolution"]
 assert resolution["state"] == "resolved", resolution
 assert resolution["by"] == "job_commit_times", resolution
 assert "none inside it" in resolution["detail"], resolution
+assert evidence["summary"]["time_to_drain_seconds"] is not None, evidence["summary"]
 problems = "\n".join(evidence["problems"])
 assert "the pause window is unexplained" not in problems, problems
 PY
@@ -957,12 +994,61 @@ PY
   fail "subsecond commits were not placed against the proven signal bounds"
 fixtures=$((fixtures + 1))
 
+expect_interval() {
+  local mutation=$1 lower=$2 upper=$3
+  local input="$fixture_dir/${mutation}.input.json"
+  local output="$fixture_dir/${mutation}.output.json"
+  mutate "$mutation" "$input"
+  python3 "$GRADER" "$input" --output "$output" 2>"$fixture_dir/${mutation}.log" ||
+    fail "$mutation did not retain a recovery drain interval: $(cat "$fixture_dir/${mutation}.log")"
+  python3 - "$output" "$lower" "$upper" <<'PY' ||
+import json, sys
+evidence = json.load(open(sys.argv[1], encoding="utf-8"))["evidence"]
+interval = evidence["summary"]["time_to_drain_seconds"]
+assert interval["lower_bound"] == float(sys.argv[2]), interval
+assert interval["upper_bound"] == float(sys.argv[3]), interval
+assert interval["restoration_boundary"] == "restoration_applied_at", interval
+PY
+    fail "$mutation reported the wrong recovery drain interval"
+  fixtures=$((fixtures + 1))
+}
+
+expect_no_interval() {
+  local mutation=$1 want=$2
+  local input="$fixture_dir/${mutation}.input.json"
+  local output="$fixture_dir/${mutation}.output.json"
+  local rc=0
+  mutate "$mutation" "$input"
+  python3 "$GRADER" "$input" --output "$output" 2>"$fixture_dir/${mutation}.log" || rc=$?
+  [[ "$rc" -eq 1 ]] || fail "$mutation exited $rc, expected the unverified exit 1"
+  python3 - "$output" "$want" <<'PY' ||
+import json, sys
+evidence = json.load(open(sys.argv[1], encoding="utf-8"))["evidence"]
+assert evidence["summary"]["time_to_drain_seconds"] is None, evidence["summary"]
+assert sys.argv[2] in "\n".join(evidence["problems"]), evidence["problems"]
+PY
+    fail "$mutation forced a drain interval from insufficient observations"
+  fixtures=$((fixtures + 1))
+}
+
 expect_unverified missing-series 'no usable backlog observation'
 expect_unverified no-rise 'no observed unreconciled backlog'
-expect_unverified no-drain 'did not drain after restoration'
+expect_no_interval no-drain 'did not drain after restoration'
+expect_no_interval missing-drain-pod 'backlog sample at 2026-09-07T12:01:02+00:00 missed pods'
+expect_interval duplicate-scrape-generations 0 11
+expect_interval staggered-pod-scrapes 1 10
 expect_unverified missing-revision 'missing pinned repository revision'
 expect_resolved pre-restoration-drain
+expect_resolved zero-before-positive
+expect_interval zero-before-positive 5 20
 expect_unverified pre-restoration-drain-undated 'shows zero backlog with completions up by 2 before restoration'
+python3 - "$fixture_dir/pre-restoration-drain-undated.output.json" <<'PY' ||
+import json, sys
+evidence = json.load(open(sys.argv[1], encoding="utf-8"))["evidence"]
+assert evidence["grade"] == "unverified", evidence
+assert evidence["summary"]["time_to_drain_seconds"] is not None, evidence["summary"]
+PY
+  fail "an unresolved pause finding suppressed the independent recovery interval"
 expect_unverified pre-restoration-drain-undated 'no job row for accepted job job-b'
 expect_unverified commit-inside-pause 'job job-b committed at 2026-09-07T12:00:20.551200+00:00, inside the proven stopped window'
 expect_unverified commit-inside-pause 'shows zero backlog with completions up by 2 before restoration'
