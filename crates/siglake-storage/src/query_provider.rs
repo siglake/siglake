@@ -2431,10 +2431,13 @@ impl SiglakeIcebergTableScan {
     }
 
     /// K-way merge of already-sorted batch streams on `timestamp` in the scan
-    /// direction (the WS-3 per-cluster merge).
+    /// direction (the WS-3 per-cluster merge). For a source-safe ordered LIMIT,
+    /// inputs are admitted in manifest-bound order. Once the buffered nth row
+    /// is strictly ahead of the next input's bound, that input and the older
+    /// suffix stay unopened; equal or unavailable bounds are never excluded.
     fn merge_record_streams(
         &self,
-        inputs: Vec<SendableRecordBatchStream>,
+        mut inputs: Vec<OrderedMergeInput>,
         partition: usize,
         context: &TaskContext,
         schema: ArrowSchemaRef,
@@ -2453,30 +2456,178 @@ impl SiglakeIcebergTableScan {
             .register(context.memory_pool());
         metrics::counter!("siglake_query_scan_ordered_merge_streams_total")
             .increment(inputs.len() as u64);
-        let merged = StreamingMergeBuilder::new()
-            .with_streams(inputs)
-            .with_schema(schema)
-            .with_expressions(&ordering)
-            // Throwaway metrics set: SourceMetricsStream already records this
-            // partition's output against the scan's plan metrics.
-            .with_metrics(BaselineMetrics::new(
-                &ExecutionPlanMetricsSet::new(),
+        let limit = self.ordered_limit.filter(|&limit| {
+            let cap = ordered_single_partition_max_limit();
+            self.ordered_source_limit_safe && cap > 0 && limit <= cap
+        });
+        if limit.is_none() || inputs.iter().any(|input| input.frontier_bound.is_none()) {
+            return Ok(build_ordered_merge(
+                inputs.into_iter().map(|input| input.stream).collect(),
+                schema,
+                &ordering,
                 partition,
-            ))
-            // A browse asks the merge for `limit` rows and throws the rest of
-            // the batch away; building the full batch first holds every
-            // contributing input batch in the merge's reservation.
-            .with_batch_size(
-                reader_tuning
-                    .batch_size
-                    .unwrap_or(8192)
-                    .max(1)
-                    .min(self.ordered_limit.unwrap_or(usize::MAX)),
+                reader_tuning.batch_size.unwrap_or(8192).max(1),
+                reservation,
+                None,
+            )?
+            .boxed());
+        }
+
+        if self.sort_descending {
+            inputs.sort_by_key(|input| Reverse(input.frontier_bound));
+        } else {
+            inputs.sort_by_key(|input| input.frontier_bound);
+        }
+        let descending = self.sort_descending;
+        let batch_size = reader_tuning
+            .batch_size
+            .unwrap_or(8192)
+            .max(1)
+            .min(limit.expect("checked above"));
+        let prepare_schema = schema.clone();
+        let prepared = async move {
+            let admitted = frontier_pruned_merge_inputs(
+                inputs,
+                limit.expect("checked above"),
+                descending,
+                prepare_schema.clone(),
             )
-            .with_reservation(reservation)
-            .build()?;
-        Ok(merged.boxed())
+            .await?;
+            let col = Column::new_with_schema("timestamp", prepare_schema.as_ref())?;
+            let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+                Arc::new(col),
+                SortOptions {
+                    descending,
+                    nulls_first: descending,
+                },
+            )])
+            .ok_or_else(|| DataFusionError::Internal("empty ordered-merge ordering".into()))?;
+            build_ordered_merge(
+                admitted,
+                prepare_schema,
+                &ordering,
+                partition,
+                batch_size,
+                reservation,
+                limit,
+            )
+        };
+        Ok(futures::stream::once(prepared).try_flatten().boxed())
     }
+}
+
+fn build_ordered_merge(
+    inputs: Vec<SendableRecordBatchStream>,
+    schema: ArrowSchemaRef,
+    ordering: &LexOrdering,
+    partition: usize,
+    batch_size: usize,
+    reservation: datafusion::execution::memory_pool::MemoryReservation,
+    fetch: Option<usize>,
+) -> DFResult<SendableRecordBatchStream> {
+    StreamingMergeBuilder::new()
+        .with_streams(inputs)
+        .with_schema(schema)
+        .with_expressions(ordering)
+        .with_metrics(BaselineMetrics::new(
+            &ExecutionPlanMetricsSet::new(),
+            partition,
+        ))
+        .with_batch_size(batch_size)
+        .with_fetch(fetch)
+        .with_reservation(reservation)
+        .build()
+}
+
+/// Buffer at most `limit` rows from each newly admitted input. Those prefixes
+/// contain every row that input could contribute to the global top N. Once the
+/// exact nth value is strictly ahead of the next bound, all remaining inputs
+/// are safe to leave unopened. Returning finite prefix streams also makes the
+/// source-level limit explicit: this path is reached only when pushed filters
+/// cannot remove rows above the scan.
+async fn frontier_pruned_merge_inputs(
+    inputs: Vec<OrderedMergeInput>,
+    limit: usize,
+    descending: bool,
+    schema: ArrowSchemaRef,
+) -> DFResult<Vec<SendableRecordBatchStream>> {
+    let timestamp_idx = schema.index_of("timestamp")?;
+    let mut admitted = Vec::new();
+    let mut frontier_values = Vec::new();
+    let mut inputs = inputs.into_iter().peekable();
+
+    while let Some(mut input) = inputs.next() {
+        let mut batches = Vec::new();
+        let mut rows = 0usize;
+        while rows < limit {
+            let Some(batch) = input.stream.next().await.transpose()? else {
+                break;
+            };
+            let take = (limit - rows).min(batch.num_rows());
+            if take == 0 {
+                continue;
+            }
+            let prefix = batch.slice(0, take);
+            let Some(values) = timestamp_bound_values(&prefix, timestamp_idx) else {
+                batches.push(batch);
+                let mut all = admitted;
+                all.push(Box::pin(RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(batches.into_iter().map(Ok)).chain(input.stream),
+                )) as SendableRecordBatchStream);
+                for remaining in inputs {
+                    all.push(remaining.stream);
+                }
+                return Ok(all);
+            };
+            frontier_values.extend(values);
+            rows += take;
+            batches.push(prefix);
+        }
+        admitted.push(Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(batches.into_iter().map(Ok)),
+        )) as SendableRecordBatchStream);
+
+        if frontier_values.len() < limit {
+            continue;
+        }
+        let nth = nth_ordered_value(&mut frontier_values, limit, descending);
+        if bound_is_strictly_behind(
+            nth,
+            inputs.peek().and_then(|next| next.frontier_bound),
+            descending,
+        ) {
+            break;
+        }
+    }
+    Ok(admitted)
+}
+
+fn timestamp_bound_values(batch: &RecordBatch, timestamp_idx: usize) -> Option<Vec<i64>> {
+    use datafusion::arrow::array::{Array, TimestampMicrosecondArray};
+
+    let column = batch
+        .column(timestamp_idx)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()?;
+    if column.null_count() != 0 {
+        return None;
+    }
+    Some((0..column.len()).map(|row| column.value(row)).collect())
+}
+
+fn nth_ordered_value(values: &mut [i64], limit: usize, descending: bool) -> i64 {
+    let nth = limit - 1;
+    if descending {
+        *values.select_nth_unstable_by(nth, |a, b| b.cmp(a)).1
+    } else {
+        *values.select_nth_unstable(nth).1
+    }
+}
+
+fn bound_is_strictly_behind(nth: i64, bound: Option<i64>, descending: bool) -> bool {
+    bound.is_some_and(|bound| if descending { bound < nth } else { bound > nth })
 }
 
 /// The physical output ordering to advertise for this scan, or a refusal when
@@ -2834,7 +2985,32 @@ async fn scan_output_ordering(
                         }
                     }
                     part_streams = part_streams.max(layer_sizes.len());
-                    plan.push(OrderedCluster::Merge(layer_sizes));
+                    let mut layer_offset = off;
+                    let layers = layer_sizes
+                        .into_iter()
+                        .map(|file_count| {
+                            let layer = &part[layer_offset..layer_offset + file_count];
+                            layer_offset += file_count;
+                            let frontier_bound = if requested_descending {
+                                layer
+                                    .iter()
+                                    .map(|(_, bounds)| bounds.1)
+                                    .max()
+                                    .expect("merge layer is non-empty")
+                            } else {
+                                layer
+                                    .iter()
+                                    .map(|(_, bounds)| bounds.0)
+                                    .min()
+                                    .expect("merge layer is non-empty")
+                            };
+                            OrderedMergeLayer {
+                                file_count,
+                                frontier_bound,
+                            }
+                        })
+                        .collect();
+                    plan.push(OrderedCluster::Merge(layers));
                     off += cs;
                 }
                 budget_used += part_streams;
@@ -3093,15 +3269,29 @@ enum OrderedCluster {
     /// A time-disjoint run of this many files: ordered sequential chain.
     Run(usize),
     /// Overlapping files k-way merged over layers (each layer a sequential
-    /// disjoint run); fan-in = layer count = overlap depth. Values are the
-    /// layer sizes, summing to the cluster's file count.
-    Merge(Vec<usize>),
+    /// disjoint run); fan-in = layer count = overlap depth. Layer file counts
+    /// sum to the cluster's file count, and their bounds drive lazy admission.
+    Merge(Vec<OrderedMergeLayer>),
     /// Depth-spike fallback: overlap depth exceeds the per-merge fan-in cap
     /// but the cluster's rows fit [`ordered_sort_cluster_max_rows`] — decode
     /// all files (bounded concurrency, unordered) and sort in memory before
     /// emitting. Preserves the scan-wide ordered advertisement that a refusal
     /// would forfeit.
     Sort(usize),
+}
+
+/// One sequential, time-disjoint input to an overlapping-cluster merge.
+/// `frontier_bound` is the input's first possible value in scan order (the
+/// upper manifest bound for DESC, lower for ASC).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrderedMergeLayer {
+    file_count: usize,
+    frontier_bound: i64,
+}
+
+struct OrderedMergeInput {
+    stream: SendableRecordBatchStream,
+    frontier_bound: Option<i64>,
 }
 
 /// Row budget for [`OrderedCluster::Sort`] (`SIGLAKE_ORDERED_SORT_CLUSTER_MAX_ROWS`,
@@ -4785,7 +4975,9 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                     .iter()
                     .map(|c| match c {
                         OrderedCluster::Run(n) | OrderedCluster::Sort(n) => *n,
-                        OrderedCluster::Merge(layers) => layers.iter().sum(),
+                        OrderedCluster::Merge(layers) => {
+                            layers.iter().map(|layer| layer.file_count).sum()
+                        }
                     })
                     .sum::<usize>(),
                 tasks.len(),
@@ -4797,7 +4989,9 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
             for cluster in &clusters {
                 let n: usize = match cluster {
                     OrderedCluster::Run(n) | OrderedCluster::Sort(n) => *n,
-                    OrderedCluster::Merge(layers) => layers.iter().sum(),
+                    OrderedCluster::Merge(layers) => {
+                        layers.iter().map(|layer| layer.file_count).sum()
+                    }
                 };
                 let tail = rest.split_off(n.min(rest.len()));
                 let mut cluster_tasks = std::mem::replace(&mut rest, tail);
@@ -4824,11 +5018,12 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                             reservation,
                         )?);
                     }
-                    OrderedCluster::Merge(layer_sizes) => {
-                        let mut layers: Vec<SendableRecordBatchStream> =
-                            Vec::with_capacity(layer_sizes.len());
-                        for &ls in layer_sizes {
-                            let tail = cluster_tasks.split_off(ls.min(cluster_tasks.len()));
+                    OrderedCluster::Merge(layer_plans) => {
+                        let mut layers: Vec<OrderedMergeInput> =
+                            Vec::with_capacity(layer_plans.len());
+                        for layer_plan in layer_plans {
+                            let tail = cluster_tasks
+                                .split_off(layer_plan.file_count.min(cluster_tasks.len()));
                             let layer = std::mem::replace(&mut cluster_tasks, tail);
                             let chained = self.sequential_task_chain(
                                 layer,
@@ -4836,10 +5031,13 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                                 fetched_byte_counter.clone(),
                                 scan_counters.clone(),
                             )?;
-                            layers.push(Box::pin(RecordBatchStreamAdapter::new(
-                                schema.clone(),
-                                chained,
-                            )));
+                            layers.push(OrderedMergeInput {
+                                stream: Box::pin(RecordBatchStreamAdapter::new(
+                                    schema.clone(),
+                                    chained,
+                                )),
+                                frontier_bound: Some(layer_plan.frontier_bound),
+                            });
                         }
                         segments.push(self.merge_record_streams(
                             layers,
@@ -6605,6 +6803,17 @@ mod tests {
                 _ => 0,
             })
             .sum()
+    }
+
+    #[test]
+    fn frontier_pruning_keeps_equal_and_missing_bounds() {
+        assert!(bound_is_strictly_behind(100, Some(99), true));
+        assert!(!bound_is_strictly_behind(100, Some(100), true));
+        assert!(!bound_is_strictly_behind(100, None, true));
+
+        assert!(bound_is_strictly_behind(100, Some(101), false));
+        assert!(!bound_is_strictly_behind(100, Some(100), false));
+        assert!(!bound_is_strictly_behind(100, None, false));
     }
 
     /// The decline is a three-input decision and the scan that consumes it
