@@ -20,14 +20,32 @@ mkdir "$check_dir/bin"
 cat >"$check_dir/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 # The regression test must not inspect or modify the machine's Docker state.
+if [ -n "${TEST_DOCKER_CALLS:-}" ]; then
+  printf '%s\n' "$*" >>"$TEST_DOCKER_CALLS"
+fi
 case "$*" in
-  *label=com.docker.compose.project=*) exit 0 ;;
+  *label=com.docker.compose.project=*)
+    [ -z "${TEST_PROJECT_PORTS:-}" ] || printf '%s\n' "$TEST_PROJECT_PORTS"
+    ;;
   *'{{.Names}}|{{.Ports}}'*)
-    printf 'foreign-postgres|127.0.0.1:%s->5432/tcp\n' "${TEST_PORT:?}"
+    [ -z "${TEST_PORT:-}" ] \
+      || printf 'foreign-postgres|127.0.0.1:%s->5432/tcp\n' "$TEST_PORT"
+    ;;
+  *'up --build -d'*) exit "${TEST_DOCKER_UP_RC:-0}" ;;
+  *'logs --tail 50'*)
+    echo "fake compose diagnostics"
+    exit "${TEST_DOCKER_LOGS_RC:-0}"
     ;;
 esac
 EOF
 chmod +x "$check_dir/bin/docker"
+
+cat >"$check_dir/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+# A successful startup reaches one health probe, which must stay hermetic too.
+exit 0
+EOF
+chmod +x "$check_dir/bin/curl"
 
 python3 - <<'PY' >"$check_dir/port" &
 import socket
@@ -183,3 +201,74 @@ if ! grep -Fq 'ci_local_choose_compose_ingest_port "$dlog"' scripts/ci-local.sh;
 fi
 
 echo "ok (ci-local selected and logged free ingest host port $selected_port; occupied 18088 ignored)"
+
+# A compose startup error used to leave before the health-timeout logger could
+# run. Drive the whole up script with fake Docker and curl commands so startup
+# diagnostics and status propagation stay covered without a daemon.
+run_up_scenario() {
+  env PATH="$check_dir/bin:$PATH" \
+    TEST_DOCKER_CALLS="$check_dir/docker.calls" \
+    TEST_DOCKER_UP_RC="$1" TEST_DOCKER_LOGS_RC="$2" \
+    TEST_PROJECT_PORTS='0.0.0.0:25331->5432/tcp, 0.0.0.0:25332->9000/tcp, 0.0.0.0:25333->9001/tcp, 0.0.0.0:25334->8088/tcp, 0.0.0.0:25335->4317/tcp, 0.0.0.0:25336->9100/tcp, 0.0.0.0:25337->9101/tcp, 0.0.0.0:25338->8089/tcp, 0.0.0.0:25339->9105/tcp, 0.0.0.0:25340->9090/tcp' \
+    SIGLAKE_PG_HOST_PORT=25331 \
+    SIGLAKE_MINIO_HOST_PORT=25332 \
+    SIGLAKE_MINIO_CONSOLE_HOST_PORT=25333 \
+    SIGLAKE_INGEST_HOST_PORT=25334 \
+    SIGLAKE_OTLP_GRPC_HOST_PORT=25335 \
+    SIGLAKE_INGEST_METRICS_HOST_PORT=25336 \
+    SIGLAKE_COMPACTOR_METRICS_HOST_PORT=25337 \
+    SIGLAKE_QUERY_HOST_PORT=25338 \
+    SIGLAKE_QUERY_METRICS_HOST_PORT=25339 \
+    SIGLAKE_PROMETHEUS_HOST_PORT=25340 \
+    scripts/up.sh 2>&1
+}
+
+: >"$check_dir/docker.calls"
+startup_rc=0
+output=$(run_up_scenario 23 0) || startup_rc=$?
+if [ "$startup_rc" -ne 23 ]; then
+  echo "FAIL compose startup failure returned $startup_rc instead of 23" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+if [[ $output != *"docker compose startup failed; recent service logs:"* ]] \
+  || [[ $output != *"fake compose diagnostics"* ]]; then
+  echo "FAIL compose startup failure did not print service diagnostics" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+if ! grep -Fq 'logs --tail 50' "$check_dir/docker.calls"; then
+  echo "FAIL compose startup failure did not request service logs" >&2
+  exit 1
+fi
+
+: >"$check_dir/docker.calls"
+startup_rc=0
+output=$(run_up_scenario 24 42) || startup_rc=$?
+if [ "$startup_rc" -ne 24 ]; then
+  echo "FAIL diagnostic collection failure masked startup status 24 as $startup_rc" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+if ! grep -Fq 'logs --tail 50' "$check_dir/docker.calls"; then
+  echo "FAIL failed diagnostic collection was not attempted" >&2
+  exit 1
+fi
+
+: >"$check_dir/docker.calls"
+if ! output=$(run_up_scenario 0 0); then
+  echo "FAIL successful compose startup no longer completes" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+if [[ $output != *"siglake stress-test environment is up."* ]]; then
+  echo "FAIL successful compose startup lost its connection summary" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+if grep -Fq 'logs --tail 50' "$check_dir/docker.calls"; then
+  echo "FAIL successful compose startup requested failure diagnostics" >&2
+  exit 1
+fi
+
+echo "ok (compose startup failures retain status and print best-effort service logs)"
