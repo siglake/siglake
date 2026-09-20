@@ -107,6 +107,26 @@ def scrape_time(sample: dict[str, Any]) -> dt.datetime | None:
     return dt.datetime.fromtimestamp(min(stamps), dt.timezone.utc)
 
 
+def series_scrape_times(
+    sample: dict[str, Any], field: str
+) -> dict[str, dt.datetime] | None:
+    """Prometheus scrape generation for each pod in one numeric series."""
+    rows = sample.get(field)
+    if not isinstance(rows, list) or not rows:
+        return None
+    result: dict[str, dt.datetime] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("pod"), str):
+            return None
+        stamp = row.get("sample_time")
+        if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+            return None
+        if row["pod"] in result:
+            return None
+        result[row["pod"]] = dt.datetime.fromtimestamp(float(stamp), dt.timezone.utc)
+    return result
+
+
 def process_states(sample: dict[str, Any]) -> list[dict[str, str]] | None:
     """The `pid/state/starttime` rows the pause window observed, if usable."""
     observation = sample.get("postgres")
@@ -132,7 +152,72 @@ class Observation:
     backlog: dict[str, float]
     completions: dict[str, float]
     scraped_at: dt.datetime | None
+    backlog_scraped_at: dict[str, dt.datetime] | None
     processes: list[dict[str, str]] | None
+
+
+def recovery_drain_interval(
+    observations: list[Observation],
+    expected_pods: set[str],
+    restoration_applied: RecordedStamp | None,
+) -> tuple[dt.datetime | None, dict[str, Any] | None]:
+    """Bracket a positive-to-zero recovery episode by scrape generations.
+
+    Poll timestamps cannot date the state Prometheus returned. A drain is
+    supported only after every expected pod has an advancing all-zero scrape
+    newer than the latest positive scrape in the episode. Repeated instant
+    queries against one scrape generation therefore neither narrow nor invent
+    an interval.
+    """
+    if not expected_pods or restoration_applied is None:
+        return None, None
+
+    latest_positive_scrape: dt.datetime | None = None
+    for observation in observations:
+        scrape_times = observation.backlog_scraped_at
+        if scrape_times is None or expected_pods - scrape_times.keys():
+            continue
+
+        for pod in expected_pods:
+            if observation.backlog.get(pod, 0) > 0:
+                stamp = scrape_times[pod]
+                if latest_positive_scrape is None or stamp > latest_positive_scrape:
+                    latest_positive_scrape = stamp
+
+        if (
+            observation.phase != "recovery"
+            or latest_positive_scrape is None
+            or any(observation.backlog.get(pod) != 0 for pod in expected_pods)
+        ):
+            continue
+
+        zero_scrapes = [scrape_times[pod] for pod in expected_pods]
+        if any(stamp <= latest_positive_scrape for stamp in zero_scrapes):
+            continue
+        if any(stamp < restoration_applied.until for stamp in zero_scrapes):
+            continue
+
+        last_zero_scrape = max(zero_scrapes)
+        lower_seconds = max(
+            0.0,
+            (latest_positive_scrape - restoration_applied.until).total_seconds(),
+        )
+        upper_seconds = (
+            last_zero_scrape - restoration_applied.at
+        ).total_seconds()
+        return observation.at, {
+            "lower_bound": lower_seconds,
+            "upper_bound": upper_seconds,
+            "restoration_boundary": "restoration_applied_at",
+            "last_positive_scrape_at": latest_positive_scrape.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "all_pods_zero_by_scrape_at": last_zero_scrape.isoformat().replace(
+                "+00:00", "Z"
+            ),
+        }
+
+    return None, None
 
 
 def grade_pause(
@@ -603,6 +688,7 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
                     backlog=backlog,
                     completions=completions,
                     scraped_at=scrape_time(sample),
+                    backlog_scraped_at=series_scrape_times(sample, "backlog"),
                     processes=process_states(sample),
                 )
             )
@@ -768,13 +854,11 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
             problems.extend(drain_problems)
 
     drained_at: dt.datetime | None = None
+    time_to_drain_seconds: dict[str, Any] | None = None
     if positive and restored_at:
-        first_positive_at = positive[0][0]
-        for observation in parsed_samples:
-            if observation.at >= max(first_positive_at, restored_at) and observation.phase == "recovery" and expected_set:
-                if all(observation.backlog.get(pod) == 0 for pod in expected_set):
-                    drained_at = observation.at
-                    break
+        drained_at, time_to_drain_seconds = recovery_drain_interval(
+            parsed_samples, expected_set, restoration_applied_stamp
+        )
         if drained_at is None:
             problems.append("the observed backlog did not drain after restoration")
 
@@ -822,13 +906,7 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
         "peak_backlog_by_pod": peak_by_pod,
         "first_backlog_at": positive[0][0].isoformat().replace("+00:00", "Z") if positive else None,
         "drained_at": drained_at.isoformat().replace("+00:00", "Z") if drained_at else None,
-        # Undefined when the backlog reached zero before restoration: there is
-        # then no restoration-to-drain interval to report.
-        "time_to_drain_seconds": (
-            (drained_at - restored_at).total_seconds()
-            if drained_at and restored_at and pre_restoration_drain is None
-            else None
-        ),
+        "time_to_drain_seconds": time_to_drain_seconds,
         "pre_restoration_drain": pre_restoration_drain,
         "job_commit_times": commit_times,
         "outage_samples_with_process_state": observed_outage_states,
