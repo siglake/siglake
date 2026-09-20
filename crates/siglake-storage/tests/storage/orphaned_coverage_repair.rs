@@ -141,12 +141,29 @@ async fn seed(dir: &std::path::Path) -> Arc<IcebergContext> {
     ice
 }
 
+/// One row-conserving re-cluster commit, which is all the properties below ask
+/// of it. It rewrites ONE day partition, not the whole table: the seeded span is
+/// `SPAN_SECS` (about 42 days), and `recluster_files` takes one partition value
+/// per call (#4720). The largest live group is chosen so the rewrite merges
+/// files where the fixture has more than one in a day; a group of one is still a
+/// rewrite commit, which is what a repeated call gets.
 async fn recluster(ice: &IcebergContext) {
     let ident = ice.index_table_ident(INDEX);
     let files = ice.live_data_files(&ident).await.unwrap();
     assert!(files.len() > 1, "need multiple files to re-cluster");
+    let mut groups: BTreeMap<String, Vec<_>> = BTreeMap::new();
+    for file in files {
+        groups
+            .entry(format!("{:?}", file.partition()))
+            .or_default()
+            .push(file);
+    }
+    let bin = groups
+        .into_values()
+        .max_by_key(|group| group.len())
+        .expect("a live partition to re-cluster");
     let bloom: Vec<&str> = vec!["host", "source", "sourcetype", "index"];
-    ice.recluster_files(&ident, files, &bloom).await.unwrap();
+    ice.recluster_files(&ident, bin, &bloom).await.unwrap();
 }
 
 /// The one incarnation directory holding this table's aggregate artifacts.

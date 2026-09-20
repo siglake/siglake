@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Re-cluster contract (breaking)**:
+  `IcebergContext::recluster_files{,_with}` now refuses a bin spanning two
+  partition values on every dispatch, not only the streaming ones (#4200).
+  The in-RAM merge accepted such a bin and split its output by partition value
+  correctly, but which merge a bin takes is decided by its size and the
+  `SIGLAKE_RECLUSTER_*` knobs, so the same call succeeded on a small table and
+  failed on a large one. The refusal happens before the catalog is read and
+  before any output is written; the error names the partition span and the
+  remedy. Callers group their files by partition value and call once per group,
+  which both shipped planners already do — no behaviour change for the
+  compactor or the operator. (#4720)
+
 - **Query audit (fix)**: a storage append that returns an error now charges
   `siglake_query_audit_dropped_total{reason="append"}` for every row in the
   abandoned batch, beside the existing single append-failure increment. The

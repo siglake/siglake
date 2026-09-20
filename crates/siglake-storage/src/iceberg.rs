@@ -9358,13 +9358,16 @@ fn recluster_should_stream(files: &[DataFile], merge: &ReclusterMergeOptions) ->
 /// `None` when the whole bin shares one partition value (including the
 /// unpartitioned case, where every value is the empty struct).
 ///
-/// This is the precondition [`IcebergContext::recluster_files_with`] enforces on
-/// its streaming dispatches: they write their output through one writer stamped
-/// with `files[0].partition()` (see `build_merge_output_writer`), so a bin
-/// spanning two day partitions would commit rows under the wrong partition value
-/// and a query whose timestamp predicate resolves against the other day prunes
-/// the file. The row-count guard cannot see it — the rows are all there, just
-/// unreachable.
+/// This is the precondition [`IcebergContext::recluster_files_with`] enforces at
+/// its entry point, whichever merge the bin would dispatch to. The streaming
+/// executors write their output through one writer stamped with
+/// `files[0].partition()` (see `build_merge_output_writer`), so a bin spanning
+/// two day partitions would commit rows under the wrong partition value and a
+/// query whose timestamp predicate resolves against the other day prunes the
+/// file. The row-count guard cannot see it — the rows are all there, just
+/// unreachable. The in-RAM concat splits by partition value instead, so it would
+/// be correct; it is held to the same precondition so that whether a mixed bin
+/// works does not depend on the bin's size (#4720).
 fn first_cross_partition_file(files: &[DataFile]) -> Option<usize> {
     let first = files.first()?.partition();
     files.iter().position(|f| f.partition() != first)
@@ -18271,9 +18274,9 @@ impl IcebergContext {
             None
         } else {
             // All input files share a partition value: `recluster_files_with`
-            // refuses a mixed bin before dispatching to either streaming
-            // executor (see `first_cross_partition_file`), and the delete-task
-            // survivor rewrite passes a single file. So one partition key drives
+            // refuses a mixed bin at its entry point, before any dispatch (see
+            // `first_cross_partition_file`), and the delete-task survivor
+            // rewrite passes a single file. So one partition key drives
             // the whole output. Stamping it from `files[0]` is only sound under
             // that precondition — a mixed bin would land the other partition's
             // rows behind a wrong manifest partition value, where a predicated
@@ -18802,10 +18805,9 @@ impl IcebergContext {
     /// Re-cluster one bin of data files into time-sorted replacement output and
     /// commit the rewrite.
     ///
-    /// Group `files` by partition value and call once per group. Only the in-RAM
-    /// merge can honour a bin spanning several partition values, and whether a
-    /// bin takes that path is decided by its size — see
-    /// [`Self::recluster_files_with`] for the full precondition.
+    /// Group `files` by partition value and call once per group: a bin spanning
+    /// several partition values is refused — see [`Self::recluster_files_with`]
+    /// for why.
     pub async fn recluster_files(
         &self,
         table_ident: &TableIdent,
@@ -18825,21 +18827,21 @@ impl IcebergContext {
     /// instead of the `SIGLAKE_RECLUSTER_*` environment (each `None` field still
     /// reads the environment). See [`ReclusterMergeOptions`] for why this exists.
     ///
-    /// Partitioning precondition: a bin should hold one partition value, and a
+    /// Partitioning precondition: `files` must hold ONE partition value, and a
     /// caller that bins its own files groups by partition value first — both
     /// shipped planners do ([`Self::recluster_pass`] and
-    /// [`Self::recluster_all_indexes`]).
+    /// [`Self::recluster_all_indexes`]). A mixed bin is refused before the
+    /// catalog is read and before any output is written, on every dispatch.
     ///
-    /// A mixed bin is honoured only by the in-RAM merge, which splits its output
-    /// by partition value (`write_batch_to_data_files`) and so writes one
-    /// correctly-stamped file per partition. The streaming executors cannot:
-    /// they write through a single writer stamped with one partition value, so a
-    /// mixed bin routed to them is REFUSED before any output is written (#4200 —
-    /// it used to commit rows under the wrong partition value, where a
-    /// timestamp-predicated query prunes them away while `count(*)` still counts
-    /// them). Dispatch is decided by bin size and the `SIGLAKE_RECLUSTER_*`
-    /// knobs, so a caller that cannot bound its bins must group by partition;
-    /// see `docs/LIMITATIONS.md`.
+    /// The streaming executors write through a single writer stamped with one
+    /// partition value, so a mixed bin used to commit rows under the wrong value,
+    /// where a timestamp-predicated query prunes them away while `count(*)` still
+    /// counts them (#4200). The in-RAM concat splits its output by partition
+    /// value (`write_batch_to_data_files`) and was correct on the same input, but
+    /// which of the two a bin takes is decided by its size and the
+    /// `SIGLAKE_RECLUSTER_*` knobs — so taking a mixed bin there made the
+    /// contract size-dependent. It is refused too (#4720); see
+    /// `docs/LIMITATIONS.md`.
     pub async fn recluster_files_with(
         &self,
         table_ident: &TableIdent,
@@ -18860,6 +18862,39 @@ impl IcebergContext {
                 bytes_in: 0,
                 bytes_out: 0,
             });
+        }
+
+        // One partition value per call, on every dispatch. The streaming
+        // executors write the whole merge through one writer stamped with
+        // `files[0].partition()`, so a bin straddling two day partitions would
+        // commit the second day's rows under the first day's value: rows
+        // conserved (the row-count guard below still passes), rows invisible,
+        // because a predicate that resolves to the real day prunes the file at
+        // the partition filter (#4200). The in-RAM concat splits its output by
+        // partition value and would have been correct, but which of the two a
+        // bin takes is decided by its size — so accepting a mixed bin there
+        // made the contract size-dependent, and a caller that developed against
+        // small tables met the error in production (#4720). Refuse here, before
+        // the catalog read and before the first output byte, rather than
+        // regroup: the caller's bin budgets (`max_pass_bytes`, the generation
+        // cap) are stated per output file, and silently turning one bin into N
+        // would break them.
+        if let Some(other) = first_cross_partition_file(&files) {
+            anyhow::bail!(
+                "re-cluster of {table_ident} was handed a bin spanning {} partitions: {} is \
+                 in partition {:?} but {} is in {:?}. A re-cluster writes one output \
+                 partition per call — group the files by partition value and call once per \
+                 group.",
+                files
+                    .iter()
+                    .map(|f| format!("{:?}", f.partition()))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                files[0].file_path(),
+                files[0].partition(),
+                files[other].file_path(),
+                files[other].partition(),
+            );
         }
 
         let table = self
@@ -18895,33 +18930,6 @@ impl IcebergContext {
         // Both re-sort into the table's declared (time-ascending) order; the
         // streaming path bounds decoded memory so an oversized bin can't OOM.
         let (added, rows, merge_path) = if recluster_should_stream(&files, merge) {
-            // Every streaming executor writes the whole merge through one
-            // writer stamped with `files[0].partition()`, so a bin straddling
-            // two day partitions would commit the second day's rows under the
-            // first day's partition value: rows conserved (the row-count guard
-            // below still passes), rows invisible, because a predicate that
-            // resolves to the real day prunes the file at the partition filter.
-            // Refuse here — before the first output byte is written and before
-            // the rewrite commit — rather than regroup: the caller's bin budgets
-            // (`max_pass_bytes`, the generation cap) are stated per output file,
-            // and silently turning one bin into N would break them.
-            if let Some(other) = first_cross_partition_file(&files) {
-                anyhow::bail!(
-                    "streaming re-cluster of {table_ident} was handed a bin spanning {} \
-                     partitions: {} is in partition {:?} but {} is in {:?}. The streaming \
-                     merge writes one output partition per call — group the files by \
-                     partition value and call once per group.",
-                    files
-                        .iter()
-                        .map(|f| format!("{:?}", f.partition()))
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .len(),
-                    files[0].file_path(),
-                    files[0].partition(),
-                    files[other].file_path(),
-                    files[other].partition(),
-                );
-            }
             let fanin = merge
                 .merge_fanin
                 .map(|n| n.max(2))
@@ -26085,7 +26093,12 @@ mod compaction_consolidation_tests {
         let ice = IcebergContext::open(&tmp.path().join("warehouse"))
             .await
             .unwrap();
-        let day0 = 1_700_000_000i64;
+        // Snapped to UTC midnight so `day0 + j % 86_400` stays inside ONE
+        // `day(timestamp)` partition: the bin is a single re-cluster call, and a
+        // call takes one partition value (#4200, #4720). The unsnapped base
+        // (1_700_000_000 = 22:13:20Z) put every append across midnight, so the
+        // bin was refused before it merged a row. Same 6.4M rows, same spread.
+        let day0 = 1_700_000_000i64 - (1_700_000_000i64 % 86_400);
         let k = 64usize;
         let rows_per = 100_000usize;
         for _ in 0..k {

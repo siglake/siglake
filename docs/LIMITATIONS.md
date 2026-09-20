@@ -1596,24 +1596,27 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   because a delete rewrite writes at generation 0 like an ingest flush. The
   consequence throughout is pruning: an unindexed or unbloomed file is scanned
   and row-evaluated instead of skipped, and returns exact rows.
-- **A re-cluster bin may span partitions only while it fits in RAM.**
+- **A re-cluster bin holds one partition value.**
   `IcebergContext::recluster_files_with` takes a bin of data files and merges
-  it into replacement output. The in-RAM merge splits its output by partition
-  value, so a bin holding two days rewrites into one correctly-stamped file
-  per day. The streaming executors — every rewrite past the in-RAM caps —
-  write through a single writer stamped with one partition value and cannot;
-  they now REFUSE a mixed bin before writing anything rather than commit rows
-  under the wrong partition value, where a timestamp-predicated query prunes
-  them away while `count(*)` still counts them (#4200). The dispatch is chosen
-  by bin size and the `SIGLAKE_RECLUSTER_*` knobs, so a caller that cannot
-  bound its bins must group by partition value and call once per group, as
-  both shipped planners (`recluster_pass`,
+  it into replacement output. A bin spanning two partition values is REFUSED
+  at the entry point, before the catalog read and before anything is written.
+  The streaming executors — every rewrite past the in-RAM caps — write through
+  a single writer stamped with one partition value, so a mixed bin used to
+  commit rows under the wrong value, where a timestamp-predicated query prunes
+  them away while `count(*)` still counts them (#4200). The in-RAM merge
+  splits its output by partition value and was correct on the same input, but
+  which of the two a bin takes is decided by its size and the
+  `SIGLAKE_RECLUSTER_*` knobs — so accepting a mixed bin there made the
+  contract size-dependent, and a caller that developed against small tables met
+  the error in production. Both are refused since #4720. Group by partition
+  value and call once per group, as both shipped planners (`recluster_pass`,
   `recluster_all_indexes{,_leveled}`) do. Automatic regrouping is deliberately
-  not done: bin budgets (`max_pass_bytes`, the rewrite-generation cap) are
-  stated per output file.
+  not done, on any dispatch: bin budgets (`max_pass_bytes`, the
+  rewrite-generation cap) are stated per output file, and turning one bin into
+  N would break them.
   `crates/siglake-storage/tests/storage/recluster_cross_partition.rs` pins the
-  refusal on each streaming dispatch, the in-RAM fan-out, and window
-  visibility either way.
+  refusal on all four dispatches, the grouped rewrite that replaces it, and
+  window visibility either way.
 - **Search v1 limits:** FTS pruning engages only on columns with index blobs
   (others row-eval); the current metadata path retains Puffin statistics
   registration after its data snapshot expires; strict mapping mode enforces
