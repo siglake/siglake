@@ -10,5 +10,4 @@
 - [ ] New behavior is covered by tests
 - [ ] Every commit is signed off (`git commit -s`; see CONTRIBUTING.md "Licensing and sign-off")
 
-<!-- If this defers something user-visible, add it to README "Things
-     deliberately not yet done". -->
+<!-- If this defers something user-visible, add it to docs/LIMITATIONS.md. -->

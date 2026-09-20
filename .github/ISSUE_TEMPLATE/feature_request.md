@@ -10,7 +10,7 @@ labels: enhancement
 
 ## Proposed solution
 
-<!-- If you have a shape in mind. Check README "Things deliberately not
-     yet done" first — it lists known deferrals and their reasoning. -->
+<!-- If you have a shape in mind, check docs/LIMITATIONS.md first. It lists
+     known deferrals and their reasoning. -->
 
 ## Alternatives considered

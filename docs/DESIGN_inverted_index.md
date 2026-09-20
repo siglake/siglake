@@ -28,14 +28,16 @@ Puffin index. **Slice C = AWS validation** remains: run
 
 ### Slice A — build at write time ✅
 
-The writer builds the index unless `SIGLAKE_INVERTED_INDEX=0` (Helm
-`compactor.invertedIndex.enabled: false`; operator
-`spec.extraEnv` with the same env opt-out). It indexes the events table's `raw`
-column and stamps the hex blob into the footer KV
+The in-memory writer builds the whole-file v1 footer index unless
+`SIGLAKE_INVERTED_INDEX=0` (Helm `compactor.invertedIndex.enabled: false`;
+operator `spec.extraEnv` with the same env opt-out). It indexes the events
+table's `raw` column and stamps the hex blob into the footer KV
 (`siglake_index::INVERTED_INDEX_KV_KEY`) at the single-writer + partition-split
-commit paths. Metrics `siglake_index_build_{seconds,bytes}`. The streaming
-re-cluster writer rebuilds the index for its committed output files, so both
-flush and re-cluster paths retain exact query results and indexed output.
+commit paths. Metrics `siglake_index_build_{seconds,bytes}`. Streaming
+re-cluster output carries row-group blooms and aggregate footers but no
+whole-file inverted index. It builds a seg2 sidecar one Parquet row group at a
+time and registers it in the rewrite transaction only when
+`SIGLAKE_SEGMENTED_INDEX_WRITES=1`, which defaults off.
 
 ### Post-rewrite Puffin rebuild ✅
 
@@ -52,8 +54,9 @@ Why off: a parsed index costs about 40 bytes per indexed row (≈294 MB for a
 `keyword_last25`, `keyword_last5` and `substring_scan` 2-45x over ceilings that
 were measured on the scan path on 2026-09-03. Nothing about reads changes:
 indexes already registered are still discovered and used, and the flush path's
-footer index is still written. Only new sidecars after a rewrite stop.
-Index-path performance is 0.1.1 work.
+footer index is still written. Only new sidecars after a rewrite stop. The
+redesign is a 0.2.0 boundary; none of its slices changes a 0.1.0 or 0.1.x
+default.
 
 Streaming rewrite outputs carry row-group blooms and aggregate footers but no
 whole-file inverted index, so they require a Puffin sidecar. In-memory rewrite
