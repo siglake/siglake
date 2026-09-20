@@ -31,7 +31,16 @@ case "$*" in
     [ -z "${TEST_PORT:-}" ] \
       || printf 'foreign-postgres|127.0.0.1:%s->5432/tcp\n' "$TEST_PORT"
     ;;
+  *'up -d garage'*) exit "${TEST_DOCKER_GARAGE_UP_RC:-0}" ;;
+  *'run --rm garage-init'*)
+    echo "fake garage-init attached output"
+    exit "${TEST_DOCKER_GARAGE_INIT_RC:-0}"
+    ;;
   *'up --build -d'*) exit "${TEST_DOCKER_UP_RC:-0}" ;;
+  *'logs --tail 50 garage'*)
+    echo "fake garage diagnostics"
+    exit "${TEST_DOCKER_GARAGE_LOGS_RC:-0}"
+    ;;
   *'logs --tail 50'*)
     echo "fake compose diagnostics"
     exit "${TEST_DOCKER_LOGS_RC:-0}"
@@ -272,3 +281,98 @@ if grep -Fq 'logs --tail 50' "$check_dir/docker.calls"; then
 fi
 
 echo "ok (compose startup failures retain status and print best-effort service logs)"
+
+# Garage starts in two steps before the main compose command. Cover each one
+# independently because `garage-init` is an attached, removed-on-exit container:
+# its own output is the only reliable initialization diagnostic after failure.
+run_garage_scenario() {
+  env PATH="$check_dir/bin:$PATH" \
+    TEST_DOCKER_CALLS="$check_dir/docker.calls" \
+    TEST_DOCKER_GARAGE_UP_RC="$1" TEST_DOCKER_GARAGE_INIT_RC="$2" \
+    TEST_DOCKER_GARAGE_LOGS_RC="$3" \
+    TEST_PROJECT_PORTS='0.0.0.0:25431->5432/tcp, 0.0.0.0:25432->9000/tcp, 0.0.0.0:25433->9001/tcp, 0.0.0.0:25434->8088/tcp, 0.0.0.0:25435->4317/tcp, 0.0.0.0:25436->9100/tcp, 0.0.0.0:25437->9101/tcp, 0.0.0.0:25438->8089/tcp, 0.0.0.0:25439->9105/tcp, 0.0.0.0:25440->9090/tcp, 0.0.0.0:25441->3900/tcp, 0.0.0.0:25442->3903/tcp' \
+    SIGLAKE_OBJECT_STORE=garage \
+    SIGLAKE_PG_HOST_PORT=25431 \
+    SIGLAKE_MINIO_HOST_PORT=25432 \
+    SIGLAKE_MINIO_CONSOLE_HOST_PORT=25433 \
+    SIGLAKE_INGEST_HOST_PORT=25434 \
+    SIGLAKE_OTLP_GRPC_HOST_PORT=25435 \
+    SIGLAKE_INGEST_METRICS_HOST_PORT=25436 \
+    SIGLAKE_COMPACTOR_METRICS_HOST_PORT=25437 \
+    SIGLAKE_QUERY_HOST_PORT=25438 \
+    SIGLAKE_QUERY_METRICS_HOST_PORT=25439 \
+    SIGLAKE_PROMETHEUS_HOST_PORT=25440 \
+    SIGLAKE_GARAGE_HOST_PORT=25441 \
+    SIGLAKE_GARAGE_ADMIN_HOST_PORT=25442 \
+    scripts/up.sh 2>&1
+}
+
+: >"$check_dir/docker.calls"
+garage_rc=0
+output=$(run_garage_scenario 31 0 0) || garage_rc=$?
+if [ "$garage_rc" -ne 31 ]; then
+  echo "FAIL garage startup failure returned $garage_rc instead of 31" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+if [[ $output != *"garage startup failed; recent garage logs:"* ]] \
+  || [[ $output != *"fake garage diagnostics"* ]]; then
+  echo "FAIL garage startup failure did not print garage diagnostics" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+if ! grep -Fq 'logs --tail 50 garage' "$check_dir/docker.calls"; then
+  echo "FAIL garage startup failure did not request garage logs" >&2
+  exit 1
+fi
+if grep -Fq 'run --rm garage-init' "$check_dir/docker.calls"; then
+  echo "FAIL garage startup failure continued to garage-init" >&2
+  exit 1
+fi
+
+: >"$check_dir/docker.calls"
+garage_rc=0
+output=$(run_garage_scenario 0 32 0) || garage_rc=$?
+if [ "$garage_rc" -ne 32 ]; then
+  echo "FAIL garage-init failure returned $garage_rc instead of 32" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+if [[ $output != *"fake garage-init attached output"* ]] \
+  || [[ $output != *"garage initialization failed; recent garage logs:"* ]] \
+  || [[ $output != *"fake garage diagnostics"* ]]; then
+  echo "FAIL garage-init failure did not retain attached output and garage diagnostics" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+
+: >"$check_dir/docker.calls"
+garage_rc=0
+output=$(run_garage_scenario 0 33 47) || garage_rc=$?
+if [ "$garage_rc" -ne 33 ]; then
+  echo "FAIL garage diagnostic collection failure masked garage-init status 33 as $garage_rc" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+if ! grep -Fq 'logs --tail 50 garage' "$check_dir/docker.calls"; then
+  echo "FAIL failed garage diagnostic collection was not attempted" >&2
+  exit 1
+fi
+
+: >"$check_dir/docker.calls"
+if ! output=$(run_garage_scenario 0 0 0); then
+  echo "FAIL successful garage startup no longer completes" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+if [[ $output != *"siglake stress-test environment is up."* ]]; then
+  echo "FAIL successful garage startup lost its connection summary" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+if grep -Fq 'logs --tail 50 garage' "$check_dir/docker.calls"; then
+  echo "FAIL successful garage startup requested failure diagnostics" >&2
+  exit 1
+fi
+
+echo "ok (garage startup failures retain status and print best-effort garage logs)"
