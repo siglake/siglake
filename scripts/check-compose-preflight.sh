@@ -131,7 +131,8 @@ if [[ $output != *"$expected"* ]]; then
   printf '%s\n' "$output" >&2
   exit 1
 fi
-output=$(PATH="$check_dir/bin:$PATH" SIGLAKE_GARAGE_HOST_PORT=99999 \
+output=$(PATH="$check_dir/bin:$PATH" SIGLAKE_OBJECT_STORE=minio \
+  SIGLAKE_GARAGE_HOST_PORT=99999 \
   scripts/up.sh --preflight-only 2>&1) || true
 if [[ $output == *SIGLAKE_GARAGE_HOST_PORT* ]]; then
   echo "FAIL compose preflight checked the garage ports in the default minio arm" >&2
