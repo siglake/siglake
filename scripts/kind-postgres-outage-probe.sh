@@ -77,45 +77,104 @@ done
 # node-signal-snippet-begin
 POSTGRES_NODE_SIGNAL_SNIPPET='
 signal=$1
-pid=$2
-starttime=$3
-pid_namespace=$4
-container_id=$5
-[ "$(cat "/proc/$pid/comm" 2>/dev/null || true)" = postgres ] || {
-  echo "PID $pid is no longer postgres" >&2
-  exit 1
+init_pid=$2
+container_id=$3
+identities=$4
+tab=$(printf "\t")
+
+signal_one() {
+  pid=$1
+  starttime=$2
+  pid_namespace=$3
+  [ "$(cat "/proc/$pid/comm" 2>/dev/null || true)" = postgres ] || {
+    echo "PID $pid is no longer postgres" >&2
+    return 1
+  }
+  [ "$(readlink "/proc/$pid/ns/pid" 2>/dev/null || true)" = "$pid_namespace" ] || {
+    echo "PID $pid changed PID namespace" >&2
+    return 1
+  }
+  grep -Fq -- "$container_id" "/proc/$pid/cgroup" || {
+    echo "PID $pid is outside container $container_id" >&2
+    return 1
+  }
+  line=$(cat "/proc/$pid/stat")
+  rest=${line##*") "}
+  [ "$(printf %s "$rest" | cut -d" " -f20)" = "$starttime" ] || {
+    echo "PID $pid was replaced" >&2
+    return 1
+  }
+  kill "-$signal" "$pid"
 }
-[ "$(readlink "/proc/$pid/ns/pid" 2>/dev/null || true)" = "$pid_namespace" ] || {
-  echo "PID $pid changed PID namespace" >&2
-  exit 1
-}
-grep -Fq -- "$container_id" "/proc/$pid/cgroup" || {
-  echo "PID $pid is outside container $container_id" >&2
-  exit 1
-}
-line=$(cat "/proc/$pid/stat")
-rest=${line##*") "}
-[ "$(printf %s "$rest" | cut -d" " -f20)" = "$starttime" ] || {
-  echo "PID $pid was replaced" >&2
-  exit 1
-}
-kill "-$signal" "$pid"
+
+started_at=
+status=0
+if [ "$signal" = STOP ]; then
+  first=1
+  while IFS="$tab" read -r pid _ starttime pid_namespace; do
+    [ -n "$pid" ] || continue
+    if [ "$first" -eq 1 ]; then
+      [ "$pid" = "$init_pid" ] || {
+        echo "the Postgres postmaster is not first in the signal set" >&2
+        exit 1
+      }
+      started_at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+      first=0
+    fi
+    # Stopping the postmaster first prevents it from forking another backend
+    # while the remaining recorded identities are checked and stopped.
+    signal_one "$pid" "$starttime" "$pid_namespace" || exit $?
+  done <<EOF
+$identities
+EOF
+else
+  # Resume every child before the postmaster. Accumulate identity failures so
+  # cleanup still attempts every process selected by the pause.
+  started_at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+  while IFS="$tab" read -r pid _ starttime pid_namespace; do
+    [ -n "$pid" ] || continue
+    [ "$pid" = "$init_pid" ] && continue
+    signal_one "$pid" "$starttime" "$pid_namespace" || status=1
+  done <<EOF
+$identities
+EOF
+  while IFS="$tab" read -r pid _ starttime pid_namespace; do
+    [ "$pid" = "$init_pid" ] || continue
+    signal_one "$pid" "$starttime" "$pid_namespace" || status=1
+  done <<EOF
+$identities
+EOF
+  [ "$status" -eq 0 ] || exit "$status"
+fi
+
 attempts=0
 while [ "$attempts" -lt 50 ]; do
-  line=$(cat "/proc/$pid/stat" 2>/dev/null || true)
-  if [ -z "$line" ] && [ "$signal" = CONT ]; then
-    exit 0
-  fi
-  rest=${line##*") "}
-  state=${rest%% *}
-  if { [ "$signal" = STOP ] && [ "$state" = T ]; } ||
-    { [ "$signal" = CONT ] && [ "$state" != T ]; }; then
+  ready=1
+  while IFS="$tab" read -r pid _ _ _; do
+    [ -n "$pid" ] || continue
+    line=$(cat "/proc/$pid/stat" 2>/dev/null || true)
+    if [ -z "$line" ]; then
+      [ "$signal" = CONT ] || ready=0
+      continue
+    fi
+    rest=${line##*") "}
+    state=${rest%% *}
+    if { [ "$signal" = STOP ] && [ "$state" != T ]; } ||
+      { [ "$signal" = CONT ] && [ "$state" = T ]; }; then
+      ready=0
+    fi
+  done <<EOF
+$identities
+EOF
+  if [ "$ready" -eq 1 ]; then
+    printf "started_at\t%s\napplied_at\t%s\n" \
+      "$started_at" "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
     exit 0
   fi
   attempts=$((attempts + 1))
   sleep 0.02
 done
-echo "PID $pid did not reach the state required by $signal" >&2
+echo "the Postgres process set did not reach the state required by $signal" >&2
 exit 1
 '
 # node-signal-snippet-end
@@ -125,11 +184,12 @@ node_processes() {
     node-process-list "$POSTGRES_CONTAINER_PID" "$POSTGRES_CONTAINER_ID"
 }
 
-signal_postgres_process() {
-  local signal=$1 pid=$2 starttime=$3 pid_namespace=$4
+signal_postgres_processes() {
+  local signal=$1 identities
+  identities=$(<"$POSTGRES_PROCESSES_FILE")
   docker exec "$POSTGRES_NODE" sh -eu -c "$POSTGRES_NODE_SIGNAL_SNIPPET" \
-    node-signal "$signal" "$pid" "$starttime" "$pid_namespace" \
-    "$POSTGRES_CONTAINER_ID"
+    node-signal-group "$signal" "$POSTGRES_CONTAINER_PID" \
+    "$POSTGRES_CONTAINER_ID" "$identities"
 }
 
 # Freeze the postmaster first so it cannot fork a new backend while the exact
@@ -151,9 +211,7 @@ pause_postgres_processes() {
   ((backend_count > 0)) || die "no established Postgres backend process found"
   POSTGRES_PID_NAMESPACE=$(awk -F '\t' 'NR == 1 { print $4 }' "$POSTGRES_PROCESSES_FILE")
 
-  while IFS=$'\t' read -r pid _ starttime pid_namespace; do
-    signal_postgres_process STOP "$pid" "$starttime" "$pid_namespace"
-  done <"$POSTGRES_PROCESSES_FILE"
+  signal_postgres_processes STOP
 
   node_processes >"$verified"
   awk -F '\t' '$2 == "T" { print $1 "\t" $3 "\t" $4 }' "$verified" | sort -n >"$verified.ids"
@@ -168,16 +226,7 @@ pause_postgres_processes() {
 # so one stale process cannot prevent restoration of the remaining set.
 continue_postgres_processes() {
   [[ -s "$POSTGRES_PROCESSES_FILE" ]] || return 0
-  local pid state starttime pid_namespace status=0
-  while IFS=$'\t' read -r pid state starttime pid_namespace; do
-    [[ "$pid" == "$POSTGRES_CONTAINER_PID" ]] && continue
-    signal_postgres_process CONT "$pid" "$starttime" "$pid_namespace" || status=1
-  done <"$POSTGRES_PROCESSES_FILE"
-  while IFS=$'\t' read -r pid state starttime pid_namespace; do
-    [[ "$pid" == "$POSTGRES_CONTAINER_PID" ]] || continue
-    signal_postgres_process CONT "$pid" "$starttime" "$pid_namespace" || status=1
-  done <"$POSTGRES_PROCESSES_FILE"
-  return "$status"
+  signal_postgres_processes CONT
 }
 
 # Read the exact process set the pause selected, one `pid<TAB>state<TAB>starttime`
@@ -581,14 +630,19 @@ done
 wait
 SUBMISSION_FINISHED_AT=$(iso_now)
 
-OUTAGE_STARTED_AT=$(iso_now)
 log "pause only $POSTGRES_POD for ${OUTAGE_SECONDS}s"
 POSTGRES_PAUSED=1
-pause_postgres_processes >/dev/null
-# The signal transition is bounded by OUTAGE_STARTED_AT and this stamp. The
-# grader also accounts for each stamp's retained millisecond precision, so a
-# commit that overlaps the transition remains unplaceable.
-PAUSE_APPLIED_AT=$(iso_now)
+pause_postgres_processes >"$TMP_DIR/pause-signal-boundaries"
+# These bounds are read inside the single kind-node exec, at the first signal
+# attempt and after every selected process reports stopped. The grader
+# accounts for their retained millisecond precision, so a commit that still
+# overlaps the transition remains unplaceable.
+OUTAGE_STARTED_AT=$(awk -F '\t' '$1 == "started_at" { print $2 }' \
+  "$TMP_DIR/pause-signal-boundaries")
+PAUSE_APPLIED_AT=$(awk -F '\t' '$1 == "applied_at" { print $2 }' \
+  "$TMP_DIR/pause-signal-boundaries")
+[[ -n "$OUTAGE_STARTED_AT" && -n "$PAUSE_APPLIED_AT" ]] ||
+  die "the Postgres pause did not return measured signal bounds"
 
 observed_positive=0
 write_probed=0
@@ -608,10 +662,14 @@ while ((SECONDS < outage_deadline)); do
   sleep "$SAMPLE_INTERVAL_SECONDS"
 done
 
-RESTORATION_STARTED_AT=$(iso_now)
 log "continue $POSTGRES_POD and wait for readiness"
-continue_postgres_processes >/dev/null
-RESTORATION_APPLIED_AT=$(iso_now)
+continue_postgres_processes >"$TMP_DIR/restoration-signal-boundaries"
+RESTORATION_STARTED_AT=$(awk -F '\t' '$1 == "started_at" { print $2 }' \
+  "$TMP_DIR/restoration-signal-boundaries")
+RESTORATION_APPLIED_AT=$(awk -F '\t' '$1 == "applied_at" { print $2 }' \
+  "$TMP_DIR/restoration-signal-boundaries")
+[[ -n "$RESTORATION_STARTED_AT" && -n "$RESTORATION_APPLIED_AT" ]] ||
+  die "the Postgres continuation did not return measured signal bounds"
 POSTGRES_PAUSED=0
 kubectl --context "$KUBE_CONTEXT" --request-timeout=125s -n "$NAMESPACE" wait \
   --for=condition=Ready "pod/$POSTGRES_POD" --timeout=120s >/dev/null

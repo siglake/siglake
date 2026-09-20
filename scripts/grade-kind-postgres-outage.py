@@ -617,9 +617,9 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
         timestamps.get("restoration_started_at"), "restoration_started_at", problems
     )
     ready_at = parse_stamp(timestamps.get("postgres_ready_at"), "postgres_ready_at", problems)
-    # Read after the exec that carries each signal, so they bound the interval a
-    # commit timestamp has to fall in to be a write taken while the processes
-    # were stopped.
+    # Read from the exec that carries each process-set signal, so they bound the
+    # interval a commit timestamp has to fall in to be a write taken while the
+    # processes were stopped.
     pause_applied_at = parse_stamp(
         timestamps.get("pause_applied_at"), "pause_applied_at", problems
     )
