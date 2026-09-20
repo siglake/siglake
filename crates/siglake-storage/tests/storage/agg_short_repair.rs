@@ -49,6 +49,13 @@ fn index_config(id: &str) -> IndexConfig {
                     },
                     required: false,
                 },
+                FieldMapping {
+                    name: "service".into(),
+                    field_type: FieldType::Text {
+                        tokenizer: Some("raw".into()),
+                    },
+                    required: false,
+                },
             ],
             timestamp_field: "timestamp".to_string(),
             // `host` is a declared dimension with 5,000 distinct values per
@@ -79,6 +86,11 @@ fn batch(cfg: &IndexConfig, nth: i64) -> RecordBatch {
                     .map(|i| format!("h-{:06}", nth * ROWS + i))
                     .collect::<Vec<_>>(),
             )),
+            std::sync::Arc::new(StringArray::from(
+                (0..ROWS)
+                    .map(|i| format!("svc-{:06}", nth * ROWS + i))
+                    .collect::<Vec<_>>(),
+            )),
             std::sync::Arc::new(StringArray::from(vec![None::<&str>; ROWS as usize])),
         ],
     )
@@ -101,6 +113,11 @@ fn wide_batch(cfg: &IndexConfig, nth: i64, rows: i64) -> RecordBatch {
             std::sync::Arc::new(StringArray::from(
                 (0..rows)
                     .map(|i| format!("h-{:08}", nth * rows + i))
+                    .collect::<Vec<_>>(),
+            )),
+            std::sync::Arc::new(StringArray::from(
+                (0..rows)
+                    .map(|i| format!("svc-{:08}", nth * rows + i))
                     .collect::<Vec<_>>(),
             )),
             std::sync::Arc::new(StringArray::from(vec![None::<&str>; rows as usize])),
@@ -458,9 +475,9 @@ async fn a_repair_carries_the_sketch_half_of_the_deltas_its_watermark_retires() 
             .map(|(_, outcome)| outcome.clone()),
         Some(ShortAggregateOutcome::Repaired {
             columns: vec!["host".to_string()],
-            unrestored: Vec::new()
+            unrestored: vec!["trace_id".to_string()]
         }),
-        "precondition: the exact half is what the census found and rebuilt"
+        "the exact half is rebuilt and the unavailable carried sketch is reported"
     );
     let wide = read_wide(&wh);
     let carried = wide.sketches.as_ref().expect("the sketch half is carried");
@@ -496,6 +513,106 @@ async fn a_repair_carries_the_sketch_half_of_the_deltas_its_watermark_retires() 
     assert_eq!(
         (approximate.rows_accounted, approximate.rows.len()),
         (SKETCH_ROWS, 1)
+    );
+}
+
+/// A census repair may recover one already-short sketch without making an
+/// unreadable sibling fatal. `timestamp_ns` is the production case: it is
+/// admitted as a typed group dimension, then its per-row-unique values exceed
+/// the footer cap, while the raw-page fallback deliberately supports only
+/// dictionary-encoded UTF-8.
+#[tokio::test]
+async fn a_repair_restores_a_short_sketch_beside_unreadable_timestamp_ns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wh = tmp.path().join("warehouse");
+    let ice = open(&wh).await;
+
+    for nth in 0..2i64 {
+        let base = 1_700_000_000 + nth * ROWS;
+        let events: Vec<Event> = (0..ROWS)
+            .map(|row| Event {
+                timestamp: Utc.timestamp_opt(base + row, 0).single().unwrap(),
+                host: format!("h-{:06}", nth * ROWS + row),
+                source: "src".into(),
+                sourcetype: if row % 2 == 0 {
+                    "app:json".into()
+                } else {
+                    "syslog".into()
+                },
+                index: "main".into(),
+                raw: "request".into(),
+                attributes: None,
+            })
+            .collect();
+        ice.append_events(&events).await.unwrap();
+    }
+    ice.fold_group_count_deltas(1).await.unwrap();
+    let table_rows = (2 * ROWS) as u64;
+
+    // Model a marker-era loss: one exact column and one sketch are already
+    // short. A second sketch is complete but cannot be recomputed from these
+    // files. The rebuild must correct what it can and retain that sibling.
+    let path = wide_path(&wh);
+    let mut wide = read_wide(&wh);
+    let mut exact = wide.decode_all().expect("the folded base is exact");
+    exact.columns.insert(
+        "host".to_string(),
+        counts("host", 1).columns.remove("host").unwrap(),
+    );
+    exact
+        .columns
+        .remove("sourcetype")
+        .expect("sourcetype starts exact");
+    wide.set_group_counts(Some(exact));
+    let mut sketches = GroupCountSketches {
+        version: GROUP_COUNT_SKETCH_VERSION,
+        columns: BTreeMap::new(),
+    };
+    sketches.columns.insert(
+        "sourcetype".to_string(),
+        ColumnSketch::from_exact(64, [("app:json".to_string(), 1)].into_iter().collect(), 1),
+    );
+    sketches.columns.insert(
+        "timestamp_ns".to_string(),
+        ColumnSketch::from_exact(
+            64,
+            [("1700000000000000000".to_string(), table_rows)]
+                .into_iter()
+                .collect(),
+            table_rows,
+        ),
+    );
+    wide.sketches = Some(sketches);
+    write_wide(&path, &wide);
+    ice.invalidate_cached_table(ice.events_table_ident()).await;
+
+    let outcomes = ice.repair_short_group_count_aggregates(1).await.unwrap();
+    assert_eq!(
+        outcomes,
+        vec![(
+            "events".to_string(),
+            ShortAggregateOutcome::Repaired {
+                columns: vec!["host".to_string()],
+                unrestored: vec!["timestamp_ns".to_string()],
+            }
+        )],
+        "the unreadable sketch is reported without failing the exact repair"
+    );
+
+    let repaired = read_wide(&wh);
+    let repaired_sketches = repaired.sketches.expect("both sketches remain");
+    assert_eq!(
+        repaired_sketches.columns["sourcetype"].rows, table_rows,
+        "the readable short sketch is rebuilt from every committed file"
+    );
+    assert_eq!(
+        repaired_sketches.columns["timestamp_ns"].rows, table_rows,
+        "the unavailable column keeps its carried state"
+    );
+    assert_eq!(
+        served(&ice, "events").await,
+        ("tier1_wide".to_string(), table_rows),
+        "the exact deficit is repaired in the same publication"
     );
 }
 
@@ -648,24 +765,20 @@ async fn a_recorded_column_is_skipped_without_reading_any_file() {
 /// ```
 ///
 /// The census must be cheap enough to run on a timer over every table, and the
-/// repair must be expensive enough to justify budgeting it. Recorded 2026-09-20
-/// on the dev box (release, local filesystem warehouse, 8 commits, one
-/// dimension column, one distinct value per row):
+/// repair must be expensive enough to justify budgeting it. The retained A/B
+/// uses matching warehouses: the control rebuild carries two sketches, while
+/// the restoration arm recomputes the readable one and carries the unavailable
+/// `timestamp_ns` sketch. Recorded 2026-09-20 on the dev box (release, local
+/// filesystem warehouse, 8 commits, two high-cardinality dimensions):
 ///
 /// ```text
-/// rows=40000  census=14.6ms  marker_put=1.1ms  marker_bytes=60  repair=65.1ms
-/// rows=400000 census=145.4ms marker_put=1.3ms  marker_bytes=60  repair=876.5ms
+/// rows=40000  carried_only=51.2ms  restoration=91.0ms   delta=39.7ms
+/// rows=400000 carried_only=792.5ms restoration=1432.5ms delta=640.0ms
 /// ```
 ///
-/// Both halves are linear in the column's distinct values — the census walks
-/// the base object, the repair reads the files — and the repair is ~6× the
-/// census per column. That sets both defaults. The census at 900 s costs
-/// milliseconds per table, so it can be unconditional. The repair extrapolates
-/// to ~9 minutes per column at 250M rows on a local filesystem, so a 22-column
-/// table is hours: it is opt-in, budgeted at one table per pass, and on a table
-/// that size the operator's `rebuild-group-counts` is still the tool (the
-/// compactor's 600 s watchdog would cut a repair that long and its trip counter
-/// is what says so).
+/// Each restorable sketch adds one Tier-2 query. That keeps restoration inside
+/// the existing opt-in, one-table repair budget; it does not add work to the
+/// census-only pass or the CLI.
 #[tokio::test]
 #[ignore = "measurement, not an assertion"]
 async fn measure_census_and_repair_cost() {
@@ -677,27 +790,11 @@ async fn measure_census_and_repair_cost() {
 async fn measure_one(rows_per_commit: i64) {
     const COMMITS: i64 = 8;
     let tmp = tempfile::tempdir().unwrap();
-    let wh = tmp.path().join("warehouse");
-    let ice = open(&wh).await;
-    let cfg = index_config("cost");
-    ice.create_index(&cfg).await.unwrap();
-    let ident = ice.index_table_ident("cost");
-
-    for n in 0..COMMITS {
-        ice.append_to_table(&ident, wide_batch(&cfg, n, rows_per_commit), &["host"])
-            .await
-            .unwrap();
-    }
-    // Lose the first commit's contribution, then fold: the base is short and
-    // the census has something to find.
-    let mut deltas: Vec<std::path::PathBuf> = aggregate_artifacts(&wh)
-        .into_iter()
-        .filter(|p| p.to_string_lossy().contains("siglake-agg-deltas"))
-        .collect();
-    deltas.sort();
-    std::fs::remove_file(&deltas[0]).unwrap();
-    ice.fold_group_count_deltas(1).await.unwrap();
-    ice.invalidate_cached_table(&ident).await;
+    let carry_wh = tmp.path().join("carry");
+    let restore_wh = tmp.path().join("restore");
+    let carry = prepare_cost_fixture(&carry_wh, "carry", rows_per_commit).await;
+    let ice = prepare_cost_fixture(&restore_wh, "restore", rows_per_commit).await;
+    let ident = ice.index_table_ident("restore");
 
     let started = std::time::Instant::now();
     let census = ice.repair_short_group_count_aggregates(0).await.unwrap();
@@ -719,7 +816,7 @@ async fn measure_one(rows_per_commit: i64) {
         .await
         .unwrap();
     let marker_ms = started.elapsed().as_secs_f64() * 1e3;
-    let marker = aggregate_artifacts(&wh)
+    let marker = aggregate_artifacts(&restore_wh)
         .into_iter()
         .find(|p| p.to_string_lossy().ends_with(".rebuild.json"))
         .expect("durable marker was written");
@@ -727,24 +824,99 @@ async fn measure_one(rows_per_commit: i64) {
 
     ice.invalidate_cached_table(&ident).await;
     let started = std::time::Instant::now();
+    let carry_report = carry.rebuild_group_count_aggregate("carry").await.unwrap();
+    let carried_only_ms = started.elapsed().as_secs_f64() * 1e3;
+    assert!(!carry_report.skipped_no_columns);
+    let carried = read_wide(&carry_wh).sketches.unwrap();
+    assert_eq!(carried.columns["service"].rows, 1);
+
+    let started = std::time::Instant::now();
     let repair = ice.repair_short_group_count_aggregates(1).await.unwrap();
-    let repair_ms = started.elapsed().as_secs_f64() * 1e3;
+    let restoration_ms = started.elapsed().as_secs_f64() * 1e3;
     assert!(
         matches!(
             repair.first().map(|(_, o)| o),
-            Some(ShortAggregateOutcome::Repaired { .. })
+            Some(ShortAggregateOutcome::Repaired { unrestored, .. })
+                if unrestored == &["timestamp_ns".to_string()]
         ),
         "{repair:?}"
+    );
+    let restored = read_wide(&restore_wh).sketches.unwrap();
+    assert_eq!(
+        restored.columns["service"].rows,
+        (COMMITS * rows_per_commit) as u64
     );
 
     let rows = (COMMITS * rows_per_commit) as f64;
     println!(
         "rows={rows:.0} commits={COMMITS} census={census_ms:.1}ms \
          marker_put={marker_ms:.1}ms marker_bytes={marker_bytes} \
-         repair={repair_ms:.1}ms ratio={:.0}x repair_per_100k_rows={:.0}ms",
-        repair_ms / census_ms.max(f64::MIN_POSITIVE),
-        repair_ms / rows * 100_000.0
+         carried_only={carried_only_ms:.1}ms restoration={restoration_ms:.1}ms \
+         restoration_delta={:.1}ms restoration_per_100k_rows={:.0}ms",
+        restoration_ms - carried_only_ms,
+        restoration_ms / rows * 100_000.0
     );
+}
+
+async fn prepare_cost_fixture(
+    wh: &std::path::Path,
+    index: &str,
+    rows_per_commit: i64,
+) -> IcebergContext {
+    const COMMITS: i64 = 8;
+    let ice = open(wh).await;
+    let cfg = index_config(index);
+    ice.create_index(&cfg).await.unwrap();
+    let ident = ice.index_table_ident(index);
+    for n in 0..COMMITS {
+        ice.append_to_table(
+            &ident,
+            wide_batch(&cfg, n, rows_per_commit),
+            &["host", "service"],
+        )
+        .await
+        .unwrap();
+    }
+    let mut deltas: Vec<std::path::PathBuf> = aggregate_artifacts(wh)
+        .into_iter()
+        .filter(|path| path.to_string_lossy().contains("siglake-agg-deltas"))
+        .collect();
+    deltas.sort();
+    std::fs::remove_file(&deltas[0]).unwrap();
+    ice.fold_group_count_deltas(1).await.unwrap();
+
+    let path = wide_path(wh);
+    let mut wide = read_wide(wh);
+    let mut exact = wide.decode_all().unwrap();
+    exact.columns.remove("service").unwrap();
+    wide.set_group_counts(Some(exact));
+    let table_rows = (COMMITS * rows_per_commit) as u64;
+    wide.sketches = Some(GroupCountSketches {
+        version: GROUP_COUNT_SKETCH_VERSION,
+        columns: BTreeMap::from([
+            (
+                "service".to_string(),
+                ColumnSketch::from_exact(
+                    64,
+                    [("svc-00000000".to_string(), 1)].into_iter().collect(),
+                    1,
+                ),
+            ),
+            (
+                "timestamp_ns".to_string(),
+                ColumnSketch::from_exact(
+                    64,
+                    [("1700000000000000000".to_string(), table_rows)]
+                        .into_iter()
+                        .collect(),
+                    table_rows,
+                ),
+            ),
+        ]),
+    });
+    write_wide(&path, &wide);
+    ice.invalidate_cached_table(&ident).await;
+    ice
 }
 
 /// Local reproduction for #4628: cancel the same census+repair future the

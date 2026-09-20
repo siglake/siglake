@@ -658,11 +658,17 @@ siglake rebuild-group-counts --namespace <ns> --table <table>
 
 Both automatic and operator-triggered rebuilds use the same exact per-file
 Tier-2 path as a query, record a `rebuilt_through` watermark so an old or late
-delta is not folded twice, and are safe to re-run. A census rebuild rebuilds the
-exact columns only, so it merges the sketch half of every delta that watermark
-retires into the base first — the fold deletes those deltas rather than folding
-them, and an approximate column's rows are not re-added by any later commit. They deliberately repair
-only the incarnation's `siglake-agg-wide.json`, not the inline
+delta is not folded twice, and are safe to re-run. A census rebuild recomputes
+each existing sketch as well as the exact columns. Sketches are independent: a
+column whose files return unavailable keeps its carried base-plus-delta state
+and is reported as unrestored, while a read error fails the rebuild. The
+events table's demoted `timestamp_ns` is the expected unavailable case; it does
+not prevent another short sketch from being corrected. The rebuild merges the
+sketch half of every delta its watermark retires before attempting replacements
+— the fold deletes those deltas rather than folding them, and no later commit
+re-adds their rows. Marker repair remains all-or-nothing and the CLI carries
+sketches without recomputing them. Rebuilds deliberately repair only the
+incarnation's `siglake-agg-wide.json`, not the inline
 `siglake-aggregates.json` object maintained by the commit path. A
 repaired column therefore reports `served_by: "tier1_wide"` even when it is
 below the 4096 inline cap, and a cold metadata cache may read and fold the wide
