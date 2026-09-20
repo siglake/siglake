@@ -1710,7 +1710,7 @@ pub struct SiglakeIcebergTableScan {
     /// promoted predicates — NOT time-only windows). Drives the ordered
     /// chain's prefetch decision; see `sequential_task_chain`.
     residual_filtered: bool,
-    /// Exact `(min, max)` of the `timestamp` column in epoch nanoseconds across
+    /// Exact `(min, max)` of the `timestamp` column in its Arrow time unit across
     /// the scanned files, from the manifest bounds — populated only for an
     /// unfiltered scan whose output schema includes `timestamp`. Reported as
     /// column statistics so DataFusion answers `min/max(timestamp)` with zero IO.
@@ -1772,11 +1772,64 @@ fn iceberg_field_id(field: &arrow_schema::Field) -> Option<i32> {
         .and_then(|v| v.parse().ok())
 }
 
-/// Global `(min, max)` of the `timestamp` column (epoch nanos) across the alive
-/// data files of `snapshot_id` (or the current snapshot), read from the manifest
-/// bounds. The manifests are already warm in the object cache from planning, so
-/// this is an in-memory re-walk, not extra IO. `None` if there's no snapshot or
-/// no file carries the bound.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GlobalTimestampBoundsCacheKey {
+    table_uuid: uuid::Uuid,
+    snapshot_id: i64,
+    field_id: i32,
+}
+
+const GLOBAL_TIMESTAMP_BOUNDS_CACHE_CAP: usize = 256;
+
+/// `(entries, insertion order)` for immutable-snapshot timestamp bounds.
+type GlobalTimestampBoundsCacheInner = (
+    HashMap<GlobalTimestampBoundsCacheKey, Option<(i64, i64)>>,
+    VecDeque<GlobalTimestampBoundsCacheKey>,
+);
+
+static GLOBAL_TIMESTAMP_BOUNDS_CACHE: OnceLock<std::sync::Mutex<GlobalTimestampBoundsCacheInner>> =
+    OnceLock::new();
+
+fn global_timestamp_bounds_cache() -> &'static std::sync::Mutex<GlobalTimestampBoundsCacheInner> {
+    GLOBAL_TIMESTAMP_BOUNDS_CACHE
+        .get_or_init(|| std::sync::Mutex::new((HashMap::new(), VecDeque::new())))
+}
+
+/// The outer `Option` distinguishes a cache miss from a cached snapshot with
+/// no timestamp bounds.
+fn global_timestamp_bounds_cache_get(
+    key: GlobalTimestampBoundsCacheKey,
+) -> Option<Option<(i64, i64)>> {
+    let guard = global_timestamp_bounds_cache().lock().ok()?;
+    guard.0.get(&key).copied()
+}
+
+fn global_timestamp_bounds_cache_put(
+    key: GlobalTimestampBoundsCacheKey,
+    bounds: Option<(i64, i64)>,
+) {
+    if let Ok(mut guard) = global_timestamp_bounds_cache().lock() {
+        let (map, order) = &mut *guard;
+        if map.insert(key, bounds).is_none() {
+            order.push_back(key);
+            while map.len() > GLOBAL_TIMESTAMP_BOUNDS_CACHE_CAP {
+                if let Some(old) = order.pop_front() {
+                    map.remove(&old);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Global `(min, max)` of the `timestamp` column across the alive data files of
+/// `snapshot_id` (or the current snapshot), read from the manifest bounds.
+/// Direct manifest loads bypass Iceberg's parsed-object cache, so retain the
+/// result by `(table UUID, snapshot, field id)`. Entries are pure functions of
+/// immutable snapshots and have no TTL; the bounded FIFO only ages old
+/// snapshots out. A failed manifest walk is not cached and can recover on the
+/// next plan. `None` if there's no snapshot or no file carries the bound.
 async fn global_timestamp_bounds(
     table: &Table,
     snapshot_id: Option<i64>,
@@ -1788,14 +1841,28 @@ async fn global_timestamp_bounds(
         Some(id) => meta.snapshot_by_id(id)?,
         None => meta.current_snapshot()?,
     };
-    let manifest_list = snapshot
+    let key = GlobalTimestampBoundsCacheKey {
+        table_uuid: meta.uuid(),
+        snapshot_id: snapshot.snapshot_id(),
+        field_id: ts_field_id,
+    };
+    if let Some(bounds) = global_timestamp_bounds_cache_get(key) {
+        return bounds;
+    }
+    let manifest_list = match snapshot
         .load_manifest_list(table.file_io(), &table.metadata_ref())
         .await
-        .ok()?;
+    {
+        Ok(manifest_list) => manifest_list,
+        Err(_) => return None,
+    };
     let mut min: Option<i64> = None;
     let mut max: Option<i64> = None;
     for mf in manifest_list.entries() {
-        let manifest = mf.load_manifest(table.file_io()).await.ok()?;
+        let manifest = match mf.load_manifest(table.file_io()).await {
+            Ok(manifest) => manifest,
+            Err(_) => return None,
+        };
         for entry in manifest.entries() {
             if !entry.is_alive() {
                 continue;
@@ -1813,10 +1880,12 @@ async fn global_timestamp_bounds(
             }
         }
     }
-    match (min, max) {
+    let bounds = match (min, max) {
         (Some(a), Some(b)) => Some((a, b)),
         _ => None,
-    }
+    };
+    global_timestamp_bounds_cache_put(key, bounds);
+    bounds
 }
 
 /// Whether this scan may load a per-file inverted index for its text
@@ -3765,14 +3834,11 @@ fn cluster_partition_inner(bounds: &[(i64, i64)], descending: bool) -> (Vec<usiz
     (idx, sizes)
 }
 
-/// Per-file `(min, max)` of the `timestamp` column (epoch nanos) for the alive
-/// data files of the scanned snapshot, keyed by data-file path — the per-file
-/// sibling of [`global_timestamp_bounds`]. The manifests are warm in the object
-/// cache from planning, so this is an in-memory re-walk, not extra IO. A file
-/// without both bounds is simply absent from the map.
 /// Per-file `sort_order_id` manifest stamps for the serving snapshot's live
 /// files (`None` per file = written before stamping existed). `None` overall
-/// = the manifest walk failed — the caller refuses the advertisement.
+/// = the manifest walk failed — the caller refuses the advertisement. These
+/// direct loads bypass Iceberg's parsed-object cache; the ordered-plan cache
+/// amortises the walk for an unchanged snapshot.
 async fn per_file_sort_order_ids(
     table: &Table,
     snapshot_id: Option<i64>,
@@ -3800,6 +3866,11 @@ async fn per_file_sort_order_ids(
     Some(out)
 }
 
+/// Per-file `(min, max)` of the `timestamp` column for the alive data files of
+/// the scanned snapshot, keyed by data-file path — the per-file sibling of
+/// [`global_timestamp_bounds`]. These direct loads bypass Iceberg's
+/// parsed-object cache; the ordered-plan cache amortises the walk for an
+/// unchanged snapshot. A file without both bounds is absent from the map.
 async fn per_file_timestamp_bounds(
     table: &Table,
     snapshot_id: Option<i64>,
