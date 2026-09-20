@@ -23,7 +23,7 @@ INGESTER_POD_LABEL_CAPTURE=1 scripts/kind-round.sh  # scale the ingester and ret
                                                     # per-pod label evidence
 COMPACTOR_POD_LABEL_CAPTURE=1 scripts/kind-round.sh # install two claim compactors and
                                                     # retain shared-queue evidence
-POSTGRES_OUTAGE_PROBE=1 scripts/kind-round.sh  # additionally measure persistent-job
+POSTGRES_OUTAGE_PROBE=1 scripts/kind-round.sh  # also measure persistent-job
                                               # backlog through a bounded PG pause
 scripts/kind-down.sh       # helm uninstall + kind delete cluster
 ```
@@ -76,7 +76,40 @@ Values at or below `4096` may leave panel 141's
 `siglake_group_count_deltas_folded_bucket` query without a series, in which
 case the panel check exits the round non-zero.
 
-`POSTGRES_OUTAGE_PROBE=1` additionally enables `query.jobs.persistent` for this
+The mirror-reclamation qualification is two separately launched rounds over
+one frozen source. Each launch must state the complete recipe; the script
+refuses a partial arm before creating a cluster:
+
+```bash
+KIND_ROUND_MIRROR_RECLAIM_ARM=off \
+KIND_ROUND_CATALOG_CLAIM_ENABLED=false \
+KIND_ROUND_WAL_MIRROR_ENABLED=true \
+KIND_ROUND_WAL_MIRROR_ACTIVE_INTERVAL_SECS=0 \
+KIND_ROUND_COMMITTED_RETENTION_SECS=901 \
+KIND_ROUND_MIRROR_LEDGER_RECLAIM=false \
+KIND_ROUND_LOAD_SECONDS=3600 \
+RESULTS_DIR=results/mirror-reclaim-qualification scripts/kind-round.sh
+
+KIND_ROUND_MIRROR_RECLAIM_ARM=on \
+KIND_ROUND_CATALOG_CLAIM_ENABLED=false \
+KIND_ROUND_WAL_MIRROR_ENABLED=true \
+KIND_ROUND_WAL_MIRROR_ACTIVE_INTERVAL_SECS=0 \
+KIND_ROUND_COMMITTED_RETENTION_SECS=901 \
+KIND_ROUND_MIRROR_LEDGER_RECLAIM=true \
+KIND_ROUND_LOAD_SECONDS=3600 \
+RESULTS_DIR=results/mirror-reclaim-qualification scripts/kind-round.sh
+```
+
+The arms write to `mirror-reclaim-off/` and `mirror-reclaim-on/` beneath the
+given results directory. Each directory retains the exact launch, rendered
+configuration, one-minute mirror object/byte and scoped `wal_segments` series,
+the retention-purge, unreclaimed, mark-error and committed-row counters, the
+actual load window, raw start/end compactor metrics, and sent-versus-Iceberg-
+committed row reconciliation. Pod identity and restart count accompany every
+counter sample. This mode changes no chart default and is off when
+`KIND_ROUND_MIRROR_RECLAIM_ARM` is unset.
+
+`POSTGRES_OUTAGE_PROBE=1` also enables `query.jobs.persistent` for this
 throwaway install, submits a bounded batch burst, pauses only the kind Postgres
 process, restores it under a shell trap, and retains
 `results/postgres-outage-reconnect.json`. That evidence pins the repository and

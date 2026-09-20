@@ -27,7 +27,11 @@ LOAD_EVENTS="${KIND_ROUND_EVENTS:-6000}"
   exit 1
 }
 LOAD_BATCH=500
-LOAD_SECONDS=330
+LOAD_SECONDS="${KIND_ROUND_LOAD_SECONDS:-330}"
+[[ "$LOAD_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'ERROR: KIND_ROUND_LOAD_SECONDS must be a positive integer\n' >&2
+  exit 1
+}
 STEADY_BATCH=64
 BENCH_DIR=bench
 QUERY_HEADLESS_SERVICE=siglake-query-headless
@@ -132,6 +136,79 @@ COMPACTOR_CAPTURE_BATCH_MAX_AGE_SECONDS=300
 # `app_kubernetes_io_instance` is the release name.
 RELEASE=siglake
 
+# #4953's two-arm mirror-prefix qualification is explicit and off by default.
+# Each arm is a separate kind round over the same frozen source. Stating every
+# value here makes the launch record self-contained; the exact qualification
+# recipe is checked below so an almost-correct arm cannot produce plausible
+# evidence. Ordinary rounds retain their previous effective configuration.
+MIRROR_RECLAIM_ARM="${KIND_ROUND_MIRROR_RECLAIM_ARM:-}"
+CATALOG_CLAIM_ENABLED="${KIND_ROUND_CATALOG_CLAIM_ENABLED:-true}"
+WAL_MIRROR_ENABLED="${KIND_ROUND_WAL_MIRROR_ENABLED:-true}"
+WAL_MIRROR_ACTIVE_INTERVAL_SECS="${KIND_ROUND_WAL_MIRROR_ACTIVE_INTERVAL_SECS:-0}"
+COMMITTED_RETENTION_SECS="${KIND_ROUND_COMMITTED_RETENTION_SECS:-86400}"
+MIRROR_LEDGER_RECLAIM="${KIND_ROUND_MIRROR_LEDGER_RECLAIM:-false}"
+for boolean_name in CATALOG_CLAIM_ENABLED WAL_MIRROR_ENABLED MIRROR_LEDGER_RECLAIM; do
+  boolean_value="${!boolean_name}"
+  [[ "$boolean_value" == true || "$boolean_value" == false ]] || {
+    printf 'ERROR: %s must be true or false\n' "$boolean_name" >&2
+    exit 1
+  }
+done
+[[ "$WAL_MIRROR_ACTIVE_INTERVAL_SECS" =~ ^[0-9]+$ ]] || {
+  printf 'ERROR: KIND_ROUND_WAL_MIRROR_ACTIVE_INTERVAL_SECS must be a non-negative integer\n' >&2
+  exit 1
+}
+[[ "$COMMITTED_RETENTION_SECS" =~ ^[0-9]+$ ]] || {
+  printf 'ERROR: KIND_ROUND_COMMITTED_RETENTION_SECS must be a non-negative integer\n' >&2
+  exit 1
+}
+case "$MIRROR_RECLAIM_ARM" in
+  '') ;;
+  off | on)
+    for incompatible_name in POSTGRES_OUTAGE_PROBE SCHEMA_ROLLBACK_PROBE \
+      INGESTER_POD_LABEL_CAPTURE COMPACTOR_POD_LABEL_CAPTURE; do
+      incompatible_value="${!incompatible_name}"
+      [[ "$incompatible_value" == 0 ]] || {
+        printf 'ERROR: mirror-reclaim qualification cannot run with %s=1\n' \
+          "$incompatible_name" >&2
+        exit 1
+      }
+    done
+    [[ "$CATALOG_CLAIM_ENABLED" == false ]] || {
+      printf 'ERROR: mirror-reclaim qualification requires KIND_ROUND_CATALOG_CLAIM_ENABLED=false\n' >&2
+      exit 1
+    }
+    [[ "$WAL_MIRROR_ENABLED" == true ]] || {
+      printf 'ERROR: mirror-reclaim qualification requires KIND_ROUND_WAL_MIRROR_ENABLED=true\n' >&2
+      exit 1
+    }
+    [[ "$WAL_MIRROR_ACTIVE_INTERVAL_SECS" == 0 ]] || {
+      printf 'ERROR: mirror-reclaim qualification requires KIND_ROUND_WAL_MIRROR_ACTIVE_INTERVAL_SECS=0\n' >&2
+      exit 1
+    }
+    [[ "$COMMITTED_RETENTION_SECS" == 901 ]] || {
+      printf 'ERROR: mirror-reclaim qualification requires KIND_ROUND_COMMITTED_RETENTION_SECS=901\n' >&2
+      exit 1
+    }
+    [[ "$LOAD_SECONDS" == 3600 ]] || {
+      printf 'ERROR: mirror-reclaim qualification requires KIND_ROUND_LOAD_SECONDS=3600\n' >&2
+      exit 1
+    }
+    expected_reclaim=false
+    [[ "$MIRROR_RECLAIM_ARM" == on ]] && expected_reclaim=true
+    [[ "$MIRROR_LEDGER_RECLAIM" == "$expected_reclaim" ]] || {
+      printf 'ERROR: mirror-reclaim arm %s requires KIND_ROUND_MIRROR_LEDGER_RECLAIM=%s\n' \
+        "$MIRROR_RECLAIM_ARM" "$expected_reclaim" >&2
+      exit 1
+    }
+    ;;
+  *)
+    printf 'ERROR: KIND_ROUND_MIRROR_RECLAIM_ARM must be off, on, or unset\n' >&2
+    exit 1
+    ;;
+esac
+MIRROR_RECLAIM_SAMPLE_SECONDS=60
+
 # Evidence the manager's read_results run collects: `deploy/aws-runner/run.sh`
 # rsyncs the snapshot's results/ back off the throwaway box.
 RESULTS_DIR="${RESULTS_DIR:-$ROOT/results}"
@@ -150,6 +227,16 @@ COMPACTOR_RAW_JSON="$RESULTS_DIR/compactor-pod-labels-raw.json"
 COMPACTOR_SAMPLE_TIMES_JSON="$RESULTS_DIR/compactor-pod-labels-sample-times.json"
 COMPACTOR_PER_POD_JSON="$RESULTS_DIR/compactor-pod-labels-per-pod.json"
 COMPACTOR_EXPRESSION_JSON="$RESULTS_DIR/compactor-pod-labels-expression.json"
+if [[ -n "$MIRROR_RECLAIM_ARM" ]]; then
+  MIRROR_RECLAIM_RESULTS_DIR="$RESULTS_DIR/mirror-reclaim-$MIRROR_RECLAIM_ARM"
+  MIRROR_RECLAIM_LAUNCH_JSON="$MIRROR_RECLAIM_RESULTS_DIR/launch.json"
+  MIRROR_RECLAIM_CONFIG_JSON="$MIRROR_RECLAIM_RESULTS_DIR/effective-config.json"
+  MIRROR_RECLAIM_SERIES_JSONL="$MIRROR_RECLAIM_RESULTS_DIR/measurements.jsonl"
+  MIRROR_RECLAIM_LOAD_JSON="$MIRROR_RECLAIM_RESULTS_DIR/load-window.json"
+  MIRROR_RECLAIM_ROWS_JSON="$MIRROR_RECLAIM_RESULTS_DIR/row-reconciliation.json"
+  MIRROR_RECLAIM_METRICS_START="$MIRROR_RECLAIM_RESULTS_DIR/compactor-metrics-start.prom"
+  MIRROR_RECLAIM_METRICS_END="$MIRROR_RECLAIM_RESULTS_DIR/compactor-metrics-end.prom"
+fi
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/siglake-kind-round.XXXXXX")"
 KIND_CLUSTER_OWNERSHIP_FILE="$TMP_DIR/kind-cluster-owned"
@@ -1758,6 +1845,383 @@ PY
   ((COMPACTOR_POD_LABEL_FAILURE == 0))
 }
 
+# --- #4953: filesystem-drain mirror-reclamation qualification ---------------
+MIRROR_RECLAIM_MC_POD=siglake-mirror-reclaim-mc
+MIRROR_RECLAIM_SAMPLE_OBJECTS=0
+MIRROR_RECLAIM_SAMPLE_BYTES=0
+MIRROR_RECLAIM_SAMPLE_LEDGER=0
+MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED=0
+MIRROR_RECLAIM_BASE_ROWS_COMMITTED=0
+MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH=0
+MIRROR_RECLAIM_LAST_SAMPLE_EPOCH=0
+MIRROR_RECLAIM_LOAD_STARTED_EPOCH=0
+MIRROR_RECLAIM_LOAD_FINISHED_EPOCH=0
+
+write_mirror_reclaim_launch() {
+  [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
+  mkdir -p "$MIRROR_RECLAIM_RESULTS_DIR"
+  python3 - "$MIRROR_RECLAIM_LAUNCH_JSON" "$MIRROR_RECLAIM_ARM" \
+    "$CATALOG_CLAIM_ENABLED" "$WAL_MIRROR_ENABLED" \
+    "$WAL_MIRROR_ACTIVE_INTERVAL_SECS" "$COMMITTED_RETENTION_SECS" \
+    "$MIRROR_LEDGER_RECLAIM" "$LOAD_SECONDS" "$MIRROR_RECLAIM_RESULTS_DIR" \
+    "$(git -C "$ROOT" rev-parse HEAD)" "$@" <<'PY'
+import json
+import sys
+
+(
+    path, arm, catalog_claim, mirror, active_interval, retention, reclaim,
+    load_seconds, results_dir, commit, *helm_args,
+) = sys.argv[1:]
+document = {
+    "schema": "siglake.kind.mirror_reclaim_launch.v1",
+    "arm": arm,
+    "source_commit": commit,
+    "results_directory": results_dir,
+    "inputs": {
+        "KIND_ROUND_MIRROR_RECLAIM_ARM": arm,
+        "KIND_ROUND_CATALOG_CLAIM_ENABLED": catalog_claim,
+        "KIND_ROUND_WAL_MIRROR_ENABLED": mirror,
+        "KIND_ROUND_WAL_MIRROR_ACTIVE_INTERVAL_SECS": int(active_interval),
+        "KIND_ROUND_COMMITTED_RETENTION_SECS": int(retention),
+        "KIND_ROUND_MIRROR_LEDGER_RECLAIM": reclaim,
+        "KIND_ROUND_LOAD_SECONDS": int(load_seconds),
+    },
+    "helm_command": [
+        "helm", "--kube-context", "<kind-context>", "upgrade", "--install",
+        "siglake", "deploy/helm/siglake", *helm_args,
+    ],
+}
+with open(path, "w", encoding="utf-8") as out:
+    json.dump(document, out, indent=2)
+    out.write("\n")
+PY
+}
+
+capture_mirror_reclaim_effective_config() {
+  [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
+  local helm_json="$TMP_DIR/mirror-reclaim-helm-values.json"
+  local ingester_json="$TMP_DIR/mirror-reclaim-ingester.json"
+  local compactor_json="$TMP_DIR/mirror-reclaim-compactor.json"
+  helm --kube-context "$KUBE_CONTEXT" get values siglake -n "$NAMESPACE" --all -o json \
+    >"$helm_json"
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get deployment siglake-ingester -o json \
+    >"$ingester_json"
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get deployment siglake-compactor -o json \
+    >"$compactor_json"
+  python3 - "$MIRROR_RECLAIM_CONFIG_JSON" "$MIRROR_RECLAIM_ARM" \
+    "$helm_json" "$ingester_json" "$compactor_json" <<'PY'
+import json
+import sys
+
+out_path, arm, helm_path, ingester_path, compactor_path = sys.argv[1:]
+values = json.load(open(helm_path, encoding="utf-8"))
+ingester = json.load(open(ingester_path, encoding="utf-8"))
+compactor = json.load(open(compactor_path, encoding="utf-8"))
+
+
+def container(deployment, name):
+    matches = [item for item in deployment["spec"]["template"]["spec"]["containers"]
+               if item["name"] == name]
+    if len(matches) != 1:
+        raise SystemExit(f"expected one {name} container, found {len(matches)}")
+    return matches[0]
+
+
+def env_map(item):
+    return {entry["name"]: entry.get("value") for entry in item.get("env", [])
+            if "value" in entry}
+
+
+ingester_container = container(ingester, "ingester")
+compactor_container = container(compactor, "compactor")
+ingester_env = env_map(ingester_container)
+compactor_env = env_map(compactor_container)
+selected = {
+    "compactor.catalogClaim.enabled": values["compactor"]["catalogClaim"]["enabled"],
+    "compactor.committedRetentionSecs": values["compactor"]["committedRetentionSecs"],
+    "compactor.mirrorLedgerReclaim": values["compactor"]["mirrorLedgerReclaim"],
+    "wal.mirror.enabled": values["wal"]["mirror"]["enabled"],
+    "wal.mirror.activeIntervalSecs": values["wal"]["mirror"]["activeIntervalSecs"],
+}
+expected = {
+    "compactor.catalogClaim.enabled": False,
+    "compactor.committedRetentionSecs": 901,
+    "compactor.mirrorLedgerReclaim": arm == "on",
+    "wal.mirror.enabled": True,
+    "wal.mirror.activeIntervalSecs": 0,
+}
+if selected != expected:
+    raise SystemExit(f"effective Helm values differ: expected={expected!r} got={selected!r}")
+if "--catalog-claim" in compactor_container.get("args", []):
+    raise SystemExit("filesystem-drain arm rendered --catalog-claim")
+if ingester_env.get("SIGLAKE_WAL_MIRROR_PREFIX") != values["wal"]["mirror"]["prefix"]:
+    raise SystemExit("ingester did not render the enabled WAL mirror prefix")
+if ingester_env.get("SIGLAKE_REMOTE_WAL_DRAIN") != "0":
+    raise SystemExit("ingester did not render the filesystem-drain arm")
+if "SIGLAKE_WAL_ACTIVE_MIRROR_INTERVAL_SECS" in ingester_env:
+    raise SystemExit("activeIntervalSecs=0 rendered an active-mirror interval")
+if compactor_env.get("SIGLAKE_COMMITTED_RETENTION_SECS") != "901":
+    raise SystemExit("compactor did not render committedRetentionSecs=901")
+if compactor_env.get("SIGLAKE_MIRROR_LEDGER_RECLAIM") != ("1" if arm == "on" else "0"):
+    raise SystemExit("compactor did not render the selected ledger-reclaim arm")
+
+document = {
+    "schema": "siglake.kind.mirror_reclaim_effective_config.v1",
+    "arm": arm,
+    "helm_values": selected,
+    "deployed": {
+        "ingester": {
+            "deployment_uid": ingester["metadata"]["uid"],
+            "wal_mirror_prefix": ingester_env["SIGLAKE_WAL_MIRROR_PREFIX"],
+            "remote_wal_drain": ingester_env["SIGLAKE_REMOTE_WAL_DRAIN"],
+            "active_mirror_interval_env": ingester_env.get(
+                "SIGLAKE_WAL_ACTIVE_MIRROR_INTERVAL_SECS"
+            ),
+        },
+        "compactor": {
+            "deployment_uid": compactor["metadata"]["uid"],
+            "args": compactor_container.get("args", []),
+            "committed_retention_secs": int(
+                compactor_env["SIGLAKE_COMMITTED_RETENTION_SECS"]
+            ),
+            "mirror_ledger_reclaim": compactor_env["SIGLAKE_MIRROR_LEDGER_RECLAIM"],
+        },
+    },
+}
+with open(out_path, "w", encoding="utf-8") as out:
+    json.dump(document, out, indent=2)
+    out.write("\n")
+PY
+}
+
+start_mirror_reclaim_observer() {
+  [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" run "$MIRROR_RECLAIM_MC_POD" \
+    --image=quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z \
+    --restart=Never --command -- sleep 7200 >/dev/null
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" wait \
+    --for=condition=Ready "pod/$MIRROR_RECLAIM_MC_POD" --timeout=120s >/dev/null
+  : >"$MIRROR_RECLAIM_SERIES_JSONL"
+}
+
+capture_mirror_reclaim_sample() {
+  [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
+  local now_epoch metrics_file objects_file ledger_file pod pod_uid restart_count
+  now_epoch=$(date +%s)
+  metrics_file="$TMP_DIR/mirror-reclaim-compactor.metrics"
+  objects_file="$TMP_DIR/mirror-reclaim-objects.jsonl"
+  ledger_file="$TMP_DIR/mirror-reclaim-ledger.tsv"
+  pod="$(kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get pod \
+    -l 'app.kubernetes.io/instance=siglake,app.kubernetes.io/component=compactor' \
+    --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')"
+  [[ -n "$pod" ]] || die "no compactor pod found for mirror-reclaim sample"
+  pod_uid="$(kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get pod "$pod" \
+    -o jsonpath='{.metadata.uid}')"
+  restart_count="$(kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get pod "$pod" \
+    -o jsonpath='{.status.containerStatuses[?(@.name=="compactor")].restartCount}')"
+  start_query_pod_forward "$pod" 19102 9101 mirror-reclaim
+  curl -fsS http://127.0.0.1:19102/metrics >"$metrics_file"
+  stop_active_forward
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" exec "$MIRROR_RECLAIM_MC_POD" -- \
+    sh -c 'mc alias set local http://minio:9000 minioadmin minioadmin --quiet && mc ls --recursive --json local/siglake-warehouse/warehouse/wal-mirror/' \
+    >"$objects_file"
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" exec postgres-0 -- \
+    psql -U siglake -d siglake -At -F $'\t' -c \
+    "SELECT status, count(*), coalesce(sum(rows), 0) FROM wal_segments WHERE tenant = 'default' AND index_id = '' GROUP BY status ORDER BY status" \
+    >"$ledger_file"
+  IFS=$'\t' read -r MIRROR_RECLAIM_SAMPLE_OBJECTS MIRROR_RECLAIM_SAMPLE_BYTES \
+    MIRROR_RECLAIM_SAMPLE_LEDGER MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED < <(
+    python3 - "$MIRROR_RECLAIM_SERIES_JSONL" "$MIRROR_RECLAIM_ARM" \
+      "$now_epoch" "$MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH" "$objects_file" \
+      "$ledger_file" "$metrics_file" "$pod" "$pod_uid" "$restart_count" <<'PY'
+import datetime
+import json
+import re
+import sys
+
+(
+    out_path, arm, epoch, first_epoch, objects_path, ledger_path, metrics_path,
+    pod, pod_uid, restart_count,
+) = sys.argv[1:]
+epoch = int(epoch)
+first_epoch = int(first_epoch) or epoch
+
+object_count = 0
+object_bytes = 0
+for raw in open(objects_path, encoding="utf-8"):
+    raw = raw.strip()
+    if not raw:
+        continue
+    item = json.loads(raw)
+    if item.get("type") == "file" or "size" in item:
+        object_count += 1
+        object_bytes += int(item.get("size", 0))
+
+ledger = {}
+ledger_rows = 0
+for raw in open(ledger_path, encoding="utf-8"):
+    status, count, rows = raw.rstrip("\n").split("\t")
+    ledger[status] = {"segments": int(count), "rows": int(rows)}
+    ledger_rows += int(count)
+
+metric_re = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([^\s]+)$")
+metrics = []
+for raw in open(metrics_path, encoding="utf-8"):
+    match = metric_re.match(raw.strip())
+    if match:
+        metrics.append(match.groups())
+
+
+def total(name, required=False, tenant=None):
+    found = []
+    for metric, labels, value in metrics:
+        if metric != name:
+            continue
+        if tenant is not None and f'tenant="{tenant}"' not in (labels or ""):
+            continue
+        found.append(float(value))
+    if required and not found:
+        raise SystemExit(f"required metric {name} is absent")
+    return sum(found)
+
+
+counters = {
+    "siglake_compactor_retention_purged_total": total(
+        "siglake_compactor_retention_purged_total"
+    ),
+    "siglake_compactor_mirror_unreclaimed_total": total(
+        "siglake_compactor_mirror_unreclaimed_total", required=True
+    ),
+    "siglake_compactor_mirror_mark_errors_total": total(
+        "siglake_compactor_mirror_mark_errors_total", required=True
+    ),
+    "siglake_compactor_rows_committed_total": total(
+        "siglake_compactor_rows_committed_total", tenant="default"
+    ),
+}
+document = {
+    "schema": "siglake.kind.mirror_reclaim_sample.v1",
+    "arm": arm,
+    "timestamp": datetime.datetime.fromtimestamp(
+        epoch, datetime.timezone.utc
+    ).isoformat().replace("+00:00", "Z"),
+    "unix_seconds": epoch,
+    "elapsed_seconds": epoch - first_epoch,
+    "mirror_prefix": {"objects": object_count, "bytes": object_bytes},
+    "wal_segments": {"scope": {"tenant": "default", "index_id": ""},
+                     "total": ledger_rows, "by_status": ledger},
+    "counters": counters,
+    "counter_process": {
+        "pod": pod, "pod_uid": pod_uid, "restart_count": int(restart_count)
+    },
+}
+with open(out_path, "a", encoding="utf-8") as out:
+    json.dump(document, out, separators=(",", ":"))
+    out.write("\n")
+print(
+    object_count, object_bytes, ledger_rows,
+    int(counters["siglake_compactor_rows_committed_total"]), sep="\t"
+)
+PY
+  )
+  if ((MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH == 0)); then
+    MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH=$now_epoch
+    MIRROR_RECLAIM_BASE_ROWS_COMMITTED=$MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED
+    cp "$metrics_file" "$MIRROR_RECLAIM_METRICS_START"
+  fi
+  MIRROR_RECLAIM_LAST_SAMPLE_EPOCH=$now_epoch
+  cp "$metrics_file" "$MIRROR_RECLAIM_METRICS_END"
+}
+
+finish_mirror_reclaim_evidence() {
+  [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
+  local sent_rows=$1 workload_rounds=$2 query_response query_rows deadline committed_rows
+  deadline=$((SECONDS + 300))
+  while ((SECONDS < deadline)); do
+    capture_mirror_reclaim_sample
+    if ((MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED - MIRROR_RECLAIM_BASE_ROWS_COMMITTED == sent_rows)); then
+      break
+    fi
+    sleep 10
+  done
+  committed_rows=$((MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED - MIRROR_RECLAIM_BASE_ROWS_COMMITTED))
+  ((committed_rows == sent_rows)) ||
+    die "mirror-reclaim row reconciliation did not drain: sent=${sent_rows} committed=${committed_rows}"
+  query_response="$(run_sql 'SELECT count(*) AS n FROM events')"
+  query_rows="$(printf '%s' "$query_response" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["rows"][0]["n"])')"
+  python3 - "$MIRROR_RECLAIM_LOAD_JSON" "$MIRROR_RECLAIM_ROWS_JSON" \
+    "$MIRROR_RECLAIM_ARM" "$MIRROR_RECLAIM_LOAD_STARTED_EPOCH" \
+    "$MIRROR_RECLAIM_LOAD_FINISHED_EPOCH" "$LOAD_SECONDS" "$workload_rounds" \
+    "$sent_rows" "$committed_rows" "$query_rows" \
+    "$MIRROR_RECLAIM_BASE_ROWS_COMMITTED" "$MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED" \
+    "$MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH" "$MIRROR_RECLAIM_LAST_SAMPLE_EPOCH" <<'PY'
+import datetime
+import json
+import sys
+
+(
+    load_path, rows_path, arm, started, finished, configured, rounds, sent,
+    committed, query_rows, counter_start, counter_end, sample_start, sample_end,
+) = sys.argv[1:]
+started, finished, configured, rounds, sent, committed, query_rows = map(
+    int, (started, finished, configured, rounds, sent, committed, query_rows)
+)
+counter_start, counter_end, sample_start, sample_end = map(
+    int, (counter_start, counter_end, sample_start, sample_end)
+)
+
+
+def stamp(epoch):
+    return datetime.datetime.fromtimestamp(
+        epoch, datetime.timezone.utc
+    ).isoformat().replace("+00:00", "Z")
+
+
+load = {
+    "schema": "siglake.kind.mirror_reclaim_load_window.v1",
+    "arm": arm,
+    "configured_seconds": configured,
+    "started_at": stamp(started),
+    "finished_at": stamp(finished),
+    "actual_seconds": finished - started,
+    "workload_rounds": rounds,
+    "sent_rows": sent,
+    "measurement_window": {
+        "started_at": stamp(sample_start), "finished_at": stamp(sample_end),
+        "seconds": sample_end - sample_start,
+    },
+}
+rows = {
+    "schema": "siglake.kind.mirror_reclaim_row_reconciliation.v1",
+    "arm": arm,
+    "sent_rows": sent,
+    "committed_rows": committed,
+    "difference": committed - sent,
+    "committed_evidence": {
+        "metric": "siglake_compactor_rows_committed_total{tenant=\"default\"}",
+        "counter_start": counter_start,
+        "counter_end": counter_end,
+        "counter_delta": counter_end - counter_start,
+        "meaning": "incremented only after a successful Iceberg commit",
+    },
+    "query_rows_after_committed_drain": query_rows,
+    "verified": committed == sent == query_rows,
+}
+if not rows["verified"]:
+    raise SystemExit(
+        f"row reconciliation differs: sent={sent} committed={committed} query={query_rows}"
+    )
+for path, document in ((load_path, load), (rows_path, rows)):
+    with open(path, "w", encoding="utf-8") as out:
+        json.dump(document, out, indent=2)
+        out.write("\n")
+PY
+  printf 'MIRROR_RECLAIM_EVIDENCE arm=%s directory=%s sent=%s committed=%s status=ok\n' \
+    "$MIRROR_RECLAIM_ARM" "${MIRROR_RECLAIM_RESULTS_DIR#"$ROOT/"}" \
+    "$sent_rows" "$committed_rows"
+}
+
 log "bring up the base kind deployment"
 KIND_CLUSTER_NAME="$CLUSTER_NAME" \
   KIND_CLUSTER_OWNERSHIP_FILE="$KIND_CLUSTER_OWNERSHIP_FILE" \
@@ -1780,16 +2244,18 @@ helm --kube-context "$KUBE_CONTEXT" upgrade --install keda kedacore/keda \
   --wait --timeout 10m
 
 log "upgrade Siglake with monitoring, mirror reconciliation and a ${QUERY_SCALE_BASE}-${QUERY_SCALE_TARGET} query KEDA range"
-helm --kube-context "$KUBE_CONTEXT" upgrade --install siglake \
-  "$ROOT/deploy/helm/siglake" \
+SIGLAKE_HELM_ARGS=(
   --namespace "$NAMESPACE" \
   --values "$ROOT/deploy/kind/values.kind.yaml" \
   --set prometheusRule.enabled=true \
   --set prometheusRule.labels.release="$PROM_RELEASE" \
   --set serviceMonitor.enabled=true \
   --set serviceMonitor.labels.release="$PROM_RELEASE" \
-  --set wal.mirror.enabled=true \
-  --set compactor.catalogClaim.enabled=true \
+  --set wal.mirror.enabled="$WAL_MIRROR_ENABLED" \
+  --set wal.mirror.activeIntervalSecs="$WAL_MIRROR_ACTIVE_INTERVAL_SECS" \
+  --set compactor.catalogClaim.enabled="$CATALOG_CLAIM_ENABLED" \
+  --set compactor.committedRetentionSecs="$COMMITTED_RETENTION_SECS" \
+  --set compactor.mirrorLedgerReclaim="$MIRROR_LEDGER_RECLAIM" \
   --set query.jobs.persistent="$PERSISTENT_JOB_STORE" \
   --set query.replicas="$QUERY_SCALE_BASE" \
   --set keda.enabled=true \
@@ -1802,14 +2268,22 @@ helm --kube-context "$KUBE_CONTEXT" upgrade --install siglake \
   --set keda.cooldownPeriodSeconds="$SCALE_COOLDOWN_SECONDS" \
   --set-string keda.prometheusServerAddress="http://${PROM_RELEASE}-prometheus.${PROM_NAMESPACE}.svc.cluster.local:9090" \
   --wait --timeout 10m
+)
+write_mirror_reclaim_launch "${SIGLAKE_HELM_ARGS[@]}"
+helm --kube-context "$KUBE_CONTEXT" upgrade --install siglake \
+  "$ROOT/deploy/helm/siglake" "${SIGLAKE_HELM_ARGS[@]}"
 
 kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" rollout status deployment/siglake-ingester --timeout=180s
 kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" rollout status deployment/siglake-compactor --timeout=180s
 kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" rollout status statefulset/siglake-query --timeout=180s
 
+capture_mirror_reclaim_effective_config
+start_mirror_reclaim_observer
+
 log "scrape pre-registered alerted counters before load"
 scrape_preregistered_zeros ingester 9100 19100
 scrape_preregistered_zeros compactor 9101 19101
+capture_mirror_reclaim_sample
 
 log "$(initial_load_description)"
 for ((offset = 0; offset < LOAD_EVENTS; offset += LOAD_BATCH)); do
@@ -1920,6 +2394,10 @@ mapfile -t WORKLOADS <"$TMP_DIR/workloads.tsv"
 init_scale_evidence
 started=$SECONDS
 deadline=$((SECONDS + LOAD_SECONDS))
+if [[ -n "$MIRROR_RECLAIM_ARM" ]]; then
+  MIRROR_RECLAIM_LOAD_STARTED_EPOCH=$(date +%s)
+  MIRROR_RECLAIM_NEXT_SAMPLE_EPOCH=$((MIRROR_RECLAIM_LOAD_STARTED_EPOCH + MIRROR_RECLAIM_SAMPLE_SECONDS))
+fi
 # The window runs on past LOAD_SECONDS only while the scale step still has a
 # transition outstanding, and never past this.
 SCALE_HARD_DEADLINE=$((deadline + SCALE_GRACE_SECONDS))
@@ -1942,12 +2420,21 @@ while ((SECONDS < deadline)) || [[ "$SCALE_PHASE" != done ]]; do
   run_sql 'SELECT raw, count(*) AS n FROM events GROUP BY raw ORDER BY n DESC LIMIT 10' >/dev/null
   rounds=$((rounds + 1))
   advance_query_scale
+  if [[ -n "$MIRROR_RECLAIM_ARM" ]] &&
+      (( $(date +%s) >= MIRROR_RECLAIM_NEXT_SAMPLE_EPOCH )); then
+    capture_mirror_reclaim_sample
+    MIRROR_RECLAIM_NEXT_SAMPLE_EPOCH=$((MIRROR_RECLAIM_LAST_SAMPLE_EPOCH + MIRROR_RECLAIM_SAMPLE_SECONDS))
+  fi
   sleep 1
 done
+if [[ -n "$MIRROR_RECLAIM_ARM" ]]; then
+  MIRROR_RECLAIM_LOAD_FINISHED_EPOCH=$(date +%s)
+fi
 printf 'WORKLOADS shapes=%s rounds=%s duration_seconds=%s elapsed_seconds=%s status=ok\n' \
   "${#WORKLOADS[@]}" "$rounds" "$LOAD_SECONDS" "$((SECONDS - started))"
 write_scale_evidence ||
   scale_failure "the scale evidence did not hold; see ${SCALE_JSON#"$ROOT/"}"
+finish_mirror_reclaim_evidence "$next_event" "$rounds"
 
 log "port-forward Prometheus and wait for its API"
 kubectl --context "$KUBE_CONTEXT" -n "$PROM_NAMESPACE" port-forward \

@@ -28,8 +28,10 @@ target=$(printf '%s\n' "$round_body" | sed -n 's/^COMPACTOR_SCALE_TARGET=\([0-9]
 [[ "$target" =~ ^[0-9]+$ ]] && ((target >= 2)) ||
   fail "$ROUND does not select at least two compactors"
 for setting in \
-  '--set wal.mirror.enabled=true' \
-  '--set compactor.catalogClaim.enabled=true' \
+  'WAL_MIRROR_ENABLED="${KIND_ROUND_WAL_MIRROR_ENABLED:-true}"' \
+  'CATALOG_CLAIM_ENABLED="${KIND_ROUND_CATALOG_CLAIM_ENABLED:-true}"' \
+  '--set wal.mirror.enabled="$WAL_MIRROR_ENABLED"' \
+  '--set compactor.catalogClaim.enabled="$CATALOG_CLAIM_ENABLED"' \
   '--set compactor.replicas="$COMPACTOR_SCALE_TARGET"' \
   '--set compactor.commitBatch.targetMb="$COMPACTOR_CAPTURE_BATCH_TARGET_MB"' \
   '--set compactor.commitBatch.maxAgeSecs="$COMPACTOR_CAPTURE_BATCH_MAX_AGE_SECONDS"'; do
