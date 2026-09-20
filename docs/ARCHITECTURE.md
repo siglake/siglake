@@ -1042,8 +1042,11 @@ storage append that stops answering costs its own batch instead of the audit
 service: the deadline releases that batch's retained budget, counts its rows
 under `reason="append_deadline"`, and the worker takes the rows behind it. The
 abandoned batch is never re-appended — the deadline cuts the await, not the
-commit that may already have landed — which is the `query_audit` table's one
-source of silent row loss under a healthy process. For batch jobs,
+commit that may already have landed. A storage append that returns an error
+also abandons its whole batch without retry, counts every row under
+`reason="append"`, and increments the append failure counter once. These are
+the `query_audit` table's two sources of whole-batch row loss under a healthy
+process. For batch jobs,
 `query_audit.duration_ms` measures the bounded run lifecycle from the moment the
 queued future starts on the dedicated batch runtime; it excludes both
 batch-runtime queue time and the HTTP `202` handoff. The jobs API exposes

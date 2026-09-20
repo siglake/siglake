@@ -514,9 +514,9 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
     // Query responses stay non-blocking when the best-effort audit path is
     // saturated or stopped. Pre-register every bounded reason so the first
     // whole-row refusal is visible to the dashboard's increase() reader.
-    // `append_deadline` is the one that is charged per row of an abandoned
-    // batch rather than per refused submit: the storage append outlived its
-    // service deadline and those rows are gone (#3438).
+    // `append` and `append_deadline` are charged per row of an abandoned batch
+    // rather than per refused submit: the storage append failed or outlived
+    // its service deadline and those rows are gone (#3438, #4669).
     AlertedCounter {
         name: "siglake_query_audit_dropped_total",
         series: &[
@@ -525,6 +525,7 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
             &[("reason", "byte_limit")],
             &[("reason", "channel_full")],
             &[("reason", "worker_shutdown")],
+            &[("reason", "append")],
             &[("reason", "append_deadline")],
         ],
     },
