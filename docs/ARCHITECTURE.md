@@ -199,6 +199,17 @@ claim on, and claim-mode HPA scaling there is CPU-only. It also refuses
 takes no claim and the chart renders none for it, and a rolling update alone
 puts two of them on one table.
 
+The kind evidence round has a default-off check for that shared-queue shape.
+It installs two compactors through the guarded chart path only after the
+round's ordinary observations, holds a positive sealed queue below a temporary
+commit-batch threshold, and retains the raw series, their Prometheus source
+sample times, the per-pod sums and the operator expression. Since the two
+processes refresh their gauges independently, the grade requires the same
+positive total across two advancing scrape generations; it does not treat one
+unequal sample during queue movement as a sharded queue. The offline fixture
+and grader are committed, while a live `kind_round` remains the acceptance
+step (`COMPACTOR_POD_LABEL_CAPTURE=1`, #5548).
+
 **What the mirror costs.** Measured on loopback against a filesystem-backed
 object store, five interleaved on/off pairs per shape, ack mode and WAL roll
 held constant (`docs/PERF_WAL_MIRROR_2026-09-11.md`, re-measured 2026-09-13 with

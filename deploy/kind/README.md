@@ -20,6 +20,8 @@ scripts/kind-round.sh      # Prometheus + KEDA load/evidence round (~6 minutes o
                            # plus up to 5 more for the 2→4→2 query scale step)
 INGESTER_POD_LABEL_CAPTURE=1 scripts/kind-round.sh  # scale the ingester and retain
                                                     # per-pod label evidence
+COMPACTOR_POD_LABEL_CAPTURE=1 scripts/kind-round.sh # install two claim compactors and
+                                                    # retain shared-queue evidence
 POSTGRES_OUTAGE_PROBE=1 scripts/kind-round.sh  # additionally measure persistent-job
                                               # backlog through a bounded PG pause
 scripts/kind-down.sh       # helm uninstall + kind delete cluster
@@ -144,6 +146,31 @@ gate) pins the captured expression against `prom.rs`, drives both the
 default-off path and the enabled capture against stand-in `kubectl`, `curl` and
 `git`, and runs the grader over one passing fixture and eight mutations of it;
 no cluster is involved.
+
+Only rounds launched with `COMPACTOR_POD_LABEL_CAPTURE=1` collect the
+compactor shared-queue evidence. The phase runs last, after the panel,
+ScaledObject and optional schema-rollback observations. It upgrades the same
+release with `compactor.replicas=2`, keeps the existing catalog claim and WAL
+mirror, and temporarily raises the commit-batch hold to 1,024 MiB or 300
+seconds. It then drives 500 events per second for 15 seconds and waits for two
+successive Prometheus scrape generations in which both ready compactor pods
+publish the same positive `siglake_compactor_sealed_pending{tenant="default"}`
+value. The second generation must advance each pod's source scrape timestamp;
+one coincidentally equal read is insufficient while the two processes refresh
+their gauges independently.
+
+The four verbatim answers are
+`results/compactor-pod-labels-{raw,sample-times,per-pod,expression}.json`.
+The raw and `timestamp(...)` answers retain labels and source sample times;
+the other two retain `sum by (pod)` and the operator's exact
+`avg(sum by (pod) (...))` expression at the same evaluation time. The grader
+requires exactly the ready pods, `tenant=default`, two advancing settled scrape
+generations, equal positive per-pod totals within one 15-second scrape interval,
+and an operator value equal to that shared total. A sum of the replicas' copies
+therefore fails. `scripts/check-kind-compactor-pod-labels.sh` pins the
+expression to `crates/siglake-operator/src/prom.rs`, checks that the chart's
+claim, mirror and custom-metric refusals remain in force, drives the settling
+helper, and grades mutation fixtures without a cluster.
 
 The command exits non-zero when required panel/trigger data is absent or a
 ScaledObject is unhealthy. Before the cluster is deleted the script prints the
