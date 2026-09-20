@@ -28,6 +28,20 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   is something else would stamp an order that is not a time order, and the
   safe half (the shipped templates and every bulk-created index, all of which
   declare `timestamp`) covers what users actually have.
+- **Aliasing another projected column to `timestamp` opts out of implicit
+  newest-first ordering.** `SELECT raw AS timestamp FROM events LIMIT 100`
+  browses in file order. Injecting a bare `ORDER BY timestamp` would bind to
+  the output alias and select a different top-N; qualifying the source as
+  `events.timestamp` is rejected as ambiguous by DataFusion 53.1.0. The
+  newest crates.io release checked on 2026-09-20, DataFusion 55.1.0, retains
+  the same qualified/unqualified collision in `DFSchema::check_names`, though
+  PostgreSQL resolves this shape to the source column. Siglake therefore keeps
+  the conservative refusal. An automatic derived-table rewrite would also
+  lose the ordered-scan, clipped-scan, managed-index and distributed ordered
+  merge classifications, all of which require the table or sort at the query
+  root. Use a different output alias to retain the implicit order, or write a
+  derived table with an explicit inner `ORDER BY timestamp DESC` when the
+  output must be named `timestamp`.
 - **A managed-index ETag is an optimistic validator, not a lock.** A failed
   `If-Match` returns `current` and the ETag derived from the exact commit base
   that rejected the update, but another writer can replace that mapping before
