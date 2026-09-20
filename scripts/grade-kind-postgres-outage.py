@@ -8,6 +8,7 @@ import dataclasses
 import datetime as dt
 import json
 import pathlib
+import re
 import sys
 from typing import Any
 
@@ -29,12 +30,40 @@ def parse_stamp(value: Any, field: str, problems: list[str]) -> dt.datetime | No
 
 STOPPED_STATES = {"T", "t"}
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "timeout"}
-# The probe's own stamps are truncated to the second and are read around the
-# exec that carries the pause or continuation signal, so the signal landed
-# somewhere inside a one-second band on either side of them. A commit timestamp
-# inside that band cannot be placed against the pause at all; only one past it
-# is a write that happened while the processes were stopped.
-EDGE_SLACK = dt.timedelta(seconds=1)
+STAMP_FRACTION = re.compile(r"[T ]\d{2}:\d{2}:\d{2}(?:\.(\d+))?")
+
+
+@dataclasses.dataclass(frozen=True)
+class RecordedStamp:
+    """The interval represented by a timestamp at its recorded precision."""
+
+    at: dt.datetime
+    resolution: dt.timedelta
+
+    @property
+    def until(self) -> dt.datetime:
+        return self.at + self.resolution
+
+
+def recorded_stamp(value: Any, parsed: dt.datetime | None) -> RecordedStamp | None:
+    if parsed is None or not isinstance(value, str):
+        return None
+    match = STAMP_FRACTION.search(value)
+    digits = len(match.group(1)) if match and match.group(1) else 0
+    if digits == 0:
+        resolution = dt.timedelta(seconds=1)
+    else:
+        # datetime has microsecond resolution. More input digits cannot make
+        # the parsed interval narrower than that.
+        resolution = dt.timedelta(microseconds=max(1, 10 ** max(0, 6 - digits)))
+    return RecordedStamp(parsed, resolution)
+
+
+def resolution_label(stamp: RecordedStamp) -> str:
+    seconds = stamp.resolution.total_seconds()
+    if seconds >= 1:
+        return f"{seconds:g}s"
+    return f"{seconds * 1000:g}ms"
 
 
 def numeric_series(sample: dict[str, Any], field: str) -> dict[str, float] | None:
@@ -249,9 +278,10 @@ def parse_pg_stamp(value: Any) -> dt.datetime | None:
 def grade_commit_times(
     document: dict[str, Any],
     accepted: list[dict[str, Any]],
-    outage_at: dt.datetime | None,
-    pause_applied_at: dt.datetime | None,
-    restoration_at: dt.datetime | None,
+    outage_started: RecordedStamp | None,
+    pause_applied: RecordedStamp | None,
+    restoration_started: RecordedStamp | None,
+    restoration_applied: RecordedStamp | None,
     problems: list[str],
 ) -> dict[str, Any]:
     """Date each accepted job's row version by its Postgres commit timestamp.
@@ -262,9 +292,11 @@ def grade_commit_times(
     already-terminal row, so a recovered job's latest commit can postdate a
     terminal write that landed earlier. Anything the reading cannot place -- a
     missing row, a NULL timestamp, a job still short of a terminal status, a
-    recovered row, a commit inside the second-resolution band around the pause
-    edges -- is kept as a gap, and a gap is what stops this reading from
-    settling the pause question either way.
+    recovered row, or a commit whose recorded interval overlaps a signal
+    transition -- is kept as a gap, and a gap is what stops this reading from
+    settling the pause question either way. Timestamp intervals come from the
+    precision retained in each field, preserving a one-second interval for
+    historical traces while using the probe's current millisecond precision.
     """
     reading: dict[str, Any] = {
         "collected_at": None,
@@ -276,6 +308,7 @@ def grade_commit_times(
         "committed_in_pause": [],
         "committed_after_restoration": 0,
         "unplaceable_commits": [],
+        "signal_boundaries": None,
         "gaps": [],
         "settles_pause": False,
     }
@@ -311,8 +344,27 @@ def grade_commit_times(
             continue
         by_id.setdefault(row["job_id"], []).append(row)
 
-    if pause_applied_at is None or restoration_at is None:
-        gaps.append("the trace has no pause and restoration stamps to place commit timestamps against")
+    boundaries = (outage_started, pause_applied, restoration_started, restoration_applied)
+    if any(stamp is None for stamp in boundaries):
+        gaps.append(
+            "the trace has no complete pause and restoration bounds to place commit timestamps against"
+        )
+    else:
+        assert all(stamp is not None for stamp in boundaries)
+        reading["signal_boundaries"] = {
+            "pause_transition": {
+                "earliest": outage_started.at.isoformat(),
+                "latest": pause_applied.until.isoformat(),
+            },
+            "proven_stopped": {
+                "earliest": pause_applied.until.isoformat(),
+                "latest": restoration_started.at.isoformat(),
+            },
+            "restoration_transition": {
+                "earliest": restoration_started.at.isoformat(),
+                "latest": restoration_applied.until.isoformat(),
+            },
+        }
 
     seen: set[str] = set()
     for index, submission in enumerate(accepted):
@@ -351,37 +403,52 @@ def grade_commit_times(
     # does not distinguish them either.
     for job_id, matches in sorted(by_id.items()):
         for row in matches:
-            committed = parse_pg_stamp(row.get("committed_at"))
-            if committed is None or pause_applied_at is None or restoration_at is None:
+            committed_at = parse_pg_stamp(row.get("committed_at"))
+            committed = recorded_stamp(row.get("committed_at"), committed_at)
+            if committed is None or any(stamp is None for stamp in boundaries):
                 continue
-            stamp = committed.isoformat()
-            if outage_at is not None and committed < outage_at:
+            assert outage_started is not None
+            assert pause_applied is not None
+            assert restoration_started is not None
+            assert restoration_applied is not None
+            stamp = committed.at.isoformat()
+            if committed.until <= outage_started.at:
                 reading["committed_before_pause"] += 1
-            elif committed < pause_applied_at + EDGE_SLACK:
-                reading["unplaceable_commits"].append(job_id)
-                problems.append(
-                    f"job {job_id} committed at {stamp}, within {EDGE_SLACK.total_seconds():g}s of "
-                    f"the pause applied at {pause_applied_at.isoformat()}: the probe's stamps are "
-                    "truncated to the second, so this commit cannot be placed inside or outside "
-                    "the pause"
-                )
-            elif committed < restoration_at:
+            elif (
+                committed.at >= pause_applied.until
+                and committed.until <= restoration_started.at
+            ):
                 reading["committed_in_pause"].append(job_id)
                 problems.append(
-                    f"job {job_id} committed at {stamp}, inside the pause window that was applied "
-                    f"at {pause_applied_at.isoformat()} and lifted at "
-                    f"{restoration_at.isoformat()}, so the pause did not block writes"
+                    f"job {job_id} committed at {stamp}, inside the proven stopped window from "
+                    f"{pause_applied.until.isoformat()} through "
+                    f"{restoration_started.at.isoformat()}, so the pause did not block writes"
                 )
-            elif committed < restoration_at + EDGE_SLACK:
-                reading["unplaceable_commits"].append(job_id)
-                problems.append(
-                    f"job {job_id} committed at {stamp}, within {EDGE_SLACK.total_seconds():g}s of "
-                    f"restoration at {restoration_at.isoformat()}: the probe's stamps are "
-                    "truncated to the second, so this commit cannot be placed inside or outside "
-                    "the pause"
-                )
-            else:
+            elif committed.at >= restoration_applied.until:
                 reading["committed_after_restoration"] += 1
+            else:
+                reading["unplaceable_commits"].append(job_id)
+                if committed.until > outage_started.at and committed.at < pause_applied.until:
+                    transition = "pause"
+                    started = outage_started
+                    applied = pause_applied
+                elif (
+                    committed.until > restoration_started.at
+                    and committed.at < restoration_applied.until
+                ):
+                    transition = "restoration"
+                    started = restoration_started
+                    applied = restoration_applied
+                else:
+                    transition = "signal-boundary"
+                    started = outage_started
+                    applied = restoration_applied
+                problems.append(
+                    f"job {job_id} committed at {stamp}, overlapping the {transition} transition "
+                    f"bounded by {started.at.isoformat()} ({resolution_label(started)} precision) "
+                    f"and {applied.until.isoformat()} ({resolution_label(applied)} precision), so "
+                    "the commit cannot be placed inside or outside the proven stopped window"
+                )
 
     if not accepted:
         gaps.append("no accepted submission to correlate commit times with")
@@ -473,6 +540,16 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
     )
     restoration_applied_at = parse_stamp(
         timestamps.get("restoration_applied_at"), "restoration_applied_at", problems
+    )
+    outage_stamp = recorded_stamp(timestamps.get("outage_started_at"), outage_at)
+    pause_applied_stamp = recorded_stamp(
+        timestamps.get("pause_applied_at"), pause_applied_at
+    )
+    restoration_started_stamp = recorded_stamp(
+        timestamps.get("restoration_started_at"), restored_at
+    )
+    restoration_applied_stamp = recorded_stamp(
+        timestamps.get("restoration_applied_at"), restoration_applied_at
     )
     if outage_at and restored_at and restored_at <= outage_at:
         problems.append("restoration did not follow the outage")
@@ -578,7 +655,13 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
     write_probe_outcomes = grade_write_probes(document, problems)
     grade_container(document, problems)
     commit_times = grade_commit_times(
-        document, accepted, outage_at, pause_applied_at, restored_at, problems
+        document,
+        accepted,
+        outage_stamp,
+        pause_applied_stamp,
+        restoration_started_stamp,
+        restoration_applied_stamp,
+        problems,
     )
 
     totals = [(row.at, row.phase, sum(row.backlog.values())) for row in parsed_samples]
