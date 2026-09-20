@@ -26,7 +26,8 @@ use futures::future::{try_join_all, BoxFuture};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use iceberg::arrow::{arrow_schema_to_schema, RecordBatchPartitionSplitter};
 use iceberg::io::{
-    FileIO, FileIOBuilder, FileRead, InputFile, LocalFsStorageFactory, StorageFactory,
+    FileIO, FileIOBuilder, FileRead, InputFile, LocalFsStorageFactory, StorageFactory, S3_ENDPOINT,
+    S3_PATH_STYLE_ACCESS, S3_REGION,
 };
 use iceberg::puffin::{
     Blob as PuffinBlob, CompressionCodec as PuffinCompressionCodec, PuffinReader, PuffinWriter,
@@ -1786,6 +1787,166 @@ pub fn storage_factory_for(warehouse_url: &str) -> Result<Arc<dyn StorageFactory
             );
         }
     })
+}
+
+/// Resolve the addressing mode for Iceberg's S3 FileIO.
+///
+/// An explicit AWS SDK setting wins. A custom endpoint defaults to path-style
+/// because the bundled MinIO and the other S3-compatible stores used by local
+/// deployments do not publish per-bucket DNS names. With no endpoint, leave
+/// the property unset and retain Iceberg's virtual-host-style AWS default.
+fn s3_path_style_access_from(endpoint: Option<&str>, configured: Option<&str>) -> Option<String> {
+    configured
+        .map(str::to_owned)
+        .or_else(|| endpoint.map(|_| "true".to_owned()))
+}
+
+/// Translate the standard AWS endpoint, region and addressing environment
+/// into the Iceberg properties consumed by the vendored OpenDAL FileIO.
+/// Credentials continue through [`crate::aws_credential::SiglakeAwsLoader`],
+/// preserving its static-key, IRSA, ECS and IMDS provider order.
+fn s3_file_io_properties_from(
+    endpoint_url_s3: Option<&str>,
+    endpoint_url: Option<&str>,
+    force_path_style: Option<&str>,
+    region: Option<&str>,
+    default_region: Option<&str>,
+) -> HashMap<String, String> {
+    let mut properties = HashMap::new();
+    let endpoint = endpoint_url_s3.or(endpoint_url);
+    if let Some(endpoint) = endpoint {
+        properties.insert(S3_ENDPOINT.to_owned(), endpoint.to_owned());
+    }
+    if let Some(region) = region.or(default_region) {
+        properties.insert(S3_REGION.to_owned(), region.to_owned());
+    }
+    if let Some(path_style_access) = s3_path_style_access_from(endpoint, force_path_style) {
+        properties.insert(S3_PATH_STYLE_ACCESS.to_owned(), path_style_access);
+    }
+    properties
+}
+
+fn s3_file_io_properties() -> HashMap<String, String> {
+    let endpoint_url_s3 = std::env::var("AWS_ENDPOINT_URL_S3").ok();
+    let endpoint_url = std::env::var("AWS_ENDPOINT_URL").ok();
+    let force_path_style = std::env::var("AWS_S3_FORCE_PATH_STYLE").ok();
+    let region = std::env::var("AWS_REGION").ok();
+    let default_region = std::env::var("AWS_DEFAULT_REGION").ok();
+    s3_file_io_properties_from(
+        endpoint_url_s3.as_deref(),
+        endpoint_url.as_deref(),
+        force_path_style.as_deref(),
+        region.as_deref(),
+        default_region.as_deref(),
+    )
+}
+
+#[cfg(test)]
+mod s3_file_io_properties_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn resolved(endpoint: Option<&str>, configured: Option<&str>) -> Option<String> {
+        s3_path_style_access_from(endpoint, configured)
+    }
+
+    #[test]
+    fn path_style_resolver_covers_absent_true_and_false() {
+        assert_eq!(resolved(None, None), None);
+        assert_eq!(
+            resolved(Some("http://minio:9000"), None).as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            resolved(Some("http://minio:9000"), Some("true")).as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            resolved(Some("http://minio:9000"), Some("false")).as_deref(),
+            Some("false")
+        );
+        assert_eq!(resolved(None, Some("true")).as_deref(), Some("true"));
+        assert_eq!(resolved(None, Some("false")).as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn s3_specific_endpoint_and_region_take_precedence() {
+        let properties = s3_file_io_properties_from(
+            Some("http://s3-specific:9000"),
+            Some("http://general:9000"),
+            None,
+            Some("specific-region"),
+            Some("default-region"),
+        );
+        assert_eq!(
+            properties.get(S3_ENDPOINT).map(String::as_str),
+            Some("http://s3-specific:9000")
+        );
+        assert_eq!(
+            properties.get(S3_REGION).map(String::as_str),
+            Some("specific-region")
+        );
+        assert_eq!(
+            properties.get(S3_PATH_STYLE_ACCESS).map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_endpoint_request_uses_bucket_in_path_not_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let endpoint = format!("http://{address}");
+        let mut properties =
+            s3_file_io_properties_from(None, Some(&endpoint), None, Some("us-east-1"), None);
+        properties.insert("s3.allow-anonymous".to_owned(), "true".to_owned());
+        let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: None,
+        }))
+        .with_props(properties)
+        .build();
+
+        assert!(!file_io
+            .exists("s3://siglake-warehouse/warehouse/siglake/events/metadata/probe.json")
+            .await
+            .unwrap());
+        let request = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut lines = request.lines();
+        assert_eq!(
+            lines.next(),
+            Some("HEAD /siglake-warehouse/warehouse/siglake/events/metadata/probe.json HTTP/1.1")
+        );
+        let host = lines
+            .find(|line| line.to_ascii_lowercase().starts_with("host:"))
+            .unwrap();
+        assert_eq!(host, format!("host: {address}"));
+    }
 }
 
 /// Strip a leading `scheme://` so iceberg paths (which may carry
@@ -10982,11 +11143,11 @@ impl IcebergContext {
     ///   - `file://abs/path` → [`LocalFsStorageFactory`].
     ///   - `s3://bucket/prefix` or `s3a://...` →
     ///     [`OpenDalStorageFactory::S3`]. Credentials come from the standard
-    ///     AWS environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-    ///     `AWS_REGION`, `AWS_ENDPOINT_URL_S3`, `AWS_S3_FORCE_PATH_STYLE`)
-    ///     because `iceberg-catalog-sql 0.9` doesn't currently flow
-    ///     user-supplied props into FileIO. K8s pods will get these via
-    ///     a `Secret` mounted as env vars, or via IRSA on EKS.
+    ///     AWS environment (static keys, IRSA, ECS or IMDS). Region, endpoint
+    ///     and `AWS_S3_FORCE_PATH_STYLE` are translated into Iceberg FileIO
+    ///     properties; a custom endpoint defaults to path-style addressing.
+    ///     K8s pods get these settings from chart-managed env vars, a `Secret`
+    ///     mounted as env vars, or IRSA on EKS.
     ///   - `memory://...` → [`OpenDalStorageFactory::Memory`] (tests only).
     pub async fn open_with(catalog_uri: &str, warehouse_url: &str) -> Result<Self> {
         Self::open_with_namespace(catalog_uri, warehouse_url, NAMESPACE).await
@@ -11052,14 +11213,22 @@ impl IcebergContext {
             SqlBindStyle::QMark
         };
         let factory = storage_factory_for(warehouse_url)?;
-        let warehouse_file_io = FileIOBuilder::new(factory.clone()).build();
+        let file_io_properties =
+            if warehouse_url.starts_with("s3://") || warehouse_url.starts_with("s3a://") {
+                s3_file_io_properties()
+            } else {
+                HashMap::new()
+            };
+        let warehouse_file_io = FileIOBuilder::new(factory.clone())
+            .with_props(file_io_properties.clone())
+            .build();
 
         let catalog = SqlCatalogBuilder::default()
             .uri(catalog_uri.to_string())
             .warehouse_location(warehouse_url.to_string())
             .sql_bind_style(bind_style)
             .with_storage_factory(factory)
-            .load("siglake", HashMap::new())
+            .load("siglake", file_io_properties)
             .await
             .with_context(|| format!("loading SQL catalog at {catalog_uri}"))?;
         let catalog: Arc<dyn Catalog> = Arc::new(catalog);
