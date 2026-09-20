@@ -391,7 +391,7 @@ value=0
 if [[ "$expression" == timestamp* ]]; then
   value=$(( $(date +%s) - 1 ))
 elif [[ "$expression" == *jobs_total* ]]; then
-  if ((calls >= 4)); then value=2; fi
+  if [[ ! -e "$STANDIN_STATE/paused" ]] && ((calls >= 4)); then value=2; fi
 elif ((calls >= 2 && calls <= 3)); then
   value=1
 fi
@@ -453,6 +453,9 @@ done <"$STANDIN_STATE/job-ids"
 STANDIN
 chmod +x "$fixture_dir/psql-commit-standin"
 
+# Leave two sampling intervals after the midpoint. With a two-second window,
+# the first sample can finish just before the midpoint, then `sleep 1` lands at
+# the deadline and the loop never takes its scheduled outage write probe.
 standin_rc=0
 PATH="$standin_dir:$PATH" \
   STANDIN_STATE="$standin_state" \
@@ -464,7 +467,7 @@ PATH="$standin_dir:$PATH" \
   COMMIT_TIMES_ROWS="$fixture_dir/standin-commit.rows" \
   KUBE_CONTEXT=fixture NAMESPACE=fixture PROM_URL=http://fixture.invalid \
   RESULTS_DIR="$standin_state/results" \
-  POSTGRES_OUTAGE_JOBS=2 POSTGRES_OUTAGE_SECONDS=2 \
+  POSTGRES_OUTAGE_JOBS=2 POSTGRES_OUTAGE_SECONDS=4 \
   POSTGRES_OUTAGE_SAMPLE_INTERVAL_SECONDS=1 \
   POSTGRES_OUTAGE_DRAIN_TIMEOUT_SECONDS=2 \
   POSTGRES_OUTAGE_WRITE_PROBE_SECONDS=1 \
