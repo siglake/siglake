@@ -211,8 +211,13 @@ dimensions are in every file's footer and in no aggregate, so the plain rebuild
 cannot help and the read path serves them from the per-file tier forever. The
 flag unions the typed part of the write path's column set
 (`group_count_columns_for` with no declared dims — a typed column is never a
-bloom column) into the rebuild. An admitted column is held to the typed cap on
-its whole-table distinct count (counted, reported, not written when over), and
+bloom column) into the rebuild. Typed inference excludes the canonical
+`timestamp_ns` twin when the schema also has the canonical `timestamp` field:
+the twin is event-time storage, not a group dimension. A user field named
+`timestamp_ns` beside another declared event-time field is still inferred, and
+an explicitly declared dimension is still admitted. An admitted column is held
+to the typed cap on its whole-table distinct count (counted, reported, not
+written when over), and
 is left absent — never partial — when `grouped_counts_from_files` returns
 `None`, i.e. some live file has no footer for it and the raw-page decode cannot
 read its physical type or the column is missing from that file's schema. That

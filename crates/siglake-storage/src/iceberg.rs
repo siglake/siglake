@@ -3715,14 +3715,15 @@ pub fn result_caches_enabled() -> bool {
     })
 }
 
-/// Group-count footer column set: the Utf8 bloom dims plus every typed
-/// (Int64/Float64/Boolean) field in the batch schema — in events/index
-/// batches those are exactly the WS-7 typed promoted columns (the base
-/// schema has no bare numeric/bool fields), and native typed dims on custom
-/// indexes get footers for free. The cardinality cap drops anything too
-/// wide, so over-inclusion is safe.
+/// Group-count footer column set: the Utf8 bloom dims plus inferred typed
+/// (Int64/Float64/Boolean) fields in the batch schema. The canonical
+/// `timestamp_ns` twin is storage metadata for the event time, not a group
+/// dimension, so inference excludes it. An explicitly declared dimension of
+/// that name stays in `bloom_columns`, and the name remains inferable on a user
+/// schema where `timestamp` is not the canonical timestamp field.
 fn group_count_columns_for(schema: &arrow_schema::Schema, bloom_columns: &[&str]) -> Vec<String> {
     let mut cols: Vec<String> = bloom_columns.iter().map(|c| c.to_string()).collect();
+    let has_canonical_nanos_twin = schema_has_canonical_nanos_twin(schema);
     for f in schema.fields() {
         let typed = matches!(
             f.data_type(),
@@ -3730,11 +3731,85 @@ fn group_count_columns_for(schema: &arrow_schema::Schema, bloom_columns: &[&str]
                 | arrow_schema::DataType::Float64
                 | arrow_schema::DataType::Boolean
         );
-        if typed && !cols.iter().any(|c| c == f.name()) {
+        let canonical_nanos_twin =
+            has_canonical_nanos_twin && f.name() == siglake_core::TIMESTAMP_NS_COLUMN;
+        if typed && !canonical_nanos_twin && !cols.iter().any(|c| c == f.name()) {
             cols.push(f.name().clone());
         }
     }
     cols
+}
+
+fn schema_has_canonical_nanos_twin(schema: &arrow_schema::Schema) -> bool {
+    schema
+        .column_with_name("timestamp")
+        .is_some_and(|(_, field)| {
+            matches!(field.data_type(), arrow_schema::DataType::Timestamp(_, _))
+        })
+        && schema
+            .column_with_name(siglake_core::TIMESTAMP_NS_COLUMN)
+            .is_some_and(|(_, field)| matches!(field.data_type(), arrow_schema::DataType::Int64))
+}
+
+#[cfg(test)]
+mod group_count_column_tests {
+    use super::group_count_columns_for;
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+    #[test]
+    fn canonical_event_time_is_not_an_inferred_dimension() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(siglake_core::TIMESTAMP_NS_COLUMN, DataType::Int64, false),
+            Field::new("status", DataType::Int64, false),
+            Field::new("ratio", DataType::Float64, false),
+            Field::new("sampled", DataType::Boolean, false),
+            Field::new("service", DataType::Utf8, false),
+        ]);
+
+        assert_eq!(
+            group_count_columns_for(&schema, &["service"]),
+            vec!["service", "status", "ratio", "sampled"]
+        );
+    }
+
+    #[test]
+    fn unrelated_user_timestamp_ns_remains_an_inferred_dimension() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(siglake_core::TIMESTAMP_NS_COLUMN, DataType::Int64, false),
+        ]);
+
+        assert_eq!(
+            group_count_columns_for(&schema, &[]),
+            vec![siglake_core::TIMESTAMP_NS_COLUMN]
+        );
+    }
+
+    #[test]
+    fn an_explicit_canonical_timestamp_ns_dimension_is_preserved() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(siglake_core::TIMESTAMP_NS_COLUMN, DataType::Int64, false),
+        ]);
+
+        assert_eq!(
+            group_count_columns_for(&schema, &[siglake_core::TIMESTAMP_NS_COLUMN]),
+            vec![siglake_core::TIMESTAMP_NS_COLUMN]
+        );
+    }
 }
 
 /// Output batch size for the compaction merges — bounds per-batch decoded
@@ -4088,9 +4163,9 @@ fn record_tier2_group_counts(footer_files: usize, fallback_files: usize, kind: T
 /// footer key for the same value are byte-identical.
 ///
 /// Without this the two disagree about which columns exist at all: the per-file
-/// footer set is `group_count_columns_for`, which deliberately adds
-/// Int64/Float64/Boolean, while these builders took only `StringArray` and
-/// silently skipped everything else. A typed column therefore reached the
+/// footer set is `group_count_columns_for`, which deliberately adds inferred
+/// dimension-like Int64/Float64/Boolean fields, while these builders took only
+/// `StringArray` and silently skipped everything else. A typed column therefore reached the
 /// footers (Tier-2) but never the table-level aggregate (Tier-1) — so
 /// `GROUP BY status` was served by summing a footer per live file while
 /// `GROUP BY method`, the same shape on a text column, answered from warm
@@ -4268,7 +4343,8 @@ fn reconcile_split_columns(
 /// The cardinality cap for a typed column that was INFERRED into the group-count
 /// set rather than declared as a dimension.
 ///
-/// `group_count_columns_for` admits every Int64/Float64/Boolean field, which is
+/// `group_count_columns_for` admits inferred Int64/Float64/Boolean fields (apart
+/// from the canonical event-time nanosecond twin), which is
 /// right for the per-file footers — they are per-file, capped at
 /// `MAX_GROUP_COUNT_CARDINALITY`, and a column that does not fit is simply
 /// absent from that file. It is NOT right for the table-level wide aggregate,
@@ -22579,19 +22655,32 @@ impl IcebergContext {
 
         // The column set comes from the EXISTING object, as the wide rebuild's
         // does: a repair restores what the table was maintaining, and inventing
-        // columns here would change what it serves.
+        // columns here would change what it serves. The canonical nanosecond
+        // twin is the one removal: objects written before its inference fix may
+        // carry it, and a replacement must not make that obsolete residue whole.
         let columns: Vec<String> = existing
             .time_group_counts
             .as_ref()
             .map(|tg| tg.columns.keys().cloned().collect())
             .unwrap_or_default();
+        let arrow_schema =
+            iceberg::arrow::schema_to_arrow_schema(cached.table.metadata().current_schema())
+                .context("current schema to arrow")?;
+        let has_canonical_nanos_twin = schema_has_canonical_nanos_twin(&arrow_schema);
+        let rebuild_columns: Vec<String> = columns
+            .iter()
+            .filter(|column| {
+                !(has_canonical_nanos_twin && column.as_str() == siglake_core::TIMESTAMP_NS_COLUMN)
+            })
+            .cloned()
+            .collect();
 
         let buckets = self.rebuilt_time_buckets(ident, &cached).await?;
-        let groups = if columns.is_empty() {
+        let groups = if rebuild_columns.is_empty() {
             None
         } else {
             Some(
-                self.rebuilt_time_group_counts(ident, &cached, &columns)
+                self.rebuilt_time_group_counts(ident, &cached, &rebuild_columns)
                     .await?,
             )
         };
@@ -22604,11 +22693,20 @@ impl IcebergContext {
         let buckets_ok = buckets_total == record_count;
         let mut column_reports = Vec::with_capacity(columns.len());
         for column in &columns {
-            let rows = groups.as_ref().and_then(|g| g.column_total(column));
+            let excluded_legacy_nanos =
+                has_canonical_nanos_twin && column.as_str() == siglake_core::TIMESTAMP_NS_COLUMN;
+            let rows = if excluded_legacy_nanos {
+                existing
+                    .time_group_counts
+                    .as_ref()
+                    .and_then(|g| g.column_total(column))
+            } else {
+                groups.as_ref().and_then(|g| g.column_total(column))
+            };
             column_reports.push(InlineTimeRebuiltColumn {
                 column: column.clone(),
                 rows,
-                covers_table: rows == Some(record_count),
+                covers_table: !excluded_legacy_nanos && rows == Some(record_count),
             });
         }
         // A column short of the row count is dropped, not published partial:
