@@ -326,6 +326,91 @@ printf "detail\t%s\n" "$(tr "\n\t" "  " <"$errors" | cut -c1-200)"
 '
 # commit-times-snippet-end
 
+# An insert-only record of every job-row write, installed on the throwaway kind
+# Postgres before the burst is submitted. The trigger inserts from inside the
+# transaction that wrote the job row, so the history row's own `xmin` is that
+# transaction and `pg_xact_commit_timestamp` over the history dates the
+# transition itself. `AMEND_RECOVERED_ERROR_SQL`
+# (crates/siglake-query-server/src/jobs.rs:2313) rewrites an already-terminal
+# recovered row, which is what leaves the visible row version postdating the
+# terminal write it replaced; that amendment is a second history row here,
+# never an edit of the first. Polling the visible row instead would miss a
+# terminal version amended between two polls.
+#
+# The DDL travels in a quoted heredoc: this snippet is a single-quoted bash
+# string executed by `sh -eu -c`, which would expand the `$fn$` and `$op$`
+# dollar-quote tags to its own PID. No single quote appears here either, for
+# the same reason the reader above has none.
+# job-history-install-snippet-begin
+POSTGRES_JOB_HISTORY_INSTALL_SNIPPET='
+errors=${JOB_HISTORY_INSTALL_ERRORS:-/tmp/siglake-outage-job-history-install.err}
+: >"$errors"
+psql_bin=${JOB_HISTORY_PSQL:-psql}
+user=${PGUSER:-${POSTGRES_USER:-postgres}}
+database=${PGDATABASE:-${POSTGRES_DB:-postgres}}
+install_status=0
+"$psql_bin" -qtAX -v ON_ERROR_STOP=1 -U "$user" -d "$database" -f - \
+  >/dev/null 2>>"$errors" <<"SQL" || install_status=$?
+CREATE TABLE IF NOT EXISTS siglake_outage_job_history (
+    seq          bigserial PRIMARY KEY,
+    job_id       text NOT NULL,
+    op           text NOT NULL,
+    old_status   text,
+    new_status   text,
+    recovered_at timestamptz,
+    observed_at  timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE OR REPLACE FUNCTION siglake_outage_record_job_write() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    INSERT INTO siglake_outage_job_history
+        (job_id, op, old_status, new_status, recovered_at)
+    VALUES (
+        NEW.job_id,
+        TG_OP,
+        CASE WHEN TG_OP = $op$INSERT$op$ THEN NULL ELSE OLD.status END,
+        NEW.status,
+        NEW.recovered_at
+    );
+    RETURN NULL;
+END;
+$fn$;
+DROP TRIGGER IF EXISTS siglake_outage_job_history_trigger ON siglake_query_jobs;
+CREATE TRIGGER siglake_outage_job_history_trigger
+    AFTER INSERT OR UPDATE ON siglake_query_jobs
+    FOR EACH ROW EXECUTE FUNCTION siglake_outage_record_job_write();
+SQL
+printf "install\t%s\n" "$install_status"
+printf "detail\t%s\n" "$(tr "\n\t" "  " <"$errors" | cut -c1-200)"
+'
+# job-history-install-snippet-end
+
+# Read the history back with each row dated by the transaction that wrote it.
+# Ordered by `seq`, which is the insert order and therefore the transition
+# order, so the first terminal row is the terminal write and anything after it
+# for the same job is an amendment.
+# job-history-snippet-begin
+POSTGRES_JOB_HISTORY_SNIPPET='
+errors=${JOB_HISTORY_ERRORS:-/tmp/siglake-outage-job-history.err}
+rows=${JOB_HISTORY_ROWS:-/tmp/siglake-outage-job-history.rows}
+: >"$errors"
+: >"$rows"
+tab=$(printf "\t")
+psql_bin=${JOB_HISTORY_PSQL:-psql}
+user=${PGUSER:-${POSTGRES_USER:-postgres}}
+database=${PGDATABASE:-${POSTGRES_DB:-postgres}}
+query_status=0
+"$psql_bin" -qtAX -F"$tab" -v ON_ERROR_STOP=1 -U "$user" -d "$database" \
+  -c "SELECT seq, job_id, op, old_status, new_status, recovered_at, observed_at, pg_xact_commit_timestamp(xmin) FROM siglake_outage_job_history ORDER BY seq" \
+  >"$rows" 2>>"$errors" || query_status=$?
+printf "status\t%s\n" "$query_status"
+while IFS= read -r line; do
+  printf "row\t%s\n" "$line"
+done <"$rows"
+printf "detail\t%s\n" "$(tr "\n\t" "  " <"$errors" | cut -c1-200)"
+'
+# job-history-snippet-end
+
 # The pause-window readers are advisory: a failed exec is retained as evidence that
 # the pause window went unobserved, never as a reason to leave Postgres stopped.
 # Their request timeouts are short for the same reason — an exec that cannot be
@@ -376,6 +461,26 @@ postgres_commit_times() {
   kubectl --context "$KUBE_CONTEXT" --request-timeout=30s -n "$NAMESPACE" \
     exec "$POSTGRES_POD" -- sh -eu -c "$POSTGRES_COMMIT_TIMES_SNIPPET" \
     commit-times >"$output" 2>"$output.err" || status=$?
+  printf '%s' "$status"
+}
+
+# Advisory in the same way: a failed install is retained as the reason the
+# history is empty, never as a reason to abandon the run. Without it the
+# grader is back to dating the visible row version alone, which is the gap
+# this reader exists to close.
+postgres_install_job_history() {
+  local output=$1 status=0
+  kubectl --context "$KUBE_CONTEXT" --request-timeout=30s -n "$NAMESPACE" \
+    exec "$POSTGRES_POD" -- sh -eu -c "$POSTGRES_JOB_HISTORY_INSTALL_SNIPPET" \
+    job-history-install >"$output" 2>"$output.err" || status=$?
+  printf '%s' "$status"
+}
+
+postgres_job_history() {
+  local output=$1 status=0
+  kubectl --context "$KUBE_CONTEXT" --request-timeout=30s -n "$NAMESPACE" \
+    exec "$POSTGRES_POD" -- sh -eu -c "$POSTGRES_JOB_HISTORY_SNIPPET" \
+    job-history >"$output" 2>"$output.err" || status=$?
   printf '%s' "$status"
 }
 
@@ -622,6 +727,12 @@ log "record baseline from Prometheus"
 sample_metrics baseline >/dev/null
 postgres_write_probe baseline
 CONTAINER_BEFORE=$(postgres_container_status)
+# Before the burst, so every transition this probe is about is recorded. The
+# job table itself already exists: the query server creates it at start-up
+# (`SCHEMA_SQL_STATEMENTS`, crates/siglake-query-server/src/jobs.rs:2322).
+log "install the job-row write history on the throwaway Postgres"
+JOB_HISTORY_INSTALL_STATUS=$(postgres_install_job_history \
+  "$TMP_DIR/job-history-install")
 SUBMISSION_STARTED_AT=$(iso_now)
 log "submit a burst of $REQUESTED_JOBS bounded batch jobs before the fault"
 for index in $(seq 1 "$REQUESTED_JOBS"); do
@@ -695,6 +806,10 @@ log "read job-row commit timestamps"
 COMMIT_TIMES_AT=$(iso_now)
 COMMIT_TIMES_STATUS=$(postgres_commit_times "$TMP_DIR/commit-times")
 
+log "read the job-row write history"
+JOB_HISTORY_AT=$(iso_now)
+JOB_HISTORY_STATUS=$(postgres_job_history "$TMP_DIR/job-history")
+
 python3 - "$ROOT" "$TMP_DIR" "$SAMPLES_FILE" "$SUBMISSIONS_DIR" \
   "$SUBMISSION_STARTED_AT" "$SUBMISSION_FINISHED_AT" "$OUTAGE_STARTED_AT" \
   "$RESTORATION_STARTED_AT" "$POSTGRES_READY_AT" "$SAMPLING_ENDED_AT" \
@@ -704,7 +819,10 @@ python3 - "$ROOT" "$TMP_DIR" "$SAMPLES_FILE" "$SUBMISSIONS_DIR" \
   "$CONTAINER_AFTER" "$PAUSE_APPLIED_AT" "$RESTORATION_APPLIED_AT" \
   "$COMMIT_TIMES_AT" "$COMMIT_TIMES_STATUS" "$TMP_DIR/commit-times" \
   "$POSTGRES_NODE" "$POSTGRES_CONTAINER_ID" "$POSTGRES_CONTAINER_PID" \
-  "$POSTGRES_PID_NAMESPACE" "$POSTGRES_PROCESSES_FILE" "$TMP_DIR/raw.json" <<'PY'
+  "$POSTGRES_PID_NAMESPACE" "$POSTGRES_PROCESSES_FILE" \
+  "$JOB_HISTORY_AT" "$JOB_HISTORY_INSTALL_STATUS" "$JOB_HISTORY_STATUS" \
+  "$TMP_DIR/job-history-install" "$TMP_DIR/job-history" \
+  "$TMP_DIR/raw.json" <<'PY'
 import datetime, json, pathlib, subprocess, sys
 (
     root, tmp, samples_path, submissions_dir, submission_started, submission_finished,
@@ -713,7 +831,9 @@ import datetime, json, pathlib, subprocess, sys
     query, write_probe_seconds, write_probes_path, container_before, container_after,
     pause_applied, restoration_applied, commit_times_at, commit_times_status,
     commit_times_path, postgres_node, postgres_container_id, postgres_container_pid,
-    postgres_pid_namespace, postgres_processes_path, output,
+    postgres_pid_namespace, postgres_processes_path, job_history_at,
+    job_history_install_status, job_history_status, job_history_install_path,
+    job_history_path, output,
 ) = sys.argv[1:]
 tmp = pathlib.Path(tmp)
 
@@ -760,6 +880,64 @@ def commit_times(path, at, exec_status):
         except OSError:
             pass
     return reading
+
+# The insert-only transition history, in the two shapes its snippets print.
+# Its rows are never rewritten, so each one's commit timestamp dates the
+# transaction that made the transition rather than the latest version of the
+# job row. An install that failed is retained as the reason the history is
+# empty; the grader reads an empty history as something it cannot date, so
+# this must not turn a failure into "the job made no transitions".
+def snippet_lines(path):
+    try:
+        return open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return []
+
+
+def exec_complaint(path):
+    try:
+        return open(path + ".err", encoding="utf-8").read().replace("\n", " ").strip()[:200]
+    except OSError:
+        return ""
+
+
+def write_history(install_path, read_path, at, install_exec_status, exec_status):
+    reading = {
+        "at": at,
+        "install_exec_status": int(install_exec_status) if install_exec_status.isdigit() else 1,
+        "install_status": None,
+        "install_detail": "",
+        "exec_status": int(exec_status) if exec_status.isdigit() else 1,
+        "query_status": None,
+        "rows": [],
+        "detail": "",
+    }
+    for line in snippet_lines(install_path):
+        parts = line.split("\t")
+        if parts[0] == "install" and len(parts) == 2:
+            reading["install_status"] = int(parts[1]) if parts[1].isdigit() else None
+        elif parts[0] == "detail" and len(parts) == 2:
+            reading["install_detail"] = parts[1]
+    if not reading["install_detail"]:
+        reading["install_detail"] = exec_complaint(install_path)
+    fields = (
+        "seq", "job_id", "op", "old_status", "new_status", "recovered_at",
+        "observed_at", "committed_at",
+    )
+    for line in snippet_lines(read_path):
+        parts = line.split("\t")
+        if parts[0] == "status" and len(parts) == 2:
+            reading["query_status"] = int(parts[1]) if parts[1].isdigit() else None
+        elif parts[0] == "row" and len(parts) == len(fields) + 1:
+            row = {name: (parts[index + 1] or None) for index, name in enumerate(fields)}
+            row["seq"] = int(row["seq"]) if (row["seq"] or "").isdigit() else None
+            reading["rows"].append(row)
+        elif parts[0] == "detail" and len(parts) == 2:
+            reading["detail"] = parts[1]
+    if not reading["detail"]:
+        reading["detail"] = exec_complaint(read_path)
+    return reading
+
 
 def container_identity(raw):
     parts = raw.split("\t")
@@ -808,7 +986,7 @@ write_probes = [
     json.loads(line) for line in open(write_probes_path, encoding="utf-8") if line.strip()
 ]
 document = {
-    "schema_version": 3,
+    "schema_version": 4,
     "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
     "revisions": {
         "repository_commit": subprocess.check_output(
@@ -847,6 +1025,10 @@ document = {
     },
     "write_probes": write_probes,
     "job_commit_times": commit_times(commit_times_path, commit_times_at, commit_times_status),
+    "job_write_history": write_history(
+        job_history_install_path, job_history_path, job_history_at,
+        job_history_install_status, job_history_status,
+    ),
     "timestamps": {
         "submission_started_at": submission_started,
         "submission_finished_at": submission_finished,

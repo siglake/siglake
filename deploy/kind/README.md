@@ -143,10 +143,20 @@ problem: the completion was observed work, not landed work.
 That reading has limits the grader keeps rather than papers over.
 `pg_xact_commit_timestamp(xmin)` dates the row version that is visible at
 collection time, not every status transition, and a recovered row can be
-amended after it went terminal, so a recovered row cannot clear anything. A
-missing row, a NULL timestamp, a job still short of a terminal status, and a
-commit inside the second the probe's own stamps are truncated to are all held
-as gaps, and a gap leaves the observation unexplained.
+amended after it went terminal. For that case the probe installs an
+insert-only write history on the throwaway Postgres before it submits
+anything: an `AFTER INSERT OR UPDATE` trigger on `siglake_query_jobs` writes
+one `siglake_outage_job_history` row per job-row write, from inside the same
+transaction, so the history row's own `xmin` dates the transition rather than
+the latest version of the job row. The first history row carrying a terminal
+status is the terminal write; anything after it for that job is an amendment,
+retained separately. A recovered row is still a gap when the history is
+missing or its terminal transaction has no commit timestamp. A missing row, a
+NULL timestamp, a job still short of a terminal status, and a commit inside
+the second the probe's own stamps are truncated to are all held as gaps, and a
+gap leaves the observation unexplained. The trigger belongs to the probe and
+the throwaway install alone; nothing in the chart, the compose stack or the
+job store knows about it.
 
 `scripts/check-kind-postgres-outage-evidence.sh` grades offline fixtures in CI;
 missing series, a backlog that never rises, one that never drains, a missing or
@@ -154,10 +164,12 @@ running process observation, a bounded write that completed during the pause, a
 container restart, an undated or in-pause job-row commit, and an outage sample
 with zero backlog and rising completions before restoration are all
 `unverified`, not passing evidence. A drain whose accepted job rows are all
-dated outside the pause is graded `verified` with the resolution recorded. The
-same check runs the probe's three remote readers against a synthetic `/proc`
-and psql stand-ins, and drives the probe end to end against recording stand-ins
-for `kubectl` and `curl`. No cluster is involved.
+dated outside the pause is graded `verified` with the resolution recorded, and
+so is one whose amended row is dated by its retained write history. The same
+check runs the probe's remote readers against a synthetic `/proc` and psql
+stand-ins — including the history DDL, whose dollar-quoted plpgsql body has to
+reach psql unexpanded — and drives the probe end to end against recording
+stand-ins for `kubectl` and `curl`. No cluster is involved.
 
 Only rounds launched with `INGESTER_POD_LABEL_CAPTURE=1` collect the ingester
 per-pod label evidence; ordinary rounds leave the phase off. After every other
