@@ -1157,6 +1157,9 @@ arbitrary windows and strict validity guards before any fast path is trusted.
 windowed — early-stops without a blocking sort: the scan advertises the
 table's declared direction when partitions are single files or time-disjoint
 runs, and k-way-merges overlapping partitions (bounded fan-in) otherwise.
+For a source-safe ordered limit, an overlap merge opens inputs by their leading
+manifest bound and stops before an older suffix once the exact nth timestamp is
+known; equal or unavailable bounds remain admitted.
 Direction-aware for legacy DESC tables; observable via
 `siglake_query_scan_output_ordering_total`.
 
