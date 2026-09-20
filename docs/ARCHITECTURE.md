@@ -482,7 +482,9 @@ reclustering completes (`docs/DESIGN_time_ordered_storage.md`).
   checksummed-Zstd **Puffin sidecars** registered to the snapshot;
 - per-file **group-count** and **time-bucket** footers powering the aggregate
   fast paths — group counts use a compact front-coded binary encoding a query
-  can read one column out of without touching the rest
+  can read one column out of without touching the rest. Inferred typed group
+  dimensions omit the canonical `timestamp_ns` event-time twin; explicitly
+  declared dimensions and unrelated user fields with that name remain eligible
   (`docs/DESIGN_group_count_footer_encoding.md`);
 - file-layout metadata plus rewrite-generation markers in the file *names*
   (`siglake-g<N>-…`), so compaction policy is computable from the manifest
@@ -699,7 +701,8 @@ footers for the current column set. An admitted column is held to
 `SIGLAKE_TYPED_GROUP_COUNT_CARDINALITY` (default `1024`) on its whole-table
 distinct count and is reported, not written, when over it. The same knob caps
 the exact group-count cardinality of typed columns admitted by inference at
-write time; declared dimensions retain the table-level cap. Raising it admits
+write time; the canonical `timestamp_ns` event-time twin is not inferred, and
+declared dimensions retain the table-level cap. Raising it admits
 wider typed columns but also increases per-commit delta size and counting work.
 
 The inline object's own repair is a separate command, for a separate failure —

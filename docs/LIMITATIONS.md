@@ -1451,7 +1451,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   an old table as the fast path failing. Rebuilds repair only the wide Tier-1
   object: they do not backfill the inline object, so repaired columns remain
   `tier1_wide` even below its 4096-entry cap and may pay a wide-object fold on a
-  cold metadata cache.
+  cold metadata cache. Objects written before the canonical `timestamp_ns`
+  event-time twin was excluded from inferred dimensions may still report that
+  column as short until the inline aggregate is rebuilt; the read guard refuses
+  the short column, so exact SQL answers continue through the per-file path.
 - **The short-aggregate census reports more than it repairs.** Every 15 minutes
   the maintenance pass finds a maintained column short of `total-records` with
   every commit's contribution accounted for and fires
