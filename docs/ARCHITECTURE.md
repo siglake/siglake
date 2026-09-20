@@ -621,9 +621,18 @@ without the record one unreadable column would cost a full Tier-2 rebuild every
 pass.
 
 Every verdict lands on
-`siglake_group_count_short_aggregates_total{iceberg_namespace="<ns>",table="<table>",outcome="detected|repaired|incomplete|failed"}`
+`siglake_group_count_short_aggregates_total{iceberg_namespace="<ns>",table="<table>",outcome="detected|repaired|incomplete|failed|backed_off_watchdog|backed_off_failed|backed_off_interrupted|suppressed|marker_failed"}`
 and a WARN line naming the columns, and `SiglakeGroupCountAggregateShort` fires
-on all but `repaired`. One compactor censuses the base namespace and every
+on all but `repaired`. Before an automatic Tier-2 scan, the compactor writes a
+unique incarnation-scoped `*.short-repair.<attempt-uuid>.json` record beside
+the deltas. Watchdog cancellation, a returned failure and a process restart
+retain fixed reasons and delay later attempts by 15 minutes, one hour and four
+hours; the fourth unsuccessful attempt suppresses automatic work until an
+operator rebuild succeeds. The metadata census completes for every table
+before the one-table repair budget is spent, and only that repair is under the
+600-second watchdog. A successful aggregate CAS clears covered attempt records;
+`rebuild-group-counts` does the same and reports the number cleared. One
+compactor censuses the base namespace and every
 `tenant_*` namespace, each with its own `events`, so this counter and the three
 beside it (`siglake_group_count_delta_write_failures_total`,
 `siglake_side_aggregate_publish_failures_total`,
@@ -639,10 +648,9 @@ increment. Rebuilding automatically is **opt-in**
 the repair is one Tier-2 query per maintained column. The ~9 minutes per column
 at 250M rows is a linear extrapolation from 40k/400k local-filesystem fixtures,
 not a measured large-table timeout; the compactor's 600 s cooperative watchdog
-can cut that scan. A cut repair publishes no partial aggregate and currently
-retries on the next pass or process restart. The 0.2.0 design records attempts
-under the table-incarnation aggregate prefix, applies bounded durable backoff
-and keeps the final aggregate CAS as the only success record
+can cut that scan. A cut repair publishes no partial aggregate; its durable
+attempt record prevents an immediate retry after the next pass or process
+restart. The implementation keeps the final aggregate CAS as the only success record
 ([`DESIGN_short_aggregate_repair_backoff.md`](DESIGN_short_aggregate_repair_backoff.md)).
 With repair on, one table per pass is rebuilt
 (`SIGLAKE_AGG_SHORT_REPAIR_MAX_TABLES`), because every table upgraded across the

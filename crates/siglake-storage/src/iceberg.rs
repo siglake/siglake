@@ -6192,6 +6192,21 @@ fn group_count_rebuild_sequence_number(rel_path: &str) -> Option<i64> {
     delta_object_sequence_number(rel_path, ".rebuild.json")
 }
 
+fn short_repair_marker_rel_path(sequence_number: i64, attempt_id: Uuid) -> String {
+    format!("{GROUP_COUNT_DELTA_DIR}/{sequence_number:020}.short-repair.{attempt_id}.json")
+}
+
+fn short_repair_marker_sequence_number(rel_path: &str) -> Option<i64> {
+    let (dir, file) = rel_path.rsplit_once('/')?;
+    if dir != GROUP_COUNT_DELTA_DIR && !dir.ends_with(&format!("/{GROUP_COUNT_DELTA_DIR}")) {
+        return None;
+    }
+    let (sequence, attempt) = file.split_once(".short-repair.")?;
+    let attempt = attempt.strip_suffix(".json")?;
+    Uuid::parse_str(attempt).ok()?;
+    sequence.parse().ok()
+}
+
 /// Sequence number of a delta-directory object named `<seq>{suffix}`.
 ///
 /// The directory component is REQUIRED: a `1.json` sitting anywhere else is not
@@ -6289,6 +6304,28 @@ mod aggregate_incarnation_path_tests {
             assert_eq!(group_count_delta_sequence_number(bad), None, "{bad}");
         }
     }
+
+    #[tokio::test]
+    async fn a_refused_short_repair_marker_spends_the_bounded_write_budget() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let error = retry_short_repair_marker_write("short-repair-test", move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            async { anyhow::bail!("refused") }
+        })
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("refused"), "{error:#}");
+        assert_eq!(calls.load(Ordering::SeqCst), DELTA_WRITE_ATTEMPTS as usize);
+    }
+
+    #[test]
+    fn short_repair_schedule_suppresses_after_four_attempts() {
+        assert_eq!(short_repair_delay(1), Some(chrono::Duration::minutes(15)));
+        assert_eq!(short_repair_delay(2), Some(chrono::Duration::hours(1)));
+        assert_eq!(short_repair_delay(3), Some(chrono::Duration::hours(4)));
+        assert_eq!(short_repair_delay(4), None);
+    }
 }
 
 /// The exact columns carried by the lost delta, with the cardinality cap that
@@ -6302,6 +6339,29 @@ struct GroupCountRebuildMarker {
     columns: BTreeMap<String, usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     sketch_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAggregateAttemptReason {
+    Started,
+    Watchdog,
+    Failed,
+    Interrupted,
+    Malformed,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ShortAggregateAttemptMarker {
+    version: u8,
+    attempt_id: Uuid,
+    table_uuid: Uuid,
+    target_snapshot_id: i64,
+    target_sequence_number: i64,
+    maintained_columns: Vec<String>,
+    started_at: String,
+    reason: ShortAggregateAttemptReason,
+    next_eligible_at: String,
 }
 
 /// Serde shim: persist [`FileGroupCounts`] inside the side-aggregates object
@@ -7675,6 +7735,7 @@ where
 struct ListedGroupCountObjects {
     deltas: Vec<(i64, String)>,
     rebuild_markers: Vec<(i64, String)>,
+    short_repair_markers: Vec<(i64, String)>,
 }
 
 /// Every delta and rebuild marker present. They deliberately share a prefix so
@@ -7693,12 +7754,15 @@ async fn list_group_count_objects(op: &opendal::Operator) -> Result<ListedGroupC
         let path = entry.path().to_string();
         if let Some(sequence_number) = group_count_rebuild_sequence_number(&path) {
             out.rebuild_markers.push((sequence_number, path));
+        } else if let Some(sequence_number) = short_repair_marker_sequence_number(&path) {
+            out.short_repair_markers.push((sequence_number, path));
         } else if let Some(sequence_number) = group_count_delta_sequence_number(&path) {
             out.deltas.push((sequence_number, path));
         }
     }
     out.deltas.sort_unstable();
     out.rebuild_markers.sort_unstable();
+    out.short_repair_markers.sort_unstable();
     Ok(out)
 }
 
@@ -7814,6 +7878,188 @@ async fn delete_group_count_rebuild_markers(
     deleted
 }
 
+const SHORT_REPAIR_MAX_ATTEMPTS: usize = 4;
+
+fn short_repair_delay(attempts: usize) -> Option<chrono::Duration> {
+    match attempts {
+        1 => Some(chrono::Duration::minutes(15)),
+        2 => Some(chrono::Duration::hours(1)),
+        3 => Some(chrono::Duration::hours(4)),
+        _ => None,
+    }
+}
+
+async fn write_short_repair_marker(
+    op: &opendal::Operator,
+    rel: &str,
+    marker: &ShortAggregateAttemptMarker,
+) -> Result<()> {
+    let body = serde_json::to_vec(marker).context("serialize short-repair marker")?;
+    retry_short_repair_marker_write(rel, || {
+        let op = op.clone();
+        let rel = rel.to_string();
+        let body = body.clone();
+        async move { op.write(&rel, body).await.map(|_| ()).map_err(Into::into) }
+    })
+    .await
+}
+
+async fn retry_short_repair_marker_write<F, Fut>(rel: &str, write: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    retry_object_write("short-repair marker", rel, DELTA_WRITE_ATTEMPTS, write)
+        .await
+        .map(|_| ())
+}
+
+async fn read_short_repair_marker(
+    op: &opendal::Operator,
+    rel: &str,
+) -> Result<Option<ShortAggregateAttemptMarker>> {
+    match op.read(rel).await {
+        Ok(bytes) => serde_json::from_slice(&bytes.to_bytes())
+            .with_context(|| format!("parse short-repair marker {rel}"))
+            .map(Some),
+        Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read short-repair marker {rel}")),
+    }
+}
+
+async fn delete_short_repair_markers(
+    op: &opendal::Operator,
+    markers: &[(i64, String)],
+    rebuilt_through: i64,
+) -> usize {
+    let mut deleted = 0;
+    for (_, path) in markers
+        .iter()
+        .filter(|(sequence_number, _)| *sequence_number <= rebuilt_through)
+    {
+        match op.delete(path).await {
+            Ok(()) => deleted += 1,
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => deleted += 1,
+            Err(e) => tracing::warn!(
+                error = ?e,
+                path,
+                "short-repair marker delete failed; the next census will retry"
+            ),
+        }
+    }
+    deleted
+}
+
+async fn short_repair_history_outcome(
+    op: &opendal::Operator,
+    table_uuid: Uuid,
+    paths: &[(i64, String)],
+    columns: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<ShortAggregateOutcome>> {
+    let mut markers = Vec::new();
+    for (sequence_number, path) in paths {
+        let marker = match read_short_repair_marker(op, path).await {
+            Ok(Some(marker)) => marker,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(?error, path, "short-repair marker is malformed");
+                return Ok(Some(ShortAggregateOutcome::Suppressed {
+                    columns: columns.to_vec(),
+                    attempts: paths.len(),
+                    reason: ShortAggregateAttemptReason::Malformed,
+                    marker: Some(path.clone()),
+                }));
+            }
+        };
+        if marker.version != 1
+            || marker.table_uuid != table_uuid
+            || marker.target_sequence_number != *sequence_number
+            || marker.reason == ShortAggregateAttemptReason::Malformed
+        {
+            return Ok(Some(ShortAggregateOutcome::Suppressed {
+                columns: columns.to_vec(),
+                attempts: paths.len(),
+                reason: ShortAggregateAttemptReason::Malformed,
+                marker: Some(path.clone()),
+            }));
+        }
+        let started_at = match marker.started_at.parse::<chrono::DateTime<chrono::Utc>>() {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Some(ShortAggregateOutcome::Suppressed {
+                    columns: columns.to_vec(),
+                    attempts: paths.len(),
+                    reason: ShortAggregateAttemptReason::Malformed,
+                    marker: Some(path.clone()),
+                }));
+            }
+        };
+        let next = match marker
+            .next_eligible_at
+            .parse::<chrono::DateTime<chrono::Utc>>()
+        {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Some(ShortAggregateOutcome::Suppressed {
+                    columns: columns.to_vec(),
+                    attempts: paths.len(),
+                    reason: ShortAggregateAttemptReason::Malformed,
+                    marker: Some(path.clone()),
+                }));
+            }
+        };
+        markers.push((path.clone(), marker, started_at, next));
+    }
+    if markers.is_empty() {
+        return Ok(None);
+    }
+    markers.sort_by_key(|(_, _, started_at, _)| *started_at);
+    let attempts = markers.len();
+
+    for (path, marker, _, next) in &mut markers {
+        if marker.reason == ShortAggregateAttemptReason::Started && *next <= now {
+            marker.reason = ShortAggregateAttemptReason::Interrupted;
+            marker.next_eligible_at = short_repair_delay(attempts)
+                .map(|delay| now + delay)
+                .unwrap_or(now)
+                .to_rfc3339();
+            write_short_repair_marker(op, path, marker).await?;
+            *next = marker.next_eligible_at.parse().expect("just formatted UTC");
+        }
+    }
+    if let Some((_, marker, _, _)) = markers
+        .iter()
+        .rev()
+        .find(|(_, marker, _, _)| marker.reason == ShortAggregateAttemptReason::Started)
+    {
+        return Ok(Some(ShortAggregateOutcome::BackedOff {
+            columns: columns.to_vec(),
+            attempts,
+            reason: ShortAggregateAttemptReason::Started,
+            next_eligible_at: marker.next_eligible_at.clone(),
+        }));
+    }
+    let (_, latest, _, next) = markers.last().expect("non-empty history");
+    if attempts >= SHORT_REPAIR_MAX_ATTEMPTS {
+        return Ok(Some(ShortAggregateOutcome::Suppressed {
+            columns: columns.to_vec(),
+            attempts,
+            reason: latest.reason,
+            marker: None,
+        }));
+    }
+    if latest.reason == ShortAggregateAttemptReason::Started || *next > now {
+        return Ok(Some(ShortAggregateOutcome::BackedOff {
+            columns: columns.to_vec(),
+            attempts,
+            reason: latest.reason,
+            next_eligible_at: latest.next_eligible_at.clone(),
+        }));
+    }
+    Ok(None)
+}
+
 /// Read one delta. `None` means the object is gone — which is a real state, not
 /// an error: the compactor deletes a delta once it is absorbed, so a reader
 /// that listed before the delete and read after must notice and retry against
@@ -7915,21 +8161,35 @@ async fn fold_wide_group_counts(
     cap: usize,
     sketch_m: usize,
 ) -> Result<FoldedWide> {
+    fold_wide_group_counts_with_deltas(op, cap, sketch_m, None).await
+}
+
+async fn fold_wide_group_counts_with_deltas(
+    op: &opendal::Operator,
+    cap: usize,
+    sketch_m: usize,
+    listed_deltas: Option<&[(i64, String)]>,
+) -> Result<FoldedWide> {
     use futures::StreamExt;
     const MAX_ATTEMPTS: usize = 3;
+    let mut supplied_deltas = listed_deltas.map(|deltas| deltas.to_vec());
     for _ in 0..MAX_ATTEMPTS {
         let (wide, _) = load_wide_group_counts(op).await?;
         let wide = wide.unwrap_or_default();
         let mut folded = WideGroupCounts {
             coverage: wide.coverage,
             coverage_links: wide.coverage_links.clone(),
+            rebuilt_through: wide.rebuilt_through,
             // Carried so the maintenance census reads its own suppression
             // record off the memoised folded view instead of GETting the base
             // object (26.5 MB at the measured extreme) a second time.
             short_repair: wide.short_repair.clone(),
             ..WideGroupCounts::default()
         };
-        let present = list_group_count_deltas(op).await?;
+        let present = match supplied_deltas.take() {
+            Some(present) => present,
+            None => list_group_count_deltas(op).await?,
+        };
         // The READ-side twin of the compactor fold's filter, and it has to say
         // the same thing: a delta at or below `rebuilt_through` describes rows
         // the rebuild already read out of the committed FILES. Folding it here
@@ -8027,7 +8287,7 @@ pub enum ShortAggregateOutcome {
     Pending { columns: Vec<String> },
     /// Short only in columns a previous rebuild already proved it cannot
     /// restore. Nothing to do but tell an operator.
-    Suppressed { columns: Vec<String> },
+    Unrestored { columns: Vec<String> },
     /// Short with every contribution accounted for, and no rebuild ran:
     /// automatic repair is off, or this pass's budget is spent.
     Detected { columns: Vec<String> },
@@ -8038,8 +8298,47 @@ pub enum ShortAggregateOutcome {
         columns: Vec<String>,
         unrestored: Vec<String>,
     },
+    /// Durable history defers another automatic scan until its UTC deadline.
+    BackedOff {
+        columns: Vec<String>,
+        attempts: usize,
+        reason: ShortAggregateAttemptReason,
+        next_eligible_at: String,
+    },
+    /// Four automatic attempts have been spent, or a marker is malformed.
+    Suppressed {
+        columns: Vec<String>,
+        attempts: usize,
+        reason: ShortAggregateAttemptReason,
+        marker: Option<String>,
+    },
+    /// The pre-attempt marker could not be persisted, so no Tier-2 scan ran.
+    MarkerFailed { columns: Vec<String> },
     /// The rebuild errored. The deficit is unchanged and a later pass retries.
-    Failed,
+    Failed { columns: Vec<String> },
+}
+
+#[derive(Debug, Clone)]
+pub struct ShortAggregateCensus {
+    pub table: String,
+    pub outcome: ShortAggregateOutcome,
+    maintained_columns: Vec<String>,
+    target_snapshot_id: i64,
+    target_sequence_number: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShortAggregateAttempt {
+    table: String,
+    columns: Vec<String>,
+    marker_path: String,
+    marker: ShortAggregateAttemptMarker,
+}
+
+#[derive(Debug, Clone)]
+pub enum ShortAggregateAttemptStart {
+    Ready(ShortAggregateAttempt),
+    Outcome(ShortAggregateOutcome),
 }
 
 /// What the inline-coverage census made of one table (#4674).
@@ -12803,6 +13102,39 @@ impl IcebergContext {
         .await
     }
 
+    /// Test-only injection point for a durable short-repair attempt. Integration
+    /// tests use it to pin operator cleanup without exposing marker internals.
+    #[doc(hidden)]
+    pub async fn write_short_repair_marker_for_test(&self, ident: &TableIdent) -> Result<String> {
+        let table = self.catalog.load_table(ident).await?;
+        let snapshot = table
+            .metadata()
+            .current_snapshot()
+            .ok_or_else(|| anyhow::anyhow!("{ident} has no current snapshot"))?;
+        let op = aggregate_operator(&table)?
+            .ok_or_else(|| anyhow::anyhow!("{ident} has no UUID for a short-repair marker"))?;
+        let attempt_id = Uuid::now_v7();
+        let path = short_repair_marker_rel_path(snapshot.sequence_number(), attempt_id);
+        let now = chrono::Utc::now();
+        write_short_repair_marker(
+            &op,
+            &path,
+            &ShortAggregateAttemptMarker {
+                version: 1,
+                attempt_id,
+                table_uuid: table.metadata().uuid(),
+                target_snapshot_id: snapshot.snapshot_id(),
+                target_sequence_number: snapshot.sequence_number(),
+                maintained_columns: Vec::new(),
+                started_at: now.to_rfc3339(),
+                reason: ShortAggregateAttemptReason::Failed,
+                next_eligible_at: (now + chrono::Duration::minutes(15)).to_rfc3339(),
+            },
+        )
+        .await?;
+        Ok(path)
+    }
+
     /// Consume durable markers left by committers whose delta PUT exhausted its
     /// retry budget. This runs only from the compactor's aggregate-maintenance
     /// pass; query and ingest paths never pay the Tier-2 rebuild scan.
@@ -12971,94 +13303,265 @@ impl IcebergContext {
         &self,
         max_repairs: usize,
     ) -> Result<Vec<(String, ShortAggregateOutcome)>> {
+        let census = self.census_short_group_count_aggregates().await?;
+        let mut out = Vec::new();
+        let mut repairs = 0;
+        for item in census {
+            let mut outcome = item.outcome.clone();
+            if matches!(outcome, ShortAggregateOutcome::Detected { .. }) && repairs < max_repairs {
+                match self
+                    .prepare_short_group_count_repair(&item, Duration::from_secs(600))
+                    .await?
+                {
+                    ShortAggregateAttemptStart::Ready(attempt) => {
+                        repairs += 1;
+                        outcome = self.execute_short_group_count_repair(&attempt).await;
+                    }
+                    ShortAggregateAttemptStart::Outcome(other) => outcome = other,
+                }
+            }
+            self.report_short_group_count_outcome(&item.table, &outcome);
+            out.push((item.table, outcome));
+        }
+        Ok(out)
+    }
+
+    pub async fn census_short_group_count_aggregates(&self) -> Result<Vec<ShortAggregateCensus>> {
         if !self.group_count_deltas_enabled() {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        let mut repairs = 0usize;
         for ident in self.aggregate_table_idents().await {
-            // The counter's namespace label. Taken from the ident rather than
-            // from `self` so it can never name a different namespace than the
-            // `table` beside it.
-            let namespace = ident.namespace().to_string();
-            // One table's transient read error must not skip the rest: this is
-            // a whole-warehouse sweep on a timer, and the events table is
-            // usually last in nobody's interest.
-            let census = match self.short_group_count_census(&ident).await {
-                Ok(census) => census,
-                Err(error) => {
-                    tracing::warn!(error = ?error, table = %ident,
-                        "short group-count census failed");
-                    continue;
-                }
-            };
-            let outcome = match census {
-                ShortAggregateOutcome::Covered => continue,
-                ShortAggregateOutcome::Detected { columns } if repairs < max_repairs => {
-                    repairs += 1;
-                    self.repair_short_group_count_aggregate(&ident, columns)
-                        .await
-                }
-                other => other,
-            };
-            match &outcome {
-                ShortAggregateOutcome::Pending { columns } => tracing::debug!(
+            match self.short_group_count_census(&ident).await {
+                Ok(Some(item)) => out.push(item),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    error = ?error,
                     table = %ident,
-                    columns = %columns.join(","),
-                    "group-count aggregate is short, but the newest generation's \
-                     contribution has not landed yet; leaving it to the fold"
+                    "short group-count census failed"
                 ),
-                ShortAggregateOutcome::Suppressed { columns } => tracing::debug!(
-                    table = %ident,
-                    columns = %columns.join(","),
-                    "group-count aggregate is short only in columns a previous \
-                     rebuild could not restore; not rebuilding again"
-                ),
-                ShortAggregateOutcome::Detected { columns } => {
-                    record_group_count_short_aggregate(&namespace, ident.name(), "detected");
-                    tracing::warn!(
-                        table = %ident,
-                        columns = %columns.join(","),
-                        "group-count aggregate is SHORT of record_count with every \
-                         contribution accounted for; GROUP BY on these columns stays \
-                         on the exact per-file path. Automatic repair is off or its \
-                         per-pass budget is spent — run \
-                         `siglake rebuild-group-counts --namespace <ns> --table <t>` \
-                         or set SIGLAKE_AGG_SHORT_REPAIR=1"
-                    );
-                }
-                ShortAggregateOutcome::Repaired {
-                    columns,
-                    unrestored,
-                } => {
-                    if unrestored.is_empty() {
-                        record_group_count_short_aggregate(&namespace, ident.name(), "repaired");
-                        tracing::info!(
-                            table = %ident,
-                            columns = %columns.join(","),
-                            "rebuilt a short group-count aggregate from committed files"
-                        );
-                    } else {
-                        record_group_count_short_aggregate(&namespace, ident.name(), "incomplete");
-                        tracing::warn!(
-                            table = %ident,
-                            columns = %unrestored.join(","),
-                            "rebuilt a short group-count aggregate, but these columns \
-                             were not restored from the files; an exact column remains \
-                             on the per-file path and a sketch keeps its carried state. \
-                             Exact residue is recorded so later passes do not rebuild \
-                             for it again"
-                        );
-                    }
-                }
-                ShortAggregateOutcome::Failed => {
-                    record_group_count_short_aggregate(&namespace, ident.name(), "failed");
-                }
-                ShortAggregateOutcome::Covered => {}
             }
-            out.push((ident.name().to_string(), outcome));
         }
         Ok(out)
+    }
+
+    pub async fn prepare_short_group_count_repair(
+        &self,
+        census: &ShortAggregateCensus,
+        watchdog: Duration,
+    ) -> Result<ShortAggregateAttemptStart> {
+        let ShortAggregateOutcome::Detected { columns } = &census.outcome else {
+            return Ok(ShortAggregateAttemptStart::Outcome(census.outcome.clone()));
+        };
+        let ident = TableIdent::new(self.namespace.clone(), census.table.clone());
+        let table = self.catalog.load_table(&ident).await?;
+        let Some(op) = aggregate_operator(&table)? else {
+            return Ok(ShortAggregateAttemptStart::Outcome(
+                ShortAggregateOutcome::Covered,
+            ));
+        };
+        let listed = list_group_count_objects(&op).await?;
+        if let Some(outcome) = short_repair_history_outcome(
+            &op,
+            table.metadata().uuid(),
+            &listed.short_repair_markers,
+            columns,
+            chrono::Utc::now(),
+        )
+        .await?
+        {
+            return Ok(ShortAggregateAttemptStart::Outcome(outcome));
+        }
+        let attempt_id = Uuid::now_v7();
+        let marker_path = short_repair_marker_rel_path(census.target_sequence_number, attempt_id);
+        let now = chrono::Utc::now();
+        let marker = ShortAggregateAttemptMarker {
+            version: 1,
+            attempt_id,
+            table_uuid: table.metadata().uuid(),
+            target_snapshot_id: census.target_snapshot_id,
+            target_sequence_number: census.target_sequence_number,
+            maintained_columns: census.maintained_columns.clone(),
+            started_at: now.to_rfc3339(),
+            reason: ShortAggregateAttemptReason::Started,
+            next_eligible_at: (now
+                + chrono::Duration::from_std(watchdog)
+                    .unwrap_or_else(|_| chrono::Duration::minutes(10)))
+            .to_rfc3339(),
+        };
+        if let Err(error) = write_short_repair_marker(&op, &marker_path, &marker).await {
+            tracing::warn!(?error, table = %ident, "short-repair marker write failed");
+            return Ok(ShortAggregateAttemptStart::Outcome(
+                ShortAggregateOutcome::MarkerFailed {
+                    columns: columns.clone(),
+                },
+            ));
+        }
+        Ok(ShortAggregateAttemptStart::Ready(ShortAggregateAttempt {
+            table: census.table.clone(),
+            columns: columns.clone(),
+            marker_path,
+            marker,
+        }))
+    }
+
+    pub async fn execute_short_group_count_repair(
+        &self,
+        attempt: &ShortAggregateAttempt,
+    ) -> ShortAggregateOutcome {
+        let ident = TableIdent::new(self.namespace.clone(), attempt.table.clone());
+        let outcome = self
+            .repair_short_group_count_aggregate(&ident, attempt.columns.clone())
+            .await;
+        match &outcome {
+            ShortAggregateOutcome::Repaired { .. } | ShortAggregateOutcome::Covered => {
+                if let Ok(table) = self.catalog.load_table(&ident).await {
+                    if let Ok(Some(op)) = aggregate_operator(&table) {
+                        if let Ok((wide, _)) = load_wide_group_counts(&op).await {
+                            if let Some(rebuilt_through) = wide.and_then(|w| w.rebuilt_through) {
+                                if let Ok(listed) = list_group_count_objects(&op).await {
+                                    delete_short_repair_markers(
+                                        &op,
+                                        &listed.short_repair_markers,
+                                        rebuilt_through,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ShortAggregateOutcome::Failed { .. } => {
+                if let Err(error) = self
+                    .record_short_group_count_attempt(attempt, ShortAggregateAttemptReason::Failed)
+                    .await
+                {
+                    tracing::warn!(?error, table = %ident, "failed to persist repair failure");
+                }
+            }
+            _ => {}
+        }
+        outcome
+    }
+
+    pub async fn record_short_group_count_attempt(
+        &self,
+        attempt: &ShortAggregateAttempt,
+        reason: ShortAggregateAttemptReason,
+    ) -> Result<ShortAggregateOutcome> {
+        debug_assert!(matches!(
+            reason,
+            ShortAggregateAttemptReason::Watchdog | ShortAggregateAttemptReason::Failed
+        ));
+        let ident = TableIdent::new(self.namespace.clone(), attempt.table.clone());
+        let table = self.catalog.load_table(&ident).await?;
+        let op = aggregate_operator(&table)?.ok_or_else(|| anyhow::anyhow!("no table UUID"))?;
+        let attempts = list_group_count_objects(&op)
+            .await?
+            .short_repair_markers
+            .len();
+        let mut marker = attempt.marker.clone();
+        marker.reason = reason;
+        marker.next_eligible_at = short_repair_delay(attempts)
+            .map(|delay| chrono::Utc::now() + delay)
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
+        write_short_repair_marker(&op, &attempt.marker_path, &marker).await?;
+        if attempts >= SHORT_REPAIR_MAX_ATTEMPTS {
+            Ok(ShortAggregateOutcome::Suppressed {
+                columns: attempt.columns.clone(),
+                attempts,
+                reason,
+                marker: None,
+            })
+        } else {
+            Ok(ShortAggregateOutcome::BackedOff {
+                columns: attempt.columns.clone(),
+                attempts,
+                reason,
+                next_eligible_at: marker.next_eligible_at,
+            })
+        }
+    }
+
+    pub fn report_short_group_count_outcome(&self, table: &str, outcome: &ShortAggregateOutcome) {
+        let namespace = self.namespace().to_string();
+        let command =
+            format!("siglake rebuild-group-counts --namespace {namespace} --table {table}");
+        match outcome {
+            ShortAggregateOutcome::Covered => {}
+            ShortAggregateOutcome::Pending { columns } => tracing::debug!(
+                namespace,
+                table,
+                columns = %columns.join(","),
+                "short aggregate is waiting for the newest contribution"
+            ),
+            ShortAggregateOutcome::Unrestored { columns } => tracing::debug!(
+                namespace,
+                table,
+                columns = %columns.join(","),
+                "short aggregate contains only unrestorable columns"
+            ),
+            ShortAggregateOutcome::Detected { columns } => {
+                record_group_count_short_aggregate(&namespace, table, "detected");
+                tracing::warn!(namespace, table, columns = %columns.join(","), %command,
+                    "group-count aggregate is short; automatic repair is off or its budget is spent");
+            }
+            ShortAggregateOutcome::Repaired { unrestored, .. } => {
+                let label = if unrestored.is_empty() {
+                    "repaired"
+                } else {
+                    "incomplete"
+                };
+                record_group_count_short_aggregate(&namespace, table, label);
+                if unrestored.is_empty() {
+                    tracing::info!(
+                        namespace,
+                        table,
+                        "rebuilt a short group-count aggregate from committed files"
+                    );
+                } else {
+                    tracing::warn!(namespace, table, columns = %unrestored.join(","),
+                        "short group-count rebuild left unrestored columns");
+                }
+            }
+            ShortAggregateOutcome::BackedOff {
+                attempts,
+                reason,
+                next_eligible_at,
+                ..
+            } => {
+                let label = match reason {
+                    ShortAggregateAttemptReason::Watchdog => "backed_off_watchdog",
+                    ShortAggregateAttemptReason::Failed => "backed_off_failed",
+                    ShortAggregateAttemptReason::Started
+                    | ShortAggregateAttemptReason::Interrupted
+                    | ShortAggregateAttemptReason::Malformed => "backed_off_interrupted",
+                };
+                record_group_count_short_aggregate(&namespace, table, label);
+                tracing::warn!(namespace, table, attempts, reason = ?reason, next_eligible_at,
+                    %command, "short-aggregate automatic repair is backed off");
+            }
+            ShortAggregateOutcome::Suppressed {
+                attempts,
+                reason,
+                marker,
+                ..
+            } => {
+                record_group_count_short_aggregate(&namespace, table, "suppressed");
+                tracing::warn!(namespace, table, attempts, reason = ?reason, marker, %command,
+                    "short-aggregate automatic repair is suppressed");
+            }
+            ShortAggregateOutcome::MarkerFailed { .. } => {
+                record_group_count_short_aggregate(&namespace, table, "marker_failed");
+                tracing::warn!(namespace, table, %command,
+                    "short-aggregate repair did not start because its durable marker could not be written");
+            }
+            ShortAggregateOutcome::Failed { .. } => {
+                record_group_count_short_aggregate(&namespace, table, "failed");
+            }
+        }
     }
 
     /// Which maintained columns the Tier-1 read guard cannot serve, and whether
@@ -13070,31 +13573,50 @@ impl IcebergContext {
     /// already served or leave one that is not. It does not CALL the guard:
     /// that decodes one column's values per call, and asking it for 22 columns
     /// walks a 26.5 MB blob 22 times to compare 22 integers.
-    async fn short_group_count_census(&self, ident: &TableIdent) -> Result<ShortAggregateOutcome> {
+    async fn short_group_count_census(
+        &self,
+        ident: &TableIdent,
+    ) -> Result<Option<ShortAggregateCensus>> {
         let cached = self.cached_table_entry(ident).await?;
         // Incarnation fence (#2919): a table with no UUID publishes and reads no
         // aggregate at all, so it has nothing to be short of, and the artifacts
         // at the shared path are somebody else's.
-        if aggregate_operator(&cached.table)?.is_none() {
-            return Ok(ShortAggregateOutcome::Covered);
-        }
-        let Some(record_count) = cached
-            .table
-            .metadata()
-            .current_snapshot()
-            .and_then(|s| s.summary().additional_properties.get("total-records"))
+        let Some(op) = aggregate_operator(&cached.table)? else {
+            return Ok(None);
+        };
+        let Some(snapshot) = cached.table.metadata().current_snapshot() else {
+            return Ok(None);
+        };
+        let Some(record_count) = snapshot
+            .summary()
+            .additional_properties
+            .get("total-records")
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|rc| *rc > 0)
         else {
-            return Ok(ShortAggregateOutcome::Covered);
+            return Ok(None);
         };
+        let mut objects = list_group_count_objects(&op).await?;
         // The FOLDED view, so an outstanding delta explains its own rows before
         // anything calls the aggregate short — the fold defers persisting until
         // a backlog is worth the write, and a reader folds what is outstanding
         // itself.
-        let Some(wide) = self.cached_wide_group_counts(&cached).await? else {
-            return Ok(ShortAggregateOutcome::Covered);
+        let Some(wide) = fold_wide_group_counts_with_deltas(
+            &op,
+            self.table_group_count_cardinality(),
+            self.group_count_sketch_counters(),
+            Some(&objects.deltas),
+        )
+        .await?
+        else {
+            return Ok(None);
         };
+        if let Some(rebuilt_through) = wide.rebuilt_through {
+            delete_short_repair_markers(&op, &objects.short_repair_markers, rebuilt_through).await;
+            objects
+                .short_repair_markers
+                .retain(|(sequence, _)| *sequence > rebuilt_through);
+        }
         let Some(totals) = wide
             .group_counts
             .as_deref()
@@ -13104,8 +13626,11 @@ impl IcebergContext {
             // maintains, so there is no deficit to measure. A table whose
             // columns are all sketched lands here too, and a sketch is short of
             // `record_count` by design.
-            return Ok(ShortAggregateOutcome::Covered);
+            return Ok(None);
         };
+        let mut maintained_columns: Vec<String> =
+            totals.iter().map(|(column, _)| column.clone()).collect();
+        maintained_columns.sort();
         let wide_covers = aggregate_covers_current_snapshot(&cached.table, wide.coverage);
         let mut short: Vec<String> = totals
             .into_iter()
@@ -13113,7 +13638,7 @@ impl IcebergContext {
             .map(|(column, _)| column)
             .collect();
         if short.is_empty() {
-            return Ok(ShortAggregateOutcome::Covered);
+            return Ok(None);
         }
         // The guard's first arm, for the columns the wide one leaves short. On a
         // table where the incremental path was switched on mid-life the inline
@@ -13133,7 +13658,7 @@ impl IcebergContext {
             }
         }
         if short.is_empty() {
-            return Ok(ShortAggregateOutcome::Covered);
+            return Ok(None);
         }
         // Residue of an earlier repair: a column over the cardinality cap, or
         // unreadable in some live file, comes back short on the next commit's
@@ -13143,9 +13668,15 @@ impl IcebergContext {
                 .into_iter()
                 .partition(|column| residue.unrestored.contains(column));
             if remaining.is_empty() {
-                return Ok(ShortAggregateOutcome::Suppressed {
-                    columns: suppressed,
-                });
+                return Ok(Some(ShortAggregateCensus {
+                    table: ident.name().to_string(),
+                    outcome: ShortAggregateOutcome::Unrestored {
+                        columns: suppressed,
+                    },
+                    maintained_columns,
+                    target_snapshot_id: snapshot.snapshot_id(),
+                    target_sequence_number: snapshot.sequence_number(),
+                }));
             }
             short = remaining;
         }
@@ -13155,9 +13686,32 @@ impl IcebergContext {
             wide.coverage,
             &wide.coverage_links,
         ) {
-            return Ok(ShortAggregateOutcome::Pending { columns: short });
+            return Ok(Some(ShortAggregateCensus {
+                table: ident.name().to_string(),
+                outcome: ShortAggregateOutcome::Pending { columns: short },
+                maintained_columns,
+                target_snapshot_id: snapshot.snapshot_id(),
+                target_sequence_number: snapshot.sequence_number(),
+            }));
         }
-        Ok(ShortAggregateOutcome::Detected { columns: short })
+        let outcome = short_repair_history_outcome(
+            &op,
+            cached.table.metadata().uuid(),
+            &objects.short_repair_markers,
+            &short,
+            chrono::Utc::now(),
+        )
+        .await?
+        .unwrap_or_else(|| ShortAggregateOutcome::Detected {
+            columns: short.clone(),
+        });
+        Ok(Some(ShortAggregateCensus {
+            table: ident.name().to_string(),
+            outcome,
+            maintained_columns,
+            target_snapshot_id: snapshot.snapshot_id(),
+            target_sequence_number: snapshot.sequence_number(),
+        }))
     }
 
     /// Rebuild one table's short aggregate and record what the rebuild could
@@ -13200,7 +13754,7 @@ impl IcebergContext {
             Err(error) => {
                 tracing::warn!(error = ?error, table = %ident,
                     "rebuild of a short group-count aggregate failed");
-                return ShortAggregateOutcome::Failed;
+                return ShortAggregateOutcome::Failed { columns };
             }
         };
         if report.skipped_no_columns {
@@ -21677,6 +22231,7 @@ impl IcebergContext {
                 columns: Vec::new(),
                 skipped_no_columns: true,
                 admissible_typed_columns,
+                short_repair_markers_deleted: 0,
             });
         }
 
@@ -21863,6 +22418,18 @@ impl IcebergContext {
         // says `materialized` until the process restarts.
         self.invalidate_cached_table(ident).await;
 
+        let short_repair_markers_deleted = match list_group_count_objects(&op).await {
+            Ok(listed) => {
+                delete_short_repair_markers(&op, &listed.short_repair_markers, sequence_number)
+                    .await
+            }
+            Err(error) => {
+                tracing::warn!(?error, table = %ident,
+                    "short-repair marker cleanup listing failed; the next census will retry");
+                0
+            }
+        };
+
         if let Some(out) = unrestored_sketches_out.as_mut() {
             out.extend(unrestored_sketches.iter().cloned());
         }
@@ -21875,6 +22442,7 @@ impl IcebergContext {
             columns: report,
             skipped_no_columns: false,
             admissible_typed_columns,
+            short_repair_markers_deleted,
         })
     }
 
@@ -29993,6 +30561,8 @@ pub struct GroupCountRebuild {
     /// are what the flag would add, so a caller can say so instead of
     /// reporting a column as unrecoverable.
     pub admissible_typed_columns: Vec<String>,
+    /// Durable automatic-attempt records cleared after the successful CAS.
+    pub short_repair_markers_deleted: usize,
 }
 
 /// One column's rebuild outcome.

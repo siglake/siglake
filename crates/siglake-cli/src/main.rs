@@ -5714,6 +5714,10 @@ async fn run_rebuild_group_counts(
     let report = ice
         .rebuild_group_count_aggregate_with(table, options)
         .await?;
+    println!(
+        "{namespace}.{table}: cleared {} short-repair attempt record(s)",
+        report.short_repair_markers_deleted
+    );
 
     // Typed columns the schema has and the aggregate does not — with the flag
     // off, this is the remedy; with it on, they are in the report as admitted.

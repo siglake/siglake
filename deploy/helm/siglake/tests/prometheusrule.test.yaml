@@ -764,6 +764,37 @@ tests:
         alertname: SiglakeGroupCountAggregateShort
         exp_alerts: []
 
+  - name: durable short-repair suppression reaches the existing alert
+    interval: 1m
+    input_series:
+      - series: 'siglake_group_count_short_aggregates_total{namespace="logs",pod="compactor-0",iceberg_namespace="siglake",table="events",outcome="suppressed"}'
+        values: '0 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: SiglakeGroupCountAggregateShort
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              iceberg_namespace: siglake
+              table: events
+              outcome: suppressed
+              severity: warning
+            exp_annotations:
+              summary: The group-count aggregate for siglake.events is short of its row count
+              description: >-
+                The maintenance census found table siglake.events short of
+                `total-records` in at least one maintained column, with every
+                commit's contribution present — outcome suppressed. Answers
+                stay exact; `GROUP BY` on those columns runs on the exact
+                per-file path and will keep doing so, because no later commit
+                closes the gap. The compactor's WARN line names the columns.
+                Run `siglake rebuild-group-counts --namespace siglake --table
+                events`, which recomputes the aggregate from the committed
+                files and is safe to re-run, or set
+                `compactor.shortAggregateRepair=true` to have the maintenance
+                pass rebuild one table per census.
+
   # The rebuild and publication alerts carry the same pair, and their repair
   # commands have to name the namespace they would run against.
   - name: an incomplete rebuild and a lost publication name their namespace

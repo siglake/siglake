@@ -253,7 +253,9 @@ spec:
           # `detected` is what a default install records — one series per
           # census, every 15 minutes, until an operator acts — and `incomplete`
           # means the rebuild ran and the column still cannot cover the table.
-          expr: increase(siglake_group_count_short_aggregates_total{outcome=~"detected|incomplete|failed"}[1h]) > 0
+          # Durable backoff, suppression and marker refusal share this reader;
+          # their fixed outcome labels keep the alert bounded.
+          expr: increase(siglake_group_count_short_aggregates_total{outcome=~"detected|incomplete|failed|backed_off_watchdog|backed_off_failed|backed_off_interrupted|suppressed|marker_failed"}[1h]) > 0
           for: 0m
           labels:
             severity: warning

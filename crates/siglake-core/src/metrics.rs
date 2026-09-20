@@ -396,6 +396,31 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
                 ("table", "events"),
                 ("outcome", "failed"),
             ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "backed_off_watchdog"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "backed_off_failed"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "backed_off_interrupted"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "suppressed"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "marker_failed"),
+            ],
         ],
     },
     // #3000: the maintenance census's verdict on an aggregate that is short of
