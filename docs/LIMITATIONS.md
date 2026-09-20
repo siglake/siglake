@@ -1448,7 +1448,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `SiglakeGroupCountAggregateShort`; rebuilding it is opt-in
   (`SIGLAKE_AGG_SHORT_REPAIR=1`, `compactor.shortAggregateRepair`) and budgeted
   at one table per pass, because the rebuild is one Tier-2 query per maintained
-  column. The ~9 minutes per column per 250M rows is extrapolated from local
+  exact column plus one per existing sketch. A sketch the files cannot serve
+  keeps its carried state and is reported as unrestored; it does not prevent
+  the other sketches or the exact deficit from being repaired. The ~9 minutes
+  per column per 250M rows is extrapolated from local
   40k/400k-row fixtures, not measured at that size.
   Three gaps follow from that shape. A table wide or large enough for the
   rebuild to exceed the compactor's cooperative watchdog (600 s) has it cut,

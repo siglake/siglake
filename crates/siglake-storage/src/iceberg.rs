@@ -7708,6 +7708,48 @@ async fn list_group_count_deltas(op: &opendal::Operator) -> Result<Vec<(i64, Str
     Ok(list_group_count_objects(op).await?.deltas)
 }
 
+/// The sketch state a rebuild must preserve before it advances
+/// `rebuilt_through`: the stored base plus every not-yet-absorbed delta at or
+/// below the new watermark. Exact columns the same rebuild restored are
+/// excluded so one column never lands on both sides of the aggregate.
+async fn carried_group_count_sketches(
+    op: &opendal::Operator,
+    existing: Option<&WideGroupCounts>,
+    sequence_number: i64,
+    rebuilt_exact: &BTreeMap<String, ColumnGroupCounts>,
+) -> Result<GroupCountSketches> {
+    let mut carried = existing
+        .and_then(|wide| wide.sketches.clone())
+        .unwrap_or_else(|| GroupCountSketches {
+            version: GROUP_COUNT_SKETCH_VERSION,
+            columns: BTreeMap::new(),
+        });
+    carried
+        .columns
+        .retain(|column, _| !rebuilt_exact.contains_key(column));
+    let absorbed: BTreeSet<i64> = existing
+        .map(|wide| wide.absorbed.iter().copied().collect())
+        .unwrap_or_default();
+    for (sequence, path) in list_group_count_deltas(op).await? {
+        if sequence > sequence_number || absorbed.contains(&sequence) {
+            continue;
+        }
+        let Some(delta) = read_group_count_delta(op, &path).await? else {
+            continue;
+        };
+        let Some(mut sketches) = delta.sketches else {
+            continue;
+        };
+        sketches
+            .columns
+            .retain(|column, _| !rebuilt_exact.contains_key(column));
+        if !sketches.is_empty() {
+            carried.merge(&sketches);
+        }
+    }
+    Ok(carried)
+}
+
 async fn write_group_count_rebuild_marker(
     op: &opendal::Operator,
     marker: &GroupCountRebuildMarker,
@@ -7989,8 +8031,9 @@ pub enum ShortAggregateOutcome {
     /// Short with every contribution accounted for, and no rebuild ran:
     /// automatic repair is off, or this pass's budget is spent.
     Detected { columns: Vec<String> },
-    /// A rebuild ran. `unrestored` is empty when every short column now covers
-    /// the table.
+    /// A rebuild ran. `unrestored` names a short exact column that still does
+    /// not cover the table or a sketch whose files returned unavailable and
+    /// therefore kept its carried state.
     Repaired {
         columns: Vec<String>,
         unrestored: Vec<String>,
@@ -12826,9 +12869,13 @@ impl IcebergContext {
             .rebuild_group_count_aggregate_for(
                 ident,
                 GroupCountRebuildOptions::default(),
-                &repair_columns,
-                Some(&repair_sketch_columns),
-                None,
+                GroupCountRebuildRequest {
+                    repair_columns: &repair_columns,
+                    repair_sketch_columns: Some(&repair_sketch_columns),
+                    best_effort_sketches: false,
+                    unrestored_sketches_out: None,
+                    short_columns: None,
+                },
             )
             .await?;
         anyhow::ensure!(
@@ -12997,9 +13044,10 @@ impl IcebergContext {
                             table = %ident,
                             columns = %unrestored.join(","),
                             "rebuilt a short group-count aggregate, but these columns \
-                             still cannot cover the table and remain on the per-file \
-                             path; they are recorded so later passes do not rebuild \
-                             for them again"
+                             were not restored from the files; an exact column remains \
+                             on the per-file path and a sketch keeps its carried state. \
+                             Exact residue is recorded so later passes do not rebuild \
+                             for it again"
                         );
                     }
                 }
@@ -13120,6 +13168,8 @@ impl IcebergContext {
         columns: Vec<String>,
     ) -> ShortAggregateOutcome {
         let short: BTreeSet<String> = columns.iter().cloned().collect();
+        let sketch_columns = BTreeSet::new();
+        let mut unrestored_sketches = Vec::new();
         // The census read a memoised folded view; the rebuild must take its
         // maintained column set from a fresh load, or it would omit a column a
         // concurrent fold has since added.
@@ -13131,20 +13181,18 @@ impl IcebergContext {
                 // that is an operator decision (`--admit-typed-columns`), and
                 // one a repair must not make on its own.
                 GroupCountRebuildOptions::default(),
-                &BTreeMap::new(),
-                // NOT the sketches. Asking for them recomputes every sketched
-                // column from the files and fails the WHOLE rebuild on the
-                // first one the files cannot serve — which on the events table
-                // is `timestamp_ns` the moment its per-row-unique values get it
-                // demoted, so the repair would never complete on the table that
-                // needs it most. What the rebuild does instead is carry the
-                // sketch half of every delta its watermark is about to make
-                // deletable, so an approximate column keeps its rows without
-                // costing a second Tier-2 query per sketched column. The exact
-                // columns are the ones Tier-1 serves, and they are rebuilt from
-                // the files.
-                None,
-                Some(&short),
+                GroupCountRebuildRequest {
+                    repair_columns: &BTreeMap::new(),
+                    // Recompute sketches one column at a time. A column the files
+                    // cannot serve keeps its carried state; a real read error still
+                    // fails the rebuild. This is census-only: marker repair retains
+                    // its all-or-nothing contract and the CLI keeps carrying
+                    // sketches without paying their Tier-2 reads.
+                    repair_sketch_columns: Some(&sketch_columns),
+                    best_effort_sketches: true,
+                    unrestored_sketches_out: Some(&mut unrestored_sketches),
+                    short_columns: Some(&short),
+                },
             )
             .await
         {
@@ -13162,12 +13210,15 @@ impl IcebergContext {
                 "short group-count rebuild found no maintained columns");
             return ShortAggregateOutcome::Covered;
         }
-        let unrestored: Vec<String> = report
+        let mut unrestored: Vec<String> = report
             .columns
             .iter()
             .filter(|column| short.contains(&column.column) && !column.covers_table)
             .map(|column| column.column.clone())
             .collect();
+        unrestored.extend(unrestored_sketches);
+        unrestored.sort();
+        unrestored.dedup();
         ShortAggregateOutcome::Repaired {
             columns,
             unrestored,
@@ -21492,8 +21543,18 @@ impl IcebergContext {
         options: GroupCountRebuildOptions,
     ) -> Result<GroupCountRebuild> {
         let ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
-        self.rebuild_group_count_aggregate_for(&ident, options, &BTreeMap::new(), None, None)
-            .await
+        self.rebuild_group_count_aggregate_for(
+            &ident,
+            options,
+            GroupCountRebuildRequest {
+                repair_columns: &BTreeMap::new(),
+                repair_sketch_columns: None,
+                best_effort_sketches: false,
+                unrestored_sketches_out: None,
+                short_columns: None,
+            },
+        )
+        .await
     }
 
     /// Ident-based core used by the maintenance compactor. Repair markers can
@@ -21511,10 +21572,16 @@ impl IcebergContext {
         &self,
         ident: &TableIdent,
         options: GroupCountRebuildOptions,
-        repair_columns: &BTreeMap<String, usize>,
-        repair_sketch_columns: Option<&BTreeSet<String>>,
-        short_columns: Option<&BTreeSet<String>>,
+        request: GroupCountRebuildRequest<'_>,
     ) -> Result<GroupCountRebuild> {
+        let GroupCountRebuildRequest {
+            repair_columns,
+            repair_sketch_columns,
+            best_effort_sketches,
+            mut unrestored_sketches_out,
+            short_columns,
+        } = request;
+        debug_assert!(repair_sketch_columns.is_some() || !best_effort_sketches);
         let table_name = ident.name();
         let cached = self.cached_table_entry(ident).await?;
         let snapshot = cached.table.metadata().current_snapshot().ok_or_else(|| {
@@ -21679,12 +21746,23 @@ impl IcebergContext {
                 .insert(column.clone(), ColumnGroupCounts { values, nulls });
         }
 
-        let rebuilt_sketches = if repair_sketch_columns.is_some() {
+        let (rebuilt_sketches, unrestored_sketches) = if repair_sketch_columns.is_some() {
             let sketch_m = self.group_count_sketch_counters();
-            let mut sketches = GroupCountSketches {
-                version: GROUP_COUNT_SKETCH_VERSION,
-                columns: BTreeMap::new(),
+            let mut sketches = if best_effort_sketches {
+                carried_group_count_sketches(
+                    &op,
+                    existing.as_ref(),
+                    sequence_number,
+                    &rebuilt.columns,
+                )
+                .await?
+            } else {
+                GroupCountSketches {
+                    version: GROUP_COUNT_SKETCH_VERSION,
+                    columns: BTreeMap::new(),
+                }
             };
+            let mut unrestored = Vec::new();
             for column in &sketches_to_rebuild {
                 // A column is represented exactly OR approximately, never by
                 // two partial halves. This can remove a marker-only exact
@@ -21692,12 +21770,14 @@ impl IcebergContext {
                 rebuilt.columns.remove(column);
                 let counts = self
                     .grouped_counts_from_files(&cached, ident, column, None)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "cannot rebuild group-count sketch `{column}` for {table_name}"
-                        )
-                    })?;
+                    .await?;
+                let Some(counts) = counts else {
+                    if best_effort_sketches {
+                        unrestored.push(column.clone());
+                        continue;
+                    }
+                    anyhow::bail!("cannot rebuild group-count sketch `{column}` for {table_name}");
+                };
                 let mut values = BTreeMap::new();
                 let mut rows = 0u64;
                 for (value, count) in counts {
@@ -21711,7 +21791,7 @@ impl IcebergContext {
                     ColumnSketch::from_exact(sketch_m, values, rows),
                 );
             }
-            Some(sketches)
+            (Some(sketches), unrestored)
         } else {
             // Not recomputing the sketches, but they must not silently LOSE
             // rows either. `rebuilt_through` makes every delta at or below it
@@ -21726,36 +21806,18 @@ impl IcebergContext {
             // a column represented both ways is reconciled by demoting the
             // exact side, which would undo the repair and leave the next census
             // rebuilding the same column every pass.
-            let mut carried = existing
-                .as_ref()
-                .and_then(|w| w.sketches.clone())
-                .unwrap_or_else(|| GroupCountSketches {
-                    version: GROUP_COUNT_SKETCH_VERSION,
-                    columns: BTreeMap::new(),
-                });
-            let absorbed: BTreeSet<i64> = existing
-                .as_ref()
-                .map(|w| w.absorbed.iter().copied().collect())
-                .unwrap_or_default();
-            for (seq, path) in list_group_count_deltas(&op).await? {
-                if seq > sequence_number || absorbed.contains(&seq) {
-                    continue;
-                }
-                let Some(delta) = read_group_count_delta(&op, &path).await? else {
-                    continue;
-                };
-                let Some(mut sketches) = delta.sketches else {
-                    continue;
-                };
-                sketches
-                    .columns
-                    .retain(|column, _| !rebuilt.columns.contains_key(column));
-                if sketches.is_empty() {
-                    continue;
-                }
-                carried.merge(&sketches);
-            }
-            Some(carried)
+            (
+                Some(
+                    carried_group_count_sketches(
+                        &op,
+                        existing.as_ref(),
+                        sequence_number,
+                        &rebuilt.columns,
+                    )
+                    .await?,
+                ),
+                Vec::new(),
+            )
         };
 
         // CAS the object. On conflict the whole rebuild is redone rather than
@@ -21800,6 +21862,10 @@ impl IcebergContext {
         // Without this the object on disk is repaired and every query still
         // says `materialized` until the process restarts.
         self.invalidate_cached_table(ident).await;
+
+        if let Some(out) = unrestored_sketches_out.as_mut() {
+            out.extend(unrestored_sketches.iter().cloned());
+        }
 
         metrics::counter!("siglake_group_count_aggregate_rebuilds_total").increment(1);
         Ok(GroupCountRebuild {
@@ -29894,6 +29960,17 @@ pub struct GroupCountRebuildOptions {
     /// WHOLE-TABLE distinct count, and is left absent — never partial — if any
     /// live file can serve it from neither its footer nor a raw-page decode.
     pub admit_typed_columns: bool,
+}
+
+/// Internal controls that distinguish marker, census and operator rebuilds.
+/// Kept together so adding a recovery mode does not turn the shared core into
+/// a list of coupled booleans and optional column sets.
+struct GroupCountRebuildRequest<'a> {
+    repair_columns: &'a BTreeMap<String, usize>,
+    repair_sketch_columns: Option<&'a BTreeSet<String>>,
+    best_effort_sketches: bool,
+    unrestored_sketches_out: Option<&'a mut Vec<String>>,
+    short_columns: Option<&'a BTreeSet<String>>,
 }
 
 /// What one [`IcebergContext::rebuild_group_count_aggregate`] did.
