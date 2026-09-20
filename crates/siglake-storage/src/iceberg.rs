@@ -3928,7 +3928,8 @@ fn base_group_count_cardinality() -> usize {
 /// rollback story: drop the knob and the mechanism disappears.
 impl FileGroupCounts {
     /// Parse a [`FileGroupCounts`] from a JSON blob — the shape of the
-    /// snapshot-side aggregates object (`metadata/siglake-aggregates.json`),
+    /// snapshot-side aggregates object at
+    /// `<table location>/metadata/siglake-agg/<table-uuid>/siglake-aggregates.json`,
     /// which is JSON by design; the per-file FOOTER uses the compact encoding.
     pub fn from_json(s: &str) -> Option<Self> {
         serde_json::from_str(s).ok()
