@@ -316,7 +316,75 @@ retry wins against: a warm table's per-file fallback measured ~2ms.
 - `crates/siglake-cli/tests/cli/rebuild_time_aggregates_cli.rs`: the report an
   operator reads, from the real binary.
 
-One thing the measurement did not cover and the implementation therefore does
-not claim: the 2-D decode's cost at scale. It is a two-column pass over the
-live files, so it is bounded by what a Tier-2 query already costs on the same
-table, but no at-scale figure has been taken.
+## Row-removing commits stay operator-repaired (#4675, 2026-09-20)
+
+No scheduler was added. Retention and delete tasks continue to leave an
+unproven inline object for `rebuild-time-aggregates` to repair. This is a
+measured decision, not a claim that the repair is free.
+
+### Local per-trigger measurement
+
+`orphaned_coverage_repair::hourly_retention_rebuild_cost_report`, release
+build, one shared development box, 2026-09-20. The fixture invokes retention
+once on an index whose policy carries `schedule = "0 * * * *"`, then measures
+five cold contexts over the 16 live files. Each file has 200 rows and spans two
+hourly aggregate buckets, forcing the 2-D arm to decode. “Hourly” describes the
+external cadence an operator would put around `retention-sweep --apply`;
+neither that CLI nor the compactor consumes `RetentionPolicy.schedule`.
+
+The bucket-only rows are the measured `rebuilt_time_buckets` phase of the full
+pass. They do not publish a bucket-only object. Decoded bytes are the projected
+Arrow batches' `get_array_memory_size`, not encoded object-store bytes.
+
+| policy after one retention trigger | bucket reads | bucket decoded | group reads | group decoded | cold p50 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| operator-only, until a later manual pass | 0 | 0 B | 0 | 0 B | 0 ms |
+| bucket-only, valid footers | 16 footer | 0 B | 0 | 0 B | 14.83 ms |
+| full rebuild, valid footers | 16 footer | 0 B | 16 decode | 196,864 B | 17.72 ms |
+| bucket-only, all bucket footers absent | 16 decode | 27,136 B | 0 | 0 B | 14.07 ms |
+| full rebuild, all bucket footers absent | 16 decode | 27,136 B | 16 decode | 196,864 B | 16.97 ms |
+
+The missing-footer arm is slightly faster on this local-filesystem run despite
+doing more decode work. Millisecond differences at this size are noise; the
+read source and decoded-byte columns are the portable result. The measurement
+adds `siglake_inline_time_rebuild_decoded_bytes{component}` and
+`siglake_inline_time_rebuild_seconds{component}` beside the existing file
+counters so a later operator pass reports the same split on its real table.
+
+The deterministic publication-fence fixture measured the discarded-work case
+separately. Three appends force all three attempts to lose their final fence.
+The attempts see one, then two, then three live files: six bucket-footer reads,
+six contained-file group-footer reads, zero decoded bytes, zero publications,
+and 134.19 ms elapsed in a debug build including the three append commits. The
+portable result is the repeated 1 + 2 + 3 reads: a conflict discards the whole
+pass, and the bounded retry can spend three passes without publishing. The
+UUID/snapshot/CAS fence still leaves the concurrent writer's bytes untouched.
+
+### Why the scheduler did not earn its surface
+
+The cheap half would restore `time_buckets`, including `windowed_count`, but a
+safe partial publication is not a small hook. The only durable column list for
+the later 2-D repair is the existing `time_group_counts` map. Dropping that map
+loses the list; retaining it under a new coverage edge would certify stale
+counts. The already-covered no-op would then keep a later full pass from
+running. Solving those points needs a new partial-coverage protocol or another
+durable source for the column list, neither authorized by this task.
+
+Full repair after every row-removing commit avoids that protocol but moves the
+unmeasured large-table 2-D cost onto the trigger cadence. A retention sweep is
+a separate CLI process, not a compactor loop with an existing scheduling knob.
+The delete-task hook would run in its quiet window, but a commit at the final
+fence still discards the pass; the three-attempt UUID/snapshot/CAS contract must
+remain intact. The bounded retry is preferable to publishing a mixed snapshot.
+
+Operator-only repair therefore keeps the shipped default and avoids a durable
+format change. It accepts that `windowed_count` full-scans and the other two
+consumers use their exact per-file paths between the row-removing commit and
+the operator pass. `orphaned_coverage_repair::the_rebuild_restores_tier_1_after_hourly_retention`
+pins the retention-specific unproven → rebuilt transition and exact answer.
+
+One limit remains: 196,864 decoded bytes over 3,200 local rows is not a
+large-table 2-D measurement. The earlier statement still holds at that scale:
+the pass is bounded by a Tier-2 query over the same columns, but no fleet number
+has been taken. That missing number is a reason to keep automatic full repair
+off, not an estimate of its cost.

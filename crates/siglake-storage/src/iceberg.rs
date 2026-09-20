@@ -3018,15 +3018,17 @@ async fn scan_file_timestamp_buckets_windowed(
     lo: Option<i64>,
     hi: Option<i64>,
     counts: &mut BTreeMap<i64, i64>,
-) -> Result<()> {
+) -> Result<u64> {
     use arrow_array::Array;
     use futures::StreamExt;
 
     let (mut reader, time_column) = pruned_window_batch_stream(file_io, path, &[], lo, hi).await?;
+    let mut decoded_bytes = 0u64;
     let bucket_of =
         |ts: i64| -> i64 { origin_ns + (ts - origin_ns).div_euclid(interval_ns) * interval_ns };
     while let Some(batch) = reader.next().await {
         let batch = batch.with_context(|| format!("decode parquet batch {path}"))?;
+        decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size() as u64);
         let col = siglake_core::column_nanos(
             batch.column(batch.schema().index_of(time_column.name.as_str())?),
         )
@@ -3043,7 +3045,7 @@ async fn scan_file_timestamp_buckets_windowed(
             *counts.entry(bucket_of(t)).or_default() += 1;
         }
     }
-    Ok(())
+    Ok(decoded_bytes)
 }
 
 /// The survivor projection for one delete predicate.
@@ -22858,6 +22860,7 @@ impl IcebergContext {
         ident: &TableIdent,
         cached: &CachedTableEntry,
     ) -> Result<TimeBucketCounts> {
+        let started = Instant::now();
         let files = self.live_data_files_cached(ident).await?;
         let file_io = cached.table.file_io().clone();
         let footer_cache = self.footer_cache.clone();
@@ -22892,22 +22895,31 @@ impl IcebergContext {
             .increment((files.len() - decode.len()) as u64);
         metrics::counter!("siglake_inline_time_rebuild_files_total", "source" => "decode")
             .increment(decode.len() as u64);
-        let scanned: Vec<BTreeMap<i64, i64>> =
+        let scanned: Vec<(BTreeMap<i64, i64>, u64)> =
             futures::stream::iter(decode.into_iter().map(|path| {
                 let file_io = file_io.clone();
                 async move {
                     let mut m = BTreeMap::new();
-                    scan_file_timestamp_buckets_windowed(
+                    let decoded_bytes = scan_file_timestamp_buckets_windowed(
                         &file_io, &path, width, 0, None, None, &mut m,
                     )
                     .await?;
-                    Ok::<_, anyhow::Error>(m)
+                    Ok::<_, anyhow::Error>((m, decoded_bytes))
                 }
             }))
             .buffer_unordered(concurrency)
             .try_collect()
             .await?;
-        for partial in scanned {
+        let decoded_bytes = scanned
+            .iter()
+            .map(|(_, bytes)| *bytes)
+            .fold(0u64, u64::saturating_add);
+        metrics::histogram!(
+            "siglake_inline_time_rebuild_decoded_bytes",
+            "component" => "time_buckets"
+        )
+        .record(decoded_bytes as f64);
+        for (partial, _) in scanned {
             for (start, count) in partial {
                 if let Ok(count) = u64::try_from(count) {
                     *out.entry(start).or_insert(0) += count;
@@ -22924,6 +22936,11 @@ impl IcebergContext {
         while rebuilt.buckets.len() > TIME_BUCKET_CAP {
             rebuilt.coarsen_to(rebuilt.width_ns.saturating_mul(2));
         }
+        metrics::histogram!(
+            "siglake_inline_time_rebuild_seconds",
+            "component" => "time_buckets"
+        )
+        .record(started.elapsed().as_secs_f64());
         Ok(rebuilt)
     }
 
@@ -22947,6 +22964,7 @@ impl IcebergContext {
         cached: &CachedTableEntry,
         columns: &[String],
     ) -> Result<TimeGroupCounts> {
+        let started = Instant::now();
         let files = self.live_data_files_cached(ident).await?;
         let file_io = cached.table.file_io().clone();
         let footer_cache = self.footer_cache.clone();
@@ -23038,14 +23056,24 @@ impl IcebergContext {
             .increment(decode.len() as u64);
 
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let decoded: Vec<TimeGroupCounts> = futures::stream::iter(decode.into_iter().map(|path| {
-            let file_io = file_io.clone();
-            let refs = refs.clone();
-            async move { decode_file_time_group_counts(&file_io, &path, &refs, width).await }
-        }))
-        .buffer_unordered(concurrency)
-        .try_collect()
-        .await?;
+        let decoded: Vec<(TimeGroupCounts, u64)> =
+            futures::stream::iter(decode.into_iter().map(|path| {
+                let file_io = file_io.clone();
+                let refs = refs.clone();
+                async move { decode_file_time_group_counts(&file_io, &path, &refs, width).await }
+            }))
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
+        let decoded_bytes = decoded
+            .iter()
+            .map(|(_, bytes)| *bytes)
+            .fold(0u64, u64::saturating_add);
+        metrics::histogram!(
+            "siglake_inline_time_rebuild_decoded_bytes",
+            "component" => "time_group_counts"
+        )
+        .record(decoded_bytes as f64);
         // Everything lands through `merge`, including the footer part, so the
         // value/total caps and the bucket coarsening are enforced by the same
         // code that enforces them at commit time. The merges only ever add, so
@@ -23055,9 +23083,14 @@ impl IcebergContext {
             columns: BTreeMap::new(),
         };
         rebuilt.merge(&from_footers);
-        for partial in &decoded {
+        for (partial, _) in &decoded {
             rebuilt.merge(partial);
         }
+        metrics::histogram!(
+            "siglake_inline_time_rebuild_seconds",
+            "component" => "time_group_counts"
+        )
+        .record(started.elapsed().as_secs_f64());
         Ok(rebuilt)
     }
 
@@ -30602,7 +30635,7 @@ async fn decode_file_time_group_counts(
     path: &str,
     columns: &[&str],
     width_ns: i64,
-) -> Result<TimeGroupCounts> {
+) -> Result<(TimeGroupCounts, u64)> {
     use futures::StreamExt;
 
     let (mut reader, _) = pruned_window_batch_stream(file_io, path, columns, None, None).await?;
@@ -30610,13 +30643,15 @@ async fn decode_file_time_group_counts(
         width_ns,
         columns: BTreeMap::new(),
     };
+    let mut decoded_bytes = 0u64;
     while let Some(batch) = reader.next().await {
         let batch = batch.with_context(|| format!("decode parquet batch {path}"))?;
+        decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size() as u64);
         if let Some(partial) = file_time_group_counts(&batch, columns, width_ns) {
             out.merge(&partial);
         }
     }
-    Ok(out)
+    Ok((out, decoded_bytes))
 }
 
 /// What one [`IcebergContext::rebuild_inline_time_aggregates`] did.
@@ -32389,6 +32424,63 @@ mod side_publication_retry_tests {
             .sum()
     }
 
+    fn metric_counter_with_label(
+        snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        name: &str,
+        label_key: &str,
+        label_value: &str,
+    ) -> u64 {
+        snapshot
+            .iter()
+            .filter(|(key, _, _, _)| {
+                key.key().name() == name
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == label_key && label.value() == label_value)
+            })
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Counter(value) => *value,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    fn metric_histogram_with_label(
+        snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        name: &str,
+        label_key: &str,
+        label_value: &str,
+    ) -> f64 {
+        snapshot
+            .iter()
+            .filter(|(key, _, _, _)| {
+                key.key().name() == name
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == label_key && label.value() == label_value)
+            })
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Histogram(samples) => samples
+                    .iter()
+                    .map(|sample| sample.into_inner())
+                    .sum::<f64>(),
+                _ => 0.0,
+            })
+            .sum()
+    }
+
     #[tokio::test]
     async fn inline_rebuild_retries_a_newer_pending_link_and_reads_the_new_snapshot() {
         let (tmp, ice, _legacy) = inline_rebuild_fixture().await;
@@ -32456,6 +32548,7 @@ mod side_publication_retry_tests {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let guard = metrics::set_default_local_recorder(&recorder);
+        let started = Instant::now();
 
         let error = ice
             .rebuild_inline_time_aggregates_in("events", |op| PendingLinkStore {
@@ -32468,6 +32561,7 @@ mod side_publication_retry_tests {
             })
             .await
             .expect_err("three commits must spend the retry budget");
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let metrics = snapshotter.snapshot().into_vec();
         drop(guard);
 
@@ -32486,6 +32580,29 @@ mod side_publication_retry_tests {
             metric_counter(&metrics, "siglake_inline_time_aggregate_rebuilds_total"),
             0
         );
+        let time_footer = metric_counter_with_label(
+            &metrics,
+            "siglake_inline_time_rebuild_files_total",
+            "source",
+            "footer",
+        );
+        let group_footer = metric_counter_with_label(
+            &metrics,
+            "siglake_inline_time_group_rebuild_files_total",
+            "source",
+            "footer",
+        );
+        let decoded_bytes = metric_histogram_with_label(
+            &metrics,
+            "siglake_inline_time_rebuild_decoded_bytes",
+            "component",
+            "time_group_counts",
+        );
+        println!(
+            "three conflicts: elapsed={elapsed_ms:.2}ms time-footer={time_footer} \
+             group-footer={group_footer} decoded={decoded_bytes:.0}B published=0"
+        );
+        assert_eq!((time_footer, group_footer, decoded_bytes as u64), (6, 6, 0));
         let table = ice.catalog().load_table(ice.table_ident()).await.unwrap();
         let op = aggregate_operator(&table).unwrap().unwrap();
         let bytes = op.read(SIDE_AGGREGATES_REL_PATH).await.unwrap().to_vec();

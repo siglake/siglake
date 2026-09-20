@@ -20,11 +20,16 @@
 //! anything on the commit path.
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::{Duration, TimeZone, Utc};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-use siglake_core::index_config::IndexConfig;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ArrowWriter;
+use parquet::file::properties::WriterProperties;
+use siglake_core::index_config::{IndexConfig, RetentionPolicy};
 use siglake_core::Event;
 use siglake_storage::iceberg::{
     IcebergContext, IcebergTuning, InlineCoverageOutcome, SnapshotAggregates, TimeBounds,
@@ -57,6 +62,15 @@ fn index_config() -> IndexConfig {
         index_id: INDEX.into(),
         ..IndexConfig::builtin_events()
     }
+}
+
+fn hourly_retention_config() -> IndexConfig {
+    let mut config = index_config();
+    config.retention = Some(RetentionPolicy {
+        period_secs: 2 * 60 * 60,
+        schedule: Some("0 * * * *".to_string()),
+    });
+    config
 }
 
 fn base_time() -> chrono::DateTime<Utc> {
@@ -92,6 +106,29 @@ async fn append(ice: &IcebergContext, config: &IndexConfig, from: i64, rows: i64
     let bloom_cols: Vec<String> = config.doc_mapping.tag_fields.to_vec();
     let bloom: Vec<&str> = bloom_cols.iter().map(String::as_str).collect();
     ice.append_to_table(&ident, mapped, &bloom).await.unwrap();
+}
+
+async fn append_times(
+    ice: &IcebergContext,
+    config: &IndexConfig,
+    times: &[chrono::DateTime<Utc>],
+    prefix: &str,
+) {
+    let mut events = Vec::with_capacity(times.len());
+    for (i, timestamp) in times.iter().enumerate() {
+        let mut event = Event::now(format!("{prefix}-{i}"));
+        event.timestamp = *timestamp;
+        event.host = format!("{prefix}-host-{}", i % 2);
+        event.sourcetype = ["info", "warn"][i % 2].to_string();
+        events.push(event);
+    }
+    let batch = siglake_core::events_to_record_batch(&events).unwrap();
+    let mapped = siglake_core::mapping::map_carrier_batch(&batch, config).unwrap();
+    let bloom_cols: Vec<String> = config.doc_mapping.tag_fields.to_vec();
+    let bloom: Vec<&str> = bloom_cols.iter().map(String::as_str).collect();
+    ice.append_to_table(&ice.index_table_ident(INDEX), mapped, &bloom)
+        .await
+        .unwrap();
 }
 
 async fn seed(dir: &std::path::Path) -> Arc<IcebergContext> {
@@ -135,6 +172,48 @@ fn aggregate_dir(root: &std::path::Path) -> std::path::PathBuf {
 fn read_side(dir: &std::path::Path) -> SnapshotAggregates {
     let path = aggregate_dir(&dir.join("warehouse")).join("siglake-aggregates.json");
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+fn strip_coverage(dir: &std::path::Path) {
+    let path = aggregate_dir(&dir.join("warehouse")).join("siglake-aggregates.json");
+    let mut side: SnapshotAggregates =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    side.coverage = None;
+    side.coverage_links.clear();
+    std::fs::write(path, serde_json::to_vec(&side).unwrap()).unwrap();
+}
+
+/// Rewrite one immutable fixture file without its time-bucket KV. The Iceberg
+/// manifest still describes the same rows and bounds; the measurement opens no
+/// writer after this point. This is the pre-footer shape the rebuild's validity
+/// guard must demote to a timestamp decode.
+fn remove_time_bucket_footer(path: &str) {
+    let path = std::path::Path::new(path.strip_prefix("file://").unwrap_or(path));
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap()).unwrap();
+    let schema = builder.schema().clone();
+    let key_values = builder
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|kv| kv.key != siglake_storage::iceberg::TIME_BUCKETS_KV_KEY)
+        .collect();
+    let batches: Vec<_> = builder
+        .build()
+        .unwrap()
+        .map(|batch| batch.unwrap())
+        .collect();
+    let properties = WriterProperties::builder()
+        .set_key_value_metadata(Some(key_values))
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(properties)).unwrap();
+    for batch in &batches {
+        writer.write(batch).unwrap();
+    }
+    writer.close().unwrap();
 }
 
 /// The trailing quarter of the span, snapped to the aggregate's hourly bucket
@@ -478,6 +557,266 @@ async fn the_rebuild_restores_tier_1_after_a_delete_task() {
         Some(exact_hist),
         "the rebuilt histogram disagrees with the exact one"
     );
+}
+
+/// Retention is the other shipped row-removing commit. Its schedule is an
+/// operator concern (the CLI does not consume this cron string), but an hourly
+/// policy must leave the same unproven state as a delete task and the same
+/// rebuild must restore exact Tier-1 answers.
+#[tokio::test]
+async fn the_rebuild_restores_tier_1_after_hourly_retention() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = open(tmp.path()).await;
+    let config = hourly_retention_config();
+    ice.create_index(&config).await.unwrap();
+
+    let now = Utc::now();
+    let hour = Utc
+        .timestamp_opt(now.timestamp().div_euclid(3_600) * 3_600, 0)
+        .unwrap();
+    append_times(
+        &ice,
+        &config,
+        &[hour - Duration::hours(6), hour - Duration::hours(5)],
+        "expired",
+    )
+    .await;
+    append_times(
+        &ice,
+        &config,
+        &[hour - Duration::minutes(90), hour - Duration::minutes(30)],
+        "straddling",
+    )
+    .await;
+    append_times(
+        &ice,
+        &config,
+        &[hour - Duration::minutes(20), hour - Duration::minutes(10)],
+        "recent",
+    )
+    .await;
+
+    let window = TimeBounds {
+        start: Some(hour - Duration::hours(2)),
+        end: Some(hour + Duration::hours(1)),
+    };
+    assert_eq!(windowed_groups(&ice, window).await.0, "tier1_windowed_agg");
+
+    let retained = ice.enforce_index_retention(INDEX).await.unwrap();
+    assert!(retained.files_dropped > 0, "{retained:?}");
+    let (label, exact) = windowed_groups(&ice, window).await;
+    assert_eq!(label, "materialized");
+    assert_eq!(census(&ice).await.0, InlineCoverageOutcome::Unproven);
+
+    let report = ice.rebuild_inline_time_aggregates(INDEX).await.unwrap();
+    assert!(report.published, "{report:?}");
+    assert!(report.time_buckets_restored, "{report:?}");
+    assert_eq!(census(&ice).await.0, InlineCoverageOutcome::Covered);
+    let (label, rebuilt) = windowed_groups(&ice, window).await;
+    assert_eq!(label, "tier1_windowed_agg");
+    assert_eq!(rebuilt, exact, "the retention repair changed the answer");
+}
+
+#[derive(Debug)]
+struct RebuildCost {
+    full_ms: f64,
+    buckets_ms: f64,
+    bucket_footer_files: u64,
+    bucket_decode_files: u64,
+    bucket_decoded_bytes: u64,
+    group_footer_files: u64,
+    group_decode_files: u64,
+    group_decoded_bytes: u64,
+}
+
+type MetricSnapshot = (
+    metrics_util::CompositeKey,
+    Option<metrics::Unit>,
+    Option<metrics::SharedString>,
+    DebugValue,
+);
+
+fn metric_counter(snapshot: &[MetricSnapshot], name: &str, source: &str) -> u64 {
+    snapshot
+        .iter()
+        .filter(|(key, _, _, _)| {
+            key.key().name() == name
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "source" && label.value() == source)
+        })
+        .map(|(_, _, _, value)| match value {
+            DebugValue::Counter(value) => *value,
+            _ => 0,
+        })
+        .sum()
+}
+
+fn metric_histogram(snapshot: &[MetricSnapshot], name: &str, component: &str) -> f64 {
+    snapshot
+        .iter()
+        .filter(|(key, _, _, _)| {
+            key.key().name() == name
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "component" && label.value() == component)
+        })
+        .map(|(_, _, _, value)| match value {
+            DebugValue::Histogram(samples) => samples
+                .iter()
+                .map(|sample| sample.into_inner())
+                .sum::<f64>(),
+            _ => 0.0,
+        })
+        .sum()
+}
+
+async fn sample_rebuild(dir: &std::path::Path) -> RebuildCost {
+    strip_coverage(dir);
+    let ice = open(dir).await;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let guard = metrics::set_default_local_recorder(&recorder);
+    let started = Instant::now();
+    let report = ice.rebuild_inline_time_aggregates(INDEX).await.unwrap();
+    let full_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let snapshot = snapshotter.snapshot().into_vec();
+    drop(guard);
+    assert!(report.published, "{report:?}");
+
+    RebuildCost {
+        full_ms,
+        buckets_ms: metric_histogram(
+            &snapshot,
+            "siglake_inline_time_rebuild_seconds",
+            "time_buckets",
+        ) * 1_000.0,
+        bucket_footer_files: metric_counter(
+            &snapshot,
+            "siglake_inline_time_rebuild_files_total",
+            "footer",
+        ),
+        bucket_decode_files: metric_counter(
+            &snapshot,
+            "siglake_inline_time_rebuild_files_total",
+            "decode",
+        ),
+        bucket_decoded_bytes: metric_histogram(
+            &snapshot,
+            "siglake_inline_time_rebuild_decoded_bytes",
+            "time_buckets",
+        ) as u64,
+        group_footer_files: metric_counter(
+            &snapshot,
+            "siglake_inline_time_group_rebuild_files_total",
+            "footer",
+        ),
+        group_decode_files: metric_counter(
+            &snapshot,
+            "siglake_inline_time_group_rebuild_files_total",
+            "decode",
+        ),
+        group_decoded_bytes: metric_histogram(
+            &snapshot,
+            "siglake_inline_time_rebuild_decoded_bytes",
+            "time_group_counts",
+        ) as u64,
+    }
+}
+
+fn median(samples: &[RebuildCost], get: impl Fn(&RebuildCost) -> f64) -> f64 {
+    let mut values: Vec<f64> = samples.iter().map(get).collect();
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
+
+fn print_cost(label: &str, samples: &[RebuildCost]) {
+    let first = &samples[0];
+    assert!(samples.iter().all(|sample| {
+        sample.bucket_footer_files == first.bucket_footer_files
+            && sample.bucket_decode_files == first.bucket_decode_files
+            && sample.bucket_decoded_bytes == first.bucket_decoded_bytes
+            && sample.group_footer_files == first.group_footer_files
+            && sample.group_decode_files == first.group_decode_files
+            && sample.group_decoded_bytes == first.group_decoded_bytes
+    }));
+    println!(
+        "{label}: bucket-only p50={:.2}ms files={}/{}(footer/decode) decoded={}B; \
+         full p50={:.2}ms group-files={}/{}(footer/decode) group-decoded={}B",
+        median(samples, |sample| sample.buckets_ms),
+        first.bucket_footer_files,
+        first.bucket_decode_files,
+        first.bucket_decoded_bytes,
+        median(samples, |sample| sample.full_ms),
+        first.group_footer_files,
+        first.group_decode_files,
+        first.group_decoded_bytes,
+    );
+}
+
+/// Local decision input for #4675. The table models an operator invoking the
+/// CLI hourly: one retention trigger drops old files and leaves 16 live files,
+/// each spanning two aggregate buckets so the full 2-D pass must decode them.
+/// Five fresh contexts provide cold-cache medians. The second arm removes the
+/// time-bucket footer to measure the specified legacy/invalid-footer fallback.
+#[tokio::test]
+#[ignore = "measurement report"]
+async fn hourly_retention_rebuild_cost_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = open(tmp.path()).await;
+    let config = hourly_retention_config();
+    ice.create_index(&config).await.unwrap();
+    let now = Utc::now();
+    let hour = Utc
+        .timestamp_opt(now.timestamp().div_euclid(3_600) * 3_600, 0)
+        .unwrap();
+
+    for append_no in 0..8 {
+        let times: Vec<_> = (0..200)
+            .map(|row| hour - Duration::hours(6) + Duration::seconds(append_no * 200 + row))
+            .collect();
+        append_times(&ice, &config, &times, "expired").await;
+    }
+    for append_no in 0..16 {
+        let times: Vec<_> = (0..200)
+            .map(|row| {
+                let base = if row % 2 == 0 {
+                    hour - Duration::minutes(90)
+                } else {
+                    hour - Duration::minutes(30)
+                };
+                base + Duration::seconds(append_no)
+            })
+            .collect();
+        append_times(&ice, &config, &times, "live").await;
+    }
+    let retained = ice.enforce_index_retention(INDEX).await.unwrap();
+    assert!(retained.files_dropped >= 8, "{retained:?}");
+    let ident = ice.index_table_ident(INDEX);
+    let files = ice.live_data_files(&ident).await.unwrap();
+    assert_eq!(files.len(), 16, "fixture drifted: {retained:?}");
+    let paths: Vec<String> = files
+        .iter()
+        .map(|file| file.file_path().to_string())
+        .collect();
+    drop(ice);
+
+    let mut footer = Vec::new();
+    for _ in 0..5 {
+        footer.push(sample_rebuild(tmp.path()).await);
+    }
+    print_cost("valid-footer", &footer);
+
+    for path in &paths {
+        remove_time_bucket_footer(path);
+    }
+    let mut missing = Vec::new();
+    for _ in 0..5 {
+        missing.push(sample_rebuild(tmp.path()).await);
+    }
+    print_cost("missing-footer", &missing);
 }
 
 /// A republication has to land on a root the next append can join. The pass
