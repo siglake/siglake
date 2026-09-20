@@ -886,7 +886,8 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   additionally driven end to end against the in-memory store through an
   injected write fault, which is not the same as a real connection failure.
 - **Reconciliation of finished-but-unpersisted jobs is per-process memory, and
-  its live-Postgres half is unmeasured.** The ids a replica finished without
+  a recovered success still loses its result body.** The ids a replica
+  finished without
   persisting a verdict are held in that process only: a pod that is killed
   before its next pass loses the note, and the row is then resolved by
   lease-expiry recovery instead (bounded, but a lease later, and as
@@ -896,19 +897,24 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   the same fallback. A reconciled row carries a fixed error text, so a failed
   run's specific message is lost with the write that could not store it, and a
   reconciled *success* is a `failed` row asking for a resubmit — the result
-  body is deliberately not retained across an outage. Every assertion is
+  body is deliberately not retained across an outage. The unit assertions are
   hermetic (in-memory store, injected write faults, a store wedged under
-  virtual time); nothing has been observed against a real Postgres outage. The
+  virtual time), and run #129 added a verified local-kind Postgres outage. All
+  seven accepted jobs committed after restoration; the backlog peaked at seven
+  (3/4 per query pod) and drained within a measured 0-13.19887-second interval
+  after restoration. The
   two ways a row is left with nobody retrying it do page
   (`SiglakeBatchRowStrandedNonTerminal`, on the dropped counter and
-  `cause=write_abandoned`); `cause=write_deferred` and the
-  `siglake_query_jobs_unreconciled` gauge are deliberately dashboard-only,
-  since a rising and then falling backlog is reconciliation working. An
+  `cause=write_abandoned`). `cause=write_deferred` remains diagnostic, while
+  `SiglakeBatchReconciliationBacklogStalled` warns when the
+  `siglake_query_jobs_unreconciled` gauge remains nonzero for 15 seconds. That
+  threshold rounds the measured upper bound to the next 5-second retry, so the
+  observed rising-and-falling backlog stays quiet. An
   opt-in, bounded local-kind probe now retains the per-pod outage/reconnect
   trace in `results/postgres-outage-reconnect.json` and grades missing or
-  non-draining observations `unverified`; no live round has supplied the first
-  measured trace yet (`POSTGRES_OUTAGE_PROBE=1 scripts/kind-round.sh`). Three
-  rounds have run it, and none of them measured what it claimed: the retained
+  non-draining observations `unverified`
+  (`POSTGRES_OUTAGE_PROBE=1 scripts/kind-round.sh`). Earlier rounds did not
+  measure what they claimed: the retained
   traces carried no evidence that the paused process set stayed stopped, and no
   Prometheus scrape timestamp, so a counter that moved could not be placed
   against the pause. Run #76's trace is kept under `scripts/testdata/` as a
@@ -931,14 +937,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   collection, not every status transition, so a recovered row — which the
   amendment path can rewrite after it went terminal — a missing row, a NULL
   timestamp, a nonterminal job, or a commit overlapping either signal
-  transition all leave the observation unexplained. The probe now retains its
+  transition all leave the observation unexplained. The probe retains its
   local observations to the millisecond and the grader derives uncertainty
   from each timestamp's recorded precision; historical second-only traces keep
   their full one-second uncertainty. A commit is a stopped-window failure only
   when its own interval lies after the verified pause and before restoration
-  starts. No live round has supplied a dated trace with these boundaries yet,
-  so what happened in run #76 is still unexplained; nothing here establishes a
-  persistence failure.
+  starts. Run #129 supplied those boundaries and had no commit inside the
+  pause; run #76 remains an intentionally red regression fixture, not evidence
+  of a persistence failure.
 - **The query server's `/healthz` is a constant 200, so no probe acts on the
   one known query degradation.** `/healthz` answers `ok` for as long as the
   process is serving and `/readyz` only round-trips the catalog. The still-open
@@ -1664,7 +1670,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   query tier is reached through SQL over HTTP and the Elasticsearch- and
   Jaeger-compatible shims. What does ship for operations: a starter Grafana
   dashboard (`deploy/grafana/siglake-overview.json` — import it yourself, the
-  chart does not render it) and a `PrometheusRule` with 36 alerts grouped by
+  chart does not render it) and a `PrometheusRule` with 37 alerts grouped by
   what an operator should do (data-loss, stalled, refusing, saturation),
   rendered when `prometheusRule.enabled` is set (default off). No metrics
   downsampling; retention is file/day-granular (no row-level retention).

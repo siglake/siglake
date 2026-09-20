@@ -373,6 +373,33 @@ spec:
 
     - name: siglake.stalled
       rules:
+        - alert: SiglakeBatchReconciliationBacklogStalled
+          # #5615's verified run #129 peaked at seven parked rows, split 3/4
+          # across the query pods, and bounded restoration-to-zero at 13.19887s.
+          # Reconciliation retries every 5s, so 15s is that observed upper
+          # bound rounded up to the next retry boundary: the measured recovery
+          # stays quiet, while a backlog still present after the next pass warns.
+          #
+          # Keep this warning separate from
+          # SiglakeBatchRowStrandedNonTerminal. That critical alert means the
+          # bounded bookkeeping refused a row and nothing will retry it; this
+          # gauge contains rows whose executor is still retrying them.
+          expr: siglake_query_jobs_unreconciled > 0
+          for: 15s
+          labels:
+            severity: warning
+          annotations:
+            summary: A query pod's batch reconciliation backlog is not draining
+            description: >-
+              {{ "{{ $value }}" }} finished batch job(s) on
+              {{ "{{ $labels.pod }}" }} have remained without a persisted
+              terminal state beyond the 15-second recovery bound selected from
+              the verified Postgres outage trace (peak 7, 3/4 per pod; drained
+              within 13.2 seconds after restoration). The executor is still
+              retrying these rows, so restore the shared job store and inspect
+              its query-server WARN lines before the 1024-row bookkeeping cap
+              is reached. This warning does not mean rows were abandoned;
+              SiglakeBatchRowStrandedNonTerminal reports that separate failure.
         - alert: SiglakeCompactorWatchdogTripping
           # Tripped 52 times on 2026-08-15 with nothing watching.
           expr: increase(siglake_compactor_watchdog_trips_total[30m]) > 0

@@ -1099,8 +1099,12 @@ the old behaviour and waits for its executor to exit, when lease-expiry
 recovery reaches it. That degradation pages —
 `SiglakeBatchRowStrandedNonTerminal`, on the dropped counter and on the run's
 own `cause=write_abandoned` report of the same event, deduplicated to one
-alert per pod. The backlog itself does not: a nonzero
-`siglake_query_jobs_unreconciled` that drains again is the mechanism working.
+alert per pod. The backlog has a separate warning:
+`SiglakeBatchReconciliationBacklogStalled` fires when
+`siglake_query_jobs_unreconciled` stays nonzero for 15 seconds. That threshold
+rounds run #129's verified 13.19887-second restoration-to-drain upper bound to
+the next 5-second reconciliation pass, so its measured 3/4-per-pod transient
+stays quiet while a backlog that misses the next pass warns.
 
 **A batch job's row says what it is doing while it does it.** `running` and
 `started_at` are published *before* the query executes, and the cost estimate
