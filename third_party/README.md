@@ -153,7 +153,8 @@ the sources under test rather than randomised: a path dependency's absolute
 path is part of cargo's unit hash, so a fresh path would mean recompiling the
 fork and everything below it on every run (~46 s against ~3 s).
 
-Product builds resolve the forks through the root `Cargo.lock`.
+The forks do not carry checked-in lockfiles. Product builds resolve them
+through the root `Cargo.lock`.
 `scripts/check-fork-tests.sh` resolves a fresh lock inside its isolated mirror
 and inspects only that lock.
 
