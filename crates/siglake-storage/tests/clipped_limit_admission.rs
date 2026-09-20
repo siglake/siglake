@@ -209,15 +209,44 @@ fn assert_all_qualify(rows: &[String], sql: &str) {
 
 /// THE MEASUREMENT. One layout, two arms, the ramp the only difference.
 ///
-/// Both arms are scheduler-dependent: how far the ungated fan-out gets before
-/// the root stream closes is a race, and so is how many credits the ramp
-/// collects in the same window. So the arms are INTERLEAVED and summed over
-/// several pairs rather than compared once — the same discipline the loopback
-/// ingest A/Bs use. The mechanism itself is asserted separately and without a
-/// scheduler, in `a_partition_behind_the_ramp_reads_nothing`.
+/// The gated arm is scheduler-dependent: credits are paid per emitted batch and
+/// per partition end, so a root stream that is slow to close widens the ramp
+/// geometrically towards the fan-out it exists to prevent. On an idle lane the
+/// gated arm decodes one or two row groups; under the full-workspace gate it
+/// reached five (#5610: pair 0 gated 5 row groups, drain 13.3 ms against the
+/// 3.3 ms of the pairs either side). The ungated arm, by contrast, is steady at
+/// four row groups in every pair measured in either regime.
+///
+/// So the statistic has to tolerate a loaded box without being satisfied by
+/// one. Two shapes were rejected before this one:
+///
+///   * the SUM over a fixed three pairs is what went red on the gate — one slow
+///     gated pair carries the whole sum past the threshold;
+///   * the FIRST pair to show the cut, taken over up to 32 pairs, is a minimum
+///     over noisy draws. Under six concurrent copies of this binary at 24 test
+///     threads on a 24-core box it passed 26 times in 36 with the ramp OFF on
+///     both arms. It grades the luckiest pair, so it grades the scheduler.
+///
+/// The MEDIAN of each arm across a fixed odd number of pairs is neither. A pair
+/// or two of gated-arm noise cannot move it, and with the ramp off both arms
+/// decode the same four row groups, so the medians are equal and the assertion
+/// fails. A/B'd at the shape the gate itself runs — one test binary at 24
+/// threads, ambient load 32 — over 24 runs per arm: with the ramp on, every run
+/// reported a gated median of 276,728 bytes against an ungated 553,456 and
+/// passed; with `factor: 0` on both arms every run reported 553,456 against
+/// 553,456 and failed. Pairs are still INTERLEAVED and the arm order still
+/// alternates within them, because the arm that runs second in a pair finds the
+/// footers cached and is handed the shorter window.
+///
+/// Starving the box further than the gate does erases the effect rather than
+/// the measurement of it: at six concurrent copies the ramp widens to the full
+/// fan-out before the limit can cancel anything, and the medians converge. The
+/// mechanism itself is therefore asserted separately and without a scheduler,
+/// in `a_partition_behind_the_ramp_reads_nothing`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit() {
-    const PAIRS: usize = 3;
+    // Odd, so the median is a pair that was actually measured.
+    const PAIRS: usize = 7;
     const LIMIT: usize = 20;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -230,13 +259,33 @@ async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit()
     let ungated_ctx = clipped_context(LIMIT, 0);
     ice.register_with_datafusion(&ungated_ctx).await.unwrap();
 
+    // Decoded bytes, not files read: a file counts as read the moment its
+    // footer lands, so `files_read` measures how many partitions won a
+    // scheduling race with the root stream closing (10/5/6 and 7/4/5 across three
+    // otherwise identical ungated pairs on this box). Decoded bytes count the
+    // batches that were actually built, which is the cost the card is about and
+    // which the ramp bounds directly — the gated arm decoded exactly two
+    // batches in every pair measured on an idle lane.
+    let mut decoded: Vec<(usize, usize)> = Vec::new();
+    let mut ungated_groups: Vec<usize> = Vec::new();
     let (mut gated_files, mut ungated_files) = (0usize, 0usize);
-    let (mut gated_decoded, mut ungated_decoded) = (0usize, 0usize);
     for pair in 0..PAIRS {
-        let gated = run_arm(&gated_ctx, &sql, "raw").await;
-        let ungated = run_arm(&ungated_ctx, &sql, "raw").await;
+        // The arm that runs SECOND in a pair finds the footers cached and
+        // closes its root stream sooner, which is itself worth fan-out: with
+        // the gated arm always first, a loaded box hands the ungated arm the
+        // shorter window and the comparison tilts the wrong way. Alternating
+        // the order pays that cost to both arms equally.
+        let gated_first = pair % 2 == 0;
+        let (gated, ungated) = if gated_first {
+            let gated = run_arm(&gated_ctx, &sql, "raw").await;
+            (gated, run_arm(&ungated_ctx, &sql, "raw").await)
+        } else {
+            let ungated = run_arm(&ungated_ctx, &sql, "raw").await;
+            (run_arm(&gated_ctx, &sql, "raw").await, ungated)
+        };
         eprintln!(
-            "CLIPPED-ADMISSION pair={pair} gated={:?} drain={:?} ungated={:?} drain={:?}",
+            "CLIPPED-ADMISSION pair={pair} gated_first={gated_first} gated={:?} drain={:?} \
+             ungated={:?} drain={:?}",
             gated.work, gated.drain, ungated.work, ungated.drain
         );
 
@@ -254,40 +303,42 @@ async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit()
         assert_eq!(ungated.rows.len(), LIMIT, "ungated arm must fill the limit");
         assert_all_qualify(&gated.rows, &sql);
         assert_all_qualify(&ungated.rows, &sql);
-        // The ungated arm is the shape the card measured: more than one
-        // partition decodes speculatively before the limit can cancel them.
-        // Asserted, not assumed — without it the comparison below proves
-        // nothing. How FAR the fan-out gets is bounded by how long the root
-        // stream takes to close rather than by the partition count (at 32
-        // partitions this fixture still only reached 6 files), so the floor is
-        // "more than one partition", not a fraction of the plan.
-        assert!(
-            ungated.work.row_groups_read > 1,
-            "the ungated arm no longer reproduces the fan-out this test exists for: {:?}",
-            ungated.work
-        );
-
         gated_files += gated.work.files_read;
         ungated_files += ungated.work.files_read;
-        gated_decoded += gated.work.decoded_bytes;
-        ungated_decoded += ungated.work.decoded_bytes;
+        decoded.push((gated.work.decoded_bytes, ungated.work.decoded_bytes));
+        ungated_groups.push(ungated.work.row_groups_read);
     }
 
+    let median = |mut xs: Vec<usize>| {
+        xs.sort_unstable();
+        xs[xs.len() / 2]
+    };
+    let gated_median = median(decoded.iter().map(|(g, _)| *g).collect());
+    let ungated_median = median(decoded.iter().map(|(_, u)| *u).collect());
+    let ungated_group_median = median(ungated_groups.clone());
     eprintln!(
-        "CLIPPED-ADMISSION total pairs={PAIRS} files gated={gated_files} ungated={ungated_files} \
-         decoded_bytes gated={gated_decoded} ungated={ungated_decoded}"
+        "CLIPPED-ADMISSION pairs={PAIRS} median decoded_bytes gated={gated_median} \
+         ungated={ungated_median} median ungated row_groups={ungated_group_median} \
+         files gated={gated_files} ungated={ungated_files} per pair {decoded:?}"
     );
-    // Decoded bytes, not files read: a file counts as read the moment its
-    // footer lands, so `files_read` measures how many partitions won a
-    // scheduling race with the root stream closing (10/5/6 and 7/4/5 across three
-    // otherwise identical ungated pairs on this box). Decoded bytes count the
-    // batches that were actually built, which is the cost the card is about and
-    // which the ramp bounds directly — the gated arm decoded exactly two
-    // batches in every pair measured.
+    // The ungated arm is the shape the card measured: more than one partition
+    // decodes speculatively before the limit can cancel them. Checked, not
+    // assumed — against the median too, because a single pair that answered out
+    // of one partition compares the ramp against nothing. How FAR the fan-out
+    // gets is bounded by how long the root stream takes to close rather than by
+    // the partition count (at 32 partitions this fixture still only reached 6
+    // files), so the floor is "more than one partition", not a fraction of the
+    // plan.
     assert!(
-        gated_decoded * 3 <= ungated_decoded * 2,
-        "the ramp must cut what an early-stopped clipped LIMIT decodes by at least a third: \
-         gated {gated_decoded} ungated {ungated_decoded} over {PAIRS} pairs \
+        ungated_group_median > 1,
+        "the ungated arm no longer reproduces the fan-out this test exists for: \
+         row groups per pair {ungated_groups:?}"
+    );
+    assert!(
+        gated_median * 3 <= ungated_median * 2,
+        "the ramp must cut what an early-stopped clipped LIMIT decodes by at least a third at \
+         the median of {PAIRS} pairs: gated {gated_median} ungated {ungated_median}, \
+         decoded bytes (gated, ungated) {decoded:?} \
          (files gated {gated_files} ungated {ungated_files})"
     );
 }

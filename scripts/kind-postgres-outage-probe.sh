@@ -23,6 +23,12 @@ WRITE_PROBES_FILE="$TMP_DIR/write-probes.jsonl"
 SUBMISSIONS_DIR="$TMP_DIR/submissions"
 POSTGRES_PAUSED=0
 POSTGRES_POD=
+POSTGRES_POD_UID=
+POSTGRES_NODE=
+POSTGRES_CONTAINER_ID=
+POSTGRES_CONTAINER_PID=
+POSTGRES_PID_NAMESPACE=
+POSTGRES_PROCESSES_FILE="$TMP_DIR/postgres-processes.tsv"
 
 log() { printf '==> postgres-outage: %s\n' "$*" >&2; }
 die() { printf 'ERROR: postgres-outage: %s\n' "$*" >&2; exit 1; }
@@ -35,55 +41,143 @@ restore_postgres() {
   POSTGRES_PAUSED=0
 }
 
-# The postgres image execs the postmaster as PID 1, but every established
-# client is served by another process. Freeze PID 1 first so it cannot fork a
-# new backend while the exact postgres process set is being stopped. The
-# remote identity checks keep this bounded to the disposable postgres pod.
-pause_postgres_processes() {
-  kubectl --context "$KUBE_CONTEXT" --request-timeout=30s -n "$NAMESPACE" \
-    exec "$POSTGRES_POD" -- sh -eu -c '
-      [ "$(cat /proc/1/comm)" = postgres ] || {
-        echo "PID 1 is not postgres; refusing to pause the container" >&2
-        exit 1
-      }
-      kill -STOP 1
-      backend_count=0
-      for comm_path in /proc/[0-9]*/comm; do
-        pid=${comm_path#/proc/}
-        pid=${pid%/comm}
-        [ "$pid" = 1 ] && continue
-        [ "$(cat "$comm_path" 2>/dev/null || true)" = postgres ] || continue
-        kill -STOP "$pid"
-        backend_count=$((backend_count + 1))
-      done
-      if [ "$backend_count" -eq 0 ]; then
-        kill -CONT 1
-        echo "no established postgres backend process found" >&2
-        exit 1
-      fi
-    '
+# `docker exec` enters the kind node's PID namespace, which is an ancestor of
+# the Postgres container's private namespace. The snippets below never enter
+# the workload container. Every process is tied to the CRI-reported init PID by
+# PID-namespace inode, exact comm, start time and container cgroup before a
+# signal is delivered.
+# node-process-list-snippet-begin
+POSTGRES_NODE_PROCESS_LIST_SNIPPET='
+init_pid=$1
+container_id=$2
+[ "$(cat "/proc/$init_pid/comm" 2>/dev/null || true)" = postgres ] || {
+  echo "CRI init PID $init_pid is not postgres" >&2
+  exit 1
+}
+grep -Fq -- "$container_id" "/proc/$init_pid/cgroup" || {
+  echo "CRI init PID $init_pid is outside container $container_id" >&2
+  exit 1
+}
+pid_namespace=$(readlink "/proc/$init_pid/ns/pid")
+for comm_path in /proc/[0-9]*/comm; do
+  pid=${comm_path#/proc/}
+  pid=${pid%/comm}
+  [ "$(cat "$comm_path" 2>/dev/null || true)" = postgres ] || continue
+  [ "$(readlink "/proc/$pid/ns/pid" 2>/dev/null || true)" = "$pid_namespace" ] || continue
+  line=$(cat "/proc/$pid/stat" 2>/dev/null || true)
+  [ -n "$line" ] || continue
+  rest=${line##*") "}
+  state=${rest%% *}
+  starttime=$(printf %s "$rest" | cut -d" " -f20)
+  printf "%s\t%s\t%s\t%s\n" "$pid" "$state" "$starttime" "$pid_namespace"
+done
+'
+# node-process-list-snippet-end
+
+# node-signal-snippet-begin
+POSTGRES_NODE_SIGNAL_SNIPPET='
+signal=$1
+pid=$2
+starttime=$3
+pid_namespace=$4
+container_id=$5
+[ "$(cat "/proc/$pid/comm" 2>/dev/null || true)" = postgres ] || {
+  echo "PID $pid is no longer postgres" >&2
+  exit 1
+}
+[ "$(readlink "/proc/$pid/ns/pid" 2>/dev/null || true)" = "$pid_namespace" ] || {
+  echo "PID $pid changed PID namespace" >&2
+  exit 1
+}
+grep -Fq -- "$container_id" "/proc/$pid/cgroup" || {
+  echo "PID $pid is outside container $container_id" >&2
+  exit 1
+}
+line=$(cat "/proc/$pid/stat")
+rest=${line##*") "}
+[ "$(printf %s "$rest" | cut -d" " -f20)" = "$starttime" ] || {
+  echo "PID $pid was replaced" >&2
+  exit 1
+}
+kill "-$signal" "$pid"
+attempts=0
+while [ "$attempts" -lt 50 ]; do
+  line=$(cat "/proc/$pid/stat" 2>/dev/null || true)
+  if [ -z "$line" ] && [ "$signal" = CONT ]; then
+    exit 0
+  fi
+  rest=${line##*") "}
+  state=${rest%% *}
+  if { [ "$signal" = STOP ] && [ "$state" = T ]; } ||
+    { [ "$signal" = CONT ] && [ "$state" != T ]; }; then
+    exit 0
+  fi
+  attempts=$((attempts + 1))
+  sleep 0.02
+done
+echo "PID $pid did not reach the state required by $signal" >&2
+exit 1
+'
+# node-signal-snippet-end
+
+node_processes() {
+  docker exec "$POSTGRES_NODE" sh -eu -c "$POSTGRES_NODE_PROCESS_LIST_SNIPPET" \
+    node-process-list "$POSTGRES_CONTAINER_PID" "$POSTGRES_CONTAINER_ID"
 }
 
-# Continue children before PID 1, which prevents the postmaster from creating
-# a new backend until every surviving process selected by the pause is live.
-# Re-scan by exact process name so this also repairs a partially completed
-# pause from an error or signal path.
+signal_postgres_process() {
+  local signal=$1 pid=$2 starttime=$3 pid_namespace=$4
+  docker exec "$POSTGRES_NODE" sh -eu -c "$POSTGRES_NODE_SIGNAL_SNIPPET" \
+    node-signal "$signal" "$pid" "$starttime" "$pid_namespace" \
+    "$POSTGRES_CONTAINER_ID"
+}
+
+# Freeze the postmaster first so it cannot fork a new backend while the exact
+# established process set is stopped. Record every selected identity before
+# the first signal; trap cleanup can therefore repair a partial sequence.
+pause_postgres_processes() {
+  local current="$TMP_DIR/postgres-processes.current" verified="$TMP_DIR/postgres-processes.verified"
+  local pid state starttime pid_namespace backend_count=0
+  node_processes >"$current"
+  awk -F '\t' -v init="$POSTGRES_CONTAINER_PID" '$1 == init { print; found=1 } END { exit !found }' \
+    "$current" >"$POSTGRES_PROCESSES_FILE" ||
+    die "the CRI init PID was absent from the verified Postgres process set"
+  while IFS=$'\t' read -r pid state starttime pid_namespace; do
+    [[ "$pid" == "$POSTGRES_CONTAINER_PID" ]] && continue
+    printf '%s\t%s\t%s\t%s\n' "$pid" "$state" "$starttime" "$pid_namespace" \
+      >>"$POSTGRES_PROCESSES_FILE"
+    backend_count=$((backend_count + 1))
+  done <"$current"
+  ((backend_count > 0)) || die "no established Postgres backend process found"
+  POSTGRES_PID_NAMESPACE=$(awk -F '\t' 'NR == 1 { print $4 }' "$POSTGRES_PROCESSES_FILE")
+
+  while IFS=$'\t' read -r pid _ starttime pid_namespace; do
+    signal_postgres_process STOP "$pid" "$starttime" "$pid_namespace"
+  done <"$POSTGRES_PROCESSES_FILE"
+
+  node_processes >"$verified"
+  awk -F '\t' '$2 == "T" { print $1 "\t" $3 "\t" $4 }' "$verified" | sort -n >"$verified.ids"
+  awk -F '\t' '{ print $1 "\t" $3 "\t" $4 }' "$POSTGRES_PROCESSES_FILE" | sort -n \
+    >"$current.ids"
+  cmp -s "$current.ids" "$verified.ids" ||
+    die "the Postgres process set was not wholly stopped and unchanged"
+}
+
+# Continue children before the postmaster. Each attempt repeats every identity
+# check; a replaced or foreign PID is never signalled. Failures are accumulated
+# so one stale process cannot prevent restoration of the remaining set.
 continue_postgres_processes() {
-  kubectl --context "$KUBE_CONTEXT" --request-timeout=30s -n "$NAMESPACE" \
-    exec "$POSTGRES_POD" -- sh -eu -c '
-      [ "$(cat /proc/1/comm)" = postgres ] || {
-        echo "PID 1 is not postgres; refusing to signal the container" >&2
-        exit 1
-      }
-      for comm_path in /proc/[0-9]*/comm; do
-        pid=${comm_path#/proc/}
-        pid=${pid%/comm}
-        [ "$pid" = 1 ] && continue
-        [ "$(cat "$comm_path" 2>/dev/null || true)" = postgres ] || continue
-        kill -CONT "$pid" 2>/dev/null || true
-      done
-      kill -CONT 1
-    '
+  [[ -s "$POSTGRES_PROCESSES_FILE" ]] || return 0
+  local pid state starttime pid_namespace status=0
+  while IFS=$'\t' read -r pid state starttime pid_namespace; do
+    [[ "$pid" == "$POSTGRES_CONTAINER_PID" ]] && continue
+    signal_postgres_process CONT "$pid" "$starttime" "$pid_namespace" || status=1
+  done <"$POSTGRES_PROCESSES_FILE"
+  while IFS=$'\t' read -r pid state starttime pid_namespace; do
+    [[ "$pid" == "$POSTGRES_CONTAINER_PID" ]] || continue
+    signal_postgres_process CONT "$pid" "$starttime" "$pid_namespace" || status=1
+  done <"$POSTGRES_PROCESSES_FILE"
+  return "$status"
 }
 
 # Read the exact process set the pause selected, one `pid<TAB>state<TAB>starttime`
@@ -243,6 +337,78 @@ postgres_container_status() {
     2>/dev/null || true
 }
 
+resolve_postgres_signal_target() {
+  local pod_target node_inspection container_name node_running kind_cluster kind_role node_name
+  local cri_inspection="$TMP_DIR/postgres-cri.json"
+  pod_target=$(python3 - "$TMP_DIR/postgres-pod.json" <<'PY'
+import json, sys
+
+pod = json.load(open(sys.argv[1], encoding="utf-8"))
+statuses = pod.get("status", {}).get("containerStatuses", [])
+if len(statuses) != 1:
+    raise SystemExit(f"expected one Postgres container status, found {len(statuses)}")
+status = statuses[0]
+container_id = status.get("containerID", "")
+if not container_id.startswith("containerd://"):
+    raise SystemExit(f"expected a containerd runtime ID, got {container_id!r}")
+runtime_id = container_id.removeprefix("containerd://")
+if len(runtime_id) != 64 or any(char not in "0123456789abcdef" for char in runtime_id):
+    raise SystemExit(f"invalid containerd ID {runtime_id!r}")
+fields = (
+    pod.get("metadata", {}).get("uid", ""),
+    pod.get("spec", {}).get("nodeName", ""),
+    status.get("name", ""),
+    runtime_id,
+)
+if not all(fields) or fields[2] != "postgres":
+    raise SystemExit(f"incomplete or unexpected Postgres target: {fields!r}")
+print("\t".join(fields))
+PY
+) || die "could not resolve the Postgres pod's node and container identity"
+  IFS=$'\t' read -r POSTGRES_POD_UID POSTGRES_NODE container_name \
+    POSTGRES_CONTAINER_ID <<<"$pod_target"
+
+  node_inspection=$(docker inspect --format \
+    '{{.State.Running}}{{"\t"}}{{with index .Config.Labels "io.x-k8s.kind.cluster"}}{{.}}{{end}}{{"\t"}}{{with index .Config.Labels "io.x-k8s.kind.role"}}{{.}}{{end}}{{"\t"}}{{.Name}}' \
+    "$POSTGRES_NODE") || die "could not inspect the Postgres pod's node $POSTGRES_NODE"
+  IFS=$'\t' read -r node_running kind_cluster kind_role node_name <<<"$node_inspection"
+  [[ "$node_running" == true && -n "$kind_cluster" && \
+    ("$kind_role" == control-plane || "$kind_role" == worker) && \
+    "$KUBE_CONTEXT" == "kind-$kind_cluster" && \
+    "$node_name" == "/$POSTGRES_NODE" ]] ||
+    die "$POSTGRES_NODE is not the running kind node that owns the Postgres pod"
+
+  docker exec "$POSTGRES_NODE" crictl inspect "$POSTGRES_CONTAINER_ID" \
+    >"$cri_inspection" ||
+    die "could not inspect Postgres container $POSTGRES_CONTAINER_ID on $POSTGRES_NODE"
+  POSTGRES_CONTAINER_PID=$(python3 - "$cri_inspection" "$POSTGRES_CONTAINER_ID" \
+    "$POSTGRES_POD_UID" <<'PY'
+import json, sys
+
+path, expected_id, expected_pod_uid = sys.argv[1:]
+inspection = json.load(open(path, encoding="utf-8"))
+status = inspection.get("status", {})
+labels = status.get("labels", {})
+pid = inspection.get("info", {}).get("pid")
+if status.get("id") != expected_id:
+    raise SystemExit("CRI returned a different container ID")
+if status.get("metadata", {}).get("name") != "postgres":
+    raise SystemExit("CRI container name is not postgres")
+if status.get("state") != "CONTAINER_RUNNING":
+    raise SystemExit(f"Postgres container is not running: {status.get('state')!r}")
+if labels.get("io.kubernetes.pod.uid") != expected_pod_uid:
+    raise SystemExit("CRI pod UID does not match the selected Kubernetes pod")
+try:
+    pid = int(pid)
+except (TypeError, ValueError):
+    raise SystemExit(f"CRI returned an invalid init PID: {pid!r}")
+if pid <= 1:
+    raise SystemExit(f"CRI returned an invalid init PID: {pid}")
+print(pid)
+PY
+) || die "CRI identity did not match the selected Postgres pod"
+}
+
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
@@ -252,7 +418,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for tool in curl git kubectl python3; do
+for tool in curl docker git kubectl python3; do
   command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
 for value in "$REQUESTED_JOBS" "$OUTAGE_SECONDS" "$DRAIN_TIMEOUT_SECONDS" \
@@ -284,6 +450,7 @@ kubectl --context "$KUBE_CONTEXT" --request-timeout=30s -n "$NAMESPACE" get pods
 kubectl --context "$KUBE_CONTEXT" --request-timeout=30s -n "$NAMESPACE" \
   get pod "$POSTGRES_POD" \
   -o json >"$TMP_DIR/postgres-pod.json"
+resolve_postgres_signal_target
 python3 - "$TMP_DIR/query-pods.json" >"$TMP_DIR/expected-pods" <<'PY'
 import json, sys
 items = json.load(open(sys.argv[1], encoding="utf-8")).get("items", [])
@@ -480,7 +647,8 @@ python3 - "$ROOT" "$TMP_DIR" "$SAMPLES_FILE" "$SUBMISSIONS_DIR" \
   "$WRITE_PROBE_SECONDS" "$WRITE_PROBES_FILE" "$CONTAINER_BEFORE" \
   "$CONTAINER_AFTER" "$PAUSE_APPLIED_AT" "$RESTORATION_APPLIED_AT" \
   "$COMMIT_TIMES_AT" "$COMMIT_TIMES_STATUS" "$TMP_DIR/commit-times" \
-  "$TMP_DIR/raw.json" <<'PY'
+  "$POSTGRES_NODE" "$POSTGRES_CONTAINER_ID" "$POSTGRES_CONTAINER_PID" \
+  "$POSTGRES_PID_NAMESPACE" "$POSTGRES_PROCESSES_FILE" "$TMP_DIR/raw.json" <<'PY'
 import datetime, json, pathlib, subprocess, sys
 (
     root, tmp, samples_path, submissions_dir, submission_started, submission_finished,
@@ -488,7 +656,8 @@ import datetime, json, pathlib, subprocess, sys
     requested_jobs, outage_seconds, drain_timeout, sample_interval, query_timeout,
     query, write_probe_seconds, write_probes_path, container_before, container_after,
     pause_applied, restoration_applied, commit_times_at, commit_times_status,
-    commit_times_path, output,
+    commit_times_path, postgres_node, postgres_container_id, postgres_container_pid,
+    postgres_pid_namespace, postgres_processes_path, output,
 ) = sys.argv[1:]
 tmp = pathlib.Path(tmp)
 
@@ -551,6 +720,18 @@ def container_revision(item):
         "image_id": status.get("imageID"),
     }
 
+def fault_processes(path):
+    rows = []
+    for line in open(path, encoding="utf-8"):
+        pid, state, starttime, pid_namespace = line.rstrip("\n").split("\t")
+        rows.append({
+            "node_pid": int(pid),
+            "state_before": state,
+            "starttime": starttime,
+            "pid_namespace": pid_namespace,
+        })
+    return rows
+
 query_items = json.load(open(tmp / "query-pods.json", encoding="utf-8")).get("items", [])
 postgres_item = json.load(open(tmp / "postgres-pod.json", encoding="utf-8"))
 expected = [line.strip() for line in open(tmp / "expected-pods", encoding="utf-8") if line.strip()]
@@ -600,6 +781,13 @@ document = {
         "pod": postgres_item["metadata"]["name"],
         "before": container_identity(container_before),
         "after": container_identity(container_after),
+    },
+    "fault_target": {
+        "node": postgres_node,
+        "container_id": postgres_container_id,
+        "container_init_pid": int(postgres_container_pid),
+        "pid_namespace": postgres_pid_namespace,
+        "processes": fault_processes(postgres_processes_path),
     },
     "write_probes": write_probes,
     "job_commit_times": commit_times(commit_times_path, commit_times_at, commit_times_status),
