@@ -95,12 +95,16 @@ contains "$probe_body" 'pid_namespace=$(readlink "/proc/$init_pid/ns/pid")' ||
   fail "$PROBE does not bind backends to the Postgres PID namespace"
 contains "$probe_body" 'grep -Fq -- "$container_id" "/proc/$pid/cgroup"' ||
   fail "$PROBE does not bind signalled processes to the current container cgroup"
-contains "$probe_body" 'PID $pid did not reach the state required by $signal' ||
+contains "$probe_body" 'the Postgres process set did not reach the state required by $signal' ||
   fail "$PROBE does not reject an ineffective STOP"
 contains "$probe_body" 'continue_postgres_processes >/dev/null 2>&1 || true' ||
   fail "$PROBE trap cleanup does not restore the backend process set"
-[[ $(grep -c '^continue_postgres_processes >/dev/null$' "$PROBE") -eq 1 ]] ||
+[[ $(grep -c '^continue_postgres_processes >"$TMP_DIR/restoration-signal-boundaries"$' "$PROBE") -eq 1 ]] ||
   fail "$PROBE normal path does not restore through the shared continuation helper"
+contains "$probe_body" 'node-signal-group "$signal" "$POSTGRES_CONTAINER_PID"' ||
+  fail "$PROBE does not signal the recorded process set in one kind-node exec"
+contains "$probe_body" 'started_at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)' ||
+  fail "$PROBE does not measure signal start inside the kind-node exec"
 if grep -A30 '^pause_postgres_processes()' "$PROBE" | grep -q 'kubectl .*exec'; then
   fail "$PROBE still sends STOP from inside the Postgres container namespace"
 fi
@@ -132,8 +136,8 @@ contains "$probe_body" 'iso_now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }' ||
 # A counter cannot say when a row was written, so the row itself has to be
 # dated. The commit-time reading is taken after the bounded recovery window --
 # a ready postmaster is not a finished reconciliation -- and the stamps read
-# either side of the pause and continuation execs are what place a commit
-# inside the window rather than against a stamp taken before the signal.
+# at the first signal attempt and after every process reaches its new state
+# place a commit inside the measured transition window.
 contains "$probe_body" 'COMMIT_TIMES_STATUS=$(postgres_commit_times "$TMP_DIR/commit-times")' ||
   fail "$PROBE does not read the job rows' commit timestamps"
 contains "$probe_body" 'pg_xact_commit_timestamp(xmin)' ||
@@ -156,10 +160,10 @@ if not ready < recovery < collect:
         f"order; got {ready + 1}, {recovery + 1}, {collect + 1}"
     )
 PY
-for stamp in PAUSE_APPLIED_AT RESTORATION_APPLIED_AT; do
-  contains "$probe_body" "$stamp=\$(iso_now)" ||
-    fail "$PROBE does not stamp the applied side of the pause/restoration signal ($stamp)"
-done
+contains "$probe_body" 'PAUSE_APPLIED_AT=$(awk' ||
+  fail "$PROBE does not retain the measured pause-applied bound"
+contains "$probe_body" 'RESTORATION_APPLIED_AT=$(awk' ||
+  fail "$PROBE does not retain the measured restoration-applied bound"
 contains "$probe_body" '"pause_applied_at": pause_applied,' ||
   fail "$PROBE does not retain pause_applied_at"
 contains "$probe_body" '"restoration_applied_at": restoration_applied,' ||
@@ -374,7 +378,7 @@ action=
 action_index=0
 for ((i = 1; i <= $#; i++)); do
   case "${!i}" in
-    node-process-list|node-signal) action=${!i}; action_index=$i; break ;;
+    node-process-list|node-signal-group) action=${!i}; action_index=$i; break ;;
   esac
 done
 case "$action" in
@@ -385,24 +389,54 @@ case "$action" in
       printf '%s\t%s\t%s\tpid:[4026533000]\n' "$pid" "$state" "$((700 + pid))"
     done
     ;;
-  node-signal)
+  node-signal-group)
     signal_index=$((action_index + 1))
-    pid_index=$((action_index + 2))
+    init_index=$((action_index + 2))
+    identities_index=$((action_index + 4))
     signal=${!signal_index}
-    pid=${!pid_index}
-    printf '%s %s\n' "$signal" "$pid" >>"$STANDIN_STATE/signals"
+    init_pid=${!init_index}
+    identities=${!identities_index}
+    printf '%s\n' "$signal" >>"$STANDIN_STATE/signal-execs"
+    started_at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+    signal_one() {
+      local pid=$1
+      printf '%s %s\n' "$signal" "$pid" >>"$STANDIN_STATE/signals"
+      if [[ "$signal" == STOP ]]; then
+        if [[ "${STANDIN_STOP_MODE:-working}" == partial && "$pid" == 142 ]]; then
+          return 17
+        fi
+        if [[ "${STANDIN_STOP_MODE:-working}" != ineffective ]]; then
+          : >"$STANDIN_STATE/stopped-$pid"
+          : >"$STANDIN_STATE/paused"
+        fi
+      else
+        rm -f "$STANDIN_STATE/stopped-$pid"
+        if [[ "$pid" == "$init_pid" ]]; then
+          rm -f "$STANDIN_STATE/paused"
+        fi
+      fi
+      return 0
+    }
     if [[ "$signal" == STOP ]]; then
-      if [[ "${STANDIN_STOP_MODE:-working}" == partial && "$pid" == 142 ]]; then
-        exit 17
-      fi
-      if [[ "${STANDIN_STOP_MODE:-working}" != ineffective ]]; then
-        : >"$STANDIN_STATE/stopped-$pid"
-        : >"$STANDIN_STATE/paused"
-      fi
+      while IFS=$'\t' read -r pid _; do
+        signal_one "$pid" || exit $?
+      done <<<"$identities"
     else
-      rm -f "$STANDIN_STATE/stopped-$pid"
-      [[ "$pid" == 100 ]] && rm -f "$STANDIN_STATE/paused"
+      status=0
+      while IFS=$'\t' read -r pid _; do
+        [[ "$pid" == "$init_pid" ]] && continue
+        signal_one "$pid" || status=1
+      done <<<"$identities"
+      while IFS=$'\t' read -r pid _; do
+        [[ "$pid" == "$init_pid" ]] || continue
+        signal_one "$pid" || status=1
+      done <<<"$identities"
+      if [[ "$status" -ne 0 ]]; then
+        exit "$status"
+      fi
     fi
+    printf 'started_at\t%s\napplied_at\t%s\n' \
+      "$started_at" "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
     exit 0
     ;;
   *) exit 64 ;;
@@ -580,6 +614,7 @@ PATH="$standin_dir:$PATH" \
 [[ "$standin_rc" -eq 0 ]] ||
   fail "the probe did not produce gradeable evidence against stand-ins (exit $standin_rc): $(<"$fixture_dir/standin.log")"
 python3 - "$standin_state/results/postgres-outage-reconnect.json" <<'PY' ||
+import datetime as dt
 import json, sys
 document = json.load(open(sys.argv[1], encoding="utf-8"))
 assert document["schema_version"] == 3, document["schema_version"]
@@ -594,6 +629,10 @@ assert commits["committed_in_pause"] == [], commits
 assert commits["unplaceable_commits"] == [], commits
 assert commits["gaps"] == [], commits
 assert commits["settles_pause"] is True, commits
+pause_bounds = commits["signal_boundaries"]["pause_transition"]
+pause_earliest = dt.datetime.fromisoformat(pause_bounds["earliest"])
+pause_latest = dt.datetime.fromisoformat(pause_bounds["latest"])
+assert (pause_latest - pause_earliest).total_seconds() < 0.1, pause_bounds
 assert summary["peak_backlog_total"] == 2, summary
 assert summary["pre_restoration_drain"] is None, summary
 assert summary["stopped_postgres_processes"] == 3, summary
@@ -613,12 +652,14 @@ fixtures=$((fixtures + 1))
 signals=$(<"$standin_state/signals")
 [[ "$signals" == $'STOP 100\nSTOP 142\nSTOP 143\nCONT 142\nCONT 143\nCONT 100' ]] ||
   fail "the recording path did not stop the postmaster first and continue it last: $signals"
+[[ $(<"$standin_state/signal-execs") == $'STOP\nCONT' ]] ||
+  fail "the recording path did not use one kind-node exec per process-set signal"
 fixtures=$((fixtures + 1))
 
 # An exec that returns success without changing process state is the original
 # defect's shape. The post-signal rescan must reject it, then cleanup must still
 # CONT every recorded identity.
-rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,paused,signals,stopped-*}
+rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,paused,signal-execs,signals,stopped-*}
 ineffective_rc=0
 PATH="$standin_dir:$PATH" STANDIN_STATE="$standin_state" \
   STANDIN_STOP_MODE=ineffective PROC_ROOT="$paused_tree" \
@@ -640,7 +681,7 @@ fixtures=$((fixtures + 1))
 # If one backend STOP fails after the postmaster was stopped, the pre-recorded
 # process list must let the EXIT trap restore that postmaster and attempt every
 # other candidate without restarting the container.
-rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,paused,signals,stopped-*}
+rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,paused,signal-execs,signals,stopped-*}
 partial_rc=0
 PATH="$standin_dir:$PATH" STANDIN_STATE="$standin_state" \
   STANDIN_STOP_MODE=partial PROC_ROOT="$paused_tree" \
