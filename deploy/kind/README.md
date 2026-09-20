@@ -18,6 +18,7 @@ scripts/kind-up.sh         # kind create cluster + apply manifests + helm instal
 scripts/kind-smoke.sh      # POST events → poll query-server → assert
 scripts/kind-round.sh      # Prometheus + KEDA load/evidence round (~6 minutes of load,
                            # plus up to 5 more for the 2→4→2 query scale step)
+KIND_ROUND_EVENTS=100 scripts/kind-round.sh       # set the initial load batch
 INGESTER_POD_LABEL_CAPTURE=1 scripts/kind-round.sh  # scale the ingester and retain
                                                     # per-pod label evidence
 COMPACTOR_POD_LABEL_CAPTURE=1 scripts/kind-round.sh # install two claim compactors and
@@ -68,6 +69,12 @@ local gate) reads the round script statically and requires
 `query.replicas` to be installed from those constants, and the evidence file
 name to be derived from them and named by this document. It runs its own
 mutation fixtures on copies of the script; no cluster is involved.
+
+`KIND_ROUND_EVENTS` sets the initial load size and defaults to `6000`; it must
+be a positive integer. Each initial event uses a distinct `host-{i}` value.
+Values at or below `4096` may leave panel 141's
+`siglake_group_count_deltas_folded_bucket` query without a series, in which
+case the panel check exits the round non-zero.
 
 `POSTGRES_OUTAGE_PROBE=1` additionally enables `query.jobs.persistent` for this
 throwaway install, submits a bounded batch burst, pauses only the kind Postgres

@@ -256,6 +256,8 @@ jobs:
       # at that file to name the same one. No cluster, no kubectl, no helm.
       - name: the kind round keeps KEDA headroom on the query tier
         run: scripts/check-kind-round-scale.sh
+      - name: the kind round validates and applies its initial event count
+        run: scripts/check-kind-round-events.sh
       - name: Postgres outage evidence rejects missing and non-draining traces
         run: scripts/check-kind-postgres-outage-evidence.sh
       - name: schema rollback evidence covers chart and operator reverts
