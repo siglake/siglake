@@ -173,8 +173,13 @@ CHART_DIR = pathlib.Path("deploy/helm/siglake")
 # decide it separately, and the note's copy did not look at `query.oidc`.
 NOTES_TEMPLATE = CHART_DIR / "templates/NOTES.txt"
 QUERY_STS_TEMPLATE = CHART_DIR / "templates/statefulset-query-server.yaml"
+INGEST_DEPLOYMENT_TEMPLATE = CHART_DIR / "templates/deployment-ingester.yaml"
+HELPERS_TEMPLATE = CHART_DIR / "templates/_helpers.tpl"
 QUERY_AUTH_HELPER = 'include "siglake.queryAuthOn"'
+INGEST_AUTH_HELPER = 'include "siglake.ingestAuthOn"'
+INGEST_TOKENS_HELPER = 'include "siglake.ingestTokensSecret"'
 OPEN_QUERY_WARNING = "the query API is running open"
+OPEN_INGEST_WARNING = "the ingest API is running open"
 # The ConfigMap notes_probe_chart() renders the notes into, since a render
 # cannot show them any other way.
 NOTES_PROBE_NAME = "siglake-notes-probe"
@@ -386,7 +391,9 @@ def render_notes(chart: str, extra: list[str]) -> str:
     return ""
 
 
-def check_notes_open_warning(notes: str, expected: bool) -> list[str]:
+def check_notes_open_warning(
+    notes: str, expected: bool, warning: str, tier: str
+) -> list[str]:
     """Hold the install notes' open-API warning to what the tier enforces.
 
     #4317: the warning names the authentication the operator is missing, so it
@@ -396,26 +403,31 @@ def check_notes_open_warning(notes: str, expected: bool) -> list[str]:
     """
     if not notes.strip():
         return ["the render carried no NOTES.txt text at all"]
-    warned = OPEN_QUERY_WARNING in notes
+    warned = warning in notes
     if warned == expected:
         return []
     if expected:
         return [
-            "this install authenticates nothing on the query tier, and the notes "
-            f"do not say so: no {OPEN_QUERY_WARNING!r} warning in {notes.strip()!r}"
+            f"this install authenticates nothing on the {tier} tier, and the notes "
+            f"do not say so: no {warning!r} warning in {notes.strip()!r}"
         ]
-    line = next(line for line in notes.splitlines() if OPEN_QUERY_WARNING in line)
+    line = next(line for line in notes.splitlines() if warning in line)
     return [
-        "the notes call the query API open on an install that authenticates its "
+        f"the notes call the {tier} API open on an install that authenticates its "
         f"callers: {line.strip()!r}"
     ]
 
 
 def check_notes_auth_predicate(
+    tier: str,
+    warning: str,
+    auth_helper: str,
+    workload_path: pathlib.Path,
+    workload_helper: str | None = None,
     notes_path: pathlib.Path = NOTES_TEMPLATE,
-    sts_path: pathlib.Path = QUERY_STS_TEMPLATE,
+    helpers_path: pathlib.Path = HELPERS_TEMPLATE,
 ) -> list[str]:
-    """The note and the query pods must read ONE authentication predicate.
+    """The note and a tier's pods must share their authentication predicate.
 
     The render arms prove what a given install prints. This proves the two
     templates cannot start answering the question separately again — which is
@@ -425,27 +437,40 @@ def check_notes_auth_predicate(
     """
     problems = []
     lines = notes_path.read_text().splitlines()
-    if QUERY_AUTH_HELPER not in sts_path.read_text():
+    pod_helper = workload_helper or auth_helper
+    if pod_helper not in workload_path.read_text():
         problems.append(
-            f"{sts_path} no longer decides query authentication through "
-            f"`{QUERY_AUTH_HELPER}`, so {notes_path} can describe an install the "
+            f"{workload_path} no longer decides {tier} authentication through "
+            f"`{pod_helper}`, so {notes_path} can describe an install the "
             "pods do not run"
         )
-    warnings = [i for i, line in enumerate(lines) if OPEN_QUERY_WARNING in line]
+    if workload_helper is not None:
+        helpers = helpers_path.read_text()
+        helper_name = auth_helper.removeprefix('include "').removesuffix('"')
+        definition = f'{{{{- define "{helper_name}" -}}}}'
+        start = helpers.find(definition)
+        following_definition = helpers.find("{{- define ", start + len(definition))
+        body = helpers[start:following_definition if following_definition >= 0 else None]
+        if start < 0 or workload_helper not in body:
+            problems.append(
+                f"{helpers_path} no longer makes `{auth_helper}` read the same "
+                f"`{workload_helper}` {workload_path} uses"
+            )
+    warnings = [i for i, line in enumerate(lines) if warning in line]
     if not warnings:
         problems.append(
-            f"{notes_path} prints no {OPEN_QUERY_WARNING!r} warning: an install "
-            "with no query authentication would say nothing about it"
+            f"{notes_path} prints no {warning!r} warning: an install "
+            f"with no {tier} authentication would say nothing about it"
         )
     for index in warnings:
         guard = next(
             (lines[i] for i in range(index, -1, -1) if "{{- if" in lines[i]), None
         )
-        if guard is None or QUERY_AUTH_HELPER not in guard:
+        if guard is None or auth_helper not in guard:
             problems.append(
-                f"{notes_path}:{index + 1} warns that the query API is open under "
+                f"{notes_path}:{index + 1} warns that the {tier} API is open under "
                 f"`{guard.strip() if guard else 'no condition'}`, not under "
-                f"`{QUERY_AUTH_HELPER}`"
+                f"`{auth_helper}`"
             )
     return problems
 
@@ -3459,17 +3484,37 @@ def source_checks(
         )
     # The install notes' authentication predicate is template source too; the
     # arms that read the rendered notes are in check_query_notes below.
-    problems = check_notes_auth_predicate()
-    if problems:
-        failed = True
-        for p in problems:
-            print(f"FAIL [notes] {p}", file=sys.stderr)
-    else:
-        print(
-            f"ok   [notes] {NOTES_TEMPLATE} warns about an open query API under the "
-            f"same `{QUERY_AUTH_HELPER}` {QUERY_STS_TEMPLATE} runs on",
-            flush=True,
+    note_predicates = [
+        (
+            "query",
+            OPEN_QUERY_WARNING,
+            QUERY_AUTH_HELPER,
+            QUERY_STS_TEMPLATE,
+            None,
+        ),
+        (
+            "ingest",
+            OPEN_INGEST_WARNING,
+            INGEST_AUTH_HELPER,
+            INGEST_DEPLOYMENT_TEMPLATE,
+            INGEST_TOKENS_HELPER,
+        ),
+    ]
+    for tier, warning, auth_helper, workload, workload_helper in note_predicates:
+        problems = check_notes_auth_predicate(
+            tier, warning, auth_helper, workload, workload_helper
         )
+        if problems:
+            failed = True
+            for p in problems:
+                print(f"FAIL [notes-{tier}] {p}", file=sys.stderr)
+        else:
+            shared = workload_helper or auth_helper
+            print(
+                f"ok   [notes-{tier}] {NOTES_TEMPLATE} warns about an open {tier} "
+                f"API under `{auth_helper}`, sharing `{shared}` with {workload}",
+                flush=True,
+            )
     # Nor does the README's alert count, which is read from the template source.
     count, problems = check_alert_count_files()
     if problems:
@@ -3499,7 +3544,7 @@ def source_checks(
 
 
 def check_query_notes(chart: str, base: list[str], oidc_issuer: str) -> bool:
-    """Hold the install notes to the query tier's real authentication.
+    """Hold the install notes to both tiers' real authentication.
 
     Returns True when an arm failed. Separate from the render matrix because
     the notes reach this script through a probe copy of the chart
@@ -3513,32 +3558,53 @@ def check_query_notes(chart: str, base: list[str], oidc_issuer: str) -> bool:
     # included, since that is the arm the warning used to ignore. The disabled
     # tier has no API to call open. Each authenticated arm carries a
     # coordinator token for the same reason the matrix arms above do.
-    notes_matrix = [
-        ("notes-open", [], True),
+    query_notes_matrix = [
+        ("notes-open", [], True, True),
         ("notes-oidc",
          ["--set", f"query.oidc.issuer={oidc_issuer}",
           "--set", "query.oidc.audience=siglake-query",
-          "--set", "query.distributed.coordinatorToken.value=coord"], False),
+          "--set", "query.distributed.coordinatorToken.value=coord"], False, True),
         ("notes-oidc-tenant-claim",
          ["--set", f"query.oidc.issuer={oidc_issuer}",
           "--set", "query.oidc.audience=siglake-query",
           "--set", "query.oidc.tenantClaim=org_id",
-          "--set", "query.distributed.coordinatorToken.value=coord"], False),
+          "--set", "query.distributed.coordinatorToken.value=coord"], False, True),
         ("notes-tokens-inline",
          ["--set", "query.tokens.list={dev-1}",
-          "--set", "query.distributed.coordinatorToken.value=coord"], False),
+          "--set", "query.distributed.coordinatorToken.value=coord"], False, True),
         ("notes-tokens-existing-secret",
          ["--set", "query.tokens.existingSecret=byo-query-tokens",
-          "--set", "query.distributed.coordinatorToken.value=coord"], False),
+          "--set", "query.distributed.coordinatorToken.value=coord"], False, True),
         ("notes-tokens-eso",
          ["--set", "externalSecrets.enabled=true",
           "--set", "externalSecrets.queryTokens.remoteKey=siglake/query-tokens",
-          "--set", "query.distributed.coordinatorToken.value=coord"], False),
-        ("notes-query-disabled", ["--set", "query.enabled=false"], False),
+          "--set", "query.distributed.coordinatorToken.value=coord"], False, True),
+        ("notes-query-disabled", ["--set", "query.enabled=false"], False, True),
+    ]
+    # #4321: the ingest tier has two static-token sources and the same complete
+    # OIDC-pair rule as query. Query remains open in each arm, so asserting its
+    # warning separately prevents one tier's predicate from hiding the other.
+    ingest_notes_matrix = [
+        ("ingest-notes-open", [], True, True),
+        ("ingest-notes-tokens-inline",
+         ["--set", "ingester.auth.list={write-1}"], True, False),
+        ("ingest-notes-tokens-existing-secret",
+         ["--set", "ingester.auth.existingSecret=byo-ingest-tokens"], True, False),
+        ("ingest-notes-oidc",
+         ["--set", f"ingester.oidc.issuer={oidc_issuer}",
+          "--set", "ingester.oidc.audience=siglake-ingest"], True, False),
+        ("ingest-notes-oidc-tenant-claim",
+         ["--set", f"ingester.oidc.issuer={oidc_issuer}",
+          "--set", "ingester.oidc.audience=siglake-ingest",
+          "--set", "ingester.oidc.tenantClaim=org_id"], True, False),
+        ("ingest-notes-ingester-disabled",
+         ["--set", "ingester.enabled=false"], True, False),
     ]
     with tempfile.TemporaryDirectory() as tmp_dir:
         probe = notes_probe_chart(pathlib.Path(chart), pathlib.Path(tmp_dir))
-        for label, extra, expect_warning in notes_matrix:
+        for label, extra, expect_query_warning, expect_ingest_warning in (
+            query_notes_matrix + ingest_notes_matrix
+        ):
             try:
                 notes = render_notes(str(probe), base + extra)
             except subprocess.CalledProcessError as error:
@@ -3549,14 +3615,26 @@ def check_query_notes(chart: str, base: list[str], oidc_issuer: str) -> bool:
                     file=sys.stderr,
                 )
                 continue
-            problems = check_notes_open_warning(notes, expect_warning)
+            problems = check_notes_open_warning(
+                notes, expect_query_warning, OPEN_QUERY_WARNING, "query"
+            )
+            problems.extend(
+                check_notes_open_warning(
+                    notes, expect_ingest_warning, OPEN_INGEST_WARNING, "ingest"
+                )
+            )
             if problems:
                 failed = True
                 for p in problems:
                     print(f"FAIL [{label}] {p}", file=sys.stderr)
             else:
-                said = "warns the query API is open" if expect_warning else "does not"
-                print(f"ok   [{label}] the install notes {said}", flush=True)
+                query_result = "open" if expect_query_warning else "authenticated or off"
+                ingest_result = "open" if expect_ingest_warning else "authenticated or off"
+                print(
+                    f"ok   [{label}] the install notes report query={query_result}, "
+                    f"ingest={ingest_result}",
+                    flush=True,
+                )
     return failed
 
 

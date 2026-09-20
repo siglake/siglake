@@ -38,6 +38,18 @@ or the binaries will fail to authenticate to S3.
 {{- end }}
 
 {{- /*
+  The helper also resolves the static-token Secret read by the Deployment, so
+  this warning follows the authentication the ingester actually enforces.
+*/ -}}
+{{- if and .Values.ingester.enabled (not (include "siglake.ingestAuthOn" .)) }}
+
+WARNING: the ingest API is running open. ingester.auth.{existingSecret,list} are
+empty, and ingester.oidc has no issuer/audience pair. Set a token source, or
+ingester.oidc.issuer together with ingester.oidc.audience, before exposing this
+cluster.
+{{- end }}
+
+{{- /*
   #4317: the same predicate the query StatefulSet runs on, so this note
   describes the authentication the pods actually enforce. It used to read the
   three token values by hand, which called an OIDC-only install open and told
