@@ -894,6 +894,20 @@ if [ "$WITH_HEAVY" = 1 ]; then
         SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
           cargo test -p siglake-storage --lib eligible_claim_postgres -- \
             --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+        # Multi-shard Postgres claims transition rows before applying the Rust
+        # ownership filter. Prove a foreign row is released and its owner can
+        # claim it; SQLite filters before its per-row UPDATE and cannot cover
+        # that ordering.
+        SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
+          cargo test -p siglake-storage --lib sharded_claim_postgres -- \
+            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+        # The consumed-proof watermark advances in the same transaction as the
+        # segment transition. Exercise both its successful commit and rollback
+        # after a Postgres statement failure; SQLite does not poison the open
+        # transaction in the same way.
+        SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
+          cargo test -p siglake-storage --lib watermark_transaction_postgres -- \
+            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
       else
         dk_ok=0
       fi
