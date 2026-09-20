@@ -48,8 +48,24 @@ if [ "$SIGLAKE_OBJECT_STORE" = garage ]; then
   # depends_on without pulling garage into the default MinIO arm. Order it here
   # instead: `run --rm` blocks and returns the probe's exit code.
   echo "==> starting garage and waiting for its default bucket"
-  docker compose -p "$SIGLAKE_COMPOSE_PROJECT" -f "$COMPOSE" up -d garage
-  docker compose -p "$SIGLAKE_COMPOSE_PROJECT" -f "$COMPOSE" run --rm garage-init
+  if docker compose -p "$SIGLAKE_COMPOSE_PROJECT" -f "$COMPOSE" up -d garage; then
+    :
+  else
+    compose_rc=$?
+    echo "  garage startup failed; recent garage logs:" >&2
+    docker compose -p "$SIGLAKE_COMPOSE_PROJECT" -f "$COMPOSE" logs --tail 50 garage \
+      || true
+    exit "$compose_rc"
+  fi
+  if docker compose -p "$SIGLAKE_COMPOSE_PROJECT" -f "$COMPOSE" run --rm garage-init; then
+    :
+  else
+    compose_rc=$?
+    echo "  garage initialization failed; recent garage logs:" >&2
+    docker compose -p "$SIGLAKE_COMPOSE_PROJECT" -f "$COMPOSE" logs --tail 50 garage \
+      || true
+    exit "$compose_rc"
+  fi
 fi
 
 echo "==> docker compose up (build + start)"
