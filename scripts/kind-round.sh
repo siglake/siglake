@@ -21,7 +21,11 @@ PROM_LOCAL_PORT=19090
 PROM_URL="http://127.0.0.1:${PROM_LOCAL_PORT}"
 QUERY_LOCAL_PORT=18089
 QUERY_METRICS_LOCAL_PORT=19105
-LOAD_EVENTS=6000
+LOAD_EVENTS="${KIND_ROUND_EVENTS:-6000}"
+[[ "$LOAD_EVENTS" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'ERROR: KIND_ROUND_EVENTS must be a positive integer\n' >&2
+  exit 1
+}
 LOAD_BATCH=500
 LOAD_SECONDS=330
 STEADY_BATCH=64
@@ -159,6 +163,13 @@ log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 dump_section() { printf -- '--- %s\n' "$*"; }
+
+initial_load_description() {
+  local inline_group_count_ceiling=4096 relation='at or below'
+  ((LOAD_EVENTS > inline_group_count_ceiling)) && relation=above
+  printf 'ingest %s events with %s distinct hosts (%s the %s inline group-count ceiling)' \
+    "$LOAD_EVENTS" "$LOAD_EVENTS" "$relation" "$inline_group_count_ceiling"
+}
 
 # Is $1 one of the remaining arguments, compared whole? Deliberately not
 # `printf '%s\n' "${array[@]}" | grep -qx`: `grep -q` exits at its first match,
@@ -1800,7 +1811,7 @@ log "scrape pre-registered alerted counters before load"
 scrape_preregistered_zeros ingester 9100 19100
 scrape_preregistered_zeros compactor 9101 19101
 
-log "ingest ${LOAD_EVENTS} events with >4096 distinct hosts"
+log "$(initial_load_description)"
 for ((offset = 0; offset < LOAD_EVENTS; offset += LOAD_BATCH)); do
   count=$LOAD_BATCH
   ((offset + count <= LOAD_EVENTS)) || count=$((LOAD_EVENTS - offset))
