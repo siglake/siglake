@@ -7092,6 +7092,36 @@ trait SideCasStore {
 
 struct OpendalSideCas<'a>(&'a opendal::Operator);
 
+/// Owned form used by retry loops whose store is constructed inside an
+/// attempt. Keeping the operator owned gives tests a factory seam without
+/// changing the public rebuild API.
+struct OwnedOpendalSideCas(opendal::Operator);
+
+impl SideCasStore for OwnedOpendalSideCas {
+    async fn load(&self, rel_path: &str) -> Result<(Option<SnapshotAggregates>, Option<String>)> {
+        OpendalSideCas(&self.0).load(rel_path).await
+    }
+
+    async fn store_if(
+        &self,
+        rel_path: &str,
+        body: Vec<u8>,
+        version: Option<&str>,
+    ) -> Result<CasWrite> {
+        OpendalSideCas(&self.0)
+            .store_if(rel_path, body, version)
+            .await
+    }
+
+    async fn store(&self, rel_path: &str, body: Vec<u8>) -> Result<()> {
+        OpendalSideCas(&self.0).store(rel_path, body).await
+    }
+
+    fn conditional(&self) -> bool {
+        OpendalSideCas(&self.0).conditional()
+    }
+}
+
 impl SideCasStore for OpendalSideCas<'_> {
     async fn load(&self, rel_path: &str) -> Result<(Option<SnapshotAggregates>, Option<String>)> {
         match self.0.stat(rel_path).await {
@@ -22565,10 +22595,27 @@ impl IcebergContext {
         &self,
         table_name: &str,
     ) -> Result<InlineTimeAggregateRebuild> {
+        self.rebuild_inline_time_aggregates_in(table_name, |op| OwnedOpendalSideCas(op.clone()))
+            .await
+    }
+
+    /// Private store seam for deterministic coverage of the rebuild's fences.
+    async fn rebuild_inline_time_aggregates_in<S, F>(
+        &self,
+        table_name: &str,
+        store_for: F,
+    ) -> Result<InlineTimeAggregateRebuild>
+    where
+        S: SideCasStore,
+        F: Fn(&opendal::Operator) -> S,
+    {
         let ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
         let mut moved = 0u32;
         loop {
-            match self.rebuild_inline_time_aggregates_once(&ident).await? {
+            match self
+                .rebuild_inline_time_aggregates_once_in(&ident, &store_for)
+                .await?
+            {
                 Some(report) => return Ok(report),
                 None => {
                     moved += 1;
@@ -22589,10 +22636,15 @@ impl IcebergContext {
 
     /// One attempt. `Ok(None)` means the table committed under the pass and the
     /// caller should start over; every other outcome is a report.
-    async fn rebuild_inline_time_aggregates_once(
+    async fn rebuild_inline_time_aggregates_once_in<S, F>(
         &self,
         ident: &TableIdent,
-    ) -> Result<Option<InlineTimeAggregateRebuild>> {
+        store_for: &F,
+    ) -> Result<Option<InlineTimeAggregateRebuild>>
+    where
+        S: SideCasStore,
+        F: Fn(&opendal::Operator) -> S,
+    {
         let table_name = ident.name().to_string();
         // A fresh handle, not the memoized entry: the pass must read the files
         // of the snapshot it is about to name, and a cached entry can be a
@@ -22631,7 +22683,7 @@ impl IcebergContext {
                  so there is nothing safe to rebuild into"
             )
         })?;
-        let store = OpendalSideCas(&op);
+        let store = store_for(&op);
         let (existing, version) = store.load(SIDE_AGGREGATES_REL_PATH).await?;
         let existing = existing.ok_or_else(|| {
             anyhow::anyhow!(
@@ -31997,15 +32049,16 @@ mod side_publication_retry_tests {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A versioned in-memory side store with two scripted faults: a write that
-    /// fails before it applies, and a write that APPLIES and then reports an
-    /// error — the ambiguous case, where a blind replay would fold the same
-    /// counts in twice.
+    /// A versioned in-memory side store with scripted read and write faults.
     struct FlakyStore {
         state: std::sync::Mutex<Option<(u64, Vec<u8>)>>,
         fail_before_write: AtomicUsize,
         lose_response: AtomicUsize,
+        conflict_before_write: AtomicUsize,
+        writer_change_on_load: AtomicUsize,
+        writer_updates: AtomicUsize,
         conditional: bool,
+        conditional_attempts: AtomicUsize,
         writes: AtomicUsize,
     }
 
@@ -32015,9 +32068,19 @@ mod side_publication_retry_tests {
                 state: std::sync::Mutex::new(None),
                 fail_before_write: AtomicUsize::new(0),
                 lose_response: AtomicUsize::new(0),
+                conflict_before_write: AtomicUsize::new(0),
+                writer_change_on_load: AtomicUsize::new(0),
+                writer_updates: AtomicUsize::new(0),
                 conditional,
+                conditional_attempts: AtomicUsize::new(0),
                 writes: AtomicUsize::new(0),
             }
+        }
+
+        fn seeded(conditional: bool, side: &SnapshotAggregates) -> Self {
+            let store = Self::new(conditional);
+            *store.state.lock().unwrap() = Some((1, serde_json::to_vec(side).unwrap()));
+            store
         }
 
         fn fail_before_write(self, n: usize) -> Self {
@@ -32027,6 +32090,17 @@ mod side_publication_retry_tests {
 
         fn lose_response(self, n: usize) -> Self {
             self.lose_response.store(n, Ordering::Relaxed);
+            self
+        }
+
+        fn conflict_before_write(self, n: usize) -> Self {
+            self.conflict_before_write.store(n, Ordering::Relaxed);
+            self
+        }
+
+        /// Make the nth load observe a concurrent writer's new bytes/version.
+        fn writer_change_on_load(self, n: usize) -> Self {
+            self.writer_change_on_load.store(n, Ordering::Relaxed);
             self
         }
 
@@ -32050,10 +32124,69 @@ mod side_publication_retry_tests {
                 .as_ref()
                 .map(|(_, body)| serde_json::from_slice(body).unwrap())
         }
+
+        fn bytes(&self) -> Option<Vec<u8>> {
+            self.state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(_, body)| body.clone())
+        }
+
+        fn apply_scripted_writer_change(&self) {
+            let mut guard = self.state.lock().unwrap();
+            let (version, body) = guard.as_mut().expect("the writer needs a seeded object");
+            let mut side: SnapshotAggregates = serde_json::from_slice(body).unwrap();
+            side.group_counts = Some(FileGroupCounts {
+                columns: BTreeMap::from([(
+                    "writer-owned".to_string(),
+                    ColumnGroupCounts {
+                        values: BTreeMap::from([("final".to_string(), 1)]),
+                        nulls: 0,
+                    },
+                )]),
+            });
+            *body = serde_json::to_vec(&side).unwrap();
+            *version += 1;
+            self.writer_updates.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedFlakyStore(Arc<FlakyStore>);
+
+    impl SideCasStore for SharedFlakyStore {
+        async fn load(&self, rel: &str) -> Result<(Option<SnapshotAggregates>, Option<String>)> {
+            self.0.load(rel).await
+        }
+
+        async fn store_if(
+            &self,
+            rel: &str,
+            body: Vec<u8>,
+            version: Option<&str>,
+        ) -> Result<CasWrite> {
+            self.0.store_if(rel, body, version).await
+        }
+
+        async fn store(&self, rel: &str, body: Vec<u8>) -> Result<()> {
+            self.0.store(rel, body).await
+        }
+
+        fn conditional(&self) -> bool {
+            self.0.conditional()
+        }
     }
 
     impl SideCasStore for FlakyStore {
         async fn load(&self, _rel: &str) -> Result<(Option<SnapshotAggregates>, Option<String>)> {
+            if self
+                .writer_change_on_load
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                == Ok(1)
+            {
+                self.apply_scripted_writer_change();
+            }
             let guard = self.state.lock().unwrap();
             Ok(match &*guard {
                 Some((v, body)) => (
@@ -32070,8 +32203,12 @@ mod side_publication_retry_tests {
             body: Vec<u8>,
             version: Option<&str>,
         ) -> Result<CasWrite> {
+            self.conditional_attempts.fetch_add(1, Ordering::Relaxed);
             if Self::take(&self.fail_before_write) {
                 anyhow::bail!("injected failure before the write applied");
+            }
+            if Self::take(&self.conflict_before_write) {
+                return Ok(CasWrite::Conflict);
             }
             let current = self
                 .state
@@ -32152,6 +32289,282 @@ mod side_publication_retry_tests {
                 .as_ref()
                 .and_then(|tg| tg.column_total("level")),
         )
+    }
+
+    async fn inline_rebuild_fixture() -> (tempfile::TempDir, IcebergContext, SnapshotAggregates) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        ice.append_events(&[Event::now("seed")]).await.unwrap();
+        let table = ice.catalog().load_table(ice.table_ident()).await.unwrap();
+        let op = aggregate_operator(&table).unwrap().unwrap();
+        let (mut side, _) = OpendalSideCas(&op)
+            .load(SIDE_AGGREGATES_REL_PATH)
+            .await
+            .unwrap();
+        let mut side = side.take().expect("the append must publish a side object");
+        assert!(
+            side.group_counts.is_some(),
+            "the fixture protects group_counts"
+        );
+        side.coverage = None;
+        side.coverage_links.clear();
+        OpendalSideCas(&op)
+            .store(SIDE_AGGREGATES_REL_PATH, serde_json::to_vec(&side).unwrap())
+            .await
+            .unwrap();
+        (tmp, ice, side)
+    }
+
+    struct PendingLinkStore {
+        inner: OwnedOpendalSideCas,
+        loads: AtomicUsize,
+        remaining_appends: Arc<AtomicUsize>,
+        writer: IcebergContext,
+        writer_final_bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        writer_snapshot: Arc<std::sync::Mutex<Option<i64>>>,
+    }
+
+    impl SideCasStore for PendingLinkStore {
+        async fn load(&self, rel: &str) -> Result<(Option<SnapshotAggregates>, Option<String>)> {
+            if self.loads.fetch_add(1, Ordering::SeqCst) == 1
+                && self
+                    .remaining_appends
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                self.writer
+                    .append_events(&[Event::now("concurrent")])
+                    .await
+                    .unwrap();
+                let table = self
+                    .writer
+                    .catalog()
+                    .load_table(self.writer.table_ident())
+                    .await
+                    .unwrap();
+                *self.writer_snapshot.lock().unwrap() =
+                    Some(table.metadata().current_snapshot().unwrap().snapshot_id());
+                *self.writer_final_bytes.lock().unwrap() =
+                    self.inner.0.read(rel).await.unwrap().to_vec();
+            }
+            self.inner.load(rel).await
+        }
+
+        async fn store_if(
+            &self,
+            rel: &str,
+            body: Vec<u8>,
+            version: Option<&str>,
+        ) -> Result<CasWrite> {
+            self.inner.store_if(rel, body, version).await
+        }
+
+        async fn store(&self, rel: &str, body: Vec<u8>) -> Result<()> {
+            self.inner.store(rel, body).await
+        }
+
+        fn conditional(&self) -> bool {
+            self.inner.conditional()
+        }
+    }
+
+    fn metric_counter(
+        snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        name: &str,
+    ) -> u64 {
+        snapshot
+            .iter()
+            .filter(|(key, _, _, _)| key.key().name() == name)
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Counter(value) => *value,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn inline_rebuild_retries_a_newer_pending_link_and_reads_the_new_snapshot() {
+        let (tmp, ice, _legacy) = inline_rebuild_fixture().await;
+        let writer = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let remaining_appends = Arc::new(AtomicUsize::new(1));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let writer_final_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer_snapshot = Arc::new(std::sync::Mutex::new(None));
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let report = ice
+            .rebuild_inline_time_aggregates_in("events", |op| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                PendingLinkStore {
+                    inner: OwnedOpendalSideCas(op.clone()),
+                    loads: AtomicUsize::new(0),
+                    remaining_appends: remaining_appends.clone(),
+                    writer: writer.clone(),
+                    writer_final_bytes: writer_final_bytes.clone(),
+                    writer_snapshot: writer_snapshot.clone(),
+                }
+            })
+            .await
+            .unwrap();
+        let metrics = snapshotter.snapshot().into_vec();
+        drop(guard);
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(report.record_count, 2);
+        assert_eq!(
+            report.coverage.snapshot_id,
+            writer_snapshot.lock().unwrap().unwrap()
+        );
+        assert_eq!(
+            metric_counter(
+                &metrics,
+                "siglake_inline_time_aggregate_rebuild_conflicts_total"
+            ),
+            1
+        );
+        let table = ice.catalog().load_table(ice.table_ident()).await.unwrap();
+        let op = aggregate_operator(&table).unwrap().unwrap();
+        let (side, _) = OpendalSideCas(&op)
+            .load(SIDE_AGGREGATES_REL_PATH)
+            .await
+            .unwrap();
+        let side = side.unwrap();
+        assert!(side.coverage_links.is_empty());
+        assert!(side.group_counts.is_none());
+    }
+
+    #[tokio::test]
+    async fn inline_rebuild_exhaustion_preserves_the_last_writer_bytes() {
+        let (tmp, ice, _legacy) = inline_rebuild_fixture().await;
+        let writer = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let remaining_appends = Arc::new(AtomicUsize::new(3));
+        let writer_final_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer_snapshot = Arc::new(std::sync::Mutex::new(None));
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let error = ice
+            .rebuild_inline_time_aggregates_in("events", |op| PendingLinkStore {
+                inner: OwnedOpendalSideCas(op.clone()),
+                loads: AtomicUsize::new(0),
+                remaining_appends: remaining_appends.clone(),
+                writer: writer.clone(),
+                writer_final_bytes: writer_final_bytes.clone(),
+                writer_snapshot: writer_snapshot.clone(),
+            })
+            .await
+            .expect_err("three commits must spend the retry budget");
+        let metrics = snapshotter.snapshot().into_vec();
+        drop(guard);
+
+        let text = format!("{error:#}");
+        assert!(text.contains("committed under the inline time-aggregate rebuild 3 times"));
+        assert!(text.contains("window with no ingest"), "{text}");
+        assert_eq!(remaining_appends.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            metric_counter(
+                &metrics,
+                "siglake_inline_time_aggregate_rebuild_conflicts_total"
+            ),
+            3
+        );
+        assert_eq!(
+            metric_counter(&metrics, "siglake_inline_time_aggregate_rebuilds_total"),
+            0
+        );
+        let table = ice.catalog().load_table(ice.table_ident()).await.unwrap();
+        let op = aggregate_operator(&table).unwrap().unwrap();
+        let bytes = op.read(SIDE_AGGREGATES_REL_PATH).await.unwrap().to_vec();
+        assert_eq!(bytes, *writer_final_bytes.lock().unwrap());
+        let side: SnapshotAggregates = serde_json::from_slice(&bytes).unwrap();
+        assert!(side.group_counts.is_some(), "the legacy map was dropped");
+        assert!(side.coverage.is_none());
+        assert_eq!(
+            side.coverage_links.len(),
+            1,
+            "successive pending links join into one run"
+        );
+        assert_eq!(
+            side.coverage_links[0].sequence_number,
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .sequence_number(),
+            "the joined pending run must retain the third writer's head"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_rebuild_retries_a_version_change_without_overwriting_the_writer() {
+        let (_tmp, ice, legacy) = inline_rebuild_fixture().await;
+        let original = serde_json::to_vec(&legacy).unwrap();
+        let store = Arc::new(FlakyStore::seeded(true, &legacy).writer_change_on_load(2));
+        let ident = ice.table_ident().clone();
+
+        let outcome = ice
+            .rebuild_inline_time_aggregates_once_in(&ident, &|_| SharedFlakyStore(store.clone()))
+            .await
+            .unwrap();
+
+        assert!(
+            outcome.is_none(),
+            "a changed version must retry the whole pass"
+        );
+        assert_eq!(store.writer_updates.load(Ordering::Relaxed), 1);
+        assert_eq!(store.writes.load(Ordering::Relaxed), 0);
+        assert_ne!(
+            store.bytes().unwrap(),
+            original,
+            "the writer changed the object"
+        );
+        assert!(
+            store
+                .aggregates()
+                .unwrap()
+                .group_counts
+                .unwrap()
+                .columns
+                .contains_key("writer-owned"),
+            "the rebuild overwrote the concurrent writer's final bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_rebuild_retries_one_conditional_conflict_then_publishes() {
+        let (_tmp, ice, legacy) = inline_rebuild_fixture().await;
+        let store = Arc::new(FlakyStore::seeded(true, &legacy).conflict_before_write(1));
+
+        let report = ice
+            .rebuild_inline_time_aggregates_in("events", |_| SharedFlakyStore(store.clone()))
+            .await
+            .unwrap();
+
+        assert!(report.published, "the retry must publish the rebuilt maps");
+        assert_eq!(store.conditional_attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            store.writes.load(Ordering::Relaxed),
+            1,
+            "the conflicting conditional write must not apply a partial rebuild"
+        );
+        assert!(
+            store.aggregates().unwrap().group_counts.is_none(),
+            "the successful replacement drops the uncertified legacy map"
+        );
     }
 
     /// THE DEFECT (#3799). The write-behind flusher took the pending deltas out

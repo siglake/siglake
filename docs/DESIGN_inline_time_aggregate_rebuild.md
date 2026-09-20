@@ -309,6 +309,10 @@ retry wins against: a warm table's per-file fallback measured ~2ms.
   coverage advancing on the appends that follow, the second pass as a reported
   no-op, the footer and decode arms agreeing with what maintenance accumulated,
   and the refusal to invent an object that is not there.
+- In-file tests through the private `SideCasStore` seam cover a newer pending
+  link, a changed object version, a conditional-write conflict, and
+  retry-budget exhaustion. The exhaustion case pins the concurrent writer's
+  final bytes and the retained legacy `group_counts` map.
 - `crates/siglake-cli/tests/cli/rebuild_time_aggregates_cli.rs`: the report an
   operator reads, from the real binary.
 
