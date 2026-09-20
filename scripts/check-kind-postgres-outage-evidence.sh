@@ -408,6 +408,48 @@ case "$action" in
   *) exit 64 ;;
 esac
 STANDIN
+# Keep the offline trace ordered even if the host wall clock steps while other
+# gate jobs run. Epoch seconds still delegate to the real clock for timeouts;
+# only retained ISO stamps, scrape generations and the fixture commit move on
+# this fixed millisecond clock.
+cat >"$standin_dir/date" <<'STANDIN'
+#!/usr/bin/env bash
+set -euo pipefail
+counter_file="$STANDIN_STATE/iso-clock"
+if [[ $# -eq 2 && $1 == -u && $2 == +%Y-%m-%dT%H:%M:%S.%3NZ ]]; then
+  counter=$(cat "$counter_file" 2>/dev/null || echo 0)
+  counter=$((counter + 1))
+  printf '%s' "$counter" >"$counter_file"
+  python3 - "$counter" <<'PY'
+import datetime as dt
+import sys
+
+base = dt.datetime(2026, 9, 20, 12, tzinfo=dt.timezone.utc)
+stamp = base + dt.timedelta(milliseconds=int(sys.argv[1]))
+print(stamp.isoformat(timespec="milliseconds").replace("+00:00", "Z"))
+PY
+  exit 0
+fi
+if [[ $# -eq 1 && $1 == +%s.%N ]]; then
+  counter=$(cat "$counter_file" 2>/dev/null || echo 0)
+  python3 - "$counter" <<'PY'
+import datetime as dt
+import sys
+
+base = dt.datetime(2026, 9, 20, 12, tzinfo=dt.timezone.utc).timestamp()
+print(f"{base + int(sys.argv[1]) / 1000:.3f}")
+PY
+  exit 0
+fi
+if [[
+  $# -eq 4 && $1 == -u && $2 == -d && $3 == "+3 seconds" &&
+  $4 == +%Y-%m-%d\ %H:%M:%S.%6N+00
+]]; then
+  printf '%s\n' '2026-09-20 12:01:00.000000+00'
+  exit 0
+fi
+exec /usr/bin/date "$@"
+STANDIN
 cat >"$standin_dir/curl" <<'STANDIN'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -454,7 +496,9 @@ printf '{"metric":{"pod":"siglake-query-0"},"value":[%s,"%s"]},' "$(date +%s)" "
 printf '{"metric":{"pod":"siglake-query-1"},"value":[%s,"%s"]}' "$(date +%s)" "$value"
 printf ']}}'
 STANDIN
-chmod +x "$standin_dir/kubectl" "$standin_dir/docker" "$standin_dir/curl"
+chmod +x \
+  "$standin_dir/kubectl" "$standin_dir/docker" "$standin_dir/date" \
+  "$standin_dir/curl"
 
 standin_state="$fixture_dir/state"
 mkdir -p "$standin_state/results"
@@ -574,7 +618,7 @@ fixtures=$((fixtures + 1))
 # An exec that returns success without changing process state is the original
 # defect's shape. The post-signal rescan must reject it, then cleanup must still
 # CONT every recorded identity.
-rm -f "$standin_state"/{backlog-calls,job-ids,paused,signals,stopped-*}
+rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,paused,signals,stopped-*}
 ineffective_rc=0
 PATH="$standin_dir:$PATH" STANDIN_STATE="$standin_state" \
   STANDIN_STOP_MODE=ineffective PROC_ROOT="$paused_tree" \
@@ -596,7 +640,7 @@ fixtures=$((fixtures + 1))
 # If one backend STOP fails after the postmaster was stopped, the pre-recorded
 # process list must let the EXIT trap restore that postmaster and attempt every
 # other candidate without restarting the container.
-rm -f "$standin_state"/{backlog-calls,job-ids,paused,signals,stopped-*}
+rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,paused,signals,stopped-*}
 partial_rc=0
 PATH="$standin_dir:$PATH" STANDIN_STATE="$standin_state" \
   STANDIN_STOP_MODE=partial PROC_ROOT="$paused_tree" \
