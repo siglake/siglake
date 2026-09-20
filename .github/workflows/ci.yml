@@ -861,7 +861,7 @@ jobs:
           cache-from: type=gha,scope=siglake-operator
           cache-to: type=gha,scope=siglake-operator,mode=max
 
-      # All five suites need the compose stack, so they share one lifecycle.
+      # All seven suites need the compose stack, so they share one lifecycle.
       # The second is SQL that no hermetic test can reach: shared-store batch
       # job ownership (#1845), where getting it wrong destroys a live
       # replica's job result on every query scale-out, and the cancellation
@@ -888,6 +888,13 @@ jobs:
       # UPDATE ... FROM agg, and returns an empty vec before the statement on
       # SQLite. It reuses the third's scratch-schema isolation and its already
       # linked test binary.
+      #
+      # The sixth covers the older Postgres claim statement's multi-shard
+      # release: it claims before the Rust shard filter, unlike SQLite, and a
+      # foreign row must return to sealed before its owner can claim it. The
+      # seventh covers the consumed-proof transaction: the segment state and
+      # watermark advance must commit or roll back together after a Postgres
+      # statement error. Both reuse the same isolated scratch schemas.
       - name: MinIO pagination and the Postgres catalog suites
         env:
           SIGLAKE_TEST_S3_ENDPOINT: http://localhost:9000
@@ -903,6 +910,10 @@ jobs:
           cargo test -p siglake-storage --lib wal_ledger_postgres -- \
             --ignored --nocapture
           cargo test -p siglake-storage --lib eligible_claim_postgres -- \
+            --ignored --nocapture
+          cargo test -p siglake-storage --lib sharded_claim_postgres -- \
+            --ignored --nocapture
+          cargo test -p siglake-storage --lib watermark_transaction_postgres -- \
             --ignored --nocapture
 
       # Same reason as the `test` job's report: the builder stage's release

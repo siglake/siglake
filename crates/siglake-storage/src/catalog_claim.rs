@@ -3731,8 +3731,9 @@ mod local_commit_mark_tests {
 /// rows and strand them in `processing`.
 ///
 /// [`Scratch`], [`in_scratch`] and [`assert_both_gates_run`] are `pub(super)`
-/// because [`eligible_claim_postgres`] runs in the same compose step and must
-/// reuse this isolation rather than open a second kind of connection (#5189).
+/// because the other live catalog suites run in the same compose step and must
+/// reuse this isolation rather than open a second kind of connection (#5189,
+/// #5420).
 #[cfg(test)]
 mod local_commit_mark_postgres {
     use super::local_commit_mark_tests::{local, row};
@@ -3813,7 +3814,7 @@ mod local_commit_mark_postgres {
 
     /// Run one case in a fresh schema and drop the schema either way. The cases
     /// return `Result` rather than asserting so that a failure still cleans up
-    /// and still names which case went wrong. Two suites share it now, so the
+    /// and still names which case went wrong. Four suites share it now, so the
     /// count is theirs, not this helper's.
     pub(super) async fn in_scratch<F, Fut>(
         admin: &AnyPool,
@@ -3826,7 +3827,7 @@ mod local_commit_mark_postgres {
         Fut: std::future::Future<Output = Result<()>>,
     {
         let scratch = Scratch::create(admin, base, label).await?;
-        // The store's pool is closed before the schema goes, so nine cases do
+        // The store's pool is closed before the schema goes, so twelve cases do
         // not leave nine pools' worth of idle sessions on a compose Postgres
         // that has its own ingest, compactor and query server connected.
         let outcome = match scratch.connect().await {
@@ -4534,6 +4535,320 @@ mod eligible_claim_postgres {
         assert!(
             failed.is_empty(),
             "the candidate-local eligibility decision is wrong on Postgres:\n{}",
+            failed.join("\n")
+        );
+    }
+}
+
+/// The multi-shard part of [`SqlSegmentClaim::try_claim_sharded`] against the
+/// deployed catalog backend. Postgres claims before the Rust-side shard
+/// filter, so a foreign row has to cross `processing` and return to `sealed`;
+/// SQLite filters before its per-row UPDATE and cannot exercise that path.
+#[cfg(test)]
+mod sharded_claim_postgres {
+    use super::local_commit_mark_postgres::{assert_both_gates_run, in_scratch, URI_VAR};
+    use super::*;
+    use anyhow::ensure;
+
+    const LABEL: &str = "sharded_claim";
+    const SHARD_COUNT: usize = 2;
+
+    fn index_for_shard(shard: usize) -> String {
+        (0..)
+            .map(|n| format!("idx-{n}"))
+            .find(|index| SqlSegmentClaim::index_shard(index, SHARD_COUNT) == shard)
+            .expect("the two-shard FNV mapping has a member")
+    }
+
+    async fn seed(claim: &SqlSegmentClaim, id: &str, index_id: &str) -> Result<()> {
+        ensure!(
+            claim
+                .register(
+                    id,
+                    "default",
+                    index_id,
+                    &format!("wal-mirror/{id}.arrow"),
+                    1,
+                    1,
+                )
+                .await?,
+            "seeding {id} must insert a row"
+        );
+        Ok(())
+    }
+
+    async fn state(
+        claim: &SqlSegmentClaim,
+        id: &str,
+    ) -> Result<(String, Option<String>, i64, Option<i64>)> {
+        let q = claim.dialect.rewrite(
+            "SELECT status, claimer, attempts, not_before_ms FROM wal_segments WHERE id = ?",
+        );
+        sqlx::query_as(&q)
+            .bind(id)
+            .fetch_optional(&claim.pool)
+            .await
+            .with_context(|| format!("read back {id}"))?
+            .with_context(|| format!("no row {id}"))
+    }
+
+    async fn foreign_rows_return_to_their_owner(claim: SqlSegmentClaim) -> Result<()> {
+        let mine_index = index_for_shard(0);
+        let foreign_index = index_for_shard(1);
+        seed(&claim, "mine", &mine_index).await?;
+        seed(&claim, "foreign", &foreign_index).await?;
+
+        let mine = claim.try_claim_sharded(1, 0, SHARD_COUNT).await?;
+        ensure!(
+            mine.iter().map(|row| row.id.as_str()).collect::<Vec<_>>() == ["mine"],
+            "shard 0 returned the wrong rows: {:?}",
+            mine.iter().map(|row| &row.id).collect::<Vec<_>>()
+        );
+        let mine_state = state(&claim, "mine").await?;
+        ensure!(mine_state.0 == "processing", "mine is {}", mine_state.0);
+        ensure!(
+            mine_state.1.as_deref() == Some("pg-sharded_claim"),
+            "mine has claimer {:?}",
+            mine_state.1
+        );
+
+        let foreign = state(&claim, "foreign").await?;
+        ensure!(
+            foreign.0 == "sealed",
+            "foreign row stranded as {}, not sealed",
+            foreign.0
+        );
+        ensure!(
+            foreign.1.is_none(),
+            "foreign row kept claimer {:?}",
+            foreign.1
+        );
+        ensure!(
+            foreign.2 == 1 && foreign.3.is_some(),
+            "foreign row did not pass through release: {foreign:?}"
+        );
+
+        // `release` applies the normal retry delay. Make that elapsed without
+        // sleeping: this case is about ownership after release, not backoff.
+        let q = claim
+            .dialect
+            .rewrite("UPDATE wal_segments SET not_before_ms = NULL WHERE id = ?");
+        sqlx::query(&q)
+            .bind("foreign")
+            .execute(&claim.pool)
+            .await
+            .context("make the released foreign row due")?;
+        let owner = claim.try_claim_sharded(1, 1, SHARD_COUNT).await?;
+        ensure!(
+            owner.iter().map(|row| row.id.as_str()).collect::<Vec<_>>() == ["foreign"],
+            "the owner could not reclaim its released row: {:?}",
+            owner.iter().map(|row| &row.id).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn both_gates_run_this_module_by_name() {
+        assert_both_gates_run(module_path!().rsplit("::").next().expect("module name"));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn foreign_shard_claims_return_to_the_owner_on_postgres() {
+        let base = match std::env::var(URI_VAR) {
+            Ok(uri) if !uri.trim().is_empty() => uri,
+            _ => {
+                eprintln!("skipped: {URI_VAR} is unset; nothing was verified");
+                return;
+            }
+        };
+        sqlx::any::install_default_drivers();
+        let admin = AnyPool::connect(&base)
+            .await
+            .unwrap_or_else(|e| panic!("connect {URI_VAR}: {e}"));
+        let started = std::time::Instant::now();
+        let outcome = in_scratch(&admin, &base, LABEL, foreign_rows_return_to_their_owner).await;
+        eprintln!(
+            "sharded_claim_postgres: foreign release in {:?}",
+            started.elapsed()
+        );
+        admin.close().await;
+        outcome.unwrap_or_else(|e| panic!("foreign-shard release is wrong on Postgres: {e:#}"));
+    }
+}
+
+/// The consumed-proof transaction against Postgres. A successful batch must
+/// commit its segment state and watermark together, while a watermark
+/// statement error must roll both back. SQLite does not model Postgres's
+/// aborted-transaction state after a failed statement.
+#[cfg(test)]
+mod watermark_transaction_postgres {
+    use super::local_commit_mark_postgres::{assert_both_gates_run, in_scratch, URI_VAR};
+    use super::*;
+    use anyhow::ensure;
+
+    const LABEL: &str = "watermark_tx";
+    const INDEX: &str = "idx";
+    const TABLE_UUID: &str = "uuid-live";
+
+    async fn seed_and_claim(claim: &SqlSegmentClaim, id: &str) -> Result<ClaimedSegment> {
+        ensure!(
+            claim
+                .register(
+                    id,
+                    "default",
+                    INDEX,
+                    &format!("wal-mirror/{id}.arrow"),
+                    1,
+                    1,
+                )
+                .await?,
+            "seeding {id} must insert a row"
+        );
+        let mut claimed = claim.try_claim(1).await?;
+        ensure!(claimed.len() == 1, "claim returned {} rows", claimed.len());
+        Ok(claimed.pop().expect("length checked"))
+    }
+
+    async fn row_state(claim: &SqlSegmentClaim, id: &str) -> Result<(String, Option<i64>)> {
+        let q = claim
+            .dialect
+            .rewrite("SELECT status, committed_at_ms FROM wal_segments WHERE id = ?");
+        sqlx::query_as(&q)
+            .bind(id)
+            .fetch_optional(&claim.pool)
+            .await
+            .with_context(|| format!("read back {id}"))?
+            .with_context(|| format!("no row {id}"))
+    }
+
+    fn provenance() -> ProofProvenance {
+        let mut provenance = ProofProvenance::default();
+        provenance.record("default", INDEX, TABLE_UUID);
+        provenance
+    }
+
+    async fn commits_row_and_watermark_together(claim: SqlSegmentClaim) -> Result<()> {
+        let claimed = seed_and_claim(&claim, "success").await?;
+        claim
+            .mark_committed_batch(&[claimed.id], &provenance())
+            .await?;
+
+        let row = row_state(&claim, "success").await?;
+        ensure!(row.0 == "committed", "success row is {}", row.0);
+        ensure!(row.1.is_some(), "success row has no commit timestamp");
+        let watermark = claim
+            .consumed_proof_watermark("default", INDEX)
+            .await?
+            .context("successful transaction wrote no watermark")?;
+        ensure!(
+            watermark.acknowledged_through_ms == claimed.claimed_at.timestamp_millis(),
+            "watermark {watermark:?} does not describe claim at {}",
+            claimed.claimed_at.timestamp_millis()
+        );
+        ensure!(
+            watermark.table_uuid.as_deref() == Some(TABLE_UUID),
+            "watermark has the wrong incarnation: {watermark:?}"
+        );
+        Ok(())
+    }
+
+    async fn a_failed_watermark_statement_rolls_back_the_row(claim: SqlSegmentClaim) -> Result<()> {
+        seed_and_claim(&claim, "rollback").await?;
+        sqlx::query(
+            "INSERT INTO consumed_proof_watermarks \
+             (tenant, index_id, acknowledged_through_ms, table_uuid) \
+             VALUES ('default', 'idx', 1, 'uuid-live')",
+        )
+        .execute(&claim.pool)
+        .await
+        .context("seed the prior watermark")?;
+        sqlx::query(
+            "ALTER TABLE consumed_proof_watermarks ADD CONSTRAINT reject_watermark_advance \
+             CHECK (acknowledged_through_ms <= 1)",
+        )
+        .execute(&claim.pool)
+        .await
+        .context("install the watermark failure")?;
+
+        let error = claim
+            .mark_committed_batch(&["rollback".to_string()], &provenance())
+            .await
+            .expect_err("the check constraint must reject the watermark advance");
+        ensure!(
+            format!("{error:#}").contains("advance consumed-proof watermark"),
+            "the intended statement did not fail: {error:#}"
+        );
+
+        let row = row_state(&claim, "rollback").await?;
+        ensure!(
+            row == ("processing".to_string(), None),
+            "the segment UPDATE escaped the failed transaction: {row:?}"
+        );
+        let watermark = claim
+            .consumed_proof_watermark("default", INDEX)
+            .await?
+            .context("the prior watermark disappeared")?;
+        ensure!(
+            watermark.acknowledged_through_ms == 1
+                && watermark.table_uuid.as_deref() == Some(TABLE_UUID),
+            "the failed transaction changed the watermark: {watermark:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn both_gates_run_this_module_by_name() {
+        assert_both_gates_run(module_path!().rsplit("::").next().expect("module name"));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn row_and_watermark_are_one_postgres_transaction() {
+        let base = match std::env::var(URI_VAR) {
+            Ok(uri) if !uri.trim().is_empty() => uri,
+            _ => {
+                eprintln!("skipped: {URI_VAR} is unset; nothing was verified");
+                return;
+            }
+        };
+        sqlx::any::install_default_drivers();
+        let admin = AnyPool::connect(&base)
+            .await
+            .unwrap_or_else(|e| panic!("connect {URI_VAR}: {e}"));
+        let started = std::time::Instant::now();
+        let mut outcomes: Vec<(&str, Result<()>)> = Vec::new();
+        macro_rules! case {
+            ($name:expr, $body:expr) => {{
+                let case_started = std::time::Instant::now();
+                let outcome = in_scratch(&admin, &base, LABEL, $body).await;
+                eprintln!(
+                    "watermark_transaction_postgres: {} in {:?}",
+                    $name,
+                    case_started.elapsed()
+                );
+                outcomes.push(($name, outcome));
+            }};
+        }
+        case!("successful advance", commits_row_and_watermark_together);
+        case!(
+            "failed advance rolls back row state",
+            a_failed_watermark_statement_rolls_back_the_row
+        );
+        eprintln!(
+            "watermark_transaction_postgres: {} cases in {:?}",
+            outcomes.len(),
+            started.elapsed()
+        );
+        admin.close().await;
+
+        let failed: Vec<String> = outcomes
+            .into_iter()
+            .filter_map(|(case, outcome)| outcome.err().map(|e| format!("- {case}: {e:#}")))
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "the row/watermark transaction is wrong on Postgres:\n{}",
             failed.join("\n")
         );
     }
