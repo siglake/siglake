@@ -938,10 +938,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   reports how many committed inside the pause window, and resolves the
   zero-backlog observation when every accepted job is dated outside it. That
   reading is bounded: the commit timestamp dates the row version visible at
-  collection, not every status transition, so a recovered row — which the
-  amendment path can rewrite after it went terminal — a missing row, a NULL
-  timestamp, a nonterminal job, or a commit overlapping either signal
-  transition all leave the observation unexplained. The probe retains its
+  collection, not every status transition. For the one transition that matters
+  the probe now installs an insert-only write history on that throwaway
+  Postgres before the burst — a trigger on `siglake_query_jobs` recording each
+  write from inside its own transaction — so a row the amendment path rewrote
+  after it went terminal can still be dated by the transaction that made it
+  terminal, with the amendment kept as a separate row. A recovered row with no
+  history or an undated terminal transaction, a missing row, a NULL timestamp,
+  a nonterminal job, or a commit overlapping either signal transition all
+  leave the observation unexplained. The probe retains its
   local observations to the millisecond and the grader derives uncertainty
   from each timestamp's recorded precision; historical second-only traces keep
   their full one-second uncertainty. A commit is a stopped-window failure only

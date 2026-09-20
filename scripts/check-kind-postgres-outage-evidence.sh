@@ -116,7 +116,7 @@ fi
 # no way to date the counters it read, so the probe must now retain a process
 # state per sample, a bounded write in each phase, the container's identity
 # across the window, and the Prometheus scrape each value came from.
-contains "$probe_body" '"schema_version": 3' ||
+contains "$probe_body" '"schema_version": 4' ||
   fail "$PROBE does not retain the pause-evidence schema version"
 contains "$probe_body" 'state_status=$(postgres_process_state "$TMP_DIR/postgres-state")' ||
   fail "$PROBE does not read the Postgres process state on every sample"
@@ -158,6 +158,40 @@ if not ready < recovery < collect:
     raise SystemExit(
         "expected readiness, the end of the recovery window and the commit-time read in "
         f"order; got {ready + 1}, {recovery + 1}, {collect + 1}"
+    )
+PY
+# The visible row version is not the terminal write when the amendment path
+# rewrote it, so the probe installs an insert-only transition history on the
+# throwaway Postgres before it submits anything, and reads it back dated by the
+# transaction that wrote each job row.
+contains "$probe_body" 'JOB_HISTORY_INSTALL_STATUS=$(postgres_install_job_history' ||
+  fail "$PROBE does not install the job-row write history"
+contains "$probe_body" 'JOB_HISTORY_STATUS=$(postgres_job_history "$TMP_DIR/job-history")' ||
+  fail "$PROBE does not read the job-row write history back"
+contains "$probe_body" 'FOR EACH ROW EXECUTE FUNCTION siglake_outage_record_job_write();' ||
+  fail "$PROBE does not record a history row per job-row write"
+contains "$probe_body" 'pg_xact_commit_timestamp(xmin) FROM siglake_outage_job_history ORDER BY seq' ||
+  fail "$PROBE does not date each history row by the transaction that wrote it"
+if grep -rq 'siglake_outage_job_history' "$CHART_DIR" deploy/aws deploy/docker-compose.yml \
+  crates 2>/dev/null; then
+  fail "the probe's job write history leaked out of the throwaway kind install"
+fi
+python3 - "$PROBE" <<'PY' || fail "$PROBE does not install the write history before the burst"
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+install = next(i for i, line in enumerate(lines)
+               if line.startswith("JOB_HISTORY_INSTALL_STATUS="))
+burst = next(i for i, line in enumerate(lines)
+             if line == 'for index in $(seq 1 "$REQUESTED_JOBS"); do')
+read = next(i for i, line in enumerate(lines)
+            if line.startswith("JOB_HISTORY_STATUS="))
+collect = next(i for i, line in enumerate(lines)
+               if line.startswith("COMMIT_TIMES_STATUS="))
+if not install < burst < collect < read:
+    raise SystemExit(
+        "expected the history install, the burst, the commit-time read and the history read "
+        f"in order; got {install + 1}, {burst + 1}, {collect + 1}, {read + 1}"
     )
 PY
 contains "$probe_body" 'PAUSE_APPLIED_AT=$(awk' ||
@@ -202,7 +236,10 @@ extract_snippet write-probe-snippet "$fixture_dir/write-probe.sh"
 extract_snippet commit-times-snippet "$fixture_dir/commit-times.sh"
 extract_snippet node-process-list-snippet "$fixture_dir/node-process-list.sh"
 extract_snippet node-signal-snippet "$fixture_dir/node-signal.sh"
-sh -n "$fixture_dir/node-process-list.sh" "$fixture_dir/node-signal.sh" ||
+extract_snippet job-history-install-snippet "$fixture_dir/job-history-install.sh"
+extract_snippet job-history-snippet "$fixture_dir/job-history.sh"
+sh -n "$fixture_dir/node-process-list.sh" "$fixture_dir/node-signal.sh" \
+  "$fixture_dir/job-history-install.sh" "$fixture_dir/job-history.sh" ||
   fail "the kind-node process snippets are not valid POSIX shell"
 
 # `pid:comm:state:starttime` per process. Field 3 of /proc/<pid>/stat is the
@@ -306,6 +343,85 @@ if contains "$off_arm" "$(printf 'row\t')"; then
 fi
 fixtures=$((fixtures + 1))
 
+# The history installer, against a psql stand-in that keeps the DDL it was fed.
+# Both snippets are single-quoted bash strings run by `sh -eu -c`, so the
+# dollar-quote tags that carry the plpgsql body would become the shell's PID if
+# the DDL were not in a quoted heredoc. That is invisible in a review and only
+# fails against a real Postgres, so the tags are checked in what psql received.
+job_history_install_arm() {
+  local name=$1 rc=$2 out
+  cat >"$fixture_dir/psql-history-$name" <<STANDIN
+#!/bin/sh
+cat >"$fixture_dir/history-ddl-$name"
+[ "$rc" -eq 0 ] || echo "ERROR: relation siglake_query_jobs does not exist" >&2
+exit "$rc"
+STANDIN
+  chmod +x "$fixture_dir/psql-history-$name"
+  out=$(JOB_HISTORY_PSQL="$fixture_dir/psql-history-$name" \
+    JOB_HISTORY_INSTALL_ERRORS="$fixture_dir/psql-history-$name.err" \
+    sh -eu -c "$(<"$fixture_dir/job-history-install.sh")" job-history-install)
+  printf '%s' "$out"
+}
+
+install_arm=$(job_history_install_arm ok 0)
+contains "$install_arm" "$(printf 'install\t0')" ||
+  fail "the history installer did not report its status: $install_arm"
+install_ddl="$(<"$fixture_dir/history-ddl-ok")"
+contains "$install_ddl" 'LANGUAGE plpgsql AS $fn$' ||
+  fail "the shell expanded the plpgsql dollar-quote tag before psql saw it: $install_ddl"
+contains "$install_ddl" 'CASE WHEN TG_OP = $op$INSERT$op$ THEN NULL ELSE OLD.status END' ||
+  fail "the shell expanded the INSERT literal's dollar-quote tag: $install_ddl"
+contains "$install_ddl" 'AFTER INSERT OR UPDATE ON siglake_query_jobs' ||
+  fail "the history trigger does not fire on every job-row write: $install_ddl"
+[[ $(grep -c -F -- '$fn$' "$fixture_dir/history-ddl-ok") -eq 2 ]] ||
+  fail "the plpgsql body is not delimited by a matched dollar-quote pair: $install_ddl"
+fixtures=$((fixtures + 1))
+
+failed_install_arm=$(job_history_install_arm missing 3)
+contains "$failed_install_arm" "$(printf 'install\t3')" ||
+  fail "the history installer hid a failed install: $failed_install_arm"
+contains "$failed_install_arm" 'relation siglake_query_jobs does not exist' ||
+  fail "the history installer dropped the install error: $failed_install_arm"
+fixtures=$((fixtures + 1))
+
+# The reader, with the history present and with the table absent. The second
+# arm has to come back as a failed query, not as a job that made no writes.
+job_history_read_arm() {
+  local name=$1 rows=$2 rc=$3 out
+  cat >"$fixture_dir/psql-history-read-$name" <<STANDIN
+#!/bin/sh
+printf '%s' "$rows"
+[ "$rc" -eq 0 ] || echo "ERROR: relation siglake_outage_job_history does not exist" >&2
+exit "$rc"
+STANDIN
+  chmod +x "$fixture_dir/psql-history-read-$name"
+  out=$(JOB_HISTORY_PSQL="$fixture_dir/psql-history-read-$name" \
+    JOB_HISTORY_ERRORS="$fixture_dir/psql-history-read-$name.err" \
+    JOB_HISTORY_ROWS="$fixture_dir/psql-history-read-$name.rows" \
+    sh -eu -c "$(<"$fixture_dir/job-history.sh")" job-history)
+  printf '%s' "$out"
+}
+
+history_arm=$(job_history_read_arm present \
+  '1	job-a	INSERT		pending		2026-09-07 12:00:01.204817+00	2026-09-07 12:00:01.205901+00
+2	job-a	UPDATE	running	failed	2026-09-07 12:00:51+00	2026-09-07 12:00:51.771902+00	2026-09-07 12:00:51.884113+00
+' 0)
+contains "$history_arm" "$(printf 'status\t0')" ||
+  fail "the history reader did not report its query status: $history_arm"
+contains "$history_arm" "$(printf 'row\t2\tjob-a\tUPDATE\trunning\tfailed')" ||
+  fail "the history reader did not tag its rows: $history_arm"
+fixtures=$((fixtures + 1))
+
+missing_history_arm=$(job_history_read_arm absent '' 3)
+contains "$missing_history_arm" "$(printf 'status\t3')" ||
+  fail "the history reader hid a failed query: $missing_history_arm"
+contains "$missing_history_arm" 'relation siglake_outage_job_history does not exist' ||
+  fail "the history reader dropped the error detail: $missing_history_arm"
+if contains "$missing_history_arm" "$(printf 'row\t')"; then
+  fail "the history reader invented rows from a failed query: $missing_history_arm"
+fi
+fixtures=$((fixtures + 1))
+
 # Drive the whole probe once against recording stand-ins, so the retained
 # document's shape is proven by the script that writes it rather than by a
 # fixture someone kept in step by hand. The `kubectl` stand-in runs only the
@@ -340,7 +456,7 @@ case "$command" in
     done
     text=${body[3]:-}
     if [[ "$text" == *PROC_ROOT* || "$text" == *WRITE_PROBE_PSQL* \
-      || "$text" == *COMMIT_TIMES_PSQL* ]]; then
+      || "$text" == *COMMIT_TIMES_PSQL* || "$text" == *JOB_HISTORY_PSQL* ]]; then
       exec "${body[@]}"
     fi
     exit 0
@@ -592,6 +708,32 @@ done <"$STANDIN_STATE/job-ids"
 STANDIN
 chmod +x "$fixture_dir/psql-commit-standin"
 
+# One stand-in for both history snippets: the installer feeds its DDL on stdin
+# and asks for nothing back, the reader passes `-c`. It answers for the same
+# accepted ids, with a terminal transition dated where the commit-time
+# stand-in dates the row, and an earlier `pending` insert before the pause.
+cat >"$fixture_dir/psql-history-standin" <<'STANDIN'
+#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    -f) cat >"$STANDIN_STATE/history-installed"; exit 0 ;;
+  esac
+done
+committed=$(date -u -d "+3 seconds" "+%Y-%m-%d %H:%M:%S.%6N+00")
+seq=0
+while IFS= read -r job_id; do
+  seq=$((seq + 1))
+  printf '%s\t%s\tINSERT\t\tpending\t\t%s\t%s\n' \
+    "$seq" "$job_id" "2026-09-07 12:00:01.204817+00" "2026-09-07 12:00:01.205901+00"
+done <"$STANDIN_STATE/job-ids"
+while IFS= read -r job_id; do
+  seq=$((seq + 1))
+  printf '%s\t%s\tUPDATE\trunning\tsucceeded\t\t%s\t%s\n' \
+    "$seq" "$job_id" "$committed" "$committed"
+done <"$STANDIN_STATE/job-ids"
+STANDIN
+chmod +x "$fixture_dir/psql-history-standin"
+
 # Leave two sampling intervals after the midpoint. With a two-second window,
 # the first sample can finish just before the midpoint, then `sleep 1` lands at
 # the deadline and the loop never takes its scheduled outage write probe.
@@ -604,6 +746,10 @@ PATH="$standin_dir:$PATH" \
   COMMIT_TIMES_PSQL="$fixture_dir/psql-commit-standin" \
   COMMIT_TIMES_ERRORS="$fixture_dir/standin-commit.err" \
   COMMIT_TIMES_ROWS="$fixture_dir/standin-commit.rows" \
+  JOB_HISTORY_PSQL="$fixture_dir/psql-history-standin" \
+  JOB_HISTORY_INSTALL_ERRORS="$fixture_dir/standin-history-install.err" \
+  JOB_HISTORY_ERRORS="$fixture_dir/standin-history.err" \
+  JOB_HISTORY_ROWS="$fixture_dir/standin-history.rows" \
   KUBE_CONTEXT=kind-fixture NAMESPACE=fixture PROM_URL=http://fixture.invalid \
   RESULTS_DIR="$standin_state/results" \
   POSTGRES_OUTAGE_JOBS=2 POSTGRES_OUTAGE_SECONDS=4 \
@@ -617,7 +763,7 @@ python3 - "$standin_state/results/postgres-outage-reconnect.json" <<'PY' ||
 import datetime as dt
 import json, sys
 document = json.load(open(sys.argv[1], encoding="utf-8"))
-assert document["schema_version"] == 3, document["schema_version"]
+assert document["schema_version"] == 4, document["schema_version"]
 evidence = document["evidence"]
 assert evidence["grade"] == "verified", evidence["problems"]
 summary = evidence["summary"]
@@ -629,6 +775,15 @@ assert commits["committed_in_pause"] == [], commits
 assert commits["unplaceable_commits"] == [], commits
 assert commits["gaps"] == [], commits
 assert commits["settles_pause"] is True, commits
+history = summary["job_write_history"]
+assert history["install_status"] == 0, history
+assert history["query_status"] == 0, history
+assert history["tracked_jobs"] == 2, history
+assert sorted(history["terminal_writes"]) == ["job-1", "job-2"], history
+assert history["committed_in_pause"] == [], history
+assert history["unplaceable_commits"] == [], history
+assert history["gaps"] == [], history
+assert document["job_write_history"]["rows"][0]["seq"] == 1, document["job_write_history"]
 pause_bounds = commits["signal_boundaries"]["pause_transition"]
 pause_earliest = dt.datetime.fromisoformat(pause_bounds["earliest"])
 pause_latest = dt.datetime.fromisoformat(pause_bounds["latest"])
@@ -659,12 +814,13 @@ fixtures=$((fixtures + 1))
 # An exec that returns success without changing process state is the original
 # defect's shape. The post-signal rescan must reject it, then cleanup must still
 # CONT every recorded identity.
-rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,paused,signal-execs,signals,stopped-*}
+rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,history-installed,paused,signal-execs,signals,stopped-*}
 ineffective_rc=0
 PATH="$standin_dir:$PATH" STANDIN_STATE="$standin_state" \
   STANDIN_STOP_MODE=ineffective PROC_ROOT="$paused_tree" \
   WRITE_PROBE_PSQL="$fixture_dir/psql-standin" \
   COMMIT_TIMES_PSQL="$fixture_dir/psql-commit-standin" \
+  JOB_HISTORY_PSQL="$fixture_dir/psql-history-standin" \
   KUBE_CONTEXT=kind-fixture NAMESPACE=fixture PROM_URL=http://fixture.invalid \
   RESULTS_DIR="$standin_state/results" POSTGRES_OUTAGE_JOBS=1 \
   POSTGRES_OUTAGE_SECONDS=4 POSTGRES_OUTAGE_SAMPLE_INTERVAL_SECONDS=1 \
@@ -681,12 +837,13 @@ fixtures=$((fixtures + 1))
 # If one backend STOP fails after the postmaster was stopped, the pre-recorded
 # process list must let the EXIT trap restore that postmaster and attempt every
 # other candidate without restarting the container.
-rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,paused,signal-execs,signals,stopped-*}
+rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,history-installed,paused,signal-execs,signals,stopped-*}
 partial_rc=0
 PATH="$standin_dir:$PATH" STANDIN_STATE="$standin_state" \
   STANDIN_STOP_MODE=partial PROC_ROOT="$paused_tree" \
   WRITE_PROBE_PSQL="$fixture_dir/psql-standin" \
   COMMIT_TIMES_PSQL="$fixture_dir/psql-commit-standin" \
+  JOB_HISTORY_PSQL="$fixture_dir/psql-history-standin" \
   KUBE_CONTEXT=kind-fixture NAMESPACE=fixture PROM_URL=http://fixture.invalid \
   RESULTS_DIR="$standin_state/results" POSTGRES_OUTAGE_JOBS=1 \
   POSTGRES_OUTAGE_SECONDS=4 POSTGRES_OUTAGE_SAMPLE_INTERVAL_SECONDS=1 \
@@ -837,6 +994,36 @@ def commit_row(job_id):
         row for row in document["job_commit_times"]["rows"] if row["job_id"] == job_id
     )
 
+def history_row(seq):
+    return next(row for row in document["job_write_history"]["rows"] if row["seq"] == seq)
+
+def amended_job_row():
+    """The amendment path's shape: job-a is recovered, went terminal at
+    12:00:51.884113, and `AMEND_RECOVERED_ERROR_SQL` rewrote its error two
+    seconds later. `pg_xact_commit_timestamp(xmin)` on the visible row now
+    dates the amendment, and no poll of the row version could have caught the
+    terminal version in between. Only the insert-only history still carries
+    it, as the first terminal transition for the job."""
+    pre_restoration_drain()
+    recovered_at = "2026-09-07 12:00:51.000000+00"
+    visible = commit_row("job-a")
+    visible["status"] = "failed"
+    visible["recovered_at"] = recovered_at
+    visible["committed_at"] = "2026-09-07 12:00:53.402881+00"
+    terminal = history_row(5)
+    terminal["new_status"] = "failed"
+    terminal["recovered_at"] = recovered_at
+    document["job_write_history"]["rows"].append({
+        "seq": 7,
+        "job_id": "job-a",
+        "op": "UPDATE",
+        "old_status": "failed",
+        "new_status": "failed",
+        "recovered_at": recovered_at,
+        "observed_at": "2026-09-07 12:00:53.301660+00",
+        "committed_at": "2026-09-07 12:00:53.402881+00",
+    })
+
 def pre_restoration_drain():
     """Run #76's shape: the backlog empties and completions rise while the
     samples are still labelled `outage`."""
@@ -932,8 +1119,31 @@ elif mutation == "subsecond-restoration-transition":
     subsecond_boundaries()
     commit_row("job-b")["committed_at"] = "2026-09-07 12:00:48.150000+00"
 elif mutation == "amended-job-row":
-    pre_restoration_drain()
-    commit_row("job-a")["recovered_at"] = "2026-09-07 12:00:51.000000+00"
+    amended_job_row()
+elif mutation == "amended-job-row-without-history":
+    amended_job_row()
+    del document["job_write_history"]
+elif mutation == "amended-job-row-before-history":
+    # A trace retained before the history existed. It has to grade exactly as
+    # it did then -- a recovered row is a gap -- and it must not be asked for
+    # a reading its own version never promised.
+    amended_job_row()
+    del document["job_write_history"]
+    document["schema_version"] = 3
+elif mutation == "amended-job-row-undated-history":
+    amended_job_row()
+    history_row(5)["committed_at"] = None
+elif mutation == "history-terminal-write-in-pause":
+    # The visible row version says the terminal write landed after
+    # restoration. The history says the transition it amended did not.
+    amended_job_row()
+    history_row(5)["committed_at"] = "2026-09-07 12:00:20.551200+00"
+elif mutation == "history-not-installed":
+    document["job_write_history"]["install_status"] = 3
+    document["job_write_history"]["rows"] = []
+    document["job_write_history"]["install_detail"] = (
+        "ERROR: relation siglake_query_jobs does not exist"
+    )
 elif mutation == "null-commit-time":
     commit_row("job-b")["committed_at"] = None
 elif mutation == "nonterminal-job-row":
@@ -1141,8 +1351,49 @@ expect_unverified commit-at-pause-edge 'overlapping the pause transition bounded
 expect_unverified commit-at-restoration-edge 'overlapping the restoration transition bounded by 2026-09-07T12:00:48+00:00 (1s precision) and 2026-09-07T12:00:50+00:00 (1s precision)'
 expect_unverified subsecond-pause-transition 'overlapping the pause transition bounded by 2026-09-07T12:00:03.100000+00:00 (1ms precision) and 2026-09-07T12:00:03.201000+00:00 (1ms precision)'
 expect_unverified subsecond-restoration-transition 'overlapping the restoration transition bounded by 2026-09-07T12:00:48.100000+00:00 (1ms precision) and 2026-09-07T12:00:48.201000+00:00 (1ms precision)'
-expect_unverified amended-job-row 'may be an amendment of an earlier terminal write'
-expect_unverified amended-job-row 'the pause window is unexplained'
+# The amended row is the case the write history exists for. Its visible
+# version is dated by the amendment, so the row version alone leaves the drain
+# unexplained; the retained history still says when the terminal write
+# committed, and that is what resolves it.
+expect_resolved amended-job-row
+python3 - "$fixture_dir/amended-job-row.output.json" <<'PY' ||
+import json, sys
+summary = json.load(open(sys.argv[1], encoding="utf-8"))["evidence"]["summary"]
+commits = summary["job_commit_times"]
+assert commits["gaps"] == [], commits
+assert commits["terminal_writes_dated_by_history"] == 1, commits
+history = summary["job_write_history"]
+terminal = history["terminal_writes"]["job-a"]
+assert terminal["seq"] == 5, terminal
+assert terminal["status"] == "failed", terminal
+assert terminal["recorded_committed_at"] == "2026-09-07 12:00:51.884113+00", terminal
+assert history["amendments"] == {"job-a": 1}, history
+assert history["committed_in_pause"] == [], history
+assert history["unplaceable_commits"] == [], history
+PY
+  fail "the write history did not date job-a's terminal write ahead of its amendment"
+fixtures=$((fixtures + 1))
+# Without the history, or with a terminal transaction Postgres cannot date, the
+# same trace is back to the visible row version and stays a gap.
+expect_unverified amended-job-row-without-history 'may be an amendment of an earlier terminal write'
+expect_unverified amended-job-row-without-history 'the pause window is unexplained'
+expect_unverified amended-job-row-without-history 'missing job-row write-history observations'
+expect_unverified amended-job-row-before-history 'may be an amendment of an earlier terminal write'
+python3 - "$fixture_dir/amended-job-row-before-history.output.json" <<'PY' ||
+import json, sys
+evidence = json.load(open(sys.argv[1], encoding="utf-8"))["evidence"]
+problems = "\n".join(evidence["problems"])
+assert "write-history" not in problems, problems
+assert "write history" not in problems, problems
+assert evidence["summary"]["job_write_history"] is None, evidence["summary"]
+PY
+  fail "a pre-history trace was held to a reading its own version never carried"
+fixtures=$((fixtures + 1))
+expect_unverified amended-job-row-undated-history 'its retained terminal transition has no usable commit timestamp'
+expect_unverified amended-job-row-undated-history 'the pause window is unexplained'
+expect_unverified history-terminal-write-in-pause 'inside the proven stopped window'
+expect_unverified history-terminal-write-in-pause 'so the pause did not block writes'
+expect_unverified history-not-installed 'the job-row write history is incomplete'
 expect_unverified null-commit-time 'job job-b has no usable commit timestamp'
 expect_unverified nonterminal-job-row "job job-b is 'running' after the recovery window"
 expect_unverified uncorrelated-job-row 'no job row for accepted job job-b'
