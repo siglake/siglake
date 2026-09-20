@@ -1,6 +1,6 @@
-//! Regression (#4200): a streaming `recluster_files_with` must refuse a bin
-//! whose files sit in different `day(timestamp)` partitions, and it must refuse
-//! before writing anything.
+//! Regression (#4200, #4720): `recluster_files_with` must refuse a bin whose
+//! files sit in different `day(timestamp)` partitions, whichever merge the bin
+//! would dispatch to, and it must refuse before writing anything.
 //!
 //! The streaming merge executors stamp their whole output with
 //! `files[0].partition()`, so a two-day bin used to commit one day's rows under
@@ -13,10 +13,12 @@
 //! answered 0 where 4 rows match. The prune is the partition filter, not file
 //! stats: the merged file's `timestamp` bounds cover both days.
 //!
-//! The in-RAM concat splits its output by partition value, so on the same input
-//! it wrote two correctly-stamped files and every window stayed exact. That path
-//! keeps taking mixed bins (in-tree callers rewrite a whole multi-day index
-//! table through it); only the streaming dispatches refuse.
+//! The in-RAM concat splits its output by partition value and wrote two
+//! correctly-stamped files on the same input, so it was never the defect. It is
+//! refused all the same (#4720): dispatch is chosen by bin size, so accepting a
+//! mixed bin there made the contract size-dependent — the same call succeeded
+//! under the in-RAM caps and failed above them. The in-RAM arm below is the
+//! fourth entry of the same table, asserting the same refusal.
 //!
 //! Timestamps are fixed calendar instants, never `Event::now`, so the partition
 //! values do not depend on when the test runs.
@@ -141,7 +143,7 @@ async fn total_count(ice: &IcebergContext) -> i64 {
 }
 
 #[tokio::test]
-async fn cross_partition_bin_is_refused_on_every_streaming_dispatch() {
+async fn cross_partition_bin_is_refused_on_every_dispatch() {
     let tmp = tempfile::tempdir().unwrap();
     let warehouse = tmp.path().join("warehouse");
     let (ice, ident, written) = three_file_two_day_warehouse(&warehouse).await;
@@ -167,11 +169,15 @@ async fn cross_partition_bin_is_refused_on_every_streaming_dispatch() {
     let files_before = ice.live_data_files(&ident).await.unwrap();
     let on_disk_before = parquet_files(&warehouse);
 
-    // One arm per streaming merge implementation `recluster_files_with` can
-    // dispatch to, each pinned by explicit options so the environment cannot
-    // steer it: the slice-streaming k-way merge (bin within the fan-in cap), the
-    // page-bounded plan merge and the legacy tiered merge (both above it). Every
-    // one of them writes through a single partition-stamped writer.
+    // One arm per merge implementation `recluster_files_with` can dispatch to,
+    // each pinned by explicit options so the environment cannot steer it: the
+    // slice-streaming k-way merge (bin within the fan-in cap), the page-bounded
+    // plan merge and the legacy tiered merge (both above it), and the whole-bin
+    // in-RAM concat with both caps lifted so the bin cannot be pushed off it.
+    // The three streaming ones write through a single partition-stamped writer;
+    // the in-RAM one splits by partition value and would have produced two
+    // correct files — it is refused anyway so the contract does not turn on the
+    // bin's size (#4720).
     let arms = [
         (
             "slice streaming",
@@ -196,6 +202,15 @@ async fn cross_partition_bin_is_refused_on_every_streaming_dispatch() {
                 force_streaming: Some(true),
                 merge_fanin: Some(2),
                 force_tiered: Some(true),
+                ..ReclusterMergeOptions::default()
+            },
+        ),
+        (
+            "in-RAM concat",
+            ReclusterMergeOptions {
+                force_streaming: Some(false),
+                inram_max_bytes: Some(u64::MAX),
+                inram_max_rows: Some(u64::MAX),
                 ..ReclusterMergeOptions::default()
             },
         ),
@@ -253,12 +268,13 @@ async fn cross_partition_bin_is_refused_on_every_streaming_dispatch() {
     }
 }
 
-/// The other half of the contract: the in-RAM merge still accepts a two-day bin
-/// — in-tree callers rewrite whole multi-day tables through it — and it is
-/// correct because it splits its output by partition value. This is what the
-/// streaming refusal is measured against, so it is pinned rather than assumed.
+/// The remedy the refusal names, on the same fixture and the same in-RAM
+/// options: group by partition value and call once per group. Two calls rewrite
+/// the whole table, each output file carries its own group's partition value,
+/// and every window is exact — which is what the mixed-bin in-RAM call used to
+/// produce in one call, so nothing is lost by refusing it.
 #[tokio::test]
-async fn in_ram_merge_of_a_two_day_bin_splits_by_partition() {
+async fn grouping_by_partition_rewrites_the_whole_table_in_ram() {
     let tmp = tempfile::tempdir().unwrap();
     let warehouse = tmp.path().join("warehouse");
     let (ice, ident, written) = three_file_two_day_warehouse(&warehouse).await;
@@ -269,14 +285,31 @@ async fn in_ram_merge_of_a_two_day_bin_splits_by_partition() {
         inram_max_rows: Some(u64::MAX),
         ..ReclusterMergeOptions::default()
     };
-    let files = ice.live_data_files(&ident).await.unwrap();
-    let stats = ice
-        .recluster_files_with(&ident, files, BLOOM_FILTER_COLUMNS, &merge)
-        .await
-        .expect("in-RAM merge takes a mixed bin");
-    assert_eq!(stats.files_removed, 3);
-    assert_eq!(stats.files_added, 2, "one output file per day partition");
-    assert_eq!(stats.rows, written.len(), "every row carried through");
+    let mut groups: std::collections::BTreeMap<String, Vec<_>> = std::collections::BTreeMap::new();
+    for file in ice.live_data_files(&ident).await.unwrap() {
+        groups
+            .entry(format!("{:?}", file.partition()))
+            .or_default()
+            .push(file);
+    }
+    assert_eq!(groups.len(), 2, "two day partitions to rewrite");
+
+    let mut removed = 0usize;
+    let mut rows = 0usize;
+    for (partition, bin) in groups {
+        let stats = ice
+            .recluster_files_with(&ident, bin, BLOOM_FILTER_COLUMNS, &merge)
+            .await
+            .unwrap_or_else(|e| panic!("single-partition bin {partition} must merge: {e:#}"));
+        assert!(stats.files_added >= 1, "{partition}: output written");
+        removed += stats.files_removed;
+        rows += stats.rows;
+    }
+    assert_eq!(
+        removed, 3,
+        "every input file rewritten across the two calls"
+    );
+    assert_eq!(rows, written.len(), "every row carried through");
 
     let merged = ice.live_data_files(&ident).await.unwrap();
     let stamped: std::collections::BTreeSet<String> = merged
@@ -295,7 +328,7 @@ async fn in_ram_merge_of_a_two_day_bin_splits_by_partition() {
         assert_eq!(
             window_count(&ice, cutoff).await,
             expect,
-            "window from {cutoff} exact after the in-RAM rewrite"
+            "window from {cutoff} exact after the grouped rewrite"
         );
     }
 }

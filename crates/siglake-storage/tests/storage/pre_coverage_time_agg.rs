@@ -16,6 +16,7 @@
 //!   cargo test --release -p siglake-storage --test storage \
 //!     pre_coverage_time_agg::the_fallback_cost_report -- --ignored --nocapture
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
@@ -335,10 +336,24 @@ async fn a_recluster_does_not_restore_coverage() {
 
     let ice = open(tmp.path()).await;
     let ident = ice.index_table_ident(INDEX);
+    // One re-cluster commit is what this asks for. The seed spans about 42 day
+    // partitions and `recluster_files` takes one partition value per call
+    // (#4720), so the bin is one day's files, not the whole live set.
     let files = ice.live_data_files(&ident).await.unwrap();
     assert!(files.len() > 1, "need multiple files to compact");
+    let mut groups: BTreeMap<String, Vec<_>> = BTreeMap::new();
+    for file in files {
+        groups
+            .entry(format!("{:?}", file.partition()))
+            .or_default()
+            .push(file);
+    }
+    let bin = groups
+        .into_values()
+        .max_by_key(|group| group.len())
+        .expect("a live partition to re-cluster");
     let bloom: Vec<&str> = vec!["host", "source", "sourcetype", "index"];
-    ice.recluster_files(&ident, files, &bloom).await.unwrap();
+    ice.recluster_files(&ident, bin, &bloom).await.unwrap();
 
     assert_eq!(read_side(tmp.path()).coverage, None);
     let window = last25(4, 200);
