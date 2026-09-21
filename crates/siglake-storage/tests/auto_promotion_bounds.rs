@@ -79,11 +79,12 @@ async fn a_zero_threshold_leaves_the_schema_untouched() {
     let before = schema_fingerprint(&ice).await;
     assert_eq!(before.1, None, "a fresh table carries no promotions");
 
-    let newly = ice
-        .auto_promote_hot_keys(0.0, 16, FILES, ROWS)
+    let report = ice
+        .auto_promote_hot_keys_for_report(ice.events_table_ident(), 0.0, 16, FILES, ROWS)
         .await
         .unwrap();
-    assert!(newly.is_empty(), "{newly:?}");
+    assert_eq!(report.candidates, None, "disabled is not a zero-key sample");
+    assert!(report.promoted.is_empty(), "{report:?}");
     assert_eq!(
         schema_fingerprint(&ice).await,
         before,
@@ -114,11 +115,12 @@ async fn a_zero_column_ceiling_leaves_the_schema_untouched() {
         .unwrap();
 
     let before = schema_fingerprint(&ice).await;
-    let newly = ice
-        .auto_promote_hot_keys(0.5, 0, FILES, ROWS)
+    let report = ice
+        .auto_promote_hot_keys_for_report(ice.events_table_ident(), 0.5, 0, FILES, ROWS)
         .await
         .unwrap();
-    assert!(newly.is_empty(), "{newly:?}");
+    assert_eq!(report.candidates, None, "a zero cap does not sample");
+    assert!(report.promoted.is_empty(), "{report:?}");
     assert_eq!(schema_fingerprint(&ice).await, before);
 }
 
@@ -145,10 +147,13 @@ async fn the_column_ceiling_bounds_one_pass_and_the_next() {
         .unwrap();
 
     let (before, _) = schema_fingerprint(&ice).await;
-    let newly = ice
-        .auto_promote_hot_keys(0.5, 5, FILES, ROWS)
+    let report = ice
+        .auto_promote_hot_keys_for_report(ice.events_table_ident(), 0.5, 5, FILES, ROWS)
         .await
         .unwrap();
+    assert_eq!(report.candidates, Some(20));
+    assert_eq!(report.declined.len(), 15);
+    let newly = report.promoted;
     assert_eq!(newly.len(), 5, "{newly:?}");
     let (after, property) = schema_fingerprint(&ice).await;
     assert_eq!(
@@ -164,9 +169,10 @@ async fn the_column_ceiling_bounds_one_pass_and_the_next() {
     // At the ceiling, the next pass is a no-op — it does not even re-declare
     // the list it already holds.
     let again = ice
-        .auto_promote_hot_keys(0.5, 5, FILES, ROWS)
+        .auto_promote_hot_keys_for_report(ice.events_table_ident(), 0.5, 5, FILES, ROWS)
         .await
         .unwrap();
-    assert!(again.is_empty(), "{again:?}");
+    assert_eq!(again.candidates, None, "an at-cap pass does not sample");
+    assert!(again.promoted.is_empty(), "{again:?}");
     assert_eq!(schema_fingerprint(&ice).await.0, after);
 }

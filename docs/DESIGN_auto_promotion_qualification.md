@@ -1,7 +1,8 @@
 # Attribute auto-promotion: qualification of the opt-in path
 
-*2026-09-17 (#3052). Status: qualified as opt-in, at its bounds. No default
-change proposed, and this document does not authorize one.*
+*2026-09-17 (#3052), observability added 2026-09-21 (#5060). Status: qualified
+as opt-in, at its bounds. No default change proposed, and this document does
+not authorize one.*
 
 Prerequisite reading: `DESIGN_ws7_attr_get_pruning.md` (what promotion is for),
 `crates/siglake-core/src/promote.rs` (extraction), `LIMITATIONS.md`.
@@ -185,10 +186,20 @@ claims. It does not say the feature should be on. Missing:
    `tenant_*` namespaces the drain commits into, and the 300 s cadence gate is
    process-global — harmless while the re-clustering pass is single-namespace,
    latent the moment it is not.
-4. **Observability.** One counter (`siglake_compactor_auto_promotions_total`)
-   plus the census-drop counter. Nothing reports what a pass considered and
-   declined, so an operator cannot see a promotion coming, and nothing alerts
-   on a table approaching its column ceiling.
-5. **A per-tenant override.** The knobs are process-wide. One tenant's
+4. **A per-tenant override.** The knobs are process-wide. One tenant's
    attribute shape decides promotions for every table the compactor's namespace
    holds.
+
+The former observability item closed in #5060. Every discovered table now
+pre-registers `siglake_auto_promotion_passes_total` for `promoted`,
+`nothing_cleared`, `at_ceiling` and `failed`, so a zero is a known table whose
+pass has not completed rather than an absent series. The enabled gauge separates
+that state from a disabled feature. `siglake_auto_promotion_candidates` is the
+last sampled count of unpromoted keys that cleared the frequency bar, including
+keys later refused for mixed type, name collision or the configured cap; its
+availability sibling is zero on disabled and already-at-cap paths, which still
+perform no data-file reads. `siglake_auto_promotion_columns{kind="used|limit"}`
+publishes usage against the effective configured cap per Iceberg namespace and
+table. The packaged dashboard reads all of these and
+`SiglakeAutoPromotionNearCeiling` warns at 80%. One INFO line per sampled pass
+retains bounded key names by refusal reason and an exact truncation count.

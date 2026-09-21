@@ -2299,6 +2299,63 @@
     "overrides": []
    },
    "description": "Puffin index registrations refused because the target snapshot already carries a statistics file. The existing file stays discoverable; the warning log names data files left on the scan path until a later snapshot."
+  },
+  {
+   "id": 174,
+   "type": "timeseries",
+   "title": "Auto-promotion",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 228
+   },
+   "targets": [
+    {
+     "expr": "sum by (iceberg_namespace, table, outcome) (siglake_auto_promotion_passes_total{namespace=~\"$namespace\"})",
+     "legendFormat": "passes {{iceberg_namespace}}.{{table}} {{outcome}}",
+     "refId": "A"
+    },
+    {
+     "expr": "max by (namespace, iceberg_namespace, table) (siglake_auto_promotion_candidates{namespace=~\"$namespace\"}) and on (namespace, iceberg_namespace, table) max by (namespace, iceberg_namespace, table) (siglake_auto_promotion_candidates_available{namespace=~\"$namespace\"}) == 1",
+     "legendFormat": "candidates {{iceberg_namespace}}.{{table}}",
+     "refId": "B"
+    },
+    {
+     "expr": "max by (namespace, iceberg_namespace, table) (siglake_auto_promotion_columns{namespace=~\"$namespace\",kind=\"used\"} / ignoring (kind) siglake_auto_promotion_columns{namespace=~\"$namespace\",kind=\"limit\"})",
+     "legendFormat": "cap used {{iceberg_namespace}}.{{table}}",
+     "refId": "C"
+    },
+    {
+     "expr": "max by (namespace, iceberg_namespace, table) (siglake_auto_promotion_enabled{namespace=~\"$namespace\"})",
+     "legendFormat": "enabled {{iceberg_namespace}}.{{table}}",
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byFrameRefID",
+       "options": "C"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percentunit"
+       }
+      ]
+     }
+    ]
+   },
+   "description": "Per-table auto-promotion state, grouped by Iceberg namespace and table. enabled=0 is explicitly disabled. enabled=1 with every pass outcome at zero has not run yet; nothing_cleared is a completed sampled pass with no additions. candidates is the last sampled count of unpromoted keys that cleared the frequency threshold, including keys refused for the configured cap, a name collision or mixed sampled types; it is hidden when candidates_available=0 because disabled and at-cap passes do not sample. Cap used divides current promoted columns by the effective configured cap. Read the compactor's INFO line for bounded declined-key names and truncation counts."
   }
  ]
 }

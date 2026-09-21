@@ -1152,3 +1152,76 @@ tests:
       - eval_time: 40m
         alertname: SiglakeCompactorOrphansHeld
         exp_alerts: []
+
+  - name: auto-promotion uses each table's configured cap
+    interval: 1m
+    input_series:
+      - series: 'siglake_auto_promotion_columns{namespace="logs",iceberg_namespace="tenant_acme",table="events",kind="used"}'
+        values: '13+0x15'
+      - series: 'siglake_auto_promotion_columns{namespace="logs",iceberg_namespace="tenant_acme",table="events",kind="limit"}'
+        values: '16+0x15'
+      - series: 'siglake_auto_promotion_enabled{namespace="logs",iceberg_namespace="tenant_acme",table="events"}'
+        values: '1+0x15'
+      - series: 'siglake_auto_promotion_columns{namespace="logs",iceberg_namespace="siglake",table="small_cap",kind="used"}'
+        values: '7+0x15'
+      - series: 'siglake_auto_promotion_columns{namespace="logs",iceberg_namespace="siglake",table="small_cap",kind="limit"}'
+        values: '8+0x15'
+      - series: 'siglake_auto_promotion_enabled{namespace="logs",iceberg_namespace="siglake",table="small_cap"}'
+        values: '1+0x15'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: SiglakeAutoPromotionNearCeiling
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: SiglakeAutoPromotionNearCeiling
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              iceberg_namespace: tenant_acme
+              table: events
+              severity: warning
+            exp_annotations:
+              summary: Auto-promotion is near its configured column cap
+              description: >-
+                tenant_acme.events has consumed at least 80% of its effective
+                auto-promotion column cap. Read the dashboard's Auto-promotion
+                panel and the compactor's "auto-promotion pass finished" INFO
+                lines for candidates refused by the cap, name collisions or
+                mixed sampled types. Raising SIGLAKE_AUTO_PROMOTE_MAX_COLUMNS
+                permits more irreversible schema additions; setting
+                SIGLAKE_AUTO_PROMOTE_MIN_PCT=0 stops future automatic additions.
+          - exp_labels:
+              namespace: logs
+              iceberg_namespace: siglake
+              table: small_cap
+              severity: warning
+            exp_annotations:
+              summary: Auto-promotion is near its configured column cap
+              description: >-
+                siglake.small_cap has consumed at least 80% of its effective
+                auto-promotion column cap. Read the dashboard's Auto-promotion
+                panel and the compactor's "auto-promotion pass finished" INFO
+                lines for candidates refused by the cap, name collisions or
+                mixed sampled types. Raising SIGLAKE_AUTO_PROMOTE_MAX_COLUMNS
+                permits more irreversible schema additions; setting
+                SIGLAKE_AUTO_PROMOTE_MIN_PCT=0 stops future automatic additions.
+
+  - name: auto-promotion below its cap or disabled stays silent
+    interval: 1m
+    input_series:
+      - series: 'siglake_auto_promotion_columns{namespace="logs",iceberg_namespace="siglake",table="below",kind="used"}'
+        values: '12+0x15'
+      - series: 'siglake_auto_promotion_columns{namespace="logs",iceberg_namespace="siglake",table="below",kind="limit"}'
+        values: '16+0x15'
+      - series: 'siglake_auto_promotion_enabled{namespace="logs",iceberg_namespace="siglake",table="below"}'
+        values: '1+0x15'
+      - series: 'siglake_auto_promotion_columns{namespace="logs",iceberg_namespace="siglake",table="disabled",kind="used"}'
+        values: '16+0x15'
+      - series: 'siglake_auto_promotion_columns{namespace="logs",iceberg_namespace="siglake",table="disabled",kind="limit"}'
+        values: '16+0x15'
+      - series: 'siglake_auto_promotion_enabled{namespace="logs",iceberg_namespace="siglake",table="disabled"}'
+        values: '0+0x15'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SiglakeAutoPromotionNearCeiling
+        exp_alerts: []

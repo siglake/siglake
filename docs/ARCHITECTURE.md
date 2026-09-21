@@ -799,6 +799,17 @@ census. Those are specified, measured and tested in
 [`DESIGN_auto_promotion_qualification.md`](DESIGN_auto_promotion_qualification.md),
 with the evidence a default-on decision would need and the open items that
 decision is still missing; nothing in this section changes until one is taken.
+Each known table publishes its effective configured cap and current promoted
+column count in `siglake_auto_promotion_columns`, plus an explicit enabled
+reading and four per-pass outcomes. A sampled pass retains the number of keys
+that cleared the frequency bar in `siglake_auto_promotion_candidates`; the
+availability sibling is zero when the feature is disabled or the table is
+already at its cap, because those paths preserve the no-sampling boundary and
+have no candidate verdict. The structured INFO line names a bounded set of
+keys refused for the cap, a schema-name collision or mixed sampled types and
+reports how many names were truncated. `SiglakeAutoPromotionNearCeiling` reads
+the per-table configured cap at 80%; it does not infer a universal schema
+column ceiling.
 
 **Upgrades and schema versions.** A siglake binary declares the schema it
 wants; a table records the schema it is at, under the
