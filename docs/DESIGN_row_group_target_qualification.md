@@ -142,9 +142,15 @@ nothing, not that the reader stopped coalescing (#5806).
 
 `sum(length(raw)) WHERE host = 'host-needle'` takes two fetches on the row group
 it selects — the predicate column under the page-index selection, widened to
-8,192-row batch boundaries because parquet caches predicate columns, then `raw`
-under the selection the predicate produced. Each goes through the coalescer on
-its own. From the merged output's offset index, with the fetches traced:
+batch boundaries because parquet caches predicate columns, then `raw` under the
+selection the predicate produced. Each goes through the coalescer on its own.
+The batch is parquet's own `DEFAULT_BATCH_SIZE` of 1,024, not DataFusion's
+8,192: the fork calls `with_batch_size` only when siglake configured one
+(`third_party/iceberg/src/arrow/reader/pipeline.rs`), and nothing here sets
+`QueryScanTuning::batch_size`. On this layout the distinction does not move a
+byte — the page rows the index selects are already batch-aligned at both sizes —
+but the model has to name the right one to stay right on another geometry.
+From the merged output's offset index, with the fetches traced:
 
 | arm | rows/rg | needle lands on | `host` asked / fetched | `raw` asked / fetched | `bytes_data` |
 |---|---|---|---|---|---|
@@ -188,6 +194,13 @@ coincidence as a law about geometry.
 297,904 / 297,904 / 478,482 B. The 32 MiB arm reads 1.6x the 64 MiB arm instead
 of 4x, and lands within 1% of the 256 MiB default instead of 40% above it. What
 remains is the PLAIN page, which any arm pays whenever its needle misses page 0.
+
+The control also prices what the coalescer buys. The scan's `reads` counter goes
+5 -> 6 on the 256 MiB arm and 4 -> 6 on the 32 MiB arm when coalescing is turned
+off, and does not move on the two arms whose needle is on page 0 and which had
+no gap to merge. So the two arms that were charged the gap are exactly the two
+that saved a request for it: one and two fetches respectively, against 367 KB
+and 703 KB.
 
 Neither `merge_ranges` nor the page selection is wrong, so nothing is fixed here
 and no default moves. On object storage the coalescer is trading those bytes for

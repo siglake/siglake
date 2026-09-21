@@ -60,9 +60,11 @@
 //! between it and the one it wanted, and the page itself. `audit_needle_pages`
 //! reconstructs both of the needle query's fetches from the merged output's
 //! offset index and prints the predicted requested and fetched totals next to
-//! the measured `bytes_data`; `RG_COALESCE_BYTES=1` is the control that turns
-//! the coalescing off, after which the two agree. The readings and what they
-//! settle are in the design document's #5133 section.
+//! the measured `bytes_data`. `fetched` equals `measured` in every arm at both
+//! thresholds — that equality is what makes the model evidence rather than a
+//! story; `RG_COALESCE_BYTES=1` is the control that turns the coalescing off,
+//! after which `requested` equals them too. The readings and what they settle
+//! are in the design document's #5133 section.
 //!
 //! COMPACTOR-ONLY. The corpus is appended through the DEFAULT tuning and the
 //! arm's target is applied to the context afterwards, so every arm merges a
@@ -374,6 +376,14 @@ fn anatomy_of(paths: &[String]) -> Anatomy {
 /// (`third_party/iceberg/src/arrow/reader/file_reader.rs`). `bytes_data` charges
 /// the length of each MERGED fetch, not the length of what was asked for, so
 /// this is the function that turns requested page bytes into attributed bytes.
+///
+/// This copy drifts if the fork's changes. The fork's own
+/// `test_merge_ranges_{empty,no_coalesce,coalesce,overlapping,unsorted}` pin
+/// the merging, and `coalesced_data_ranges_are_attributed_once_per_physical_fetch`
+/// pins that `bytes_data` charges the merged fetch; they run in the
+/// `fork-tests` job (`scripts/check-fork-tests.sh`). The `predict` line's
+/// `fetched` total equalling the measured `bytes_data` is what catches drift
+/// here.
 fn merge_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
     if ranges.is_empty() {
         return vec![];
@@ -1074,9 +1084,13 @@ async fn measure_row_group_target_arm() {
         } else {
             1024 * 1024
         },
-        // DataFusion's default, which nothing here overrides; the reader hands
-        // it to `expand_to_batch_boundaries` for the cached predicate column.
-        8192,
+        // Parquet's own `DEFAULT_BATCH_SIZE` (`arrow_reader/mod.rs`), which is
+        // what applies here: the fork calls `with_batch_size` only when
+        // siglake configured one (`reader/pipeline.rs`, `if let Some(..)`) and
+        // this fixture leaves `QueryScanTuning::batch_size` unset in every arm.
+        // The reader hands it to `expand_to_batch_boundaries` for the cached
+        // predicate column.
+        1024,
         needle_data_bytes,
     );
     println!();
