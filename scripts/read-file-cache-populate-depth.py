@@ -24,8 +24,10 @@ sample is >= 131,072 — the `le="131071"` bucket edge, which this reader
 requires. Being handed that many rows is necessary, not sufficient: a file
 whose groups are larger closes none of them at that depth, and the rows are
 only a whole group when the read also started on a group boundary. Recorded
-footer geometry (--geometry) is what turns the fraction into a statement about
-group completion; without it the reader says so rather than guessing.
+Footer geometry (--geometry) bounds what group completion could mean. The
+current collector samples the table's largest files and does not prove that a
+shape read them, so the geometry is not verified per-shape membership; without
+an attributed file set the reader must not present it as one.
 """
 
 from __future__ import annotations
@@ -503,7 +505,10 @@ def main(argv: list[str]) -> int:
         action="append",
         default=[],
         metavar="NAME=PATH",
-        help="recorded footer geometry for the files the shape scanned",
+        help=(
+            "recorded footer geometry (currently table-sampled; file membership "
+            "is not verified per shape)"
+        ),
     )
     parser.add_argument(
         "--stats",
