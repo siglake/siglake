@@ -28,6 +28,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::{SQLOptions, SessionContext};
+use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
     visit_expressions, visit_expressions_mut, BinaryOperator as SqlBinaryOperator, Cte,
     Expr as SqlAstExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
@@ -2123,6 +2124,14 @@ fn sql_string_literal(expr: &SqlAstExpr) -> Option<String> {
     }
 }
 
+/// The exact schema column DataFusion's default SQL planner binds this
+/// identifier to: unquoted names are ASCII-lowercased and quoted names retain
+/// their written case. Group-count aggregates use exact column keys, so the
+/// browse hints must carry this resolved name rather than the parser spelling.
+fn normalized_sql_ident(ident: &Ident) -> String {
+    IdentNormalizer::default().normalize(ident.clone())
+}
+
 /// A pure time-range conjunct: `timestamp <op> <anything>` (or flipped) for a
 /// range operator. The value side is deliberately loose — casts, literals,
 /// and function calls all count; the point is only that the term constrains
@@ -2154,7 +2163,11 @@ fn sql_expr_dimensional_term(expr: &SqlAstExpr) -> Option<(String, Vec<String>, 
             if ident_is_timestamp(col) {
                 return None;
             }
-            Some((col.value.clone(), vec![value], matches!(op, Op::NotEq)))
+            Some((
+                normalized_sql_ident(col),
+                vec![value],
+                matches!(op, Op::NotEq),
+            ))
         }
         SqlAstExpr::InList {
             expr,
@@ -2166,7 +2179,7 @@ fn sql_expr_dimensional_term(expr: &SqlAstExpr) -> Option<(String, Vec<String>, 
                 return None;
             }
             let values: Option<Vec<String>> = list.iter().map(sql_string_literal).collect();
-            Some((col.value.clone(), values?, *negated))
+            Some((normalized_sql_ident(col), values?, *negated))
         }
         SqlAstExpr::Nested(inner) => sql_expr_dimensional_term(inner),
         _ => None,
@@ -2402,6 +2415,14 @@ async fn residual_browse_low_selectivity(
     let Some(min_frac) = ordered_residual_min_frac() else {
         return false;
     };
+    residual_browse_low_selectivity_at(ice, shape, min_frac).await
+}
+
+async fn residual_browse_low_selectivity_at(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    shape: &ResidualBrowseShape,
+    min_frac: f64,
+) -> bool {
     let rows = match ice
         .grouped_counts_with_summary(&shape.table, &shape.column, None, None)
         .await
@@ -10943,6 +10964,158 @@ mod tests {
             ),
             None
         );
+    }
+
+    fn case_distinct_browse_config() -> IndexConfig {
+        IndexConfig {
+            index_id: "case-distinct".to_string(),
+            doc_mapping: DocMapping {
+                mode: MappingMode::Dynamic,
+                field_mappings: vec![
+                    field("timestamp", FieldType::Datetime, true),
+                    field(
+                        "region",
+                        FieldType::Text {
+                            tokenizer: Some("raw".to_string()),
+                        },
+                        true,
+                    ),
+                    field(
+                        "Region",
+                        FieldType::Text {
+                            tokenizer: Some("raw".to_string()),
+                        },
+                        true,
+                    ),
+                ],
+                timestamp_field: "timestamp".to_string(),
+                tag_fields: vec!["region".to_string(), "Region".to_string()],
+                default_search_fields: Vec::new(),
+            },
+            retention: None,
+            index_at_flush: None,
+        }
+    }
+
+    async fn case_distinct_browse_fixture() -> (tempfile::TempDir, IcebergContext) {
+        use arrow_array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let config = case_distinct_browse_config();
+        ice.create_index(&config).await.unwrap();
+
+        // `region='probe'` is below the ordered-hint threshold (1/200), while
+        // the distinct quoted `Region='probe'` is common (100/200).
+        let region: Vec<&str> = (0..200)
+            .map(|row| if row == 0 { "probe" } else { "other" })
+            .collect();
+        let title_region: Vec<&str> = (0..200)
+            .map(|row| if row < 100 { "probe" } else { "other" })
+            .collect();
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(
+                TimestampMicrosecondArray::from_iter_values(0..200)
+                    .with_timezone(siglake_core::TIMESTAMP_TZ),
+            ),
+            Arc::new(StringArray::from(region)),
+            Arc::new(StringArray::from(title_region)),
+            Arc::new(StringArray::from(vec![None::<&str>; 200])),
+        ];
+        let batch = RecordBatch::try_new(config.to_arrow_schema(), arrays).unwrap();
+        ice.append_to_table(
+            &ice.index_table_ident("case-distinct"),
+            batch,
+            &["region", "Region"],
+        )
+        .await
+        .unwrap();
+        (tmp, ice)
+    }
+
+    /// #5024: both browse-policy consumers use the same quote-aware column
+    /// name as DataFusion. Exact aggregate keys remain case-sensitive, so the
+    /// two mapped columns below deliberately produce different answers.
+    #[tokio::test]
+    async fn browse_policies_resolve_dimension_case_like_datafusion() {
+        let (_tmp, ice) = case_distinct_browse_fixture().await;
+
+        let expected_scans = [
+            // Equality and IN: unquoted names bind to lowercase `region`.
+            (
+                "SELECT timestamp FROM \"case-distinct\" WHERE region = 'probe' LIMIT 4",
+                Some(200),
+            ),
+            (
+                "SELECT timestamp FROM \"case-distinct\" WHERE REGION = 'probe' LIMIT 4",
+                Some(200),
+            ),
+            (
+                "SELECT timestamp FROM \"case-distinct\" WHERE REGION IN ('probe') LIMIT 4",
+                Some(200),
+            ),
+            // Quoting selects the distinct mixed-case aggregate.
+            (
+                "SELECT timestamp FROM \"case-distinct\" WHERE \"Region\" = 'probe' LIMIT 4",
+                Some(8),
+            ),
+            // Both negated forms retain the same distinction.
+            (
+                "SELECT timestamp FROM \"case-distinct\" WHERE REGION <> 'other' LIMIT 4",
+                Some(200),
+            ),
+            (
+                "SELECT timestamp FROM \"case-distinct\" WHERE REGION NOT IN ('other') LIMIT 4",
+                Some(200),
+            ),
+            (
+                "SELECT timestamp FROM \"case-distinct\" WHERE \"Region\" <> 'other' LIMIT 4",
+                Some(8),
+            ),
+            (
+                "SELECT timestamp FROM \"case-distinct\" WHERE \"Region\" NOT IN ('other') LIMIT 4",
+                Some(8),
+            ),
+            // No exact schema/aggregate key: preserve the conservative fallback.
+            (
+                "SELECT timestamp FROM \"case-distinct\" WHERE \"REGION\" = 'probe' LIMIT 4",
+                None,
+            ),
+        ];
+        for (sql, expected) in expected_scans {
+            assert_eq!(
+                browse_expected_scan_rows(&ice, sql, 4).await,
+                expected,
+                "distribution estimate for {sql}"
+            );
+        }
+
+        let ordered_cases = [
+            ("region = 'probe'", false),
+            ("REGION = 'probe'", false),
+            ("REGION IN ('probe')", false),
+            ("REGION <> 'other'", false),
+            ("REGION NOT IN ('other')", false),
+            ("\"Region\" = 'probe'", true),
+            ("\"Region\" IN ('probe')", true),
+            ("\"Region\" <> 'other'", true),
+            ("\"Region\" NOT IN ('other')", true),
+            ("\"REGION\" = 'probe'", false),
+        ];
+        for (predicate, expected) in ordered_cases {
+            let sql = format!(
+                "SELECT timestamp FROM \"case-distinct\" WHERE {predicate} \
+                 ORDER BY timestamp DESC LIMIT 4"
+            );
+            let shape = detect_ordered_residual_browse(&sql).expect("ordered browse shape");
+            assert_eq!(
+                residual_browse_low_selectivity_at(&ice, &shape, 0.01).await,
+                expected,
+                "ordered hint for {sql}"
+            );
+        }
     }
 
     /// `logs_config`'s twin with the canonical event-time column, i.e. what

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Query (fix)**: browse selectivity hints now bind dimensional identifiers
+  with DataFusion's quote-aware case rules before reading exact group counts.
+  `WHERE REGION = 'probe'` uses the `region` aggregate, while a quoted
+  `"Region"` remains a distinct mapped column. Missing exact-case aggregates
+  keep the conservative limit-only fallback. Query results were unaffected;
+  the defect only discarded the ordered-scan and distribution estimates.
+  (#5024)
+
 - **Compactor observability (fix)**: a completed filesystem sweep now creates
   `siglake_compactor_pass_claim_attempts_exhausted_total{tenant}` at 0 for
   every tenant it publishes gauges for. The counter was written only when a
