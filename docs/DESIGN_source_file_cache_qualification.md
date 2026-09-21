@@ -177,3 +177,70 @@ floor exists to hold. **On the packaged pod, enabling this cache means raising
    4Gi floor has room for one of them.
 5. A decision about the off-pool population memory, which today is neither
    budgeted nor bounded by the partition count.
+
+## 2026-09-21: shared population-budget prototype (#5074)
+
+The local prototype selects admission against the decoded-file cache's existing
+process-wide byte budget. Completed entries and every admitted live population
+batch use one conservative currency: `RecordBatch::get_array_memory_size`.
+Admission uses a lock-free compare-and-swap before retaining a batch. EOF moves
+the same charge into the completed entry, so handoff neither releases a gap nor
+charges the bytes twice. Cancellation, read failure, an oversized candidate, a
+duplicate entry and a contended insert keep the charge until their retained
+batches are dropped, then release it. Refusal abandons optional population and
+the scan continues with the same answer.
+
+The gate is `QueryScanTuning::file_cache_population_bound_prototype`. It has no
+environment variable, CLI flag, chart value or operator field. It adds no
+cache-outcome label; local qualification reads `budget_refusals` and
+`peak_accounted_bytes` from `decoded_file_cache_population_stats()`. Packaged
+limits, cache defaults and memory-pool sizing are unchanged.
+
+Two alternatives were not prototyped:
+
+- Reserving population from the query pool charges the same bytes twice. The
+  whole file-cache budget is already subtracted before that pool is sized. It
+  would require changing the budget model as well as the population path.
+- A per-query population count does not bound overlapping queries. A
+  process-wide semaphore would put a count on streams rather than bytes and
+  still needs a byte policy for differently sized candidates.
+
+`file_cache_population_bound.rs` drives eight scan partitions and two
+overlapping queries at a four-entry budget, then repeats with resident entries
+and cancels a population through `LIMIT`. Every query returns all requested
+rows, `peak_accounted_bytes <= max_bytes`, and in-flight charges return to zero
+after insertion and cancellation. Unit coverage drives failed and contended
+insertion; the existing oversize and population-shape fixtures cover the other
+terminal paths. The row-group prototype uses the same `PopulationCharge` and
+compiles through the same ownership rules.
+
+The retained #3053 measurement was rerun in release mode on 2026-09-21 (8 files
+x 65,536 rows, 8 partitions, 5 executions). One decoded entry priced 5.4 MiB;
+the four-entry budget was 22 MiB. Times are cold / warm p50 / warm max:
+
+| arm | times (ms) | warm cache work per run | installed / peak population |
+| --- | --- | --- | --- |
+| off | 9.8 / 9.1 / 11.1 | none | 0 / 0 MiB |
+| fits (86 MiB) | 9.0 / 1.2 / 6.3 | 7 hits | 43.1 / 32.0 MiB retained |
+| bytes (22 MiB) | 8.0 / 6.5 / 8.1 | 4 hits, 4 inserts, 4 evictions | 21.6 / 31.6 MiB retained |
+| shared (22 MiB) | 8.9 / 6.5 / 6.6 | 4 hits, 4 refusals, no insertion or eviction | 21.6 / 21.1 MiB retained; 21.6 MiB accounted peak |
+| oversize (16 MiB) | 7.6 / 8.4 / 8.7 | 8 oversized refusals | 0 / 27.0 MiB retained |
+
+All arms returned the same 524,288 rows as the disabled control. The shared arm
+enforced the configured bound, including populations that returned no cache
+entry. It also exposed a policy defect: once residents fill the budget, no new
+population can reach EOF and displace one. The existing LRU arm turns over four
+entries per warm pass; the bounded arm freezes the first four and has the same
+6.5 ms warm median. Which four files stay resident becomes scheduler order,
+not recency.
+
+## Disposition: REVISE
+
+Do not adopt this admission rule in production. The hard bound and ownership
+accounting are sound, but loss of resident turnover changes cache policy and
+buys no time on the matched control. Production work must preserve the same
+configured byte bound while making room for a completed candidate without
+blocking on the cache mutex per batch. Task #5786 carries that implementation;
+it must reuse this fixture and update `ARCHITECTURE.md`, `LIMITATIONS.md` and
+the operator-facing docs if adopted. The in-process prototype remains as the
+qualification record.

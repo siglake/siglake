@@ -1,7 +1,7 @@
 //! Task #3053: what an explicitly configured decoded-file cache buys, and what
 //! it costs, at budgets a pod can actually afford.
 //!
-//! `#[ignore]`d — it writes half a million events and runs five budgets over a
+//! `#[ignore]`d — it writes half a million events and runs six policy arms over a
 //! repeated drained scan, which is a measurement, not a gate. Run it and read
 //! the table it prints:
 //!
@@ -66,6 +66,17 @@ fn tuning(max_bytes: Option<u64>, max_entries: Option<usize>) -> QueryScanTuning
         file_concurrency_limit: Some(FILES),
         batch_size: Some(BATCH_ROWS),
         ..Default::default()
+    }
+}
+
+fn bounded_tuning(
+    max_bytes: Option<u64>,
+    max_entries: Option<usize>,
+    population_bound: bool,
+) -> QueryScanTuning {
+    QueryScanTuning {
+        file_cache_population_bound_prototype: population_bound,
+        ..tuning(max_bytes, max_entries)
     }
 }
 
@@ -138,7 +149,7 @@ fn mib(bytes: u64) -> f64 {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "measurement: 512k events written, five cache budgets over a repeated drained scan"]
+#[ignore = "measurement: 512k events written, six cache policy arms over a repeated drained scan"]
 async fn file_cache_budget_measurement() {
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
@@ -195,22 +206,29 @@ async fn file_cache_budget_measurement() {
         mib(table_bytes(tmp.path()))
     );
 
-    let arms: [(&str, Option<u64>, Option<usize>); 5] = [
-        ("off", Some(0), Some(0)),
-        ("fits", Some(16 * entry_bytes), Some(64)),
-        ("bytes", Some(4 * entry_bytes), Some(64)),
-        ("entries", Some(16 * entry_bytes), Some(2)),
-        ("oversize", Some(3 * entry_bytes), Some(64)),
+    let arms: [(&str, Option<u64>, Option<usize>, bool); 6] = [
+        ("off", Some(0), Some(0), false),
+        ("fits", Some(16 * entry_bytes), Some(64), false),
+        ("bytes", Some(4 * entry_bytes), Some(64), false),
+        ("shared", Some(4 * entry_bytes), Some(64), true),
+        ("entries", Some(16 * entry_bytes), Some(2), false),
+        ("oversize", Some(3 * entry_bytes), Some(64), false),
     ];
 
     println!(
         "\n{:<9} {:>9} {:>9} {:>9} {:>9}   counters, then footprint and population peak (MiB)",
         "arm", "budget", "cold_ms", "warm_p50", "warm_max"
     );
-    for (arm, max_bytes, max_entries) in arms {
+    for (arm, max_bytes, max_entries, population_bound) in arms {
         siglake_storage::clear_decoded_file_cache();
-        siglake_storage::configure_query_scan_tuning(tuning(max_bytes, max_entries));
+        siglake_storage::configure_query_scan_tuning(bounded_tuning(
+            max_bytes,
+            max_entries,
+            population_bound,
+        ));
         siglake_storage::reset_decoded_file_cache_population_peaks();
+        let refusals_before =
+            siglake_storage::decoded_file_cache_population_stats().budget_refusals;
         let ctx = siglake_storage::session_context_with_target_partitions(Some(FILES));
         ice.register_with_datafusion(&ctx).await.unwrap();
         let _ = Counters::read(&snapshotter);
@@ -243,7 +261,8 @@ async fn file_cache_budget_measurement() {
         println!(
             "{:<9} {:>9} {:>9.1} {:>9.1} {:>9.1}\n    cold  {}\n    warm  {}\n    \
              cache entries={} priced={:.1} extent={:.1} retained={:.1} | \
-             population peak extent={:.1} retained={:.1} streams={}",
+             population peak extent={:.1} retained={:.1} streams={} | \
+             accounted_peak={:.1} refusals={}",
             arm,
             max_bytes
                 .map(|bytes| format!("{:.0}MiB", mib(bytes)))
@@ -260,6 +279,8 @@ async fn file_cache_budget_measurement() {
             mib(population.peak_extent_bytes),
             mib(population.peak_retained_bytes),
             population.peak_streams,
+            mib(population.peak_accounted_bytes),
+            population.budget_refusals.saturating_sub(refusals_before),
         );
     }
 

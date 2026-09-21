@@ -704,6 +704,17 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   ("Decoded-file cache populations") in `deploy/grafana/siglake-overview.json`
   charts them; on a default install, where the cache is off, every arm stays at
   zero.
+  Population buffers also remain outside the configured cache byte bound in
+  shipped policy. #5074's in-process prototype admitted completed entries and
+  live populations against one conservative process-wide total and held an
+  eight-partition, two-query scan to its 22 MiB budget. It was not adopted:
+  once four resident entries filled that budget, later misses could not retain
+  enough of a candidate to reach EOF and evict one. The bounded arm therefore
+  froze its first four entries and matched the existing four-entry LRU arm's
+  6.5 ms warm median. #5786 carries a production design that must keep the hard
+  bound without losing turnover; the prototype, measurements and REVISE
+  disposition are in
+  [`DESIGN_source_file_cache_qualification.md`](DESIGN_source_file_cache_qualification.md).
   Until 2026-09-17 an operator who turned the cache on also paid for the populate
   path stripping the query's predicate, which is what makes an entry reusable:
   the read then decoded the whole projection instead of the pages the predicate
