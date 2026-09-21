@@ -772,13 +772,16 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   sufficient — a file whose groups are larger closes none at that depth, and a
   read that does not start on a group boundary closes none at any depth, so the
   reader takes recorded footer geometry as a separate input. The round
-  collector currently samples the table's largest Parquet objects;
-  the SQL response does not name the files a shape read. Heterogeneous files
-  can therefore make that geometry belong to a different file set, so it is
-  table-sampled evidence and cannot verify per-shape membership or completed
-  groups (#4959). The local qualification and a bounded future representation
-  are recorded in `DESIGN_row_group_decoded_cache_qualification.md`; no public
-  response field ships from that investigation.
+  collector's largest-object sample remains table-wide input, but 0.2.0 SQL
+  responses can now join geometry to the shape's actual membership:
+  `stats.scan.file_attribution` carries up to 32 table-relative object keys and
+  task byte ranges, plus `cache_candidate`, `reader_opened` and `cache_hit`.
+  `files_omitted` counts tasks dropped by shards or the coordinator, and
+  `identity_complete` is false whenever the bounded list or a transport cannot
+  establish complete membership. A consumer must refuse per-shape geometry
+  claims when that boolean is false. The representation and local
+  qualification are recorded in
+  `DESIGN_row_group_decoded_cache_qualification.md` (#4959, #5727).
   No fleet numbers exist yet: the local evidence is hermetic fixtures
   (`crates/siglake-storage/tests/file_cache_populate_depth.rs`,
   `crates/siglake-query-server/tests/file_cache_populate_depth_stats.rs`), and

@@ -6417,6 +6417,30 @@ fn scan_detail_from_runtime(
     if runtime.files_planned == 0 && runtime.files_read == 0 {
         return None;
     }
+    let mut file_attribution: Option<crate::format::FileAttribution> = None;
+    for snapshot in &runtime.file_attributions {
+        let next = crate::format::FileAttribution {
+            files: snapshot
+                .files
+                .iter()
+                .map(|entry| crate::format::FileAttributionEntry {
+                    table: entry.identity.table.clone(),
+                    object_key: entry.identity.object_key.clone(),
+                    start: entry.identity.start,
+                    length: entry.identity.length,
+                    cache_candidate: entry.cache_candidate,
+                    reader_opened: entry.reader_opened,
+                    cache_hit: entry.cache_hit,
+                })
+                .collect(),
+            files_omitted: snapshot.files_omitted,
+            identity_complete: snapshot.identity_complete && runtime.unsettled_partitions == 0,
+        };
+        match &mut file_attribution {
+            Some(current) => current.absorb(&next),
+            None => file_attribution = Some(next),
+        }
+    }
     Some(Box::new(crate::format::ScanDetail {
         files_planned: runtime.files_planned,
         files_read: runtime.files_read,
@@ -6441,6 +6465,7 @@ fn scan_detail_from_runtime(
         file_cache_populate_rows: runtime.file_cache_populate_rows,
         unsettled_partitions: runtime.unsettled_partitions,
         ordering: runtime.ordering_outcome.map(str::to_string),
+        file_attribution,
     }))
 }
 
@@ -15212,13 +15237,18 @@ pub async fn shard(
         axum::http::HeaderValue::from_static("application/vnd.apache.arrow.stream"),
     );
     let runtime = crate::midflight::summarize_plan_runtime(&plan);
-    if let Some(scan) = scan_detail_from_runtime(&runtime) {
-        if let Ok(value) = axum::http::HeaderValue::from_str(
-            &serde_json::to_string(scan.as_ref()).unwrap_or_default(),
-        ) {
-            resp.headers_mut().insert("x-siglake-scan", value);
-        }
+    let scan = scan_detail_from_runtime(&runtime);
+    let encoded_scan = serde_json::to_vec(&scan).map_err(ApiError::internal)?;
+    if encoded_scan.len() > crate::coordinator::SHARD_SCAN_HEADER_MAX_BYTES {
+        return Err(ApiError::internal(anyhow::anyhow!(
+            "shard scan attribution is {} bytes, exceeds {}-byte transport limit",
+            encoded_scan.len(),
+            crate::coordinator::SHARD_SCAN_HEADER_MAX_BYTES
+        )));
     }
+    let scan_header = axum::http::HeaderValue::from_bytes(&encoded_scan)
+        .map_err(|error| ApiError::internal(anyhow::Error::new(error)))?;
+    resp.headers_mut().insert("x-siglake-scan", scan_header);
     Ok(resp)
 }
 

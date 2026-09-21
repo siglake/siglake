@@ -23,7 +23,11 @@ use crate::arrow::ScanCounters;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
+use crate::scan::FileScanTask;
 use crate::util::available_parallelism;
+
+/// Callback invoked after a data file's Parquet metadata opens successfully.
+pub type FileOpenedObserver = Arc<dyn Fn(&FileScanTask) + Send + Sync>;
 
 /// Default gap between byte ranges below which they are coalesced into a
 /// single request. Matches object_store's `OBJECT_STORE_COALESCE_DEFAULT`.
@@ -138,6 +142,7 @@ pub struct ArrowReaderBuilder {
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
     scan_counters: Option<Arc<ScanCounters>>,
+    file_opened_observer: Option<FileOpenedObserver>,
     cache_bypass: bool,
     raw_prune_spec: Option<RawPruneSpec>,
     promoted_prune: Vec<PromotedPruneSpec>,
@@ -160,6 +165,7 @@ impl ArrowReaderBuilder {
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
             scan_counters: None,
+            file_opened_observer: None,
             cache_bypass: false,
             raw_prune_spec: None,
             promoted_prune: Vec::new(),
@@ -227,6 +233,16 @@ impl ArrowReaderBuilder {
         self
     }
 
+    /// Observe a data-file task only after its Parquet file was opened and its
+    /// metadata loaded successfully.
+    pub fn with_file_opened_observer(
+        mut self,
+        observer: Option<FileOpenedObserver>,
+    ) -> Self {
+        self.file_opened_observer = observer;
+        self
+    }
+
     /// Bypass parsed immutable footer caches for measurement controls.
     pub fn with_cache_bypass(mut self, cache_bypass: bool) -> Self {
         self.cache_bypass = cache_bypass;
@@ -289,6 +305,7 @@ impl ArrowReaderBuilder {
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
             scan_counters: self.scan_counters,
+            file_opened_observer: self.file_opened_observer,
             cache_bypass: self.cache_bypass,
             raw_prune_spec: self.raw_prune_spec,
             promoted_prune: self.promoted_prune,
@@ -313,6 +330,7 @@ pub struct ArrowReader {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     scan_counters: Option<Arc<ScanCounters>>,
+    file_opened_observer: Option<FileOpenedObserver>,
     cache_bypass: bool,
     raw_prune_spec: Option<RawPruneSpec>,
     promoted_prune: Vec<PromotedPruneSpec>,

@@ -1,8 +1,9 @@
 use std::any::Any;
 use std::cmp::Reverse;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use std::task::{Context, Poll};
@@ -179,6 +180,161 @@ struct EffectiveFileCacheTuning {
 const FILE_ATTRIBUTION_PROTOTYPE_CAP: usize = 128;
 const FILE_ATTRIBUTION_METRIC: &str = "qualification_file_attribution";
 const FILE_ATTRIBUTION_OMITTED_METRIC: &str = "qualification_file_attribution_omitted";
+
+/// Maximum file-task identities retained by one scan. The query server merges
+/// scan leaves and shards, then applies this same cap again request-wide.
+pub const FILE_ATTRIBUTION_CAP: usize = 32;
+
+/// Stable identity for one planned Iceberg file task.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileAttributionIdentity {
+    pub table: String,
+    pub object_key: String,
+    pub start: u64,
+    pub length: u64,
+}
+
+/// Outcomes observed for a retained file task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileAttributionEntry {
+    pub identity: FileAttributionIdentity,
+    pub cache_candidate: bool,
+    pub reader_opened: bool,
+    pub cache_hit: bool,
+}
+
+/// One bounded scan-leaf snapshot. Entries are sorted by identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileAttributionSnapshot {
+    pub files: Vec<FileAttributionEntry>,
+    pub files_omitted: u64,
+    pub identity_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FileAttributionOutcome {
+    CacheCandidate,
+    ReaderOpened,
+    CacheHit,
+}
+
+#[derive(Debug)]
+struct FileAttributionCollector {
+    table: String,
+    table_location: String,
+    entries: Mutex<BTreeMap<FileAttributionIdentity, FileAttributionEntry>>,
+    files_omitted: u64,
+}
+
+impl FileAttributionCollector {
+    fn new<'a>(table: &Table, tasks: impl Iterator<Item = &'a FileScanTask>) -> Self {
+        let table_name = table.identifier().to_string();
+        let table_location = table
+            .metadata()
+            .location()
+            .trim_end_matches('/')
+            .to_string();
+        let mut identities = BTreeMap::new();
+        let mut invalid = 0_u64;
+        for task in tasks {
+            let Some(identity) = Self::identity_for(
+                &table_name,
+                &table_location,
+                task.data_file_path(),
+                task.start,
+                task.length,
+            ) else {
+                invalid += 1;
+                continue;
+            };
+            identities
+                .entry(identity.clone())
+                .or_insert(FileAttributionEntry {
+                    identity,
+                    cache_candidate: false,
+                    reader_opened: false,
+                    cache_hit: false,
+                });
+        }
+        let excess = identities.len().saturating_sub(FILE_ATTRIBUTION_CAP) as u64;
+        while identities.len() > FILE_ATTRIBUTION_CAP {
+            identities.pop_last();
+        }
+        Self {
+            table: table_name,
+            table_location,
+            entries: Mutex::new(identities),
+            files_omitted: invalid.saturating_add(excess),
+        }
+    }
+
+    fn identity_for(
+        table: &str,
+        table_location: &str,
+        file: &str,
+        start: u64,
+        length: u64,
+    ) -> Option<FileAttributionIdentity> {
+        let suffix = file.strip_prefix(table_location)?.strip_prefix('/')?;
+        if suffix.is_empty() {
+            return None;
+        }
+        Some(FileAttributionIdentity {
+            table: table.to_string(),
+            object_key: suffix.to_string(),
+            start,
+            length,
+        })
+    }
+
+    fn observe(&self, task: &FileScanTask, outcome: FileAttributionOutcome) {
+        let Some(identity) = self.identity_for_task(task) else {
+            return;
+        };
+        self.observe_identity(&identity, outcome);
+    }
+
+    fn identity_for_task(&self, task: &FileScanTask) -> Option<FileAttributionIdentity> {
+        Self::identity_for(
+            &self.table,
+            &self.table_location,
+            task.data_file_path(),
+            task.start,
+            task.length,
+        )
+    }
+
+    fn observe_identity(
+        &self,
+        identity: &FileAttributionIdentity,
+        outcome: FileAttributionOutcome,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(entry) = entries.get_mut(identity) else {
+            return;
+        };
+        match outcome {
+            FileAttributionOutcome::CacheCandidate => entry.cache_candidate = true,
+            FileAttributionOutcome::ReaderOpened => entry.reader_opened = true,
+            FileAttributionOutcome::CacheHit => entry.cache_hit = true,
+        }
+    }
+
+    fn snapshot(&self, identity_complete: bool) -> FileAttributionSnapshot {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        FileAttributionSnapshot {
+            files: entries.values().cloned().collect(),
+            files_omitted: self.files_omitted,
+            identity_complete: identity_complete && self.files_omitted == 0,
+        }
+    }
+}
 
 #[derive(Clone)]
 enum FileAttributionMetrics {
@@ -1757,6 +1913,7 @@ fn schema_with_text_tokenizers_of(
 #[derive(Debug)]
 pub struct SiglakeIcebergTableScan {
     table: Table,
+    file_attribution: Arc<FileAttributionCollector>,
     plan_properties: Arc<PlanProperties>,
     projection: Option<Vec<String>>,
     projected_columns: Arc<Vec<String>>,
@@ -2367,9 +2524,14 @@ impl SiglakeIcebergTableScan {
             None
         };
         let ordering_outcome = ordering.outcome;
+        let file_attribution = Arc::new(FileAttributionCollector::new(
+            &table,
+            task_partitions.iter().flatten(),
+        ));
 
         Ok(Self {
             table,
+            file_attribution,
             plan_properties,
             projection,
             projected_columns,
@@ -2428,6 +2590,11 @@ impl SiglakeIcebergTableScan {
         self.ordering_outcome
     }
 
+    /// Bounded, deterministic file-task membership and outcomes for this scan.
+    pub fn file_attribution(&self) -> FileAttributionSnapshot {
+        self.file_attribution.snapshot(self.live_partitions() == 0)
+    }
+
     /// WS-3: build a sorted partition stream by k-way merging the per-file
     /// batch streams on `timestamp` in the declared direction — for partitions
     /// whose files OVERLAP in time (a disjoint run streams by plain ordered
@@ -2448,6 +2615,7 @@ impl SiglakeIcebergTableScan {
         let raw_prune_spec = self.raw_prune_spec.clone();
         let promoted_prune = self.promoted_prune.clone();
         let reverse_scan = self.reverse_scan;
+        let file_attribution = self.file_attribution.clone();
         // #90: NEVER route an ordered per-task stream through the batch
         // cache — its fill decodes the WHOLE task before the first batch
         // (see the execute-path bypass), which defeats the lazy early-stop
@@ -2461,6 +2629,9 @@ impl SiglakeIcebergTableScan {
                 .with_data_file_concurrency_limit(1)
                 .with_row_selection_enabled(true)
                 .with_scan_counters(Some(scan_counters))
+                .with_file_opened_observer(Some(Arc::new(move |task| {
+                    file_attribution.observe(task, FileAttributionOutcome::ReaderOpened);
+                })))
                 .with_raw_prune_spec(raw_prune_spec)
                 .with_promoted_prune(promoted_prune);
             if reverse_scan {
@@ -4697,7 +4868,10 @@ fn open_task_batch_stream_uncached(
     raw_prune_spec: Option<RawPruneSpec>,
     promoted_prune: Vec<PromotedPruneSpec>,
     reverse: bool,
+    file_attribution: Arc<FileAttributionCollector>,
+    opened_identity: Option<FileAttributionIdentity>,
 ) -> DFResult<TaskBatchStream> {
+    let opened_identity = opened_identity.or_else(|| file_attribution.identity_for_task(&task));
     let task_stream: FileScanTaskStream = futures::stream::iter(std::iter::once(Ok(task))).boxed();
     // Enable page-index row selection: data files carry Parquet page statistics
     // (ColumnIndex/OffsetIndex, written by default), so a scan predicate prunes
@@ -4709,6 +4883,11 @@ fn open_task_batch_stream_uncached(
         .with_data_file_concurrency_limit(1)
         .with_row_selection_enabled(true)
         .with_scan_counters(Some(scan_counters))
+        .with_file_opened_observer(Some(Arc::new(move |_task| {
+            if let Some(identity) = &opened_identity {
+                file_attribution.observe_identity(identity, FileAttributionOutcome::ReaderOpened);
+            }
+        })))
         .with_raw_prune_spec(raw_prune_spec)
         .with_promoted_prune(promoted_prune);
     if reverse {
@@ -4747,14 +4926,15 @@ async fn open_task_batch_stream_cached(
     byte_counter: Arc<std::sync::atomic::AtomicU64>,
     scan_counters: Arc<ScanCounters>,
     cache_counters: Arc<FileCacheCounters>,
+    attribution: Arc<FileAttributionCollector>,
     raw_prune_spec: Option<RawPruneSpec>,
     promoted_prune: Vec<PromotedPruneSpec>,
     reverse: bool,
-    file_attribution: Option<FileAttributionMetrics>,
+    qualification_attribution: Option<FileAttributionMetrics>,
 ) -> DFResult<TaskBatchStream> {
     if !cache_tuning.enabled() {
-        if let Some(attribution) = &file_attribution {
-            attribution.reader_attempt();
+        if let Some(qualification) = &qualification_attribution {
+            qualification.reader_attempt();
         }
         return open_task_batch_stream_uncached(
             file_io,
@@ -4765,11 +4945,14 @@ async fn open_task_batch_stream_cached(
             raw_prune_spec,
             promoted_prune,
             reverse,
+            attribution,
+            None,
         );
     }
 
-    if let Some(attribution) = &file_attribution {
-        attribution.cache_candidate();
+    attribution.observe(&task, FileAttributionOutcome::CacheCandidate);
+    if let Some(qualification) = &qualification_attribution {
+        qualification.cache_candidate();
     }
 
     let fallback_key = task_cache_key_with_direction(&task, reverse);
@@ -4792,6 +4975,7 @@ async fn open_task_batch_stream_cached(
         })
     };
     if let Some(hit) = hit {
+        attribution.observe(&task, FileAttributionOutcome::CacheHit);
         metrics::counter!(
             "siglake_query_scan_file_cache_requests_total",
             "outcome" => "hit"
@@ -4807,8 +4991,8 @@ async fn open_task_batch_stream_cached(
             futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)).boxed(),
         );
     }
-    if let Some(attribution) = &file_attribution {
-        attribution.reader_attempt();
+    if let Some(qualification) = &qualification_attribution {
+        qualification.reader_attempt();
     }
 
     // #4891: under the shipped policy, a task carrying a converted predicate
@@ -4851,6 +5035,8 @@ async fn open_task_batch_stream_cached(
             raw_prune_spec,
             promoted_prune,
             reverse,
+            attribution,
+            None,
         );
     }
 
@@ -4870,6 +5056,7 @@ async fn open_task_batch_stream_cached(
                 scan_counters,
                 cache_counters,
                 reverse,
+                attribution,
             );
         }
     }
@@ -4902,6 +5089,8 @@ async fn open_task_batch_stream_cached(
             None,
             Vec::new(),
             reverse,
+            attribution,
+            None,
         )?,
         buffered: Vec::new(),
         buffered_bytes: 0,
@@ -4933,6 +5122,7 @@ fn row_group_task_stream(
     scan_counters: Arc<ScanCounters>,
     cache_counters: Arc<FileCacheCounters>,
     reverse: bool,
+    attribution: Arc<FileAttributionCollector>,
 ) -> DFResult<TaskBatchStream> {
     let populate =
         |inner: TaskBatchStream, keys: Vec<String>, group_rows: Vec<u64>| -> TaskBatchStream {
@@ -4952,6 +5142,7 @@ fn row_group_task_stream(
         };
     match plan {
         RowGroupPlan::Served(batches) => {
+            attribution.observe(&task, FileAttributionOutcome::CacheHit);
             metrics::counter!(
                 "siglake_query_scan_file_cache_requests_total",
                 "outcome" => "hit"
@@ -4970,6 +5161,8 @@ fn row_group_task_stream(
             keys,
             group_rows,
         } => {
+            attribution.observe(&task, FileAttributionOutcome::CacheHit);
+            let opened_identity = attribution.identity_for_task(&task);
             metrics::counter!(
                 "siglake_query_scan_file_cache_requests_total",
                 "outcome" => "miss"
@@ -4997,6 +5190,8 @@ fn row_group_task_stream(
                 None,
                 Vec::new(),
                 reverse,
+                attribution,
+                opened_identity,
             )?;
             Ok(
                 futures::stream::iter(served.into_iter().map(Ok::<_, DataFusionError>))
@@ -5022,6 +5217,8 @@ fn row_group_task_stream(
                 None,
                 Vec::new(),
                 reverse,
+                attribution,
+                None,
             )?;
             Ok(populate(inner, keys, group_rows))
         }
@@ -5305,6 +5502,7 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
             let counter = fetched_byte_counter.clone();
             let task_scan_counters = scan_counters.clone();
             let task_cache_counters = file_cache_counters.clone();
+            let task_attribution = self.file_attribution.clone();
             let raw_prune_spec = raw_prune_spec.clone();
             let promoted_prune = self.promoted_prune.clone();
             let task_futures = futures::stream::iter(tasks.into_iter().enumerate().map(
@@ -5313,6 +5511,7 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                     let counter = counter.clone();
                     let task_scan_counters = task_scan_counters.clone();
                     let task_cache_counters = task_cache_counters.clone();
+                    let attribution = task_attribution.clone();
                     let raw_prune_spec = raw_prune_spec.clone();
                     let promoted_prune = promoted_prune.clone();
                     let file_attribution = file_attributions
@@ -5328,6 +5527,7 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                             counter,
                             task_scan_counters,
                             task_cache_counters,
+                            attribution,
                             raw_prune_spec,
                             promoted_prune,
                             reverse_scan,
@@ -5360,6 +5560,7 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                     .boxed()
             }
         } else {
+            let file_attribution = self.file_attribution.clone();
             let task_stream: FileScanTaskStream =
                 futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
             // We own the read path (vendored iceberg), so the reader reports
@@ -5372,6 +5573,9 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                 // within the survivors.
                 .with_row_selection_enabled(true)
                 .with_scan_counters(Some(scan_counters.clone()))
+                .with_file_opened_observer(Some(Arc::new(move |task| {
+                    file_attribution.observe(task, FileAttributionOutcome::ReaderOpened);
+                })))
                 .with_raw_prune_spec(raw_prune_spec.clone())
                 .with_promoted_prune(self.promoted_prune.clone())
                 // WS-3: an order-advertising scan's tasks form a time-ascending

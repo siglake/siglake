@@ -2160,6 +2160,54 @@ components:
 
         The `type` field selects one of seven mapping shapes. `tokenizer` is valid
         only for `text`, and every shape rejects unknown fields.
+    FileAttribution:
+      type: object
+      description: Bounded file-task membership and decoded-cache outcomes for one request.
+      required:
+      - files
+      - files_omitted
+      - identity_complete
+      properties:
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileAttributionEntry'
+        files_omitted:
+          type: integer
+          format: int64
+          minimum: 0
+        identity_complete:
+          type: boolean
+    FileAttributionEntry:
+      type: object
+      description: One table-relative Iceberg file task retained in the attribution block.
+      required:
+      - table
+      - object_key
+      - start
+      - length
+      - cache_candidate
+      - reader_opened
+      - cache_hit
+      properties:
+        cache_candidate:
+          type: boolean
+        cache_hit:
+          type: boolean
+        length:
+          type: integer
+          format: int64
+          minimum: 0
+        object_key:
+          type: string
+        reader_opened:
+          type: boolean
+        start:
+          type: integer
+          format: int64
+          minimum: 0
+        table:
+          type: string
     HealthResponse:
       type: object
       description: '`GET /healthz` response body.'
@@ -2675,6 +2723,14 @@ components:
           type: integer
           format: int64
           minimum: 0
+        file_attribution:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/FileAttribution'
+            description: |-
+              Bounded file-task membership for geometry joins. Keys are relative to
+              the Iceberg table location; omissions are explicit and make
+              `identity_complete` false.
         file_cache_bypasses:
           type: integer
           format: int64
