@@ -33,6 +33,10 @@ TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "timeout"}
 # The first trace version that carries `job_write_history`. Earlier traces are
 # graded on the visible row version alone; they had nothing else.
 HISTORY_SCHEMA_VERSION = 4
+# The first trace version whose write-probe rows are dated by Postgres. Earlier
+# traces kept the probes' outcomes and nothing to check the clock against.
+WRITE_PROBE_TIMES_SCHEMA_VERSION = 5
+WRITE_PROBE_PHASES = ("baseline", "outage", "recovery")
 STAMP_FRACTION = re.compile(r"[T ]\d{2}:\d{2}:\d{2}(?:\.(\d+))?")
 
 
@@ -515,6 +519,152 @@ def grade_write_history(
     return reading
 
 
+PLACEMENT_DESCRIPTIONS = {
+    "before_pause": "before the pause was applied",
+    "after_restoration": "after restoration was applied",
+}
+# Where the probe knows it took each write, because it took it itself.
+EXPECTED_WRITE_PROBE_PLACEMENT = {
+    "baseline": "before_pause",
+    "recovery": "after_restoration",
+}
+
+
+def grade_write_probe_commit_times(
+    document: dict[str, Any],
+    probe_outcomes: dict[str, list[str]],
+    outage_started: RecordedStamp | None,
+    pause_applied: RecordedStamp | None,
+    restoration_started: RecordedStamp | None,
+    restoration_applied: RecordedStamp | None,
+    problems: list[str],
+) -> dict[str, Any] | None:
+    """Date the probe's own bounded writes and check them against where it took them.
+
+    Every other commit timestamp in the trace is placed against stamps the
+    probe read from the kind node's clock, so a systematic skew between that
+    clock and Postgres's would move the whole reading together and leave no
+    trace of itself. The write probe is the one write whose intended commit
+    time the probe already knows: its baseline row was written before the
+    pause and its recovery row after restoration. A row Postgres dates on the
+    wrong side of the pause is that contradiction, and it is reported on its
+    own -- the job-row readings are not also marked incomplete, because what
+    this says is that the scheme those readings use cannot be trusted here,
+    not that some particular job row is undated. Returns None when the trace
+    carries no such reading, which is every trace retained before schema 5.
+    """
+    observation = document.get("write_probe_commit_times")
+    if not isinstance(observation, dict):
+        return None
+    reading: dict[str, Any] = {
+        "collected_at": observation.get("at"),
+        "query_status": observation.get("query_status"),
+        "rows_returned": None,
+        "placements": {},
+        "contradictions": [],
+        "gaps": [],
+    }
+    gaps: list[str] = reading["gaps"]
+    contradictions: list[str] = reading["contradictions"]
+    rows = observation.get("rows")
+    if not isinstance(rows, list):
+        rows = []
+    reading["rows_returned"] = len(rows)
+    if observation.get("exec_status") != 0 or observation.get("query_status") != 0:
+        gaps.append(
+            "the write-probe commit-time query did not run: "
+            f"{str(observation.get('detail', ''))[:160]!r}"
+        )
+
+    by_phase: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        phase = row.get("phase") if isinstance(row, dict) else None
+        if phase not in WRITE_PROBE_PHASES:
+            gaps.append(f"a retained write-probe row names no phase of the probe: {phase!r}")
+            continue
+        assert isinstance(row, dict)
+        by_phase.setdefault(phase, []).append(row)
+
+    boundaries = (outage_started, pause_applied, restoration_started, restoration_applied)
+    if any(stamp is None for stamp in boundaries):
+        gaps.append(
+            "the trace has no complete pause and restoration bounds to place the write probe's "
+            "own commits against"
+        )
+
+    # A row for the write taken inside the pause is not a dating question: the
+    # probe reported that write killed by its watchdog, so a row for it says
+    # the write landed anyway.
+    for row in by_phase.get("outage", []):
+        committed_at = parse_pg_stamp(row.get("committed_at"))
+        contradictions.append("outage")
+        problems.append(
+            "the bounded write taken during the pause left a row in the probe's control table"
+            + (f", committed at {committed_at.isoformat()}" if committed_at else "")
+            + ", so the pause did not block writes"
+        )
+
+    for phase in ("baseline", "recovery"):
+        expected = EXPECTED_WRITE_PROBE_PLACEMENT[phase]
+        matches = by_phase.get(phase, [])
+        if not matches:
+            if "completed" in probe_outcomes.get(phase, []):
+                gaps.append(
+                    f"the {phase} write probe completed but left no row in the probe's control "
+                    "table to date"
+                )
+            continue
+        if len(matches) > 1:
+            gaps.append(f"the {phase} write probe left {len(matches)} rows in the control table")
+        for row in matches:
+            committed_at = parse_pg_stamp(row.get("committed_at"))
+            committed = recorded_stamp(row.get("committed_at"), committed_at)
+            if committed is None:
+                gaps.append(f"the {phase} write probe's row has no usable commit timestamp")
+                continue
+            if any(stamp is None for stamp in boundaries):
+                continue
+            assert outage_started is not None
+            assert pause_applied is not None
+            assert restoration_started is not None
+            assert restoration_applied is not None
+            placement, transition = place_commit(
+                committed,
+                (outage_started, pause_applied, restoration_started, restoration_applied),
+            )
+            reading["placements"][phase] = placement
+            stamp = committed.at.isoformat()
+            if placement == expected:
+                continue
+            contradictions.append(phase)
+            if placement == "unplaceable":
+                assert transition is not None
+                name, started, applied = transition
+                problems.append(
+                    f"the {phase} write probe's row committed at {stamp}, overlapping the {name} "
+                    f"transition bounded by {started.at.isoformat()} "
+                    f"({resolution_label(started)} precision) and {applied.until.isoformat()} "
+                    f"({resolution_label(applied)} precision), so the one write whose side of the "
+                    "pause the probe knows cannot be placed on it"
+                )
+                continue
+            where = PLACEMENT_DESCRIPTIONS.get(placement) or (
+                "inside the proven stopped window from "
+                f"{pause_applied.until.isoformat()} through "
+                f"{restoration_started.at.isoformat()}"
+            )
+            problems.append(
+                f"the {phase} write probe's row committed at {stamp}, {where}, although the probe "
+                f"took that write {PLACEMENT_DESCRIPTIONS[expected]}: Postgres's commit clock and "
+                "the probe's signal stamps disagree, so no commit timestamp in this trace can be "
+                "placed against the pause"
+            )
+
+    if gaps and document.get("schema_version", 0) >= WRITE_PROBE_TIMES_SCHEMA_VERSION:
+        problems.append("the write probe's own commit times are incomplete: " + "; ".join(gaps))
+    return reading
+
+
 def grade_commit_times(
     document: dict[str, Any],
     accepted: list[dict[str, Any]],
@@ -725,7 +875,7 @@ def grade_commit_times(
 
 def grade(document: dict[str, Any]) -> dict[str, Any]:
     problems: list[str] = []
-    if document.get("schema_version") not in {1, 2, 3, 4}:
+    if document.get("schema_version") not in {1, 2, 3, 4, 5}:
         problems.append("unsupported or missing schema_version")
     revisions = document.get("revisions")
     if not isinstance(revisions, dict) or not revisions.get("repository_commit"):
@@ -914,6 +1064,20 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
 
     stopped_processes, observed_outage_states = grade_pause(parsed_samples, problems)
     write_probe_outcomes = grade_write_probes(document, problems)
+    write_probe_commit_times = grade_write_probe_commit_times(
+        document,
+        write_probe_outcomes,
+        outage_stamp,
+        pause_applied_stamp,
+        restoration_started_stamp,
+        restoration_applied_stamp,
+        problems,
+    )
+    if (
+        write_probe_commit_times is None
+        and document.get("schema_version", 0) >= WRITE_PROBE_TIMES_SCHEMA_VERSION
+    ):
+        problems.append("missing write-probe commit-time observations")
     grade_container(document, problems)
     write_history = grade_write_history(
         document,
@@ -1099,6 +1263,7 @@ def grade(document: dict[str, Any]) -> dict[str, Any]:
         "outage_samples_with_process_state": observed_outage_states,
         "stopped_postgres_processes": stopped_processes,
         "write_probe_outcomes": write_probe_outcomes,
+        "write_probe_commit_times": write_probe_commit_times,
         "max_observation_lag_seconds": max(observation_lags) if observation_lags else None,
     }
     return {
@@ -1132,6 +1297,7 @@ def main() -> int:
         sys.stdout.write(rendered)
     commits = result["summary"]["job_commit_times"]
     drain = result["summary"]["pre_restoration_drain"]
+    control = result["summary"]["write_probe_commit_times"]
     print(
         "POSTGRES_OUTAGE_EVIDENCE "
         f"grade={result['grade']} peak={result['summary']['peak_backlog_total']} "
@@ -1139,6 +1305,8 @@ def main() -> int:
         f"job_rows_committed_in_pause={len(commits['committed_in_pause'])} "
         f"job_rows_dated={commits['correlated_jobs']} "
         f"terminal_writes_dated_by_history={commits['terminal_writes_dated_by_history']} "
+        f"write_probe_rows_placed="
+        f"{','.join(f'{phase}={where}' for phase, where in control['placements'].items()) if control and control['placements'] else 'none'} "
         f"pre_restoration_drain="
         f"{(drain['resolution'] or {}).get('state', 'unresolved') if drain else 'none'}",
         file=sys.stderr,

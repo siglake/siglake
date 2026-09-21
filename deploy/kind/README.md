@@ -158,10 +158,25 @@ gap leaves the observation unexplained. The trigger belongs to the probe and
 the throwaway install alone; nothing in the chart, the compose stack or the
 job store knows about it.
 
+Every one of those placements is made against stamps the probe read from the
+kind node's clock, so a skew between that clock and Postgres's would move the
+whole reading together. The bounded write probe is the control: it is the one
+write whose side of the pause the probe knows in advance, so each row it
+writes carries the phase that wrote it, and after the recovery write the probe
+reads them back dated by `pg_xact_commit_timestamp(xmin)` as
+`write_probe_commit_times`. The baseline row has to be dated before the pause
+was applied and the recovery row after restoration was applied; either one on
+the wrong side, or overlapping a signal transition, is `unverified` on its own,
+whatever the job rows say. A row for the write taken during the pause is the
+stronger finding — that write was reported killed by its watchdog, so a row for
+it says it landed anyway. The control table belongs to the probe in the same
+way the history does.
+
 `scripts/check-kind-postgres-outage-evidence.sh` grades offline fixtures in CI;
 missing series, a backlog that never rises, one that never drains, a missing or
 running process observation, a bounded write that completed during the pause, a
-container restart, an undated or in-pause job-row commit, and an outage sample
+container restart, an undated or in-pause job-row commit, a write-probe row
+Postgres dates on the wrong side of the pause, and an outage sample
 with zero backlog and rising completions before restoration are all
 `unverified`, not passing evidence. A drain whose accepted job rows are all
 dated outside the pause is graded `verified` with the resolution recorded, and

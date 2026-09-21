@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "generated_at": "2026-09-07T12:02:00Z",
   "revisions": {
     "repository_commit": "0123456789abcdef",
@@ -82,6 +82,24 @@
       "detail": ""
     }
   ],
+  "write_probe_commit_times": {
+    "at": "2026-09-07T12:01:08Z",
+    "exec_status": 0,
+    "query_status": 0,
+    "rows": [
+      {
+        "phase": "baseline",
+        "observed_at": "2026-09-07 12:00:00.331904+00",
+        "committed_at": "2026-09-07 12:00:00.332715+00"
+      },
+      {
+        "phase": "recovery",
+        "observed_at": "2026-09-07 12:00:51.108220+00",
+        "committed_at": "2026-09-07 12:00:51.109044+00"
+      }
+    ],
+    "detail": ""
+  },
   "job_commit_times": {
     "at": "2026-09-07T12:01:06Z",
     "exec_status": 0,
