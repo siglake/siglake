@@ -377,7 +377,9 @@ enum Command {
     /// neither marker — the default install — by looking the listed segment
     /// ids up in `wal_segments`, read-only. See the flag's own help.
     WalRecover {
-        /// Full source URL (e.g. `s3://bucket/wal-mirror`).
+        /// Full source URL. It must name the mirror root at
+        /// `<warehouse-url>/<wal-mirror-prefix>/` (e.g.
+        /// `s3://bucket/warehouse/wal-mirror/`).
         #[arg(long, env = "SIGLAKE_WAL_MIRROR_URL")]
         from: String,
         /// Local WAL ROOT to populate — the same path the ingester and
