@@ -1761,21 +1761,32 @@ in [`DESIGN_query_tenant_admission.md`](DESIGN_query_tenant_admission.md).
 
 Metrics and emission are separate paths, on purpose.
 
-**Metrics stay on Prometheus.** Every binary exports its counters, gauges and
-histograms through the `metrics` crate to a `/metrics` endpoint
+**Metrics stay on Prometheus.** The ingest, compactor, query and operator
+processes export their counters, gauges and histograms through the `metrics`
+crate to a `/metrics` endpoint
 (`siglake_core::metrics::init`), which is what the chart's `ServiceMonitor`,
 the `PrometheusRule` alerts, the KEDA scalers and the Grafana dashboard read.
 No call site changed when OTel arrived. A collector with a Prometheus receiver
-is how these reach an OTLP backend.
+is how these reach an OTLP backend. `siglake-loadgen` and `siglake-corpus` use
+neither the `metrics` crate nor a `/metrics` endpoint.
 
-**Logs and traces leave as OTLP/HTTP, when configured.** `siglake_core::
-telemetry::init` installs the process's `tracing` subscriber: the console
-layer always, plus — when an endpoint is configured — an OTel logs bridge and
-an OTel traces layer. The logs bridge forwards existing `tracing::info!` and
-friends as OTLP log records, so no logging call site changed either. The
-traces layer forwards the spans placed at the boundaries that cost something:
-the ingest handlers and `ingest_batch`, the compactor drain, the query
-server's per-request middleware and `distributed_inner`.
+**Logs and traces leave as OTLP/HTTP from instrumented processes, when
+configured.** `siglake_core::telemetry::init` installs the process's `tracing`
+subscriber: the console layer always, plus — when an endpoint is configured —
+an OTel logs bridge and an OTel traces layer. The logs bridge forwards existing
+`tracing::info!` and friends as OTLP log records, so no logging call site
+changed either. The traces layer forwards the spans placed at the server-side
+boundaries that cost something: the ingest handlers and `ingest_batch`, the
+compactor drain, the query server's per-request middleware and
+`distributed_inner`.
+
+The `siglake-loadgen` and `siglake-corpus` executables instead install their
+own console-only `tracing_subscriber` subscribers. They do not emit logs or
+traces to an OTel backend when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and their
+ingest requests do not inject W3C `traceparent`. The ingest HTTP router's
+ordinary `TraceLayer` does not extract a remote parent either. The shipped
+instrumentation therefore starts an ingest trace at the ingest handler; it
+does not provide client-to-ingest trace continuity from either load generator.
 
 **A distributed query is one trace.** The coordinator injects W3C
 `traceparent` into each shard request and the worker's middleware extracts it,
@@ -1783,7 +1794,8 @@ so a fan-out's worker spans are children of the coordinator's span rather than
 unrelated roots. `crates/siglake-query-server/tests/otel_traceparent_propagation.rs`
 pins that over a real socket.
 
-**Configuration is the standard OTel environment, and it is off by default.**
+**Configuration for instrumented processes is the standard OTel environment,
+and it is off by default.**
 
 | Variable | Effect |
 | --- | --- |
@@ -1804,9 +1816,11 @@ tests drive directly; nothing mutates the process environment.
 
 **Shutdown is explicit, because nothing else flushes.** The batch processors
 buffer, and the providers live in a `OnceLock` that never drops, so a
-drop-at-exit guard would ship nothing. Each binary's `main` initializes
-telemetry and then wraps a `run()`, so one `telemetry::shutdown()` covers the
+drop-at-exit guard would ship nothing. Each entry point that uses
+`telemetry::init` wraps its work so one `telemetry::shutdown()` covers the
 graceful SIGTERM return, one-shot commands and errors after initialization.
+The two load generator entry points neither initialize OTel providers nor call
+this shutdown path; their console subscribers have no OTel batches to flush.
 
 **The disabled path is cheap, not free.** The per-request middleware runs
 whatever the configuration: it allocates the request path, asks the global

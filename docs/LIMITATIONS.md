@@ -1732,6 +1732,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   [Deployment](ARCHITECTURE.md#deployment). A first-class block was left out
   until a deployment has run with emission on and shown which knobs an operator
   actually reaches for.
+- **The load generators are outside in-process OTel emission.**
+  `siglake-loadgen` and `siglake-corpus` install console-only subscribers, so
+  their logs and traces do not reach an OTel backend when an endpoint is set.
+  Their ingest requests do not inject W3C `traceparent`, and the ingest
+  router's `TraceLayer` does not extract a remote parent. A trace therefore
+  begins at the ingest handler rather than at the load generator that issued
+  the request. Client-to-ingest continuity requires both client injection and
+  ingest-side extraction; neither half is implemented.
 - **Metrics do not leave as OTLP from the process.** `siglake_*` metrics are
   Prometheus, scraped from `/metrics`; the OTel metrics SDK is not wired, so an
   OTLP-only backend needs a collector with a Prometheus receiver. Moving the
