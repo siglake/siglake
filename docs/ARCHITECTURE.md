@@ -1868,25 +1868,32 @@ noise; against an empty request it is most of the cost.
 
 ## Diagnostics
 
-### The metrics port is node-local, and nothing on it is authenticated
+### The metrics port binds every interface, and nothing on it is authenticated
 
 Every role serves `--metrics-bind` (9100 for the ingester, 9101 for the
-compactor, 9105 for the query tier): `/metrics` for Prometheus, `/` as a
-one-line pointer to it, and nothing else in a release build. The compactor's
-liveness probe is a `tcpSocket` against it. None of it checks a token — the
-query tier's bearer tokens and OIDC guard 8089, not this — so **treat the
-metrics port as an internal control surface and do not route it through an
-Ingress or a LoadBalancer.**
+compactor, 9105 for the query tier, 9190 for the operator): `/metrics` for
+Prometheus, `/` as a one-line pointer to it, and nothing else in a release
+build. The compactor's liveness probe is a `tcpSocket` against it. The default
+is `0.0.0.0` in every role, and the chart, the operator and
+`deploy/docker-compose.yml` render that same wildcard, so the listener answers
+on every IPv4 interface of its network namespace — whatever the pod or node
+has. None of it checks a token — the query tier's bearer tokens and OIDC guard
+8089, not this — so **treat the metrics port as an internal control surface and
+do not route it through an Ingress or a LoadBalancer.**
 
-The chart's `networkPolicy.enabled` writes an **egress** policy only; there is
-no shipped ingress restriction on the metrics port, so the reachability you get
-is whatever your cluster's default is. A cluster that allows pod-to-pod traffic
-allows scrapes from anywhere in it. Restricting it further is an operator
-decision: your own `NetworkPolicy` admitting only the Prometheus
-ServiceAccount's pods, or no policy and `kubectl port-forward` for ad-hoc
-reads. On the AWS bench stack the security group opens 8088, 8089 and 22 only,
-which is why the port is reachable from the node and its peers and nowhere
-else.
+Who can reach it is a deployment decision. The chart's `networkPolicy.enabled`
+writes an **egress** policy only; there is no shipped ingress restriction on
+the metrics port, so the reachability you get is whatever your cluster's
+default is. A cluster that allows pod-to-pod traffic allows scrapes from
+anywhere in it. Restricting it further is yours to write: an ingress
+`NetworkPolicy` that selects the Prometheus pods by namespace and pod labels —
+NetworkPolicy has no ServiceAccount selector, so the allowed caller has to be
+expressed as a `namespaceSelector` plus a `podSelector`. `kubectl
+port-forward` is a way to read the port ad hoc, not a restriction on it. On the
+AWS bench stack the security group opens 8088, 8089 and 22 to `allowed_cidr`
+and all TCP within the group itself, which is why the port is reachable from
+the node and its peers and nowhere else **there** — that stack's rules, not a
+property of the listener.
 
 ### On-demand profiling and the `PROFILING=1` image
 
