@@ -1077,6 +1077,11 @@ impl Stream for CachePopulateStream {
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 if !this.oversized {
+                    // Population retains `batch.clone()`, so a sliced array keeps its
+                    // whole backing allocation alive. Price that retained allocation:
+                    // `get_slice_memory_size` estimates a compact copy of the slice and
+                    // could admit one whose live backing buffer exceeds the entry limit.
+                    // This same total becomes `CachedFileBatches::bytes` at EOF.
                     let buffered_bytes = this
                         .buffered_bytes
                         .saturating_add(batch.get_array_memory_size() as u64);
@@ -7429,6 +7434,89 @@ mod tests {
             1,
             "an oversized candidate is abandoned exactly once"
         );
+    }
+
+    #[test]
+    fn cache_population_prices_a_slice_by_its_retained_backing_allocation() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("value", DataType::Int32, false),
+        ]));
+        let owner = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(
+                datafusion::arrow::array::Int32Array::from_iter_values(0..16_384_i32),
+            )],
+        )
+        .unwrap();
+        let slice = owner.slice(8_192, 1);
+        let extent_bytes = batch_extent_bytes(&slice);
+        let retained_bytes = batch_retained_bytes(&slice);
+        let priced_bytes = slice.get_array_memory_size() as u64;
+        drop(owner);
+
+        assert_eq!(
+            slice
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap()
+                .value(0),
+            8_192,
+            "the slice remains backed after its unsliced owner is dropped"
+        );
+        assert!(
+            retained_bytes > extent_bytes,
+            "fixture must retain more than its compact slice extent: \
+             retained={retained_bytes}, extent={extent_bytes}"
+        );
+        assert!(
+            priced_bytes >= retained_bytes,
+            "the admission price must cover the retained Arrow allocation: \
+             priced={priced_bytes}, retained={retained_bytes}"
+        );
+
+        let stream = |key: &str, tuning| CachePopulateStream {
+            key: key.to_string(),
+            tuning,
+            inner: futures::stream::iter([Ok::<_, DataFusionError>(slice.clone())]).boxed(),
+            buffered: Vec::new(),
+            buffered_bytes: 0,
+            oversized: false,
+            insert_done: false,
+            charge: PopulationCharge::open(),
+            yielded_rows: 0,
+            end: PopulateEnd::Unpolled,
+            cache_counters: Arc::new(FileCacheCounters::default()),
+        };
+
+        futures::executor::block_on(async {
+            let extent_limit = EffectiveFileCacheTuning {
+                // The compact slice extent fits exactly, while the allocation the
+                // cached clone retains does not.
+                max_bytes: Some(extent_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)),
+                max_entries: Some(1),
+                row_group_prototype: false,
+            };
+            let mut refused = stream("sliced-refused", extent_limit);
+            assert!(refused.next().await.unwrap().is_ok());
+            assert!(refused.oversized);
+            assert!(refused.buffered.is_empty());
+            drop(refused);
+
+            let retained_limit = EffectiveFileCacheTuning {
+                max_bytes: Some(priced_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)),
+                max_entries: Some(1),
+                row_group_prototype: false,
+            };
+            let mut admitted = stream("sliced-admitted", retained_limit);
+            assert!(admitted.next().await.unwrap().is_ok());
+            assert_eq!(admitted.buffered_bytes, priced_bytes);
+
+            let mut cache = QueryFileBatchCache::default();
+            admitted.insert_buffered(&mut cache);
+            admitted.insert_done = true;
+            assert_eq!(cache.get("sliced-admitted").unwrap().bytes, priced_bytes);
+        });
     }
 
     /// #4846's counter and the three ways a population finishes without one.
