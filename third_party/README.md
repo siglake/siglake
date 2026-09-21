@@ -164,7 +164,7 @@ work behind:
 | `puffin_blob_cache_honours_both_bounds` | Renamed and extended as `blob_cache_holds_both_bounds_and_rejects_oversized_entries` in `puffin/reader.rs` |
 | `report_segmented_reader_read_cost` | Same ignored measurement reporter in `arrow/reader/pruning.rs` |
 | `segmented_index_reads_are_off_unless_asked_for`, `the_directory_budget_is_resolved_from_its_own_knob`, `parsed_index_cache_max_bytes_resolves`, `puffin_blob_cache_bounds_resolve`, `configured_text_index_budgets_beat_the_constants` | Resolver and configured-budget coverage belongs to #5737 |
-| `a_registered_segmented_sidecar_selects_the_scans_rows` | Seg2 discovery and Parquet integration coverage belongs to #5739 |
+| `a_registered_segmented_sidecar_selects_the_scans_rows` | Same name in `arrow/reader/pruning.rs`, ported to the seg2 blob type the reader discovers (#5739) |
 
 The staged-reader tests restored by #5007 remain in
 `arrow/reader/pruning.rs`; this inventory does not replace their named
