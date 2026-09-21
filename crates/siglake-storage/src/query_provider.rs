@@ -166,6 +166,9 @@ struct EffectiveFileCacheTuning {
     max_entries: Option<usize>,
     /// #4847 prototype gate; see [`crate::QueryScanTuning::file_cache_row_group_prototype`].
     row_group_prototype: bool,
+    /// #4905 prototype gate; see
+    /// [`crate::QueryScanTuning::file_cache_predicate_key_prototype`].
+    predicate_key_prototype: bool,
 }
 
 /// Selectivity-aware ordered-policy override, injected through
@@ -4589,6 +4592,21 @@ fn task_cache_key_with_direction(task: &FileScanTask, reverse: bool) -> String {
     format!("{}:reverse={reverse}", task_cache_key(task))
 }
 
+/// #4905's predicate-keyed identity. The serialized bound predicate retains
+/// field ids, operators, literal types and literal values; the existing key
+/// keeps the file range, projection, delete set and direction distinctions.
+/// This key is used only by the in-process qualification prototype.
+fn task_cache_key_with_predicate_direction(task: &FileScanTask, reverse: bool) -> String {
+    let base = task_cache_key_with_direction(task, reverse);
+    match task.predicate.as_ref() {
+        Some(predicate) => format!(
+            "{base}:predicate={}",
+            serde_json::to_string(predicate).expect("bound predicates serialize")
+        ),
+        None => base,
+    }
+}
+
 /// The task a population reads under: the query's predicate removed, so the
 /// entry is a function of the file and the projection alone and a later query
 /// with a different predicate can reuse it.
@@ -4680,12 +4698,24 @@ async fn open_task_batch_stream_cached(
         );
     }
 
-    let key = task_cache_key_with_direction(&task, reverse);
+    let fallback_key = task_cache_key_with_direction(&task, reverse);
+    let key = if cache_tuning.predicate_key_prototype && task.predicate.is_some() {
+        task_cache_key_with_predicate_direction(&task, reverse)
+    } else {
+        fallback_key.clone()
+    };
     let hit = {
         let cache = query_file_batch_cache()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.get(&key)
+        cache.get(&key).or_else(|| {
+            // A predicate-free entry contains the whole task and remains a
+            // valid fallback for a predicate-keyed lookup. The residual filter
+            // retained during planning enforces the query predicate.
+            (key != fallback_key)
+                .then(|| cache.get(&fallback_key))
+                .flatten()
+        })
     };
     if let Some(hit) = hit {
         metrics::counter!(
@@ -4704,10 +4734,11 @@ async fn open_task_batch_stream_cached(
         );
     }
 
-    // #4891: a task carrying a converted predicate reads FEWER pages than any
-    // population of it can. An entry has to be reusable by a query with a
-    // different predicate, so the populate read strips `task.predicate` and
-    // decodes the whole projection where the reader's page index would have
+    // #4891: under the shipped policy, a task carrying a converted predicate
+    // reads FEWER pages than any reusable population of it can. Such an entry
+    // has to serve a query with a different predicate, so its populate read
+    // strips `task.predicate` and decodes the whole projection where the
+    // reader's page index would have
     // skipped most of it — measured 2.8x slower than the cache-disabled arm on
     // a `host = '<label>' LIMIT 100` browse, which then inserts nothing because
     // the clip drops the stream before end-of-stream (#4494, #4847). So a
@@ -4718,8 +4749,14 @@ async fn open_task_batch_stream_cached(
     // Only the POPULATE path is declined. The lookup above is unchanged, so an
     // entry a predicate-free scan left behind still serves this query, and
     // `filter_pushdown_with_file_cache` keeps DataFusion's residual filter
-    // whenever the cache is on, so both routes answer exactly.
-    if task.predicate.is_some() || raw_prune_spec.is_some() || !promoted_prune.is_empty() {
+    // whenever the cache is on, so both routes answer exactly. #4905's
+    // in-process qualification gate is the sole exception to the decline: it
+    // keeps the predicate in both the key and the read.
+    let predicate_population = cache_tuning.predicate_key_prototype && task.predicate.is_some();
+    if (task.predicate.is_some() && !predicate_population)
+        || raw_prune_spec.is_some()
+        || !promoted_prune.is_empty()
+    {
         metrics::counter!(
             "siglake_query_scan_file_cache_requests_total",
             "outcome" => "bypass"
@@ -4768,7 +4805,14 @@ async fn open_task_batch_stream_cached(
     cache_counters
         .misses
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let cacheable = cacheable_task(&task);
+    let cacheable = if predicate_population {
+        // The predicate is part of `key`, so the entry is allowed to contain
+        // exactly the rows this reader produces. Insertion still happens only
+        // at EOF; a clipped prefix never becomes a complete entry.
+        task.clone()
+    } else {
+        cacheable_task(&task)
+    };
     Ok(Box::pin(CachePopulateStream {
         key,
         tuning: cache_tuning,
@@ -5497,13 +5541,15 @@ fn filter_pushdown_with_file_cache(
     kind: TableProviderFilterPushDown,
     file_cache_enabled: bool,
 ) -> TableProviderFilterPushDown {
-    // Cache entries are whole-file decoded batches read under no predicate, so
-    // an entry populated by one query is returned unfiltered to the next one,
-    // whatever it asked for. Keep DataFusion's residual FilterExec whenever that
-    // path is enabled; otherwise an Exact declaration would let a hit expose
-    // rows that the SQL predicate rejects. This holds after #4891: a predicate
-    // task now bypasses the cache on a miss, but it can still HIT an entry a
-    // predicate-free scan left behind.
+    // Shipped cache entries are whole-file decoded batches read under no
+    // predicate, so an entry populated by one query is returned unfiltered to
+    // the next one, whatever it asked for. Keep DataFusion's residual FilterExec
+    // whenever that path is enabled; otherwise an Exact declaration would let a
+    // hit expose rows that the SQL predicate rejects. This holds after #4891: a
+    // predicate task now bypasses the cache on a miss, but it can still HIT an
+    // entry a predicate-free scan left behind. It also remains mandatory for
+    // #4905's in-process predicate-key prototype because planning cannot know
+    // whether execution will find that key or use the predicate-free fallback.
     if file_cache_enabled && kind == TableProviderFilterPushDown::Exact {
         TableProviderFilterPushDown::Inexact
     } else {
@@ -6172,6 +6218,7 @@ fn effective_file_cache_tuning(tuning: crate::QueryScanTuning) -> EffectiveFileC
         max_bytes: tuning.file_cache_max_bytes.filter(|n| *n > 0),
         max_entries: tuning.file_cache_max_entries.filter(|n| *n > 0),
         row_group_prototype: tuning.file_cache_row_group_prototype,
+        predicate_key_prototype: tuning.file_cache_predicate_key_prototype,
     }
 }
 
@@ -7070,6 +7117,42 @@ mod tests {
     }
 
     #[test]
+    fn predicate_cache_key_keeps_predicate_and_existing_identity() {
+        let mut left = task("a", 100);
+        let mut right = task("a", 100);
+        left.project_field_ids = vec![1, 2];
+        right.project_field_ids = vec![1, 2];
+        left.predicate = Some(
+            Predicate::AlwaysTrue
+                .bind(left.schema.clone(), true)
+                .unwrap(),
+        );
+        right.predicate = Some(
+            Predicate::AlwaysFalse
+                .bind(right.schema.clone(), true)
+                .unwrap(),
+        );
+        assert_ne!(
+            task_cache_key_with_predicate_direction(&left, false),
+            task_cache_key_with_predicate_direction(&right, false),
+            "predicate literals/operators are part of the prototype key"
+        );
+        assert_ne!(
+            task_cache_key_with_predicate_direction(&left, false),
+            task_cache_key_with_predicate_direction(&left, true),
+            "direction remains part of the prototype key"
+        );
+
+        right.predicate = left.predicate.clone();
+        right.start += 1;
+        assert_ne!(
+            task_cache_key_with_predicate_direction(&left, false),
+            task_cache_key_with_predicate_direction(&right, false),
+            "the existing byte range remains part of the prototype key"
+        );
+    }
+
+    #[test]
     fn cacheable_task_strips_only_query_predicate() {
         let mut original = task("a", 100);
         original.project_field_ids = vec![1];
@@ -7382,6 +7465,7 @@ mod tests {
             max_bytes: Some(batch_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)),
             max_entries: Some(1),
             row_group_prototype: false,
+            predicate_key_prototype: false,
         };
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -7496,6 +7580,7 @@ mod tests {
                 max_bytes: Some(extent_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)),
                 max_entries: Some(1),
                 row_group_prototype: false,
+                predicate_key_prototype: false,
             };
             let mut refused = stream("sliced-refused", extent_limit);
             assert!(refused.next().await.unwrap().is_ok());
@@ -7507,6 +7592,7 @@ mod tests {
                 max_bytes: Some(priced_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)),
                 max_entries: Some(1),
                 row_group_prototype: false,
+                predicate_key_prototype: false,
             };
             let mut admitted = stream("sliced-admitted", retained_limit);
             assert!(admitted.next().await.unwrap().is_ok());
@@ -7531,12 +7617,14 @@ mod tests {
             max_bytes: Some(batch_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION * 8)),
             max_entries: Some(8),
             row_group_prototype: false,
+            predicate_key_prototype: false,
         };
         // One batch fits; the second crosses the quarter-budget entry bound.
         let tight = EffectiveFileCacheTuning {
             max_bytes: Some(batch_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)),
             max_entries: Some(8),
             row_group_prototype: false,
+            predicate_key_prototype: false,
         };
         let source = |batches: usize| -> TaskBatchStream {
             futures::stream::iter(

@@ -204,7 +204,9 @@ It does not, on this evidence, earn adoption:
    population should be taken after that cost is either accepted with numbers or
    removed (predicate-carrying entries, or declining to populate when the reader
    would prune). *Removed on 2026-09-17 by #4891, by declining — which also
-   removes the prototype's best regime. See "reason (2) is fixed" below.*
+   removes the prototype's best regime. See "reason (2) is fixed" below. The
+   predicate-carrying alternative was measured separately under #4905 and
+   rejected: `docs/DESIGN_predicate_keyed_decoded_cache.md`.*
 3. **Scan attribution goes partly blind.** A group served from cache builds no
    reader, so `row_groups_read`, `rows_pruned_selection` and fetched bytes
    under-report — already true of a whole-file hit, but a task can now be half
