@@ -14,6 +14,25 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use siglake_core::Event;
 use siglake_storage::iceberg::{IcebergContext, IcebergTuning, ReclusterMergeOptions};
 
+/// The `--test storage` binary's fixture clock, included rather than copied:
+/// the rewrite fixtures below hand their whole live set to
+/// `recluster_files_with`, which takes one `day(timestamp)` partition per call,
+/// so they take their event timestamps from the same fixed UTC day.
+#[path = "storage/fixture_clock.rs"]
+mod fixture_clock;
+use fixture_clock::{assert_one_partition, fixture_base};
+
+/// One second apart off [`fixture_base`], for the fixtures that named their
+/// rows and left the timestamps to `Event::now()`. A run straddling UTC
+/// midnight split those appends across two partitions and the rewrite came back
+/// an error (#5678).
+fn event_at(offset_secs: i64, raw: &str) -> Event {
+    Event {
+        timestamp: fixture_base() + chrono::Duration::seconds(offset_secs),
+        ..Event::now(raw)
+    }
+}
+
 type SnapshotVec = Vec<(
     metrics_util::CompositeKey,
     Option<metrics::Unit>,
@@ -332,14 +351,14 @@ async fn streaming_recluster_rebuilds_once_and_survives_snapshot_expiry() {
         });
     for chunk in [
         vec![
-            Event::now("database timeout"),
-            Event::now("healthy startup"),
+            event_at(0, "database timeout"),
+            event_at(1, "healthy startup"),
         ],
         vec![
-            Event::now("database migration"),
-            Event::now("info heartbeat"),
+            event_at(2, "database migration"),
+            event_at(3, "info heartbeat"),
         ],
-        vec![Event::now("database retry"), Event::now("steady state")],
+        vec![event_at(4, "database retry"), event_at(5, "steady state")],
     ] {
         ice.append_events(&chunk).await.unwrap();
     }
@@ -347,6 +366,10 @@ async fn streaming_recluster_rebuilds_once_and_survives_snapshot_expiry() {
     let ident = ice.events_table_ident().clone();
     let before = ice.live_data_files(&ident).await.unwrap();
     assert!(before.len() >= 2, "need multiple files to recluster");
+    assert_one_partition(
+        &before,
+        "streaming_recluster_rebuilds_once_and_survives_snapshot_expiry",
+    );
 
     let bloom = ice.events_bloom_columns();
     let bloom_refs: Vec<&str> = bloom.iter().map(String::as_str).collect();
@@ -396,7 +419,7 @@ async fn streaming_recluster_rebuilds_once_and_survives_snapshot_expiry() {
         "a no-op rebuild must not register a second statistics file"
     );
 
-    ice.append_events(&[Event::now("database after rewrite")])
+    ice.append_events(&[event_at(6, "database after rewrite")])
         .await
         .unwrap();
     let current = ice.live_data_files(&ident).await.unwrap();
@@ -481,15 +504,19 @@ async fn inram_recluster_keeps_footer_indexes_without_rebuilding_puffin() {
             index_rebuild: Some(true),
             ..Default::default()
         });
-    ice.append_events(&[Event::now("database timeout"), Event::now("healthy")])
+    ice.append_events(&[event_at(0, "database timeout"), event_at(1, "healthy")])
         .await
         .unwrap();
-    ice.append_events(&[Event::now("database retry"), Event::now("steady")])
+    ice.append_events(&[event_at(2, "database retry"), event_at(3, "steady")])
         .await
         .unwrap();
 
     let ident = ice.events_table_ident().clone();
     let before = ice.live_data_files(&ident).await.unwrap();
+    assert_one_partition(
+        &before,
+        "inram_recluster_keeps_footer_indexes_without_rebuilding_puffin",
+    );
     let bloom = ice.events_bloom_columns();
     let bloom_refs: Vec<&str> = bloom.iter().map(String::as_str).collect();
     ice.recluster_files_with(
@@ -1949,15 +1976,19 @@ async fn explicit_rebuild_opt_out_leaves_streaming_outputs_queryable() {
             index_rebuild: Some(false),
             ..Default::default()
         });
-    ice.append_events(&[Event::now("database timeout"), Event::now("healthy")])
+    ice.append_events(&[event_at(0, "database timeout"), event_at(1, "healthy")])
         .await
         .unwrap();
-    ice.append_events(&[Event::now("database retry"), Event::now("steady")])
+    ice.append_events(&[event_at(2, "database retry"), event_at(3, "steady")])
         .await
         .unwrap();
 
     let ident = ice.events_table_ident().clone();
     let before = ice.live_data_files(&ident).await.unwrap();
+    assert_one_partition(
+        &before,
+        "explicit_rebuild_opt_out_leaves_streaming_outputs_queryable",
+    );
     let bloom = ice.events_bloom_columns();
     let bloom_refs: Vec<&str> = bloom.iter().map(String::as_str).collect();
     ice.recluster_files_with(

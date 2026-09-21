@@ -14339,16 +14339,29 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        for commit in 0..3 {
-            let events: Vec<Event> = (0..4)
-                .map(|row| Event::now(format!("base {commit}/{row}")))
+        // Pinned event data. The rewrite below hands two of the committed files
+        // to `recluster_files`, which takes one `day(timestamp)` partition per
+        // call; on `Event::now()` a run that crossed UTC midnight between the
+        // three appends split them across two days and the rewrite came back an
+        // error (#5678). Midnight of a fixed day plus a second per row, the same
+        // base the fixtures above use.
+        let base = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        for commit in 0..3i64 {
+            let events: Vec<Event> = (0..4i64)
+                .map(|row| Event {
+                    timestamp: base + chrono::Duration::seconds(commit * 4 + row),
+                    ..Event::now(format!("base {commit}/{row}"))
+                })
                 .collect();
             ice.append_events(&events).await.unwrap();
         }
 
         let wal_root = tmp.path().join("wal");
-        let buffered: Vec<Event> = (0..5)
-            .map(|row| Event::now(format!("buffered {row}")))
+        let buffered: Vec<Event> = (0..5i64)
+            .map(|row| Event {
+                timestamp: base + chrono::Duration::seconds(100 + row),
+                ..Event::now(format!("buffered {row}"))
+            })
             .collect();
         let mut writer = siglake_wal::WalWriter::with_thresholds(
             &wal_root,
@@ -14413,6 +14426,18 @@ mod tests {
             .into_iter()
             .take(2)
             .collect();
+        // The bin is one partition by construction of `base` above; stating it
+        // here puts a lost pin on the seeding rather than on the rewrite.
+        assert!(
+            rewrite_files
+                .iter()
+                .all(|file| file.partition() == rewrite_files[0].partition()),
+            "the rewrite bin must hold one partition value: {:?}",
+            rewrite_files
+                .iter()
+                .map(|file| format!("{:?}", file.partition()))
+                .collect::<std::collections::BTreeSet<_>>()
+        );
         let consumed = vec![segment_name];
         let (drain, rewrite) = tokio::join!(
             ice.append_batch_with_consumed(segment_batch.clone(), &consumed),

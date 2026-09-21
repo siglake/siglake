@@ -28,6 +28,35 @@ pub fn fixture_base() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2023, 11, 15, 12, 0, 0).unwrap()
 }
 
+/// The geometry a re-cluster fixture is built on: the bin it hands to
+/// `recluster_files` carries one `day(timestamp)` partition value.
+///
+/// Since #4720 `recluster_files_with` refuses a mixed bin at the entry point,
+/// on every dispatch. A fixture that seeds with `Event::now()` and then
+/// re-clusters its whole live set is single-partition only because one process
+/// run normally sits inside one UTC day; a run that straddles midnight splits
+/// the appends across two `day(timestamp)` values and the rewrite comes back an
+/// error (#5678). Asserting the geometry next to the seeding names the
+/// fixture's own base as the cause instead of reading as a re-cluster defect.
+///
+/// Only meaningful for a fixture whose events are pinned: on the wall clock it
+/// would be the same once-a-day flake, moved.
+#[allow(dead_code)] // `delete_task_size_gate` shares this module for `fixture_base` alone.
+pub fn assert_one_partition(files: &[iceberg::spec::DataFile], what: &str) {
+    let Some(first) = files.first().map(|file| file.partition()) else {
+        return;
+    };
+    assert!(
+        files.iter().all(|file| file.partition() == first),
+        "{what}: the re-cluster bin spans more than one partition, so the fixture's \
+         events are not on one pinned UTC day: {:?}",
+        files
+            .iter()
+            .map(|file| format!("{:?}", file.partition()))
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+}
+
 /// How far a fixture that needs its rows in one file may reach off
 /// [`fixture_base`] in either direction. The widest such window today is the
 /// two hours `delete_task_claim::seed_with_predicate` reaches back.

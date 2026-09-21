@@ -7867,8 +7867,24 @@ mod durable_reclaim_proof_tests {
                 .await
                 .unwrap(),
         );
+        // Pinned event data: the re-cluster below takes two of these files, and
+        // a bin spanning two `day(timestamp)` partitions is refused. On
+        // `Event::now()` a run that crossed UTC midnight between the appends
+        // split them and the rewrite came back an error (#5678). Claim ages and
+        // `claimed_at` stay on the real clock.
+        let event_base = {
+            use chrono::TimeZone;
+            chrono::Utc
+                .with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+                .single()
+                .expect("valid instant")
+        };
+        let event_at = |offset_secs: i64, raw: String| siglake_core::Event {
+            timestamp: event_base + chrono::Duration::seconds(offset_secs),
+            ..siglake_core::Event::now(raw)
+        };
         let original =
-            siglake_core::events_to_record_batch(&[siglake_core::Event::now("failed-mark-row")])
+            siglake_core::events_to_record_batch(&[event_at(0, "failed-mark-row".to_string())])
                 .unwrap();
         ice.append_batch_with_consumed_proof(
             original,
@@ -7885,23 +7901,30 @@ mod durable_reclaim_proof_tests {
         let proving_snapshot = ice.current_events_snapshot_id().await.unwrap().unwrap();
 
         // More than 100 later snapshots, one of them a real data-file rewrite.
-        for n in 0..2 {
-            ice.append_events(&[siglake_core::Event::now(format!("pre-recluster-{n}"))])
+        for n in 0..2i64 {
+            ice.append_events(&[event_at(1 + n, format!("pre-recluster-{n}"))])
                 .await
                 .unwrap();
         }
         let ident = ice.events_table_ident().clone();
         let files = ice.live_data_files(&ident).await.unwrap();
         assert!(files.len() >= 2);
-        ice.recluster_files(
-            &ident,
-            files.into_iter().take(2).collect(),
-            siglake_storage::iceberg::BLOOM_FILTER_COLUMNS,
-        )
-        .await
-        .unwrap();
-        for n in 0..99 {
-            ice.append_events(&[siglake_core::Event::now(format!("post-recluster-{n}"))])
+        let bin: Vec<_> = files.into_iter().take(2).collect();
+        // One partition by construction of `event_base`; stating it here puts a
+        // lost pin on the seeding rather than on the rewrite.
+        assert!(
+            bin.iter()
+                .all(|file| file.partition() == bin[0].partition()),
+            "the rewrite bin must hold one partition value: {:?}",
+            bin.iter()
+                .map(|file| format!("{:?}", file.partition()))
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        ice.recluster_files(&ident, bin, siglake_storage::iceberg::BLOOM_FILTER_COLUMNS)
+            .await
+            .unwrap();
+        for n in 0..99i64 {
+            ice.append_events(&[event_at(3 + n, format!("post-recluster-{n}"))])
                 .await
                 .unwrap();
         }

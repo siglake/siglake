@@ -2968,9 +2968,17 @@ async fn consumed_proof_survives_recluster_commit() {
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(&warehouse_dir(&tmp)).await.unwrap();
 
+    // Pinned event data: both appends are re-clustered as one bin, and a bin
+    // spanning two `day(timestamp)` partitions is refused (#4720). On
+    // `Event::now()` this held only for a run that stayed inside one UTC day
+    // (#5678).
+    let base = crate::fixture_clock::fixture_base();
     for (n, segment) in ["proof-a.arrow", "proof-b.arrow"].into_iter().enumerate() {
         let events: Vec<Event> = (0..3)
-            .map(|i| Event::now(format!("proof-{n}-{i}")))
+            .map(|i| Event {
+                timestamp: base + chrono::Duration::seconds((n * 3 + i) as i64),
+                ..Event::now(format!("proof-{n}-{i}"))
+            })
             .collect();
         let batch = siglake_core::events_to_record_batch(&events).unwrap();
         ice.append_batch_with_consumed(batch, &[segment.to_string()])
@@ -2992,6 +3000,7 @@ async fn consumed_proof_survives_recluster_commit() {
 
     let files = ice.live_data_files(&ident).await.unwrap();
     assert!(files.len() >= 2, "test needs a real multi-file rewrite");
+    crate::fixture_clock::assert_one_partition(&files, "consumed_proof_survives_recluster_commit");
     ice.recluster_files(&ident, files, BLOOM_FILTER_COLUMNS)
         .await
         .unwrap();
