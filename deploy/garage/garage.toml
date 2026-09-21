@@ -23,7 +23,7 @@ rpc_bind_addr = "[::]:3901"
 rpc_public_addr = "127.0.0.1:3901"
 # Loopback-only dev secret, the same posture as minioadmin/minioadmin above it.
 # Regenerate with `openssl rand -hex 32` for anything that is not this stack.
-rpc_secret = "00000000000000000000000000000000000000000000000000000000000dev01"
+rpc_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 [s3_api]
 s3_region = "us-east-1"

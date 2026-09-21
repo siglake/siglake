@@ -16,6 +16,34 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Garage refuses to start unless rpc_secret is exactly 32 bytes encoded as
+# hexadecimal. Keep this check daemon-free so the shell gate catches malformed
+# development fixtures before the opt-in Docker arm reaches Garage itself.
+garage_rpc_secret_is_valid() {
+  [[ $1 =~ ^[0-9a-fA-F]{64}$ ]]
+}
+
+malformed_garage_rpc_secret=00000000000000000000000000000000000000000000000000000000000dev01
+if garage_rpc_secret_is_valid "$malformed_garage_rpc_secret"; then
+  echo "FAIL garage RPC-secret check accepted the non-hex regression fixture" >&2
+  exit 1
+fi
+
+mapfile -t garage_rpc_secrets < <(
+  sed -n 's/^[[:space:]]*rpc_secret[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' \
+    deploy/garage/garage.toml
+)
+if [ "${#garage_rpc_secrets[@]}" -ne 1 ]; then
+  echo "FAIL deploy/garage/garage.toml must contain exactly one quoted rpc_secret" >&2
+  exit 1
+fi
+if ! garage_rpc_secret_is_valid "${garage_rpc_secrets[0]}"; then
+  echo "FAIL deploy/garage/garage.toml rpc_secret must be 64 hexadecimal characters" >&2
+  exit 1
+fi
+
+echo "ok (garage RPC secret is 32 bytes encoded as hexadecimal)"
+
 mkdir "$check_dir/bin"
 cat >"$check_dir/bin/docker" <<'EOF'
 #!/usr/bin/env bash
