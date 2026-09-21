@@ -170,6 +170,11 @@ jobs:
         run: scripts/check-loadgen.sh
       - name: compose preflight rejects an occupied published port
         run: scripts/check-compose-preflight.sh
+      # The live conditional-write probe belongs to ci-local's Docker job, but
+      # its arm selection, SigV4 headers, classification and cleanup are all
+      # exercised here against a stand-in curl without a daemon or credentials.
+      - name: the conditional-write probe retains and grades raw S3 responses
+        run: scripts/check-conditional-write-probe.sh
       # ci-local.sh's own reporting is code, and until now the only thing that
       # checked it was running the local gate. These three tests cover the
       # helpers whose wrong answer is a gate that reports success: the
