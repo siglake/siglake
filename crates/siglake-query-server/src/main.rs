@@ -523,6 +523,8 @@ async fn run() -> Result<()> {
         // #5074's shared population bound is a local qualification prototype
         // with no operator surface; the server never turns it on.
         file_cache_population_bound_prototype: false,
+        // #5786's pre-adoption unbounded-population control is local-only.
+        file_cache_unbounded_population_prototype: false,
         // #4959's per-file attribution is a local qualification gate with no
         // response or operator surface; the server never turns it on.
         file_attribution_prototype: false,

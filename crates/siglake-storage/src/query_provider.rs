@@ -173,8 +173,36 @@ struct EffectiveFileCacheTuning {
     predicate_key_prototype: bool,
     /// #5074 in-process-only shared population-budget qualification.
     population_bound_prototype: bool,
+    /// #5786 in-process-only pre-adoption measurement control.
+    unbounded_population_prototype: bool,
     /// #4959 in-process-only per-file attribution qualification.
     file_attribution_prototype: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopulationAdmission {
+    /// Pre-#5786 measurement control: populations do not share the entry bound.
+    UnboundedPrototype,
+    /// #5074's rejected rule: charge each retained batch only if free space
+    /// already exists, which freezes residents once they fill the budget.
+    ExactPrototype,
+    /// Production: reserve one maximum-sized candidate, evicting residents
+    /// once at admission so subsequent batches need no cache lock.
+    Replacement { max_bytes: u64 },
+}
+
+impl EffectiveFileCacheTuning {
+    fn population_admission(self) -> PopulationAdmission {
+        if self.unbounded_population_prototype {
+            PopulationAdmission::UnboundedPrototype
+        } else if self.population_bound_prototype {
+            PopulationAdmission::ExactPrototype
+        } else {
+            PopulationAdmission::Replacement {
+                max_bytes: self.max_bytes.unwrap_or(0),
+            }
+        }
+    }
 }
 
 /// #4959's qualification capture is intentionally bounded. This is a local
@@ -626,6 +654,35 @@ impl QueryFileBatchCache {
         metrics::gauge!("siglake_query_scan_file_cache_bytes").set(self.bytes as f64);
         metrics::gauge!("siglake_query_scan_file_cache_entries").set(self.entries.len() as f64);
     }
+
+    /// Remove the least-recently inserted live entry. Stale order nodes are
+    /// skipped, matching [`Self::insert`]'s existing replacement discipline.
+    fn evict_oldest(&mut self) -> bool {
+        while let Some(oldest) = self.order.pop_front() {
+            let should_remove = self.entries.contains_key(&oldest)
+                && self
+                    .order
+                    .iter()
+                    .all(|candidate| candidate.as_str() != oldest.as_str());
+            if !should_remove {
+                continue;
+            }
+            let Some(evicted) = self.entries.remove(&oldest) else {
+                continue;
+            };
+            self.bytes = self.bytes.saturating_sub(evicted.bytes);
+            decoded_file_cache_accounted_bytes().fetch_sub(evicted.bytes, Relaxed);
+            metrics::counter!(
+                "siglake_query_scan_file_cache_requests_total",
+                "outcome" => "evict"
+            )
+            .increment(1);
+            metrics::gauge!("siglake_query_scan_file_cache_bytes").set(self.bytes as f64);
+            metrics::gauge!("siglake_query_scan_file_cache_entries").set(self.entries.len() as f64);
+            return true;
+        }
+        false
+    }
 }
 
 impl Drop for QueryFileBatchCache {
@@ -642,6 +699,40 @@ fn decoded_file_cache_accounted_bytes() -> &'static std::sync::atomic::AtomicU64
 fn query_file_batch_cache() -> &'static std::sync::Mutex<QueryFileBatchCache> {
     static CACHE: OnceLock<std::sync::Mutex<QueryFileBatchCache>> = OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(QueryFileBatchCache::default()))
+}
+
+/// Reserve `bytes` from the decoded-cache budget. The fast path is lock-free.
+/// When residents fill the budget, the slow path takes the cache mutex once,
+/// evicts oldest entries until the reservation fits, and never waits if another
+/// cache operation owns the mutex.
+fn try_reserve_population_with_replacement(bytes: u64, max_bytes: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let reserve = || {
+        decoded_file_cache_accounted_bytes()
+            .fetch_update(Relaxed, Relaxed, |current| {
+                current.checked_add(bytes).filter(|next| *next <= max_bytes)
+            })
+            .ok()
+    };
+    if reserve().is_some() {
+        return true;
+    }
+
+    let cache = query_file_batch_cache();
+    let mut cache = match cache.try_lock() {
+        Ok(cache) => cache,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    loop {
+        if reserve().is_some() {
+            return true;
+        }
+        if !cache.evict_oldest() {
+            return false;
+        }
+    }
 }
 
 /// Drop every decoded-cache entry. Measurement hook: the cache is process-wide,
@@ -794,10 +885,10 @@ pub struct DecodedFileCachePopulationStats {
     pub peak_extent_bytes: u64,
     pub peak_retained_bytes: u64,
     pub peak_streams: u64,
-    /// Peak completed-entry plus admitted-population bytes under #5074's
-    /// single conservative accounting currency.
+    /// Peak completed-entry plus admitted-population bytes under the shared
+    /// conservative accounting currency.
     pub peak_accounted_bytes: u64,
-    /// Population batches refused by #5074's shared-budget prototype.
+    /// Population admissions refused by either bounded policy.
     pub budget_refusals: u64,
 }
 
@@ -835,12 +926,16 @@ pub fn reset_decoded_file_cache_population_peaks() {
 struct PopulationCharge {
     extent_bytes: u64,
     retained_bytes: u64,
+    /// Actual conservative price of the batches this stream retains.
     priced_bytes: u64,
-    shared_budget: bool,
+    /// Bytes held in the process-wide accounting total. Production reserves a
+    /// maximum-sized entry once; #5074 reserves the exact batch price.
+    reserved_bytes: u64,
+    admission: PopulationAdmission,
 }
 
 impl PopulationCharge {
-    fn open(shared_budget: bool) -> Self {
+    fn open(admission: PopulationAdmission) -> Self {
         use std::sync::atomic::Ordering::Relaxed;
         let meter = population_meter();
         let streams = meter.streams.fetch_add(1, Relaxed) + 1;
@@ -849,7 +944,8 @@ impl PopulationCharge {
             extent_bytes: 0,
             retained_bytes: 0,
             priced_bytes: 0,
-            shared_budget,
+            reserved_bytes: 0,
+            admission,
         }
     }
 
@@ -859,25 +955,51 @@ impl PopulationCharge {
         let extent = batch_extent_bytes(batch);
         let retained = batch_retained_bytes(batch);
         let priced = batch.get_array_memory_size() as u64;
-        if self.shared_budget {
-            let Some(max_bytes) = max_bytes else {
-                return false;
-            };
-            let admitted = decoded_file_cache_accounted_bytes()
-                .fetch_update(Relaxed, Relaxed, |current| {
-                    current
-                        .checked_add(priced)
-                        .filter(|next| *next <= max_bytes)
-                })
-                .ok();
-            let Some(previous) = admitted else {
-                population_meter().budget_refusals.fetch_add(1, Relaxed);
-                return false;
-            };
+        let admitted_total = match self.admission {
+            PopulationAdmission::UnboundedPrototype => None,
+            PopulationAdmission::ExactPrototype => {
+                let Some(max_bytes) = max_bytes else {
+                    return false;
+                };
+                let admitted = decoded_file_cache_accounted_bytes()
+                    .fetch_update(Relaxed, Relaxed, |current| {
+                        current
+                            .checked_add(priced)
+                            .filter(|next| *next <= max_bytes)
+                    })
+                    .ok();
+                let Some(previous) = admitted else {
+                    population_meter().budget_refusals.fetch_add(1, Relaxed);
+                    return false;
+                };
+                self.reserved_bytes = self.reserved_bytes.saturating_add(priced);
+                Some(previous.saturating_add(priced))
+            }
+            PopulationAdmission::Replacement { max_bytes } => {
+                if self.reserved_bytes == 0 {
+                    let reservation = max_bytes / MAX_FILE_CACHE_ENTRY_FRACTION;
+                    if reservation == 0
+                        || !try_reserve_population_with_replacement(reservation, max_bytes)
+                    {
+                        population_meter().budget_refusals.fetch_add(1, Relaxed);
+                        return false;
+                    }
+                    self.reserved_bytes = reservation;
+                }
+                None
+            }
+        };
+        if let Some(total) = admitted_total {
             population_meter()
                 .peak_accounted_bytes
-                .fetch_max(previous.saturating_add(priced), Relaxed);
-            self.priced_bytes = self.priced_bytes.saturating_add(priced);
+                .fetch_max(total, Relaxed);
+        }
+        self.priced_bytes = self.priced_bytes.saturating_add(priced);
+        if matches!(self.admission, PopulationAdmission::Replacement { .. }) {
+            debug_assert!(self.priced_bytes <= self.reserved_bytes);
+            population_meter()
+                .peak_accounted_bytes
+                .fetch_max(decoded_file_cache_accounted_bytes().load(Relaxed), Relaxed);
         }
         self.extent_bytes = self.extent_bytes.saturating_add(extent);
         self.retained_bytes = self.retained_bytes.saturating_add(retained);
@@ -900,15 +1022,17 @@ impl PopulationCharge {
         meter
             .retained_bytes
             .fetch_sub(std::mem::take(&mut self.retained_bytes), Relaxed);
-        if self.shared_budget {
+        self.priced_bytes = 0;
+        if self.reserved_bytes > 0 {
             decoded_file_cache_accounted_bytes()
-                .fetch_sub(std::mem::take(&mut self.priced_bytes), Relaxed);
+                .fetch_sub(std::mem::take(&mut self.reserved_bytes), Relaxed);
         }
     }
 
     /// Move an admitted charge into a completed cache entry without changing
-    /// the shared total. Population-only measurements stop at the handoff.
-    fn transfer_to_cache(&mut self) {
+    /// ownership. A production reservation is conservative, so its unused tail
+    /// is released at the handoff.
+    fn transfer_to_cache(&mut self, entry_bytes: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let meter = population_meter();
         meter
@@ -917,7 +1041,18 @@ impl PopulationCharge {
         meter
             .retained_bytes
             .fetch_sub(std::mem::take(&mut self.retained_bytes), Relaxed);
+        debug_assert_eq!(self.priced_bytes, entry_bytes);
+        debug_assert!(self.reserved_bytes >= entry_bytes);
+        let unused = self.reserved_bytes.saturating_sub(entry_bytes);
+        if unused > 0 {
+            decoded_file_cache_accounted_bytes().fetch_sub(unused, Relaxed);
+        }
         self.priced_bytes = 0;
+        self.reserved_bytes = 0;
+    }
+
+    fn reserved(&self) -> bool {
+        self.reserved_bytes > 0
     }
 }
 
@@ -1313,17 +1448,19 @@ impl CachePopulateStream {
 
     fn insert_buffered(&mut self, cache: &mut QueryFileBatchCache) {
         if cache.get(&self.key).is_none() {
+            let entry_bytes = self.buffered_bytes;
+            let population_reserved = self.charge.reserved();
             cache.insert(
                 self.key.clone(),
                 CachedFileBatches {
-                    bytes: self.buffered_bytes,
+                    bytes: entry_bytes,
                     batches: Arc::new(std::mem::take(&mut self.buffered)),
                 },
                 self.tuning,
-                self.tuning.population_bound_prototype,
+                population_reserved,
             );
-            if self.tuning.population_bound_prototype {
-                self.charge.transfer_to_cache();
+            if population_reserved {
+                self.charge.transfer_to_cache(entry_bytes);
             } else {
                 self.charge.release_buffered();
             }
@@ -1679,26 +1816,22 @@ impl RowGroupPopulateStream {
 
     fn insert_group(&mut self) {
         let key = self.keys[self.at].clone();
+        let entry_bytes = self.buffered_bytes;
         let entry = CachedFileBatches {
-            bytes: self.buffered_bytes,
+            bytes: entry_bytes,
             batches: Arc::new(std::mem::take(&mut self.buffered)),
         };
         self.buffered_bytes = 0;
-        self.charge.release_buffered();
         // Same non-blocking discipline as the whole-file path: the insert is an
         // optimization and the entry is rebuildable, so a contended lock is
         // counted and skipped, never waited on.
         match query_file_batch_cache().try_lock() {
             Ok(mut cache) => {
                 if cache.get(&key).is_none() {
-                    cache.insert(
-                        key,
-                        entry,
-                        self.tuning,
-                        self.tuning.population_bound_prototype,
-                    );
-                    if self.tuning.population_bound_prototype {
-                        self.charge.transfer_to_cache();
+                    let population_reserved = self.charge.reserved();
+                    cache.insert(key, entry, self.tuning, population_reserved);
+                    if population_reserved {
+                        self.charge.transfer_to_cache(entry_bytes);
                     } else {
                         self.charge.release_buffered();
                     }
@@ -1716,14 +1849,10 @@ impl RowGroupPopulateStream {
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                 let mut cache = poisoned.into_inner();
                 if cache.get(&key).is_none() {
-                    cache.insert(
-                        key,
-                        entry,
-                        self.tuning,
-                        self.tuning.population_bound_prototype,
-                    );
-                    if self.tuning.population_bound_prototype {
-                        self.charge.transfer_to_cache();
+                    let population_reserved = self.charge.reserved();
+                    cache.insert(key, entry, self.tuning, population_reserved);
+                    if population_reserved {
+                        self.charge.transfer_to_cache(entry_bytes);
                     } else {
                         self.charge.release_buffered();
                     }
@@ -5242,7 +5371,7 @@ async fn open_task_batch_stream_cached(
         oversized: false,
         population_refused: false,
         insert_done: false,
-        charge: PopulationCharge::open(cache_tuning.population_bound_prototype),
+        charge: PopulationCharge::open(cache_tuning.population_admission()),
         yielded_rows: 0,
         end: PopulateEnd::Unpolled,
         cache_counters,
@@ -5284,7 +5413,7 @@ fn row_group_task_stream(
                 group_skipped: false,
                 population_refused: false,
                 misaligned: false,
-                charge: PopulationCharge::open(cache_tuning.population_bound_prototype),
+                charge: PopulationCharge::open(cache_tuning.population_admission()),
             })
         };
     match plan {
@@ -6699,6 +6828,7 @@ fn effective_file_cache_tuning(tuning: crate::QueryScanTuning) -> EffectiveFileC
         row_group_prototype: tuning.file_cache_row_group_prototype,
         predicate_key_prototype: tuning.file_cache_predicate_key_prototype,
         population_bound_prototype: tuning.file_cache_population_bound_prototype,
+        unbounded_population_prototype: tuning.file_cache_unbounded_population_prototype,
         file_attribution_prototype: tuning.file_attribution_prototype,
     }
 }
@@ -7948,6 +8078,7 @@ mod tests {
             row_group_prototype: false,
             predicate_key_prototype: false,
             population_bound_prototype: false,
+            unbounded_population_prototype: true,
             file_attribution_prototype: false,
         };
         let recorder = DebuggingRecorder::new();
@@ -7970,7 +8101,7 @@ mod tests {
                     oversized: false,
                     population_refused: false,
                     insert_done: false,
-                    charge: PopulationCharge::open(false),
+                    charge: PopulationCharge::open(PopulationAdmission::UnboundedPrototype),
                     yielded_rows: 0,
                     end: PopulateEnd::Unpolled,
                     cache_counters: Arc::new(FileCacheCounters::default()),
@@ -8005,7 +8136,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_population_charge_survives_failure_and_releases_on_contention() {
+    fn bounded_population_charges_survive_failure_and_release_on_contention() {
         let batch = string_batch(64);
         let tuning = EffectiveFileCacheTuning {
             max_bytes: Some(u64::MAX),
@@ -8013,9 +8144,10 @@ mod tests {
             row_group_prototype: false,
             predicate_key_prototype: false,
             population_bound_prototype: true,
+            unbounded_population_prototype: false,
             file_attribution_prototype: false,
         };
-        let stream = |key: &str, inner| CachePopulateStream {
+        let stream = |key: &str, inner, admission| CachePopulateStream {
             key: key.to_string(),
             tuning,
             inner,
@@ -8024,41 +8156,52 @@ mod tests {
             oversized: false,
             population_refused: false,
             insert_done: false,
-            charge: PopulationCharge::open(true),
+            charge: PopulationCharge::open(admission),
             yielded_rows: 0,
             end: PopulateEnd::Unpolled,
             cache_counters: Arc::new(FileCacheCounters::default()),
         };
 
-        futures::executor::block_on(async {
-            let failing: TaskBatchStream = futures::stream::iter([
-                Ok::<_, DataFusionError>(batch.clone()),
-                Err(DataFusionError::External("decode failed".into())),
-            ])
-            .boxed();
-            let mut failed = stream("failed-shared-charge", failing);
-            assert!(failed.next().await.unwrap().is_ok());
-            assert!(failed.charge.priced_bytes > 0);
-            assert!(failed.next().await.unwrap().is_err());
-            assert!(
-                failed.charge.priced_bytes > 0,
-                "the error must not release while retained batches are still owned"
-            );
-            drop(failed);
+        for (name, admission) in [
+            ("prototype", PopulationAdmission::ExactPrototype),
+            (
+                "production",
+                PopulationAdmission::Replacement {
+                    max_bytes: u64::MAX,
+                },
+            ),
+        ] {
+            futures::executor::block_on(async {
+                let failing: TaskBatchStream = futures::stream::iter([
+                    Ok::<_, DataFusionError>(batch.clone()),
+                    Err(DataFusionError::External("decode failed".into())),
+                ])
+                .boxed();
+                let mut failed = stream(&format!("failed-{name}-charge"), failing, admission);
+                assert!(failed.next().await.unwrap().is_ok());
+                assert!(failed.charge.priced_bytes > 0);
+                assert!(failed.next().await.unwrap().is_err());
+                assert!(
+                    failed.charge.priced_bytes > 0,
+                    "the error must not release while retained batches are still owned"
+                );
+                drop(failed);
 
-            let inner: TaskBatchStream =
-                futures::stream::iter([Ok::<_, DataFusionError>(batch.clone())]).boxed();
-            let mut contended = stream("contended-shared-charge", inner);
-            assert!(contended.next().await.unwrap().is_ok());
-            assert!(contended.charge.priced_bytes > 0);
+                let inner: TaskBatchStream =
+                    futures::stream::iter([Ok::<_, DataFusionError>(batch.clone())]).boxed();
+                let mut contended = stream(&format!("contended-{name}-charge"), inner, admission);
+                assert!(contended.next().await.unwrap().is_ok());
+                assert!(contended.charge.priced_bytes > 0);
 
-            let cache = std::sync::Mutex::new(QueryFileBatchCache::default());
-            let guard = cache.lock().unwrap();
-            contended.finish_buffered(&cache);
-            assert!(contended.buffered.is_empty());
-            assert_eq!(contended.charge.priced_bytes, 0);
-            drop(guard);
-        });
+                let cache = std::sync::Mutex::new(QueryFileBatchCache::default());
+                let guard = cache.lock().unwrap();
+                contended.finish_buffered(&cache);
+                assert!(contended.buffered.is_empty());
+                assert_eq!(contended.charge.priced_bytes, 0);
+                assert_eq!(contended.charge.reserved_bytes, 0);
+                drop(guard);
+            });
+        }
     }
 
     #[test]
@@ -8109,7 +8252,7 @@ mod tests {
             oversized: false,
             population_refused: false,
             insert_done: false,
-            charge: PopulationCharge::open(tuning.population_bound_prototype),
+            charge: PopulationCharge::open(tuning.population_admission()),
             yielded_rows: 0,
             end: PopulateEnd::Unpolled,
             cache_counters: Arc::new(FileCacheCounters::default()),
@@ -8124,6 +8267,7 @@ mod tests {
                 row_group_prototype: false,
                 predicate_key_prototype: false,
                 population_bound_prototype: false,
+                unbounded_population_prototype: true,
                 file_attribution_prototype: false,
             };
             let mut refused = stream("sliced-refused", extent_limit);
@@ -8138,6 +8282,7 @@ mod tests {
                 row_group_prototype: false,
                 predicate_key_prototype: false,
                 population_bound_prototype: false,
+                unbounded_population_prototype: true,
                 file_attribution_prototype: false,
             };
             let mut admitted = stream("sliced-admitted", retained_limit);
@@ -8165,6 +8310,7 @@ mod tests {
             row_group_prototype: false,
             predicate_key_prototype: false,
             population_bound_prototype: false,
+            unbounded_population_prototype: true,
             file_attribution_prototype: false,
         };
         // One batch fits; the second crosses the quarter-budget entry bound.
@@ -8174,6 +8320,7 @@ mod tests {
             row_group_prototype: false,
             predicate_key_prototype: false,
             population_bound_prototype: false,
+            unbounded_population_prototype: true,
             file_attribution_prototype: false,
         };
         let source = |batches: usize| -> TaskBatchStream {
@@ -8191,7 +8338,7 @@ mod tests {
             oversized: false,
             population_refused: false,
             insert_done: false,
-            charge: PopulationCharge::open(tuning.population_bound_prototype),
+            charge: PopulationCharge::open(tuning.population_admission()),
             yielded_rows: 0,
             end: PopulateEnd::Unpolled,
             cache_counters: Arc::new(FileCacheCounters::default()),

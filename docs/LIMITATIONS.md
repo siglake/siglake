@@ -704,16 +704,16 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   ("Decoded-file cache populations") in `deploy/grafana/siglake-overview.json`
   charts them; on a default install, where the cache is off, every arm stays at
   zero.
-  Population buffers also remain outside the configured cache byte bound in
-  shipped policy. #5074's in-process prototype admitted completed entries and
-  live populations against one conservative process-wide total and held an
-  eight-partition, two-query scan to its 22 MiB budget. It was not adopted:
-  once four resident entries filled that budget, later misses could not retain
-  enough of a candidate to reach EOF and evict one. The bounded arm therefore
-  froze its first four entries and matched the existing four-entry LRU arm's
-  6.5 ms warm median. #5786 carries a production design that must keep the hard
-  bound without losing turnover; the prototype, measurements and REVISE
-  disposition are in
+  Population buffers now share the configured cache byte bound with completed
+  entries (#5786). A population reserves one maximum-sized entry on its first
+  retained batch, evicting oldest residents if required; later batches need no
+  cache mutex. Cancellation, read failure, oversize, a duplicate and a contended
+  insert release the reservation. The eight-partition, two-query fixture holds
+  completed entries plus live populations to its 22 MiB budget and replaces
+  residents for a changed projection. #5074's rejected exact-batch prototype is
+  retained beside it as the negative control: its first four residents freeze
+  because no later candidate can retain a first batch. The ownership tests,
+  matched measurements and adopted disposition are in
   [`DESIGN_source_file_cache_qualification.md`](DESIGN_source_file_cache_qualification.md).
   Until 2026-09-17 an operator who turned the cache on also paid for the populate
   path stripping the query's predicate, which is what makes an entry reusable:
@@ -811,9 +811,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   7.6-9.3), a budget covering HALF of it is within noise of no cache at all,
   because an LRU over a repeated scan evicts what the next pass wants, and a
   budget below four entries caches nothing while still subtracting its bytes
-  from the query memory pool. Population memory is charged on top of the budget
-  and outside the pool: 30-37 MiB peak across 8 concurrent streams against an 88
-  MiB budget, and 27-28 MiB in the arm that inserts nothing. Both limits must be
+  from the query memory pool. Those historical arms left population memory on
+  top of the cache budget. The adopted 22 MiB replacement arm instead held its
+  combined accounted peak to 21.6 MiB, retained at most 17.1 MiB in live
+  populations, and kept four completed entries at 21.6 MiB. Both limits must be
   positive; a pod given one of the two now logs a warning naming the derived
   pair. Bounds, quarter rule and explicit zero are pinned by
   `crates/siglake-storage/tests/file_cache_budget_bounds.rs`, the pool

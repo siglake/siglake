@@ -1440,7 +1440,18 @@ entry per MiB of it, and its bytes leave the query memory pool before the pool
 takes its share: at the chart's 4Gi floor that spends the one-file decode
 reservation the floor exists to hold. Measured locally, the cache is 5-7x faster
 warm when the budget covers the working set and within noise of no cache when it
-covers half of it.
+covers half of it. Completed entries and live populations now share that byte
+budget. On the first retained batch, a population reserves the quarter-budget
+maximum entry size. A lock-free atomic reservation is the common path; when
+residents leave too little room, admission tries the cache mutex once, evicts
+oldest residents until the reservation fits, and refuses optional population
+rather than waiting if the mutex is busy. Later batches use the same reservation
+without touching the mutex. EOF transfers the actual
+`get_array_memory_size` charge into the entry and releases the unused
+reservation; cancellation, read failure, an oversized candidate, duplicate
+insertion and contended insertion release it all. Completed entries plus every
+admitted population therefore stay at or below the configured byte ceiling
+while a changing working set can replace full residents.
 `siglake_query_scan_file_cache_requests_total{outcome}` reports each cache
 decision. The overview dashboard charts
 `insert_skipped_contended / (insert + insert_skipped_contended)` per query pod:
