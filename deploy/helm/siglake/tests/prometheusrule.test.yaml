@@ -4,6 +4,37 @@ rule_files:
 evaluation_interval: 5s
 
 tests:
+  - name: an IPC framing refusal raises its critical alert
+    interval: 1m
+    input_series:
+      - series: 'siglake_wal_ipc_framing_refused_total{namespace="logs",pod="compactor-0"}'
+        values: '0 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: SiglakeWalIpcFramingRefused
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              severity: critical
+            exp_annotations:
+              summary: A WAL segment failed its IPC framing check
+              description: >-
+                A WAL read found length framing that the segment bytes cannot
+                back. The segment is unreadable and requires investigation.
+
+  - name: a CRC mismatch alone does not raise the IPC framing alert
+    interval: 1m
+    input_series:
+      - series: 'siglake_wal_crc_mismatch_total{namespace="logs",pod="compactor-0"}'
+        values: '0 1 1'
+      - series: 'siglake_wal_ipc_framing_refused_total{namespace="logs",pod="compactor-0"}'
+        values: '0 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: SiglakeWalIpcFramingRefused
+        exp_alerts: []
+
   - name: a torn recovered WAL tail raises its warning
     interval: 1m
     input_series:

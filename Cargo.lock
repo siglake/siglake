@@ -6621,6 +6621,7 @@ dependencies = [
  "chrono",
  "futures",
  "metrics",
+ "metrics-util",
  "object_store",
  "opendal",
  "serde",

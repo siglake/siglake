@@ -89,7 +89,9 @@ CRC-validated framing (WS-8); a segment without that framing — written before
 WS-8, or framed and then corrupted past recognition — has its Arrow IPC length
 prefixes walked against the file size before anything is decoded, so no
 declared metadata or body length can size an allocation the file cannot back
-(#4650). Sealed + active segments
+(#4650). Each framing refusal increments
+`siglake_wal_ipc_framing_refused_total`, the signal that an unreadable WAL
+requires investigation. Sealed + active segments
 mirror to object storage on configurable intervals — **sealed segments mirror by
 default** wherever a warehouse URL is set, so the WAL volume is not the only copy
 of what has been acknowledged. Active mirroring

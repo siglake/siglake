@@ -148,6 +148,16 @@ spec:
             description: >-
               Framing corruption on a segment that was acked. It will be
               quarantined rather than committed, so its rows are unreachable.
+        - alert: SiglakeWalIpcFramingRefused
+          expr: increase(siglake_wal_ipc_framing_refused_total[15m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: A WAL segment failed its IPC framing check
+            description: >-
+              A WAL read found length framing that the segment bytes cannot
+              back. The segment is unreadable and requires investigation.
         - alert: SiglakeSchemaWritesRefused
           # Not loss — the refusal is what PREVENTS loss — but it means ingest
           # is 5xx-ing until someone migrates.
