@@ -449,7 +449,8 @@ separately.
 `day(timestamp)`-partitioned, written as ZSTD-3 Parquet v2 with datatype-tuned
 encodings (`DELTA_BINARY_PACKED` timestamps, dictionaries on tags). Row groups
 are byte-targeted (~256 MB uncompressed) from the in-flight batch's measured
-row size; every write path emits files through the same writer.
+row size; every write path emits files through the same writer, but flush and
+merge measure that row size differently (see Compaction).
 Fresh tables stamp the minimum Iceberg format version required by their schema.
 Every schema siglake ships — `events`, `query_audit`, user indexes — is
 **format version 2**: event time is a microsecond `timestamptz`, and no Siglake
@@ -934,11 +935,20 @@ through 200 GB and 1 TB sustained-ingest rounds
   merge's first output batch and takes
   `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` (or
   `IcebergTuning::target_row_group_bytes`, 256 MB uncompressed by default)
-  divided by that batch's decoded row size, clamped to 128 Ki–4 Mi rows — the
-  same sizing the flush path makes from the batch it is handed. The open row
-  group is buffered decoded while its bloom accumulates, so that target is also
-  what bounds a merge's, a re-cluster's and a delete rewrite's writer-side
-  memory (see [`LIMITATIONS.md`](LIMITATIONS.md)). The default is measured
+  divided by that batch's measured row size, clamped to 128 Ki–4 Mi rows. The
+  two write paths measure that row size differently, by design: flush prices
+  the whole buffer allocation of a batch it assembled itself, while the merge
+  paths price the extent their rows span, because a page-bounded merge emits
+  zero-copy slices of a decoded input part and the allocation measure would
+  charge a slice for the whole part behind it. On the same data the two differ
+  by about 2x, so one byte target asks for two different row counts depending
+  on which writer reads it. Both read one sample batch — the first — and both
+  are clamped, so neither is a byte guarantee. The open row group is buffered
+  decoded while its bloom accumulates, so the target sizes a merge's, a
+  re-cluster's and a delete rewrite's writer-side buffer in ROWS; the bytes
+  resident for those rows run over the target, because a buffered batch keeps
+  whole buffers and the merge priced them by extent
+  (see [`LIMITATIONS.md`](LIMITATIONS.md)). The default is measured
   against the packaged 1Gi compactor in
   [`DESIGN_row_group_target_qualification.md`](DESIGN_row_group_target_qualification.md),
   which keeps it and records 64 MiB as a compactor-scoped candidate for 0.2.0.

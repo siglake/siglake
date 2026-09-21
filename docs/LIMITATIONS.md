@@ -1561,10 +1561,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   of the whole decoded file that is the gate's win. Since #4754 the row group
   is `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` (or
   `IcebergTuning::target_row_group_bytes`) divided by the first written batch's
-  row size, so lowering the target lowers what a rewrite holds; until then the
-  merge-output writer asked with no sample batch and took a flat 1,048,576 rows
-  with the byte target unread. It remains a target and not a cap, and it stops
-  at the 128 Ki-row floor (`MIN_ROW_GROUP_ROWS`): at the ~1.2 KB decoded per row
+  row size — the extent its rows span, `sampled_row_bytes` — so lowering the
+  target lowers what a rewrite holds; until then the merge-output writer asked
+  with no sample batch and took a flat 1,048,576 rows with the byte target
+  unread. It remains a target and not a cap: the buffered row group holds whole
+  Arrow buffers, which on these fixtures is about twice the extent the target
+  was priced in. It also stops at the 128 Ki-row floor (`MIN_ROW_GROUP_ROWS`): at the ~1.2 KB decoded per row
   those fixtures carry, the smallest row group any target can ask for still
   holds ~157 MB of survivors, and a narrow GDPR delete leaves nearly every row a
   survivor. What a 256 MiB cold-target candidate costs a compactor packaged at
@@ -1585,6 +1587,29 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   sampled extent (468 B/row here) and paid in Arrow buffers (874 B/row), so a
   target of N bytes holds close to 2N; and it does nothing below the 128 Ki-row
   floor, which on a wide-row corpus binds before 64 MiB does.
+- **One row-group byte target, two estimators: flush prices allocation, the
+  merge paths price extent.** `TARGET_ROW_GROUP_UNCOMPRESSED_BYTES` and its
+  `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` override are one number, read two
+  ways. The ingest flush path divides it by `RecordBatch::get_array_memory_size`
+  — whole buffer allocations — which is accurate there, because that writer is
+  handed a batch the flush path assembled itself. The merge, re-cluster and
+  delete-rewrite paths divide it by `ArrayData::get_slice_memory_size`
+  (`sampled_row_bytes`), the extent the rows span, because a page-bounded merge
+  writes zero-copy slices of a decoded input part: the allocation measure would
+  charge a 2,000-row slice for the whole 8,192-row part behind it and size the
+  row group off how the plan happened to cut its first run. The two differ by
+  about 2x on the same data — 432 B/row by allocation against 201 B/row by
+  extent on the 512 Ki-row half-deleted fixture in
+  `crates/siglake-storage/tests/delete_task_size_gate.rs` — so the same target
+  asks for roughly half as many rows on flush as on merge. Both estimators read
+  one sample batch, the first, and both results are clamped to 128 Ki–4 Mi
+  rows, so neither is a byte guarantee in either direction. Neither is a
+  resident-byte ceiling either: a buffered row group holds whole buffers, and
+  the gap above the priced extent is the slack the two entries above measure.
+  The split is what ships, and it is kept (decided 2026-09-16, #4774): moving
+  flush onto the extent measure would change ingest output layout, and no
+  measurement of that side exists. `docs/DESIGN_row_group_target_qualification.md`
+  measures the merge side only.
 - **Streamed rewrite output carries no inline inverted index.** Every rewrite
   past the in-RAM caps — a leveled compaction merge, a re-clustering pass, or
   a delete task's large candidates (16 MiB compressed / 128 Ki rows) — is
