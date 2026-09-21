@@ -1221,7 +1221,12 @@ For a source-safe ordered limit, an overlap merge opens inputs by their leading
 manifest bound and stops before an older suffix once the exact nth timestamp is
 known; equal or unavailable bounds remain admitted.
 Direction-aware for legacy DESC tables; observable via
-`siglake_query_scan_output_ordering_total`.
+`siglake_query_scan_output_ordering_total`, whose `outcome="advertised"`
+series counts successfully advertised physical scans, and
+`siglake_query_scan_ordered_merge_partitions_total`, which sums the overlap
+partitions across those scans. A scan can contribute zero or several overlap
+partitions, so the two totals have different units. Ordered-plan cache hits and
+freshly built plans use the same accounting; round exports include both paths.
 
 **Unordered clipped `LIMIT`: a staged start.** The opposite shape — `WHERE …
 LIMIT n` with no `ORDER BY` — keeps its parallel pruned plan, one partition per
