@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **WAL recovery (fix)**: `siglake wal-recover` now exits nonzero when every
+  candidate body is unreadable and no segment is already present. Plan and
+  apply still succeed for empty mirrors, idempotent re-runs and mixed mirrors
+  where a readable segment can be restored. (#5092)
+
 - **Query (fix)**: browse selectivity hints now bind dimensional identifiers
   with DataFusion's quote-aware case rules before reading exact group counts.
   `WHERE REGION = 'probe'` uses the `region` aggregate, while a quoted

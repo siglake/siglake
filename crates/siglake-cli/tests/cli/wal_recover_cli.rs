@@ -458,3 +458,121 @@ fn recover_refuses_an_unreadable_active_object_and_says_so_in_both_forms() {
     // Refuse-and-count, not quarantine: the command writes only under `--to`.
     assert!(torn.exists(), "the mirror object is left where it is");
 }
+
+/// An unreadable object is a cleanly reported refusal, not a successful empty
+/// restore. Both forms stop before creating the WAL root, and neither suggests
+/// that the operator chose the wrong `--from`.
+#[test]
+fn recover_fails_when_every_candidate_is_unreadable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mirror = tmp.path().join("warehouse").join("wal-mirror");
+    let torn = mirror
+        .join("_active")
+        .join("widgets")
+        .join("torn.arrow.partial");
+    std::fs::create_dir_all(torn.parent().unwrap()).unwrap();
+    std::fs::write(&torn, b"").unwrap();
+
+    let from = format!("file://{}", mirror.display());
+    let wal = tmp.path().join("wal");
+    for (arm, run) in [
+        ("plan", recover as fn(&str, &Path) -> (String, String, bool)),
+        ("apply", recover_apply),
+    ] {
+        let (stdout, stderr, ok) = run(&from, &wal);
+        assert!(!ok, "{arm}: {stdout}{stderr}");
+        assert!(
+            stdout.contains("UNREADABLE: `_active/widgets/torn.arrow.partial`")
+                && stdout.contains("totals: 0 segments")
+                && stdout.contains("1 unreadable"),
+            "{arm}: {stdout}{stderr}"
+        );
+        assert!(
+            stderr.contains("1 candidate body does not decode as a WAL segment under --from")
+                && stderr.contains("_active/widgets/torn.arrow.partial")
+                && !stderr.contains("--from must name the MIRROR ROOT"),
+            "{arm}: {stderr}"
+        );
+        assert!(!wal.exists(), "{arm}: the failed run created --to");
+    }
+}
+
+/// Already-present work makes an unreadable neighbor a partial but successful
+/// answer: the runbook can distinguish it from both an empty mirror and a
+/// restore with no recoverable candidate.
+#[test]
+fn recover_succeeds_with_an_already_present_segment_and_an_unreadable_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mirror = tmp.path().join("warehouse").join("wal-mirror");
+    let good = seal_one(&tmp.path().join("src"), "acme-events");
+    let name = good.file_name().unwrap().to_str().unwrap().to_string();
+    place(&mirror, &format!("acme/{name}"), &good);
+
+    let from = format!("file://{}", mirror.display());
+    let wal = tmp.path().join("wal");
+    let (stdout, stderr, ok) = recover_apply(&from, &wal);
+    assert!(ok, "initial restore: {stdout}{stderr}");
+    assert!(stdout.contains("pulled 1 segments"), "{stdout}{stderr}");
+
+    let torn = mirror
+        .join("_active")
+        .join("widgets")
+        .join("torn.arrow.partial");
+    std::fs::create_dir_all(torn.parent().unwrap()).unwrap();
+    std::fs::write(&torn, b"").unwrap();
+
+    let (stdout, stderr, ok) = recover_apply(&from, &wal);
+    assert!(ok, "idempotent mixed restore: {stdout}{stderr}");
+    assert!(
+        stdout.contains("pulled 0 segments")
+            && stdout.contains("1 already present")
+            && stdout.contains("1 unreadable"),
+        "{stdout}{stderr}"
+    );
+    assert!(
+        wal.join("acme").join(SEALED_DIR).join(name).exists(),
+        "the existing segment remains present"
+    );
+    assert!(!wal.join("widgets").exists());
+}
+
+/// A mirror can have both a recognised unreadable candidate and keys whose
+/// layout is unknown. The unreadable body is the actionable failure; the
+/// diagnostic must not claim every key proves a wrong mirror root.
+#[test]
+fn recover_reports_unreadable_and_skipped_without_claiming_every_key_was_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mirror = tmp.path().join("warehouse").join("wal-mirror");
+    let torn = mirror
+        .join("_active")
+        .join("widgets")
+        .join("torn.arrow.partial");
+    std::fs::create_dir_all(torn.parent().unwrap()).unwrap();
+    std::fs::write(&torn, b"").unwrap();
+    let foreign = mirror.join("acme/orders/nested/foreign.arrow");
+    std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    std::fs::write(&foreign, b"not inspected because its layout is refused").unwrap();
+
+    let from = format!("file://{}", mirror.display());
+    let wal = tmp.path().join("wal");
+    for (arm, run) in [
+        ("plan", recover as fn(&str, &Path) -> (String, String, bool)),
+        ("apply", recover_apply),
+    ] {
+        let (stdout, stderr, ok) = run(&from, &wal);
+        assert!(!ok, "{arm}: {stdout}{stderr}");
+        assert!(
+            stdout.contains("totals: 0 segments")
+                && stdout.contains("1 unreadable")
+                && stdout.contains("1 keys skipped"),
+            "{arm}: {stdout}{stderr}"
+        );
+        assert!(
+            stderr.contains("1 other key has an unrecognised layout")
+                && !stderr.contains("all 1 keys")
+                && !stderr.contains("--from must name the MIRROR ROOT"),
+            "{arm}: {stderr}"
+        );
+        assert!(!wal.exists(), "{arm}: the failed run created --to");
+    }
+}

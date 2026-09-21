@@ -370,8 +370,9 @@ enum Command {
     /// object or a `<tenant>/<index>/owner` marker one component deeper than
     /// the mirror layout puts it means `--from` is one component above the
     /// mirror root, and both forms then exit nonzero naming the directory to
-    /// pass instead. Both also exit nonzero when every key was skipped and
-    /// there is nothing to restore.
+    /// pass instead. Both also exit nonzero when every key was skipped, or
+    /// when every candidate body is unreadable and no segment is already
+    /// present, leaving nothing recoverable.
     ///
     /// `--catalog <uri>` adds the exact answer for a mirror that carries
     /// neither marker — the default install — by looking the listed segment
@@ -2999,7 +3000,30 @@ async fn run_wal_recover(
     // The plan is printed first either way, then the run bails: the counts an
     // operator needs to see the mistake are on stdout before the diagnostic
     // that names it.
-    if plan.segments() == 0 && plan.skipped > 0 && !refused {
+    if plan.segments() == 0 && !plan.unreadable.is_empty() && !refused {
+        let unreadable = plan.unreadable.len();
+        let body = if unreadable == 1 {
+            "candidate body does"
+        } else {
+            "candidate bodies do"
+        };
+        anyhow::bail!(
+            "restored nothing: {unreadable} {body} not decode as a WAL segment under --from{}{}; \
+             no recoverable candidate remains. The unreadable objects were left in the mirror, \
+             and {} is unchanged.",
+            plan.unreadable
+                .first()
+                .map(|bad| format!(" (e.g. `{}`)", bad.key))
+                .unwrap_or_default(),
+            match plan.skipped {
+                0 => String::new(),
+                1 => ", and 1 other key has an unrecognised layout".to_string(),
+                skipped => format!(", and {skipped} other keys have an unrecognised layout"),
+            },
+            to.display()
+        );
+    }
+    if plan.segments() == 0 && plan.skipped > 0 && plan.unreadable.is_empty() && !refused {
         anyhow::bail!(
             "restored nothing: all {} keys under --from have a layout recovery will not guess \
              at{}. --from must name the MIRROR ROOT — the directory holding \
@@ -3068,14 +3092,36 @@ async fn run_wal_recover(
         to.display()
     );
 
-    // The "understood nothing" exit is decided on the plan above, before any
-    // write: a listing whose every key is refused has no candidates, so this
-    // apply had nothing to pull and nothing already present either.
+    // The unrecognised-layout "understood nothing" exit is decided on the
+    // plan above, before any write: a listing whose every key is refused has
+    // no candidates, so this apply had nothing to pull or find present.
     if summary.skipped > 0 {
         tracing::warn!(
             skipped = summary.skipped,
             sample = summary.sample_skipped_key.as_deref().unwrap_or(""),
             "wal-recover: keys under --from were skipped as unrecognised"
+        );
+    }
+    // A body can change after the plan read it. Keep the apply-time answer in
+    // lockstep with the plan-time one without turning a partial restore or an
+    // idempotent re-run into a failure.
+    if summary.pulled == 0 && summary.already_present == 0 && summary.unreadable > 0 {
+        let unreadable = summary.unreadable;
+        let body = if unreadable == 1 {
+            "candidate body does"
+        } else {
+            "candidate bodies do"
+        };
+        anyhow::bail!(
+            "restored nothing: {unreadable} {body} not decode as a WAL segment under --from{}; \
+             no recoverable candidate remains. The unreadable objects were left in the mirror, \
+             and no WAL segment was written under {}.",
+            summary
+                .sample_unreadable_key
+                .as_deref()
+                .map(|key| format!(" (e.g. `{key}`)"))
+                .unwrap_or_default(),
+            to.display()
         );
     }
     Ok(())
