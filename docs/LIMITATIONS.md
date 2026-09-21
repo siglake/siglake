@@ -732,6 +732,16 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   declared `Inexact` so a hit can be re-filtered (measured at 0.1-0.6 ms and 0.5
   MiB emitted on the fixture's shallower browse), and the budget is still
   subtracted from the query pool.
+  #4905 rejected unconditional predicate-keyed admission after a local
+  20-request synthetic trace. Its deliberately favorable 50% repeat ceiling
+  produced 40 hits from 80 task lookups and cut repeated predicates from
+  5.75-6.12 ms to 0.62-0.88 ms, but ten predicates over four files created 40
+  complete entries: a 16-entry cap evicted 24 (60%). Six one-use moving windows
+  accounted for those 24 inserts and evictions without one hit. The survivors
+  retained only 0.525 MiB, so entry count bound before bytes. The shipped #4891
+  bypass stays; a future frequency-gated admission policy would be a different
+  proposal. The workload assumptions, answer-equivalence gate and full numbers
+  are in [`DESIGN_predicate_keyed_decoded_cache.md`](DESIGN_predicate_keyed_decoded_cache.md).
   #4847 qualified the row-group-granular alternative locally and the disposition
   is REVISE, with the shipped policy kept: per-row-group population does insert
   from a clipped browse and cuts its repeat from 6.7 ms to 2.0 ms, and it drops

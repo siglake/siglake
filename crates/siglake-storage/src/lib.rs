@@ -79,6 +79,15 @@ pub struct QueryScanTuning {
     /// measurement fixture. Shipped policy stays drained-scan-only — see
     /// `docs/DESIGN_row_group_decoded_cache_qualification.md`.
     pub file_cache_row_group_prototype: bool,
+    /// #4905 LOCAL QUALIFICATION PROTOTYPE: admit a fully drained read under a
+    /// converted predicate, keyed by that predicate in addition to the shipped
+    /// file/projection/delete/range/direction identity.
+    ///
+    /// Deliberately has no environment variable, CLI flag, chart value or
+    /// operator field. Planning remains `Inexact`, so DataFusion keeps the
+    /// residual filter on hits and misses; only an in-process measurement can
+    /// enable this. See `docs/DESIGN_predicate_keyed_decoded_cache.md`.
+    pub file_cache_predicate_key_prototype: bool,
 }
 
 /// Effective process-wide read-cache configuration.
