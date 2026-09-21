@@ -853,10 +853,11 @@ wal:
   existingClaim: ""
   # WAL → object-store mirror. Each sealed WAL segment is uploaded to
   # `s3://<s3.bucket>/<s3.warehousePrefix>/<wal.mirror.prefix>/` on a
-  # best-effort background task. DR recipe, two steps: `siglake wal-recover
-  # --from s3://<bucket>/<warehousePrefix>/<prefix> --to <wal-root>` PRINTS
-  # the plan and writes nothing; read the destinations it lists, then re-run
-  # it with `--apply`. `--to` is the WAL ROOT, and recovery rebuilds the
+  # best-effort background task. Filesystem-drain DR recipe, two steps:
+  # `siglake wal-recover --from
+  # s3://<bucket>/<warehousePrefix>/<prefix> --to <wal-root>` PRINTS the plan
+  # and writes nothing; read the destinations it lists, then re-run it with
+  # `--apply`. `--to` is the WAL ROOT, and recovery rebuilds the
   # <tenant>[/<index>]/sealed/ layout beneath it so each segment is committed
   # to the namespace and table it came from. `--from` must name the mirror
   # root, not the warehouse URL above it: where the mirror has an `_active/`
@@ -864,7 +865,10 @@ wal:
   # has neither the plan is the check. A candidate whose body does not decode
   # as a WAL segment — an `_active/` object caught mid-PUT is the usual one —
   # is refused, reported as `unreadable` rather than `pulled` in both the plan
-  # and the report, and left in the mirror for you to look at.
+  # and the report, and left in the mirror for you to look at. In catalog-claim
+  # mode, repair a reported catalog or object-store fault and let
+  # mirror-to-catalog reconciliation register orphaned sealed objects;
+  # `wal-recover` restores local files that this drain does not read.
   #
   # ON by default since 2026-09-11: without it the WAL volume is the only copy
   # of everything acknowledged but not yet committed, and losing it loses that
