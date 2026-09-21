@@ -142,9 +142,12 @@ because the command writes only under `--to`. A flushed prefix whose final
 Arrow IPC message is torn still restores: that is the case the active mirror is
 built around. The report carries the counts that separate a finished restore
 from one that understood nothing — segments already present, unreadable
-candidates, and keys skipped for a layout recovery will not guess at — and
-exits nonzero when every key was skipped and nothing was restored, which is
-`--from` naming an ancestor of the mirror root.
+candidates, and keys skipped for a layout recovery will not guess at. Both the
+plan and apply forms exit nonzero when every key was skipped and nothing was
+restored, which is `--from` naming an ancestor of the mirror root. They also
+exit nonzero when at least one candidate is unreadable and no segment can be
+restored or is already present; a mixed mirror still restores its readable
+segments and succeeds while reporting the unreadable count.
 
 The same listing decides whether `--from` IS the mirror root, from the two
 markers siglake writes at a fixed depth under it: a first component `_active`

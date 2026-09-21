@@ -1381,6 +1381,9 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `wal-recover` puts every candidate through that same decode before it writes
   (#5077): one that does not yield a row is refused, counted in `unreadable`
   rather than `pulled`, named in the plan and the report, and left where it is.
+  Both plan and apply exit nonzero when unreadable candidates leave no segment
+  recoverable or already present. A mixed mirror still restores its readable
+  segments, reports the unreadable count and exits successfully.
   An `_active/` object is listable, and stat-able at zero bytes, before its
   body lands on any store whose PUT is not atomic, and it used to become a
   zero-byte sealed segment the drain then could not read. What is left out is
