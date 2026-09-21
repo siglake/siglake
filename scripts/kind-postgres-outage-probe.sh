@@ -261,17 +261,29 @@ done
 # connection sits in the listen backlog and psql never returns; the watchdog
 # kills it and `blocked` is that timeout, distinguished from a write that
 # actually completed. Emits a single `key=value` TSV line.
+#
+# The row carries the phase that wrote it, because this is the one write whose
+# intended commit time the probe already knows: a baseline row Postgres dates
+# inside the proven stopped window is the dating scheme contradicting itself,
+# which no job-row reading can show. `$2` is the phase as a ready-made SQL
+# literal, built by the caller: this snippet is a single-quoted bash string, so
+# a single quote cannot appear in it, and a dollar-quote tag written here would
+# be expanded by the `sh -eu -c` that runs it. Substituting the caller's value
+# does not re-expand it. The table is created by the baseline write, so a
+# cluster carrying one from an earlier probe version fails the insert loudly
+# rather than recording a row with no phase.
 # write-probe-snippet-begin
 POSTGRES_WRITE_PROBE_SNIPPET='
 timeout_seconds=$1
+phase_literal=$2
 errors=${WRITE_PROBE_ERRORS:-/tmp/siglake-outage-write-probe.err}
 : >"$errors"
 started=$(date +%s)
 ${WRITE_PROBE_PSQL:-psql} -qtAX -v ON_ERROR_STOP=1 \
   -U "${PGUSER:-${POSTGRES_USER:-postgres}}" \
   -d "${PGDATABASE:-${POSTGRES_DB:-postgres}}" \
-  -c "CREATE TABLE IF NOT EXISTS siglake_outage_write_probe (observed_at timestamptz NOT NULL DEFAULT now())" \
-  -c "INSERT INTO siglake_outage_write_probe DEFAULT VALUES" \
+  -c "CREATE TABLE IF NOT EXISTS siglake_outage_write_probe (phase text NOT NULL, observed_at timestamptz NOT NULL DEFAULT now())" \
+  -c "INSERT INTO siglake_outage_write_probe (phase) VALUES ($phase_literal)" \
   >/dev/null 2>"$errors" &
 probe_pid=$!
 ( sleep "$timeout_seconds"; kill -KILL "$probe_pid" 2>/dev/null || true ) >/dev/null 2>&1 &
@@ -411,6 +423,35 @@ printf "detail\t%s\n" "$(tr "\n\t" "  " <"$errors" | cut -c1-200)"
 '
 # job-history-snippet-end
 
+# Date the write probe's own rows by the transaction that wrote each one. The
+# probe knows when it took those writes -- baseline before the pause,
+# recovery after restoration -- so they are the control on every other commit
+# timestamp in the trace: a systematic skew between the kind node's clock and
+# Postgres's moves every job-row commit together, and nothing else here would
+# notice. Ordered by phase and commit time so a phase that wrote twice is
+# visible as two rows rather than as one arbitrary row.
+# write-probe-times-snippet-begin
+POSTGRES_WRITE_PROBE_TIMES_SNIPPET='
+errors=${WRITE_PROBE_TIMES_ERRORS:-/tmp/siglake-outage-write-probe-times.err}
+rows=${WRITE_PROBE_TIMES_ROWS:-/tmp/siglake-outage-write-probe-times.rows}
+: >"$errors"
+: >"$rows"
+tab=$(printf "\t")
+psql_bin=${WRITE_PROBE_TIMES_PSQL:-psql}
+user=${PGUSER:-${POSTGRES_USER:-postgres}}
+database=${PGDATABASE:-${POSTGRES_DB:-postgres}}
+query_status=0
+"$psql_bin" -qtAX -F"$tab" -v ON_ERROR_STOP=1 -U "$user" -d "$database" \
+  -c "SELECT phase, observed_at, pg_xact_commit_timestamp(xmin) FROM siglake_outage_write_probe ORDER BY phase, 3" \
+  >"$rows" 2>>"$errors" || query_status=$?
+printf "status\t%s\n" "$query_status"
+while IFS= read -r line; do
+  printf "row\t%s\n" "$line"
+done <"$rows"
+printf "detail\t%s\n" "$(tr "\n\t" "  " <"$errors" | cut -c1-200)"
+'
+# write-probe-times-snippet-end
+
 # The pause-window readers are advisory: a failed exec is retained as evidence that
 # the pause window went unobserved, never as a reason to leave Postgres stopped.
 # Their request timeouts are short for the same reason — an exec that cannot be
@@ -425,11 +466,19 @@ postgres_process_state() {
 
 postgres_write_probe() {
   local phase=$1 at status=0 line=
+  # The phase reaches psql as a dollar-quoted literal built here, where a
+  # single quote is allowed and nothing re-expands the tag. Only these three
+  # names are ever written, so the literal cannot carry its own tag.
+  case "$phase" in
+    baseline | outage | recovery) ;;
+    *) die "unknown write-probe phase: $phase" ;;
+  esac
   at=$(iso_now)
   line=$(kubectl --context "$KUBE_CONTEXT" \
     --request-timeout="$((WRITE_PROBE_SECONDS + 15))s" -n "$NAMESPACE" \
     exec "$POSTGRES_POD" -- sh -eu -c "$POSTGRES_WRITE_PROBE_SNIPPET" \
-    write-probe "$WRITE_PROBE_SECONDS" 2>"$TMP_DIR/write-probe.err") || status=$?
+    write-probe "$WRITE_PROBE_SECONDS" '$phase$'"$phase"'$phase$' \
+    2>"$TMP_DIR/write-probe.err") || status=$?
   python3 - "$phase" "$at" "$WRITE_PROBE_SECONDS" "$status" "$line" \
     "$WRITE_PROBES_FILE" <<'PY'
 import json, sys
@@ -481,6 +530,16 @@ postgres_job_history() {
   kubectl --context "$KUBE_CONTEXT" --request-timeout=30s -n "$NAMESPACE" \
     exec "$POSTGRES_POD" -- sh -eu -c "$POSTGRES_JOB_HISTORY_SNIPPET" \
     job-history >"$output" 2>"$output.err" || status=$?
+  printf '%s' "$status"
+}
+
+# Advisory in the same way: without it the trace keeps the write probes'
+# outcomes and loses the control on the clock they were dated against.
+postgres_write_probe_times() {
+  local output=$1 status=0
+  kubectl --context "$KUBE_CONTEXT" --request-timeout=30s -n "$NAMESPACE" \
+    exec "$POSTGRES_POD" -- sh -eu -c "$POSTGRES_WRITE_PROBE_TIMES_SNIPPET" \
+    write-probe-times >"$output" 2>"$output.err" || status=$?
   printf '%s' "$status"
 }
 
@@ -810,6 +869,11 @@ log "read the job-row write history"
 JOB_HISTORY_AT=$(iso_now)
 JOB_HISTORY_STATUS=$(postgres_job_history "$TMP_DIR/job-history")
 
+# After the recovery write probe, which is the last row this table gets.
+log "read the write probe's own commit timestamps"
+WRITE_PROBE_TIMES_AT=$(iso_now)
+WRITE_PROBE_TIMES_STATUS=$(postgres_write_probe_times "$TMP_DIR/write-probe-times")
+
 python3 - "$ROOT" "$TMP_DIR" "$SAMPLES_FILE" "$SUBMISSIONS_DIR" \
   "$SUBMISSION_STARTED_AT" "$SUBMISSION_FINISHED_AT" "$OUTAGE_STARTED_AT" \
   "$RESTORATION_STARTED_AT" "$POSTGRES_READY_AT" "$SAMPLING_ENDED_AT" \
@@ -822,6 +886,8 @@ python3 - "$ROOT" "$TMP_DIR" "$SAMPLES_FILE" "$SUBMISSIONS_DIR" \
   "$POSTGRES_PID_NAMESPACE" "$POSTGRES_PROCESSES_FILE" \
   "$JOB_HISTORY_AT" "$JOB_HISTORY_INSTALL_STATUS" "$JOB_HISTORY_STATUS" \
   "$TMP_DIR/job-history-install" "$TMP_DIR/job-history" \
+  "$WRITE_PROBE_TIMES_AT" "$WRITE_PROBE_TIMES_STATUS" \
+  "$TMP_DIR/write-probe-times" \
   "$TMP_DIR/raw.json" <<'PY'
 import datetime, json, pathlib, subprocess, sys
 (
@@ -833,7 +899,8 @@ import datetime, json, pathlib, subprocess, sys
     commit_times_path, postgres_node, postgres_container_id, postgres_container_pid,
     postgres_pid_namespace, postgres_processes_path, job_history_at,
     job_history_install_status, job_history_status, job_history_install_path,
-    job_history_path, output,
+    job_history_path, write_probe_times_at, write_probe_times_status,
+    write_probe_times_path, output,
 ) = sys.argv[1:]
 tmp = pathlib.Path(tmp)
 
@@ -939,6 +1006,33 @@ def write_history(install_path, read_path, at, install_exec_status, exec_status)
     return reading
 
 
+# The write probe's own rows, dated by Postgres. A failed query is retained as
+# a failed query: an empty row set here would read as "the baseline write never
+# committed", which is a different finding from "nothing could read the table".
+def write_probe_times(path, at, exec_status):
+    reading = {
+        "at": at,
+        "exec_status": int(exec_status) if exec_status.isdigit() else 1,
+        "query_status": None,
+        "rows": [],
+        "detail": "",
+    }
+    fields = ("phase", "observed_at", "committed_at")
+    for line in snippet_lines(path):
+        parts = line.split("\t")
+        if parts[0] == "status" and len(parts) == 2:
+            reading["query_status"] = int(parts[1]) if parts[1].isdigit() else None
+        elif parts[0] == "row" and len(parts) == len(fields) + 1:
+            reading["rows"].append(
+                {name: (parts[index + 1] or None) for index, name in enumerate(fields)}
+            )
+        elif parts[0] == "detail" and len(parts) == 2:
+            reading["detail"] = parts[1]
+    if not reading["detail"]:
+        reading["detail"] = exec_complaint(path)
+    return reading
+
+
 def container_identity(raw):
     parts = raw.split("\t")
     if len(parts) != 3 or not parts[0] or not parts[1].isdigit():
@@ -986,7 +1080,7 @@ write_probes = [
     json.loads(line) for line in open(write_probes_path, encoding="utf-8") if line.strip()
 ]
 document = {
-    "schema_version": 4,
+    "schema_version": 5,
     "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
     "revisions": {
         "repository_commit": subprocess.check_output(
@@ -1024,6 +1118,9 @@ document = {
         "processes": fault_processes(postgres_processes_path),
     },
     "write_probes": write_probes,
+    "write_probe_commit_times": write_probe_times(
+        write_probe_times_path, write_probe_times_at, write_probe_times_status
+    ),
     "job_commit_times": commit_times(commit_times_path, commit_times_at, commit_times_status),
     "job_write_history": write_history(
         job_history_install_path, job_history_path, job_history_at,

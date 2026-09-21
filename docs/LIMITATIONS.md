@@ -946,7 +946,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   terminal, with the amendment kept as a separate row. A recovered row with no
   history or an undated terminal transaction, a missing row, a NULL timestamp,
   a nonterminal job, or a commit overlapping either signal transition all
-  leave the observation unexplained. The probe retains its
+  leave the observation unexplained. Every placement is made against stamps
+  read from the kind node's clock, so the bounded write probe carries the
+  phase that wrote each of its rows and the probe reads them back dated by
+  Postgres too: its baseline row has to land before the pause was applied and
+  its recovery row after restoration was applied, and either one on the wrong
+  side is `unverified` on its own — the one skew between the two clocks that
+  would otherwise move every job-row commit together and show up nowhere. The
+  probe retains its
   local observations to the millisecond and the grader derives uncertainty
   from each timestamp's recorded precision; historical second-only traces keep
   their full one-second uncertainty. A commit is a stopped-window failure only

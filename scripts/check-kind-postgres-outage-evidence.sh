@@ -116,7 +116,7 @@ fi
 # no way to date the counters it read, so the probe must now retain a process
 # state per sample, a bounded write in each phase, the container's identity
 # across the window, and the Prometheus scrape each value came from.
-contains "$probe_body" '"schema_version": 4' ||
+contains "$probe_body" '"schema_version": 5' ||
   fail "$PROBE does not retain the pause-evidence schema version"
 contains "$probe_body" 'state_status=$(postgres_process_state "$TMP_DIR/postgres-state")' ||
   fail "$PROBE does not read the Postgres process state on every sample"
@@ -194,6 +194,36 @@ if not install < burst < collect < read:
         f"in order; got {install + 1}, {burst + 1}, {collect + 1}, {read + 1}"
     )
 PY
+# The write probe is the one write whose side of the pause the probe knows in
+# advance, so its rows carry the phase that wrote them and are read back dated
+# by Postgres. Without that control, a clock skew between the kind node and
+# Postgres moves every job-row commit together and leaves no trace.
+contains "$probe_body" 'INSERT INTO siglake_outage_write_probe (phase) VALUES ($phase_literal)' ||
+  fail "$PROBE does not record which phase took each write-probe row"
+contains "$probe_body" 'write-probe "$WRITE_PROBE_SECONDS"' ||
+  fail "$PROBE does not pass the write-probe timeout to its snippet"
+contains "$probe_body" 'WRITE_PROBE_TIMES_STATUS=$(postgres_write_probe_times' ||
+  fail "$PROBE does not read the write probe's own commit timestamps"
+contains "$probe_body" 'pg_xact_commit_timestamp(xmin) FROM siglake_outage_write_probe' ||
+  fail "$PROBE does not date the write-probe rows by their Postgres commit timestamp"
+if grep -rq 'siglake_outage_write_probe' "$CHART_DIR" deploy/aws deploy/docker-compose.yml \
+  crates 2>/dev/null; then
+  fail "the probe's write-probe control table leaked out of the throwaway kind install"
+fi
+python3 - "$PROBE" <<'PY' || fail "$PROBE does not date the write-probe rows after the recovery write"
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+recovery = next(i for i, line in enumerate(lines)
+                if line == "postgres_write_probe recovery")
+read = next(i for i, line in enumerate(lines)
+            if line.startswith("WRITE_PROBE_TIMES_STATUS="))
+if not recovery < read:
+    raise SystemExit(
+        f"expected the recovery write probe before the reading that dates it; got "
+        f"{recovery + 1}, {read + 1}"
+    )
+PY
 contains "$probe_body" 'PAUSE_APPLIED_AT=$(awk' ||
   fail "$PROBE does not retain the measured pause-applied bound"
 contains "$probe_body" 'RESTORATION_APPLIED_AT=$(awk' ||
@@ -238,8 +268,10 @@ extract_snippet node-process-list-snippet "$fixture_dir/node-process-list.sh"
 extract_snippet node-signal-snippet "$fixture_dir/node-signal.sh"
 extract_snippet job-history-install-snippet "$fixture_dir/job-history-install.sh"
 extract_snippet job-history-snippet "$fixture_dir/job-history.sh"
+extract_snippet write-probe-times-snippet "$fixture_dir/write-probe-times.sh"
 sh -n "$fixture_dir/node-process-list.sh" "$fixture_dir/node-signal.sh" \
-  "$fixture_dir/job-history-install.sh" "$fixture_dir/job-history.sh" ||
+  "$fixture_dir/job-history-install.sh" "$fixture_dir/job-history.sh" \
+  "$fixture_dir/write-probe-times.sh" ||
   fail "the kind-node process snippets are not valid POSIX shell"
 
 # `pid:comm:state:starttime` per process. Field 3 of /proc/<pid>/stat is the
@@ -280,11 +312,13 @@ fixtures=$((fixtures + 1))
 
 write_probe_arm() {
   local name=$1 body=$2 want=$3 out
-  printf '#!/bin/sh\n%s\n' "$body" >"$fixture_dir/psql-$name"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$@" >"%s"\n%s\n' \
+    "$fixture_dir/psql-$name.argv" "$body" >"$fixture_dir/psql-$name"
   chmod +x "$fixture_dir/psql-$name"
   out=$(WRITE_PROBE_PSQL="$fixture_dir/psql-$name" \
     WRITE_PROBE_ERRORS="$fixture_dir/psql-$name.err" \
-    sh -eu -c "$(<"$fixture_dir/write-probe.sh")" write-probe 2 2>/dev/null) ||
+    sh -eu -c "$(<"$fixture_dir/write-probe.sh")" write-probe 2 '$phase$baseline$phase$' \
+    2>/dev/null) ||
     fail "the write probe failed on the $name stand-in"
   contains "$out" "outcome=$want" ||
     fail "the $name write-probe stand-in was graded $out, expected outcome=$want"
@@ -294,6 +328,55 @@ write_probe_arm() {
 write_probe_arm completes 'exit 0' completed
 write_probe_arm hangs 'sleep 60' blocked
 write_probe_arm refuses 'echo "connection refused" >&2; exit 2' error
+
+# The phase reaches psql as the caller's dollar-quoted literal. The snippet is
+# a single-quoted bash string run by `sh -eu -c`, so a tag written inside it
+# would have been expanded before psql saw it -- invisible in review, and only
+# visible against a real Postgres.
+contains "$(<"$fixture_dir/psql-completes.argv")" \
+  'INSERT INTO siglake_outage_write_probe (phase) VALUES ($phase$baseline$phase$)' ||
+  fail "the write probe did not send its phase as an intact SQL literal: $(<"$fixture_dir/psql-completes.argv")"
+contains "$(<"$fixture_dir/psql-completes.argv")" \
+  'CREATE TABLE IF NOT EXISTS siglake_outage_write_probe (phase text NOT NULL' ||
+  fail "the write probe's control table does not carry the phase that wrote each row"
+fixtures=$((fixtures + 1))
+
+# The reader that dates those rows, with the table present and with it absent.
+write_probe_times_arm() {
+  local name=$1 rows=$2 rc=$3 out
+  cat >"$fixture_dir/psql-probe-times-$name" <<STANDIN
+#!/bin/sh
+printf '%s' "$rows"
+[ "$rc" -eq 0 ] || echo "ERROR: relation siglake_outage_write_probe does not exist" >&2
+exit "$rc"
+STANDIN
+  chmod +x "$fixture_dir/psql-probe-times-$name"
+  out=$(WRITE_PROBE_TIMES_PSQL="$fixture_dir/psql-probe-times-$name" \
+    WRITE_PROBE_TIMES_ERRORS="$fixture_dir/psql-probe-times-$name.err" \
+    WRITE_PROBE_TIMES_ROWS="$fixture_dir/psql-probe-times-$name.rows" \
+    sh -eu -c "$(<"$fixture_dir/write-probe-times.sh")" write-probe-times)
+  printf '%s' "$out"
+}
+
+probe_times_arm=$(write_probe_times_arm present \
+  'baseline	2026-09-07 12:00:00.331904+00	2026-09-07 12:00:00.332715+00
+recovery	2026-09-07 12:00:51.108220+00	2026-09-07 12:00:51.109044+00
+' 0)
+contains "$probe_times_arm" "$(printf 'status\t0')" ||
+  fail "the write-probe commit-time reader did not report its query status: $probe_times_arm"
+contains "$probe_times_arm" "$(printf 'row\tbaseline\t2026-09-07 12:00:00.331904+00')" ||
+  fail "the write-probe commit-time reader did not tag its rows: $probe_times_arm"
+fixtures=$((fixtures + 1))
+
+missing_probe_times_arm=$(write_probe_times_arm absent '' 3)
+contains "$missing_probe_times_arm" "$(printf 'status\t3')" ||
+  fail "the write-probe commit-time reader hid a failed query: $missing_probe_times_arm"
+contains "$missing_probe_times_arm" 'relation siglake_outage_write_probe does not exist' ||
+  fail "the write-probe commit-time reader dropped the error detail: $missing_probe_times_arm"
+if contains "$missing_probe_times_arm" "$(printf 'row\t')"; then
+  fail "the write-probe commit-time reader invented rows from a failed query: $missing_probe_times_arm"
+fi
+fixtures=$((fixtures + 1))
 
 # The commit-time reader, against a psql stand-in that answers `SHOW` and the
 # row query separately. The second arm is the one that matters: with the
@@ -456,7 +539,8 @@ case "$command" in
     done
     text=${body[3]:-}
     if [[ "$text" == *PROC_ROOT* || "$text" == *WRITE_PROBE_PSQL* \
-      || "$text" == *COMMIT_TIMES_PSQL* || "$text" == *JOB_HISTORY_PSQL* ]]; then
+      || "$text" == *COMMIT_TIMES_PSQL* || "$text" == *JOB_HISTORY_PSQL* \
+      || "$text" == *WRITE_PROBE_TIMES_PSQL* ]]; then
       exec "${body[@]}"
     fi
     exit 0
@@ -685,9 +769,35 @@ PY
 paused_tree="$fixture_dir/proc-paused"
 make_proc_tree "$paused_tree" \
   1:postgres:T:311 42:postgres:T:742 43:postgres:T:743 44:sh:R:744
-printf '#!/bin/sh\n[ -e "$STANDIN_STATE/paused" ] && exec sleep 60\nexit 0\n' \
-  >"$fixture_dir/psql-standin"
+# The write probe's stand-in hangs while the processes are stopped, and
+# otherwise records the row its insert would have made: the phase carried in
+# the statement, dated on the same fixed clock the probe reads its own stamps
+# from. The reader stand-in below hands those rows back, so the control's two
+# placements come out of the run rather than out of a hand-kept fixture.
+cat >"$fixture_dir/psql-standin" <<'STANDIN'
+#!/bin/sh
+[ -e "$STANDIN_STATE/paused" ] && exec sleep 60
+phase=
+for arg in "$@"; do
+  case "$arg" in
+    *"INSERT INTO siglake_outage_write_probe"*)
+      phase=${arg##*VALUES (}
+      phase=${phase%)}
+      phase=${phase#\$phase\$}
+      phase=${phase%\$phase\$}
+      ;;
+  esac
+done
+[ -n "$phase" ] || exit 0
+committed=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+printf '%s\t%s\t%s\n' "$phase" "$committed" "$committed" \
+  >>"$STANDIN_STATE/write-probe-rows"
+exit 0
+STANDIN
 chmod +x "$fixture_dir/psql-standin"
+printf '#!/bin/sh\ncat "$STANDIN_STATE/write-probe-rows" 2>/dev/null || true\n' \
+  >"$fixture_dir/psql-probe-times-standin"
+chmod +x "$fixture_dir/psql-probe-times-standin"
 
 # The commit-time stand-in answers for the ids the curl stand-in accepted. Its
 # timestamps sit a few seconds ahead of the stand-in's own collection instant:
@@ -750,6 +860,9 @@ PATH="$standin_dir:$PATH" \
   JOB_HISTORY_INSTALL_ERRORS="$fixture_dir/standin-history-install.err" \
   JOB_HISTORY_ERRORS="$fixture_dir/standin-history.err" \
   JOB_HISTORY_ROWS="$fixture_dir/standin-history.rows" \
+  WRITE_PROBE_TIMES_PSQL="$fixture_dir/psql-probe-times-standin" \
+  WRITE_PROBE_TIMES_ERRORS="$fixture_dir/standin-probe-times.err" \
+  WRITE_PROBE_TIMES_ROWS="$fixture_dir/standin-probe-times.rows" \
   KUBE_CONTEXT=kind-fixture NAMESPACE=fixture PROM_URL=http://fixture.invalid \
   RESULTS_DIR="$standin_state/results" \
   POSTGRES_OUTAGE_JOBS=2 POSTGRES_OUTAGE_SECONDS=4 \
@@ -763,7 +876,7 @@ python3 - "$standin_state/results/postgres-outage-reconnect.json" <<'PY' ||
 import datetime as dt
 import json, sys
 document = json.load(open(sys.argv[1], encoding="utf-8"))
-assert document["schema_version"] == 4, document["schema_version"]
+assert document["schema_version"] == 5, document["schema_version"]
 evidence = document["evidence"]
 assert evidence["grade"] == "verified", evidence["problems"]
 summary = evidence["summary"]
@@ -795,6 +908,18 @@ assert summary["outage_samples_with_process_state"] >= 1, summary
 assert summary["max_observation_lag_seconds"] is not None, summary
 assert summary["write_probe_outcomes"]["outage"] == ["blocked"], summary
 assert summary["write_probe_outcomes"]["baseline"] == ["completed"], summary
+control = summary["write_probe_commit_times"]
+assert control["query_status"] == 0, control
+assert control["rows_returned"] == 2, control
+assert control["placements"] == {
+    "baseline": "before_pause",
+    "recovery": "after_restoration",
+}, control
+assert control["contradictions"] == [], control
+assert control["gaps"] == [], control
+rows = document["write_probe_commit_times"]["rows"]
+assert [row["phase"] for row in rows] == ["baseline", "recovery"], rows
+assert all(row["committed_at"] for row in rows), rows
 target = document["fault_target"]
 assert target["node"] == "fixture-control-plane", target
 assert target["container_id"] == "a" * 64, target
@@ -814,7 +939,7 @@ fixtures=$((fixtures + 1))
 # An exec that returns success without changing process state is the original
 # defect's shape. The post-signal rescan must reject it, then cleanup must still
 # CONT every recorded identity.
-rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,history-installed,paused,signal-execs,signals,stopped-*}
+rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,history-installed,paused,signal-execs,signals,write-probe-rows,stopped-*}
 ineffective_rc=0
 PATH="$standin_dir:$PATH" STANDIN_STATE="$standin_state" \
   STANDIN_STOP_MODE=ineffective PROC_ROOT="$paused_tree" \
@@ -837,7 +962,7 @@ fixtures=$((fixtures + 1))
 # If one backend STOP fails after the postmaster was stopped, the pre-recorded
 # process list must let the EXIT trap restore that postmaster and attempt every
 # other candidate without restarting the container.
-rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,history-installed,paused,signal-execs,signals,stopped-*}
+rm -f "$standin_state"/{backlog-calls,iso-clock,job-ids,history-installed,paused,signal-execs,signals,write-probe-rows,stopped-*}
 partial_rc=0
 PATH="$standin_dir:$PATH" STANDIN_STATE="$standin_state" \
   STANDIN_STOP_MODE=partial PROC_ROOT="$paused_tree" \
@@ -996,6 +1121,11 @@ def commit_row(job_id):
 
 def history_row(seq):
     return next(row for row in document["job_write_history"]["rows"] if row["seq"] == seq)
+
+def write_probe_row(phase):
+    return next(
+        row for row in document["write_probe_commit_times"]["rows"] if row["phase"] == phase
+    )
 
 def amended_job_row():
     """The amendment path's shape: job-a is recovered, went terminal at
@@ -1200,6 +1330,42 @@ elif mutation == "no-write-probe-in-pause":
     document["write_probes"] = [
         probe for probe in document["write_probes"] if probe["phase"] != "outage"
     ]
+elif mutation == "write-probe-row-in-pause":
+    # The control on the whole dating scheme: this write was taken before the
+    # pause was applied, and Postgres dates it inside the stopped window. One
+    # of the two clocks is wrong, and every job-row commit in the trace was
+    # placed with them.
+    write_probe_row("baseline")["committed_at"] = "2026-09-07 12:00:20.551200+00"
+elif mutation == "recovery-write-probe-row-before-pause":
+    write_probe_row("recovery")["committed_at"] = "2026-09-07 12:00:00.902100+00"
+elif mutation == "write-probe-row-at-restoration-edge":
+    write_probe_row("recovery")["committed_at"] = "2026-09-07 12:00:48.114000+00"
+elif mutation == "write-probe-row-missing":
+    document["write_probe_commit_times"]["rows"] = [
+        row for row in document["write_probe_commit_times"]["rows"]
+        if row["phase"] != "baseline"
+    ]
+elif mutation == "outage-write-probe-row":
+    # The probe reported that write killed by its watchdog, so a row for it
+    # says the write landed anyway.
+    document["write_probe_commit_times"]["rows"].append({
+        "phase": "outage",
+        "observed_at": "2026-09-07 12:00:20.400000+00",
+        "committed_at": "2026-09-07 12:00:20.551200+00",
+    })
+elif mutation == "write-probe-times-query-failed":
+    document["write_probe_commit_times"]["query_status"] = 3
+    document["write_probe_commit_times"]["rows"] = []
+    document["write_probe_commit_times"]["detail"] = (
+        "ERROR: relation siglake_outage_write_probe does not exist"
+    )
+elif mutation == "missing-write-probe-times":
+    del document["write_probe_commit_times"]
+elif mutation == "write-probe-times-before-schema":
+    # A trace retained before the write probe's rows were dated. It carries no
+    # such reading and must not be asked for one.
+    del document["write_probe_commit_times"]
+    document["schema_version"] = 4
 elif mutation == "container-restarted":
     document["postgres_container"]["after"]["restart_count"] = 1
 else:
@@ -1410,6 +1576,57 @@ expect_unverified fewer-stopped-processes 'the stopped Postgres process set shra
 expect_unverified write-completed-in-pause 'while Postgres was paused, so the pause did not block writes'
 expect_unverified no-write-probe-in-pause 'no bounded write was attempted while Postgres was paused'
 expect_unverified container-restarted 'the Postgres container restarted during the probe'
+
+# The write probe's own rows are the control on the dating scheme: the probe
+# took the baseline write before the pause and the recovery write after
+# restoration, so Postgres placing either on the wrong side says the two clocks
+# disagree, whatever the job rows look like. The in-pause baseline row is the
+# case that must stand on its own -- an otherwise clean trace, one problem.
+expect_unverified write-probe-row-in-pause \
+  "the baseline write probe's row committed at 2026-09-07T12:00:20.551200+00:00, inside the proven stopped window"
+python3 - "$fixture_dir/write-probe-row-in-pause.output.json" <<'PY' ||
+import json, sys
+evidence = json.load(open(sys.argv[1], encoding="utf-8"))["evidence"]
+assert evidence["problems"] == [
+    "the baseline write probe's row committed at 2026-09-07T12:00:20.551200+00:00, inside the "
+    "proven stopped window from 2026-09-07T12:00:05+00:00 through 2026-09-07T12:00:48+00:00, "
+    "although the probe took that write before the pause was applied: Postgres's commit clock "
+    "and the probe's signal stamps disagree, so no commit timestamp in this trace can be placed "
+    "against the pause"
+], evidence["problems"]
+control = evidence["summary"]["write_probe_commit_times"]
+assert control["contradictions"] == ["baseline"], control
+assert control["gaps"] == [], control
+assert evidence["summary"]["job_commit_times"]["settles_pause"] is True, evidence["summary"]
+PY
+  fail "an in-pause baseline write-probe row was not the only reason the trace failed"
+fixtures=$((fixtures + 1))
+expect_unverified recovery-write-probe-row-before-pause \
+  "the recovery write probe's row committed at 2026-09-07T12:00:00.902100+00:00, before the pause was applied, although the probe took that write after restoration was applied"
+expect_unverified write-probe-row-at-restoration-edge \
+  'overlapping the restoration transition bounded by 2026-09-07T12:00:48+00:00 (1s precision) and 2026-09-07T12:00:50+00:00 (1s precision), so the one write whose side of the pause the probe knows cannot be placed on it'
+expect_unverified write-probe-row-missing \
+  "the baseline write probe completed but left no row in the probe's control table to date"
+expect_unverified outage-write-probe-row \
+  "the bounded write taken during the pause left a row in the probe's control table, committed at 2026-09-07T12:00:20.551200+00:00, so the pause did not block writes"
+expect_unverified write-probe-times-query-failed \
+  'the write-probe commit-time query did not run'
+expect_unverified missing-write-probe-times 'missing write-probe commit-time observations'
+
+# A trace from before the reading existed grades exactly as it did then.
+before_schema="$fixture_dir/write-probe-times-before-schema.input.json"
+mutate write-probe-times-before-schema "$before_schema"
+python3 "$GRADER" "$before_schema" --output "$fixture_dir/write-probe-times-before-schema.output.json" \
+  2>"$fixture_dir/write-probe-times-before-schema.log" ||
+  fail "a pre-control trace did not pass: $(cat "$fixture_dir/write-probe-times-before-schema.log")"
+python3 - "$fixture_dir/write-probe-times-before-schema.output.json" <<'PY' ||
+import json, sys
+evidence = json.load(open(sys.argv[1], encoding="utf-8"))["evidence"]
+assert evidence["grade"] == "verified", evidence["problems"]
+assert evidence["summary"]["write_probe_commit_times"] is None, evidence["summary"]
+PY
+  fail "a pre-control trace was held to a reading its own version never carried"
+fixtures=$((fixtures + 1))
 
 # The retained run #76 trace, which the previous grader called `verified` with
 # `time_to_drain_seconds: 0.0`. It has to stay in the tree and it has to fail:
