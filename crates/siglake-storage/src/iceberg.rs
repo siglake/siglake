@@ -2182,9 +2182,13 @@ fn row_group_rows_for_avg(avg_row_bytes: usize, target_bytes: usize) -> usize {
 ///
 /// The extent is not all the writer holds: a buffered batch keeps whole
 /// buffers, and a batch built by the ingest path carries ~2x its extent in
-/// allocation slack (measured 2026-09-16 on the delete fixture: 432 B/row by
-/// `get_array_memory_size` against 216 B/row here). So the byte target is a
-/// target for the rows, and the resident bytes can run over it by that slack.
+/// allocation slack (measured 2026-09-16 on the 512 Ki-row half-deleted delete
+/// fixture: 432 B/row by `get_array_memory_size` against 201 B/row here — see
+/// `measure_peak_against_row_group_target` in
+/// `tests/delete_task_size_gate.rs`). So the byte target is a target for the
+/// rows, and the resident bytes can run over it by that slack. The split with
+/// the flush path is kept deliberately (#4774, `docs/LIMITATIONS.md`): moving
+/// flush onto this measure would change ingest output layout unmeasured.
 /// Pricing the slack instead is what cannot be done here — on a slice it is the
 /// whole part behind it, shared with every other slice of that part.
 fn sampled_row_bytes(batch: &RecordBatch) -> Option<usize> {
