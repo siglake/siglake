@@ -1079,7 +1079,9 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   a segment's exact `_active/` sibling after its sealed object is confirmed,
   including the ambiguous-upload and catch-up paths. A late active PUT checks
   for the sealed sibling and removes itself, so sealing does not leave one new
-  partial per writer. This is local cleanup, not a prefix sweep: `_active/`
+  partial per writer. A concurrent `wal-recover` that listed only that partial
+  derives and prefers the sealed sibling, including when cleanup deletes the
+  listed key before its GET. This is local cleanup, not a prefix sweep: `_active/`
   blobs orphaned by older versions, or left after all three DELETE attempts
   fail and the matching local segment is later removed, are not discovered
   later.
