@@ -1056,24 +1056,28 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   today a dependency on one. Default-on waits on a retained object-store
   acceptance run and a separate release decision.
 
-  Two populations stay outside it either way. A segment no local drain ever
-  committed — a dropped index incarnation's, quarantined into `stale/`, or one
-  whose ingester volume was lost before it drained — is never marked and is
-  never deleted, by design: registering an unattributable object would be the
-  one thing that could turn a listing into a delete. And a locally-committed
-  segment whose mark never became durable (a Postgres outage longer than the
-  3600s `committed/` ceiling) has its local copy swept anyway, to keep the WAL
-  volume bounded, and its object counted in
+  Two sealed-segment populations stay outside it either way. A segment no
+  local drain ever committed — a dropped index incarnation's, quarantined into
+  `stale/`, or one whose ingester volume was lost before it drained — is never
+  marked and is never deleted, by design: registering an unattributable object
+  would be the one thing that could turn a listing into a delete. And a
+  locally-committed segment whose mark never became durable (a Postgres outage
+  longer than the 3600s `committed/` ceiling) has its local copy swept anyway,
+  to keep the WAL volume bounded, and its object counted in
   `siglake_compactor_mirror_unreclaimed_total` — a leak that needs the
-  lifecycle rule below or a manual pass. `_active/` blobs are outside all of
-  it (#4914), and since #5055 there is one per open writer rather than one per
-  ingester: a segment's blob is left behind when that segment seals, so what
-  the prefix accumulates is one object per (tenant, index, write shard,
-  segment) the flag was on for. Nothing but the lifecycle rule collects them.
+  lifecycle rule below or a manual pass. Current active-mirror writers remove
+  a segment's exact `_active/` sibling after its sealed object is confirmed,
+  including the ambiguous-upload and catch-up paths. A late active PUT checks
+  for the sealed sibling and removes itself, so sealing does not leave one new
+  partial per writer. This is local cleanup, not a prefix sweep: `_active/`
+  blobs orphaned by older versions, or left after all three DELETE attempts
+  fail and the matching local segment is later removed, are not discovered
+  later.
 
   So an object-store lifecycle expiry longer than your worst-case drain backlog
   remains the operator-side complement, and the only thing that collects those
-  three populations. Two things to get right when writing that rule. The prefix
+  sealed populations and historical or terminal-failure active partials. Two
+  things to get right when writing that rule. The prefix
   to match is `<s3.warehousePrefix>/<wal.mirror.prefix>/`: the uploader's
   object store is rooted at the warehouse URL, so mirror keys sit under the
   warehouse prefix rather than beside it. And the Terraform module adds no
