@@ -222,6 +222,7 @@ else
   scripts/check-aws-down-destroy.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-loadgen.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-compose-preflight.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  scripts/check-conditional-write-probe.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-ci-local-test-guard.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-bench-ports.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-jaeger-ui-recording.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
@@ -857,6 +858,11 @@ if [ "$WITH_HEAVY" = 1 ]; then
         SIGLAKE_TEST_S3_SECRET_KEY="$SIGLAKE_S3_SECRET_KEY" \
           cargo test -p siglake-compactor --test s3_mirror_pagination -- \
             --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+        # Keep the selected endpoint alive long enough to record its raw S3
+        # conditional-write behaviour. This establishes endpoint behaviour,
+        # not OpenDAL's error mapping; the helper grades only complete,
+        # authenticated observations and always deletes its one disposable key.
+        scripts/ci-local-conditional-write-probe.sh >>"$dlog" 2>&1 || dk_ok=0
         # The shared-store job ownership rules (#1845) are the only thing
         # standing between a query scale-out and a destroyed batch result,
         # and no hermetic test can reach them: they are SQL. compose's
