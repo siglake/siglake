@@ -517,6 +517,9 @@ async fn run() -> Result<()> {
         // #4847's row-group population is a local prototype with no operator
         // surface; the server never turns it on.
         file_cache_row_group_prototype: false,
+        // #4905's predicate-keyed population is a local prototype with no
+        // operator surface; the server never turns it on.
+        file_cache_predicate_key_prototype: false,
     });
     tracing::info!(
         target_partitions = query_scan.target_partitions,

@@ -55,17 +55,27 @@ population declined; `predicate` is the in-process prototype.
 | post4891 | 6.12 | 6.12 | 5.71 | 5.75 | 6.51 |
 | predicate | 6.40 | **0.62** | 5.48 | **0.88** | 6.97 |
 
-| arm | task hits / lookups | completed / inserted | evicted | resident entries | retained | reader fetched |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| disabled | — | — | — | 0 | 0 | 5.8 MiB |
-| post4891 | 0 / 80 | 0 / 0 | 0 | 0 | 0 | 5.8 MiB |
-| predicate | **40 / 80 (50%)** | 40 / 40 | **24** | 16 | 0.525 MiB | **2.9 MiB** |
+| arm | task hits / lookups | completed / inserted | evicted | resident entries | retained | reader fetched | decoded |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| disabled | — | — | — | 0 | 0 | 5.8 MiB | 2.6 MiB |
+| post4891 | 0 / 80 | 0 / 0 | 0 | 0 | 0 | 5.8 MiB | 2.6 MiB |
+| predicate | **40 / 80 (50%)** | 40 / 40 | **24** | 16 | 0.525 MiB | **2.9 MiB** | 2.6 MiB |
 
 The repeated stable predicate is 9.9x faster than `post4891`; repeats of the
-three varied labels are 6.5x faster. Reader-fetched bytes fall in proportion to
-the 50% task hit rate. Scan output stays 2.6 MiB in all arms because cached rows
-still pass through the residual filter; the reduction is physical reader work,
-not rows handed to DataFusion.
+three varied labels are 6.5x faster. Reader-fetched bytes
+(`siglake_query_scan_partition_fetched_bytes`) fall in proportion to the 50%
+task hit rate. Decoded bytes (`siglake_query_scan_partition_decoded_bytes`) are
+2.6 MiB in all three arms, including cache-disabled: a served entry still yields
+the same batches through the residual filter, so what a hit saves is physical
+reader work, not decode volume handed to DataFusion. On this fixture the two
+move together only because a miss decodes what it fetches.
+
+A second release run on the same box reproduced every counter in this table
+exactly — 40/80 hits, 40 completed, 24 evicted, 16 resident, 0.525 MiB retained,
+2.9 MiB against 5.8 MiB fetched — and the repeat speedups within noise (0.63 ms
+and 0.87 ms). Cold p50s moved by up to 2.7 ms between runs on a shared box, so
+the disposition rests on the counters and the repeat/cold ratio, not on any cold
+column.
 
 The entry budget, rather than bytes, binds first. Ten predicates over four file
 identities create 40 complete entries. The 16 survivors retain 0.525 MiB, about

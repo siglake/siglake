@@ -1381,6 +1381,11 @@ against that policy and against no cache at all in
 `docs/DESIGN_row_group_decoded_cache_qualification.md` — a local prototype
 reachable only in-process, with the recorded disposition and what would change
 it, so nothing in this section changes until it is adopted.
+Keying entries by the predicate they were read under, the other shape #4891
+offered, is qualified the same way in
+`docs/DESIGN_predicate_keyed_decoded_cache.md`; its disposition is reject, on a
+synthetic browse trace where changing literals evicted entries faster than
+repeats could use them.
 Sizing it, for the operator who does turn it on, is
 `docs/DESIGN_source_file_cache_qualification.md`: both limits have to be
 positive (a pod given one of the two warns at startup and runs without the

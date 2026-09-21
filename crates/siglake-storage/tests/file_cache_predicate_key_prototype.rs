@@ -8,6 +8,7 @@
 //! path; planning stays `Inexact`, so the residual `FilterExec` is present on
 //! both kinds of hit.
 
+use chrono::{Duration, TimeZone, Utc};
 use datafusion::prelude::SessionContext;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use siglake_core::Event;
@@ -20,9 +21,14 @@ const CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const CACHE_MAX_ENTRIES: usize = 64;
 
 fn fixture() -> Vec<Event> {
+    // The events table partitions by day, and the `miss: 1 / insert: 1`
+    // assertions below read one task per query: seeding with `Event::now()`
+    // would split the fixture into two data files across a UTC midnight.
+    let base = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
     (0..ROWS)
         .map(|i| {
             let mut event = Event::now(format!("row-{i} checkout latency={} ms", i % 97));
+            event.timestamp = base + Duration::milliseconds(i as i64);
             event.host = if i < MATCHES {
                 "alpha"
             } else if i < 2 * MATCHES {
