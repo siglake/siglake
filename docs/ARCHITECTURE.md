@@ -118,7 +118,12 @@ and creates nothing under `--to`, `--to` itself included. The plan reads the
 body of each candidate it would write and decodes it, so a candidate that is
 not a WAL segment is named, with its reason, before `--apply` rather than in
 the report afterwards; an already-present destination is not read, so a re-run
-does not re-download the mirror. `--apply` performs
+does not re-download the mirror. A plan whose listing saw only an `_active/`
+copy retains its exact sealed key too. Both the plan's body check and the apply
+GET prefer that sealed object if it has since appeared, and retry it if active
+cleanup wins between their sealed check and active GET. Thus cleanup cannot
+strand a selected partial, and the restore still publishes one segment rather
+than both copies. `--apply` performs
 the restore, rebuilding the per-tenant and per-index layout so each segment
 returns to the namespace and table it came from — including the tenant's own
 `sealed/`, the discovery directory the drain enumerates tenants by, which an

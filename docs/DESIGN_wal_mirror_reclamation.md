@@ -380,7 +380,12 @@ All but the last are in `mirror_ledger_reclaim_tests`
    sealed sibling after writing too, closing the race where it lands after the
    first delete. Cleanup is bounded and uses no listing; historical partials
    and terminal cleanup failures with no remaining local segment remain for
-   the operator's lifecycle rule.
+   the operator's lifecycle rule. Recovery retains the exact sealed sibling
+   when a non-atomic listing selects only an active key. Its body check and
+   apply GET prefer the sealed copy, then retry it when cleanup wins after the
+   first sealed check, so no selected partial is stranded and only one local
+   segment is published. Operator-facing documentation is tracked in
+   siglake-docs #5777.
 3. **The ingester's local WAL sweep never looks at per-index WAL directories.**
    `local_wal_sweep_once` walks tenant directories and the root
    (`crates/siglake-cli/src/main.rs:1529-1534`), while the catch-up sweep and the

@@ -1870,12 +1870,83 @@ pub struct RecoveryPlan {
     /// object: the plan restores one of them, and each object's routing is
     /// certified on its own.
     pub listed: Vec<ListedSegment>,
-    /// The objects to fetch, keyed by store key — an apply's work list.
-    candidates: Vec<(String, RecoveryTarget)>,
+    /// The objects to fetch — an apply's work list. An active candidate keeps
+    /// its exact sealed sibling so a cleanup between LIST and GET cannot
+    /// strand the restore.
+    candidates: Vec<RecoveryCandidate>,
     /// What `wal_segments` said about this listing, when the caller passed
     /// `--catalog` and looked the ids up. `None` is the shipped no-catalog
     /// path, byte for byte.
     ledger: Option<LedgerVerdict>,
+}
+
+#[derive(Debug, Clone)]
+struct RecoveryCandidate {
+    /// Key selected by the listing. This is the active key when the listing
+    /// did not observe a sealed replacement yet.
+    key: String,
+    /// Exact sealed sibling of an active key. `None` for a candidate the
+    /// listing already selected in sealed form.
+    sealed_key: Option<String>,
+    target: RecoveryTarget,
+}
+
+struct RecoveryRead {
+    key: String,
+    body: bytes::Bytes,
+    partial: bool,
+}
+
+/// Read the best copy of one listed segment without another LIST.
+///
+/// A sealed upload is published before its active sibling is deleted. A
+/// non-atomic listing can therefore retain only the active key, and cleanup
+/// can remove that key before either the plan's body check or the apply GET.
+/// Prefer the derivable sealed sibling, then use the listed active copy. If
+/// the active GET loses that race, retry the sealed sibling once: the sealed
+/// PUT necessarily preceded the delete that produced `NotFound`.
+async fn read_recovery_candidate(
+    op: &Operator,
+    candidate: &RecoveryCandidate,
+) -> Result<RecoveryRead> {
+    if let Some(sealed_key) = &candidate.sealed_key {
+        match op.read(sealed_key).await {
+            Ok(body) => {
+                return Ok(RecoveryRead {
+                    key: sealed_key.clone(),
+                    body: body.to_bytes(),
+                    partial: false,
+                });
+            }
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("GET {sealed_key}")),
+        }
+    }
+
+    match op.read(&candidate.key).await {
+        Ok(body) => Ok(RecoveryRead {
+            key: candidate.key.clone(),
+            body: body.to_bytes(),
+            partial: candidate.target.partial,
+        }),
+        Err(active_err) if active_err.kind() == opendal::ErrorKind::NotFound => {
+            let Some(sealed_key) = &candidate.sealed_key else {
+                return Err(active_err).with_context(|| format!("GET {}", candidate.key));
+            };
+            let body = op.read(sealed_key).await.with_context(|| {
+                format!(
+                    "GET {} after listed active copy {} disappeared",
+                    sealed_key, candidate.key
+                )
+            })?;
+            Ok(RecoveryRead {
+                key: sealed_key.clone(),
+                body: body.to_bytes(),
+                partial: false,
+            })
+        }
+        Err(e) => Err(e).with_context(|| format!("GET {}", candidate.key)),
+    }
 }
 
 impl RecoveryPlan {
@@ -2083,23 +2154,34 @@ pub async fn plan_recovery(op: &Operator, prefix: &str, wal_root: &Path) -> Resu
 
     let mut by_dest: std::collections::BTreeMap<(String, Option<String>), PlanGroup> =
         std::collections::BTreeMap::new();
-    let mut work: Vec<(String, RecoveryTarget)> = Vec::with_capacity(candidates.len());
+    let mut work: Vec<RecoveryCandidate> = Vec::with_capacity(candidates.len());
     let mut unreadable: Vec<UnreadableCandidate> = Vec::new();
     // A contradicted listing is refused whole by `apply_plan`, so reading its
     // bodies would buy an operator nothing and cost a GET per key.
     let check_bodies = !matches!(verdict, RootVerdict::Contradicted { .. });
     for (key, bytes, target) in candidates.into_values() {
+        let sealed_key = target.partial.then(|| {
+            let suffix = key
+                .strip_prefix(listing_prefix.as_str())
+                .expect("candidate came from this listing prefix");
+            format!("{listing_prefix}{}", sealed_form(suffix))
+        });
+        let candidate = RecoveryCandidate {
+            key: key.clone(),
+            sealed_key,
+            target: target.clone(),
+        };
         let dest = wal_root.join(&target.rel);
         if check_bodies && !dest.exists() {
-            let body = op.read(&key).await.with_context(|| format!("GET {key}"))?;
-            if let Err(e) = segment_rows(&body.to_bytes()) {
+            let selected = read_recovery_candidate(op, &candidate).await?;
+            if let Err(e) = segment_rows(&selected.body) {
                 tracing::warn!(
-                    key = %key,
+                    key = %selected.key,
                     error = %format!("{e:#}"),
                     "wal-recover: candidate body is not a readable WAL segment, refused"
                 );
                 unreadable.push(UnreadableCandidate {
-                    key,
+                    key: selected.key,
                     reason: format!("{e:#}"),
                 });
                 continue;
@@ -2126,11 +2208,11 @@ pub async fn plan_recovery(op: &Operator, prefix: &str, wal_root: &Path) -> Resu
         if dest.exists() {
             group.already_present += 1;
         }
-        work.push((key, target));
+        work.push(candidate);
     }
     // Stable order for the apply too, so two runs of the same plan write in
     // the same sequence.
-    work.sort_by(|a, b| a.0.cmp(&b.0));
+    work.sort_by(|a, b| a.key.cmp(&b.key));
     unreadable.sort_by(|a, b| a.key.cmp(&b.key));
     if !unreadable.is_empty() {
         metrics::counter!("siglake_wal_recover_unreadable_total")
@@ -2275,20 +2357,25 @@ pub async fn apply_plan(
     };
 
     crate::create_wal_dir(wal_root).with_context(|| format!("create {}", wal_root.display()))?;
-    for (key, target) in plan.candidates {
+    for candidate in plan.candidates {
+        let target = &candidate.target;
         let dest = wal_root.join(&target.rel);
         if dest.exists() {
             // The discovery-dir repair runs on this path too, because the
             // already-present skip is the path a re-run takes over a restore
             // that landed the segments and not that directory — and that
             // restore is the invisible one (#4972). It costs one `is_dir`.
-            ensure_discovery_dir(wal_root, &target)?;
+            ensure_discovery_dir(wal_root, target)?;
             summary.already_present += 1;
             tracing::debug!(dest = %dest.display(), "wal-recover: already present, skipping");
             continue;
         }
-        let bs = op.read(&key).await.with_context(|| format!("GET {key}"))?;
-        let body = bs.to_bytes();
+        let selected = read_recovery_candidate(op, &candidate).await?;
+        let RecoveryRead {
+            key: selected_key,
+            body,
+            partial: selected_partial,
+        } = selected;
         // The plan read this body too, and it read it EARLIER: an `_active/`
         // object re-PUT in between is listable at zero bytes while its body
         // lands, so the bytes about to be published are the ones that have to
@@ -2298,16 +2385,16 @@ pub async fn apply_plan(
             summary.unreadable += 1;
             summary
                 .sample_unreadable_key
-                .get_or_insert_with(|| key.clone());
+                .get_or_insert_with(|| selected_key.clone());
             metrics::counter!("siglake_wal_recover_unreadable_total").increment(1);
             tracing::warn!(
-                key = %key,
+                key = %selected_key,
                 error = %format!("{e:#}"),
                 "wal-recover: candidate body is not a readable WAL segment, nothing written"
             );
             continue;
         }
-        ensure_discovery_dir(wal_root, &target)?;
+        ensure_discovery_dir(wal_root, target)?;
         let Some(parent) = dest.parent() else {
             anyhow::bail!(
                 "restored segment {} has no parent directory",
@@ -2326,10 +2413,10 @@ pub async fn apply_plan(
             .with_context(|| format!("write {}", dest.display()))?;
         summary.pulled += 1;
         tracing::info!(
-            key = %key,
+            key = %selected_key,
             dest = %target.rel.display(),
             bytes = body.len(),
-            from_active_mirror = target.partial,
+            from_active_mirror = selected_partial,
             "wal-recover: pulled"
         );
     }
@@ -2374,7 +2461,7 @@ mod tests {
 
     use siglake_core::Event;
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn memory_op() -> Operator {
@@ -2522,6 +2609,84 @@ mod tests {
                 self.gate.started.notify_one();
                 self.gate.release.notified().await;
             }
+            self.inner.write(path, args).await
+        }
+
+        async fn stat(&self, path: &str, args: OpStat) -> opendal::Result<opendal::raw::RpStat> {
+            self.inner.stat(path, args).await
+        }
+
+        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
+            self.inner.delete().await
+        }
+
+        async fn list(
+            &self,
+            path: &str,
+            args: OpList,
+        ) -> opendal::Result<(opendal::raw::RpList, Self::Lister)> {
+            self.inner.list(path, args).await
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct ActiveReadGate {
+        blocked: Arc<AtomicBool>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct ActiveReadGateLayer(ActiveReadGate);
+
+    #[derive(Debug)]
+    struct ActiveReadGateAccess<A> {
+        inner: A,
+        gate: ActiveReadGate,
+    }
+
+    impl<A: Access> Layer<A> for ActiveReadGateLayer {
+        type LayeredAccess = ActiveReadGateAccess<A>;
+
+        fn layer(&self, inner: A) -> Self::LayeredAccess {
+            ActiveReadGateAccess {
+                inner,
+                gate: self.0.clone(),
+            }
+        }
+    }
+
+    impl<A: Access> LayeredAccess for ActiveReadGateAccess<A> {
+        type Inner = A;
+        type Reader = A::Reader;
+        type Writer = A::Writer;
+        type Lister = A::Lister;
+        type Deleter = A::Deleter;
+        type Copier = A::Copier;
+
+        fn inner(&self) -> &Self::Inner {
+            &self.inner
+        }
+
+        async fn read(
+            &self,
+            path: &str,
+            args: OpRead,
+        ) -> opendal::Result<(opendal::raw::RpRead, Self::Reader)> {
+            if (path.contains("/_active/") || path.starts_with("_active/"))
+                && !self.gate.blocked.swap(true, Ordering::SeqCst)
+            {
+                self.gate.started.notify_one();
+                self.gate.release.notified().await;
+            }
+            self.inner.read(path, args).await
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<(opendal::raw::RpWrite, Self::Writer)> {
             self.inner.write(path, args).await
         }
 
@@ -4970,6 +5135,87 @@ mod tests {
             std::fs::read(sealed.join("both.arrow")).unwrap(),
             complete,
             "the sealed copy must win over its active prefix"
+        );
+    }
+
+    /// #5071: LIST and GET are not one object-store operation. A recovery
+    /// plan may retain the active key just before the sealed PUT lands, then
+    /// apply after cleanup either has or has not deleted that key. In both
+    /// interleavings the exact sealed sibling wins, once, with all rows.
+    #[tokio::test]
+    async fn a_plan_that_listed_only_active_uses_its_later_sealed_replacement() {
+        for cleanup_finished in [false, true] {
+            let op = memory_op();
+            let active_key = "wal-mirror/_active/acme/s1.arrow.partial";
+            let sealed_key = "wal-mirror/acme/s1.arrow";
+            op.write(active_key, active_body(1)).await.unwrap();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("wal");
+            let plan = plan_recovery(&op, "wal-mirror", &root).await.unwrap();
+            assert_eq!(plan.segments(), 1, "the stale listing retained active");
+
+            let complete = sealed_body(3);
+            op.write(sealed_key, complete.clone()).await.unwrap();
+            if cleanup_finished {
+                op.delete(active_key).await.unwrap();
+            }
+
+            let summary = apply_plan(&op, plan, &root).await.unwrap();
+            assert_eq!(summary.pulled, 1);
+            assert_eq!(summary.unreadable, 0);
+            assert_eq!(
+                std::fs::read(root.join("acme").join(SEALED_DIR).join("s1.arrow")).unwrap(),
+                complete,
+                "sealed must win whether cleanup_finished={cleanup_finished}"
+            );
+            assert_eq!(
+                crate::list_sealed(&root.join("acme")).unwrap().len(),
+                1,
+                "the two remote copies restore one local segment"
+            );
+        }
+    }
+
+    /// The narrower interval inside one body check: its first sealed GET saw
+    /// no object, then the sealed PUT and active DELETE both completed before
+    /// the selected active GET. The retry must recover the published sealed
+    /// replacement rather than fail the whole plan on the stale active key.
+    #[tokio::test]
+    async fn cleanup_between_the_sealed_probe_and_active_get_retries_sealed() {
+        let gate = ActiveReadGate::default();
+        let op = Operator::new(Memory::default())
+            .unwrap()
+            .layer(ActiveReadGateLayer(gate.clone()))
+            .finish();
+        let active_key = "wal-mirror/_active/acme/s1.arrow.partial";
+        let sealed_key = "wal-mirror/acme/s1.arrow";
+        op.write(active_key, active_body(1)).await.unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        let plan_task = tokio::spawn({
+            let op = op.clone();
+            let root = root.clone();
+            async move { plan_recovery(&op, "wal-mirror", &root).await }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.started.notified())
+            .await
+            .expect("plan reached the active GET after its sealed probe");
+        let complete = sealed_body(3);
+        op.write(sealed_key, complete.clone()).await.unwrap();
+        op.delete(active_key).await.unwrap();
+        gate.release.notify_one();
+
+        let plan = plan_task.await.unwrap().unwrap();
+        assert_eq!(plan.segments(), 1);
+        assert!(plan.unreadable.is_empty());
+        let summary = apply_plan(&op, plan, &root).await.unwrap();
+        assert_eq!(summary.pulled, 1);
+        assert_eq!(
+            std::fs::read(root.join("acme").join(SEALED_DIR).join("s1.arrow")).unwrap(),
+            complete
         );
     }
 
