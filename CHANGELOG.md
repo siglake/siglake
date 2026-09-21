@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Compactor observability (fix)**: a completed filesystem sweep now creates
+  `siglake_compactor_pass_claim_attempts_exhausted_total{tenant}` at 0 for
+  every tenant it publishes gauges for. The counter was written only when a
+  drain pass gave up re-claiming a segment, so on a healthy compactor the
+  series was absent and could not be told apart from a drain that never ran.
+  Accumulated counts survive later sweeps. (#5014)
+
 - **WAL observability (feature)**: an IPC framing walk that refuses an
   unreadable sealed, legacy or recovered partial WAL segment now increments
   `siglake_wal_ipc_framing_refused_total`. Every role pre-registers the series;

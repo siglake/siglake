@@ -22,6 +22,7 @@ use siglake_wal::WalWriter;
 
 const TENANT: &str = "acme";
 const GAUGE: &str = "siglake_compactor_sealed_pending";
+const PASS_CLAIM: &str = siglake_compactor::PASS_CLAIM_ATTEMPTS_EXHAUSTED;
 
 /// Seal exactly `count` segments into `dir`, one event apiece.
 fn seal_n(dir: &Path, ingester: &str, count: usize) {
@@ -54,6 +55,29 @@ fn published_backlog(snapshotter: &Snapshotter) -> Option<f64> {
         .map(|(_, _, _, value)| match value {
             DebugValue::Gauge(g) => g.into_inner(),
             other => panic!("{GAUGE} must be a gauge, got {other:?}"),
+        })
+}
+
+/// The tenant's pass-claim counter, or `None` when the cycle never registered
+/// the series.
+///
+/// `Snapshotter::snapshot` swaps every counter back to 0 as it reads, so a
+/// test that takes two snapshots reads deltas; each caller here takes one.
+fn published_pass_claim(snapshotter: &Snapshotter, tenant: &str) -> Option<u64> {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find(|(key, _, _, _)| {
+            key.key().name() == PASS_CLAIM
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "tenant" && label.value() == tenant)
+        })
+        .map(|(_, _, _, value)| match value {
+            DebugValue::Counter(c) => c,
+            other => panic!("{PASS_CLAIM} must be a counter, got {other:?}"),
         })
 }
 
@@ -245,5 +269,108 @@ async fn a_cycle_that_fails_partway_publishes_no_backlog_at_all() {
         published_backlog(&snapshotter),
         None,
         "an incomplete sweep must publish neither a partial total nor a zero"
+    );
+}
+
+/// #5014: the sweep registers `siglake_compactor_pass_claim_attempts_exhausted_total`
+/// at 0 for every tenant it publishes gauges for.
+///
+/// The counter is otherwise written only when a pass gives up re-claiming a
+/// segment, so on a healthy compactor the series did not exist at all — and
+/// #4723's reading of it, "the bound was never hit", could not be told apart
+/// from a drain that never ran.
+#[tokio::test]
+async fn a_swept_tenant_registers_its_pass_claim_counter_at_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_root = tmp.path().join("wal");
+    let tenant_dir = wal_root.join(TENANT);
+    seal_n(&tenant_dir, TENANT, 2);
+
+    let ice = Arc::new(
+        IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap(),
+    );
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    {
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        Compactor::new(&wal_root, ice).run_once().await.unwrap();
+    }
+    assert_eq!(
+        published_pass_claim(&snapshotter, TENANT),
+        Some(0),
+        "a completed sweep registers the tenant's pass-claim counter at zero"
+    );
+}
+
+/// The zero is what an operator scrapes, so assert it in exposition form,
+/// against a recorder built the way `metrics::init` builds the global one.
+#[tokio::test]
+async fn a_healthy_scrape_carries_the_pass_claim_counter_at_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_root = tmp.path().join("wal");
+    // No tenant subdirectory: the legacy top-level layout, which the sweep
+    // labels `default`. One tenant, two segments, nothing that fails.
+    seal_n(&wal_root, "default", 2);
+
+    let ice = Arc::new(
+        IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap(),
+    );
+    let recorder = siglake_core::metrics::builder()
+        .expect("builder")
+        .build_recorder();
+    {
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        Compactor::new(&wal_root, ice).run_once().await.unwrap();
+    }
+    let scrape = recorder.handle().render();
+    assert!(
+        scrape.contains(&format!("{PASS_CLAIM}{{tenant=\"default\"}} 0")),
+        "{scrape}"
+    );
+}
+
+/// Registering the series must not clear it: a tenant that withheld segments
+/// keeps its total across the sweeps that follow, or the counter would report
+/// only whatever happened since the last cycle and every `increase()` over it
+/// would read a reset as a drop.
+#[tokio::test]
+async fn a_later_sweep_preserves_a_tenants_pass_claim_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_root = tmp.path().join("wal");
+    let tenant_dir = wal_root.join(TENANT);
+    seal_n(&tenant_dir, TENANT, 2);
+
+    let ice = Arc::new(
+        IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap(),
+    );
+    let compactor = Compactor::new(&wal_root, ice);
+    // A Prometheus recorder rather than the debugging one: `render` leaves the
+    // counter standing, so the second cycle is read against the first cycle's
+    // accumulated total and not against a drained zero.
+    let recorder = siglake_core::metrics::builder()
+        .expect("builder")
+        .build_recorder();
+    let scrape = {
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        compactor.run_once().await.unwrap();
+        // Stands in for a pass that gave up on two segments. Reproducing that
+        // needs a cause that fails every claim, which `withhold_spent_segment`
+        // already has its own coverage for; what is under test here is the
+        // sweep that runs afterwards.
+        metrics::counter!(PASS_CLAIM, "tenant" => TENANT.to_string()).increment(2);
+        // A second, empty sweep: the tenant is still published, so `publish`
+        // registers its counter again.
+        compactor.run_once().await.unwrap();
+        recorder.handle().render()
+    };
+    assert!(
+        scrape.contains(&format!("{PASS_CLAIM}{{tenant=\"{TENANT}\"}} 2")),
+        "{scrape}"
     );
 }
