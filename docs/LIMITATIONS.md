@@ -1375,10 +1375,13 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `--to`, so a refused object stays in the mirror, and nothing reclaims
   `_active/` at all (#4914). Every read
   walks the Arrow IPC length prefixes against the byte count first, so a
-  declared length cannot size an allocation the segment cannot back — but the
-  file size is the whole of that bound, and in a segment with no frame CRC
-  behind it a torn tail and deliberate corruption are the same bytes. The ack is also only as
-  durable as the filesystem under the WAL: siglake syncs the segment's bytes
+  declared length cannot size an allocation the segment cannot back. A refusal
+  increments `siglake_wal_ipc_framing_refused_total` and raises the critical
+  `SiglakeWalIpcFramingRefused` alert because the segment is unreadable and
+  requires investigation. The file size is the whole of that bound, and in a
+  segment with no frame CRC behind it a torn tail and deliberate corruption
+  are the same bytes. The ack is also only as durable as the filesystem under
+  the WAL: siglake syncs the segment's bytes
   and every directory entry that names it, and assumes those syncs reach the
   device. A network filesystem answers `fsync(2)` on its own terms and
   siglake measures none of them, so ext4 or xfs on a node-attached volume is
@@ -1741,7 +1744,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   query tier is reached through SQL over HTTP and the Elasticsearch- and
   Jaeger-compatible shims. What does ship for operations: a starter Grafana
   dashboard (`deploy/grafana/siglake-overview.json` — import it yourself, the
-  chart does not render it) and a `PrometheusRule` with 37 alerts grouped by
+  chart does not render it) and a `PrometheusRule` with 38 alerts grouped by
   what an operator should do (data-loss, stalled, refusing, saturation),
   rendered when `prometheusRule.enabled` is set (default off). No metrics
   downsampling; retention is file/day-granular (no row-level retention).

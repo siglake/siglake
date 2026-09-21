@@ -334,9 +334,14 @@
      "expr": "sum(increase(siglake_wal_partial_tail_dropped_total{namespace=~\"$namespace\"}[5m]))",
      "legendFormat": "partial tails dropped",
      "refId": "C"
+    },
+    {
+     "expr": "sum(increase(siglake_wal_ipc_framing_refused_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "IPC framing refused",
+     "refId": "D"
     }
    ],
-   "description": "Adoption is expected after a pod dies mid-write. A dropped tail means the recovered partial ended during an IPC message; its complete fsynced prefix remains readable and the original bytes remain on disk."
+   "description": "Adoption is expected after a pod dies mid-write. A dropped tail means the recovered partial ended during an IPC message; its complete fsynced prefix remains readable and the original bytes remain on disk. An IPC framing refusal means a WAL segment is unreadable and requires investigation."
   },
   {
    "id": 109,

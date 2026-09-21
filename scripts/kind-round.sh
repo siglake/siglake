@@ -482,6 +482,7 @@ expected = {
         ("siglake_wal_mirror_register_abandoned_total", {}),
         ("siglake_wal_mirror_upload_abandoned_total", {}),
         ("siglake_wal_crc_mismatch_total", {}),
+        ("siglake_wal_ipc_framing_refused_total", {}),
         ("siglake_wal_partials_adopted_total", {}),
     ],
     "compactor": [
@@ -500,6 +501,7 @@ expected = {
             {"iceberg_namespace": "siglake", "table": "events"},
         ),
         ("siglake_wal_crc_mismatch_total", {}),
+        ("siglake_wal_ipc_framing_refused_total", {}),
     ],
 }
 

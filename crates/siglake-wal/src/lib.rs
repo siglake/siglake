@@ -2692,10 +2692,13 @@ fn read_partial_segment_bytes(path: &Path, bytes: &[u8]) -> Result<Vec<RecordBat
         IpcStreamExtent::Complete => return decode_ipc_stream(bytes),
         IpcStreamExtent::Truncated { offset, detail } => (offset, detail),
         // Bytes all present and still not a message: corruption, not a tear.
-        IpcStreamExtent::Malformed { offset, detail } => bail!(
-            "WAL partial-segment IPC framing check for {}: the message at byte {offset} {detail}",
-            path.display()
-        ),
+        IpcStreamExtent::Malformed { offset, detail } => {
+            metrics::counter!("siglake_wal_ipc_framing_refused_total").increment(1);
+            bail!(
+                "WAL partial-segment IPC framing check for {}: the message at byte {offset} {detail}",
+                path.display()
+            )
+        }
     };
 
     // Tolerance is for a message cut short by the crash, and only behind at
@@ -2707,6 +2710,7 @@ fn read_partial_segment_bytes(path: &Path, bytes: &[u8]) -> Result<Vec<RecordBat
         )
     })?;
     if batches.is_empty() {
+        metrics::counter!("siglake_wal_ipc_framing_refused_total").increment(1);
         bail!(
             "WAL partial-segment IPC framing check for {}: the message at byte {torn_at} {detail}, \
              and no complete batch precedes it",
@@ -3099,6 +3103,7 @@ pub fn read_segment_bytes(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
         IpcStreamExtent::Complete => {}
         IpcStreamExtent::Truncated { offset, detail }
         | IpcStreamExtent::Malformed { offset, detail } => {
+            metrics::counter!("siglake_wal_ipc_framing_refused_total").increment(1);
             bail!("WAL segment IPC framing check: the message at byte {offset} {detail}")
         }
     }
@@ -3998,6 +4003,23 @@ mod segment_owner_tests {
 #[cfg(test)]
 mod ipc_framing_tests {
     use super::*;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    fn framing_refusals(read: impl FnOnce()) -> u64 {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, read);
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == "siglake_wal_ipc_framing_refused_total")
+            .map(|(key, _, _, value)| match value {
+                DebugValue::Counter(count) => count,
+                other => panic!("{} must be a counter, got {other:?}", key.key().name()),
+            })
+            .sum()
+    }
 
     /// A genuine legacy (pre-WS-8) raw-IPC segment: schema message, one
     /// record-batch message, EOS marker.
@@ -4214,6 +4236,95 @@ mod ipc_framing_tests {
             "refusing {} adversarial segments took {elapsed:?}; one of these bytes cost 9.2 s \
              before the framing walk",
             adversarial().len()
+        );
+    }
+
+    #[test]
+    fn framing_refusal_counter_covers_sealed_legacy_and_partial_reads() {
+        let legacy_refused = framing_refusals(|| {
+            assert!(read_segment_bytes(b"truncated").is_err());
+            assert!(read_segment_bytes(b"truncated").is_err());
+        });
+        assert_eq!(legacy_refused, 2, "each refused read attempt is counted");
+
+        let body = b"truncated";
+        let sealed = build_wal_frame(0, 0, 0, None, body, crc32(body));
+        let sealed_refused = framing_refusals(|| {
+            assert!(read_segment_from_bytes(&sealed).is_err());
+        });
+        assert_eq!(sealed_refused, 1, "a framed sealed refusal is counted");
+
+        let mut partial_body = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut partial_body, &events_schema()).unwrap();
+            writer.finish().unwrap();
+        }
+        partial_body.truncate(partial_body.len() - 8);
+        partial_body.extend_from_slice(&IPC_CONTINUATION_MARKER);
+        partial_body.extend_from_slice(&8u32.to_le_bytes()[..2]);
+        let partial = build_wal_frame(WAL_FRAME_FLAG_PARTIAL, 0, 0, None, &partial_body, 0);
+        let partial_refused = framing_refusals(|| {
+            let err = read_segment_from_bytes(&partial).unwrap_err();
+            assert!(format!("{err:#}").contains("no complete batch precedes it"));
+        });
+        assert_eq!(partial_refused, 1, "a torn first partial append is refused");
+
+        let mut malformed_partial = build_wal_frame(WAL_FRAME_FLAG_PARTIAL, 0, 0, None, &[], 0);
+        malformed_partial.extend_from_slice(&i32::MIN.to_le_bytes());
+        let malformed_refused = framing_refusals(|| {
+            assert!(read_segment_from_bytes(&malformed_partial).is_err());
+        });
+        assert_eq!(malformed_refused, 1, "malformed partial framing is refused");
+    }
+
+    #[test]
+    fn framing_refusal_counter_excludes_other_read_outcomes() {
+        let valid = legacy_bytes(4);
+        assert_eq!(
+            framing_refusals(|| assert_eq!(read_segment_bytes(&valid).unwrap().len(), 1)),
+            0,
+            "a genuine segment is not a refusal"
+        );
+
+        let batch = events_to_record_batch(&[Event::now("complete")]).unwrap();
+        let mut decoder_corruption = Vec::new();
+        {
+            let mut writer =
+                StreamWriter::try_new(&mut decoder_corruption, &batch.schema()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        decoder_corruption.truncate(decoder_corruption.len() - 8);
+        decoder_corruption.extend_from_slice(&IPC_CONTINUATION_MARKER);
+        decoder_corruption.extend_from_slice(&8u32.to_le_bytes());
+        decoder_corruption.extend_from_slice(&[0; 72]);
+        let decoder_corruption =
+            build_wal_frame(WAL_FRAME_FLAG_PARTIAL, 0, 0, None, &decoder_corruption, 0);
+        assert_eq!(
+            framing_refusals(|| assert!(read_segment_from_bytes(&decoder_corruption).is_err())),
+            0,
+            "decoder corruption after an accepted walk is not a framing refusal"
+        );
+
+        let mut tolerated_tail = valid[..valid.len() - 8].to_vec();
+        tolerated_tail.extend_from_slice(&IPC_CONTINUATION_MARKER);
+        tolerated_tail.extend_from_slice(&8u32.to_le_bytes()[..2]);
+        let tolerated_tail =
+            build_wal_frame(WAL_FRAME_FLAG_PARTIAL, 0, 0, None, &tolerated_tail, 0);
+        assert_eq!(
+            framing_refusals(|| {
+                assert_eq!(read_segment_from_bytes(&tolerated_tail).unwrap().len(), 1)
+            }),
+            0,
+            "a recovered prefix with a torn tail is tolerated"
+        );
+
+        let body = b"truncated";
+        let crc_failure = build_wal_frame(0, 0, 0, None, body, crc32(body).wrapping_add(1));
+        assert_eq!(
+            framing_refusals(|| assert!(read_segment_from_bytes(&crc_failure).is_err())),
+            0,
+            "a CRC-only failure never reaches the framing walk"
         );
     }
 

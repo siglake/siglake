@@ -241,6 +241,10 @@ pub const INGESTER_ALERTED_COUNTERS: &[AlertedCounter] = &[
         series: UNLABELLED,
     },
     AlertedCounter {
+        name: "siglake_wal_ipc_framing_refused_total",
+        series: UNLABELLED,
+    },
+    AlertedCounter {
         name: "siglake_wal_partials_adopted_total",
         series: UNLABELLED,
     },
@@ -251,8 +255,8 @@ pub const INGESTER_ALERTED_COUNTERS: &[AlertedCounter] = &[
 ];
 
 /// Counters the compactor (`siglake compactor`, not `--once`, which serves no
-/// metrics) pre-registers. `siglake_wal_crc_mismatch_total` is here too: the
-/// drain reads sealed segments through the same CRC check as ingest replay.
+/// metrics) pre-registers. The WAL CRC and IPC-framing counters are here too:
+/// the drain reads sealed segments through the same checks as ingest replay.
 /// The group-count counters are labelled by Iceberg namespace and table (and
 /// rebuild outcome) and are listed for the default namespace's events
 /// table only (`siglake_storage::iceberg::NAMESPACE` and `TABLE_NAME`, held
@@ -511,14 +515,19 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
         series: UNLABELLED,
     },
     AlertedCounter {
+        name: "siglake_wal_ipc_framing_refused_total",
+        series: UNLABELLED,
+    },
+    AlertedCounter {
         name: "siglake_wal_partial_tail_dropped_total",
         series: UNLABELLED,
     },
     TABLE_CACHE_FENCED,
 ];
 
-/// Counters the query server pre-registers. The WAL CRC counter is here as
-/// well: the real-time buffer and the hot caches read sealed segments.
+/// Counters the query server pre-registers. The WAL CRC and IPC-framing
+/// counters are here as well: the real-time buffer and hot caches read sealed
+/// segments.
 pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
     // Query responses stay non-blocking when the best-effort audit path is
     // saturated or stopped. Pre-register every bounded reason so the first
@@ -690,6 +699,10 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
     },
     AlertedCounter {
         name: "siglake_wal_crc_mismatch_total",
+        series: UNLABELLED,
+    },
+    AlertedCounter {
+        name: "siglake_wal_ipc_framing_refused_total",
         series: UNLABELLED,
     },
     AlertedCounter {

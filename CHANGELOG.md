@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **WAL observability (feature)**: an IPC framing walk that refuses an
+  unreadable sealed, legacy or recovered partial WAL segment now increments
+  `siglake_wal_ipc_framing_refused_total`. Every role pre-registers the series;
+  the starter dashboard charts it and a critical alert calls for investigation.
+  CRC failures and recovered partials with a readable prefix remain separate.
+  (#5010)
+
 - **Query API (breaking)**: scanning records responses can now include
   `stats.scan.file_attribution`, a request-wide list of at most 32 sorted,
   table-relative file-task identities and their decoded-cache outcomes.
