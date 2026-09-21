@@ -122,11 +122,12 @@ spec:
           annotations:
             summary: WAL segments are durable in the mirror but absent from the catalog
             description: >-
-              {{ "{{ $value }}" }} segment registration(s) were abandoned. Those rows were
-              ACKED to the client and are permanently unqueryable — no error will
-              be raised anywhere else. Run `siglake wal-recover` (it prints a
-              plan; re-run it with `--apply` to restore) or re-register the
-              affected keys.
+              {{ "{{ $value }}" }} segment registration(s) exhausted their retries.
+              Their rows were ACKED to the client and are durable in the mirror,
+              but remain unqueryable until catalog registration succeeds. Read
+              the ingester ERROR for the affected id, URL, and catalog or
+              object-store fault. Repair that fault, then let mirror-to-catalog
+              reconciliation register the orphaned sealed objects.
         - alert: SiglakeWalMirrorUploadAbandoned
           expr: increase(siglake_wal_mirror_upload_abandoned_total[10m]) > 0
           for: 0m
