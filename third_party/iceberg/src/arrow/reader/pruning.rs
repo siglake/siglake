@@ -7,10 +7,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use futures::StreamExt;
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 
-use super::{ArrowReader, PromotedPruneSpec, RawPruneSpec};
+use super::{ArrowReader, DEFAULT_RANGE_FETCH_CONCURRENCY, PromotedPruneSpec, RawPruneSpec};
 use crate::Result;
 use crate::io::FileIO;
 use crate::puffin::PuffinReader;
@@ -755,6 +756,15 @@ impl ArrowReader {
                 .record(cost.reads as f64);
             metrics::histogram!("siglake_iceberg_segmented_index_fetched_bytes")
                 .record(cost.bytes as f64);
+            // #5007: what the staged shape costs and buys. `_stages` is the
+            // rounds of store waits the lookup took, against the `_range_reads`
+            // a serial source would have waited for one at a time;
+            // `_reader_reads` is what a stage re-decodes on its way past the
+            // ranges the lookup already holds.
+            metrics::histogram!("siglake_iceberg_segmented_index_stages")
+                .record(cost.stages as f64);
+            metrics::histogram!("siglake_iceberg_segmented_index_reader_reads")
+                .record(cost.requests as f64);
             let SegmentedOutcome::Matching {
                 rows,
                 resident_bytes,
@@ -799,53 +809,65 @@ fn segmented_index_reads_enabled() -> bool {
     })
 }
 
-type SegmentedRangeRequest = (u64, usize, tokio::sync::oneshot::Sender<Option<Vec<u8>>>);
+/// siglake (#5007): how many of a stage's ranges a segmented lookup fetches at
+/// once. Default [`DEFAULT_RANGE_FETCH_CONCURRENCY`], the bound the scan's own
+/// merged-range reader uses;
+/// `SIGLAKE_SEGMENTED_INDEX_RANGE_CONCURRENCY` overrides it.
+fn segmented_range_concurrency() -> usize {
+    static CONCURRENCY: OnceLock<usize> = OnceLock::new();
+    *CONCURRENCY.get_or_init(|| {
+        segmented_range_concurrency_from(
+            std::env::var("SIGLAKE_SEGMENTED_INDEX_RANGE_CONCURRENCY")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
 
+fn segmented_range_concurrency_from(raw: Option<&str>) -> usize {
+    raw.map(str::trim)
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&concurrency| concurrency > 0)
+        .unwrap_or(DEFAULT_RANGE_FETCH_CONCURRENCY)
+}
+
+/// What one segmented lookup fetched — the evidence that it read a sliver of
+/// the blob rather than the whole of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SegmentedReadCost {
+    /// Ranges the store served — and, within a rounding of the dedupe below,
+    /// the sequential round trips a source serving one range at a time would
+    /// have taken. A range the reader asked for twice (two terms in one
+    /// dictionary block, a later stage re-reading an earlier one) is fetched
+    /// once and counted once.
     reads: u64,
     bytes: u64,
+    /// Reads the reader made, across every stage. Against [`Self::reads`] this
+    /// is what the staged shape re-decodes: a range read again is served from
+    /// what the lookup already holds, but its block is verified and walked
+    /// again.
+    requests: u64,
+    /// Rounds of store waits: the trailer, the directory, the dictionary
+    /// blocks, the posting sections.
+    stages: u64,
 }
 
-#[derive(Default)]
-struct SegmentedReadCounters {
-    reads: std::sync::atomic::AtomicU64,
-    bytes: std::sync::atomic::AtomicU64,
-}
-
-impl SegmentedReadCounters {
-    fn cost(&self) -> SegmentedReadCost {
-        use std::sync::atomic::Ordering::Relaxed;
-        SegmentedReadCost {
-            reads: self.reads.load(Relaxed),
-            bytes: self.bytes.load(Relaxed),
-        }
+fn segmented_cost(
+    source: &siglake_index::segmented::StagedSource,
+    stages: u64,
+) -> SegmentedReadCost {
+    SegmentedReadCost {
+        reads: source.fetched_reads(),
+        bytes: source.fetched_bytes(),
+        requests: source.requests(),
+        stages,
     }
 }
 
-#[derive(Clone)]
-struct PuffinRangeSource {
-    len: u64,
-    requests: tokio::sync::mpsc::Sender<SegmentedRangeRequest>,
-    counters: Arc<SegmentedReadCounters>,
-}
-
-impl siglake_index::segmented::RangeSource for PuffinRangeSource {
-    fn len(&self) -> u64 {
-        self.len
-    }
-
-    fn read(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let (reply, answer) = tokio::sync::oneshot::channel();
-        self.requests.blocking_send((offset, len, reply)).ok()?;
-        let bytes = answer.blocking_recv().ok()??;
-        self.counters.reads.fetch_add(1, Relaxed);
-        self.counters.bytes.fetch_add(bytes.len() as u64, Relaxed);
-        Some(bytes)
-    }
-}
-
+/// What one lookup concluded. A decline carries the reason it is recorded
+/// under as a metric label; all of them mean the same thing to the caller,
+/// which is that this index said nothing about the file.
+#[derive(Debug)]
 enum SegmentedOutcome {
     Matching {
         rows: Vec<u32>,
@@ -854,6 +876,26 @@ enum SegmentedOutcome {
     Declined(&'static str),
 }
 
+/// One segmented lookup over one blob, driven in **stages** (#5007): the
+/// lookup itself is synchronous and runs on this task, decoding only the
+/// ranges it already holds and recording the ones it does not
+/// ([`siglake_index::segmented::StagedSource`]); this then fetches that
+/// stage's ranges together, through [`crate::puffin::BlobRangeReader`], and
+/// runs the lookup again. A store wait happens between two runs of the lookup,
+/// never inside one, so it holds no thread of tokio's blocking pool — where
+/// #4561 held one for the whole of a file's lookup, IO waits included, per file
+/// a fanned-out scan was looking up in.
+///
+/// The stages are the trailer, the directory, the dictionary blocks the terms
+/// name and their posting sections: four rounds of store waits for any shape,
+/// whatever its read count, plus one per additional term of a conjunction
+/// (whose postings are fetched rarest-first and stop as soon as the
+/// intersection empties). The ranges *within* a stage go out together, bounded
+/// by [`segmented_range_concurrency`].
+///
+/// The directory itself is held between lookups (#5006,
+/// [`segmented_directory_cache_get`]), so a repeat lookup on the same blob
+/// reads neither the trailer nor the directory.
 async fn segmented_matching_rows(
     file_io: &FileIO,
     statistics_path: &str,
@@ -873,47 +915,94 @@ async fn segmented_matching_rows(
             ));
         }
     };
-    let counters = Arc::new(SegmentedReadCounters::default());
-    let (requests, mut inbox) = tokio::sync::mpsc::channel::<SegmentedRangeRequest>(1);
-    let source = PuffinRangeSource {
-        len: range_reader.len(),
-        requests,
-        counters: Arc::clone(&counters),
-    };
+    let source = siglake_index::segmented::StagedSource::new(range_reader.len());
     let offset = blob_metadata.offset();
     let held = (!cache_bypass)
         .then(|| segmented_directory_cache_get(statistics_path, offset))
         .flatten();
-    let row_counts = row_counts.to_vec();
-    let groups = groups.map(<[usize]>::to_vec);
-    let spec = spec.clone();
-    let lookup = tokio::task::spawn_blocking(move || {
-        segmented_lookup(source, &row_counts, groups.as_deref(), &spec, held)
-    });
-    while let Some((offset, len, reply)) = inbox.recv().await {
-        let bytes = range_reader
-            .read_at(offset, len as u64)
-            .await
-            .ok()
-            .map(|bytes| bytes.to_vec());
-        let _ = reply.send(bytes);
+    // Termination does not rest on this: a stage fills every range it asked
+    // for, an unreadable one included, so the held set only grows and a blob
+    // has finitely many ranges. It bounds a future reader that asked for
+    // ranges some other way.
+    let stage_budget =
+        8 + 4 * (spec.all_terms.len() + spec.any_terms.len() + spec.index_substrings.len()).max(1);
+    let concurrency = segmented_range_concurrency();
+    let mut stages = 0u64;
+    // The directory the first stage that could parse it parsed. Carried into
+    // the later stages so that a replay re-decodes dictionary blocks and not
+    // the whole directory (474.9 KiB on the 7.34M-row file), and held apart
+    // from the round's own return so the entry still reaches the cache when the
+    // answering round opened on it.
+    let mut parsed_here: Option<Arc<siglake_index::segmented::SegmentedDirectory>> = None;
+    let mut directory = held;
+    loop {
+        let (outcome, parsed) = segmented_lookup(
+            source.clone(),
+            row_counts,
+            groups,
+            spec,
+            directory.as_ref().map(Arc::clone),
+        );
+        if let Some(parsed) = parsed {
+            parsed_here = Some(Arc::clone(&parsed));
+            directory = Some(parsed);
+        }
+        let misses = source.take_misses();
+        if misses.is_empty() {
+            // A directory this lookup parsed is kept whatever the outcome: the
+            // parse is what the next lookup on this blob should not repeat, and
+            // a decline over one file's row groups says nothing about the next
+            // query's.
+            if !cache_bypass && let Some(directory) = parsed_here {
+                segmented_directory_cache_put(statistics_path, offset, directory);
+            }
+            return Ok((outcome, segmented_cost(&source, stages)));
+        }
+        stages += 1;
+        if stages > stage_budget as u64 {
+            return Ok((
+                SegmentedOutcome::Declined("stages"),
+                segmented_cost(&source, stages),
+            ));
+        }
+        // This stage's ranges, together. A range the store refuses is filled as
+        // unreadable, which the reader reads as the failed range read it is —
+        // `Unanswerable`, never a wrong answer — and which keeps the next run
+        // from asking for it again.
+        let reader = &range_reader;
+        futures::stream::iter(misses.into_iter().map(|(offset, len)| async move {
+            (
+                offset,
+                len,
+                reader
+                    .read_at(offset, len as u64)
+                    .await
+                    .ok()
+                    .map(|bytes| bytes.to_vec()),
+            )
+        }))
+        .buffer_unordered(concurrency)
+        .for_each(|(offset, len, bytes)| {
+            match bytes {
+                Some(bytes) => source.fill(offset, len, bytes),
+                None => source.fill_unreadable(offset, len),
+            }
+            std::future::ready(())
+        })
+        .await;
     }
-    let (outcome, parsed) = lookup.await.map_err(|error| {
-        crate::Error::new(
-            crate::ErrorKind::Unexpected,
-            format!("segmented index lookup: {error}"),
-        )
-    })?;
-    if !cache_bypass
-        && let Some(directory) = parsed
-    {
-        segmented_directory_cache_put(statistics_path, offset, directory);
-    }
-    Ok((outcome, counters.cost()))
 }
 
+/// The whole per-file policy (#4561), synchronous, over whatever ranges the
+/// source holds.
+///
+/// Called once per stage (#5007). A range the source does not hold is a
+/// recorded miss and reads as a failed read, so a run that is missing one
+/// declines; [`segmented_matching_rows`] fetches what the run recorded and
+/// calls this again, and only a run that recorded nothing is the lookup's
+/// answer.
 fn segmented_lookup(
-    source: PuffinRangeSource,
+    source: siglake_index::segmented::StagedSource,
     row_counts: &[u64],
     groups: Option<&[usize]>,
     spec: &RawPruneSpec,
@@ -1282,22 +1371,35 @@ fn index_matches_row_selection(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow_array::{RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use siglake_index::segmented::SEGMENTED_BLOB_TYPE;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::file::metadata::{KeyValue, ParquetMetaData};
     use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use parquet::file::reader::{FileReader, SerializedFileReader};
+    use tempfile::TempDir;
 
     use super::{
-        ArrowReader, PromotedPruneSpec, RawPruneSpec, index_load_concurrency_from,
-        intersect_sorted, union_sorted,
+        ArrowReader, DEFAULT_RANGE_FETCH_CONCURRENCY, PromotedPruneSpec, RawPruneSpec,
+        SegmentedOutcome, SegmentedReadCost, index_load_concurrency_from, intersect_sorted,
+        parsed_inverted_index_cache_stats, segmented_directory_cache_footprint,
+        segmented_directory_cache_put, segmented_directory_cache_stats, segmented_matching_rows,
+        segmented_range_concurrency_from, union_sorted,
     };
     use crate::delete_vector::DeleteVector;
-    use crate::io::FileIO;
-    use crate::puffin::{Blob, CompressionCodec, PuffinWriter};
+    use crate::io::{
+        FileIO, FileIOBuilder, FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage,
+        StorageConfig, StorageFactory,
+    };
+    use crate::puffin::{Blob, BlobMetadata, CompressionCodec, PuffinReader, PuffinWriter};
     use crate::scan::{FileScanTask, StatisticsBlobReference};
     use crate::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
 
@@ -1681,5 +1783,1212 @@ mod tests {
                 .is_none(),
             "a stale row-group stamp must fall back to the exact scan"
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // siglake #4561: bounded partial reads of a segmented inverted-index
+    // sidecar, and #5007's staged driver for them. The prototype is off by
+    // default; these drive it directly.
+    // ----------------------------------------------------------------------
+
+    /// The measurement corpus in miniature: shared tokens, a 2%-density
+    /// `queen`, a `checkout` every twentieth row, one token unique to each row
+    /// and a `rareneedle` on one row in 997 — the generator
+    /// `docs/DESIGN_segmented_inverted_index.md`'s tables were taken on.
+    fn segmented_corpus(rows: usize) -> Vec<String> {
+        (0..rows)
+            .map(|row| {
+                let queen = if row % 50 == 0 { " queen" } else { "" };
+                let checkout = if row % 20 == 0 { " checkout" } else { "" };
+                let rare = if row % 997 == 0 { " rareneedle" } else { "" };
+                format!(
+                    "service-{} status {}{queen}{checkout}{rare} row-{row:06}",
+                    row % 20,
+                    200 + row % 5
+                )
+            })
+            .collect()
+    }
+
+    /// A Puffin statistics file carrying **both** sidecar formats for the same
+    /// data file and column: the segmented one uncompressed (its interior has
+    /// to be addressable) beside a Zstd v1 blob, which is how a table would
+    /// carry a mixture while the prototype is being measured.
+    async fn write_mixed_sidecar(
+        dir: &TempDir,
+        rows: &[String],
+        group_rows: u32,
+    ) -> (FileIO, String) {
+        write_mixed_sidecar_for(dir, rows, group_rows, "file:///data/0.parquet").await
+    }
+
+    async fn write_mixed_sidecar_for(
+        dir: &TempDir,
+        rows: &[String],
+        group_rows: u32,
+        data_file: &str,
+    ) -> (FileIO, String) {
+        let file_io = FileIO::new_with_fs();
+        let path = format!("{}/sidecar.puffin", dir.path().to_str().unwrap());
+        let output = file_io.new_output(&path).unwrap();
+        let mut writer = PuffinWriter::new(&output, HashMap::new(), false)
+            .await
+            .unwrap();
+        let properties = HashMap::from([
+            ("data_file".to_string(), data_file.to_string()),
+            ("column".to_string(), "raw".to_string()),
+            ("tokenizer".to_string(), "simple".to_string()),
+        ]);
+        let mut segmented_properties = properties.clone();
+        segmented_properties.insert("format".to_string(), "seg1".to_string());
+        writer
+            .add(
+                Blob::builder()
+                    .r#type(siglake_index::segmented::SEGMENTED_BLOB_TYPE.to_string())
+                    .fields(vec![1])
+                    .snapshot_id(1)
+                    .sequence_number(1)
+                    .data(siglake_index::segmented::encode_from_rows(
+                        rows.iter().map(String::as_str),
+                        group_rows,
+                    ))
+                    .properties(segmented_properties)
+                    .build(),
+                CompressionCodec::None,
+            )
+            .await
+            .unwrap();
+        let mut v1_properties = properties.clone();
+        v1_properties.insert("format".to_string(), "v1".to_string());
+        v1_properties.insert("row_group_size".to_string(), group_rows.to_string());
+        writer
+            .add(
+                Blob::builder()
+                    .r#type("siglake-inverted-v1".to_string())
+                    .fields(vec![1])
+                    .snapshot_id(1)
+                    .sequence_number(1)
+                    .data(
+                        siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str))
+                            .to_bytes(),
+                    )
+                    .properties(v1_properties)
+                    .build(),
+                CompressionCodec::zstd_default(),
+            )
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        (file_io, path)
+    }
+
+    async fn sidecar_blob(file_io: &FileIO, path: &str, blob_type: &str) -> BlobMetadata {
+        sidecar_blob_for(file_io, path, blob_type, "file:///data/0.parquet").await
+    }
+
+    async fn sidecar_blob_for(
+        file_io: &FileIO,
+        path: &str,
+        blob_type: &str,
+        data_file: &str,
+    ) -> BlobMetadata {
+        PuffinReader::new(file_io.new_input(path).unwrap())
+            .with_cache_bypass(true)
+            .file_metadata()
+            .await
+            .unwrap()
+            .blobs()
+            .iter()
+            .find(|blob| {
+                blob.blob_type() == blob_type
+                    && blob.properties().get("data_file").map(String::as_str) == Some(data_file)
+                    && blob.properties().get("column").map(String::as_str) == Some("raw")
+            })
+            .cloned()
+            .expect("the sidecar carries this blob type")
+    }
+
+    fn row_counts(rows: usize, group_rows: usize) -> Vec<u64> {
+        let mut counts = Vec::new();
+        let mut remaining = rows;
+        while remaining > 0 {
+            let group = remaining.min(group_rows);
+            counts.push(group as u64);
+            remaining -= group;
+        }
+        counts
+    }
+
+    fn all_terms_spec(terms: &[&str]) -> RawPruneSpec {
+        RawPruneSpec {
+            all_terms: terms.iter().map(|term| term.to_string()).collect(),
+            ..RawPruneSpec::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_segmented_sidecar_answers_a_term_from_a_sliver_of_the_blob() {
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(20_000);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, 5_000).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let blob_len = blob.length();
+        let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
+
+        let (outcome, cost) = segmented_matching_rows(
+            &file_io,
+            &path,
+            &blob,
+            &row_counts(20_000, 5_000),
+            None,
+            &all_terms_spec(&["rareneedle"]),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let SegmentedOutcome::Matching {
+            rows: matching,
+            resident_bytes,
+        } = outcome
+        else {
+            panic!("the term is in the sidecar: {outcome:?}");
+        };
+        assert_eq!(matching, v1.postings("rareneedle").unwrap().to_vec());
+        println!(
+            "rare term over {blob_len} blob bytes: {} range reads, {} fetched, \
+             {resident_bytes} resident (v1 parses to {})",
+            cost.reads,
+            cost.bytes,
+            v1.heap_size_bytes()
+        );
+        assert!(
+            cost.bytes * 20 < blob_len,
+            "a point lookup fetched {} of {blob_len} bytes",
+            cost.bytes
+        );
+        assert!(
+            (resident_bytes as u64) * 10 < blob_len,
+            "the reader kept {resident_bytes} bytes of a {blob_len}-byte blob"
+        );
+        assert!(
+            resident_bytes * 10 < v1.heap_size_bytes(),
+            "resident {resident_bytes} against a parsed v1 index of {}",
+            v1.heap_size_bytes()
+        );
+    }
+
+    /// A second lookup on the same `(statistics file, blob offset)` reads
+    /// neither the trailer nor the directory (#5006), and the two shipped
+    /// text-index caches are untouched by either lookup.
+    #[tokio::test]
+    async fn a_second_lookup_on_the_same_blob_reads_no_directory() {
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(20_000);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, 5_000).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let counts = row_counts(20_000, 5_000);
+        let spec = all_terms_spec(&["rareneedle"]);
+
+        // What the open costs on this blob, priced the way #4561's table
+        // prices it: an empty group selection reads the trailer and the
+        // directory and nothing else.
+        let (_, open) =
+            segmented_matching_rows(&file_io, &path, &blob, &counts, Some(&[]), &spec, true)
+                .await
+                .unwrap();
+        assert_eq!(open.reads, 2);
+
+        let (cold, cold_cost) =
+            segmented_matching_rows(&file_io, &path, &blob, &counts, None, &spec, false)
+                .await
+                .unwrap();
+        let (warm, warm_cost) =
+            segmented_matching_rows(&file_io, &path, &blob, &counts, None, &spec, false)
+                .await
+                .unwrap();
+
+        let (
+            SegmentedOutcome::Matching {
+                rows: cold_rows,
+                resident_bytes: cold_resident,
+            },
+            SegmentedOutcome::Matching {
+                rows: warm_rows,
+                resident_bytes: warm_resident,
+            },
+        ) = (cold, warm)
+        else {
+            panic!("both lookups answer");
+        };
+        assert_eq!(cold_rows, warm_rows, "the same answer, warm");
+        assert_eq!(
+            warm_cost.reads,
+            cold_cost.reads - open.reads,
+            "the warm lookup read the term's ranges and nothing else"
+        );
+        assert_eq!(warm_cost.bytes, cold_cost.bytes - open.bytes);
+        // Two of the cold lookup's four rounds of store waits are the open, so
+        // a held directory takes two (#5007).
+        assert_eq!(cold_cost.stages, 4);
+        assert_eq!(warm_cost.stages, 2);
+        // The resident cost does not disappear when it is paid once: both
+        // lookups report it, which is what #4562's warm arm reports as memory.
+        assert_eq!(warm_resident, cold_resident);
+        assert!(warm_resident > 0);
+        assert_eq!(segmented_directory_cache_stats(&path), (1, 1));
+
+        // A bypassing lookup neither reads the held directory nor adds one.
+        let (_, bypassed) =
+            segmented_matching_rows(&file_io, &path, &blob, &counts, None, &spec, true)
+                .await
+                .unwrap();
+        assert_eq!(bypassed.reads, cold_cost.reads);
+        assert_eq!(segmented_directory_cache_stats(&path), (1, 1));
+
+        // And this path spends none of the two shipped caches' budgets: it
+        // holds no parsed index and no blob bytes.
+        assert_eq!(parsed_inverted_index_cache_stats(&path), (0, 0));
+        let (blob_entries, blob_bytes, _) = crate::arrow::puffin_blob_cache_stats(&path);
+        assert_eq!((blob_entries, blob_bytes), (0, 0));
+    }
+
+    /// Two sidecars are two entries: a held directory answers for the blob it
+    /// was parsed from and no other.
+    #[tokio::test]
+    async fn held_directories_are_per_blob_identity() {
+        let first_dir = TempDir::new().unwrap();
+        let second_dir = TempDir::new().unwrap();
+        let first_rows = segmented_corpus(4_000);
+        let second_rows = segmented_corpus(2_000);
+        let (first_io, first_path) = write_mixed_sidecar(&first_dir, &first_rows, 1_000).await;
+        let (second_io, second_path) = write_mixed_sidecar(&second_dir, &second_rows, 500).await;
+        let first_blob = sidecar_blob(&first_io, &first_path, SEGMENTED_BLOB_TYPE).await;
+        let second_blob = sidecar_blob(&second_io, &second_path, SEGMENTED_BLOB_TYPE).await;
+        let spec = all_terms_spec(&["rareneedle"]);
+        let v1_first =
+            siglake_index::InvertedIndex::from_rows(first_rows.iter().map(String::as_str));
+        let v1_second =
+            siglake_index::InvertedIndex::from_rows(second_rows.iter().map(String::as_str));
+
+        for _ in 0..2 {
+            for (io, path, blob, counts, expected) in [
+                (
+                    &first_io,
+                    &first_path,
+                    &first_blob,
+                    row_counts(4_000, 1_000),
+                    v1_first.postings("rareneedle").unwrap().to_vec(),
+                ),
+                (
+                    &second_io,
+                    &second_path,
+                    &second_blob,
+                    row_counts(2_000, 500),
+                    v1_second.postings("rareneedle").unwrap().to_vec(),
+                ),
+            ] {
+                let (outcome, _) =
+                    segmented_matching_rows(io, path, blob, &counts, None, &spec, false)
+                        .await
+                        .unwrap();
+                let SegmentedOutcome::Matching { rows, .. } = outcome else {
+                    panic!("{path}: {outcome:?}");
+                };
+                assert_eq!(rows, expected, "{path}");
+            }
+        }
+        assert_eq!(segmented_directory_cache_stats(&first_path), (1, 1));
+        assert_eq!(segmented_directory_cache_stats(&second_path), (1, 1));
+
+        // The row domain is re-checked against the caller's file on every
+        // lookup, held directory or not: the directory describes the blob, not
+        // the Parquet file it is being applied to.
+        let (outcome, _) = segmented_matching_rows(
+            &first_io,
+            &first_path,
+            &first_blob,
+            &[2_000, 2_000],
+            None,
+            &spec,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, SegmentedOutcome::Declined("row_domain")),
+            "{outcome:?}"
+        );
+    }
+
+    /// A held directory that is not this blob's is not a reason to decline the
+    /// file: the lookup reads the blob's own directory and answers.
+    #[tokio::test]
+    async fn a_directory_that_is_not_this_blobs_falls_back_to_reading_it() {
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(4_000);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, 1_000).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let counts = row_counts(4_000, 1_000);
+        let spec = all_terms_spec(&["rareneedle"]);
+        let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
+
+        // A directory parsed from a different blob, planted under this blob's
+        // identity — the shape a mis-keyed or stale entry would have.
+        let other = siglake_index::segmented::encode_from_rows(
+            segmented_corpus(2_000).iter().map(String::as_str),
+            500,
+        );
+        let planted = siglake_index::segmented::SegmentedDirectory::read(
+            &siglake_index::segmented::SliceSource::new(other),
+        )
+        .expect("the fixture blob parses");
+        segmented_directory_cache_put(&path, blob.offset(), Arc::new(planted));
+
+        let (outcome, cost) =
+            segmented_matching_rows(&file_io, &path, &blob, &counts, None, &spec, false)
+                .await
+                .unwrap();
+        let SegmentedOutcome::Matching { rows: matching, .. } = outcome else {
+            panic!("the blob's own directory answers: {outcome:?}");
+        };
+        assert_eq!(matching, v1.postings("rareneedle").unwrap().to_vec());
+        assert!(
+            cost.reads >= 2,
+            "it read the trailer and the directory itself: {} reads",
+            cost.reads
+        );
+    }
+
+    #[tokio::test]
+    async fn a_segmented_lookup_reads_only_the_row_groups_the_scan_kept() {
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(20_000);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, 5_000).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let counts = row_counts(20_000, 5_000);
+        let spec = all_terms_spec(&["queen"]);
+
+        let (whole, whole_cost) =
+            segmented_matching_rows(&file_io, &path, &blob, &counts, None, &spec, true)
+                .await
+                .unwrap();
+        let (kept, kept_cost) =
+            segmented_matching_rows(&file_io, &path, &blob, &counts, Some(&[2, 3]), &spec, true)
+                .await
+                .unwrap();
+
+        let (
+            SegmentedOutcome::Matching { rows: whole, .. },
+            SegmentedOutcome::Matching { rows: kept, .. },
+        ) = (whole, kept)
+        else {
+            panic!("both lookups answer");
+        };
+        assert_eq!(
+            kept,
+            whole
+                .iter()
+                .copied()
+                .filter(|row| (10_000..20_000).contains(row))
+                .collect::<Vec<_>>(),
+            "the restriction is exactly those groups' rows, file-physical"
+        );
+        // A rejected group costs no read at all: the trailer and the
+        // directory, then one dictionary block and one posting section per
+        // kept group.
+        assert_eq!(whole_cost.reads, 2 + 4 * 2);
+        assert_eq!(kept_cost.reads, 2 + 2 * 2);
+        assert!(
+            kept_cost.bytes < whole_cost.bytes,
+            "two of four groups fetched {} bytes against {}",
+            kept_cost.bytes,
+            whole_cost.bytes
+        );
+        // An empty selection is the caller having pruned everything, not a
+        // malformed one: a definitive no-match, and no read at all.
+        let (empty, empty_cost) =
+            segmented_matching_rows(&file_io, &path, &blob, &counts, Some(&[]), &spec, true)
+                .await
+                .unwrap();
+        assert!(
+            matches!(&empty, SegmentedOutcome::Matching { rows, .. } if rows.is_empty()),
+            "{empty:?}"
+        );
+        assert_eq!(empty_cost.reads, 2, "the trailer and the directory only");
+    }
+
+    #[tokio::test]
+    async fn and_or_and_substring_agree_with_the_whole_file_index() {
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(4_000);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, 512).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let counts = row_counts(4_000, 512);
+        let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
+
+        // Terms whose postings straddle every row-group boundary, terms
+        // confined to one group, and one the file does not have.
+        let specs = [
+            all_terms_spec(&["queen", "checkout"]),
+            all_terms_spec(&["rareneedle"]),
+            all_terms_spec(&["queen", "absentterm"]),
+            RawPruneSpec {
+                any_terms: vec!["rareneedle".to_string(), "000513".to_string()],
+                ..RawPruneSpec::default()
+            },
+            RawPruneSpec {
+                all_terms: vec!["checkout".to_string()],
+                any_terms: vec!["queen".to_string(), "absentterm".to_string()],
+                ..RawPruneSpec::default()
+            },
+            RawPruneSpec {
+                index_substrings: vec!["ueen".to_string()],
+                ..RawPruneSpec::default()
+            },
+            RawPruneSpec {
+                all_terms: vec!["checkout".to_string()],
+                index_substrings: vec!["ueen".to_string()],
+                ..RawPruneSpec::default()
+            },
+        ];
+
+        for spec in specs {
+            let mut expected: Option<Vec<u32>> = None;
+            if !spec.all_terms.is_empty() {
+                let terms: Vec<&str> = spec.all_terms.iter().map(String::as_str).collect();
+                expected = Some(v1.matching_rows_all(&terms));
+            }
+            if !spec.any_terms.is_empty() {
+                let any = spec
+                    .any_terms
+                    .iter()
+                    .fold(Vec::new(), |acc: Vec<u32>, term| {
+                        union_sorted(&acc, v1.postings(term).unwrap_or(&[]))
+                    });
+                expected = Some(match expected {
+                    Some(existing) => intersect_sorted(&existing, &any),
+                    None => any,
+                });
+            }
+            for substr in &spec.index_substrings {
+                let rows = v1.rows_containing(substr).unwrap();
+                expected = Some(match expected {
+                    Some(existing) => intersect_sorted(&existing, &rows),
+                    None => rows,
+                });
+            }
+
+            let (outcome, _) =
+                segmented_matching_rows(&file_io, &path, &blob, &counts, None, &spec, true)
+                    .await
+                    .unwrap();
+            let SegmentedOutcome::Matching { rows: matching, .. } = outcome else {
+                panic!("{spec:?} is answerable: {outcome:?}");
+            };
+            assert_eq!(matching, expected.unwrap(), "{spec:?}");
+            assert!(
+                matching.windows(2).all(|pair| pair[0] < pair[1]),
+                "file-physical ordinals, strictly ascending: {spec:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_term_the_sidecar_cannot_answer_declines_the_file() {
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(2_000);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, 512).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let counts = row_counts(2_000, 512);
+
+        // A term that does not normalize is not "no rows match" — the v1
+        // reader's per-term union would drop it and prune rows it might have
+        // matched.
+        for spec in [
+            all_terms_spec(&["qu"]),
+            RawPruneSpec {
+                any_terms: vec!["queen".to_string(), "qu".to_string()],
+                ..RawPruneSpec::default()
+            },
+        ] {
+            let (outcome, _) =
+                segmented_matching_rows(&file_io, &path, &blob, &counts, None, &spec, true)
+                    .await
+                    .unwrap();
+            assert!(
+                matches!(outcome, SegmentedOutcome::Declined("unanswerable")),
+                "{spec:?}: {outcome:?}"
+            );
+        }
+
+        // A spec with no hints concludes nothing rather than selecting no rows.
+        let (outcome, _) = segmented_matching_rows(
+            &file_io,
+            &path,
+            &blob,
+            &counts,
+            None,
+            &RawPruneSpec::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, SegmentedOutcome::Declined("no_hints")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_that_is_not_about_this_files_row_groups_is_declined() {
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(2_000);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, 512).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let spec = all_terms_spec(&["queen"]);
+
+        // The file's real layout is 512, 512, 512, 464. A whole-file index
+        // checked against one stamped `row_group_size` accepts the first of
+        // these — every group but the last is 512 rows — and the second has
+        // the file's group count with the wrong domain; the directory states
+        // every group, so both are refused before anything is pruned.
+        for counts in [
+            vec![512, 512, 512, 512],
+            vec![512, 512, 464, 512],
+            vec![1_000, 1_000],
+            vec![2_000],
+        ] {
+            let (outcome, _) =
+                segmented_matching_rows(&file_io, &path, &blob, &counts, None, &spec, true)
+                    .await
+                    .unwrap();
+            assert!(
+                matches!(outcome, SegmentedOutcome::Declined("row_domain")),
+                "{counts:?}: {outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_compressed_sidecar_has_no_addressable_interior() {
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(2_000);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, 512).await;
+        // The same statistics file carries both formats for the same column,
+        // each discovered by its own blob type.
+        let v1_blob = sidecar_blob(&file_io, &path, "siglake-inverted-v1").await;
+        let segmented = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        assert_eq!(
+            v1_blob.properties().get("format").map(String::as_str),
+            Some("v1")
+        );
+        assert_eq!(
+            segmented.properties().get("format").map(String::as_str),
+            Some("seg1")
+        );
+        assert!(segmented.properties().get("row_group_size").is_none());
+
+        let (outcome, cost) = segmented_matching_rows(
+            &file_io,
+            &path,
+            &v1_blob,
+            &row_counts(2_000, 512),
+            None,
+            &all_terms_spec(&["queen"]),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, SegmentedOutcome::Declined("compressed")),
+            "{outcome:?}"
+        );
+        assert_eq!(cost.reads, 0, "declined before reading anything");
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_segmented_sidecar_declines_rather_than_dropping_rows() {
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(2_000);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, 512).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let counts = row_counts(2_000, 512);
+        let spec = all_terms_spec(&["queen"]);
+
+        let mut bytes = std::fs::read(path.trim_start_matches("file://")).unwrap();
+        // A flipped bit inside the blob's body: a dictionary block's CRC no
+        // longer matches, so the lookup is unanswerable rather than a group
+        // that quietly does not have the term.
+        let target = (blob.offset() + blob.length() / 2) as usize;
+        bytes[target] ^= 0x40;
+        let corrupt = format!("{}/corrupt.puffin", dir.path().to_str().unwrap());
+        std::fs::write(corrupt.trim_start_matches("file://"), &bytes).unwrap();
+
+        let (outcome, _) =
+            segmented_matching_rows(&file_io, &corrupt, &blob, &counts, None, &spec, true)
+                .await
+                .unwrap();
+        // Whichever section the flip landed in, the one thing that must not
+        // happen is a shorter answer: a partial reader that reads a corrupt
+        // block as "this group does not have the term" drops rows the scan
+        // then never decodes.
+        if let SegmentedOutcome::Matching { rows: matching, .. } = &outcome {
+            let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
+            assert_eq!(
+                matching,
+                &v1.postings("queen").unwrap().to_vec(),
+                "a corrupt sidecar answered, and answered wrong"
+            );
+        }
+
+        // And a blob whose trailer is gone does not open at all.
+        let mut truncated = bytes.clone();
+        let end = (blob.offset() + blob.length()) as usize;
+        truncated[end - 3] ^= 0xff;
+        let truncated_path = format!("{}/truncated.puffin", dir.path().to_str().unwrap());
+        std::fs::write(truncated_path.trim_start_matches("file://"), &truncated).unwrap();
+        let (outcome, cost) =
+            segmented_matching_rows(&file_io, &truncated_path, &blob, &counts, None, &spec, true)
+                .await
+                .unwrap();
+        assert!(
+            matches!(outcome, SegmentedOutcome::Declined("open")),
+            "{outcome:?}"
+        );
+        assert_eq!(cost.reads, 1, "the trailer, and nothing after it");
+    }
+
+    /// What a text predicate costs through the reader's segmented path, per
+    /// shape: the ranges it asked the object store for, the bytes in them, and
+    /// what it keeps afterwards. The codec-level tables in
+    /// `docs/DESIGN_segmented_inverted_index.md` are the same quantities
+    /// measured without the Puffin container; this one measures them through
+    /// it, which is what #4561 integrates.
+    ///
+    /// Sized by `SIGLAKE_SEG_READER_ROWS` and `SIGLAKE_SEG_READER_GROUPS`.
+    /// Run it from a kept fork mirror (`scripts/check-fork-tests.sh --fork
+    /// iceberg --keep`):
+    ///
+    /// ```text
+    /// cargo test --release --lib report_segmented_reader_read_cost -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "measurement, minutes"]
+    async fn report_segmented_reader_read_cost() {
+        fn knob(name: &str, fallback: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|raw| raw.trim().parse().ok())
+                .unwrap_or(fallback)
+        }
+        let n_rows = knob("SIGLAKE_SEG_READER_ROWS", 1_000_000);
+        let n_groups = knob("SIGLAKE_SEG_READER_GROUPS", 8);
+        let group_rows = n_rows.div_ceil(n_groups);
+
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(n_rows);
+        let (file_io, path) = write_mixed_sidecar(&dir, &rows, group_rows as u32).await;
+        let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+        let counts = row_counts(n_rows, group_rows);
+        let v1 = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str));
+        let last_quarter: Vec<usize> = (counts.len() - counts.len() / 4..counts.len()).collect();
+
+        println!(
+            "\n{n_rows} rows in {} row groups: segmented blob {} B, v1 parsed {} B",
+            counts.len(),
+            blob.length(),
+            v1.heap_size_bytes()
+        );
+        // The `cold` columns below include the open; the `warm` ones are the
+        // same lookup with the directory held (#5006), which is the deployed
+        // cost once a file has been queried once. An empty group selection is
+        // a definitive no-match, so it costs the open and nothing else —
+        // which is how the open is priced here.
+        let (_, open) = segmented_matching_rows(
+            &file_io,
+            &path,
+            &blob,
+            &counts,
+            Some(&[]),
+            &all_terms_spec(&["rareneedle"]),
+            true,
+        )
+        .await
+        .unwrap();
+        println!(
+            "cold open (trailer + directory): {} reads, {} B",
+            open.reads, open.bytes
+        );
+        println!(
+            "shape                 rows  cold reads  cold fetched   ÷ blob  \
+             warm reads  warm fetched   ÷ blob   resident"
+        );
+
+        let shapes: Vec<(&str, RawPruneSpec, Option<&[usize]>)> = vec![
+            ("rare", all_terms_spec(&["rareneedle"]), None),
+            (
+                "rare_last25",
+                all_terms_spec(&["rareneedle"]),
+                Some(last_quarter.as_slice()),
+            ),
+            ("keyword", all_terms_spec(&["queen"]), None),
+            ("unique_token", all_terms_spec(&["000001"]), None),
+            (
+                "and_rare_keyword",
+                all_terms_spec(&["queen", "rareneedle"]),
+                None,
+            ),
+            (
+                "or_rare_unique",
+                RawPruneSpec {
+                    any_terms: vec!["rareneedle".to_string(), "000001".to_string()],
+                    ..RawPruneSpec::default()
+                },
+                None,
+            ),
+            (
+                "substring_sweep",
+                RawPruneSpec {
+                    index_substrings: vec!["ueen".to_string()],
+                    ..RawPruneSpec::default()
+                },
+                None,
+            ),
+        ];
+
+        // #5007's columns, printed as a second table below: the rounds of
+        // store waits against the reads a serial source would have waited for
+        // one at a time, and what the replay re-decodes on the way.
+        let mut staged: Vec<(&str, SegmentedReadCost, SegmentedReadCost, u128, u128)> = Vec::new();
+        for (name, spec, groups) in shapes {
+            let started = std::time::Instant::now();
+            let (outcome, cost) =
+                segmented_matching_rows(&file_io, &path, &blob, &counts, groups, &spec, true)
+                    .await
+                    .unwrap();
+            let cold_micros = started.elapsed().as_micros();
+            let SegmentedOutcome::Matching {
+                rows: matching,
+                resident_bytes,
+            } = outcome
+            else {
+                panic!("{name}: {outcome:?}");
+            };
+            // Exact against the whole-file index, restricted to the groups the
+            // shape kept, before any cost is reported.
+            let mut expected: Option<Vec<u32>> = None;
+            if !spec.all_terms.is_empty() {
+                let terms: Vec<&str> = spec.all_terms.iter().map(String::as_str).collect();
+                expected = Some(v1.matching_rows_all(&terms));
+            }
+            if !spec.any_terms.is_empty() {
+                let any = spec
+                    .any_terms
+                    .iter()
+                    .fold(Vec::new(), |acc: Vec<u32>, term| {
+                        union_sorted(&acc, v1.postings(term).unwrap_or(&[]))
+                    });
+                expected = Some(any);
+            }
+            for substr in &spec.index_substrings {
+                expected = Some(v1.rows_containing(substr).unwrap());
+            }
+            let mut expected = expected.unwrap();
+            if let Some(groups) = groups {
+                let first_row: u64 = counts[..groups[0]].iter().sum();
+                expected.retain(|row| u64::from(*row) >= first_row);
+            }
+            assert_eq!(matching, expected, "{name}");
+            // The warm arm: the first of these parses the directory and holds
+            // it, the second runs on the held one. Both answer the same rows
+            // as the cold arm, which is asserted before either is reported.
+            let mut warm = SegmentedReadCost::default();
+            let mut warm_micros = 0u128;
+            for _ in 0..2 {
+                let started = std::time::Instant::now();
+                let (outcome, cost) =
+                    segmented_matching_rows(&file_io, &path, &blob, &counts, groups, &spec, false)
+                        .await
+                        .unwrap();
+                warm_micros = started.elapsed().as_micros();
+                let SegmentedOutcome::Matching {
+                    rows: warm_rows, ..
+                } = outcome
+                else {
+                    panic!("{name} warm: {outcome:?}");
+                };
+                assert_eq!(warm_rows, expected, "{name} warm");
+                warm = cost;
+            }
+            println!(
+                "{name:<20} {:>8} {:>11} {:>13} {:>7.3}% {:>11} {:>13} {:>7.3}% {:>10}",
+                matching.len(),
+                cost.reads,
+                cost.bytes,
+                100.0 * cost.bytes as f64 / blob.length() as f64,
+                warm.reads,
+                warm.bytes,
+                100.0 * warm.bytes as f64 / blob.length() as f64,
+                resident_bytes
+            );
+            staged.push((name, cost, warm, cold_micros, warm_micros));
+        }
+        println!(
+            "\nstaged reading (#5007): stages are the rounds of store waits; reader reads are \
+             what each round re-decodes\nshape                 cold stages  cold reads  \
+             cold reader reads  cold µs  warm stages  warm reads  warm reader reads  warm µs"
+        );
+        for (name, cold, warm, cold_micros, warm_micros) in staged {
+            println!(
+                "{name:<20} {:>12} {:>11} {:>18} {:>8} {:>12} {:>11} {:>18} {:>8}",
+                cold.stages,
+                cold.reads,
+                cold.requests,
+                cold_micros,
+                warm.stages,
+                warm.reads,
+                warm.requests,
+                warm_micros
+            );
+        }
+        let footprint = segmented_directory_cache_footprint();
+        println!(
+            "\ndirectory cache: {} entries, {} B resident, {} hits, {} evictions, \
+             {} oversized",
+            footprint.entries,
+            footprint.bytes,
+            footprint.hits,
+            footprint.evictions,
+            footprint.oversized_skips
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // siglake #5007: the store waits happen between runs of the synchronous
+    // reader, so a lookup holds no thread of tokio's blocking pool.
+    // ----------------------------------------------------------------------
+
+    /// An in-memory store whose every range read takes `delay_millis` and which
+    /// records how many reads were in flight at once — the two things the
+    /// staged shape has to be measured against. It serves bytes per path, so
+    /// one of these stands in for a fanned-out scan's several sidecars.
+    #[derive(Debug, Default)]
+    struct DelayedStorageState {
+        files: std::sync::Mutex<HashMap<String, Bytes>>,
+        delay_millis: AtomicUsize,
+        reads: AtomicUsize,
+        in_flight: AtomicUsize,
+        peak_in_flight: AtomicUsize,
+    }
+
+    fn default_delayed_storage_state() -> Arc<DelayedStorageState> {
+        Arc::new(DelayedStorageState::default())
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct DelayedStorageFactory {
+        #[serde(skip, default = "default_delayed_storage_state")]
+        state: Arc<DelayedStorageState>,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct DelayedStorage {
+        #[serde(skip, default = "default_delayed_storage_state")]
+        state: Arc<DelayedStorageState>,
+    }
+
+    #[typetag::serde]
+    impl StorageFactory for DelayedStorageFactory {
+        fn build(&self, _config: &StorageConfig) -> crate::Result<Arc<dyn Storage>> {
+            Ok(Arc::new(DelayedStorage {
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct DelayedFileRead {
+        state: Arc<DelayedStorageState>,
+        path: String,
+    }
+
+    #[async_trait]
+    impl FileRead for DelayedFileRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            let in_flight = self.state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state
+                .peak_in_flight
+                .fetch_max(in_flight, Ordering::SeqCst);
+            self.state.reads.fetch_add(1, Ordering::SeqCst);
+            let delay = self.state.delay_millis.load(Ordering::SeqCst) as u64;
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            self.state.in_flight.fetch_sub(1, Ordering::SeqCst);
+            let files = self.state.files.lock().unwrap();
+            let data = files.get(&self.path).ok_or_else(|| {
+                crate::Error::new(
+                    crate::ErrorKind::DataInvalid,
+                    format!("no file {}", self.path),
+                )
+            })?;
+            Ok(data.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    #[async_trait]
+    #[typetag::serde]
+    impl Storage for DelayedStorage {
+        async fn exists(&self, path: &str) -> crate::Result<bool> {
+            Ok(self.state.files.lock().unwrap().contains_key(path))
+        }
+
+        async fn metadata(&self, path: &str) -> crate::Result<FileMetadata> {
+            let files = self.state.files.lock().unwrap();
+            let data = files.get(path).ok_or_else(|| {
+                crate::Error::new(crate::ErrorKind::DataInvalid, format!("no file {path}"))
+            })?;
+            Ok(FileMetadata {
+                size: data.len() as u64,
+            })
+        }
+
+        async fn read(&self, path: &str) -> crate::Result<Bytes> {
+            let files = self.state.files.lock().unwrap();
+            files.get(path).cloned().ok_or_else(|| {
+                crate::Error::new(crate::ErrorKind::DataInvalid, format!("no file {path}"))
+            })
+        }
+
+        async fn reader(&self, path: &str) -> crate::Result<Box<dyn FileRead>> {
+            Ok(Box::new(DelayedFileRead {
+                state: Arc::clone(&self.state),
+                path: path.to_string(),
+            }))
+        }
+
+        async fn write(&self, path: &str, bs: Bytes) -> crate::Result<()> {
+            self.state
+                .files
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), bs);
+            Ok(())
+        }
+
+        async fn writer(&self, _path: &str) -> crate::Result<Box<dyn FileWrite>> {
+            Err(crate::Error::new(
+                crate::ErrorKind::FeatureUnsupported,
+                "this store is seeded, not written to",
+            ))
+        }
+
+        async fn delete(&self, path: &str) -> crate::Result<()> {
+            self.state.files.lock().unwrap().remove(path);
+            Ok(())
+        }
+
+        async fn delete_prefix(&self, _path: &str) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn delete_stream(
+            &self,
+            mut paths: futures::stream::BoxStream<'static, String>,
+        ) -> crate::Result<()> {
+            while let Some(path) = paths.next().await {
+                self.delete(&path).await?;
+            }
+            Ok(())
+        }
+
+        fn new_input(&self, path: &str) -> crate::Result<InputFile> {
+            Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+
+        fn new_output(&self, path: &str) -> crate::Result<OutputFile> {
+            Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+    }
+
+    /// #5007's acceptance, whole: eight files' lookups, each range read
+    /// delayed, run to an answer on a runtime whose **entire** blocking pool
+    /// is occupied for the duration. #4561's shape cannot: it ran each lookup
+    /// on a blocking thread and served its ranges from the async side, so with
+    /// the pool held it could not start, and with a pool of *n* threads it
+    /// could not have more than *n* files in flight however small each read
+    /// was. (Checked the other way round while #5007 was written: with the
+    /// blocking-thread lookup restored, this test times out.)
+    ///
+    /// The answers, the three outcomes and the fetched-byte accounting are the
+    /// same ones the tests above pin; what this adds is where the waits went.
+    #[test]
+    fn a_segmented_lookup_waits_on_the_store_without_a_blocking_thread() {
+        const FILES: usize = 8;
+        const DELAY_MS: usize = 10;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // The sidecar bytes, written once through the filesystem store (which
+        // does use the blocking pool) before anything occupies it.
+        let dir = TempDir::new().unwrap();
+        let rows = segmented_corpus(4_000);
+        let (blob, sidecar) = runtime.block_on(async {
+            let (file_io, path) = write_mixed_sidecar(&dir, &rows, 1_000).await;
+            let blob = sidecar_blob(&file_io, &path, SEGMENTED_BLOB_TYPE).await;
+            (blob, Bytes::from(std::fs::read(&path).unwrap()))
+        });
+        let state = Arc::new(DelayedStorageState::default());
+        state.delay_millis.store(DELAY_MS, Ordering::SeqCst);
+        let paths: Vec<String> = (0..FILES)
+            .map(|file| format!("memory://seg-5007-{file}.puffin"))
+            .collect();
+        {
+            let mut files = state.files.lock().unwrap();
+            for path in &paths {
+                files.insert(path.clone(), sidecar.clone());
+            }
+        }
+        let file_io = FileIOBuilder::new(Arc::new(DelayedStorageFactory {
+            state: Arc::clone(&state),
+        }))
+        .build();
+        let counts = row_counts(4_000, 1_000);
+        let spec = all_terms_spec(&["rareneedle"]);
+        let expected = siglake_index::InvertedIndex::from_rows(rows.iter().map(String::as_str))
+            .postings("rareneedle")
+            .unwrap()
+            .to_vec();
+
+        // Hold the whole blocking pool, and prove it is held before the
+        // lookups start rather than assuming the task was picked up.
+        let (release, wait_for_release) = std::sync::mpsc::channel::<()>();
+        let (held, wait_until_held) = std::sync::mpsc::channel::<()>();
+        runtime.spawn_blocking(move || {
+            held.send(()).unwrap();
+            let _ = wait_for_release.recv();
+        });
+        wait_until_held
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the one blocking thread is occupied");
+
+        // One file first: its peak in-flight reads are this lookup's own, so
+        // they say whether a stage's ranges went out together.
+        let solo = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                segmented_matching_rows(&file_io, &paths[0], &blob, &counts, None, &spec, true),
+            )
+            .await
+            .expect("a lookup that waited on a blocking thread could not finish here")
+            .unwrap()
+        });
+        let (solo_outcome, solo_cost) = solo;
+        let SegmentedOutcome::Matching {
+            rows: solo_rows, ..
+        } = solo_outcome
+        else {
+            panic!("the term is in the sidecar: {solo_outcome:?}");
+        };
+        assert_eq!(solo_rows, expected);
+        let solo_peak = state.peak_in_flight.load(Ordering::SeqCst);
+        assert!(
+            solo_peak > 1,
+            "one lookup's stage should fetch its ranges together, peak {solo_peak}"
+        );
+        assert!(
+            solo_cost.stages <= 5,
+            "{} stages for {} store reads",
+            solo_cost.stages,
+            solo_cost.reads
+        );
+        assert!(solo_cost.reads > solo_cost.stages);
+        assert!(solo_cost.requests >= solo_cost.reads);
+
+        // Then the fan-out: eight files at once, still under the held pool.
+        state.reads.store(0, Ordering::SeqCst);
+        state.peak_in_flight.store(0, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let answers = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                futures::future::join_all(paths.iter().map(|path| {
+                    let file_io = file_io.clone();
+                    let blob = blob.clone();
+                    let counts = counts.clone();
+                    let spec = spec.clone();
+                    async move {
+                        segmented_matching_rows(&file_io, path, &blob, &counts, None, &spec, true)
+                            .await
+                            .unwrap()
+                    }
+                })),
+            )
+            .await
+            .expect("eight lookups that each held a blocking thread could not finish here")
+        });
+        let elapsed = started.elapsed();
+        release.send(()).ok();
+
+        for (path, (outcome, cost)) in paths.iter().zip(&answers) {
+            let SegmentedOutcome::Matching { rows, .. } = outcome else {
+                panic!("{path}: {outcome:?}");
+            };
+            assert_eq!(rows, &expected, "{path}");
+            assert_eq!(cost.stages, solo_cost.stages, "{path}");
+            assert_eq!(cost.reads, solo_cost.reads, "{path}");
+            assert_eq!(cost.bytes, solo_cost.bytes, "{path}");
+        }
+        // The latency claim, against the shape it replaces: a source serving
+        // one range at a time costs a round trip per read, and these eight
+        // lookups took fewer than half of one file's worth of those.
+        let serial = std::time::Duration::from_millis(solo_cost.reads * DELAY_MS as u64);
+        assert!(
+            elapsed * 2 < serial * FILES as u32,
+            "{FILES} files took {elapsed:?}; one file's reads served one at a time is {serial:?}"
+        );
+        println!(
+            "one lookup: {} stages, {} store reads, {} reader reads, {} bytes, peak {solo_peak} \
+             in flight\n{FILES} files: {elapsed:?} at {DELAY_MS} ms a read, peak {} in flight, \
+             {} store reads (serial, one file: {serial:?})",
+            solo_cost.stages,
+            solo_cost.reads,
+            solo_cost.requests,
+            solo_cost.bytes,
+            state.peak_in_flight.load(Ordering::SeqCst),
+            state.reads.load(Ordering::SeqCst),
+        );
+    }
+
+    #[test]
+    fn the_range_concurrency_is_resolved_from_its_own_knob() {
+        // Unset, empty or unparseable is the scan's own merged-range bound,
+        // and `0` is not "no concurrency at all" — a stage with no fetches in
+        // flight never completes.
+        assert_eq!(
+            segmented_range_concurrency_from(None),
+            DEFAULT_RANGE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            segmented_range_concurrency_from(Some("")),
+            DEFAULT_RANGE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            segmented_range_concurrency_from(Some("plenty")),
+            DEFAULT_RANGE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            segmented_range_concurrency_from(Some("-4")),
+            DEFAULT_RANGE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            segmented_range_concurrency_from(Some("0")),
+            DEFAULT_RANGE_FETCH_CONCURRENCY
+        );
+        assert_eq!(segmented_range_concurrency_from(Some(" 3 ")), 3);
     }
 }

@@ -672,6 +672,161 @@ impl RangeSource for SliceSource {
     }
 }
 
+/// A [`RangeSource`] that serves only ranges a caller has already fetched and
+/// records the ones it could not serve — the seam for a caller whose store is
+/// async (siglake #5007).
+///
+/// #4561's reader integration ran each lookup on a blocking thread and served
+/// its ranges from the async side over a channel, so one thread of tokio's
+/// blocking pool was held across every store wait, per file being looked up in.
+/// This inverts that. A lookup runs to the first range it does not hold,
+/// records that range as a **miss** and answers
+/// [`Unanswerable`](Lookup::Unanswerable); the caller fetches every miss the
+/// round recorded — together, and on the async side — fills them in with
+/// [`Self::fill`], and runs the same lookup again. A lookup is a pure function
+/// of the blob's bytes, so the replay asks for the same ranges and gets one
+/// stage further each round: trailer, directory, dictionary blocks, posting
+/// sections. Four rounds answer every shape the reader has an entry point for,
+/// whatever that shape's read count is, and no thread is held between them.
+///
+/// A range the caller tried to fetch and could not is filled with
+/// [`Self::fill_unreadable`]: the reader then sees the same `None` a failed
+/// read gives it today and declines the file, and — because a filled range is
+/// never a miss again — the loop ends instead of asking for it forever. That is
+/// the termination argument: every round either fills at least one range or
+/// records no miss at all, and the ranges of a blob are finite.
+///
+/// Two costs, against the blocking-thread shape it replaces:
+///
+/// - every range a lookup fetched is held until the lookup ends, so its peak is
+///   the lookup's fetched bytes rather than one range;
+/// - the stages before the last are decoded once per round, so a shape whose
+///   cost is dictionary decoding pays that decode about twice.
+///
+/// Both are measured, per shape, in
+/// `docs/DESIGN_segmented_inverted_index.md`.
+///
+/// Cloneable, and every clone shares one set of held ranges and counters: a
+/// lookup that opens a second reader on the same blob (#5006's fallback when a
+/// held directory turns out not to be this blob's) must not refetch what the
+/// first open already paid for.
+#[derive(Clone)]
+pub struct StagedSource {
+    len: u64,
+    state: Arc<std::sync::Mutex<StagedState>>,
+}
+
+#[derive(Default)]
+struct StagedState {
+    /// `None` is a range the caller could not read — held, so it is asked for
+    /// once and then answers `None` for the rest of the lookup.
+    held: std::collections::HashMap<(u64, usize), Option<Arc<[u8]>>>,
+    misses: Vec<(u64, usize)>,
+    requests: u64,
+    fetched_reads: u64,
+    fetched_bytes: u64,
+    held_bytes: usize,
+}
+
+impl StagedSource {
+    /// A source holding nothing, for a blob of `len` bytes. The length is the
+    /// caller's: a reader bounds every range against it, so a source that
+    /// claims the wrong length reads a different blob.
+    pub fn new(len: u64) -> Self {
+        Self {
+            len,
+            state: Arc::new(std::sync::Mutex::new(StagedState::default())),
+        }
+    }
+
+    /// Ranges asked for since the last call, and not held. Clearing them is
+    /// what makes a round a round: the caller fetches exactly these.
+    pub fn take_misses(&self) -> Vec<(u64, usize)> {
+        std::mem::take(&mut self.state().misses)
+    }
+
+    /// Hand back a range the caller fetched. `bytes.len()` must be `len` — a
+    /// short read is not this range, and is held as unreadable instead.
+    pub fn fill(&self, offset: u64, len: usize, bytes: Vec<u8>) {
+        if bytes.len() != len {
+            self.fill_unreadable(offset, len);
+            return;
+        }
+        let mut state = self.state();
+        state.fetched_reads += 1;
+        state.fetched_bytes += len as u64;
+        state.held_bytes += len;
+        state.held.insert((offset, len), Some(bytes.into()));
+    }
+
+    /// Hand back a range the caller could not fetch. The reader reads this as
+    /// a failed range read, which is [`Unanswerable`](Lookup::Unanswerable).
+    pub fn fill_unreadable(&self, offset: u64, len: usize) {
+        self.state().held.insert((offset, len), None);
+    }
+
+    /// Ranges the store served, across every round — what the lookup cost it.
+    /// A range asked for twice (two terms in one dictionary block, a replay
+    /// re-reading an earlier stage) is fetched once and counted once.
+    pub fn fetched_reads(&self) -> u64 {
+        self.state().fetched_reads
+    }
+
+    /// Bytes the store served, across every round, on the same terms as
+    /// [`Self::fetched_reads`].
+    pub fn fetched_bytes(&self) -> u64 {
+        self.state().fetched_bytes
+    }
+
+    /// Reads the *reader* asked for, across every round. This is the count a
+    /// synchronous source charges ([`SliceSource::reads`]), and so the number
+    /// of sequential round trips the same lookup would cost a caller that
+    /// served each read on its own — which is what the staged rounds replace.
+    pub fn requests(&self) -> u64 {
+        self.state().requests
+    }
+
+    /// Bytes of fetched ranges the source is holding — the lookup's peak
+    /// in-flight cost, which the blocking-thread shape paid one range at a
+    /// time.
+    pub fn held_bytes(&self) -> usize {
+        self.state().held_bytes
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, StagedState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl RangeSource for StagedSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
+        // A range outside the blob is never a miss: fetching it would not help,
+        // and a source that recorded it would ask for it every round. This is
+        // the refusal `SliceSource` gives for the same range.
+        if offset.checked_add(len as u64)? > self.len {
+            return None;
+        }
+        let mut state = self.state();
+        state.requests += 1;
+        match state.held.get(&(offset, len)) {
+            Some(Some(bytes)) => Some(bytes.to_vec()),
+            Some(None) => None,
+            None => {
+                if !state.misses.contains(&(offset, len)) {
+                    state.misses.push((offset, len));
+                }
+                None
+            }
+        }
+    }
+}
+
 /// The parsed directory of a segmented blob: every group's row domain and
 /// section extents, and the dictionary-block index inside each. This is the
 /// whole of a reader's resident state ([`Self::resident_bytes`]) and it is a
@@ -1048,6 +1203,7 @@ impl<S: RangeSource> SegmentedReader<S> {
         };
         let mut rows: Vec<u32> = Vec::new();
         let mut found = false;
+        let mut unanswerable = false;
         for index in indices {
             let group = &self.directory.groups[index];
             match self.group_postings(group, &normalized) {
@@ -1056,8 +1212,16 @@ impl<S: RangeSource> SegmentedReader<S> {
                     rows.extend(group_rows);
                 }
                 Ok(None) => {}
-                Err(()) => return Lookup::Unanswerable,
+                // The answer is settled — this lookup concludes nothing — but
+                // the remaining groups are still walked, so a source serving
+                // ranges in stages learns every range this lookup needs from
+                // one pass rather than one group at a time (#5007). Nothing
+                // read after this point can change the outcome.
+                Err(()) => unanswerable = true,
             }
+        }
+        if unanswerable {
+            return Lookup::Unanswerable;
         }
         if found {
             Lookup::Rows(rows)
@@ -1102,6 +1266,10 @@ impl<S: RangeSource> SegmentedReader<S> {
             normalized.push(normalize_query_term(term)?);
         }
         let mut rows: Vec<u32> = Vec::new();
+        // Set by any failed or unreadable range. The walk continues to the end
+        // so that a staged source learns every range this lookup needs in one
+        // pass (#5007); the answer is already settled as "cannot answer".
+        let mut unanswerable = false;
         for index in indices {
             let group = &self.directory.groups[index];
             let mut located: Vec<(usize, u64, u32, u32)> = Vec::with_capacity(normalized.len());
@@ -1111,7 +1279,7 @@ impl<S: RangeSource> SegmentedReader<S> {
                     // No group-wide match is possible, and no postings were
                     // read for the terms already located.
                     Ok(None) => break,
-                    Err(()) => return None,
+                    Err(()) => unanswerable = true,
                 }
             }
             if located.len() != normalized.len() {
@@ -1120,9 +1288,10 @@ impl<S: RangeSource> SegmentedReader<S> {
             located.sort_by_key(|(_, _, _, df)| *df);
             let mut acc: Option<Vec<u32>> = None;
             for (block_index, offset, len, df) in located {
-                let list = self
-                    .read_postings(group, block_index, offset, len, df)
-                    .ok()?;
+                let Ok(list) = self.read_postings(group, block_index, offset, len, df) else {
+                    unanswerable = true;
+                    break;
+                };
                 acc = Some(match acc {
                     None => list,
                     Some(previous) => intersect_sorted(&previous, &list),
@@ -1132,6 +1301,9 @@ impl<S: RangeSource> SegmentedReader<S> {
                 }
             }
             rows.extend(acc.unwrap_or_default());
+        }
+        if unanswerable {
+            return None;
         }
         Some(rows)
     }
@@ -1158,13 +1330,25 @@ impl<S: RangeSource> SegmentedReader<S> {
         groups: Option<&[usize]>,
     ) -> Option<Vec<u32>> {
         self.group_indices(groups)?;
+        // Up front, as the conjunction does it: a term that does not normalize
+        // refuses the disjunction before any range is read.
+        for term in terms {
+            normalize_query_term(term)?;
+        }
         let mut rows: Vec<u32> = Vec::new();
+        // A range this index could not read settles the verdict, and the
+        // remaining terms are still walked so that a staged source sees their
+        // ranges in the same pass (#5007).
+        let mut unanswerable = false;
         for term in terms {
             match self.postings_in_groups(term, groups) {
                 Lookup::Rows(list) => rows = union_sorted(&rows, &list),
                 Lookup::Absent => {}
-                Lookup::Unanswerable => return None,
+                Lookup::Unanswerable => unanswerable = true,
             }
+        }
+        if unanswerable {
+            return None;
         }
         Some(rows)
     }
@@ -1325,11 +1509,18 @@ impl<S: RangeSource> SegmentedReader<S> {
         let normalized = normalize_query_term(substr)?;
         let indices = self.group_indices(groups)?;
         let mut rows: Vec<u32> = Vec::new();
+        // The sweep reads every block of every group it was given, so its
+        // ranges are known from the directory alone; a failed one settles the
+        // verdict without cutting the walk short (#5007).
+        let mut unanswerable = false;
         for index in indices {
             let group = &self.directory.groups[index];
             let mut matches: Vec<(usize, u64, u32, u32)> = Vec::new();
             for (block_index, block) in group.blocks.iter().enumerate() {
-                let bytes = self.read_block(group, block)?;
+                let Some(bytes) = self.read_block(group, block) else {
+                    unanswerable = true;
+                    continue;
+                };
                 let postings_base = match self.directory.format {
                     SegmentedFormat::Seg1 => block.postings_base,
                     SegmentedFormat::Seg2 => 0,
@@ -1344,15 +1535,18 @@ impl<S: RangeSource> SegmentedReader<S> {
                     true
                 });
                 if walked.is_err() {
-                    return None;
+                    unanswerable = true;
                 }
             }
             for (block_index, offset, len, df) in matches {
-                let group_rows = self
-                    .read_postings(group, block_index, offset, len, df)
-                    .ok()?;
-                rows = union_sorted(&rows, &group_rows);
+                match self.read_postings(group, block_index, offset, len, df) {
+                    Ok(group_rows) => rows = union_sorted(&rows, &group_rows),
+                    Err(()) => unanswerable = true,
+                }
             }
+        }
+        if unanswerable {
+            return None;
         }
         Some(rows)
     }
@@ -2890,6 +3084,233 @@ mod tests {
                 "term {term}"
             );
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // siglake #5007: driving a lookup from ranges fetched in stages, so a
+    // caller whose store is async holds no thread across its waits.
+    // ----------------------------------------------------------------------
+
+    /// Run `answer` against a [`StagedSource`], serve whatever it asked for and
+    /// could not get, and run it again, until a round records no miss.
+    /// `unreadable` is a range the store refuses, once — the failed-read case.
+    ///
+    /// The caller's async driver is this loop with the fetch awaited, which is
+    /// what `ArrowReader::segmented_matching_rows` does.
+    fn staged<T>(
+        blob: &[u8],
+        unreadable: Option<(u64, usize)>,
+        answer: impl Fn(StagedSource) -> T,
+    ) -> (T, StagedSource, usize) {
+        let source = StagedSource::new(blob.len() as u64);
+        let mut rounds = 0usize;
+        loop {
+            let answered = answer(source.clone());
+            let misses = source.take_misses();
+            if misses.is_empty() {
+                return (answered, source, rounds);
+            }
+            rounds += 1;
+            assert!(rounds < 16, "the rounds are the stages, not the reads");
+            for (offset, len) in misses {
+                let start = offset as usize;
+                match blob.get(start..start + len) {
+                    Some(bytes) if Some((offset, len)) != unreadable => {
+                        source.fill(offset, len, bytes.to_vec())
+                    }
+                    _ => source.fill_unreadable(offset, len),
+                }
+            }
+        }
+    }
+
+    /// Every entry point the reader integration uses, named so one generic
+    /// function can answer it against either source.
+    fn shaped<S: RangeSource>(reader: &SegmentedReader<S>, shape: &str) -> String {
+        match shape {
+            "rare" => format!("{:?}", reader.postings("rareneedle")),
+            "absent" => format!("{:?}", reader.postings("absentterm")),
+            "unnormalized" => format!("{:?}", reader.postings("qu")),
+            "and" => format!("{:?}", reader.matching_rows_all(&["rareneedle", "queen"])),
+            "and_absent" => format!("{:?}", reader.matching_rows_all(&["queen", "absentterm"])),
+            "or" => format!("{:?}", reader.matching_rows_any(&["rareneedle", "000999"])),
+            "or_unanswerable" => format!("{:?}", reader.matching_rows_any(&["queen", "qu"])),
+            "substring" => format!("{:?}", reader.rows_containing("service-1")),
+            "kept_groups" => format!(
+                "{:?}",
+                reader.matching_rows_all_in_groups(&["queen"], Some(&[1, 3]))
+            ),
+            "no_groups" => format!(
+                "{:?}",
+                reader.matching_rows_all_in_groups(&["queen"], Some(&[]))
+            ),
+            "bad_groups" => format!(
+                "{:?}",
+                reader.matching_rows_all_in_groups(&["queen"], Some(&[9]))
+            ),
+            other => panic!("unknown shape {other}"),
+        }
+    }
+
+    /// The acceptance: every shape answers what the synchronous reader answers,
+    /// the rounds are the stages (the open, its dictionary blocks, their
+    /// posting sections) rather than the reads, and the store is asked for no
+    /// more reads or bytes than the synchronous lookup asked it for.
+    #[test]
+    fn a_staged_lookup_answers_what_a_synchronous_one_does() {
+        let rows = corpus(4_000);
+        for blob in [encoded(&rows, 1_000), encoded_v2(&rows, 1_000)] {
+            // The bound is the stages, not the reads: the trailer, the
+            // directory, every group's dictionary block, then their posting
+            // sections. A conjunction pays one round per term instead of one
+            // for all of them, because its postings are fetched in ascending
+            // document frequency and it stops as soon as the intersection
+            // empties — an ordering worth more than the round trip it costs.
+            for (shape, rounds_allowed) in [
+                ("rare", 4),
+                ("absent", 4),
+                ("unnormalized", 4),
+                ("and", 5),
+                ("and_absent", 4),
+                ("or", 4),
+                ("or_unanswerable", 4),
+                ("substring", 4),
+                ("kept_groups", 4),
+                ("no_groups", 4),
+                ("bad_groups", 4),
+            ] {
+                // Priced from the open, which is the whole of the comparison:
+                // both arms pay the trailer and the directory.
+                let direct = open(blob.clone());
+                let expected = shaped(&direct, shape);
+                let sync_reads = direct.source().reads();
+                let sync_bytes = direct.source().bytes_read();
+                let (answered, source, rounds) = staged(&blob, None, |staged| {
+                    SegmentedReader::open(staged)
+                        .map(|reader| shaped(&reader, shape))
+                        .unwrap_or_else(|| "open refused".to_string())
+                });
+                assert_eq!(answered, expected, "{shape}");
+                assert!(
+                    rounds <= rounds_allowed,
+                    "{shape}: {rounds} rounds for {} reader reads",
+                    source.requests()
+                );
+                assert!(
+                    source.fetched_bytes() <= sync_bytes,
+                    "{shape}: staged fetched {} against {sync_bytes}",
+                    source.fetched_bytes()
+                );
+                assert!(
+                    source.fetched_reads() <= sync_reads,
+                    "{shape}: {} store reads against {sync_reads}",
+                    source.fetched_reads()
+                );
+            }
+        }
+    }
+
+    /// A range the store cannot serve is the failed-read case: the lookup
+    /// declines, and the rounds end rather than asking for it again. Without
+    /// the held refusal this loop does not terminate, which is why an
+    /// unreadable range is filled rather than left missing.
+    #[test]
+    fn a_range_the_store_refuses_declines_and_ends_the_rounds() {
+        let rows = corpus(1_000);
+        let blob = encoded(&rows, 250);
+        // The trailer, refused: the open concludes nothing, exactly as a
+        // truncated blob does.
+        let trailer = (
+            blob.len() as u64 - SEGMENTED_TRAILER_LEN as u64,
+            SEGMENTED_TRAILER_LEN,
+        );
+        let (answered, source, rounds) = staged(&blob, Some(trailer), |staged| {
+            SegmentedReader::open(staged).map(|reader| format!("{:?}", reader.postings("queen")))
+        });
+        assert_eq!(answered, None, "the open refused");
+        assert_eq!(rounds, 1);
+        assert_eq!(source.fetched_reads(), 0, "nothing was served");
+
+        // And one dictionary block refused, which is the interesting case: the
+        // open succeeded, so the lookup has to decline the file rather than
+        // report the term absent.
+        let located = {
+            let reader = open(blob.clone());
+            let group = &reader.directory().groups[0];
+            let block = &group.blocks[0];
+            (
+                group.dict_offset + u64::from(block.offset),
+                block.len as usize,
+            )
+        };
+        let (answered, _, rounds) = staged(&blob, Some(located), |staged| {
+            SegmentedReader::open(staged).map(|reader| {
+                format!(
+                    "{:?}",
+                    reader.matching_rows_all_in_groups(&["queen"], Some(&[0]))
+                )
+            })
+        });
+        assert_eq!(answered, Some("None".to_string()), "declined, not absent");
+        assert!(rounds <= 4, "{rounds} rounds");
+    }
+
+    /// What the staged shape buys beyond the thread: the ranges of a stage are
+    /// asked for together, so a block two terms share is fetched once and the
+    /// reads the store sees are fewer than the reads the reader made.
+    #[test]
+    fn ranges_a_lookup_asks_for_twice_are_fetched_once() {
+        let rows = corpus(4_000);
+        let blob = encoded(&rows, 4_000);
+        let (answered, source, rounds) = staged(&blob, None, |staged| {
+            SegmentedReader::open(staged)
+                .map(|reader| reader.matching_rows_all(&["queen", "checkout"]))
+        });
+        let direct = open(blob.clone());
+        assert_eq!(
+            answered,
+            Some(direct.matching_rows_all(&["queen", "checkout"]))
+        );
+        assert!(
+            source.fetched_reads() < source.requests(),
+            "{} store reads for {} reader reads",
+            source.fetched_reads(),
+            source.requests()
+        );
+        assert!(rounds <= 5, "{rounds} rounds");
+
+        // The substring sweep is the shape that makes the point about latency:
+        // hundreds of reader reads, still one round per stage.
+        let (_, sweep, sweep_rounds) = staged(&blob, None, |staged| {
+            SegmentedReader::open(staged).map(|reader| reader.rows_containing("service"))
+        });
+        assert!(sweep.requests() > 20, "{} reads", sweep.requests());
+        assert!(sweep_rounds <= 4, "{sweep_rounds} rounds");
+    }
+
+    /// #5006's fallback opens a second reader on the same blob when a held
+    /// directory turns out not to be its. Both opens share one source, so the
+    /// second pays for no range the first already fetched.
+    #[test]
+    fn a_second_open_on_one_staged_source_refetches_nothing() {
+        let rows = corpus(1_000);
+        let blob = encoded(&rows, 250);
+        let foreign = SegmentedDirectory::read(&SliceSource::new(encoded(&corpus(500), 125)))
+            .expect("the fixture parses");
+        let foreign = Arc::new(foreign);
+        let (answered, source, _) = staged(&blob, None, |staged| {
+            let reader = SegmentedReader::open_with_directory(staged.clone(), Arc::clone(&foreign))
+                .or_else(|| SegmentedReader::open(staged))?;
+            Some(format!("{:?}", reader.postings("rareneedle")))
+        });
+        let direct = open(blob.clone());
+        assert_eq!(
+            answered,
+            Some(format!("{:?}", direct.postings("rareneedle")))
+        );
+        // Every range was fetched once, whichever open asked for it.
+        assert!(source.fetched_reads() <= source.requests());
+        assert_eq!(source.fetched_bytes() as usize, source.held_bytes());
     }
 
     /// The two open format questions #4560 owes, priced at the scale

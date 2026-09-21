@@ -388,7 +388,13 @@ anything it cannot conclude falling back to the v1 index or an exact scan
 (#4561), and the parsed directory held between lookups under a byte budget of
 its own (#5006, `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`, separate
 from the two budgets above) — but only when `SIGLAKE_SEGMENTED_INDEX_READS` is
-set. A streaming re-cluster can build the compressed seg2 generation one
+set. A lookup reads in stages: the synchronous reader runs over the ranges it
+holds and records the ones it does not, and the caller fetches a stage's ranges
+together (`SIGLAKE_SEGMENTED_INDEX_RANGE_CONCURRENCY`, default 10) between runs,
+so a store wait never holds a thread of the blocking pool and a shape's rounds
+of waits are its stages — four, or two on a held directory — rather than its
+reads, which run from 4 to 2,938 per file (#5007).
+A streaming re-cluster can build the compressed seg2 generation one
 Parquet row group at a time when `SIGLAKE_SEGMENTED_INDEX_WRITES=1`: each
 finished output file contributes one uncompressed Puffin blob whose interior
 contains independently compressed dictionary and posting blocks, and the

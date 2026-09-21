@@ -631,14 +631,12 @@ arrives with the Parquet metadata the scan already read, so there is nothing to
 read in part.
 
 **The sync/async seam.** `RangeSource` is synchronous and the object store is
-not. The lookup runs on a blocking thread and hands each range to the async
-side over a channel, one at a time; a range the async side cannot serve comes
-back as `None`, which the reader turns into `Unanswerable`. Below the
-directory nothing is cached: the reader asks for what a term needs, per
-lookup. The blocking thread is held for the whole lookup, IO waits included,
-which is a prototype's simplification and not what a shipped version should
-do — one scanned file occupies one thread of tokio's blocking pool for as long
-as its lookup takes.
+not. A range the async side cannot serve comes back as `None`, which the reader
+turns into `Unanswerable`. Below the directory nothing is cached: the reader
+asks for what a term needs, per lookup. #4561 bridged the seam by running each
+lookup on a blocking thread and serving its ranges over a channel, one at a
+time, which held one thread of tokio's blocking pool for the whole of a
+lookup, IO waits included; #5007 replaced that with the staged reader below.
 
 ### Holding the directory between lookups (#5006)
 
@@ -654,9 +652,10 @@ charges every shape at 1M rows, 474.9 KiB per file at 7.34M.
 
 Four things this deliberately does not do:
 
-- **It holds no per-lookup state.** The channel, the counters and the
+- **It holds no per-lookup state.** The staged source, the counters and the
   `BlobRangeReader` are built per lookup and the cost reported
-  (`_range_reads`, `_fetched_bytes`) is that lookup's alone, warm or cold. The
+  (`_range_reads`, `_fetched_bytes`, and since #5007 `_stages` and
+  `_reader_reads`) is that lookup's alone, warm or cold. The
   resident-byte histogram is recorded on a warm lookup too: the memory a warm
   arm spends is the thing #4562 is comparing, and it must not vanish from the
   report because it was paid once.
@@ -711,6 +710,7 @@ exact scan otherwise:
 | `no_hints` | the prune spec carries nothing this index can answer |
 | `clipped_document_frequency` | point terms' summed df exceeds the clipped query's row limit |
 | `clipped_estimate_unavailable` | a clipped substring would require a full dictionary sweep rather than a point estimate |
+| `stages` | the staged rounds did not converge inside their budget (#5007) — unreachable for this reader, and a bound rather than an expected outcome |
 
 Two entry points changed in `siglake_index::segmented` for this, both
 reader-side policy the codec deliberately left open:
@@ -736,10 +736,80 @@ The substring sweep is answered exactly and costs what it costs (below);
 declining it is a per-execution decision and belongs with #4375's policy, which
 already gates this path along with the v1 one.
 
+### Reading in stages, not on a blocking thread (#5007)
+
+Two shapes were on the table for the seam.
+
+An **async trait on the reader** makes every entry point `async` and awaits
+each range where the lookup needs it. It holds no thread, and it keeps the
+reads strictly serial: one round trip per read, which is the `reads` column
+below running from 4 to 2,938 per file. It also reopens the codec API #4560
+had just settled, and issuing a group's reads concurrently from inside the
+reader would mean the codec depending on a runtime.
+
+A **staged reader** runs the synchronous lookup over the ranges it already
+holds. A range it does not hold is recorded as a miss and reads as a failed
+read, so that run declines; the caller then fetches every miss the run
+recorded — together — and runs the same lookup again. A lookup is a pure
+function of the blob's bytes, so the replay asks for the same ranges and gets
+one stage further each round. Nothing waits on the store inside a run, so
+nothing holds a thread across a wait.
+
+**The staged reader is what the reader does now**
+(`siglake_index::segmented::StagedSource`, `segmented_matching_rows` in
+`third_party/iceberg/src/arrow/reader/pruning.rs`). The codec's API is
+untouched. What
+changed inside it is that a failed range read no longer returns from the middle
+of a multi-group walk: the verdict is the same, `Unanswerable` the moment any
+range fails, but the walk finishes, so one run records every range the lookup
+needs rather than one group's. Without that the rounds would be the groups
+(`2 + 2G` for a single term over `G` kept groups); with it they are the
+stages — the trailer, the directory, every dictionary block the terms name
+across every kept group, and their posting sections. Four rounds for any
+shape, two of them gone when the directory is held (#5006), plus one round per
+additional term of a conjunction, whose postings are fetched rarest-first and
+stop as soon as the intersection empties. That ordering is worth more than the
+round trip it costs (the `and_rare_keyword` row below reads 26 ranges where an
+unordered conjunction reads both terms' postings in every group).
+
+The ranges of one stage go out together, bounded by
+`SIGLAKE_SEGMENTED_INDEX_RANGE_CONCURRENCY` — default 10, which is
+`DEFAULT_RANGE_FETCH_CONCURRENCY`, the bound the scan's own merged-range reader
+uses. A range the store refuses is filled as unreadable rather than left
+missing, which is both what the reader reads as a failed read and what ends the
+rounds: every round fills every range it asked for, so the held set only grows
+and a blob has finitely many ranges. A stage budget
+(`Declined("stages")`) bounds the loop anyway, for a future reader that asked
+for its ranges some other way.
+
+**What it costs.** Two things, both of them per lookup and both measured
+below:
+
+- every range a lookup fetched is held until the lookup ends, so its peak is
+  the lookup's fetched bytes rather than one range — 65,481 bytes for the
+  `rare` shape, 5,207,615 for the substring sweep;
+- a stage re-decodes the ranges it already holds on its way past them, which
+  the `reader reads` column prices: 45 reads against 18 fetched for `rare`, and
+  8,805 against 2,938 for the sweep, whose cost *is* dictionary decoding. The
+  directory itself is parsed once per lookup, not once per stage: the first
+  stage that parses it hands it to the next, the way a held directory is handed
+  in.
+
+**Where the waits went**, measured hermetically: eight files' lookups run
+concurrently against an in-memory store that delays every range read by 10 ms,
+on a runtime with two workers and a blocking pool of one thread that a parked
+task holds for the duration
+(`a_segmented_lookup_waits_on_the_store_without_a_blocking_thread`). All eight
+answer in **51.3 ms** — four stages each, 10 store reads, 25 reader reads, 32
+range reads in flight at the peak. With #4561's driver restored (the same test,
+the blocking-thread lookup patched back in), one lookup does not finish, because
+the pool it needs a thread from is held: 60 seconds on the first measurement,
+and 10 on the control re-run after this work was carried onto the 0.10.1 fork.
+
 ### What a lookup costs through the reader
 
-`report_segmented_reader_read_cost` (`third_party/iceberg/src/arrow/reader.rs`,
-`#[ignore]`d) measures the same quantities the tables below do, through the
+`report_segmented_reader_read_cost`
+(`third_party/iceberg/src/arrow/reader/pruning.rs`, `#[ignore]`d) measures the same quantities the tables below do, through the
 Puffin container. Release build, 1,000,000 rows in 8 row groups, a 12,127,530-byte
 segmented blob against a 74,284,630-byte parsed v1 index:
 
@@ -752,16 +822,24 @@ directory held (#5006), which is what a file costs after its first query.
 | rare_last25 | 251 | 6 | 58,108 | 0.479% | 4 | 2,448 | 0.020% |
 | keyword | 20,000 | 18 | 83,475 | 0.688% | 16 | 27,815 | 0.229% |
 | unique_token | 1 | 4 | 57,415 | 0.473% | 2 | 1,755 | 0.014% |
-| and_rare_keyword | 21 | 34 | 93,296 | 0.769% | 32 | 37,636 | 0.310% |
+| and_rare_keyword | 21 | 26 | 85,481 | 0.705% | 24 | 29,821 | 0.246% |
 | or_rare_unique | 1,005 | 20 | 67,236 | 0.554% | 18 | 11,576 | 0.095% |
 | substring_sweep | 20,000 | 2,938 | 5,207,615 | 42.940% | 2,936 | 5,151,955 | 42.481% |
 
-Resident state is 135,222 bytes for every row — the directory, 549x smaller
-than the parsed v1 index of the same file. (#4561 reported 135,238 for the
-same directory: the 16 bytes are the reader's own `size_of`, which moved to
+Resident state is 158,646 bytes for every row — the directory, 468x smaller
+than the parsed v1 index of the same file. (#4561 and #5006 reported 135,238
+and 135,222 for the same file: the difference is seg2's per-block entry, which
+#4988 added to every directory whatever format the blob is. The 16 bytes
+between those two are the reader's own `size_of`, which moved to
 `SegmentedDirectory` when #5006 split them.) Every row's answer is asserted
 equal to the whole-file index's, restricted to the groups the shape kept,
 before any cost is reported, cold and warm alike.
+
+`and_rare_keyword` is the one row #5007 moved: 26 reads and 85,481 bytes where
+the blocking-thread reader charged 34 and 93,296. Both terms sit in the same
+dictionary block in each group; a staged lookup fetches that block once, and
+the counters report what the store served rather than what the reader asked
+for.
 
 **The cold columns are the open**: two reads and 55,660 bytes of trailer and
 directory, which is most of what every point shape fetches, and the whole
@@ -772,9 +850,41 @@ the dictionary sweep the format does not help.
 
 `and_rare_keyword` reads both terms' postings here — `rareneedle` and `queen`
 are both in every row group, so the intersection never empties early — and its
-34 reads are two dictionary lookups plus two posting reads per group. The
+26 reads are one dictionary block plus two posting reads per group. The
 saving the df ordering buys shows where a term is absent from a group or the
 intersection empties, which the codec's own fixtures pin.
+
+#### Stages against reads (#5007)
+
+The same run, same fixture, with the store waits counted. `stages` is the
+rounds of waits the lookup took; `reader reads` is what those rounds decode
+between them, against the `reads` the store served; `µs` is the lookup's wall
+time through the Puffin container on a local file, two samples per arm, against
+the blocking-thread driver on the same box and build.
+
+| shape | reads | stages | reader reads | staged µs | #4561 µs |
+|---|---:|---:|---:|---:|---:|
+| rare | 18 | 4 | 45 | 376 / 444 | 771 / 784 |
+| rare_last25 | 6 | 4 | 15 | 425 / 504 | 551 / 534 |
+| keyword | 18 | 4 | 45 | 498 / 571 | 966 / 857 |
+| unique_token | 4 | 4 | 10 | 278 / 330 | 550 / 501 |
+| and_rare_keyword | 26 | 5 | 109 | 631 / 720 | 848 / 1,096 |
+| or_rare_unique | 20 | 4 | 50 | 381 / 440 | 523 / 741 |
+| substring_sweep | 2,938 | 4 | 8,805 | 89,445 / 99,620 | 75,577 / 78,173 |
+
+Warm (directory held), the same two arms: two stages for every point shape and
+three for the conjunction, 113-208 µs against 280-352 for the point shapes,
+373 against 504-618 for the conjunction, and 85,125-86,210 against
+70,518-73,034 for the sweep.
+
+A local file's read is microseconds, so these columns are not the latency
+argument — they are the *decode* argument, and they bound what the replay
+costs: every point shape is faster staged (its four ranges go out together
+where the blocking-thread reader waited for them in turn), and the substring
+sweep is 18-27% slower, which is its 8,805 reader reads against 2,938 fetched
+ranges. The latency argument is the delayed-store measurement above: at 10 ms a
+read, one `rare` lookup is 4 stages against 18 sequential reads, and eight
+files' lookups finish in the time one stage takes.
 
 ## Measurements
 
@@ -1301,10 +1411,12 @@ Both revisions identified by #4562 are now in code:
    scan fallbacks. The table and cost accounting above are the retained result.
 
 **Not blocking, and still open:** the substring sweep reads the whole dictionary
-and stays a decline; the directory cache's value is measured in bytes and
+and stays a decline; and the directory cache's value is measured in bytes and
 requests, not local latency, so what it is worth depends on an object-store
-round; and the sync/async seam still holds a blocking thread for a whole lookup,
-which one process at 14 files does not stress.
+round. The sync/async seam no longer holds a blocking thread for a lookup
+(#5007, [staged reading](#reading-in-stages-not-on-a-blocking-thread-5007)),
+and what it now leaves open is smaller: a stage re-decodes what the lookup
+already holds, which only the substring sweep pays enough of to see.
 
 ## Acceptance sequence
 
@@ -1359,6 +1471,19 @@ What remains, in order:
    estimate. Common terms decline as `clipped_document_frequency`; a substring
    declines as `clipped_estimate_unavailable` without sweeping the dictionary.
    Whole-file v1 and ordered-limit declines are unchanged.
+7. ~~**#5007**~~ — done, see [Reading in
+   stages](#reading-in-stages-not-on-a-blocking-thread-5007): a lookup's store
+   waits happen between runs of the synchronous reader, so no lookup holds a
+   blocking-pool thread, and a shape's rounds of waits are its stages rather
+   than its reads. The staged shape was chosen over an async codec API, and the
+   evidence for both the choice and its cost is in that section.
+8. **An open question for #4561**: the substring sweep reads the whole
+   dictionary, and `keyword`-class terms with millions of postings read megabytes
+   of posting bytes. Both are regimes where partial reads buy little, and #4375's
+   per-execution policy is the place to decline them. The document frequency a
+   policy would want is now in the directory — a 474.9 KiB read per file — which
+   is the cheapest selectivity estimate this design makes available and did not
+   exist before it.
 
 ## Reproduce
 
@@ -1408,10 +1533,18 @@ cargo test --release --lib report_segmented_reader_read_cost -- --ignored --noca
 ```
 
 sized by `SIGLAKE_SEG_READER_ROWS` (1,000,000) and `SIGLAKE_SEG_READER_GROUPS`
-(8), 5.3 s at those values. It prints the cold and warm columns and the
-directory cache's footprint; running it under
+(8), 5.3 s at those values. It prints the cold and warm columns, the stages
+table and the directory cache's footprint; running it under
 `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES=0` is the negative control,
 where the warm columns come back equal to the cold ones.
+
+The blocking-pool claim is a unit test rather than a measurement
+(`a_segmented_lookup_waits_on_the_store_without_a_blocking_thread`, 0.5 s in
+the same fork run). Its arm against #4561's driver is not retained: it was
+taken by copying `third_party/iceberg/src` aside, patching the
+blocking-thread lookup back into the copy and running
+`scripts/check-fork-tests.sh --fork iceberg --fork-src iceberg=<copy>/src`,
+where the test times out at 60 s and the other 1,198 pass.
 
 The query-path comparison (#4562) is `report_rebuild_on_off_text_shapes` in
 `crates/siglake-storage/tests/puffin_rebuild.rs`, run three times over one kept
