@@ -1,6 +1,18 @@
 use siglake_core::Event;
 use siglake_storage::iceberg::{GcOptions, IcebergContext};
 
+use crate::fixture_clock::{assert_one_partition, fixture_base};
+
+/// One second apart off [`fixture_base`], so the appends a fixture then
+/// re-clusters carry one `day(timestamp)` partition value whatever time of day
+/// the suite runs (#5678).
+fn event_at(offset_secs: i64, raw: &str) -> Event {
+    Event {
+        timestamp: fixture_base() + chrono::Duration::seconds(offset_secs),
+        ..Event::now(raw)
+    }
+}
+
 async fn rewritten_sidecars() -> (
     tempfile::TempDir,
     IcebergContext,
@@ -18,10 +30,10 @@ async fn rewritten_sidecars() -> (
             index_footer_max_bytes: Some(1),
             ..Default::default()
         });
-    ice.append_events(&[Event::now("database timeout one")])
+    ice.append_events(&[event_at(0, "database timeout one")])
         .await
         .unwrap();
-    ice.append_events(&[Event::now("database timeout two")])
+    ice.append_events(&[event_at(1, "database timeout two")])
         .await
         .unwrap();
     let ident = ice.events_table_ident().clone();
@@ -34,6 +46,7 @@ async fn rewritten_sidecars() -> (
     assert_eq!(retired_sidecars.len(), 2);
 
     let files = ice.live_data_files(&ident).await.unwrap();
+    assert_one_partition(&files, "rewritten_sidecars");
     ice.recluster_files(
         &ident,
         files,
@@ -41,7 +54,7 @@ async fn rewritten_sidecars() -> (
     )
     .await
     .unwrap();
-    ice.append_events(&[Event::now("database timeout live")])
+    ice.append_events(&[event_at(2, "database timeout live")])
         .await
         .unwrap();
 
