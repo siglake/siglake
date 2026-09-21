@@ -96,6 +96,14 @@ pub struct QueryScanTuning {
     /// operator field. The cache defaults and packaged memory limits stay
     /// unchanged while the shared bound is qualified locally.
     pub file_cache_population_bound_prototype: bool,
+    /// #5786 LOCAL QUALIFICATION CONTROL: retain the pre-#5786 policy whose
+    /// completed entries are byte-bounded but whose live populations are not.
+    ///
+    /// Deliberately has no environment variable, CLI flag, chart value or
+    /// operator field. Production always accounts populations against the
+    /// configured decoded-file cache budget; this switch exists only for the
+    /// matched measurement in `file_cache_budget_measurement.rs`.
+    pub file_cache_unbounded_population_prototype: bool,
     /// #4959 LOCAL QUALIFICATION PROTOTYPE: retain the bounded file-task
     /// identities a scan planned, offered to the decoded cache, and attempted
     /// to open as labelled DataFusion node metrics.

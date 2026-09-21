@@ -1,7 +1,7 @@
 //! Task #3053: what an explicitly configured decoded-file cache buys, and what
 //! it costs, at budgets a pod can actually afford.
 //!
-//! `#[ignore]`d — it writes half a million events and runs six policy arms over a
+//! `#[ignore]`d — it writes half a million events and runs seven policy arms over a
 //! repeated drained scan, which is a measurement, not a gate. Run it and read
 //! the table it prints:
 //!
@@ -21,6 +21,7 @@
 //! * `off`      — the packaged default, `0/0`; the control every arm is read against;
 //! * `fits`     — 16 entries' worth of bytes, so the whole working set stays;
 //! * `bytes`    — 4 entries' worth, so the BYTE bound evicts;
+//! * `replace`  — the same budget with #5786's population-safe replacement;
 //! * `entries`  — the same 16-entry byte budget with `max_entries = 2`, so the
 //!   ENTRY bound evicts while bytes are free;
 //! * `oversize` — 3 entries' worth, which puts one entry over `budget / 4` and
@@ -73,9 +74,11 @@ fn bounded_tuning(
     max_bytes: Option<u64>,
     max_entries: Option<usize>,
     population_bound: bool,
+    unbounded_population: bool,
 ) -> QueryScanTuning {
     QueryScanTuning {
         file_cache_population_bound_prototype: population_bound,
+        file_cache_unbounded_population_prototype: unbounded_population,
         ..tuning(max_bytes, max_entries)
     }
 }
@@ -101,6 +104,14 @@ struct Counters {
     skip_oversized: u64,
     contended: u64,
     abandoned: u64,
+}
+
+struct MeasurementArm {
+    name: &'static str,
+    max_bytes: Option<u64>,
+    max_entries: Option<usize>,
+    exact_batch_prototype: bool,
+    unbounded_population_control: bool,
 }
 
 impl Counters {
@@ -149,7 +160,7 @@ fn mib(bytes: u64) -> f64 {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "measurement: 512k events written, six cache policy arms over a repeated drained scan"]
+#[ignore = "measurement: 512k events written, seven cache policy arms over a repeated drained scan"]
 async fn file_cache_budget_measurement() {
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
@@ -174,9 +185,11 @@ async fn file_cache_budget_measurement() {
     // Every arm below is a multiple of this number, so the byte bound, the
     // entry bound and the oversized rule each bite where the data puts them.
     siglake_storage::clear_decoded_file_cache();
-    siglake_storage::configure_query_scan_tuning(tuning(
+    siglake_storage::configure_query_scan_tuning(bounded_tuning(
         Some(8 * 1024 * 1024 * 1024),
         Some(16_384),
+        false,
+        true,
     ));
     let probe_ctx = siglake_storage::session_context_with_target_partitions(Some(FILES));
     ice.register_with_datafusion(&probe_ctx).await.unwrap();
@@ -206,25 +219,69 @@ async fn file_cache_budget_measurement() {
         mib(table_bytes(tmp.path()))
     );
 
-    let arms: [(&str, Option<u64>, Option<usize>, bool); 6] = [
-        ("off", Some(0), Some(0), false),
-        ("fits", Some(16 * entry_bytes), Some(64), false),
-        ("bytes", Some(4 * entry_bytes), Some(64), false),
-        ("shared", Some(4 * entry_bytes), Some(64), true),
-        ("entries", Some(16 * entry_bytes), Some(2), false),
-        ("oversize", Some(3 * entry_bytes), Some(64), false),
+    let arms = [
+        MeasurementArm {
+            name: "off",
+            max_bytes: Some(0),
+            max_entries: Some(0),
+            exact_batch_prototype: false,
+            unbounded_population_control: true,
+        },
+        MeasurementArm {
+            name: "fits",
+            max_bytes: Some(16 * entry_bytes),
+            max_entries: Some(64),
+            exact_batch_prototype: false,
+            unbounded_population_control: true,
+        },
+        MeasurementArm {
+            name: "bytes",
+            max_bytes: Some(4 * entry_bytes),
+            max_entries: Some(64),
+            exact_batch_prototype: false,
+            unbounded_population_control: true,
+        },
+        MeasurementArm {
+            name: "replace",
+            max_bytes: Some(4 * entry_bytes),
+            max_entries: Some(64),
+            exact_batch_prototype: false,
+            unbounded_population_control: false,
+        },
+        MeasurementArm {
+            name: "shared",
+            max_bytes: Some(4 * entry_bytes),
+            max_entries: Some(64),
+            exact_batch_prototype: true,
+            unbounded_population_control: false,
+        },
+        MeasurementArm {
+            name: "entries",
+            max_bytes: Some(16 * entry_bytes),
+            max_entries: Some(2),
+            exact_batch_prototype: false,
+            unbounded_population_control: true,
+        },
+        MeasurementArm {
+            name: "oversize",
+            max_bytes: Some(3 * entry_bytes),
+            max_entries: Some(64),
+            exact_batch_prototype: false,
+            unbounded_population_control: true,
+        },
     ];
 
     println!(
         "\n{:<9} {:>9} {:>9} {:>9} {:>9}   counters, then footprint and population peak (MiB)",
         "arm", "budget", "cold_ms", "warm_p50", "warm_max"
     );
-    for (arm, max_bytes, max_entries, population_bound) in arms {
+    for arm in arms {
         siglake_storage::clear_decoded_file_cache();
         siglake_storage::configure_query_scan_tuning(bounded_tuning(
-            max_bytes,
-            max_entries,
-            population_bound,
+            arm.max_bytes,
+            arm.max_entries,
+            arm.exact_batch_prototype,
+            arm.unbounded_population_control,
         ));
         siglake_storage::reset_decoded_file_cache_population_peaks();
         let refusals_before =
@@ -242,7 +299,8 @@ async fn file_cache_budget_measurement() {
             timings.push(started.elapsed().as_secs_f64() * 1000.0);
             assert_eq!(
                 got, expected,
-                "{arm} run {run} returned {got} of {expected} rows"
+                "{} run {run} returned {got} of {expected} rows",
+                arm.name
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let delta = Counters::read(&snapshotter);
@@ -263,8 +321,8 @@ async fn file_cache_budget_measurement() {
              cache entries={} priced={:.1} extent={:.1} retained={:.1} | \
              population peak extent={:.1} retained={:.1} streams={} | \
              accounted_peak={:.1} refusals={}",
-            arm,
-            max_bytes
+            arm.name,
+            arm.max_bytes
                 .map(|bytes| format!("{:.0}MiB", mib(bytes)))
                 .unwrap_or_else(|| "-".into()),
             timings[0],

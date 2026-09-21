@@ -1,6 +1,6 @@
 # Design — the opt-in source-file cache, at budgets a pod can afford (#3053)
 
-Status (2026-09-17): **opt-in, unchanged.** The decoded-file cache stays off in
+Status (2026-09-21): **opt-in; population bound adopted.** The decoded-file cache stays off in
 the chart, the compose file and the operator
 (`SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_{BYTES,ENTRIES}` are `0` in all three), and
 nothing here proposes a default. What this document adds is the sizing an
@@ -244,3 +244,54 @@ blocking on the cache mutex per batch. Task #5786 carries that implementation;
 it must reuse this fixture and update `ARCHITECTURE.md`, `LIMITATIONS.md` and
 the operator-facing docs if adopted. The in-process prototype remains as the
 qualification record.
+
+## 2026-09-21: turnover-preserving production admission (#5786)
+
+Production admission charges each retained batch at its exact
+`RecordBatch::get_array_memory_size`, the same currency as completed entries.
+Its fast path is one atomic compare-and-swap. If residents fill the budget, the
+pressure path uses a non-blocking cache `try_lock`, evicts oldest entries until
+that batch fits, and retries the atomic charge while holding that lock. A
+contended lock refuses optional population and leaves the scan answer unchanged.
+Thus no batch waits on the cache mutex, and a fitting working set of small files
+is not reduced to four slots by the `budget / 4` maximum-entry rule.
+
+EOF moves the accumulated charge into the cache without a gap in ownership.
+Cancellation, read failure, oversize, a duplicate insertion and a contended
+insertion release it. Cache defaults, packaged memory limits and query-pool
+subtraction are unchanged.
+
+`file_cache_population_bound.rs` now drives the production rule under eight
+partitions and two overlapping queries, changes the projection after residents
+fill the four-entry budget, and requires both insertion and eviction while
+`peak_accounted_bytes <= max_bytes`. It then runs #5074's rule as a negative
+control and observes no insertion or eviction after the same resident set fills
+the budget. The cancellation assertion runs under production admission. Unit
+coverage runs read failure and contended insertion through both rules; existing
+fixtures retain the oversized, duplicate and answer-equivalence coverage.
+The query-server's 64-small-file convergence test is the capacity guard: on the
+gate reproduction it installed 62 entries on the first pass and all 64 on the
+second under a 256 MiB budget.
+
+The retained release-mode measurement was rerun on 2026-09-21 with the same 8 x
+65,536-row fixture, eight partitions and five executions. One entry remained
+5.4 MiB and the four-entry budget remained 22 MiB:
+
+| arm | cold / warm p50 / warm max (ms) | warm cache work per run | installed / peak population |
+| --- | --- | --- | --- |
+| off | 9.3 / 8.9 / 9.1 | none | 0 / 0 MiB |
+| existing LRU (22 MiB) | 8.0 / 6.7 / 6.9 | 4 hits, 4 inserts, 4 evictions | 21.6 / 28.7 MiB retained |
+| replacement (22 MiB) | 10.9 / 6.9 / 7.5 | 4 hits, 4 inserts, 4 evictions | 21.6 / 21.3 MiB retained; 21.6 MiB accounted peak |
+| #5074 exact-batch (22 MiB) | 7.6 / 5.7 / 6.2 | 4 hits, 4 refusals, no insertion or eviction | 21.6 / 21.3 MiB retained; 21.6 MiB accounted peak |
+
+All arms returned 524,288 rows. The replacement arm retains the hard bound and
+turns over residents; its 6.9 ms warm median is within the run-to-run spread of
+the existing half-working-set control. The exact-batch arm is faster in this run
+because it keeps the scheduler-selected first four entries and does no insertion
+work, which is the policy defect rather than a production win.
+
+## Disposition: ADOPT
+
+Use exact charges with replacement whenever the decoded-file cache is enabled. Keep
+the old unbounded and exact-batch rules only as in-process measurement controls.
+The cache remains opt-in and all packaged limits remain zero.
