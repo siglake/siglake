@@ -705,10 +705,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   charts them; on a default install, where the cache is off, every arm stays at
   zero.
   Population buffers now share the configured cache byte bound with completed
-  entries (#5786). A population reserves one maximum-sized entry on its first
-  retained batch, evicting oldest residents if required; later batches need no
-  cache mutex. Cancellation, read failure, oversize, a duplicate and a contended
-  insert release the reservation. The eight-partition, two-query fixture holds
+  entries (#5786). Each retained batch charges its exact decoded bytes with a
+  lock-free atomic fast path; only a charge that lacks room tries the cache mutex
+  without waiting and evicts oldest residents. Cancellation, read failure,
+  oversize, a duplicate and a contended insert release the accumulated charge.
+  The eight-partition, two-query fixture holds
   completed entries plus live populations to its 22 MiB budget and replaces
   residents for a changed projection. #5074's rejected exact-batch prototype is
   retained beside it as the negative control: its first four residents freeze
@@ -813,7 +814,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   budget below four entries caches nothing while still subtracting its bytes
   from the query memory pool. Those historical arms left population memory on
   top of the cache budget. The adopted 22 MiB replacement arm instead held its
-  combined accounted peak to 21.6 MiB, retained at most 17.1 MiB in live
+  combined accounted peak to 21.6 MiB, retained at most 21.3 MiB in live
   populations, and kept four completed entries at 21.6 MiB. Both limits must be
   positive; a pod given one of the two now logs a warning naming the derived
   pair. Bounds, quarter rule and explicit zero are pinned by

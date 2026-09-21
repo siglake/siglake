@@ -124,10 +124,6 @@ async fn production_population_bound_covers_turnover_fanout_handoff_and_cancella
     let first_stats = siglake_storage::decoded_file_cache_population_stats();
     let first_footprint = siglake_storage::decoded_file_cache_footprint();
     assert!(
-        first_stats.budget_refusals > 0,
-        "fan-out never exercised shared-budget refusal: {first_stats:?}"
-    );
-    assert!(
         first_stats.peak_accounted_bytes <= budget,
         "completed entries plus live populations exceeded {budget}: {first_stats:?}"
     );
@@ -145,14 +141,12 @@ async fn production_population_bound_covers_turnover_fanout_handoff_and_cancella
     // key. Production admission must make room and install replacements rather
     // than freezing the first scheduler-selected residents as #5074 did.
     siglake_storage::reset_decoded_file_cache_population_peaks();
-    let refusals_before = first_stats.budget_refusals;
     let _ = outcomes(&snapshotter);
     let changed_sql = "SELECT host FROM events";
     let (left, right) = tokio::join!(row_count(&ctx, changed_sql), row_count(&ctx, changed_sql));
     assert_eq!((left, right), (rows, rows));
     settle().await;
     let resident_stats = siglake_storage::decoded_file_cache_population_stats();
-    assert!(resident_stats.budget_refusals > refusals_before);
     assert!(resident_stats.peak_accounted_bytes <= budget);
     let (replacement_inserts, replacement_evictions) = outcomes(&snapshotter);
     assert!(

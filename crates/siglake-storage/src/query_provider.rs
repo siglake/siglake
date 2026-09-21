@@ -186,8 +186,8 @@ enum PopulationAdmission {
     /// #5074's rejected rule: charge each retained batch only if free space
     /// already exists, which freezes residents once they fill the budget.
     ExactPrototype,
-    /// Production: reserve one maximum-sized candidate, evicting residents
-    /// once at admission so subsequent batches need no cache lock.
+    /// Production: charge retained batches exactly, evicting residents with a
+    /// non-blocking cache lock only when the atomic fast path lacks room.
     Replacement { max_bytes: u64 },
 }
 
@@ -928,8 +928,8 @@ struct PopulationCharge {
     retained_bytes: u64,
     /// Actual conservative price of the batches this stream retains.
     priced_bytes: u64,
-    /// Bytes held in the process-wide accounting total. Production reserves a
-    /// maximum-sized entry once; #5074 reserves the exact batch price.
+    /// Bytes held in the process-wide accounting total. Production reserves
+    /// exact retained-batch bytes; the unbounded control reserves nothing.
     reserved_bytes: u64,
     admission: PopulationAdmission,
 }
@@ -976,17 +976,12 @@ impl PopulationCharge {
                 Some(previous.saturating_add(priced))
             }
             PopulationAdmission::Replacement { max_bytes } => {
-                if self.reserved_bytes == 0 {
-                    let reservation = max_bytes / MAX_FILE_CACHE_ENTRY_FRACTION;
-                    if reservation == 0
-                        || !try_reserve_population_with_replacement(reservation, max_bytes)
-                    {
-                        population_meter().budget_refusals.fetch_add(1, Relaxed);
-                        return false;
-                    }
-                    self.reserved_bytes = reservation;
+                if !try_reserve_population_with_replacement(priced, max_bytes) {
+                    population_meter().budget_refusals.fetch_add(1, Relaxed);
+                    return false;
                 }
-                None
+                self.reserved_bytes = self.reserved_bytes.saturating_add(priced);
+                Some(decoded_file_cache_accounted_bytes().load(Relaxed))
             }
         };
         if let Some(total) = admitted_total {
@@ -995,12 +990,10 @@ impl PopulationCharge {
                 .fetch_max(total, Relaxed);
         }
         self.priced_bytes = self.priced_bytes.saturating_add(priced);
-        if matches!(self.admission, PopulationAdmission::Replacement { .. }) {
-            debug_assert!(self.priced_bytes <= self.reserved_bytes);
-            population_meter()
-                .peak_accounted_bytes
-                .fetch_max(decoded_file_cache_accounted_bytes().load(Relaxed), Relaxed);
-        }
+        debug_assert!(
+            matches!(self.admission, PopulationAdmission::UnboundedPrototype)
+                || self.priced_bytes == self.reserved_bytes
+        );
         self.extent_bytes = self.extent_bytes.saturating_add(extent);
         self.retained_bytes = self.retained_bytes.saturating_add(retained);
         let meter = population_meter();
@@ -1030,8 +1023,7 @@ impl PopulationCharge {
     }
 
     /// Move an admitted charge into a completed cache entry without changing
-    /// ownership. A production reservation is conservative, so its unused tail
-    /// is released at the handoff.
+    /// ownership.
     fn transfer_to_cache(&mut self, entry_bytes: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let meter = population_meter();
@@ -1042,11 +1034,7 @@ impl PopulationCharge {
             .retained_bytes
             .fetch_sub(std::mem::take(&mut self.retained_bytes), Relaxed);
         debug_assert_eq!(self.priced_bytes, entry_bytes);
-        debug_assert!(self.reserved_bytes >= entry_bytes);
-        let unused = self.reserved_bytes.saturating_sub(entry_bytes);
-        if unused > 0 {
-            decoded_file_cache_accounted_bytes().fetch_sub(unused, Relaxed);
-        }
+        debug_assert_eq!(self.reserved_bytes, entry_bytes);
         self.priced_bytes = 0;
         self.reserved_bytes = 0;
     }
@@ -8202,6 +8190,33 @@ mod tests {
                 drop(guard);
             });
         }
+
+        // Fill the accounting total and hold the cache mutex so production
+        // admission cannot make room. Refusing optional population must still
+        // yield the reader's batch unchanged and retain nothing.
+        let priced = batch.get_array_memory_size() as u64;
+        let cache_guard = query_file_batch_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let accounted = decoded_file_cache_accounted_bytes().load(Relaxed);
+        let max_bytes = accounted.saturating_add(priced.saturating_mul(4));
+        let padding = max_bytes.saturating_sub(accounted);
+        decoded_file_cache_accounted_bytes().fetch_add(padding, Relaxed);
+        futures::executor::block_on(async {
+            let inner = futures::stream::iter([Ok::<_, DataFusionError>(batch.clone())]).boxed();
+            let mut refused = stream(
+                "production-refusal",
+                inner,
+                PopulationAdmission::Replacement { max_bytes },
+            );
+            let yielded = refused.next().await.unwrap().unwrap();
+            assert_eq!(yielded, batch);
+            assert!(refused.population_refused);
+            assert!(refused.buffered.is_empty());
+            assert_eq!(refused.charge.reserved_bytes, 0);
+        });
+        decoded_file_cache_accounted_bytes().fetch_sub(padding, Relaxed);
+        drop(cache_guard);
     }
 
     #[test]

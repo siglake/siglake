@@ -247,22 +247,19 @@ qualification record.
 
 ## 2026-09-21: turnover-preserving production admission (#5786)
 
-Production admission reserves the quarter-budget maximum candidate on the first
-batch a population would retain. The reservation uses the same
-`RecordBatch::get_array_memory_size` currency as completed entries. Its fast path
-is one atomic compare-and-swap. If residents fill the budget, the slow path uses
-one non-blocking cache `try_lock`, evicts oldest entries until the reservation
-fits, and retries the atomic reservation while holding that lock. A contended
-lock refuses optional population and leaves the scan answer unchanged. No later
-batch acquires the cache mutex.
+Production admission charges each retained batch at its exact
+`RecordBatch::get_array_memory_size`, the same currency as completed entries.
+Its fast path is one atomic compare-and-swap. If residents fill the budget, the
+pressure path uses a non-blocking cache `try_lock`, evicts oldest entries until
+that batch fits, and retries the atomic charge while holding that lock. A
+contended lock refuses optional population and leaves the scan answer unchanged.
+Thus no batch waits on the cache mutex, and a fitting working set of small files
+is not reduced to four slots by the `budget / 4` maximum-entry rule.
 
-The reservation is deliberately larger than most completed entries. EOF moves
-the actual entry bytes into the cache and releases the unused tail without a
-gap in ownership. Cancellation, read failure, oversize, a duplicate insertion
-and a contended insertion release the full reservation. At most four maximum
-candidates can be live because the existing per-entry rule is `budget / 4`;
-smaller completed entries can share the remaining bytes after handoff. Cache
-defaults, packaged memory limits and query-pool subtraction are unchanged.
+EOF moves the accumulated charge into the cache without a gap in ownership.
+Cancellation, read failure, oversize, a duplicate insertion and a contended
+insertion release it. Cache defaults, packaged memory limits and query-pool
+subtraction are unchanged.
 
 `file_cache_population_bound.rs` now drives the production rule under eight
 partitions and two overlapping queries, changes the projection after residents
@@ -272,6 +269,9 @@ control and observes no insertion or eviction after the same resident set fills
 the budget. The cancellation assertion runs under production admission. Unit
 coverage runs read failure and contended insertion through both rules; existing
 fixtures retain the oversized, duplicate and answer-equivalence coverage.
+The query-server's 64-small-file convergence test is the capacity guard: on the
+gate reproduction it installed 62 entries on the first pass and all 64 on the
+second under a 256 MiB budget.
 
 The retained release-mode measurement was rerun on 2026-09-21 with the same 8 x
 65,536-row fixture, eight partitions and five executions. One entry remained
@@ -279,19 +279,19 @@ The retained release-mode measurement was rerun on 2026-09-21 with the same 8 x
 
 | arm | cold / warm p50 / warm max (ms) | warm cache work per run | installed / peak population |
 | --- | --- | --- | --- |
-| off | 7.2 / 7.2 / 8.2 | none | 0 / 0 MiB |
-| existing LRU (22 MiB) | 6.8 / 7.1 / 7.3 | 4 hits, 4 inserts, 4 evictions | 21.6 / 30.4 MiB retained |
-| replacement (22 MiB) | 7.7 / 6.4 / 7.8 | 4 hits, 3 inserts, 3 evictions | 21.6 / 17.1 MiB retained; 21.6 MiB accounted peak |
-| #5074 exact-batch (22 MiB) | 8.5 / 5.5 / 6.1 | 4 hits, 4 refusals, no insertion or eviction | 21.6 / 21.1 MiB retained; 21.6 MiB accounted peak |
+| off | 9.3 / 8.9 / 9.1 | none | 0 / 0 MiB |
+| existing LRU (22 MiB) | 8.0 / 6.7 / 6.9 | 4 hits, 4 inserts, 4 evictions | 21.6 / 28.7 MiB retained |
+| replacement (22 MiB) | 10.9 / 6.9 / 7.5 | 4 hits, 4 inserts, 4 evictions | 21.6 / 21.3 MiB retained; 21.6 MiB accounted peak |
+| #5074 exact-batch (22 MiB) | 7.6 / 5.7 / 6.2 | 4 hits, 4 refusals, no insertion or eviction | 21.6 / 21.3 MiB retained; 21.6 MiB accounted peak |
 
 All arms returned 524,288 rows. The replacement arm retains the hard bound and
-turns over residents; its 6.4 ms warm median is within the run-to-run spread of
+turns over residents; its 6.9 ms warm median is within the run-to-run spread of
 the existing half-working-set control. The exact-batch arm is faster in this run
 because it keeps the scheduler-selected first four entries and does no insertion
 work, which is the policy defect rather than a production win.
 
 ## Disposition: ADOPT
 
-Use replacement reservations whenever the decoded-file cache is enabled. Keep
+Use exact charges with replacement whenever the decoded-file cache is enabled. Keep
 the old unbounded and exact-batch rules only as in-process measurement controls.
 The cache remains opt-in and all packaged limits remain zero.
