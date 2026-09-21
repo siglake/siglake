@@ -797,16 +797,21 @@ impl ArrowReader {
 fn segmented_index_reads_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
+        segmented_index_reads_from(
             std::env::var("SIGLAKE_SEGMENTED_INDEX_READS")
                 .ok()
-                .as_deref()
-                .map(str::trim)
-                .map(str::to_ascii_lowercase)
                 .as_deref(),
-            Some("1" | "true" | "yes" | "on")
         )
     })
+}
+
+fn segmented_index_reads_from(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 /// siglake (#5007): how many of a stage's ranges a segmented lookup fetches at
@@ -1188,9 +1193,16 @@ fn segmented_directory_cache() -> &'static Mutex<SegmentedDirectoryCache> {
 }
 
 fn segmented_directory_cache_max_bytes() -> usize {
-    std::env::var("SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
+    segmented_directory_cache_max_bytes_from(
+        std::env::var("SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn segmented_directory_cache_max_bytes_from(raw: Option<&str>) -> usize {
+    raw.map(str::trim)
+        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(64 * 1024 * 1024)
 }
 
@@ -1391,7 +1403,8 @@ mod tests {
         ArrowReader, DEFAULT_RANGE_FETCH_CONCURRENCY, PromotedPruneSpec, RawPruneSpec,
         SegmentedOutcome, SegmentedReadCost, index_load_concurrency_from, intersect_sorted,
         parsed_inverted_index_cache_stats, segmented_directory_cache_footprint,
-        segmented_directory_cache_put, segmented_directory_cache_stats, segmented_matching_rows,
+        segmented_directory_cache_max_bytes_from, segmented_directory_cache_put,
+        segmented_directory_cache_stats, segmented_index_reads_from, segmented_matching_rows,
         segmented_range_concurrency_from, union_sorted,
     };
     use crate::delete_vector::DeleteVector;
@@ -2990,5 +3003,45 @@ mod tests {
             DEFAULT_RANGE_FETCH_CONCURRENCY
         );
         assert_eq!(segmented_range_concurrency_from(Some(" 3 ")), 3);
+    }
+
+    #[test]
+    fn segmented_reads_are_resolved_without_environment_mutation() {
+        assert!(!segmented_index_reads_from(None));
+        assert!(!segmented_index_reads_from(Some("")));
+        assert!(!segmented_index_reads_from(Some("sometimes")));
+        assert!(!segmented_index_reads_from(Some("0")));
+        assert!(!segmented_index_reads_from(Some("   ")));
+        assert!(segmented_index_reads_from(Some("  TrUe  ")));
+        for enabled in ["1", "true", "yes", "on"] {
+            assert!(segmented_index_reads_from(Some(enabled)), "{enabled}");
+        }
+    }
+
+    #[test]
+    fn segmented_directory_budget_is_resolved_without_environment_mutation() {
+        const DEFAULT: usize = 64 * 1024 * 1024;
+        assert_eq!(segmented_directory_cache_max_bytes_from(None), DEFAULT);
+        assert_eq!(
+            segmented_directory_cache_max_bytes_from(Some("")),
+            DEFAULT
+        );
+        assert_eq!(
+            segmented_directory_cache_max_bytes_from(Some("many")),
+            DEFAULT
+        );
+        assert_eq!(segmented_directory_cache_max_bytes_from(Some("0")), 0);
+        assert_eq!(
+            segmented_directory_cache_max_bytes_from(Some("   ")),
+            DEFAULT
+        );
+        assert_eq!(
+            segmented_directory_cache_max_bytes_from(Some(" 4096 ")),
+            4096
+        );
+        assert_eq!(
+            segmented_directory_cache_max_bytes_from(Some(&usize::MAX.to_string())),
+            usize::MAX
+        );
     }
 }

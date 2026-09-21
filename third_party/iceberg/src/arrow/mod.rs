@@ -88,42 +88,69 @@ pub fn clear_text_index_cache_max_bytes() {
 
 fn configured_cache_bytes(
     configured: &std::sync::atomic::AtomicU64,
-    env_name: &str,
-    default: u64,
-) -> u64 {
+    raw: Option<&str>,
+    resolver: fn(Option<&str>) -> usize,
+) -> usize {
     let configured = configured.load(std::sync::atomic::Ordering::Relaxed);
+    configured_cache_bytes_from(configured, raw, resolver)
+}
+
+fn configured_cache_bytes_from(
+    configured: u64,
+    raw: Option<&str>,
+    resolver: fn(Option<&str>) -> usize,
+) -> usize {
     if configured != TEXT_INDEX_CACHE_UNCONFIGURED {
-        return configured;
+        return configured.min(usize::MAX as u64) as usize;
     }
-    std::env::var(env_name)
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
+    resolver(raw)
+}
+
+fn cache_max_bytes_from(raw: Option<&str>, default: u64) -> usize {
+    raw.map(str::trim)
+        .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(default)
+        .min(usize::MAX as u64) as usize
+}
+
+fn puffin_blob_cache_max_bytes_from(raw: Option<&str>) -> usize {
+    cache_max_bytes_from(raw, 256 * 1024 * 1024)
+}
+
+fn parsed_index_cache_max_bytes_from(raw: Option<&str>) -> usize {
+    cache_max_bytes_from(raw, 1024 * 1024 * 1024)
+}
+
+fn puffin_blob_cache_max_entries_from(raw: Option<&str>) -> usize {
+    raw.map(str::trim)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(128)
 }
 
 pub(crate) fn puffin_blob_cache_max_bytes() -> usize {
+    let raw = std::env::var("SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES").ok();
     configured_cache_bytes(
         &CONFIGURED_PUFFIN_BLOB_CACHE_MAX_BYTES,
-        "SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES",
-        256 * 1024 * 1024,
+        raw.as_deref(),
+        puffin_blob_cache_max_bytes_from,
     )
-    .min(usize::MAX as u64) as usize
 }
 
 pub(crate) fn parsed_index_cache_max_bytes() -> usize {
+    let raw = std::env::var("SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES").ok();
     configured_cache_bytes(
         &CONFIGURED_PARSED_INDEX_CACHE_MAX_BYTES,
-        "SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES",
-        1024 * 1024 * 1024,
+        raw.as_deref(),
+        parsed_index_cache_max_bytes_from,
     )
-    .min(usize::MAX as u64) as usize
 }
 
 pub(crate) fn puffin_blob_cache_max_entries() -> usize {
-    std::env::var("SIGLAKE_PUFFIN_BLOB_CACHE_MAX_ENTRIES")
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(128)
+    puffin_blob_cache_max_entries_from(
+        std::env::var("SIGLAKE_PUFFIN_BLOB_CACHE_MAX_ENTRIES")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Return the text-index cache byte budgets currently in force.
@@ -136,6 +163,87 @@ pub fn text_index_cache_max_bytes_in_force() -> (u64, u64) {
         parsed_index_cache_max_bytes() as u64,
         puffin_blob_cache_max_bytes() as u64,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        TEXT_INDEX_CACHE_UNCONFIGURED, configured_cache_bytes_from,
+        parsed_index_cache_max_bytes_from, puffin_blob_cache_max_bytes_from,
+        puffin_blob_cache_max_entries_from,
+    };
+
+    #[test]
+    fn puffin_blob_byte_budget_is_resolved_without_environment_mutation() {
+        const DEFAULT: usize = 256 * 1024 * 1024;
+        assert_eq!(puffin_blob_cache_max_bytes_from(None), DEFAULT);
+        assert_eq!(puffin_blob_cache_max_bytes_from(Some("")), DEFAULT);
+        assert_eq!(puffin_blob_cache_max_bytes_from(Some("many")), DEFAULT);
+        assert_eq!(puffin_blob_cache_max_bytes_from(Some("0")), 0);
+        assert_eq!(puffin_blob_cache_max_bytes_from(Some("   ")), DEFAULT);
+        assert_eq!(puffin_blob_cache_max_bytes_from(Some(" 4096 ")), 4096);
+        assert_eq!(
+            puffin_blob_cache_max_bytes_from(Some(&u64::MAX.to_string())),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn parsed_index_byte_budget_is_resolved_without_environment_mutation() {
+        const DEFAULT: usize = 1024 * 1024 * 1024;
+        assert_eq!(parsed_index_cache_max_bytes_from(None), DEFAULT);
+        assert_eq!(parsed_index_cache_max_bytes_from(Some("")), DEFAULT);
+        assert_eq!(parsed_index_cache_max_bytes_from(Some("many")), DEFAULT);
+        assert_eq!(parsed_index_cache_max_bytes_from(Some("0")), 0);
+        assert_eq!(parsed_index_cache_max_bytes_from(Some("   ")), DEFAULT);
+        assert_eq!(parsed_index_cache_max_bytes_from(Some(" 8192 ")), 8192);
+        assert_eq!(
+            parsed_index_cache_max_bytes_from(Some(&u64::MAX.to_string())),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn puffin_blob_entry_limit_is_resolved_without_environment_mutation() {
+        assert_eq!(puffin_blob_cache_max_entries_from(None), 128);
+        assert_eq!(puffin_blob_cache_max_entries_from(Some("")), 128);
+        assert_eq!(puffin_blob_cache_max_entries_from(Some("many")), 128);
+        assert_eq!(puffin_blob_cache_max_entries_from(Some("0")), 0);
+        assert_eq!(puffin_blob_cache_max_entries_from(Some("   ")), 128);
+        assert_eq!(puffin_blob_cache_max_entries_from(Some(" 64 ")), 64);
+        assert_eq!(
+            puffin_blob_cache_max_entries_from(Some(&usize::MAX.to_string())),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn configured_byte_budget_takes_precedence_over_environment_resolution() {
+        assert_eq!(
+            configured_cache_bytes_from(17, Some("23"), parsed_index_cache_max_bytes_from),
+            17
+        );
+        assert_eq!(
+            configured_cache_bytes_from(19, Some("29"), puffin_blob_cache_max_bytes_from),
+            19
+        );
+        assert_eq!(
+            configured_cache_bytes_from(
+                TEXT_INDEX_CACHE_UNCONFIGURED,
+                Some("23"),
+                parsed_index_cache_max_bytes_from,
+            ),
+            23
+        );
+        assert_eq!(
+            configured_cache_bytes_from(
+                TEXT_INDEX_CACHE_UNCONFIGURED,
+                Some("29"),
+                puffin_blob_cache_max_bytes_from,
+            ),
+            29
+        );
+    }
 }
 /// Record batch partition splitter for partitioned tables
 pub mod record_batch_partition_splitter;
