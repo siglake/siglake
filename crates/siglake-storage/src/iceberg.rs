@@ -13051,6 +13051,13 @@ impl IcebergContext {
             .await?;
         for config in self.list_indexes().await.unwrap_or_default() {
             let ident = self.index_table_ident(&config.index_id);
+            // `list_indexes` reports the events table among the indexes, and
+            // its ident is this namespace's `table_ident` — checking it again
+            // would repeat the manifest walk that reached the verdict above
+            // (every pass, for as long as the backfill stays incomplete).
+            if ident == self.table_ident {
+                continue;
+            }
             flipped |= self.ensure_promotion_backfill_property_for(&ident).await?;
         }
         Ok(flipped)
