@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Query API (breaking)**: scanning records responses can now include
+  `stats.scan.file_attribution`, a request-wide list of at most 32 sorted,
+  table-relative file-task identities and their decoded-cache outcomes.
+  `files_omitted` counts bounded-away identities and `identity_complete` is
+  false when any shard or the coordinator omitted one. Distributed workers
+  must send a valid bounded attribution header, including `null` for a
+  scan-free result; missing, malformed or oversized headers now fail the shard
+  instead of silently producing incomplete scan stats. (#5727)
+
 - **Re-cluster contract (breaking)**:
   `IcebergContext::recluster_files{,_with}` now refuses a bin spanning two
   partition values on every dispatch, not only the streaming ones (#4200).

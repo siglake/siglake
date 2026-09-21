@@ -101,6 +101,21 @@ async fn scan_stats_separate_population_depth_from_an_ineligible_shape() {
         "a predicate-free browse populates; nothing bypassed: {scan}"
     );
     assert_eq!(scan["file_cache_misses"].as_u64().unwrap_or(0), 1, "{scan}");
+    let attribution = &scan["file_attribution"];
+    assert_eq!(attribution["files_omitted"], 0, "{attribution}");
+    assert_eq!(attribution["identity_complete"], true, "{attribution}");
+    let files = attribution["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "{attribution}");
+    assert_eq!(files[0]["table"], "siglake.events", "{attribution}");
+    assert!(
+        files[0]["object_key"]
+            .as_str()
+            .is_some_and(|key| key.starts_with("data/") && !key.contains("://")),
+        "the object key must be table-relative: {attribution}"
+    );
+    assert_eq!(files[0]["cache_candidate"], true, "{attribution}");
+    assert_eq!(files[0]["reader_opened"], true, "{attribution}");
+    assert_eq!(files[0]["cache_hit"], false, "{attribution}");
 
     // The same browse under a converted predicate: no population, so no depth,
     // and the bypass count is what says so. Reading the absent

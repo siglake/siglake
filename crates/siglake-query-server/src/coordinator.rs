@@ -48,6 +48,33 @@ use datafusion::prelude::SessionContext;
 use siglake_storage::iceberg::TableGeneration;
 use siglake_storage::ScanShard;
 
+/// Hard bound for worker scan attribution carried in `x-siglake-scan`.
+pub const SHARD_SCAN_HEADER_MAX_BYTES: usize = 16 * 1024;
+
+fn decode_shard_scan_header(bytes: Option<&[u8]>) -> Result<Option<crate::format::ScanDetail>> {
+    let bytes = bytes.context("shard response missing x-siglake-scan")?;
+    anyhow::ensure!(
+        bytes.len() <= SHARD_SCAN_HEADER_MAX_BYTES,
+        "shard x-siglake-scan exceeds {} bytes",
+        SHARD_SCAN_HEADER_MAX_BYTES
+    );
+    let mut scan: Option<crate::format::ScanDetail> =
+        serde_json::from_slice(bytes).context("parse shard x-siglake-scan")?;
+    if let Some(attribution) = scan
+        .as_mut()
+        .and_then(|detail| detail.file_attribution.take())
+    {
+        let mut normalized = crate::format::FileAttribution {
+            files: Vec::new(),
+            files_omitted: 0,
+            identity_complete: true,
+        };
+        normalized.absorb(&attribution);
+        scan.as_mut().expect("scan was Some").file_attribution = Some(normalized);
+    }
+    Ok(scan)
+}
+
 /// Runs a query against one shard of the file set, returning its result
 /// batches. Implemented in-process ([`LocalShardRunner`]) for tests + the
 /// single-pod fallback, and over HTTP for cross-pod fan-out (part 2b).
@@ -277,11 +304,11 @@ impl ShardRunner for HttpShardRunner {
             let body = resp.text().await.unwrap_or_default();
             return Err(ShardError { status, url, body }.into());
         }
-        let scan = resp
-            .headers()
-            .get("x-siglake-scan")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| serde_json::from_str(v).ok());
+        let scan = decode_shard_scan_header(
+            resp.headers()
+                .get("x-siglake-scan")
+                .map(|header| header.as_bytes()),
+        )?;
         let bytes = resp.bytes().await.context("read shard response")?;
         Ok(ShardRun {
             batches: crate::format::arrow_ipc_to_batches(&bytes)?,
@@ -825,12 +852,22 @@ pub async fn coordinate_with_failover(
     let mut partials: Vec<RecordBatch> = Vec::new();
     let mut shard_wall_micros = Vec::with_capacity(shards);
     let mut scan: Option<crate::format::ScanDetail> = None;
+    let mut shard_missing_file_attribution = false;
     for (run, wall) in shard_runs {
         let mut run = run?;
         partials.append(&mut run.batches);
         shard_wall_micros.push(wall);
         if let Some(s) = run.scan {
+            shard_missing_file_attribution |= s.file_attribution.is_none();
             scan.get_or_insert_with(Default::default).absorb(&s);
+        }
+    }
+    if shard_missing_file_attribution {
+        if let Some(attribution) = scan
+            .as_mut()
+            .and_then(|detail| detail.file_attribution.as_mut())
+        {
+            attribution.identity_complete = false;
         }
     }
     // Fold in any caller-supplied partials (WS-6 WAL buffer) before the merge.
@@ -1099,6 +1136,35 @@ mod tests {
             shard_failure_is_retryable(&internal),
             "a worker that broke internally should still be retried"
         );
+    }
+
+    #[test]
+    fn shard_scan_transport_refuses_malformed_and_oversized_attribution() {
+        let missing = decode_shard_scan_header(None).unwrap_err();
+        assert!(missing.to_string().contains("missing x-siglake-scan"));
+
+        let malformed = decode_shard_scan_header(Some(b"{not-json}")).unwrap_err();
+        assert!(malformed.to_string().contains("parse shard x-siglake-scan"));
+
+        let oversized = vec![b'x'; SHARD_SCAN_HEADER_MAX_BYTES + 1];
+        let error = decode_shard_scan_header(Some(&oversized)).unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+
+        assert!(decode_shard_scan_header(Some(b"null")).unwrap().is_none());
+
+        let contradicted = serde_json::to_vec(&crate::format::ScanDetail {
+            file_attribution: Some(crate::format::FileAttribution {
+                files: Vec::new(),
+                files_omitted: 1,
+                identity_complete: true,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let decoded = decode_shard_scan_header(Some(&contradicted))
+            .unwrap()
+            .unwrap();
+        assert!(!decoded.file_attribution.unwrap().identity_complete);
     }
 
     use super::*;
@@ -1386,6 +1452,72 @@ mod tests {
             })
             .sum();
         assert_eq!(total, 4, "merged sum of per-shard partials");
+    }
+
+    #[tokio::test]
+    async fn distributed_file_attribution_deduplicates_and_ors_shard_outcomes() {
+        struct AttributingRunner {
+            schema: SchemaRef,
+        }
+
+        #[async_trait]
+        impl ShardRunner for AttributingRunner {
+            async fn run(&self, _sql: &str, _shard: Option<ScanShard>) -> Result<Vec<RecordBatch>> {
+                unreachable!("coordinate uses run_detailed")
+            }
+
+            async fn run_detailed(&self, _sql: &str, shard: Option<ScanShard>) -> Result<ShardRun> {
+                let index = shard.unwrap().index;
+                let file = crate::format::FileAttributionEntry {
+                    table: "ns.events".to_string(),
+                    object_key: "data/shared.parquet".to_string(),
+                    start: 0,
+                    length: 100,
+                    cache_candidate: index == 1,
+                    reader_opened: index == 0,
+                    cache_hit: index == 1,
+                };
+                Ok(ShardRun {
+                    batches: vec![RecordBatch::try_new(
+                        self.schema.clone(),
+                        vec![Arc::new(Int64Array::from(vec![1_i64]))],
+                    )?],
+                    scan: Some(crate::format::ScanDetail {
+                        file_attribution: Some(crate::format::FileAttribution {
+                            files: vec![file],
+                            files_omitted: 0,
+                            identity_complete: true,
+                        }),
+                        ..Default::default()
+                    }),
+                })
+            }
+        }
+
+        let ctx = events_ctx().await;
+        let runner = AttributingRunner {
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "count(*)",
+                DataType::Int64,
+                false,
+            )])),
+        };
+        let (_, stats) = coordinate_with_extra_stats(
+            &ctx,
+            &runner,
+            "SELECT count(*) FROM events",
+            2,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let attribution = stats.scan.unwrap().file_attribution.unwrap();
+        assert_eq!(attribution.files.len(), 1);
+        let file = &attribution.files[0];
+        assert!(file.cache_candidate && file.reader_opened && file.cache_hit);
+        assert_eq!(attribution.files_omitted, 0);
+        assert!(attribution.identity_complete);
     }
 
     /// Records every shard it is asked to run, and returns a fixed partial

@@ -71,6 +71,7 @@ impl ArrowReader {
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
             scan_metrics: scan_metrics.clone(),
+            file_opened_observer: self.file_opened_observer,
             cache_bypass: self.cache_bypass,
             raw_prune_spec: self.raw_prune_spec,
             promoted_prune: self.promoted_prune,
@@ -129,6 +130,7 @@ struct FileScanTaskReader {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     scan_metrics: ScanMetrics,
+    file_opened_observer: Option<super::FileOpenedObserver>,
     cache_bypass: bool,
     raw_prune_spec: Option<RawPruneSpec>,
     promoted_prune: Vec<PromotedPruneSpec>,
@@ -157,6 +159,9 @@ impl FileScanTaskReader {
             self.cache_bypass,
         )
         .await?;
+        if let Some(observer) = &self.file_opened_observer {
+            observer(&task);
+        }
         self.scan_metrics
             .counters()
             .files_read

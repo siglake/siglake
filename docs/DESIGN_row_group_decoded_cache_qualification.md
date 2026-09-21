@@ -397,20 +397,21 @@ and grouping the three labelled node metrics took 582 ns per collection over
 query execution and allocator bookkeeping; they qualify collection and wire
 shape, not total heap. At the local 128-entry cap, linear JSON growth is about
 26.3 KiB before shard-envelope fields. That is too large to add to the existing
-`x-siglake-scan` header: this tree sets no header-size budget, header encoding
-failure silently omits the header, and the coordinator silently drops invalid
-JSON.
+`x-siglake-scan` header at qualification time: the transport had no size
+budget, header encoding failure silently omitted the header, and the
+coordinator silently dropped invalid JSON.
 
-### Recommended production shape
+### Production shape (0.2.0)
 
-Keep `stats.scan` unchanged for this cycle. A later 0.2.0 API change should add
-an optional object, capped at 32 request-wide entries, with table-relative
-object keys, task `start`/`length`, and booleans for `cache_candidate`,
+Task #5727 adds an optional `stats.scan.file_attribution` object, capped at 32
+request-wide entries, with table-relative object keys, task `start`/`length`,
+and booleans for `cache_candidate`,
 `reader_opened` and `cache_hit`; include `files_omitted` and
 `identity_complete`. Thirty-two entries are about 6.6 KiB at the measured
-path length, before envelope overhead. Do not place that object in
-`x-siglake-scan` until the shard transport has an explicit size limit and a
-non-silent parse/encoding failure.
+path length, before envelope overhead. The shard's `x-siglake-scan` transport
+has a 16 KiB hard limit. Missing, oversized, malformed or unencodable
+attribution fails the shard response instead of disappearing from a complete
+answer.
 
 Distributed aggregation must merge identities by `(table, object key, start,
 length)`, OR the outcome booleans, sort by that tuple, apply the request-wide
@@ -420,9 +421,11 @@ shard supplied valid, untruncated attribution. This avoids treating two shards'
 copies of one file as two geometry inputs and prevents shard arrival order from
 choosing the retained list.
 
-Until that field exists, `--geometry` is table-sampled input. The depth and
-INELIGIBLE readings remain valid; any statement about which files a shape read
-or how many row groups it completed remains unverified.
+`reader_opened` is observed after `open_parquet_file` succeeds. The collector
+uses planned task membership, so a retained entry with every outcome false is
+a planned task that execution did not reach. The local and distributed tests
+cover membership, stable merge order, deduplication, the request cap and shard
+transport refusal. This changes no cache admission or sizing default.
 
 ## Reproduce
 
