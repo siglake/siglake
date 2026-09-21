@@ -2081,6 +2081,20 @@ mod tests {
             "format".to_string(),
             siglake_index::segmented::SEGMENTED_V2_FORMAT_PROPERTY.to_string(),
         );
+        // The blob type is a discovery key only: the decoder dispatches on the
+        // trailer's version byte and answers a seg1 payload registered under
+        // the seg2 type just as readily. Pin what this fixture encodes, or the
+        // port goes back to testing seg1 without failing.
+        let bytes = segmented.finish();
+        assert_eq!(
+            siglake_index::segmented::SegmentedReader::open(
+                siglake_index::segmented::SliceSource::new(bytes.clone())
+            )
+            .unwrap()
+            .directory()
+            .format_property(),
+            siglake_index::segmented::SEGMENTED_V2_FORMAT_PROPERTY
+        );
         writer
             .add(
                 Blob::builder()
@@ -2088,7 +2102,7 @@ mod tests {
                     .fields(vec![1])
                     .snapshot_id(1)
                     .sequence_number(1)
-                    .data(segmented.finish())
+                    .data(bytes)
                     .properties(seg2_properties)
                     .build(),
                 CompressionCodec::None,
@@ -3297,9 +3311,10 @@ mod tests {
                 "1".to_string(),
             )])),
         ]));
-        let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), vec![Arc::new(
-            StringArray::from_iter_values(rows.iter()),
-        )])
+        let batch = RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(StringArray::from_iter_values(rows.iter()))],
+        )
         .unwrap();
         let properties = WriterProperties::builder()
             .set_max_row_group_row_count(Some(512))
