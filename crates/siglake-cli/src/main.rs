@@ -377,7 +377,9 @@ enum Command {
     /// neither marker — the default install — by looking the listed segment
     /// ids up in `wal_segments`, read-only. See the flag's own help.
     WalRecover {
-        /// Full source URL (e.g. `s3://bucket/wal-mirror`).
+        /// Full source URL. It must name the mirror root at
+        /// `<warehouse-url>/<wal-mirror-prefix>/` (e.g.
+        /// `s3://bucket/warehouse/wal-mirror/`).
         #[arg(long, env = "SIGLAKE_WAL_MIRROR_URL")]
         from: String,
         /// Local WAL ROOT to populate — the same path the ingester and
@@ -2255,6 +2257,9 @@ async fn run_ingest_server(
         let store = build_opendal_operator(url)?;
         let (mut mirror, handle) =
             siglake_wal::mirror::WalMirror::new(store.clone(), prefix.to_string());
+        if active_mirror_interval.is_some() {
+            mirror = mirror.with_active_partial_cleanup();
+        }
         // Fleet mode: the ingester registers its own uploads in the shared
         // `wal_segments` catalog, so drains claim them IMMEDIATELY and their
         // `sync_mirror_to_catalog` stays a rare recovery sweep — re-listing +
@@ -2313,6 +2318,7 @@ async fn run_ingest_server(
             let sweep_prefix = prefix.to_string();
             let sweep_root = wal_dir.clone();
             let sweep_claim_uri = catalog_uri.map(|s| s.to_string());
+            let cleanup_active_partials = active_mirror_interval.is_some();
             tokio::spawn(async move {
                 // Register what the sweep recovers. Uploading to the mirror is
                 // only half the repair: an unregistered segment is never
@@ -2333,8 +2339,14 @@ async fn run_ingest_server(
                 };
                 let mut state = CatchUpSweepState::default();
                 loop {
-                    let mut sweep =
-                        || siglake_wal::mirror::catch_up_sweep(&op, &sweep_prefix, &sweep_root);
+                    let mut sweep = || {
+                        siglake_wal::mirror::catch_up_sweep_configured(
+                            &op,
+                            &sweep_prefix,
+                            &sweep_root,
+                            cleanup_active_partials,
+                        )
+                    };
                     wal_mirror_catch_up_pass(
                         &mut state,
                         sweep_claim_uri.as_ref().map(|_| &mut claim_factory),
@@ -3302,7 +3314,15 @@ async fn run_gc_orphans(
 
     let mode = if apply { "APPLY" } else { "dry-run" };
     println!(
-        "[{mode}] {ident}: scanned={} reachable={} orphans={} ({:.1} MiB) skipped_recent={} deleted={}",
+        "[{mode}] {ident}: statistics_eligible={} statistics_removed={} \
+         statistics_kept_live={} statistics_skipped_unowned={} \
+         statistics_skipped_missing_data_file={} scanned={} reachable={} \
+         orphans={} ({:.1} MiB) skipped_recent={} deleted={}",
+        report.statistics_entries_eligible,
+        report.statistics_entries_removed,
+        report.statistics_entries_kept_live,
+        report.statistics_entries_skipped_unowned,
+        report.statistics_entries_skipped_missing_data_file,
         report.scanned,
         report.reachable,
         report.orphans,
@@ -4003,12 +4023,13 @@ pub fn build_opendal_operator(url: &str) -> Result<opendal::Operator> {
             let region = std::env::var("AWS_REGION")
                 .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
                 .unwrap_or_else(|_| "us-east-1".to_string());
+            let chain = reqsign_core::ProvideCredentialChain::new().push(std::sync::Arc::new(
+                siglake_storage::aws_credential::SiglakeAwsLoader::new(),
+            ));
             let mut builder = opendal::services::S3::default()
                 .bucket(bucket)
                 .region(&region)
-                .customized_credential_load(Box::new(
-                    siglake_storage::aws_credential::SiglakeAwsLoader::new(),
-                ));
+                .credential_provider_chain(chain);
             if !root.is_empty() {
                 builder = builder.root(root);
             }
@@ -5705,6 +5726,10 @@ async fn run_rebuild_group_counts(
     let report = ice
         .rebuild_group_count_aggregate_with(table, options)
         .await?;
+    println!(
+        "{namespace}.{table}: cleared {} short-repair attempt record(s)",
+        report.short_repair_markers_deleted
+    );
 
     // Typed columns the schema has and the aggregate does not — with the flag
     // off, this is the remedy; with it on, they are in the report as admitted.

@@ -7,16 +7,16 @@
 //! `POST /api/v1/index-templates`.
 
 use axum::extract::{Extension, Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use siglake_core::index_config::IndexConfig;
-use siglake_storage::index_manager::IndexTemplate;
+use siglake_storage::index_manager::{IndexConfigEntity, IndexConfigPrecondition, IndexTemplate};
 
 use crate::auth::CallerIdentity;
 use crate::error::ApiError;
 #[allow(unused_imports)] // referenced by the `#[utoipa::path]` response bodies
-use crate::openapi_dto::ApiErrorBody;
+use crate::openapi_dto::{ApiErrorBody, ManagedIndexPreconditionErrorBody};
 use crate::AppState;
 
 /// Create an index.
@@ -38,7 +38,8 @@ use crate::AppState;
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 409, description = "An index with this id already exists.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
@@ -76,7 +77,8 @@ pub async fn create(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
     ),
@@ -103,13 +105,15 @@ pub async fn list(
     tag = "indexes",
     params(("id" = String, Path, description = "Index id.")),
     responses(
-        (status = 200, description = "The index configuration.", body = IndexConfig),
+        (status = 200, description = "The index configuration.", body = IndexConfig,
+         headers(("ETag" = String, description = "Strong validator for this table incarnation's full index configuration."))),
         (status = 401, description = "Missing or invalid credentials.", body = ApiErrorBody),
         (status = 403, description = "Tenant refused before the handler runs. This \
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 404, description = "No such index.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
@@ -124,14 +128,14 @@ pub async fn get(
         .resolve_ice(&identity)
         .await
         .map_err(ApiError::internal)?;
-    let config = ice
-        .get_index(&id)
+    let entity = ice
+        .get_index_entity(&id)
         .await
         .map_err(ApiError::from_index_manager)?
         .ok_or_else(|| {
             ApiError::new_status(StatusCode::NOT_FOUND, format!("index {id} not found"))
         })?;
-    Ok((StatusCode::OK, Json(config)).into_response())
+    index_entity_response(StatusCode::OK, entity)
 }
 
 /// Replace an index configuration.
@@ -143,11 +147,15 @@ pub async fn get(
     put,
     path = "/api/v1/indexes/{id}",
     tag = "indexes",
-    params(("id" = String, Path, description = "Index id. Must match the body's `index_id`.")),
+    params(
+        ("id" = String, Path, description = "Index id. Must match the body's `index_id`."),
+        ("If-Match" = Option<String>, Header, description = "Optional RFC 9110 strong entity-tag condition. `*` matches any existing index.")
+    ),
     request_body = IndexConfig,
     responses(
         (status = 200, description = "Updated. Body is the stored configuration.",
-         body = IndexConfig),
+         body = IndexConfig,
+         headers(("ETag" = String, description = "Strong validator for the returned configuration."))),
         (status = 400, description = "Invalid configuration, or the path id does not \
             match the body's `index_id`.", body = ApiErrorBody),
         (status = 401, description = "Missing or invalid credentials.", body = ApiErrorBody),
@@ -155,9 +163,13 @@ pub async fn get(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 404, description = "No such index.", body = ApiErrorBody),
+        (status = 412, description = "The supplied If-Match condition is false. `current` and ETag come from the exact rejecting commit base; another writer may replace them before this response arrives.",
+         body = ManagedIndexPreconditionErrorBody,
+         headers(("ETag" = String, description = "Strong validator matching `current`."))),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
     ),
 )]
@@ -165,6 +177,7 @@ pub async fn update(
     State(state): State<AppState>,
     Extension(identity): Extension<CallerIdentity>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(config): Json<IndexConfig>,
 ) -> Result<Response, ApiError> {
     if id != config.index_id {
@@ -178,15 +191,120 @@ pub async fn update(
         .resolve_ice(&identity)
         .await
         .map_err(ApiError::internal)?;
-    ice.update_index(&config)
-        .await
-        .map_err(ApiError::from_index_manager)?;
-    let stored = ice
-        .get_index(&id)
+    match parse_if_match(&headers)? {
+        Some(precondition) => ice
+            .update_index_if_match(&config, precondition)
+            .await
+            .map_err(ApiError::from_index_manager)?,
+        None => ice
+            .update_index(&config)
+            .await
+            .map_err(ApiError::from_index_manager)?,
+    }
+    let entity = ice
+        .get_index_entity(&id)
         .await
         .map_err(ApiError::from_index_manager)?
         .ok_or_else(|| ApiError::internal("updated index missing from catalog"))?;
-    Ok((StatusCode::OK, Json(stored)).into_response())
+    index_entity_response(StatusCode::OK, entity)
+}
+
+fn index_entity_response(
+    status: StatusCode,
+    entity: IndexConfigEntity,
+) -> Result<Response, ApiError> {
+    let etag = HeaderValue::from_str(&entity.etag)
+        .map_err(|err| ApiError::internal(format!("invalid managed-index ETag: {err}")))?;
+    let mut response = (status, Json(entity.config)).into_response();
+    response.headers_mut().insert(header::ETAG, etag);
+    Ok(response)
+}
+
+fn parse_if_match(headers: &HeaderMap) -> Result<Option<IndexConfigPrecondition>, ApiError> {
+    let values: Vec<&HeaderValue> = headers.get_all(header::IF_MATCH).iter().collect();
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    let mut wildcard = false;
+    let mut strong = Vec::new();
+    for value in values {
+        match parse_if_match_value(value.as_bytes()) {
+            Ok(ParsedIfMatch::Any) => wildcard = true,
+            Ok(ParsedIfMatch::Tags(tags)) => strong.extend(tags),
+            Err(()) => return Err(ApiError::bad_request("malformed If-Match header")),
+        }
+    }
+    if wildcard {
+        if !strong.is_empty() || headers.get_all(header::IF_MATCH).iter().count() != 1 {
+            return Err(ApiError::bad_request("malformed If-Match header"));
+        }
+        Ok(Some(IndexConfigPrecondition::Any))
+    } else {
+        Ok(Some(IndexConfigPrecondition::StrongEtags(strong)))
+    }
+}
+
+enum ParsedIfMatch {
+    Any,
+    Tags(Vec<String>),
+}
+
+fn parse_if_match_value(input: &[u8]) -> Result<ParsedIfMatch, ()> {
+    let mut pos = skip_ows(input, 0);
+    if input.get(pos) == Some(&b'*') {
+        pos = skip_ows(input, pos + 1);
+        return (pos == input.len()).then_some(ParsedIfMatch::Any).ok_or(());
+    }
+
+    let mut strong = Vec::new();
+    loop {
+        let weak = input.get(pos..pos + 2) == Some(b"W/");
+        if weak {
+            pos += 2;
+        }
+        if input.get(pos) != Some(&b'\"') {
+            return Err(());
+        }
+        let start = pos;
+        pos += 1;
+        while let Some(&byte) = input.get(pos) {
+            if byte == b'\"' {
+                break;
+            }
+            if !(byte == 0x21 || (0x23..=0x7e).contains(&byte) || byte >= 0x80) {
+                return Err(());
+            }
+            pos += 1;
+        }
+        if input.get(pos) != Some(&b'\"') {
+            return Err(());
+        }
+        pos += 1;
+        if !weak {
+            if let Ok(tag) = std::str::from_utf8(&input[start..pos]) {
+                strong.push(tag.to_string());
+            }
+        }
+        pos = skip_ows(input, pos);
+        if pos == input.len() {
+            return Ok(ParsedIfMatch::Tags(strong));
+        }
+        if input.get(pos) != Some(&b',') {
+            return Err(());
+        }
+        pos = skip_ows(input, pos + 1);
+        if pos == input.len() {
+            return Err(());
+        }
+    }
+}
+
+fn skip_ows(input: &[u8], mut pos: usize) -> usize {
+    while matches!(input.get(pos), Some(b' ' | b'\t')) {
+        pos += 1;
+    }
+    pos
 }
 
 /// Delete an index.
@@ -206,7 +324,8 @@ pub async fn update(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 404, description = "No such index.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
@@ -251,7 +370,8 @@ pub async fn delete(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
     ),
@@ -293,7 +413,8 @@ pub async fn list_templates(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
     ),
@@ -334,7 +455,8 @@ pub async fn put_template(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 404, description = "No such template.", body = ApiErrorBody),
         (status = 500, description = "Internal error.", body = ApiErrorBody),
@@ -360,5 +482,35 @@ pub async fn delete_template(
             StatusCode::NOT_FOUND,
             format!("index template {id} not found"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn if_match_parser_uses_strong_comparison_and_accepts_lists() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::IF_MATCH,
+            HeaderValue::from_static("W/\"weak\", \"first,tag\", \"second\""),
+        );
+        assert_eq!(
+            parse_if_match(&headers).unwrap(),
+            Some(IndexConfigPrecondition::StrongEtags(vec![
+                "\"first,tag\"".to_string(),
+                "\"second\"".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn if_match_parser_rejects_malformed_or_mixed_wildcards() {
+        for value in ["", "tag", "\"unterminated", "\"tag\",", "*, \"tag\""] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::IF_MATCH, HeaderValue::from_str(value).unwrap());
+            assert!(parse_if_match(&headers).is_err(), "accepted {value:?}");
+        }
     }
 }

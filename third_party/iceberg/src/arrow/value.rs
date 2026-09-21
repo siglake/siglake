@@ -1199,39 +1199,42 @@ mod test {
 
         let result = arrow_struct_to_literal(&struct_array, &iceberg_struct_type).unwrap();
 
-        assert_eq!(result, vec![
-            Some(Literal::Struct(Struct::from_iter(vec![
-                Some(Literal::bool(true)),
-                Some(Literal::int(3)),
-                Some(Literal::long(5)),
-                Some(Literal::float(1.1)),
-                Some(Literal::double(3.3)),
-                Some(Literal::decimal(1000)),
-                Some(Literal::date(18628)),
-                Some(Literal::time(123456789)),
-                Some(Literal::timestamp(1622548800000000)),
-                Some(Literal::timestamp_nano(1622548800000000000)),
-                Some(Literal::string("a".to_string())),
-                Some(Literal::binary(b"abc".to_vec())),
-            ]))),
-            Some(Literal::Struct(Struct::from_iter(vec![
-                Some(Literal::bool(false)),
-                Some(Literal::int(4)),
-                Some(Literal::long(6)),
-                Some(Literal::float(2.2)),
-                Some(Literal::double(4.4)),
-                Some(Literal::decimal(2000)),
-                Some(Literal::date(18629)),
-                Some(Literal::time(987654321)),
-                Some(Literal::timestamp(1622635200000000)),
-                Some(Literal::timestamp_nano(1622635200000000000)),
-                Some(Literal::string("b".to_string())),
-                Some(Literal::binary(b"def".to_vec())),
-            ]))),
-            Some(Literal::Struct(Struct::from_iter(vec![
-                None, None, None, None, None, None, None, None, None, None, None, None,
-            ]))),
-        ]);
+        assert_eq!(
+            result,
+            vec![
+                Some(Literal::Struct(Struct::from_iter(vec![
+                    Some(Literal::bool(true)),
+                    Some(Literal::int(3)),
+                    Some(Literal::long(5)),
+                    Some(Literal::float(1.1)),
+                    Some(Literal::double(3.3)),
+                    Some(Literal::decimal(1000)),
+                    Some(Literal::date(18628)),
+                    Some(Literal::time(123456789)),
+                    Some(Literal::timestamp(1622548800000000)),
+                    Some(Literal::timestamp_nano(1622548800000000000)),
+                    Some(Literal::string("a".to_string())),
+                    Some(Literal::binary(b"abc".to_vec())),
+                ]))),
+                Some(Literal::Struct(Struct::from_iter(vec![
+                    Some(Literal::bool(false)),
+                    Some(Literal::int(4)),
+                    Some(Literal::long(6)),
+                    Some(Literal::float(2.2)),
+                    Some(Literal::double(4.4)),
+                    Some(Literal::decimal(2000)),
+                    Some(Literal::date(18629)),
+                    Some(Literal::time(987654321)),
+                    Some(Literal::timestamp(1622635200000000)),
+                    Some(Literal::timestamp_nano(1622635200000000000)),
+                    Some(Literal::string("b".to_string())),
+                    Some(Literal::binary(b"def".to_vec())),
+                ]))),
+                Some(Literal::Struct(Struct::from_iter(vec![
+                    None, None, None, None, None, None, None, None, None, None, None, None,
+                ]))),
+            ]
+        );
     }
 
     #[test]
@@ -1303,14 +1306,17 @@ mod test {
         ]);
 
         let result = arrow_struct_to_literal(&struct_array, &iceberg_struct_type).unwrap();
-        assert_eq!(result, vec![
-            Some(Literal::Struct(Struct::from_iter(vec![None, None,]))),
-            Some(Literal::Struct(Struct::from_iter(vec![
-                Some(Literal::int(1)),
+        assert_eq!(
+            result,
+            vec![
+                Some(Literal::Struct(Struct::from_iter(vec![None, None,]))),
+                Some(Literal::Struct(Struct::from_iter(vec![
+                    Some(Literal::int(1)),
+                    None,
+                ]))),
                 None,
-            ]))),
-            None,
-        ]);
+            ]
+        );
     }
 
     #[test]
@@ -1763,67 +1769,70 @@ mod test {
             };
 
         let result = arrow_struct_to_literal(&struct_array, &struct_type).unwrap();
-        assert_eq!(result, vec![
-            Some(Literal::Struct(Struct::from_iter(vec![
-                Some(Literal::List(vec![
-                    Some(Literal::Struct(Struct::from_iter(vec![
-                        Some(Literal::int(10)),
-                        Some(Literal::int(20)),
-                    ]))),
-                    Some(Literal::Struct(Struct::from_iter(vec![
-                        Some(Literal::int(11)),
-                        Some(Literal::int(21)),
-                    ]))),
-                ])),
-                Some(Literal::List(vec![
-                    Some(Literal::Map(Map::from_iter(vec![
-                        (Literal::int(1), Some(Literal::int(100))),
-                        (Literal::int(3), Some(Literal::int(300))),
-                    ]))),
-                    Some(Literal::Map(Map::from_iter(vec![(
-                        Literal::int(2),
-                        Some(Literal::int(200))
-                    ),]))),
-                ])),
-                Some(Literal::List(vec![
+        assert_eq!(
+            result,
+            vec![
+                Some(Literal::Struct(Struct::from_iter(vec![
                     Some(Literal::List(vec![
-                        Some(Literal::int(100)),
-                        Some(Literal::int(101)),
-                        Some(Literal::int(102)),
+                        Some(Literal::Struct(Struct::from_iter(vec![
+                            Some(Literal::int(10)),
+                            Some(Literal::int(20)),
+                        ]))),
+                        Some(Literal::Struct(Struct::from_iter(vec![
+                            Some(Literal::int(11)),
+                            Some(Literal::int(21)),
+                        ]))),
                     ])),
                     Some(Literal::List(vec![
-                        Some(Literal::int(200)),
-                        Some(Literal::int(201)),
-                    ])),
-                ])),
-            ]))),
-            Some(Literal::Struct(Struct::from_iter(vec![
-                Some(Literal::List(vec![
-                    Some(Literal::Struct(Struct::from_iter(vec![
-                        Some(Literal::int(12)),
-                        Some(Literal::int(22)),
-                    ]))),
-                    Some(Literal::Struct(Struct::from_iter(vec![
-                        Some(Literal::int(13)),
-                        Some(Literal::int(23)),
-                    ]))),
-                ])),
-                Some(Literal::List(vec![Some(Literal::Map(Map::from_iter(
-                    vec![(Literal::int(3), Some(Literal::int(300))),]
-                ))),])),
-                Some(Literal::List(vec![
-                    Some(Literal::List(vec![
-                        Some(Literal::int(300)),
-                        Some(Literal::int(301)),
-                        Some(Literal::int(302)),
+                        Some(Literal::Map(Map::from_iter(vec![
+                            (Literal::int(1), Some(Literal::int(100))),
+                            (Literal::int(3), Some(Literal::int(300))),
+                        ]))),
+                        Some(Literal::Map(Map::from_iter(vec![(
+                            Literal::int(2),
+                            Some(Literal::int(200))
+                        ),]))),
                     ])),
                     Some(Literal::List(vec![
-                        Some(Literal::int(400)),
-                        Some(Literal::int(401)),
+                        Some(Literal::List(vec![
+                            Some(Literal::int(100)),
+                            Some(Literal::int(101)),
+                            Some(Literal::int(102)),
+                        ])),
+                        Some(Literal::List(vec![
+                            Some(Literal::int(200)),
+                            Some(Literal::int(201)),
+                        ])),
                     ])),
-                ])),
-            ]))),
-        ]);
+                ]))),
+                Some(Literal::Struct(Struct::from_iter(vec![
+                    Some(Literal::List(vec![
+                        Some(Literal::Struct(Struct::from_iter(vec![
+                            Some(Literal::int(12)),
+                            Some(Literal::int(22)),
+                        ]))),
+                        Some(Literal::Struct(Struct::from_iter(vec![
+                            Some(Literal::int(13)),
+                            Some(Literal::int(23)),
+                        ]))),
+                    ])),
+                    Some(Literal::List(vec![Some(Literal::Map(Map::from_iter(
+                        vec![(Literal::int(3), Some(Literal::int(300))),]
+                    ))),])),
+                    Some(Literal::List(vec![
+                        Some(Literal::List(vec![
+                            Some(Literal::int(300)),
+                            Some(Literal::int(301)),
+                            Some(Literal::int(302)),
+                        ])),
+                        Some(Literal::List(vec![
+                            Some(Literal::int(400)),
+                            Some(Literal::int(401)),
+                        ])),
+                    ])),
+                ]))),
+            ]
+        );
     }
 
     #[test]

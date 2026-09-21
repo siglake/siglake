@@ -355,6 +355,9 @@ async fn rebuild_group_counts_reports_origin_hint_and_closing_summaries() {
             edited >= 2,
             "expected to edit the inline object and at least one delta, edited {edited}"
         );
+        ice.write_short_repair_marker_for_test(&ident)
+            .await
+            .unwrap();
         // Dropped before the binary runs so the child is the only open handle
         // on the SQLite catalog.
     }
@@ -364,6 +367,12 @@ async fn rebuild_group_counts_reports_origin_hint_and_closing_summaries() {
     assert!(
         out.contains(&format!("{NAMESPACE}.{TABLE}: rebuilt through sequence")),
         "header line missing:\n{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "{NAMESPACE}.{TABLE}: cleared 1 short-repair attempt record(s)"
+        )),
+        "attempt cleanup report missing:\n{out}"
     );
     assert!(
         out.contains(&format!("(table rows: {total})")),

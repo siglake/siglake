@@ -178,9 +178,12 @@ a stale snapshot and the check would call it exact
 
 Postgres has no URI equivalent of `mode=ro`, so the production reader runs its
 SELECTs inside `START TRANSACTION READ ONLY` and lets the server refuse a
-write. There is no Postgres in a lane, so the statements are parse-gated in the
-Postgres dialect (`the_read_only_statements_parse_as_postgres`), the same cover
-the watermark statements get.
+write. Ordinary lane tests parse-gate the statements in the Postgres dialect
+(`the_read_only_statements_parse_as_postgres`), the same cover the watermark
+statements get. The compose gate also runs `wal_ledger_postgres` against its
+live Postgres: 259 ids cross the 256-wide bind boundary, an `UPDATE` on the
+reader's fenced connection must return SQLSTATE 25006, and separate scratch
+schemas distinguish a missing `wal_segments` table from an empty ledger.
 
 ## Cost
 
@@ -264,8 +267,7 @@ revisions relative to the card's sketch:
 
 The production slice is a separate card, blocked on this document. What it does
 not need is another qualification: the arithmetic is pinned by 19 hermetic
-cases, and the only thing a round could add is a Postgres arm, which the
-compose step is the place for.
+cases, and the compose step now carries the Postgres arm.
 
 ## What shipped (#4997)
 

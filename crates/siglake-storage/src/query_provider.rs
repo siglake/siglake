@@ -1,8 +1,9 @@
 use std::any::Any;
 use std::cmp::Reverse;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use std::task::{Context, Poll};
@@ -166,6 +167,230 @@ struct EffectiveFileCacheTuning {
     max_entries: Option<usize>,
     /// #4847 prototype gate; see [`crate::QueryScanTuning::file_cache_row_group_prototype`].
     row_group_prototype: bool,
+    /// #4905 prototype gate; see
+    /// [`crate::QueryScanTuning::file_cache_predicate_key_prototype`].
+    predicate_key_prototype: bool,
+    /// #4959 in-process-only per-file attribution qualification.
+    file_attribution_prototype: bool,
+}
+
+/// #4959's qualification capture is intentionally bounded. This is a local
+/// measurement aid, not a public response contract; a large scan records the
+/// first tasks in plan order and counts the rest as omitted.
+const FILE_ATTRIBUTION_PROTOTYPE_CAP: usize = 128;
+const FILE_ATTRIBUTION_METRIC: &str = "qualification_file_attribution";
+const FILE_ATTRIBUTION_OMITTED_METRIC: &str = "qualification_file_attribution_omitted";
+
+/// Maximum file-task identities retained by one scan. The query server merges
+/// scan leaves and shards, then applies this same cap again request-wide.
+pub const FILE_ATTRIBUTION_CAP: usize = 32;
+
+/// Stable identity for one planned Iceberg file task.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileAttributionIdentity {
+    pub table: String,
+    pub object_key: String,
+    pub start: u64,
+    pub length: u64,
+}
+
+/// Outcomes observed for a retained file task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileAttributionEntry {
+    pub identity: FileAttributionIdentity,
+    pub cache_candidate: bool,
+    pub reader_opened: bool,
+    pub cache_hit: bool,
+}
+
+/// One bounded scan-leaf snapshot. Entries are sorted by identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileAttributionSnapshot {
+    pub files: Vec<FileAttributionEntry>,
+    pub files_omitted: u64,
+    pub identity_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FileAttributionOutcome {
+    CacheCandidate,
+    ReaderOpened,
+    CacheHit,
+}
+
+#[derive(Debug)]
+struct FileAttributionCollector {
+    table: String,
+    table_location: String,
+    entries: Mutex<BTreeMap<FileAttributionIdentity, FileAttributionEntry>>,
+    files_omitted: u64,
+}
+
+impl FileAttributionCollector {
+    fn new<'a>(table: &Table, tasks: impl Iterator<Item = &'a FileScanTask>) -> Self {
+        let table_name = table.identifier().to_string();
+        let table_location = table
+            .metadata()
+            .location()
+            .trim_end_matches('/')
+            .to_string();
+        let mut identities = BTreeMap::new();
+        let mut invalid = 0_u64;
+        for task in tasks {
+            let Some(identity) = Self::identity_for(
+                &table_name,
+                &table_location,
+                task.data_file_path(),
+                task.start,
+                task.length,
+            ) else {
+                invalid += 1;
+                continue;
+            };
+            identities
+                .entry(identity.clone())
+                .or_insert(FileAttributionEntry {
+                    identity,
+                    cache_candidate: false,
+                    reader_opened: false,
+                    cache_hit: false,
+                });
+        }
+        let excess = identities.len().saturating_sub(FILE_ATTRIBUTION_CAP) as u64;
+        while identities.len() > FILE_ATTRIBUTION_CAP {
+            identities.pop_last();
+        }
+        Self {
+            table: table_name,
+            table_location,
+            entries: Mutex::new(identities),
+            files_omitted: invalid.saturating_add(excess),
+        }
+    }
+
+    fn identity_for(
+        table: &str,
+        table_location: &str,
+        file: &str,
+        start: u64,
+        length: u64,
+    ) -> Option<FileAttributionIdentity> {
+        let suffix = file.strip_prefix(table_location)?.strip_prefix('/')?;
+        if suffix.is_empty() {
+            return None;
+        }
+        Some(FileAttributionIdentity {
+            table: table.to_string(),
+            object_key: suffix.to_string(),
+            start,
+            length,
+        })
+    }
+
+    fn observe(&self, task: &FileScanTask, outcome: FileAttributionOutcome) {
+        let Some(identity) = self.identity_for_task(task) else {
+            return;
+        };
+        self.observe_identity(&identity, outcome);
+    }
+
+    fn identity_for_task(&self, task: &FileScanTask) -> Option<FileAttributionIdentity> {
+        Self::identity_for(
+            &self.table,
+            &self.table_location,
+            task.data_file_path(),
+            task.start,
+            task.length,
+        )
+    }
+
+    fn observe_identity(
+        &self,
+        identity: &FileAttributionIdentity,
+        outcome: FileAttributionOutcome,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(entry) = entries.get_mut(identity) else {
+            return;
+        };
+        match outcome {
+            FileAttributionOutcome::CacheCandidate => entry.cache_candidate = true,
+            FileAttributionOutcome::ReaderOpened => entry.reader_opened = true,
+            FileAttributionOutcome::CacheHit => entry.cache_hit = true,
+        }
+    }
+
+    fn snapshot(&self, identity_complete: bool) -> FileAttributionSnapshot {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        FileAttributionSnapshot {
+            files: entries.values().cloned().collect(),
+            files_omitted: self.files_omitted,
+            identity_complete: identity_complete && self.files_omitted == 0,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum FileAttributionMetrics {
+    Named {
+        cache_candidate: Count,
+        reader_attempt: Count,
+    },
+    Omitted {
+        cache_candidate: Count,
+        reader_attempt: Count,
+    },
+}
+
+impl FileAttributionMetrics {
+    fn cache_candidate(&self) {
+        match self {
+            Self::Named {
+                cache_candidate, ..
+            }
+            | Self::Omitted {
+                cache_candidate, ..
+            } => cache_candidate.add(1),
+        }
+    }
+
+    fn reader_attempt(&self) {
+        match self {
+            Self::Named { reader_attempt, .. } | Self::Omitted { reader_attempt, .. } => {
+                reader_attempt.add(1);
+            }
+        }
+    }
+}
+
+fn file_attribution_counter(
+    metrics: &ExecutionPlanMetricsSet,
+    partition: usize,
+    task: &FileScanTask,
+    stage: &'static str,
+) -> Count {
+    MetricBuilder::new(metrics)
+        .with_new_label("stage", stage)
+        .with_new_label("file", task.data_file_path().to_string())
+        .with_new_label("start", task.start.to_string())
+        .with_new_label("length", task.length.to_string())
+        .counter(FILE_ATTRIBUTION_METRIC, partition)
+}
+
+fn file_attribution_omitted_counter(
+    metrics: &ExecutionPlanMetricsSet,
+    partition: usize,
+    stage: &'static str,
+) -> Count {
+    MetricBuilder::new(metrics)
+        .with_new_label("stage", stage)
+        .counter(FILE_ATTRIBUTION_OMITTED_METRIC, partition)
 }
 
 /// Selectivity-aware ordered-policy override, injected through
@@ -1077,6 +1302,11 @@ impl Stream for CachePopulateStream {
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 if !this.oversized {
+                    // Population retains `batch.clone()`, so a sliced array keeps its
+                    // whole backing allocation alive. Price that retained allocation:
+                    // `get_slice_memory_size` estimates a compact copy of the slice and
+                    // could admit one whose live backing buffer exceeds the entry limit.
+                    // This same total becomes `CachedFileBatches::bytes` at EOF.
                     let buffered_bytes = this
                         .buffered_bytes
                         .saturating_add(batch.get_array_memory_size() as u64);
@@ -1683,7 +1913,8 @@ fn schema_with_text_tokenizers_of(
 #[derive(Debug)]
 pub struct SiglakeIcebergTableScan {
     table: Table,
-    plan_properties: PlanProperties,
+    file_attribution: Arc<FileAttributionCollector>,
+    plan_properties: Arc<PlanProperties>,
     projection: Option<Vec<String>>,
     projected_columns: Arc<Vec<String>>,
     limit: Option<usize>,
@@ -1710,7 +1941,7 @@ pub struct SiglakeIcebergTableScan {
     /// promoted predicates — NOT time-only windows). Drives the ordered
     /// chain's prefetch decision; see `sequential_task_chain`.
     residual_filtered: bool,
-    /// Exact `(min, max)` of the `timestamp` column in epoch nanoseconds across
+    /// Exact `(min, max)` of the `timestamp` column in its Arrow time unit across
     /// the scanned files, from the manifest bounds — populated only for an
     /// unfiltered scan whose output schema includes `timestamp`. Reported as
     /// column statistics so DataFusion answers `min/max(timestamp)` with zero IO.
@@ -1772,11 +2003,64 @@ fn iceberg_field_id(field: &arrow_schema::Field) -> Option<i32> {
         .and_then(|v| v.parse().ok())
 }
 
-/// Global `(min, max)` of the `timestamp` column (epoch nanos) across the alive
-/// data files of `snapshot_id` (or the current snapshot), read from the manifest
-/// bounds. The manifests are already warm in the object cache from planning, so
-/// this is an in-memory re-walk, not extra IO. `None` if there's no snapshot or
-/// no file carries the bound.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GlobalTimestampBoundsCacheKey {
+    table_uuid: uuid::Uuid,
+    snapshot_id: i64,
+    field_id: i32,
+}
+
+const GLOBAL_TIMESTAMP_BOUNDS_CACHE_CAP: usize = 256;
+
+/// `(entries, insertion order)` for immutable-snapshot timestamp bounds.
+type GlobalTimestampBoundsCacheInner = (
+    HashMap<GlobalTimestampBoundsCacheKey, Option<(i64, i64)>>,
+    VecDeque<GlobalTimestampBoundsCacheKey>,
+);
+
+static GLOBAL_TIMESTAMP_BOUNDS_CACHE: OnceLock<std::sync::Mutex<GlobalTimestampBoundsCacheInner>> =
+    OnceLock::new();
+
+fn global_timestamp_bounds_cache() -> &'static std::sync::Mutex<GlobalTimestampBoundsCacheInner> {
+    GLOBAL_TIMESTAMP_BOUNDS_CACHE
+        .get_or_init(|| std::sync::Mutex::new((HashMap::new(), VecDeque::new())))
+}
+
+/// The outer `Option` distinguishes a cache miss from a cached snapshot with
+/// no timestamp bounds.
+fn global_timestamp_bounds_cache_get(
+    key: GlobalTimestampBoundsCacheKey,
+) -> Option<Option<(i64, i64)>> {
+    let guard = global_timestamp_bounds_cache().lock().ok()?;
+    guard.0.get(&key).copied()
+}
+
+fn global_timestamp_bounds_cache_put(
+    key: GlobalTimestampBoundsCacheKey,
+    bounds: Option<(i64, i64)>,
+) {
+    if let Ok(mut guard) = global_timestamp_bounds_cache().lock() {
+        let (map, order) = &mut *guard;
+        if map.insert(key, bounds).is_none() {
+            order.push_back(key);
+            while map.len() > GLOBAL_TIMESTAMP_BOUNDS_CACHE_CAP {
+                if let Some(old) = order.pop_front() {
+                    map.remove(&old);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Global `(min, max)` of the `timestamp` column across the alive data files of
+/// `snapshot_id` (or the current snapshot), read from the manifest bounds.
+/// Direct manifest loads bypass Iceberg's parsed-object cache, so retain the
+/// result by `(table UUID, snapshot, field id)`. Entries are pure functions of
+/// immutable snapshots and have no TTL; the bounded FIFO only ages old
+/// snapshots out. A failed manifest walk is not cached and can recover on the
+/// next plan. `None` if there's no snapshot or no file carries the bound.
 async fn global_timestamp_bounds(
     table: &Table,
     snapshot_id: Option<i64>,
@@ -1788,14 +2072,28 @@ async fn global_timestamp_bounds(
         Some(id) => meta.snapshot_by_id(id)?,
         None => meta.current_snapshot()?,
     };
-    let manifest_list = snapshot
+    let key = GlobalTimestampBoundsCacheKey {
+        table_uuid: meta.uuid(),
+        snapshot_id: snapshot.snapshot_id(),
+        field_id: ts_field_id,
+    };
+    if let Some(bounds) = global_timestamp_bounds_cache_get(key) {
+        return bounds;
+    }
+    let manifest_list = match snapshot
         .load_manifest_list(table.file_io(), &table.metadata_ref())
         .await
-        .ok()?;
+    {
+        Ok(manifest_list) => manifest_list,
+        Err(_) => return None,
+    };
     let mut min: Option<i64> = None;
     let mut max: Option<i64> = None;
     for mf in manifest_list.entries() {
-        let manifest = mf.load_manifest(table.file_io()).await.ok()?;
+        let manifest = match mf.load_manifest(table.file_io()).await {
+            Ok(manifest) => manifest,
+            Err(_) => return None,
+        };
         for entry in manifest.entries() {
             if !entry.is_alive() {
                 continue;
@@ -1813,20 +2111,22 @@ async fn global_timestamp_bounds(
             }
         }
     }
-    match (min, max) {
+    let bounds = match (min, max) {
         (Some(a), Some(b)) => Some((a, b)),
         _ => None,
-    }
+    };
+    global_timestamp_bounds_cache_put(key, bounds);
+    bounds
 }
 
 /// Whether this scan may load a per-file inverted index for its text
 /// predicate, and if not, the reason to attribute the refusal to.
 ///
-/// The index is a WHOLE-FILE structure: touching it at all costs a
+/// The v1 index is a WHOLE-FILE structure: touching it at all costs a
 /// deserialization proportional to the file's rows (~40 bytes of parsed index
 /// per indexed row), independent of how many rows the query ends up wanting.
-/// Both declines below are the same argument from opposite ends of the plan —
-/// the query wants a handful of rows and the index charges for all of them:
+/// Both v1 declines below are the same argument from opposite ends of the plan
+/// — the query wants a handful of rows and the index charges for all of them:
 ///
 /// - `ordered_limit`: an index RowSelection batches by SELECTED rows, so sparse
 ///   postings span most of a large file before the first batch is emitted,
@@ -1839,13 +2139,11 @@ async fn global_timestamp_bounds(
 ///   scanned, `substring_scan` 813.1 ms against 4.5 ms
 ///   (`docs/DESIGN_inverted_index.md`).
 ///
-/// Neither is a selectivity estimate, because the planner has none: a term's
-/// document frequency lives inside the index it is deciding whether to load.
-/// The cost of being wrong is bounded and asymmetric — a declined rare term
-/// pays a scan it would have skipped, an accepted common term pays a
-/// whole-file decode per planned file. Reaching sparse postings without
-/// materializing a whole file's index is #4376's segmented format, not a
-/// threshold to guess here.
+/// The segmented reader can now estimate point-term document frequency before
+/// it fetches postings. A clipped execution therefore carries its limit into
+/// `RawPruneSpec`: v1 remains declined, while seg2 admits terms whose summed df
+/// is no larger than the clip (#5040). Ordered scans retain the unconditional
+/// decline because sparse postings still defeat their contiguous early stop.
 ///
 /// Correctness does not turn on this: the index only ever produces a
 /// superset RowSelection, and the engine re-evaluates the exact predicate
@@ -1891,6 +2189,12 @@ impl SiglakeIcebergTableScan {
             .map(|config| text_field_tokenizers(&config))
             .unwrap_or_default();
         let mut raw_prune_spec = extract_raw_prune_spec(filters, &text_tokenizers)?;
+        let clipped_limit = limit.or_else(|| {
+            state
+                .config()
+                .get_extension::<ClippedScanLimit>()
+                .map(|limit| limit.limit)
+        });
         let text_index_decline = text_index_decline_reason(
             raw_prune_spec.is_some(),
             state
@@ -1898,13 +2202,17 @@ impl SiglakeIcebergTableScan {
                 .get_extension::<PreferredScanOrder>()
                 .is_some()
                 && state.config().get_extension::<OrderedScanLimit>().is_some(),
-            limit.is_some() || state.config().get_extension::<ClippedScanLimit>().is_some(),
+            clipped_limit.is_some(),
         );
         if let Some(reason) = text_index_decline {
-            raw_prune_spec
+            let spec = raw_prune_spec
                 .as_mut()
-                .expect("a reason is only returned for a text spec")
-                .inverted_index_row_selection = false;
+                .expect("a reason is only returned for a text spec");
+            if reason == "ordered_limit" {
+                spec.inverted_index_row_selection = false;
+            } else {
+                spec.segmented_clipped_limit = clipped_limit;
+            }
             metrics::counter!(
                 "siglake_query_inverted_index_declined_total",
                 "reason" => reason
@@ -2141,12 +2449,12 @@ impl SiglakeIcebergTableScan {
             }
             None => EquivalenceProperties::new(output_schema.clone()),
         };
-        let plan_properties = PlanProperties::new(
+        let plan_properties = Arc::new(PlanProperties::new(
             eq_properties,
             Partitioning::UnknownPartitioning(partition_count),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         let decoded_budget_bytes = scan_decoded_budget_bytes();
         let decompression_factor = scan_decompression_factor();
         let aggregate_reader_budget = clamp_aggregate_reader_budget(
@@ -2216,9 +2524,14 @@ impl SiglakeIcebergTableScan {
             None
         };
         let ordering_outcome = ordering.outcome;
+        let file_attribution = Arc::new(FileAttributionCollector::new(
+            &table,
+            task_partitions.iter().flatten(),
+        ));
 
         Ok(Self {
             table,
+            file_attribution,
             plan_properties,
             projection,
             projected_columns,
@@ -2277,6 +2590,11 @@ impl SiglakeIcebergTableScan {
         self.ordering_outcome
     }
 
+    /// Bounded, deterministic file-task membership and outcomes for this scan.
+    pub fn file_attribution(&self) -> FileAttributionSnapshot {
+        self.file_attribution.snapshot(self.live_partitions() == 0)
+    }
+
     /// WS-3: build a sorted partition stream by k-way merging the per-file
     /// batch streams on `timestamp` in the declared direction — for partitions
     /// whose files OVERLAP in time (a disjoint run streams by plain ordered
@@ -2290,13 +2608,14 @@ impl SiglakeIcebergTableScan {
         &self,
         task: FileScanTask,
         file_io: iceberg::io::FileIO,
-        fetched_byte_counter: Arc<std::sync::atomic::AtomicU64>,
+        _fetched_byte_counter: Arc<std::sync::atomic::AtomicU64>,
         scan_counters: Arc<ScanCounters>,
     ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
         let reader_tuning = self.reader_tuning;
         let raw_prune_spec = self.raw_prune_spec.clone();
         let promoted_prune = self.promoted_prune.clone();
         let reverse_scan = self.reverse_scan;
+        let file_attribution = self.file_attribution.clone();
         // #90: NEVER route an ordered per-task stream through the batch
         // cache — its fill decodes the WHOLE task before the first batch
         // (see the execute-path bypass), which defeats the lazy early-stop
@@ -2306,11 +2625,13 @@ impl SiglakeIcebergTableScan {
         {
             let task_stream: FileScanTaskStream =
                 futures::stream::iter(std::iter::once(Ok(task))).boxed();
-            let mut reader = ArrowReaderBuilder::new(file_io)
+            let mut reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current())
                 .with_data_file_concurrency_limit(1)
                 .with_row_selection_enabled(true)
-                .with_byte_counter(fetched_byte_counter)
                 .with_scan_counters(Some(scan_counters))
+                .with_file_opened_observer(Some(Arc::new(move |task| {
+                    file_attribution.observe(task, FileAttributionOutcome::ReaderOpened);
+                })))
                 .with_raw_prune_spec(raw_prune_spec)
                 .with_promoted_prune(promoted_prune);
             if reverse_scan {
@@ -2335,6 +2656,7 @@ impl SiglakeIcebergTableScan {
                 .build()
                 .read(task_stream)
                 .map_err(|e| DataFusionError::External(e.into()))?
+                .stream()
                 .map(|result| result.map_err(|e| DataFusionError::External(e.into())))
                 .boxed())
         }
@@ -2423,10 +2745,13 @@ impl SiglakeIcebergTableScan {
     }
 
     /// K-way merge of already-sorted batch streams on `timestamp` in the scan
-    /// direction (the WS-3 per-cluster merge).
+    /// direction (the WS-3 per-cluster merge). For a source-safe ordered LIMIT,
+    /// inputs are admitted in manifest-bound order. Once the buffered nth row
+    /// is strictly ahead of the next input's bound, that input and the older
+    /// suffix stay unopened; equal or unavailable bounds are never excluded.
     fn merge_record_streams(
         &self,
-        inputs: Vec<SendableRecordBatchStream>,
+        mut inputs: Vec<OrderedMergeInput>,
         partition: usize,
         context: &TaskContext,
         schema: ArrowSchemaRef,
@@ -2445,30 +2770,178 @@ impl SiglakeIcebergTableScan {
             .register(context.memory_pool());
         metrics::counter!("siglake_query_scan_ordered_merge_streams_total")
             .increment(inputs.len() as u64);
-        let merged = StreamingMergeBuilder::new()
-            .with_streams(inputs)
-            .with_schema(schema)
-            .with_expressions(&ordering)
-            // Throwaway metrics set: SourceMetricsStream already records this
-            // partition's output against the scan's plan metrics.
-            .with_metrics(BaselineMetrics::new(
-                &ExecutionPlanMetricsSet::new(),
+        let limit = self.ordered_limit.filter(|&limit| {
+            let cap = ordered_single_partition_max_limit();
+            self.ordered_source_limit_safe && cap > 0 && limit <= cap
+        });
+        if limit.is_none() || inputs.iter().any(|input| input.frontier_bound.is_none()) {
+            return Ok(build_ordered_merge(
+                inputs.into_iter().map(|input| input.stream).collect(),
+                schema,
+                &ordering,
                 partition,
-            ))
-            // A browse asks the merge for `limit` rows and throws the rest of
-            // the batch away; building the full batch first holds every
-            // contributing input batch in the merge's reservation.
-            .with_batch_size(
-                reader_tuning
-                    .batch_size
-                    .unwrap_or(8192)
-                    .max(1)
-                    .min(self.ordered_limit.unwrap_or(usize::MAX)),
+                reader_tuning.batch_size.unwrap_or(8192).max(1),
+                reservation,
+                None,
+            )?
+            .boxed());
+        }
+
+        if self.sort_descending {
+            inputs.sort_by_key(|input| Reverse(input.frontier_bound));
+        } else {
+            inputs.sort_by_key(|input| input.frontier_bound);
+        }
+        let descending = self.sort_descending;
+        let batch_size = reader_tuning
+            .batch_size
+            .unwrap_or(8192)
+            .max(1)
+            .min(limit.expect("checked above"));
+        let prepare_schema = schema.clone();
+        let prepared = async move {
+            let admitted = frontier_pruned_merge_inputs(
+                inputs,
+                limit.expect("checked above"),
+                descending,
+                prepare_schema.clone(),
             )
-            .with_reservation(reservation)
-            .build()?;
-        Ok(merged.boxed())
+            .await?;
+            let col = Column::new_with_schema("timestamp", prepare_schema.as_ref())?;
+            let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+                Arc::new(col),
+                SortOptions {
+                    descending,
+                    nulls_first: descending,
+                },
+            )])
+            .ok_or_else(|| DataFusionError::Internal("empty ordered-merge ordering".into()))?;
+            build_ordered_merge(
+                admitted,
+                prepare_schema,
+                &ordering,
+                partition,
+                batch_size,
+                reservation,
+                limit,
+            )
+        };
+        Ok(futures::stream::once(prepared).try_flatten().boxed())
     }
+}
+
+fn build_ordered_merge(
+    inputs: Vec<SendableRecordBatchStream>,
+    schema: ArrowSchemaRef,
+    ordering: &LexOrdering,
+    partition: usize,
+    batch_size: usize,
+    reservation: datafusion::execution::memory_pool::MemoryReservation,
+    fetch: Option<usize>,
+) -> DFResult<SendableRecordBatchStream> {
+    StreamingMergeBuilder::new()
+        .with_streams(inputs)
+        .with_schema(schema)
+        .with_expressions(ordering)
+        .with_metrics(BaselineMetrics::new(
+            &ExecutionPlanMetricsSet::new(),
+            partition,
+        ))
+        .with_batch_size(batch_size)
+        .with_fetch(fetch)
+        .with_reservation(reservation)
+        .build()
+}
+
+/// Buffer at most `limit` rows from each newly admitted input. Those prefixes
+/// contain every row that input could contribute to the global top N. Once the
+/// exact nth value is strictly ahead of the next bound, all remaining inputs
+/// are safe to leave unopened. Returning finite prefix streams also makes the
+/// source-level limit explicit: this path is reached only when pushed filters
+/// cannot remove rows above the scan.
+async fn frontier_pruned_merge_inputs(
+    inputs: Vec<OrderedMergeInput>,
+    limit: usize,
+    descending: bool,
+    schema: ArrowSchemaRef,
+) -> DFResult<Vec<SendableRecordBatchStream>> {
+    let timestamp_idx = schema.index_of("timestamp")?;
+    let mut admitted = Vec::new();
+    let mut frontier_values = Vec::new();
+    let mut inputs = inputs.into_iter().peekable();
+
+    while let Some(mut input) = inputs.next() {
+        let mut batches = Vec::new();
+        let mut rows = 0usize;
+        while rows < limit {
+            let Some(batch) = input.stream.next().await.transpose()? else {
+                break;
+            };
+            let take = (limit - rows).min(batch.num_rows());
+            if take == 0 {
+                continue;
+            }
+            let prefix = batch.slice(0, take);
+            let Some(values) = timestamp_bound_values(&prefix, timestamp_idx) else {
+                batches.push(batch);
+                let mut all = admitted;
+                all.push(Box::pin(RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(batches.into_iter().map(Ok)).chain(input.stream),
+                )) as SendableRecordBatchStream);
+                for remaining in inputs {
+                    all.push(remaining.stream);
+                }
+                return Ok(all);
+            };
+            frontier_values.extend(values);
+            rows += take;
+            batches.push(prefix);
+        }
+        admitted.push(Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(batches.into_iter().map(Ok)),
+        )) as SendableRecordBatchStream);
+
+        if frontier_values.len() < limit {
+            continue;
+        }
+        let nth = nth_ordered_value(&mut frontier_values, limit, descending);
+        if bound_is_strictly_behind(
+            nth,
+            inputs.peek().and_then(|next| next.frontier_bound),
+            descending,
+        ) {
+            break;
+        }
+    }
+    Ok(admitted)
+}
+
+fn timestamp_bound_values(batch: &RecordBatch, timestamp_idx: usize) -> Option<Vec<i64>> {
+    use datafusion::arrow::array::{Array, TimestampMicrosecondArray};
+
+    let column = batch
+        .column(timestamp_idx)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()?;
+    if column.null_count() != 0 {
+        return None;
+    }
+    Some((0..column.len()).map(|row| column.value(row)).collect())
+}
+
+fn nth_ordered_value(values: &mut [i64], limit: usize, descending: bool) -> i64 {
+    let nth = limit - 1;
+    if descending {
+        *values.select_nth_unstable_by(nth, |a, b| b.cmp(a)).1
+    } else {
+        *values.select_nth_unstable(nth).1
+    }
+}
+
+fn bound_is_strictly_behind(nth: i64, bound: Option<i64>, descending: bool) -> bool {
+    bound.is_some_and(|bound| if descending { bound < nth } else { bound > nth })
 }
 
 /// The physical output ordering to advertise for this scan, or a refusal when
@@ -2826,7 +3299,32 @@ async fn scan_output_ordering(
                         }
                     }
                     part_streams = part_streams.max(layer_sizes.len());
-                    plan.push(OrderedCluster::Merge(layer_sizes));
+                    let mut layer_offset = off;
+                    let layers = layer_sizes
+                        .into_iter()
+                        .map(|file_count| {
+                            let layer = &part[layer_offset..layer_offset + file_count];
+                            layer_offset += file_count;
+                            let frontier_bound = if requested_descending {
+                                layer
+                                    .iter()
+                                    .map(|(_, bounds)| bounds.1)
+                                    .max()
+                                    .expect("merge layer is non-empty")
+                            } else {
+                                layer
+                                    .iter()
+                                    .map(|(_, bounds)| bounds.0)
+                                    .min()
+                                    .expect("merge layer is non-empty")
+                            };
+                            OrderedMergeLayer {
+                                file_count,
+                                frontier_bound,
+                            }
+                        })
+                        .collect();
+                    plan.push(OrderedCluster::Merge(layers));
                     off += cs;
                 }
                 budget_used += part_streams;
@@ -3085,15 +3583,29 @@ enum OrderedCluster {
     /// A time-disjoint run of this many files: ordered sequential chain.
     Run(usize),
     /// Overlapping files k-way merged over layers (each layer a sequential
-    /// disjoint run); fan-in = layer count = overlap depth. Values are the
-    /// layer sizes, summing to the cluster's file count.
-    Merge(Vec<usize>),
+    /// disjoint run); fan-in = layer count = overlap depth. Layer file counts
+    /// sum to the cluster's file count, and their bounds drive lazy admission.
+    Merge(Vec<OrderedMergeLayer>),
     /// Depth-spike fallback: overlap depth exceeds the per-merge fan-in cap
     /// but the cluster's rows fit [`ordered_sort_cluster_max_rows`] — decode
     /// all files (bounded concurrency, unordered) and sort in memory before
     /// emitting. Preserves the scan-wide ordered advertisement that a refusal
     /// would forfeit.
     Sort(usize),
+}
+
+/// One sequential, time-disjoint input to an overlapping-cluster merge.
+/// `frontier_bound` is the input's first possible value in scan order (the
+/// upper manifest bound for DESC, lower for ASC).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrderedMergeLayer {
+    file_count: usize,
+    frontier_bound: i64,
+}
+
+struct OrderedMergeInput {
+    stream: SendableRecordBatchStream,
+    frontier_bound: Option<i64>,
 }
 
 /// Row budget for [`OrderedCluster::Sort`] (`SIGLAKE_ORDERED_SORT_CLUSTER_MAX_ROWS`,
@@ -3567,14 +4079,11 @@ fn cluster_partition_inner(bounds: &[(i64, i64)], descending: bool) -> (Vec<usiz
     (idx, sizes)
 }
 
-/// Per-file `(min, max)` of the `timestamp` column (epoch nanos) for the alive
-/// data files of the scanned snapshot, keyed by data-file path — the per-file
-/// sibling of [`global_timestamp_bounds`]. The manifests are warm in the object
-/// cache from planning, so this is an in-memory re-walk, not extra IO. A file
-/// without both bounds is simply absent from the map.
 /// Per-file `sort_order_id` manifest stamps for the serving snapshot's live
 /// files (`None` per file = written before stamping existed). `None` overall
-/// = the manifest walk failed — the caller refuses the advertisement.
+/// = the manifest walk failed — the caller refuses the advertisement. These
+/// direct loads bypass Iceberg's parsed-object cache; the ordered-plan cache
+/// amortises the walk for an unchanged snapshot.
 async fn per_file_sort_order_ids(
     table: &Table,
     snapshot_id: Option<i64>,
@@ -3602,6 +4111,11 @@ async fn per_file_sort_order_ids(
     Some(out)
 }
 
+/// Per-file `(min, max)` of the `timestamp` column for the alive data files of
+/// the scanned snapshot, keyed by data-file path — the per-file sibling of
+/// [`global_timestamp_bounds`]. These direct loads bypass Iceberg's
+/// parsed-object cache; the ordered-plan cache amortises the walk for an
+/// unchanged snapshot. A file without both bounds is absent from the map.
 async fn per_file_timestamp_bounds(
     table: &Table,
     snapshot_id: Option<i64>,
@@ -4157,9 +4671,9 @@ impl SourceMetricsStream {
             .record(self.output_batches as f64);
         metrics::histogram!("siglake_query_scan_partition_decoded_bytes")
             .record(self.decoded_bytes as f64);
-        let fetched_bytes = self
-            .fetched_byte_counter
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let fetched_bytes = self.scan_counters.bytes_read();
+        self.fetched_byte_counter
+            .store(fetched_bytes, std::sync::atomic::Ordering::Relaxed);
         metrics::histogram!("siglake_query_scan_partition_fetched_bytes")
             .record(fetched_bytes as f64);
         // Real read bytes (post-prune) as a DataFusion node metric → per-query
@@ -4315,6 +4829,21 @@ fn task_cache_key_with_direction(task: &FileScanTask, reverse: bool) -> String {
     format!("{}:reverse={reverse}", task_cache_key(task))
 }
 
+/// #4905's predicate-keyed identity. The serialized bound predicate retains
+/// field ids, operators, literal types and literal values; the existing key
+/// keeps the file range, projection, delete set and direction distinctions.
+/// This key is used only by the in-process qualification prototype.
+fn task_cache_key_with_predicate_direction(task: &FileScanTask, reverse: bool) -> String {
+    let base = task_cache_key_with_direction(task, reverse);
+    match task.predicate.as_ref() {
+        Some(predicate) => format!(
+            "{base}:predicate={}",
+            serde_json::to_string(predicate).expect("bound predicates serialize")
+        ),
+        None => base,
+    }
+}
+
 /// The task a population reads under: the query's predicate removed, so the
 /// entry is a function of the file and the projection alone and a later query
 /// with a different predicate can reuse it.
@@ -4334,12 +4863,15 @@ fn open_task_batch_stream_uncached(
     file_io: iceberg::io::FileIO,
     task: FileScanTask,
     reader_tuning: EffectiveReaderTuning,
-    byte_counter: Arc<std::sync::atomic::AtomicU64>,
+    _byte_counter: Arc<std::sync::atomic::AtomicU64>,
     scan_counters: Arc<ScanCounters>,
     raw_prune_spec: Option<RawPruneSpec>,
     promoted_prune: Vec<PromotedPruneSpec>,
     reverse: bool,
+    file_attribution: Arc<FileAttributionCollector>,
+    opened_identity: Option<FileAttributionIdentity>,
 ) -> DFResult<TaskBatchStream> {
+    let opened_identity = opened_identity.or_else(|| file_attribution.identity_for_task(&task));
     let task_stream: FileScanTaskStream = futures::stream::iter(std::iter::once(Ok(task))).boxed();
     // Enable page-index row selection: data files carry Parquet page statistics
     // (ColumnIndex/OffsetIndex, written by default), so a scan predicate prunes
@@ -4347,11 +4879,15 @@ fn open_task_batch_stream_uncached(
     // For time-ordered storage a `timestamp` range predicate skips pages whose
     // min/max fall outside the range. The page index is only loaded when a
     // predicate is present, so predicate-free scans pay nothing.
-    let mut reader = ArrowReaderBuilder::new(file_io)
+    let mut reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current())
         .with_data_file_concurrency_limit(1)
         .with_row_selection_enabled(true)
-        .with_byte_counter(byte_counter)
         .with_scan_counters(Some(scan_counters))
+        .with_file_opened_observer(Some(Arc::new(move |_task| {
+            if let Some(identity) = &opened_identity {
+                file_attribution.observe_identity(identity, FileAttributionOutcome::ReaderOpened);
+            }
+        })))
         .with_raw_prune_spec(raw_prune_spec)
         .with_promoted_prune(promoted_prune);
     if reverse {
@@ -4376,6 +4912,7 @@ fn open_task_batch_stream_uncached(
         .build()
         .read(task_stream)
         .map_err(|e| DataFusionError::External(e.into()))?
+        .stream()
         .map(|result| result.map_err(|e| DataFusionError::External(e.into())))
         .boxed())
 }
@@ -4389,11 +4926,16 @@ async fn open_task_batch_stream_cached(
     byte_counter: Arc<std::sync::atomic::AtomicU64>,
     scan_counters: Arc<ScanCounters>,
     cache_counters: Arc<FileCacheCounters>,
+    attribution: Arc<FileAttributionCollector>,
     raw_prune_spec: Option<RawPruneSpec>,
     promoted_prune: Vec<PromotedPruneSpec>,
     reverse: bool,
+    qualification_attribution: Option<FileAttributionMetrics>,
 ) -> DFResult<TaskBatchStream> {
     if !cache_tuning.enabled() {
+        if let Some(qualification) = &qualification_attribution {
+            qualification.reader_attempt();
+        }
         return open_task_batch_stream_uncached(
             file_io,
             task,
@@ -4403,17 +4945,37 @@ async fn open_task_batch_stream_cached(
             raw_prune_spec,
             promoted_prune,
             reverse,
+            attribution,
+            None,
         );
     }
 
-    let key = task_cache_key_with_direction(&task, reverse);
+    attribution.observe(&task, FileAttributionOutcome::CacheCandidate);
+    if let Some(qualification) = &qualification_attribution {
+        qualification.cache_candidate();
+    }
+
+    let fallback_key = task_cache_key_with_direction(&task, reverse);
+    let key = if cache_tuning.predicate_key_prototype && task.predicate.is_some() {
+        task_cache_key_with_predicate_direction(&task, reverse)
+    } else {
+        fallback_key.clone()
+    };
     let hit = {
         let cache = query_file_batch_cache()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.get(&key)
+        cache.get(&key).or_else(|| {
+            // A predicate-free entry contains the whole task and remains a
+            // valid fallback for a predicate-keyed lookup. The residual filter
+            // retained during planning enforces the query predicate.
+            (key != fallback_key)
+                .then(|| cache.get(&fallback_key))
+                .flatten()
+        })
     };
     if let Some(hit) = hit {
+        attribution.observe(&task, FileAttributionOutcome::CacheHit);
         metrics::counter!(
             "siglake_query_scan_file_cache_requests_total",
             "outcome" => "hit"
@@ -4429,11 +4991,15 @@ async fn open_task_batch_stream_cached(
             futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)).boxed(),
         );
     }
+    if let Some(qualification) = &qualification_attribution {
+        qualification.reader_attempt();
+    }
 
-    // #4891: a task carrying a converted predicate reads FEWER pages than any
-    // population of it can. An entry has to be reusable by a query with a
-    // different predicate, so the populate read strips `task.predicate` and
-    // decodes the whole projection where the reader's page index would have
+    // #4891: under the shipped policy, a task carrying a converted predicate
+    // reads FEWER pages than any reusable population of it can. Such an entry
+    // has to serve a query with a different predicate, so its populate read
+    // strips `task.predicate` and decodes the whole projection where the
+    // reader's page index would have
     // skipped most of it — measured 2.8x slower than the cache-disabled arm on
     // a `host = '<label>' LIMIT 100` browse, which then inserts nothing because
     // the clip drops the stream before end-of-stream (#4494, #4847). So a
@@ -4444,8 +5010,14 @@ async fn open_task_batch_stream_cached(
     // Only the POPULATE path is declined. The lookup above is unchanged, so an
     // entry a predicate-free scan left behind still serves this query, and
     // `filter_pushdown_with_file_cache` keeps DataFusion's residual filter
-    // whenever the cache is on, so both routes answer exactly.
-    if task.predicate.is_some() || raw_prune_spec.is_some() || !promoted_prune.is_empty() {
+    // whenever the cache is on, so both routes answer exactly. #4905's
+    // in-process qualification gate is the sole exception to the decline: it
+    // keeps the predicate in both the key and the read.
+    let predicate_population = cache_tuning.predicate_key_prototype && task.predicate.is_some();
+    if (task.predicate.is_some() && !predicate_population)
+        || raw_prune_spec.is_some()
+        || !promoted_prune.is_empty()
+    {
         metrics::counter!(
             "siglake_query_scan_file_cache_requests_total",
             "outcome" => "bypass"
@@ -4463,6 +5035,8 @@ async fn open_task_batch_stream_cached(
             raw_prune_spec,
             promoted_prune,
             reverse,
+            attribution,
+            None,
         );
     }
 
@@ -4482,6 +5056,7 @@ async fn open_task_batch_stream_cached(
                 scan_counters,
                 cache_counters,
                 reverse,
+                attribution,
             );
         }
     }
@@ -4494,7 +5069,14 @@ async fn open_task_batch_stream_cached(
     cache_counters
         .misses
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let cacheable = cacheable_task(&task);
+    let cacheable = if predicate_population {
+        // The predicate is part of `key`, so the entry is allowed to contain
+        // exactly the rows this reader produces. Insertion still happens only
+        // at EOF; a clipped prefix never becomes a complete entry.
+        task.clone()
+    } else {
+        cacheable_task(&task)
+    };
     Ok(Box::pin(CachePopulateStream {
         key,
         tuning: cache_tuning,
@@ -4507,6 +5089,8 @@ async fn open_task_batch_stream_cached(
             None,
             Vec::new(),
             reverse,
+            attribution,
+            None,
         )?,
         buffered: Vec::new(),
         buffered_bytes: 0,
@@ -4538,6 +5122,7 @@ fn row_group_task_stream(
     scan_counters: Arc<ScanCounters>,
     cache_counters: Arc<FileCacheCounters>,
     reverse: bool,
+    attribution: Arc<FileAttributionCollector>,
 ) -> DFResult<TaskBatchStream> {
     let populate =
         |inner: TaskBatchStream, keys: Vec<String>, group_rows: Vec<u64>| -> TaskBatchStream {
@@ -4557,6 +5142,7 @@ fn row_group_task_stream(
         };
     match plan {
         RowGroupPlan::Served(batches) => {
+            attribution.observe(&task, FileAttributionOutcome::CacheHit);
             metrics::counter!(
                 "siglake_query_scan_file_cache_requests_total",
                 "outcome" => "hit"
@@ -4575,6 +5161,8 @@ fn row_group_task_stream(
             keys,
             group_rows,
         } => {
+            attribution.observe(&task, FileAttributionOutcome::CacheHit);
+            let opened_identity = attribution.identity_for_task(&task);
             metrics::counter!(
                 "siglake_query_scan_file_cache_requests_total",
                 "outcome" => "miss"
@@ -4602,6 +5190,8 @@ fn row_group_task_stream(
                 None,
                 Vec::new(),
                 reverse,
+                attribution,
+                opened_identity,
             )?;
             Ok(
                 futures::stream::iter(served.into_iter().map(Ok::<_, DataFusionError>))
@@ -4627,6 +5217,8 @@ fn row_group_task_stream(
                 None,
                 Vec::new(),
                 reverse,
+                attribution,
+                None,
             )?;
             Ok(populate(inner, keys, group_rows))
         }
@@ -4653,13 +5245,8 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
         Ok(self)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
-    }
-
-    #[allow(deprecated)]
-    fn statistics(&self) -> DFResult<Statistics> {
-        self.partition_statistics(None)
     }
 
     fn execute(
@@ -4715,6 +5302,50 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
         let bytes_scanned = MetricBuilder::new(&metrics).counter("bytes_scanned", partition);
         let planned_rows_metric = MetricBuilder::new(&metrics).counter("planned_rows", partition);
         planned_rows_metric.add(planned_rows);
+
+        // #4959: keep this entirely inside the in-process qualification gate.
+        // Each retained task contributes three labelled counters; tasks beyond
+        // the cap share stage-specific omitted counters instead of retaining
+        // another path. Plan pruning has already happened, so `planned` is the
+        // exact task set this scan leaf received.
+        let file_attributions = file_cache_tuning.file_attribution_prototype.then(|| {
+            let planned_omitted = file_attribution_omitted_counter(&metrics, partition, "planned");
+            let candidate_omitted =
+                file_attribution_omitted_counter(&metrics, partition, "cache_candidate");
+            let reader_omitted =
+                file_attribution_omitted_counter(&metrics, partition, "reader_attempt");
+            tasks
+                .iter()
+                .enumerate()
+                .map(|(index, task)| {
+                    if index < FILE_ATTRIBUTION_PROTOTYPE_CAP {
+                        let planned =
+                            file_attribution_counter(&metrics, partition, task, "planned");
+                        planned.add(1);
+                        FileAttributionMetrics::Named {
+                            cache_candidate: file_attribution_counter(
+                                &metrics,
+                                partition,
+                                task,
+                                "cache_candidate",
+                            ),
+                            reader_attempt: file_attribution_counter(
+                                &metrics,
+                                partition,
+                                task,
+                                "reader_attempt",
+                            ),
+                        }
+                    } else {
+                        planned_omitted.add(1);
+                        FileAttributionMetrics::Omitted {
+                            cache_candidate: candidate_omitted.clone(),
+                            reader_attempt: reader_omitted.clone(),
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
 
         let partition_started = Instant::now();
         let reader_build_started = Instant::now();
@@ -4782,7 +5413,9 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                     .iter()
                     .map(|c| match c {
                         OrderedCluster::Run(n) | OrderedCluster::Sort(n) => *n,
-                        OrderedCluster::Merge(layers) => layers.iter().sum(),
+                        OrderedCluster::Merge(layers) => {
+                            layers.iter().map(|layer| layer.file_count).sum()
+                        }
                     })
                     .sum::<usize>(),
                 tasks.len(),
@@ -4794,7 +5427,9 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
             for cluster in &clusters {
                 let n: usize = match cluster {
                     OrderedCluster::Run(n) | OrderedCluster::Sort(n) => *n,
-                    OrderedCluster::Merge(layers) => layers.iter().sum(),
+                    OrderedCluster::Merge(layers) => {
+                        layers.iter().map(|layer| layer.file_count).sum()
+                    }
                 };
                 let tail = rest.split_off(n.min(rest.len()));
                 let mut cluster_tasks = std::mem::replace(&mut rest, tail);
@@ -4821,11 +5456,12 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                             reservation,
                         )?);
                     }
-                    OrderedCluster::Merge(layer_sizes) => {
-                        let mut layers: Vec<SendableRecordBatchStream> =
-                            Vec::with_capacity(layer_sizes.len());
-                        for &ls in layer_sizes {
-                            let tail = cluster_tasks.split_off(ls.min(cluster_tasks.len()));
+                    OrderedCluster::Merge(layer_plans) => {
+                        let mut layers: Vec<OrderedMergeInput> =
+                            Vec::with_capacity(layer_plans.len());
+                        for layer_plan in layer_plans {
+                            let tail = cluster_tasks
+                                .split_off(layer_plan.file_count.min(cluster_tasks.len()));
                             let layer = std::mem::replace(&mut cluster_tasks, tail);
                             let chained = self.sequential_task_chain(
                                 layer,
@@ -4833,10 +5469,13 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                                 fetched_byte_counter.clone(),
                                 scan_counters.clone(),
                             )?;
-                            layers.push(Box::pin(RecordBatchStreamAdapter::new(
-                                schema.clone(),
-                                chained,
-                            )));
+                            layers.push(OrderedMergeInput {
+                                stream: Box::pin(RecordBatchStreamAdapter::new(
+                                    schema.clone(),
+                                    chained,
+                                )),
+                                frontier_bound: Some(layer_plan.frontier_bound),
+                            });
                         }
                         segments.push(self.merge_record_streams(
                             layers,
@@ -4863,32 +5502,42 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
             let counter = fetched_byte_counter.clone();
             let task_scan_counters = scan_counters.clone();
             let task_cache_counters = file_cache_counters.clone();
+            let task_attribution = self.file_attribution.clone();
             let raw_prune_spec = raw_prune_spec.clone();
             let promoted_prune = self.promoted_prune.clone();
-            let task_futures = futures::stream::iter(tasks.into_iter().map(move |task| {
-                let file_io = file_io.clone();
-                let counter = counter.clone();
-                let task_scan_counters = task_scan_counters.clone();
-                let task_cache_counters = task_cache_counters.clone();
-                let raw_prune_spec = raw_prune_spec.clone();
-                let promoted_prune = promoted_prune.clone();
-                async move {
-                    open_task_batch_stream_cached(
-                        file_io,
-                        task,
-                        reader_tuning,
-                        file_cache_tuning,
-                        counter,
-                        task_scan_counters,
-                        task_cache_counters,
-                        raw_prune_spec,
-                        promoted_prune,
-                        reverse_scan,
-                    )
-                    .await
-                }
-                .boxed()
-            }));
+            let task_futures = futures::stream::iter(tasks.into_iter().enumerate().map(
+                move |(task_index, task)| {
+                    let file_io = file_io.clone();
+                    let counter = counter.clone();
+                    let task_scan_counters = task_scan_counters.clone();
+                    let task_cache_counters = task_cache_counters.clone();
+                    let attribution = task_attribution.clone();
+                    let raw_prune_spec = raw_prune_spec.clone();
+                    let promoted_prune = promoted_prune.clone();
+                    let file_attribution = file_attributions
+                        .as_ref()
+                        .and_then(|entries| entries.get(task_index))
+                        .cloned();
+                    async move {
+                        open_task_batch_stream_cached(
+                            file_io,
+                            task,
+                            reader_tuning,
+                            file_cache_tuning,
+                            counter,
+                            task_scan_counters,
+                            task_cache_counters,
+                            attribution,
+                            raw_prune_spec,
+                            promoted_prune,
+                            reverse_scan,
+                            file_attribution,
+                        )
+                        .await
+                    }
+                    .boxed()
+                },
+            ));
             // WS-3: an order-advertising scan must emit batches in task order
             // (the tasks form a time-ascending disjoint run). Non-front files
             // may prefetch ahead, but their buffered batches are byte-budgeted
@@ -4911,19 +5560,22 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                     .boxed()
             }
         } else {
+            let file_attribution = self.file_attribution.clone();
             let task_stream: FileScanTaskStream =
                 futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
             // We own the read path (vendored iceberg), so the reader reports
             // actual fetched bytes through the per-scan counter below.
-            let mut reader = ArrowReaderBuilder::new(file_io)
+            let mut reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current())
                 .with_data_file_concurrency_limit(execute_file_concurrency_limit)
                 // Page-index row selection (see the single-task reader above):
                 // composes with the raw-bloom + predicate row-group filtering —
                 // those narrow row groups first, then the page index prunes rows
                 // within the survivors.
                 .with_row_selection_enabled(true)
-                .with_byte_counter(fetched_byte_counter.clone())
                 .with_scan_counters(Some(scan_counters.clone()))
+                .with_file_opened_observer(Some(Arc::new(move |task| {
+                    file_attribution.observe(task, FileAttributionOutcome::ReaderOpened);
+                })))
                 .with_raw_prune_spec(raw_prune_spec.clone())
                 .with_promoted_prune(self.promoted_prune.clone())
                 // WS-3: an order-advertising scan's tasks form a time-ascending
@@ -4951,6 +5603,7 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                 .build()
                 .read(task_stream)
                 .map_err(|e| DataFusionError::External(e.into()))?
+                .stream()
                 .map(|result| result.map_err(|e| DataFusionError::External(e.into())))
                 .boxed()
         };
@@ -5220,13 +5873,15 @@ fn filter_pushdown_with_file_cache(
     kind: TableProviderFilterPushDown,
     file_cache_enabled: bool,
 ) -> TableProviderFilterPushDown {
-    // Cache entries are whole-file decoded batches read under no predicate, so
-    // an entry populated by one query is returned unfiltered to the next one,
-    // whatever it asked for. Keep DataFusion's residual FilterExec whenever that
-    // path is enabled; otherwise an Exact declaration would let a hit expose
-    // rows that the SQL predicate rejects. This holds after #4891: a predicate
-    // task now bypasses the cache on a miss, but it can still HIT an entry a
-    // predicate-free scan left behind.
+    // Shipped cache entries are whole-file decoded batches read under no
+    // predicate, so an entry populated by one query is returned unfiltered to
+    // the next one, whatever it asked for. Keep DataFusion's residual FilterExec
+    // whenever that path is enabled; otherwise an Exact declaration would let a
+    // hit expose rows that the SQL predicate rejects. This holds after #4891: a
+    // predicate task now bypasses the cache on a miss, but it can still HIT an
+    // entry a predicate-free scan left behind. It also remains mandatory for
+    // #4905's in-process predicate-key prototype because planning cannot know
+    // whether execution will find that key or use the predicate-free fallback.
     if file_cache_enabled && kind == TableProviderFilterPushDown::Exact {
         TableProviderFilterPushDown::Inexact
     } else {
@@ -5895,6 +6550,8 @@ fn effective_file_cache_tuning(tuning: crate::QueryScanTuning) -> EffectiveFileC
         max_bytes: tuning.file_cache_max_bytes.filter(|n| *n > 0),
         max_entries: tuning.file_cache_max_entries.filter(|n| *n > 0),
         row_group_prototype: tuning.file_cache_row_group_prototype,
+        predicate_key_prototype: tuning.file_cache_predicate_key_prototype,
+        file_attribution_prototype: tuning.file_attribution_prototype,
     }
 }
 
@@ -5974,7 +6631,7 @@ fn reserve_decode_budget(
     if decoded_per_file == 0 || desired_concurrency == 0 {
         return (desired_concurrency.max(1), None);
     }
-    let mut reservation = MemoryConsumer::new("siglake-scan-decode").register(pool);
+    let reservation = MemoryConsumer::new("siglake-scan-decode").register(pool);
     let mut concurrency = desired_concurrency.max(1);
     loop {
         let want = (concurrency as u64).saturating_mul(decoded_per_file);
@@ -6604,6 +7261,17 @@ mod tests {
             .sum()
     }
 
+    #[test]
+    fn frontier_pruning_keeps_equal_and_missing_bounds() {
+        assert!(bound_is_strictly_behind(100, Some(99), true));
+        assert!(!bound_is_strictly_behind(100, Some(100), true));
+        assert!(!bound_is_strictly_behind(100, None, true));
+
+        assert!(bound_is_strictly_behind(100, Some(101), false));
+        assert!(!bound_is_strictly_behind(100, Some(100), false));
+        assert!(!bound_is_strictly_behind(100, None, false));
+    }
+
     /// The decline is a three-input decision and the scan that consumes it
     /// needs a warehouse, a text corpus and a plan to reach. Driving the
     /// resolver directly is what makes each arm — including the two that must
@@ -6779,6 +7447,42 @@ mod tests {
             equality_ids: Some(vec![9, 11]),
         });
         assert_ne!(task_cache_key(&left), task_cache_key(&right));
+    }
+
+    #[test]
+    fn predicate_cache_key_keeps_predicate_and_existing_identity() {
+        let mut left = task("a", 100);
+        let mut right = task("a", 100);
+        left.project_field_ids = vec![1, 2];
+        right.project_field_ids = vec![1, 2];
+        left.predicate = Some(
+            Predicate::AlwaysTrue
+                .bind(left.schema.clone(), true)
+                .unwrap(),
+        );
+        right.predicate = Some(
+            Predicate::AlwaysFalse
+                .bind(right.schema.clone(), true)
+                .unwrap(),
+        );
+        assert_ne!(
+            task_cache_key_with_predicate_direction(&left, false),
+            task_cache_key_with_predicate_direction(&right, false),
+            "predicate literals/operators are part of the prototype key"
+        );
+        assert_ne!(
+            task_cache_key_with_predicate_direction(&left, false),
+            task_cache_key_with_predicate_direction(&left, true),
+            "direction remains part of the prototype key"
+        );
+
+        right.predicate = left.predicate.clone();
+        right.start += 1;
+        assert_ne!(
+            task_cache_key_with_predicate_direction(&left, false),
+            task_cache_key_with_predicate_direction(&right, false),
+            "the existing byte range remains part of the prototype key"
+        );
     }
 
     #[test]
@@ -7094,6 +7798,8 @@ mod tests {
             max_bytes: Some(batch_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)),
             max_entries: Some(1),
             row_group_prototype: false,
+            predicate_key_prototype: false,
+            file_attribution_prototype: false,
         };
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -7148,6 +7854,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cache_population_prices_a_slice_by_its_retained_backing_allocation() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("value", DataType::Int32, false),
+        ]));
+        let owner = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(
+                datafusion::arrow::array::Int32Array::from_iter_values(0..16_384_i32),
+            )],
+        )
+        .unwrap();
+        let slice = owner.slice(8_192, 1);
+        let extent_bytes = batch_extent_bytes(&slice);
+        let retained_bytes = batch_retained_bytes(&slice);
+        let priced_bytes = slice.get_array_memory_size() as u64;
+        drop(owner);
+
+        assert_eq!(
+            slice
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap()
+                .value(0),
+            8_192,
+            "the slice remains backed after its unsliced owner is dropped"
+        );
+        assert!(
+            retained_bytes > extent_bytes,
+            "fixture must retain more than its compact slice extent: \
+             retained={retained_bytes}, extent={extent_bytes}"
+        );
+        assert!(
+            priced_bytes >= retained_bytes,
+            "the admission price must cover the retained Arrow allocation: \
+             priced={priced_bytes}, retained={retained_bytes}"
+        );
+
+        let stream = |key: &str, tuning| CachePopulateStream {
+            key: key.to_string(),
+            tuning,
+            inner: futures::stream::iter([Ok::<_, DataFusionError>(slice.clone())]).boxed(),
+            buffered: Vec::new(),
+            buffered_bytes: 0,
+            oversized: false,
+            insert_done: false,
+            charge: PopulationCharge::open(),
+            yielded_rows: 0,
+            end: PopulateEnd::Unpolled,
+            cache_counters: Arc::new(FileCacheCounters::default()),
+        };
+
+        futures::executor::block_on(async {
+            let extent_limit = EffectiveFileCacheTuning {
+                // The compact slice extent fits exactly, while the allocation the
+                // cached clone retains does not.
+                max_bytes: Some(extent_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)),
+                max_entries: Some(1),
+                row_group_prototype: false,
+                predicate_key_prototype: false,
+                file_attribution_prototype: false,
+            };
+            let mut refused = stream("sliced-refused", extent_limit);
+            assert!(refused.next().await.unwrap().is_ok());
+            assert!(refused.oversized);
+            assert!(refused.buffered.is_empty());
+            drop(refused);
+
+            let retained_limit = EffectiveFileCacheTuning {
+                max_bytes: Some(priced_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)),
+                max_entries: Some(1),
+                row_group_prototype: false,
+                predicate_key_prototype: false,
+                file_attribution_prototype: false,
+            };
+            let mut admitted = stream("sliced-admitted", retained_limit);
+            assert!(admitted.next().await.unwrap().is_ok());
+            assert_eq!(admitted.buffered_bytes, priced_bytes);
+
+            let mut cache = QueryFileBatchCache::default();
+            admitted.insert_buffered(&mut cache);
+            admitted.insert_done = true;
+            assert_eq!(cache.get("sliced-admitted").unwrap().bytes, priced_bytes);
+        });
+    }
+
     /// #4846's counter and the three ways a population finishes without one.
     /// One test because all four arms read the same counter and the
     /// already-populated arm needs the process-wide cache, which parallel
@@ -7160,12 +7953,16 @@ mod tests {
             max_bytes: Some(batch_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION * 8)),
             max_entries: Some(8),
             row_group_prototype: false,
+            predicate_key_prototype: false,
+            file_attribution_prototype: false,
         };
         // One batch fits; the second crosses the quarter-budget entry bound.
         let tight = EffectiveFileCacheTuning {
             max_bytes: Some(batch_bytes.saturating_mul(MAX_FILE_CACHE_ENTRY_FRACTION)),
             max_entries: Some(8),
             row_group_prototype: false,
+            predicate_key_prototype: false,
+            file_attribution_prototype: false,
         };
         let source = |batches: usize| -> TaskBatchStream {
             futures::stream::iter(
@@ -7900,7 +8697,7 @@ mod decode_budget_pool_tests {
     #[test]
     fn a_full_pool_degrades_to_one_file_rather_than_failing() {
         let p = pool(256 * 1024 * 1024);
-        let mut hog = MemoryConsumer::new("hog").register(&p);
+        let hog = MemoryConsumer::new("hog").register(&p);
         hog.try_grow(250 * 1024 * 1024).unwrap();
 
         let (concurrency, reservation) = reserve_decode_budget(&p, 16, PER_FILE);

@@ -140,7 +140,11 @@ async fn a_typed_column_keeps_its_group_count_footer_through_a_merge() {
     ice.create_index(&config).await.unwrap();
     let ident = ice.index_table_ident(&config.index_id);
 
-    let base = Utc::now().timestamp_micros();
+    // Pinned: the three appends are merged as one bin, and `recluster_files_with`
+    // takes one `day(timestamp)` partition per call. On `Utc::now()` the two
+    // seconds this fixture spans crossed a UTC midnight once a day and the merge
+    // came back an error (#5678).
+    let base = crate::fixture_clock::fixture_base().timestamp_micros();
     for b in 0..3i64 {
         ice.append_to_table(
             &ident,
@@ -154,6 +158,10 @@ async fn a_typed_column_keeps_its_group_count_footer_through_a_merge() {
     // Ingest side: the typed column must reach the footer, alongside the text one.
     let pre = ice.live_data_files(&ident).await.unwrap();
     assert!(pre.len() >= 2, "need >=2 files to merge, got {}", pre.len());
+    crate::fixture_clock::assert_one_partition(
+        &pre,
+        "a_typed_column_keeps_its_group_count_footer_through_a_merge",
+    );
     for f in &pre {
         let cols = footer_group_count_columns(f.file_path());
         assert!(

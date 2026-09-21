@@ -42,6 +42,16 @@ shared queue reported by every claim worker and a per-tenant local count under
 the filesystem drain, and one expression has to chart both without multiplying
 the backlog by the replica count (#3692).
 
+It evaluates the decoded-file cache's contended-insert fraction per query pod,
+including missing outcome arms and the explicit zero used for an idle pod, so a
+PromQL edit cannot silently turn the diagnostic into a fleet-wide rate or NaN
+(#3086).
+
+It evaluates the four index-build panels too. In particular, the summary
+quantiles stay as one sample per compactor — percentiles cannot be averaged —
+while the rebuild counters add the same table across compactors and retain a
+separate line for every other table (#5231).
+
 It also holds the README to the PrometheusRule: the "No built-in UI" bullet
 states how many alerts the rule ships, and that number is counted from the
 template source here so it cannot drift as alerts are added.
@@ -72,6 +82,16 @@ than a hardcoded window, that at 0 the rule is not rendered, and that both arms
 survive: a bounded page counter and the durable rotation-generation gauge.
 Either arm alone is not a stall — pages running is normal, and no rotation
 completing is also what a deliberately disabled reconciliation looks like.
+
+The compactor's WAL volume is held to its drain mode, and the migration
+guidance to both: a container running `--catalog-claim` must have an
+`emptyDir` there and the filesystem drain a `persistentVolumeClaim`, while the
+ingester keeps the claim in both modes. That volume is why a held orphan does
+not survive the switch — the claim-mode pod cannot census the directory it sat
+in and publishes no `siglake_compactor_orphans_held` — so the chart README and
+`docs/LIMITATIONS.md` have to keep carrying the inventory step, and the
+operator's `DrainModeHandoverRequired` has to keep existing for them to name
+(#5150).
 
 Finally, every Helm hook Job must carry the object-store credentials used by
 any Deployment or StatefulSet in the same render. Hook Jobs run before the new
@@ -153,8 +173,13 @@ CHART_DIR = pathlib.Path("deploy/helm/siglake")
 # decide it separately, and the note's copy did not look at `query.oidc`.
 NOTES_TEMPLATE = CHART_DIR / "templates/NOTES.txt"
 QUERY_STS_TEMPLATE = CHART_DIR / "templates/statefulset-query-server.yaml"
+INGEST_DEPLOYMENT_TEMPLATE = CHART_DIR / "templates/deployment-ingester.yaml"
+HELPERS_TEMPLATE = CHART_DIR / "templates/_helpers.tpl"
 QUERY_AUTH_HELPER = 'include "siglake.queryAuthOn"'
+INGEST_AUTH_HELPER = 'include "siglake.ingestAuthOn"'
+INGEST_TOKENS_HELPER = 'include "siglake.ingestTokensSecret"'
 OPEN_QUERY_WARNING = "the query API is running open"
+OPEN_INGEST_WARNING = "the ingest API is running open"
 # The ConfigMap notes_probe_chart() renders the notes into, since a render
 # cannot show them any other way.
 NOTES_PROBE_NAME = "siglake-notes-probe"
@@ -216,6 +241,28 @@ DEFAULT_FILE_CACHE_ENV = {
 INGEST_CONTAINER = "ingester"
 COMPACTOR_CONTAINER = "compactor"
 INDEX_REBUILD_ENV = "SIGLAKE_INDEX_REBUILD"
+# The claim-mode WAL volume and the migration guidance written around it
+# (#5150). A compactor running `--catalog-claim` gets an `emptyDir` so the
+# replicas are not pinned to the (possibly RWO) WAL claim's node, which means
+# it cannot see a held orphan the filesystem drain left under `<wal>/orphans/`
+# on that claim — and publishes no `siglake_compactor_orphans_held` to say so.
+# The docs below are the whole mitigation, so they are held to the render.
+CLAIM_ARG = "--catalog-claim"
+WAL_VOLUME = "wal"
+CHART_README = pathlib.Path("deploy/helm/siglake/README.md")
+LIMITATIONS = pathlib.Path("docs/LIMITATIONS.md")
+COMPACTOR_TEMPLATE = pathlib.Path(
+    "deploy/helm/siglake/templates/deployment-compactor.yaml"
+)
+# Where the operator refuses the same handover. The docs send an operator to
+# this reason string; a rename must fail here rather than leave them looking
+# for a condition nothing reports.
+RECONCILER = pathlib.Path("crates/siglake-operator/src/reconciler.rs")
+HANDOVER_REASON = "DrainModeHandoverRequired"
+ORPHAN_MIGRATION_HEADING = (
+    "### Switching an existing filesystem-drain release to the claim"
+)
+ORPHANS_HELD_GAUGE = "siglake_compactor_orphans_held"
 WAL_MIRROR_ENV = "SIGLAKE_WAL_MIRROR_PREFIX"
 DEFAULT_WAL_MIRROR_PREFIX = "wal-mirror"
 # #4273: the token allow-list, and the three values that can name its Secret.
@@ -344,7 +391,9 @@ def render_notes(chart: str, extra: list[str]) -> str:
     return ""
 
 
-def check_notes_open_warning(notes: str, expected: bool) -> list[str]:
+def check_notes_open_warning(
+    notes: str, expected: bool, warning: str, tier: str
+) -> list[str]:
     """Hold the install notes' open-API warning to what the tier enforces.
 
     #4317: the warning names the authentication the operator is missing, so it
@@ -354,26 +403,31 @@ def check_notes_open_warning(notes: str, expected: bool) -> list[str]:
     """
     if not notes.strip():
         return ["the render carried no NOTES.txt text at all"]
-    warned = OPEN_QUERY_WARNING in notes
+    warned = warning in notes
     if warned == expected:
         return []
     if expected:
         return [
-            "this install authenticates nothing on the query tier, and the notes "
-            f"do not say so: no {OPEN_QUERY_WARNING!r} warning in {notes.strip()!r}"
+            f"this install authenticates nothing on the {tier} tier, and the notes "
+            f"do not say so: no {warning!r} warning in {notes.strip()!r}"
         ]
-    line = next(line for line in notes.splitlines() if OPEN_QUERY_WARNING in line)
+    line = next(line for line in notes.splitlines() if warning in line)
     return [
-        "the notes call the query API open on an install that authenticates its "
+        f"the notes call the {tier} API open on an install that authenticates its "
         f"callers: {line.strip()!r}"
     ]
 
 
 def check_notes_auth_predicate(
+    tier: str,
+    warning: str,
+    auth_helper: str,
+    workload_path: pathlib.Path,
+    workload_helper: str | None = None,
     notes_path: pathlib.Path = NOTES_TEMPLATE,
-    sts_path: pathlib.Path = QUERY_STS_TEMPLATE,
+    helpers_path: pathlib.Path = HELPERS_TEMPLATE,
 ) -> list[str]:
-    """The note and the query pods must read ONE authentication predicate.
+    """The note and a tier's pods must share their authentication predicate.
 
     The render arms prove what a given install prints. This proves the two
     templates cannot start answering the question separately again — which is
@@ -383,27 +437,40 @@ def check_notes_auth_predicate(
     """
     problems = []
     lines = notes_path.read_text().splitlines()
-    if QUERY_AUTH_HELPER not in sts_path.read_text():
+    pod_helper = workload_helper or auth_helper
+    if pod_helper not in workload_path.read_text():
         problems.append(
-            f"{sts_path} no longer decides query authentication through "
-            f"`{QUERY_AUTH_HELPER}`, so {notes_path} can describe an install the "
+            f"{workload_path} no longer decides {tier} authentication through "
+            f"`{pod_helper}`, so {notes_path} can describe an install the "
             "pods do not run"
         )
-    warnings = [i for i, line in enumerate(lines) if OPEN_QUERY_WARNING in line]
+    if workload_helper is not None:
+        helpers = helpers_path.read_text()
+        helper_name = auth_helper.removeprefix('include "').removesuffix('"')
+        definition = f'{{{{- define "{helper_name}" -}}}}'
+        start = helpers.find(definition)
+        following_definition = helpers.find("{{- define ", start + len(definition))
+        body = helpers[start:following_definition if following_definition >= 0 else None]
+        if start < 0 or workload_helper not in body:
+            problems.append(
+                f"{helpers_path} no longer makes `{auth_helper}` read the same "
+                f"`{workload_helper}` {workload_path} uses"
+            )
+    warnings = [i for i, line in enumerate(lines) if warning in line]
     if not warnings:
         problems.append(
-            f"{notes_path} prints no {OPEN_QUERY_WARNING!r} warning: an install "
-            "with no query authentication would say nothing about it"
+            f"{notes_path} prints no {warning!r} warning: an install "
+            f"with no {tier} authentication would say nothing about it"
         )
     for index in warnings:
         guard = next(
             (lines[i] for i in range(index, -1, -1) if "{{- if" in lines[i]), None
         )
-        if guard is None or QUERY_AUTH_HELPER not in guard:
+        if guard is None or auth_helper not in guard:
             problems.append(
-                f"{notes_path}:{index + 1} warns that the query API is open under "
+                f"{notes_path}:{index + 1} warns that the {tier} API is open under "
                 f"`{guard.strip() if guard else 'no condition'}`, not under "
-                f"`{QUERY_AUTH_HELPER}`"
+                f"`{auth_helper}`"
             )
     return problems
 
@@ -918,6 +985,7 @@ def check(
     problems.extend(check_otlp_grpc(docs, expected_otlp_grpc_port))
     problems.extend(check_jobs_store(docs, persistent_jobs))
     problems.extend(check_compactor_index_rebuild(docs, expected_index_rebuild))
+    problems.extend(check_claim_mode_wal_volume(docs))
 
     return problems
 
@@ -951,6 +1019,68 @@ def check_compactor_index_rebuild(docs: list[dict], expected: str) -> list[str]:
             f"{INDEX_REBUILD_ENV}={values[-1]!r}; expected {expected!r}"
         ]
     return []
+
+
+def wal_volume(doc: dict) -> dict | None:
+    """The pod spec's `wal` volume, or None when it declares no such volume."""
+    for volume in doc["spec"]["template"]["spec"].get("volumes") or []:
+        if volume.get("name") == WAL_VOLUME:
+            return volume
+    return None
+
+
+def check_claim_mode_wal_volume(docs: list[dict]) -> list[str]:
+    """Hold the migration guidance to the volumes the render actually gives out.
+
+    Two facts carry the guidance in `deploy/helm/siglake/README.md` and
+    `docs/LIMITATIONS.md`: a claim-mode compactor has an `emptyDir` where the
+    WAL claim used to be, so neither it nor any check inside it can census the
+    orphans the filesystem drain held there; and the ingester keeps the claim
+    mounted in both modes, which is what makes the directory reachable after
+    the switch. Each is read off the compactor's own `--catalog-claim` arg, so
+    this passes or fails per render arm rather than on a parameter.
+    """
+    problems: list[str] = []
+    for doc in docs:
+        if doc.get("kind") != "Deployment":
+            continue
+        containers = doc["spec"]["template"]["spec"].get("containers", [])
+        names = {c.get("name") for c in containers}
+        if COMPACTOR_CONTAINER in names:
+            claimed = any(
+                CLAIM_ARG in (c.get("args") or [])
+                for c in containers
+                if c.get("name") == COMPACTOR_CONTAINER
+            )
+            volume = wal_volume(doc)
+            if volume is None:
+                problems.append(
+                    f"Deployment/{doc['metadata']['name']} declares no '{WAL_VOLUME}' "
+                    f"volume; both modes mount one"
+                )
+            elif claimed and "emptyDir" not in volume:
+                problems.append(
+                    f"Deployment/{doc['metadata']['name']} runs {CLAIM_ARG} with a "
+                    f"'{WAL_VOLUME}' volume that is not an emptyDir ({sorted(volume)}); "
+                    f"the migration guidance in {CHART_README} and {LIMITATIONS} says a "
+                    f"claim-mode compactor cannot reach the old WAL claim's orphans/"
+                )
+            elif not claimed and "persistentVolumeClaim" not in volume:
+                problems.append(
+                    f"Deployment/{doc['metadata']['name']} runs the filesystem drain "
+                    f"with a '{WAL_VOLUME}' volume that is not a persistentVolumeClaim "
+                    f"({sorted(volume)}); that drain reads sealed/, processing/ and "
+                    f"orphans/ off the claim"
+                )
+        if INGEST_CONTAINER in names:
+            volume = wal_volume(doc)
+            if volume is None or "persistentVolumeClaim" not in volume:
+                problems.append(
+                    f"Deployment/{doc['metadata']['name']} does not mount the WAL "
+                    f"persistentVolumeClaim; {CHART_README} tells an operator to "
+                    f"inventory the held orphans from an ingester pod after the switch"
+                )
+    return problems
 
 
 def promql_exprs(doc: dict) -> list[tuple[str, str]]:
@@ -1487,6 +1617,28 @@ def check_oidc_env(docs: list[dict], expected: dict[str, dict[str, str]]) -> lis
     return problems
 
 
+def check_query_allowed_tenants_env(
+    docs: list[dict], expected: str | None
+) -> list[str]:
+    """The query allow-list reaches query pods only on the configured arm."""
+    value = None
+    for doc in docs:
+        if doc.get("kind") != "StatefulSet":
+            continue
+        for container in doc["spec"]["template"]["spec"].get("containers", []):
+            if container.get("name") != QUERY_CONTAINER:
+                continue
+            for env in container.get("env") or []:
+                if env.get("name") == "SIGLAKE_QUERY_ALLOWED_TENANTS":
+                    value = env.get("value")
+    if value != expected:
+        return [
+            "query container renders SIGLAKE_QUERY_ALLOWED_TENANTS "
+            f"as {value!r}; expected {expected!r}"
+        ]
+    return []
+
+
 def check_query_peer_discovery(docs: list[dict]) -> list[str]:
     """#967: hold the four halves of runtime peer discovery together.
 
@@ -2018,15 +2170,25 @@ def check_dashboard(path: pathlib.Path, exported: "Exported") -> list[str]:
 OVERVIEW_DASHBOARD = DASHBOARD_DIR / "siglake-overview.json"
 # #3969's text-index families and the dimension each panel must GROUP BY rather
 # than match on: the stage of a per-file index load, the parsed-index cache's
-# lookup outcome, and which bound dropped an entry. The vocabularies are the
-# reader's, exported from the Iceberg fork
+# lookup outcome, and which bound dropped an entry. #4718 adds the blob cache's
+# two labelled families on the same terms. The vocabularies are the reader's,
+# exported from the Iceberg fork
 # (`TEXT_INDEX_STARTUP_STAGES`, `PARSED_INDEX_CACHE_OUTCOMES`,
-# `PARSED_INDEX_CACHE_DROP_REASONS`) and held to these panels by
-# `text_index_startup_series_are_preregistered` in siglake-storage.
+# `PARSED_INDEX_CACHE_DROP_REASONS`, `PUFFIN_BLOB_CACHE_OUTCOMES`,
+# `PUFFIN_BLOB_CACHE_DROP_REASONS`) and held to these panels by
+# `text_index_startup_series_are_preregistered` and
+# `puffin_blob_cache_series_are_preregistered` in siglake-storage.
 TEXT_INDEX_GROUPINGS = {
     "siglake_iceberg_text_index_startup_seconds": "stage",
+    "siglake_index_footer_checksum_refused_total": "reason",
     "siglake_iceberg_parsed_index_cache_lookups_total": "outcome",
     "siglake_iceberg_parsed_index_cache_evictions_total": "reason",
+    "siglake_iceberg_puffin_blob_cache_lookups_total": "outcome",
+    "siglake_iceberg_puffin_blob_cache_evictions_total": "reason",
+    # #5231's seg2 writer on the same terms: the panel exists to say WHY a
+    # sidecar was refused, and a fourth refusal reason added to the writer has
+    # to reach it without anyone editing the dashboard.
+    "siglake_iceberg_segmented_index_writes_total": "reason",
 }
 # "Text-index startup by stage (p50 / p99)".
 TEXT_INDEX_STARTUP_PANEL = 159
@@ -2044,6 +2206,32 @@ TEXT_INDEX_STARTUP_SERIES = {
 TEXT_INDEX_STARTUP_EXPECTED = {
     "0.50": {"decode": 0.05 + (0.5 - 0.05) * 0.5, "permit_wait": 0.0025 * 0.5},
     "0.99": {"decode": 0.05 + (0.5 - 0.05) * 0.99, "permit_wait": 0.0025 * 0.99},
+}
+# The decoded-file cache's contended-insert fraction, kept separate from panel
+# 162's raw outcome rates because the units differ.
+FILE_CACHE_CONTENTION_PANEL = 172
+FILE_CACHE_REQUESTS_METRIC = "siglake_query_scan_file_cache_requests_total"
+# #5231's four index-build panels. Every target is named so moving or deleting
+# one fails instead of leaving its promtool check evaluating a smaller set.
+INDEX_BUILD_PANELS = (167, 168, 169, 170)
+INDEX_BUILD_TARGETS = {
+    (167, "A"): "siglake_iceberg_segmented_index_writes_total",
+    (168, "A"): "siglake_iceberg_segmented_index_written_bytes",
+    (168, "B"): "siglake_iceberg_segmented_index_written_bytes",
+    (168, "C"): "siglake_iceberg_segmented_index_group_index_bytes",
+    (168, "D"): "siglake_iceberg_segmented_index_group_index_bytes",
+    (169, "A"): "siglake_index_rebuild_files_total",
+    (169, "B"): "siglake_index_rebuild_bytes_total",
+    (170, "A"): "siglake_index_rebuild_seconds_bucket",
+    (170, "B"): "siglake_index_rebuild_seconds_bucket",
+}
+INDEX_BUILD_QUANTILES = {
+    (168, "A"): "0.5",
+    (168, "B"): "0.99",
+    (168, "C"): "0.5",
+    (168, "D"): "0.99",
+    (170, "A"): "0.50",
+    (170, "B"): "0.99",
 }
 # "Drain backlog (segments + bytes)" and the "Oldest unclaimed segment age"
 # panel an operator is told to read beside it, as `metric -> (panel, reduction)`.
@@ -2105,6 +2293,114 @@ DRAIN_BACKLOG_SERIES = {
         ],
     },
 }
+
+
+def file_cache_contention_expr(dashboard: dict) -> str | None:
+    """Panel 172's one shipped expression, or None if its shape changed."""
+    for panel in dashboard_panels(dashboard):
+        if panel.get("id") != FILE_CACHE_CONTENTION_PANEL:
+            continue
+        targets = panel.get("targets") or []
+        if len(targets) != 1 or targets[0].get("refId") != "A":
+            return None
+        expr = targets[0].get("expr")
+        return expr if isinstance(expr, str) else None
+    return None
+
+
+def file_cache_contention_fixture(expr: str) -> str:
+    """A promtool fixture for the contended-insert fraction per query pod.
+
+    query-0 has both outcomes and a known 25% fraction. query-1 lacks the skip
+    outcome and must still read 0%; query-2 lacks insert and must read 100%.
+    query-idle has both pre-registered series at zero and must take the panel's
+    explicit zero fallback instead of producing NaN.
+    """
+    series = (
+        ("query-0", "insert", "0+3x6"),
+        ("query-0", "insert_skipped_contended", "0+1x6"),
+        ("query-1", "insert", "0+2x6"),
+        ("query-2", "insert_skipped_contended", "0+2x6"),
+        ("query-idle", "insert", "0x7"),
+        ("query-idle", "insert_skipped_contended", "0x7"),
+    )
+    out = (
+        "evaluation_interval: 1m\n"
+        "fuzzy_compare: true\n"
+        "tests:\n"
+        "  - name: decoded-file cache contention per query pod\n"
+        "    interval: 1m\n"
+        "    input_series:\n"
+    )
+    for pod, outcome, values in series:
+        out += (
+            f"      - series: '{FILE_CACHE_REQUESTS_METRIC}{{namespace=\"logs\","
+            f'app_kubernetes_io_component="query",pod="{pod}",'
+            f'outcome="{outcome}"}}\'\n'
+            f"        values: '{values}'\n"
+        )
+    out += "    promql_expr_test:\n"
+    out += f"      - expr: '{expr.replace('$namespace', '.*')}'\n"
+    out += "        eval_time: 6m\n        exp_samples:\n"
+    for pod, value in (
+        ("query-0", "0.25"),
+        ("query-1", "0"),
+        ("query-2", "1"),
+        ("query-idle", "0"),
+    ):
+        out += (
+            f"          - labels: '{{namespace=\"logs\",pod=\"{pod}\"}}'\n"
+            f"            value: {value}\n"
+        )
+    return out
+
+
+def check_file_cache_contention_panel(
+    require_promtool: bool = False,
+) -> tuple[list[str], bool]:
+    """Evaluate panel 172's shipped fraction with Prometheus' own engine."""
+    try:
+        dashboard = json.loads(OVERVIEW_DASHBOARD.read_text())
+    except (OSError, ValueError) as e:
+        return [f"{OVERVIEW_DASHBOARD}: not readable as JSON ({e})"], False
+    expr = file_cache_contention_expr(dashboard)
+    if expr is None or FILE_CACHE_REQUESTS_METRIC not in expr:
+        return [
+            f"{OVERVIEW_DASHBOARD}: panel {FILE_CACHE_CONTENTION_PANEL} no longer "
+            f"has one target A reading {FILE_CACHE_REQUESTS_METRIC}; re-point "
+            "FILE_CACHE_CONTENTION_PANEL rather than leaving this check partial"
+        ], False
+    if "'" in expr:
+        return [
+            f"{OVERVIEW_DASHBOARD}: panel {FILE_CACHE_CONTENTION_PANEL} expression "
+            "needs YAML escaping"
+        ], False
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = pathlib.Path(tmp_dir)
+        name = "file-cache-contention.test.yaml"
+        (tmp_path / name).write_text(file_cache_contention_fixture(expr))
+        try:
+            subprocess.run(
+                ["promtool", "test", "rules", name],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=tmp_path,
+            )
+        except FileNotFoundError:
+            problem = (
+                "promtool not installed; the decoded-file cache contention panel "
+                "expression was not evaluated"
+            )
+            return ([problem] if require_promtool else []), True
+        except subprocess.CalledProcessError as e:
+            output = "\n".join(s for s in (e.stdout.strip(), e.stderr.strip()) if s)
+            return [
+                f"{OVERVIEW_DASHBOARD}: panel {FILE_CACHE_CONTENTION_PANEL} does "
+                "not read the contended-insert fraction per query pod:"
+                + (f"\n{output}" if output else "")
+            ], False
+    return [], False
 
 
 def drain_backlog_exprs(dashboard: dict) -> dict[str, str]:
@@ -2394,6 +2690,210 @@ def check_text_index_startup_panel(require_promtool: bool = False) -> tuple[list
     return [], False
 
 
+def index_build_exprs(dashboard: dict) -> dict[tuple[int, str], str]:
+    """Panels 167--170's expressions, keyed by panel and target reference."""
+    out: dict[tuple[int, str], str] = {}
+    for panel in dashboard_panels(dashboard):
+        panel_id = panel.get("id")
+        if panel_id not in INDEX_BUILD_PANELS:
+            continue
+        for target in panel.get("targets") or []:
+            ref_id = target.get("refId")
+            expr = target.get("expr")
+            if isinstance(ref_id, str) and isinstance(expr, str):
+                out.setdefault((panel_id, ref_id), expr)
+    return out
+
+
+def index_build_fixture(exprs: dict[tuple[int, str], str]) -> str:
+    """A promtool fixture over panels 167--170's shipped expressions.
+
+    Panel 168's two compactor values must remain two fully labelled samples;
+    the explicit average and sum controls show that the fixture distinguishes
+    the invalid fleet reductions. Panel 169 has the inverse shape: two pods'
+    counters for one table must become one line while another table remains
+    separate; its ungrouped-sum control shows the otherwise plausible bad
+    reading. Panels 167 and 170 are evaluated with their own labelled counter
+    and histogram inputs before the dashboard success line names them.
+    """
+    out = "evaluation_interval: 1m\nfuzzy_compare: true\ntests:\n"
+    for key, expr in sorted(exprs.items()):
+        panel, ref_id = key
+        metric = INDEX_BUILD_TARGETS[key]
+        out += f"  - name: index build panel {panel} target {ref_id}\n"
+        if panel in (167, 169):
+            out += "    interval: 10m\n    input_series:\n"
+            if panel == 167:
+                series = (
+                    ("compactor-0", 'outcome="written",reason="none"', 10),
+                    ("compactor-1", 'outcome="written",reason="none"', 5),
+                    ("compactor-0", 'outcome="refused",reason="column"', 2),
+                )
+            else:
+                series = (
+                    ("compactor-0", 'table="events"', 10),
+                    ("compactor-1", 'table="events"', 5),
+                    ("compactor-0", 'table="audit"', 2),
+                )
+            for pod, labels, observations in series:
+                out += (
+                    f"      - series: '{metric}{{namespace=\"logs\","
+                    f'app_kubernetes_io_instance="siglake",'
+                    f'app_kubernetes_io_component="compactor",pod="{pod}",'
+                    f"{labels}}}'\n        values: '0+{observations}x6'\n"
+                )
+            out += "    promql_expr_test:\n"
+            out += f"      - expr: '{expr.replace('$namespace', '.*')}'\n"
+            out += "        eval_time: 1h\n        exp_samples:\n"
+            if panel == 167:
+                out += (
+                    '          - labels: \'{outcome="refused",reason="column"}\'\n'
+                    "            value: 12\n"
+                    '          - labels: \'{outcome="written",reason="none"}\'\n'
+                    "            value: 90\n"
+                )
+            else:
+                out += (
+                    '          - labels: \'{table="audit"}\'\n'
+                    "            value: 12\n"
+                    '          - labels: \'{table="events"}\'\n'
+                    "            value: 90\n"
+                    f"      - expr: 'sum(increase({metric}[1h]))'\n"
+                    "        eval_time: 1h\n        exp_samples:\n"
+                    "          - labels: '{}'\n            value: 102\n"
+                )
+        elif panel == 168:
+            quantile = INDEX_BUILD_QUANTILES[key]
+            out += "    input_series:\n"
+            for pod, value in (("compactor-0", 1000), ("compactor-1", 9000)):
+                out += (
+                    f"      - series: '{metric}{{namespace=\"logs\","
+                    f'app_kubernetes_io_instance="siglake",'
+                    f'app_kubernetes_io_component="compactor",pod="{pod}",'
+                    f'quantile="{quantile}"}}\'\n'
+                    f"        values: '{value}'\n"
+                )
+            selector = f'{metric}{{namespace=~".*", quantile="{quantile}"}}'
+            out += "    promql_expr_test:\n"
+            out += f"      - expr: '{expr.replace('$namespace', '.*')}'\n"
+            out += "        exp_samples:\n"
+            for pod, value in (("compactor-0", 1000), ("compactor-1", 9000)):
+                out += (
+                    "          - labels: "
+                    f"'{{__name__=\"{metric}\",namespace=\"logs\","
+                    f"app_kubernetes_io_instance=\"siglake\","
+                    f"app_kubernetes_io_component=\"compactor\",pod=\"{pod}\","
+                    f"quantile=\"{quantile}\"}}'\n"
+                    f"            value: {value}\n"
+                )
+            out += (
+                f"      - expr: 'avg({selector})'\n"
+                "        exp_samples:\n"
+                "          - labels: '{}'\n            value: 5000\n"
+                f"      - expr: 'sum({selector})'\n"
+                "        exp_samples:\n"
+                "          - labels: '{}'\n            value: 10000\n"
+            )
+        else:
+            quantile = float(INDEX_BUILD_QUANTILES[key])
+            out += "    interval: 1m\n    input_series:\n"
+            histogram_series = (
+                ("compactor-0", "events", "100", 0),
+                ("compactor-0", "events", "1000", 10),
+                ("compactor-0", "events", "+Inf", 10),
+                ("compactor-1", "events", "100", 0),
+                ("compactor-1", "events", "1000", 5),
+                ("compactor-1", "events", "+Inf", 5),
+                ("compactor-0", "audit", "100", 2),
+                ("compactor-0", "audit", "1000", 2),
+                ("compactor-0", "audit", "+Inf", 2),
+            )
+            for pod, table, le, observations in histogram_series:
+                out += (
+                    f"      - series: '{metric}{{namespace=\"logs\","
+                    f'app_kubernetes_io_instance="siglake",'
+                    f'app_kubernetes_io_component="compactor",pod="{pod}",'
+                    f'table="{table}",le="{le}"}}\'\n'
+                    f"        values: '0+{observations}x6'\n"
+                )
+            out += "    promql_expr_test:\n"
+            out += f"      - expr: '{expr.replace('$namespace', '.*')}'\n"
+            out += "        eval_time: 6m\n        exp_samples:\n"
+            out += (
+                '          - labels: \'{table="audit"}\'\n'
+                f"            value: {100 * quantile}\n"
+                '          - labels: \'{table="events"}\'\n'
+                f"            value: {100 + 900 * quantile}\n"
+            )
+    return out
+
+
+def check_index_build_panels(require_promtool: bool = False) -> tuple[list[str], bool]:
+    """Evaluate panels 167--170's expressions with Prometheus' own engine."""
+    try:
+        dashboard = json.loads(OVERVIEW_DASHBOARD.read_text())
+    except (OSError, ValueError) as e:
+        return [f"{OVERVIEW_DASHBOARD}: not readable as JSON ({e})"], False
+    exprs = index_build_exprs(dashboard)
+    missing = sorted(set(INDEX_BUILD_TARGETS) - set(exprs))
+    unexpected = sorted(set(exprs) - set(INDEX_BUILD_TARGETS))
+    if missing or unexpected:
+        detail = []
+        if missing:
+            detail.append(
+                "missing " + ", ".join(f"{panel}/{ref}" for panel, ref in missing)
+            )
+        if unexpected:
+            detail.append(
+                "unexpected "
+                + ", ".join(f"{panel}/{ref}" for panel, ref in unexpected)
+            )
+        return [
+            f"{OVERVIEW_DASHBOARD}: index-build panel targets changed "
+            f"({'; '.join(detail)}); "
+            "re-point INDEX_BUILD_TARGETS rather than leaving this check partial"
+        ], False
+    for key, metric in INDEX_BUILD_TARGETS.items():
+        expr = exprs[key]
+        if metric not in expr:
+            return [
+                f"{OVERVIEW_DASHBOARD}: panel {key[0]} target {key[1]} no longer "
+                f"reads {metric}; re-point INDEX_BUILD_TARGETS"
+            ], False
+        if "'" in expr:
+            return [
+                f"{OVERVIEW_DASHBOARD}: panel {key[0]} target {key[1]} expression "
+                "needs YAML escaping"
+            ], False
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = pathlib.Path(tmp_dir)
+        name = "index-build-panels.test.yaml"
+        (tmp_path / name).write_text(index_build_fixture(exprs))
+        try:
+            subprocess.run(
+                ["promtool", "test", "rules", name],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=tmp_path,
+            )
+        except FileNotFoundError:
+            problem = (
+                "promtool not installed; the index-build panel expressions were "
+                "not evaluated"
+            )
+            return ([problem] if require_promtool else []), True
+        except subprocess.CalledProcessError as e:
+            output = "\n".join(s for s in (e.stdout.strip(), e.stderr.strip()) if s)
+            return [
+                f"{OVERVIEW_DASHBOARD}: panels "
+                f"{', '.join(str(panel) for panel in INDEX_BUILD_PANELS)} do not "
+                "preserve per-pod summary quantiles and per-table rebuild totals:"
+                + (f"\n{output}" if output else "")
+            ], False
+    return [], False
+
+
 def check_dashboards(exported: "Exported | None" = None) -> tuple[int, list[str]]:
     """Check every dashboard under deploy/grafana; returns (count, problems)."""
     if exported is None:
@@ -2443,6 +2943,53 @@ def check_alert_count_files() -> tuple[int, list[str]]:
     except OSError as e:
         return 0, [f"cannot read {e.filename}: {e.strerror}"]
     return alert_count(template), check_alert_count(template, readme)
+
+
+def check_orphan_handover_docs() -> list[str]:
+    """The filesystem-to-claim migration guidance, held to what it describes.
+
+    Documentation is the whole answer to a held orphan surviving the switch
+    (#5150): nothing censuses the old claim, nothing pages, and the chart
+    performs the switch without refusing it the way the operator does. So the
+    two places that carry the guidance have to keep carrying it, and the three
+    things it names — the claim-mode `emptyDir`, the gauge that is absent
+    afterwards, and the operator's refusal — have to keep existing. The render
+    matrix checks the volume itself; this runs from the tree, so it reports on
+    a box without helm too.
+    """
+    required = {
+        CHART_README: [
+            (ORPHAN_MIGRATION_HEADING, "the migration section an operator is sent to"),
+            ("orphans/", "the directory to inventory before switching"),
+            (ORPHANS_HELD_GAUGE, "the reading that disappears with the switch"),
+            ("emptyDir", "why the claim-mode pod cannot census it"),
+            (HANDOVER_REASON, "the operator's refusal, which the chart does not make"),
+        ],
+        LIMITATIONS: [
+            ("orphans/", "the directory to inventory before switching"),
+            (ORPHANS_HELD_GAUGE, "the reading that disappears with the switch"),
+            ("emptyDir", "why the claim-mode pod cannot census it"),
+            (COMPACTOR_TEMPLATE.name, "where that volume is rendered"),
+            (HANDOVER_REASON, "the operator's refusal, which the chart does not make"),
+        ],
+        COMPACTOR_TEMPLATE: [
+            ("emptyDir", "the claim-mode WAL volume the guidance is written around"),
+        ],
+        RECONCILER: [
+            (HANDOVER_REASON, "the condition reason both documents name"),
+        ],
+    }
+    problems: list[str] = []
+    for path, phrases in required.items():
+        try:
+            text = path.read_text()
+        except OSError as e:
+            problems.append(f"cannot read {e.filename}: {e.strerror}")
+            continue
+        for phrase, why in phrases:
+            if phrase not in text:
+                problems.append(f"{path} no longer says '{phrase}' — {why}")
+    return problems
 
 
 class ExpositionRuleError(Exception):
@@ -2905,11 +3452,19 @@ def source_checks(
     # The dashboard needs no render, so it is checked before any and still
     # reports when helm itself is unavailable.
     count, problems = check_dashboards(exported)
+    contention_problems, contention_skipped = check_file_cache_contention_panel(
+        require_promtool
+    )
+    problems.extend(contention_problems)
     panel_problems, panel_skipped = check_drain_backlog_panel(require_promtool)
     problems.extend(panel_problems)
     startup_problems, startup_skipped = check_text_index_startup_panel(require_promtool)
     problems.extend(startup_problems)
-    panel_skipped = panel_skipped or startup_skipped
+    index_problems, index_skipped = check_index_build_panels(require_promtool)
+    problems.extend(index_problems)
+    panel_skipped = (
+        contention_skipped or panel_skipped or startup_skipped or index_skipped
+    )
     if problems:
         failed = True
         for p in problems:
@@ -2918,8 +3473,10 @@ def source_checks(
         panel_result = (
             "; panel expressions skipped (promtool not installed)"
             if panel_skipped
-            else f"; panels {DRAIN_BACKLOG_PANEL}, {DRAIN_AGE_PANEL} and "
-            f"{TEXT_INDEX_STARTUP_PANEL} passed promtool"
+            else f"; panels {FILE_CACHE_CONTENTION_PANEL}, "
+            f"{DRAIN_BACKLOG_PANEL}, {DRAIN_AGE_PANEL}, "
+            f"{TEXT_INDEX_STARTUP_PANEL}, "
+            f"{', '.join(str(panel) for panel in INDEX_BUILD_PANELS)} passed promtool"
         )
         print(
             f"ok   [dashboard] {count} dashboard(s) under {DASHBOARD_DIR}{panel_result}",
@@ -2927,17 +3484,37 @@ def source_checks(
         )
     # The install notes' authentication predicate is template source too; the
     # arms that read the rendered notes are in check_query_notes below.
-    problems = check_notes_auth_predicate()
-    if problems:
-        failed = True
-        for p in problems:
-            print(f"FAIL [notes] {p}", file=sys.stderr)
-    else:
-        print(
-            f"ok   [notes] {NOTES_TEMPLATE} warns about an open query API under the "
-            f"same `{QUERY_AUTH_HELPER}` {QUERY_STS_TEMPLATE} runs on",
-            flush=True,
+    note_predicates = [
+        (
+            "query",
+            OPEN_QUERY_WARNING,
+            QUERY_AUTH_HELPER,
+            QUERY_STS_TEMPLATE,
+            None,
+        ),
+        (
+            "ingest",
+            OPEN_INGEST_WARNING,
+            INGEST_AUTH_HELPER,
+            INGEST_DEPLOYMENT_TEMPLATE,
+            INGEST_TOKENS_HELPER,
+        ),
+    ]
+    for tier, warning, auth_helper, workload, workload_helper in note_predicates:
+        problems = check_notes_auth_predicate(
+            tier, warning, auth_helper, workload, workload_helper
         )
+        if problems:
+            failed = True
+            for p in problems:
+                print(f"FAIL [notes-{tier}] {p}", file=sys.stderr)
+        else:
+            shared = workload_helper or auth_helper
+            print(
+                f"ok   [notes-{tier}] {NOTES_TEMPLATE} warns about an open {tier} "
+                f"API under `{auth_helper}`, sharing `{shared}` with {workload}",
+                flush=True,
+            )
     # Nor does the README's alert count, which is read from the template source.
     count, problems = check_alert_count_files()
     if problems:
@@ -2949,11 +3526,25 @@ def source_checks(
             f"ok   [alerts] {count} `- alert:` rules in {RULE_TEMPLATE}; {README} agrees",
             flush=True,
         )
+    # Same: the filesystem-to-claim migration guidance reads the tree, and it
+    # is the only handling a held orphan gets across that switch.
+    problems = check_orphan_handover_docs()
+    if problems:
+        failed = True
+        for p in problems:
+            print(f"FAIL [handover] {p}", file=sys.stderr)
+    else:
+        print(
+            f"ok   [handover] {CHART_README} and {LIMITATIONS} carry the held-orphan "
+            f"migration step, against {COMPACTOR_TEMPLATE.name}'s claim-mode emptyDir "
+            f"and {RECONCILER.name}'s {HANDOVER_REASON}",
+            flush=True,
+        )
     return failed, exported, env_catalog
 
 
 def check_query_notes(chart: str, base: list[str], oidc_issuer: str) -> bool:
-    """Hold the install notes to the query tier's real authentication.
+    """Hold the install notes to both tiers' real authentication.
 
     Returns True when an arm failed. Separate from the render matrix because
     the notes reach this script through a probe copy of the chart
@@ -2967,32 +3558,53 @@ def check_query_notes(chart: str, base: list[str], oidc_issuer: str) -> bool:
     # included, since that is the arm the warning used to ignore. The disabled
     # tier has no API to call open. Each authenticated arm carries a
     # coordinator token for the same reason the matrix arms above do.
-    notes_matrix = [
-        ("notes-open", [], True),
+    query_notes_matrix = [
+        ("notes-open", [], True, True),
         ("notes-oidc",
          ["--set", f"query.oidc.issuer={oidc_issuer}",
           "--set", "query.oidc.audience=siglake-query",
-          "--set", "query.distributed.coordinatorToken.value=coord"], False),
+          "--set", "query.distributed.coordinatorToken.value=coord"], False, True),
         ("notes-oidc-tenant-claim",
          ["--set", f"query.oidc.issuer={oidc_issuer}",
           "--set", "query.oidc.audience=siglake-query",
           "--set", "query.oidc.tenantClaim=org_id",
-          "--set", "query.distributed.coordinatorToken.value=coord"], False),
+          "--set", "query.distributed.coordinatorToken.value=coord"], False, True),
         ("notes-tokens-inline",
          ["--set", "query.tokens.list={dev-1}",
-          "--set", "query.distributed.coordinatorToken.value=coord"], False),
+          "--set", "query.distributed.coordinatorToken.value=coord"], False, True),
         ("notes-tokens-existing-secret",
          ["--set", "query.tokens.existingSecret=byo-query-tokens",
-          "--set", "query.distributed.coordinatorToken.value=coord"], False),
+          "--set", "query.distributed.coordinatorToken.value=coord"], False, True),
         ("notes-tokens-eso",
          ["--set", "externalSecrets.enabled=true",
           "--set", "externalSecrets.queryTokens.remoteKey=siglake/query-tokens",
-          "--set", "query.distributed.coordinatorToken.value=coord"], False),
-        ("notes-query-disabled", ["--set", "query.enabled=false"], False),
+          "--set", "query.distributed.coordinatorToken.value=coord"], False, True),
+        ("notes-query-disabled", ["--set", "query.enabled=false"], False, True),
+    ]
+    # #4321: the ingest tier has two static-token sources and the same complete
+    # OIDC-pair rule as query. Query remains open in each arm, so asserting its
+    # warning separately prevents one tier's predicate from hiding the other.
+    ingest_notes_matrix = [
+        ("ingest-notes-open", [], True, True),
+        ("ingest-notes-tokens-inline",
+         ["--set", "ingester.auth.list={write-1}"], True, False),
+        ("ingest-notes-tokens-existing-secret",
+         ["--set", "ingester.auth.existingSecret=byo-ingest-tokens"], True, False),
+        ("ingest-notes-oidc",
+         ["--set", f"ingester.oidc.issuer={oidc_issuer}",
+          "--set", "ingester.oidc.audience=siglake-ingest"], True, False),
+        ("ingest-notes-oidc-tenant-claim",
+         ["--set", f"ingester.oidc.issuer={oidc_issuer}",
+          "--set", "ingester.oidc.audience=siglake-ingest",
+          "--set", "ingester.oidc.tenantClaim=org_id"], True, False),
+        ("ingest-notes-ingester-disabled",
+         ["--set", "ingester.enabled=false"], True, False),
     ]
     with tempfile.TemporaryDirectory() as tmp_dir:
         probe = notes_probe_chart(pathlib.Path(chart), pathlib.Path(tmp_dir))
-        for label, extra, expect_warning in notes_matrix:
+        for label, extra, expect_query_warning, expect_ingest_warning in (
+            query_notes_matrix + ingest_notes_matrix
+        ):
             try:
                 notes = render_notes(str(probe), base + extra)
             except subprocess.CalledProcessError as error:
@@ -3003,14 +3615,26 @@ def check_query_notes(chart: str, base: list[str], oidc_issuer: str) -> bool:
                     file=sys.stderr,
                 )
                 continue
-            problems = check_notes_open_warning(notes, expect_warning)
+            problems = check_notes_open_warning(
+                notes, expect_query_warning, OPEN_QUERY_WARNING, "query"
+            )
+            problems.extend(
+                check_notes_open_warning(
+                    notes, expect_ingest_warning, OPEN_INGEST_WARNING, "ingest"
+                )
+            )
             if problems:
                 failed = True
                 for p in problems:
                     print(f"FAIL [{label}] {p}", file=sys.stderr)
             else:
-                said = "warns the query API is open" if expect_warning else "does not"
-                print(f"ok   [{label}] the install notes {said}", flush=True)
+                query_result = "open" if expect_query_warning else "authenticated or off"
+                ingest_result = "open" if expect_ingest_warning else "authenticated or off"
+                print(
+                    f"ok   [{label}] the install notes report query={query_result}, "
+                    f"ingest={ingest_result}",
+                    flush=True,
+                )
     return failed
 
 
@@ -3185,6 +3809,7 @@ def main(argv: list[str] | None = None) -> int:
          ["--set", "query.oidc.issuer=https://idp.example/realms/siglake",
           "--set", "query.oidc.audience=siglake-query",
           "--set", "query.oidc.tenantClaim=org_id",
+          "--set", "query.allowedTenants={acme,widgets}",
           "--set", "query.distributed.coordinatorToken.value=coord"]),
         # The single-tenant OIDC configuration on both tiers: issuer and
         # audience with no claim, where SIGLAKE_OIDC_TENANT_CLAIM must be
@@ -3276,6 +3901,9 @@ def main(argv: list[str] | None = None) -> int:
             },
         },
     }
+    expected_query_allowed_tenants = {
+        "oidc-query": "acme,widgets",
+    }
     # #3718: which metrics each HPA may carry, per arm. The compactor's backlog
     # gauge is a per-pod (`Pods`) metric to the autoscaler, so it belongs only
     # on an arm where the reading is one pod's own.
@@ -3341,6 +3969,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         problems.extend(check_hpa_metrics(docs, expected_hpa_metrics.get(label, {})))
         problems.extend(check_oidc_env(docs, expected_oidc.get(label, {})))
+        problems.extend(
+            check_query_allowed_tenants_env(
+                docs, expected_query_allowed_tenants.get(label)
+            )
+        )
         checked_rules, promtool_problems, promtool_skipped = check_prometheus_rules(
             docs, require_promtool=args.require_promtool
         )
@@ -3472,6 +4105,10 @@ def main(argv: list[str] | None = None) -> int:
          ["--set", "query.oidc.issuer=https://idp.example/realms/siglake",
           "--set", "query.oidc.audience=siglake-query"],
          coord_message, coord_allowed),
+        ("query-allowed-tenants-without-claim",
+         ["--set", "query.allowedTenants={acme,widgets}"],
+         "query.allowedTenants is non-empty but query.oidc.tenantClaim is unset",
+         "installing a query allow-list with no verified tenant claim to match"),
         ("query-tokens-eso-plus-inline",
          eso_tokens + ["--set", "query.tokens.list={dev-1,dev-2}"],
          token_source_message, token_source_allowed),

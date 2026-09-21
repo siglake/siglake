@@ -333,6 +333,15 @@ declared = next(i for i, line in enumerate(lines)
 settings_end = next(i for i, line in enumerate(lines[declared:], declared)
                     if line == "}")
 
+# Another opt-in may refuse being combined with this arm. That reference is a
+# launch-time validation, not a second path into the schema probe.
+qualification_settings = next(i for i, line in enumerate(lines)
+                              if line == 'case "$MIRROR_RECLAIM_ARM" in')
+qualification_settings_end = next(
+    i for i, line in enumerate(lines[qualification_settings:], qualification_settings)
+    if line == "esac"
+)
+
 # The opt-in block, and where it ends: a `fi` in the first column, so an `if`
 # nested inside the block cannot close it early.
 guard = [i for i, line in enumerate(lines)
@@ -350,6 +359,7 @@ stray = [
     if any(token in line for token in tokens)
     and not line.lstrip().startswith("#")
     and not declared <= i <= settings_end
+    and not qualification_settings <= i <= qualification_settings_end
     and not opens <= i <= closes
 ]
 if stray:

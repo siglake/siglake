@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,7 +26,8 @@ use futures::future::{try_join_all, BoxFuture};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use iceberg::arrow::{arrow_schema_to_schema, RecordBatchPartitionSplitter};
 use iceberg::io::{
-    FileIO, FileIOBuilder, FileRead, InputFile, LocalFsStorageFactory, StorageFactory,
+    FileIO, FileIOBuilder, FileRead, InputFile, LocalFsStorageFactory, StorageFactory, S3_ENDPOINT,
+    S3_PATH_STYLE_ACCESS, S3_REGION,
 };
 use iceberg::puffin::{
     Blob as PuffinBlob, CompressionCodec as PuffinCompressionCodec, PuffinReader, PuffinWriter,
@@ -39,18 +40,20 @@ use iceberg::spec::{
 };
 use iceberg::table::Table;
 use iceberg::transaction::{
-    ApplyTransactionAction, ExpireSnapshotsAction, Transaction, UpdateSchemaAction,
+    ActionCommit, AddColumn, ApplyTransactionAction, Transaction, TransactionAction,
 };
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::{
+    ParquetWriterBuilder, SegmentedIndexBlob, SegmentedIndexColumn, SegmentedIndexSink,
+};
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{
-    Catalog, CatalogBuilder, ErrorKind as IcebergErrorKind, NamespaceIdent, TableCreation,
-    TableIdent,
+    Catalog, CatalogBuilder, Error as IcebergError, ErrorKind as IcebergErrorKind, NamespaceIdent,
+    TableCreation, TableIdent, TableRequirement, TableUpdate,
 };
 use iceberg_catalog_sql::{SqlBindStyle, SqlCatalogBuilder};
 use iceberg_storage_opendal::{CustomAwsCredentialLoader, OpenDalStorageFactory};
@@ -416,11 +419,11 @@ mod alerted_counter_catalog_tests {
     }
 
     #[test]
-    fn group_count_delta_write_retries_are_labelled_by_table() {
+    fn group_count_delta_write_retries_are_labelled_by_namespace_and_table() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
-            super::record_group_count_delta_write_retries("logs-index", 2);
+            super::record_group_count_delta_write_retries(super::NAMESPACE, "logs-index", 2);
         });
 
         let retries = snapshotter
@@ -429,21 +432,69 @@ mod alerted_counter_catalog_tests {
             .into_iter()
             .find(|(key, _, _, _)| {
                 key.key().name() == "siglake_group_count_delta_write_retries_total"
+                    && has_label(key, "iceberg_namespace", super::NAMESPACE)
+                    && has_label(key, "table", "logs-index")
             })
-            .expect("retry counter is published");
-        assert!(
-            retries
-                .0
-                .key()
-                .labels()
-                .any(|label| label.key() == "table" && label.value() == "logs-index"),
-            "retry counter lacks its table label: {retries:?}"
-        );
+            .expect("retry counter is published with both labels");
         assert!(matches!(retries.3, DebugValue::Counter(2)), "{retries:?}");
+    }
+
+    /// #4759's acceptance, the same shape as
+    /// [`a_rebuild_in_each_namespace_is_two_series`]: the commit path writes
+    /// deltas for the base namespace and every `tenant_*` one, so retries on the
+    /// two `events` tables must not land on one series — the precursor alert
+    /// would otherwise name a bare `events` no operator can locate.
+    #[test]
+    fn retries_in_each_namespace_are_two_series() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            super::record_group_count_delta_write_retries(super::NAMESPACE, super::TABLE_NAME, 2);
+            super::record_group_count_delta_write_retries("tenant_acme", super::TABLE_NAME, 3);
+        });
+
+        let samples = snapshotter.snapshot().into_vec();
+        for (namespace, expected) in [(super::NAMESPACE, 2u64), ("tenant_acme", 3)] {
+            let sample = samples
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == "siglake_group_count_delta_write_retries_total"
+                        && has_label(key, "iceberg_namespace", namespace)
+                        && has_label(key, "table", super::TABLE_NAME)
+                })
+                .unwrap_or_else(|| panic!("no retry series for {namespace}: {samples:?}"));
+            assert!(
+                matches!(sample.3, DebugValue::Counter(c) if c == expected),
+                "{namespace} carries another namespace's retries: {sample:?}"
+            );
+        }
+    }
+
+    /// The precursor alert reads `rate()` rather than `increase()`, so
+    /// `check-chart.py` does not force this counter into a catalog. Pre-register
+    /// it anyway, beside the failure counter it precedes: the dashboard panel
+    /// shows both, and an absent retry series next to a present failure series
+    /// reads as "no retries" only by accident.
+    #[test]
+    fn group_count_delta_write_retries_is_preregistered_for_the_events_table() {
+        let registered = siglake_core::metrics::COMPACTOR_ALERTED_COUNTERS
+            .iter()
+            .find(|c| c.name == "siglake_group_count_delta_write_retries_total")
+            .expect("compactor catalog lists the delta write-retry counter");
+        let events: &[(&str, &str)] = &[
+            ("iceberg_namespace", super::NAMESPACE),
+            ("table", super::TABLE_NAME),
+        ];
+        assert!(registered.series.contains(&events), "{registered:?}");
     }
 }
 
 const SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE: &str = "siglake-inverted-v1";
+/// The v1 sidecar's integrity cover is the Zstd frame content checksum enabled
+/// by the fork's `CompressionCodec::Zstd` implementation. Keep the choice
+/// explicit and pinned by `v1_puffin_sidecars_keep_the_checksummed_codec`.
+const SIGLAKE_PUFFIN_INVERTED_CODEC: PuffinCompressionCodec =
+    PuffinCompressionCodec::zstd_default();
 const DEFAULT_SIGLAKE_INDEX_FOOTER_MAX_BYTES: usize = 1024 * 1024;
 const DELETE_TASKS_CONFIG_DIR: &str = "_siglake/config/delete_tasks";
 
@@ -881,6 +932,20 @@ impl Default for GcOptions {
 /// Outcome of an orphan-GC pass. See [`IcebergContext::gc_orphans`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GcReport {
+    /// Siglake-owned statistics entries that referenced no retained live data
+    /// file and were eligible for removal before the orphan walk.
+    pub statistics_entries_eligible: usize,
+    /// Eligible statistics entries removed from table metadata (0 in dry-run).
+    pub statistics_entries_removed: usize,
+    /// Statistics entries kept because at least one blob references a retained
+    /// live data file. Mixed live/retired entries are counted here.
+    pub statistics_entries_kept_live: usize,
+    /// Entries left untouched because they contain a blob type Siglake does
+    /// not own.
+    pub statistics_entries_skipped_unowned: usize,
+    /// Entries left untouched because an owned blob has no `data_file`
+    /// property.
+    pub statistics_entries_skipped_missing_data_file: usize,
     /// In-scope files listed under `data/` + `metadata/` (excludes
     /// `*.metadata.json`).
     pub scanned: usize,
@@ -894,6 +959,21 @@ pub struct GcReport {
     pub skipped_recent: usize,
     /// Files actually deleted (0 in dry-run).
     pub deleted: usize,
+}
+
+/// Outcome of deciding which Iceberg statistics entries Siglake may retire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatisticsRetirementReport {
+    /// Owned entries whose blobs all reference retired data files.
+    pub eligible: usize,
+    /// Entries actually removed from table metadata (0 in dry-run).
+    pub removed: usize,
+    /// Entries kept whole because at least one blob still references live data.
+    pub kept_live: usize,
+    /// Entries containing at least one blob type Siglake does not own.
+    pub skipped_unowned: usize,
+    /// Owned entries containing a blob without a `data_file` property.
+    pub skipped_missing_data_file: usize,
 }
 
 /// Which of the three merge implementations a re-cluster bin actually took.
@@ -957,6 +1037,11 @@ struct LazyMergeOutputWriter<'a> {
     bloom_columns: &'a [&'a str],
     with_footers: bool,
     rewrite_gen: u32,
+    /// Where this merge's segmented sidecars land (#4377), or `None` when the
+    /// writer builds none. One sink per rewrite, shared by every output file
+    /// the rolling writer opens, so a partition-split rewrite leaves one
+    /// sidecar per output file and the caller registers them together.
+    segmented_sink: Option<Arc<SegmentedIndexSink>>,
     inner: Option<Box<dyn IcebergWriter>>,
 }
 
@@ -972,6 +1057,7 @@ impl LazyMergeOutputWriter<'_> {
                         self.with_footers,
                         self.rewrite_gen,
                         Some(&batch),
+                        self.segmented_sink.clone(),
                     )
                     .await?,
             );
@@ -1732,10 +1818,9 @@ pub fn storage_factory_for(warehouse_url: &str) -> Result<Arc<dyn StorageFactory
     Ok(match scheme {
         "file" => Arc::new(LocalFsStorageFactory),
         "s3" | "s3a" => Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: scheme.to_string(),
-            customized_credential_load: Some(CustomAwsCredentialLoader::new(Arc::new(
+            customized_credential_load: Some(CustomAwsCredentialLoader::new(
                 crate::aws_credential::SiglakeAwsLoader::new(),
-            ))),
+            )),
         }),
         "memory" => Arc::new(OpenDalStorageFactory::Memory),
         // gs/gcs/az/azdls would go here once we add those features.
@@ -1745,6 +1830,166 @@ pub fn storage_factory_for(warehouse_url: &str) -> Result<Arc<dyn StorageFactory
             );
         }
     })
+}
+
+/// Resolve the addressing mode for Iceberg's S3 FileIO.
+///
+/// An explicit AWS SDK setting wins. A custom endpoint defaults to path-style
+/// because the bundled MinIO and the other S3-compatible stores used by local
+/// deployments do not publish per-bucket DNS names. With no endpoint, leave
+/// the property unset and retain Iceberg's virtual-host-style AWS default.
+fn s3_path_style_access_from(endpoint: Option<&str>, configured: Option<&str>) -> Option<String> {
+    configured
+        .map(str::to_owned)
+        .or_else(|| endpoint.map(|_| "true".to_owned()))
+}
+
+/// Translate the standard AWS endpoint, region and addressing environment
+/// into the Iceberg properties consumed by the vendored OpenDAL FileIO.
+/// Credentials continue through [`crate::aws_credential::SiglakeAwsLoader`],
+/// preserving its static-key, IRSA, ECS and IMDS provider order.
+fn s3_file_io_properties_from(
+    endpoint_url_s3: Option<&str>,
+    endpoint_url: Option<&str>,
+    force_path_style: Option<&str>,
+    region: Option<&str>,
+    default_region: Option<&str>,
+) -> HashMap<String, String> {
+    let mut properties = HashMap::new();
+    let endpoint = endpoint_url_s3.or(endpoint_url);
+    if let Some(endpoint) = endpoint {
+        properties.insert(S3_ENDPOINT.to_owned(), endpoint.to_owned());
+    }
+    if let Some(region) = region.or(default_region) {
+        properties.insert(S3_REGION.to_owned(), region.to_owned());
+    }
+    if let Some(path_style_access) = s3_path_style_access_from(endpoint, force_path_style) {
+        properties.insert(S3_PATH_STYLE_ACCESS.to_owned(), path_style_access);
+    }
+    properties
+}
+
+fn s3_file_io_properties() -> HashMap<String, String> {
+    let endpoint_url_s3 = std::env::var("AWS_ENDPOINT_URL_S3").ok();
+    let endpoint_url = std::env::var("AWS_ENDPOINT_URL").ok();
+    let force_path_style = std::env::var("AWS_S3_FORCE_PATH_STYLE").ok();
+    let region = std::env::var("AWS_REGION").ok();
+    let default_region = std::env::var("AWS_DEFAULT_REGION").ok();
+    s3_file_io_properties_from(
+        endpoint_url_s3.as_deref(),
+        endpoint_url.as_deref(),
+        force_path_style.as_deref(),
+        region.as_deref(),
+        default_region.as_deref(),
+    )
+}
+
+#[cfg(test)]
+mod s3_file_io_properties_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn resolved(endpoint: Option<&str>, configured: Option<&str>) -> Option<String> {
+        s3_path_style_access_from(endpoint, configured)
+    }
+
+    #[test]
+    fn path_style_resolver_covers_absent_true_and_false() {
+        assert_eq!(resolved(None, None), None);
+        assert_eq!(
+            resolved(Some("http://minio:9000"), None).as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            resolved(Some("http://minio:9000"), Some("true")).as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            resolved(Some("http://minio:9000"), Some("false")).as_deref(),
+            Some("false")
+        );
+        assert_eq!(resolved(None, Some("true")).as_deref(), Some("true"));
+        assert_eq!(resolved(None, Some("false")).as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn s3_specific_endpoint_and_region_take_precedence() {
+        let properties = s3_file_io_properties_from(
+            Some("http://s3-specific:9000"),
+            Some("http://general:9000"),
+            None,
+            Some("specific-region"),
+            Some("default-region"),
+        );
+        assert_eq!(
+            properties.get(S3_ENDPOINT).map(String::as_str),
+            Some("http://s3-specific:9000")
+        );
+        assert_eq!(
+            properties.get(S3_REGION).map(String::as_str),
+            Some("specific-region")
+        );
+        assert_eq!(
+            properties.get(S3_PATH_STYLE_ACCESS).map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_endpoint_request_uses_bucket_in_path_not_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let endpoint = format!("http://{address}");
+        let mut properties =
+            s3_file_io_properties_from(None, Some(&endpoint), None, Some("us-east-1"), None);
+        properties.insert("s3.allow-anonymous".to_owned(), "true".to_owned());
+        let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: None,
+        }))
+        .with_props(properties)
+        .build();
+
+        assert!(!file_io
+            .exists("s3://siglake-warehouse/warehouse/siglake/events/metadata/probe.json")
+            .await
+            .unwrap());
+        let request = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut lines = request.lines();
+        assert_eq!(
+            lines.next(),
+            Some("HEAD /siglake-warehouse/warehouse/siglake/events/metadata/probe.json HTTP/1.1")
+        );
+        let host = lines
+            .find(|line| line.to_ascii_lowercase().starts_with("host:"))
+            .unwrap();
+        assert_eq!(host, format!("host: {address}"));
+    }
 }
 
 /// Strip a leading `scheme://` so iceberg paths (which may carry
@@ -1775,12 +2020,12 @@ fn warehouse_operator(location: &str) -> Result<opendal::Operator> {
             let region = std::env::var("AWS_REGION")
                 .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
                 .unwrap_or_else(|_| "us-east-1".to_string());
+            let chain = reqsign_core::ProvideCredentialChain::new()
+                .push(Arc::new(crate::aws_credential::SiglakeAwsLoader::new()));
             let mut builder = opendal::services::S3::default()
                 .bucket(bucket)
                 .region(&region)
-                .customized_credential_load(Box::new(
-                    crate::aws_credential::SiglakeAwsLoader::new(),
-                ));
+                .credential_provider_chain(chain);
             if !root.is_empty() {
                 builder = builder.root(root);
             }
@@ -1937,9 +2182,13 @@ fn row_group_rows_for_avg(avg_row_bytes: usize, target_bytes: usize) -> usize {
 ///
 /// The extent is not all the writer holds: a buffered batch keeps whole
 /// buffers, and a batch built by the ingest path carries ~2x its extent in
-/// allocation slack (measured 2026-09-16 on the delete fixture: 432 B/row by
-/// `get_array_memory_size` against 216 B/row here). So the byte target is a
-/// target for the rows, and the resident bytes can run over it by that slack.
+/// allocation slack (measured 2026-09-16 on the 512 Ki-row half-deleted delete
+/// fixture: 432 B/row by `get_array_memory_size` against 201 B/row here — see
+/// `measure_peak_against_row_group_target` in
+/// `tests/delete_task_size_gate.rs`). So the byte target is a target for the
+/// rows, and the resident bytes can run over it by that slack. The split with
+/// the flush path is kept deliberately (#4774, `docs/LIMITATIONS.md`): moving
+/// flush onto this measure would change ingest output layout unmeasured.
 /// Pricing the slack instead is what cannot be done here — on a slice it is the
 /// whole part behind it, shared with every other slice of that part.
 fn sampled_row_bytes(batch: &RecordBatch) -> Option<usize> {
@@ -2816,15 +3065,17 @@ async fn scan_file_timestamp_buckets_windowed(
     lo: Option<i64>,
     hi: Option<i64>,
     counts: &mut BTreeMap<i64, i64>,
-) -> Result<()> {
+) -> Result<u64> {
     use arrow_array::Array;
     use futures::StreamExt;
 
     let (mut reader, time_column) = pruned_window_batch_stream(file_io, path, &[], lo, hi).await?;
+    let mut decoded_bytes = 0u64;
     let bucket_of =
         |ts: i64| -> i64 { origin_ns + (ts - origin_ns).div_euclid(interval_ns) * interval_ns };
     while let Some(batch) = reader.next().await {
         let batch = batch.with_context(|| format!("decode parquet batch {path}"))?;
+        decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size() as u64);
         let col = siglake_core::column_nanos(
             batch.column(batch.schema().index_of(time_column.name.as_str())?),
         )
@@ -2841,7 +3092,7 @@ async fn scan_file_timestamp_buckets_windowed(
             *counts.entry(bucket_of(t)).or_default() += 1;
         }
     }
-    Ok(())
+    Ok(decoded_bytes)
 }
 
 /// The survivor projection for one delete predicate.
@@ -3344,7 +3595,7 @@ fn siglake_writer_properties(
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
         .set_dictionary_enabled(true)
         .set_data_page_row_count_limit(20_000)
-        .set_max_row_group_size(max_row_group_rows)
+        .set_max_row_group_row_count(Some(max_row_group_rows))
         // Datatype-driven encoding for the `timestamp` column (every siglake table
         // is time-ordered, so it's the leading sort column). A dictionary on a
         // near-unique nanosecond INT64 is wasted; DELTA_BINARY_PACKED encodes the
@@ -3513,14 +3764,15 @@ pub fn result_caches_enabled() -> bool {
     })
 }
 
-/// Group-count footer column set: the Utf8 bloom dims plus every typed
-/// (Int64/Float64/Boolean) field in the batch schema — in events/index
-/// batches those are exactly the WS-7 typed promoted columns (the base
-/// schema has no bare numeric/bool fields), and native typed dims on custom
-/// indexes get footers for free. The cardinality cap drops anything too
-/// wide, so over-inclusion is safe.
+/// Group-count footer column set: the Utf8 bloom dims plus inferred typed
+/// (Int64/Float64/Boolean) fields in the batch schema. The canonical
+/// `timestamp_ns` twin is storage metadata for the event time, not a group
+/// dimension, so inference excludes it. An explicitly declared dimension of
+/// that name stays in `bloom_columns`, and the name remains inferable on a user
+/// schema where `timestamp` is not the canonical timestamp field.
 fn group_count_columns_for(schema: &arrow_schema::Schema, bloom_columns: &[&str]) -> Vec<String> {
     let mut cols: Vec<String> = bloom_columns.iter().map(|c| c.to_string()).collect();
+    let has_canonical_nanos_twin = schema_has_canonical_nanos_twin(schema);
     for f in schema.fields() {
         let typed = matches!(
             f.data_type(),
@@ -3528,11 +3780,85 @@ fn group_count_columns_for(schema: &arrow_schema::Schema, bloom_columns: &[&str]
                 | arrow_schema::DataType::Float64
                 | arrow_schema::DataType::Boolean
         );
-        if typed && !cols.iter().any(|c| c == f.name()) {
+        let canonical_nanos_twin =
+            has_canonical_nanos_twin && f.name() == siglake_core::TIMESTAMP_NS_COLUMN;
+        if typed && !canonical_nanos_twin && !cols.iter().any(|c| c == f.name()) {
             cols.push(f.name().clone());
         }
     }
     cols
+}
+
+fn schema_has_canonical_nanos_twin(schema: &arrow_schema::Schema) -> bool {
+    schema
+        .column_with_name("timestamp")
+        .is_some_and(|(_, field)| {
+            matches!(field.data_type(), arrow_schema::DataType::Timestamp(_, _))
+        })
+        && schema
+            .column_with_name(siglake_core::TIMESTAMP_NS_COLUMN)
+            .is_some_and(|(_, field)| matches!(field.data_type(), arrow_schema::DataType::Int64))
+}
+
+#[cfg(test)]
+mod group_count_column_tests {
+    use super::group_count_columns_for;
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+    #[test]
+    fn canonical_event_time_is_not_an_inferred_dimension() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(siglake_core::TIMESTAMP_NS_COLUMN, DataType::Int64, false),
+            Field::new("status", DataType::Int64, false),
+            Field::new("ratio", DataType::Float64, false),
+            Field::new("sampled", DataType::Boolean, false),
+            Field::new("service", DataType::Utf8, false),
+        ]);
+
+        assert_eq!(
+            group_count_columns_for(&schema, &["service"]),
+            vec!["service", "status", "ratio", "sampled"]
+        );
+    }
+
+    #[test]
+    fn unrelated_user_timestamp_ns_remains_an_inferred_dimension() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(siglake_core::TIMESTAMP_NS_COLUMN, DataType::Int64, false),
+        ]);
+
+        assert_eq!(
+            group_count_columns_for(&schema, &[]),
+            vec![siglake_core::TIMESTAMP_NS_COLUMN]
+        );
+    }
+
+    #[test]
+    fn an_explicit_canonical_timestamp_ns_dimension_is_preserved() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(siglake_core::TIMESTAMP_NS_COLUMN, DataType::Int64, false),
+        ]);
+
+        assert_eq!(
+            group_count_columns_for(&schema, &[siglake_core::TIMESTAMP_NS_COLUMN]),
+            vec![siglake_core::TIMESTAMP_NS_COLUMN]
+        );
+    }
 }
 
 /// Output batch size for the compaction merges — bounds per-batch decoded
@@ -3726,7 +4052,8 @@ fn base_group_count_cardinality() -> usize {
 /// rollback story: drop the knob and the mechanism disappears.
 impl FileGroupCounts {
     /// Parse a [`FileGroupCounts`] from a JSON blob — the shape of the
-    /// snapshot-side aggregates object (`metadata/siglake-aggregates.json`),
+    /// snapshot-side aggregates object at
+    /// `<table location>/metadata/siglake-agg/<table-uuid>/siglake-aggregates.json`,
     /// which is JSON by design; the per-file FOOTER uses the compact encoding.
     pub fn from_json(s: &str) -> Option<Self> {
         serde_json::from_str(s).ok()
@@ -3885,9 +4212,9 @@ fn record_tier2_group_counts(footer_files: usize, fallback_files: usize, kind: T
 /// footer key for the same value are byte-identical.
 ///
 /// Without this the two disagree about which columns exist at all: the per-file
-/// footer set is `group_count_columns_for`, which deliberately adds
-/// Int64/Float64/Boolean, while these builders took only `StringArray` and
-/// silently skipped everything else. A typed column therefore reached the
+/// footer set is `group_count_columns_for`, which deliberately adds inferred
+/// dimension-like Int64/Float64/Boolean fields, while these builders took only
+/// `StringArray` and silently skipped everything else. A typed column therefore reached the
 /// footers (Tier-2) but never the table-level aggregate (Tier-1) — so
 /// `GROUP BY status` was served by summing a footer per live file while
 /// `GROUP BY method`, the same shape on a text column, answered from warm
@@ -4065,7 +4392,8 @@ fn reconcile_split_columns(
 /// The cardinality cap for a typed column that was INFERRED into the group-count
 /// set rather than declared as a dimension.
 ///
-/// `group_count_columns_for` admits every Int64/Float64/Boolean field, which is
+/// `group_count_columns_for` admits inferred Int64/Float64/Boolean fields (apart
+/// from the canonical event-time nanosecond twin), which is
 /// right for the per-file footers — they are per-file, capped at
 /// `MAX_GROUP_COUNT_CARDINALITY`, and a column that does not fit is simply
 /// absent from that file. It is NOT right for the table-level wide aggregate,
@@ -5989,6 +6317,21 @@ fn group_count_rebuild_sequence_number(rel_path: &str) -> Option<i64> {
     delta_object_sequence_number(rel_path, ".rebuild.json")
 }
 
+fn short_repair_marker_rel_path(sequence_number: i64, attempt_id: Uuid) -> String {
+    format!("{GROUP_COUNT_DELTA_DIR}/{sequence_number:020}.short-repair.{attempt_id}.json")
+}
+
+fn short_repair_marker_sequence_number(rel_path: &str) -> Option<i64> {
+    let (dir, file) = rel_path.rsplit_once('/')?;
+    if dir != GROUP_COUNT_DELTA_DIR && !dir.ends_with(&format!("/{GROUP_COUNT_DELTA_DIR}")) {
+        return None;
+    }
+    let (sequence, attempt) = file.split_once(".short-repair.")?;
+    let attempt = attempt.strip_suffix(".json")?;
+    Uuid::parse_str(attempt).ok()?;
+    sequence.parse().ok()
+}
+
 /// Sequence number of a delta-directory object named `<seq>{suffix}`.
 ///
 /// The directory component is REQUIRED: a `1.json` sitting anywhere else is not
@@ -6086,6 +6429,28 @@ mod aggregate_incarnation_path_tests {
             assert_eq!(group_count_delta_sequence_number(bad), None, "{bad}");
         }
     }
+
+    #[tokio::test]
+    async fn a_refused_short_repair_marker_spends_the_bounded_write_budget() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let error = retry_short_repair_marker_write("short-repair-test", move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            async { anyhow::bail!("refused") }
+        })
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("refused"), "{error:#}");
+        assert_eq!(calls.load(Ordering::SeqCst), DELTA_WRITE_ATTEMPTS as usize);
+    }
+
+    #[test]
+    fn short_repair_schedule_suppresses_after_four_attempts() {
+        assert_eq!(short_repair_delay(1), Some(chrono::Duration::minutes(15)));
+        assert_eq!(short_repair_delay(2), Some(chrono::Duration::hours(1)));
+        assert_eq!(short_repair_delay(3), Some(chrono::Duration::hours(4)));
+        assert_eq!(short_repair_delay(4), None);
+    }
 }
 
 /// The exact columns carried by the lost delta, with the cardinality cap that
@@ -6099,6 +6464,29 @@ struct GroupCountRebuildMarker {
     columns: BTreeMap<String, usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     sketch_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAggregateAttemptReason {
+    Started,
+    Watchdog,
+    Failed,
+    Interrupted,
+    Malformed,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ShortAggregateAttemptMarker {
+    version: u8,
+    attempt_id: Uuid,
+    table_uuid: Uuid,
+    target_snapshot_id: i64,
+    target_sequence_number: i64,
+    maintained_columns: Vec<String>,
+    started_at: String,
+    reason: ShortAggregateAttemptReason,
+    next_eligible_at: String,
 }
 
 /// Serde shim: persist [`FileGroupCounts`] inside the side-aggregates object
@@ -6753,6 +7141,36 @@ trait SideCasStore {
 
 struct OpendalSideCas<'a>(&'a opendal::Operator);
 
+/// Owned form used by retry loops whose store is constructed inside an
+/// attempt. Keeping the operator owned gives tests a factory seam without
+/// changing the public rebuild API.
+struct OwnedOpendalSideCas(opendal::Operator);
+
+impl SideCasStore for OwnedOpendalSideCas {
+    async fn load(&self, rel_path: &str) -> Result<(Option<SnapshotAggregates>, Option<String>)> {
+        OpendalSideCas(&self.0).load(rel_path).await
+    }
+
+    async fn store_if(
+        &self,
+        rel_path: &str,
+        body: Vec<u8>,
+        version: Option<&str>,
+    ) -> Result<CasWrite> {
+        OpendalSideCas(&self.0)
+            .store_if(rel_path, body, version)
+            .await
+    }
+
+    async fn store(&self, rel_path: &str, body: Vec<u8>) -> Result<()> {
+        OpendalSideCas(&self.0).store(rel_path, body).await
+    }
+
+    fn conditional(&self) -> bool {
+        OpendalSideCas(&self.0).conditional()
+    }
+}
+
 impl SideCasStore for OpendalSideCas<'_> {
     async fn load(&self, rel_path: &str) -> Result<(Option<SnapshotAggregates>, Option<String>)> {
         match self.0.stat(rel_path).await {
@@ -7295,6 +7713,7 @@ async fn write_side_aggregate_bytes(file_io: &FileIO, path: &str, bytes: Vec<u8>
 /// not encode on the second try either.
 async fn write_group_count_delta(
     op: &opendal::Operator,
+    namespace: &str,
     table: &str,
     delta: &GroupCountDelta,
 ) -> Result<()> {
@@ -7308,7 +7727,7 @@ async fn write_group_count_delta(
     })
     .await?;
     if retries > 0 {
-        record_group_count_delta_write_retries(table, u64::from(retries));
+        record_group_count_delta_write_retries(namespace, table, u64::from(retries));
         tracing::info!(
             rel,
             attempt = retries + 1,
@@ -7326,6 +7745,7 @@ const DELTA_WRITE_ATTEMPTS: u32 = 4;
 /// attempts are spent. A policy that is only exercised through a live S3 client
 /// is a policy nobody has checked.
 async fn retry_delta_write<F, Fut>(
+    namespace: &str,
     table: &str,
     rel: &str,
     max_attempts: u32,
@@ -7337,7 +7757,7 @@ where
 {
     let retries = retry_object_write("group-count delta", rel, max_attempts, write).await?;
     if retries > 0 {
-        record_group_count_delta_write_retries(table, u64::from(retries));
+        record_group_count_delta_write_retries(namespace, table, u64::from(retries));
         tracing::info!(
             rel,
             attempt = retries + 1,
@@ -7382,9 +7802,14 @@ where
     Err(last.unwrap_or_else(|| anyhow::anyhow!("write {kind} {rel}")))
 }
 
-fn record_group_count_delta_write_retries(table: &str, retries: u64) {
+/// Labelled by `iceberg_namespace` as well as `table` for the reason given on
+/// [`record_group_count_short_aggregate`]: one commit path writes deltas for the
+/// base namespace and every `tenant_*` namespace, each with its own `events`,
+/// and a bare `table` merged them into one series (#4759).
+fn record_group_count_delta_write_retries(namespace: &str, table: &str, retries: u64) {
     metrics::counter!(
         "siglake_group_count_delta_write_retries_total",
+        "iceberg_namespace" => namespace.to_owned(),
         "table" => table.to_owned()
     )
     .increment(retries);
@@ -7456,6 +7881,7 @@ pub fn report_inline_coverage(namespace: &str, table: &str, unproven: bool) {
 /// Test-only view of [`retry_delta_write`].
 #[doc(hidden)]
 pub async fn retry_delta_write_for_test<F, Fut>(
+    namespace: &str,
     table: &str,
     rel: &str,
     max_attempts: u32,
@@ -7465,13 +7891,14 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    retry_delta_write(table, rel, max_attempts, write).await
+    retry_delta_write(namespace, table, rel, max_attempts, write).await
 }
 
 #[derive(Default)]
 struct ListedGroupCountObjects {
     deltas: Vec<(i64, String)>,
     rebuild_markers: Vec<(i64, String)>,
+    short_repair_markers: Vec<(i64, String)>,
 }
 
 /// Every delta and rebuild marker present. They deliberately share a prefix so
@@ -7490,12 +7917,15 @@ async fn list_group_count_objects(op: &opendal::Operator) -> Result<ListedGroupC
         let path = entry.path().to_string();
         if let Some(sequence_number) = group_count_rebuild_sequence_number(&path) {
             out.rebuild_markers.push((sequence_number, path));
+        } else if let Some(sequence_number) = short_repair_marker_sequence_number(&path) {
+            out.short_repair_markers.push((sequence_number, path));
         } else if let Some(sequence_number) = group_count_delta_sequence_number(&path) {
             out.deltas.push((sequence_number, path));
         }
     }
     out.deltas.sort_unstable();
     out.rebuild_markers.sort_unstable();
+    out.short_repair_markers.sort_unstable();
     Ok(out)
 }
 
@@ -7503,6 +7933,48 @@ async fn list_group_count_objects(op: &opendal::Operator) -> Result<ListedGroupC
 /// consume rebuild markers; only the compactor fold does.
 async fn list_group_count_deltas(op: &opendal::Operator) -> Result<Vec<(i64, String)>> {
     Ok(list_group_count_objects(op).await?.deltas)
+}
+
+/// The sketch state a rebuild must preserve before it advances
+/// `rebuilt_through`: the stored base plus every not-yet-absorbed delta at or
+/// below the new watermark. Exact columns the same rebuild restored are
+/// excluded so one column never lands on both sides of the aggregate.
+async fn carried_group_count_sketches(
+    op: &opendal::Operator,
+    existing: Option<&WideGroupCounts>,
+    sequence_number: i64,
+    rebuilt_exact: &BTreeMap<String, ColumnGroupCounts>,
+) -> Result<GroupCountSketches> {
+    let mut carried = existing
+        .and_then(|wide| wide.sketches.clone())
+        .unwrap_or_else(|| GroupCountSketches {
+            version: GROUP_COUNT_SKETCH_VERSION,
+            columns: BTreeMap::new(),
+        });
+    carried
+        .columns
+        .retain(|column, _| !rebuilt_exact.contains_key(column));
+    let absorbed: BTreeSet<i64> = existing
+        .map(|wide| wide.absorbed.iter().copied().collect())
+        .unwrap_or_default();
+    for (sequence, path) in list_group_count_deltas(op).await? {
+        if sequence > sequence_number || absorbed.contains(&sequence) {
+            continue;
+        }
+        let Some(delta) = read_group_count_delta(op, &path).await? else {
+            continue;
+        };
+        let Some(mut sketches) = delta.sketches else {
+            continue;
+        };
+        sketches
+            .columns
+            .retain(|column, _| !rebuilt_exact.contains_key(column));
+        if !sketches.is_empty() {
+            carried.merge(&sketches);
+        }
+    }
+    Ok(carried)
 }
 
 async fn write_group_count_rebuild_marker(
@@ -7567,6 +8039,188 @@ async fn delete_group_count_rebuild_markers(
         }
     }
     deleted
+}
+
+const SHORT_REPAIR_MAX_ATTEMPTS: usize = 4;
+
+fn short_repair_delay(attempts: usize) -> Option<chrono::Duration> {
+    match attempts {
+        1 => Some(chrono::Duration::minutes(15)),
+        2 => Some(chrono::Duration::hours(1)),
+        3 => Some(chrono::Duration::hours(4)),
+        _ => None,
+    }
+}
+
+async fn write_short_repair_marker(
+    op: &opendal::Operator,
+    rel: &str,
+    marker: &ShortAggregateAttemptMarker,
+) -> Result<()> {
+    let body = serde_json::to_vec(marker).context("serialize short-repair marker")?;
+    retry_short_repair_marker_write(rel, || {
+        let op = op.clone();
+        let rel = rel.to_string();
+        let body = body.clone();
+        async move { op.write(&rel, body).await.map(|_| ()).map_err(Into::into) }
+    })
+    .await
+}
+
+async fn retry_short_repair_marker_write<F, Fut>(rel: &str, write: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    retry_object_write("short-repair marker", rel, DELTA_WRITE_ATTEMPTS, write)
+        .await
+        .map(|_| ())
+}
+
+async fn read_short_repair_marker(
+    op: &opendal::Operator,
+    rel: &str,
+) -> Result<Option<ShortAggregateAttemptMarker>> {
+    match op.read(rel).await {
+        Ok(bytes) => serde_json::from_slice(&bytes.to_bytes())
+            .with_context(|| format!("parse short-repair marker {rel}"))
+            .map(Some),
+        Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read short-repair marker {rel}")),
+    }
+}
+
+async fn delete_short_repair_markers(
+    op: &opendal::Operator,
+    markers: &[(i64, String)],
+    rebuilt_through: i64,
+) -> usize {
+    let mut deleted = 0;
+    for (_, path) in markers
+        .iter()
+        .filter(|(sequence_number, _)| *sequence_number <= rebuilt_through)
+    {
+        match op.delete(path).await {
+            Ok(()) => deleted += 1,
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => deleted += 1,
+            Err(e) => tracing::warn!(
+                error = ?e,
+                path,
+                "short-repair marker delete failed; the next census will retry"
+            ),
+        }
+    }
+    deleted
+}
+
+async fn short_repair_history_outcome(
+    op: &opendal::Operator,
+    table_uuid: Uuid,
+    paths: &[(i64, String)],
+    columns: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<ShortAggregateOutcome>> {
+    let mut markers = Vec::new();
+    for (sequence_number, path) in paths {
+        let marker = match read_short_repair_marker(op, path).await {
+            Ok(Some(marker)) => marker,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(?error, path, "short-repair marker is malformed");
+                return Ok(Some(ShortAggregateOutcome::Suppressed {
+                    columns: columns.to_vec(),
+                    attempts: paths.len(),
+                    reason: ShortAggregateAttemptReason::Malformed,
+                    marker: Some(path.clone()),
+                }));
+            }
+        };
+        if marker.version != 1
+            || marker.table_uuid != table_uuid
+            || marker.target_sequence_number != *sequence_number
+            || marker.reason == ShortAggregateAttemptReason::Malformed
+        {
+            return Ok(Some(ShortAggregateOutcome::Suppressed {
+                columns: columns.to_vec(),
+                attempts: paths.len(),
+                reason: ShortAggregateAttemptReason::Malformed,
+                marker: Some(path.clone()),
+            }));
+        }
+        let started_at = match marker.started_at.parse::<chrono::DateTime<chrono::Utc>>() {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Some(ShortAggregateOutcome::Suppressed {
+                    columns: columns.to_vec(),
+                    attempts: paths.len(),
+                    reason: ShortAggregateAttemptReason::Malformed,
+                    marker: Some(path.clone()),
+                }));
+            }
+        };
+        let next = match marker
+            .next_eligible_at
+            .parse::<chrono::DateTime<chrono::Utc>>()
+        {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Some(ShortAggregateOutcome::Suppressed {
+                    columns: columns.to_vec(),
+                    attempts: paths.len(),
+                    reason: ShortAggregateAttemptReason::Malformed,
+                    marker: Some(path.clone()),
+                }));
+            }
+        };
+        markers.push((path.clone(), marker, started_at, next));
+    }
+    if markers.is_empty() {
+        return Ok(None);
+    }
+    markers.sort_by_key(|(_, _, started_at, _)| *started_at);
+    let attempts = markers.len();
+
+    for (path, marker, _, next) in &mut markers {
+        if marker.reason == ShortAggregateAttemptReason::Started && *next <= now {
+            marker.reason = ShortAggregateAttemptReason::Interrupted;
+            marker.next_eligible_at = short_repair_delay(attempts)
+                .map(|delay| now + delay)
+                .unwrap_or(now)
+                .to_rfc3339();
+            write_short_repair_marker(op, path, marker).await?;
+            *next = marker.next_eligible_at.parse().expect("just formatted UTC");
+        }
+    }
+    if let Some((_, marker, _, _)) = markers
+        .iter()
+        .rev()
+        .find(|(_, marker, _, _)| marker.reason == ShortAggregateAttemptReason::Started)
+    {
+        return Ok(Some(ShortAggregateOutcome::BackedOff {
+            columns: columns.to_vec(),
+            attempts,
+            reason: ShortAggregateAttemptReason::Started,
+            next_eligible_at: marker.next_eligible_at.clone(),
+        }));
+    }
+    let (_, latest, _, next) = markers.last().expect("non-empty history");
+    if attempts >= SHORT_REPAIR_MAX_ATTEMPTS {
+        return Ok(Some(ShortAggregateOutcome::Suppressed {
+            columns: columns.to_vec(),
+            attempts,
+            reason: latest.reason,
+            marker: None,
+        }));
+    }
+    if latest.reason == ShortAggregateAttemptReason::Started || *next > now {
+        return Ok(Some(ShortAggregateOutcome::BackedOff {
+            columns: columns.to_vec(),
+            attempts,
+            reason: latest.reason,
+            next_eligible_at: latest.next_eligible_at.clone(),
+        }));
+    }
+    Ok(None)
 }
 
 /// Read one delta. `None` means the object is gone — which is a real state, not
@@ -7670,21 +8324,35 @@ async fn fold_wide_group_counts(
     cap: usize,
     sketch_m: usize,
 ) -> Result<FoldedWide> {
+    fold_wide_group_counts_with_deltas(op, cap, sketch_m, None).await
+}
+
+async fn fold_wide_group_counts_with_deltas(
+    op: &opendal::Operator,
+    cap: usize,
+    sketch_m: usize,
+    listed_deltas: Option<&[(i64, String)]>,
+) -> Result<FoldedWide> {
     use futures::StreamExt;
     const MAX_ATTEMPTS: usize = 3;
+    let mut supplied_deltas = listed_deltas.map(|deltas| deltas.to_vec());
     for _ in 0..MAX_ATTEMPTS {
         let (wide, _) = load_wide_group_counts(op).await?;
         let wide = wide.unwrap_or_default();
         let mut folded = WideGroupCounts {
             coverage: wide.coverage,
             coverage_links: wide.coverage_links.clone(),
+            rebuilt_through: wide.rebuilt_through,
             // Carried so the maintenance census reads its own suppression
             // record off the memoised folded view instead of GETting the base
             // object (26.5 MB at the measured extreme) a second time.
             short_repair: wide.short_repair.clone(),
             ..WideGroupCounts::default()
         };
-        let present = list_group_count_deltas(op).await?;
+        let present = match supplied_deltas.take() {
+            Some(present) => present,
+            None => list_group_count_deltas(op).await?,
+        };
         // The READ-side twin of the compactor fold's filter, and it has to say
         // the same thing: a delta at or below `rebuilt_through` describes rows
         // the rebuild already read out of the committed FILES. Folding it here
@@ -7782,18 +8450,58 @@ pub enum ShortAggregateOutcome {
     Pending { columns: Vec<String> },
     /// Short only in columns a previous rebuild already proved it cannot
     /// restore. Nothing to do but tell an operator.
-    Suppressed { columns: Vec<String> },
+    Unrestored { columns: Vec<String> },
     /// Short with every contribution accounted for, and no rebuild ran:
     /// automatic repair is off, or this pass's budget is spent.
     Detected { columns: Vec<String> },
-    /// A rebuild ran. `unrestored` is empty when every short column now covers
-    /// the table.
+    /// A rebuild ran. `unrestored` names a short exact column that still does
+    /// not cover the table or a sketch whose files returned unavailable and
+    /// therefore kept its carried state.
     Repaired {
         columns: Vec<String>,
         unrestored: Vec<String>,
     },
+    /// Durable history defers another automatic scan until its UTC deadline.
+    BackedOff {
+        columns: Vec<String>,
+        attempts: usize,
+        reason: ShortAggregateAttemptReason,
+        next_eligible_at: String,
+    },
+    /// Four automatic attempts have been spent, or a marker is malformed.
+    Suppressed {
+        columns: Vec<String>,
+        attempts: usize,
+        reason: ShortAggregateAttemptReason,
+        marker: Option<String>,
+    },
+    /// The pre-attempt marker could not be persisted, so no Tier-2 scan ran.
+    MarkerFailed { columns: Vec<String> },
     /// The rebuild errored. The deficit is unchanged and a later pass retries.
-    Failed,
+    Failed { columns: Vec<String> },
+}
+
+#[derive(Debug, Clone)]
+pub struct ShortAggregateCensus {
+    pub table: String,
+    pub outcome: ShortAggregateOutcome,
+    maintained_columns: Vec<String>,
+    target_snapshot_id: i64,
+    target_sequence_number: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShortAggregateAttempt {
+    table: String,
+    columns: Vec<String>,
+    marker_path: String,
+    marker: ShortAggregateAttemptMarker,
+}
+
+#[derive(Debug, Clone)]
+pub enum ShortAggregateAttemptStart {
+    Ready(ShortAggregateAttempt),
+    Outcome(ShortAggregateOutcome),
 }
 
 /// What the inline-coverage census made of one table (#4674).
@@ -8019,7 +8727,7 @@ mod pruned_window_tests {
         let ts = arrow_array::TimestampNanosecondArray::from((0..rows).collect::<Vec<_>>());
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ts)]).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(rg_rows)
+            .set_max_row_group_row_count(Some(rg_rows))
             .build();
         let file = std::fs::File::create(path).unwrap();
         let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
@@ -8333,6 +9041,39 @@ fn tokenizer_name(tokenizer: siglake_bloom::Tokenizer) -> &'static str {
     }
 }
 
+/// The text columns a rewrite builds a segmented (`seg2`) sidecar for: the
+/// table's inverted-index specs, restricted to the columns the output schema
+/// actually carries as Utf8.
+///
+/// The same specs the v1 sidecar is built from, so a file's segmented sidecar
+/// covers the columns its v1 one would have and the reader's per-column
+/// discovery finds one or the other. A spec naming a column the schema does not
+/// carry as text is dropped here rather than in the writer, which would
+/// otherwise refuse the whole file's sidecar set for it.
+fn segmented_index_columns_for_table(
+    table: &Table,
+    arrow_schema: &arrow_schema::Schema,
+    inverted_index_enabled: bool,
+) -> Result<Vec<SegmentedIndexColumn>> {
+    Ok(
+        inverted_index_spec_for_table(table, None, inverted_index_enabled)?
+            .into_iter()
+            .filter(|spec| {
+                matches!(
+                    arrow_schema
+                        .field_with_name(spec.column.as_str())
+                        .map(|field| field.data_type()),
+                    Ok(arrow_schema::DataType::Utf8)
+                )
+            })
+            .map(|spec| SegmentedIndexColumn {
+                column: spec.column,
+                tokenizer: spec.tokenizer,
+            })
+            .collect(),
+    )
+}
+
 fn record_batch_inverted_indexes(
     batch: &RecordBatch,
     specs: &[InvertedIndexSpec],
@@ -8384,6 +9125,7 @@ fn split_footer_and_puffin_indexes(
     let mut puffin = Vec::new();
     for blob in serialized {
         if blob.bytes.len() <= threshold {
+            let checksum = format!("{:08x}", siglake_index::inverted_index_crc32(&blob.bytes));
             let mut hex = String::with_capacity(blob.bytes.len() * 2);
             for b in &blob.bytes {
                 hex.push(char::from_digit((b >> 4) as u32, 16).unwrap());
@@ -8392,6 +9134,10 @@ fn split_footer_and_puffin_indexes(
             footer.push((
                 siglake_index::inverted_index_kv_key(blob.column.as_str()).into_owned(),
                 hex,
+            ));
+            footer.push((
+                siglake_index::inverted_index_crc32_kv_key(blob.column.as_str()).into_owned(),
+                checksum,
             ));
         } else {
             puffin.push(blob);
@@ -8619,6 +9365,21 @@ pub struct IcebergTuning {
     pub delete_rewrite_inram_max_bytes: Option<u64>,
     /// Row cap for the same decision.
     pub delete_rewrite_inram_max_rows: Option<u64>,
+    /// Whether a re-clustering rewrite builds a segmented (`seg2`)
+    /// inverted-index sidecar for its output as it merges. `None` = as
+    /// `SIGLAKE_SEGMENTED_INDEX_WRITES` says, which is off.
+    pub segmented_index_writes: Option<bool>,
+    /// Dictionary-block byte target for that sidecar. `None` = as
+    /// `SIGLAKE_SEGMENTED_INDEX_BLOCK_BYTES` says, which is the codec's 4 KiB.
+    pub segmented_index_block_bytes: Option<usize>,
+    /// Compressed-byte target at which a merge's rolling writer opens another
+    /// output file. `None` = Iceberg's `write.target-file-size-bytes` default,
+    /// which is what production uses.
+    ///
+    /// Exists so a test can exercise a rewrite that splits its output across
+    /// several data files — one sidecar per output file (#4377) — without
+    /// writing half a gigabyte to get there.
+    pub merge_target_file_bytes: Option<usize>,
 }
 
 /// Decide whether a re-cluster bin is merged via the memory-bounded streaming
@@ -8652,13 +9413,16 @@ fn recluster_should_stream(files: &[DataFile], merge: &ReclusterMergeOptions) ->
 /// `None` when the whole bin shares one partition value (including the
 /// unpartitioned case, where every value is the empty struct).
 ///
-/// This is the precondition [`IcebergContext::recluster_files_with`] enforces on
-/// its streaming dispatches: they write their output through one writer stamped
-/// with `files[0].partition()` (see `build_merge_output_writer`), so a bin
-/// spanning two day partitions would commit rows under the wrong partition value
-/// and a query whose timestamp predicate resolves against the other day prunes
-/// the file. The row-count guard cannot see it — the rows are all there, just
-/// unreachable.
+/// This is the precondition [`IcebergContext::recluster_files_with`] enforces at
+/// its entry point, whichever merge the bin would dispatch to. The streaming
+/// executors write their output through one writer stamped with
+/// `files[0].partition()` (see `build_merge_output_writer`), so a bin spanning
+/// two day partitions would commit rows under the wrong partition value and a
+/// query whose timestamp predicate resolves against the other day prunes the
+/// file. The row-count guard cannot see it — the rows are all there, just
+/// unreachable. The in-RAM concat splits by partition value instead, so it would
+/// be correct; it is held to the same precondition so that whether a mixed bin
+/// works does not depend on the bin's size (#4720).
 fn first_cross_partition_file(files: &[DataFile]) -> Option<usize> {
     let first = files.first()?.partition();
     files.iter().position(|f| f.partition() != first)
@@ -8996,13 +9760,30 @@ fn tenant_metric_label(namespace: &NamespaceIdent) -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// Every `(data file, column)` a registered production Puffin text sidecar
+/// already covers.
+///
+/// This is what makes a rebuild idempotent, and since #4377 it is also what
+/// keeps the post-commit full-file decode away from a file a rewrite already
+/// indexed: a seg2 sidecar is registered with the rewrite that wrote it, so the
+/// maintenance rebuild sees the column covered and reads nothing. A seg2 blob
+/// and a whole-file v1 blob are alternative answers for the same column.
+/// Prototype seg1 never shipped and no longer suppresses a production rebuild
+/// (#5230).
+fn puffin_blob_suppresses_rebuild(blob_type: &str) -> bool {
+    matches!(
+        blob_type,
+        SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE | siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE
+    )
+}
+
 fn existing_puffin_index_columns(
     metadata: &iceberg::spec::TableMetadata,
 ) -> HashSet<(String, String)> {
     metadata
         .statistics_iter()
         .flat_map(|stats| stats.blob_metadata.iter())
-        .filter(|blob| blob.r#type == SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE)
+        .filter(|blob| puffin_blob_suppresses_rebuild(&blob.r#type))
         .filter_map(|blob| {
             Some((
                 blob.properties.get("data_file")?.to_string(),
@@ -9010,6 +9791,24 @@ fn existing_puffin_index_columns(
             ))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod rebuild_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn only_production_text_sidecars_suppress_a_rebuild() {
+        assert!(puffin_blob_suppresses_rebuild(
+            SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE
+        ));
+        assert!(puffin_blob_suppresses_rebuild(
+            siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE
+        ));
+        assert!(!puffin_blob_suppresses_rebuild(
+            siglake_index::segmented::SEGMENTED_BLOB_TYPE
+        ));
+    }
 }
 
 async fn parquet_footer_has_index(path: &str, file_io: &FileIO, column: &str) -> bool {
@@ -9109,6 +9908,259 @@ async fn build_puffin_index_blobs_for_file(
         .collect())
 }
 
+/// Write one Puffin statistics file holding the segmented (`seg2`) sidecars a
+/// rewrite just built, for a snapshot id the caller reserved and has not
+/// committed yet (#4377).
+///
+/// Two things differ from [`write_puffin_sidecar`], and both are the format:
+///
+/// - **The blobs are registered with no codec.** A compressed blob has no
+///   addressable interior, and the reader refuses one
+///   (`BlobRangeReader`/`declined{reason="compressed"}`). Seg2 compresses each
+///   dictionary block and posting span itself, so the container does not have
+///   to.
+/// - **No `row_group_size` property.** The directory states every group's row
+///   count, so the reader validates the sidecar against the file's own Parquet
+///   metadata rather than against a stamped number that can agree by accident.
+///
+/// The object is written before the rewrite commits. That is deliberate: the
+/// statistics file has to exist for the transaction to reference it, and an
+/// object no metadata points at is not discoverable — a failed commit leaves an
+/// orphan for `gc_orphans`, never a partial index.
+async fn write_segmented_puffin_sidecar(
+    table: &Table,
+    snapshot_id: i64,
+    sequence_number: i64,
+    blobs: &[SegmentedIndexBlob],
+) -> Result<StatisticsFile> {
+    let statistics_path = next_puffin_sidecar_path(table)?;
+    let output_file = table
+        .file_io()
+        .new_output(&statistics_path)
+        .with_context(|| format!("new_output {statistics_path}"))?;
+    let mut writer = PuffinWriter::new(&output_file, HashMap::new(), false)
+        .await
+        .context("PuffinWriter::new")?;
+    let schema = table.metadata().current_schema();
+    let mut statistics_blob_metadata = Vec::with_capacity(blobs.len());
+    for blob in blobs {
+        let field_id = schema
+            .field_id_by_name(blob.column.as_str())
+            .unwrap_or_default();
+        let properties = HashMap::from([
+            ("data_file".to_string(), blob.data_file_path.clone()),
+            ("column".to_string(), blob.column.clone()),
+            (
+                "tokenizer".to_string(),
+                tokenizer_name(blob.tokenizer).to_string(),
+            ),
+            (
+                "format".to_string(),
+                siglake_index::segmented::SEGMENTED_V2_FORMAT_PROPERTY.to_string(),
+            ),
+        ]);
+        writer
+            .add(
+                PuffinBlob::builder()
+                    .r#type(siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE.to_string())
+                    .fields(vec![field_id])
+                    .snapshot_id(snapshot_id)
+                    .sequence_number(sequence_number)
+                    .data(blob.bytes.clone())
+                    .properties(properties.clone())
+                    .build(),
+                PuffinCompressionCodec::None,
+            )
+            .await
+            .context("PuffinWriter::add")?;
+        statistics_blob_metadata.push(StatisticsBlobMetadata {
+            r#type: siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE.to_string(),
+            snapshot_id,
+            sequence_number,
+            fields: vec![field_id],
+            properties,
+        });
+    }
+    writer.close().await.context("PuffinWriter::close")?;
+    let input = output_file.to_input_file();
+    let file_size_in_bytes = input.metadata().await?.size as i64;
+    let file_footer_size_in_bytes = PuffinReader::new(input)
+        .footer_size_in_bytes()
+        .await
+        .context("PuffinReader::footer_size_in_bytes")? as i64;
+    Ok(StatisticsFile {
+        snapshot_id,
+        statistics_path,
+        file_size_in_bytes,
+        file_footer_size_in_bytes,
+        key_metadata: None,
+        blob_metadata: statistics_blob_metadata,
+    })
+}
+
+/// Registers a rewrite's already-built seg2 blobs against the snapshot the
+/// rewrite action produced on this transaction attempt.
+///
+/// Transaction retries re-apply actions after refreshing their base. Writing
+/// the Puffin file here, after `RewriteFilesAction`, gives both its physical
+/// footer and its table metadata the refreshed snapshot's sequence number.
+/// The immutable Parquet output and seg2 bytes are reused; a Puffin file from a
+/// failed CAS attempt remains unreferenced and is reclaimed as an orphan.
+struct PublishSegmentedStatisticsAction {
+    snapshot_id: i64,
+    blobs: Vec<SegmentedIndexBlob>,
+}
+
+#[async_trait::async_trait]
+impl TransactionAction for PublishSegmentedStatisticsAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        let snapshot = table.metadata().current_snapshot().ok_or_else(|| {
+            IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "segmented statistics action found no rewrite snapshot",
+            )
+        })?;
+        if snapshot.snapshot_id() != self.snapshot_id {
+            return Err(IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "segmented statistics action did not follow its rewrite snapshot",
+            )
+            .with_context("expected_snapshot_id", self.snapshot_id.to_string())
+            .with_context("found_snapshot_id", snapshot.snapshot_id().to_string()));
+        }
+        let statistics = write_segmented_puffin_sidecar(
+            table,
+            snapshot.snapshot_id(),
+            snapshot.sequence_number(),
+            &self.blobs,
+        )
+        .await
+        .map_err(|err| {
+            IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "failed to write segmented index sidecar",
+            )
+            .with_source(err)
+        })?;
+        Ok(ActionCommit::new(
+            vec![TableUpdate::SetStatistics { statistics }],
+            vec![],
+        ))
+    }
+}
+
+/// What the last-evaluated transaction base said about the target snapshot's
+/// statistics entry.
+///
+/// One `bool` rather than a counter: `Transaction::do_commit` re-applies its
+/// actions per attempt, so the value is overwritten on every refreshed base and
+/// the last write is the outcome the caller committed (or deferred) under. A
+/// deferral ends the transaction — it produces neither updates nor
+/// requirements, so `do_commit` returns without a catalog write and no further
+/// attempt can follow it.
+#[derive(Debug, Default)]
+struct FirstStatisticsRegistrationObservation {
+    deferred: AtomicBool,
+}
+
+impl FirstStatisticsRegistrationObservation {
+    fn store(&self, deferred: bool) {
+        self.deferred.store(deferred, Ordering::Relaxed);
+    }
+
+    fn deferred(&self) -> bool {
+        self.deferred.load(Ordering::Relaxed)
+    }
+}
+
+/// Registers an already-written Puffin statistics file against a committed
+/// snapshot, and only while that snapshot still carries none.
+///
+/// A snapshot holds at most one statistics file and `set_statistics` inserts by
+/// snapshot id, so a second registration REPLACES the first rather than merging
+/// into it (#5228). Registration is therefore first-writer-wins, and the loser
+/// defers: it leaves the winning file registered and its blobs discoverable.
+///
+/// The absence check belongs here, inside the action, because that is the only
+/// place it sees the base the commit will actually land on.
+/// `Transaction::do_commit` loads the table at the top of every attempt and
+/// re-applies each action against it, so a check made against the caller's own
+/// handle says nothing about the first attempt's refreshed base, and nothing at
+/// all about the base of an attempt that follows a lost CAS (#5298). The
+/// caller's pre-write check stays as a cheap short-circuit; this one decides.
+struct RegisterFirstStatisticsAction {
+    snapshot_id: i64,
+    /// Written before the transaction and re-referenced unchanged on every
+    /// attempt: the target snapshot is already committed, so both the entry's
+    /// snapshot id and the sequence number stamped into the Puffin footer are
+    /// immutable for the life of the transaction. (A rewrite's sidecar is the
+    /// other case — its snapshot is reserved and not yet committed, so #5260
+    /// writes that one per attempt.)
+    statistics: StatisticsFile,
+    observation: Arc<FirstStatisticsRegistrationObservation>,
+}
+
+#[async_trait::async_trait]
+impl TransactionAction for RegisterFirstStatisticsAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        if table.metadata().snapshot_by_id(self.snapshot_id).is_none() {
+            // The snapshot the blobs are addressed to left the table between
+            // the caller's load and this attempt's base. Registering against it
+            // would describe rows no reader can reach through it.
+            return Err(IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "index registration target snapshot is not on the transaction base",
+            )
+            .with_context("snapshot_id", self.snapshot_id.to_string()));
+        }
+        if table
+            .metadata()
+            .statistics_for_snapshot(self.snapshot_id)
+            .is_some()
+        {
+            self.observation.store(true);
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+        self.observation.store(false);
+        Ok(ActionCommit::new(
+            vec![TableUpdate::SetStatistics {
+                statistics: self.statistics.clone(),
+            }],
+            vec![TableRequirement::UuidMatch {
+                uuid: table.metadata().uuid(),
+            }],
+        ))
+    }
+}
+
+/// Count and log one deferred index registration.
+///
+/// Called once per registration call, never once per commit attempt: a retry is
+/// the same deferral seen again, and counting attempts would make the rate of
+/// this bounded series a function of catalog contention.
+fn record_registration_deferral(
+    table_ident: &TableIdent,
+    snapshot_id: i64,
+    deferred_files: &BTreeSet<String>,
+    written_sidecar: Option<&str>,
+) {
+    metrics::counter!(
+        "siglake_index_registration_deferred_total",
+        "reason" => "snapshot_has_statistics"
+    )
+    .increment(1);
+    tracing::warn!(
+        table = %table_ident,
+        snapshot_id,
+        files = deferred_files.len(),
+        deferred_files = ?deferred_files,
+        // Present when the deferral was decided after the sidecar was already
+        // written: the object is unreferenced and `gc_orphans` reclaims it.
+        orphaned_sidecar = written_sidecar,
+        "deferred Puffin index registration because the snapshot already has a statistics file"
+    );
+}
+
 async fn write_puffin_sidecar(
     table: &Table,
     snapshot: &iceberg::spec::Snapshot,
@@ -9151,7 +10203,7 @@ async fn write_puffin_sidecar(
                     .data(blob.bytes)
                     .properties(properties.clone())
                     .build(),
-                PuffinCompressionCodec::Zstd,
+                SIGLAKE_PUFFIN_INVERTED_CODEC,
             )
             .await
             .context("PuffinWriter::add")?;
@@ -10236,6 +11288,38 @@ fn index_rebuild_enabled_from(configured: Option<&str>) -> bool {
     configured == Some("1")
 }
 
+/// Whether a re-clustering rewrite builds a **segmented** (`seg2`)
+/// inverted-index sidecar for its output while it merges, from the raw
+/// `SIGLAKE_SEGMENTED_INDEX_WRITES` value (`None` = unset).
+///
+/// OFF unless the value is the explicit `"1"` opt-in (#4377). #4562 measured
+/// the format through the query path and the disposition is to proceed
+/// (`docs/DESIGN_segmented_inverted_index.md`), but the reads it would feed are
+/// themselves behind `SIGLAKE_SEGMENTED_INDEX_READS` and neither has been
+/// qualified on an AWS round. With the knob unset a rewrite writes what it
+/// wrote before, byte for byte: no sidecar is built, nothing is registered, and
+/// the output carries no new footer key.
+///
+/// Pure so the deployment default and the opt-in are testable without mutating
+/// the process environment.
+fn segmented_index_writes_enabled_from(configured: Option<&str>) -> bool {
+    configured == Some("1")
+}
+
+/// Dictionary-block byte target for a segmented sidecar built during a rewrite,
+/// from the raw `SIGLAKE_SEGMENTED_INDEX_BLOCK_BYTES` value.
+///
+/// The block size trades the resident directory against the bytes one lookup
+/// fetches, and every measurement in the design was taken at the codec's 4 KiB
+/// default. An unparseable or zero value keeps that default; the codec floors
+/// whatever it is given at 64 bytes.
+fn segmented_index_block_bytes_from(configured: Option<&str>) -> usize {
+    configured
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES)
+}
+
 /// Idempotent namespace bootstrap: check, create, and treat a lost creation
 /// race as success.
 ///
@@ -10283,6 +11367,264 @@ async fn create_namespace_tolerating_existing(
     }
 }
 
+#[derive(Debug, Default)]
+struct StatisticsRetirementObservation {
+    eligible: AtomicUsize,
+    kept_live: AtomicUsize,
+    skipped_unowned: AtomicUsize,
+    skipped_missing_data_file: AtomicUsize,
+}
+
+impl StatisticsRetirementObservation {
+    fn store(&self, report: StatisticsRetirementReport) {
+        self.eligible.store(report.eligible, Ordering::Relaxed);
+        self.kept_live.store(report.kept_live, Ordering::Relaxed);
+        self.skipped_unowned
+            .store(report.skipped_unowned, Ordering::Relaxed);
+        self.skipped_missing_data_file
+            .store(report.skipped_missing_data_file, Ordering::Relaxed);
+    }
+
+    fn report(&self, applied: bool) -> StatisticsRetirementReport {
+        let eligible = self.eligible.load(Ordering::Relaxed);
+        StatisticsRetirementReport {
+            eligible,
+            removed: usize::from(applied) * eligible,
+            kept_live: self.kept_live.load(Ordering::Relaxed),
+            skipped_unowned: self.skipped_unowned.load(Ordering::Relaxed),
+            skipped_missing_data_file: self.skipped_missing_data_file.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct RetireObsoleteStatisticsAction {
+    observation: Arc<StatisticsRetirementObservation>,
+}
+
+impl RetireObsoleteStatisticsAction {
+    fn new() -> (Self, Arc<StatisticsRetirementObservation>) {
+        let observation = Arc::new(StatisticsRetirementObservation::default());
+        (
+            Self {
+                observation: Arc::clone(&observation),
+            },
+            observation,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl TransactionAction for RetireObsoleteStatisticsAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        if table.metadata().statistics_iter().next().is_none() {
+            self.observation
+                .store(StatisticsRetirementReport::default());
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+        let live_data_files = retained_live_data_file_paths(table).await?;
+        let (report, snapshot_ids, _) =
+            statistics_retirement_plan(table.metadata(), &live_data_files);
+        self.observation.store(report);
+        if snapshot_ids.is_empty() {
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+        Ok(ActionCommit::new(
+            snapshot_ids
+                .into_iter()
+                .map(|snapshot_id| TableUpdate::RemoveStatistics { snapshot_id })
+                .collect(),
+            vec![TableRequirement::UuidMatch {
+                uuid: table.metadata().uuid(),
+            }],
+        ))
+    }
+}
+
+fn siglake_owned_statistics_blob(blob_type: &str) -> bool {
+    matches!(
+        blob_type,
+        SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE
+            | siglake_index::segmented::SEGMENTED_BLOB_TYPE
+            | siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatisticsDisposition {
+    Retire,
+    KeepLive,
+    SkipUnowned,
+    SkipMissingDataFile,
+}
+
+fn statistics_disposition(
+    statistics: &StatisticsFile,
+    live_data_files: &HashSet<String>,
+) -> StatisticsDisposition {
+    if statistics
+        .blob_metadata
+        .iter()
+        .any(|blob| !siglake_owned_statistics_blob(&blob.r#type))
+    {
+        return StatisticsDisposition::SkipUnowned;
+    }
+    if statistics.blob_metadata.is_empty()
+        || statistics
+            .blob_metadata
+            .iter()
+            .any(|blob| !blob.properties.contains_key("data_file"))
+    {
+        return StatisticsDisposition::SkipMissingDataFile;
+    }
+    if statistics.blob_metadata.iter().any(|blob| {
+        live_data_files.contains(
+            blob.properties
+                .get("data_file")
+                .expect("presence checked above"),
+        )
+    }) {
+        StatisticsDisposition::KeepLive
+    } else {
+        StatisticsDisposition::Retire
+    }
+}
+
+fn statistics_retirement_plan(
+    metadata: &iceberg::spec::TableMetadata,
+    live_data_files: &HashSet<String>,
+) -> (StatisticsRetirementReport, Vec<i64>, Vec<String>) {
+    let mut report = StatisticsRetirementReport::default();
+    let mut snapshot_ids = Vec::new();
+    let mut statistics_paths = Vec::new();
+    for statistics in metadata.statistics_iter() {
+        match statistics_disposition(statistics, live_data_files) {
+            StatisticsDisposition::Retire => {
+                report.eligible += 1;
+                snapshot_ids.push(statistics.snapshot_id);
+                statistics_paths.push(statistics.statistics_path.clone());
+            }
+            StatisticsDisposition::KeepLive => report.kept_live += 1,
+            StatisticsDisposition::SkipUnowned => report.skipped_unowned += 1,
+            StatisticsDisposition::SkipMissingDataFile => {
+                report.skipped_missing_data_file += 1;
+            }
+        }
+    }
+    (report, snapshot_ids, statistics_paths)
+}
+
+async fn retained_live_data_file_paths(table: &Table) -> iceberg::Result<HashSet<String>> {
+    let metadata = table.metadata_ref();
+    let mut live = HashSet::new();
+    let mut visited_manifests = HashSet::new();
+    for snapshot in metadata.snapshots() {
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), &metadata)
+            .await?;
+        for manifest_file in manifest_list.entries() {
+            if !visited_manifests.insert(manifest_file.manifest_path.clone()) {
+                continue;
+            }
+            let manifest = manifest_file.load_manifest(table.file_io()).await?;
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    live.insert(entry.data_file().file_path().to_string());
+                }
+            }
+        }
+    }
+    Ok(live)
+}
+
+fn record_statistics_retirement(report: StatisticsRetirementReport) {
+    metrics::counter!("siglake_iceberg_statistics_removed_total").increment(report.removed as u64);
+    metrics::counter!(
+        "siglake_iceberg_statistics_retirement_skipped_total",
+        "reason" => "unowned_blob_type"
+    )
+    .increment(report.skipped_unowned as u64);
+    metrics::counter!(
+        "siglake_iceberg_statistics_retirement_skipped_total",
+        "reason" => "missing_data_file"
+    )
+    .increment(report.skipped_missing_data_file as u64);
+}
+
+#[cfg(test)]
+mod statistics_retirement_tests {
+    use super::*;
+
+    fn blob(blob_type: &str, data_file: Option<&str>) -> StatisticsBlobMetadata {
+        StatisticsBlobMetadata {
+            r#type: blob_type.to_string(),
+            snapshot_id: 7,
+            sequence_number: 7,
+            fields: vec![1],
+            properties: data_file
+                .map(|path| HashMap::from([("data_file".to_string(), path.to_string())]))
+                .unwrap_or_default(),
+        }
+    }
+
+    fn statistics(blobs: Vec<StatisticsBlobMetadata>) -> StatisticsFile {
+        StatisticsFile {
+            snapshot_id: 7,
+            statistics_path: "file:///warehouse/metadata/index.puffin".to_string(),
+            file_size_in_bytes: 100,
+            file_footer_size_in_bytes: 10,
+            key_metadata: None,
+            blob_metadata: blobs,
+        }
+    }
+
+    #[test]
+    fn an_entry_with_any_live_blob_stays_whole() {
+        let live = HashSet::from(["file:///warehouse/data/live.parquet".to_string()]);
+        let entry = statistics(vec![
+            blob(
+                SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE,
+                Some("file:///warehouse/data/retired.parquet"),
+            ),
+            blob(
+                siglake_index::segmented::SEGMENTED_V2_BLOB_TYPE,
+                Some("file:///warehouse/data/live.parquet"),
+            ),
+        ]);
+        assert_eq!(
+            statistics_disposition(&entry, &live),
+            StatisticsDisposition::KeepLive
+        );
+    }
+
+    #[test]
+    fn only_owned_entries_with_complete_retired_references_are_removed() {
+        let live = HashSet::new();
+        let retired = statistics(vec![blob(
+            siglake_index::segmented::SEGMENTED_BLOB_TYPE,
+            Some("file:///warehouse/data/retired.parquet"),
+        )]);
+        assert_eq!(
+            statistics_disposition(&retired, &live),
+            StatisticsDisposition::Retire
+        );
+
+        let unowned = statistics(vec![blob(
+            "apache-datasketches-theta-v1",
+            Some("file:///warehouse/data/retired.parquet"),
+        )]);
+        assert_eq!(
+            statistics_disposition(&unowned, &live),
+            StatisticsDisposition::SkipUnowned
+        );
+
+        let missing = statistics(vec![blob(SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE, None)]);
+        assert_eq!(
+            statistics_disposition(&missing, &live),
+            StatisticsDisposition::SkipMissingDataFile
+        );
+    }
+}
+
 impl IcebergContext {
     /// Open (or create) a siglake catalog rooted at `warehouse_dir`.
     ///
@@ -10310,11 +11652,11 @@ impl IcebergContext {
     ///   - `file://abs/path` → [`LocalFsStorageFactory`].
     ///   - `s3://bucket/prefix` or `s3a://...` →
     ///     [`OpenDalStorageFactory::S3`]. Credentials come from the standard
-    ///     AWS environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-    ///     `AWS_REGION`, `AWS_ENDPOINT_URL_S3`, `AWS_S3_FORCE_PATH_STYLE`)
-    ///     because `iceberg-catalog-sql 0.9` doesn't currently flow
-    ///     user-supplied props into FileIO. K8s pods will get these via
-    ///     a `Secret` mounted as env vars, or via IRSA on EKS.
+    ///     AWS environment (static keys, IRSA, ECS or IMDS). Region, endpoint
+    ///     and `AWS_S3_FORCE_PATH_STYLE` are translated into Iceberg FileIO
+    ///     properties; a custom endpoint defaults to path-style addressing.
+    ///     K8s pods get these settings from chart-managed env vars, a `Secret`
+    ///     mounted as env vars, or IRSA on EKS.
     ///   - `memory://...` → [`OpenDalStorageFactory::Memory`] (tests only).
     pub async fn open_with(catalog_uri: &str, warehouse_url: &str) -> Result<Self> {
         Self::open_with_namespace(catalog_uri, warehouse_url, NAMESPACE).await
@@ -10380,14 +11722,22 @@ impl IcebergContext {
             SqlBindStyle::QMark
         };
         let factory = storage_factory_for(warehouse_url)?;
-        let warehouse_file_io = FileIOBuilder::new(factory.clone()).build();
+        let file_io_properties =
+            if warehouse_url.starts_with("s3://") || warehouse_url.starts_with("s3a://") {
+                s3_file_io_properties()
+            } else {
+                HashMap::new()
+            };
+        let warehouse_file_io = FileIOBuilder::new(factory.clone())
+            .with_props(file_io_properties.clone())
+            .build();
 
         let catalog = SqlCatalogBuilder::default()
             .uri(catalog_uri.to_string())
             .warehouse_location(warehouse_url.to_string())
             .sql_bind_style(bind_style)
             .with_storage_factory(factory)
-            .load("siglake", HashMap::new())
+            .load("siglake", file_io_properties)
             .await
             .with_context(|| format!("loading SQL catalog at {catalog_uri}"))?;
         let catalog: Arc<dyn Catalog> = Arc::new(catalog);
@@ -10535,6 +11885,28 @@ impl IcebergContext {
     fn index_rebuild_enabled(&self) -> bool {
         self.tuning.index_rebuild.unwrap_or_else(|| {
             index_rebuild_enabled_from(std::env::var("SIGLAKE_INDEX_REBUILD").ok().as_deref())
+        })
+    }
+
+    /// See [`segmented_index_writes_enabled_from`]. Off unless opted in.
+    fn segmented_index_writes_enabled(&self) -> bool {
+        self.tuning.segmented_index_writes.unwrap_or_else(|| {
+            segmented_index_writes_enabled_from(
+                std::env::var("SIGLAKE_SEGMENTED_INDEX_WRITES")
+                    .ok()
+                    .as_deref(),
+            )
+        })
+    }
+
+    /// See [`segmented_index_block_bytes_from`].
+    fn segmented_index_block_bytes(&self) -> usize {
+        self.tuning.segmented_index_block_bytes.unwrap_or_else(|| {
+            segmented_index_block_bytes_from(
+                std::env::var("SIGLAKE_SEGMENTED_INDEX_BLOCK_BYTES")
+                    .ok()
+                    .as_deref(),
+            )
         })
     }
 
@@ -11896,6 +13268,39 @@ impl IcebergContext {
         .await
     }
 
+    /// Test-only injection point for a durable short-repair attempt. Integration
+    /// tests use it to pin operator cleanup without exposing marker internals.
+    #[doc(hidden)]
+    pub async fn write_short_repair_marker_for_test(&self, ident: &TableIdent) -> Result<String> {
+        let table = self.catalog.load_table(ident).await?;
+        let snapshot = table
+            .metadata()
+            .current_snapshot()
+            .ok_or_else(|| anyhow::anyhow!("{ident} has no current snapshot"))?;
+        let op = aggregate_operator(&table)?
+            .ok_or_else(|| anyhow::anyhow!("{ident} has no UUID for a short-repair marker"))?;
+        let attempt_id = Uuid::now_v7();
+        let path = short_repair_marker_rel_path(snapshot.sequence_number(), attempt_id);
+        let now = chrono::Utc::now();
+        write_short_repair_marker(
+            &op,
+            &path,
+            &ShortAggregateAttemptMarker {
+                version: 1,
+                attempt_id,
+                table_uuid: table.metadata().uuid(),
+                target_snapshot_id: snapshot.snapshot_id(),
+                target_sequence_number: snapshot.sequence_number(),
+                maintained_columns: Vec::new(),
+                started_at: now.to_rfc3339(),
+                reason: ShortAggregateAttemptReason::Failed,
+                next_eligible_at: (now + chrono::Duration::minutes(15)).to_rfc3339(),
+            },
+        )
+        .await?;
+        Ok(path)
+    }
+
     /// Consume durable markers left by committers whose delta PUT exhausted its
     /// retry budget. This runs only from the compactor's aggregate-maintenance
     /// pass; query and ingest paths never pay the Tier-2 rebuild scan.
@@ -11962,9 +13367,13 @@ impl IcebergContext {
             .rebuild_group_count_aggregate_for(
                 ident,
                 GroupCountRebuildOptions::default(),
-                &repair_columns,
-                Some(&repair_sketch_columns),
-                None,
+                GroupCountRebuildRequest {
+                    repair_columns: &repair_columns,
+                    repair_sketch_columns: Some(&repair_sketch_columns),
+                    best_effort_sketches: false,
+                    unrestored_sketches_out: None,
+                    short_columns: None,
+                },
             )
             .await?;
         anyhow::ensure!(
@@ -12060,93 +13469,265 @@ impl IcebergContext {
         &self,
         max_repairs: usize,
     ) -> Result<Vec<(String, ShortAggregateOutcome)>> {
+        let census = self.census_short_group_count_aggregates().await?;
+        let mut out = Vec::new();
+        let mut repairs = 0;
+        for item in census {
+            let mut outcome = item.outcome.clone();
+            if matches!(outcome, ShortAggregateOutcome::Detected { .. }) && repairs < max_repairs {
+                match self
+                    .prepare_short_group_count_repair(&item, Duration::from_secs(600))
+                    .await?
+                {
+                    ShortAggregateAttemptStart::Ready(attempt) => {
+                        repairs += 1;
+                        outcome = self.execute_short_group_count_repair(&attempt).await;
+                    }
+                    ShortAggregateAttemptStart::Outcome(other) => outcome = other,
+                }
+            }
+            self.report_short_group_count_outcome(&item.table, &outcome);
+            out.push((item.table, outcome));
+        }
+        Ok(out)
+    }
+
+    pub async fn census_short_group_count_aggregates(&self) -> Result<Vec<ShortAggregateCensus>> {
         if !self.group_count_deltas_enabled() {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        let mut repairs = 0usize;
         for ident in self.aggregate_table_idents().await {
-            // The counter's namespace label. Taken from the ident rather than
-            // from `self` so it can never name a different namespace than the
-            // `table` beside it.
-            let namespace = ident.namespace().to_string();
-            // One table's transient read error must not skip the rest: this is
-            // a whole-warehouse sweep on a timer, and the events table is
-            // usually last in nobody's interest.
-            let census = match self.short_group_count_census(&ident).await {
-                Ok(census) => census,
-                Err(error) => {
-                    tracing::warn!(error = ?error, table = %ident,
-                        "short group-count census failed");
-                    continue;
-                }
-            };
-            let outcome = match census {
-                ShortAggregateOutcome::Covered => continue,
-                ShortAggregateOutcome::Detected { columns } if repairs < max_repairs => {
-                    repairs += 1;
-                    self.repair_short_group_count_aggregate(&ident, columns)
-                        .await
-                }
-                other => other,
-            };
-            match &outcome {
-                ShortAggregateOutcome::Pending { columns } => tracing::debug!(
+            match self.short_group_count_census(&ident).await {
+                Ok(Some(item)) => out.push(item),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    error = ?error,
                     table = %ident,
-                    columns = %columns.join(","),
-                    "group-count aggregate is short, but the newest generation's \
-                     contribution has not landed yet; leaving it to the fold"
+                    "short group-count census failed"
                 ),
-                ShortAggregateOutcome::Suppressed { columns } => tracing::debug!(
-                    table = %ident,
-                    columns = %columns.join(","),
-                    "group-count aggregate is short only in columns a previous \
-                     rebuild could not restore; not rebuilding again"
-                ),
-                ShortAggregateOutcome::Detected { columns } => {
-                    record_group_count_short_aggregate(&namespace, ident.name(), "detected");
-                    tracing::warn!(
-                        table = %ident,
-                        columns = %columns.join(","),
-                        "group-count aggregate is SHORT of record_count with every \
-                         contribution accounted for; GROUP BY on these columns stays \
-                         on the exact per-file path. Automatic repair is off or its \
-                         per-pass budget is spent — run \
-                         `siglake rebuild-group-counts --namespace <ns> --table <t>` \
-                         or set SIGLAKE_AGG_SHORT_REPAIR=1"
-                    );
-                }
-                ShortAggregateOutcome::Repaired {
-                    columns,
-                    unrestored,
-                } => {
-                    if unrestored.is_empty() {
-                        record_group_count_short_aggregate(&namespace, ident.name(), "repaired");
-                        tracing::info!(
-                            table = %ident,
-                            columns = %columns.join(","),
-                            "rebuilt a short group-count aggregate from committed files"
-                        );
-                    } else {
-                        record_group_count_short_aggregate(&namespace, ident.name(), "incomplete");
-                        tracing::warn!(
-                            table = %ident,
-                            columns = %unrestored.join(","),
-                            "rebuilt a short group-count aggregate, but these columns \
-                             still cannot cover the table and remain on the per-file \
-                             path; they are recorded so later passes do not rebuild \
-                             for them again"
-                        );
-                    }
-                }
-                ShortAggregateOutcome::Failed => {
-                    record_group_count_short_aggregate(&namespace, ident.name(), "failed");
-                }
-                ShortAggregateOutcome::Covered => {}
             }
-            out.push((ident.name().to_string(), outcome));
         }
         Ok(out)
+    }
+
+    pub async fn prepare_short_group_count_repair(
+        &self,
+        census: &ShortAggregateCensus,
+        watchdog: Duration,
+    ) -> Result<ShortAggregateAttemptStart> {
+        let ShortAggregateOutcome::Detected { columns } = &census.outcome else {
+            return Ok(ShortAggregateAttemptStart::Outcome(census.outcome.clone()));
+        };
+        let ident = TableIdent::new(self.namespace.clone(), census.table.clone());
+        let table = self.catalog.load_table(&ident).await?;
+        let Some(op) = aggregate_operator(&table)? else {
+            return Ok(ShortAggregateAttemptStart::Outcome(
+                ShortAggregateOutcome::Covered,
+            ));
+        };
+        let listed = list_group_count_objects(&op).await?;
+        if let Some(outcome) = short_repair_history_outcome(
+            &op,
+            table.metadata().uuid(),
+            &listed.short_repair_markers,
+            columns,
+            chrono::Utc::now(),
+        )
+        .await?
+        {
+            return Ok(ShortAggregateAttemptStart::Outcome(outcome));
+        }
+        let attempt_id = Uuid::now_v7();
+        let marker_path = short_repair_marker_rel_path(census.target_sequence_number, attempt_id);
+        let now = chrono::Utc::now();
+        let marker = ShortAggregateAttemptMarker {
+            version: 1,
+            attempt_id,
+            table_uuid: table.metadata().uuid(),
+            target_snapshot_id: census.target_snapshot_id,
+            target_sequence_number: census.target_sequence_number,
+            maintained_columns: census.maintained_columns.clone(),
+            started_at: now.to_rfc3339(),
+            reason: ShortAggregateAttemptReason::Started,
+            next_eligible_at: (now
+                + chrono::Duration::from_std(watchdog)
+                    .unwrap_or_else(|_| chrono::Duration::minutes(10)))
+            .to_rfc3339(),
+        };
+        if let Err(error) = write_short_repair_marker(&op, &marker_path, &marker).await {
+            tracing::warn!(?error, table = %ident, "short-repair marker write failed");
+            return Ok(ShortAggregateAttemptStart::Outcome(
+                ShortAggregateOutcome::MarkerFailed {
+                    columns: columns.clone(),
+                },
+            ));
+        }
+        Ok(ShortAggregateAttemptStart::Ready(ShortAggregateAttempt {
+            table: census.table.clone(),
+            columns: columns.clone(),
+            marker_path,
+            marker,
+        }))
+    }
+
+    pub async fn execute_short_group_count_repair(
+        &self,
+        attempt: &ShortAggregateAttempt,
+    ) -> ShortAggregateOutcome {
+        let ident = TableIdent::new(self.namespace.clone(), attempt.table.clone());
+        let outcome = self
+            .repair_short_group_count_aggregate(&ident, attempt.columns.clone())
+            .await;
+        match &outcome {
+            ShortAggregateOutcome::Repaired { .. } | ShortAggregateOutcome::Covered => {
+                if let Ok(table) = self.catalog.load_table(&ident).await {
+                    if let Ok(Some(op)) = aggregate_operator(&table) {
+                        if let Ok((wide, _)) = load_wide_group_counts(&op).await {
+                            if let Some(rebuilt_through) = wide.and_then(|w| w.rebuilt_through) {
+                                if let Ok(listed) = list_group_count_objects(&op).await {
+                                    delete_short_repair_markers(
+                                        &op,
+                                        &listed.short_repair_markers,
+                                        rebuilt_through,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ShortAggregateOutcome::Failed { .. } => {
+                if let Err(error) = self
+                    .record_short_group_count_attempt(attempt, ShortAggregateAttemptReason::Failed)
+                    .await
+                {
+                    tracing::warn!(?error, table = %ident, "failed to persist repair failure");
+                }
+            }
+            _ => {}
+        }
+        outcome
+    }
+
+    pub async fn record_short_group_count_attempt(
+        &self,
+        attempt: &ShortAggregateAttempt,
+        reason: ShortAggregateAttemptReason,
+    ) -> Result<ShortAggregateOutcome> {
+        debug_assert!(matches!(
+            reason,
+            ShortAggregateAttemptReason::Watchdog | ShortAggregateAttemptReason::Failed
+        ));
+        let ident = TableIdent::new(self.namespace.clone(), attempt.table.clone());
+        let table = self.catalog.load_table(&ident).await?;
+        let op = aggregate_operator(&table)?.ok_or_else(|| anyhow::anyhow!("no table UUID"))?;
+        let attempts = list_group_count_objects(&op)
+            .await?
+            .short_repair_markers
+            .len();
+        let mut marker = attempt.marker.clone();
+        marker.reason = reason;
+        marker.next_eligible_at = short_repair_delay(attempts)
+            .map(|delay| chrono::Utc::now() + delay)
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
+        write_short_repair_marker(&op, &attempt.marker_path, &marker).await?;
+        if attempts >= SHORT_REPAIR_MAX_ATTEMPTS {
+            Ok(ShortAggregateOutcome::Suppressed {
+                columns: attempt.columns.clone(),
+                attempts,
+                reason,
+                marker: None,
+            })
+        } else {
+            Ok(ShortAggregateOutcome::BackedOff {
+                columns: attempt.columns.clone(),
+                attempts,
+                reason,
+                next_eligible_at: marker.next_eligible_at,
+            })
+        }
+    }
+
+    pub fn report_short_group_count_outcome(&self, table: &str, outcome: &ShortAggregateOutcome) {
+        let namespace = self.namespace().to_string();
+        let command =
+            format!("siglake rebuild-group-counts --namespace {namespace} --table {table}");
+        match outcome {
+            ShortAggregateOutcome::Covered => {}
+            ShortAggregateOutcome::Pending { columns } => tracing::debug!(
+                namespace,
+                table,
+                columns = %columns.join(","),
+                "short aggregate is waiting for the newest contribution"
+            ),
+            ShortAggregateOutcome::Unrestored { columns } => tracing::debug!(
+                namespace,
+                table,
+                columns = %columns.join(","),
+                "short aggregate contains only unrestorable columns"
+            ),
+            ShortAggregateOutcome::Detected { columns } => {
+                record_group_count_short_aggregate(&namespace, table, "detected");
+                tracing::warn!(namespace, table, columns = %columns.join(","), %command,
+                    "group-count aggregate is short; automatic repair is off or its budget is spent");
+            }
+            ShortAggregateOutcome::Repaired { unrestored, .. } => {
+                let label = if unrestored.is_empty() {
+                    "repaired"
+                } else {
+                    "incomplete"
+                };
+                record_group_count_short_aggregate(&namespace, table, label);
+                if unrestored.is_empty() {
+                    tracing::info!(
+                        namespace,
+                        table,
+                        "rebuilt a short group-count aggregate from committed files"
+                    );
+                } else {
+                    tracing::warn!(namespace, table, columns = %unrestored.join(","),
+                        "short group-count rebuild left unrestored columns");
+                }
+            }
+            ShortAggregateOutcome::BackedOff {
+                attempts,
+                reason,
+                next_eligible_at,
+                ..
+            } => {
+                let label = match reason {
+                    ShortAggregateAttemptReason::Watchdog => "backed_off_watchdog",
+                    ShortAggregateAttemptReason::Failed => "backed_off_failed",
+                    ShortAggregateAttemptReason::Started
+                    | ShortAggregateAttemptReason::Interrupted
+                    | ShortAggregateAttemptReason::Malformed => "backed_off_interrupted",
+                };
+                record_group_count_short_aggregate(&namespace, table, label);
+                tracing::warn!(namespace, table, attempts, reason = ?reason, next_eligible_at,
+                    %command, "short-aggregate automatic repair is backed off");
+            }
+            ShortAggregateOutcome::Suppressed {
+                attempts,
+                reason,
+                marker,
+                ..
+            } => {
+                record_group_count_short_aggregate(&namespace, table, "suppressed");
+                tracing::warn!(namespace, table, attempts, reason = ?reason, marker, %command,
+                    "short-aggregate automatic repair is suppressed");
+            }
+            ShortAggregateOutcome::MarkerFailed { .. } => {
+                record_group_count_short_aggregate(&namespace, table, "marker_failed");
+                tracing::warn!(namespace, table, %command,
+                    "short-aggregate repair did not start because its durable marker could not be written");
+            }
+            ShortAggregateOutcome::Failed { .. } => {
+                record_group_count_short_aggregate(&namespace, table, "failed");
+            }
+        }
     }
 
     /// Which maintained columns the Tier-1 read guard cannot serve, and whether
@@ -12158,31 +13739,50 @@ impl IcebergContext {
     /// already served or leave one that is not. It does not CALL the guard:
     /// that decodes one column's values per call, and asking it for 22 columns
     /// walks a 26.5 MB blob 22 times to compare 22 integers.
-    async fn short_group_count_census(&self, ident: &TableIdent) -> Result<ShortAggregateOutcome> {
+    async fn short_group_count_census(
+        &self,
+        ident: &TableIdent,
+    ) -> Result<Option<ShortAggregateCensus>> {
         let cached = self.cached_table_entry(ident).await?;
         // Incarnation fence (#2919): a table with no UUID publishes and reads no
         // aggregate at all, so it has nothing to be short of, and the artifacts
         // at the shared path are somebody else's.
-        if aggregate_operator(&cached.table)?.is_none() {
-            return Ok(ShortAggregateOutcome::Covered);
-        }
-        let Some(record_count) = cached
-            .table
-            .metadata()
-            .current_snapshot()
-            .and_then(|s| s.summary().additional_properties.get("total-records"))
+        let Some(op) = aggregate_operator(&cached.table)? else {
+            return Ok(None);
+        };
+        let Some(snapshot) = cached.table.metadata().current_snapshot() else {
+            return Ok(None);
+        };
+        let Some(record_count) = snapshot
+            .summary()
+            .additional_properties
+            .get("total-records")
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|rc| *rc > 0)
         else {
-            return Ok(ShortAggregateOutcome::Covered);
+            return Ok(None);
         };
+        let mut objects = list_group_count_objects(&op).await?;
         // The FOLDED view, so an outstanding delta explains its own rows before
         // anything calls the aggregate short — the fold defers persisting until
         // a backlog is worth the write, and a reader folds what is outstanding
         // itself.
-        let Some(wide) = self.cached_wide_group_counts(&cached).await? else {
-            return Ok(ShortAggregateOutcome::Covered);
+        let Some(wide) = fold_wide_group_counts_with_deltas(
+            &op,
+            self.table_group_count_cardinality(),
+            self.group_count_sketch_counters(),
+            Some(&objects.deltas),
+        )
+        .await?
+        else {
+            return Ok(None);
         };
+        if let Some(rebuilt_through) = wide.rebuilt_through {
+            delete_short_repair_markers(&op, &objects.short_repair_markers, rebuilt_through).await;
+            objects
+                .short_repair_markers
+                .retain(|(sequence, _)| *sequence > rebuilt_through);
+        }
         let Some(totals) = wide
             .group_counts
             .as_deref()
@@ -12192,8 +13792,11 @@ impl IcebergContext {
             // maintains, so there is no deficit to measure. A table whose
             // columns are all sketched lands here too, and a sketch is short of
             // `record_count` by design.
-            return Ok(ShortAggregateOutcome::Covered);
+            return Ok(None);
         };
+        let mut maintained_columns: Vec<String> =
+            totals.iter().map(|(column, _)| column.clone()).collect();
+        maintained_columns.sort();
         let wide_covers = aggregate_covers_current_snapshot(&cached.table, wide.coverage);
         let mut short: Vec<String> = totals
             .into_iter()
@@ -12201,7 +13804,7 @@ impl IcebergContext {
             .map(|(column, _)| column)
             .collect();
         if short.is_empty() {
-            return Ok(ShortAggregateOutcome::Covered);
+            return Ok(None);
         }
         // The guard's first arm, for the columns the wide one leaves short. On a
         // table where the incremental path was switched on mid-life the inline
@@ -12221,7 +13824,7 @@ impl IcebergContext {
             }
         }
         if short.is_empty() {
-            return Ok(ShortAggregateOutcome::Covered);
+            return Ok(None);
         }
         // Residue of an earlier repair: a column over the cardinality cap, or
         // unreadable in some live file, comes back short on the next commit's
@@ -12231,9 +13834,15 @@ impl IcebergContext {
                 .into_iter()
                 .partition(|column| residue.unrestored.contains(column));
             if remaining.is_empty() {
-                return Ok(ShortAggregateOutcome::Suppressed {
-                    columns: suppressed,
-                });
+                return Ok(Some(ShortAggregateCensus {
+                    table: ident.name().to_string(),
+                    outcome: ShortAggregateOutcome::Unrestored {
+                        columns: suppressed,
+                    },
+                    maintained_columns,
+                    target_snapshot_id: snapshot.snapshot_id(),
+                    target_sequence_number: snapshot.sequence_number(),
+                }));
             }
             short = remaining;
         }
@@ -12243,9 +13852,32 @@ impl IcebergContext {
             wide.coverage,
             &wide.coverage_links,
         ) {
-            return Ok(ShortAggregateOutcome::Pending { columns: short });
+            return Ok(Some(ShortAggregateCensus {
+                table: ident.name().to_string(),
+                outcome: ShortAggregateOutcome::Pending { columns: short },
+                maintained_columns,
+                target_snapshot_id: snapshot.snapshot_id(),
+                target_sequence_number: snapshot.sequence_number(),
+            }));
         }
-        Ok(ShortAggregateOutcome::Detected { columns: short })
+        let outcome = short_repair_history_outcome(
+            &op,
+            cached.table.metadata().uuid(),
+            &objects.short_repair_markers,
+            &short,
+            chrono::Utc::now(),
+        )
+        .await?
+        .unwrap_or_else(|| ShortAggregateOutcome::Detected {
+            columns: short.clone(),
+        });
+        Ok(Some(ShortAggregateCensus {
+            table: ident.name().to_string(),
+            outcome,
+            maintained_columns,
+            target_snapshot_id: snapshot.snapshot_id(),
+            target_sequence_number: snapshot.sequence_number(),
+        }))
     }
 
     /// Rebuild one table's short aggregate and record what the rebuild could
@@ -12256,6 +13888,8 @@ impl IcebergContext {
         columns: Vec<String>,
     ) -> ShortAggregateOutcome {
         let short: BTreeSet<String> = columns.iter().cloned().collect();
+        let sketch_columns = BTreeSet::new();
+        let mut unrestored_sketches = Vec::new();
         // The census read a memoised folded view; the rebuild must take its
         // maintained column set from a fresh load, or it would omit a column a
         // concurrent fold has since added.
@@ -12267,20 +13901,18 @@ impl IcebergContext {
                 // that is an operator decision (`--admit-typed-columns`), and
                 // one a repair must not make on its own.
                 GroupCountRebuildOptions::default(),
-                &BTreeMap::new(),
-                // NOT the sketches. Asking for them recomputes every sketched
-                // column from the files and fails the WHOLE rebuild on the
-                // first one the files cannot serve — which on the events table
-                // is `timestamp_ns` the moment its per-row-unique values get it
-                // demoted, so the repair would never complete on the table that
-                // needs it most. What the rebuild does instead is carry the
-                // sketch half of every delta its watermark is about to make
-                // deletable, so an approximate column keeps its rows without
-                // costing a second Tier-2 query per sketched column. The exact
-                // columns are the ones Tier-1 serves, and they are rebuilt from
-                // the files.
-                None,
-                Some(&short),
+                GroupCountRebuildRequest {
+                    repair_columns: &BTreeMap::new(),
+                    // Recompute sketches one column at a time. A column the files
+                    // cannot serve keeps its carried state; a real read error still
+                    // fails the rebuild. This is census-only: marker repair retains
+                    // its all-or-nothing contract and the CLI keeps carrying
+                    // sketches without paying their Tier-2 reads.
+                    repair_sketch_columns: Some(&sketch_columns),
+                    best_effort_sketches: true,
+                    unrestored_sketches_out: Some(&mut unrestored_sketches),
+                    short_columns: Some(&short),
+                },
             )
             .await
         {
@@ -12288,7 +13920,7 @@ impl IcebergContext {
             Err(error) => {
                 tracing::warn!(error = ?error, table = %ident,
                     "rebuild of a short group-count aggregate failed");
-                return ShortAggregateOutcome::Failed;
+                return ShortAggregateOutcome::Failed { columns };
             }
         };
         if report.skipped_no_columns {
@@ -12298,12 +13930,15 @@ impl IcebergContext {
                 "short group-count rebuild found no maintained columns");
             return ShortAggregateOutcome::Covered;
         }
-        let unrestored: Vec<String> = report
+        let mut unrestored: Vec<String> = report
             .columns
             .iter()
             .filter(|column| short.contains(&column.column) && !column.covers_table)
             .map(|column| column.column.clone())
             .collect();
+        unrestored.extend(unrestored_sketches);
+        unrestored.sort();
+        unrestored.dedup();
         ShortAggregateOutcome::Repaired {
             columns,
             unrestored,
@@ -13686,18 +15321,23 @@ impl IcebergContext {
                         group_counts: wide_gc,
                         sketches: delta_sketches,
                     };
-                    if let Err(err) = write_group_count_delta(&op, table_ident.name(), &delta).await
+                    // Both the retry counter inside the write and the failure
+                    // counter below name the namespace as well as the table
+                    // (#4737, #4759): one commit path serves the base namespace
+                    // and every `tenant_*` namespace, each with its own
+                    // `events`.
+                    let iceberg_namespace = table_ident.namespace().to_string();
+                    if let Err(err) =
+                        write_group_count_delta(&op, &iceberg_namespace, table_ident.name(), &delta)
+                            .await
                     {
                         // COUNTED, because this was a log line only and a log
                         // line nothing reads is how the 2026-09-02 regression
                         // took a bisect to explain. The count is the alarm; the
                         // message is the remedy.
-                        // Labelled by namespace as well as table (#4737): one
-                        // compactor writes for every `tenant_*` namespace, and
-                        // a bare `events` merges them into one series.
                         metrics::counter!(
                             "siglake_group_count_delta_write_failures_total",
-                            "iceberg_namespace" => table_ident.namespace().to_string(),
+                            "iceberg_namespace" => iceberg_namespace,
                             "table" => table_ident.name().to_string()
                         )
                         .increment(1);
@@ -13828,9 +15468,23 @@ impl IcebergContext {
         table: &Table,
         blobs: Vec<PuffinSidecarBlobSpec>,
         snapshot_id: i64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if blobs.is_empty() {
-            return Ok(());
+            return Ok(false);
+        }
+        let covered_files: BTreeSet<String> = blobs
+            .iter()
+            .map(|blob| blob.data_file_path.clone())
+            .collect();
+        if table
+            .metadata()
+            .statistics_for_snapshot(snapshot_id)
+            .is_some()
+        {
+            // Already lost on the caller's own handle: nothing was written, so
+            // there is no sidecar to orphan.
+            record_registration_deferral(table.identifier(), snapshot_id, &covered_files, None);
+            return Ok(false);
         }
         let snapshot = table
             .metadata()
@@ -13840,16 +15494,32 @@ impl IcebergContext {
                 anyhow::anyhow!("snapshot {snapshot_id} not present on committed table")
             })?;
         let statistics = write_puffin_sidecar(table, snapshot, blobs).await?;
+        let statistics_path = statistics.statistics_path.clone();
+        let observation = Arc::new(FirstStatisticsRegistrationObservation::default());
         let tx = Transaction::new(table);
-        let tx = tx
-            .update_statistics()
-            .set_statistics(statistics)
-            .apply(tx)
-            .context("UpdateStatisticsAction::apply")?;
+        let tx = RegisterFirstStatisticsAction {
+            snapshot_id,
+            statistics,
+            observation: Arc::clone(&observation),
+        }
+        .apply(tx)
+        .context("RegisterFirstStatisticsAction::apply")?;
         tx.commit(self.catalog.as_ref())
             .await
-            .context("update_statistics Transaction::commit")?;
-        Ok(())
+            .context("register_statistics Transaction::commit")?;
+        if observation.deferred() {
+            // A competing registration reached this snapshot first — either
+            // before this transaction's own base refresh or inside the CAS
+            // window of a lost attempt. The written sidecar is unreferenced.
+            record_registration_deferral(
+                table.identifier(),
+                snapshot_id,
+                &covered_files,
+                Some(statistics_path.as_str()),
+            );
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     pub async fn rebuild_inverted_indexes_for_files(
@@ -13901,8 +15571,12 @@ impl IcebergContext {
         if blobs.is_empty() {
             return Ok(0);
         }
-        self.register_puffin_sidecar_for_snapshot(&table, blobs, snapshot_id)
-            .await?;
+        if !self
+            .register_puffin_sidecar_for_snapshot(&table, blobs, snapshot_id)
+            .await?
+        {
+            return Ok(0);
+        }
         let tenant = tenant_metric_label(self.namespace());
         let table_name = table_ident.name().to_string();
         metrics::counter!(
@@ -13993,8 +15667,16 @@ impl IcebergContext {
             .load_table(table_ident)
             .await
             .with_context(|| format!("load_table {table_ident}"))?;
-        let expired = ExpireSnapshotsAction::expired_ids_aged(&table, retain_last, older_than_ms);
-        if expired.is_empty() {
+        let tx = Transaction::new(&table);
+        let mut action = tx
+            .expire_snapshots()
+            .retain_last(retain_last.max(1))
+            .retain_statistics_files();
+        action = action.expire_older_than_ms(older_than_ms.unwrap_or(i64::MAX));
+        let (expired, expired_refs) = action
+            .planned_removals(&table)
+            .context("ExpireSnapshotsAction::planned_removals")?;
+        if expired.is_empty() && expired_refs.is_empty() {
             return Ok(0);
         }
         let n = expired.len();
@@ -14002,17 +15684,22 @@ impl IcebergContext {
         // that is the only place the current edge is still provable.
         let expiring: HashSet<i64> = expired.iter().copied().collect();
         let reroot = self.coverage_reroot_for_expiry(&table, &expiring).await;
-        let tx = Transaction::new(&table);
-        let mut action = tx.expire_snapshots().retain_last(retain_last);
-        if let Some(cutoff) = older_than_ms {
-            action = action.older_than(cutoff);
-        }
         let tx = action.apply(tx).context("ExpireSnapshotsAction::apply")?;
+        // This action runs after expiry against the transaction's updated
+        // table, and is re-evaluated against a refreshed base on every CAS
+        // retry. A statistics entry becomes removable only when no retained
+        // snapshot has an alive reference to any data file it names.
+        let (retire_action, retirement_observation) = RetireObsoleteStatisticsAction::new();
+        let tx = retire_action
+            .apply(tx)
+            .context("RetireObsoleteStatisticsAction::apply")?;
         tx.commit(self.catalog.as_ref())
             .await
             .context("expire_snapshots commit")?;
+        let retirement = retirement_observation.report(true);
         self.invalidate_cached_table(table_ident).await;
         metrics::counter!("siglake_iceberg_snapshots_expired_total").increment(n as u64);
+        record_statistics_retirement(retirement);
         if let Some((proven, target)) = reroot {
             // After the commit, not before: an append that lands in this window
             // builds its link against the shrunken metadata, so its parent is
@@ -14223,11 +15910,13 @@ impl IcebergContext {
         }
         let added = missing.len();
 
-        let mut action = UpdateSchemaAction::new();
-        for f in &missing {
-            action = action.add_optional_column(f.name.as_str(), f.field_type.as_ref().clone());
-        }
         let tx = Transaction::new(&table);
+        let mut action = tx.update_schema();
+        for f in &missing {
+            action = action.add_column(
+                AddColumn::optional(f.name.as_str(), f.field_type.as_ref().clone()).if_not_exists(),
+            );
+        }
         let tx = action.apply(tx).context("UpdateSchemaAction::apply")?;
         tx.commit(self.catalog.as_ref())
             .await
@@ -14299,7 +15988,7 @@ impl IcebergContext {
         let batch = align_batch_to_table_schema(table, batch)?;
         let batch = sort_batch_to_table_order(table, batch)?;
         let sorting_columns = table_sorting_columns(table, batch.schema().as_ref());
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone())
+        let location_gen = DefaultLocationGenerator::new(table.metadata())
             .context("default location generator")?;
         let partition_location_gen = location_gen.clone();
         // Per-commit unique prefix: `DefaultFileNameGenerator`'s internal
@@ -14939,6 +16628,59 @@ impl IcebergContext {
         self.execute_all_delete_tasks_inner(false).await
     }
 
+    /// Remove statistics entries that Siglake can prove describe no data file
+    /// reachable through a retained snapshot. Only entries made entirely of
+    /// Siglake inverted-index blob types, with a `data_file` property on every
+    /// blob, are eligible. A mixed live/retired entry stays whole.
+    ///
+    /// `apply=false` reports the classification without committing. The
+    /// action is re-evaluated against the transaction's refreshed table on a
+    /// catalog conflict, so a newly retained live reference cannot be removed
+    /// from a stale plan.
+    pub async fn retire_obsolete_statistics(
+        &self,
+        table_ident: &TableIdent,
+        apply: bool,
+    ) -> Result<StatisticsRetirementReport> {
+        Ok(self
+            .retire_obsolete_statistics_inner(table_ident, apply)
+            .await?
+            .0)
+    }
+
+    async fn retire_obsolete_statistics_inner(
+        &self,
+        table_ident: &TableIdent,
+        apply: bool,
+    ) -> Result<(StatisticsRetirementReport, Vec<String>)> {
+        let table = self
+            .catalog
+            .load_table(table_ident)
+            .await
+            .with_context(|| format!("load_table {table_ident}"))?;
+        if !apply {
+            let live_data_files = retained_live_data_file_paths(&table)
+                .await
+                .context("retained live data files for statistics retirement")?;
+            let (report, _, paths) = statistics_retirement_plan(table.metadata(), &live_data_files);
+            return Ok((report, paths));
+        }
+
+        let (action, observation) = RetireObsoleteStatisticsAction::new();
+        let tx = action
+            .apply(Transaction::new(&table))
+            .context("RetireObsoleteStatisticsAction::apply")?;
+        tx.commit(self.catalog.as_ref())
+            .await
+            .context("retire obsolete statistics commit")?;
+        let report = observation.report(true);
+        if report.removed > 0 {
+            self.invalidate_cached_table(table_ident).await;
+        }
+        record_statistics_retirement(report);
+        Ok((report, Vec::new()))
+    }
+
     /// All object-store paths reachable from the table's **retained**
     /// snapshots: every snapshot's manifest-list avro, every manifest avro in
     /// those lists, and every *alive* (`Added`/`Existing`) data file. This is
@@ -15003,8 +16745,22 @@ impl IcebergContext {
     pub async fn gc_orphans(&self, table_ident: &TableIdent, opts: GcOptions) -> Result<GcReport> {
         use futures::StreamExt;
 
+        // Removing a metadata entry and deleting its Puffin object are one
+        // maintenance sequence. Dry-run classifies the entries without
+        // changing reachability; apply commits RemoveStatistics first, then
+        // the ordinary age gate decides whether the object may be deleted.
+        let (statistics, dry_run_retired_paths) = self
+            .retire_obsolete_statistics_inner(table_ident, opts.apply)
+            .await?;
+
         // 1. The live set (full iceberg paths).
-        let reachable = self.reachable_files(table_ident).await?;
+        let mut reachable = self.reachable_files(table_ident).await?;
+        // Predict the same candidates apply mode creates without mutating the
+        // catalog. Their bytes and age therefore appear in the dry-run report
+        // instead of first appearing only when the operator applies it.
+        for path in dry_run_retired_paths {
+            reachable.remove(&path);
+        }
 
         // 2. Key the live set by path-relative-to-table-location. Bail if any
         //    reachable path is not under the location — never risk deleting a
@@ -15044,6 +16800,11 @@ impl IcebergContext {
         let now_secs = chrono::Utc::now().timestamp();
         let min_age_secs = opts.min_age.as_secs();
         let mut report = GcReport {
+            statistics_entries_eligible: statistics.eligible,
+            statistics_entries_removed: statistics.removed,
+            statistics_entries_kept_live: statistics.kept_live,
+            statistics_entries_skipped_unowned: statistics.skipped_unowned,
+            statistics_entries_skipped_missing_data_file: statistics.skipped_missing_data_file,
             reachable: reachable_rel.len(),
             ..Default::default()
         };
@@ -15708,7 +17469,14 @@ impl IcebergContext {
         // it still answers the question the guard below asks: would this
         // rewrite conserve the file's rows?
         let mut writer = apply.then(|| {
-            self.lazy_merge_output_writer(table, std::slice::from_ref(file), bloom_columns, true, 0)
+            self.lazy_merge_output_writer(
+                table,
+                std::slice::from_ref(file),
+                bloom_columns,
+                true,
+                0,
+                None,
+            )
         });
         let mut survivor_rows = 0u64;
         while let Some(batch) = survivors.next().await {
@@ -16240,6 +18008,7 @@ impl IcebergContext {
     /// WI-200G fix) while bounding open decoders (so a 600-file day can't OOM).
     /// Intermediate files are written to the table's data dir and deleted once the
     /// next tier consumes them (never committed to the table).
+    #[allow(clippy::too_many_arguments)]
     async fn merge_files_streaming(
         &self,
         table: &Table,
@@ -16248,10 +18017,22 @@ impl IcebergContext {
         rewrite_gen: u32,
         fanin: usize,
         merge: &ReclusterMergeOptions,
+        // One sink for the whole merge, whichever path runs and however many
+        // output files it opens (#4377). Intermediate tier files pass `None`:
+        // they are re-read and discarded, so a sidecar for one would be
+        // registered against a file no snapshot ever holds.
+        segmented_sink: Option<Arc<SegmentedIndexSink>>,
     ) -> Result<(Vec<DataFile>, usize, MergePathKind)> {
         if files.len() <= fanin {
             let (added, rows) = self
-                .merge_file_slice_streaming(table, files, bloom_columns, true, rewrite_gen)
+                .merge_file_slice_streaming(
+                    table,
+                    files,
+                    bloom_columns,
+                    true,
+                    rewrite_gen,
+                    segmented_sink,
+                )
                 .await?;
             return Ok((added, rows, MergePathKind::SliceStreaming));
         }
@@ -16275,6 +18056,7 @@ impl IcebergContext {
                         .merge_chunk_rows
                         .map(|rows| rows.max(1024))
                         .unwrap_or_else(Self::merge_chunk_rows),
+                    segmented_sink,
                 ),
             )
             .await?;
@@ -16285,7 +18067,14 @@ impl IcebergContext {
         loop {
             if tier.len() <= fanin {
                 let (added, rows) = self
-                    .merge_file_slice_streaming(table, &tier, bloom_columns, true, rewrite_gen)
+                    .merge_file_slice_streaming(
+                        table,
+                        &tier,
+                        bloom_columns,
+                        true,
+                        rewrite_gen,
+                        segmented_sink.clone(),
+                    )
                     .await?;
                 if tier_is_intermediate {
                     self.delete_intermediate_files(table, &tier).await;
@@ -16295,7 +18084,14 @@ impl IcebergContext {
             let mut next: Vec<DataFile> = Vec::new();
             for chunk in tier.chunks(fanin) {
                 let (added, _) = self
-                    .merge_file_slice_streaming(table, chunk, bloom_columns, false, rewrite_gen)
+                    .merge_file_slice_streaming(
+                        table,
+                        chunk,
+                        bloom_columns,
+                        false,
+                        rewrite_gen,
+                        None,
+                    )
                     .await?;
                 next.extend(added);
             }
@@ -16403,6 +18199,7 @@ impl IcebergContext {
         bloom_columns: &'a [&'a str],
         with_footers: bool,
         rewrite_gen: u32,
+        segmented_sink: Option<Arc<SegmentedIndexSink>>,
     ) -> LazyMergeOutputWriter<'a> {
         LazyMergeOutputWriter {
             ctx: self,
@@ -16411,6 +18208,7 @@ impl IcebergContext {
             bloom_columns,
             with_footers,
             rewrite_gen,
+            segmented_sink,
             inner: None,
         }
     }
@@ -16424,6 +18222,7 @@ impl IcebergContext {
     /// files are transient sorted Parquet the next tier re-reads + discards, so
     /// footers there are wasted work, and they stay unmarked (gen 0) so only
     /// final output carries the rewrite generation.
+    #[allow(clippy::too_many_arguments)]
     async fn build_merge_output_writer(
         &self,
         table: &Table,
@@ -16438,6 +18237,9 @@ impl IcebergContext {
         // through `lazy_merge_output_writer`, which holds the build until it
         // has a batch.
         sample: Option<&RecordBatch>,
+        // Where the output files' segmented sidecars land (#4377). `None` is
+        // every caller that did not opt in, and then the writer builds none.
+        segmented_sink: Option<Arc<SegmentedIndexSink>>,
         // Boxed rather than `impl IcebergWriter`: an opaque return here makes
         // every future up the compactor call chain trip rustc's
         // higher-ranked-lifetime `Send` limitation at `tokio::spawn`.
@@ -16484,20 +18286,47 @@ impl IcebergContext {
             if let Some(col) = raw_rowgroup_bloom_column_for_schema(&arrow_schema) {
                 parquet_builder = parquet_builder.with_raw_rowgroup_bloom_column(col);
             }
+            // #4377: build the segmented sidecar in this same forward pass,
+            // one group per row group. Only on final output — an intermediate
+            // tier file is re-read and discarded, so a sidecar for it would be
+            // registered against a file that never reaches a snapshot.
+            if let Some(sink) = segmented_sink {
+                let columns = segmented_index_columns_for_table(
+                    table,
+                    &arrow_schema,
+                    self.inverted_index_enabled(),
+                )?;
+                if !columns.is_empty() {
+                    parquet_builder = parquet_builder.with_segmented_index(
+                        columns,
+                        self.segmented_index_block_bytes(),
+                        sink,
+                    );
+                }
+            }
         }
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone())
+        let location_gen = DefaultLocationGenerator::new(table.metadata())
             .context("default location generator")?;
         let name_gen = DefaultFileNameGenerator::new(
             rewrite_prefix(if with_footers { rewrite_gen } else { 0 }),
             None,
             DataFileFormat::Parquet,
         );
-        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-            parquet_builder,
-            table.file_io().clone(),
-            location_gen,
-            name_gen,
-        );
+        let rolling = match self.tuning.merge_target_file_bytes {
+            Some(target) => RollingFileWriterBuilder::new(
+                parquet_builder,
+                target,
+                table.file_io().clone(),
+                location_gen,
+                name_gen,
+            ),
+            None => RollingFileWriterBuilder::new_with_default_file_size(
+                parquet_builder,
+                table.file_io().clone(),
+                location_gen,
+                name_gen,
+            ),
+        };
         let data_file_builder = DataFileWriterBuilder::new(rolling);
 
         let spec = table.metadata().default_partition_spec();
@@ -16505,9 +18334,9 @@ impl IcebergContext {
             None
         } else {
             // All input files share a partition value: `recluster_files_with`
-            // refuses a mixed bin before dispatching to either streaming
-            // executor (see `first_cross_partition_file`), and the delete-task
-            // survivor rewrite passes a single file. So one partition key drives
+            // refuses a mixed bin at its entry point, before any dispatch (see
+            // `first_cross_partition_file`), and the delete-task survivor
+            // rewrite passes a single file. So one partition key drives
             // the whole output. Stamping it from `files[0]` is only sound under
             // that precondition — a mixed bin would land the other partition's
             // rows behind a wrong manifest partition value, where a predicated
@@ -16532,6 +18361,7 @@ impl IcebergContext {
         bloom_columns: &[&str],
         with_footers: bool,
         rewrite_gen: u32,
+        segmented_sink: Option<Arc<SegmentedIndexSink>>,
     ) -> Result<(Vec<DataFile>, usize)> {
         use futures::StreamExt;
         use iceberg::arrow::ArrowFileReader;
@@ -16573,8 +18403,14 @@ impl IcebergContext {
             sources.push(stream);
         }
 
-        let mut writer =
-            self.lazy_merge_output_writer(table, files, bloom_columns, with_footers, rewrite_gen);
+        let mut writer = self.lazy_merge_output_writer(
+            table,
+            files,
+            bloom_columns,
+            with_footers,
+            rewrite_gen,
+            segmented_sink,
+        );
 
         let mut merge =
             crate::merge::TimestampKwayMerge::new(sources, merge_col, MERGE_BATCH_ROWS, descending);
@@ -16657,6 +18493,7 @@ impl IcebergContext {
         bloom_columns: &[&str],
         rewrite_gen: u32,
         chunk_rows: usize,
+        segmented_sink: Option<Arc<SegmentedIndexSink>>,
     ) -> Result<(Vec<DataFile>, usize)> {
         use arrow::compute::interleave_record_batch;
         use futures::{StreamExt, TryStreamExt};
@@ -16816,8 +18653,14 @@ impl IcebergContext {
             inflight.push_back(spawn_fetch(ci, args));
         }
 
-        let mut writer =
-            self.lazy_merge_output_writer(table, files, bloom_columns, true, rewrite_gen);
+        let mut writer = self.lazy_merge_output_writer(
+            table,
+            files,
+            bloom_columns,
+            true,
+            rewrite_gen,
+            segmented_sink,
+        );
         let mut rows_written = 0usize;
         let mut fetch_total_nanos = 0u64;
         loop {
@@ -17022,10 +18865,9 @@ impl IcebergContext {
     /// Re-cluster one bin of data files into time-sorted replacement output and
     /// commit the rewrite.
     ///
-    /// Group `files` by partition value and call once per group. Only the in-RAM
-    /// merge can honour a bin spanning several partition values, and whether a
-    /// bin takes that path is decided by its size — see
-    /// [`Self::recluster_files_with`] for the full precondition.
+    /// Group `files` by partition value and call once per group: a bin spanning
+    /// several partition values is refused — see [`Self::recluster_files_with`]
+    /// for why.
     pub async fn recluster_files(
         &self,
         table_ident: &TableIdent,
@@ -17045,21 +18887,21 @@ impl IcebergContext {
     /// instead of the `SIGLAKE_RECLUSTER_*` environment (each `None` field still
     /// reads the environment). See [`ReclusterMergeOptions`] for why this exists.
     ///
-    /// Partitioning precondition: a bin should hold one partition value, and a
+    /// Partitioning precondition: `files` must hold ONE partition value, and a
     /// caller that bins its own files groups by partition value first — both
     /// shipped planners do ([`Self::recluster_pass`] and
-    /// [`Self::recluster_all_indexes`]).
+    /// [`Self::recluster_all_indexes`]). A mixed bin is refused before the
+    /// catalog is read and before any output is written, on every dispatch.
     ///
-    /// A mixed bin is honoured only by the in-RAM merge, which splits its output
-    /// by partition value (`write_batch_to_data_files`) and so writes one
-    /// correctly-stamped file per partition. The streaming executors cannot:
-    /// they write through a single writer stamped with one partition value, so a
-    /// mixed bin routed to them is REFUSED before any output is written (#4200 —
-    /// it used to commit rows under the wrong partition value, where a
-    /// timestamp-predicated query prunes them away while `count(*)` still counts
-    /// them). Dispatch is decided by bin size and the `SIGLAKE_RECLUSTER_*`
-    /// knobs, so a caller that cannot bound its bins must group by partition;
-    /// see `docs/LIMITATIONS.md`.
+    /// The streaming executors write through a single writer stamped with one
+    /// partition value, so a mixed bin used to commit rows under the wrong value,
+    /// where a timestamp-predicated query prunes them away while `count(*)` still
+    /// counts them (#4200). The in-RAM concat splits its output by partition
+    /// value (`write_batch_to_data_files`) and was correct on the same input, but
+    /// which of the two a bin takes is decided by its size and the
+    /// `SIGLAKE_RECLUSTER_*` knobs — so taking a mixed bin there made the
+    /// contract size-dependent. It is refused too (#4720); see
+    /// `docs/LIMITATIONS.md`.
     pub async fn recluster_files_with(
         &self,
         table_ident: &TableIdent,
@@ -17082,6 +18924,39 @@ impl IcebergContext {
             });
         }
 
+        // One partition value per call, on every dispatch. The streaming
+        // executors write the whole merge through one writer stamped with
+        // `files[0].partition()`, so a bin straddling two day partitions would
+        // commit the second day's rows under the first day's value: rows
+        // conserved (the row-count guard below still passes), rows invisible,
+        // because a predicate that resolves to the real day prunes the file at
+        // the partition filter (#4200). The in-RAM concat splits its output by
+        // partition value and would have been correct, but which of the two a
+        // bin takes is decided by its size — so accepting a mixed bin there
+        // made the contract size-dependent, and a caller that developed against
+        // small tables met the error in production (#4720). Refuse here, before
+        // the catalog read and before the first output byte, rather than
+        // regroup: the caller's bin budgets (`max_pass_bytes`, the generation
+        // cap) are stated per output file, and silently turning one bin into N
+        // would break them.
+        if let Some(other) = first_cross_partition_file(&files) {
+            anyhow::bail!(
+                "re-cluster of {table_ident} was handed a bin spanning {} partitions: {} is \
+                 in partition {:?} but {} is in {:?}. A re-cluster writes one output \
+                 partition per call — group the files by partition value and call once per \
+                 group.",
+                files
+                    .iter()
+                    .map(|f| format!("{:?}", f.partition()))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                files[0].file_path(),
+                files[0].partition(),
+                files[other].file_path(),
+                files[other].partition(),
+            );
+        }
+
         let table = self
             .catalog
             .load_table(table_ident)
@@ -17099,45 +18974,36 @@ impl IcebergContext {
             .unwrap_or(0)
             .saturating_add(1);
 
+        // #4377: the segmented sidecars this rewrite's streaming output builds
+        // as it emits row groups, collected here and registered in the same
+        // transaction as the rewrite below. `None` unless the writer is opted
+        // in, and then nothing about the output changes. The in-RAM arm keeps
+        // its inline v1 index and contributes nothing here (it holds the whole
+        // bin decoded, which is the case the format's bounded build is not for).
+        let segmented_sink = self
+            .segmented_index_writes_enabled()
+            .then(|| Arc::new(SegmentedIndexSink::new()));
+
         // Produce the re-clustered output files + the row count carried through.
         // Two paths: the bounded streaming k-way merge (for bins too large for an
         // in-RAM concat, or when forced), or the whole-bin in-RAM concat + sort.
         // Both re-sort into the table's declared (time-ascending) order; the
         // streaming path bounds decoded memory so an oversized bin can't OOM.
         let (added, rows, merge_path) = if recluster_should_stream(&files, merge) {
-            // Every streaming executor writes the whole merge through one
-            // writer stamped with `files[0].partition()`, so a bin straddling
-            // two day partitions would commit the second day's rows under the
-            // first day's partition value: rows conserved (the row-count guard
-            // below still passes), rows invisible, because a predicate that
-            // resolves to the real day prunes the file at the partition filter.
-            // Refuse here — before the first output byte is written and before
-            // the rewrite commit — rather than regroup: the caller's bin budgets
-            // (`max_pass_bytes`, the generation cap) are stated per output file,
-            // and silently turning one bin into N would break them.
-            if let Some(other) = first_cross_partition_file(&files) {
-                anyhow::bail!(
-                    "streaming re-cluster of {table_ident} was handed a bin spanning {} \
-                     partitions: {} is in partition {:?} but {} is in {:?}. The streaming \
-                     merge writes one output partition per call — group the files by \
-                     partition value and call once per group.",
-                    files
-                        .iter()
-                        .map(|f| format!("{:?}", f.partition()))
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .len(),
-                    files[0].file_path(),
-                    files[0].partition(),
-                    files[other].file_path(),
-                    files[other].partition(),
-                );
-            }
             let fanin = merge
                 .merge_fanin
                 .map(|n| n.max(2))
                 .unwrap_or_else(Self::recluster_merge_fanin);
-            self.merge_files_streaming(&table, &files, bloom_columns, out_gen, fanin, merge)
-                .await?
+            self.merge_files_streaming(
+                &table,
+                &files,
+                bloom_columns,
+                out_gen,
+                fanin,
+                merge,
+                segmented_sink.clone(),
+            )
+            .await?
         } else {
             // The set is bounded by the caller, so an in-memory concat is OK.
             let combined = self.read_files_concatenated(&table, &files).await?;
@@ -17184,8 +19050,18 @@ impl IcebergContext {
             }
         };
 
+        // #4377: publish the segmented sidecars WITH the rewrite. Reserve the
+        // snapshot id now, but write the Puffin object from the transaction
+        // action after the rewrite has been re-applied to the attempt's current
+        // base. That keeps the physical footer's sequence aligned across a
+        // stale first base and every CAS retry (#5260). The immutable Parquet
+        // output and completed seg2 bytes are reused on every attempt.
+        let segmented_blobs = segmented_sink.map(|sink| sink.take()).unwrap_or_default();
+        let segmented_snapshot_id = (!segmented_blobs.is_empty())
+            .then(|| iceberg::transaction::reserve_snapshot_id(&table));
+
         let tx = Transaction::new(&table);
-        let action = tx
+        let mut action = tx
             .rewrite_files()
             // Unique per-writer UUID filenames ⇒ a merged output can't collide with
             // an existing file; skip the O(live files)-per-commit duplicate scan
@@ -17200,10 +19076,22 @@ impl IcebergContext {
                 REWRITE_COMMIT_PROP.to_string(),
                 "recluster".to_string(),
             )]));
+        if let Some(reserved) = segmented_snapshot_id {
+            action = action.with_snapshot_id(reserved);
+        }
         // B.1.1: ALL per-snapshot aggregates now live in the fixed-path side object,
         // which persists across the recluster (rows unchanged → still valid against
         // total-records). No summary carry-forward needed anymore.
         let tx = action.apply(tx).context("RewriteFilesAction::apply")?;
+        let tx = match segmented_snapshot_id {
+            Some(snapshot_id) => PublishSegmentedStatisticsAction {
+                snapshot_id,
+                blobs: segmented_blobs,
+            }
+            .apply(tx)
+            .context("PublishSegmentedStatisticsAction::apply")?,
+            None => tx,
+        };
         {
             let _commit_guard = self
                 .table_commit_lock
@@ -19361,6 +21249,16 @@ impl IcebergContext {
         &self.catalog
     }
 
+    /// Replace the catalog with a delegating test catalog.
+    ///
+    /// This is public only so integration regressions can choose catalog-CAS
+    /// interleavings with [`test_catalog::TestCatalog`].
+    #[doc(hidden)]
+    pub fn with_catalog_for_test(mut self, catalog: Arc<dyn Catalog>) -> Self {
+        self.catalog = catalog;
+        self
+    }
+
     /// Namespace for all siglake tables.
     pub fn namespace(&self) -> &NamespaceIdent {
         &self.namespace
@@ -20375,8 +22273,18 @@ impl IcebergContext {
         options: GroupCountRebuildOptions,
     ) -> Result<GroupCountRebuild> {
         let ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
-        self.rebuild_group_count_aggregate_for(&ident, options, &BTreeMap::new(), None, None)
-            .await
+        self.rebuild_group_count_aggregate_for(
+            &ident,
+            options,
+            GroupCountRebuildRequest {
+                repair_columns: &BTreeMap::new(),
+                repair_sketch_columns: None,
+                best_effort_sketches: false,
+                unrestored_sketches_out: None,
+                short_columns: None,
+            },
+        )
+        .await
     }
 
     /// Ident-based core used by the maintenance compactor. Repair markers can
@@ -20394,10 +22302,16 @@ impl IcebergContext {
         &self,
         ident: &TableIdent,
         options: GroupCountRebuildOptions,
-        repair_columns: &BTreeMap<String, usize>,
-        repair_sketch_columns: Option<&BTreeSet<String>>,
-        short_columns: Option<&BTreeSet<String>>,
+        request: GroupCountRebuildRequest<'_>,
     ) -> Result<GroupCountRebuild> {
+        let GroupCountRebuildRequest {
+            repair_columns,
+            repair_sketch_columns,
+            best_effort_sketches,
+            mut unrestored_sketches_out,
+            short_columns,
+        } = request;
+        debug_assert!(repair_sketch_columns.is_some() || !best_effort_sketches);
         let table_name = ident.name();
         let cached = self.cached_table_entry(ident).await?;
         let snapshot = cached.table.metadata().current_snapshot().ok_or_else(|| {
@@ -20493,6 +22407,7 @@ impl IcebergContext {
                 columns: Vec::new(),
                 skipped_no_columns: true,
                 admissible_typed_columns,
+                short_repair_markers_deleted: 0,
             });
         }
 
@@ -20562,12 +22477,23 @@ impl IcebergContext {
                 .insert(column.clone(), ColumnGroupCounts { values, nulls });
         }
 
-        let rebuilt_sketches = if repair_sketch_columns.is_some() {
+        let (rebuilt_sketches, unrestored_sketches) = if repair_sketch_columns.is_some() {
             let sketch_m = self.group_count_sketch_counters();
-            let mut sketches = GroupCountSketches {
-                version: GROUP_COUNT_SKETCH_VERSION,
-                columns: BTreeMap::new(),
+            let mut sketches = if best_effort_sketches {
+                carried_group_count_sketches(
+                    &op,
+                    existing.as_ref(),
+                    sequence_number,
+                    &rebuilt.columns,
+                )
+                .await?
+            } else {
+                GroupCountSketches {
+                    version: GROUP_COUNT_SKETCH_VERSION,
+                    columns: BTreeMap::new(),
+                }
             };
+            let mut unrestored = Vec::new();
             for column in &sketches_to_rebuild {
                 // A column is represented exactly OR approximately, never by
                 // two partial halves. This can remove a marker-only exact
@@ -20575,12 +22501,14 @@ impl IcebergContext {
                 rebuilt.columns.remove(column);
                 let counts = self
                     .grouped_counts_from_files(&cached, ident, column, None)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "cannot rebuild group-count sketch `{column}` for {table_name}"
-                        )
-                    })?;
+                    .await?;
+                let Some(counts) = counts else {
+                    if best_effort_sketches {
+                        unrestored.push(column.clone());
+                        continue;
+                    }
+                    anyhow::bail!("cannot rebuild group-count sketch `{column}` for {table_name}");
+                };
                 let mut values = BTreeMap::new();
                 let mut rows = 0u64;
                 for (value, count) in counts {
@@ -20594,7 +22522,7 @@ impl IcebergContext {
                     ColumnSketch::from_exact(sketch_m, values, rows),
                 );
             }
-            Some(sketches)
+            (Some(sketches), unrestored)
         } else {
             // Not recomputing the sketches, but they must not silently LOSE
             // rows either. `rebuilt_through` makes every delta at or below it
@@ -20609,36 +22537,18 @@ impl IcebergContext {
             // a column represented both ways is reconciled by demoting the
             // exact side, which would undo the repair and leave the next census
             // rebuilding the same column every pass.
-            let mut carried = existing
-                .as_ref()
-                .and_then(|w| w.sketches.clone())
-                .unwrap_or_else(|| GroupCountSketches {
-                    version: GROUP_COUNT_SKETCH_VERSION,
-                    columns: BTreeMap::new(),
-                });
-            let absorbed: BTreeSet<i64> = existing
-                .as_ref()
-                .map(|w| w.absorbed.iter().copied().collect())
-                .unwrap_or_default();
-            for (seq, path) in list_group_count_deltas(&op).await? {
-                if seq > sequence_number || absorbed.contains(&seq) {
-                    continue;
-                }
-                let Some(delta) = read_group_count_delta(&op, &path).await? else {
-                    continue;
-                };
-                let Some(mut sketches) = delta.sketches else {
-                    continue;
-                };
-                sketches
-                    .columns
-                    .retain(|column, _| !rebuilt.columns.contains_key(column));
-                if sketches.is_empty() {
-                    continue;
-                }
-                carried.merge(&sketches);
-            }
-            Some(carried)
+            (
+                Some(
+                    carried_group_count_sketches(
+                        &op,
+                        existing.as_ref(),
+                        sequence_number,
+                        &rebuilt.columns,
+                    )
+                    .await?,
+                ),
+                Vec::new(),
+            )
         };
 
         // CAS the object. On conflict the whole rebuild is redone rather than
@@ -20684,6 +22594,22 @@ impl IcebergContext {
         // says `materialized` until the process restarts.
         self.invalidate_cached_table(ident).await;
 
+        let short_repair_markers_deleted = match list_group_count_objects(&op).await {
+            Ok(listed) => {
+                delete_short_repair_markers(&op, &listed.short_repair_markers, sequence_number)
+                    .await
+            }
+            Err(error) => {
+                tracing::warn!(?error, table = %ident,
+                    "short-repair marker cleanup listing failed; the next census will retry");
+                0
+            }
+        };
+
+        if let Some(out) = unrestored_sketches_out.as_mut() {
+            out.extend(unrestored_sketches.iter().cloned());
+        }
+
         metrics::counter!("siglake_group_count_aggregate_rebuilds_total").increment(1);
         Ok(GroupCountRebuild {
             table: table_name.to_string(),
@@ -20692,6 +22618,7 @@ impl IcebergContext {
             columns: report,
             skipped_no_columns: false,
             admissible_typed_columns,
+            short_repair_markers_deleted,
         })
     }
 
@@ -20738,10 +22665,27 @@ impl IcebergContext {
         &self,
         table_name: &str,
     ) -> Result<InlineTimeAggregateRebuild> {
+        self.rebuild_inline_time_aggregates_in(table_name, |op| OwnedOpendalSideCas(op.clone()))
+            .await
+    }
+
+    /// Private store seam for deterministic coverage of the rebuild's fences.
+    async fn rebuild_inline_time_aggregates_in<S, F>(
+        &self,
+        table_name: &str,
+        store_for: F,
+    ) -> Result<InlineTimeAggregateRebuild>
+    where
+        S: SideCasStore,
+        F: Fn(&opendal::Operator) -> S,
+    {
         let ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
         let mut moved = 0u32;
         loop {
-            match self.rebuild_inline_time_aggregates_once(&ident).await? {
+            match self
+                .rebuild_inline_time_aggregates_once_in(&ident, &store_for)
+                .await?
+            {
                 Some(report) => return Ok(report),
                 None => {
                     moved += 1;
@@ -20762,10 +22706,15 @@ impl IcebergContext {
 
     /// One attempt. `Ok(None)` means the table committed under the pass and the
     /// caller should start over; every other outcome is a report.
-    async fn rebuild_inline_time_aggregates_once(
+    async fn rebuild_inline_time_aggregates_once_in<S, F>(
         &self,
         ident: &TableIdent,
-    ) -> Result<Option<InlineTimeAggregateRebuild>> {
+        store_for: &F,
+    ) -> Result<Option<InlineTimeAggregateRebuild>>
+    where
+        S: SideCasStore,
+        F: Fn(&opendal::Operator) -> S,
+    {
         let table_name = ident.name().to_string();
         // A fresh handle, not the memoized entry: the pass must read the files
         // of the snapshot it is about to name, and a cached entry can be a
@@ -20804,7 +22753,7 @@ impl IcebergContext {
                  so there is nothing safe to rebuild into"
             )
         })?;
-        let store = OpendalSideCas(&op);
+        let store = store_for(&op);
         let (existing, version) = store.load(SIDE_AGGREGATES_REL_PATH).await?;
         let existing = existing.ok_or_else(|| {
             anyhow::anyhow!(
@@ -20828,19 +22777,32 @@ impl IcebergContext {
 
         // The column set comes from the EXISTING object, as the wide rebuild's
         // does: a repair restores what the table was maintaining, and inventing
-        // columns here would change what it serves.
+        // columns here would change what it serves. The canonical nanosecond
+        // twin is the one removal: objects written before its inference fix may
+        // carry it, and a replacement must not make that obsolete residue whole.
         let columns: Vec<String> = existing
             .time_group_counts
             .as_ref()
             .map(|tg| tg.columns.keys().cloned().collect())
             .unwrap_or_default();
+        let arrow_schema =
+            iceberg::arrow::schema_to_arrow_schema(cached.table.metadata().current_schema())
+                .context("current schema to arrow")?;
+        let has_canonical_nanos_twin = schema_has_canonical_nanos_twin(&arrow_schema);
+        let rebuild_columns: Vec<String> = columns
+            .iter()
+            .filter(|column| {
+                !(has_canonical_nanos_twin && column.as_str() == siglake_core::TIMESTAMP_NS_COLUMN)
+            })
+            .cloned()
+            .collect();
 
         let buckets = self.rebuilt_time_buckets(ident, &cached).await?;
-        let groups = if columns.is_empty() {
+        let groups = if rebuild_columns.is_empty() {
             None
         } else {
             Some(
-                self.rebuilt_time_group_counts(ident, &cached, &columns)
+                self.rebuilt_time_group_counts(ident, &cached, &rebuild_columns)
                     .await?,
             )
         };
@@ -20853,11 +22815,20 @@ impl IcebergContext {
         let buckets_ok = buckets_total == record_count;
         let mut column_reports = Vec::with_capacity(columns.len());
         for column in &columns {
-            let rows = groups.as_ref().and_then(|g| g.column_total(column));
+            let excluded_legacy_nanos =
+                has_canonical_nanos_twin && column.as_str() == siglake_core::TIMESTAMP_NS_COLUMN;
+            let rows = if excluded_legacy_nanos {
+                existing
+                    .time_group_counts
+                    .as_ref()
+                    .and_then(|g| g.column_total(column))
+            } else {
+                groups.as_ref().and_then(|g| g.column_total(column))
+            };
             column_reports.push(InlineTimeRebuiltColumn {
                 column: column.clone(),
                 rows,
-                covers_table: rows == Some(record_count),
+                covers_table: !excluded_legacy_nanos && rows == Some(record_count),
             });
         }
         // A column short of the row count is dropped, not published partial:
@@ -20957,6 +22928,7 @@ impl IcebergContext {
         ident: &TableIdent,
         cached: &CachedTableEntry,
     ) -> Result<TimeBucketCounts> {
+        let started = Instant::now();
         let files = self.live_data_files_cached(ident).await?;
         let file_io = cached.table.file_io().clone();
         let footer_cache = self.footer_cache.clone();
@@ -20991,22 +22963,31 @@ impl IcebergContext {
             .increment((files.len() - decode.len()) as u64);
         metrics::counter!("siglake_inline_time_rebuild_files_total", "source" => "decode")
             .increment(decode.len() as u64);
-        let scanned: Vec<BTreeMap<i64, i64>> =
+        let scanned: Vec<(BTreeMap<i64, i64>, u64)> =
             futures::stream::iter(decode.into_iter().map(|path| {
                 let file_io = file_io.clone();
                 async move {
                     let mut m = BTreeMap::new();
-                    scan_file_timestamp_buckets_windowed(
+                    let decoded_bytes = scan_file_timestamp_buckets_windowed(
                         &file_io, &path, width, 0, None, None, &mut m,
                     )
                     .await?;
-                    Ok::<_, anyhow::Error>(m)
+                    Ok::<_, anyhow::Error>((m, decoded_bytes))
                 }
             }))
             .buffer_unordered(concurrency)
             .try_collect()
             .await?;
-        for partial in scanned {
+        let decoded_bytes = scanned
+            .iter()
+            .map(|(_, bytes)| *bytes)
+            .fold(0u64, u64::saturating_add);
+        metrics::histogram!(
+            "siglake_inline_time_rebuild_decoded_bytes",
+            "component" => "time_buckets"
+        )
+        .record(decoded_bytes as f64);
+        for (partial, _) in scanned {
             for (start, count) in partial {
                 if let Ok(count) = u64::try_from(count) {
                     *out.entry(start).or_insert(0) += count;
@@ -21023,6 +23004,11 @@ impl IcebergContext {
         while rebuilt.buckets.len() > TIME_BUCKET_CAP {
             rebuilt.coarsen_to(rebuilt.width_ns.saturating_mul(2));
         }
+        metrics::histogram!(
+            "siglake_inline_time_rebuild_seconds",
+            "component" => "time_buckets"
+        )
+        .record(started.elapsed().as_secs_f64());
         Ok(rebuilt)
     }
 
@@ -21046,6 +23032,7 @@ impl IcebergContext {
         cached: &CachedTableEntry,
         columns: &[String],
     ) -> Result<TimeGroupCounts> {
+        let started = Instant::now();
         let files = self.live_data_files_cached(ident).await?;
         let file_io = cached.table.file_io().clone();
         let footer_cache = self.footer_cache.clone();
@@ -21137,14 +23124,24 @@ impl IcebergContext {
             .increment(decode.len() as u64);
 
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let decoded: Vec<TimeGroupCounts> = futures::stream::iter(decode.into_iter().map(|path| {
-            let file_io = file_io.clone();
-            let refs = refs.clone();
-            async move { decode_file_time_group_counts(&file_io, &path, &refs, width).await }
-        }))
-        .buffer_unordered(concurrency)
-        .try_collect()
-        .await?;
+        let decoded: Vec<(TimeGroupCounts, u64)> =
+            futures::stream::iter(decode.into_iter().map(|path| {
+                let file_io = file_io.clone();
+                let refs = refs.clone();
+                async move { decode_file_time_group_counts(&file_io, &path, &refs, width).await }
+            }))
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
+        let decoded_bytes = decoded
+            .iter()
+            .map(|(_, bytes)| *bytes)
+            .fold(0u64, u64::saturating_add);
+        metrics::histogram!(
+            "siglake_inline_time_rebuild_decoded_bytes",
+            "component" => "time_group_counts"
+        )
+        .record(decoded_bytes as f64);
         // Everything lands through `merge`, including the footer part, so the
         // value/total caps and the bucket coarsening are enforced by the same
         // code that enforces them at commit time. The merges only ever add, so
@@ -21154,9 +23151,14 @@ impl IcebergContext {
             columns: BTreeMap::new(),
         };
         rebuilt.merge(&from_footers);
-        for partial in &decoded {
+        for (partial, _) in &decoded {
             rebuilt.merge(partial);
         }
+        metrics::histogram!(
+            "siglake_inline_time_rebuild_seconds",
+            "component" => "time_group_counts"
+        )
+        .record(started.elapsed().as_secs_f64());
         Ok(rebuilt)
     }
 
@@ -22994,12 +24996,64 @@ mod env_knob_resolver_tests {
     }
 
     #[test]
+    fn footer_indexes_carry_a_collision_safe_sibling_checksum() {
+        let bytes = siglake_index::InvertedIndex::from_rows(["needle haystack"]).to_bytes();
+        let expected_checksum = format!("{:08x}", siglake_index::inverted_index_crc32(&bytes));
+        let (footer, puffin) = split_footer_and_puffin_indexes(
+            vec![SerializedInvertedIndex {
+                column: "crc32".to_string(),
+                tokenizer: siglake_bloom::Tokenizer::Default,
+                bytes,
+            }],
+            usize::MAX,
+        );
+        assert!(puffin.is_empty());
+        let footer: HashMap<_, _> = footer.into_iter().collect();
+        assert!(footer.contains_key("siglake.inverted_index.v1.crc32"));
+        assert_eq!(
+            footer.get("siglake.inverted_index.crc32.v1.crc32"),
+            Some(&expected_checksum)
+        );
+    }
+
+    #[test]
+    fn v1_puffin_sidecars_keep_the_checksummed_codec() {
+        assert_eq!(
+            SIGLAKE_PUFFIN_INVERTED_CODEC,
+            PuffinCompressionCodec::zstd_default(),
+            "CompressionCodec::Zstd writes a frame content checksum; changing the v1 sidecar codec needs another integrity cover"
+        );
+    }
+
+    #[test]
     fn index_rebuild_defaults_off_and_only_literal_one_enables_it() {
         assert!(!index_rebuild_enabled_from(None));
         assert!(!index_rebuild_enabled_from(Some("0")));
         assert!(!index_rebuild_enabled_from(Some("true")));
         assert!(!index_rebuild_enabled_from(Some("junk")));
         assert!(index_rebuild_enabled_from(Some("1")));
+    }
+
+    #[test]
+    fn segmented_index_writes_default_off_and_only_literal_one_enables_them() {
+        assert!(!segmented_index_writes_enabled_from(None));
+        assert!(!segmented_index_writes_enabled_from(Some("0")));
+        assert!(!segmented_index_writes_enabled_from(Some("true")));
+        assert!(!segmented_index_writes_enabled_from(Some("junk")));
+        assert!(segmented_index_writes_enabled_from(Some("1")));
+    }
+
+    #[test]
+    fn segmented_index_block_bytes_keeps_the_codec_default_unless_given_a_size() {
+        let codec_default = siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES;
+        assert_eq!(segmented_index_block_bytes_from(None), codec_default);
+        assert_eq!(segmented_index_block_bytes_from(Some("0")), codec_default);
+        assert_eq!(
+            segmented_index_block_bytes_from(Some("4 KiB")),
+            codec_default
+        );
+        assert_eq!(segmented_index_block_bytes_from(Some("-1")), codec_default);
+        assert_eq!(segmented_index_block_bytes_from(Some("16384")), 16_384);
     }
 }
 
@@ -24099,7 +26153,12 @@ mod compaction_consolidation_tests {
         let ice = IcebergContext::open(&tmp.path().join("warehouse"))
             .await
             .unwrap();
-        let day0 = 1_700_000_000i64;
+        // Snapped to UTC midnight so `day0 + j % 86_400` stays inside ONE
+        // `day(timestamp)` partition: the bin is a single re-cluster call, and a
+        // call takes one partition value (#4200, #4720). The unsnapped base
+        // (1_700_000_000 = 22:13:20Z) put every append across midnight, so the
+        // bin was refused before it merged a row. Same 6.4M rows, same spread.
+        let day0 = 1_700_000_000i64 - (1_700_000_000i64 % 86_400);
         let k = 64usize;
         let rows_per = 100_000usize;
         for _ in 0..k {
@@ -27164,6 +29223,7 @@ mod streaming_recluster_tests {
                 1,
                 IcebergContext::recluster_merge_fanin(),
                 &ReclusterMergeOptions::default(),
+                None,
             )
             .await
             .unwrap();
@@ -27273,11 +29333,11 @@ mod streaming_recluster_tests {
         let table = ice.catalog().load_table(&ident).await.unwrap();
 
         let (streamed, streamed_rows) = ice
-            .merge_file_slice_streaming(&table, &files, BLOOM_FILTER_COLUMNS, true, 1)
+            .merge_file_slice_streaming(&table, &files, BLOOM_FILTER_COLUMNS, true, 1, None)
             .await
             .unwrap();
         let (paged, paged_rows) = ice
-            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 1, 4)
+            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 1, 4, None)
             .await
             .unwrap();
         assert_eq!(streamed_rows, 25);
@@ -27324,7 +29384,7 @@ mod streaming_recluster_tests {
         let table = ice.catalog().load_table(&ident).await.unwrap();
 
         let (added, rows) = ice
-            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 2, 1 << 20)
+            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 2, 1 << 20, None)
             .await
             .unwrap();
         assert_eq!(rows, 6);
@@ -28648,7 +30708,7 @@ async fn decode_file_time_group_counts(
     path: &str,
     columns: &[&str],
     width_ns: i64,
-) -> Result<TimeGroupCounts> {
+) -> Result<(TimeGroupCounts, u64)> {
     use futures::StreamExt;
 
     let (mut reader, _) = pruned_window_batch_stream(file_io, path, columns, None, None).await?;
@@ -28656,13 +30716,15 @@ async fn decode_file_time_group_counts(
         width_ns,
         columns: BTreeMap::new(),
     };
+    let mut decoded_bytes = 0u64;
     while let Some(batch) = reader.next().await {
         let batch = batch.with_context(|| format!("decode parquet batch {path}"))?;
+        decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size() as u64);
         if let Some(partial) = file_time_group_counts(&batch, columns, width_ns) {
             out.merge(&partial);
         }
     }
-    Ok(out)
+    Ok((out, decoded_bytes))
 }
 
 /// What one [`IcebergContext::rebuild_inline_time_aggregates`] did.
@@ -28726,6 +30788,17 @@ pub struct GroupCountRebuildOptions {
     pub admit_typed_columns: bool,
 }
 
+/// Internal controls that distinguish marker, census and operator rebuilds.
+/// Kept together so adding a recovery mode does not turn the shared core into
+/// a list of coupled booleans and optional column sets.
+struct GroupCountRebuildRequest<'a> {
+    repair_columns: &'a BTreeMap<String, usize>,
+    repair_sketch_columns: Option<&'a BTreeSet<String>>,
+    best_effort_sketches: bool,
+    unrestored_sketches_out: Option<&'a mut Vec<String>>,
+    short_columns: Option<&'a BTreeSet<String>>,
+}
+
 /// What one [`IcebergContext::rebuild_group_count_aggregate`] did.
 #[derive(Debug, Clone)]
 pub struct GroupCountRebuild {
@@ -28746,6 +30819,8 @@ pub struct GroupCountRebuild {
     /// are what the flag would add, so a caller can say so instead of
     /// reporting a column as unrecoverable.
     pub admissible_typed_columns: Vec<String>,
+    /// Durable automatic-attempt records cleared after the successful CAS.
+    pub short_repair_markers_deleted: usize,
 }
 
 /// One column's rebuild outcome.
@@ -28774,8 +30849,8 @@ pub struct GroupCountRebuiltColumn {
     pub over_cap: Option<usize>,
 }
 
-#[cfg(test)]
-pub(crate) mod test_catalog {
+#[doc(hidden)]
+pub mod test_catalog {
     //! One delegating [`Catalog`] for the regressions that need a chosen
     //! interleaving instead of a raced one.
     //!
@@ -28818,7 +30893,7 @@ pub(crate) mod test_catalog {
     /// Pass-through catalog with per-method hooks. Build with
     /// [`TestCatalog::new`], attach hooks, and finish with
     /// [`TestCatalog::shared`] — `Catalog` is only ever held behind an `Arc`.
-    pub(crate) struct TestCatalog {
+    pub struct TestCatalog {
         inner: Arc<dyn Catalog>,
         after_load_table: Option<Hook>,
         gate: Mutex<Option<Gate>>,
@@ -28843,7 +30918,7 @@ pub(crate) mod test_catalog {
     }
 
     impl TestCatalog {
-        pub(crate) fn new(inner: Arc<dyn Catalog>) -> Self {
+        pub fn new(inner: Arc<dyn Catalog>) -> Self {
             Self {
                 inner,
                 after_load_table: None,
@@ -28855,7 +30930,7 @@ pub(crate) mod test_catalog {
 
         /// Await `hook` after *every* `load_table`, i.e. once the caller's
         /// metadata is in hand but before it has it.
-        pub(crate) fn after_load_table<F, Fut>(mut self, hook: F) -> Self
+        pub fn after_load_table<F, Fut>(mut self, hook: F) -> Self
         where
             F: Fn() -> Fut + Send + Sync + 'static,
             Fut: Future<Output = ()> + Send + 'static,
@@ -28868,7 +30943,7 @@ pub(crate) mod test_catalog {
         /// the CAS window of one attempt: the conditional UPDATE that follows
         /// runs against whatever the hook left behind. [`Self::fired`] reports
         /// whether it ran.
-        pub(crate) fn before_first_update_with_base<F, Fut>(mut self, hook: F) -> Self
+        pub fn before_first_update_with_base<F, Fut>(mut self, hook: F) -> Self
         where
             F: Fn() -> Fut + Send + Sync + 'static,
             Fut: Future<Output = ()> + Send + 'static,
@@ -28877,7 +30952,7 @@ pub(crate) mod test_catalog {
             self
         }
 
-        pub(crate) fn shared(self) -> Arc<Self> {
+        pub fn shared(self) -> Arc<Self> {
             Arc::new(self)
         }
 
@@ -28885,7 +30960,7 @@ pub(crate) mod test_catalog {
         /// next `load_table` has its (by then possibly stale) metadata in hand,
         /// and sending on `release` lets it return. Exactly one load is gated
         /// per arming, so the test's own calls run unimpeded.
-        pub(crate) fn arm(
+        pub fn arm(
             &self,
         ) -> (
             tokio::sync::oneshot::Receiver<()>,
@@ -28898,7 +30973,7 @@ pub(crate) mod test_catalog {
         }
 
         /// Whether the [`Self::before_first_update_with_base`] hook has run.
-        pub(crate) fn fired(&self) -> bool {
+        pub fn fired(&self) -> bool {
             self.fired.load(Ordering::SeqCst)
         }
     }
@@ -28978,6 +31053,10 @@ pub(crate) mod test_catalog {
             self.inner.drop_table(table).await
         }
 
+        async fn purge_table(&self, table: &TableIdent) -> Result<()> {
+            self.inner.purge_table(table).await
+        }
+
         async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
             self.inner.table_exists(table).await
         }
@@ -29003,6 +31082,7 @@ pub(crate) mod test_catalog {
     /// re-pointed root cannot pass by scanning nothing, and every hand-written
     /// `Catalog` impl site as `(path relative to the root, 1-based line, byte
     /// offset)`.
+    #[cfg(test)]
     struct CatalogImplScan {
         scanned: usize,
         sites: Vec<(String, usize, usize)>,
@@ -29011,6 +31091,7 @@ pub(crate) mod test_catalog {
     /// Every hand-written pass-through `Catalog` impl under `root`, found by
     /// reading the sources rather than by listing modules, so a file added
     /// later is inside the guard without editing the tests below.
+    #[cfg(test)]
     fn scan_for_catalog_impls(root: &std::path::Path) -> CatalogImplScan {
         /// Every `.rs` file under `dir`, recursively.
         fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -29109,10 +31190,8 @@ pub(crate) mod test_catalog {
 
     /// #2588 — the same fence around this crate's integration tests, which the
     /// `src/` walk above never reached. An integration test cannot call
-    /// [`TestCatalog`] (it is `pub(crate)` behind `cfg(test)`), so the only way
-    /// for one to choose an interleaving is a fresh copy of the pass-through —
-    /// the shape #2569 collapsed. There is no consumer waiting on a public
-    /// test-support surface, so the guard says where the test belongs instead.
+    /// [`TestCatalog`], so the only reason to add a fresh copy of the
+    /// pass-through would be missing this shared support.
     #[test]
     fn no_hand_written_catalog_impl_under_integration_tests() {
         let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"));
@@ -29130,12 +31209,7 @@ pub(crate) mod test_catalog {
         assert!(
             sites.is_empty(),
             "hand-written pass-through `Catalog` impl under tests/: {sites:?}. The decorator for \
-             a chosen interleaving is `iceberg::test_catalog::TestCatalog`, but it is \
-             `pub(crate)` behind `#[cfg(test)]`, so an integration test cannot reach it and \
-             there is nothing here to import. Put the interleaving test in this crate's own \
-             unit tests, where `TestCatalog` is in scope; if it truly needs a separate test \
-             binary, lift the shared test-only support out from behind `cfg(test)` first and \
-             widen this guard with it."
+             a chosen interleaving is `iceberg::test_catalog::TestCatalog`; import it instead."
         );
     }
 
@@ -30083,15 +32157,16 @@ mod side_publication_retry_tests {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A versioned in-memory side store with two scripted faults: a write that
-    /// fails before it applies, and a write that APPLIES and then reports an
-    /// error — the ambiguous case, where a blind replay would fold the same
-    /// counts in twice.
+    /// A versioned in-memory side store with scripted read and write faults.
     struct FlakyStore {
         state: std::sync::Mutex<Option<(u64, Vec<u8>)>>,
         fail_before_write: AtomicUsize,
         lose_response: AtomicUsize,
+        conflict_before_write: AtomicUsize,
+        writer_change_on_load: AtomicUsize,
+        writer_updates: AtomicUsize,
         conditional: bool,
+        conditional_attempts: AtomicUsize,
         writes: AtomicUsize,
     }
 
@@ -30101,9 +32176,19 @@ mod side_publication_retry_tests {
                 state: std::sync::Mutex::new(None),
                 fail_before_write: AtomicUsize::new(0),
                 lose_response: AtomicUsize::new(0),
+                conflict_before_write: AtomicUsize::new(0),
+                writer_change_on_load: AtomicUsize::new(0),
+                writer_updates: AtomicUsize::new(0),
                 conditional,
+                conditional_attempts: AtomicUsize::new(0),
                 writes: AtomicUsize::new(0),
             }
+        }
+
+        fn seeded(conditional: bool, side: &SnapshotAggregates) -> Self {
+            let store = Self::new(conditional);
+            *store.state.lock().unwrap() = Some((1, serde_json::to_vec(side).unwrap()));
+            store
         }
 
         fn fail_before_write(self, n: usize) -> Self {
@@ -30113,6 +32198,17 @@ mod side_publication_retry_tests {
 
         fn lose_response(self, n: usize) -> Self {
             self.lose_response.store(n, Ordering::Relaxed);
+            self
+        }
+
+        fn conflict_before_write(self, n: usize) -> Self {
+            self.conflict_before_write.store(n, Ordering::Relaxed);
+            self
+        }
+
+        /// Make the nth load observe a concurrent writer's new bytes/version.
+        fn writer_change_on_load(self, n: usize) -> Self {
+            self.writer_change_on_load.store(n, Ordering::Relaxed);
             self
         }
 
@@ -30136,10 +32232,69 @@ mod side_publication_retry_tests {
                 .as_ref()
                 .map(|(_, body)| serde_json::from_slice(body).unwrap())
         }
+
+        fn bytes(&self) -> Option<Vec<u8>> {
+            self.state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(_, body)| body.clone())
+        }
+
+        fn apply_scripted_writer_change(&self) {
+            let mut guard = self.state.lock().unwrap();
+            let (version, body) = guard.as_mut().expect("the writer needs a seeded object");
+            let mut side: SnapshotAggregates = serde_json::from_slice(body).unwrap();
+            side.group_counts = Some(FileGroupCounts {
+                columns: BTreeMap::from([(
+                    "writer-owned".to_string(),
+                    ColumnGroupCounts {
+                        values: BTreeMap::from([("final".to_string(), 1)]),
+                        nulls: 0,
+                    },
+                )]),
+            });
+            *body = serde_json::to_vec(&side).unwrap();
+            *version += 1;
+            self.writer_updates.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedFlakyStore(Arc<FlakyStore>);
+
+    impl SideCasStore for SharedFlakyStore {
+        async fn load(&self, rel: &str) -> Result<(Option<SnapshotAggregates>, Option<String>)> {
+            self.0.load(rel).await
+        }
+
+        async fn store_if(
+            &self,
+            rel: &str,
+            body: Vec<u8>,
+            version: Option<&str>,
+        ) -> Result<CasWrite> {
+            self.0.store_if(rel, body, version).await
+        }
+
+        async fn store(&self, rel: &str, body: Vec<u8>) -> Result<()> {
+            self.0.store(rel, body).await
+        }
+
+        fn conditional(&self) -> bool {
+            self.0.conditional()
+        }
     }
 
     impl SideCasStore for FlakyStore {
         async fn load(&self, _rel: &str) -> Result<(Option<SnapshotAggregates>, Option<String>)> {
+            if self
+                .writer_change_on_load
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                == Ok(1)
+            {
+                self.apply_scripted_writer_change();
+            }
             let guard = self.state.lock().unwrap();
             Ok(match &*guard {
                 Some((v, body)) => (
@@ -30156,8 +32311,12 @@ mod side_publication_retry_tests {
             body: Vec<u8>,
             version: Option<&str>,
         ) -> Result<CasWrite> {
+            self.conditional_attempts.fetch_add(1, Ordering::Relaxed);
             if Self::take(&self.fail_before_write) {
                 anyhow::bail!("injected failure before the write applied");
+            }
+            if Self::take(&self.conflict_before_write) {
+                return Ok(CasWrite::Conflict);
             }
             let current = self
                 .state
@@ -30238,6 +32397,364 @@ mod side_publication_retry_tests {
                 .as_ref()
                 .and_then(|tg| tg.column_total("level")),
         )
+    }
+
+    async fn inline_rebuild_fixture() -> (tempfile::TempDir, IcebergContext, SnapshotAggregates) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        ice.append_events(&[Event::now("seed")]).await.unwrap();
+        let table = ice.catalog().load_table(ice.table_ident()).await.unwrap();
+        let op = aggregate_operator(&table).unwrap().unwrap();
+        let (mut side, _) = OpendalSideCas(&op)
+            .load(SIDE_AGGREGATES_REL_PATH)
+            .await
+            .unwrap();
+        let mut side = side.take().expect("the append must publish a side object");
+        assert!(
+            side.group_counts.is_some(),
+            "the fixture protects group_counts"
+        );
+        side.coverage = None;
+        side.coverage_links.clear();
+        OpendalSideCas(&op)
+            .store(SIDE_AGGREGATES_REL_PATH, serde_json::to_vec(&side).unwrap())
+            .await
+            .unwrap();
+        (tmp, ice, side)
+    }
+
+    struct PendingLinkStore {
+        inner: OwnedOpendalSideCas,
+        loads: AtomicUsize,
+        remaining_appends: Arc<AtomicUsize>,
+        writer: IcebergContext,
+        writer_final_bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        writer_snapshot: Arc<std::sync::Mutex<Option<i64>>>,
+    }
+
+    impl SideCasStore for PendingLinkStore {
+        async fn load(&self, rel: &str) -> Result<(Option<SnapshotAggregates>, Option<String>)> {
+            if self.loads.fetch_add(1, Ordering::SeqCst) == 1
+                && self
+                    .remaining_appends
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                self.writer
+                    .append_events(&[Event::now("concurrent")])
+                    .await
+                    .unwrap();
+                let table = self
+                    .writer
+                    .catalog()
+                    .load_table(self.writer.table_ident())
+                    .await
+                    .unwrap();
+                *self.writer_snapshot.lock().unwrap() =
+                    Some(table.metadata().current_snapshot().unwrap().snapshot_id());
+                *self.writer_final_bytes.lock().unwrap() =
+                    self.inner.0.read(rel).await.unwrap().to_vec();
+            }
+            self.inner.load(rel).await
+        }
+
+        async fn store_if(
+            &self,
+            rel: &str,
+            body: Vec<u8>,
+            version: Option<&str>,
+        ) -> Result<CasWrite> {
+            self.inner.store_if(rel, body, version).await
+        }
+
+        async fn store(&self, rel: &str, body: Vec<u8>) -> Result<()> {
+            self.inner.store(rel, body).await
+        }
+
+        fn conditional(&self) -> bool {
+            self.inner.conditional()
+        }
+    }
+
+    fn metric_counter(
+        snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        name: &str,
+    ) -> u64 {
+        snapshot
+            .iter()
+            .filter(|(key, _, _, _)| key.key().name() == name)
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Counter(value) => *value,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    fn metric_counter_with_label(
+        snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        name: &str,
+        label_key: &str,
+        label_value: &str,
+    ) -> u64 {
+        snapshot
+            .iter()
+            .filter(|(key, _, _, _)| {
+                key.key().name() == name
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == label_key && label.value() == label_value)
+            })
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Counter(value) => *value,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    fn metric_histogram_with_label(
+        snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        name: &str,
+        label_key: &str,
+        label_value: &str,
+    ) -> f64 {
+        snapshot
+            .iter()
+            .filter(|(key, _, _, _)| {
+                key.key().name() == name
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == label_key && label.value() == label_value)
+            })
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Histogram(samples) => samples
+                    .iter()
+                    .map(|sample| sample.into_inner())
+                    .sum::<f64>(),
+                _ => 0.0,
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn inline_rebuild_retries_a_newer_pending_link_and_reads_the_new_snapshot() {
+        let (tmp, ice, _legacy) = inline_rebuild_fixture().await;
+        let writer = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let remaining_appends = Arc::new(AtomicUsize::new(1));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let writer_final_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer_snapshot = Arc::new(std::sync::Mutex::new(None));
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let report = ice
+            .rebuild_inline_time_aggregates_in("events", |op| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                PendingLinkStore {
+                    inner: OwnedOpendalSideCas(op.clone()),
+                    loads: AtomicUsize::new(0),
+                    remaining_appends: remaining_appends.clone(),
+                    writer: writer.clone(),
+                    writer_final_bytes: writer_final_bytes.clone(),
+                    writer_snapshot: writer_snapshot.clone(),
+                }
+            })
+            .await
+            .unwrap();
+        let metrics = snapshotter.snapshot().into_vec();
+        drop(guard);
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(report.record_count, 2);
+        assert_eq!(
+            report.coverage.snapshot_id,
+            writer_snapshot.lock().unwrap().unwrap()
+        );
+        assert_eq!(
+            metric_counter(
+                &metrics,
+                "siglake_inline_time_aggregate_rebuild_conflicts_total"
+            ),
+            1
+        );
+        let table = ice.catalog().load_table(ice.table_ident()).await.unwrap();
+        let op = aggregate_operator(&table).unwrap().unwrap();
+        let (side, _) = OpendalSideCas(&op)
+            .load(SIDE_AGGREGATES_REL_PATH)
+            .await
+            .unwrap();
+        let side = side.unwrap();
+        assert!(side.coverage_links.is_empty());
+        assert!(side.group_counts.is_none());
+    }
+
+    #[tokio::test]
+    async fn inline_rebuild_exhaustion_preserves_the_last_writer_bytes() {
+        let (tmp, ice, _legacy) = inline_rebuild_fixture().await;
+        let writer = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let remaining_appends = Arc::new(AtomicUsize::new(3));
+        let writer_final_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer_snapshot = Arc::new(std::sync::Mutex::new(None));
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        let started = Instant::now();
+
+        let error = ice
+            .rebuild_inline_time_aggregates_in("events", |op| PendingLinkStore {
+                inner: OwnedOpendalSideCas(op.clone()),
+                loads: AtomicUsize::new(0),
+                remaining_appends: remaining_appends.clone(),
+                writer: writer.clone(),
+                writer_final_bytes: writer_final_bytes.clone(),
+                writer_snapshot: writer_snapshot.clone(),
+            })
+            .await
+            .expect_err("three commits must spend the retry budget");
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let metrics = snapshotter.snapshot().into_vec();
+        drop(guard);
+
+        let text = format!("{error:#}");
+        assert!(text.contains("committed under the inline time-aggregate rebuild 3 times"));
+        assert!(text.contains("window with no ingest"), "{text}");
+        assert_eq!(remaining_appends.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            metric_counter(
+                &metrics,
+                "siglake_inline_time_aggregate_rebuild_conflicts_total"
+            ),
+            3
+        );
+        assert_eq!(
+            metric_counter(&metrics, "siglake_inline_time_aggregate_rebuilds_total"),
+            0
+        );
+        let time_footer = metric_counter_with_label(
+            &metrics,
+            "siglake_inline_time_rebuild_files_total",
+            "source",
+            "footer",
+        );
+        let group_footer = metric_counter_with_label(
+            &metrics,
+            "siglake_inline_time_group_rebuild_files_total",
+            "source",
+            "footer",
+        );
+        let decoded_bytes = metric_histogram_with_label(
+            &metrics,
+            "siglake_inline_time_rebuild_decoded_bytes",
+            "component",
+            "time_group_counts",
+        );
+        println!(
+            "three conflicts: elapsed={elapsed_ms:.2}ms time-footer={time_footer} \
+             group-footer={group_footer} decoded={decoded_bytes:.0}B published=0"
+        );
+        assert_eq!((time_footer, group_footer, decoded_bytes as u64), (6, 6, 0));
+        let table = ice.catalog().load_table(ice.table_ident()).await.unwrap();
+        let op = aggregate_operator(&table).unwrap().unwrap();
+        let bytes = op.read(SIDE_AGGREGATES_REL_PATH).await.unwrap().to_vec();
+        assert_eq!(bytes, *writer_final_bytes.lock().unwrap());
+        let side: SnapshotAggregates = serde_json::from_slice(&bytes).unwrap();
+        assert!(side.group_counts.is_some(), "the legacy map was dropped");
+        assert!(side.coverage.is_none());
+        assert_eq!(
+            side.coverage_links.len(),
+            1,
+            "successive pending links join into one run"
+        );
+        assert_eq!(
+            side.coverage_links[0].sequence_number,
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .sequence_number(),
+            "the joined pending run must retain the third writer's head"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_rebuild_retries_a_version_change_without_overwriting_the_writer() {
+        let (_tmp, ice, legacy) = inline_rebuild_fixture().await;
+        let original = serde_json::to_vec(&legacy).unwrap();
+        let store = Arc::new(FlakyStore::seeded(true, &legacy).writer_change_on_load(2));
+        let ident = ice.table_ident().clone();
+
+        let outcome = ice
+            .rebuild_inline_time_aggregates_once_in(&ident, &|_| SharedFlakyStore(store.clone()))
+            .await
+            .unwrap();
+
+        assert!(
+            outcome.is_none(),
+            "a changed version must retry the whole pass"
+        );
+        assert_eq!(store.writer_updates.load(Ordering::Relaxed), 1);
+        assert_eq!(store.writes.load(Ordering::Relaxed), 0);
+        assert_ne!(
+            store.bytes().unwrap(),
+            original,
+            "the writer changed the object"
+        );
+        assert!(
+            store
+                .aggregates()
+                .unwrap()
+                .group_counts
+                .unwrap()
+                .columns
+                .contains_key("writer-owned"),
+            "the rebuild overwrote the concurrent writer's final bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_rebuild_retries_one_conditional_conflict_then_publishes() {
+        let (_tmp, ice, legacy) = inline_rebuild_fixture().await;
+        let store = Arc::new(FlakyStore::seeded(true, &legacy).conflict_before_write(1));
+
+        let report = ice
+            .rebuild_inline_time_aggregates_in("events", |_| SharedFlakyStore(store.clone()))
+            .await
+            .unwrap();
+
+        assert!(report.published, "the retry must publish the rebuilt maps");
+        assert_eq!(store.conditional_attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            store.writes.load(Ordering::Relaxed),
+            1,
+            "the conflicting conditional write must not apply a partial rebuild"
+        );
+        assert!(
+            store.aggregates().unwrap().group_counts.is_none(),
+            "the successful replacement drops the uncertified legacy map"
+        );
     }
 
     /// THE DEFECT (#3799). The write-behind flusher took the pending deltas out

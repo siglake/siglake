@@ -13,6 +13,7 @@
 //!   similarly becomes a final `{ "_meta": "error", … }` line so the
 //!   body remains parseable. Constant memory regardless of result size.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -157,7 +158,68 @@ impl ScanDetail {
         if self.ordering.is_none() {
             self.ordering = o.ordering.clone();
         }
+        match (&mut self.file_attribution, &o.file_attribution) {
+            (Some(current), Some(other)) => current.absorb(other),
+            (None, Some(other)) => self.file_attribution = Some(other.clone()),
+            (Some(current), None) => current.identity_complete = false,
+            (None, None) => {}
+        }
     }
+}
+
+/// Bounded file-task membership and decoded-cache outcomes for one request.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct FileAttribution {
+    pub files: Vec<FileAttributionEntry>,
+    pub files_omitted: u64,
+    pub identity_complete: bool,
+}
+
+impl FileAttribution {
+    /// Merge scan leaves or shards by stable task identity, OR outcomes, then
+    /// apply the public request-wide cap.
+    pub fn absorb(&mut self, other: &Self) {
+        let complete = self.identity_complete && other.identity_complete;
+        self.files_omitted = self.files_omitted.saturating_add(other.files_omitted);
+        let mut merged = BTreeMap::new();
+        for file in self.files.drain(..).chain(other.files.iter().cloned()) {
+            let key = (
+                file.table.clone(),
+                file.object_key.clone(),
+                file.start,
+                file.length,
+            );
+            merged
+                .entry(key)
+                .and_modify(|entry: &mut FileAttributionEntry| {
+                    entry.cache_candidate |= file.cache_candidate;
+                    entry.reader_opened |= file.reader_opened;
+                    entry.cache_hit |= file.cache_hit;
+                })
+                .or_insert(file);
+        }
+        let dropped = merged
+            .len()
+            .saturating_sub(siglake_storage::FILE_ATTRIBUTION_CAP);
+        self.files_omitted = self.files_omitted.saturating_add(dropped as u64);
+        self.files = merged
+            .into_values()
+            .take(siglake_storage::FILE_ATTRIBUTION_CAP)
+            .collect();
+        self.identity_complete = complete && self.files_omitted == 0;
+    }
+}
+
+/// One table-relative Iceberg file task retained in the attribution block.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct FileAttributionEntry {
+    pub table: String,
+    pub object_key: String,
+    pub start: u64,
+    pub length: u64,
+    pub cache_candidate: bool,
+    pub reader_opened: bool,
+    pub cache_hit: bool,
 }
 
 /// Serde skip predicate for the F-5 byte-class fields: omit them when zero so
@@ -233,6 +295,11 @@ pub struct ScanDetail {
     /// predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ordering: Option<String>,
+    /// Bounded file-task membership for geometry joins. Keys are relative to
+    /// the Iceberg table location; omissions are explicit and make
+    /// `identity_complete` false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_attribution: Option<FileAttribution>,
 }
 
 /// Per-query wall-clock attribution, all in microseconds. The single-pod path
@@ -911,11 +978,91 @@ fn make_execution_error_marker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use siglake_storage::FILE_ATTRIBUTION_CAP;
     use std::sync::Arc;
 
     use arrow_array::StringArray;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::error::DataFusionError;
+
+    fn attributed_file(key: &str, start: u64) -> FileAttributionEntry {
+        FileAttributionEntry {
+            table: "ns.events".to_string(),
+            object_key: key.to_string(),
+            start,
+            length: 100,
+            cache_candidate: false,
+            reader_opened: false,
+            cache_hit: false,
+        }
+    }
+
+    #[test]
+    fn file_attribution_deduplicates_orders_and_ors_outcomes() {
+        let mut left = FileAttribution {
+            files: vec![
+                attributed_file("data/z.parquet", 0),
+                attributed_file("data/a.parquet", 2),
+            ],
+            files_omitted: 0,
+            identity_complete: true,
+        };
+        left.files[0].reader_opened = true;
+        let mut duplicate = attributed_file("data/z.parquet", 0);
+        duplicate.cache_candidate = true;
+        duplicate.cache_hit = true;
+        let right = FileAttribution {
+            files: vec![duplicate, attributed_file("data/a.parquet", 1)],
+            files_omitted: 0,
+            identity_complete: true,
+        };
+
+        left.absorb(&right);
+
+        let keys = left
+            .files
+            .iter()
+            .map(|file| (file.object_key.as_str(), file.start))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                ("data/a.parquet", 1),
+                ("data/a.parquet", 2),
+                ("data/z.parquet", 0)
+            ]
+        );
+        let merged = &left.files[2];
+        assert!(merged.cache_candidate && merged.reader_opened && merged.cache_hit);
+        assert_eq!(left.files_omitted, 0);
+        assert!(left.identity_complete);
+    }
+
+    #[test]
+    fn file_attribution_applies_the_request_cap_after_stable_merge() {
+        let mut left = FileAttribution {
+            files: (0..FILE_ATTRIBUTION_CAP)
+                .map(|index| attributed_file(&format!("data/{:03}.parquet", index * 2), 0))
+                .collect(),
+            files_omitted: 0,
+            identity_complete: true,
+        };
+        let right = FileAttribution {
+            files: (0..FILE_ATTRIBUTION_CAP)
+                .map(|index| attributed_file(&format!("data/{:03}.parquet", index * 2 + 1), 0))
+                .collect(),
+            files_omitted: 3,
+            identity_complete: false,
+        };
+
+        left.absorb(&right);
+
+        assert_eq!(left.files.len(), FILE_ATTRIBUTION_CAP);
+        assert_eq!(left.files[0].object_key, "data/000.parquet");
+        assert_eq!(left.files.last().unwrap().object_key, "data/031.parquet");
+        assert_eq!(left.files_omitted, FILE_ATTRIBUTION_CAP as u64 + 3);
+        assert!(!left.identity_complete);
+    }
 
     #[test]
     fn records_renderer_json_scratch_is_bounded_to_one_row() {

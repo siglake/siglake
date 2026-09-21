@@ -6,6 +6,7 @@
 //! takes the fast path. `windowed_agg_fallback_total{stale_or_capped}` fired
 //! once per execution.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{Duration, TimeZone, Utc};
@@ -188,10 +189,26 @@ async fn a_recluster_commit_preserves_the_rollup() {
         "the rollup must serve this before compaction, or the test proves nothing"
     );
 
-    // Compact every live file into one.
+    // Compact the whole table, one day partition at a time: the seed spans 12
+    // `day(timestamp)` partitions and `recluster_files` takes one partition
+    // value per call (#4720), so this is a dozen rewrite commits, not one. Every
+    // live file is rewritten, which is what the question asks — and each commit
+    // is another chance for the rollup to be dropped.
     let files = ice.live_data_files(&ident).await.unwrap();
     assert!(files.len() > 1, "need multiple files to compact");
-    ice.recluster_files(&ident, files, &bloom).await.unwrap();
+    let mut groups: BTreeMap<String, Vec<_>> = BTreeMap::new();
+    for file in files {
+        groups
+            .entry(format!("{:?}", file.partition()))
+            .or_default()
+            .push(file);
+    }
+    assert!(groups.len() > 1, "the seed must span several partitions");
+    for (partition, bin) in groups {
+        ice.recluster_files(&ident, bin, &bloom)
+            .await
+            .unwrap_or_else(|e| panic!("re-cluster of partition {partition}: {e:#}"));
+    }
 
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();

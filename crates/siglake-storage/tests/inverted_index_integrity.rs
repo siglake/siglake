@@ -5,23 +5,18 @@
 //! the reader's disposition, which is different on each path and is the part
 //! `docs/LIMITATIONS.md` has to state:
 //!
-//! - **footer KV** (hex in the Parquet footer): nothing covers the stored
-//!   bytes. A flip that still decodes and still matches the file's row count
-//!   passes both of #4558's layers, prunes, and the query answers **short** —
-//!   no error, no counter.
+//! - **footer KV** (hex in the Parquet footer): new files carry a sibling
+//!   CRC-32. A disagreement is a decoder refusal, so the exact scan runs.
+//!   Legacy files without the sibling keep their old-reader compatibility and
+//!   still prune.
 //! - **Puffin sidecar, as written** (`CompressionCodec::Zstd`,
 //!   `include_checksum(true)`): the flip hits the Zstd frame and
 //!   `PuffinReader::blob` errors. `ArrowReader` propagates it
 //!   (`third_party/iceberg/src/arrow/reader.rs`), so the **query fails**. It is
 //!   not a fallback to a scan, and it is not a short answer.
-//! - **Puffin sidecar with `CompressionCodec::None`**: the same exposure as the
-//!   footer KV. Nothing in the path covers a blob; the codec does. No siglake
-//!   writer selects `None` today (`crates/siglake-storage/src/iceberg.rs`
-//!   registers Zstd), so this arm is what the cover is worth, not a shipped
-//!   state.
-//! - **warm**: neither path re-verifies anything. A parsed index already in the
-//!   cache answers from memory, so a file corrupted after a query warmed it
-//!   keeps answering correctly until the entry is evicted.
+//! - **warm**: a footer checksum is verified before a parsed-cache handout, so
+//!   an observed mismatch cannot be hidden by an existing cached parse. Puffin
+//!   keeps its write-once sidecar identity and frame-checksum behavior.
 //!
 //! One test function, sequential arms: the metrics recorder is process-global
 //! and `snapshot()` drains every counter, so concurrent tests would steal each
@@ -127,15 +122,31 @@ fn arrow_schema() -> Arc<ArrowSchema> {
 
 /// `ROWS` rows of `raw` in `ROW_GROUP_ROWS`-row row groups, carrying
 /// `index_hex` as the file's inverted-index footer KV.
-fn write_data_file(dir: &Path, name: &str, index_hex: Option<&str>) -> (String, u64) {
+fn write_data_file(
+    dir: &Path,
+    name: &str,
+    index_hex: Option<&str>,
+    index_crc32: Option<&str>,
+) -> (String, u64) {
     let path = dir.join(name);
     let schema = arrow_schema();
-    let mut properties = WriterProperties::builder().set_max_row_group_size(ROW_GROUP_ROWS);
+    let mut properties =
+        WriterProperties::builder().set_max_row_group_row_count(Some(ROW_GROUP_ROWS));
+    let mut key_values = Vec::new();
     if let Some(hex) = index_hex {
-        properties = properties.set_key_value_metadata(Some(vec![KeyValue::new(
+        key_values.push(KeyValue::new(
             siglake_index::INVERTED_INDEX_KV_KEY.to_string(),
             hex.to_string(),
-        )]));
+        ));
+    }
+    if let Some(crc32) = index_crc32 {
+        key_values.push(KeyValue::new(
+            siglake_index::INVERTED_INDEX_CRC32_KV_KEY.to_string(),
+            crc32.to_string(),
+        ));
+    }
+    if !key_values.is_empty() {
+        properties = properties.set_key_value_metadata(Some(key_values));
     }
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -226,7 +237,7 @@ async fn scan_raw_values(
     statistics_blobs: Vec<StatisticsBlobReference>,
     cache_bypass: bool,
 ) -> Result<Vec<String>, String> {
-    let reader = ArrowReaderBuilder::new(FileIO::new_with_fs())
+    let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), iceberg::Runtime::current())
         .with_row_selection_enabled(true)
         .with_cache_bypass(cache_bypass)
         .with_raw_prune_spec(Some(RawPruneSpec {
@@ -255,6 +266,7 @@ async fn scan_raw_values(
     let batches = reader
         .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
         .map_err(|err| err.to_string())?
+        .stream()
         .try_collect::<Vec<RecordBatch>>()
         .await
         .map_err(|err| err.to_string())?;
@@ -275,7 +287,7 @@ async fn scan_raw_values(
 
 /// How many files the index pruned on `storage`, and how many blobs the two
 /// #4558 layers refused, since the last call.
-fn pruning_delta(snapshotter: &Snapshotter, storage: &str) -> (u64, u64) {
+fn pruning_delta(snapshotter: &Snapshotter, storage: &str) -> (u64, u64, u64, u64) {
     let snapshot = snapshotter.snapshot().into_vec();
     (
         counter_sum(
@@ -287,6 +299,16 @@ fn pruning_delta(snapshotter: &Snapshotter, storage: &str) -> (u64, u64) {
             &snapshot,
             "siglake_index_row_domain_mismatch_total",
             Some(("storage", storage)),
+        ),
+        counter_sum(
+            &snapshot,
+            "siglake_index_footer_checksum_refused_total",
+            Some(("reason", "malformed")),
+        ),
+        counter_sum(
+            &snapshot,
+            "siglake_index_footer_checksum_refused_total",
+            Some(("reason", "mismatch")),
         ),
     )
 }
@@ -339,7 +361,7 @@ fn silently_wrong_blobs(sound: &InvertedIndex) -> (Vec<u8>, Vec<u8>) {
 }
 
 #[tokio::test]
-async fn a_corrupt_stored_blob_is_answered_differently_on_each_storage_path() {
+async fn footer_checksums_refuse_corruption_and_zstd_keeps_sidecars_covered() {
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     recorder.install().expect("install debugging recorder");
@@ -351,87 +373,98 @@ async fn a_corrupt_stored_blob_is_answered_differently_on_each_storage_path() {
     assert_eq!(sound.n_rows(), ROWS as u32);
     let (term_gone, postings_wrong) = silently_wrong_blobs(&sound);
     let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+    let checksum =
+        |bytes: &[u8]| -> String { format!("{:08x}", siglake_index::inverted_index_crc32(bytes)) };
 
     // --- Control: no index at all. The answer every arm is measured against.
-    let (path, size) = write_data_file(tmp.path(), "control.parquet", None);
+    let (path, size) = write_data_file(tmp.path(), "control.parquet", None, None);
     let decoded = scan_raw_values(&path, size, vec![], true).await.unwrap();
     assert_eq!(decoded.len(), ROWS, "no index decodes the whole file");
     for needle in &needles {
         assert!(decoded.contains(needle));
     }
-    assert_eq!(pruning_delta(&snapshotter, "footer_kv"), (0, 0));
+    assert_eq!(pruning_delta(&snapshotter, "footer_kv"), (0, 0, 0, 0));
 
-    // --- Footer KV, sound blob: prunes to the matching rows, answer intact.
+    // --- Legacy footer KV: absence of the sibling remains compatible and the
+    // old blob still prunes.
     let (path, size) = write_data_file(
         tmp.path(),
-        "footer_sound.parquet",
+        "footer_legacy.parquet",
         Some(&hex(&sound.to_bytes())),
+        None,
     );
     let decoded = scan_raw_values(&path, size, vec![], true).await.unwrap();
     assert_eq!(decoded.len(), NEEDLE_ROWS.len(), "pruned to the matches");
     for needle in &needles {
         assert!(decoded.contains(needle));
     }
-    assert_eq!(pruning_delta(&snapshotter, "footer_kv"), (1, 0));
+    assert_eq!(pruning_delta(&snapshotter, "footer_kv"), (1, 0, 0, 0));
 
-    // --- Footer KV, corrupt stored bytes: the exposure, in both shapes. The
-    // scan succeeds, the index prunes, neither #4558 layer objects, and the
-    // answer is short — by the whole file when the term itself was flipped, by
-    // one row when a posting delta was.
-    // `decoded` is what the scan handed up, so an arm that prunes to four rows
-    // and misses three matches decoded three rows that do not match.
-    for (arm, blob, decodes) in [
-        ("term_gone", &term_gone, 0),
-        ("postings_wrong", &postings_wrong, NEEDLE_ROWS.len()),
+    // --- New footer KV, sound blob: the sibling agrees and pruning is
+    // unchanged for a new reader. An old reader ignores the unknown key and
+    // sees the same v1 blob bytes as the legacy arm above.
+    let sound_bytes = sound.to_bytes();
+    let sound_checksum = checksum(&sound_bytes);
+    let (path, size) = write_data_file(
+        tmp.path(),
+        "footer_sound.parquet",
+        Some(&hex(&sound_bytes)),
+        Some(&sound_checksum),
+    );
+    let decoded = scan_raw_values(&path, size, vec![], true).await.unwrap();
+    assert_eq!(decoded.len(), NEEDLE_ROWS.len(), "pruned to the matches");
+    assert_eq!(pruning_delta(&snapshotter, "footer_kv"), (1, 0, 0, 0));
+
+    // --- Footer KV, corrupt stored bytes with the sum left unchanged: both
+    // silently-wrong shapes are refused and the exact scan returns every row.
+    for (arm, blob) in [
+        ("term_gone", &term_gone),
+        ("postings_wrong", &postings_wrong),
     ] {
         let (path, size) = write_data_file(
             tmp.path(),
             &format!("footer_{arm}.parquet"),
             Some(&hex(blob)),
+            Some(&sound_checksum),
         );
         let decoded = scan_raw_values(&path, size, vec![], true).await.unwrap();
-        let missing: Vec<&String> = needles
-            .iter()
-            .filter(|needle| !decoded.contains(needle))
-            .collect();
-        println!(
-            "footer KV, {arm}: decoded {} of {ROWS} rows, lost {} of {} needles",
-            decoded.len(),
-            missing.len(),
-            needles.len()
-        );
-        assert_eq!(
-            decoded.len(),
-            decodes,
-            "arm {arm} decoded rows the corrupt index selected"
-        );
-        assert!(
-            !missing.is_empty(),
-            "arm {arm} has to cost the query matches"
-        );
+        assert_eq!(decoded.len(), ROWS, "arm {arm} takes the exact scan");
+        assert!(needles.iter().all(|needle| decoded.contains(needle)));
         assert_eq!(
             pruning_delta(&snapshotter, "footer_kv"),
-            (1, 0),
-            "arm {arm} pruned, and nothing refused it"
+            (0, 0, 0, 1),
+            "arm {arm} is refused before it can prune"
         );
     }
 
+    // A present sibling must be exactly eight hexadecimal characters. Its
+    // own corruption takes the same decoder-refusal path.
+    let (path, size) = write_data_file(
+        tmp.path(),
+        "footer_malformed_checksum.parquet",
+        Some(&hex(&sound_bytes)),
+        Some("not-a-crc"),
+    );
+    let decoded = scan_raw_values(&path, size, vec![], true).await.unwrap();
+    assert_eq!(decoded.len(), ROWS);
+    assert_eq!(pruning_delta(&snapshotter, "footer_kv"), (0, 0, 1, 0));
+
     // --- Puffin sidecar, as the writer registers it (Zstd, checksummed), sound
     // blob: same pruning through the sidecar path.
-    let (path, size) = write_data_file(tmp.path(), "puffin_sound.parquet", None);
+    let (path, size) = write_data_file(tmp.path(), "puffin_sound.parquet", None, None);
     let (reference, range) = write_sidecar(
         tmp.path(),
         "puffin_sound.puffin",
         &path,
         sound.to_bytes(),
-        CompressionCodec::Zstd,
+        CompressionCodec::zstd_default(),
     )
     .await;
     let decoded = scan_raw_values(&path, size, vec![reference.clone()], true)
         .await
         .unwrap();
     assert_eq!(decoded.len(), NEEDLE_ROWS.len(), "pruned to the matches");
-    assert_eq!(pruning_delta(&snapshotter, "puffin"), (1, 0));
+    assert_eq!(pruning_delta(&snapshotter, "puffin"), (1, 0, 0, 0));
 
     // --- Puffin sidecar, one flipped stored bit inside the blob: the Zstd
     // frame refuses it and the error propagates. The query fails; it does not
@@ -447,64 +480,38 @@ async fn a_corrupt_stored_blob_is_answered_differently_on_each_storage_path() {
     println!("Puffin sidecar, corrupt Zstd frame: {failure}");
     assert_eq!(
         pruning_delta(&snapshotter, "puffin"),
-        (0, 0),
+        (0, 0, 0, 0),
         "nothing pruned and nothing was refused as an index: {failure}"
     );
 
-    // --- Puffin sidecar with the compression the writer does not select: the
-    // frame is what covers the path, so an uncompressed blob has the footer
-    // KV's exposure. Same corrupt body, same silent short answer.
-    let (path, size) = write_data_file(tmp.path(), "puffin_plain.parquet", None);
-    let (reference, _) = write_sidecar(
+    // --- Repeated footer read with caches enabled: the first refusal cannot
+    // populate the parsed cache, and the warm metadata path verifies again.
+    let corrupt_hex = hex(&postings_wrong);
+    let (footer_path, footer_size) = write_data_file(
         tmp.path(),
-        "puffin_plain.puffin",
-        &path,
-        postings_wrong.clone(),
-        CompressionCodec::None,
-    )
-    .await;
-    let decoded = scan_raw_values(&path, size, vec![reference], true)
-        .await
-        .unwrap();
-    let missing: Vec<&String> = needles
-        .iter()
-        .filter(|needle| !decoded.contains(needle))
-        .collect();
-    assert!(
-        !missing.is_empty(),
-        "an uncompressed corrupt sidecar costs the query rows, like the footer KV"
+        "warm_footer.parquet",
+        Some(&corrupt_hex),
+        Some(&sound_checksum),
     );
-    println!(
-        "Puffin sidecar, uncompressed corrupt blob: decoded {} of {ROWS} rows, lost {} of {} needles",
-        decoded.len(),
-        missing.len(),
-        needles.len()
-    );
-    assert_eq!(pruning_delta(&snapshotter, "puffin"), (1, 0));
-}
+    for pass in ["cold", "warm"] {
+        let decoded = scan_raw_values(&footer_path, footer_size, vec![], false)
+            .await
+            .expect("a footer mismatch falls back to the exact scan");
+        assert_eq!(decoded.len(), ROWS, "{pass} mismatch takes the exact scan");
+        assert!(needles.iter().all(|needle| decoded.contains(needle)));
+    }
+    assert_eq!(pruning_delta(&snapshotter, "footer_kv"), (0, 0, 0, 2));
 
-/// Warm, on both paths: the caches hold the parsed index under an identity that
-/// says "this file, written once", so nothing re-reads or re-verifies the
-/// stored bytes. A file that rots after a query warmed it keeps answering from
-/// the parse until the entry is evicted — and the cold read of the same file
-/// then behaves as the arms above.
-///
-/// Separate test function, but the same process-global recorder is not read
-/// here: the answer is the assertion.
-#[tokio::test]
-async fn a_warm_parsed_index_does_not_see_a_corruption_that_lands_after_it() {
-    let tmp = tempfile::tempdir().unwrap();
-    let rows = raw_rows();
-    let needles = needle_texts(&rows);
-    let sound = InvertedIndex::from_rows(rows.iter().map(String::as_str));
-
-    let (path, size) = write_data_file(tmp.path(), "warm.parquet", None);
+    // --- Puffin's parsed cache is keyed by its write-once sidecar identity.
+    // A warm parse avoids the corrupt stored frame; bypassing that cache makes
+    // the Zstd content checksum fail the read.
+    let (path, size) = write_data_file(tmp.path(), "warm_sidecar.parquet", None, None);
     let (reference, range) = write_sidecar(
         tmp.path(),
         "warm.puffin",
         &path,
         sound.to_bytes(),
-        CompressionCodec::Zstd,
+        CompressionCodec::zstd_default(),
     )
     .await;
 

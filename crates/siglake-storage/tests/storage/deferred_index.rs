@@ -9,6 +9,18 @@ use siglake_bloom::{RAW_TRIGRAM_BLOOM_KV_KEY, RAW_TRIGRAM_ROWGROUP_BLOOM_KV_KEY}
 use siglake_core::Event;
 use siglake_storage::iceberg::{IcebergContext, BLOOM_FILTER_COLUMNS};
 
+use crate::fixture_clock::{assert_one_partition, fixture_base};
+
+/// One second apart off [`fixture_base`], so the four appends below re-cluster
+/// as one `day(timestamp)` partition whatever time of day the suite runs
+/// (#5678).
+fn event_at(offset_secs: i64, raw: String) -> Event {
+    Event {
+        timestamp: fixture_base() + chrono::Duration::seconds(offset_secs),
+        ..Event::now(raw)
+    }
+}
+
 fn footer_keys(path: &std::path::Path) -> Vec<String> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let bytes = std::fs::read(path).unwrap();
@@ -59,7 +71,7 @@ async fn deferred_table_skips_index_at_flush_and_materializes_at_compaction() {
 
     // Four ingest-time appends (gen 0) — all index work must be skipped.
     for i in 0..4 {
-        ice.append_events(&[Event::now(format!("database timeout batch {i}"))])
+        ice.append_events(&[event_at(i, format!("database timeout batch {i}"))])
             .await
             .unwrap();
     }
@@ -117,6 +129,7 @@ async fn deferred_table_skips_index_at_flush_and_materializes_at_compaction() {
     // Compaction (gen ≥ 1) materializes the indexes on the merged output.
     let ident = ice.events_table_ident().clone();
     let files = ice.live_data_files(&ident).await.unwrap();
+    assert_one_partition(&files, "deferred_table_skips_index_at_flush");
     ice.recluster_files(&ident, files, BLOOM_FILTER_COLUMNS)
         .await
         .unwrap();

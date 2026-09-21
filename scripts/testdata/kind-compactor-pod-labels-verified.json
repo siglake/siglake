@@ -1,0 +1,163 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-19T23:55:00Z",
+  "evaluated_at": 1789862100,
+  "revisions": {
+    "repository_commit": "0123456789abcdef0123456789abcdef01234567",
+    "compactor_pods": [
+      {
+        "pod": "siglake-compactor-67b66d6c59-2xq4t",
+        "container": "compactor",
+        "image": "siglake:kind",
+        "image_id": "docker.io/library/siglake@sha256:1f2e3d4c5b6a7988990a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60"
+      },
+      {
+        "pod": "siglake-compactor-67b66d6c59-nd7wz",
+        "container": "compactor",
+        "image": "siglake:kind",
+        "image_id": "docker.io/library/siglake@sha256:1f2e3d4c5b6a7988990a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60"
+      }
+    ]
+  },
+  "settings": {
+    "namespace": "default",
+    "release": "siglake",
+    "scale_path": "helm_upgrade_reuse_values",
+    "compactor_replicas": 2,
+    "load_seconds": 15,
+    "compactor_interval_seconds": 1,
+    "scrape_interval_seconds": 15,
+    "commit_batch_target_mb": 1024,
+    "commit_batch_max_age_seconds": 300
+  },
+  "expected_pods": [
+    "siglake-compactor-67b66d6c59-2xq4t",
+    "siglake-compactor-67b66d6c59-nd7wz"
+  ],
+  "settling_samples": [
+    {
+      "pods": [
+        {
+          "pod": "siglake-compactor-67b66d6c59-2xq4t",
+          "value": 7.0,
+          "sample_time": 1789862071.0
+        },
+        {
+          "pod": "siglake-compactor-67b66d6c59-nd7wz",
+          "value": 7.0,
+          "sample_time": 1789862072.0
+        }
+      ]
+    },
+    {
+      "pods": [
+        {
+          "pod": "siglake-compactor-67b66d6c59-2xq4t",
+          "value": 7.0,
+          "sample_time": 1789862086.0
+        },
+        {
+          "pod": "siglake-compactor-67b66d6c59-nd7wz",
+          "value": 7.0,
+          "sample_time": 1789862087.0
+        }
+      ]
+    }
+  ],
+  "queries": {
+    "raw": {
+      "expression": "siglake_compactor_sealed_pending{namespace=\"default\",app_kubernetes_io_instance=\"siglake\",app_kubernetes_io_component=\"compactor\"}",
+      "time": 1789862100,
+      "response": {
+        "status": "success",
+        "data": {
+          "resultType": "vector",
+          "result": [
+            {
+              "metric": {
+                "__name__": "siglake_compactor_sealed_pending",
+                "namespace": "default",
+                "pod": "siglake-compactor-67b66d6c59-2xq4t",
+                "tenant": "default"
+              },
+              "value": [1789862100, "7"]
+            },
+            {
+              "metric": {
+                "__name__": "siglake_compactor_sealed_pending",
+                "namespace": "default",
+                "pod": "siglake-compactor-67b66d6c59-nd7wz",
+                "tenant": "default"
+              },
+              "value": [1789862100, "7"]
+            }
+          ]
+        }
+      }
+    },
+    "sample_times": {
+      "expression": "timestamp(siglake_compactor_sealed_pending{namespace=\"default\",app_kubernetes_io_instance=\"siglake\",app_kubernetes_io_component=\"compactor\"})",
+      "time": 1789862100,
+      "response": {
+        "status": "success",
+        "data": {
+          "resultType": "vector",
+          "result": [
+            {
+              "metric": {
+                "namespace": "default",
+                "pod": "siglake-compactor-67b66d6c59-2xq4t",
+                "tenant": "default"
+              },
+              "value": [1789862100, "1789862086"]
+            },
+            {
+              "metric": {
+                "namespace": "default",
+                "pod": "siglake-compactor-67b66d6c59-nd7wz",
+                "tenant": "default"
+              },
+              "value": [1789862100, "1789862087"]
+            }
+          ]
+        }
+      }
+    },
+    "per_pod": {
+      "expression": "sum by (pod) (siglake_compactor_sealed_pending{namespace=\"default\",app_kubernetes_io_instance=\"siglake\",app_kubernetes_io_component=\"compactor\"})",
+      "time": 1789862100,
+      "response": {
+        "status": "success",
+        "data": {
+          "resultType": "vector",
+          "result": [
+            {
+              "metric": {"pod": "siglake-compactor-67b66d6c59-2xq4t"},
+              "value": [1789862100, "7"]
+            },
+            {
+              "metric": {"pod": "siglake-compactor-67b66d6c59-nd7wz"},
+              "value": [1789862100, "7"]
+            }
+          ]
+        }
+      }
+    },
+    "operator_expression": {
+      "expression": "avg(sum by (pod) (siglake_compactor_sealed_pending{namespace=\"default\",app_kubernetes_io_instance=\"siglake\",app_kubernetes_io_component=\"compactor\"}))",
+      "time": 1789862100,
+      "response": {
+        "status": "success",
+        "data": {
+          "resultType": "vector",
+          "result": [
+            {
+              "metric": {},
+              "value": [1789862100, "7"]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

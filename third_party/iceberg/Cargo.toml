@@ -7,16 +7,15 @@
 #
 # If you are reading this file be aware that the original Cargo.toml
 # will likely look very different (and much more reasonable).
-# The original Cargo.toml is not vendored: the pristine upstream package,
-# Cargo.toml.orig included, is the crates.io copy in the cargo registry.
-# siglake's divergences from it are git history plus third_party/README.md.
+# See Cargo.toml.orig for the original contents.
 
 [package]
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.94"
 name = "iceberg"
-version = "0.9.1"
+version = "0.10.1"
 build = false
+publish = true
 autolib = false
 autobins = false
 autoexamples = false
@@ -41,39 +40,45 @@ default = []
 name = "iceberg"
 path = "src/lib.rs"
 
+[dependencies.aes-gcm]
+version = "0.10"
+
 [dependencies.anyhow]
 version = "1.0.72"
 
 [dependencies.apache-avro]
 version = "0.21"
-features = ["zstandard"]
+features = [
+    "snappy",
+    "zstandard",
+]
 
 [dependencies.array-init]
 version = "2"
 
 [dependencies.arrow-arith]
-version = "57.1"
+version = "58"
 
 [dependencies.arrow-array]
-version = "57.1"
+version = "58"
 
 [dependencies.arrow-buffer]
-version = "57.1"
+version = "58"
 
 [dependencies.arrow-cast]
-version = "57.1"
+version = "58"
 
 [dependencies.arrow-ord]
-version = "57.1"
+version = "58"
 
 [dependencies.arrow-schema]
-version = "57.1"
+version = "58"
 
 [dependencies.arrow-select]
-version = "57.1"
+version = "58"
 
 [dependencies.arrow-string]
-version = "57.1"
+version = "58"
 
 [dependencies.as-any]
 version = "0.3.2"
@@ -145,8 +150,11 @@ version = "1.20"
 version = "4"
 
 [dependencies.parquet]
-version = "57.1"
-features = ["async"]
+version = "58"
+features = [
+    "async",
+    "encryption",
+]
 
 [dependencies.rand]
 version = "0.9.3"
@@ -184,16 +192,15 @@ features = ["derive"]
 
 [dependencies.tokio]
 version = "1.47"
-# siglake: `rt` for `tokio::task::coop::consume_budget` on the object-cache hit
-# path in `io/file_io.rs` (and for the `runtime` module's `spawn`); `time` for
-# `tokio::time::timeout` on the reversed-chunk in-flight wait in
-# `arrow/reader.rs` and for the `tokio::time::sleep` handed to backon in
-# `transaction/mod.rs`. Upstream asks for `sync` alone and the rest arrive
-# through feature unification (reqwest turns on `time`, parquet `macros`), so
-# these lines are what keeps the fork buildable on its own.
-features = ["sync", "rt", "time"]
+features = [
+    "sync",
+    "rt-multi-thread",
+]
 optional = false
 default-features = false
+
+[dependencies.tracing]
+version = "0.1.41"
 
 [dependencies.typed-builder]
 version = "0.20"
@@ -207,6 +214,9 @@ version = "2.5.7"
 [dependencies.uuid]
 version = "1.18"
 features = ["v7"]
+
+[dependencies.zeroize]
+version = "1.7"
 
 [dependencies.zstd]
 version = "0.13.3"
@@ -231,17 +241,7 @@ version = "1.11.3"
 
 [dev-dependencies.serde_arrow]
 version = "0.14"
-features = ["arrow-57"]
+features = ["arrow-58"]
 
 [dev-dependencies.tempfile]
 version = "3.18"
-
-# siglake: test-only tokio features, kept out of the production dependency
-# above. `macros` for the `#[tokio::test]` and `#[tokio::main]` attributes,
-# `rt-multi-thread` because `#[tokio::main]` defaults to that flavour -- the
-# five `writer` and crate-root doctests need it, and without this entry they
-# only build inside a workspace that turns the feature on for something else.
-[dev-dependencies.tokio]
-version = "1.47"
-features = ["macros", "rt-multi-thread"]
-default-features = false

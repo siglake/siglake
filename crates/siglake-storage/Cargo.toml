@@ -35,6 +35,7 @@ siglake-index = { workspace = true }
 siglake-wal = { workspace = true }
 
 anyhow = { workspace = true }
+base64 = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
@@ -52,12 +53,15 @@ iceberg-storage-opendal = { workspace = true }
 metrics = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 # BIG-3 orphan GC lists + deletes warehouse files directly via opendal
 # (the Storage trait in the vendored iceberg fork has no list API and the
 # concrete opendal-backed Storage is not vendored). Warehouse-scoped
 # Operator built the same way the WAL mirror builds its S3/Fs backend.
 opendal = { workspace = true }
-reqsign = { workspace = true }
+reqsign-aws-v4 = { workspace = true }
+reqsign-core = { workspace = true }
+http = "1"
 reqwest = { workspace = true }
 # `iceberg-catalog-sql` brings sqlx in transitively but does not enable a
 # runtime feature on it; we depend on sqlx here purely to flip the

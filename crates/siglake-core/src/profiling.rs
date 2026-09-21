@@ -12,11 +12,15 @@
 //! this one is the only HTTP surface every role shares ([`crate::metrics::init`]
 //! is called by `siglake-cli`, `siglake-query-server` and `siglake-operator`),
 //! so one mount point profiles the ingester, the compactor and the query tier.
-//! Its exposure model is the same as `/metrics`: node-local. The AWS bench
-//! stack opens only 8088, 8089 and 22, so 9100/9105 are reachable from the node
-//! and its peers and nowhere else. **Do not mount these routes on the public
-//! API port** — a CPU profile is a stack-trace oracle and the heap route names
-//! allocation sites.
+//! Its exposure model is the same as `/metrics`: `--metrics-bind` defaults to
+//! `0.0.0.0` in every role, so the listener answers on every IPv4 interface of
+//! the process's network namespace, and who may reach it is a deployment
+//! decision — the cluster's default, an ingress `NetworkPolicy` the operator
+//! writes, a security group. On the AWS bench stack the security group opens
+//! 8088, 8089 and 22 to the configured CIDR and all TCP within the group, so
+//! 9100/9105 are reachable from the node and its peers and nowhere else
+//! *there*. **Do not mount these routes on the public API port** — a CPU
+//! profile is a stack-trace oracle and the heap route names allocation sites.
 //!
 //! ## What each route is for
 //!

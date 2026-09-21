@@ -19,6 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::RangeFrom;
 
+use futures::TryStreamExt;
+use futures::stream::FuturesUnordered;
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -33,6 +35,11 @@ use crate::transaction::ActionCommit;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
+
+/// Reserve a snapshot id before constructing a rewrite sidecar.
+pub fn reserve_snapshot_id(table: &Table) -> i64 {
+    SnapshotProducer::generate_unique_snapshot_id(table)
+}
 
 /// A trait that defines how different table operations produce new snapshots.
 ///
@@ -111,12 +118,8 @@ pub(crate) struct SnapshotProducer<'a> {
     pub(crate) table: &'a Table,
     snapshot_id: i64,
     commit_uuid: Uuid,
-    key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
-    // Data files to remove from the table in this snapshot (used by overwrite/rewrite
-    // operations). Default empty for append. Files are matched by path against the
-    // current snapshot's live manifest entries.
     removed_data_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
@@ -128,7 +131,6 @@ impl<'a> SnapshotProducer<'a> {
     pub(crate) fn new(
         table: &'a Table,
         commit_uuid: Uuid,
-        key_metadata: Option<Vec<u8>>,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
     ) -> Self {
@@ -136,7 +138,6 @@ impl<'a> SnapshotProducer<'a> {
             table,
             snapshot_id: Self::generate_unique_snapshot_id(table),
             commit_uuid,
-            key_metadata,
             snapshot_properties,
             added_data_files,
             removed_data_files: Vec::new(),
@@ -144,9 +145,36 @@ impl<'a> SnapshotProducer<'a> {
         }
     }
 
-    /// Set the data files to remove in this snapshot. Used by overwrite/rewrite
-    /// operations; append leaves this empty. Files are matched by path against the
-    /// current snapshot's live manifest entries when the manifests are rewritten.
+    pub(crate) fn new_with_snapshot_id(
+        table: &'a Table,
+        snapshot_id: i64,
+        commit_uuid: Uuid,
+        snapshot_properties: HashMap<String, String>,
+        added_data_files: Vec<DataFile>,
+    ) -> Result<Self> {
+        if table
+            .metadata()
+            .snapshots()
+            .any(|snapshot| snapshot.snapshot_id() == snapshot_id)
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("reserved snapshot id {snapshot_id} is already present on the table"),
+            )
+            .with_retryable(false));
+        }
+
+        Ok(Self {
+            table,
+            snapshot_id,
+            commit_uuid,
+            snapshot_properties,
+            added_data_files,
+            removed_data_files: Vec::new(),
+            manifest_counter: (0..),
+        })
+    }
+
     pub(crate) fn set_removed_data_files(&mut self, removed_data_files: Vec<DataFile>) {
         self.removed_data_files = removed_data_files;
     }
@@ -176,29 +204,46 @@ impl<'a> SnapshotProducer<'a> {
     }
 
     pub(crate) async fn validate_duplicate_files(&self) -> Result<()> {
+        let Some(current_snapshot) = self.table.metadata().current_snapshot() else {
+            return Ok(());
+        };
+
         let new_files: HashSet<&str> = self
             .added_data_files
             .iter()
             .map(|df| df.file_path.as_str())
             .collect();
 
-        let mut referenced_files = Vec::new();
-        if let Some(current_snapshot) = self.table.metadata().current_snapshot() {
-            let manifest_list = current_snapshot
-                .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
-                .await?;
-            for manifest_list_entry in manifest_list.entries() {
-                let manifest = manifest_list_entry
-                    .load_manifest(self.table.file_io())
-                    .await?;
-                for entry in manifest.entries() {
-                    let file_path = entry.file_path();
-                    if new_files.contains(file_path) && entry.is_alive() {
-                        referenced_files.push(file_path.to_string());
-                    }
-                }
-            }
-        }
+        let runtime = self.table.runtime();
+        let file_io = self.table.file_io();
+        let manifest_list = self
+            .table
+            .manifest_list_reader(current_snapshot)
+            .load()
+            .await?;
+
+        let new_files_ref = &new_files;
+        let referenced_files: Vec<String> = manifest_list
+            .consume_entries()
+            .into_iter()
+            .map(|entry| {
+                let file_io = file_io.clone();
+                runtime
+                    .io()
+                    .spawn(async move { entry.load_manifest(&file_io).await })
+            })
+            .collect::<FuturesUnordered<_>>()
+            .try_fold(Vec::new(), |mut acc, manifest| async move {
+                acc.extend(
+                    manifest?
+                        .entries()
+                        .iter()
+                        .filter(|e| new_files_ref.contains(e.file_path()) && e.is_alive())
+                        .map(|e| e.file_path().to_string()),
+                );
+                Ok(acc)
+            })
+            .await?;
 
         if !referenced_files.is_empty() {
             return Err(Error::new(
@@ -248,7 +293,6 @@ impl<'a> SnapshotProducer<'a> {
         let builder = ManifestWriterBuilder::new(
             output_file,
             Some(self.snapshot_id),
-            self.key_metadata.clone(),
             self.table.metadata().current_schema().clone(),
             self.table
                 .metadata()
@@ -331,21 +375,7 @@ impl<'a> SnapshotProducer<'a> {
         writer.write_manifest_file().await
     }
 
-    /// Rewrite the current snapshot's data manifests to remove `self.removed_data_files`.
-    ///
-    /// For each existing manifest:
-    /// - If it references none of the removed files, it is carried forward unchanged.
-    /// - Otherwise it is rewritten: surviving live entries are re-emitted as `Existing`
-    ///   (preserving their snapshot id and sequence numbers) and removed entries are
-    ///   re-emitted as `Deleted` tombstones (preserving their sequence numbers). Already
-    ///   dead entries are dropped.
-    ///
-    /// This is the data-integrity-critical core of the overwrite operation: the live
-    /// file set of the new snapshot is exactly `(previous live files − removed files)`,
-    /// and removed files are recorded as tombstones so a later snapshot-expiry can
-    /// physically delete them. It refuses to commit unless every file it was asked to
-    /// remove was found as a live entry — guarding against a partial removal that would
-    /// duplicate rows once the re-clustered replacements are appended.
+    /// Rewrite current data manifests while removing the requested live files.
     async fn rewrite_existing_manifests_for_removal(&mut self) -> Result<Vec<ManifestFile>> {
         let Some(snapshot) = self.table.metadata().current_snapshot() else {
             return Err(Error::new(
@@ -353,15 +383,11 @@ impl<'a> SnapshotProducer<'a> {
                 "Cannot remove data files: table has no current snapshot",
             ));
         };
-        let manifest_list = snapshot
-            .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
-            .await?;
-
-        // Owned (not borrowing `self`) so we can take `&mut self` for the manifest writer.
+        let manifest_list = self.table.manifest_list_reader(snapshot).load().await?;
         let removed_paths: HashSet<String> = self
             .removed_data_files
             .iter()
-            .map(|df| df.file_path.clone())
+            .map(|file| file.file_path.clone())
             .collect();
 
         let mut result = Vec::with_capacity(manifest_list.entries().len());
@@ -369,22 +395,18 @@ impl<'a> SnapshotProducer<'a> {
 
         for manifest_file in manifest_list.entries() {
             let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
-
             let touches_removed = manifest
                 .entries()
                 .iter()
                 .any(|entry| entry.is_alive() && removed_paths.contains(entry.file_path()));
 
             if !touches_removed {
-                // Carry forward unchanged if it still has live files.
                 if manifest_file.has_added_files() || manifest_file.has_existing_files() {
                     result.push(manifest_file.clone());
                 }
                 continue;
             }
 
-            // Rewrite: kept live entries become Existing, removed entries become Deleted
-            // tombstones, already-dead entries are dropped.
             let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
             let mut wrote_entry = false;
             for entry in manifest.entries() {
@@ -427,8 +449,7 @@ impl<'a> SnapshotProducer<'a> {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Rewrite expected to remove {} files but matched {} live manifest entries; \
-                     refusing to commit a snapshot that would silently drop or retain files",
+                    "Rewrite expected to remove {} files but matched {} live manifest entries; refusing to commit a partial rewrite",
                     self.removed_data_files.len(),
                     matched
                 ),
@@ -448,11 +469,6 @@ impl<'a> SnapshotProducer<'a> {
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        //
-        // A rewrite can also be delete-only: it removes live files and adds none. The
-        // removals are the snapshot's content, so that shape needs no snapshot property
-        // to justify the commit (`RewriteFilesAction::commit` rejects the both-empty
-        // case before it gets here).
         if self.added_data_files.is_empty()
             && self.removed_data_files.is_empty()
             && self.snapshot_properties.is_empty()
@@ -463,10 +479,6 @@ impl<'a> SnapshotProducer<'a> {
             ));
         }
 
-        // When the operation removes files, rewrite the existing manifests to drop them
-        // (marking removed entries Deleted and carrying the rest as Existing). Otherwise
-        // defer to the operation's own choice of carried-forward manifests (append carries
-        // all of them). The two paths are mutually exclusive by construction.
         let mut manifest_files = if self.removed_data_files.is_empty() {
             snapshot_produce_operation.existing_manifest(self).await?
         } else {
@@ -513,9 +525,7 @@ impl<'a> SnapshotProducer<'a> {
                 table_metadata.default_partition_spec().clone(),
             );
         }
-        // Account for replaced files (a `RewriteFilesAction`/recluster removes the
-        // old files while adding the rewritten ones). Without this their records
-        // were never counted as deleted, so the running totals would double-count.
+
         for data_file in &self.removed_data_files {
             summary_collector.remove_file(
                 data_file,
@@ -524,29 +534,21 @@ impl<'a> SnapshotProducer<'a> {
             );
         }
 
-        // The new snapshot (`self.snapshot_id`) is not in `table_metadata` yet, so
-        // looking it up to find its parent always returned `None` — which made
-        // `update_snapshot_summaries` treat every commit as if from an empty table,
-        // so the cumulative totals (`total-records`, `total-data-files`,
-        // `total-file-size`, …) reflected only the current commit instead of the
-        // running table total. The parent IS the table's current snapshot (set as
-        // the new snapshot's parent below), so use it directly.
         let previous_snapshot = table_metadata.current_snapshot();
 
-        let mut additional_properties = summary_collector.build();
-        additional_properties.extend(self.snapshot_properties.clone());
+        // User-supplied snapshot properties are applied first, then the computed
+        // metrics overwrite any colliding keys. This matches iceberg-java
+        // (`SnapshotProducer.summary`), where computed `added-*`/`total-*` values
+        // are written after user properties so a user cannot shadow them with a
+        // bad (or merely wrong) value that would corrupt the snapshot summary.
+        let mut additional_properties = self.snapshot_properties.clone();
+        additional_properties.extend(summary_collector.build());
 
         let summary = Summary {
             operation: snapshot_produce_operation.operation(),
             additional_properties,
         };
 
-        // Do NOT request the full-table-truncate path: it resets the running totals
-        // as if the overwrite replaced the ENTIRE table, which is wrong for a
-        // partial rewrite (recluster rewrites only some files — most reclusters).
-        // With added + removed files both accounted above, `update_totals` derives
-        // the correct new totals (prev + added − removed) for every operation,
-        // including a true full overwrite (where removed == all live files).
         update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()), false)
     }
 
@@ -571,26 +573,26 @@ impl<'a> SnapshotProducer<'a> {
         let manifest_list_path = self.generate_manifest_list_file_path(0);
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
+        let writer = self
+            .table
+            .file_io()
+            .new_output(manifest_list_path.clone())?
+            .writer()
+            .await?;
         let mut manifest_list_writer = match self.table.metadata().format_version() {
             FormatVersion::V1 => ManifestListWriter::v1(
-                self.table
-                    .file_io()
-                    .new_output(manifest_list_path.clone())?,
+                writer,
                 self.snapshot_id,
                 self.table.metadata().current_snapshot_id(),
             ),
             FormatVersion::V2 => ManifestListWriter::v2(
-                self.table
-                    .file_io()
-                    .new_output(manifest_list_path.clone())?,
+                writer,
                 self.snapshot_id,
                 self.table.metadata().current_snapshot_id(),
                 next_seq_num,
             ),
             FormatVersion::V3 => ManifestListWriter::v3(
-                self.table
-                    .file_io()
-                    .new_output(manifest_list_path.clone())?,
+                writer,
                 self.snapshot_id,
                 self.table.metadata().current_snapshot_id(),
                 next_seq_num,

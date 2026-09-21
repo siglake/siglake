@@ -123,8 +123,8 @@ up and fall back to the per-file path.
 ## Repair and limits
 
 A delta PUT gets four total attempts, with 250/500/750ms delays between them.
-`siglake_group_count_delta_write_retries_total{table="<table>"}` counts the
-retries used when a later attempt succeeds;
+`siglake_group_count_delta_write_retries_total{iceberg_namespace="<ns>",table="<table>"}`
+counts the retries used when a later attempt succeeds;
 `siglake_group_count_delta_write_failures_total{iceberg_namespace="<ns>",table="<table>"}`
 counts a PUT that exhausted all four. The committer then writes a durable rebuild marker;
 the maintenance compactor recomputes through the exact Tier-2 path — footer
@@ -158,28 +158,50 @@ short by the next delta, so the rebuild records the columns it failed to restore
 rebuild) and the census skips them until another rebuild — a marker repair, or
 the CLI — clears the record.
 
-A census rebuild recomputes the **exact** columns from the files and leaves the
-sketches alone: recomputing them costs a second Tier-2 query per sketched column
-and fails the whole rebuild on the first column the files cannot serve, which on
-the events table is `timestamp_ns` the moment its per-row-unique values demote
-it. That leaves one edge to close. `rebuilt_through` makes every delta at or
-below it redundant, and both folds then delete rather than fold it — sketch half
-included, which no later commit re-adds. So the rebuild merges the sketch half of
-exactly those deltas into the base in the same write, under the same predicate
-the fold uses, and drops from the carry any column it just restored exactly: a
-column represented both ways is reconciled by demoting the exact side, which
-would undo the repair. The marker path, which does recompute sketches from the
-files, is unchanged.
+A census rebuild recomputes the **exact** columns and each existing sketch from
+the files. Sketch restoration is per column: `None` from the Tier-2 path means
+that column keeps the base-plus-delta state the rebuild was already required to
+carry and is reported as unrestored; an object-store or decode error still
+fails the rebuild. This distinction matters on the events table, where
+`timestamp_ns` becomes a sketch after its per-row-unique values cross the cap,
+but neither its omitted footer nor the UTF-8-only raw-page fallback can serve
+it. One unavailable typed column no longer prevents a readable short sketch
+beside it from being corrected. Exact-versus-sketch exclusivity is preserved:
+any column selected for sketch restoration is removed from the exact result.
 
-Measured 2026-09-16 (release, local filesystem, one dimension column): census
-12.3ms / repair 64.4ms at 40k rows, 139.3ms / 849.4ms at 400k. Both are linear
-in the column's distinct values and the repair is ~6× the census per column, so
-the census is unconditional and the repair is opt-in
+The carry remains necessary. `rebuilt_through` makes every delta at or below it
+redundant, and both folds then delete rather than fold it — sketch half included,
+which no later commit re-adds. The rebuild therefore merges the sketch half of
+exactly those deltas into the base under the fold's own redundancy predicate,
+then replaces each sketch it could recompute. Marker repair retains its
+all-or-nothing sketch contract, because a durable marker names rows known to be
+lost. The CLI still carries sketches without recomputing them, so its cost and
+operator contract are unchanged.
+
+Measured again 2026-09-20 (release, local filesystem, one dimension column):
+census 14.6ms / repair 65.1ms at 40k rows, 145.4ms / 876.5ms at 400k. Both are
+linear in the column's distinct values and the repair is ~6× the census per
+column, so the census is unconditional and the repair is opt-in
 (`SIGLAKE_AGG_SHORT_REPAIR=1`) and budgeted at one table per pass
 (`SIGLAKE_AGG_SHORT_REPAIR_MAX_TABLES`). At the 1TB shape the extrapolation is
-~9 minutes per column per 250M rows, which the compactor's 600s watchdog cuts —
-safely, since the rebuild publishes in one write at the end — and that is why a
-table that size stays the operator's to rebuild.
+~9 minutes per column per 250M rows; no large-table timeout was measured. The
+compactor's cooperative 600s watchdog can cut that repair safely because the
+rebuild publishes in one write at the end. A local cancellation at a requested
+286.3ms returned at the scan's next yield, 830.5ms, published nothing, and was
+detected again after reopening the warehouse. The durable 0.2.0 retry decision,
+including the 1.3ms local marker-path measurement, is in
+[`DESIGN_short_aggregate_repair_backoff.md`](DESIGN_short_aggregate_repair_backoff.md).
+Until it is implemented, a table that size stays the operator's to rebuild.
+
+The sketch-restoration A/B uses matching 8-commit warehouses with two
+high-cardinality dimensions and an unavailable carried `timestamp_ns` sketch.
+At 40k rows, carrying the two sketches cost 51.2ms and restoring the readable
+one cost 91.0ms (+39.7ms). At 400k rows the pair was 792.5ms and 1,432.5ms
+(+640.0ms). This is the expected one extra Tier-2 query per readable sketch.
+The extension is kept because it runs only inside the existing opt-in,
+one-table-per-pass repair budget and is the only automatic path that can correct
+a sketch already short before the repair. The census-only pass, marker repair
+and CLI add no work.
 
 The rebuild takes its column set from the aggregate, not the schema: it repairs
 what a table was maintaining, and inventing columns would change what the table
@@ -189,8 +211,13 @@ dimensions are in every file's footer and in no aggregate, so the plain rebuild
 cannot help and the read path serves them from the per-file tier forever. The
 flag unions the typed part of the write path's column set
 (`group_count_columns_for` with no declared dims — a typed column is never a
-bloom column) into the rebuild. An admitted column is held to the typed cap on
-its whole-table distinct count (counted, reported, not written when over), and
+bloom column) into the rebuild. Typed inference excludes the canonical
+`timestamp_ns` twin when the schema also has the canonical `timestamp` field:
+the twin is event-time storage, not a group dimension. A user field named
+`timestamp_ns` beside another declared event-time field is still inferred, and
+an explicitly declared dimension is still admitted. An admitted column is held
+to the typed cap on its whole-table distinct count (counted, reported, not
+written when over), and
 is left absent — never partial — when `grouped_counts_from_files` returns
 `None`, i.e. some live file has no footer for it and the raw-page decode cannot
 read its physical type or the column is missing from that file's schema. That
@@ -404,6 +431,12 @@ against it after the 2026-08-03 round; the measurements changed the plan twice.
 The ordering contract needed care in the second item: a `Vec`'s order is the
 codec's promise where a `BTreeMap`'s was the container's guarantee. Both are
 pinned by differential tests against the map-backed path, break-checked.
+
+**6. Census sketch recovery ✅ (2026-09-20).** The opt-in census rebuild now
+restores each readable sketch and carries an unavailable one independently.
+The retained cost A/B and the `timestamp_ns` regression are in
+`agg_short_repair`; the measured decision is recorded under "Repair and
+limits" above.
 
 ## Risks
 

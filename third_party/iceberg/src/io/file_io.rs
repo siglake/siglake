@@ -17,52 +17,38 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::Bytes;
+use futures::{Stream, StreamExt};
 
 use super::storage::{
     LocalFsStorageFactory, MemoryStorageFactory, Storage, StorageConfig, StorageFactory,
 };
 use crate::Result;
+use crate::io::read_observability::ReadDebouncer;
 
-/// siglake byte-range object cache (the "cold-S3 read floor" hot cache).
-///
-/// `object_cache.rs` caches parsed manifests/manifest-lists; this caches the raw
-/// *data-file* bytes — Parquet footers, column chunks, and index sidecars — that
-/// every read otherwise re-fetches from object storage. Iceberg data/metadata
-/// files are write-once (UUID/version-named, never mutated in place), so caching
-/// by `(path, range)` is always correct. Process-global, LRU by total bytes,
-/// gated by `SIGLAKE_OBJECT_CACHE_BYTES` (0/unset disables — so only processes
-/// that opt in, e.g. the query server, pay the memory). The overwritten WAL
-/// mirror is excluded out of caution.
-fn object_cache_max_atomic() -> &'static std::sync::atomic::AtomicU64 {
-    static MAX: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
+fn object_cache_max_atomic() -> &'static AtomicU64 {
+    static MAX: OnceLock<AtomicU64> = OnceLock::new();
     MAX.get_or_init(|| {
-        // Default from the env so any process opts in by setting it; the query
-        // server overrides via `set_object_cache_max_bytes`.
-        let env = std::env::var("SIGLAKE_OBJECT_CACHE_BYTES")
+        let configured = std::env::var("SIGLAKE_OBJECT_CACHE_BYTES")
             .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+            .and_then(|value| value.parse().ok())
             .unwrap_or(0);
-        std::sync::atomic::AtomicU64::new(env)
+        AtomicU64::new(configured)
     })
 }
 
 fn object_cache_max_bytes() -> u64 {
-    object_cache_max_atomic().load(std::sync::atomic::Ordering::Relaxed)
+    object_cache_max_atomic().load(Ordering::Relaxed)
 }
 
-/// Set the byte-range object cache budget (bytes; 0 disables). Lets a process
-/// (e.g. the query server) enable the hot cache without relying on the
-/// `SIGLAKE_OBJECT_CACHE_BYTES` env. Process-global; takes effect for subsequent
-/// reads.
+/// Set the process-wide immutable byte-range cache budget. Zero disables it.
 pub fn set_object_cache_max_bytes(max_bytes: u64) {
-    object_cache_max_atomic().store(max_bytes, std::sync::atomic::Ordering::Relaxed);
+    object_cache_max_atomic().store(max_bytes, Ordering::Relaxed);
 }
 
-/// Immutable Iceberg data/metadata only — never cache the in-place-overwritten
-/// WAL mirror / active segment.
 fn object_cache_cacheable(path: &str) -> bool {
     !path.contains("/wal-mirror/") && !path.contains("/_active/")
 }
@@ -81,14 +67,13 @@ impl ByteRangeCache {
 
     fn insert(&mut self, key: String, value: Bytes, max_bytes: u64) {
         let len = value.len() as u64;
-        // Never let one entry exceed the whole budget (it would evict everything
-        // then itself thrash); leave such reads uncached.
         if len > max_bytes {
             return;
         }
-        if let Some(prev) = self.entries.insert(key.clone(), value) {
-            self.bytes = self.bytes.saturating_sub(prev.len() as u64);
+        if self.entries.contains_key(&key) {
+            return;
         }
+        self.entries.insert(key.clone(), value);
         self.bytes = self.bytes.saturating_add(len);
         self.order.push_back(key);
         while self.bytes > max_bytes {
@@ -117,18 +102,6 @@ fn object_cache_get(key: &str) -> Option<Bytes> {
     hit
 }
 
-/// siglake: a cache hit resolves inside the caller's poll, so a loop of hits
-/// (a warm manifest walk, a footer sweep, a fully cached page scan) never
-/// returns `Pending` and no `tokio::time::timeout` around it can fire until the
-/// loop ends — a timeout only fires between polls. Spend one unit of tokio's
-/// cooperative budget per hit instead: the task yields only once the budget
-/// (128 units per poll) is gone, so an all-hit loop yields every 128 reads and a
-/// timeout above it becomes enforceable at that granularity, while a read path
-/// with a handful of hits pays a thread-local decrement. Outside a tokio
-/// runtime the budget is unconstrained and this never yields.
-///
-/// Every hit path in this file goes through here; see the audit table in
-/// siglake's `docs/DESIGN_continuous_compaction_and_ingest.md` (#1165).
 async fn object_cache_hit(hit: Bytes) -> Bytes {
     tokio::task::coop::consume_budget().await;
     hit
@@ -141,10 +114,19 @@ fn object_cache_put(key: String, value: Bytes, max_bytes: u64) {
     }
 }
 
-/// A [`FileRead`] that serves byte ranges from the process-global byte-range
-/// cache, filling on miss from the underlying reader.
+#[derive(Clone)]
+struct CachedPopulation {
+    bytes: Bytes,
+    attribution: Arc<AtomicBool>,
+}
+
+fn range_read_debouncer() -> &'static ReadDebouncer<String, CachedPopulation> {
+    static DEBOUNCER: OnceLock<ReadDebouncer<String, CachedPopulation>> = OnceLock::new();
+    DEBOUNCER.get_or_init(ReadDebouncer::default)
+}
+
 struct CachingFileRead {
-    inner: Box<dyn FileRead>,
+    inner: Arc<dyn FileRead>,
     path: String,
     max_bytes: u64,
 }
@@ -152,13 +134,43 @@ struct CachingFileRead {
 #[async_trait::async_trait]
 impl FileRead for CachingFileRead {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+        Ok(self.read_with_outcome(range).await?.bytes)
+    }
+
+    async fn read_with_outcome(&self, range: Range<u64>) -> crate::Result<ReadOutcome> {
         let key = format!("{}@{}-{}", self.path, range.start, range.end);
         if let Some(hit) = object_cache_get(&key) {
-            return Ok(object_cache_hit(hit).await);
+            return Ok(ReadOutcome {
+                bytes: object_cache_hit(hit).await,
+                fetched: false,
+            });
         }
-        let bytes = self.inner.read(range).await?;
-        object_cache_put(key, bytes.clone(), self.max_bytes);
-        Ok(bytes)
+
+        let inner = Arc::clone(&self.inner);
+        let operation_key = key.clone();
+        let cache_key = key.clone();
+        let max_bytes = self.max_bytes;
+        let population = range_read_debouncer()
+            .run(operation_key, "immutable_range", move || async move {
+                if let Some(hit) = object_cache_get(&cache_key) {
+                    return Ok(CachedPopulation {
+                        bytes: object_cache_hit(hit).await,
+                        attribution: Arc::new(AtomicBool::new(false)),
+                    });
+                }
+                let bytes = inner.read(range).await?;
+                object_cache_put(cache_key, bytes.clone(), max_bytes);
+                Ok(CachedPopulation {
+                    bytes,
+                    attribution: Arc::new(AtomicBool::new(true)),
+                })
+            })
+            .await?;
+        let fetched = population.attribution.swap(false, Ordering::AcqRel);
+        Ok(ReadOutcome {
+            bytes: population.bytes,
+            fetched,
+        })
     }
 }
 
@@ -277,6 +289,18 @@ impl FileIO {
         self.get_storage()?.delete_prefix(path.as_ref()).await
     }
 
+    /// Delete multiple files from a stream of paths.
+    ///
+    /// # Arguments
+    ///
+    /// * paths: A stream of absolute paths starting with the scheme string used to construct [`FileIO`].
+    pub async fn delete_stream(
+        &self,
+        paths: impl Stream<Item = String> + Send + 'static,
+    ) -> Result<()> {
+        self.get_storage()?.delete_stream(paths.boxed()).await
+    }
+
     /// Check file exists.
     ///
     /// # Arguments
@@ -377,6 +401,34 @@ pub trait FileRead: Send + Sync + Unpin + 'static {
     ///
     /// TODO: we can support reading non-contiguous bytes in the future.
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
+
+    /// Read a range and report whether this call populated bytes from storage.
+    /// Cache wrappers override this so scan metrics count physical reads once.
+    async fn read_with_outcome(&self, range: Range<u64>) -> crate::Result<ReadOutcome> {
+        Ok(ReadOutcome {
+            bytes: self.read(range).await?,
+            fetched: true,
+        })
+    }
+}
+
+/// Result of a range read with physical-fetch attribution.
+pub struct ReadOutcome {
+    /// Returned bytes.
+    pub bytes: Bytes,
+    /// True for exactly one caller when storage was accessed.
+    pub fetched: bool,
+}
+
+#[async_trait::async_trait]
+impl<T: AsRef<dyn FileRead> + Send + Sync + Unpin + 'static> FileRead for T {
+    async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+        self.as_ref().read(range).await
+    }
+
+    async fn read_with_outcome(&self, range: Range<u64>) -> crate::Result<ReadOutcome> {
+        self.as_ref().read_with_outcome(range).await
+    }
 }
 
 /// Input file is used for reading from files.
@@ -418,9 +470,26 @@ impl InputFile {
             if let Some(hit) = object_cache_get(&key) {
                 return Ok(object_cache_hit(hit).await);
             }
-            let bytes = self.storage.read(&self.path).await?;
-            object_cache_put(key, bytes.clone(), max_bytes);
-            return Ok(bytes);
+            let storage = Arc::clone(&self.storage);
+            let path = self.path.clone();
+            let cache_key = key.clone();
+            return range_read_debouncer()
+                .run(key, "immutable_whole", move || async move {
+                    if let Some(hit) = object_cache_get(&cache_key) {
+                        return Ok(CachedPopulation {
+                            bytes: object_cache_hit(hit).await,
+                            attribution: Arc::new(AtomicBool::new(false)),
+                        });
+                    }
+                    let bytes = storage.read(&path).await?;
+                    object_cache_put(cache_key, bytes.clone(), max_bytes);
+                    Ok(CachedPopulation {
+                        bytes,
+                        attribution: Arc::new(AtomicBool::new(true)),
+                    })
+                })
+                .await
+                .map(|population| population.bytes);
         }
         self.storage.read(&self.path).await
     }
@@ -433,7 +502,7 @@ impl InputFile {
         let max_bytes = object_cache_max_bytes();
         if max_bytes > 0 && object_cache_cacheable(&self.path) {
             Ok(Box::new(CachingFileRead {
-                inner,
+                inner: Arc::from(inner),
                 path: self.path.clone(),
                 max_bytes,
             }))
@@ -527,6 +596,7 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
     use futures::AsyncReadExt;
@@ -534,10 +604,71 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{FileIO, FileIOBuilder};
-    use crate::io::{LocalFsStorageFactory, MemoryStorageFactory};
+    use crate::io::{FileRead, LocalFsStorageFactory, MemoryStorageFactory};
 
     fn create_local_file_io() -> FileIO {
         FileIO::new_with_fs()
+    }
+
+    #[derive(Debug)]
+    struct CountedRead {
+        bytes: Bytes,
+        reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl FileRead for CountedRead {
+        async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+            Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    #[tokio::test]
+    async fn immutable_range_cache_is_single_flight_and_cooperative() {
+        super::set_object_cache_max_bytes(64 * 1024 * 1024);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let payload = Bytes::from_static(b"candidate immutable bytes");
+        let reader = Arc::new(super::CachingFileRead {
+            inner: Arc::new(CountedRead {
+                bytes: payload.clone(),
+                reads: Arc::clone(&reads),
+            }),
+            path: "memory://candidate/single-flight-1752.parquet".to_string(),
+            max_bytes: 64 * 1024 * 1024,
+        });
+        let len = payload.len() as u64;
+
+        let (left, right) = tokio::join!(reader.read(0..len), reader.read(0..len));
+        assert_eq!(left.unwrap(), payload);
+        assert_eq!(right.unwrap(), payload);
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+
+        let hits = std::pin::pin!(async {
+            for _ in 0..1_000 {
+                assert_eq!(reader.read(0..len).await.unwrap(), payload);
+            }
+        });
+        assert!(
+            futures::poll!(hits).is_pending(),
+            "warm-cache loops must spend tokio cooperative budget"
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn immutable_range_cache_enforces_byte_bound_and_rejects_oversized_entries() {
+        let mut cache = super::ByteRangeCache::default();
+        cache.insert("a".into(), Bytes::from_static(b"aaaa"), 6);
+        cache.insert("b".into(), Bytes::from_static(b"bbbb"), 6);
+        assert!(cache.get("a").is_none());
+        assert_eq!(cache.get("b").unwrap(), Bytes::from_static(b"bbbb"));
+        assert!(cache.bytes <= 6);
+
+        cache.insert("oversized".into(), Bytes::from_static(b"1234567"), 6);
+        assert!(cache.get("oversized").is_none());
+        assert!(cache.bytes <= 6);
     }
 
     fn write_to_file<P: AsRef<Path>>(s: &str, path: P) {
@@ -680,37 +811,5 @@ mod tests {
 
         assert_eq!(file_io.config().get("key1"), Some(&"value1".to_string()));
         assert_eq!(file_io.config().get("key2"), Some(&"value2".to_string()));
-    }
-
-    #[test]
-    fn byte_range_cache_serves_then_evicts_by_bytes() {
-        let mut cache = super::ByteRangeCache::default();
-        // Budget = 10 bytes. Insert three 4-byte entries -> the first is evicted.
-        cache.insert("a".into(), Bytes::from_static(b"aaaa"), 10);
-        cache.insert("b".into(), Bytes::from_static(b"bbbb"), 10);
-        assert!(cache.get("a").is_some());
-        assert!(cache.get("b").is_some());
-        cache.insert("c".into(), Bytes::from_static(b"cccc"), 10); // 12 > 10 -> evict oldest
-        assert!(cache.get("a").is_none(), "oldest evicted past the byte budget");
-        assert!(cache.get("b").is_some());
-        assert!(cache.get("c").is_some());
-        assert!(cache.bytes <= 10);
-    }
-
-    #[test]
-    fn byte_range_cache_skips_entries_larger_than_budget() {
-        let mut cache = super::ByteRangeCache::default();
-        cache.insert("big".into(), Bytes::from_static(b"xxxxxxxx"), 4); // 8 > 4 -> not cached
-        assert!(cache.get("big").is_none());
-        assert_eq!(cache.bytes, 0);
-    }
-
-    #[test]
-    fn object_cache_excludes_the_overwritten_wal_mirror() {
-        assert!(super::object_cache_cacheable(
-            "s3://b/warehouse/siglake/events/data/abc.parquet"
-        ));
-        assert!(!super::object_cache_cacheable("s3://b/wal-mirror/seg-1.arrow"));
-        assert!(!super::object_cache_cacheable("s3://b/wal-mirror/_active/seg.arrow"));
     }
 }

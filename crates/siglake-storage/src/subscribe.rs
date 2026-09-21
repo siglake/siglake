@@ -591,8 +591,11 @@ impl IcebergSubscription {
 
         let task_stream =
             futures::stream::iter(tasks.into_iter().map(Ok::<_, iceberg::Error>)).boxed();
-        let reader = ArrowReaderBuilder::new(file_io.clone()).build();
-        let mut arrow_stream = reader.read(task_stream).context("ArrowReader::read")?;
+        let reader = ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build();
+        let mut arrow_stream = reader
+            .read(task_stream)
+            .context("ArrowReader::read")?
+            .stream();
 
         let mut out = Vec::new();
         while let Some(batch) = arrow_stream.next().await {

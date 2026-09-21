@@ -399,8 +399,25 @@ pub enum SubmitOutcome {
     /// Lane is full. Handler should return 503 with the suggested
     /// `Retry-After` header.
     Backpressure { retry_after_secs: u64 },
+    /// A novel `(tenant, index)` key was refused because the persistent lane
+    /// map has reached its configured bound. The handler returns 503 without
+    /// a retry hint: this process cannot predict when operator action or
+    /// different routing will make the key admissible.
+    LaneCapRefused { max_lanes: usize },
     /// Writer task replied with an error. Handler should return 500.
     Failed(anyhow::Error),
+}
+
+#[derive(Debug)]
+enum LaneForError {
+    CapReached { max_lanes: usize },
+    Failed(anyhow::Error),
+}
+
+impl From<anyhow::Error> for LaneForError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Failed(error)
+    }
 }
 
 /// Mpsc-fed router. One [`Lane`] per active tenant. Created with
@@ -595,11 +612,14 @@ impl BackpressureRouter {
         &self,
         tenant: &str,
         index: &str,
-    ) -> Result<(
-        mpsc::Sender<LaneCommand>,
-        Arc<AtomicUsize>,
-        Arc<AtomicUsize>,
-    )> {
+    ) -> std::result::Result<
+        (
+            mpsc::Sender<LaneCommand>,
+            Arc<AtomicUsize>,
+            Arc<AtomicUsize>,
+        ),
+        LaneForError,
+    > {
         let key = LaneKey {
             tenant: tenant.to_string(),
             index: index.to_string(),
@@ -634,12 +654,9 @@ impl BackpressureRouter {
         // error and the process keeps the descriptors it has.
         if self.max_lanes > 0 && lanes.len() >= self.max_lanes {
             metrics::counter!("siglake_ingest_lane_refused_total").increment(1);
-            anyhow::bail!(
-                "lane limit reached ({} lanes): refusing a new (tenant `{tenant}`, index \
-                 `{index}`) lane. Both are client headers; raise --ingest-max-lanes or bound \
-                 them with --allowed-tenants.",
-                self.max_lanes
-            );
+            return Err(LaneForError::CapReached {
+                max_lanes: self.max_lanes,
+            });
         }
         let tenant_root = self.root.join(tenant);
         let dir = if index == EVENTS_INDEX_ID {
@@ -735,7 +752,10 @@ impl BackpressureRouter {
         let event_count = batch.num_rows();
         let (tx, pending_commands, pending_events) = match self.lane_for(tenant, index).await {
             Ok(lane) => lane,
-            Err(e) => return SubmitOutcome::Failed(e),
+            Err(LaneForError::CapReached { max_lanes }) => {
+                return SubmitOutcome::LaneCapRefused { max_lanes };
+            }
+            Err(LaneForError::Failed(e)) => return SubmitOutcome::Failed(e),
         };
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = WriteCommand {
@@ -944,6 +964,9 @@ mod tests {
                 SubmitOutcome::Backpressure { retry_after_secs } => {
                     assert!(retry_after_secs >= 1);
                     saw_backpressure = true;
+                }
+                SubmitOutcome::LaneCapRefused { max_lanes } => {
+                    panic!("unexpected lane-cap refusal at {max_lanes} lanes")
                 }
                 SubmitOutcome::Failed(e) => panic!("unexpected Failed: {e:#}"),
             }

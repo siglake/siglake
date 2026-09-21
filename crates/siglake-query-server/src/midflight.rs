@@ -28,7 +28,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct PlanRuntimeStats {
     pub nodes: usize,
     pub leaf_output_rows: u64,
@@ -80,6 +80,9 @@ pub struct PlanRuntimeStats {
     /// siglake scan. Lets an individual breaker-tripped browse attribute
     /// WHICH path it executed (pod-level outcome counters can't).
     pub ordering_outcome: Option<&'static str>,
+    /// Per-scan bounded file identities. The response layer merges these
+    /// request-wide after all leaves have settled.
+    pub file_attributions: Vec<siglake_storage::FileAttributionSnapshot>,
 }
 use futures::stream::StreamExt;
 
@@ -618,6 +621,7 @@ pub fn summarize_plan_runtime(plan: &Arc<dyn ExecutionPlan>) -> PlanRuntimeStats
             // Read at the same instant as the counters below, so the summary
             // says how many partitions' folds it is missing, if any.
             out.unsettled_partitions += scan.live_partitions() as u64;
+            out.file_attributions.push(scan.file_attribution());
         }
         if let Some(metrics) = node.metrics() {
             let aggregate = metrics.aggregate_by_name();

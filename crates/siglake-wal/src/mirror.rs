@@ -215,6 +215,61 @@ async fn write_mirror_owner(
 /// Upload attempts before a segment is declared permanently failed.
 const MIRROR_UPLOAD_ATTEMPTS: u32 = 5;
 
+/// Active-partial DELETE attempts after a sealed object is confirmed. The
+/// cleanup is best-effort and must not turn a successful sealed upload into a
+/// failed registration, but a transient object-store error should not leave a
+/// permanent orphan either.
+const ACTIVE_CLEANUP_ATTEMPTS: u32 = 3;
+
+fn mirror_key(prefix: &str, suffix: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        suffix.trim_start_matches('/').to_string()
+    } else {
+        format!("{prefix}/{}", suffix.trim_start_matches('/'))
+    }
+}
+
+/// Exact active sibling of a sealed mirror suffix. This is deliberately a
+/// pure key transform: cleanup never lists `_active/` or touches another
+/// tenant/index whose segment happens to have the same basename.
+fn active_partial_key(prefix: &str, sealed_suffix: &str) -> Option<String> {
+    sealed_suffix
+        .strip_suffix(".arrow")
+        .map(|stem| mirror_key(prefix, &format!("_active/{stem}.arrow.partial")))
+}
+
+/// Remove the exact active sibling after the sealed object has been confirmed.
+/// Errors are contained here so registration and pin release still happen.
+async fn cleanup_active_partial(op: &Operator, prefix: &str, sealed_suffix: &str) {
+    let Some(key) = active_partial_key(prefix, sealed_suffix) else {
+        return;
+    };
+    let mut delay = std::time::Duration::from_millis(10);
+    for attempt in 1..=ACTIVE_CLEANUP_ATTEMPTS {
+        match op.delete(&key).await {
+            Ok(()) => {
+                tracing::debug!(%key, "WAL mirror removed sealed segment's active partial");
+                return;
+            }
+            Err(e) if attempt < ACTIVE_CLEANUP_ATTEMPTS => {
+                tracing::debug!(%key, attempt, error = ?e,
+                    "WAL mirror active-partial cleanup failed; retrying");
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            Err(e) => {
+                metrics::counter!("siglake_wal_mirror_failures_total",
+                    "reason" => "active_cleanup")
+                .increment(1);
+                tracing::warn!(%key, attempts = ACTIVE_CLEANUP_ATTEMPTS, error = ?e,
+                    "WAL mirror active-partial cleanup failed; sealed segment remains registered");
+                return;
+            }
+        }
+    }
+}
+
 /// Durable hard links held while a sealed segment waits for its remote upload.
 /// The local drain may reap its own link without removing this one.
 const MIRROR_PENDING_DIR: &str = "mirror-pending";
@@ -242,7 +297,11 @@ impl WalMirrorHandle {
     /// Non-blocking send. On send failure (receiver gone) the durable pin stays
     /// for catch-up and the failure counter records the dead worker.
     pub fn enqueue(&self, segment: WalSegment) {
-        if let Err(e) = pin_segment(&segment) {
+        let pin_started = std::time::Instant::now();
+        let pin_result = pin_segment(&segment);
+        metrics::histogram!("siglake_wal_mirror_pin_duration_seconds")
+            .record(pin_started.elapsed().as_secs_f64());
+        if let Err(e) = pin_result {
             metrics::counter!("siglake_wal_mirror_failures_total",
                 "reason" => "pin")
             .increment(1);
@@ -282,6 +341,7 @@ pub struct WalMirror {
     op: Operator,
     prefix: String,
     uploaded_tx: Option<UnboundedSender<MirroredSegment>>,
+    cleanup_active_partials: bool,
 }
 
 impl WalMirror {
@@ -293,6 +353,7 @@ impl WalMirror {
         let queued = Arc::new(AtomicUsize::new(0));
         let prefix = prefix.into().trim_matches('/').to_string();
         metrics::gauge!("siglake_wal_mirror_queue_depth").set(0.0);
+        let _ = metrics::histogram!("siglake_wal_mirror_pin_duration_seconds");
         (
             Self {
                 rx,
@@ -300,6 +361,7 @@ impl WalMirror {
                 op,
                 prefix,
                 uploaded_tx: None,
+                cleanup_active_partials: false,
             },
             WalMirrorHandle { tx, queued },
         )
@@ -308,6 +370,14 @@ impl WalMirror {
     /// Notify `tx` after each successful upload (see [`MirroredSegment`]).
     pub fn with_uploaded_tx(mut self, tx: UnboundedSender<MirroredSegment>) -> Self {
         self.uploaded_tx = Some(tx);
+        self
+    }
+
+    /// Delete exact `_active/` siblings after sealed-object confirmation.
+    /// Kept off with active mirroring so the default sealed-only path does not
+    /// add one object-store DELETE per segment.
+    pub fn with_active_partial_cleanup(mut self) -> Self {
+        self.cleanup_active_partials = true;
         self
     }
 
@@ -358,6 +428,10 @@ impl WalMirror {
                             "WAL mirror upload recovered");
                     }
                     self.notify_uploaded(segment, bytes);
+                    if self.cleanup_active_partials {
+                        cleanup_active_partial(&self.op, &self.prefix, &segment.mirror_key_suffix)
+                            .await;
+                    }
                     self.remove_pin(segment);
                     return;
                 }
@@ -385,7 +459,7 @@ impl WalMirror {
         metrics::counter!("siglake_wal_mirror_failures_total", "reason" => "upload").increment(1);
 
         // Did it actually land despite the error?
-        let key = format!("{}/{}", self.prefix, segment.mirror_key_suffix);
+        let key = mirror_key(&self.prefix, &segment.mirror_key_suffix);
         match self.op.stat(&key).await {
             Ok(meta) => {
                 metrics::counter!("siglake_wal_mirror_upload_present_after_error_total")
@@ -394,6 +468,10 @@ impl WalMirror {
                     "WAL mirror upload reported an error but the object IS present; \
                      registering it so it cannot strand unqueryable");
                 self.notify_uploaded(segment, meta.content_length());
+                if self.cleanup_active_partials {
+                    cleanup_active_partial(&self.op, &self.prefix, &segment.mirror_key_suffix)
+                        .await;
+                }
                 self.remove_pin(segment);
             }
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
@@ -439,7 +517,7 @@ impl WalMirror {
             id,
             tenant,
             index_id,
-            url: format!("{}/{}", self.prefix, suffix),
+            url: mirror_key(&self.prefix, suffix),
             bytes,
             rows: segment.rows,
         });
@@ -467,7 +545,7 @@ impl WalMirror {
             }
         })?;
         let n = bytes.len() as u64;
-        let key = format!("{}/{}", self.prefix, segment.mirror_key_suffix);
+        let key = mirror_key(&self.prefix, &segment.mirror_key_suffix);
         self.op
             .write(&key, bytes)
             .await
@@ -572,6 +650,18 @@ pub async fn catch_up_sweep(
     prefix: &str,
     wal_root: &std::path::Path,
 ) -> Result<Vec<MirroredSegment>> {
+    catch_up_sweep_configured(op, prefix, wal_root, false).await
+}
+
+/// [`catch_up_sweep`] with exact active-sibling cleanup enabled when the
+/// caller also enabled active mirroring. Keeping the switch at the caller
+/// avoids DELETE requests on every sealed-only catch-up candidate.
+pub async fn catch_up_sweep_configured(
+    op: &Operator,
+    prefix: &str,
+    wal_root: &std::path::Path,
+    cleanup_active_partials: bool,
+) -> Result<Vec<MirroredSegment>> {
     use futures::{stream, StreamExt};
 
     let prefix = prefix.trim_matches('/');
@@ -647,12 +737,12 @@ pub async fn catch_up_sweep(
     while let Some((candidate, stat)) = checks.next().await {
         match stat {
             Ok(metadata) if metadata.is_file() => {
+                let suffix = if candidate.subdir.is_empty() {
+                    candidate.name.clone()
+                } else {
+                    format!("{}/{name}", candidate.subdir, name = candidate.name)
+                };
                 if candidate.pinned {
-                    let suffix = if candidate.subdir.is_empty() {
-                        candidate.name.clone()
-                    } else {
-                        format!("{}/{name}", candidate.subdir, name = candidate.name)
-                    };
                     let (tenant, index_id) = parse_mirror_key_suffix(&suffix);
                     uploaded.push(MirroredSegment {
                         id: candidate.name.trim_end_matches(".arrow").to_string(),
@@ -663,6 +753,9 @@ pub async fn catch_up_sweep(
                         rows: 0,
                     });
                     remove_candidate_pin(&candidate.path);
+                }
+                if cleanup_active_partials {
+                    cleanup_active_partial(op, prefix, &suffix).await;
                 }
                 continue;
             }
@@ -748,6 +841,9 @@ pub async fn catch_up_sweep(
         } else {
             format!("{}/{name}", candidate.subdir, name = candidate.name)
         };
+        if cleanup_active_partials {
+            cleanup_active_partial(op, prefix, &suffix).await;
+        }
         // Reuse the one parser that defines the layout contract, rather than
         // re-deriving it here and letting the two drift. It takes the suffix
         // WITHOUT the mirror prefix: `<file>`, `<tenant>/<file>`, or
@@ -1039,9 +1135,16 @@ pub async fn active_mirror_loop(
                 }
             };
             let n = body.len() as u64;
-            let key = match subdir.as_deref() {
-                Some(sub) if !sub.is_empty() => format!("{prefix}/_active/{sub}/{filename}"),
-                _ => format!("{prefix}/_active/{filename}"),
+            let sealed_name = match filename.strip_suffix(".partial") {
+                Some(name) => name,
+                None => continue,
+            };
+            let sealed_suffix = match subdir.as_deref() {
+                Some(sub) if !sub.is_empty() => format!("{sub}/{sealed_name}"),
+                _ => sealed_name.to_string(),
+            };
+            let Some(key) = active_partial_key(&prefix, &sealed_suffix) else {
+                continue;
             };
             match op.write(&key, body).await {
                 Ok(_) => {
@@ -1052,6 +1155,27 @@ pub async fn active_mirror_loop(
                     // the flush reported: appends land between the two, and
                     // the next tick must re-upload what this one did not send.
                     uploaded.insert(path, n);
+
+                    // Sealing can win after the writer lock is released but
+                    // before this PUT completes. The sealed uploader deletes
+                    // first when it wins; this side deletes after its own PUT
+                    // when it loses, so neither ordering can recreate the
+                    // partial permanently.
+                    let sealed_key = mirror_key(&prefix, &sealed_suffix);
+                    match op.stat(&sealed_key).await {
+                        Ok(meta) if meta.is_file() => {
+                            cleanup_active_partial(&op, &prefix, &sealed_suffix).await;
+                        }
+                        Ok(_) => {}
+                        Err(e) if e.kind() == opendal::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            metrics::counter!("siglake_wal_mirror_failures_total",
+                                "reason" => "active_cleanup_stat")
+                            .increment(1);
+                            tracing::warn!(%sealed_key, error = ?e,
+                                "WAL active mirror could not check for a sealed sibling");
+                        }
+                    }
                 }
                 Err(e) => {
                     metrics::counter!("siglake_wal_mirror_failures_total",
@@ -1695,7 +1819,7 @@ pub struct PlanGroup {
     /// Distinct segments (a sealed key and its active prefix are one).
     pub segments: usize,
     /// Bytes the listing reported for them, or `None` when the store does not
-    /// report sizes in a listing (opendal's in-memory service does not).
+    /// report sizes in a listing.
     pub bytes: Option<u64>,
     /// One key, verbatim, so the operator can see what the layout looked like.
     pub sample_key: String,
@@ -2243,7 +2367,9 @@ mod tests {
     use super::*;
     use crate::SEALED_DIR;
 
-    use opendal::layers::observe::{MetricLabels, MetricValue, MetricsIntercept, MetricsLayer};
+    use opendal::raw::{
+        oio, Access, Layer, LayeredAccess, OpDelete, OpList, OpRead, OpStat, OpWrite,
+    };
     use opendal::services::Memory;
 
     use siglake_core::Event;
@@ -2263,34 +2389,282 @@ mod tests {
         move_on_stat: Arc<Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>>,
     }
 
-    impl MetricsIntercept for RequestCounts {
-        fn observe(&self, labels: MetricLabels, value: MetricValue) {
-            let MetricValue::OperationExecuting(1) = value else {
-                return;
-            };
-            match labels.operation {
-                "list" => {
-                    self.lists.fetch_add(1, Ordering::Relaxed);
-                }
-                "stat" => {
-                    self.stats.fetch_add(1, Ordering::Relaxed);
-                    if let Some((from, to)) = self.move_on_stat.lock().unwrap().take() {
-                        std::fs::rename(from, to).unwrap();
-                    }
-                }
-                "write" => {
-                    self.writes.fetch_add(1, Ordering::Relaxed);
-                }
-                _ => {}
+    #[derive(Clone, Debug)]
+    struct CountingLayer(RequestCounts);
+
+    #[derive(Debug)]
+    struct CountingAccess<A> {
+        inner: A,
+        counts: RequestCounts,
+    }
+
+    impl<A: Access> Layer<A> for CountingLayer {
+        type LayeredAccess = CountingAccess<A>;
+
+        fn layer(&self, inner: A) -> Self::LayeredAccess {
+            CountingAccess {
+                inner,
+                counts: self.0.clone(),
             }
+        }
+    }
+
+    impl<A: Access> LayeredAccess for CountingAccess<A> {
+        type Inner = A;
+        type Reader = A::Reader;
+        type Writer = A::Writer;
+        type Lister = A::Lister;
+        type Deleter = A::Deleter;
+        type Copier = A::Copier;
+
+        fn inner(&self) -> &Self::Inner {
+            &self.inner
+        }
+
+        async fn read(
+            &self,
+            path: &str,
+            args: OpRead,
+        ) -> opendal::Result<(opendal::raw::RpRead, Self::Reader)> {
+            self.inner.read(path, args).await
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<(opendal::raw::RpWrite, Self::Writer)> {
+            self.counts.writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.write(path, args).await
+        }
+
+        async fn stat(&self, path: &str, args: OpStat) -> opendal::Result<opendal::raw::RpStat> {
+            self.counts.stats.fetch_add(1, Ordering::Relaxed);
+            if let Some((from, to)) = self.counts.move_on_stat.lock().unwrap().take() {
+                std::fs::rename(from, to).unwrap();
+            }
+            self.inner.stat(path, args).await
+        }
+
+        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
+            self.inner.delete().await
+        }
+
+        async fn list(
+            &self,
+            path: &str,
+            args: OpList,
+        ) -> opendal::Result<(opendal::raw::RpList, Self::Lister)> {
+            self.counts.lists.fetch_add(1, Ordering::Relaxed);
+            self.inner.list(path, args).await
         }
     }
 
     fn counting_fs_op(root: &Path, counts: RequestCounts) -> Operator {
         Operator::new(opendal::services::Fs::default().root(root.to_str().unwrap()))
             .unwrap()
-            .layer(MetricsLayer::new(counts))
+            .layer(CountingLayer(counts))
             .finish()
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct ActiveWriteGate {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct ActiveWriteGateLayer(ActiveWriteGate);
+
+    #[derive(Debug)]
+    struct ActiveWriteGateAccess<A> {
+        inner: A,
+        gate: ActiveWriteGate,
+    }
+
+    impl<A: Access> Layer<A> for ActiveWriteGateLayer {
+        type LayeredAccess = ActiveWriteGateAccess<A>;
+
+        fn layer(&self, inner: A) -> Self::LayeredAccess {
+            ActiveWriteGateAccess {
+                inner,
+                gate: self.0.clone(),
+            }
+        }
+    }
+
+    impl<A: Access> LayeredAccess for ActiveWriteGateAccess<A> {
+        type Inner = A;
+        type Reader = A::Reader;
+        type Writer = A::Writer;
+        type Lister = A::Lister;
+        type Deleter = A::Deleter;
+        type Copier = A::Copier;
+
+        fn inner(&self) -> &Self::Inner {
+            &self.inner
+        }
+
+        async fn read(
+            &self,
+            path: &str,
+            args: OpRead,
+        ) -> opendal::Result<(opendal::raw::RpRead, Self::Reader)> {
+            self.inner.read(path, args).await
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<(opendal::raw::RpWrite, Self::Writer)> {
+            if path.contains("/_active/") || path.starts_with("_active/") {
+                self.gate.started.notify_one();
+                self.gate.release.notified().await;
+            }
+            self.inner.write(path, args).await
+        }
+
+        async fn stat(&self, path: &str, args: OpStat) -> opendal::Result<opendal::raw::RpStat> {
+            self.inner.stat(path, args).await
+        }
+
+        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
+            self.inner.delete().await
+        }
+
+        async fn list(
+            &self,
+            path: &str,
+            args: OpList,
+        ) -> opendal::Result<(opendal::raw::RpList, Self::Lister)> {
+            self.inner.list(path, args).await
+        }
+    }
+
+    struct OneShotActiveSource {
+        snapshot: Mutex<Option<ActiveSnapshot>>,
+        ticks: AtomicUsize,
+        second_tick: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl ActiveMirrorSource for OneShotActiveSource {
+        async fn flush_active(&self) -> Vec<ActiveSnapshot> {
+            if self.ticks.fetch_add(1, Ordering::SeqCst) == 0 {
+                return self.snapshot.lock().unwrap().take().into_iter().collect();
+            }
+            self.second_tick.notify_one();
+            Vec::new()
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct DeleteFault {
+        failures_left: Arc<AtomicUsize>,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct DeleteFaultLayer(DeleteFault);
+
+    #[derive(Debug)]
+    struct DeleteFaultAccess<A> {
+        inner: A,
+        fault: DeleteFault,
+    }
+
+    #[derive(Debug)]
+    struct DeleteFaultDeleter<D> {
+        inner: D,
+        fault: DeleteFault,
+    }
+
+    impl<A: Access> Layer<A> for DeleteFaultLayer {
+        type LayeredAccess = DeleteFaultAccess<A>;
+
+        fn layer(&self, inner: A) -> Self::LayeredAccess {
+            DeleteFaultAccess {
+                inner,
+                fault: self.0.clone(),
+            }
+        }
+    }
+
+    impl<A: Access> LayeredAccess for DeleteFaultAccess<A> {
+        type Inner = A;
+        type Reader = A::Reader;
+        type Writer = A::Writer;
+        type Lister = A::Lister;
+        type Deleter = DeleteFaultDeleter<A::Deleter>;
+        type Copier = A::Copier;
+
+        fn inner(&self) -> &Self::Inner {
+            &self.inner
+        }
+
+        async fn read(
+            &self,
+            path: &str,
+            args: OpRead,
+        ) -> opendal::Result<(opendal::raw::RpRead, Self::Reader)> {
+            self.inner.read(path, args).await
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<(opendal::raw::RpWrite, Self::Writer)> {
+            self.inner.write(path, args).await
+        }
+
+        async fn stat(&self, path: &str, args: OpStat) -> opendal::Result<opendal::raw::RpStat> {
+            self.inner.stat(path, args).await
+        }
+
+        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
+            let (rp, inner) = self.inner.delete().await?;
+            Ok((
+                rp,
+                DeleteFaultDeleter {
+                    inner,
+                    fault: self.fault.clone(),
+                },
+            ))
+        }
+
+        async fn list(
+            &self,
+            path: &str,
+            args: OpList,
+        ) -> opendal::Result<(opendal::raw::RpList, Self::Lister)> {
+            self.inner.list(path, args).await
+        }
+    }
+
+    impl<D: oio::Delete> oio::Delete for DeleteFaultDeleter<D> {
+        async fn delete(&mut self, path: &str, args: OpDelete) -> opendal::Result<()> {
+            self.fault.attempts.fetch_add(1, Ordering::SeqCst);
+            if self
+                .fault
+                .failures_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    (left > 0).then(|| left - 1)
+                })
+                .is_ok()
+            {
+                return Err(opendal::Error::new(
+                    opendal::ErrorKind::Unexpected,
+                    "injected active-partial cleanup failure",
+                ));
+            }
+            self.inner.delete(path, args).await
+        }
+
+        async fn close(&mut self) -> opendal::Result<()> {
+            self.inner.close().await
+        }
     }
 
     fn synth_event(i: usize) -> Event {
@@ -2354,15 +2728,31 @@ mod tests {
         )
         .unwrap();
 
+        let recorder = siglake_core::metrics::builder()
+            .expect("metrics builder")
+            .build_recorder();
         let op = memory_op();
-        let (mirror, handle) = WalMirror::new(op.clone(), "wal-mirror");
+        let (mirror, handle) =
+            metrics::with_local_recorder(&recorder, || WalMirror::new(op.clone(), "wal-mirror"));
+        let before = recorder.handle().render();
+        assert!(
+            before.contains("siglake_wal_mirror_pin_duration_seconds_count 0"),
+            "pin histogram was not pre-registered:\n{before}"
+        );
         let mirror_task = tokio::spawn(mirror.run());
 
         writer.set_mirror_handle(Some(handle));
-        let sealed = writer
-            .append_events(&[synth_event(1), synth_event(2)])
-            .unwrap()
-            .expect("seal");
+        let sealed = metrics::with_local_recorder(&recorder, || {
+            writer
+                .append_events(&[synth_event(1), synth_event(2)])
+                .unwrap()
+                .expect("seal")
+        });
+        let after = recorder.handle().render();
+        assert!(
+            after.contains("siglake_wal_mirror_pin_duration_seconds_count 1"),
+            "sealing did not record one pin duration:\n{after}"
+        );
         drop(writer);
         mirror_task.await.unwrap();
 
@@ -3161,6 +3551,229 @@ mod tests {
         assert!(total_bytes > 0, "active-mirror blob is empty");
     }
 
+    /// #4914: the active PUT starts after the writer lock is released. Force it
+    /// to finish after the same segment's sealed upload and cleanup; the late
+    /// PUT must observe the sealed sibling and remove itself again.
+    #[tokio::test]
+    async fn a_late_active_put_cannot_recreate_a_sealed_segments_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = crate::WalWriter::with_thresholds(
+            tmp.path().join("acme/orders"),
+            "ing-test",
+            2,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        writer.set_mirror_subdir(Some("acme/orders".into()));
+        writer.append_events(&[synth_event(1)]).unwrap();
+        let snapshot = snapshot_active(&mut writer).expect("one active segment");
+        let filename = snapshot
+            .path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let sealed_suffix = format!("acme/orders/{}", filename.strip_suffix(".partial").unwrap());
+        let active_key = active_partial_key("wal-mirror", &sealed_suffix).unwrap();
+
+        let gate = ActiveWriteGate::default();
+        let op = Operator::new(Memory::default())
+            .unwrap()
+            .layer(ActiveWriteGateLayer(gate.clone()))
+            .finish();
+        let source = Arc::new(OneShotActiveSource {
+            snapshot: Mutex::new(Some(snapshot)),
+            ticks: AtomicUsize::new(0),
+            second_tick: tokio::sync::Notify::new(),
+        });
+        let active_task = tokio::spawn(active_mirror_loop(
+            vec![source.clone()],
+            op.clone(),
+            "wal-mirror".into(),
+            std::time::Duration::from_millis(1),
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.started.notified())
+            .await
+            .expect("active PUT reached the deterministic gate");
+
+        let (mirror, handle) = WalMirror::new(op.clone(), "wal-mirror");
+        let mirror = mirror.with_active_partial_cleanup();
+        writer.set_mirror_handle(Some(handle));
+        let sealed = writer
+            .append_events(&[synth_event(2)])
+            .unwrap()
+            .expect("second row seals the active segment");
+        assert_eq!(sealed.mirror_key_suffix, sealed_suffix);
+        mirror.upload_and_notify(&sealed).await;
+        assert!(op
+            .stat(&mirror_key("wal-mirror", &sealed_suffix))
+            .await
+            .is_ok());
+
+        gate.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            source.second_tick.notified(),
+        )
+        .await
+        .expect("active loop completed the late PUT and cleanup");
+        active_task.abort();
+
+        let err = op.stat(&active_key).await.unwrap_err();
+        assert_eq!(err.kind(), opendal::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_failed_sealed_upload_preserves_the_active_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let op = memory_op();
+        let suffix = "acme/orders/missing.arrow";
+        let active_key = active_partial_key("wal-mirror", suffix).unwrap();
+        op.write(&active_key, "recoverable-prefix").await.unwrap();
+        let segment = WalSegment {
+            path: tmp.path().join("sealed/missing.arrow"),
+            rows: 1,
+            bytes: 1,
+            mirror_key_suffix: suffix.into(),
+        };
+        let (mirror, _handle) = WalMirror::new(op.clone(), "wal-mirror");
+        let mirror = mirror.with_active_partial_cleanup();
+
+        mirror.upload_and_notify(&segment).await;
+
+        assert_eq!(
+            op.read(&active_key).await.unwrap().to_bytes(),
+            "recoverable-prefix".as_bytes()
+        );
+    }
+
+    /// A client-visible upload error followed by a successful STAT is still a
+    /// sealed confirmation. Its registration survives cleanup, and a transient
+    /// DELETE failure is retried rather than leaving the partial behind.
+    #[tokio::test]
+    async fn ambiguous_upload_success_retries_cleanup_and_still_registers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fault = DeleteFault::default();
+        fault.failures_left.store(1, Ordering::SeqCst);
+        let op = Operator::new(Memory::default())
+            .unwrap()
+            .layer(DeleteFaultLayer(fault.clone()))
+            .finish();
+        let suffix = "acme/orders/present.arrow";
+        let sealed_key = mirror_key("wal-mirror", suffix);
+        let active_key = active_partial_key("wal-mirror", suffix).unwrap();
+        op.write(&sealed_key, "sealed").await.unwrap();
+        op.write(&active_key, "partial").await.unwrap();
+        let segment = WalSegment {
+            path: tmp.path().join("sealed/present.arrow"),
+            rows: 7,
+            bytes: 6,
+            mirror_key_suffix: suffix.into(),
+        };
+        let (mirror, _handle) = WalMirror::new(op.clone(), "wal-mirror");
+        let mirror = mirror.with_active_partial_cleanup();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        mirror
+            .with_uploaded_tx(tx)
+            .upload_and_notify(&segment)
+            .await;
+
+        let registered = rx.recv().await.expect("confirmed object is registered");
+        assert_eq!(registered.url, sealed_key);
+        assert_eq!(fault.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            op.stat(&active_key).await.unwrap_err().kind(),
+            opendal::ErrorKind::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_failure_does_not_suppress_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fault = DeleteFault::default();
+        fault
+            .failures_left
+            .store(ACTIVE_CLEANUP_ATTEMPTS as usize, Ordering::SeqCst);
+        let op = Operator::new(Memory::default())
+            .unwrap()
+            .layer(DeleteFaultLayer(fault.clone()))
+            .finish();
+        let suffix = "acme/orders/kept.arrow";
+        let sealed_key = mirror_key("wal-mirror", suffix);
+        let active_key = active_partial_key("wal-mirror", suffix).unwrap();
+        op.write(&sealed_key, "sealed").await.unwrap();
+        op.write(&active_key, "partial").await.unwrap();
+        let segment = WalSegment {
+            path: tmp.path().join("sealed/kept.arrow"),
+            rows: 3,
+            bytes: 6,
+            mirror_key_suffix: suffix.into(),
+        };
+        let (mirror, _handle) = WalMirror::new(op.clone(), "wal-mirror");
+        let mirror = mirror.with_active_partial_cleanup();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        mirror
+            .with_uploaded_tx(tx)
+            .upload_and_notify(&segment)
+            .await;
+
+        assert_eq!(rx.recv().await.unwrap().url, sealed_key);
+        assert_eq!(
+            fault.attempts.load(Ordering::SeqCst),
+            ACTIVE_CLEANUP_ATTEMPTS as usize
+        );
+        assert!(op.stat(&active_key).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn catch_up_cleans_only_the_matching_tenant_and_index_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wal");
+        // The tenant's own sealed/ directory is the discovery marker for its
+        // index children, matching the router-created production layout.
+        std::fs::create_dir_all(root.join("acme").join(crate::SEALED_DIR)).unwrap();
+        let mut writer = crate::WalWriter::with_thresholds(
+            root.join("acme/orders"),
+            "ing-test",
+            2,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let segment = writer
+            .append_events(&[synth_event(1), synth_event(2)])
+            .unwrap()
+            .expect("seal");
+        drop(writer);
+        let name = segment.path.file_name().unwrap().to_str().unwrap();
+        let suffix = format!("acme/orders/{name}");
+        let op = memory_op();
+        let matching = active_partial_key("wal-mirror", &suffix).unwrap();
+        let tenant_sibling =
+            active_partial_key("wal-mirror", &format!("acme/{name}")).expect("tenant sibling key");
+        let other_tenant = active_partial_key("wal-mirror", &format!("widgets/orders/{name}"))
+            .expect("other tenant key");
+        for key in [&matching, &tenant_sibling, &other_tenant] {
+            op.write(key, "partial").await.unwrap();
+        }
+
+        let recovered = catch_up_sweep_configured(&op, "wal-mirror", &root, true)
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].url, mirror_key("wal-mirror", &suffix));
+        assert_eq!(
+            op.stat(&matching).await.unwrap_err().kind(),
+            opendal::ErrorKind::NotFound
+        );
+        assert!(op.stat(&tenant_sibling).await.is_ok());
+        assert!(op.stat(&other_tenant).await.is_ok());
+    }
+
     /// One tick covers every source, each writer keyed by its own subdir.
     ///
     /// The ingest server has one source per router and one writer per
@@ -3238,13 +3851,15 @@ mod tests {
     #[tokio::test]
     async fn plan_groups_by_destination_and_writes_nothing() {
         let op = memory_op();
+        let body = sealed_body(1);
+        let body_bytes = body.len() as u64;
         for key in [
             "wal-mirror/acme/a.arrow",
             "wal-mirror/acme/b.arrow",
             "wal-mirror/acme/orders/c.arrow",
             "wal-mirror/flat.arrow",
         ] {
-            op.write(key, sealed_body(1)).await.unwrap();
+            op.write(key, body.clone()).await.unwrap();
         }
         op.write("wal-mirror/README.md", bytes::Bytes::from_static(b"BODY"))
             .await
@@ -3288,10 +3903,9 @@ mod tests {
                 ("default", None, 1, format!("default/{SEALED_DIR}")),
             ]
         );
-        // opendal's in-memory service reports no size in a listing, and a
-        // plan pays one LIST and no per-object request, so it says so rather
-        // than inventing a total.
-        assert_eq!(plan.bytes(), None);
+        // OpenDAL 0.57's in-memory service reports sizes in its listing, so
+        // the plan can total them without paying for per-object requests.
+        assert_eq!(plan.bytes(), Some(body_bytes * 4));
 
         // After the apply, a second plan counts what is there instead of
         // proposing it again.

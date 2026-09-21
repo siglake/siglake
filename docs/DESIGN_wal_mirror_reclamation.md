@@ -290,7 +290,11 @@ What the implementation adds, against the shape above:
   takes `SIGLAKE_TEST_JOBS_POSTGRES_URI`, and runs in the compose step that
   already starts a Postgres for the query server's job-ownership suite. Each
   case gets its own schema, because compose points its own ingest and compactor
-  at that database and an unscoped claim would take their rows.
+  at that database and an unscoped claim would take their rows. That schema
+  isolation and its cleanup are reused by `eligible_claim_postgres` (#5189),
+  which runs `try_claim_eligible` — a CTE, `FOR UPDATE SKIP LOCKED` and an
+  `UPDATE … FROM agg`, none of which any SQLite case reaches — in the same
+  step.
 - The mark runs inside the per-directory retention sweep, so every cycle shape
   that sweeps also marks, and the gate is computed from the same listing.
 - `catch_up_sweep` no longer uploads a candidate whose only remaining local
@@ -370,15 +374,13 @@ All but the last are in `mirror_ledger_reclaim_tests`
    and stripping `"/"` off relative keys. `crates/siglake-cli/tests/cli/wal_recover_cli.rs`
    runs the binary against a `file://` mirror, with and without a trailing
    slash.
-2. **`_active/` blobs are never reclaimed by anything.** The active mirror
-   overwrites one key per in-flight segment, and when that segment seals its
-   blob is left behind; mirror-to-catalog sync explicitly skips `_active/`
-   (`crates/siglake-compactor/src/lib.rs:6040-6042`) and no retention path
-   touches it. Off by default (`activeIntervalSecs: 0`), so it bounds nothing
-   today, but an install that turns it on leaks one object per segment even in
-   claim mode — and since #5055 that is one per (tenant, index, write shard,
-   segment), because the loop covers every writer that holds rows rather than
-   the one root writer it used to be handed.
+2. **`_active/` blobs were never reclaimed by anything.** FIXED (#4914). Once
+   a sealed object is confirmed, the normal uploader, ambiguous-error STAT and
+   catch-up sweep delete its exact active sibling. The active PUT checks the
+   sealed sibling after writing too, closing the race where it lands after the
+   first delete. Cleanup is bounded and uses no listing; historical partials
+   and terminal cleanup failures with no remaining local segment remain for
+   the operator's lifecycle rule.
 3. **The ingester's local WAL sweep never looks at per-index WAL directories.**
    `local_wal_sweep_once` walks tenant directories and the root
    (`crates/siglake-cli/src/main.rs:1529-1534`), while the catch-up sweep and the

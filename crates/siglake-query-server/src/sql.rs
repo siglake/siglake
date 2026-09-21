@@ -1716,6 +1716,7 @@ fn rewrite_remaining_attr_get(
                         kind: CastKind::Cast,
                         expr: Box::new(column),
                         data_type: SqlDataType::Varchar(None),
+                        array: false,
                         format: None,
                     }
                 };
@@ -1999,7 +2000,7 @@ fn default_order_target_table(query: &SqlQuery) -> Option<String> {
         || select.top.is_some()
         || select.into.is_some()
         || select.prewhere.is_some()
-        || select.connect_by.is_some()
+        || !select.connect_by.is_empty()
         || select.value_table_mode.is_some()
     {
         return None;
@@ -3873,7 +3874,8 @@ pub(crate) async fn plan_client_sql(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 413, description = "Two distinct cases. Either the row cap was hit \
             while rendering — the body is then a `RecordsResponse` with \
@@ -4039,7 +4041,8 @@ pub async fn handle(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 413, description = "Row cap hit (body is a truncated \
             `RecordsResponse`) or the mid-flight breaker tripped (body is an error).",
@@ -6232,7 +6235,8 @@ fn batch_failed(err: &anyhow::Error, cost: CostReport) -> BatchOutcome {
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 422, description = "Unprocessable request body: a key inside \
             `limits` is not a known per-request limit. The commonest case is \
@@ -6413,6 +6417,30 @@ fn scan_detail_from_runtime(
     if runtime.files_planned == 0 && runtime.files_read == 0 {
         return None;
     }
+    let mut file_attribution: Option<crate::format::FileAttribution> = None;
+    for snapshot in &runtime.file_attributions {
+        let next = crate::format::FileAttribution {
+            files: snapshot
+                .files
+                .iter()
+                .map(|entry| crate::format::FileAttributionEntry {
+                    table: entry.identity.table.clone(),
+                    object_key: entry.identity.object_key.clone(),
+                    start: entry.identity.start,
+                    length: entry.identity.length,
+                    cache_candidate: entry.cache_candidate,
+                    reader_opened: entry.reader_opened,
+                    cache_hit: entry.cache_hit,
+                })
+                .collect(),
+            files_omitted: snapshot.files_omitted,
+            identity_complete: snapshot.identity_complete && runtime.unsettled_partitions == 0,
+        };
+        match &mut file_attribution {
+            Some(current) => current.absorb(&next),
+            None => file_attribution = Some(next),
+        }
+    }
     Some(Box::new(crate::format::ScanDetail {
         files_planned: runtime.files_planned,
         files_read: runtime.files_read,
@@ -6437,6 +6465,7 @@ fn scan_detail_from_runtime(
         file_cache_populate_rows: runtime.file_cache_populate_rows,
         unsettled_partitions: runtime.unsettled_partitions,
         ordering: runtime.ordering_outcome.map(str::to_string),
+        file_attribution,
     }))
 }
 
@@ -14335,16 +14364,29 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        for commit in 0..3 {
-            let events: Vec<Event> = (0..4)
-                .map(|row| Event::now(format!("base {commit}/{row}")))
+        // Pinned event data. The rewrite below hands two of the committed files
+        // to `recluster_files`, which takes one `day(timestamp)` partition per
+        // call; on `Event::now()` a run that crossed UTC midnight between the
+        // three appends split them across two days and the rewrite came back an
+        // error (#5678). Midnight of a fixed day plus a second per row, the same
+        // base the fixtures above use.
+        let base = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        for commit in 0..3i64 {
+            let events: Vec<Event> = (0..4i64)
+                .map(|row| Event {
+                    timestamp: base + chrono::Duration::seconds(commit * 4 + row),
+                    ..Event::now(format!("base {commit}/{row}"))
+                })
                 .collect();
             ice.append_events(&events).await.unwrap();
         }
 
         let wal_root = tmp.path().join("wal");
-        let buffered: Vec<Event> = (0..5)
-            .map(|row| Event::now(format!("buffered {row}")))
+        let buffered: Vec<Event> = (0..5i64)
+            .map(|row| Event {
+                timestamp: base + chrono::Duration::seconds(100 + row),
+                ..Event::now(format!("buffered {row}"))
+            })
             .collect();
         let mut writer = siglake_wal::WalWriter::with_thresholds(
             &wal_root,
@@ -14409,6 +14451,18 @@ mod tests {
             .into_iter()
             .take(2)
             .collect();
+        // The bin is one partition by construction of `base` above; stating it
+        // here puts a lost pin on the seeding rather than on the rewrite.
+        assert!(
+            rewrite_files
+                .iter()
+                .all(|file| file.partition() == rewrite_files[0].partition()),
+            "the rewrite bin must hold one partition value: {:?}",
+            rewrite_files
+                .iter()
+                .map(|file| format!("{:?}", file.partition()))
+                .collect::<std::collections::BTreeSet<_>>()
+        );
         let consumed = vec![segment_name];
         let (drain, rewrite) = tokio::join!(
             ice.append_batch_with_consumed(segment_batch.clone(), &consumed),
@@ -14745,7 +14799,8 @@ pub struct ShardPin {
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 413, description = "The mid-flight rows-scanned breaker tripped.",
          body = ApiErrorBody),
@@ -14851,6 +14906,11 @@ pub async fn shard(
         }
         false => identity,
     };
+    // A worker may be more restrictive than the coordinator during a rolling
+    // configuration change. Enforce its own policy against the authenticated,
+    // forwarded tenant before `resolve_ice` can create a namespace or context;
+    // the coordinator preserves this deliberate 403 for the caller.
+    state.authorize_tenant(&identity)?;
     // Resolving the tenant context can create and open a catalog; the `SEARCH`
     // rewrite reads the index config behind it. Catalog work, on this request's
     // clock like everything else.
@@ -15177,13 +15237,18 @@ pub async fn shard(
         axum::http::HeaderValue::from_static("application/vnd.apache.arrow.stream"),
     );
     let runtime = crate::midflight::summarize_plan_runtime(&plan);
-    if let Some(scan) = scan_detail_from_runtime(&runtime) {
-        if let Ok(value) = axum::http::HeaderValue::from_str(
-            &serde_json::to_string(scan.as_ref()).unwrap_or_default(),
-        ) {
-            resp.headers_mut().insert("x-siglake-scan", value);
-        }
+    let scan = scan_detail_from_runtime(&runtime);
+    let encoded_scan = serde_json::to_vec(&scan).map_err(ApiError::internal)?;
+    if encoded_scan.len() > crate::coordinator::SHARD_SCAN_HEADER_MAX_BYTES {
+        return Err(ApiError::internal(anyhow::anyhow!(
+            "shard scan attribution is {} bytes, exceeds {}-byte transport limit",
+            encoded_scan.len(),
+            crate::coordinator::SHARD_SCAN_HEADER_MAX_BYTES
+        )));
     }
+    let scan_header = axum::http::HeaderValue::from_bytes(&encoded_scan)
+        .map_err(|error| ApiError::internal(anyhow::Error::new(error)))?;
+    resp.headers_mut().insert("x-siglake-scan", scan_header);
     Ok(resp)
 }
 
@@ -15212,7 +15277,8 @@ pub async fn shard(
             server derives the tenant from a verified JWT claim when one is \
             configured (`--oidc-tenant-claim`), and this token carries none, or \
             carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 \
-            chars). Answered by the auth middleware, so it can reach every \
+            chars), or is absent from the configured `--allowed-tenants` \
+            set. Answered by the auth middleware, so it can reach every \
             operation behind it.", body = ApiErrorBody),
         (status = 413, description = "Row cap hit, or the mid-flight rows-scanned \
             breaker tripped.",

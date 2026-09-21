@@ -2,6 +2,156 @@
 
 ## Unreleased
 
+- **Query API (breaking)**: scanning records responses can now include
+  `stats.scan.file_attribution`, a request-wide list of at most 32 sorted,
+  table-relative file-task identities and their decoded-cache outcomes.
+  `files_omitted` counts bounded-away identities and `identity_complete` is
+  false when any shard or the coordinator omitted one. Distributed workers
+  must send a valid bounded attribution header, including `null` for a
+  scan-free result; missing, malformed or oversized headers now fail the shard
+  instead of silently producing incomplete scan stats. (#5727)
+
+- **Re-cluster contract (breaking)**:
+  `IcebergContext::recluster_files{,_with}` now refuses a bin spanning two
+  partition values on every dispatch, not only the streaming ones (#4200).
+  The in-RAM merge accepted such a bin and split its output by partition value
+  correctly, but which merge a bin takes is decided by its size and the
+  `SIGLAKE_RECLUSTER_*` knobs, so the same call succeeded on a small table and
+  failed on a large one. The refusal happens before the catalog is read and
+  before any output is written; the error names the partition span and the
+  remedy. Callers group their files by partition value and call once per group,
+  which both shipped planners already do — no behaviour change for the
+  compactor or the operator. (#4720)
+
+- **Query audit (fix)**: a storage append that returns an error now charges
+  `siglake_query_audit_dropped_total{reason="append"}` for every row in the
+  abandoned batch, beside the existing single append-failure increment. The
+  batch remains best-effort and is not retried. (#4669)
+
+- **Ingest admission (breaking)**: a novel `(tenant, index)` key past
+  `ingester.maxLanes` now receives HTTP `503` or gRPC `Unavailable`, rather
+  than sharing the `500` / `Internal` mapping for genuine writer failures.
+  The persistent refusal has no HTTP `Retry-After`, plain gRPC `retry-after`
+  metadata or `RetryInfo`: recovery needs different routing or operator action,
+  and bounded client retries can still expire. Existing lanes keep accepting
+  at the cap; transient queue backpressure and its retry hint are unchanged.
+  (#5531)
+
+- **Query observability (feature)**: the starter dashboard charts decoded-file
+  cache lock contention per query pod as `insert_skipped_contended / (insert +
+  insert_skipped_contended)`. A skipped insert is safe but leaves the next
+  reader to repeat the miss and decode, so this shows a cache that seldom fills
+  even when it has a positive budget. The panel handles either missing outcome
+  and renders an idle pod as 0% beside the raw zero insert rates. Its shipped
+  PromQL is evaluated with promtool against all four shapes. No alert is set;
+  #3053's representative measurements must supply a threshold and sustain
+  window. (#3086)
+
+- **Query tenancy (feature)**: `query.allowedTenants` and
+  `SIGLAKE_QUERY_ALLOWED_TENANTS` add an opt-in exact allow-list for verified
+  query tenant claims. The default remains unrestricted, and query admission
+  stays independent of `ingester.allowedTenants`, so retained data can remain
+  readable after writes stop. Direct requests and coordinator-authenticated
+  shard requests return `403` before tenant namespace/context creation when a
+  claim is absent from the set; mixed-worker refusals propagate through the
+  coordinator. The `not_allowed` metric series is pre-registered at zero and
+  `SiglakeQueryTenantsDenied` distinguishes allow-list refusals from missing or
+  unusable claims. A non-empty list without OIDC claim routing is refused by
+  both the binary and Helm chart. (#5489)
+
+- **Index management (feature)**: `GET /api/v1/indexes/{id}` and successful
+  index `PUT`s return a strong mapping ETag, and `PUT` accepts optional
+  `If-Match`. A false condition returns RFC 9110 `412 Precondition Failed` with
+  the exact rejecting-base config and its matching ETag, including after a
+  lost catalog CAS replays the transaction on another writer's mapping. The
+  validator covers the table UUID and full parsed `IndexConfig`, so data-only
+  commits preserve it and delete/recreate changes it. Headerless updates keep
+  their existing additive-only and idempotent behavior. (#5473)
+
+- **Query observability (feature)**: a Puffin index blob the cache refuses
+  outright is counted, as
+  `siglake_iceberg_puffin_blob_cache_evictions_total{reason="oversized"}`. One
+  file whose index blob alone exceeds `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES` is
+  never admitted, so it is read from object storage on every decode and the
+  cache is inert for it — a pod one blob short of its plan's per-file index
+  used to chart a rising `siglake_iceberg_puffin_blob_fetches_total` with no
+  eviction and no hit, which is also what a cold cache and a switched-off one
+  chart. The arm is pre-registered at 0 beside #4718's three, so the healthy
+  reading is a flat line rather than no data, and panel 165 ("Puffin blob cache
+  fetches / hits / evictions") already groups by `reason`. A zero bound is not
+  charged there: a disabled cache is never consulted and its flat lookup series
+  says so. Admission is unchanged — the refusal is counted before the blob is
+  copied and evicts nothing, and a key the cache already holds is
+  deduplication, not a refusal. (#5373)
+
+- **Operations (docs)**: moving a release from the filesystem drain to the
+  catalog claim is documented as a migration step for the segments the
+  filesystem drain held. A quarantined segment under `<wal>/**/orphans/` whose
+  commit status the drain could not establish is held, counted by
+  `siglake_compactor_orphans_held{tenant}` and paged by
+  `SiglakeCompactorOrphansHeld` — both from the filesystem sweep alone, and
+  with `compactor.catalogClaim.enabled: true` the compactor's WAL mount is an
+  `emptyDir`, so the pod cannot census the claim it used to read. An absent
+  series after the switch is not evidence the volume is clear. The chart README
+  ("Switching an existing filesystem-drain release to the claim") and
+  `docs/LIMITATIONS.md` now say to inventory that directory first, keep the
+  files (a held orphan's commit status is unknown, so deleting one can lose
+  rows and requeueing one can duplicate them), reach it from an ingester pod,
+  which mounts the same claim in both modes, and expect the way back to run
+  through the mirror rather than a local rename. `scripts/check-chart.py` holds
+  both documents to the rendered claim-mode volume and to the operator's
+  `DrainModeHandoverRequired`. No behaviour, mount or drain protocol changes.
+  (#5150)
+
+- **Query observability (feature)**: the Puffin blob cache reports what it is
+  doing on `/metrics`. `siglake_iceberg_puffin_blob_fetches_total` counts the
+  index blobs a process read from object storage,
+  `siglake_iceberg_puffin_blob_cache_lookups_total{outcome}` the decodes handed
+  bytes it still held against those that had to read, and
+  `siglake_iceberg_puffin_blob_cache_evictions_total{reason}` which arm of the
+  eviction rule chose each victim — `redundant` for a blob whose parsed twin is
+  resident and which therefore cannot be read until that twin goes, `stale` for
+  one nothing read while the cache turned over four times, `fifo` for the
+  fallback the coupled rule replaced. All three were process-wide diagnostics
+  readable only from a test, so a deployment could infer the blob cache's
+  behaviour only from index-phase object-store bytes against the parsed cache's
+  miss rate: that is how #4182's refetch regression — every execution re-reading
+  every blob of a 14-file plan, 4.60 GB over 183 index-phase reads against 0.50
+  GB over 73 — stayed invisible for a round, and why the miss rates in its
+  report had to be inferred from `first_batch_ms`. Every series is
+  pre-registered at 0 on the query server, so a tier that has served no text
+  query charts zero rather than "No data", and the "Puffin blob cache fetches /
+  hits / evictions" panel reads them beside the parsed cache's own. Eviction
+  behaviour, both cache defaults and the diagnostics are unchanged; the counters
+  are additive. (#4718)
+
+- **AWS reference deployment (fix)**: `deploy/aws/down.sh` settles
+  `SIGLAKE_DOWN_MODE` before it writes to the cluster. The check sat on the
+  destroy's own `case`, after the `helm uninstall`, the Postgres Secret, PVC
+  and namespace deletes and the optional warehouse sweep had run, so a typo'd
+  mode took the workload out of the cluster, destroyed nothing in AWS and
+  exited 1 — the smoke run gone and the billing resources still up. An
+  unrecognised mode now exits 1 naming the value, having run no `helm`, no
+  `kubectl delete`, no `aws s3` and no `terraform destroy`. `cluster` and `all`
+  behave as before, including their resource selection and the destroy's exit
+  status; `scripts/check-aws-down-destroy.sh` covers the rejection with the
+  default warehouse handling and with `EMPTY_WAREHOUSE=1`, which is the arm
+  that carried the sweep. (#5332)
+
+- **AWS reference deployment (fix)**: `deploy/aws/down.sh` exits with
+  terraform's status when the destroy fails. The script runs without errexit
+  and ended with `log "down complete"`, so its status was that log call: a
+  failed `terraform destroy` — targeted in the default keep-EKS mode, or the
+  full stack under `SIGLAKE_DOWN_MODE=all` — exited 0 with RDS, the warehouse
+  bucket and the IAM role still running and billing, and the caller read the
+  teardown as finished. AWS rounds have already hit `VcpuLimitExceeded` from
+  instances an earlier teardown left behind. The `helm uninstall` and
+  `kubectl delete` steps before the destroy stay best-effort, and the
+  resource selection in both modes is unchanged;
+  `scripts/check-aws-down-destroy.sh` covers the six cases under stub
+  binaries, including a run whose cleanup fails at every step and still
+  reaches the destroy. (#5309)
+
 - **Recovery (feature)**: `siglake wal-recover --catalog <uri>` settles
   whether `--from` is the mirror root from the catalog instead of from a
   marker. A mirror with no managed index and no active mirroring — the default
@@ -38,6 +188,46 @@
   one known false refusal (a `wal.mirror.prefix` changed mid-life) and the
   absence of a live Postgres arm. (#4997)
 
+- **Text indexes (feature)**: an opted-in streaming re-cluster builds the
+  compressed segmented inverted index (`seg2`) as it emits Parquet row groups,
+  then registers the completed Puffin statistics file in the same transaction
+  as the data-file rewrite. The writer holds one row group's parsed postings at
+  a time, validates the sidecar's group rows against the Parquet footer, and
+  produces one blob per output file and indexed column when a rolling rewrite
+  splits. A failed transaction leaves no discoverable index, and the existing
+  post-commit rebuild recognizes seg2 coverage instead of decoding the output
+  file again. The registration is a transaction action that runs after the
+  rewrite's, so the snapshot id and sequence number it stamps into the table
+  statistics metadata and into the Puffin footer come from the base each
+  attempt refreshed to. The action rechecks ownership against the base of every
+  attempt, so a refresh or a lost CAS cannot turn a first registration into a
+  replacement. A stale first base or a lost CAS writes another Puffin container
+  from the already-built seg2 bytes; the Parquet output is neither decoded nor
+  rewritten. Query discovery recognizes seg2 and retains existing
+  whole-file v1 reads. The unreleased seg1 prototype is no longer discovered and no longer
+  suppresses a rebuild; its pinned bytes remain a decode-only codec test.
+  `SIGLAKE_SEGMENTED_INDEX_WRITES=1` and the
+  separate `SIGLAKE_SEGMENTED_INDEX_READS=1` are both required to build and use
+  the format; both remain off by default pending AWS qualification. On the
+  14 x 7.34M-row acceptance corpus, seg2 averaged 282.77 seconds of rewrite
+  time and 251.4 MiB peak tracked heap, 12.0% faster and 80.8% smaller than the
+  post-commit v1 rebuild it replaces. If that rebuild finds an uncovered file
+  on the rewrite's snapshot, it preserves the registered seg2 blobs and counts
+  the deferred v1 registration instead of replacing them. The query-path report
+  now builds its segmented fixture through the streaming seg2 rewrite and
+  refuses retained seg1 fixtures. At 14 × 7.34M rows its two rare scans were
+  0.14x and 0.06x the scan, with exact answers and matching Parquet layouts;
+  the dated seg1 columns remain as history. A rewrite that rolls its output
+  into many files holds every finished sidecar until its transaction publishes
+  them: measured over one same-partition rewrite from 3 to 40 rolled outputs,
+  against a matched control with the writer off, that retention moved the
+  rewrite's peak live heap by under 300 bytes. The peak is the merge's own
+  buffers plus one row group's parsed index, and the retained bytes track rows
+  rather than files — 2.40 B per row per indexed column, whatever the rolling
+  target. The heap figures above are peak tracked live bytes over append plus
+  every rewrite in an arm.
+  (#4377, #5228, #5230, #5233, #5234, #5260, #5298, #5299)
+
 - **Text indexes (docs)**: the documented integrity gap in a v1 inverted-index
   blob is the **footer-KV** path only. An index stored as hex in a Parquet
   footer — the path taken per column while that column's serialized index fits
@@ -55,6 +245,19 @@
   per arm, the measured price of one whole-blob CRC-32 (4 bytes, +0.41% of the
   decode) and what a 0.1.x reader does with each placement. No format, API or
   default changed. (#4991)
+
+- **Text indexes (fix)**: newly written footer-KV v1 indexes carry an
+  eight-hex-character CRC-32 under the collision-safe
+  `siglake.inverted_index.crc32.v1[.<column>]` namespace. The reader verifies a
+  present sibling before a parsed-cache handout or decode; a malformed value or
+  disagreement tries a valid Puffin index and otherwise scans exactly. Legacy
+  blobs without the sibling keep pruning, and old readers ignore the new key,
+  so rolling upgrades retain index coverage. Refusals are counted by reason in
+  `siglake_index_footer_checksum_refused_total` and shown on the overview
+  dashboard. The v1 Puffin writer's checksummed-Zstd codec is now a pinned,
+  tested choice. A checksum still shares the Parquet footer with its blob, so
+  footer-wide damage that changes both consistently remains outside this
+  cover. (#5204)
 
 - **Alerting (feature)**: `SiglakeCompactorOrphansHeld` (critical, `for: 15m`,
   `siglake.stalled`) pages on the one WAL orphan disposition that needs a
@@ -318,6 +521,21 @@
   a base namespace moved by `SIGLAKE_TENANT_NAMESPACE` are known only at the
   increment. (#4737)
 
+- **Metrics (series identity change)**: the fifth counter in that group,
+  `siglake_group_count_delta_write_retries_total`, now carries
+  `iceberg_namespace` too. It was left behind because the retry is counted
+  inside the delta write, which took the table as a bare string; the namespace
+  is now threaded from the commit path that already had it. Its alert,
+  `SiglakeGroupCountDeltaRetrying` — the precursor that warns before a write
+  exhausts its four attempts and `SiglakeGroupCountDeltaLost` fires — named a
+  bare `events` merged across every tenant, while the alert it precedes named
+  `<namespace>.<table>`. It now names the pair, and the dashboard's retried
+  series groups by it. The same compatibility note applies: matchers on
+  `table` alone keep working, exact label-set matchers do not. The counter also
+  joins the compactor's pre-registration catalog for the default namespace's
+  `events`, so a compactor that has never retried reads 0 beside the failure
+  series rather than being absent. (#4759)
+
 - **Release images report the commit they were built from**: `siglake
   --version` and the `siglake_build_info` metric read a revision stamped in at
   build time, and the publish workflow passed none. The builds copy no Git
@@ -332,7 +550,7 @@
 
 ## 0.1.1
 
-Twelve changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
+Thirteen changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
 surface moves, and a 0.1.0 warehouse is read and written unchanged: one values
 key and six environment knobs are added, and no flag or values key is removed.
 Two defaults move. The audit worker now gives each append 30 s instead of
@@ -377,6 +595,21 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   needs a drained, non-order-preserving scan carrying no convertible predicate,
   which on a log-UI workload is close to nothing (`docs/LIMITATIONS.md`).
   (#4891)
+- **Query**: a text query over more indexed files than the text-index caches
+  hold no longer re-reads every index blob from object storage on every
+  execution. The two caches sit on either side of one decode, and only the
+  parsed side serves a warm query, so a cached blob is read exactly when its
+  parsed twin has been evicted — which is also the moment arrival-order
+  eviction dropped it. A 14-file plan on the 50G benchmark round read 4.60 GB
+  over 183 index-phase reads where the same plan had read 0.50 GB over 73.
+  Eviction now drops the blobs the parsed cache still covers, which cannot be
+  read at all, and keeps the ones it has dropped, for a bounded number of the
+  cache's turnovers so that a compacted-away file's blob is not retained for
+  the life of the process. What remains is arithmetic: a repeat text suite
+  re-fetches the indexed files the blob budget cannot cover and nothing more —
+  measured as exactly `files - blobs held` per pass over plans from 8 to 28
+  files, against the whole plan before. No budget or default changes, and no
+  answer changes: a blob-cache miss costs a fetch, never a row. (#4182)
 - **Query**: whether to *use* a text index a file already carries is now
   decided per execution. Loading one costs a deserialization proportional to
   the file's rows, and a text predicate under a bare `LIMIT` stops the scan

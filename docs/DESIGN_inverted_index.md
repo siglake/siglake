@@ -28,14 +28,16 @@ Puffin index. **Slice C = AWS validation** remains: run
 
 ### Slice A — build at write time ✅
 
-The writer builds the index unless `SIGLAKE_INVERTED_INDEX=0` (Helm
-`compactor.invertedIndex.enabled: false`; operator
-`spec.extraEnv` with the same env opt-out). It indexes the events table's `raw`
-column and stamps the hex blob into the footer KV
+The in-memory writer builds the whole-file v1 footer index unless
+`SIGLAKE_INVERTED_INDEX=0` (Helm `compactor.invertedIndex.enabled: false`;
+operator `spec.extraEnv` with the same env opt-out). It indexes the events
+table's `raw` column and stamps the hex blob into the footer KV
 (`siglake_index::INVERTED_INDEX_KV_KEY`) at the single-writer + partition-split
-commit paths. Metrics `siglake_index_build_{seconds,bytes}`. The streaming
-re-cluster writer rebuilds the index for its committed output files, so both
-flush and re-cluster paths retain exact query results and indexed output.
+commit paths. Metrics `siglake_index_build_{seconds,bytes}`. Streaming
+re-cluster output carries row-group blooms and aggregate footers but no
+whole-file inverted index. It builds a seg2 sidecar one Parquet row group at a
+time and registers it in the rewrite transaction only when
+`SIGLAKE_SEGMENTED_INDEX_WRITES=1`, which defaults off.
 
 ### Post-rewrite Puffin rebuild ✅
 
@@ -52,8 +54,9 @@ Why off: a parsed index costs about 40 bytes per indexed row (≈294 MB for a
 `keyword_last25`, `keyword_last5` and `substring_scan` 2-45x over ceilings that
 were measured on the scan path on 2026-09-03. Nothing about reads changes:
 indexes already registered are still discovered and used, and the flush path's
-footer index is still written. Only new sidecars after a rewrite stop.
-Index-path performance is 0.1.1 work.
+footer index is still written. Only new sidecars after a rewrite stop. The
+redesign is a 0.2.0 boundary; none of its slices changes a 0.1.0 or 0.1.x
+default.
 
 Streaming rewrite outputs carry row-group blooms and aggregate footers but no
 whole-file inverted index, so they require a Puffin sidecar. In-memory rewrite
@@ -62,6 +65,22 @@ outputs use the normal writer: an index at or below
 larger one still requires Puffin registration. Before decoding a file, the
 rebuild checks each configured column against registered Puffin blobs and the
 file footer. A second pass therefore registers no duplicate statistics file.
+Iceberg permits only one statistics file per snapshot. If a rebuild finds
+missing coverage on a snapshot that already has one, Siglake preserves the
+registered file and defers the new blobs; it logs their data-file paths and
+increments
+`siglake_index_registration_deferred_total{reason="snapshot_has_statistics"}`.
+The uncovered files remain scan-readable and can gain an index from a later
+rewrite or a CLI rebuild after a later snapshot.
+
+The registration is first-writer-wins under concurrency too. The absence check
+is made by `RegisterFirstStatisticsAction` inside the registration
+transaction, so it is re-made against the base of every commit attempt: a
+competitor that arrives between the caller's load and the transaction's
+refresh, or inside a lost attempt's CAS window, defers the caller instead of
+replacing what the competitor registered. A deferral is counted once per
+registration call, not once per attempt, and the sidecar the deferred caller
+had already uploaded is left unreferenced for `gc_orphans`.
 
 #### The local on/off measurement (2026-09-14)
 
@@ -325,6 +344,132 @@ snapshot expiry retains the registered statistics metadata in the current
 implementation, so the Puffin sidecar stays discoverable and a later rebuild
 remains a no-op.
 
+#### Deferred registration: reuse at a later snapshot (2026-09-19, #5319)
+
+Qualification of whether a deferred caller can recover its coverage from the
+work it already did, instead of leaving the files on the scan path until a
+later rewrite or a CLI rebuild. Local design and measurement; nothing here is
+implemented.
+
+**Two deferrals, two payloads.** The early refusal
+(`iceberg.rs:14536`) fires when the caller's own handle already shows a
+statistics file on the target snapshot. Nothing has been written: the raw
+blobs are still owned by the call and there is no object to orphan. The
+post-upload deferral (`iceberg.rs:14565`) fires when
+`RegisterFirstStatisticsAction` sees a competitor on the attempt's own base.
+By then `write_puffin_sidecar` has consumed the raw blobs and uploaded the
+sidecar, so what the caller holds is the `StatisticsFile` it returned — path,
+sizes and blob metadata — and what is on the store is an unreferenced object.
+
+**Which snapshot a retry may address.** Discovery is not snapshot-scoped:
+`existing_puffin_index_columns` and the fork's `statistics_blobs_by_file`
+(`third_party/iceberg/src/scan/mod.rs:67`) both walk `statistics_iter()` over
+every entry in table metadata and key on the blob's `data_file` property, so a
+blob registered against snapshot M covers a file added at snapshot N for every
+scan while that file is live. Retirement follows the same key:
+`statistics_disposition` retires an entry only when none of its blobs names a
+live data file, `reachable_files` protects every registered statistics path,
+and snapshot expiry keeps the entries. The rule is therefore not "the next
+snapshot" but **the current snapshot on the retry attempt's own base, when it
+carries no statistics file, and never one older than the snapshot the blobs
+were computed from**. Addressing the newest eligible snapshot is also the
+durable choice, because an older one is the first to be expired; addressing
+one older than the computed-from snapshot would attach an entry describing
+files that snapshot never held.
+
+**One attempt promises nothing.** A statistics update creates no snapshot, so
+at the instant of a deferral the current snapshot is the one the winner just
+took. An eligible target exists only if a data commit landed between the
+caller's load and its deferral — likely while an ingesting table is being
+rebuilt over a large file, impossible on a quiet one. Bounded reuse is an
+opportunistic recovery; the scan-path fallback stays the contract.
+
+**Measured cost.** `report_deferred_registration_reuse_cost` in
+`tests/segmented_index_writer.rs` starts from the state #5298's two-registrant
+regressions leave behind, appends past the occupied snapshot, and re-addresses
+the orphaned sidecar to a later statistics-free one. Release build, this box:
+
+| rows/day (files) | deferred data files | sidecar object | retained payload | bytes the reuse moves | re-decode + register | reuse commit |
+|---|---|---|---|---|---|---|
+| 150,000 (1) | 968,438 B | 328,657 B | 637 B | 0 | 0.370 s | 0.005 s |
+| 1,200,000 (5) | 7,286,010 B | 2,625,244 B | 2,092 B | 0 | 1.804 s | 0.002 s |
+
+The retained payload is that `StatisticsFile` serialized: it grows with the
+number of covered `(file, column)` pairs, not with rows. The reuse moves no
+blob bytes — the entry is re-addressed in the catalog and the object is left
+exactly as the deferral wrote it, which the report asserts by object count and
+mtime. `re-decode + register` is the alternative it displaces, timed on a
+comparable file in the same warehouse.
+
+The recovery holds, and takes no second Parquet decode: after the commit the
+deferred file appears in `registered_v1_blobs`, `reachable_files` contains the
+object it reuses (it is no longer an orphan), all four days answer exactly, the
+Puffin index fires at read time, and a rebuild over the recovered file returns
+0 with no deferral counted and no new object — that last pair is the proof,
+since a decode would have produced a sidecar and a second deferral.
+
+```
+cargo test -p siglake-storage --release --test segmented_index_writer \
+  report_deferred_registration_reuse_cost -- --ignored --nocapture
+```
+
+`SIGLAKE_REUSE_ROWS_PER_FILE` sizes it (default 150,000; above `APPEND_CHUNK` a
+day becomes several files, which is the second row).
+
+**What re-addressing does not keep identical.** The Puffin footer's
+`snapshot-id` and `sequence-number` keep naming the snapshot the blobs were
+computed from, while the catalog entry names the snapshot they are attached
+to. The fork documents those as different fields — "ID of the Iceberg table's
+snapshot the blob was computed from"
+(`third_party/iceberg/src/puffin/metadata.rs:64`) against "The snapshot id of
+the statistics file" (`third_party/iceberg/src/spec/statistic_file.rs:28`) — so
+under that reading the two values differing is the two fields saying what they
+mean. No Siglake reader compares them: `ArrowReader::puffin_blob_metadata`
+matches on blob type, `data_file` and `column`, and `puffin_inverted_index`
+adds `row_group_size`. It would still be the first entry Siglake writes where
+they differ. The seg2 writer's three-copy agreement
+(`assert_current_seg2_sequence_agreement`, #5260) is a different case: there
+the blobs were computed from the snapshot they are attached to, so all three
+have to match, and that assertion stays as it is. The alternative — rewriting
+the sidecar from the orphan's blob bytes so all three agree — costs a full read
+and a full write of the index (328 KB and 2.6 MB in the two rows above, tens of
+MB at 7.34M-row width) and leaves a second orphan, to buy agreement between
+fields that mean different things. Re-address; do not rewrite.
+
+**Retry owner.** The caller, inline, one extra transaction inside
+`register_puffin_sidecar_for_snapshot`, with the payload's lifetime bounded by
+that function call. The two rejected owners: a compactor pass that sweeps
+uncovered live files is a background retry service, which this design does not
+introduce; retaining the payload on the `IcebergContext` until the table's next
+commit gives the retention no bound in time and no owner at shutdown. Waiting
+inside the call for a commit to arrive would block a compactor thread on
+another party's progress.
+
+**What an implementation has to hold.** First-writer-wins is unchanged: the
+retry is a second `RegisterFirstStatisticsAction`, so the absence check is
+re-made against the base of each of its attempts and a second competitor defers
+it again. Before committing, re-check live-file and column coverage on that
+base — a file rewritten or deleted since the deferral must not gain an entry,
+and a column another registrant has since covered must not gain a duplicate.
+Exactly one retry: two deferrals of the same call count one deferral, the way
+attempts already do. The deterministic cases are no later snapshot (the retry
+finds the current snapshot occupied and stops), an occupied later snapshot, a
+competing registration inside the retry's own CAS window, and files rewritten
+or deleted before the retry. The early-refusal path is the cheaper half and
+worth doing on its own: the blobs are unconsumed, so one reload and a write to
+the current statistics-free snapshot wastes nothing at all.
+
+**Verdict.** Bounded reuse earns its cost as designed — kilobytes retained for
+the length of one call, no blob bytes moved, a 2-5 ms commit against a decode
+that is seconds at fixture width and tens of seconds at 7.34M rows — and it is
+filed as an implementation card. It is not urgent: the deferral needs two
+registrants on one table, and the two registrants that exist are the append
+path under `index_at_flush` and the post-rewrite rebuild under
+`SIGLAKE_INDEX_REBUILD`, which defaults off. Schedule it behind a nonzero
+`siglake_index_registration_deferred_total` from a round or a deployment;
+until then the exact scan is the documented fallback
+(`docs/LIMITATIONS.md`).
+
 ### Slice B — consume at query time ✅
 
 `Reader::inverted_index_row_selection` (in the vendored `arrow/reader.rs`):
@@ -340,7 +485,11 @@ histograms, and — since #3969 —
 `siglake_iceberg_text_index_startup_seconds{stage,storage}` around the four
 sections of that work separately (`permit_wait`, `blob_fetch`, `decode`,
 `selection`), with the parsed-index cache's lookup outcomes and eviction
-reasons beside it. One total could not say which section a regression was in:
+reasons beside it — and, since #4718, the blob cache's own
+(`siglake_iceberg_puffin_blob_fetches_total`,
+`siglake_iceberg_puffin_blob_cache_lookups_total{outcome}`,
+`siglake_iceberg_puffin_blob_cache_evictions_total{reason}`), so a re-decode
+that also re-read the blob is a reading rather than an inference. One total could not say which section a regression was in:
 run #73 measured about 30 ns per file row before a first batch and the round's
 artifacts could not attribute it. Differential storage test
 (`tests/inverted_index.rs`) asserts ground-truth-correct counts across
@@ -504,7 +653,7 @@ appended invisibly (`the_shipped_decoder_refuses_both_checksum_placements`):
    mixed-version fleet all index pruning on newly written files until every
    reader is upgraded. Old blobs keep reading either way: the version byte is
    what selects the layout.
-3. **A sibling footer-KV key** (`siglake.inverted_index.v1.crc32[.column]`,
+3. **A sibling footer-KV key** (`siglake.inverted_index.crc32.v1[.column]`,
    eight hex characters) — leaves the blob bytes and the version byte alone. An
    old reader ignores an unknown footer key and keeps pruning; a new reader
    verifies when the key is present and falls back to an exact scan when the
@@ -522,6 +671,33 @@ both is undetected. Options (1) and (2) buy one thing (3) does not: a blob that
 carries its own integrity wherever it is stored, including a future path that
 is neither of these two. Any of the three is a production format change and
 belongs to its own 0.2.0 card; this one changed no format, API or default.
+
+### Footer CRC implementation (2026-09-19, #5204)
+
+The writer now emits option (3). The implemented namespace differs from the
+one proposed above because `siglake.inverted_index.v1.crc32` was already the
+blob key for a column named `crc32`; putting `crc32` before `v1` makes the
+checksum namespace disjoint without changing any blob key or column suffix.
+The sum covers the serialized blob bytes and is written as exactly eight
+lowercase hex characters.
+
+`ArrowReader::resolve_inverted_index` verifies a present sibling before a
+parsed-cache lookup or decode. A malformed sibling, malformed stored hex, or
+CRC disagreement increments
+`siglake_index_footer_checksum_refused_total{reason="malformed"|"mismatch"}`
+and follows the existing decoder-refusal path: try a valid Puffin index, then
+scan exactly. The dashboard's "Footer text-index checksum refusals" panel
+reads both zero-pre-registered reasons. An absent sibling keeps legacy reads
+and pruning; an old reader ignores the unknown sibling and reads the unchanged
+v1 blob.
+
+The v1 Puffin writer uses a single pinned
+`SIGLAKE_PUFFIN_INVERTED_CODEC = Zstd` choice, guarded by a regression test;
+the fork's Zstd encoder enables its frame content checksum. Generic Puffin
+codecs remain unrestricted. A checksum and its blob still share one Parquet
+footer, so damage that changes both consistently is outside this cover. A CRC
+inside the blob would close that boundary at the mixed-version pruning cost
+measured above.
 
 What these numbers do not cover: object storage, AWS, or any incidence rate.
 The sweep is a uniform single-bit model of what a corrupt byte *does*, not how

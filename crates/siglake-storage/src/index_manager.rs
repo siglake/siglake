@@ -2,15 +2,19 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use iceberg::arrow::arrow_schema_to_schema;
 use iceberg::io::FileIO;
 use iceberg::spec::Type as IcebergType;
 use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
+use iceberg::transaction::{
+    ActionCommit, AddColumn, ApplyTransactionAction, Transaction, TransactionAction,
+};
 use iceberg::Error as IcebergError;
 use iceberg::ErrorKind as IcebergErrorKind;
 use iceberg::{TableIdent, TableUpdate};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use siglake_bloom::Tokenizer;
 use siglake_core::index_config::{
     DocMapping, FieldMapping, FieldType, IndexConfig, MappingMode, RetentionPolicy,
@@ -36,6 +40,33 @@ const TEMPLATE_VALIDATION_INDEX_ID: &str = "template-validation";
 /// linear policy as the delete-task records: a credential refresh recovers in
 /// seconds, and this runs behind an API call the caller will treat as durable.
 const INDEX_TEMPLATE_WRITE_ATTEMPTS: u32 = 4;
+const INDEX_CONFIG_ETAG_DOMAIN: &[u8] = b"siglake:index-config-etag:v1\0";
+
+/// One managed-index representation and its strong HTTP validator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexConfigEntity {
+    pub config: IndexConfig,
+    /// Quoted strong entity-tag, ready for an HTTP `ETag` header.
+    pub etag: String,
+}
+
+/// A parsed HTTP `If-Match` condition for a managed-index update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexConfigPrecondition {
+    /// Match any existing managed index.
+    Any,
+    /// Match when one of these strong entity-tags identifies the current config.
+    StrongEtags(Vec<String>),
+}
+
+impl IndexConfigPrecondition {
+    fn matches(&self, etag: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::StrongEtags(etags) => etags.iter().any(|candidate| candidate == etag),
+        }
+    }
+}
 
 /// Index-template metadata persisted in the warehouse config area.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -83,6 +114,12 @@ pub enum IndexManagerError {
     IndexAlreadyExists(String),
     #[error("index `{0}` does not exist")]
     IndexNotFound(String),
+    #[error("managed index `{index_id}` changed since the supplied If-Match value")]
+    StaleIndexConfig {
+        index_id: String,
+        current: IndexConfig,
+        etag: String,
+    },
     #[error("table `{0}` is not a managed index")]
     NotAnIndex(String),
     #[error(
@@ -340,6 +377,20 @@ impl IcebergContext {
         index_config_from_table(index_id, &table)
     }
 
+    /// Load one managed-index representation and its validator from one table base.
+    pub async fn get_index_entity(&self, index_id: &str) -> Result<Option<IndexConfigEntity>> {
+        let table_ident = self.index_table_ident(index_id);
+        if !self.catalog().table_exists(&table_ident).await? {
+            return Ok(None);
+        }
+        let table = self
+            .catalog()
+            .load_table(&table_ident)
+            .await
+            .with_context(|| format!("load_table {table_ident}"))?;
+        index_config_entity_from_table(index_id, &table)
+    }
+
     /// The Iceberg table UUID behind one managed index, or `None` when the
     /// name resolves to no table.
     ///
@@ -414,6 +465,18 @@ impl IcebergContext {
         self.commit_index_update(prepared).await
     }
 
+    /// Additively update a managed index only while `precondition` matches.
+    pub async fn update_index_if_match(
+        &self,
+        config: &IndexConfig,
+        precondition: IndexConfigPrecondition,
+    ) -> Result<()> {
+        let prepared = self
+            .prepare_index_update_with_precondition(config, Some(precondition))
+            .await?;
+        self.commit_index_update(prepared).await
+    }
+
     /// Validate `config` against the stored mapping and build the transaction
     /// that would store it.
     ///
@@ -425,20 +488,35 @@ impl IcebergContext {
     /// typed error for the uncontended case without paying for a commit
     /// attempt.
     async fn prepare_index_update(&self, config: &IndexConfig) -> Result<PreparedIndexUpdate> {
+        self.prepare_index_update_with_precondition(config, None)
+            .await
+    }
+
+    async fn prepare_index_update_with_precondition(
+        &self,
+        config: &IndexConfig,
+        precondition: Option<IndexConfigPrecondition>,
+    ) -> Result<PreparedIndexUpdate> {
         config.validate().context("validate index config")?;
 
-        let stored = self
-            .get_index(config.index_id.as_str())
-            .await?
-            .ok_or_else(|| IndexManagerError::IndexNotFound(config.index_id.clone()))?;
-        validate_additive_update(&stored, config)?;
-
         let table_ident = self.index_table_ident(config.index_id.as_str());
+        if !self.catalog().table_exists(&table_ident).await? {
+            return Err(IndexManagerError::IndexNotFound(config.index_id.clone()).into());
+        }
         let table = self
             .catalog()
             .load_table(&table_ident)
             .await
             .with_context(|| format!("load_table {table_ident}"))?;
+        let current = index_config_entity_from_table(config.index_id.as_str(), &table)?
+            .ok_or_else(|| IndexManagerError::IndexNotFound(config.index_id.clone()))?;
+        if precondition
+            .as_ref()
+            .is_some_and(|expected| !expected.matches(&current.etag))
+        {
+            return Err(stale_index_config_error(current).into());
+        }
+        validate_additive_update(&current.config, config)?;
 
         let desired_arrow = config.to_arrow_schema();
         let desired_iceberg = arrow_schema_to_schema(desired_arrow.as_ref())
@@ -484,6 +562,7 @@ impl IcebergContext {
                 .iter()
                 .map(|(name, _)| name.clone())
                 .collect(),
+            precondition,
         );
         let refusal = mapping.refusal();
         let mut tx = Transaction::new(&table);
@@ -496,7 +575,8 @@ impl IcebergContext {
             // the creation-time declaration.
             let mut action = tx.update_schema();
             for (name, field_type) in missing_columns {
-                action = action.add_optional_column(name.as_str(), field_type);
+                action = action
+                    .add_column(AddColumn::optional(name.as_str(), field_type).if_not_exists());
             }
             tx = action.apply(tx).context("UpdateSchemaAction::apply")?;
         }
@@ -901,6 +981,36 @@ pub(crate) fn index_config_from_table(
     Ok(None)
 }
 
+fn index_config_entity_from_table(
+    index_id: &str,
+    table: &Table,
+) -> Result<Option<IndexConfigEntity>> {
+    let Some(config) = index_config_from_table(index_id, table)? else {
+        return Ok(None);
+    };
+    let deterministic_json = serde_json::to_vec(&config)
+        .with_context(|| format!("serialize index config `{index_id}` for ETag"))?;
+    let table_uuid = table.metadata().uuid().to_string();
+    let mut digest = Sha256::new();
+    digest.update(INDEX_CONFIG_ETAG_DOMAIN);
+    digest.update(table_uuid.as_bytes());
+    digest.update([0]);
+    digest.update(deterministic_json);
+    let opaque = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize());
+    Ok(Some(IndexConfigEntity {
+        config,
+        etag: format!("\"{opaque}\""),
+    }))
+}
+
+fn stale_index_config_error(current: IndexConfigEntity) -> IndexManagerError {
+    IndexManagerError::StaleIndexConfig {
+        index_id: current.config.index_id.clone(),
+        current: current.config,
+        etag: current.etag,
+    }
+}
+
 pub(crate) fn loaded_table_index_config(table: &Table) -> Result<Option<IndexConfig>> {
     index_config_from_table(table.identifier().name(), table)
 }
@@ -976,6 +1086,7 @@ struct SetIndexMappingAction {
     /// will add. A declared column absent from the base and from this list
     /// would be stored as a mapping over a column no schema has.
     pending_columns: Vec<String>,
+    precondition: Option<IndexConfigPrecondition>,
     refusal: MappingRefusal,
 }
 
@@ -985,12 +1096,14 @@ impl SetIndexMappingAction {
         proposed_json: String,
         desired_columns: Vec<(String, IcebergType)>,
         pending_columns: Vec<String>,
+        precondition: Option<IndexConfigPrecondition>,
     ) -> Self {
         Self {
             proposed,
             proposed_json,
             desired_columns,
             pending_columns,
+            precondition,
             refusal: MappingRefusal::default(),
         }
     }
@@ -1012,7 +1125,7 @@ impl SetIndexMappingAction {
 impl TransactionAction for SetIndexMappingAction {
     async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
         let index_id = self.proposed.index_id.as_str();
-        let stored = index_config_from_table(index_id, table)
+        let current = index_config_entity_from_table(index_id, table)
             .map_err(|err| {
                 IcebergError::new(
                     IcebergErrorKind::DataInvalid,
@@ -1022,7 +1135,15 @@ impl TransactionAction for SetIndexMappingAction {
             })?
             .ok_or_else(|| self.refuse(IndexManagerError::NotAnIndex(index_id.to_string())))?;
 
-        if let Err(err) = validate_additive_update(&stored, &self.proposed) {
+        if self
+            .precondition
+            .as_ref()
+            .is_some_and(|expected| !expected.matches(&current.etag))
+        {
+            return Err(self.refuse(stale_index_config_error(current)));
+        }
+
+        if let Err(err) = validate_additive_update(&current.config, &self.proposed) {
             return Err(match err.downcast::<IndexManagerError>() {
                 Ok(typed) => self.refuse(typed),
                 // `validate_additive_update` only ever fails with a typed
@@ -1562,6 +1683,155 @@ mod tests {
         ice.get_index(index_id).await.unwrap().unwrap()
     }
 
+    #[tokio::test]
+    async fn index_config_etag_ignores_data_commits_and_changes_with_table_incarnation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ice, config) = index_with_two_writers(&tmp.path().join("warehouse")).await;
+        let initial = ice.get_index_entity("logs").await.unwrap().unwrap();
+
+        ice.append_to_table(
+            &ice.index_table_ident("logs"),
+            logs_batch(&config, &["one"], 1_700_000_000_000_000),
+            &["service"],
+        )
+        .await
+        .unwrap();
+        let after_data = ice.get_index_entity("logs").await.unwrap().unwrap();
+        assert_eq!(after_data.etag, initial.etag);
+
+        assert!(ice.delete_index("logs").await.unwrap());
+        ice.create_index(&config).await.unwrap();
+        let recreated = ice.get_index_entity("logs").await.unwrap().unwrap();
+        assert_ne!(recreated.etag, initial.etag);
+        assert_eq!(recreated.config, initial.config);
+    }
+
+    #[tokio::test]
+    async fn conditional_append_refuses_the_loser_with_the_winner_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ice, original) = index_with_two_writers(&tmp.path().join("warehouse")).await;
+        let e0 = ice.get_index_entity("logs").await.unwrap().unwrap().etag;
+
+        let mut winner = original.clone();
+        winner
+            .doc_mapping
+            .field_mappings
+            .push(mapping_field("winner", FieldType::Long, false));
+        ice.update_index_if_match(
+            &winner,
+            IndexConfigPrecondition::StrongEtags(vec![e0.clone()]),
+        )
+        .await
+        .unwrap();
+
+        let mut loser = original;
+        loser
+            .doc_mapping
+            .field_mappings
+            .push(mapping_field("loser", FieldType::Long, false));
+        let err = ice
+            .update_index_if_match(&loser, IndexConfigPrecondition::StrongEtags(vec![e0]))
+            .await
+            .unwrap_err();
+        let current = ice.get_index_entity("logs").await.unwrap().unwrap();
+        assert_eq!(
+            err.downcast_ref::<IndexManagerError>(),
+            Some(&IndexManagerError::StaleIndexConfig {
+                index_id: "logs".to_string(),
+                current: winner.clone(),
+                etag: current.etag.clone(),
+            })
+        );
+        assert_eq!(current.config, winner);
+    }
+
+    #[tokio::test]
+    async fn conditional_update_survives_an_unrelated_data_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ice, original) = index_with_two_writers(&tmp.path().join("warehouse")).await;
+        let e0 = ice.get_index_entity("logs").await.unwrap().unwrap().etag;
+        let mut updated = original.clone();
+        updated.retention = Some(RetentionPolicy {
+            period_secs: 7200,
+            schedule: None,
+        });
+        let prepared = ice
+            .prepare_index_update_with_precondition(
+                &updated,
+                Some(IndexConfigPrecondition::StrongEtags(vec![e0.clone()])),
+            )
+            .await
+            .unwrap();
+
+        ice.append_to_table(
+            &ice.index_table_ident("logs"),
+            logs_batch(&original, &["one"], 1_700_000_000_000_000),
+            &["service"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ice.get_index_entity("logs").await.unwrap().unwrap().etag,
+            e0
+        );
+
+        ice.commit_index_update(prepared).await.unwrap();
+        assert_eq!(stored_mapping_of(&ice, "logs").await, updated);
+    }
+
+    #[tokio::test]
+    async fn conditional_replay_refuses_the_commit_base_it_lost_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ice, original) = index_with_two_writers(&tmp.path().join("warehouse")).await;
+        let e0 = ice.get_index_entity("logs").await.unwrap().unwrap().etag;
+        let mut loser = original.clone();
+        loser
+            .doc_mapping
+            .field_mappings
+            .push(mapping_field("loser", FieldType::Long, false));
+        let prepared = ice
+            .prepare_index_update_with_precondition(
+                &loser,
+                Some(IndexConfigPrecondition::StrongEtags(vec![e0])),
+            )
+            .await
+            .unwrap();
+
+        let mut winner = original;
+        winner
+            .doc_mapping
+            .field_mappings
+            .push(mapping_field("winner", FieldType::Long, false));
+        let catalog = TestCatalog::new(ice.catalog().clone())
+            .before_first_update_with_base({
+                let ice = ice.clone();
+                let winner = winner.clone();
+                move || {
+                    let ice = ice.clone();
+                    let winner = winner.clone();
+                    async move { ice.update_index(&winner).await.unwrap() }
+                }
+            })
+            .shared();
+
+        let outcome = prepared
+            .transaction
+            .expect("conditional update transaction")
+            .commit(catalog.as_ref())
+            .await;
+        assert!(outcome.is_err());
+        let current = ice.get_index_entity("logs").await.unwrap().unwrap();
+        assert_eq!(
+            prepared.refusal.take(),
+            Some(IndexManagerError::StaleIndexConfig {
+                index_id: "logs".to_string(),
+                current: winner.clone(),
+                etag: current.etag.clone(),
+            })
+        );
+        assert_eq!(current.config, winner);
+    }
+
     /// A stale retention edit must not erase a concurrently added column from
     /// the stored mapping (#2552).
     ///
@@ -1813,6 +2083,7 @@ mod tests {
             json.clone(),
             vec![("ts".to_string(), long.clone())],
             vec![],
+            None,
         );
         let refusal = retyped.refusal();
         let Err(err) = Arc::new(retyped).commit(&table).await else {
@@ -1834,6 +2105,7 @@ mod tests {
             json,
             vec![("nowhere".to_string(), long)],
             vec![],
+            None,
         );
         let refusal = absent.refusal();
         assert!(Arc::new(absent).commit(&table).await.is_err());

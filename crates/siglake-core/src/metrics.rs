@@ -48,6 +48,13 @@ pub const LATENCY_BUCKETS_SECONDS: &[f64] = &[
     120.0, 300.0, 600.0, 1800.0,
 ];
 
+/// Pinning a sealed WAL segment is one hard link plus a directory fsync and
+/// normally completes below the generic latency histogram's 1 ms floor.
+pub const WAL_MIRROR_PIN_DURATION_BUCKETS_SECONDS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.00075, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+    2.5, 5.0, 10.0, 25.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
+];
+
 /// Whole mirror rotations include the one-minute gaps between bounded pages,
 /// so a 24-hour retained prefix needs hour-to-day buckets without adding those
 /// series to every request-latency histogram.
@@ -132,6 +139,11 @@ pub fn builder() -> Result<PrometheusBuilder> {
             .with_context(|| format!("count buckets for {name}"))?;
     }
     builder
+        .set_buckets_for_metric(
+            Matcher::Full("siglake_wal_mirror_pin_duration_seconds".to_string()),
+            WAL_MIRROR_PIN_DURATION_BUCKETS_SECONDS,
+        )
+        .context("WAL mirror pin duration buckets")?
         .set_buckets_for_metric(
             Matcher::Full("siglake_compactor_mirror_sync_rotation_duration_seconds".to_string()),
             MIRROR_ROTATION_DURATION_BUCKETS_SECONDS,
@@ -241,8 +253,8 @@ pub const INGESTER_ALERTED_COUNTERS: &[AlertedCounter] = &[
 /// Counters the compactor (`siglake compactor`, not `--once`, which serves no
 /// metrics) pre-registers. `siglake_wal_crc_mismatch_total` is here too: the
 /// drain reads sealed segments through the same CRC check as ingest replay.
-/// The two group-count counters are labelled by Iceberg namespace and table
-/// (and rebuild outcome) and are listed for the default namespace's events
+/// The group-count counters are labelled by Iceberg namespace and table (and
+/// rebuild outcome) and are listed for the default namespace's events
 /// table only (`siglake_storage::iceberg::NAMESPACE` and `TABLE_NAME`, held
 /// equal by tests there); an event on an index table, in a `tenant_*`
 /// namespace, or under a base namespace moved off the default by
@@ -267,6 +279,58 @@ pub const INGESTER_ALERTED_COUNTERS: &[AlertedCounter] = &[
 /// case the alert exists for. Its `_nonterminal` gauge sibling is deliberately
 /// absent: gauges are not pre-registered, and that one is dashboard-only.
 pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
+    // A snapshot can carry only one Iceberg statistics file. A v1 rebuild that
+    // reaches a rewrite snapshot which already carries seg2 blobs is deferred
+    // instead of replacing those blobs. The dashboard reads the first refusal
+    // through `increase()`, so the bounded reason series must start at zero.
+    AlertedCounter {
+        name: "siglake_index_registration_deferred_total",
+        series: &[&[("reason", "snapshot_has_statistics")]],
+    },
+    // Statistics retirement runs inside the elected snapshot-expiry pass.
+    // Register every outcome before that first pass so a clean table reads 0
+    // rather than absent; the reclaimed-byte sibling is emitted by the
+    // age-gated orphan sweep that consumes the retired Puffin objects.
+    // #5231: what a rewrite's seg2 sidecar writer decided, per sidecar. No
+    // alert reads it; it is here for the other half of the pre-registration
+    // argument. The panel's reading is `refused` — a compactor writing files
+    // whose sidecars describe a layout the file does not have, which leaves
+    // those files on the scan path — and on a compactor that refuses nothing
+    // the `refused` arms are exactly the series that would be absent, so the
+    // healthy chart would be indistinguishable from a writer that is not
+    // running at all. The writer is opt-in
+    // (`SIGLAKE_SEGMENTED_INDEX_WRITES=1`), so with the knob unset every arm
+    // including `written` stays flat at 0, which is the correct reading of a
+    // default install.
+    //
+    // Both label values reach the emitter through a variable, so
+    // `check-chart.py` sees a dynamic site and cannot hold this catalog to the
+    // call sites; `segmented_index_write_series_are_preregistered` in
+    // siglake-storage does, against the fork's `SEGMENTED_INDEX_WRITE_SERIES`.
+    AlertedCounter {
+        name: "siglake_iceberg_segmented_index_writes_total",
+        series: &[
+            &[("outcome", "written"), ("reason", "none")],
+            &[("outcome", "refused"), ("reason", "column")],
+            &[("outcome", "refused"), ("reason", "file_rows")],
+            &[("outcome", "refused"), ("reason", "row_domain")],
+        ],
+    },
+    AlertedCounter {
+        name: "siglake_iceberg_statistics_removed_total",
+        series: UNLABELLED,
+    },
+    AlertedCounter {
+        name: "siglake_iceberg_statistics_retirement_skipped_total",
+        series: &[
+            &[("reason", "unowned_blob_type")],
+            &[("reason", "missing_data_file")],
+        ],
+    },
+    AlertedCounter {
+        name: "siglake_gc_bytes_reclaimed_total",
+        series: UNLABELLED,
+    },
     AlertedCounter {
         name: "siglake_consumed_proof_cap_refusals_total",
         series: UNLABELLED,
@@ -304,6 +368,15 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
         name: "siglake_group_count_delta_write_failures_total",
         series: &[&[("iceberg_namespace", "siglake"), ("table", "events")]],
     },
+    // The precursor to the failure above, on the same panel. Its alert reads
+    // `rate()`, so `check-chart.py` does not require an entry; it is here so
+    // that a compactor which has never retried reads 0 next to the failure
+    // series rather than being absent, which on one panel is indistinguishable
+    // from a delta path that is not running (#4759).
+    AlertedCounter {
+        name: "siglake_group_count_delta_write_retries_total",
+        series: &[&[("iceberg_namespace", "siglake"), ("table", "events")]],
+    },
     // #3799: an append's contribution to the inline aggregate object exists
     // nowhere else, so a publication that spends its four attempts leaves the
     // object short of `total-records` for good. Listed with the default
@@ -331,6 +404,31 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
                 ("iceberg_namespace", "siglake"),
                 ("table", "events"),
                 ("outcome", "failed"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "backed_off_watchdog"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "backed_off_failed"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "backed_off_interrupted"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "suppressed"),
+            ],
+            &[
+                ("iceberg_namespace", "siglake"),
+                ("table", "events"),
+                ("outcome", "marker_failed"),
             ],
         ],
     },
@@ -425,9 +523,9 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
     // Query responses stay non-blocking when the best-effort audit path is
     // saturated or stopped. Pre-register every bounded reason so the first
     // whole-row refusal is visible to the dashboard's increase() reader.
-    // `append_deadline` is the one that is charged per row of an abandoned
-    // batch rather than per refused submit: the storage append outlived its
-    // service deadline and those rows are gone (#3438).
+    // `append` and `append_deadline` are charged per row of an abandoned batch
+    // rather than per refused submit: the storage append failed or outlived
+    // its service deadline and those rows are gone (#3438, #4669).
     AlertedCounter {
         name: "siglake_query_audit_dropped_total",
         series: &[
@@ -436,6 +534,7 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
             &[("reason", "byte_limit")],
             &[("reason", "channel_full")],
             &[("reason", "worker_shutdown")],
+            &[("reason", "append")],
             &[("reason", "append_deadline")],
         ],
     },
@@ -584,6 +683,7 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
     AlertedCounter {
         name: "siglake_query_tenant_denied_total",
         series: &[
+            &[("reason", "not_allowed")],
             &[("reason", "claim_missing")],
             &[("reason", "claim_invalid")],
         ],
@@ -595,6 +695,13 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
     AlertedCounter {
         name: "siglake_wal_partial_tail_dropped_total",
         series: UNLABELLED,
+    },
+    // A footer checksum refusal is query-correctness protection taking the
+    // exact-scan fallback. Both reasons feed the dashboard panel; create them
+    // at zero so its first observed refusal is a delta rather than No data.
+    AlertedCounter {
+        name: "siglake_index_footer_checksum_refused_total",
+        series: &[&[("reason", "malformed")], &[("reason", "mismatch")]],
     },
     // #3969's "Text-index startup" panels. Neither counter is alerted on; they
     // are here for the other half of the pre-registration argument — a panel
@@ -625,6 +732,42 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
         series: &[
             &[("reason", "byte_bound")],
             &[("reason", "entry_bound")],
+            &[("reason", "oversized")],
+        ],
+    },
+    // #4718's blob-cache half of the same panel, and here for the same reason:
+    // a pod whose blob cache is re-fetching every blob per execution charts a
+    // rising `fetches` beside a flat `hit`, and both readings need the arms to
+    // exist from startup — the one #4182 hid for a round was a zero hit rate,
+    // which is indistinguishable from "no text query yet" while the series is
+    // absent. The eviction reasons say which rule is running: `redundant` and
+    // `stale` are the #4182 rule following the working set, a `fifo` rate is
+    // the pre-#4182 fallback, which is what re-fetched a blob one step before
+    // the query that wanted it. `oversized` is the one arm that is not the rule
+    // at all: a blob the cache refused because it alone exceeds the budget, and
+    // a pod one blob short of its plan's per-file index emits nothing else.
+    //
+    // Recorded from the Iceberg fork with variable label values
+    // (`PUFFIN_BLOB_CACHE_OUTCOMES`, `PUFFIN_BLOB_CACHE_DROP_REASONS`), so
+    // `puffin_blob_cache_series_are_preregistered` in siglake-storage holds
+    // this catalog to them where check-chart.py cannot.
+    AlertedCounter {
+        name: "siglake_iceberg_puffin_blob_fetches_total",
+        series: UNLABELLED,
+    },
+    AlertedCounter {
+        name: "siglake_iceberg_puffin_blob_cache_lookups_total",
+        series: &[&[("outcome", "hit")], &[("outcome", "miss")]],
+    },
+    AlertedCounter {
+        name: "siglake_iceberg_puffin_blob_cache_evictions_total",
+        series: &[
+            &[("reason", "stale")],
+            &[("reason", "redundant")],
+            &[("reason", "fifo")],
+            // A blob refused outright, the way the parsed cache charges its own
+            // `oversized` (#5373): one file's index alone over the byte budget,
+            // so that file re-fetches per decode and the cache holds it never.
             &[("reason", "oversized")],
         ],
     },
@@ -825,6 +968,26 @@ mod tests {
     }
 
     #[test]
+    fn wal_mirror_pin_histogram_exports_sub_millisecond_buckets() {
+        let out = render_with(|| {
+            metrics::histogram!("siglake_wal_mirror_pin_duration_seconds").record(0.0006);
+            metrics::histogram!("siglake_test_request_duration_seconds").record(0.0006);
+        });
+        assert!(
+            out.contains("siglake_wal_mirror_pin_duration_seconds_bucket{le=\"0.0005\"} 0"),
+            "{out}"
+        );
+        assert!(
+            out.contains("siglake_wal_mirror_pin_duration_seconds_bucket{le=\"0.00075\"} 1"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("siglake_test_request_duration_seconds_bucket{le=\"0.00075\"}"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn unbucketed_histograms_deliberately_render_as_summaries() {
         let summary_names = [
             "siglake_query_scan_partition_decoded_bytes",
@@ -832,6 +995,12 @@ mod tests {
             "siglake_catalog_metadata_snapshots",
             "siglake_wal_seal_bytes",
             "siglake_wal_seal_rows",
+            // #5231's two index-build byte distributions. The dashboard reads
+            // them through a `quantile=` selector rather than
+            // `histogram_quantile()`, which only holds while they stay
+            // unbucketed here.
+            "siglake_iceberg_segmented_index_written_bytes",
+            "siglake_iceberg_segmented_index_group_index_bytes",
         ];
         let out = render_with(|| {
             for name in summary_names {
@@ -863,6 +1032,7 @@ mod tests {
     fn bucket_layouts_are_sorted_and_distinct() {
         for buckets in [
             LATENCY_BUCKETS_SECONDS,
+            WAL_MIRROR_PIN_DURATION_BUCKETS_SECONDS,
             COUNT_BUCKETS,
             MIRROR_ROTATION_DURATION_BUCKETS_SECONDS,
             MIRROR_ROTATION_OBJECT_BUCKETS,

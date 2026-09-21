@@ -276,7 +276,9 @@ impl PrimitiveType {
 
 impl Serialize for Type {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where S: Serializer {
+    where
+        S: Serializer,
+    {
         let type_serde = _serde::SerdeType::from(self);
         type_serde.serialize(serializer)
     }
@@ -284,7 +286,9 @@ impl Serialize for Type {
 
 impl<'de> Deserialize<'de> for Type {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         let type_serde = _serde::SerdeType::deserialize(deserializer)?;
         Ok(Type::from(type_serde))
     }
@@ -292,7 +296,9 @@ impl<'de> Deserialize<'de> for Type {
 
 impl<'de> Deserialize<'de> for PrimitiveType {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         let s = String::deserialize(deserializer)?;
         if s.starts_with("decimal") {
             deserialize_decimal(s.into_deserializer())
@@ -306,7 +312,9 @@ impl<'de> Deserialize<'de> for PrimitiveType {
 
 impl Serialize for PrimitiveType {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where S: Serializer {
+    where
+        S: Serializer,
+    {
         match self {
             PrimitiveType::Decimal { precision, scale } => {
                 serialize_decimal(precision, scale, serializer)
@@ -318,7 +326,9 @@ impl Serialize for PrimitiveType {
 }
 
 fn deserialize_decimal<'de, D>(deserializer: D) -> std::result::Result<PrimitiveType, D::Error>
-where D: Deserializer<'de> {
+where
+    D: Deserializer<'de>,
+{
     let s = String::deserialize(deserializer)?;
     let (precision, scale) = s
         .trim_start_matches(r"decimal(")
@@ -340,11 +350,13 @@ fn serialize_decimal<S>(
 where
     S: Serializer,
 {
-    serializer.serialize_str(&format!("decimal({precision},{scale})"))
+    serializer.serialize_str(&format!("decimal({precision}, {scale})"))
 }
 
 fn deserialize_fixed<'de, D>(deserializer: D) -> std::result::Result<PrimitiveType, D::Error>
-where D: Deserializer<'de> {
+where
+    D: Deserializer<'de>,
+{
     let fixed = String::deserialize(deserializer)?
         .trim_start_matches(r"fixed[")
         .trim_end_matches(']')
@@ -357,7 +369,9 @@ where D: Deserializer<'de> {
 }
 
 fn serialize_fixed<S>(value: &u64, serializer: S) -> std::result::Result<S::Ok, S::Error>
-where S: Serializer {
+where
+    S: Serializer,
+{
     serializer.serialize_str(&format!("fixed[{value}]"))
 }
 
@@ -370,7 +384,7 @@ impl fmt::Display for PrimitiveType {
             PrimitiveType::Float => write!(f, "float"),
             PrimitiveType::Double => write!(f, "double"),
             PrimitiveType::Decimal { precision, scale } => {
-                write!(f, "decimal({precision},{scale})")
+                write!(f, "decimal({precision}, {scale})")
             }
             PrimitiveType::Date => write!(f, "date"),
             PrimitiveType::Time => write!(f, "time"),
@@ -401,7 +415,9 @@ pub struct StructType {
 
 impl<'de> Deserialize<'de> for StructType {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         #[derive(Deserialize)]
         #[serde(field_identifier, rename_all = "lowercase")]
         enum Field {
@@ -419,7 +435,9 @@ impl<'de> Deserialize<'de> for StructType {
             }
 
             fn visit_map<V>(self, mut map: V) -> std::result::Result<StructType, V::Error>
-            where V: MapAccess<'de> {
+            where
+                V: MapAccess<'de>,
+            {
                 let mut fields = None;
                 while let Some(key) = map.next_key()? {
                     match key {
@@ -826,6 +844,22 @@ impl MapType {
             value_field,
         }
     }
+
+    /// Construct an optional map type with the given key and value fields.
+    pub fn optional(key_id: i32, key_type: Type, value_id: i32, value_type: Type) -> Self {
+        Self {
+            key_field: NestedField::map_key_element(key_id, key_type).into(),
+            value_field: NestedField::map_value_element(value_id, value_type, false).into(),
+        }
+    }
+
+    /// Construct a required map type with the given key and value fields.
+    pub fn required(key_id: i32, key_type: Type, value_id: i32, value_type: Type) -> Self {
+        Self {
+            key_field: NestedField::map_key_element(key_id, key_type).into(),
+            value_field: NestedField::map_value_element(value_id, value_type, true).into(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -858,7 +892,7 @@ mod tests {
             {"id": 3, "name": "long_field", "required": true, "type": "long"},
             {"id": 4, "name": "float_field", "required": true, "type": "float"},
             {"id": 5, "name": "double_field", "required": true, "type": "double"},
-            {"id": 6, "name": "decimal_field", "required": true, "type": "decimal(9,2)"},
+            {"id": 6, "name": "decimal_field", "required": true, "type": "decimal(9, 2)"},
             {"id": 7, "name": "date_field", "required": true, "type": "date"},
             {"id": 8, "name": "time_field", "required": true, "type": "time"},
             {"id": 9, "name": "timestamp_field", "required": true, "type": "timestamp"},
@@ -1135,6 +1169,16 @@ mod tests {
                 .into(),
             }),
         );
+
+        check_type_serde(
+            record,
+            Type::Map(MapType::optional(
+                4,
+                Type::Primitive(PrimitiveType::String),
+                5,
+                Type::Primitive(PrimitiveType::Double),
+            )),
+        );
     }
 
     #[test]
@@ -1162,6 +1206,40 @@ mod tests {
                 )
                 .into(),
             }),
+        );
+
+        check_type_serde(
+            record,
+            Type::Map(MapType::optional(
+                4,
+                Type::Primitive(PrimitiveType::Int),
+                5,
+                Type::Primitive(PrimitiveType::String),
+            )),
+        );
+    }
+
+    #[test]
+    fn map_required_int() {
+        let record = r#"
+        {
+            "type": "map",
+            "key-id": 4,
+            "key": "int",
+            "value-id": 5,
+            "value-required": true,
+            "value": "string"
+        }
+        "#;
+
+        check_type_serde(
+            record,
+            Type::Map(MapType::required(
+                4,
+                Type::Primitive(PrimitiveType::Int),
+                5,
+                Type::Primitive(PrimitiveType::String),
+            )),
         );
     }
 

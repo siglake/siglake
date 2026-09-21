@@ -24,9 +24,10 @@ pub use query_provider::{
     clear_decoded_file_cache, clear_row_group_layout_cache, decoded_file_cache_footprint,
     decoded_file_cache_population_stats, reset_decoded_file_cache_population_peaks,
     settle_scan_partitions, CancelOnDrop, ClippedAdmissionWave, ClippedScanLimit,
-    DecodedFileCacheFootprint, DecodedFileCachePopulationStats, OrderedMergeGlobalBudget,
-    OrderedResidualHint, OrderedScanLimit, OrderedScanTuning, PreferredScanOrder, QueryCancel,
-    ScanPartitionTracker, ScanSettle, ScanShard, SiglakeIcebergTableScan,
+    DecodedFileCacheFootprint, DecodedFileCachePopulationStats, FileAttributionSnapshot,
+    OrderedMergeGlobalBudget, OrderedResidualHint, OrderedScanLimit, OrderedScanTuning,
+    PreferredScanOrder, QueryCancel, ScanPartitionTracker, ScanSettle, ScanShard,
+    SiglakeIcebergTableScan, FILE_ATTRIBUTION_CAP,
 };
 
 /// Arrow field-metadata key carrying the configured text tokenizer name for a
@@ -51,7 +52,7 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::prelude::{SQLOptions, SessionContext};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{WriterProperties, WriterVersion};
@@ -79,6 +80,24 @@ pub struct QueryScanTuning {
     /// measurement fixture. Shipped policy stays drained-scan-only — see
     /// `docs/DESIGN_row_group_decoded_cache_qualification.md`.
     pub file_cache_row_group_prototype: bool,
+    /// #4905 LOCAL QUALIFICATION PROTOTYPE: admit a fully drained read under a
+    /// converted predicate, keyed by that predicate in addition to the shipped
+    /// file/projection/delete/range/direction identity.
+    ///
+    /// Deliberately has no environment variable, CLI flag, chart value or
+    /// operator field. Planning remains `Inexact`, so DataFusion keeps the
+    /// residual filter on hits and misses; only an in-process measurement can
+    /// enable this. See `docs/DESIGN_predicate_keyed_decoded_cache.md`.
+    pub file_cache_predicate_key_prototype: bool,
+    /// #4959 LOCAL QUALIFICATION PROTOTYPE: retain the bounded file-task
+    /// identities a scan planned, offered to the decoded cache, and attempted
+    /// to open as labelled DataFusion node metrics.
+    ///
+    /// Deliberately has no environment variable, CLI flag, chart value or
+    /// operator field. The public SQL response and distributed shard header
+    /// remain aggregate-only while the representation is qualified in
+    /// `docs/DESIGN_row_group_decoded_cache_qualification.md`.
+    pub file_attribution_prototype: bool,
 }
 
 /// Effective process-wide read-cache configuration.
@@ -1275,7 +1294,7 @@ pub fn default_writer_properties() -> WriterProperties {
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
         .set_dictionary_enabled(true)
         .set_data_page_row_count_limit(20_000)
-        .set_max_row_group_size(1_048_576)
+        .set_max_row_group_row_count(Some(1_048_576))
         .build()
 }
 

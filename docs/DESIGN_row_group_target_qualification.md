@@ -20,8 +20,8 @@ magnitude below a cold-target file and was measured in a debug build.
 Row groups on merged output are sized in rows, from bytes: the writer is built
 on the merge's first output batch and takes `target_row_group_bytes` divided by
 that batch's sampled row size, clamped to `MIN_ROW_GROUP_ROWS` (128 Ki) ..
-`MAX_ROW_GROUP_ROWS` (4 Mi) — `row_group_rows_for_avg`,
-`crates/siglake-storage/src/iceberg.rs:1920`.
+`MAX_ROW_GROUP_ROWS` (4 Mi) — `row_group_rows_for_avg` in
+`crates/siglake-storage/src/iceberg.rs`.
 
 The memory it bounds is the writer's carry buffer. With a row-group bloom
 column set — every merge writes one, `with_raw_rowgroup_bloom_column` — the fork
@@ -40,7 +40,10 @@ Two consequences the measurement below is shaped around:
   B/row against 874 B/row, a factor of 1.87, so a "256 MiB" row group holds
   about 478 MiB of Arrow allocation. Neither number is resident memory, which
   also carries the input chunk prefetch, the encoder and the allocator's
-  retained arenas.
+  retained arenas. The ingest flush path divides the same target by
+  `get_array_memory_size` instead, which is accurate on a batch it assembled
+  itself; that split is kept (#4774, `docs/LIMITATIONS.md`), so a target read
+  on the flush side asks for a different row count than the numbers here.
 * **Below the floor the target does nothing.** 128 Ki rows is the floor
   whatever the target says. At this corpus's row size that floor is ~109 MiB of
   buffered allocation; at the ~1.2 KB/row of the delete fixtures it is ~157 MiB

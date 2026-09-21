@@ -139,15 +139,18 @@ written down.
   index costs about 40 bytes per indexed row, and at 50 GB-class layouts the
   sidecar path landed above the text-search ceilings that were measured on the
   scan path.
-  Whether a query uses an index it finds is decided per execution: a text
-  predicate under a `LIMIT` — ordered or bare — reads a sliver of the first
-  file and would pay a whole file's postings to do it, so it stays on the scan
-  path, while an unclipped text scan keeps the index. A missing or declined
-  index costs pruning, never correctness. What a text query spends before its
+  Whether a query uses an index it finds is decided per execution. Ordered
+  `LIMIT` shapes and bare clipped shapes decline a whole-file v1 index. The
+  experimental segmented reader may keep a bare clipped point-term lookup when
+  its summed document frequency is no larger than the clip; common terms and
+  substring sweeps stay on the scan path. An unclipped text scan keeps the
+  index. A missing or declined index costs pruning, never correctness. What a
+  text query spends before its
   first batch is attributable per stage rather than as one number:
   `siglake_iceberg_text_index_startup_seconds{stage}` separates the load queue
-  from the blob read, the decode and the selection, and the parsed-index
-  cache reports its lookup outcomes beside the bound that dropped an entry
+  from the blob read, the decode and the selection, and both index caches
+  report their lookup outcomes beside the reason an entry was dropped — for the
+  blob cache, whether a re-decode also had to re-read the blob
   ([`docs/DESIGN_inverted_index.md`](docs/DESIGN_inverted_index.md),
   [`docs/DESIGN_raw_content_index.md`](docs/DESIGN_raw_content_index.md)).
 - **Exact aggregates without scans, or the exact scan.** Whole-table and
@@ -209,7 +212,7 @@ written down.
 - **No built-in UI.** The query tier is reached through SQL over HTTP and the
   Jaeger-compatible shim; Grafana is the front end. What ships for operations
   is a starter dashboard (`deploy/grafana/siglake-overview.json`, imported by
-  you) and a `PrometheusRule` with 36 alerts grouped by what an operator
+  you) and a `PrometheusRule` with 37 alerts grouped by what an operator
   should do, rendered when `prometheusRule.enabled` is set
   ([Monitoring](https://docs.siglake.dev/operations/monitoring/)).
 - **Metrics are Prometheus; logs and traces are OTLP, and off until you point
@@ -221,11 +224,14 @@ written down.
   the exporters and their batch processors are never constructed, and the
   per-request residue is +104 ns against the span layer that was already
   there ([Observability](docs/ARCHITECTURE.md#observability-opentelemetry-emission)).
-- **Iceberg is vendored, not waited for.** `third_party/iceberg` and
-  `third_party/iceberg-catalog-sql` are first-class forks carrying the atomic
+- **Iceberg is vendored, not waited for.** `third_party/iceberg`,
+  `third_party/iceberg-catalog-sql` and `third_party/iceberg-storage-opendal`
+  are first-class 0.10.1 forks carrying the atomic
   `rewrite_files` action, count- and age-based snapshot expiry, commit-reload
   elision, S3 conditional puts and the incremental append scan that table
-  subscriptions need; they are rebased against upstream periodically
+  subscriptions need, plus the OpenDAL upload and AWS credential controls.
+  They ship with Arrow/Parquet 58, DataFusion 53.1 and OpenDAL 0.57 and are
+  rebased against upstream periodically
   ([`third_party/README.md`](third_party/README.md)).
 - **The metrics port is an internal surface, and profiling is off in every
   released binary.** `--metrics-bind` (9100/9101/9105) serves `/metrics` and

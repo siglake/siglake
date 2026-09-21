@@ -88,6 +88,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+caller_named_log_dir=0
+[ -n "$LOG_DIR" ] && caller_named_log_dir=1
+
 total_started=$SECONDS
 
 # One directory per invocation, shared with nobody and emptied by no one.
@@ -109,7 +112,23 @@ case "$LOG_DIR" in /*) ;; *) LOG_DIR="$PWD/$LOG_DIR" ;; esac
 mkdir -p "$LOG_ROOT" "$LOG_DIR"
 export TMPDIR="$LOG_DIR/tmp"
 mkdir -p "$TMPDIR"
-trap 'rm -rf -- "$LOG_DIR/tmp"' EXIT
+run_pointer=
+if [ "$caller_named_log_dir" -eq 1 ]; then
+  # Caller-owned logs can live outside LOG_ROOT, where the contamination guard
+  # cannot discover them by walking for test.log. Publish this run while it is
+  # active; the pointer is diagnostic only and never changes the guard verdict.
+  run_started=$(date +%s)
+  run_pointer="$LOG_ROOT/.run-$$-$run_started.pointer"
+  if ! write_ci_local_run_pointer "$run_pointer" "$LOG_DIR" "$$" "$run_started"; then
+    echo "  warning: could not publish ci-local run pointer: $run_pointer" >&2
+    run_pointer=
+  fi
+fi
+cleanup_ci_local() {
+  rm -rf -- "$LOG_DIR/tmp"
+  [ -z "$run_pointer" ] || rm -f -- "$run_pointer"
+}
+trap cleanup_ci_local EXIT
 # `latest` is for whoever tails the newest run by hand; with two runs in
 # flight it names the one that started last.
 ln -sfn "$LOG_DIR" "$LOG_ROOT/latest" 2>/dev/null || true
@@ -200,6 +219,7 @@ else
   done < <(git ls-files '*.sh' '*.sh.tpl' '*.bash')
   scripts/check-smoke.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-aws-up-kubeconfig.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  scripts/check-aws-down-destroy.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-loadgen.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-compose-preflight.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-ci-local-test-guard.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
@@ -229,11 +249,14 @@ else
   scripts/check-external-readers-report.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-image-sizes-report.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-round-scale.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  scripts/check-kind-round-events.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  scripts/check-kind-mirror-reclaim-qualification.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-postgres-outage-evidence.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-schema-rollback-evidence.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-exact-point-falsifier-evidence.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-file-cache-populate-depth-reader.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-ingester-pod-labels.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  scripts/check-kind-compactor-pod-labels.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-round-diagnostics.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   # The release tag is `v0.1.0` and both charts ask for the numeric appVersion,
   # so the first published chart would have pulled a tag the registry does not
@@ -855,6 +878,36 @@ if [ "$WITH_HEAVY" = 1 ]; then
         # so its claim never takes a row compose's ingest registered.
         SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
           cargo test -p siglake-storage --lib local_commit_mark_postgres -- \
+            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+        # wal-recover's catalog reader uses the same deployed backend and has
+        # three properties a parser or SQLite cannot establish: all 256 `$N`
+        # binds work, the server refuses a write on the reader's own fenced
+        # connection, and a missing table differs from an empty ledger.
+        SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
+          cargo test -p siglake-storage --lib wal_ledger_postgres -- \
+            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+        # The candidate-local claim gate (#5189) is Postgres-only by
+        # construction — a CTE, FOR UPDATE SKIP LOCKED and an UPDATE ... FROM
+        # agg — and returns an empty vec before the statement on SQLite, so no
+        # hermetic case runs a line of it. Same binary and same scratch-schema
+        # isolation as the local mark above; same order as ci.yml, so the two
+        # logs read alike.
+        SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
+          cargo test -p siglake-storage --lib eligible_claim_postgres -- \
+            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+        # Multi-shard Postgres claims transition rows before applying the Rust
+        # ownership filter. Prove a foreign row is released and its owner can
+        # claim it; SQLite filters before its per-row UPDATE and cannot cover
+        # that ordering.
+        SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
+          cargo test -p siglake-storage --lib sharded_claim_postgres -- \
+            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+        # The consumed-proof watermark advances in the same transaction as the
+        # segment transition. Exercise both its successful commit and rollback
+        # after a Postgres statement failure; SQLite does not poison the open
+        # transaction in the same way.
+        SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
+          cargo test -p siglake-storage --lib watermark_transaction_postgres -- \
             --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
       else
         dk_ok=0

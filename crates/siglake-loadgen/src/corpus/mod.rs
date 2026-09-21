@@ -484,14 +484,14 @@ pub struct Manifest {
     pub events_ndjson_bytes: u64,
 }
 
-/// One verification entry. The legacy corpus stores representative SQL / SPL
+/// One verification entry. The legacy corpus stores representative SQL / SPL. <!-- vendor-name-ok: artifact compatibility, see #4601 -->
 /// alongside the expected result. The benchmark harness keys off `id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryCase {
     pub id: String,
     pub description: String,
     pub sql: String,
-    pub spl: String,
+    pub spl: String, // vendor-name-ok: artifact compatibility, see #4601
     pub expected: ExpectedResult,
 }
 
@@ -1221,13 +1221,13 @@ impl ClassicAggregator {
 
     fn into_queries(self) -> Vec<QueryCase> {
         let scope = "host LIKE '%.prod.example.com'";
-        let spl_scope = "host=*.prod.example.com";
+        let spl_scope = "host=*.prod.example.com"; // vendor-name-ok: artifact compatibility, see #4601
         vec![
             QueryCase {
                 id: "total_count".into(),
                 description: "Total event count (corpus-scoped).".into(),
                 sql: format!("SELECT count(*) AS n FROM events WHERE {scope}"),
-                spl: format!("search {spl_scope} | stats count"),
+                spl: format!("search {spl_scope} | stats count"), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::Count { value: self.total },
             },
             QueryCase {
@@ -1236,7 +1236,7 @@ impl ClassicAggregator {
                 sql: format!(
                     "SELECT count(*) AS n FROM events WHERE {scope} AND sourcetype = 'nginx:access'"
                 ),
-                spl: format!("search {spl_scope} sourcetype=nginx:access | stats count"),
+                spl: format!("search {spl_scope} sourcetype=nginx:access | stats count"), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::Count {
                     value: self.nginx_total,
                 },
@@ -1247,8 +1247,8 @@ impl ClassicAggregator {
                 sql: format!(
                     "SELECT count(*) AS n FROM events WHERE {scope} AND sourcetype = 'nginx:access' AND raw LIKE '% 500 %'"
                 ),
-                spl: format!(
-                    "search {spl_scope} sourcetype=nginx:access \" 500 \" | stats count"
+                spl: format!( // vendor-name-ok: artifact compatibility, see #4601
+                    "search {spl_scope} sourcetype=nginx:access \" 500 \" | stats count" // vendor-name-ok: artifact compatibility, see #4601
                 ),
                 expected: ExpectedResult::Count {
                     value: self.status_500,
@@ -1260,8 +1260,8 @@ impl ClassicAggregator {
                 sql: format!(
                     "SELECT count(*) AS n FROM events WHERE {scope} AND sourcetype = 'auth:syslog' AND raw LIKE '%success=false%'"
                 ),
-                spl: format!(
-                    "search {spl_scope} sourcetype=auth:syslog success=false | stats count"
+                spl: format!( // vendor-name-ok: artifact compatibility, see #4601
+                    "search {spl_scope} sourcetype=auth:syslog success=false | stats count" // vendor-name-ok: artifact compatibility, see #4601
                 ),
                 expected: ExpectedResult::Count {
                     value: self.auth_failures,
@@ -1273,7 +1273,7 @@ impl ClassicAggregator {
                 sql: format!(
                     "SELECT sourcetype, count(*) AS n FROM events WHERE {scope} GROUP BY sourcetype ORDER BY sourcetype"
                 ),
-                spl: format!("search {spl_scope} | stats count by sourcetype | sort sourcetype"),
+                spl: format!("search {spl_scope} | stats count by sourcetype | sort sourcetype"), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::GroupedCount {
                     rows: self.per_sourcetype.into_iter().collect(),
                 },
@@ -1284,7 +1284,7 @@ impl ClassicAggregator {
                 sql: format!(
                     "SELECT host, count(*) AS n FROM events WHERE {scope} GROUP BY host ORDER BY host"
                 ),
-                spl: format!("search {spl_scope} | stats count by host | sort host"),
+                spl: format!("search {spl_scope} | stats count by host | sort host"), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::GroupedCount {
                     rows: self.per_host.into_iter().collect(),
                 },
@@ -1370,14 +1370,14 @@ impl OtelRichAggregator {
                 id: "count_all".into(),
                 description: "Total otel-rich event count.".into(),
                 sql: "SELECT count(*) AS n FROM events".into(),
-                spl: String::new(),
+                spl: String::new(), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::Count { value: self.total },
             },
             QueryCase {
                 id: "rare_needle_10".into(),
                 description: "Bodies containing zugzwang0.".into(),
                 sql: "SELECT count(*) AS n FROM events WHERE match_terms(raw, 'zugzwang0')".into(),
-                spl: String::new(),
+                spl: String::new(), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::Count {
                     value: self.needles[0],
                 },
@@ -1386,7 +1386,7 @@ impl OtelRichAggregator {
                 id: "rare_needle_100".into(),
                 description: "Bodies containing zugzwang1.".into(),
                 sql: "SELECT count(*) AS n FROM events WHERE match_terms(raw, 'zugzwang1')".into(),
-                spl: String::new(),
+                spl: String::new(), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::Count {
                     value: self.needles[1],
                 },
@@ -1395,7 +1395,7 @@ impl OtelRichAggregator {
                 id: "rare_needle_1000".into(),
                 description: "Bodies containing zugzwang2.".into(),
                 sql: "SELECT count(*) AS n FROM events WHERE match_terms(raw, 'zugzwang2')".into(),
-                spl: String::new(),
+                spl: String::new(), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::Count {
                     value: self.needles[2],
                 },
@@ -1404,7 +1404,7 @@ impl OtelRichAggregator {
                 id: "rare_needle_10000".into(),
                 description: "Bodies containing zugzwang3.".into(),
                 sql: "SELECT count(*) AS n FROM events WHERE match_terms(raw, 'zugzwang3')".into(),
-                spl: String::new(),
+                spl: String::new(), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::Count {
                     value: self.needles[3],
                 },
@@ -1413,7 +1413,7 @@ impl OtelRichAggregator {
                 id: "rare_needle_100000".into(),
                 description: "Bodies containing zugzwang4.".into(),
                 sql: "SELECT count(*) AS n FROM events WHERE match_terms(raw, 'zugzwang4')".into(),
-                spl: String::new(),
+                spl: String::new(), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::Count {
                     value: self.needles[4],
                 },
@@ -1422,7 +1422,7 @@ impl OtelRichAggregator {
                 id: "common_term".into(),
                 description: "Bodies containing the common token error.".into(),
                 sql: "SELECT count(*) AS n FROM events WHERE match_terms(raw, 'error')".into(),
-                spl: String::new(),
+                spl: String::new(), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::Count {
                     value: self.common_error,
                 },
@@ -1431,14 +1431,14 @@ impl OtelRichAggregator {
                 id: "phrase".into(),
                 description: "Bodies containing the exact phrase quantum entanglement cascade.".into(),
                 sql: "SELECT count(*) AS n FROM events WHERE match_phrase(raw, 'quantum entanglement cascade')".into(),
-                spl: String::new(),
+                spl: String::new(), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::Count { value: self.phrase },
             },
             QueryCase {
                 id: "like_substring".into(),
                 description: "Bodies containing the embedded substring xqzfrag.".into(),
                 sql: "SELECT count(*) AS n FROM events WHERE raw LIKE '%xqzfrag%'".into(),
-                spl: String::new(),
+                spl: String::new(), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::Count {
                     value: self.substring,
                 },
@@ -1447,7 +1447,7 @@ impl OtelRichAggregator {
                 id: "date_histogram_1h".into(),
                 description: "1h histogram over timestamp.".into(),
                 sql: "SELECT date_bin(INTERVAL '1 hour', timestamp, TIMESTAMP '1970-01-01T00:00:00Z') AS bucket, count(*) AS n FROM events GROUP BY bucket ORDER BY bucket".into(),
-                spl: String::new(),
+                spl: String::new(), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::GroupedCount {
                     rows: self.hist_1h.into_iter().collect(),
                 },
@@ -1456,7 +1456,7 @@ impl OtelRichAggregator {
                 id: "date_histogram_24h".into(),
                 description: "24h histogram over timestamp.".into(),
                 sql: "SELECT date_bin(INTERVAL '24 hour', timestamp, TIMESTAMP '1970-01-01T00:00:00Z') AS bucket, count(*) AS n FROM events GROUP BY bucket ORDER BY bucket".into(),
-                spl: String::new(),
+                spl: String::new(), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::GroupedCount {
                     rows: self.hist_24h.into_iter().collect(),
                 },
@@ -1468,7 +1468,7 @@ impl OtelRichAggregator {
                     "SELECT TIMESTAMP '{}' AS bucket, count(*) AS n FROM events",
                     full_bucket
                 ),
-                spl: String::new(),
+                spl: String::new(), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::GroupedCount {
                     rows: self.hist_full.into_iter().collect(),
                 },
@@ -1477,7 +1477,7 @@ impl OtelRichAggregator {
                 id: "terms_top10_hosts".into(),
                 description: "Top 10 hosts by count.".into(),
                 sql: "SELECT host, count(*) AS n FROM events GROUP BY host ORDER BY n DESC, host ASC LIMIT 10".into(),
-                spl: String::new(),
+                spl: String::new(), // vendor-name-ok: artifact compatibility, see #4601
                 expected: ExpectedResult::GroupedCount { rows: top_hosts },
             },
         ]

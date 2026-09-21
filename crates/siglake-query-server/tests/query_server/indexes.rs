@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use axum::Router;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use datafusion::prelude::SessionContext;
 use siglake_core::index_config::{FieldMapping, FieldType, IndexConfig};
 use siglake_core::{events_to_record_batch, Event};
@@ -66,6 +66,28 @@ async fn request_json(
     }
 }
 
+async fn request_json_with_if_match(
+    app: &Router,
+    method: Method,
+    path: &str,
+    body: serde_json::Value,
+    if_match: &str,
+) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::IF_MATCH, if_match)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = serde_json::from_slice(&bytes).unwrap();
+    (status, headers, body)
+}
+
 fn field(name: &str, field_type: FieldType, required: bool) -> FieldMapping {
     FieldMapping {
         name: name.to_string(),
@@ -117,6 +139,76 @@ fn log_event_with_attributes(
         attributes: attributes.map(str::to_string),
         ..log_event(ts, host, raw)
     }
+}
+
+/// The instant every delete-task fixture below places its events against.
+///
+/// Index tables partition by day (`Transform::Day`, `siglake-storage`'s
+/// `src/iceberg.rs`), so one `append_to_table` whose batch spans a UTC midnight
+/// writes two data files instead of one. A fixture that places its events at
+/// `Utc::now() - N` therefore changes shape in the last minutes of a UTC day:
+/// rows it meant to put in one file land in two, and the file counts it asserts
+/// stop describing what it built. `rows_deleted` is unaffected either way.
+///
+/// The same instant as `siglake-storage`'s `tests/storage/fixture_clock.rs`
+/// (#3999), so the two crates' fixtures sit on one day. It is held here rather
+/// than shared: a cross-crate fixture would mean a `test-fixtures` feature on
+/// `siglake-core` or a fixture crate for one function.
+///
+/// Only event data is pinned. A claim's age and a task's `created_at` are age
+/// behaviour measured against the real clock and stay on it.
+fn delete_task_fixture_now() -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2023, 11, 15, 12, 0, 0).unwrap()
+}
+
+/// How far off [`delete_task_fixture_now`] an append may reach and still be
+/// guaranteed to land in one UTC day. Every offset below is whole hours or days
+/// with a tail of minutes, and the widest single append spans one hour
+/// (`delete_tasks_rest_a_second_submission_over_an_unchanged_dataset_is_a_no_op`
+/// holds `-24h` and `-23h`), so two hours of clearance covers it with slack.
+const FIXTURE_MARGIN_HOURS: i64 = 2;
+
+/// Moving [`delete_task_fixture_now`] to within [`FIXTURE_MARGIN_HOURS`] of a
+/// UTC midnight puts an append back across a day boundary, so it fails here,
+/// with the reason, instead of in whichever fixture happens to count files.
+///
+/// A/B, each base run once with no other change. At `23:30:00Z` the one-hour
+/// append splits and `…_a_second_submission_…_is_a_no_op` fails on two files;
+/// at `23:59:30Z` that one and `…_create_list_get_and_execute`'s first append
+/// split; at `00:01:00Z` the four `-3m`/`-1m` fixtures split — the shape the
+/// 2026-09-13 nightly reported against the storage twin. Re-run at `00:01:00Z`
+/// with the geometry assertions commented out, every one of those fixtures
+/// passed: `files_rewritten` still came back 1, because a candidate with no
+/// match is skipped. What a split moves here is the file geometry the fixtures
+/// are built on, not the counters they read.
+#[test]
+fn the_delete_task_fixture_base_keeps_an_append_inside_one_utc_day() {
+    let base = delete_task_fixture_now();
+    let day_start = base.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let margin = ChronoDuration::hours(FIXTURE_MARGIN_HOURS);
+    assert!(
+        base - day_start >= margin && day_start + ChronoDuration::days(1) - base >= margin,
+        "{base} leaves under {FIXTURE_MARGIN_HOURS}h of its UTC day on one side: an append \
+         reaching that far writes two day partitions instead of one"
+    );
+}
+
+/// The geometry each delete-task fixture below is built on: one
+/// `append_index_events` call, one live data file. Asserting it next to the
+/// seeding puts a lost base margin here rather than in a file-count or
+/// path-identity assertion further down, where it reads as a delete-path bug.
+async fn assert_one_file_per_append(ice: &IcebergContext, index_id: &str, appends: usize) {
+    let files = ice
+        .live_data_files(&ice.index_table_ident(index_id))
+        .await
+        .unwrap();
+    let paths: Vec<&str> = files.iter().map(|file| file.file_path()).collect();
+    assert_eq!(
+        paths.len(),
+        appends,
+        "each append must write exactly one data file; a split append means the \
+         fixture base lost its margin to UTC midnight: {paths:?}"
+    );
 }
 
 fn bloom_columns(config: &IndexConfig) -> Vec<String> {
@@ -1944,6 +2036,166 @@ async fn indexes_http_lifecycle_round_trips() {
 }
 
 #[tokio::test]
+async fn managed_index_if_match_returns_paired_config_and_etag() {
+    let srv = spawn(AuthConfig::open()).await;
+    let config = logs_config("conditional-logs");
+    let (status, _) = request_json(
+        &srv.app,
+        Method::POST,
+        "/api/v1/indexes",
+        Some(serde_json::to_value(&config).unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let response = srv
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/indexes/conditional-logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let e0 = response
+        .headers()
+        .get(axum::http::header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(e0.starts_with('"') && e0.ends_with('"'));
+
+    let mut winner = config.clone();
+    winner
+        .doc_mapping
+        .field_mappings
+        .push(field("winner", FieldType::Long, false));
+    let (status, headers, body) = request_json_with_if_match(
+        &srv.app,
+        Method::PUT,
+        "/api/v1/indexes/conditional-logs",
+        serde_json::to_value(&winner).unwrap(),
+        &e0,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(serde_json::from_value::<IndexConfig>(body).unwrap(), winner);
+    let e1 = headers
+        .get(axum::http::header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(e1, e0);
+
+    let mut loser = config;
+    loser
+        .doc_mapping
+        .field_mappings
+        .push(field("loser", FieldType::Long, false));
+    let (status, headers, body) = request_json_with_if_match(
+        &srv.app,
+        Method::PUT,
+        "/api/v1/indexes/conditional-logs",
+        serde_json::to_value(&loser).unwrap(),
+        &e0,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_eq!(body["code"], 412);
+    assert_eq!(
+        body["error"],
+        "managed index `conditional-logs` changed since the supplied If-Match value"
+    );
+    assert_eq!(
+        serde_json::from_value::<IndexConfig>(body["current"].clone()).unwrap(),
+        winner
+    );
+    assert_eq!(headers.get(axum::http::header::ETAG).unwrap(), &e1);
+}
+
+#[tokio::test]
+async fn if_match_preserves_invalid_headerless_and_recreated_table_behavior() {
+    let srv = spawn(AuthConfig::open()).await;
+    let config = logs_config("conditional-recreate");
+    let (status, _) = request_json(
+        &srv.app,
+        Method::POST,
+        "/api/v1/indexes",
+        Some(serde_json::to_value(&config).unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let entity = srv
+        .ice
+        .get_index_entity("conditional-recreate")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut invalid = config.clone();
+    invalid.doc_mapping.field_mappings[2].field_type = FieldType::Long;
+    let (status, _, body) = request_json_with_if_match(
+        &srv.app,
+        Method::PUT,
+        "/api/v1/indexes/conditional-recreate",
+        serde_json::to_value(&invalid).unwrap(),
+        &entity.etag,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _) = request_json(
+        &srv.app,
+        Method::PUT,
+        "/api/v1/indexes/conditional-recreate",
+        Some(serde_json::to_value(&invalid).unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = request_json(
+        &srv.app,
+        Method::DELETE,
+        "/api/v1/indexes/conditional-recreate",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = request_json(
+        &srv.app,
+        Method::POST,
+        "/api/v1/indexes",
+        Some(serde_json::to_value(&config).unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, headers, body) = request_json_with_if_match(
+        &srv.app,
+        Method::PUT,
+        "/api/v1/indexes/conditional-recreate",
+        serde_json::to_value(&config).unwrap(),
+        &entity.etag,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_ne!(headers.get(axum::http::header::ETAG).unwrap(), &entity.etag);
+    assert_eq!(
+        serde_json::from_value::<IndexConfig>(body["current"].clone()).unwrap(),
+        config
+    );
+}
+
+#[tokio::test]
 async fn indexes_http_errors_map_to_expected_statuses() {
     let srv = spawn(AuthConfig::open()).await;
     let config = logs_config("logs");
@@ -2185,7 +2437,7 @@ async fn delete_tasks_rest_create_list_get_and_execute() {
     let config = logs_config("logs");
     srv.ice.create_index(&config).await.unwrap();
 
-    let now = Utc::now();
+    let now = delete_task_fixture_now();
     append_index_events(
         &srv.ice,
         &config,
@@ -2203,6 +2455,9 @@ async fn delete_tasks_rest_create_list_get_and_execute() {
         ],
     )
     .await;
+    // One append, one file — so `[0]` below is the out-of-bounds file and not
+    // half of it.
+    assert_one_file_per_append(&srv.ice, "logs", 1).await;
     let outside_path = srv
         .ice
         .live_data_files(&srv.ice.index_table_ident("logs"))
@@ -2240,6 +2495,7 @@ async fn delete_tasks_rest_create_list_get_and_execute() {
         ],
     )
     .await;
+    assert_one_file_per_append(&srv.ice, "logs", 3).await;
 
     let body = serde_json::json!({
         "index_id": "logs",
@@ -2455,7 +2711,7 @@ async fn delete_tasks_rest_predicate_on_a_nullable_column_completes_and_keeps_nu
 
     let gone = r#"{"tenant":"gone"}"#;
     let stay = r#"{"tenant":"stay"}"#;
-    let now = Utc::now();
+    let now = delete_task_fixture_now();
     append_index_events(
         &srv.ice,
         &config,
@@ -2476,6 +2732,7 @@ async fn delete_tasks_rest_predicate_on_a_nullable_column_completes_and_keeps_nu
         ],
     )
     .await;
+    assert_one_file_per_append(&srv.ice, "logs", 1).await;
 
     let (status, body) = request_json(
         &srv.app,
@@ -2535,7 +2792,7 @@ async fn delete_tasks_rest_is_null_predicate_deletes_only_the_null_rows() {
     srv.ice.create_index(&config).await.unwrap();
 
     let stay = r#"{"tenant":"stay"}"#;
-    let now = Utc::now();
+    let now = delete_task_fixture_now();
     append_index_events(
         &srv.ice,
         &config,
@@ -2561,6 +2818,10 @@ async fn delete_tasks_rest_is_null_predicate_deletes_only_the_null_rows() {
         ],
     )
     .await;
+    // The REST twin of the storage fixture the 2026-09-13 nightly caught at
+    // 00:01 UTC (#3896). It asserts `rows_deleted` only, so a split append used
+    // to pass here silently; the geometry is now stated.
+    assert_one_file_per_append(&srv.ice, "logs", 1).await;
 
     let (status, body) = request_json(
         &srv.app,
@@ -2606,7 +2867,7 @@ async fn delete_tasks_dry_run_over_a_null_bearing_file_preserves_every_row() {
     srv.ice.create_index(&config).await.unwrap();
 
     let gone = r#"{"tenant":"gone"}"#;
-    let now = Utc::now();
+    let now = delete_task_fixture_now();
     append_index_events(
         &srv.ice,
         &config,
@@ -2621,6 +2882,7 @@ async fn delete_tasks_dry_run_over_a_null_bearing_file_preserves_every_row() {
         ],
     )
     .await;
+    assert_one_file_per_append(&srv.ice, "logs", 1).await;
 
     let (status, body) = request_json(
         &srv.app,
@@ -2714,7 +2976,7 @@ async fn delete_tasks_rest_resubmitting_a_failed_task_completes_under_a_new_id()
 
     let gone = r#"{"tenant":"gone"}"#;
     let stay = r#"{"tenant":"stay"}"#;
-    let now = Utc::now();
+    let now = delete_task_fixture_now();
     append_index_events(
         &srv.ice,
         &config,
@@ -2735,6 +2997,9 @@ async fn delete_tasks_rest_resubmitting_a_failed_task_completes_under_a_new_id()
         ],
     )
     .await;
+    // One append, one file — so `[0]` below names the whole candidate the
+    // pre-fix error text blamed.
+    assert_one_file_per_append(&srv.ice, "logs", 1).await;
 
     // The error text a pre-fix executor wrote: the conservation guard fired
     // because the NULL-valued nonmatch was in neither the deleted nor the
@@ -2878,7 +3143,7 @@ async fn delete_tasks_rest_a_second_submission_over_an_unchanged_dataset_is_a_no
     let config = logs_config("logs");
     srv.ice.create_index(&config).await.unwrap();
 
-    let now = Utc::now();
+    let now = delete_task_fixture_now();
     append_index_events(
         &srv.ice,
         &config,
@@ -2888,6 +3153,10 @@ async fn delete_tasks_rest_a_second_submission_over_an_unchanged_dataset_is_a_no
         ],
     )
     .await;
+    // The widest single append in this module: one hour, both rows in one file.
+    // `paths_after_second == paths_after_first` below compares the whole live
+    // set, so a split would change what that identity means.
+    assert_one_file_per_append(&srv.ice, "logs", 1).await;
 
     // Fixed bounds, evaluated once: a time-dependent predicate would make the
     // two submissions different requests.
@@ -3079,7 +3348,10 @@ async fn delete_tasks_validation_and_dry_run_reject_and_preserve_state() {
     let srv = spawn(AuthConfig::open()).await;
     let config = logs_config("logs");
     srv.ice.create_index(&config).await.unwrap();
-    let now = Utc::now();
+    // One event cannot straddle a midnight, but the fixture follows the same
+    // rule as its siblings so there is one answer to where a delete-task
+    // fixture's event time comes from.
+    let now = delete_task_fixture_now();
     append_index_events(
         &srv.ice,
         &config,
@@ -3090,6 +3362,7 @@ async fn delete_tasks_validation_and_dry_run_reject_and_preserve_state() {
         )],
     )
     .await;
+    assert_one_file_per_append(&srv.ice, "logs", 1).await;
 
     let (status, body) = request_json(
         &srv.app,

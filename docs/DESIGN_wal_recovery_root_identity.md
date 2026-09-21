@@ -279,9 +279,9 @@ strength of the same key shape this document is about.
    one LIST per invocation.
 2. The per-`(tenant, index)` plan, with counts, reconstructed destinations, a
    sample key and the skip and already-present counts #4928 added. Bytes come
-   from the listing, so a store that reports no size in a listing (opendal's
-   `fs` and in-memory services; S3 does report it) prints `size unknown`
-   rather than a per-object stat the plan's cost claim does not allow.
+   from the listing, so a store that reports no size in a listing prints
+   `size unknown` rather than a per-object stat the plan's cost claim does not
+   allow. S3 and OpenDAL 0.57's in-memory service report the size.
 3. The marker verdict, `--apply` refusing a contradicted root, and no
    `--force`. The refusal happens before `create_wal_dir`, so a contradicted
    apply leaves the volume as it found it.

@@ -21,9 +21,17 @@ PROM_LOCAL_PORT=19090
 PROM_URL="http://127.0.0.1:${PROM_LOCAL_PORT}"
 QUERY_LOCAL_PORT=18089
 QUERY_METRICS_LOCAL_PORT=19105
-LOAD_EVENTS=6000
+LOAD_EVENTS="${KIND_ROUND_EVENTS:-6000}"
+[[ "$LOAD_EVENTS" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'ERROR: KIND_ROUND_EVENTS must be a positive integer\n' >&2
+  exit 1
+}
 LOAD_BATCH=500
-LOAD_SECONDS=330
+LOAD_SECONDS="${KIND_ROUND_LOAD_SECONDS:-330}"
+[[ "$LOAD_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'ERROR: KIND_ROUND_LOAD_SECONDS must be a positive integer\n' >&2
+  exit 1
+}
 STEADY_BATCH=64
 BENCH_DIR=bench
 QUERY_HEADLESS_SERVICE=siglake-query-headless
@@ -77,6 +85,14 @@ SCALE_COOLDOWN_SECONDS=30
 # only a live round can show it is there -- and only a round with TWO scraped
 # ingester pods, each publishing more than one series, can tell the per-pod
 # mean apart from the fleet total and the per-series average.
+# The live reading has been retained, so ordinary rounds no longer pay for the
+# scale-out and traffic window. Set this only on a round explicitly tasked with
+# collecting the per-pod label evidence again.
+INGESTER_POD_LABEL_CAPTURE="${INGESTER_POD_LABEL_CAPTURE:-0}"
+[[ "$INGESTER_POD_LABEL_CAPTURE" == 0 || "$INGESTER_POD_LABEL_CAPTURE" == 1 ]] || {
+  printf 'ERROR: INGESTER_POD_LABEL_CAPTURE must be 0 or 1\n' >&2
+  exit 1
+}
 #
 # WHY THE FLOOR AND NOT THE THRESHOLD. Lowering
 # `keda.ingester.requestsPerSecondTarget` for the round is the smaller edit, but
@@ -97,9 +113,101 @@ INGESTER_POD_LABEL_SECONDS=90
 INGESTER_POD_LABEL_GRACE_SECONDS=300
 INGESTER_POD_LABEL_BATCH=48
 INGESTER_POD_LABEL_TRACES=8
+# #4151: unlike the ingester signal, the catalog-claim compactor gauge is a
+# copy of one shared queue on every replica. This opt-in installs TWO compactors
+# only after the round's ordinary evidence is complete, holds newly sealed rows
+# below a deliberately unreachable commit-batch threshold, and retains two
+# successive Prometheus scrape generations which agree on the queue depth.
+# Ordinary rounds keep the chart's one-compactor kind value.
+COMPACTOR_POD_LABEL_CAPTURE="${COMPACTOR_POD_LABEL_CAPTURE:-0}"
+[[ "$COMPACTOR_POD_LABEL_CAPTURE" == 0 || "$COMPACTOR_POD_LABEL_CAPTURE" == 1 ]] || {
+  printf 'ERROR: COMPACTOR_POD_LABEL_CAPTURE must be 0 or 1\n' >&2
+  exit 1
+}
+COMPACTOR_SCALE_TARGET=2
+COMPACTOR_POD_LABEL_LOAD_SECONDS=15
+COMPACTOR_POD_LABEL_GRACE_SECONDS=120
+COMPACTOR_POD_LABEL_BATCH=500
+COMPACTOR_INTERVAL_SECONDS=1
+COMPACTOR_SCRAPE_INTERVAL_SECONDS=15
+COMPACTOR_CAPTURE_BATCH_TARGET_MB=1024
+COMPACTOR_CAPTURE_BATCH_MAX_AGE_SECONDS=300
 # The Helm release, restated for the operator expression the capture evaluates:
 # `app_kubernetes_io_instance` is the release name.
 RELEASE=siglake
+
+# #4953's two-arm mirror-prefix qualification is explicit and off by default.
+# Each arm is a separate kind round over the same frozen source. Stating every
+# value here makes the launch record self-contained; the exact qualification
+# recipe is checked below so an almost-correct arm cannot produce plausible
+# evidence. Ordinary rounds retain their previous effective configuration.
+MIRROR_RECLAIM_ARM="${KIND_ROUND_MIRROR_RECLAIM_ARM:-}"
+CATALOG_CLAIM_ENABLED="${KIND_ROUND_CATALOG_CLAIM_ENABLED:-true}"
+WAL_MIRROR_ENABLED="${KIND_ROUND_WAL_MIRROR_ENABLED:-true}"
+WAL_MIRROR_ACTIVE_INTERVAL_SECS="${KIND_ROUND_WAL_MIRROR_ACTIVE_INTERVAL_SECS:-0}"
+COMMITTED_RETENTION_SECS="${KIND_ROUND_COMMITTED_RETENTION_SECS:-86400}"
+MIRROR_LEDGER_RECLAIM="${KIND_ROUND_MIRROR_LEDGER_RECLAIM:-false}"
+for boolean_name in CATALOG_CLAIM_ENABLED WAL_MIRROR_ENABLED MIRROR_LEDGER_RECLAIM; do
+  boolean_value="${!boolean_name}"
+  [[ "$boolean_value" == true || "$boolean_value" == false ]] || {
+    printf 'ERROR: %s must be true or false\n' "$boolean_name" >&2
+    exit 1
+  }
+done
+[[ "$WAL_MIRROR_ACTIVE_INTERVAL_SECS" =~ ^[0-9]+$ ]] || {
+  printf 'ERROR: KIND_ROUND_WAL_MIRROR_ACTIVE_INTERVAL_SECS must be a non-negative integer\n' >&2
+  exit 1
+}
+[[ "$COMMITTED_RETENTION_SECS" =~ ^[0-9]+$ ]] || {
+  printf 'ERROR: KIND_ROUND_COMMITTED_RETENTION_SECS must be a non-negative integer\n' >&2
+  exit 1
+}
+case "$MIRROR_RECLAIM_ARM" in
+  '') ;;
+  off | on)
+    for incompatible_name in POSTGRES_OUTAGE_PROBE SCHEMA_ROLLBACK_PROBE \
+      INGESTER_POD_LABEL_CAPTURE COMPACTOR_POD_LABEL_CAPTURE; do
+      incompatible_value="${!incompatible_name}"
+      [[ "$incompatible_value" == 0 ]] || {
+        printf 'ERROR: mirror-reclaim qualification cannot run with %s=1\n' \
+          "$incompatible_name" >&2
+        exit 1
+      }
+    done
+    [[ "$CATALOG_CLAIM_ENABLED" == false ]] || {
+      printf 'ERROR: mirror-reclaim qualification requires KIND_ROUND_CATALOG_CLAIM_ENABLED=false\n' >&2
+      exit 1
+    }
+    [[ "$WAL_MIRROR_ENABLED" == true ]] || {
+      printf 'ERROR: mirror-reclaim qualification requires KIND_ROUND_WAL_MIRROR_ENABLED=true\n' >&2
+      exit 1
+    }
+    [[ "$WAL_MIRROR_ACTIVE_INTERVAL_SECS" == 0 ]] || {
+      printf 'ERROR: mirror-reclaim qualification requires KIND_ROUND_WAL_MIRROR_ACTIVE_INTERVAL_SECS=0\n' >&2
+      exit 1
+    }
+    [[ "$COMMITTED_RETENTION_SECS" == 901 ]] || {
+      printf 'ERROR: mirror-reclaim qualification requires KIND_ROUND_COMMITTED_RETENTION_SECS=901\n' >&2
+      exit 1
+    }
+    [[ "$LOAD_SECONDS" == 3600 ]] || {
+      printf 'ERROR: mirror-reclaim qualification requires KIND_ROUND_LOAD_SECONDS=3600\n' >&2
+      exit 1
+    }
+    expected_reclaim=false
+    [[ "$MIRROR_RECLAIM_ARM" == on ]] && expected_reclaim=true
+    [[ "$MIRROR_LEDGER_RECLAIM" == "$expected_reclaim" ]] || {
+      printf 'ERROR: mirror-reclaim arm %s requires KIND_ROUND_MIRROR_LEDGER_RECLAIM=%s\n' \
+        "$MIRROR_RECLAIM_ARM" "$expected_reclaim" >&2
+      exit 1
+    }
+    ;;
+  *)
+    printf 'ERROR: KIND_ROUND_MIRROR_RECLAIM_ARM must be off, on, or unset\n' >&2
+    exit 1
+    ;;
+esac
+MIRROR_RECLAIM_SAMPLE_SECONDS=60
 
 # Evidence the manager's read_results run collects: `deploy/aws-runner/run.sh`
 # rsyncs the snapshot's results/ back off the throwaway box.
@@ -114,6 +222,21 @@ INGESTER_RAW_JSON="$RESULTS_DIR/ingester-pod-labels-raw.json"
 INGESTER_PER_SERIES_JSON="$RESULTS_DIR/ingester-pod-labels-per-series.json"
 INGESTER_PER_POD_JSON="$RESULTS_DIR/ingester-pod-labels-per-pod.json"
 INGESTER_EXPRESSION_JSON="$RESULTS_DIR/ingester-pod-labels-expression.json"
+COMPACTOR_POD_LABEL_JSON="$RESULTS_DIR/compactor-pod-labels.json"
+COMPACTOR_RAW_JSON="$RESULTS_DIR/compactor-pod-labels-raw.json"
+COMPACTOR_SAMPLE_TIMES_JSON="$RESULTS_DIR/compactor-pod-labels-sample-times.json"
+COMPACTOR_PER_POD_JSON="$RESULTS_DIR/compactor-pod-labels-per-pod.json"
+COMPACTOR_EXPRESSION_JSON="$RESULTS_DIR/compactor-pod-labels-expression.json"
+if [[ -n "$MIRROR_RECLAIM_ARM" ]]; then
+  MIRROR_RECLAIM_RESULTS_DIR="$RESULTS_DIR/mirror-reclaim-$MIRROR_RECLAIM_ARM"
+  MIRROR_RECLAIM_LAUNCH_JSON="$MIRROR_RECLAIM_RESULTS_DIR/launch.json"
+  MIRROR_RECLAIM_CONFIG_JSON="$MIRROR_RECLAIM_RESULTS_DIR/effective-config.json"
+  MIRROR_RECLAIM_SERIES_JSONL="$MIRROR_RECLAIM_RESULTS_DIR/measurements.jsonl"
+  MIRROR_RECLAIM_LOAD_JSON="$MIRROR_RECLAIM_RESULTS_DIR/load-window.json"
+  MIRROR_RECLAIM_ROWS_JSON="$MIRROR_RECLAIM_RESULTS_DIR/row-reconciliation.json"
+  MIRROR_RECLAIM_METRICS_START="$MIRROR_RECLAIM_RESULTS_DIR/compactor-metrics-start.prom"
+  MIRROR_RECLAIM_METRICS_END="$MIRROR_RECLAIM_RESULTS_DIR/compactor-metrics-end.prom"
+fi
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/siglake-kind-round.XXXXXX")"
 KIND_CLUSTER_OWNERSHIP_FILE="$TMP_DIR/kind-cluster-owned"
@@ -127,6 +250,13 @@ log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 dump_section() { printf -- '--- %s\n' "$*"; }
+
+initial_load_description() {
+  local inline_group_count_ceiling=4096 relation='at or below'
+  ((LOAD_EVENTS > inline_group_count_ceiling)) && relation=above
+  printf 'ingest %s events with %s distinct hosts (%s the %s inline group-count ceiling)' \
+    "$LOAD_EVENTS" "$LOAD_EVENTS" "$relation" "$inline_group_count_ceiling"
+}
 
 # Is $1 one of the remaining arguments, compared whole? Deliberately not
 # `printf '%s\n' "${array[@]}" | grep -qx`: `grep -q` exits at its first match,
@@ -1414,6 +1544,684 @@ PY
   ((INGESTER_POD_LABEL_FAILURE == 0))
 }
 
+# --- #4151: shared catalog-claim queue on every compactor -------------------
+COMPACTOR_POD_LABEL_FAILURE=0
+compactor_pod_label_failure() {
+  COMPACTOR_POD_LABEL_FAILURE=1
+  printf 'COMPACTOR_POD_LABEL_FAILURE %s\n' "$*"
+}
+
+compactor_selector() {
+  printf 'namespace="%s",app_kubernetes_io_instance="%s",app_kubernetes_io_component="compactor"' \
+    "$NAMESPACE" "$RELEASE"
+}
+compactor_raw_expression() {
+  printf 'siglake_compactor_sealed_pending{%s}' "$(compactor_selector)"
+}
+compactor_sample_times_expression() {
+  printf 'timestamp(siglake_compactor_sealed_pending{%s})' "$(compactor_selector)"
+}
+compactor_per_pod_expression() {
+  printf 'sum by (pod) (siglake_compactor_sealed_pending{%s})' "$(compactor_selector)"
+}
+# Character for character the operator's query in prom.rs. The offline check
+# compares the two format strings, so this cannot drift into evidence for a
+# query the reconciler does not run.
+compactor_operator_expression() {
+  printf 'avg(sum by (pod) (siglake_compactor_sealed_pending{%s}))' "$(compactor_selector)"
+}
+
+ready_compactor_pods() {
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get pods \
+    -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=compactor" \
+    --sort-by=.metadata.name -o json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    items = json.load(sys.stdin).get("items", [])
+except ValueError:
+    raise SystemExit(0)
+for item in items:
+    meta, status = item["metadata"], item.get("status", {})
+    if meta.get("deletionTimestamp"):
+        continue
+    conditions = {c.get("type"): c.get("status") for c in status.get("conditions", [])}
+    if conditions.get("Ready") == "True":
+        print(meta["name"])
+'
+}
+
+# The queue changes while the mirror registers freshly sealed segments, and
+# each compactor refreshes its own gauge. One unequal scrape is therefore not
+# evidence of a sharded queue. Accept only after two successive scrape
+# generations cover the same ready pods, carry the same positive total on each
+# pod, and advance every pod's source-sample timestamp. The final raw and
+# timestamp() responses are still retained verbatim below.
+compactor_capture_settled() {
+  local raw=$1 times=$2 expected=$3 candidate=$4 settled=$5
+  python3 - "$raw" "$times" "$expected" "$candidate" "$settled" \
+    "$COMPACTOR_SCRAPE_INTERVAL_SECONDS" <<'PY'
+import json
+import math
+import pathlib
+import sys
+
+raw_path, times_path, expected_path, candidate_path, settled_path, interval = sys.argv[1:]
+interval = float(interval)
+
+
+def vector(path):
+    try:
+        response = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if response.get("status") != "success":
+        return []
+    data = response.get("data", {})
+    return data.get("result", []) if data.get("resultType") == "vector" else []
+
+
+expected = {line.strip() for line in open(expected_path, encoding="utf-8") if line.strip()}
+values = {}
+for row in vector(raw_path):
+    labels = row.get("metric", {})
+    pod = labels.get("pod", "").strip()
+    if not pod or labels.get("tenant") != "default":
+        continue
+    try:
+        value = float(row["value"][1])
+    except (KeyError, IndexError, TypeError, ValueError):
+        continue
+    if math.isfinite(value):
+        values[pod] = values.get(pod, 0.0) + value
+
+sample_times = {}
+for row in vector(times_path):
+    pod = row.get("metric", {}).get("pod", "").strip()
+    try:
+        stamp = float(row["value"][1])
+    except (KeyError, IndexError, TypeError, ValueError):
+        continue
+    if pod and math.isfinite(stamp):
+        sample_times[pod] = max(sample_times.get(pod, stamp), stamp)
+
+valid = (
+    len(expected) >= 2
+    and set(values) == expected
+    and set(sample_times) == expected
+    and min(values.values(), default=0.0) > 0.0
+    and len({round(value, 9) for value in values.values()}) == 1
+    and max(sample_times.values(), default=0.0) - min(sample_times.values(), default=0.0)
+        <= interval
+)
+candidate = pathlib.Path(candidate_path)
+if not valid:
+    candidate.unlink(missing_ok=True)
+    raise SystemExit(1)
+
+current = {
+    "pods": [
+        {"pod": pod, "value": values[pod], "sample_time": sample_times[pod]}
+        for pod in sorted(expected)
+    ]
+}
+try:
+    previous = json.loads(candidate.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    previous = None
+if previous:
+    old = {row["pod"]: row for row in previous.get("pods", [])}
+    new = {row["pod"]: row for row in current["pods"]}
+    if (
+        set(old) == set(new)
+        and all(math.isclose(old[p]["value"], new[p]["value"], rel_tol=1e-9) for p in new)
+        and all(new[p]["sample_time"] > old[p]["sample_time"] for p in new)
+    ):
+        pathlib.Path(settled_path).write_text(
+            json.dumps([previous, current], indent=2) + "\n", encoding="utf-8"
+        )
+        raise SystemExit(0)
+candidate.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+raise SystemExit(1)
+PY
+}
+
+capture_compactor_pod_labels() {
+  local next=$1 deadline at pods=() rc=0 settled=0
+  local candidate="$TMP_DIR/compactor-settling-candidate.json"
+  local settling="$TMP_DIR/compactor-settling.json"
+  mkdir -p "$RESULTS_DIR"
+
+  # This Helm upgrade is the live installability check the card asks for. It
+  # uses the round's existing mirror + catalog claim, changes no HPA guard, and
+  # runs after the ordinary evidence. The large/old batch gate keeps the queue
+  # still long enough for two independently scraped gauges to converge.
+  log "install ${COMPACTOR_SCALE_TARGET} catalog-claim compactors for the shared-queue capture"
+  if ! helm --kube-context "$KUBE_CONTEXT" upgrade "$RELEASE" \
+    "$ROOT/deploy/helm/siglake" --namespace "$NAMESPACE" --reuse-values \
+    --set compactor.replicas="$COMPACTOR_SCALE_TARGET" \
+    --set compactor.commitBatch.targetMb="$COMPACTOR_CAPTURE_BATCH_TARGET_MB" \
+    --set compactor.commitBatch.maxAgeSecs="$COMPACTOR_CAPTURE_BATCH_MAX_AGE_SECONDS" \
+    --wait --timeout 10m; then
+    compactor_pod_label_failure "the chart did not install a two-compactor catalog-claim tier"
+    return 1
+  fi
+
+  deadline=$((SECONDS + COMPACTOR_POD_LABEL_GRACE_SECONDS))
+  while ((SECONDS < deadline)); do
+    mapfile -t pods < <(ready_compactor_pods)
+    ((${#pods[@]} < COMPACTOR_SCALE_TARGET)) || break
+    sleep 5
+  done
+  mapfile -t pods < <(ready_compactor_pods)
+  printf 'COMPACTOR_POD_LABEL_PODS count=%s pods=%s\n' "${#pods[@]}" "${pods[*]:-none}"
+  if ((${#pods[@]} != COMPACTOR_SCALE_TARGET)); then
+    compactor_pod_label_failure "found ${#pods[@]} ready compactor pods, expected ${COMPACTOR_SCALE_TARGET}"
+    return 1
+  fi
+  printf '%s\n' "${pods[@]}" >"$TMP_DIR/compactor-expected-pods"
+
+  log "drive sealed-WAL load for ${COMPACTOR_POD_LABEL_LOAD_SECONDS}s"
+  local traffic_deadline=$((SECONDS + COMPACTOR_POD_LABEL_LOAD_SECONDS))
+  while ((SECONDS < traffic_deadline)); do
+    ingest_events "$next" "$COMPACTOR_POD_LABEL_BATCH" || true
+    next=$((next + COMPACTOR_POD_LABEL_BATCH))
+    sleep 1
+  done
+
+  # Poll Prometheus, not the pods directly: this is the label and arithmetic
+  # path the operator consumes. timestamp(metric) retains the source scrape
+  # time behind each gauge rather than the query evaluation time.
+  while ((SECONDS < deadline)); do
+    at="$(date -u +%s)"
+    prometheus_capture "$(compactor_raw_expression)" "$at" "$COMPACTOR_RAW_JSON" || true
+    prometheus_capture "$(compactor_sample_times_expression)" "$at" \
+      "$COMPACTOR_SAMPLE_TIMES_JSON" || true
+    if compactor_capture_settled "$COMPACTOR_RAW_JSON" "$COMPACTOR_SAMPLE_TIMES_JSON" \
+      "$TMP_DIR/compactor-expected-pods" "$candidate" "$settling"; then
+      settled=1
+      break
+    fi
+    sleep 2
+  done
+  if ((settled == 0)); then
+    compactor_pod_label_failure "the two compactor gauges did not converge across two scrape generations"
+  fi
+
+  at="${at:-$(date -u +%s)}"
+  prometheus_capture "$(compactor_per_pod_expression)" "$at" "$COMPACTOR_PER_POD_JSON" ||
+    compactor_pod_label_failure "the grouped compactor query failed"
+  prometheus_capture "$(compactor_operator_expression)" "$at" "$COMPACTOR_EXPRESSION_JSON" ||
+    compactor_pod_label_failure "the operator compactor expression failed"
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get pods \
+    -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=compactor" \
+    --sort-by=.metadata.name -o json >"$TMP_DIR/compactor-pods.json" 2>/dev/null || true
+
+  python3 - "$TMP_DIR/compactor-capture.json" "$at" "$NAMESPACE" "$RELEASE" \
+    "$(iso_now)" "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)" \
+    "$TMP_DIR/compactor-pods.json" "$TMP_DIR/compactor-expected-pods" "$settling" \
+    "$COMPACTOR_SCALE_TARGET" "$COMPACTOR_POD_LABEL_LOAD_SECONDS" \
+    "$COMPACTOR_INTERVAL_SECONDS" "$COMPACTOR_SCRAPE_INTERVAL_SECONDS" \
+    "$COMPACTOR_CAPTURE_BATCH_TARGET_MB" "$COMPACTOR_CAPTURE_BATCH_MAX_AGE_SECONDS" \
+    "$(compactor_raw_expression)" "$COMPACTOR_RAW_JSON" \
+    "$(compactor_sample_times_expression)" "$COMPACTOR_SAMPLE_TIMES_JSON" \
+    "$(compactor_per_pod_expression)" "$COMPACTOR_PER_POD_JSON" \
+    "$(compactor_operator_expression)" "$COMPACTOR_EXPRESSION_JSON" <<'PY' || rc=$?
+import json
+import sys
+
+(
+    out_path, at, namespace, release, generated_at, commit, pods_path, expected_path,
+    settling_path, target, load_seconds, compactor_interval, scrape_interval,
+    batch_target, batch_max_age, raw_expression, raw_path, times_expression,
+    times_path, per_pod_expression, per_pod_path, operator_expression, operator_path,
+) = sys.argv[1:]
+
+
+def response(path):
+    try:
+        return json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"status": "error", "data": {"resultType": "vector", "result": []}}
+
+
+try:
+    items = json.load(open(pods_path, encoding="utf-8")).get("items", [])
+except (OSError, ValueError):
+    items = []
+revisions = []
+for item in items:
+    for container in item.get("status", {}).get("containerStatuses", []):
+        revisions.append({
+            "pod": item["metadata"]["name"],
+            "container": container.get("name"),
+            "image": container.get("image"),
+            "image_id": container.get("imageID"),
+        })
+expected = [line.strip() for line in open(expected_path, encoding="utf-8") if line.strip()]
+try:
+    settling = json.load(open(settling_path, encoding="utf-8"))
+except (OSError, ValueError):
+    settling = []
+document = {
+    "schema_version": 1,
+    "generated_at": generated_at,
+    "evaluated_at": int(at),
+    "revisions": {"repository_commit": commit, "compactor_pods": revisions},
+    "settings": {
+        "namespace": namespace,
+        "release": release,
+        "scale_path": "helm_upgrade_reuse_values",
+        "compactor_replicas": int(target),
+        "load_seconds": int(load_seconds),
+        "compactor_interval_seconds": int(compactor_interval),
+        "scrape_interval_seconds": int(scrape_interval),
+        "commit_batch_target_mb": int(batch_target),
+        "commit_batch_max_age_seconds": int(batch_max_age),
+    },
+    "expected_pods": expected,
+    "settling_samples": settling,
+    "queries": {
+        "raw": {"expression": raw_expression, "time": int(at), "response": response(raw_path)},
+        "sample_times": {
+            "expression": times_expression, "time": int(at), "response": response(times_path),
+        },
+        "per_pod": {
+            "expression": per_pod_expression, "time": int(at), "response": response(per_pod_path),
+        },
+        "operator_expression": {
+            "expression": operator_expression, "time": int(at), "response": response(operator_path),
+        },
+    },
+}
+json.dump(document, open(out_path, "w", encoding="utf-8"), indent=2)
+open(out_path, "a", encoding="utf-8").write("\n")
+PY
+  if ((rc != 0)); then
+    compactor_pod_label_failure "could not assemble the compactor capture document"
+  elif ! python3 "$ROOT/scripts/grade-kind-compactor-pod-labels.py" \
+    "$TMP_DIR/compactor-capture.json" --output "$COMPACTOR_POD_LABEL_JSON"; then
+    compactor_pod_label_failure "the capture did not grade verified; see ${COMPACTOR_POD_LABEL_JSON#"$ROOT/"}"
+  fi
+  ((COMPACTOR_POD_LABEL_FAILURE == 0))
+}
+
+# --- #4953: filesystem-drain mirror-reclamation qualification ---------------
+MIRROR_RECLAIM_MC_POD=siglake-mirror-reclaim-mc
+MIRROR_RECLAIM_SAMPLE_OBJECTS=0
+MIRROR_RECLAIM_SAMPLE_BYTES=0
+MIRROR_RECLAIM_SAMPLE_LEDGER=0
+MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED=0
+MIRROR_RECLAIM_BASE_ROWS_COMMITTED=0
+MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH=0
+MIRROR_RECLAIM_LAST_SAMPLE_EPOCH=0
+MIRROR_RECLAIM_LOAD_STARTED_EPOCH=0
+MIRROR_RECLAIM_LOAD_FINISHED_EPOCH=0
+
+write_mirror_reclaim_launch() {
+  [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
+  mkdir -p "$MIRROR_RECLAIM_RESULTS_DIR"
+  python3 - "$MIRROR_RECLAIM_LAUNCH_JSON" "$MIRROR_RECLAIM_ARM" \
+    "$CATALOG_CLAIM_ENABLED" "$WAL_MIRROR_ENABLED" \
+    "$WAL_MIRROR_ACTIVE_INTERVAL_SECS" "$COMMITTED_RETENTION_SECS" \
+    "$MIRROR_LEDGER_RECLAIM" "$LOAD_SECONDS" "$MIRROR_RECLAIM_RESULTS_DIR" \
+    "$(git -C "$ROOT" rev-parse HEAD)" "$@" <<'PY'
+import json
+import sys
+
+(
+    path, arm, catalog_claim, mirror, active_interval, retention, reclaim,
+    load_seconds, results_dir, commit, *helm_args,
+) = sys.argv[1:]
+document = {
+    "schema": "siglake.kind.mirror_reclaim_launch.v1",
+    "arm": arm,
+    "source_commit": commit,
+    "results_directory": results_dir,
+    "inputs": {
+        "KIND_ROUND_MIRROR_RECLAIM_ARM": arm,
+        "KIND_ROUND_CATALOG_CLAIM_ENABLED": catalog_claim,
+        "KIND_ROUND_WAL_MIRROR_ENABLED": mirror,
+        "KIND_ROUND_WAL_MIRROR_ACTIVE_INTERVAL_SECS": int(active_interval),
+        "KIND_ROUND_COMMITTED_RETENTION_SECS": int(retention),
+        "KIND_ROUND_MIRROR_LEDGER_RECLAIM": reclaim,
+        "KIND_ROUND_LOAD_SECONDS": int(load_seconds),
+    },
+    "helm_command": [
+        "helm", "--kube-context", "<kind-context>", "upgrade", "--install",
+        "siglake", "deploy/helm/siglake", *helm_args,
+    ],
+}
+with open(path, "w", encoding="utf-8") as out:
+    json.dump(document, out, indent=2)
+    out.write("\n")
+PY
+}
+
+capture_mirror_reclaim_effective_config() {
+  [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
+  local helm_json="$TMP_DIR/mirror-reclaim-helm-values.json"
+  local ingester_json="$TMP_DIR/mirror-reclaim-ingester.json"
+  local compactor_json="$TMP_DIR/mirror-reclaim-compactor.json"
+  helm --kube-context "$KUBE_CONTEXT" get values siglake -n "$NAMESPACE" --all -o json \
+    >"$helm_json"
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get deployment siglake-ingester -o json \
+    >"$ingester_json"
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get deployment siglake-compactor -o json \
+    >"$compactor_json"
+  python3 - "$MIRROR_RECLAIM_CONFIG_JSON" "$MIRROR_RECLAIM_ARM" \
+    "$helm_json" "$ingester_json" "$compactor_json" <<'PY'
+import json
+import sys
+
+out_path, arm, helm_path, ingester_path, compactor_path = sys.argv[1:]
+values = json.load(open(helm_path, encoding="utf-8"))
+ingester = json.load(open(ingester_path, encoding="utf-8"))
+compactor = json.load(open(compactor_path, encoding="utf-8"))
+
+
+def container(deployment, name):
+    matches = [item for item in deployment["spec"]["template"]["spec"]["containers"]
+               if item["name"] == name]
+    if len(matches) != 1:
+        raise SystemExit(f"expected one {name} container, found {len(matches)}")
+    return matches[0]
+
+
+def env_map(item):
+    return {entry["name"]: entry.get("value") for entry in item.get("env", [])
+            if "value" in entry}
+
+
+ingester_container = container(ingester, "ingester")
+compactor_container = container(compactor, "compactor")
+ingester_env = env_map(ingester_container)
+compactor_env = env_map(compactor_container)
+selected = {
+    "compactor.catalogClaim.enabled": values["compactor"]["catalogClaim"]["enabled"],
+    "compactor.committedRetentionSecs": values["compactor"]["committedRetentionSecs"],
+    "compactor.mirrorLedgerReclaim": values["compactor"]["mirrorLedgerReclaim"],
+    "wal.mirror.enabled": values["wal"]["mirror"]["enabled"],
+    "wal.mirror.activeIntervalSecs": values["wal"]["mirror"]["activeIntervalSecs"],
+}
+expected = {
+    "compactor.catalogClaim.enabled": False,
+    "compactor.committedRetentionSecs": 901,
+    "compactor.mirrorLedgerReclaim": arm == "on",
+    "wal.mirror.enabled": True,
+    "wal.mirror.activeIntervalSecs": 0,
+}
+if selected != expected:
+    raise SystemExit(f"effective Helm values differ: expected={expected!r} got={selected!r}")
+if "--catalog-claim" in compactor_container.get("args", []):
+    raise SystemExit("filesystem-drain arm rendered --catalog-claim")
+if ingester_env.get("SIGLAKE_WAL_MIRROR_PREFIX") != values["wal"]["mirror"]["prefix"]:
+    raise SystemExit("ingester did not render the enabled WAL mirror prefix")
+if ingester_env.get("SIGLAKE_REMOTE_WAL_DRAIN") != "0":
+    raise SystemExit("ingester did not render the filesystem-drain arm")
+if "SIGLAKE_WAL_ACTIVE_MIRROR_INTERVAL_SECS" in ingester_env:
+    raise SystemExit("activeIntervalSecs=0 rendered an active-mirror interval")
+if compactor_env.get("SIGLAKE_COMMITTED_RETENTION_SECS") != "901":
+    raise SystemExit("compactor did not render committedRetentionSecs=901")
+if compactor_env.get("SIGLAKE_MIRROR_LEDGER_RECLAIM") != ("1" if arm == "on" else "0"):
+    raise SystemExit("compactor did not render the selected ledger-reclaim arm")
+
+document = {
+    "schema": "siglake.kind.mirror_reclaim_effective_config.v1",
+    "arm": arm,
+    "helm_values": selected,
+    "deployed": {
+        "ingester": {
+            "deployment_uid": ingester["metadata"]["uid"],
+            "wal_mirror_prefix": ingester_env["SIGLAKE_WAL_MIRROR_PREFIX"],
+            "remote_wal_drain": ingester_env["SIGLAKE_REMOTE_WAL_DRAIN"],
+            "active_mirror_interval_env": ingester_env.get(
+                "SIGLAKE_WAL_ACTIVE_MIRROR_INTERVAL_SECS"
+            ),
+        },
+        "compactor": {
+            "deployment_uid": compactor["metadata"]["uid"],
+            "args": compactor_container.get("args", []),
+            "committed_retention_secs": int(
+                compactor_env["SIGLAKE_COMMITTED_RETENTION_SECS"]
+            ),
+            "mirror_ledger_reclaim": compactor_env["SIGLAKE_MIRROR_LEDGER_RECLAIM"],
+        },
+    },
+}
+with open(out_path, "w", encoding="utf-8") as out:
+    json.dump(document, out, indent=2)
+    out.write("\n")
+PY
+}
+
+start_mirror_reclaim_observer() {
+  [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" run "$MIRROR_RECLAIM_MC_POD" \
+    --image=quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z \
+    --restart=Never --command -- sleep 7200 >/dev/null
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" wait \
+    --for=condition=Ready "pod/$MIRROR_RECLAIM_MC_POD" --timeout=120s >/dev/null
+  : >"$MIRROR_RECLAIM_SERIES_JSONL"
+}
+
+capture_mirror_reclaim_sample() {
+  [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
+  local now_epoch metrics_file objects_file ledger_file pod pod_uid restart_count
+  now_epoch=$(date +%s)
+  metrics_file="$TMP_DIR/mirror-reclaim-compactor.metrics"
+  objects_file="$TMP_DIR/mirror-reclaim-objects.jsonl"
+  ledger_file="$TMP_DIR/mirror-reclaim-ledger.tsv"
+  pod="$(kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get pod \
+    -l 'app.kubernetes.io/instance=siglake,app.kubernetes.io/component=compactor' \
+    --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')"
+  [[ -n "$pod" ]] || die "no compactor pod found for mirror-reclaim sample"
+  pod_uid="$(kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get pod "$pod" \
+    -o jsonpath='{.metadata.uid}')"
+  restart_count="$(kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get pod "$pod" \
+    -o jsonpath='{.status.containerStatuses[?(@.name=="compactor")].restartCount}')"
+  start_query_pod_forward "$pod" 19102 9101 mirror-reclaim
+  curl -fsS http://127.0.0.1:19102/metrics >"$metrics_file"
+  stop_active_forward
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" exec "$MIRROR_RECLAIM_MC_POD" -- \
+    sh -c 'mc alias set local http://minio:9000 minioadmin minioadmin --quiet && mc ls --recursive --json local/siglake-warehouse/warehouse/wal-mirror/' \
+    >"$objects_file"
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" exec postgres-0 -- \
+    psql -U siglake -d siglake -At -F $'\t' -c \
+    "SELECT status, count(*), coalesce(sum(rows), 0) FROM wal_segments WHERE tenant = 'default' AND index_id = '' GROUP BY status ORDER BY status" \
+    >"$ledger_file"
+  IFS=$'\t' read -r MIRROR_RECLAIM_SAMPLE_OBJECTS MIRROR_RECLAIM_SAMPLE_BYTES \
+    MIRROR_RECLAIM_SAMPLE_LEDGER MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED < <(
+    python3 - "$MIRROR_RECLAIM_SERIES_JSONL" "$MIRROR_RECLAIM_ARM" \
+      "$now_epoch" "$MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH" "$objects_file" \
+      "$ledger_file" "$metrics_file" "$pod" "$pod_uid" "$restart_count" <<'PY'
+import datetime
+import json
+import re
+import sys
+
+(
+    out_path, arm, epoch, first_epoch, objects_path, ledger_path, metrics_path,
+    pod, pod_uid, restart_count,
+) = sys.argv[1:]
+epoch = int(epoch)
+first_epoch = int(first_epoch) or epoch
+
+object_count = 0
+object_bytes = 0
+for raw in open(objects_path, encoding="utf-8"):
+    raw = raw.strip()
+    if not raw:
+        continue
+    item = json.loads(raw)
+    if item.get("type") == "file" or "size" in item:
+        object_count += 1
+        object_bytes += int(item.get("size", 0))
+
+ledger = {}
+ledger_rows = 0
+for raw in open(ledger_path, encoding="utf-8"):
+    status, count, rows = raw.rstrip("\n").split("\t")
+    ledger[status] = {"segments": int(count), "rows": int(rows)}
+    ledger_rows += int(count)
+
+metric_re = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([^\s]+)$")
+metrics = []
+for raw in open(metrics_path, encoding="utf-8"):
+    match = metric_re.match(raw.strip())
+    if match:
+        metrics.append(match.groups())
+
+
+def total(name, required=False, tenant=None):
+    found = []
+    for metric, labels, value in metrics:
+        if metric != name:
+            continue
+        if tenant is not None and f'tenant="{tenant}"' not in (labels or ""):
+            continue
+        found.append(float(value))
+    if required and not found:
+        raise SystemExit(f"required metric {name} is absent")
+    return sum(found)
+
+
+counters = {
+    "siglake_compactor_retention_purged_total": total(
+        "siglake_compactor_retention_purged_total"
+    ),
+    "siglake_compactor_mirror_unreclaimed_total": total(
+        "siglake_compactor_mirror_unreclaimed_total", required=True
+    ),
+    "siglake_compactor_mirror_mark_errors_total": total(
+        "siglake_compactor_mirror_mark_errors_total", required=True
+    ),
+    "siglake_compactor_rows_committed_total": total(
+        "siglake_compactor_rows_committed_total", tenant="default"
+    ),
+}
+document = {
+    "schema": "siglake.kind.mirror_reclaim_sample.v1",
+    "arm": arm,
+    "timestamp": datetime.datetime.fromtimestamp(
+        epoch, datetime.timezone.utc
+    ).isoformat().replace("+00:00", "Z"),
+    "unix_seconds": epoch,
+    "elapsed_seconds": epoch - first_epoch,
+    "mirror_prefix": {"objects": object_count, "bytes": object_bytes},
+    "wal_segments": {"scope": {"tenant": "default", "index_id": ""},
+                     "total": ledger_rows, "by_status": ledger},
+    "counters": counters,
+    "counter_process": {
+        "pod": pod, "pod_uid": pod_uid, "restart_count": int(restart_count)
+    },
+}
+with open(out_path, "a", encoding="utf-8") as out:
+    json.dump(document, out, separators=(",", ":"))
+    out.write("\n")
+print(
+    object_count, object_bytes, ledger_rows,
+    int(counters["siglake_compactor_rows_committed_total"]), sep="\t"
+)
+PY
+  )
+  if ((MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH == 0)); then
+    MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH=$now_epoch
+    MIRROR_RECLAIM_BASE_ROWS_COMMITTED=$MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED
+    cp "$metrics_file" "$MIRROR_RECLAIM_METRICS_START"
+  fi
+  MIRROR_RECLAIM_LAST_SAMPLE_EPOCH=$now_epoch
+  cp "$metrics_file" "$MIRROR_RECLAIM_METRICS_END"
+}
+
+finish_mirror_reclaim_evidence() {
+  [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
+  local sent_rows=$1 workload_rounds=$2 query_response query_rows deadline committed_rows
+  deadline=$((SECONDS + 300))
+  while ((SECONDS < deadline)); do
+    capture_mirror_reclaim_sample
+    if ((MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED - MIRROR_RECLAIM_BASE_ROWS_COMMITTED == sent_rows)); then
+      break
+    fi
+    sleep 10
+  done
+  committed_rows=$((MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED - MIRROR_RECLAIM_BASE_ROWS_COMMITTED))
+  ((committed_rows == sent_rows)) ||
+    die "mirror-reclaim row reconciliation did not drain: sent=${sent_rows} committed=${committed_rows}"
+  query_response="$(run_sql 'SELECT count(*) AS n FROM events')"
+  query_rows="$(printf '%s' "$query_response" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["rows"][0]["n"])')"
+  python3 - "$MIRROR_RECLAIM_LOAD_JSON" "$MIRROR_RECLAIM_ROWS_JSON" \
+    "$MIRROR_RECLAIM_ARM" "$MIRROR_RECLAIM_LOAD_STARTED_EPOCH" \
+    "$MIRROR_RECLAIM_LOAD_FINISHED_EPOCH" "$LOAD_SECONDS" "$workload_rounds" \
+    "$sent_rows" "$committed_rows" "$query_rows" \
+    "$MIRROR_RECLAIM_BASE_ROWS_COMMITTED" "$MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED" \
+    "$MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH" "$MIRROR_RECLAIM_LAST_SAMPLE_EPOCH" <<'PY'
+import datetime
+import json
+import sys
+
+(
+    load_path, rows_path, arm, started, finished, configured, rounds, sent,
+    committed, query_rows, counter_start, counter_end, sample_start, sample_end,
+) = sys.argv[1:]
+started, finished, configured, rounds, sent, committed, query_rows = map(
+    int, (started, finished, configured, rounds, sent, committed, query_rows)
+)
+counter_start, counter_end, sample_start, sample_end = map(
+    int, (counter_start, counter_end, sample_start, sample_end)
+)
+
+
+def stamp(epoch):
+    return datetime.datetime.fromtimestamp(
+        epoch, datetime.timezone.utc
+    ).isoformat().replace("+00:00", "Z")
+
+
+load = {
+    "schema": "siglake.kind.mirror_reclaim_load_window.v1",
+    "arm": arm,
+    "configured_seconds": configured,
+    "started_at": stamp(started),
+    "finished_at": stamp(finished),
+    "actual_seconds": finished - started,
+    "workload_rounds": rounds,
+    "sent_rows": sent,
+    "measurement_window": {
+        "started_at": stamp(sample_start), "finished_at": stamp(sample_end),
+        "seconds": sample_end - sample_start,
+    },
+}
+rows = {
+    "schema": "siglake.kind.mirror_reclaim_row_reconciliation.v1",
+    "arm": arm,
+    "sent_rows": sent,
+    "committed_rows": committed,
+    "difference": committed - sent,
+    "committed_evidence": {
+        "metric": "siglake_compactor_rows_committed_total{tenant=\"default\"}",
+        "counter_start": counter_start,
+        "counter_end": counter_end,
+        "counter_delta": counter_end - counter_start,
+        "meaning": "incremented only after a successful Iceberg commit",
+    },
+    "query_rows_after_committed_drain": query_rows,
+    "verified": committed == sent == query_rows,
+}
+if not rows["verified"]:
+    raise SystemExit(
+        f"row reconciliation differs: sent={sent} committed={committed} query={query_rows}"
+    )
+for path, document in ((load_path, load), (rows_path, rows)):
+    with open(path, "w", encoding="utf-8") as out:
+        json.dump(document, out, indent=2)
+        out.write("\n")
+PY
+  printf 'MIRROR_RECLAIM_EVIDENCE arm=%s directory=%s sent=%s committed=%s status=ok\n' \
+    "$MIRROR_RECLAIM_ARM" "${MIRROR_RECLAIM_RESULTS_DIR#"$ROOT/"}" \
+    "$sent_rows" "$committed_rows"
+}
+
 log "bring up the base kind deployment"
 KIND_CLUSTER_NAME="$CLUSTER_NAME" \
   KIND_CLUSTER_OWNERSHIP_FILE="$KIND_CLUSTER_OWNERSHIP_FILE" \
@@ -1436,16 +2244,18 @@ helm --kube-context "$KUBE_CONTEXT" upgrade --install keda kedacore/keda \
   --wait --timeout 10m
 
 log "upgrade Siglake with monitoring, mirror reconciliation and a ${QUERY_SCALE_BASE}-${QUERY_SCALE_TARGET} query KEDA range"
-helm --kube-context "$KUBE_CONTEXT" upgrade --install siglake \
-  "$ROOT/deploy/helm/siglake" \
+SIGLAKE_HELM_ARGS=(
   --namespace "$NAMESPACE" \
   --values "$ROOT/deploy/kind/values.kind.yaml" \
   --set prometheusRule.enabled=true \
   --set prometheusRule.labels.release="$PROM_RELEASE" \
   --set serviceMonitor.enabled=true \
   --set serviceMonitor.labels.release="$PROM_RELEASE" \
-  --set wal.mirror.enabled=true \
-  --set compactor.catalogClaim.enabled=true \
+  --set wal.mirror.enabled="$WAL_MIRROR_ENABLED" \
+  --set wal.mirror.activeIntervalSecs="$WAL_MIRROR_ACTIVE_INTERVAL_SECS" \
+  --set compactor.catalogClaim.enabled="$CATALOG_CLAIM_ENABLED" \
+  --set compactor.committedRetentionSecs="$COMMITTED_RETENTION_SECS" \
+  --set compactor.mirrorLedgerReclaim="$MIRROR_LEDGER_RECLAIM" \
   --set query.jobs.persistent="$PERSISTENT_JOB_STORE" \
   --set query.replicas="$QUERY_SCALE_BASE" \
   --set keda.enabled=true \
@@ -1458,16 +2268,24 @@ helm --kube-context "$KUBE_CONTEXT" upgrade --install siglake \
   --set keda.cooldownPeriodSeconds="$SCALE_COOLDOWN_SECONDS" \
   --set-string keda.prometheusServerAddress="http://${PROM_RELEASE}-prometheus.${PROM_NAMESPACE}.svc.cluster.local:9090" \
   --wait --timeout 10m
+)
+write_mirror_reclaim_launch "${SIGLAKE_HELM_ARGS[@]}"
+helm --kube-context "$KUBE_CONTEXT" upgrade --install siglake \
+  "$ROOT/deploy/helm/siglake" "${SIGLAKE_HELM_ARGS[@]}"
 
 kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" rollout status deployment/siglake-ingester --timeout=180s
 kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" rollout status deployment/siglake-compactor --timeout=180s
 kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" rollout status statefulset/siglake-query --timeout=180s
 
+capture_mirror_reclaim_effective_config
+start_mirror_reclaim_observer
+
 log "scrape pre-registered alerted counters before load"
 scrape_preregistered_zeros ingester 9100 19100
 scrape_preregistered_zeros compactor 9101 19101
+capture_mirror_reclaim_sample
 
-log "ingest ${LOAD_EVENTS} events with >4096 distinct hosts"
+log "$(initial_load_description)"
 for ((offset = 0; offset < LOAD_EVENTS; offset += LOAD_BATCH)); do
   count=$LOAD_BATCH
   ((offset + count <= LOAD_EVENTS)) || count=$((LOAD_EVENTS - offset))
@@ -1576,6 +2394,10 @@ mapfile -t WORKLOADS <"$TMP_DIR/workloads.tsv"
 init_scale_evidence
 started=$SECONDS
 deadline=$((SECONDS + LOAD_SECONDS))
+if [[ -n "$MIRROR_RECLAIM_ARM" ]]; then
+  MIRROR_RECLAIM_LOAD_STARTED_EPOCH=$(date +%s)
+  MIRROR_RECLAIM_NEXT_SAMPLE_EPOCH=$((MIRROR_RECLAIM_LOAD_STARTED_EPOCH + MIRROR_RECLAIM_SAMPLE_SECONDS))
+fi
 # The window runs on past LOAD_SECONDS only while the scale step still has a
 # transition outstanding, and never past this.
 SCALE_HARD_DEADLINE=$((deadline + SCALE_GRACE_SECONDS))
@@ -1598,12 +2420,21 @@ while ((SECONDS < deadline)) || [[ "$SCALE_PHASE" != done ]]; do
   run_sql 'SELECT raw, count(*) AS n FROM events GROUP BY raw ORDER BY n DESC LIMIT 10' >/dev/null
   rounds=$((rounds + 1))
   advance_query_scale
+  if [[ -n "$MIRROR_RECLAIM_ARM" ]] &&
+      (( $(date +%s) >= MIRROR_RECLAIM_NEXT_SAMPLE_EPOCH )); then
+    capture_mirror_reclaim_sample
+    MIRROR_RECLAIM_NEXT_SAMPLE_EPOCH=$((MIRROR_RECLAIM_LAST_SAMPLE_EPOCH + MIRROR_RECLAIM_SAMPLE_SECONDS))
+  fi
   sleep 1
 done
+if [[ -n "$MIRROR_RECLAIM_ARM" ]]; then
+  MIRROR_RECLAIM_LOAD_FINISHED_EPOCH=$(date +%s)
+fi
 printf 'WORKLOADS shapes=%s rounds=%s duration_seconds=%s elapsed_seconds=%s status=ok\n' \
   "${#WORKLOADS[@]}" "$rounds" "$LOAD_SECONDS" "$((SECONDS - started))"
 write_scale_evidence ||
   scale_failure "the scale evidence did not hold; see ${SCALE_JSON#"$ROOT/"}"
+finish_mirror_reclaim_evidence "$next_event" "$rounds"
 
 log "port-forward Prometheus and wait for its API"
 kubectl --context "$KUBE_CONTEXT" -n "$PROM_NAMESPACE" port-forward \
@@ -1633,8 +2464,10 @@ fi
 # constants at the top give: this is the one step that changes a tier's replica
 # count outside the query-scaling window, so nothing the round already measured
 # can have been taken across it.
-log "capture the ingester tier's per-pod request series"
-capture_ingester_pod_labels "$next_event" || true
+if [[ "$INGESTER_POD_LABEL_CAPTURE" == 1 ]]; then
+  log "run the opt-in ingester per-pod request-series capture"
+  capture_ingester_pod_labels "$next_event" || true
+fi
 
 log "dashboard panel evidence"
 printf 'PANEL_TABLE_BEGIN\n'
@@ -1707,8 +2540,17 @@ if [[ "$SCHEMA_ROLLBACK_PROBE" == 1 ]]; then
     "$ROOT/scripts/kind-schema-rollback-probe.sh"
 fi
 
+# Last because the capture deliberately raises the compactor replica floor and
+# commit-batch hold. Nothing from the ordinary round is measured across that
+# temporary evidence-only configuration, and teardown follows its verdict.
+if [[ "$COMPACTOR_POD_LABEL_CAPTURE" == 1 ]]; then
+  log "run the opt-in compactor shared-queue per-pod capture"
+  capture_compactor_pod_labels "$next_event" || true
+fi
+
 [[ "$PANEL_FAILURES" -eq 0 ]] || die "one or more required panel/trigger queries returned zero series"
 [[ "$SCALE_FAILURES" -eq 0 ]] || die "the ${QUERY_SCALE_BASE} -> ${QUERY_SCALE_TARGET} -> ${QUERY_SCALE_BASE} query scaling step failed; see the SCALE_FAILURE lines and ${SCALE_JSON#"$ROOT/"}"
 [[ "$POSTGRES_OUTAGE_FAILURE" -eq 0 ]] || die "the requested Postgres outage probe failed with exit status ${POSTGRES_OUTAGE_FAILURE}; see POSTGRES_OUTAGE_EVIDENCE and POSTGRES_OUTAGE_PROBE above"
 [[ "$INGESTER_POD_LABEL_FAILURE" -eq 0 ]] || die "the ingester per-pod label capture failed; see the INGESTER_POD_LABEL_FAILURE lines and ${INGESTER_POD_LABEL_JSON#"$ROOT/"}"
+[[ "$COMPACTOR_POD_LABEL_FAILURE" -eq 0 ]] || die "the compactor shared-queue capture failed; see the COMPACTOR_POD_LABEL_FAILURE lines and ${COMPACTOR_POD_LABEL_JSON#"$ROOT/"}"
 log "kind evidence round passed"

@@ -41,7 +41,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -126,7 +126,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -171,7 +171,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -214,7 +214,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -269,7 +269,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -302,7 +302,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -341,7 +341,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -387,7 +387,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -420,6 +420,11 @@ paths:
       responses:
         '200':
           description: The index configuration.
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Strong validator for this table incarnation's full index configuration.
           content:
             application/json:
               schema:
@@ -431,7 +436,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -464,6 +469,14 @@ paths:
         required: true
         schema:
           type: string
+      - name: If-Match
+        in: header
+        description: Optional RFC 9110 strong entity-tag condition. `*` matches any existing index.
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
       requestBody:
         content:
           application/json:
@@ -473,6 +486,11 @@ paths:
       responses:
         '200':
           description: Updated. Body is the stored configuration.
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Strong validator for the returned configuration.
           content:
             application/json:
               schema:
@@ -490,7 +508,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -501,6 +519,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
+        '412':
+          description: The supplied If-Match condition is false. `current` and ETag come from the exact rejecting commit base; another writer may replace them before this response arrives.
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Strong validator matching `current`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManagedIndexPreconditionErrorBody'
         '500':
           description: Internal error.
           content:
@@ -533,7 +562,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -580,7 +609,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -668,7 +697,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -810,7 +839,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -898,7 +927,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -992,7 +1021,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -1067,7 +1096,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -1140,7 +1169,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -1222,7 +1251,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -1311,7 +1340,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -1397,7 +1426,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -1455,7 +1484,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -1544,7 +1573,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
@@ -1605,7 +1634,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorBody'
         '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars). Answered by the auth middleware, so it can reach every operation behind it — including this one, which reads no tenant data.
+          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it — including this one, which reads no tenant data.
           content:
             application/json:
               schema:
@@ -2131,6 +2160,54 @@ components:
 
         The `type` field selects one of seven mapping shapes. `tokenizer` is valid
         only for `text`, and every shape rejects unknown fields.
+    FileAttribution:
+      type: object
+      description: Bounded file-task membership and decoded-cache outcomes for one request.
+      required:
+      - files
+      - files_omitted
+      - identity_complete
+      properties:
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileAttributionEntry'
+        files_omitted:
+          type: integer
+          format: int64
+          minimum: 0
+        identity_complete:
+          type: boolean
+    FileAttributionEntry:
+      type: object
+      description: One table-relative Iceberg file task retained in the attribution block.
+      required:
+      - table
+      - object_key
+      - start
+      - length
+      - cache_candidate
+      - reader_opened
+      - cache_hit
+      properties:
+        cache_candidate:
+          type: boolean
+        cache_hit:
+          type: boolean
+        length:
+          type: integer
+          format: int64
+          minimum: 0
+        object_key:
+          type: string
+        reader_opened:
+          type: boolean
+        start:
+          type: integer
+          format: int64
+          minimum: 0
+        table:
+          type: string
     HealthResponse:
       type: object
       description: '`GET /healthz` response body.'
@@ -2359,6 +2436,25 @@ components:
       - failed
       - cancelled
       - timeout
+    ManagedIndexPreconditionErrorBody:
+      type: object
+      description: A failed managed-index `If-Match` condition.
+      required:
+      - error
+      - code
+      - current
+      properties:
+        code:
+          type: integer
+          format: int32
+          description: Always 412.
+          minimum: 0
+        current:
+          $ref: '#/components/schemas/IndexConfig'
+          description: Configuration from the exact commit base that rejected the condition.
+        error:
+          type: string
+          description: Human-readable failure description.
     MappingMode:
       type: string
       description: Behavior for attributes that are not declared in `field_mappings`.
@@ -2627,6 +2723,14 @@ components:
           type: integer
           format: int64
           minimum: 0
+        file_attribution:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/FileAttribution'
+            description: |-
+              Bounded file-task membership for geometry joins. Keys are relative to
+              the Iceberg table location; omissions are explicit and make
+              `identity_complete` false.
         file_cache_bypasses:
           type: integer
           format: int64

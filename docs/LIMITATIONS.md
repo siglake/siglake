@@ -7,6 +7,18 @@ moved here from the README on 2026-09-15; the docs site's
 user-facing summary of the same list. The mechanisms named below are described
 in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
+- **The persistent ingest lane cap has no timed reclamation.** Once
+  `ingester.maxLanes` admits a `(tenant, index)` lane, an empty queue does not
+  release its slot; only process shutdown drains the map. A novel key past the
+  cap receives HTTP `503` or gRPC `Unavailable` from its own typed outcome,
+  without `Retry-After`, plain gRPC `retry-after` metadata or `RetryInfo`.
+  Existing lanes keep accepting, and genuine WAL writer failures remain
+  `500` / `Internal`. Recovery requires different routing or operator action;
+  a client can spend its bounded retry budget against the same refusing pod and
+  still lose the batch. The qualification covers the exporter version pinned
+  in this tree, not every collector, SDK or agent. Its evidence and recovery
+  paths are in
+  [`DESIGN_ingest_lane_cap_response_qualification.md`](DESIGN_ingest_lane_cap_response_qualification.md).
 - **The implicit newest-first ordering only knows the column name
   `timestamp`.** An index whose doc mapping names some other
   `timestamp_field` browses in file order unless the query writes its own
@@ -16,6 +28,27 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   is something else would stamp an order that is not a time order, and the
   safe half (the shipped templates and every bulk-created index, all of which
   declare `timestamp`) covers what users actually have.
+- **Aliasing another projected column to `timestamp` opts out of implicit
+  newest-first ordering.** `SELECT raw AS timestamp FROM events LIMIT 100`
+  browses in file order. Injecting a bare `ORDER BY timestamp` would bind to
+  the output alias and select a different top-N; qualifying the source as
+  `events.timestamp` is rejected as ambiguous by DataFusion 53.1.0. The
+  newest crates.io release checked on 2026-09-20, DataFusion 55.1.0, retains
+  the same qualified/unqualified collision in `DFSchema::check_names`, though
+  PostgreSQL resolves this shape to the source column. Siglake therefore keeps
+  the conservative refusal. An automatic derived-table rewrite would also
+  lose the ordered-scan, clipped-scan, managed-index and distributed ordered
+  merge classifications, all of which require the table or sort at the query
+  root. Use a different output alias to retain the implicit order, or write a
+  derived table with an explicit inner `ORDER BY timestamp DESC` when the
+  output must be named `timestamp`.
+- **A managed-index ETag is an optimistic validator, not a lock.** A failed
+  `If-Match` returns `current` and the ETag derived from the exact commit base
+  that rejected the update, but another writer can replace that mapping before
+  the response arrives. A client that rebases onto the returned config can
+  therefore receive another `412` and must repeat the merge. The validator is
+  deliberately mapping-specific: data appends and maintenance commits do not
+  change it, while deleting and recreating the index does.
 - **A pod at the 4Gi floor caches no text indexes by default.** Both caches now
   derive from the pod's memory limit and are subtracted from the query pool, so
   they are inside the budget rather than beside it — and what they get is what
@@ -27,6 +60,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   visible rather than inferred: every acquisition is a `miss` on
   `siglake_iceberg_parsed_index_cache_lookups_total` with no eviction beside it,
   which is the shape the "Text-index startup" panels were added for (#3969).
+  With a zero blob budget the blob cache is off as well, and the floor pod says
+  so the same way: one `siglake_iceberg_puffin_blob_fetches_total` per
+  acquisition, and `siglake_iceberg_puffin_blob_cache_lookups_total` flat at the
+  zero it was pre-registered at, since a disabled cache is never consulted
+  (#4718).
   The caps that bind above 16Gi were chosen as policy; the parsed one has since
   been timed against a budget eight times its size and kept at 1 GiB on that
   evidence (#4102, below). The working set beneath them has been sized too, and
@@ -55,61 +93,113 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   override as a sizing option for a deployment that has both the query shape
   and the memory to spare; the derivation, its 1 GiB cap and the packaged 4Gi
   limit stay as they are.
-  The reader can now read a segmented sidecar in part (#4561,
+  The reader can now read a seg2 sidecar in part (#4561,
   `SIGLAKE_SEGMENTED_INDEX_READS`), which holds a directory instead of a
   parsed index, and holds it between queries under a
   byte budget of its own (#5006,
-  `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`) — but nothing writes
-  one, so neither budget above changes, and with the prototype off nothing is
-  retained under the new one either. That format has now been measured through
-  the query path against both the scan and the shipped sidecar at these
-  budgets and again with both of them off (#4562): the rare unclipped shapes go
+  `SIGLAKE_SEGMENTED_INDEX_DIRECTORY_CACHE_MAX_BYTES`). The seg1 prototype was
+  measured through the query path against both the scan and the shipped
+  sidecar at these budgets and again with both of them off (#4562): the rare
+  unclipped shapes go
   from 7.3-22.4x slower than a scan to 11.5-17.4x faster, with 15.95 MiB of
   resident directory for the same fourteen files and no eviction, and the
   result does not move when the two budgets above are zero, because that path
   uses neither. The readable seg1 prototype costs 5.59x the v1 sidecar's bytes
   on disk. The separate seg2 codec (#4988) closes that format cost with
   independently addressable Zstd blocks (16.7 MiB on the 7.34M-row fixture)
-  and a CRC per block's posting span, but production discovery still names
-  seg1 and no merge writer emits either format. A seg2 production writer and
-  discovery adoption remain part of #4377. Whether the
+  and a CRC per block's posting span. A streaming re-cluster now builds seg2
+  one Parquet row group at a time and registers its Puffin statistics file in
+  the rewrite transaction (#4377), but only when
+  `SIGLAKE_SEGMENTED_INDEX_WRITES=1`; production discovery recognizes seg2 and
+  preserves whole-file v1 reads, behind the separate
+  `SIGLAKE_SEGMENTED_INDEX_READS=1` opt-in. Seg1 discovery was retired before
+  0.2.0 because no released reader promised it and no production writer emitted
+  it; its decode-only codec fixture remains, while registered seg1 metadata is
+  ignored and does not suppress a v1 rebuild. The writer-produced 14 × 7.34M
+  rerun kept both rare scans faster than the scan (0.14x and 0.06x), with
+  27,883,741 bytes holding all fourteen directories and 17.58 MiB of statistics
+  per file; the historical seg1 columns remain in the design record. The
+  clipped policy now reads point-term document frequency from dictionary
+  blocks before fetching postings and admits a file when summed df is no
+  larger than the query's clip (#5040). On the same retained fixture,
+  `rare_keyword` moved from the 545.9 ms scan fallback to 56.6 ms p50, while
+  the four ordinary clipped shapes declined and measured 0.67-1.10x their scan
+  controls. Substring sweeps still decline without reading the dictionary.
+  Both defaults stay off until AWS qualification. The writer's local
+  build-cost acceptance is recorded now: on 14 x 7.34M rows, seg2 averaged
+  282.77 seconds of rewrite time and 251.4 MiB peak tracked heap, 12.0% faster
+  and 80.8% smaller than the post-commit v1 rebuild it replaces (#5234). The
+  same-snapshot registration and concurrent-commit sequence boundaries are
+  closed (#5228 for a registration that follows the first, #5298 for two
+  concurrent registrants — the check is re-made inside the registration's own
+  transaction action against the base of every attempt, so a refresh or a lost
+  CAS cannot turn it into a replacement; #5260 for the sequence metadata). With
+  the write opt-in and
+  `SIGLAKE_INDEX_REBUILD=1` both on, a file whose sidecar the writer refuses
+  stays unindexed until a later rewrite or a CLI rebuild at a later snapshot:
+  Iceberg permits one statistics file per snapshot, so Siglake
+  preserves the rewrite's registered seg2 blobs and counts the deferred v1
+  registration instead of replacing them
+  ([`DESIGN_segmented_inverted_index.md`](DESIGN_segmented_inverted_index.md),
+  "Registration beside the refusals"). The exact scan is the fallback for those
+  files, and reusing the deferred caller's own work at a later snapshot has been
+  qualified rather than built: the retained payload is 637-2,092 bytes, the
+  reuse moves no blob bytes and recovers coverage without a second Parquet
+  decode, but one attempt recovers nothing unless a data commit landed between
+  the caller's load and its deferral, so the fallback stays the contract
+  ([`DESIGN_inverted_index.md`](DESIGN_inverted_index.md), "Deferred
+  registration: reuse at a later snapshot", #5319). Whether the
   serialized copy earns its share at all is a separate open question: since a
   warm query reads only the parsed form, the blob is worth its bytes exactly
   when a refetch from the object store costs more than holding them, which no
   measurement against a real store has settled. Both are kept for now.
-- **A v1 inverted-index blob in a Parquet footer has no checksum; the Puffin
-  sidecar's Zstd frame has one.** #4558 made the decoder validate everything
-  the format can check itself — the serialized lengths against the bytes behind
-  them, the narrowing conversions, the varint range, the dictionary's ascent,
-  and each posting's ascent and place inside `n_rows` — and made the reader
-  match the index's row domain against the Parquet file before either a warm or
-  a cold index prunes it. What is left is a corruption that decodes and still
-  covers the file, and #4991 measured what a query then does, per storage path
-  ([`DESIGN_inverted_index.md`](DESIGN_inverted_index.md), "Which storage path
-  carries that residual"). The **footer-KV** path — hex in the Parquet footer,
-  taken per column while that column's serialized index fits
-  `SIGLAKE_INDEX_FOOTER_MAX_BYTES` (1 MiB), so the small and freshly written
-  files — is the exposed one: Parquet
-  checksums data pages, not footer metadata, and the query succeeds while
-  answering short. Of 224,368 single-bit flips of a 28 KB hex value, 125 cost
-  one probe term rows and 10,432 cost some term rows; a flip inside a term's
-  *characters* costs that term every row in the file, because an absent term is
-  a definitive "no rows match". The **Puffin sidecar** — the spillover above
-  that threshold, so the large compacted files — is covered by the codec it is
-  written with (`Zstd`, `include_checksum(true)`): none of 19,888 flips of the
-  stored frame produced a wrong answer, against 5,883 of 19,856 with the
-  content checksum off. Its failure mode is a failed query (`Restored data
-  doesn't match checksum`), not a fallback to a scan. Warm, neither path
-  re-verifies: a cached parsed index answers from the parse until it is
-  evicted. Closing the footer exposure costs 4 bytes, eight hex characters in a
-  footer value, and 0.41% of the decode the reader already pays — the
-  recommendation, the placements a 0.1.x reader refuses, and what that would
-  cost a mixed-version fleet are in the design document; the shipped format,
-  API and defaults are unchanged. The segmented figures are a different
-  question: 4 bytes per term is about a third of a *segmented* blob because a
-  partial reader fetches one term's postings and can verify only what it
-  fetched, and seg2 closes its own residual with a CRC per block's posting
-  span. Neither applies to a blob that is read whole.
+- **A text plan larger than both caches still re-fetches its excess index
+  blobs, once per execution.** Eviction no longer drops the blobs the pair does
+  hold — that was #4182, where a 14-file plan against caches for about seven
+  re-read every blob on every execution — but the residue is arithmetic: a
+  repeat suite fetches the indexed files the blob budget cannot cover, measured
+  as exactly `files - blobs held` per pass over plans from 8 to 28 files
+  (`a_plan_larger_than_both_caches_stops_refetching_every_blob` in the fork).
+  Removing the fetches means covering the plan, and the budgets stay where they
+  are: #4102 timed the parsed side against eight times its budget and kept the
+  1 GiB cap, leaving the paired hand-set override above as the deployment-level
+  answer, and blob retention against a real store is still #4054's. What the
+  split between the two forms costs is measurable locally: on the six-file
+  fixture of `crates/siglake-storage/tests/text_index_blob_refetch.rs`, holding
+  all six as serialized blobs cost 65 kB against 188 kB for the parsed form,
+  for the same zero fetches and a decode per file per query. A blob also keeps
+  its protection from eviction for a bounded number of the cache's own
+  turnovers rather than for as long as its file is planned, which is the
+  approximation that keeps a compacted-away file's blob from being retained
+  forever; the plan-level signal that would replace it does not exist.
+- **A footer inverted index's CRC-32 shares the Parquet footer it checks.** New
+  files carry the blob under `siglake.inverted_index.v1[.<column>]` and its
+  eight-hex-character CRC under the disjoint
+  `siglake.inverted_index.crc32.v1[.<column>]` namespace. A malformed or
+  mismatching sibling is refused before either a cold decode or warm parsed
+  cache handout, then the reader tries Puffin and otherwise scans exactly.
+  Legacy blobs without a sibling keep pruning so rolling upgrades do not lose
+  all footer-index acceleration; old readers ignore the new key. The remaining
+  boundary is footer-wide damage that changes both values consistently. An
+  in-blob checksum would cover that case but makes every 0.1.x reader refuse
+  every newly written index until the fleet finishes upgrading. The measured
+  corruption rates, 0.41% verification cost and placement comparison are in
+  [`DESIGN_inverted_index.md`](DESIGN_inverted_index.md), "Which storage path
+  carries that residual". Large v1 indexes remain protected by the Puffin
+  writer's pinned checksummed-Zstd codec; its corrupt-frame behavior is still a
+  query error rather than scan fallback. Seg2 uses a CRC per addressable block
+  and is a separate format boundary.
+- **Statistics-file retirement is whole-entry and limited to Siglake-owned
+  inverted indexes.** The snapshot-expiry and orphan-GC maintenance paths
+  remove an Iceberg statistics entry only when every blob has a `data_file`
+  property, every blob type is one of Siglake's v1 or segmented inverted-index
+  types, and none of those files is alive in any retained snapshot. An entry
+  with one live blob and one retired blob stays whole; Siglake does not rewrite
+  the Puffin file to split it. An entry containing another engine's blob type,
+  or an owned blob without `data_file`, also stays untouched because Siglake
+  cannot prove its lifetime. Keeping a mixed file costs metadata and object
+  storage until its last live reference retires, but preserves the Iceberg
+  interoperability boundary.
 - **A maintenance process's cache budgets are readable at startup, not on
   `/metrics`.** The compactor, the ingest server and the `siglake` maintenance
   subcommands resolve their own budgets now — zero for the two text-index
@@ -131,6 +221,37 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   segments, then delete both Deployments so the operator can create them in
   the selected mode. The handover does not automatically convert or delete
   local WAL, mirror objects, or catalog rows.
+- **A held orphan on the WAL volume does not survive the move to the
+  catalog claim, and nothing pages about it afterwards.** The filesystem
+  drain settles quarantined segments under `<wal>/**/orphans/` every cycle
+  and holds the ones whose commit status it cannot establish — the name is
+  absent from the table's consumed set and the snapshot that would prove
+  the rows were committed has expired. That hold is the level
+  `siglake_compactor_orphans_held{tenant}` and the alert
+  `SiglakeCompactorOrphansHeld`, and both come from the filesystem sweep
+  alone: with a catalog configured the cycle hands off to the claim path,
+  which claims rows and fetches bytes from the mirror and visits no WAL
+  directory. The chart goes further — with
+  `compactor.catalogClaim.enabled: true` the compactor's `wal` volume
+  renders as an `emptyDir`
+  (`deploy/helm/siglake/templates/deployment-compactor.yaml`), so the pod
+  cannot read the old claim even to census it. The operator keeps the claim
+  mounted on the compactor in both modes, and refuses the conversion
+  outright (`DrainModeHandoverRequired`, the entry above) rather than
+  migrating anything; what neither deployment surface has after the switch
+  is a reading. The series is absent, and absence is not a reading: it says
+  nothing about what the volume still holds. So inventory
+  `<wal>/**/orphans/` before switching ownership and keep the files. Each
+  one's commit status is UNKNOWN — that is why it was held, not a
+  finding that its rows are missing — so deleting one can lose rows and
+  requeueing one can duplicate them, and either needs evidence from your
+  own retention and ingest history first. The chart keeps the WAL PVC
+  rendered in claim mode for the ingester, which still mounts it at
+  `/var/lib/siglake/wal`, so the inventory is reachable from an ingester
+  pod after the switch as well as before it. What changes is the way back:
+  the compactor no longer reads `sealed/` on that volume, and a file moved
+  there reaches the table only through the ingester's mirror catch-up
+  sweep and the claim drain's mirror sync.
 - **The Helm chart cannot scale the compactor on its backlog.** Backlog-driven
   compactor scaling is `siglake-operator`'s only. The chart's HPA renders
   `siglake_compactor_sealed_pending` as a `type: Pods` metric, and that
@@ -164,6 +285,18 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   carry no `pod`, one where fewer than two pods carried traffic, and one whose
   operator value is not the mean of the per-pod sums. No round has supplied
   that capture yet (#3647).
+- **No live Prometheus has confirmed that every claim compactor exports one
+  shared sealed queue.** The catalog query behind
+  `siglake_compactor_sealed_pending` has no worker filter, and the operator
+  reads `avg(sum by (pod) (...))`, so two replicas should each export the same
+  total rather than one share. The chart permits that two-pod tier only with
+  the catalog claim and WAL mirror on; its claim-mode Pods custom metric stays
+  refused. `COMPACTOR_POD_LABEL_CAPTURE=1 scripts/kind-round.sh` now exercises
+  the permitted install after the ordinary round, holds a positive queue, and
+  retains two advancing scrape generations plus the raw labels, source sample
+  times, grouped answer and operator expression. The offline grader accounts
+  for independently refreshed gauges and rejects a sum of the replicas'
+  copies, but no kind round has supplied the live capture yet (#5548).
 - **No tier can be scaled to zero.** Every `spec.autoscaling.<component>.min`
   must be 1 or more; `0` is refused with `InvalidSpec=True` /
   `AutoscalingZeroFloorUnsupported` before the operator touches a child
@@ -175,7 +308,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   stopped tier's missing series also holds the two healthy ones at their
   current size. An activation signal that outlives the stopped pods (a
   catalog-side backlog probe, a request-driven wake-up) is not implemented.
-- **An audit batch can be lost at its append deadline.** Query responses never
+- **An audit batch can be lost at append.** Query responses never
   wait for the best-effort audit worker, its retained rows and conversion
   working set are bounded by count and charged bytes, and each append is
   bounded by a service deadline (30 s;
@@ -187,7 +320,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   and nothing re-submits them. They are not retried on purpose. The deadline
   cuts the worker's await, not the append's effects — a commit whose catalog
   write had already gone out can land unseen — so a retry would duplicate the
-  rows it did persist rather than recover the ones it did not. Rows submitted
+  rows it did persist rather than recover the ones it did not. A storage append
+  that returns an error also abandons its whole batch without retry. Its rows
+  increment `siglake_query_audit_dropped_total{reason="append"}`, while
+  `siglake_query_audit_failures_total{reason="append"}` increments once for the
+  batch. Rows submitted
   while an append is still running are dropped whole once the bounded capacity
   is full, as before. Per-row delivery is therefore best-effort in both
   directions: the `query_audit` table is an operational record, not an
@@ -393,9 +530,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `field_mappings` are no longer an extension of what is stored, and only the
   caller knows what it meant to append, so the update is refused and the caller
   must re-read the index and re-send. The refusal is a `400` — there is no
-  version or `If-Match` in the request to answer with a `409`, and no
-  merge-on-append mode. Re-sending an update that is already stored stays a
-  no-op, so an idempotent retry costs nothing.
+  version or `If-Match` in the request, and no merge-on-append mode. Re-sending
+  an update that is already stored stays a no-op, so an idempotent retry costs
+  nothing. An optional mapping-specific ETag has been qualified without
+  changing this behavior; its validator, retry rule and open `412` versus `409`
+  choice are in
+  [`DESIGN_managed_index_put_preconditions.md`](DESIGN_managed_index_put_preconditions.md).
 - **Pre-0.1.0 warehouses are not migrated to the current timestamp contract.**
   Tables written before 2026-09-06 are Iceberg format version 3 with a
   nanosecond `timestamp` and no `timestamp_ns` sibling. siglake still reads
@@ -592,6 +732,16 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   declared `Inexact` so a hit can be re-filtered (measured at 0.1-0.6 ms and 0.5
   MiB emitted on the fixture's shallower browse), and the budget is still
   subtracted from the query pool.
+  #4905 rejected unconditional predicate-keyed admission after a local
+  20-request synthetic trace. Its deliberately favorable 50% repeat ceiling
+  produced 40 hits from 80 task lookups and cut repeated predicates from
+  5.75-6.12 ms to 0.62-0.88 ms, but ten predicates over four files created 40
+  complete entries: a 16-entry cap evicted 24 (60%). Six one-use moving windows
+  accounted for those 24 inserts and evictions without one hit. The survivors
+  retained only 0.525 MiB, so entry count bound before bytes. The shipped #4891
+  bypass stays; a future frequency-gated admission policy would be a different
+  proposal. The workload assumptions, answer-equivalence gate and full numbers
+  are in [`DESIGN_predicate_keyed_decoded_cache.md`](DESIGN_predicate_keyed_decoded_cache.md).
   #4847 qualified the row-group-granular alternative locally and the disposition
   is REVISE, with the shipped policy kept: per-row-group population does insert
   from a clipped browse and cuts its repeat from 6.7 ms to 2.0 ms, and it drops
@@ -621,8 +771,18 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   establish: reaching 131,072 rows is necessary for row-group population, not
   sufficient — a file whose groups are larger closes none at that depth, and a
   read that does not start on a group boundary closes none at any depth, so the
-  reader takes recorded footer geometry as a separate input. No fleet numbers
-  exist yet: the local evidence is hermetic fixtures
+  reader takes recorded footer geometry as a separate input. The round
+  collector's largest-object sample remains table-wide input, but 0.2.0 SQL
+  responses can now join geometry to the shape's actual membership:
+  `stats.scan.file_attribution` carries up to 32 table-relative object keys and
+  task byte ranges, plus `cache_candidate`, `reader_opened` and `cache_hit`.
+  `files_omitted` counts tasks dropped by shards or the coordinator, and
+  `identity_complete` is false whenever the bounded list or a transport cannot
+  establish complete membership. A consumer must refuse per-shape geometry
+  claims when that boolean is false. The representation and local
+  qualification are recorded in
+  `DESIGN_row_group_decoded_cache_qualification.md` (#4959, #5727).
+  No fleet numbers exist yet: the local evidence is hermetic fixtures
   (`crates/siglake-storage/tests/file_cache_populate_depth.rs`,
   `crates/siglake-query-server/tests/file_cache_populate_depth_stats.rs`), and
   nothing here authorizes row-group adoption or a default change. The fleet
@@ -750,7 +910,8 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   additionally driven end to end against the in-memory store through an
   injected write fault, which is not the same as a real connection failure.
 - **Reconciliation of finished-but-unpersisted jobs is per-process memory, and
-  its live-Postgres half is unmeasured.** The ids a replica finished without
+  a recovered success still loses its result body.** The ids a replica
+  finished without
   persisting a verdict are held in that process only: a pod that is killed
   before its next pass loses the note, and the row is then resolved by
   lease-expiry recovery instead (bounded, but a lease later, and as
@@ -760,19 +921,24 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   the same fallback. A reconciled row carries a fixed error text, so a failed
   run's specific message is lost with the write that could not store it, and a
   reconciled *success* is a `failed` row asking for a resubmit — the result
-  body is deliberately not retained across an outage. Every assertion is
+  body is deliberately not retained across an outage. The unit assertions are
   hermetic (in-memory store, injected write faults, a store wedged under
-  virtual time); nothing has been observed against a real Postgres outage. The
+  virtual time), and run #129 added a verified local-kind Postgres outage. All
+  seven accepted jobs committed after restoration; the backlog peaked at seven
+  (3/4 per query pod) and drained within a measured 0-13.19887-second interval
+  after restoration. The
   two ways a row is left with nobody retrying it do page
   (`SiglakeBatchRowStrandedNonTerminal`, on the dropped counter and
-  `cause=write_abandoned`); `cause=write_deferred` and the
-  `siglake_query_jobs_unreconciled` gauge are deliberately dashboard-only,
-  since a rising and then falling backlog is reconciliation working. An
+  `cause=write_abandoned`). `cause=write_deferred` remains diagnostic, while
+  `SiglakeBatchReconciliationBacklogStalled` warns when the
+  `siglake_query_jobs_unreconciled` gauge remains nonzero for 15 seconds. That
+  threshold rounds the measured upper bound to the next 5-second retry, so the
+  observed rising-and-falling backlog stays quiet. An
   opt-in, bounded local-kind probe now retains the per-pod outage/reconnect
   trace in `results/postgres-outage-reconnect.json` and grades missing or
-  non-draining observations `unverified`; no live round has supplied the first
-  measured trace yet (`POSTGRES_OUTAGE_PROBE=1 scripts/kind-round.sh`). Three
-  rounds have run it, and none of them measured what it claimed: the retained
+  non-draining observations `unverified`
+  (`POSTGRES_OUTAGE_PROBE=1 scripts/kind-round.sh`). Earlier rounds did not
+  measure what they claimed: the retained
   traces carried no evidence that the paused process set stayed stopped, and no
   Prometheus scrape timestamp, so a counter that moved could not be placed
   against the pause. Run #76's trace is kept under `scripts/testdata/` as a
@@ -792,12 +958,29 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   reports how many committed inside the pause window, and resolves the
   zero-backlog observation when every accepted job is dated outside it. That
   reading is bounded: the commit timestamp dates the row version visible at
-  collection, not every status transition, so a recovered row — which the
-  amendment path can rewrite after it went terminal — a missing row, a NULL
-  timestamp, a nonterminal job, or a commit inside the second the probe's own
-  stamps are truncated to all leave the observation unexplained. No live round
-  has supplied a dated trace yet, so what happened in run #76 is still
-  unexplained; nothing here establishes a persistence failure.
+  collection, not every status transition. For the one transition that matters
+  the probe now installs an insert-only write history on that throwaway
+  Postgres before the burst — a trigger on `siglake_query_jobs` recording each
+  write from inside its own transaction — so a row the amendment path rewrote
+  after it went terminal can still be dated by the transaction that made it
+  terminal, with the amendment kept as a separate row. A recovered row with no
+  history or an undated terminal transaction, a missing row, a NULL timestamp,
+  a nonterminal job, or a commit overlapping either signal transition all
+  leave the observation unexplained. Every placement is made against stamps
+  read from the kind node's clock, so the bounded write probe carries the
+  phase that wrote each of its rows and the probe reads them back dated by
+  Postgres too: its baseline row has to land before the pause was applied and
+  its recovery row after restoration was applied, and either one on the wrong
+  side is `unverified` on its own — the one skew between the two clocks that
+  would otherwise move every job-row commit together and show up nowhere. The
+  probe retains its
+  local observations to the millisecond and the grader derives uncertainty
+  from each timestamp's recorded precision; historical second-only traces keep
+  their full one-second uncertainty. A commit is a stopped-window failure only
+  when its own interval lies after the verified pause and before restoration
+  starts. Run #129 supplied those boundaries and had no commit inside the
+  pause; run #76 remains an intentionally red regression fixture, not evidence
+  of a persistence failure.
 - **The query server's `/healthz` is a constant 200, so no probe acts on the
   one known query degradation.** `/healthz` answers `ok` for as long as the
   process is serving and `/readyz` only round-trips the catalog. The still-open
@@ -883,24 +1066,28 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   today a dependency on one. Default-on waits on a retained object-store
   acceptance run and a separate release decision.
 
-  Two populations stay outside it either way. A segment no local drain ever
-  committed — a dropped index incarnation's, quarantined into `stale/`, or one
-  whose ingester volume was lost before it drained — is never marked and is
-  never deleted, by design: registering an unattributable object would be the
-  one thing that could turn a listing into a delete. And a locally-committed
-  segment whose mark never became durable (a Postgres outage longer than the
-  3600s `committed/` ceiling) has its local copy swept anyway, to keep the WAL
-  volume bounded, and its object counted in
+  Two sealed-segment populations stay outside it either way. A segment no
+  local drain ever committed — a dropped index incarnation's, quarantined into
+  `stale/`, or one whose ingester volume was lost before it drained — is never
+  marked and is never deleted, by design: registering an unattributable object
+  would be the one thing that could turn a listing into a delete. And a
+  locally-committed segment whose mark never became durable (a Postgres outage
+  longer than the 3600s `committed/` ceiling) has its local copy swept anyway,
+  to keep the WAL volume bounded, and its object counted in
   `siglake_compactor_mirror_unreclaimed_total` — a leak that needs the
-  lifecycle rule below or a manual pass. `_active/` blobs are outside all of
-  it (#4914), and since #5055 there is one per open writer rather than one per
-  ingester: a segment's blob is left behind when that segment seals, so what
-  the prefix accumulates is one object per (tenant, index, write shard,
-  segment) the flag was on for. Nothing but the lifecycle rule collects them.
+  lifecycle rule below or a manual pass. Current active-mirror writers remove
+  a segment's exact `_active/` sibling after its sealed object is confirmed,
+  including the ambiguous-upload and catch-up paths. A late active PUT checks
+  for the sealed sibling and removes itself, so sealing does not leave one new
+  partial per writer. This is local cleanup, not a prefix sweep: `_active/`
+  blobs orphaned by older versions, or left after all three DELETE attempts
+  fail and the matching local segment is later removed, are not discovered
+  later.
 
   So an object-store lifecycle expiry longer than your worst-case drain backlog
   remains the operator-side complement, and the only thing that collects those
-  three populations. Two things to get right when writing that rule. The prefix
+  sealed populations and historical or terminal-failure active partials. Two
+  things to get right when writing that rule. The prefix
   to match is `<s3.warehousePrefix>/<wal.mirror.prefix>/`: the uploader's
   object store is rooted at the warehouse URL, so mirror keys sit under the
   warehouse prefix rather than beside it. And the Terraform module adds no
@@ -1073,11 +1260,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   (`_siglake/config/index_templates/<namespace>/<template_id>.json`), so a PUT
   or DELETE of one id never touches another id's key — that is what makes two
   replicas' acknowledged edits both survive. Two writers of the same id in one
-  namespace are still last-write-wins: there is no CAS, no conditional PUT, and
-  no version in the request. A DELETE leaves a tombstone record rather than
-  removing the object, because an older record may remain read-only underneath;
-  tombstones are never garbage-collected. Listing costs one LIST plus one GET
-  per template, which is fine at the handful-of-templates scale this is for.
+  namespace are still last-write-wins: template PUT has no CAS, conditional
+  header or version in the request. A DELETE leaves a tombstone record rather
+  than removing the object, because an older record may remain read-only
+  underneath; tombstones are never garbage-collected. Listing costs one LIST
+  plus one GET per template, which is fine at the handful-of-templates scale
+  this is for.
   Builds before 0.1.0 stored templates at the warehouse root. Those records are
   still read only by the configured default namespace and are never rewritten
   or deleted; named tenants must re-PUT their templates after upgrading and do
@@ -1303,7 +1491,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   an old table as the fast path failing. Rebuilds repair only the wide Tier-1
   object: they do not backfill the inline object, so repaired columns remain
   `tier1_wide` even below its 4096-entry cap and may pay a wide-object fold on a
-  cold metadata cache.
+  cold metadata cache. Objects written before the canonical `timestamp_ns`
+  event-time twin was excluded from inferred dimensions may still report that
+  column as short until the inline aggregate is rebuilt; the read guard refuses
+  the short column, so exact SQL answers continue through the per-file path.
 - **The short-aggregate census reports more than it repairs.** Every 15 minutes
   the maintenance pass finds a maintained column short of `total-records` with
   every commit's contribution accounted for and fires
@@ -1311,15 +1502,23 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `SiglakeGroupCountAggregateShort`; rebuilding it is opt-in
   (`SIGLAKE_AGG_SHORT_REPAIR=1`, `compactor.shortAggregateRepair`) and budgeted
   at one table per pass, because the rebuild is one Tier-2 query per maintained
-  column — ~9 minutes per column per 250M rows measured on a local filesystem.
+  exact column plus one per existing sketch. A sketch the files cannot serve
+  keeps its carried state and is reported as unrestored; it does not prevent
+  the other sketches or the exact deficit from being repaired. The ~9 minutes
+  per column per 250M rows is extrapolated from local
+  40k/400k-row fixtures, not measured at that size.
   Three gaps follow from that shape. A table wide or large enough for the
-  rebuild to exceed the compactor's watchdog (600 s) has it cut, publishes
-  nothing, and retries on the next pass with no durable backoff, so a
-  persistently trippable table needs the knob off and
+  rebuild to exceed the compactor's cooperative watchdog (600 s) has it cut,
+  publishes no partial aggregate, and retries on the next pass or process
+  restart with no durable backoff. A persistently trippable table needs the
+  knob off and
   `siglake rebuild-group-counts --namespace <ns> --table <t>` run once by
   hand;
   `siglake_compactor_watchdog_trips_total{stage="agg_short_repair"}` is the
-  signal. A shortfall the coverage rules cannot bridge to the current snapshot —
+  signal. Durable attempt records and bounded retry are designed for 0.2.0 in
+  [`DESIGN_short_aggregate_repair_backoff.md`](DESIGN_short_aggregate_repair_backoff.md)
+  and tracked by #5576; they are not implemented in 0.1.1. A shortfall the
+  coverage rules cannot bridge to the current snapshot —
   a foreign overwrite or a delete task as the newest commit — is never censused,
   because that state is indistinguishable from a contribution still in flight.
   And a table with no exact map at all (every column sketched, or no aggregate
@@ -1386,10 +1585,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   of the whole decoded file that is the gate's win. Since #4754 the row group
   is `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` (or
   `IcebergTuning::target_row_group_bytes`) divided by the first written batch's
-  row size, so lowering the target lowers what a rewrite holds; until then the
-  merge-output writer asked with no sample batch and took a flat 1,048,576 rows
-  with the byte target unread. It remains a target and not a cap, and it stops
-  at the 128 Ki-row floor (`MIN_ROW_GROUP_ROWS`): at the ~1.2 KB decoded per row
+  row size — the extent its rows span, `sampled_row_bytes` — so lowering the
+  target lowers what a rewrite holds; until then the merge-output writer asked
+  with no sample batch and took a flat 1,048,576 rows with the byte target
+  unread. It remains a target and not a cap: the buffered row group holds whole
+  Arrow buffers, which on these fixtures is about twice the extent the target
+  was priced in. It also stops at the 128 Ki-row floor (`MIN_ROW_GROUP_ROWS`): at the ~1.2 KB decoded per row
   those fixtures carry, the smallest row group any target can ask for still
   holds ~157 MB of survivors, and a narrow GDPR delete leaves nearly every row a
   survivor. What a 256 MiB cold-target candidate costs a compactor packaged at
@@ -1410,6 +1611,29 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   sampled extent (468 B/row here) and paid in Arrow buffers (874 B/row), so a
   target of N bytes holds close to 2N; and it does nothing below the 128 Ki-row
   floor, which on a wide-row corpus binds before 64 MiB does.
+- **One row-group byte target, two estimators: flush prices allocation, the
+  merge paths price extent.** `TARGET_ROW_GROUP_UNCOMPRESSED_BYTES` and its
+  `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` override are one number, read two
+  ways. The ingest flush path divides it by `RecordBatch::get_array_memory_size`
+  — whole buffer allocations — which is accurate there, because that writer is
+  handed a batch the flush path assembled itself. The merge, re-cluster and
+  delete-rewrite paths divide it by `ArrayData::get_slice_memory_size`
+  (`sampled_row_bytes`), the extent the rows span, because a page-bounded merge
+  writes zero-copy slices of a decoded input part: the allocation measure would
+  charge a 2,000-row slice for the whole 8,192-row part behind it and size the
+  row group off how the plan happened to cut its first run. The two differ by
+  about 2x on the same data — 432 B/row by allocation against 201 B/row by
+  extent on the 512 Ki-row half-deleted fixture in
+  `crates/siglake-storage/tests/delete_task_size_gate.rs` — so the same target
+  asks for roughly half as many rows on flush as on merge. Both estimators read
+  one sample batch, the first, and both results are clamped to 128 Ki–4 Mi
+  rows, so neither is a byte guarantee in either direction. Neither is a
+  resident-byte ceiling either: a buffered row group holds whole buffers, and
+  the gap above the priced extent is the slack the two entries above measure.
+  The split is what ships, and it is kept (decided 2026-09-16, #4774): moving
+  flush onto the extent measure would change ingest output layout, and no
+  measurement of that side exists. `docs/DESIGN_row_group_target_qualification.md`
+  measures the merge side only.
 - **Streamed rewrite output carries no inline inverted index.** Every rewrite
   past the in-RAM caps — a leveled compaction merge, a re-clustering pass, or
   a delete task's large candidates (16 MiB compressed / 128 Ki rows) — is
@@ -1433,24 +1657,27 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   because a delete rewrite writes at generation 0 like an ingest flush. The
   consequence throughout is pruning: an unindexed or unbloomed file is scanned
   and row-evaluated instead of skipped, and returns exact rows.
-- **A re-cluster bin may span partitions only while it fits in RAM.**
+- **A re-cluster bin holds one partition value.**
   `IcebergContext::recluster_files_with` takes a bin of data files and merges
-  it into replacement output. The in-RAM merge splits its output by partition
-  value, so a bin holding two days rewrites into one correctly-stamped file
-  per day. The streaming executors — every rewrite past the in-RAM caps —
-  write through a single writer stamped with one partition value and cannot;
-  they now REFUSE a mixed bin before writing anything rather than commit rows
-  under the wrong partition value, where a timestamp-predicated query prunes
-  them away while `count(*)` still counts them (#4200). The dispatch is chosen
-  by bin size and the `SIGLAKE_RECLUSTER_*` knobs, so a caller that cannot
-  bound its bins must group by partition value and call once per group, as
-  both shipped planners (`recluster_pass`,
+  it into replacement output. A bin spanning two partition values is REFUSED
+  at the entry point, before the catalog read and before anything is written.
+  The streaming executors — every rewrite past the in-RAM caps — write through
+  a single writer stamped with one partition value, so a mixed bin used to
+  commit rows under the wrong value, where a timestamp-predicated query prunes
+  them away while `count(*)` still counts them (#4200). The in-RAM merge
+  splits its output by partition value and was correct on the same input, but
+  which of the two a bin takes is decided by its size and the
+  `SIGLAKE_RECLUSTER_*` knobs — so accepting a mixed bin there made the
+  contract size-dependent, and a caller that developed against small tables met
+  the error in production. Both are refused since #4720. Group by partition
+  value and call once per group, as both shipped planners (`recluster_pass`,
   `recluster_all_indexes{,_leveled}`) do. Automatic regrouping is deliberately
-  not done: bin budgets (`max_pass_bytes`, the rewrite-generation cap) are
-  stated per output file.
+  not done, on any dispatch: bin budgets (`max_pass_bytes`, the
+  rewrite-generation cap) are stated per output file, and turning one bin into
+  N would break them.
   `crates/siglake-storage/tests/storage/recluster_cross_partition.rs` pins the
-  refusal on each streaming dispatch, the in-RAM fan-out, and window
-  visibility either way.
+  refusal on all four dispatches, the grouped rewrite that replaces it, and
+  window visibility either way.
 - **Search v1 limits:** FTS pruning engages only on columns with index blobs
   (others row-eval); the current metadata path retains Puffin statistics
   registration after its data snapshot expires; strict mapping mode enforces
@@ -1514,7 +1741,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   query tier is reached through SQL over HTTP and the Elasticsearch- and
   Jaeger-compatible shims. What does ship for operations: a starter Grafana
   dashboard (`deploy/grafana/siglake-overview.json` — import it yourself, the
-  chart does not render it) and a `PrometheusRule` with 36 alerts grouped by
+  chart does not render it) and a `PrometheusRule` with 37 alerts grouped by
   what an operator should do (data-loss, stalled, refusing, saturation),
   rendered when `prometheusRule.enabled` is set (default off). No metrics
   downsampling; retention is file/day-granular (no row-level retention).
@@ -1529,6 +1756,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   [Deployment](ARCHITECTURE.md#deployment). A first-class block was left out
   until a deployment has run with emission on and shown which knobs an operator
   actually reaches for.
+- **The load generators are outside in-process OTel emission.**
+  `siglake-loadgen` and `siglake-corpus` install console-only subscribers, so
+  their logs and traces do not reach an OTel backend when an endpoint is set.
+  Their ingest requests do not inject W3C `traceparent`, and the ingest
+  router's `TraceLayer` does not extract a remote parent. A trace therefore
+  begins at the ingest handler rather than at the load generator that issued
+  the request. Client-to-ingest continuity requires both client injection and
+  ingest-side extraction; neither half is implemented.
 - **Metrics do not leave as OTLP from the process.** `siglake_*` metrics are
   Prometheus, scraped from `/metrics`; the OTel metrics SDK is not wired, so an
   OTLP-only backend needs a collector with a Prometheus receiver. Moving the

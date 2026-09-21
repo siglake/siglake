@@ -164,6 +164,8 @@ jobs:
         run: scripts/check-smoke.sh
       - name: aws up binds every cluster write to its private kubeconfig
         run: scripts/check-aws-up-kubeconfig.sh
+      - name: aws down fails the run when terraform destroy fails
+        run: scripts/check-aws-down-destroy.sh
       - name: loadgen reports its missing local-binary prerequisite before preflight
         run: scripts/check-loadgen.sh
       - name: compose preflight rejects an occupied published port
@@ -254,6 +256,10 @@ jobs:
       # at that file to name the same one. No cluster, no kubectl, no helm.
       - name: the kind round keeps KEDA headroom on the query tier
         run: scripts/check-kind-round-scale.sh
+      - name: the kind round validates and applies its initial event count
+        run: scripts/check-kind-round-events.sh
+      - name: the kind round retains the complete mirror-reclaim qualification
+        run: scripts/check-kind-mirror-reclaim-qualification.sh
       - name: Postgres outage evidence rejects missing and non-draining traces
         run: scripts/check-kind-postgres-outage-evidence.sh
       - name: schema rollback evidence covers chart and operator reverts
@@ -276,6 +282,13 @@ jobs:
       # arithmetic mismatch. No cluster.
       - name: ingester per-pod label capture keeps labels and arithmetic
         run: scripts/check-kind-ingester-pod-labels.sh
+      # The catalog-claim backlog is one shared queue copied onto every
+      # compactor. This pins the operator expression, keeps the chart's claim
+      # and mirror guards intact, exercises the two-generation settling rule,
+      # and rejects unequal copies, stale sample times and fleet sums. No
+      # cluster, helm or kubectl is used.
+      - name: compactor per-pod capture proves one shared queue
+        run: scripts/check-kind-compactor-pod-labels.sh
       # A failed round's diagnostics dump every not-Ready pod's logs except the
       # ones already carried by a Job dump above them. That membership test used
       # to be `printf '%s\n' "${jobs[@]}" | grep -qx`, where `grep -q` exits at
@@ -340,21 +353,31 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.95.0
       # THIS JOB DOES NOT FIT A STANDARD GITHUB-HOSTED RUNNER WITHOUT THIS STEP.
-      # `cargo test --workspace` links 124 test binaries (107 of them one per
-      # `tests/*.rs` file, each carrying its own copy of DataFusion, Arrow and
-      # the AWS SDK) and cargo builds all of them before it runs any, so the
-      # peak is the sum. Measured 2026-09-04 from a warm tree with exactly the
-      # env block above: 36.6 GiB of test binaries (median 296 MiB, largest
-      # 461 MiB) plus 4.6 GiB of rlibs, rmeta and build scripts -- 41 GiB before
-      # the toolchain (0.6 GB) and the registry (2 GB). With the default full
-      # debuginfo it is 101 GiB, which is the ENOSPC the env block describes.
+      # The pre-consolidation measurement from 2026-09-04 found 124 test
+      # executables: 36.6 GiB (median 296 MiB, largest 461 MiB), plus 4.6 GiB
+      # of other target files, or 41.2 GiB total. Full debuginfo used 101 GiB.
+      # Preserve those numbers as history; they are not the current baseline.
+      #
+      # Re-measured 2026-09-19 at 19f6a3b2b772 with Rust 1.95.0 and mold 2.42.1.
+      # Each profile got a separate, initially empty CARGO_TARGET_DIR. Both used
+      # CARGO_INCREMENTAL=0, mold, and `cargo test --workspace --no-run
+      # --message-format=json`; only CARGO_PROFILE_{DEV,TEST}_DEBUG changed.
+      # Unique non-null `executable` paths in Cargo's compiler-artifact records
+      # gave the same 110 targets in both profiles (88 tests, 10 libs, 10 bins,
+      # 2 examples). At line-tables-only they occupy 44.0 GiB (median 536 MiB,
+      # largest 637 MiB), while the complete target occupies 47.5 GiB. At full
+      # debuginfo they occupy 101.3 GiB (median 1,153 MiB, largest 1,336 MiB),
+      # while the complete target occupies 106.5 GiB. The old 124 count came
+      # from the pre-consolidation tree; an isolated current build does not
+      # reproduce the later warm-tree report of 78 executables either.
       #
       # The 24.04 image ships roughly 25-30 GB of toolchains nothing here uses
       # (Android SDK, .NET, GHC, CodeQL, Swift, PowerShell modules, Miniconda,
-      # Julia, cached docker images). Deleting them is the difference between
-      # ~21 GB free and ~45-50 GB, which is enough with a margin under 10 GB --
-      # so the `df -h` at the end of this job is the number to read on the first
-      # run in a repo without Depot. If it still dies, the next rung is
+      # Julia, cached docker images). Deleting them raises free space from
+      # ~21 GB to ~45-50 GB. The isolated target alone is 47.5 GiB, so the
+      # `df -h` at the end of this job decides the hosted-runner margin after
+      # its toolchain and registry are included. If it still dies, the next
+      # rung is
       # `CARGO_PROFILE_TEST_DEBUG=0` for these runners only (roughly 22 GiB of
       # test binaries by section arithmetic on the largest one, not measured;
       # the panic message keeps file:line, only backtrace frames lose it), and
@@ -840,7 +863,7 @@ jobs:
           cache-from: type=gha,scope=siglake-operator
           cache-to: type=gha,scope=siglake-operator,mode=max
 
-      # All three suites need the compose stack, so they share one lifecycle.
+      # All seven suites need the compose stack, so they share one lifecycle.
       # The second is SQL that no hermetic test can reach: shared-store batch
       # job ownership (#1845), where getting it wrong destroys a live
       # replica's job result on every query scale-out, and the cancellation
@@ -856,7 +879,25 @@ jobs:
       # on SQLite. It creates a schema per case, so it neither sees nor moves
       # the rows compose's own ingest and compactor keep in the public schema,
       # and it needs no serialization against the suite above.
-      - name: MinIO mirror pagination, and job ownership plus the local commit mark against Postgres
+      #
+      # The fourth exercises wal-recover's read-only catalog connection at the
+      # two Postgres boundaries SQLite cannot cover: the 256-wide `$N` rewrite
+      # and the server-enforced read-only transaction. It also keeps a missing
+      # wal_segments table distinct from an existing empty ledger.
+      #
+      # The fifth is the candidate-local claim gate (#5189), which no hermetic
+      # test reaches at all: it needs a CTE, FOR UPDATE SKIP LOCKED and an
+      # UPDATE ... FROM agg, and returns an empty vec before the statement on
+      # SQLite. It reuses the third's scratch-schema isolation and its already
+      # linked test binary.
+      #
+      # The sixth covers the older Postgres claim statement's multi-shard
+      # release: it claims before the Rust shard filter, unlike SQLite, and a
+      # foreign row must return to sealed before its owner can claim it. The
+      # seventh covers the consumed-proof transaction: the segment state and
+      # watermark advance must commit or roll back together after a Postgres
+      # statement error. Both reuse the same isolated scratch schemas.
+      - name: MinIO pagination and the Postgres catalog suites
         env:
           SIGLAKE_TEST_S3_ENDPOINT: http://localhost:9000
           SIGLAKE_TEST_JOBS_POSTGRES_URI: postgres://siglake:siglake@localhost:5433/siglake
@@ -867,6 +908,14 @@ jobs:
           cargo test -p siglake-query-server --test jobs_postgres_ownership -- \
             --ignored --nocapture --test-threads=1
           cargo test -p siglake-storage --lib local_commit_mark_postgres -- \
+            --ignored --nocapture
+          cargo test -p siglake-storage --lib wal_ledger_postgres -- \
+            --ignored --nocapture
+          cargo test -p siglake-storage --lib eligible_claim_postgres -- \
+            --ignored --nocapture
+          cargo test -p siglake-storage --lib sharded_claim_postgres -- \
+            --ignored --nocapture
+          cargo test -p siglake-storage --lib watermark_transaction_postgres -- \
             --ignored --nocapture
 
       # Same reason as the `test` job's report: the builder stage's release

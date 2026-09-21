@@ -3,6 +3,7 @@ mod auth_scheme;
 mod commit_force;
 mod elastic_bulk;
 mod fake_idp;
+mod lane_cap;
 mod mem_breaker_accounting;
 mod middleware_refusals;
 mod otlp_round_trip;

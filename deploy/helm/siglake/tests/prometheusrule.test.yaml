@@ -1,7 +1,7 @@
 rule_files:
   - prometheusrule.rules.yaml
 
-evaluation_interval: 1m
+evaluation_interval: 5s
 
 tests:
   - name: a torn recovered WAL tail raises its warning
@@ -206,8 +206,8 @@ tests:
 
   # A store outage the executor IS reconciling through: rows are parked, the
   # same conditional write is retried every 5s, and the gauge tracks the
-  # backlog. No operator action, so no page.
-  - name: a deferred terminal write being reconciled does not page
+  # backlog. It does not fire the critical abandonment page.
+  - name: a deferred terminal write being reconciled does not page as abandoned
     interval: 1m
     input_series:
       - series: 'siglake_query_job_terminal_conflict_total{namespace="logs",pod="query-0",attempted="succeeded",actual="unknown",cause="write_deferred"}'
@@ -223,6 +223,51 @@ tests:
       - eval_time: 20m
         alertname: SiglakeBatchCompletionRejectedByRecovery
         exp_alerts: []
+
+  # #5615's verified run #129 peaked at 3/4 parked rows across its two pods and
+  # bounded restoration-to-drain at 13.19887s. At one-second fixture precision,
+  # keeping those peaks through t=13 and clearing them at t=14 is the measured
+  # upper-bound case; the 15-second warning must stay quiet.
+  - name: the measured Postgres recovery backlog drains before warning
+    interval: 1s
+    input_series:
+      - series: 'siglake_query_jobs_unreconciled{namespace="logs",pod="query-0"}'
+        values: '3+0x13 0+0x2'
+      - series: 'siglake_query_jobs_unreconciled{namespace="logs",pod="query-1"}'
+        values: '4+0x13 0+0x2'
+    alert_rule_test:
+      - eval_time: 15s
+        alertname: SiglakeBatchReconciliationBacklogStalled
+        exp_alerts: []
+
+  - name: a persistent batch reconciliation backlog warns
+    interval: 1s
+    input_series:
+      - series: 'siglake_query_jobs_unreconciled{namespace="logs",pod="query-0"}'
+        values: '4+0x16'
+    alert_rule_test:
+      - eval_time: 14s
+        alertname: SiglakeBatchReconciliationBacklogStalled
+        exp_alerts: []
+      - eval_time: 15s
+        alertname: SiglakeBatchReconciliationBacklogStalled
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: query-0
+              severity: warning
+            exp_annotations:
+              summary: A query pod's batch reconciliation backlog is not draining
+              description: >-
+                4 finished batch job(s) on query-0 have remained without a
+                persisted terminal state beyond the 15-second recovery bound
+                selected from the verified Postgres outage trace (peak 7, 3/4
+                per pod; drained within 13.2 seconds after restoration). The
+                executor is still retrying these rows, so restore the shared
+                job store and inspect its query-server WARN lines before the
+                1024-row bookkeeping cap is reached. This warning does not mean
+                rows were abandoned; SiglakeBatchRowStrandedNonTerminal reports
+                that separate failure.
 
   - name: shard pin misses start from the pre-registered zero baseline
     interval: 1m
@@ -523,6 +568,32 @@ tests:
         alertname: SiglakeTenantsDenied
         exp_alerts: []
 
+  - name: a query allow-list refusal raises the query tenancy alert
+    interval: 1m
+    input_series:
+      - series: 'siglake_query_tenant_denied_total{namespace="logs",pod="query-0",reason="not_allowed"}'
+        values: '0 0 3 6 9 12 15 18 21 24 27 30 33 36 39'
+      - series: 'siglake_query_tenant_denied_total{namespace="logs",pod="query-0",reason="claim_missing"}'
+        values: '0x14'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: SiglakeQueryTenantsDenied
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: query-0
+              reason: not_allowed
+              severity: warning
+            exp_annotations:
+              summary: Query is denying tenants
+              description: >-
+                Query tenants are being refused with 403 before a namespace is
+                opened. The reason label says which: not_allowed is a usable
+                verified claim absent from query.allowedTenants; claim_missing
+                or claim_invalid means the IDP is not minting a usable
+                query.oidc.tenantClaim value or the configured claim name is
+                wrong.
+
   # #3067: header_not_trusted is the single-tenant default refusing a routing
   # X-Scope-OrgID (crates/siglake-ingest/src/lib.rs), and it reads through the
   # same reason-unfiltered rule as every other refusal rather than a rule of
@@ -738,6 +809,37 @@ tests:
         alertname: SiglakeGroupCountAggregateShort
         exp_alerts: []
 
+  - name: durable short-repair suppression reaches the existing alert
+    interval: 1m
+    input_series:
+      - series: 'siglake_group_count_short_aggregates_total{namespace="logs",pod="compactor-0",iceberg_namespace="siglake",table="events",outcome="suppressed"}'
+        values: '0 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: SiglakeGroupCountAggregateShort
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: compactor-0
+              iceberg_namespace: siglake
+              table: events
+              outcome: suppressed
+              severity: warning
+            exp_annotations:
+              summary: The group-count aggregate for siglake.events is short of its row count
+              description: >-
+                The maintenance census found table siglake.events short of
+                `total-records` in at least one maintained column, with every
+                commit's contribution present — outcome suppressed. Answers
+                stay exact; `GROUP BY` on those columns runs on the exact
+                per-file path and will keep doing so, because no later commit
+                closes the gap. The compactor's WARN line names the columns.
+                Run `siglake rebuild-group-counts --namespace siglake --table
+                events`, which recomputes the aggregate from the committed
+                files and is safe to re-run, or set
+                `compactor.shortAggregateRepair=true` to have the maintenance
+                pass rebuild one table per census.
+
   # The rebuild and publication alerts carry the same pair, and their repair
   # commands have to name the namespace they would run against.
   - name: an incomplete rebuild and a lost publication name their namespace
@@ -790,6 +892,69 @@ tests:
                 that pod; run `siglake rebuild-group-counts --namespace
                 tenant_acme --table events` to restore the group-count
                 aggregate, which does not rebuild the inline time aggregates.
+
+  # #4759: the precursor alert had no case at all, and its counter carried
+  # `table` alone, so the two `events` tables one commit path writes deltas for
+  # arrived as one alert naming a table no operator could locate. The interval
+  # is 5m because the rule needs `rate()` over 15m sustained past `for: 30m`:
+  # rate turns positive around 10m and the alert fires from ~45m, so 60m is a
+  # reading inside the firing window, not on its edge.
+  - name: retried delta writes in two namespaces raise one alert each
+    interval: 5m
+    input_series:
+      - series: 'siglake_group_count_delta_write_retries_total{namespace="logs",pod="ingester-0",iceberg_namespace="siglake",table="events"}'
+        values: '0+1x15'
+      - series: 'siglake_group_count_delta_write_retries_total{namespace="logs",pod="ingester-0",iceberg_namespace="tenant_acme",table="events"}'
+        values: '0+1x15'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: SiglakeGroupCountDeltaRetrying
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: ingester-0
+              iceberg_namespace: siglake
+              table: events
+              severity: warning
+            exp_annotations:
+              summary: Group-count delta writes for siglake.events have needed retries for half an hour
+              description: >-
+                Delta writes for table siglake.events on ingester-0 have been
+                succeeding only on retry for 30 minutes. Each retry is a
+                transient object-store or credential failure; a sustained rate
+                is the precursor to SiglakeGroupCountDeltaLost, which fires once
+                a write exhausts all four attempts. Check warehouse object-store
+                health and credential refresh (IMDS) on that pod before a delta
+                is lost.
+          - exp_labels:
+              namespace: logs
+              pod: ingester-0
+              iceberg_namespace: tenant_acme
+              table: events
+              severity: warning
+            exp_annotations:
+              summary: Group-count delta writes for tenant_acme.events have needed retries for half an hour
+              description: >-
+                Delta writes for table tenant_acme.events on ingester-0 have
+                been succeeding only on retry for 30 minutes. Each retry is a
+                transient object-store or credential failure; a sustained rate
+                is the precursor to SiglakeGroupCountDeltaLost, which fires once
+                a write exhausts all four attempts. Check warehouse object-store
+                health and credential refresh (IMDS) on that pod before a delta
+                is lost.
+
+  # A single burst is what `for:` at twice the range exists to absorb: one
+  # retry, then nothing, keeps `rate()` positive for one 15m window and must
+  # not page.
+  - name: one retry burst stays silent
+    interval: 5m
+    input_series:
+      - series: 'siglake_group_count_delta_write_retries_total{namespace="logs",pod="ingester-0",iceberg_namespace="siglake",table="events"}'
+        values: '0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: SiglakeGroupCountDeltaRetrying
+        exp_alerts: []
 
   # #4674: the gauge is a current state, so the alert has to fire while it
   # stands and clear on the census pass after the repair — without a query

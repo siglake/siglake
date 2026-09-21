@@ -498,6 +498,7 @@ impl AuditService {
                 metrics::counter!("siglake_query_audit_failures_total",
                     "reason" => "append")
                 .increment(1);
+                record_drops("append", count);
             }
             None => {
                 tracing::warn!(
@@ -619,6 +620,7 @@ mod tests {
     use std::sync::Mutex;
 
     use arrow_array::{Array, StringArray};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use tokio::sync::Notify;
     use tokio::time::Instant;
 
@@ -689,8 +691,21 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FailingAppender {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AuditAppender for FailingAppender {
+        async fn append_query_audit(&self, _batch: RecordBatch) -> Result<usize> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            anyhow::bail!("fixture append failure")
+        }
+    }
+
     fn service_for(
-        appender: Arc<PendingThenAppends>,
+        appender: Arc<dyn AuditAppender>,
         flush_every: usize,
     ) -> (AuditService, AuditWriter) {
         AuditService::with_limits(
@@ -704,6 +719,53 @@ mod tests {
                 max_bytes: 1024 * 1024,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn a_failed_append_counts_every_abandoned_row_as_dropped() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+        let appender = Arc::new(FailingAppender::default());
+        let (service, writer) = service_for(appender.clone(), 3);
+        let worker = tokio::spawn(service.run());
+
+        writer.submit(row());
+        writer.submit(row());
+        writer.submit(row());
+        for _ in 0..1000 {
+            if appender.calls.load(Ordering::Acquire) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(appender.calls.load(Ordering::Acquire), 1);
+
+        drop(writer);
+        worker.await.unwrap();
+
+        let mut dropped = None;
+        let mut failures = None;
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            if !key
+                .key()
+                .labels()
+                .any(|label| label.key() == "reason" && label.value() == "append")
+            {
+                continue;
+            }
+            let DebugValue::Counter(value) = value else {
+                continue;
+            };
+            match key.key().name() {
+                "siglake_query_audit_dropped_total" => dropped = Some(value),
+                "siglake_query_audit_failures_total" => failures = Some(value),
+                _ => {}
+            }
+        }
+        assert_eq!(dropped, Some(3));
+        assert_eq!(failures, Some(1));
     }
 
     /// Wait, without advancing the clock, for the worker to record an append.
@@ -876,6 +938,7 @@ mod tests {
         assert_eq!(
             reasons,
             [
+                "append",
                 "append_deadline",
                 "byte_limit",
                 "channel_full",

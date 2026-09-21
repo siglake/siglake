@@ -231,7 +231,7 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
+    "w": 5,
     "x": 0,
     "y": 14
    },
@@ -254,8 +254,8 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
-    "x": 6,
+    "w": 5,
+    "x": 5,
     "y": 14
    },
    "targets": [
@@ -273,6 +273,39 @@
    "description": "Abandoned means the PVC is now the only copy of those rows."
   },
   {
+   "id": 173,
+   "type": "timeseries",
+   "title": "WAL mirror pin duration",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 5,
+    "x": 10,
+    "y": 14
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(siglake_wal_mirror_pin_duration_seconds_sum{namespace=~\"$namespace\"}[5m])) / sum(rate(siglake_wal_mirror_pin_duration_seconds_count{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "average",
+     "refId": "A"
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(siglake_wal_mirror_pin_duration_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p99",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    }
+   },
+   "description": "Synchronous seal time for the whole mirror pin operation, including local lookup, hard-link creation and the mirror-pending directory fsync. The metric does not attribute those components separately."
+  },
+  {
    "id": 108,
    "type": "timeseries",
    "title": "WAL recovery / integrity",
@@ -282,8 +315,8 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
-    "x": 12,
+    "w": 4,
+    "x": 15,
     "y": 14
    },
    "targets": [
@@ -315,8 +348,8 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
-    "x": 18,
+    "w": 5,
+    "x": 19,
     "y": 14
    },
    "targets": [
@@ -349,8 +382,8 @@
      "refId": "A"
     },
     {
-     "expr": "sum by (table) (increase(siglake_group_count_delta_write_retries_total{namespace=~\"$namespace\"}[5m]))",
-     "legendFormat": "retried {{table}}",
+     "expr": "sum by (iceberg_namespace, table) (increase(siglake_group_count_delta_write_retries_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "retried {{iceberg_namespace}}.{{table}}",
      "refId": "B"
     },
     {
@@ -359,7 +392,7 @@
      "refId": "C"
     }
    ],
-   "description": "Lost delta writes are grouped by Iceberg namespace and table, retried ones by table alone. A lost delta leaves the aggregate short, but writes a durable marker that the maintenance compactor normally repairs on its next aggregate fold; a sustained retry rate means the object store or credentials are flaky and a loss is likely. The third series is the inline side object's own publication: it retries on the same budget, and a loss there leaves that object short of total-records with only its group counts repairable."
+   "description": "All three series are grouped by Iceberg namespace and table: one commit path writes for the base namespace and every tenant namespace, each with its own events table. A lost delta leaves the aggregate short, but writes a durable marker that the maintenance compactor normally repairs on its next aggregate fold; a sustained retry rate means the object store or credentials are flaky and a loss is likely. The third series is the inline side object's own publication: it retries on the same budget, and a loss there leaves that object short of total-records with only its group counts repairable."
   },
   {
    "id": 143,
@@ -521,7 +554,7 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
+    "w": 4,
     "x": 0,
     "y": 39
    },
@@ -545,7 +578,7 @@
    "gridPos": {
     "h": 8,
     "w": 6,
-    "x": 6,
+    "x": 4,
     "y": 39
    },
    "targets": [
@@ -558,9 +591,14 @@
      "expr": "sum(siglake_compactor_segments_poisoned{namespace=~\"$namespace\"})",
      "legendFormat": "poison/ set-aside",
      "refId": "B"
+    },
+    {
+     "expr": "sum by (namespace, tenant) (siglake_compactor_orphans_held{namespace=~\"$namespace\"})",
+     "legendFormat": "orphans/ held {{namespace}}/{{tenant}}",
+     "refId": "C"
     }
    ],
-   "description": "Set aside and not draining without intervention: repeated drain failures (usually an index that does not exist), or a mirrored segment refused because it cannot be placed in the table its index resolves to now, which is set aside on the first cycle. Durable and unqueryable until requeued. The second line is the local filesystem drain's equivalent (#3143): a segment that failed to read on every attempt is held under `<wal>/poison/` with a note saying why, and `siglake wal-requeue --wal <wal-root>` is the way back once its cause is fixed. `siglake_compactor_segments_poisoned_total` is the event arm — a set-aside that is requeued and set aside again counts twice there and once here."
+   "description": "Set aside and not draining without intervention: repeated drain failures (usually an index that does not exist), or a mirrored segment refused because it cannot be placed in the table its index resolves to now, which is set aside on the first cycle. Durable and unqueryable until requeued. The second line is the local filesystem drain's equivalent (#3143): a segment that failed to read on every attempt is held under `<wal>/poison/` with a note saying why, and `siglake wal-requeue --wal <wal-root>` is the way back once its cause is fixed. `siglake_compactor_segments_poisoned_total` is the event arm — a set-aside that is requeued and set aside again counts twice there and once here. The third line is what `SiglakeCompactorOrphansHeld` pages on (#3267): quarantined segments under `<wal>/orphans/` that automatic disposition could not settle, because the names are absent from the table's consumed set and the snapshot that would prove whether they were committed is no longer retained. Their commit status is UNKNOWN and the files must be preserved — the rows may already be in the table or may exist nowhere else, so deleting one can lose rows and requeueing one can duplicate them, and either needs evidence from your own retention and ingest history first. Broken out by tenant, unlike the two summed lines, because the hold is per tenant and the answer to 'whose?' is the first thing the page needs; a rising line is a hold that is still growing. It is a filesystem-drain observation only: the catalog-claim drain publishes no reading at all, so no line here does not establish that a former WAL PVC has no orphans left under it."
   },
   {
    "id": 117,
@@ -572,8 +610,8 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
-    "x": 12,
+    "w": 4,
+    "x": 10,
     "y": 39
    },
    "targets": [
@@ -586,6 +624,40 @@
    "description": "The snapshots proving whether a segment was already committed had expired, so requeueing it may duplicate rows. Widen snapshot retention."
   },
   {
+   "id": 171,
+   "type": "timeseries",
+   "title": "Orphan dispositions",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 14,
+    "y": 39
+   },
+   "targets": [
+    {
+     "expr": "sum by (action) (increase(siglake_compactor_orphans_disposed_total{namespace=~\"$namespace\"}[30m]))",
+     "legendFormat": "{{action}} / 30m",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (action) (siglake_compactor_orphans_disposed_total{namespace=~\"$namespace\"})",
+     "legendFormat": "{{action}} (cumulative)",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "description": "Filesystem-drain-only dispositions of quarantined files under `<wal>/orphans/`. deleted means proven committed and removed; requeued means proven uncommitted and returned to sealed/ for draining. The 30-minute increase shows recent decisions. The cumulative companion preserves first-event visibility because each action and tenant series is registered only on its first positive disposition; absence or a flat increase does not prove that no files were settled. The catalog-claim drain does not visit WAL orphan directories or publish this counter."
+  },
+  {
    "id": 118,
    "type": "timeseries",
    "title": "Commit p99 latency",
@@ -595,8 +667,8 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 6,
-    "x": 18,
+    "w": 4,
+    "x": 20,
     "y": 39
    },
    "targets": [
@@ -1252,7 +1324,7 @@
      "min": 0
     }
    },
-   "description": "Batch runs whose execution ENDED without a terminal state being installed, because the job store was unreachable for every attempt the run could afford. The executor keeps a bounded, body-free note of those ids and retries the same conditional write every 5s: the parked gauge is that backlog and the reconciled rate is it draining, so a store outage shows as the gauge rising and then falling to zero with no operator action. It is deliberately diagnostic only — no alert reads it. The bottom two series are the failure of that mechanism and both fire SiglakeBatchRowStrandedNonTerminal: bookkeeping full at 1024 ids per replica, and a run reporting that its write could not even be tracked. They move together by construction, and either one means a client polls `running` until this pod exits and lease-expiry recovery on a peer condemns the row. Note the mixed units: the parked series is a count of ids, the other three are per-second rates."
+   "description": "Batch runs whose execution ENDED without a terminal state being installed, because the job store was unreachable for every attempt the run could afford. The executor keeps a bounded, body-free note of those ids and retries the same conditional write every 5s: the parked gauge is that backlog and the reconciled rate is it draining, so a store outage shows as the gauge rising and then falling to zero. SiglakeBatchReconciliationBacklogStalled warns when a pod's parked gauge stays nonzero for 15 seconds; the verified Postgres recovery drained a 3/4-per-pod peak within 13.2 seconds. The bottom two series are the failure of that mechanism and both fire SiglakeBatchRowStrandedNonTerminal: bookkeeping full at 1024 ids per replica, and a run reporting that its write could not even be tracked. They move together by construction, and either one means a client polls `running` until this pod exits and lease-expiry recovery on a peer condemns the row. Note the mixed units: the parked series is a count of ids, the other three are per-second rates."
   },
   {
    "id": 128,
@@ -1642,9 +1714,9 @@
    "description": "The parsed working set against the bound that evicts it. Both are published where the bounds are enforced — on admission to the cache — so neither exists before the pod's first indexed text query and both hold their last value while no text query runs; read them with the eviction arms beside them, not on their own. Resident pinned at the budget with byte_bound drops beside it is the case for raising SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES (or the query pod's memory limit, which the resolved budget follows when it is set)."
   },
   {
-   "id": 162,
+   "id": 165,
    "type": "timeseries",
-   "title": "Decoded-file cache populations (abandoned = decoded, then dropped)",
+   "title": "Puffin blob cache fetches / hits / evictions",
    "datasource": {
     "type": "prometheus",
     "uid": "${datasource}"
@@ -1654,6 +1726,45 @@
     "w": 24,
     "x": 0,
     "y": 146
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(siglake_iceberg_puffin_blob_fetches_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "fetch",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (outcome) (rate(siglake_iceberg_puffin_blob_cache_lookups_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "lookup {{outcome}}",
+     "refId": "B"
+    },
+    {
+     "expr": "sum by (reason) (rate(siglake_iceberg_puffin_blob_cache_evictions_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "dropped {{reason}}",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "min": 0
+    }
+   },
+   "description": "Whether a re-decode also had to re-read the blob. fetch is the object-store read this cache exists to stop; lookup hit is a decode handed bytes the cache still held and lookup miss is one that had to fetch. Every arm is pre-registered at 0 on the query server, so a tier serving no text query charts zero rather than No data. Read it beside the parsed-index panel: a parsed miss is what brings a query here at all, so hits climbing with parsed misses is a working set past the parsed budget but inside the blob budget, which costs a decode and no read. A fetch rate that tracks the parsed miss rate is the #4182 shape — every execution re-reading every blob — and it was inferred from index-phase bytes and first_batch_ms for a whole round before these counters existed. fetch above miss is index reading that consulted no cache: a rebuild that bypasses it, or a pod with SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES or _MAX_ENTRIES at 0. dropped oversized is the other reading this panel owes an operator: a file whose index blob alone exceeds SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES is never admitted, so it re-reads on every decode while the cache holds it never \u2014 a pod one blob short of its plan's per-file index otherwise charts exactly what a cold cache and a disabled one chart. The other dropped arms name the eviction rule that chose each victim: redundant is a blob whose parsed twin is resident, which cannot be read until that twin goes, stale is one nothing read while the cache turned over four times (its file has left the plan), and fifo is the fallback for a cache holding nothing live and recent — a steady fifo rate beside a fetch rate is the pre-#4182 behaviour, which dropped a blob one step before the query that wanted it. On run #81's keyword_and_label plan that difference was 4.60 GB over 183 index-phase reads against 0.50 GB over 73."
+  },
+  {
+   "id": 162,
+   "type": "timeseries",
+   "title": "Decoded-file cache populations (abandoned = decoded, then dropped)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 18,
+    "x": 0,
+    "y": 154
    },
    "targets": [
     {
@@ -1668,7 +1779,228 @@
      "min": 0
     }
    },
-   "description": "Decoded-file cache populations, by what happened to each one. The cache is experimental and OFF by default (SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_BYTES and _MAX_ENTRIES are 0 in the chart, the compose file and the operator), so a flat zero on every arm is the expected reading for most deployments; all eight arms are pre-registered on the query server, so zero charts as zero rather than No data. abandoned is the arm to read when it IS on (#4846): a population that decoded batches, buffered them and was dropped before the end-of-stream arm could insert them — a LIMIT satisfied from the first batches, or a cancelled query. It cannot be read off miss, which is charged when a partition OPENS its first task, once per partition: the 2026-09-15 50G rounds exported 448 miss and no insert at 8 GiB, and #4494 had to establish from four ABSENT series that those were opens rather than populations that failed to stick. abandoned at the miss rate with insert at zero is that same shape, stated directly: the budget is subtracted from the query memory pool and nothing is ever kept. insert against abandoned is therefore the readout of whether the cache is earning its bytes on this workload. The other arms: bypass is a scan with a raw-text or promoted-column predicate, which reads through the pruning reader by design and never populates; skip_oversized is one file's decoded batches crossing a quarter of the budget; insert_skipped_contended is the deliberate degrade when a finished population loses the cache lock — one skip costs one future miss, and its rate against insert is #3086; evict is the LRU bound biting. The arms do not partition miss: miss is charged before the populate stream is built, and hit and bypass never build one."
+   "description": "Decoded-file cache populations, by what happened to each one. The cache is experimental and OFF by default (SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_BYTES and _MAX_ENTRIES are 0 in the chart, the compose file and the operator), so a flat zero on every arm is the expected reading for most deployments; all eight arms are pre-registered on the query server, so zero charts as zero rather than No data. abandoned is the arm to read when it IS on (#4846): a population that decoded batches, buffered them and was dropped before the end-of-stream arm could insert them — a LIMIT satisfied from the first batches, or a cancelled query. It cannot be read off miss, which is charged when a partition OPENS its first task, once per partition: the 2026-09-15 50G rounds exported 448 miss and no insert at 8 GiB, and #4494 had to establish from four ABSENT series that those were opens rather than populations that failed to stick. abandoned at the miss rate with insert at zero is that same shape, stated directly: the budget is subtracted from the query memory pool and nothing is ever kept. insert against abandoned is therefore the readout of whether the cache is earning its bytes on this workload. The other arms: bypass is a scan with a raw-text or promoted-column predicate, which reads through the pruning reader by design and never populates; skip_oversized is one file's decoded batches crossing a quarter of the budget; insert_skipped_contended is the deliberate degrade when a finished population loses the cache lock — one skip costs one future miss, and the panel beside this one shows its share of completed insert attempts per query pod; evict is the LRU bound biting. The arms do not partition miss: miss is charged before the populate stream is built, and hit and bypass never build one."
+  },
+  {
+   "id": 172,
+   "type": "timeseries",
+   "title": "Decoded-file cache contended-insert share",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 18,
+    "y": 154
+   },
+   "targets": [
+    {
+     "expr": "((sum by (namespace, pod) (rate(siglake_query_scan_file_cache_requests_total{namespace=~\"$namespace\",outcome=\"insert_skipped_contended\"}[5m])) or sum by (namespace, pod) (rate(siglake_query_scan_file_cache_requests_total{namespace=~\"$namespace\",outcome=~\"insert|insert_skipped_contended\"}[5m])) * 0) / (sum by (namespace, pod) (rate(siglake_query_scan_file_cache_requests_total{namespace=~\"$namespace\",outcome=~\"insert|insert_skipped_contended\"}[5m])) > 0)) or sum by (namespace, pod) (rate(siglake_query_scan_file_cache_requests_total{namespace=~\"$namespace\",outcome=~\"insert|insert_skipped_contended\"}[5m])) * 0",
+     "legendFormat": "{{namespace}} / {{pod}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "min": 0,
+     "max": 1
+    }
+   },
+   "description": "The share of completed decoded-file cache insert attempts that lost the cache's try_lock, per query pod: insert_skipped_contended / (insert + insert_skipped_contended). A skip is safe because another reader can rebuild the entry, but it costs that future miss and decode. A sustained high share means contention is preventing the cache from filling; no alert is set until #3053 supplies a representative threshold and sustain window. The two outcome series are pre-registered at zero. An idle pod is rendered as 0%; confirm that the raw insert arms beside it are active before interpreting the percentage."
+  },
+  {
+   "id": 166,
+   "type": "timeseries",
+   "title": "Footer text-index checksum refusals",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 162
+   },
+   "targets": [
+    {
+     "expr": "sum by (reason) (increase(siglake_index_footer_checksum_refused_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "{{reason}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "min": 0
+    }
+   },
+   "description": "Footer-KV inverted indexes refused before pruning because their sibling CRC-32 is malformed or disagrees with the stored blob. The reader falls back to Puffin when present and otherwise scans the file exactly, so a rising rate means correctness was preserved at the cost of scan work. Both reasons are pre-registered at zero on query pods."
+  },
+  {
+   "id": 167,
+   "type": "timeseries",
+   "title": "Index sidecars written / refused by reason",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 170
+   },
+   "targets": [
+    {
+     "expr": "sum by (outcome, reason) (increase(siglake_iceberg_segmented_index_writes_total{namespace=~\"$namespace\"}[1h]))",
+     "legendFormat": "{{outcome}} {{reason}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "min": 0
+    },
+    "overrides": []
+   },
+   "description": "What the sidecar writer decided at the close of a compaction rewrite. written is charged once per (output file, indexed column); a refusal is charged once per output file, because the writer abandons that file's whole sidecar set at the first column it cannot stand behind. written is a segmented (seg2) sidecar handed to the registration; the three refused reasons are the ways a sidecar would have described a file layout the file does not have, and each one leaves that file on the scan path with no index: column is a row group whose text column could not be indexed, file_rows is a sidecar whose total rows disagree with the file's, and row_domain is a sidecar whose per-group rows disagree with the footer's row groups. A refusal is the safe outcome (the reader scans exactly, as it does for an unindexed file), so nothing here is a correctness signal — it is the one place a compactor writing files without indexes is visible. Every arm is pre-registered at 0 on the compactor, so a pod with the writer switched off charts flat zeros rather than No data: the writer is opt-in (SIGLAKE_SEGMENTED_INDEX_WRITES=1) and an all-zero panel is the correct reading of a default install. Read it against the v1 rebuild panels below: a file the writer refused is a file the post-rewrite v1 rebuild has to decode whole, if that is on at all."
+  },
+  {
+   "id": 168,
+   "type": "timeseries",
+   "title": "Index sidecar bytes / per-group index bytes (p50 / p99 per pod)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 170
+   },
+   "targets": [
+    {
+     "expr": "siglake_iceberg_segmented_index_written_bytes{namespace=~\"$namespace\", quantile=\"0.5\"}",
+     "legendFormat": "p50 sidecar {{pod}}",
+     "refId": "A"
+    },
+    {
+     "expr": "siglake_iceberg_segmented_index_written_bytes{namespace=~\"$namespace\", quantile=\"0.99\"}",
+     "legendFormat": "p99 sidecar {{pod}}",
+     "refId": "B"
+    },
+    {
+     "expr": "siglake_iceberg_segmented_index_group_index_bytes{namespace=~\"$namespace\", quantile=\"0.5\"}",
+     "legendFormat": "p50 group index {{pod}}",
+     "refId": "C"
+    },
+    {
+     "expr": "siglake_iceberg_segmented_index_group_index_bytes{namespace=~\"$namespace\", quantile=\"0.99\"}",
+     "legendFormat": "p99 group index {{pod}}",
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "min": 0
+    },
+    "overrides": []
+   },
+   "description": "What a seg2 sidecar costs, in the two units that answer different questions. sidecar is one finished blob's encoded size — the Puffin bytes the rewrite commits and a later text query fetches. group index is the heap one row group's postings and dictionary occupy while the writer builds them, recorded per row group and dropped at the end of that group: it is the bound the streaming design rests on, not the writer's peak live heap, and a series that grows with file size would mean the build had become file-proportional. Both are exported as summaries, so these are each pod's own quantiles over the exporter's rolling window and are charted per pod rather than summed or averaged — a mean of percentiles is not a percentile, and one compactor's outlier rewrite is the reading. Neither series exists before that pod's first sidecar: quantiles cannot be pre-registered, and the writer is opt-in, so No data here means no seg2 sidecar has closed on this pod."
+  },
+  {
+   "id": 169,
+   "type": "timeseries",
+   "title": "v1 index rebuild: files and source bytes",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 178
+   },
+   "targets": [
+    {
+     "expr": "sum by (table) (increase(siglake_index_rebuild_files_total{namespace=~\"$namespace\"}[1h]))",
+     "legendFormat": "files/h {{table}}",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (table) (increase(siglake_index_rebuild_bytes_total{namespace=~\"$namespace\"}[1h]))",
+     "legendFormat": "source bytes/h {{table}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "min": 0
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byFrameRefID",
+       "options": "B"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "bytes"
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "right"
+       }
+      ]
+     }
+    ]
+   },
+   "description": "The opt-in post-rewrite index rebuild (#4162), which reads a committed data file back whole and builds a v1 inverted index for every column the rewrite left without one. files is how many data files one pass rebuilt; source bytes (right axis) is those files' own size, which is the Parquet the pass re-read and decoded — not the index it produced. Both are charged once per pass and only after the registration commits, so a pass that rebuilt nothing, or whose registration was deferred, adds nothing here; the \"Index registrations deferred\" panel is where that second case shows. Neither series is pre-registered — both carry the tenant and table, known only at the increment — so a table that has never been rebuilt is absent rather than zero, and No data on the whole panel means no rebuild has committed on any pod. Rising files with the sidecar panel above flat is the compactor paying for whole-file decodes the seg2 writer would have avoided."
+  },
+  {
+   "id": 170,
+   "type": "timeseries",
+   "title": "v1 index rebuild duration (p50 / p99)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 178
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.50, sum by (le, table) (rate(siglake_index_rebuild_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p50 {{table}}",
+     "refId": "A"
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le, table) (rate(siglake_index_rebuild_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+     "legendFormat": "p99 {{table}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "min": 0
+    },
+    "overrides": []
+   },
+   "description": "How long one rebuild pass took, end to end: the footer probe over every candidate file, the whole-file decode of the ones that needed rebuilding, and the Puffin registration. A pass that rebuilt nothing, or whose registration was deferred, records nothing here at all. A classic histogram (siglake-core buckets every _seconds name), so these are quantiles over the fleet's aggregated buckets rather than one pod's — unlike the byte panel beside it. The pass runs inside a compaction cycle and holds it, so a p99 here that approaches the cycle interval is a compactor whose rebuild is the cycle. Read the sample count against the files panel to its left: the same pass can rebuild one file or many, and a p99 that climbs with a flat file rate is per-file decode cost, not more work."
   },
   {
    "id": 137,
@@ -1678,7 +2010,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 154
+    "y": 186
    },
    "collapsed": false
   },
@@ -1694,7 +2026,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 155
+    "y": 187
    },
    "targets": [
     {
@@ -1741,7 +2073,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 155
+    "y": 187
    },
    "targets": [
     {
@@ -1772,7 +2104,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 155
+    "y": 187
    },
    "targets": [
     {
@@ -1806,7 +2138,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 163
+    "y": 195
    },
    "collapsed": false
   },
@@ -1822,7 +2154,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 164
+    "y": 196
    },
    "targets": [
     {
@@ -1850,7 +2182,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 164
+    "y": 196
    },
    "targets": [
     {
@@ -1883,7 +2215,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 172
+    "y": 204
    },
    "targets": [
     {
@@ -1917,7 +2249,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 180
+    "y": 212
    },
    "targets": [
     {
@@ -1932,7 +2264,36 @@
     },
     "overrides": []
    },
-   "description": "Whole audit rows lost without changing query responses. Oversized is a single row above the byte ceiling; row_limit and byte_limit are retained-budget saturation; channel_full is a transient sender/worker race; worker_shutdown means no audit receiver remains. Those five are refusals at submit. append_deadline is the other kind: a storage append outlived its service deadline and the batch it held was abandoned, so it counts one per row already accepted, and its commit may or may not have landed."
+   "description": "Whole audit rows lost without changing query responses. Oversized is a single row above the byte ceiling; row_limit and byte_limit are retained-budget saturation; channel_full is a transient sender/worker race; worker_shutdown means no audit receiver remains. Those five are refusals at submit. append means a storage append returned an error and its whole batch was dropped without retry, counted once per row. append_deadline means an append outlived its service deadline and its batch was abandoned, counted once per row; its commit may or may not have landed."
+  },
+  {
+   "id": 164,
+   "type": "timeseries",
+   "title": "Index registrations deferred",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 220
+   },
+   "targets": [
+    {
+     "expr": "sum by (reason) (increase(siglake_index_registration_deferred_total{namespace=~\"$namespace\"}[1h]))",
+     "legendFormat": "{{reason}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "description": "Puffin index registrations refused because the target snapshot already carries a statistics file. The existing file stays discoverable; the warning log names data files left on the scan path until a later snapshot."
   }
  ]
 }

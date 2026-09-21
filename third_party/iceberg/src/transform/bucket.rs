@@ -388,18 +388,18 @@ mod test {
         )?;
 
         fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::In, vec![
-                Datum::uuid(value),
-                Datum::uuid(another),
-            ]),
+            &fixture.set_predicate(
+                PredicateOperator::In,
+                vec![Datum::uuid(value), Datum::uuid(another)],
+            ),
             Some("name IN (4, 6)"),
         )?;
 
         fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::NotIn, vec![
-                Datum::uuid(value),
-                Datum::uuid(another),
-            ]),
+            &fixture.set_predicate(
+                PredicateOperator::NotIn,
+                vec![Datum::uuid(value), Datum::uuid(another)],
+            ),
             None,
         )?;
 
@@ -455,18 +455,18 @@ mod test {
         )?;
 
         fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::In, vec![
-                Datum::fixed(value.clone()),
-                Datum::fixed(another.clone()),
-            ]),
+            &fixture.set_predicate(
+                PredicateOperator::In,
+                vec![Datum::fixed(value.clone()), Datum::fixed(another.clone())],
+            ),
             Some("name IN (4, 6)"),
         )?;
 
         fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::NotIn, vec![
-                Datum::fixed(value.clone()),
-                Datum::fixed(another.clone()),
-            ]),
+            &fixture.set_predicate(
+                PredicateOperator::NotIn,
+                vec![Datum::fixed(value.clone()), Datum::fixed(another.clone())],
+            ),
             None,
         )?;
 
@@ -515,18 +515,18 @@ mod test {
         )?;
 
         fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::In, vec![
-                Datum::string(value),
-                Datum::string(another),
-            ]),
+            &fixture.set_predicate(
+                PredicateOperator::In,
+                vec![Datum::string(value), Datum::string(another)],
+            ),
             Some("name IN (9, 4)"),
         )?;
 
         fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::NotIn, vec![
-                Datum::string(value),
-                Datum::string(another),
-            ]),
+            &fixture.set_predicate(
+                PredicateOperator::NotIn,
+                vec![Datum::string(value), Datum::string(another)],
+            ),
             None,
         )?;
 
@@ -592,19 +592,25 @@ mod test {
         )?;
 
         fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::In, vec![
-                Datum::decimal_from_str(next)?,
-                Datum::decimal_from_str(curr)?,
-                Datum::decimal_from_str(prev)?,
-            ]),
+            &fixture.set_predicate(
+                PredicateOperator::In,
+                vec![
+                    Datum::decimal_from_str(next)?,
+                    Datum::decimal_from_str(curr)?,
+                    Datum::decimal_from_str(prev)?,
+                ],
+            ),
             Some("name IN (2, 6)"),
         )?;
 
         fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::NotIn, vec![
-                Datum::decimal_from_str(curr)?,
-                Datum::decimal_from_str(next)?,
-            ]),
+            &fixture.set_predicate(
+                PredicateOperator::NotIn,
+                vec![
+                    Datum::decimal_from_str(curr)?,
+                    Datum::decimal_from_str(next)?,
+                ],
+            ),
             None,
         )?;
 
@@ -651,19 +657,22 @@ mod test {
         )?;
 
         fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::In, vec![
-                Datum::long(value - 1),
-                Datum::long(value),
-                Datum::long(value + 1),
-            ]),
+            &fixture.set_predicate(
+                PredicateOperator::In,
+                vec![
+                    Datum::long(value - 1),
+                    Datum::long(value),
+                    Datum::long(value + 1),
+                ],
+            ),
             Some("name IN (8, 7, 6)"),
         )?;
 
         fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::NotIn, vec![
-                Datum::long(value),
-                Datum::long(value + 1),
-            ]),
+            &fixture.set_predicate(
+                PredicateOperator::NotIn,
+                vec![Datum::long(value), Datum::long(value + 1)],
+            ),
             None,
         )?;
 
@@ -711,19 +720,22 @@ mod test {
         )?;
 
         fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::In, vec![
-                Datum::int(value - 1),
-                Datum::int(value),
-                Datum::int(value + 1),
-            ]),
+            &fixture.set_predicate(
+                PredicateOperator::In,
+                vec![
+                    Datum::int(value - 1),
+                    Datum::int(value),
+                    Datum::int(value + 1),
+                ],
+            ),
             Some("name IN (8, 7, 6)"),
         )?;
 
         fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::NotIn, vec![
-                Datum::int(value),
-                Datum::int(value + 1),
-            ]),
+            &fixture.set_predicate(
+                PredicateOperator::NotIn,
+                vec![Datum::int(value), Datum::int(value + 1)],
+            ),
             None,
         )?;
 

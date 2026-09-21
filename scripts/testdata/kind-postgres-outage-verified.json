@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 5,
   "generated_at": "2026-09-07T12:02:00Z",
   "revisions": {
     "repository_commit": "0123456789abcdef",
@@ -82,6 +82,24 @@
       "detail": ""
     }
   ],
+  "write_probe_commit_times": {
+    "at": "2026-09-07T12:01:08Z",
+    "exec_status": 0,
+    "query_status": 0,
+    "rows": [
+      {
+        "phase": "baseline",
+        "observed_at": "2026-09-07 12:00:00.331904+00",
+        "committed_at": "2026-09-07 12:00:00.332715+00"
+      },
+      {
+        "phase": "recovery",
+        "observed_at": "2026-09-07 12:00:51.108220+00",
+        "committed_at": "2026-09-07 12:00:51.109044+00"
+      }
+    ],
+    "detail": ""
+  },
   "job_commit_times": {
     "at": "2026-09-07T12:01:06Z",
     "exec_status": 0,
@@ -103,6 +121,77 @@
         "submitted_at": "2026-09-07 12:00:02.118440+00",
         "ended_at": "2026-09-07 12:00:52.004551+00",
         "recovered_at": null,
+        "committed_at": "2026-09-07 12:00:52.131288+00"
+      }
+    ],
+    "detail": ""
+  },
+  "job_write_history": {
+    "at": "2026-09-07T12:01:07Z",
+    "install_exec_status": 0,
+    "install_status": 0,
+    "install_detail": "",
+    "exec_status": 0,
+    "query_status": 0,
+    "rows": [
+      {
+        "seq": 1,
+        "job_id": "job-a",
+        "op": "INSERT",
+        "old_status": null,
+        "new_status": "pending",
+        "recovered_at": null,
+        "observed_at": "2026-09-07 12:00:01.204817+00",
+        "committed_at": "2026-09-07 12:00:01.205901+00"
+      },
+      {
+        "seq": 2,
+        "job_id": "job-b",
+        "op": "INSERT",
+        "old_status": null,
+        "new_status": "pending",
+        "recovered_at": null,
+        "observed_at": "2026-09-07 12:00:02.118440+00",
+        "committed_at": "2026-09-07 12:00:02.119512+00"
+      },
+      {
+        "seq": 3,
+        "job_id": "job-a",
+        "op": "UPDATE",
+        "old_status": "pending",
+        "new_status": "running",
+        "recovered_at": null,
+        "observed_at": "2026-09-07 12:00:02.301774+00",
+        "committed_at": "2026-09-07 12:00:02.302615+00"
+      },
+      {
+        "seq": 4,
+        "job_id": "job-b",
+        "op": "UPDATE",
+        "old_status": "pending",
+        "new_status": "running",
+        "recovered_at": null,
+        "observed_at": "2026-09-07 12:00:02.514093+00",
+        "committed_at": "2026-09-07 12:00:02.515002+00"
+      },
+      {
+        "seq": 5,
+        "job_id": "job-a",
+        "op": "UPDATE",
+        "old_status": "running",
+        "new_status": "succeeded",
+        "recovered_at": null,
+        "observed_at": "2026-09-07 12:00:51.771902+00",
+        "committed_at": "2026-09-07 12:00:51.884113+00"
+      },
+      {
+        "seq": 6,
+        "job_id": "job-b",
+        "op": "UPDATE",
+        "old_status": "running",
+        "new_status": "succeeded",
+        "recovered_at": null,
+        "observed_at": "2026-09-07 12:00:52.004551+00",
         "committed_at": "2026-09-07 12:00:52.131288+00"
       }
     ],

@@ -16,6 +16,7 @@
 //!   cargo test --release -p siglake-storage --test storage \
 //!     pre_coverage_time_agg::the_fallback_cost_report -- --ignored --nocapture
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
@@ -24,7 +25,8 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use siglake_core::index_config::IndexConfig;
 use siglake_core::Event;
 use siglake_storage::iceberg::{
-    IcebergContext, IcebergTuning, SnapshotAggregates, TimeBounds, SNAPSHOT_TIME_BUCKET_BASE_NS,
+    ColumnGroupCounts, IcebergContext, IcebergTuning, SnapshotAggregates, TimeBounds,
+    SNAPSHOT_TIME_BUCKET_BASE_NS,
 };
 
 const INDEX: &str = "logs-pre-coverage";
@@ -334,10 +336,24 @@ async fn a_recluster_does_not_restore_coverage() {
 
     let ice = open(tmp.path()).await;
     let ident = ice.index_table_ident(INDEX);
+    // One re-cluster commit is what this asks for. The seed spans about 42 day
+    // partitions and `recluster_files` takes one partition value per call
+    // (#4720), so the bin is one day's files, not the whole live set.
     let files = ice.live_data_files(&ident).await.unwrap();
     assert!(files.len() > 1, "need multiple files to compact");
+    let mut groups: BTreeMap<String, Vec<_>> = BTreeMap::new();
+    for file in files {
+        groups
+            .entry(format!("{:?}", file.partition()))
+            .or_default()
+            .push(file);
+    }
+    let bin = groups
+        .into_values()
+        .max_by_key(|group| group.len())
+        .expect("a live partition to re-cluster");
     let bloom: Vec<&str> = vec!["host", "source", "sourcetype", "index"];
-    ice.recluster_files(&ident, files, &bloom).await.unwrap();
+    ice.recluster_files(&ident, bin, &bloom).await.unwrap();
 
     assert_eq!(read_side(tmp.path()).coverage, None);
     let window = last25(4, 200);
@@ -727,12 +743,23 @@ async fn bucket_contained_files_are_rebuilt_from_footers_and_agree() {
     let config = index_config();
     ice.create_index(&config).await.unwrap();
     for a in 0..5 {
-        append(&ice, &config, a * 300, 300, 1).await;
+        // Repeated timestamps keep the sibling far below every cardinality cap.
+        // Its absence therefore proves the semantic exclusion, not cap eviction.
+        append(&ice, &config, a * 300, 300, 0).await;
     }
     let window = TimeBounds {
         start: Some(base_time()),
         end: Some(base_time() + Duration::hours(1)),
     };
+    let aggregate_timestamp_ns = ice
+        .grouped_counts_with_summary(INDEX, "timestamp_ns", None, None)
+        .await
+        .unwrap();
+    assert!(
+        aggregate_timestamp_ns.is_none(),
+        "timestamp_ns must miss every aggregate tier so the SQL caller takes its exact scan"
+    );
+
     let before = read_side(tmp.path());
     drop(ice);
 
@@ -772,12 +799,8 @@ async fn bucket_contained_files_are_rebuilt_from_footers_and_agree() {
 
     assert!(report.published, "{report:?}");
     let after = read_side(tmp.path());
-    // Per covering column, not map-for-map. `group_count_columns_for` admits
-    // every Int64 field, so `timestamp_ns` is in the rollup's column set and
-    // thrashes the value cap: the accumulated object holds whichever commit's
-    // 300 distinct values landed last, 300 of 1,500 rows. That column is short
-    // and the read guard refuses it either way, so the rebuild drops it —
-    // comparing whole maps would assert the leftover instead of the repair.
+    // Per covering column, not map-for-map: this pins that the footer shortcut
+    // and ordinary commit-path maintenance compute the same rollup.
     let before_tg = before.time_group_counts.expect("maintained rollup");
     let after_tg = after.time_group_counts.expect("rebuilt rollup");
     let covering: Vec<&str> = report
@@ -798,12 +821,8 @@ async fn bucket_contained_files_are_rebuilt_from_footers_and_agree() {
         );
     }
     assert!(
-        report
-            .columns
-            .iter()
-            .any(|c| c.column == "timestamp_ns" && !c.covers_table),
-        "the short timestamp column must be reported as not covering, not \
-         silently dropped: {report:?}"
+        report.columns.iter().all(|c| c.column != "timestamp_ns"),
+        "new aggregate selection must not rebuild timestamp_ns: {report:?}"
     );
     assert!(
         !after_tg.columns.contains_key("timestamp_ns"),
@@ -816,5 +835,72 @@ async fn bucket_contained_files_are_rebuilt_from_footers_and_agree() {
             .expect("windowed group counts")
             .source_label(),
         "tier1_windowed_agg"
+    );
+}
+
+/// Existing side objects can still carry the pre-fix inferred column. Keep the
+/// compatibility report pinned with explicit legacy metadata rather than
+/// making new writes recreate the defect.
+#[tokio::test]
+async fn a_legacy_short_timestamp_ns_is_reported_and_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = open(tmp.path()).await;
+    let config = index_config();
+    ice.create_index(&config).await.unwrap();
+    for a in 0..5 {
+        append(&ice, &config, a * 300, 300, 0).await;
+    }
+
+    let fixed_bytes = std::fs::read(side_object_path(tmp.path())).unwrap();
+    let mut legacy = read_side(tmp.path());
+    let legacy_tg = legacy
+        .time_group_counts
+        .as_mut()
+        .expect("maintained rollup");
+    legacy_tg.columns.insert(
+        "timestamp_ns".to_string(),
+        std::collections::BTreeMap::from([(
+            base_time()
+                .timestamp_nanos_opt()
+                .expect("base time in nanos"),
+            ColumnGroupCounts {
+                values: [("legacy".to_string(), 300)].into_iter().collect(),
+                nulls: 0,
+            },
+        )]),
+    );
+    let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+    assert!(
+        legacy_bytes.len() > fixed_bytes.len(),
+        "the excluded column must reduce the maintained side object: legacy={} fixed={}",
+        legacy_bytes.len(),
+        fixed_bytes.len()
+    );
+    eprintln!(
+        "inline aggregate bytes for 5x300 repeated timestamps: legacy={} fixed={} saved={}",
+        legacy_bytes.len(),
+        fixed_bytes.len(),
+        legacy_bytes.len() - fixed_bytes.len()
+    );
+    write_side(tmp.path(), &legacy_bytes);
+    drop(ice);
+
+    strip_coverage(tmp.path());
+    let ice = open(tmp.path()).await;
+    let report = ice.rebuild_inline_time_aggregates(INDEX).await.unwrap();
+    assert!(
+        report
+            .columns
+            .iter()
+            .any(|c| c.column == "timestamp_ns" && !c.covers_table),
+        "the short legacy timestamp column must be reported: {report:?}"
+    );
+    assert!(
+        !read_side(tmp.path())
+            .time_group_counts
+            .expect("rebuilt rollup")
+            .columns
+            .contains_key("timestamp_ns"),
+        "a legacy column short of the row count must not be published"
     );
 }

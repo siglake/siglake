@@ -202,6 +202,37 @@ metric still renders in filesystem mode, where each pod's sealed count is its
 own — but the refusal above holds that mode at `maxReplicas: 1`, so it scales
 nothing there either.
 
+### Switching an existing filesystem-drain release to the claim
+
+The upgrade re-renders the compactor onto that `emptyDir` and changes nothing
+on the volume. The PVC stays — the ingester still mounts it at
+`/var/lib/siglake/wal` — but the compactor stops reading it, so anything the
+filesystem drain had set aside there is unattended and unreported from then
+on.
+
+Held orphans are the case to settle before you switch. A segment the drain
+quarantined under `<wal>/**/orphans/` and could not settle is held, counted by
+`siglake_compactor_orphans_held{tenant}` and paged by
+`SiglakeCompactorOrphansHeld` (see the alert list below). Both readings come
+from the filesystem sweep; the claim drain publishes neither, and the pod that
+would census the directory no longer has the volume. An absent series after
+the switch is therefore not evidence that the old volume is clear.
+
+So, in order: inventory `<wal>/**/orphans/` on the PVC first — from an
+ingester pod, which mounts the same claim before and after — and record what
+is there. Keep the files. A held orphan's commit status is UNKNOWN, which is
+why it was held and not a finding that its rows are missing: they may already
+be in the table or may exist nowhere else, so deleting one can lose rows and
+requeueing one can duplicate them. Establish which from your own retention and
+ingest history before moving anything. The way back changes too: the claim
+drain never reads `sealed/`, so a file moved there afterwards reaches the
+table by way of the ingester's mirror catch-up sweep and the claim drain's
+mirror sync, not the local rename the filesystem drain used.
+
+`siglake-operator` refuses this handover rather than performing it
+(`DrainModeHandoverRequired`, `docs/LIMITATIONS.md`); the chart does not
+refuse it, which is why the inventory is yours to do.
+
 ### The ingester does not compact
 
 `ingest-server --with-compactor` gives one process an in-process compactor.
@@ -436,6 +467,15 @@ A complete `query.oidc` block is authentication, so it needs
 `query.distributed.coordinatorToken` wherever fan-out is reachable, exactly as
 a token allow-list does.
 
+`query.allowedTenants` is an optional exact allow-list for verified query
+tenant claims. Empty keeps query admission unrestricted. A non-empty list
+requires the complete `query.oidc` block including `tenantClaim`; the chart
+refuses an allow-list that has no claim routing to match. The setting is
+independent of `ingester.allowedTenants`, so removing a tenant from write
+admission does not remove access to retained data. Each worker checks its own
+list before opening the forwarded tenant namespace, and a mismatched worker's
+`403` is returned through the coordinator.
+
 ## Ingress
 
 ClusterIP only by default. Customers typically expose the query-server
@@ -537,8 +577,9 @@ automatic rebuild fails or remains incomplete and names the Iceberg
 namespace and table; use `siglake rebuild-group-counts --namespace <ns> --table
 <table>` as the operator fallback.
 `SiglakeGroupCountDeltaRetrying` (warning) fires once delta writes for a table
-have needed retries for half an hour and names both the table and pod, warning
-that an exhausted write and automatic rebuild are becoming more likely.
+have needed retries for half an hour and names the Iceberg namespace, table and
+pod, warning that an exhausted write and automatic rebuild are becoming more
+likely.
 `SiglakeSideAggregatePublicationLost` (warning) covers the inline aggregate
 object: a publication that exhausts the same four attempts loses the commit's
 contribution outright, so it fires on the failure itself. The compactor's
@@ -598,7 +639,14 @@ one can duplicate them; establish which from your own evidence (the compactor's
 segment is a readable Arrow stream) before moving anything. Raising
 `compactor.snapshotExpire.retainLast` keeps the proof available for orphans a
 future crash creates; it cannot restore history that has already expired and
-will not clear an existing hold.
+will not clear an existing hold. The level is charted per tenant on the
+"Segments quarantined" panel of the starter dashboard, beside the two other
+set-aside series, so the page's first two questions — one tenant or the fleet,
+steady or growing — are answered without an ad-hoc query. Only the filesystem
+drain publishes it: under the catalog claim the series is absent, which says
+nothing about what a former WAL PVC still holds — "Switching an existing
+filesystem-drain release to the claim" above is what to do about that before
+the switch.
 
 The starter Grafana dashboard `deploy/grafana/siglake-overview.json`
 groups panels the same way and filters on `namespace` (the label
@@ -618,17 +666,44 @@ text-index panels: a text query's per-file startup split by stage
 says whether a slowdown is the load queue, object storage, the decode or
 the postings work), the parsed-index cache's lookup outcomes beside the
 bound that dropped an entry, and its resident bytes against that bound.
+
+Four panels close that row with what the indexes those queries read cost
+to build, which was emitted but charted nowhere. The first two
+are the segmented (`seg2`) sidecar writer, which builds a sidecar as a
+compaction rewrite emits row groups: one arm per `(outcome, reason)` a
+sidecar close records, and the sidecar's encoded bytes beside the heap
+one row group's postings and dictionary occupy while they are built.
+Read the refusal arms first — `column`, `file_rows` and `row_domain` are
+the three ways a sidecar would have described a layout the output file
+does not have, and each one leaves that file on the scan path with no
+index. All four arms are created at 0 on every compactor, so a release
+that has not set `SIGLAKE_SEGMENTED_INDEX_WRITES=1` (the default) charts
+flat zeros rather than "No data". The byte panel cannot be: quantiles
+have nothing to pre-register, and it is charted **per pod** rather than
+summed — these are each compactor's own summary quantiles over the
+exporter's rolling window, and averaging percentiles across a fleet
+produces a number no pod measured. Read the `group index` arm for what
+it is: one row group's parsed-index allocation, dropped at the end of
+that group, not the writer's peak process heap. The other two panels are
+the opt-in post-rewrite v1 rebuild
+(`compactor.indexRebuild`), which reads a committed data file back whole:
+the files it rebuilt per hour with those files' own size on the right
+axis, and the pass duration as a fleet histogram quantile. The rebuild
+counters carry the tenant and table, known only at the increment, so
+they are absent rather than zero until a rebuild commits.
+
 `scripts/check-chart.py` verifies
 that every `siglake_*` series a panel or template variable names is one
 the code emits — `crates/` and the owned forks under `third_party/`,
 which is where the text-index and object-store read families live — the
 same check it applies to the alert rules and the KEDA
 trigger queries, so a renamed metric fails CI instead of blanking a panel.
-It evaluates the arithmetic of two panels with promtool rather than only
-their names: the drain backlog, which has to read one queue depth per
-namespace under two different drain shapes, and the text-index startup
-quantiles, which have to read one number per stage out of a fleet's
-buckets.
+It evaluates selected panel arithmetic with promtool rather than only the
+metric names: the drain backlog has to read one queue depth per namespace under
+two different drain shapes; the text-index startup quantiles have to read one
+number per stage out of a fleet's buckets; and the decoded-file cache's
+contended-insert fraction has to keep one line per query pod, including when an
+outcome is missing or the pod has no insert activity.
 It also holds each reference to the form the exporter renders: `_bucket`
 and `histogram_quantile()` only on the histograms `builder()` in
 `crates/siglake-core/src/metrics.rs` hands buckets (names ending in

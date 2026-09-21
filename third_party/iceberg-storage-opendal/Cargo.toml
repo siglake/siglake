@@ -7,15 +7,14 @@
 #
 # If you are reading this file be aware that the original Cargo.toml
 # will likely look very different (and much more reasonable).
-# The original Cargo.toml is not vendored: the pristine upstream package,
-# Cargo.toml.orig included, is the crates.io copy in the cargo registry.
-# siglake's divergences from it are git history plus third_party/README.md.
+# See Cargo.toml.orig for the original contents.
 
 [package]
 edition = "2024"
 name = "iceberg-storage-opendal"
-version = "0.9.1"
+version = "0.10.1"
 build = false
+publish = true
 autolib = false
 autobins = false
 autoexamples = false
@@ -46,20 +45,46 @@ opendal-all = [
     "opendal-gcs",
     "opendal-oss",
     "opendal-azdls",
+    "opendal-hf",
 ]
 opendal-azdls = ["opendal/services-azdls"]
 opendal-fs = ["opendal/services-fs"]
 opendal-gcs = ["opendal/services-gcs"]
+opendal-hf = ["opendal/services-hf"]
 opendal-memory = ["opendal/services-memory"]
 opendal-oss = ["opendal/services-oss"]
 opendal-s3 = [
     "opendal/services-s3",
-    "reqsign",
+    "reqsign-aws-v4",
+    "reqsign-core",
 ]
+# The published crate omits upstream's workspace-only iceberg_test_utils.
+# Keep its external-service tests named but outside this hermetic workspace.
+upstream-integration-tests = []
 
 [lib]
 name = "iceberg_storage_opendal"
 path = "src/lib.rs"
+
+[[test]]
+name = "file_io_gcs_test"
+path = "tests/file_io_gcs_test.rs"
+required-features = ["upstream-integration-tests"]
+
+[[test]]
+name = "file_io_hf_test"
+path = "tests/file_io_hf_test.rs"
+required-features = ["upstream-integration-tests"]
+
+[[test]]
+name = "file_io_s3_test"
+path = "tests/file_io_s3_test.rs"
+required-features = ["upstream-integration-tests"]
+
+[[test]]
+name = "resolving_storage_test"
+path = "tests/resolving_storage_test.rs"
+required-features = ["upstream-integration-tests"]
 
 [dependencies.anyhow]
 version = "1.0.72"
@@ -73,28 +98,25 @@ version = "1.11"
 [dependencies.cfg-if]
 version = "1"
 
+[dependencies.futures]
+version = "0.3"
+
 [dependencies.iceberg]
-version = "0.9.1"
+version = "0.10.0"
 
 [dependencies.metrics]
-workspace = true
-
-[dependencies.tokio]
-version = "1.47"
-features = ["sync"]
+version = "0.24"
 
 [dependencies.opendal]
-version = "0.55.0"
+version = "0.57"
 
-[dependencies.reqsign]
-version = "0.16.3"
+[dependencies.reqsign-aws-v4]
+version = "3.0.0"
 optional = true
-default-features = false
 
-[dependencies.reqwest]
-version = "0.12.12"
-features = ["json"]
-default-features = false
+[dependencies.reqsign-core]
+version = "3.0.0"
+optional = true
 
 [dependencies.serde]
 version = "1.0.219"
@@ -103,15 +125,18 @@ features = ["rc"]
 [dependencies.typetag]
 version = "0.2"
 
+[dependencies.tokio]
+version = "1.47"
+features = ["sync"]
+
 [dependencies.url]
 version = "2.5.7"
 
 [dev-dependencies.async-trait]
 version = "0.1.89"
 
-[dev-dependencies.reqsign]
-version = "0.16.3"
-default-features = false
+[dev-dependencies.metrics-util]
+version = "0.20"
 
 [dev-dependencies.reqwest]
 version = "0.12.12"
@@ -121,7 +146,8 @@ default-features = false
 [dev-dependencies.tokio]
 version = "1.47"
 features = [
-    "macros",
+    "sync",
     "rt-multi-thread",
+    "macros",
 ]
 default-features = false

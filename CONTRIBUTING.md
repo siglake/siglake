@@ -16,12 +16,12 @@ cargo build --workspace
 
 ## Testing
 
-Every change must pass the full gate before review. One command runs every job
-CI runs:
+Every change must pass the full gate before review. One command runs every
+hosted CI job plus the local-only checks:
 
 ```sh
-scripts/ci-local.sh          # fmt, shell, claude-md, set-var, dashboard, test, clippy, helm, public-tree, generated, deny
-scripts/ci-local.sh --all    # + operator-cluster (needs kind) and docker
+scripts/ci-local.sh          # build-env, fmt, shell, claude-md, set-var, dashboard, test, clippy, profiling, helm, public-tree, generated, deny, fork-tests
+scripts/ci-local.sh --all    # + operator-cluster (needs kind), docker, external-readers
 scripts/ci-local.sh --strict # a job this box cannot run (no helm, promtool, cargo-deny, kind, docker) is red, not skipped
 scripts/ci-local.sh --log-dir DIR # keep this run's job logs in DIR (or set CI_LOCAL_LOG_DIR)
 ```
@@ -31,6 +31,9 @@ cluster plus two image builds add about twenty minutes, and CI runs both heavy
 jobs on every push and pull request anyway. When you do run it, pair it with
 `--strict`, so a machine without kind reports `operator-cluster` red instead of
 skipping it under a green summary.
+
+`fork-tests` runs only in the default local gate, and `external-readers` runs
+only in the local `--all` gate. Hosted CI does not yet run either job.
 
 Each job's full output is kept in a directory the run owns,
 `${CARGO_TARGET_DIR:-target}/ci-local/<UTC stamp>-<pid>/<job>.log` unless you
@@ -86,8 +89,8 @@ and nothing has been measured against Garage yet.
 
 - Ship complete states: each PR compiles, is clippy-clean, and is tested.
   Don't merge half-states behind long-lived feature branches.
-- New user-visible limitations go in the README's "Things deliberately not
-  yet done" section — deferring something is fine, hiding it is not.
+- New user-visible limitations go in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)
+  — deferring something is fine, hiding it is not.
 - Result caches must be snapshot-keyed, never TTL-expired: a cache entry is
   a pure function of `(table, snapshot, query)` and invalidates on commit.
   TTL'd result caches silently serve stale leading-edge answers.
@@ -98,10 +101,10 @@ and nothing has been measured against Garage yet.
 
 ## Vendored forks
 
-`third_party/iceberg` and `third_party/iceberg-catalog-sql` are first-class
-forks, not submodules — see `third_party/README.md` for what diverged and
-why. Changes to fork code follow the same test/clippy gate as the rest of
-the workspace.
+`third_party/iceberg`, `third_party/iceberg-catalog-sql`, and
+`third_party/iceberg-storage-opendal` are first-class forks, not submodules —
+see `third_party/README.md` for what diverged and why. Changes to fork code
+follow the same test/clippy gate as the rest of the workspace.
 
 ## Submitting changes
 
@@ -120,7 +123,7 @@ read the diff and added the `ci:run` label. Once the hosted approval path has
 been qualified, that label releases the queued run for the exact commit; until
 then a maintainer may release it from the Actions tab. Running
 `scripts/ci-local.sh` before you open the pull request is therefore worth the
-time: it is the same set of jobs.
+time: it covers every hosted job plus the local-only checks described above.
 
 Push again and the label comes off. That is deliberate — an approval belongs to
 the commit it was given for, not to the pull request — so a new commit needs a

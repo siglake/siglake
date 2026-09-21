@@ -204,7 +204,9 @@ It does not, on this evidence, earn adoption:
    population should be taken after that cost is either accepted with numbers or
    removed (predicate-carrying entries, or declining to populate when the reader
    would prune). *Removed on 2026-09-17 by #4891, by declining — which also
-   removes the prototype's best regime. See "reason (2) is fixed" below.*
+   removes the prototype's best regime. See "reason (2) is fixed" below. The
+   predicate-carrying alternative was measured separately under #4905 and
+   rejected: `docs/DESIGN_predicate_keyed_decoded_cache.md`.*
 3. **Scan attribution goes partly blind.** A group served from cache builds no
    reader, so `row_groups_read`, `rows_pruned_selection` and fetched bytes
    under-report — already true of a whole-file hit, but a task can now be half
@@ -334,6 +336,97 @@ is #4938 (held for the next prepared normal round, isolated per shape, with the
 cache overrides and footer geometry recorded); the round-collector work it needs
 is siglake-benchmarks #4939.
 
+## 2026-09-21: file membership is different from table geometry
+
+#4959 reproduced the geometry mismatch locally without changing `stats.scan`.
+`crates/siglake-storage/tests/file_attribution_qualification.rs` writes two
+files into one table. The older, larger file has row groups of 131,072 and
+8,192 rows; the newer file has one 8,192-row group. A browse bounded to the
+newer day prunes the large file during planning and reads the short file. The
+benchmark collector's current largest-object rule would choose the old file,
+so its geometry cannot establish either membership or group completion for
+that browse.
+
+The test enables `QueryScanTuning::file_attribution_prototype`, an in-process
+gate with no environment, CLI, chart or operator surface. A distinct
+DataFusion metric, `qualification_file_attribution`, carries `stage`, `file`,
+`start` and `length` labels. It records three sets:
+
+- `planned`: tasks left after manifest and time-bound planning;
+- `cache_candidate`: planned tasks that reached the decoded-cache lookup;
+- `reader_attempt`: cache misses or bypasses for which a reader was built.
+
+The last set has the membership the geometry collector needs. It deliberately
+uses a distinct metric name rather than labelled `files_read`: DataFusion 53's
+`sum_by_name` ignores labels, so reusing that name would double the public
+counter. A reader attempt includes a file later rejected by the post-footer
+bloom, matching today's `files_read` placement. It excludes cache hits. There
+is one qualification-only edge: cancellation after building a reader stream
+but before its first poll can leave `reader_attempt` one above `files_read`.
+Moving the observation to the fork's `open_parquet_file` success site is part
+of any production implementation.
+
+The prototype retains at most 128 task identities per scan partition, in plan
+order. Later tasks increment
+`qualification_file_attribution_omitted{stage=...}`; an omitted candidate or
+reader attempt is counted only if execution reaches that task. This cap bounds
+the local fixture, but it is not the proposed wire cap because partition order
+is not a stable distributed truncation rule.
+
+### Identity and byte cost
+
+The geometry join needs the Iceberg data-file path and the task's `(start,
+length)` byte interval. Those are the file and range the scan task owns, not
+the individual footer and column-chunk GET ranges. A whole-file decoded-cache
+key also contains projection, delete identity and direction; the predicate-key
+prototype adds its bound predicate. A row-group key replaces the task interval
+with a row-group index. None of those answer a different geometry question, so
+the SQL representation should carry file/range membership and cache outcome,
+not expose an internal cache key. If per-row-group candidates ship, add bounded
+row-group indices beside the file rather than changing the file identity.
+
+On the release build of the hermetic fixture, one compact retained identity was
+167 bytes (path bytes plus two `u64`s). The test-only DataFusion metrics retain
+the path once per stage; their label names and values totalled 621 bytes for
+the three identity metrics plus the three zero-valued omission metrics, before
+metric structures and allocator overhead. The candidate JSON
+object (`files` with one `id` / `start` / `length` entry, plus `omitted`) was
+210 bytes. Reading
+and grouping the three labelled node metrics took 582 ns per collection over
+10,000 iterations. The debug build measured 4,283 ns. These numbers exclude
+query execution and allocator bookkeeping; they qualify collection and wire
+shape, not total heap. At the local 128-entry cap, linear JSON growth is about
+26.3 KiB before shard-envelope fields. That is too large to add to the existing
+`x-siglake-scan` header at qualification time: the transport had no size
+budget, header encoding failure silently omitted the header, and the
+coordinator silently dropped invalid JSON.
+
+### Production shape (0.2.0)
+
+Task #5727 adds an optional `stats.scan.file_attribution` object, capped at 32
+request-wide entries, with table-relative object keys, task `start`/`length`,
+and booleans for `cache_candidate`,
+`reader_opened` and `cache_hit`; include `files_omitted` and
+`identity_complete`. Thirty-two entries are about 6.6 KiB at the measured
+path length, before envelope overhead. The shard's `x-siglake-scan` transport
+has a 16 KiB hard limit. Missing, oversized, malformed or unencodable
+attribution fails the shard response instead of disappearing from a complete
+answer.
+
+Distributed aggregation must merge identities by `(table, object key, start,
+length)`, OR the outcome booleans, sort by that tuple, apply the request-wide
+cap after the merge, and add both shard omissions and entries dropped by the
+coordinator to `files_omitted`. `identity_complete` is true only when every
+shard supplied valid, untruncated attribution. This avoids treating two shards'
+copies of one file as two geometry inputs and prevents shard arrival order from
+choosing the retained list.
+
+`reader_opened` is observed after `open_parquet_file` succeeds. The collector
+uses planned task membership, so a retained entry with every outcome false is
+a planned task that execution did not reach. The local and distributed tests
+cover membership, stable merge order, deduplication, the request cap and shard
+transport refusal. This changes no cache admission or sizing default.
+
 ## Reproduce
 
 ```sh
@@ -342,9 +435,12 @@ cargo test -p siglake-storage --test row_group_cache_population_shape
 cargo test -p siglake-storage --test file_cache_predicate_bypass
 cargo test -p siglake-storage --test file_cache_populate_depth
 cargo test -p siglake-query-server --test file_cache_populate_depth_stats
+cargo test -p siglake-storage --test file_attribution_qualification
 scripts/check-file-cache-populate-depth-reader.sh
 
 # the numbers in this document
 cargo test --release -p siglake-storage --test row_group_cache_measurement \
   -- --ignored --nocapture
+cargo test --release -p siglake-storage --test file_attribution_qualification \
+  -- --nocapture
 ```
