@@ -484,9 +484,36 @@ mod tests {
         assert!(cache.put(key(0), std::sync::Arc::from(&b"aaaa"[..]), 2, 6));
         assert!(cache.put(key(4), std::sync::Arc::from(&b"bbbb"[..]), 2, 6));
         assert_eq!(cache.entries.len(), 1);
-        assert!(cache.bytes <= 6);
+        assert_eq!(cache.bytes, 4);
+        assert!(cache.get(&key(0)).is_none(), "byte bound evicted the oldest");
+        assert!(cache.get(&key(4)).is_some());
         assert!(!cache.put(key(8), std::sync::Arc::from(&b"1234567"[..]), 2, 6));
         assert!(!cache.entries.contains_key(&key(8)));
+        assert_eq!(cache.bytes, 4, "an oversized refusal keeps residents");
+
+        let mut cache = super::BlobCache::default();
+        for offset in [0, 4, 8] {
+            assert!(cache.put(
+                key(offset),
+                std::sync::Arc::from(&b"aaaa"[..]),
+                2,
+                usize::MAX,
+            ));
+        }
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.get(&key(0)).is_none(), "entry bound evicted the oldest");
+        assert_eq!(cache.bytes, 8);
+
+        let mut cache = super::BlobCache::default();
+        let first: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"0123456789"[..]);
+        assert!(cache.put(key(0), first.clone(), 2, usize::MAX));
+        assert!(cache.put(key(0), first, 2, usize::MAX));
+        assert_eq!(cache.order.len(), 1);
+        assert_eq!(cache.bytes, 10, "a repeat insert is charged once");
+        assert!(cache.put(key(4), std::sync::Arc::from(&b"aaaaa"[..]), 2, usize::MAX));
+        assert!(cache.put(key(8), std::sync::Arc::from(&b"bbbbb"[..]), 2, usize::MAX));
+        assert_eq!(cache.bytes, 10, "eviction returns the removed bytes");
+        assert!(cache.get(&key(0)).is_none());
     }
 
     #[tokio::test]

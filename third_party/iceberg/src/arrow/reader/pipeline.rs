@@ -803,6 +803,7 @@ impl ArrowReader {
         let parquet_file = file_io.new_input(data_file_path)?;
         let parquet_reader = parquet_file.reader().await?;
         Self::build_parquet_reader(
+            file_io.clone(),
             parquet_reader,
             file_size_in_bytes,
             parquet_read_options,
@@ -814,6 +815,7 @@ impl ArrowReader {
     }
 
     async fn build_parquet_reader(
+        file_io: FileIO,
         parquet_reader: Box<dyn FileRead>,
         file_size_in_bytes: u64,
         parquet_read_options: ParquetReadOptions,
@@ -821,14 +823,14 @@ impl ArrowReader {
         data_file_path: &str,
         cache_bypass: bool,
     ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
-        let mut reader = ArrowFileReader::new(
+        let reader = ArrowFileReader::new(
             FileMetadata {
                 size: file_size_in_bytes,
             },
             parquet_reader,
         )
         .with_parquet_read_options(parquet_read_options)
-        .with_scan_metrics(scan_metrics);
+        .with_scan_metrics(scan_metrics.clone());
 
         if !cache_bypass
             && let Some(metadata) =
@@ -845,17 +847,54 @@ impl ArrowReader {
             return Ok((reader, arrow_metadata));
         }
 
-        let arrow_metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default())
-            .await
-            .map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata").with_source(e)
-            })?;
+        let debounce_key = super::file_reader::footer_cache_key(
+            data_file_path,
+            parquet_read_options,
+        );
+        let load_path = data_file_path.to_string();
+        let cache_path = load_path.clone();
+        let metadata = super::file_reader::footer_debouncer()
+            .run(debounce_key, "footer", move || async move {
+                if !cache_bypass
+                    && let Some(metadata) =
+                        super::file_reader::footer_cache_get(&cache_path, parquet_read_options)
+                {
+                    tokio::task::coop::consume_budget().await;
+                    return Ok(metadata);
+                }
+                let parquet_file = file_io.new_input(&load_path)?;
+                let parquet_reader = parquet_file.reader().await?;
+                let mut metadata_reader = ArrowFileReader::new(
+                    FileMetadata {
+                        size: file_size_in_bytes,
+                    },
+                    parquet_reader,
+                )
+                .with_parquet_read_options(parquet_read_options)
+                .with_scan_metrics(scan_metrics);
+                metadata_reader
+                    .load_parquet_metadata(None, None)
+                    .await
+                    .map_err(|error| {
+                        Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
+                            .with_source(error)
+                    })
+            })
+            .await?;
+        let arrow_metadata = ArrowReaderMetadata::try_new(
+            Arc::clone(&metadata),
+            Default::default(),
+        )
+        .map_err(|error| {
+            Error::new(ErrorKind::Unexpected, "Failed to create ArrowReaderMetadata")
+                .with_source(error)
+        })?;
 
         if !cache_bypass {
             super::file_reader::footer_cache_put(
                 data_file_path,
                 parquet_read_options,
-                Arc::clone(arrow_metadata.metadata()),
+                metadata,
             );
         }
 
@@ -867,12 +906,15 @@ impl ArrowReader {
 mod tests {
     use std::collections::HashMap;
     use std::fs::File;
+    use std::ops::Range;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use arrow_array::cast::AsArray;
     use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use futures::{StreamExt, TryStreamExt};
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
@@ -880,9 +922,12 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::Runtime;
-    use crate::arrow::{ArrowReaderBuilder, ScanCounters};
+    use crate::arrow::{ArrowReader, ArrowReaderBuilder, ScanCounters};
     use crate::expr::{Bind, Reference};
-    use crate::io::FileIO;
+    use crate::io::{
+        FileIO, FileIOBuilder, FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage,
+        StorageConfig, StorageFactory,
+    };
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
     use crate::spec::{
         DataContentType, DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type,
@@ -896,6 +941,125 @@ mod tests {
     const INT96_TEST_NANOS_WITHIN_DAY: u64 = 43_200_000_000_000;
     const INT96_TEST_JULIAN_DAY: u32 = 2_953_529;
 
+    #[derive(Debug, Default)]
+    struct CountingStorageState {
+        data: std::sync::Mutex<Bytes>,
+        reads: AtomicUsize,
+        block_first_read: AtomicBool,
+        gate: tokio::sync::Notify,
+    }
+
+    fn default_counting_storage_state() -> Arc<CountingStorageState> {
+        Arc::new(CountingStorageState::default())
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct CountingStorageFactory {
+        #[serde(skip, default = "default_counting_storage_state")]
+        state: Arc<CountingStorageState>,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct CountingStorage {
+        #[serde(skip, default = "default_counting_storage_state")]
+        state: Arc<CountingStorageState>,
+    }
+
+    #[derive(Debug)]
+    struct CountingFileRead {
+        state: Arc<CountingStorageState>,
+    }
+
+    #[async_trait]
+    impl FileRead for CountingFileRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            let current = self.state.reads.fetch_add(1, Ordering::SeqCst) + 1;
+            if current == 1 && self.state.block_first_read.load(Ordering::SeqCst) {
+                self.state.gate.notified().await;
+            }
+            let data = self.state.data.lock().unwrap();
+            Ok(data.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoopFileWrite;
+
+    #[async_trait]
+    impl FileWrite for NoopFileWrite {
+        async fn write(&mut self, _bytes: Bytes) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&mut self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[typetag::serde]
+    impl StorageFactory for CountingStorageFactory {
+        fn build(&self, _config: &StorageConfig) -> crate::Result<Arc<dyn Storage>> {
+            Ok(Arc::new(CountingStorage {
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
+    #[async_trait]
+    #[typetag::serde]
+    impl Storage for CountingStorage {
+        async fn exists(&self, _path: &str) -> crate::Result<bool> {
+            Ok(true)
+        }
+
+        async fn metadata(&self, _path: &str) -> crate::Result<FileMetadata> {
+            Ok(FileMetadata {
+                size: self.state.data.lock().unwrap().len() as u64,
+            })
+        }
+
+        async fn read(&self, _path: &str) -> crate::Result<Bytes> {
+            Ok(self.state.data.lock().unwrap().clone())
+        }
+
+        async fn reader(&self, _path: &str) -> crate::Result<Box<dyn FileRead>> {
+            Ok(Box::new(CountingFileRead {
+                state: Arc::clone(&self.state),
+            }))
+        }
+
+        async fn write(&self, _path: &str, _bytes: Bytes) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn writer(&self, _path: &str) -> crate::Result<Box<dyn FileWrite>> {
+            Ok(Box::new(NoopFileWrite))
+        }
+
+        async fn delete(&self, _path: &str) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn delete_prefix(&self, _path: &str) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn delete_stream(
+            &self,
+            _paths: futures::stream::BoxStream<'static, String>,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn new_input(&self, path: &str) -> crate::Result<InputFile> {
+            Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+
+        fn new_output(&self, path: &str) -> crate::Result<OutputFile> {
+            Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+    }
+
     fn make_int96_test_value() -> (parquet::data_type::Int96, i64) {
         let mut val = parquet::data_type::Int96::new();
         val.set_data(
@@ -906,6 +1070,87 @@ mod tests {
         let expected_micros = (INT96_TEST_JULIAN_DAY as i64 - UNIX_EPOCH_JULIAN) * MICROS_PER_DAY
             + (INT96_TEST_NANOS_WITHIN_DAY / 1_000) as i64;
         (val, expected_micros)
+    }
+
+    fn parquet_bytes_for_footer_debounce_test() -> Bytes {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "raw",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from_iter_values([
+                "alpha", "beta", "gamma", "delta",
+            ])) as ArrayRef],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(bytes)
+    }
+
+    fn footer_debounce_file_io(state: &Arc<CountingStorageState>) -> FileIO {
+        FileIOBuilder::new(Arc::new(CountingStorageFactory {
+            state: Arc::clone(state),
+        }))
+        .build()
+    }
+
+    async fn load_footer_once(path: &str, file_io: &FileIO, file_size: u64) {
+        ArrowReader::open_parquet_file(
+            path,
+            file_io,
+            file_size,
+            super::ParquetReadOptions::builder().build(),
+            crate::arrow::ScanMetrics::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_footer_reads_are_debounced() {
+        let bytes = parquet_bytes_for_footer_debounce_test();
+        let file_size = bytes.len() as u64;
+
+        let solo = Arc::new(CountingStorageState::default());
+        *solo.data.lock().unwrap() = bytes.clone();
+        load_footer_once(
+            "memory://footer-debounce-solo.parquet",
+            &footer_debounce_file_io(&solo),
+            file_size,
+        )
+        .await;
+        let baseline_reads = solo.reads.load(Ordering::SeqCst);
+        assert!(baseline_reads > 0);
+
+        let state = Arc::new(CountingStorageState::default());
+        *state.data.lock().unwrap() = bytes;
+        state.block_first_read.store(true, Ordering::SeqCst);
+        let file_io = footer_debounce_file_io(&state);
+        let tasks = (0..8).map(|_| {
+            let file_io = file_io.clone();
+            async move {
+                load_footer_once(
+                    "memory://footer-debounce-contended.parquet",
+                    &file_io,
+                    file_size,
+                )
+                .await;
+            }
+        });
+        let mut joined = std::pin::pin!(futures::future::join_all(tasks));
+        for _ in 0..4 {
+            assert!(futures::poll!(joined.as_mut()).is_pending());
+        }
+        assert_eq!(state.reads.load(Ordering::SeqCst), 1);
+        state.gate.notify_waiters();
+        joined.await;
+        assert_eq!(state.reads.load(Ordering::SeqCst), baseline_reads);
     }
 
     async fn read_int96_batches(

@@ -34,7 +34,9 @@ use parquet::file::metadata::{
 
 use super::ParquetReadOptions;
 use crate::arrow::ScanMetrics;
-use crate::io::read_observability::{ObjectStoreReadPhase, record_object_store_reads};
+use crate::io::read_observability::{
+    ObjectStoreReadPhase, ReadDebouncer, record_object_store_reads,
+};
 use crate::io::{FileMetadata, FileRead};
 
 struct FooterCache {
@@ -52,6 +54,11 @@ fn footer_cache() -> &'static Mutex<FooterCache> {
     })
 }
 
+pub(super) fn footer_debouncer() -> &'static ReadDebouncer<String, Arc<ParquetMetaData>> {
+    static DEBOUNCER: OnceLock<ReadDebouncer<String, Arc<ParquetMetaData>>> = OnceLock::new();
+    DEBOUNCER.get_or_init(ReadDebouncer::default)
+}
+
 fn footer_cache_max_entries() -> usize {
     std::env::var("SIGLAKE_ICEBERG_FOOTER_CACHE_MAX_ENTRIES")
         .ok()
@@ -59,7 +66,7 @@ fn footer_cache_max_entries() -> usize {
         .unwrap_or(512)
 }
 
-fn footer_cache_key(path: &str, options: ParquetReadOptions) -> String {
+pub(super) fn footer_cache_key(path: &str, options: ParquetReadOptions) -> String {
     format!(
         "{path}|column={}|offset={}|page={}",
         options.preload_column_index(),
@@ -149,7 +156,7 @@ impl ArrowFileReader {
         record_object_store_reads(phase, 1, bytes);
     }
 
-    async fn load_parquet_metadata(
+    pub(super) async fn load_parquet_metadata(
         &mut self,
         decryption_properties: Option<Arc<FileDecryptionProperties>>,
         metadata_options: Option<ParquetMetaDataOptions>,
