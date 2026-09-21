@@ -2339,10 +2339,7 @@ impl SiglakeIcebergTableScan {
                         "siglake_query_ordered_plan_cache_total", "outcome" => "hit"
                     )
                     .increment(1);
-                    metrics::counter!(
-                        "siglake_query_scan_output_ordering_total", "outcome" => "advertised"
-                    )
-                    .increment(1);
+                    record_advertised_scan_ordering(cached_plan.overlap_partition_count);
                     served_from_cache = Some(ScanOrderingDecision::advertised(
                         ScanOrderingPlan {
                             exprs: vec![PhysicalSortExpr::new(
@@ -3449,20 +3446,7 @@ async fn scan_output_ordering(
         );
     };
     debug_assert_eq!(col.index(), idx);
-    // Charged once the plan is known to be advertised, not where the
-    // arrangement is built: a plan the global-fan-in gate above refuses, or one
-    // put back to its singleton partitions, runs no merge at all, and counting
-    // its clusters overstated ordered merge planning (#4366). The restored
-    // singleton case reads zero here because `overlap_partition_count` is reset
-    // along with the partitioning.
-    for _ in 0..overlap_partition_count {
-        metrics::counter!("siglake_query_scan_ordered_merge_partitions_total").increment(1);
-    }
-    metrics::counter!(
-        "siglake_query_scan_output_ordering_total",
-        "outcome" => "advertised"
-    )
-    .increment(1);
+    record_advertised_scan_ordering(overlap_partition_count);
     ScanOrderingDecision::advertised(
         ScanOrderingPlan {
             exprs: vec![PhysicalSortExpr::new(
@@ -3490,6 +3474,26 @@ async fn scan_output_ordering(
         overlap_streams_total,
         global_fan_in_budget,
     )
+}
+
+/// Record one successfully advertised physical scan and the number of its
+/// partitions that need an overlap merge. The scan counter and the
+/// partition-weighted counter deliberately have different units; keeping both
+/// writes here gives fresh plans and ordered-plan cache hits identical
+/// accounting (#5027).
+///
+/// Charged only after the plan is known to be advertised, not where the
+/// arrangement is built: a plan the global-fan-in gate refuses, or one put back
+/// to singleton partitions, runs no overlap merge (#4366).
+fn record_advertised_scan_ordering(overlap_partition_count: usize) {
+    for _ in 0..overlap_partition_count {
+        metrics::counter!("siglake_query_scan_ordered_merge_partitions_total").increment(1);
+    }
+    metrics::counter!(
+        "siglake_query_scan_output_ordering_total",
+        "outcome" => "advertised"
+    )
+    .increment(1);
 }
 
 /// Cap on the number of per-file streams a single partition's k-way ordered

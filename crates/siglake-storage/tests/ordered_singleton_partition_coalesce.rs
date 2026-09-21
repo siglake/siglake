@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use chrono::{Duration, TimeZone, Utc};
-use datafusion::physical_plan::displayable;
+use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::SessionContext;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use siglake_core::Event;
@@ -25,12 +25,14 @@ type SnapshotVec = Vec<(
 )>;
 
 const MERGE_PARTITIONS: &str = "siglake_query_scan_ordered_merge_partitions_total";
+const ORDERED_PLAN_CACHE: &str = "siglake_query_ordered_plan_cache_total";
+const OUTPUT_ORDERING: &str = "siglake_query_scan_output_ordering_total";
 
 /// One recorder per process — `install` refuses a second — and one planned
-/// query at a time under it: the coalesce test asserts the merge counter MOVED
-/// and the restored-singleton test asserts it stayed at ZERO, and both read the
-/// same process-wide counter. `Snapshotter::snapshot` drains the registry, so
-/// each gate holder's snapshot covers only its own planning.
+/// query at a time under it: the coalesce test reads exact cache and ordering
+/// counter deltas, while the restored-singleton test asserts the merge counter
+/// stayed at ZERO. `Snapshotter::snapshot` drains the registry, so each gate
+/// holder's snapshot covers only its own planning.
 static METRICS: std::sync::LazyLock<(tokio::sync::Mutex<()>, Snapshotter)> =
     std::sync::LazyLock::new(|| {
         let recorder = DebuggingRecorder::new();
@@ -39,10 +41,15 @@ static METRICS: std::sync::LazyLock<(tokio::sync::Mutex<()>, Snapshotter)> =
         (tokio::sync::Mutex::new(()), snapshotter)
     });
 
-fn counter_sum(snapshot: &SnapshotVec, name: &str) -> u64 {
+fn counter_sum(snapshot: &SnapshotVec, name: &str, label: Option<(&str, &str)>) -> u64 {
     snapshot
         .iter()
-        .filter(|(key, _, _, _)| key.key().name() == name)
+        .filter(|(key, _, _, _)| {
+            key.key().name() == name
+                && label.is_none_or(|(lk, lv)| {
+                    key.key().labels().any(|l| l.key() == lk && l.value() == lv)
+                })
+        })
         .map(|(_, _, _, value)| match value {
             DebugValue::Counter(c) => *c,
             _ => 0,
@@ -129,15 +136,14 @@ async fn small_limit_browse_coalesces_singleton_partitions_into_one_merge() {
     let (_tmp, ice) = overlapping_files(8).await;
     let ctx = browse_context(8, 100);
     ice.register_with_datafusion(&ctx).await.unwrap();
+    snapshotter.snapshot();
 
-    let df = ctx
+    let first = ctx
         .sql("SELECT \"timestamp\" FROM events ORDER BY \"timestamp\" DESC LIMIT 100")
         .await
         .unwrap();
-    let plan_str = format!(
-        "{}",
-        displayable(df.clone().create_physical_plan().await.unwrap().as_ref()).indent(true)
-    );
+    let first_plan = first.create_physical_plan().await.unwrap();
+    let plan_str = format!("{}", displayable(first_plan.as_ref()).indent(true));
     // Pre-fix this reads `partitions:[5]`: one singleton scan partition per
     // file, each polled by the SortPreservingMerge above.
     assert!(
@@ -155,18 +161,84 @@ async fn small_limit_browse_coalesces_singleton_partitions_into_one_merge() {
         "one advertised partition needs no cross-partition merge:\n{plan_str}"
     );
 
-    assert_eq!(
-        collect_ts(df.collect().await.unwrap()),
-        newest_timestamps(100)
-    );
-
-    let snapshot = snapshotter.snapshot().into_vec();
+    let first_metrics = snapshotter.snapshot().into_vec();
     // The single partition is an OVERLAP partition: its files are k-way
     // merged, not concatenated. Pre-fix this counter stayed at 0 (the tuning
     // record's `ordered_merge_overlap_partitions=0`).
-    assert!(
-        counter_sum(&snapshot, MERGE_PARTITIONS) > 0,
-        "the coalesced partition must plan an overlap merge"
+    assert_eq!(
+        counter_sum(&first_metrics, MERGE_PARTITIONS, None),
+        1,
+        "the fresh coalesced plan must charge its one overlap partition"
+    );
+    assert_eq!(
+        counter_sum(
+            &first_metrics,
+            ORDERED_PLAN_CACHE,
+            Some(("outcome", "miss"))
+        ),
+        1,
+        "the first browse must populate the ordered-plan cache"
+    );
+    assert_eq!(
+        counter_sum(&first_metrics, ORDERED_PLAN_CACHE, Some(("outcome", "hit"))),
+        0,
+        "the first browse must not be served from the ordered-plan cache"
+    );
+    assert_eq!(
+        counter_sum(
+            &first_metrics,
+            OUTPUT_ORDERING,
+            Some(("outcome", "advertised"))
+        ),
+        1,
+        "the fresh plan must advertise one ordered scan"
+    );
+    assert_eq!(
+        collect_ts(collect(first_plan, ctx.task_ctx()).await.unwrap()),
+        newest_timestamps(100)
+    );
+
+    let second = ctx
+        .sql("SELECT \"timestamp\" FROM events ORDER BY \"timestamp\" DESC LIMIT 100")
+        .await
+        .unwrap();
+    let second_plan = second.create_physical_plan().await.unwrap();
+    let second_metrics = snapshotter.snapshot().into_vec();
+    assert_eq!(
+        counter_sum(
+            &second_metrics,
+            ORDERED_PLAN_CACHE,
+            Some(("outcome", "hit"))
+        ),
+        1,
+        "the identical second browse must hit the ordered-plan cache"
+    );
+    assert_eq!(
+        counter_sum(
+            &second_metrics,
+            ORDERED_PLAN_CACHE,
+            Some(("outcome", "miss"))
+        ),
+        0,
+        "the identical second browse must not rebuild the ordered plan"
+    );
+    assert_eq!(
+        counter_sum(&second_metrics, MERGE_PARTITIONS, None),
+        1,
+        "the cached plan must charge the same overlap partition as the fresh plan"
+    );
+    assert_eq!(
+        counter_sum(
+            &second_metrics,
+            OUTPUT_ORDERING,
+            Some(("outcome", "advertised"))
+        ),
+        1,
+        "the cached plan must advertise one ordered scan"
+    );
+    assert_eq!(
+        collect_ts(collect(second_plan, ctx.task_ctx()).await.unwrap()),
+        newest_timestamps(100)
     );
 }
 
@@ -218,7 +290,7 @@ async fn restored_singleton_browse_reports_no_merge_partition() {
     );
 
     assert_eq!(
-        counter_sum(&snapshotter.snapshot().into_vec(), MERGE_PARTITIONS),
+        counter_sum(&snapshotter.snapshot().into_vec(), MERGE_PARTITIONS, None),
         0,
         "a plan restored to singleton partitions must not report an overlap merge"
     );
@@ -227,11 +299,13 @@ async fn restored_singleton_browse_reports_no_merge_partition() {
 /// The coalesce is for SMALL limits only: a browse past
 /// `SIGLAKE_ORDERED_SINGLE_PARTITION_MAX_LIMIT`'s bucket (here, no
 /// `OrderedScanLimit` at all — the shape `sql.rs` leaves alone) keeps its
-/// per-file scan parallelism. Takes no `METRICS` gate: a singleton-only scan
-/// with no fallback in hand leaves the arrangement unbuilt, so it charges no
-/// merge partitions to the other tests' snapshots.
+/// per-file scan parallelism.
 #[tokio::test]
 async fn ordered_scan_without_a_small_limit_keeps_its_singleton_partitions() {
+    let (gate, snapshotter) = &*METRICS;
+    let _held = gate.lock().await;
+    snapshotter.snapshot();
+
     let (_tmp, ice) = overlapping_files(8).await;
     let ctx = siglake_storage::session_context_with_order(
         Some(8),
