@@ -419,11 +419,11 @@ mod alerted_counter_catalog_tests {
     }
 
     #[test]
-    fn group_count_delta_write_retries_are_labelled_by_table() {
+    fn group_count_delta_write_retries_are_labelled_by_namespace_and_table() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
-            super::record_group_count_delta_write_retries("logs-index", 2);
+            super::record_group_count_delta_write_retries(super::NAMESPACE, "logs-index", 2);
         });
 
         let retries = snapshotter
@@ -432,17 +432,60 @@ mod alerted_counter_catalog_tests {
             .into_iter()
             .find(|(key, _, _, _)| {
                 key.key().name() == "siglake_group_count_delta_write_retries_total"
+                    && has_label(key, "iceberg_namespace", super::NAMESPACE)
+                    && has_label(key, "table", "logs-index")
             })
-            .expect("retry counter is published");
-        assert!(
-            retries
-                .0
-                .key()
-                .labels()
-                .any(|label| label.key() == "table" && label.value() == "logs-index"),
-            "retry counter lacks its table label: {retries:?}"
-        );
+            .expect("retry counter is published with both labels");
         assert!(matches!(retries.3, DebugValue::Counter(2)), "{retries:?}");
+    }
+
+    /// #4759's acceptance, the same shape as
+    /// [`a_rebuild_in_each_namespace_is_two_series`]: the commit path writes
+    /// deltas for the base namespace and every `tenant_*` one, so retries on the
+    /// two `events` tables must not land on one series — the precursor alert
+    /// would otherwise name a bare `events` no operator can locate.
+    #[test]
+    fn retries_in_each_namespace_are_two_series() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            super::record_group_count_delta_write_retries(super::NAMESPACE, super::TABLE_NAME, 2);
+            super::record_group_count_delta_write_retries("tenant_acme", super::TABLE_NAME, 3);
+        });
+
+        let samples = snapshotter.snapshot().into_vec();
+        for (namespace, expected) in [(super::NAMESPACE, 2u64), ("tenant_acme", 3)] {
+            let sample = samples
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == "siglake_group_count_delta_write_retries_total"
+                        && has_label(key, "iceberg_namespace", namespace)
+                        && has_label(key, "table", super::TABLE_NAME)
+                })
+                .unwrap_or_else(|| panic!("no retry series for {namespace}: {samples:?}"));
+            assert!(
+                matches!(sample.3, DebugValue::Counter(c) if c == expected),
+                "{namespace} carries another namespace's retries: {sample:?}"
+            );
+        }
+    }
+
+    /// The precursor alert reads `rate()` rather than `increase()`, so
+    /// `check-chart.py` does not force this counter into a catalog. Pre-register
+    /// it anyway, beside the failure counter it precedes: the dashboard panel
+    /// shows both, and an absent retry series next to a present failure series
+    /// reads as "no retries" only by accident.
+    #[test]
+    fn group_count_delta_write_retries_is_preregistered_for_the_events_table() {
+        let registered = siglake_core::metrics::COMPACTOR_ALERTED_COUNTERS
+            .iter()
+            .find(|c| c.name == "siglake_group_count_delta_write_retries_total")
+            .expect("compactor catalog lists the delta write-retry counter");
+        let events: &[(&str, &str)] = &[
+            ("iceberg_namespace", super::NAMESPACE),
+            ("table", super::TABLE_NAME),
+        ];
+        assert!(registered.series.contains(&events), "{registered:?}");
     }
 }
 
@@ -7666,6 +7709,7 @@ async fn write_side_aggregate_bytes(file_io: &FileIO, path: &str, bytes: Vec<u8>
 /// not encode on the second try either.
 async fn write_group_count_delta(
     op: &opendal::Operator,
+    namespace: &str,
     table: &str,
     delta: &GroupCountDelta,
 ) -> Result<()> {
@@ -7679,7 +7723,7 @@ async fn write_group_count_delta(
     })
     .await?;
     if retries > 0 {
-        record_group_count_delta_write_retries(table, u64::from(retries));
+        record_group_count_delta_write_retries(namespace, table, u64::from(retries));
         tracing::info!(
             rel,
             attempt = retries + 1,
@@ -7697,6 +7741,7 @@ const DELTA_WRITE_ATTEMPTS: u32 = 4;
 /// attempts are spent. A policy that is only exercised through a live S3 client
 /// is a policy nobody has checked.
 async fn retry_delta_write<F, Fut>(
+    namespace: &str,
     table: &str,
     rel: &str,
     max_attempts: u32,
@@ -7708,7 +7753,7 @@ where
 {
     let retries = retry_object_write("group-count delta", rel, max_attempts, write).await?;
     if retries > 0 {
-        record_group_count_delta_write_retries(table, u64::from(retries));
+        record_group_count_delta_write_retries(namespace, table, u64::from(retries));
         tracing::info!(
             rel,
             attempt = retries + 1,
@@ -7753,9 +7798,14 @@ where
     Err(last.unwrap_or_else(|| anyhow::anyhow!("write {kind} {rel}")))
 }
 
-fn record_group_count_delta_write_retries(table: &str, retries: u64) {
+/// Labelled by `iceberg_namespace` as well as `table` for the reason given on
+/// [`record_group_count_short_aggregate`]: one commit path writes deltas for the
+/// base namespace and every `tenant_*` namespace, each with its own `events`,
+/// and a bare `table` merged them into one series (#4759).
+fn record_group_count_delta_write_retries(namespace: &str, table: &str, retries: u64) {
     metrics::counter!(
         "siglake_group_count_delta_write_retries_total",
+        "iceberg_namespace" => namespace.to_owned(),
         "table" => table.to_owned()
     )
     .increment(retries);
@@ -7827,6 +7877,7 @@ pub fn report_inline_coverage(namespace: &str, table: &str, unproven: bool) {
 /// Test-only view of [`retry_delta_write`].
 #[doc(hidden)]
 pub async fn retry_delta_write_for_test<F, Fut>(
+    namespace: &str,
     table: &str,
     rel: &str,
     max_attempts: u32,
@@ -7836,7 +7887,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    retry_delta_write(table, rel, max_attempts, write).await
+    retry_delta_write(namespace, table, rel, max_attempts, write).await
 }
 
 #[derive(Default)]
@@ -15266,18 +15317,23 @@ impl IcebergContext {
                         group_counts: wide_gc,
                         sketches: delta_sketches,
                     };
-                    if let Err(err) = write_group_count_delta(&op, table_ident.name(), &delta).await
+                    // Both the retry counter inside the write and the failure
+                    // counter below name the namespace as well as the table
+                    // (#4737, #4759): one commit path serves the base namespace
+                    // and every `tenant_*` namespace, each with its own
+                    // `events`.
+                    let iceberg_namespace = table_ident.namespace().to_string();
+                    if let Err(err) =
+                        write_group_count_delta(&op, &iceberg_namespace, table_ident.name(), &delta)
+                            .await
                     {
                         // COUNTED, because this was a log line only and a log
                         // line nothing reads is how the 2026-09-02 regression
                         // took a bisect to explain. The count is the alarm; the
                         // message is the remedy.
-                        // Labelled by namespace as well as table (#4737): one
-                        // compactor writes for every `tenant_*` namespace, and
-                        // a bare `events` merges them into one series.
                         metrics::counter!(
                             "siglake_group_count_delta_write_failures_total",
-                            "iceberg_namespace" => table_ident.namespace().to_string(),
+                            "iceberg_namespace" => iceberg_namespace,
                             "table" => table_ident.name().to_string()
                         )
                         .increment(1);

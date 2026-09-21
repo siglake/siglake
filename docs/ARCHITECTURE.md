@@ -575,8 +575,8 @@ its own incarnation built (see [`LIMITATIONS.md`](LIMITATIONS.md)).
 **Group-count repair and limits.** The per-commit group-count delta write makes
 four attempts, waiting 250, 500 and 750 ms between attempts. A write that
 eventually succeeds after retry increments
-`siglake_group_count_delta_write_retries_total{table="<table>"}` by the retries
-it used; a write that exhausts all four attempts increments
+`siglake_group_count_delta_write_retries_total{iceberg_namespace="<ns>",table="<table>"}`
+by the retries it used; a write that exhausts all four attempts increments
 `siglake_group_count_delta_write_failures_total{iceberg_namespace="<ns>",table="<table>"}`.
 The Helm
 chart's `SiglakeGroupCountDeltaRetrying` alert warns on a sustained retry rate,
@@ -589,10 +589,9 @@ bounded sketches from committed files, and deletes every marker covered by the
 rebuild watermark. It increments
 `siglake_group_count_auto_rebuilds_total{iceberg_namespace="<ns>",table="<table>",outcome="success|incomplete|failed"}`;
 `SiglakeGroupCountDeltaLost` fires only when that automatic repair fails or
-completes without restoring full coverage. Both alerts name the affected namespace and
-table; the retry alert names the pod and, because its counter is not
-namespaced, the table alone. A later delta does not heal the gap; the
-marker-driven rebuild does.
+completes without restoring full coverage. Both it and the retry alert name the affected
+namespace and table; the retry alert names the pod as well. A later delta does
+not heal the gap; the marker-driven rebuild does.
 
 Each maintenance pass also adds the number of deltas folded into the base to
 `siglake_group_count_deltas_absorbed_total` and the number of already-absorbed
@@ -635,8 +634,9 @@ before the one-table repair budget is spent, and only that repair is under the
 600-second watchdog. A successful aggregate CAS clears covered attempt records;
 `rebuild-group-counts` does the same and reports the number cleared. One
 compactor censuses the base namespace and every
-`tenant_*` namespace, each with its own `events`, so this counter and the three
+`tenant_*` namespace, each with its own `events`, so this counter and the four
 beside it (`siglake_group_count_delta_write_failures_total`,
+`siglake_group_count_delta_write_retries_total`,
 `siglake_side_aggregate_publish_failures_total`,
 `siglake_group_count_auto_rebuilds_total`) carry `iceberg_namespace` as well as
 `table` — the name the alert passes to `rebuild-group-counts --namespace`. It

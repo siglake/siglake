@@ -253,8 +253,8 @@ pub const INGESTER_ALERTED_COUNTERS: &[AlertedCounter] = &[
 /// Counters the compactor (`siglake compactor`, not `--once`, which serves no
 /// metrics) pre-registers. `siglake_wal_crc_mismatch_total` is here too: the
 /// drain reads sealed segments through the same CRC check as ingest replay.
-/// The two group-count counters are labelled by Iceberg namespace and table
-/// (and rebuild outcome) and are listed for the default namespace's events
+/// The group-count counters are labelled by Iceberg namespace and table (and
+/// rebuild outcome) and are listed for the default namespace's events
 /// table only (`siglake_storage::iceberg::NAMESPACE` and `TABLE_NAME`, held
 /// equal by tests there); an event on an index table, in a `tenant_*`
 /// namespace, or under a base namespace moved off the default by
@@ -366,6 +366,15 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
     },
     AlertedCounter {
         name: "siglake_group_count_delta_write_failures_total",
+        series: &[&[("iceberg_namespace", "siglake"), ("table", "events")]],
+    },
+    // The precursor to the failure above, on the same panel. Its alert reads
+    // `rate()`, so `check-chart.py` does not require an entry; it is here so
+    // that a compactor which has never retried reads 0 next to the failure
+    // series rather than being absent, which on one panel is indistinguishable
+    // from a delta path that is not running (#4759).
+    AlertedCounter {
+        name: "siglake_group_count_delta_write_retries_total",
         series: &[&[("iceberg_namespace", "siglake"), ("table", "events")]],
     },
     // #3799: an append's contribution to the inline aggregate object exists

@@ -577,8 +577,9 @@ automatic rebuild fails or remains incomplete and names the Iceberg
 namespace and table; use `siglake rebuild-group-counts --namespace <ns> --table
 <table>` as the operator fallback.
 `SiglakeGroupCountDeltaRetrying` (warning) fires once delta writes for a table
-have needed retries for half an hour and names both the table and pod, warning
-that an exhausted write and automatic rebuild are becoming more likely.
+have needed retries for half an hour and names the Iceberg namespace, table and
+pod, warning that an exhausted write and automatic rebuild are becoming more
+likely.
 `SiglakeSideAggregatePublicationLost` (warning) covers the inline aggregate
 object: a publication that exhausts the same four attempts loses the commit's
 contribution outright, so it fires on the failure itself. The compactor's

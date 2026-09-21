@@ -354,16 +354,17 @@ spec:
           # commit. `for:` is twice the range so that a single burst, which
           # keeps `rate()` positive for one range, cannot fire it; sustaining
           # it needs retries across at least two consecutive windows. The
-          # counter carries both the table supplied by the commit path and the
-          # pod added by Prometheus, so this identifies both.
+          # counter carries the namespace and table supplied by the commit path
+          # and the pod added by Prometheus, so this identifies all three.
           expr: rate(siglake_group_count_delta_write_retries_total[15m]) > 0
           for: 30m
           labels:
             severity: warning
           annotations:
-            summary: Group-count delta writes for {{ "{{ $labels.table }}" }} have needed retries for half an hour
+            summary: Group-count delta writes for {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }} have needed retries for half an hour
             description: >-
-              Delta writes for table {{ "{{ $labels.table }}" }} on
+              Delta writes for table
+              {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }} on
               {{ "{{ $labels.pod }}" }} have been succeeding only on retry for
               30 minutes. Each retry is a transient object-store or credential
               failure; a sustained rate is the precursor to

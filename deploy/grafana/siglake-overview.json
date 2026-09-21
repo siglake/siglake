@@ -382,8 +382,8 @@
      "refId": "A"
     },
     {
-     "expr": "sum by (table) (increase(siglake_group_count_delta_write_retries_total{namespace=~\"$namespace\"}[5m]))",
-     "legendFormat": "retried {{table}}",
+     "expr": "sum by (iceberg_namespace, table) (increase(siglake_group_count_delta_write_retries_total{namespace=~\"$namespace\"}[5m]))",
+     "legendFormat": "retried {{iceberg_namespace}}.{{table}}",
      "refId": "B"
     },
     {
@@ -392,7 +392,7 @@
      "refId": "C"
     }
    ],
-   "description": "Lost delta writes are grouped by Iceberg namespace and table, retried ones by table alone. A lost delta leaves the aggregate short, but writes a durable marker that the maintenance compactor normally repairs on its next aggregate fold; a sustained retry rate means the object store or credentials are flaky and a loss is likely. The third series is the inline side object's own publication: it retries on the same budget, and a loss there leaves that object short of total-records with only its group counts repairable."
+   "description": "All three series are grouped by Iceberg namespace and table: one commit path writes for the base namespace and every tenant namespace, each with its own events table. A lost delta leaves the aggregate short, but writes a durable marker that the maintenance compactor normally repairs on its next aggregate fold; a sustained retry rate means the object store or credentials are flaky and a loss is likely. The third series is the inline side object's own publication: it retries on the same budget, and a loss there leaves that object short of total-records with only its group counts repairable."
   },
   {
    "id": 143,

@@ -512,6 +512,21 @@
   a base namespace moved by `SIGLAKE_TENANT_NAMESPACE` are known only at the
   increment. (#4737)
 
+- **Metrics (series identity change)**: the fifth counter in that group,
+  `siglake_group_count_delta_write_retries_total`, now carries
+  `iceberg_namespace` too. It was left behind because the retry is counted
+  inside the delta write, which took the table as a bare string; the namespace
+  is now threaded from the commit path that already had it. Its alert,
+  `SiglakeGroupCountDeltaRetrying` — the precursor that warns before a write
+  exhausts its four attempts and `SiglakeGroupCountDeltaLost` fires — named a
+  bare `events` merged across every tenant, while the alert it precedes named
+  `<namespace>.<table>`. It now names the pair, and the dashboard's retried
+  series groups by it. The same compatibility note applies: matchers on
+  `table` alone keep working, exact label-set matchers do not. The counter also
+  joins the compactor's pre-registration catalog for the default namespace's
+  `events`, so a compactor that has never retried reads 0 beside the failure
+  series rather than being absent. (#4759)
+
 - **Release images report the commit they were built from**: `siglake
   --version` and the `siglake_build_info` metric read a revision stamped in at
   build time, and the publish workflow passed none. The builds copy no Git

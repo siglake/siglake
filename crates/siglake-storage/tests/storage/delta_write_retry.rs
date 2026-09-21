@@ -20,8 +20,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[tokio::test]
 async fn a_transient_write_failure_is_retried_and_recovers() {
     let calls = AtomicU32::new(0);
-    let out =
-        siglake_storage::iceberg::retry_delta_write_for_test("events", "seq-1.json", 4, || {
+    let out = siglake_storage::iceberg::retry_delta_write_for_test(
+        "siglake",
+        "events",
+        "seq-1.json",
+        4,
+        || {
             let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
             async move {
                 if n < 3 {
@@ -32,8 +36,9 @@ async fn a_transient_write_failure_is_retried_and_recovers() {
                     Ok(())
                 }
             }
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(out.is_ok(), "should have recovered: {out:?}");
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -46,12 +51,17 @@ async fn a_transient_write_failure_is_retried_and_recovers() {
 #[tokio::test]
 async fn one_attempt_loses_a_transient_failure() {
     let calls = AtomicU32::new(0);
-    let out =
-        siglake_storage::iceberg::retry_delta_write_for_test("events", "seq-2.json", 1, || {
+    let out = siglake_storage::iceberg::retry_delta_write_for_test(
+        "siglake",
+        "events",
+        "seq-2.json",
+        1,
+        || {
             calls.fetch_add(1, Ordering::SeqCst);
             async move { Err(anyhow::anyhow!("temporary")) }
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(out.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -62,12 +72,17 @@ async fn one_attempt_loses_a_transient_failure() {
 #[tokio::test]
 async fn exhausted_attempts_surface_the_underlying_cause() {
     let calls = AtomicU32::new(0);
-    let out =
-        siglake_storage::iceberg::retry_delta_write_for_test("events", "seq-3.json", 4, || {
+    let out = siglake_storage::iceberg::retry_delta_write_for_test(
+        "siglake",
+        "events",
+        "seq-3.json",
+        4,
+        || {
             calls.fetch_add(1, Ordering::SeqCst);
             async move { Err(anyhow::anyhow!("IMDS token fetch timed out")) }
-        })
-        .await;
+        },
+    )
+    .await;
     let err = out.expect_err("a sustained outage must fail");
     assert_eq!(calls.load(Ordering::SeqCst), 4, "all attempts used");
     let chain = format!("{err:?}");
@@ -86,12 +101,17 @@ async fn exhausted_attempts_surface_the_underlying_cause() {
 #[tokio::test]
 async fn the_attempt_budget_is_bounded() {
     let calls = Cell::new(0u32);
-    let out =
-        siglake_storage::iceberg::retry_delta_write_for_test("events", "seq-4.json", 3, || {
+    let out = siglake_storage::iceberg::retry_delta_write_for_test(
+        "siglake",
+        "events",
+        "seq-4.json",
+        3,
+        || {
             calls.set(calls.get() + 1);
             async move { Err(anyhow::anyhow!("permanent")) }
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(out.is_err());
     assert_eq!(calls.get(), 3, "exactly the budget, no more");
 }

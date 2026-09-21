@@ -893,6 +893,69 @@ tests:
                 tenant_acme --table events` to restore the group-count
                 aggregate, which does not rebuild the inline time aggregates.
 
+  # #4759: the precursor alert had no case at all, and its counter carried
+  # `table` alone, so the two `events` tables one commit path writes deltas for
+  # arrived as one alert naming a table no operator could locate. The interval
+  # is 5m because the rule needs `rate()` over 15m sustained past `for: 30m`:
+  # rate turns positive around 10m and the alert fires from ~45m, so 60m is a
+  # reading inside the firing window, not on its edge.
+  - name: retried delta writes in two namespaces raise one alert each
+    interval: 5m
+    input_series:
+      - series: 'siglake_group_count_delta_write_retries_total{namespace="logs",pod="ingester-0",iceberg_namespace="siglake",table="events"}'
+        values: '0+1x15'
+      - series: 'siglake_group_count_delta_write_retries_total{namespace="logs",pod="ingester-0",iceberg_namespace="tenant_acme",table="events"}'
+        values: '0+1x15'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: SiglakeGroupCountDeltaRetrying
+        exp_alerts:
+          - exp_labels:
+              namespace: logs
+              pod: ingester-0
+              iceberg_namespace: siglake
+              table: events
+              severity: warning
+            exp_annotations:
+              summary: Group-count delta writes for siglake.events have needed retries for half an hour
+              description: >-
+                Delta writes for table siglake.events on ingester-0 have been
+                succeeding only on retry for 30 minutes. Each retry is a
+                transient object-store or credential failure; a sustained rate
+                is the precursor to SiglakeGroupCountDeltaLost, which fires once
+                a write exhausts all four attempts. Check warehouse object-store
+                health and credential refresh (IMDS) on that pod before a delta
+                is lost.
+          - exp_labels:
+              namespace: logs
+              pod: ingester-0
+              iceberg_namespace: tenant_acme
+              table: events
+              severity: warning
+            exp_annotations:
+              summary: Group-count delta writes for tenant_acme.events have needed retries for half an hour
+              description: >-
+                Delta writes for table tenant_acme.events on ingester-0 have
+                been succeeding only on retry for 30 minutes. Each retry is a
+                transient object-store or credential failure; a sustained rate
+                is the precursor to SiglakeGroupCountDeltaLost, which fires once
+                a write exhausts all four attempts. Check warehouse object-store
+                health and credential refresh (IMDS) on that pod before a delta
+                is lost.
+
+  # A single burst is what `for:` at twice the range exists to absorb: one
+  # retry, then nothing, keeps `rate()` positive for one 15m window and must
+  # not page.
+  - name: one retry burst stays silent
+    interval: 5m
+    input_series:
+      - series: 'siglake_group_count_delta_write_retries_total{namespace="logs",pod="ingester-0",iceberg_namespace="siglake",table="events"}'
+        values: '0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: SiglakeGroupCountDeltaRetrying
+        exp_alerts: []
+
   # #4674: the gauge is a current state, so the alert has to fire while it
   # stands and clear on the census pass after the repair — without a query
   # ever arriving. `for: 30m` is two censuses at the default cadence.
