@@ -2,6 +2,7 @@ use std::any::Any;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::pin::Pin;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -170,6 +171,8 @@ struct EffectiveFileCacheTuning {
     /// #4905 prototype gate; see
     /// [`crate::QueryScanTuning::file_cache_predicate_key_prototype`].
     predicate_key_prototype: bool,
+    /// #5074 in-process-only shared population-budget qualification.
+    population_bound_prototype: bool,
     /// #4959 in-process-only per-file attribution qualification.
     file_attribution_prototype: bool,
 }
@@ -565,7 +568,13 @@ impl QueryFileBatchCache {
         self.entries.get(key).cloned()
     }
 
-    fn insert(&mut self, key: String, entry: CachedFileBatches, tuning: EffectiveFileCacheTuning) {
+    fn insert(
+        &mut self,
+        key: String,
+        entry: CachedFileBatches,
+        tuning: EffectiveFileCacheTuning,
+        population_reserved: bool,
+    ) {
         // Don't let one oversized entry (e.g. a whole file's decoded `raw` column)
         // monopolize and thrash the cache — it would evict everything useful, then
         // sit alone. Skip caching entries larger than a quarter of the byte budget;
@@ -580,8 +589,12 @@ impl QueryFileBatchCache {
         }
         if let Some(prev) = self.entries.insert(key.clone(), entry.clone()) {
             self.bytes = self.bytes.saturating_sub(prev.bytes);
+            decoded_file_cache_accounted_bytes().fetch_sub(prev.bytes, Relaxed);
         }
         self.bytes = self.bytes.saturating_add(entry.bytes);
+        if !population_reserved {
+            decoded_file_cache_accounted_bytes().fetch_add(entry.bytes, Relaxed);
+        }
         self.order.push_back(key);
 
         let max_entries = tuning.max_entries.unwrap_or(0);
@@ -601,6 +614,7 @@ impl QueryFileBatchCache {
             if should_remove {
                 if let Some(evicted) = self.entries.remove(&oldest) {
                     self.bytes = self.bytes.saturating_sub(evicted.bytes);
+                    decoded_file_cache_accounted_bytes().fetch_sub(evicted.bytes, Relaxed);
                     metrics::counter!(
                         "siglake_query_scan_file_cache_requests_total",
                         "outcome" => "evict"
@@ -612,6 +626,17 @@ impl QueryFileBatchCache {
         metrics::gauge!("siglake_query_scan_file_cache_bytes").set(self.bytes as f64);
         metrics::gauge!("siglake_query_scan_file_cache_entries").set(self.entries.len() as f64);
     }
+}
+
+impl Drop for QueryFileBatchCache {
+    fn drop(&mut self) {
+        decoded_file_cache_accounted_bytes().fetch_sub(self.bytes, Relaxed);
+    }
+}
+
+fn decoded_file_cache_accounted_bytes() -> &'static std::sync::atomic::AtomicU64 {
+    static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    &BYTES
 }
 
 fn query_file_batch_cache() -> &'static std::sync::Mutex<QueryFileBatchCache> {
@@ -749,6 +774,8 @@ struct PopulationMeter {
     peak_extent_bytes: std::sync::atomic::AtomicU64,
     peak_retained_bytes: std::sync::atomic::AtomicU64,
     peak_streams: std::sync::atomic::AtomicU64,
+    peak_accounted_bytes: std::sync::atomic::AtomicU64,
+    budget_refusals: std::sync::atomic::AtomicU64,
 }
 
 fn population_meter() -> &'static PopulationMeter {
@@ -767,6 +794,11 @@ pub struct DecodedFileCachePopulationStats {
     pub peak_extent_bytes: u64,
     pub peak_retained_bytes: u64,
     pub peak_streams: u64,
+    /// Peak completed-entry plus admitted-population bytes under #5074's
+    /// single conservative accounting currency.
+    pub peak_accounted_bytes: u64,
+    /// Population batches refused by #5074's shared-budget prototype.
+    pub budget_refusals: u64,
 }
 
 pub fn decoded_file_cache_population_stats() -> DecodedFileCachePopulationStats {
@@ -779,6 +811,8 @@ pub fn decoded_file_cache_population_stats() -> DecodedFileCachePopulationStats 
         peak_extent_bytes: meter.peak_extent_bytes.load(Relaxed),
         peak_retained_bytes: meter.peak_retained_bytes.load(Relaxed),
         peak_streams: meter.peak_streams.load(Relaxed),
+        peak_accounted_bytes: meter.peak_accounted_bytes.load(Relaxed),
+        budget_refusals: meter.budget_refusals.load(Relaxed),
     }
 }
 
@@ -790,29 +824,61 @@ pub fn reset_decoded_file_cache_population_peaks() {
     meter.peak_extent_bytes.store(0, Relaxed);
     meter.peak_retained_bytes.store(0, Relaxed);
     meter.peak_streams.store(0, Relaxed);
+    meter
+        .peak_accounted_bytes
+        .store(decoded_file_cache_accounted_bytes().load(Relaxed), Relaxed);
 }
 
 /// One populate stream's charge against [`PopulationMeter`]. Releases exactly
 /// what it charged on drop, so a cancelled population cannot leak the gauge.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PopulationCharge {
     extent_bytes: u64,
     retained_bytes: u64,
+    priced_bytes: u64,
+    shared_budget: bool,
 }
 
 impl PopulationCharge {
-    fn open() -> Self {
+    fn open(shared_budget: bool) -> Self {
         use std::sync::atomic::Ordering::Relaxed;
         let meter = population_meter();
         let streams = meter.streams.fetch_add(1, Relaxed) + 1;
         meter.peak_streams.fetch_max(streams, Relaxed);
-        Self::default()
+        Self {
+            extent_bytes: 0,
+            retained_bytes: 0,
+            priced_bytes: 0,
+            shared_budget,
+        }
     }
 
-    fn charge(&mut self, batch: &RecordBatch) {
+    /// Reserve and record one retained batch. A refusal retains nothing.
+    fn try_charge(&mut self, batch: &RecordBatch, max_bytes: Option<u64>) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let extent = batch_extent_bytes(batch);
         let retained = batch_retained_bytes(batch);
+        let priced = batch.get_array_memory_size() as u64;
+        if self.shared_budget {
+            let Some(max_bytes) = max_bytes else {
+                return false;
+            };
+            let admitted = decoded_file_cache_accounted_bytes()
+                .fetch_update(Relaxed, Relaxed, |current| {
+                    current
+                        .checked_add(priced)
+                        .filter(|next| *next <= max_bytes)
+                })
+                .ok();
+            let Some(previous) = admitted else {
+                population_meter().budget_refusals.fetch_add(1, Relaxed);
+                return false;
+            };
+            population_meter()
+                .peak_accounted_bytes
+                .fetch_max(previous.saturating_add(priced), Relaxed);
+            self.priced_bytes = self.priced_bytes.saturating_add(priced);
+        }
         self.extent_bytes = self.extent_bytes.saturating_add(extent);
         self.retained_bytes = self.retained_bytes.saturating_add(retained);
         let meter = population_meter();
@@ -820,6 +886,7 @@ impl PopulationCharge {
         let retained_total = meter.retained_bytes.fetch_add(retained, Relaxed) + retained;
         meter.peak_extent_bytes.fetch_max(extent_total, Relaxed);
         meter.peak_retained_bytes.fetch_max(retained_total, Relaxed);
+        true
     }
 
     /// Give back what this stream holds, keeping its stream slot (it is still
@@ -833,6 +900,24 @@ impl PopulationCharge {
         meter
             .retained_bytes
             .fetch_sub(std::mem::take(&mut self.retained_bytes), Relaxed);
+        if self.shared_budget {
+            decoded_file_cache_accounted_bytes()
+                .fetch_sub(std::mem::take(&mut self.priced_bytes), Relaxed);
+        }
+    }
+
+    /// Move an admitted charge into a completed cache entry without changing
+    /// the shared total. Population-only measurements stop at the handoff.
+    fn transfer_to_cache(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let meter = population_meter();
+        meter
+            .extent_bytes
+            .fetch_sub(std::mem::take(&mut self.extent_bytes), Relaxed);
+        meter
+            .retained_bytes
+            .fetch_sub(std::mem::take(&mut self.retained_bytes), Relaxed);
+        self.priced_bytes = 0;
     }
 }
 
@@ -1190,6 +1275,9 @@ struct CachePopulateStream {
     buffered: Vec<RecordBatch>,
     buffered_bytes: u64,
     oversized: bool,
+    /// Shared population budget refused this candidate. It remains a normal
+    /// scan but no longer buffers batches for the optional cache.
+    population_refused: bool,
     insert_done: bool,
     /// Off-pool population memory this stream holds — see [`PopulationMeter`].
     charge: PopulationCharge,
@@ -1217,8 +1305,13 @@ struct CachePopulateStream {
 }
 
 impl CachePopulateStream {
-    fn insert_buffered(&mut self, cache: &mut QueryFileBatchCache) {
+    fn discard_buffered(&mut self) {
+        self.buffered.clear();
+        self.buffered_bytes = 0;
         self.charge.release_buffered();
+    }
+
+    fn insert_buffered(&mut self, cache: &mut QueryFileBatchCache) {
         if cache.get(&self.key).is_none() {
             cache.insert(
                 self.key.clone(),
@@ -1227,12 +1320,37 @@ impl CachePopulateStream {
                     batches: Arc::new(std::mem::take(&mut self.buffered)),
                 },
                 self.tuning,
+                self.tuning.population_bound_prototype,
             );
+            if self.tuning.population_bound_prototype {
+                self.charge.transfer_to_cache();
+            } else {
+                self.charge.release_buffered();
+            }
             metrics::counter!(
                 "siglake_query_scan_file_cache_requests_total",
                 "outcome" => "insert"
             )
             .increment(1);
+        } else {
+            self.discard_buffered();
+        }
+    }
+
+    fn finish_buffered(&mut self, cache: &std::sync::Mutex<QueryFileBatchCache>) {
+        match cache.try_lock() {
+            Ok(mut cache) => self.insert_buffered(&mut cache),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                self.insert_buffered(&mut poisoned.into_inner());
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                metrics::counter!(
+                    "siglake_query_scan_file_cache_requests_total",
+                    "outcome" => "insert_skipped_contended"
+                )
+                .increment(1);
+                self.discard_buffered();
+            }
         }
     }
 }
@@ -1262,7 +1380,7 @@ impl CachePopulateStream {
 /// outcome at all, and `hit` and `bypass` never build one of these.
 impl Drop for CachePopulateStream {
     fn drop(&mut self) {
-        if !self.insert_done && !self.oversized {
+        if !self.insert_done && !self.oversized && !self.population_refused {
             metrics::counter!(
                 "siglake_query_scan_file_cache_requests_total",
                 "outcome" => "abandoned"
@@ -1301,7 +1419,7 @@ impl Stream for CachePopulateStream {
                     batch.num_rows() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                if !this.oversized {
+                if !this.oversized && !this.population_refused {
                     // Population retains `batch.clone()`, so a sliced array keeps its
                     // whole backing allocation alive. Price that retained allocation:
                     // `get_slice_memory_size` estimates a compact copy of the slice and
@@ -1320,10 +1438,12 @@ impl Stream for CachePopulateStream {
                             "outcome" => "skip_oversized"
                         )
                         .increment(1);
-                    } else {
+                    } else if this.charge.try_charge(&batch, this.tuning.max_bytes) {
                         this.buffered_bytes = buffered_bytes;
-                        this.charge.charge(&batch);
                         this.buffered.push(batch.clone());
+                    } else {
+                        this.discard_buffered();
+                        this.population_refused = true;
                     }
                 }
                 Poll::Ready(Some(Ok(batch)))
@@ -1352,20 +1472,8 @@ impl Stream for CachePopulateStream {
                 // That avoids the scheduler handoff and fair waiter queue of an
                 // async mutex, which otherwise made this non-blocking try_lock
                 // lose to concurrently opening partitions almost every time.
-                if !this.oversized {
-                    match query_file_batch_cache().try_lock() {
-                        Ok(mut cache) => this.insert_buffered(&mut cache),
-                        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                            this.insert_buffered(&mut poisoned.into_inner());
-                        }
-                        Err(std::sync::TryLockError::WouldBlock) => {
-                            metrics::counter!(
-                                "siglake_query_scan_file_cache_requests_total",
-                                "outcome" => "insert_skipped_contended"
-                            )
-                            .increment(1);
-                        }
-                    }
+                if !this.oversized && !this.population_refused {
+                    this.finish_buffered(query_file_batch_cache());
                 }
                 this.insert_done = true;
                 this.end = PopulateEnd::Completed;
@@ -1554,6 +1662,8 @@ struct RowGroupPopulateStream {
     /// This group will not be inserted (it crossed the entry bound), but its
     /// rows are still counted so the next boundary is found.
     group_skipped: bool,
+    /// Shared population budget refused the current group.
+    population_refused: bool,
     /// A batch crossed a group boundary — the alignment this rests on does not
     /// hold for this read, so stop populating rather than guess.
     misaligned: bool,
@@ -1581,25 +1691,51 @@ impl RowGroupPopulateStream {
         match query_file_batch_cache().try_lock() {
             Ok(mut cache) => {
                 if cache.get(&key).is_none() {
-                    cache.insert(key, entry, self.tuning);
+                    cache.insert(
+                        key,
+                        entry,
+                        self.tuning,
+                        self.tuning.population_bound_prototype,
+                    );
+                    if self.tuning.population_bound_prototype {
+                        self.charge.transfer_to_cache();
+                    } else {
+                        self.charge.release_buffered();
+                    }
                     metrics::counter!(
                         "siglake_query_scan_file_cache_requests_total",
                         "outcome" => "insert"
                     )
                     .increment(1);
                     row_group_prototype_outcome("group_inserted");
+                } else {
+                    drop(entry);
+                    self.charge.release_buffered();
                 }
             }
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                 let mut cache = poisoned.into_inner();
                 if cache.get(&key).is_none() {
-                    cache.insert(key, entry, self.tuning);
+                    cache.insert(
+                        key,
+                        entry,
+                        self.tuning,
+                        self.tuning.population_bound_prototype,
+                    );
+                    if self.tuning.population_bound_prototype {
+                        self.charge.transfer_to_cache();
+                    } else {
+                        self.charge.release_buffered();
+                    }
                     metrics::counter!(
                         "siglake_query_scan_file_cache_requests_total",
                         "outcome" => "insert"
                     )
                     .increment(1);
                     row_group_prototype_outcome("group_inserted");
+                } else {
+                    drop(entry);
+                    self.charge.release_buffered();
                 }
             }
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -1608,6 +1744,8 @@ impl RowGroupPopulateStream {
                     "outcome" => "insert_skipped_contended"
                 )
                 .increment(1);
+                drop(entry);
+                self.charge.release_buffered();
             }
         }
     }
@@ -1650,7 +1788,7 @@ impl Stream for RowGroupPopulateStream {
                         this.discard_buffered();
                         row_group_prototype_outcome("misaligned");
                     } else {
-                        if !this.group_skipped {
+                        if !this.group_skipped && !this.population_refused {
                             let buffered_bytes = this
                                 .buffered_bytes
                                 .saturating_add(batch.get_array_memory_size() as u64);
@@ -1662,10 +1800,12 @@ impl Stream for RowGroupPopulateStream {
                                     "outcome" => "skip_oversized"
                                 )
                                 .increment(1);
-                            } else {
+                            } else if this.charge.try_charge(&batch, this.tuning.max_bytes) {
                                 this.buffered_bytes = buffered_bytes;
-                                this.charge.charge(&batch);
                                 this.buffered.push(batch.clone());
+                            } else {
+                                this.discard_buffered();
+                                this.population_refused = true;
                             }
                         }
                         this.filled_rows = filled;
@@ -1676,6 +1816,7 @@ impl Stream for RowGroupPopulateStream {
                             this.at += 1;
                             this.filled_rows = 0;
                             this.group_skipped = false;
+                            this.population_refused = false;
                         }
                     }
                 }
@@ -5099,8 +5240,9 @@ async fn open_task_batch_stream_cached(
         buffered: Vec::new(),
         buffered_bytes: 0,
         oversized: false,
+        population_refused: false,
         insert_done: false,
-        charge: PopulationCharge::open(),
+        charge: PopulationCharge::open(cache_tuning.population_bound_prototype),
         yielded_rows: 0,
         end: PopulateEnd::Unpolled,
         cache_counters,
@@ -5140,8 +5282,9 @@ fn row_group_task_stream(
                 buffered: Vec::new(),
                 buffered_bytes: 0,
                 group_skipped: false,
+                population_refused: false,
                 misaligned: false,
-                charge: PopulationCharge::open(),
+                charge: PopulationCharge::open(cache_tuning.population_bound_prototype),
             })
         };
     match plan {
@@ -6555,6 +6698,7 @@ fn effective_file_cache_tuning(tuning: crate::QueryScanTuning) -> EffectiveFileC
         max_entries: tuning.file_cache_max_entries.filter(|n| *n > 0),
         row_group_prototype: tuning.file_cache_row_group_prototype,
         predicate_key_prototype: tuning.file_cache_predicate_key_prototype,
+        population_bound_prototype: tuning.file_cache_population_bound_prototype,
         file_attribution_prototype: tuning.file_attribution_prototype,
     }
 }
@@ -7803,6 +7947,7 @@ mod tests {
             max_entries: Some(1),
             row_group_prototype: false,
             predicate_key_prototype: false,
+            population_bound_prototype: false,
             file_attribution_prototype: false,
         };
         let recorder = DebuggingRecorder::new();
@@ -7823,8 +7968,9 @@ mod tests {
                     buffered: Vec::new(),
                     buffered_bytes: 0,
                     oversized: false,
+                    population_refused: false,
                     insert_done: false,
-                    charge: PopulationCharge::open(),
+                    charge: PopulationCharge::open(false),
                     yielded_rows: 0,
                     end: PopulateEnd::Unpolled,
                     cache_counters: Arc::new(FileCacheCounters::default()),
@@ -7856,6 +8002,63 @@ mod tests {
             1,
             "an oversized candidate is abandoned exactly once"
         );
+    }
+
+    #[test]
+    fn shared_population_charge_survives_failure_and_releases_on_contention() {
+        let batch = string_batch(64);
+        let tuning = EffectiveFileCacheTuning {
+            max_bytes: Some(u64::MAX),
+            max_entries: Some(8),
+            row_group_prototype: false,
+            predicate_key_prototype: false,
+            population_bound_prototype: true,
+            file_attribution_prototype: false,
+        };
+        let stream = |key: &str, inner| CachePopulateStream {
+            key: key.to_string(),
+            tuning,
+            inner,
+            buffered: Vec::new(),
+            buffered_bytes: 0,
+            oversized: false,
+            population_refused: false,
+            insert_done: false,
+            charge: PopulationCharge::open(true),
+            yielded_rows: 0,
+            end: PopulateEnd::Unpolled,
+            cache_counters: Arc::new(FileCacheCounters::default()),
+        };
+
+        futures::executor::block_on(async {
+            let failing: TaskBatchStream = futures::stream::iter([
+                Ok::<_, DataFusionError>(batch.clone()),
+                Err(DataFusionError::External("decode failed".into())),
+            ])
+            .boxed();
+            let mut failed = stream("failed-shared-charge", failing);
+            assert!(failed.next().await.unwrap().is_ok());
+            assert!(failed.charge.priced_bytes > 0);
+            assert!(failed.next().await.unwrap().is_err());
+            assert!(
+                failed.charge.priced_bytes > 0,
+                "the error must not release while retained batches are still owned"
+            );
+            drop(failed);
+
+            let inner: TaskBatchStream =
+                futures::stream::iter([Ok::<_, DataFusionError>(batch.clone())]).boxed();
+            let mut contended = stream("contended-shared-charge", inner);
+            assert!(contended.next().await.unwrap().is_ok());
+            assert!(contended.charge.priced_bytes > 0);
+
+            let cache = std::sync::Mutex::new(QueryFileBatchCache::default());
+            let guard = cache.lock().unwrap();
+            contended.finish_buffered(&cache);
+            assert!(contended.buffered.is_empty());
+            assert_eq!(contended.charge.priced_bytes, 0);
+            drop(guard);
+        });
     }
 
     #[test]
@@ -7904,8 +8107,9 @@ mod tests {
             buffered: Vec::new(),
             buffered_bytes: 0,
             oversized: false,
+            population_refused: false,
             insert_done: false,
-            charge: PopulationCharge::open(),
+            charge: PopulationCharge::open(tuning.population_bound_prototype),
             yielded_rows: 0,
             end: PopulateEnd::Unpolled,
             cache_counters: Arc::new(FileCacheCounters::default()),
@@ -7919,6 +8123,7 @@ mod tests {
                 max_entries: Some(1),
                 row_group_prototype: false,
                 predicate_key_prototype: false,
+                population_bound_prototype: false,
                 file_attribution_prototype: false,
             };
             let mut refused = stream("sliced-refused", extent_limit);
@@ -7932,6 +8137,7 @@ mod tests {
                 max_entries: Some(1),
                 row_group_prototype: false,
                 predicate_key_prototype: false,
+                population_bound_prototype: false,
                 file_attribution_prototype: false,
             };
             let mut admitted = stream("sliced-admitted", retained_limit);
@@ -7958,6 +8164,7 @@ mod tests {
             max_entries: Some(8),
             row_group_prototype: false,
             predicate_key_prototype: false,
+            population_bound_prototype: false,
             file_attribution_prototype: false,
         };
         // One batch fits; the second crosses the quarter-budget entry bound.
@@ -7966,6 +8173,7 @@ mod tests {
             max_entries: Some(8),
             row_group_prototype: false,
             predicate_key_prototype: false,
+            population_bound_prototype: false,
             file_attribution_prototype: false,
         };
         let source = |batches: usize| -> TaskBatchStream {
@@ -7981,8 +8189,9 @@ mod tests {
             buffered: Vec::new(),
             buffered_bytes: 0,
             oversized: false,
+            population_refused: false,
             insert_done: false,
-            charge: PopulationCharge::open(),
+            charge: PopulationCharge::open(tuning.population_bound_prototype),
             yielded_rows: 0,
             end: PopulateEnd::Unpolled,
             cache_counters: Arc::new(FileCacheCounters::default()),

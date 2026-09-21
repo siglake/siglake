@@ -89,6 +89,13 @@ pub struct QueryScanTuning {
     /// residual filter on hits and misses; only an in-process measurement can
     /// enable this. See `docs/DESIGN_predicate_keyed_decoded_cache.md`.
     pub file_cache_predicate_key_prototype: bool,
+    /// #5074 LOCAL QUALIFICATION PROTOTYPE: admit population buffers against
+    /// the same process-wide byte budget as completed decoded-file entries.
+    ///
+    /// Deliberately has no environment variable, CLI flag, chart value or
+    /// operator field. The cache defaults and packaged memory limits stay
+    /// unchanged while the shared bound is qualified locally.
+    pub file_cache_population_bound_prototype: bool,
     /// #4959 LOCAL QUALIFICATION PROTOTYPE: retain the bounded file-task
     /// identities a scan planned, offered to the decoded cache, and attempted
     /// to open as labelled DataFusion node metrics.

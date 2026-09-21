@@ -520,6 +520,9 @@ async fn run() -> Result<()> {
         // #4905's predicate-keyed population is a local prototype with no
         // operator surface; the server never turns it on.
         file_cache_predicate_key_prototype: false,
+        // #5074's shared population bound is a local qualification prototype
+        // with no operator surface; the server never turns it on.
+        file_cache_population_bound_prototype: false,
         // #4959's per-file attribution is a local qualification gate with no
         // response or operator surface; the server never turns it on.
         file_attribution_prototype: false,
