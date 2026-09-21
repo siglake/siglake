@@ -771,8 +771,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   establish: reaching 131,072 rows is necessary for row-group population, not
   sufficient — a file whose groups are larger closes none at that depth, and a
   read that does not start on a group boundary closes none at any depth, so the
-  reader takes recorded footer geometry as a separate input. No fleet numbers
-  exist yet: the local evidence is hermetic fixtures
+  reader takes recorded footer geometry as a separate input. The round
+  collector currently samples the table's largest Parquet objects;
+  the SQL response does not name the files a shape read. Heterogeneous files
+  can therefore make that geometry belong to a different file set, so it is
+  table-sampled evidence and cannot verify per-shape membership or completed
+  groups (#4959). The local qualification and a bounded future representation
+  are recorded in `DESIGN_row_group_decoded_cache_qualification.md`; no public
+  response field ships from that investigation.
+  No fleet numbers exist yet: the local evidence is hermetic fixtures
   (`crates/siglake-storage/tests/file_cache_populate_depth.rs`,
   `crates/siglake-query-server/tests/file_cache_populate_depth_stats.rs`), and
   nothing here authorizes row-group adoption or a default change. The fleet

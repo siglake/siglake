@@ -169,6 +169,72 @@ struct EffectiveFileCacheTuning {
     /// #4905 prototype gate; see
     /// [`crate::QueryScanTuning::file_cache_predicate_key_prototype`].
     predicate_key_prototype: bool,
+    /// #4959 in-process-only per-file attribution qualification.
+    file_attribution_prototype: bool,
+}
+
+/// #4959's qualification capture is intentionally bounded. This is a local
+/// measurement aid, not a public response contract; a large scan records the
+/// first tasks in plan order and counts the rest as omitted.
+const FILE_ATTRIBUTION_PROTOTYPE_CAP: usize = 128;
+const FILE_ATTRIBUTION_METRIC: &str = "qualification_file_attribution";
+const FILE_ATTRIBUTION_OMITTED_METRIC: &str = "qualification_file_attribution_omitted";
+
+#[derive(Clone)]
+enum FileAttributionMetrics {
+    Named {
+        cache_candidate: Count,
+        reader_attempt: Count,
+    },
+    Omitted {
+        cache_candidate: Count,
+        reader_attempt: Count,
+    },
+}
+
+impl FileAttributionMetrics {
+    fn cache_candidate(&self) {
+        match self {
+            Self::Named {
+                cache_candidate, ..
+            }
+            | Self::Omitted {
+                cache_candidate, ..
+            } => cache_candidate.add(1),
+        }
+    }
+
+    fn reader_attempt(&self) {
+        match self {
+            Self::Named { reader_attempt, .. } | Self::Omitted { reader_attempt, .. } => {
+                reader_attempt.add(1);
+            }
+        }
+    }
+}
+
+fn file_attribution_counter(
+    metrics: &ExecutionPlanMetricsSet,
+    partition: usize,
+    task: &FileScanTask,
+    stage: &'static str,
+) -> Count {
+    MetricBuilder::new(metrics)
+        .with_new_label("stage", stage)
+        .with_new_label("file", task.data_file_path().to_string())
+        .with_new_label("start", task.start.to_string())
+        .with_new_label("length", task.length.to_string())
+        .counter(FILE_ATTRIBUTION_METRIC, partition)
+}
+
+fn file_attribution_omitted_counter(
+    metrics: &ExecutionPlanMetricsSet,
+    partition: usize,
+    stage: &'static str,
+) -> Count {
+    MetricBuilder::new(metrics)
+        .with_new_label("stage", stage)
+        .counter(FILE_ATTRIBUTION_OMITTED_METRIC, partition)
 }
 
 /// Selectivity-aware ordered-policy override, injected through
@@ -4684,8 +4750,12 @@ async fn open_task_batch_stream_cached(
     raw_prune_spec: Option<RawPruneSpec>,
     promoted_prune: Vec<PromotedPruneSpec>,
     reverse: bool,
+    file_attribution: Option<FileAttributionMetrics>,
 ) -> DFResult<TaskBatchStream> {
     if !cache_tuning.enabled() {
+        if let Some(attribution) = &file_attribution {
+            attribution.reader_attempt();
+        }
         return open_task_batch_stream_uncached(
             file_io,
             task,
@@ -4696,6 +4766,10 @@ async fn open_task_batch_stream_cached(
             promoted_prune,
             reverse,
         );
+    }
+
+    if let Some(attribution) = &file_attribution {
+        attribution.cache_candidate();
     }
 
     let fallback_key = task_cache_key_with_direction(&task, reverse);
@@ -4732,6 +4806,9 @@ async fn open_task_batch_stream_cached(
         return Ok(
             futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)).boxed(),
         );
+    }
+    if let Some(attribution) = &file_attribution {
+        attribution.reader_attempt();
     }
 
     // #4891: under the shipped policy, a task carrying a converted predicate
@@ -5029,6 +5106,50 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
         let planned_rows_metric = MetricBuilder::new(&metrics).counter("planned_rows", partition);
         planned_rows_metric.add(planned_rows);
 
+        // #4959: keep this entirely inside the in-process qualification gate.
+        // Each retained task contributes three labelled counters; tasks beyond
+        // the cap share stage-specific omitted counters instead of retaining
+        // another path. Plan pruning has already happened, so `planned` is the
+        // exact task set this scan leaf received.
+        let file_attributions = file_cache_tuning.file_attribution_prototype.then(|| {
+            let planned_omitted = file_attribution_omitted_counter(&metrics, partition, "planned");
+            let candidate_omitted =
+                file_attribution_omitted_counter(&metrics, partition, "cache_candidate");
+            let reader_omitted =
+                file_attribution_omitted_counter(&metrics, partition, "reader_attempt");
+            tasks
+                .iter()
+                .enumerate()
+                .map(|(index, task)| {
+                    if index < FILE_ATTRIBUTION_PROTOTYPE_CAP {
+                        let planned =
+                            file_attribution_counter(&metrics, partition, task, "planned");
+                        planned.add(1);
+                        FileAttributionMetrics::Named {
+                            cache_candidate: file_attribution_counter(
+                                &metrics,
+                                partition,
+                                task,
+                                "cache_candidate",
+                            ),
+                            reader_attempt: file_attribution_counter(
+                                &metrics,
+                                partition,
+                                task,
+                                "reader_attempt",
+                            ),
+                        }
+                    } else {
+                        planned_omitted.add(1);
+                        FileAttributionMetrics::Omitted {
+                            cache_candidate: candidate_omitted.clone(),
+                            reader_attempt: reader_omitted.clone(),
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+
         let partition_started = Instant::now();
         let reader_build_started = Instant::now();
         // Per-scan counter of ACTUAL object-store bytes fetched by this
@@ -5186,30 +5307,37 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
             let task_cache_counters = file_cache_counters.clone();
             let raw_prune_spec = raw_prune_spec.clone();
             let promoted_prune = self.promoted_prune.clone();
-            let task_futures = futures::stream::iter(tasks.into_iter().map(move |task| {
-                let file_io = file_io.clone();
-                let counter = counter.clone();
-                let task_scan_counters = task_scan_counters.clone();
-                let task_cache_counters = task_cache_counters.clone();
-                let raw_prune_spec = raw_prune_spec.clone();
-                let promoted_prune = promoted_prune.clone();
-                async move {
-                    open_task_batch_stream_cached(
-                        file_io,
-                        task,
-                        reader_tuning,
-                        file_cache_tuning,
-                        counter,
-                        task_scan_counters,
-                        task_cache_counters,
-                        raw_prune_spec,
-                        promoted_prune,
-                        reverse_scan,
-                    )
-                    .await
-                }
-                .boxed()
-            }));
+            let task_futures = futures::stream::iter(tasks.into_iter().enumerate().map(
+                move |(task_index, task)| {
+                    let file_io = file_io.clone();
+                    let counter = counter.clone();
+                    let task_scan_counters = task_scan_counters.clone();
+                    let task_cache_counters = task_cache_counters.clone();
+                    let raw_prune_spec = raw_prune_spec.clone();
+                    let promoted_prune = promoted_prune.clone();
+                    let file_attribution = file_attributions
+                        .as_ref()
+                        .and_then(|entries| entries.get(task_index))
+                        .cloned();
+                    async move {
+                        open_task_batch_stream_cached(
+                            file_io,
+                            task,
+                            reader_tuning,
+                            file_cache_tuning,
+                            counter,
+                            task_scan_counters,
+                            task_cache_counters,
+                            raw_prune_spec,
+                            promoted_prune,
+                            reverse_scan,
+                            file_attribution,
+                        )
+                        .await
+                    }
+                    .boxed()
+                },
+            ));
             // WS-3: an order-advertising scan must emit batches in task order
             // (the tasks form a time-ascending disjoint run). Non-front files
             // may prefetch ahead, but their buffered batches are byte-budgeted
@@ -6219,6 +6347,7 @@ fn effective_file_cache_tuning(tuning: crate::QueryScanTuning) -> EffectiveFileC
         max_entries: tuning.file_cache_max_entries.filter(|n| *n > 0),
         row_group_prototype: tuning.file_cache_row_group_prototype,
         predicate_key_prototype: tuning.file_cache_predicate_key_prototype,
+        file_attribution_prototype: tuning.file_attribution_prototype,
     }
 }
 
@@ -7466,6 +7595,7 @@ mod tests {
             max_entries: Some(1),
             row_group_prototype: false,
             predicate_key_prototype: false,
+            file_attribution_prototype: false,
         };
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -7581,6 +7711,7 @@ mod tests {
                 max_entries: Some(1),
                 row_group_prototype: false,
                 predicate_key_prototype: false,
+                file_attribution_prototype: false,
             };
             let mut refused = stream("sliced-refused", extent_limit);
             assert!(refused.next().await.unwrap().is_ok());
@@ -7593,6 +7724,7 @@ mod tests {
                 max_entries: Some(1),
                 row_group_prototype: false,
                 predicate_key_prototype: false,
+                file_attribution_prototype: false,
             };
             let mut admitted = stream("sliced-admitted", retained_limit);
             assert!(admitted.next().await.unwrap().is_ok());
@@ -7618,6 +7750,7 @@ mod tests {
             max_entries: Some(8),
             row_group_prototype: false,
             predicate_key_prototype: false,
+            file_attribution_prototype: false,
         };
         // One batch fits; the second crosses the quarter-budget entry bound.
         let tight = EffectiveFileCacheTuning {
@@ -7625,6 +7758,7 @@ mod tests {
             max_entries: Some(8),
             row_group_prototype: false,
             predicate_key_prototype: false,
+            file_attribution_prototype: false,
         };
         let source = |batches: usize| -> TaskBatchStream {
             futures::stream::iter(

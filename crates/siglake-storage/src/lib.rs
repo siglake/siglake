@@ -88,6 +88,15 @@ pub struct QueryScanTuning {
     /// residual filter on hits and misses; only an in-process measurement can
     /// enable this. See `docs/DESIGN_predicate_keyed_decoded_cache.md`.
     pub file_cache_predicate_key_prototype: bool,
+    /// #4959 LOCAL QUALIFICATION PROTOTYPE: retain the bounded file-task
+    /// identities a scan planned, offered to the decoded cache, and attempted
+    /// to open as labelled DataFusion node metrics.
+    ///
+    /// Deliberately has no environment variable, CLI flag, chart value or
+    /// operator field. The public SQL response and distributed shard header
+    /// remain aggregate-only while the representation is qualified in
+    /// `docs/DESIGN_row_group_decoded_cache_qualification.md`.
+    pub file_attribution_prototype: bool,
 }
 
 /// Effective process-wide read-cache configuration.
