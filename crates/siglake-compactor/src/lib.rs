@@ -53,10 +53,11 @@ use siglake_storage::catalog_claim::{
 };
 use siglake_storage::consumed_proof::{ConsumedProofEntry, ConsumedProofRead, ReclaimProofSources};
 use siglake_storage::iceberg::{
-    AppendIncarnationMismatch, DeleteTaskState, IcebergContext, LevelPolicy, LeveledPassOptions,
-    NonTerminalDeleteTask, NonTerminalDeleteTaskObservation, ObservedDeleteTaskClaim,
-    ProofMaintenanceIncarnationMismatch, ReclusterPolicy, ShortAggregateAttemptReason,
-    ShortAggregateAttemptStart, ShortAggregateOutcome,
+    AppendIncarnationMismatch, AutoPromotionDecline, AutoPromotionDeclineReason, DeleteTaskState,
+    IcebergContext, LevelPolicy, LeveledPassOptions, NonTerminalDeleteTask,
+    NonTerminalDeleteTaskObservation, ObservedDeleteTaskClaim, ProofMaintenanceIncarnationMismatch,
+    ReclusterPolicy, ShortAggregateAttemptReason, ShortAggregateAttemptStart,
+    ShortAggregateOutcome,
 };
 use siglake_wal::{
     claim_segment, finish_segment, list_committed, list_index_dirs, list_orphaned, list_poisoned,
@@ -2043,23 +2044,169 @@ impl Compactor {
         // only when the CR names a `schemaVersion`, and the operator reports
         // what it observed rather than deciding anything.
         let min_fraction = auto_promote_min_fraction();
-        if min_fraction > 0.0 && auto_promote_due() {
+        let max_columns = auto_promote_max_columns();
+        let enabled = min_fraction > 0.0 && max_columns > 0;
+        let due = enabled && auto_promote_due();
+        for ident in self.ice.auto_promotion_table_idents().await {
+            let iceberg_namespace = ident.namespace().to_string();
+            let table = ident.name().to_string();
+            let columns = match self.ice.auto_promotion_column_count_for(&ident).await {
+                Ok(columns) => {
+                    publish_auto_promotion_table_state(
+                        &iceberg_namespace,
+                        &table,
+                        enabled,
+                        max_columns,
+                        Some(columns),
+                    );
+                    columns
+                }
+                Err(error) => {
+                    publish_auto_promotion_table_state(
+                        &iceberg_namespace,
+                        &table,
+                        enabled,
+                        max_columns,
+                        None,
+                    );
+                    if due {
+                        note_auto_promotion_pass(&iceberg_namespace, &table, "failed");
+                    }
+                    metrics::gauge!(
+                        "siglake_auto_promotion_candidates_available",
+                        "iceberg_namespace" => iceberg_namespace.clone(),
+                        "table" => table.clone()
+                    )
+                    .set(0.0);
+                    tracing::warn!(
+                        %iceberg_namespace,
+                        %table,
+                        error = ?error,
+                        "auto-promotion table metadata read failed"
+                    );
+                    continue;
+                }
+            };
+            if !enabled {
+                metrics::gauge!(
+                    "siglake_auto_promotion_candidates_available",
+                    "iceberg_namespace" => iceberg_namespace.clone(),
+                    "table" => table.clone()
+                )
+                .set(0.0);
+                continue;
+            }
+            if !due {
+                continue;
+            }
+            if columns >= max_columns {
+                metrics::gauge!(
+                    "siglake_auto_promotion_candidates_available",
+                    "iceberg_namespace" => iceberg_namespace.clone(),
+                    "table" => table.clone()
+                )
+                .set(0.0);
+                note_auto_promotion_pass(&iceberg_namespace, &table, "at_ceiling");
+                tracing::info!(
+                    %iceberg_namespace,
+                    %table,
+                    columns,
+                    max_columns,
+                    candidates = "unavailable",
+                    "auto-promotion pass declined sampling: table is at its configured column cap"
+                );
+                continue;
+            }
+
             match self
                 .ice
-                .auto_promote_hot_keys(
+                .auto_promote_hot_keys_for_report(
+                    &ident,
                     min_fraction,
-                    auto_promote_max_columns(),
+                    max_columns,
                     auto_promote_sample_files(),
                     auto_promote_sample_rows(),
                 )
                 .await
             {
-                Ok(newly) if !newly.is_empty() => {
-                    metrics::counter!("siglake_compactor_auto_promotions_total")
-                        .increment(newly.len() as u64);
+                Ok(report) => {
+                    let candidates = report.candidates.expect(
+                        "enabled table below its column cap must return a sampled candidate count",
+                    );
+                    metrics::gauge!(
+                        "siglake_auto_promotion_candidates",
+                        "iceberg_namespace" => iceberg_namespace.clone(),
+                        "table" => table.clone()
+                    )
+                    .set(candidates as f64);
+                    metrics::gauge!(
+                        "siglake_auto_promotion_candidates_available",
+                        "iceberg_namespace" => iceberg_namespace.clone(),
+                        "table" => table.clone()
+                    )
+                    .set(1.0);
+                    metrics::gauge!(
+                        "siglake_auto_promotion_columns",
+                        "iceberg_namespace" => iceberg_namespace.clone(),
+                        "table" => table.clone(),
+                        "kind" => "used"
+                    )
+                    .set(report.columns_after as f64);
+
+                    let outcome = if report.promoted.is_empty() {
+                        "nothing_cleared"
+                    } else {
+                        metrics::counter!("siglake_compactor_auto_promotions_total")
+                            .increment(report.promoted.len() as u64);
+                        "promoted"
+                    };
+                    note_auto_promotion_pass(&iceberg_namespace, &table, outcome);
+                    let (ceiling, ceiling_truncated) =
+                        declined_keys(&report.declined, AutoPromotionDeclineReason::ColumnCeiling);
+                    let (collisions, collisions_truncated) =
+                        declined_keys(&report.declined, AutoPromotionDeclineReason::NameCollision);
+                    let (mixed, mixed_truncated) =
+                        declined_keys(&report.declined, AutoPromotionDeclineReason::MixedType);
+                    let (promoted, promoted_truncated) = bounded_key_names(
+                        report
+                            .promoted
+                            .iter()
+                            .map(|column| column.attr_key.as_str()),
+                    );
+                    tracing::info!(
+                        %iceberg_namespace,
+                        %table,
+                        outcome,
+                        candidates,
+                        columns_before = report.columns_before,
+                        columns_after = report.columns_after,
+                        max_columns,
+                        promoted = ?promoted,
+                        promoted_truncated,
+                        declined_ceiling = ?ceiling,
+                        declined_ceiling_truncated = ceiling_truncated,
+                        declined_name_collision = ?collisions,
+                        declined_name_collision_truncated = collisions_truncated,
+                        declined_mixed_type = ?mixed,
+                        declined_mixed_type_truncated = mixed_truncated,
+                        "auto-promotion pass finished"
+                    );
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = ?e, "auto-promotion sampling failed"),
+                Err(error) => {
+                    note_auto_promotion_pass(&iceberg_namespace, &table, "failed");
+                    metrics::gauge!(
+                        "siglake_auto_promotion_candidates_available",
+                        "iceberg_namespace" => iceberg_namespace.clone(),
+                        "table" => table.clone()
+                    )
+                    .set(0.0);
+                    tracing::warn!(
+                        %iceberg_namespace,
+                        %table,
+                        error = ?error,
+                        "auto-promotion sampling failed"
+                    );
+                }
             }
         }
         Ok(files_removed)
@@ -6068,6 +6215,88 @@ const DEFAULT_AUTO_PROMOTE_MAX_COLUMNS: usize = 16;
 /// cost: `files × rows` residual JSON documents parsed, once per cadence.
 const AUTO_PROMOTE_SAMPLE_FILES: usize = 4;
 const AUTO_PROMOTE_SAMPLE_ROWS: usize = 4096;
+const AUTO_PROMOTION_OUTCOMES: &[&str] = &["promoted", "nothing_cleared", "at_ceiling", "failed"];
+/// Attribute names retained in one structured pass log, per disposition.
+/// Counts remain exact; only the diagnostic names are truncated.
+const AUTO_PROMOTION_LOGGED_KEYS: usize = 32;
+
+fn preregister_auto_promotion_passes(iceberg_namespace: &str, table: &str) {
+    for outcome in AUTO_PROMOTION_OUTCOMES {
+        metrics::counter!(
+            "siglake_auto_promotion_passes_total",
+            "iceberg_namespace" => iceberg_namespace.to_string(),
+            "table" => table.to_string(),
+            "outcome" => *outcome
+        )
+        .increment(0);
+    }
+}
+
+fn publish_auto_promotion_table_state(
+    iceberg_namespace: &str,
+    table: &str,
+    enabled: bool,
+    max_columns: usize,
+    columns: Option<usize>,
+) {
+    preregister_auto_promotion_passes(iceberg_namespace, table);
+    metrics::gauge!(
+        "siglake_auto_promotion_enabled",
+        "iceberg_namespace" => iceberg_namespace.to_string(),
+        "table" => table.to_string()
+    )
+    .set(u8::from(enabled) as f64);
+    metrics::gauge!(
+        "siglake_auto_promotion_columns",
+        "iceberg_namespace" => iceberg_namespace.to_string(),
+        "table" => table.to_string(),
+        "kind" => "limit"
+    )
+    .set(max_columns as f64);
+    if let Some(columns) = columns {
+        metrics::gauge!(
+            "siglake_auto_promotion_columns",
+            "iceberg_namespace" => iceberg_namespace.to_string(),
+            "table" => table.to_string(),
+            "kind" => "used"
+        )
+        .set(columns as f64);
+    }
+}
+
+fn note_auto_promotion_pass(iceberg_namespace: &str, table: &str, outcome: &'static str) {
+    debug_assert!(AUTO_PROMOTION_OUTCOMES.contains(&outcome));
+    metrics::counter!(
+        "siglake_auto_promotion_passes_total",
+        "iceberg_namespace" => iceberg_namespace.to_string(),
+        "table" => table.to_string(),
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+fn bounded_key_names<'a>(keys: impl IntoIterator<Item = &'a str>) -> (Vec<&'a str>, usize) {
+    let all = keys.into_iter().collect::<Vec<_>>();
+    let truncated = all.len().saturating_sub(AUTO_PROMOTION_LOGGED_KEYS);
+    (
+        all.into_iter().take(AUTO_PROMOTION_LOGGED_KEYS).collect(),
+        truncated,
+    )
+}
+
+fn declined_keys(
+    declined: &[AutoPromotionDecline],
+    reason: AutoPromotionDeclineReason,
+) -> (Vec<&str>, usize) {
+    let total = declined.iter().filter(|item| item.reason == reason).count();
+    let retained = declined
+        .iter()
+        .filter(|item| item.reason == reason)
+        .take(AUTO_PROMOTION_LOGGED_KEYS)
+        .map(|item| item.attr_key.as_str())
+        .collect();
+    (retained, total.saturating_sub(AUTO_PROMOTION_LOGGED_KEYS))
+}
 
 /// WS-7 auto-promotion knobs. `SIGLAKE_AUTO_PROMOTE_MIN_PCT` (percent of
 /// sampled rows a key must appear in; 0 = auto-promotion OFF, the default),
@@ -6935,6 +7164,112 @@ mod auto_promotion_knob_tests {
             auto_promote_sample_rows_from(Some("")),
             AUTO_PROMOTE_SAMPLE_ROWS
         );
+    }
+}
+
+#[cfg(test)]
+mod auto_promotion_telemetry_tests {
+    use std::collections::BTreeMap;
+
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    use super::*;
+
+    #[test]
+    fn per_table_series_distinguish_disabled_never_run_and_every_outcome() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            publish_auto_promotion_table_state("siglake", "disabled", false, 16, Some(3));
+            publish_auto_promotion_table_state("tenant_acme", "never", true, 8, Some(7));
+            publish_auto_promotion_table_state("siglake", "completed", true, 16, Some(4));
+            for outcome in AUTO_PROMOTION_OUTCOMES {
+                note_auto_promotion_pass("siglake", "completed", outcome);
+            }
+        }
+
+        let mut counters = BTreeMap::new();
+        let mut gauges = BTreeMap::new();
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            let labels = key
+                .key()
+                .labels()
+                .map(|label| (label.key().to_string(), label.value().to_string()))
+                .collect::<BTreeMap<_, _>>();
+            match value {
+                DebugValue::Counter(value) => {
+                    counters.insert(
+                        (
+                            labels.get("table").cloned().unwrap_or_default(),
+                            labels.get("outcome").cloned().unwrap_or_default(),
+                        ),
+                        value,
+                    );
+                }
+                DebugValue::Gauge(value) => {
+                    gauges.insert(
+                        (
+                            key.key().name().to_string(),
+                            labels.get("table").cloned().unwrap_or_default(),
+                            labels.get("kind").cloned().unwrap_or_default(),
+                        ),
+                        value.into_inner(),
+                    );
+                }
+                other => panic!("unexpected metric value {other:?}"),
+            }
+        }
+
+        for outcome in AUTO_PROMOTION_OUTCOMES {
+            assert_eq!(
+                counters.get(&("disabled".into(), (*outcome).into())),
+                Some(&0)
+            );
+            assert_eq!(counters.get(&("never".into(), (*outcome).into())), Some(&0));
+            assert_eq!(
+                counters.get(&("completed".into(), (*outcome).into())),
+                Some(&1)
+            );
+        }
+        assert_eq!(
+            gauges.get(&(
+                "siglake_auto_promotion_enabled".into(),
+                "disabled".into(),
+                "".into()
+            )),
+            Some(&0.0)
+        );
+        assert_eq!(
+            gauges.get(&(
+                "siglake_auto_promotion_enabled".into(),
+                "never".into(),
+                "".into()
+            )),
+            Some(&1.0)
+        );
+        assert_eq!(
+            gauges.get(&(
+                "siglake_auto_promotion_columns".into(),
+                "never".into(),
+                "limit".into()
+            )),
+            Some(&8.0),
+            "the reader must expose the effective configured cap"
+        );
+    }
+
+    #[test]
+    fn declined_key_logs_are_bounded_and_count_the_remainder() {
+        let declined = (0..40)
+            .map(|i| AutoPromotionDecline {
+                attr_key: format!("key-{i}"),
+                reason: AutoPromotionDeclineReason::ColumnCeiling,
+            })
+            .collect::<Vec<_>>();
+        let (keys, truncated) = declined_keys(&declined, AutoPromotionDeclineReason::ColumnCeiling);
+        assert_eq!(keys.len(), AUTO_PROMOTION_LOGGED_KEYS);
+        assert_eq!(truncated, 8);
     }
 }
 

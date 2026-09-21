@@ -697,6 +697,31 @@ spec:
 
     - name: siglake.saturation
       rules:
+        - alert: SiglakeAutoPromotionNearCeiling
+          expr: >-
+            max by (namespace, iceberg_namespace, table) (
+              (
+                siglake_auto_promotion_columns{kind="used"}
+                / ignoring (kind)
+                siglake_auto_promotion_columns{kind="limit"}
+              )
+              and on (namespace, pod, iceberg_namespace, table)
+              siglake_auto_promotion_enabled == 1
+            ) >= 0.8
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Auto-promotion is near its configured column cap
+            description: >-
+              {{ "{{ $labels.iceberg_namespace }}" }}.{{ "{{ $labels.table }}" }} has
+              consumed at least 80% of its effective auto-promotion column cap.
+              Read the dashboard's Auto-promotion panel and the compactor's
+              "auto-promotion pass finished" INFO lines for candidates refused
+              by the cap, name collisions or mixed sampled types. Raising
+              SIGLAKE_AUTO_PROMOTE_MAX_COLUMNS permits more irreversible schema
+              additions; setting SIGLAKE_AUTO_PROMOTE_MIN_PCT=0 stops future
+              automatic additions.
         - alert: SiglakeQueryPoolNearLimit
           expr: >-
             siglake_query_memory_pool_bytes > 0

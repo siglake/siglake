@@ -6681,26 +6681,76 @@ fn threshold_is_off(min_fraction: f64) -> bool {
 /// irreversible additive schema change: scalar single-kind values only, an
 /// empty census promotes nothing, `max_columns` counts EXISTING promotions
 /// too, and nothing here demotes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoPromotionDeclineReason {
+    ColumnCeiling,
+    NameCollision,
+    MixedType,
+}
+
+impl AutoPromotionDeclineReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ColumnCeiling => "ceiling",
+            Self::NameCollision => "name_collision",
+            Self::MixedType => "mixed_type",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoPromotionDecline {
+    pub attr_key: String,
+    pub reason: AutoPromotionDeclineReason,
+}
+
+#[derive(Debug, Clone)]
+struct PromotionSelection {
+    /// Unpromoted keys whose sampled frequency cleared the configured bar.
+    /// This includes keys later refused for type, name, or capacity.
+    candidates: usize,
+    promoted: Vec<siglake_core::PromotedColumn>,
+    declined: Vec<AutoPromotionDecline>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AutoPromotionPassReport {
+    /// `None` means the pass deliberately did not sample (disabled or already
+    /// at its configured cap). It must not be rendered as a zero-key sample.
+    pub candidates: Option<usize>,
+    pub promoted: Vec<siglake_core::PromotedColumn>,
+    pub declined: Vec<AutoPromotionDecline>,
+    pub columns_before: usize,
+    pub columns_after: usize,
+}
+
 fn select_promotions(
     census: &SampledKeys,
     existing: &[siglake_core::PromotedColumn],
     min_fraction: f64,
     max_columns: usize,
     name_in_schema: &dyn Fn(&str) -> bool,
-) -> Vec<siglake_core::PromotedColumn> {
+) -> PromotionSelection {
     if census.rows == 0 || existing.len() >= max_columns || threshold_is_off(min_fraction) {
-        return Vec::new();
+        return PromotionSelection {
+            candidates: 0,
+            promoted: Vec::new(),
+            declined: Vec::new(),
+        };
     }
     let already: std::collections::HashSet<&str> =
         existing.iter().map(|c| c.attr_key.as_str()).collect();
-    let mut candidates: Vec<(&str, usize, siglake_core::PromotedType)> = census
+    let mut candidates: Vec<(&str, usize, Option<siglake_core::PromotedType>)> = census
         .keys
         .iter()
         .filter_map(|(key, (rows, kind))| {
-            let ty = kind.and_then(SampledKind::promoted_type)?;
             (!already.contains(key.as_str())
                 && (*rows as f64) / (census.rows as f64) >= min_fraction)
-                .then_some((key.as_str(), *rows, ty))
+                .then_some((
+                    key.as_str(),
+                    *rows,
+                    kind.and_then(SampledKind::promoted_type),
+                ))
         })
         .collect();
     // Hottest first; deterministic tie-break by name.
@@ -6709,12 +6759,29 @@ fn select_promotions(
     let mut taken: std::collections::HashSet<String> =
         existing.iter().map(|c| c.name.clone()).collect();
     let mut promoted_now = Vec::new();
+    let candidate_count = candidates.len();
+    let mut declined = Vec::new();
     for (key, _, ty) in candidates {
-        if existing.len() + promoted_now.len() >= max_columns {
-            break;
-        }
+        let Some(ty) = ty else {
+            declined.push(AutoPromotionDecline {
+                attr_key: key.to_string(),
+                reason: AutoPromotionDeclineReason::MixedType,
+            });
+            continue;
+        };
         let name = key.replace(['.', '-'], "_");
         if name_in_schema(&name) || taken.contains(&name) {
+            declined.push(AutoPromotionDecline {
+                attr_key: key.to_string(),
+                reason: AutoPromotionDeclineReason::NameCollision,
+            });
+            continue;
+        }
+        if existing.len() + promoted_now.len() >= max_columns {
+            declined.push(AutoPromotionDecline {
+                attr_key: key.to_string(),
+                reason: AutoPromotionDeclineReason::ColumnCeiling,
+            });
             continue;
         }
         taken.insert(name.clone());
@@ -6724,7 +6791,11 @@ fn select_promotions(
             ty,
         });
     }
-    promoted_now
+    PromotionSelection {
+        candidates: candidate_count,
+        promoted: promoted_now,
+        declined,
+    }
 }
 
 /// One live file as an auto-promotion sample candidate.
@@ -6819,10 +6890,13 @@ mod auto_promotion_sampling_tests {
         assert_eq!(c.rows, 4);
         assert_eq!(c.keys.get("a").map(|s| s.0), Some(2));
         assert!(select_promotions(&c, &[], 0.5, 16, &no_schema_collision)
+            .promoted
             .iter()
             .any(|col| col.attr_key == "a"));
         assert!(
-            select_promotions(&c, &[], 0.51, 16, &no_schema_collision).is_empty(),
+            select_promotions(&c, &[], 0.51, 16, &no_schema_collision)
+                .promoted
+                .is_empty(),
             "0.5 of the sample must not clear a 0.51 threshold"
         );
     }
@@ -6870,7 +6944,7 @@ mod auto_promotion_sampling_tests {
         assert_eq!(c.dropped_keys, 99);
         // Neither a dropped key nor the one id key that got in is promotable:
         // one hit in a 100-row sample is 1%, under the threshold.
-        let promoted = select_promotions(&c, &[], 0.02, 64, &no_schema_collision);
+        let promoted = select_promotions(&c, &[], 0.02, 64, &no_schema_collision).promoted;
         assert_eq!(
             promoted
                 .iter()
@@ -6889,20 +6963,28 @@ mod auto_promotion_sampling_tests {
             ty: PromotedType::Utf8,
         }];
         assert_eq!(
-            select_promotions(&c, &existing, 0.5, 3, &no_schema_collision).len(),
+            select_promotions(&c, &existing, 0.5, 3, &no_schema_collision)
+                .promoted
+                .len(),
             2,
             "one existing promotion leaves two of a three-column ceiling"
         );
         assert!(
-            select_promotions(&c, &existing, 0.5, 1, &no_schema_collision).is_empty(),
+            select_promotions(&c, &existing, 0.5, 1, &no_schema_collision)
+                .promoted
+                .is_empty(),
             "a table at its ceiling promotes nothing"
         );
         assert!(
-            select_promotions(&c, &[], 0.5, 0, &no_schema_collision).is_empty(),
+            select_promotions(&c, &[], 0.5, 0, &no_schema_collision)
+                .promoted
+                .is_empty(),
             "a zero ceiling is an off switch"
         );
         assert!(
-            select_promotions(&c, &[], 0.0, 16, &no_schema_collision).is_empty(),
+            select_promotions(&c, &[], 0.0, 16, &no_schema_collision)
+                .promoted
+                .is_empty(),
             "a zero threshold is an off switch, not promote-everything"
         );
     }
@@ -6915,7 +6997,8 @@ mod auto_promotion_sampling_tests {
             Some(r#"{"hot":"x","a":"1","b":"2"}"#),
             Some(r#"{"hot":"x"}"#),
         ]);
-        let picked = select_promotions(&c, &[], 0.5, 2, &no_schema_collision);
+        let selection = select_promotions(&c, &[], 0.5, 2, &no_schema_collision);
+        let picked = selection.promoted;
         assert_eq!(
             picked
                 .iter()
@@ -6934,7 +7017,8 @@ mod auto_promotion_sampling_tests {
             name: "a".into(),
             ty: PromotedType::Utf8,
         }];
-        let picked = select_promotions(&c, &existing, 0.5, 16, &|name| name == "host");
+        let selection = select_promotions(&c, &existing, 0.5, 16, &|name| name == "host");
+        let picked = selection.promoted;
         let keys: Vec<&str> = picked.iter().map(|c| c.attr_key.as_str()).collect();
         assert_eq!(keys, vec!["b-1"], "{picked:?}");
         assert_eq!(picked[0].name, "b_1", "`.`/`-` sanitize into the name");
@@ -6947,13 +7031,45 @@ mod auto_promotion_sampling_tests {
             16,
             &|name| name == "host",
         );
-        assert!(second.is_empty(), "{second:?}");
+        assert!(second.promoted.is_empty(), "{second:?}");
+    }
+
+    #[test]
+    fn candidate_report_retains_each_decline_reason() {
+        let c = census(&[
+            Some(r#"{"keep":"x","over":"x","host":"x","mixed":"x"}"#),
+            Some(r#"{"keep":"x","over":"x","host":"x","mixed":1}"#),
+        ]);
+        let selection = select_promotions(&c, &[], 0.5, 1, &|name| name == "host");
+        assert_eq!(selection.candidates, 4);
+        assert_eq!(
+            selection
+                .promoted
+                .iter()
+                .map(|column| column.attr_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep"]
+        );
+        assert_eq!(
+            selection
+                .declined
+                .iter()
+                .map(|item| (item.attr_key.as_str(), item.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                ("host", AutoPromotionDeclineReason::NameCollision),
+                ("mixed", AutoPromotionDeclineReason::MixedType),
+                ("over", AutoPromotionDeclineReason::ColumnCeiling),
+            ]
+        );
     }
 
     #[test]
     fn an_empty_sample_promotes_nothing() {
         let c = SampledKeys::with_cap(MAX_SAMPLED_KEYS);
-        assert!(select_promotions(&c, &[], 0.01, 64, &no_schema_collision).is_empty());
+        assert!(select_promotions(&c, &[], 0.01, 64, &no_schema_collision)
+            .promoted
+            .is_empty());
     }
 
     #[test]
@@ -14115,14 +14231,15 @@ impl IcebergContext {
         sample_rows_per_file: usize,
     ) -> Result<Vec<siglake_core::PromotedColumn>> {
         let mut newly = self
-            .auto_promote_hot_keys_for(
+            .auto_promote_hot_keys_for_report(
                 &self.table_ident.clone(),
                 min_fraction,
                 max_columns,
                 sample_files,
                 sample_rows_per_file,
             )
-            .await?;
+            .await?
+            .promoted;
         for config in self.list_indexes().await.unwrap_or_default() {
             let ident = self.index_table_ident(&config.index_id);
             // `list_indexes` reports the events table among the indexes, and
@@ -14133,38 +14250,69 @@ impl IcebergContext {
                 continue;
             }
             newly.extend(
-                self.auto_promote_hot_keys_for(
+                self.auto_promote_hot_keys_for_report(
                     &ident,
                     min_fraction,
                     max_columns,
                     sample_files,
                     sample_rows_per_file,
                 )
-                .await?,
+                .await?
+                .promoted,
             );
         }
         Ok(newly)
     }
 
-    /// [`Self::auto_promote_hot_keys`] for one table.
-    pub async fn auto_promote_hot_keys_for(
+    /// Every table auto-promotion visits, namespace-qualified and deduplicated.
+    /// Index discovery remains best effort, matching the maintenance callers:
+    /// the events table is always returned even when index listing fails.
+    pub async fn auto_promotion_table_idents(&self) -> Vec<TableIdent> {
+        let mut idents = vec![self.table_ident.clone()];
+        for config in self.list_indexes().await.unwrap_or_default() {
+            let ident = self.index_table_ident(&config.index_id);
+            if !idents.contains(&ident) {
+                idents.push(ident);
+            }
+        }
+        idents
+    }
+
+    /// Current promoted-column usage for one table. This reads cached table
+    /// metadata only; it never lists data files or samples attributes.
+    pub async fn auto_promotion_column_count_for(&self, table_ident: &TableIdent) -> Result<usize> {
+        let entry = self.cached_table_entry(table_ident).await?;
+        Ok(self.promoted_for_table(&entry.table).len())
+    }
+
+    /// [`Self::auto_promote_hot_keys`] for one table, retaining the bounded
+    /// candidate and refusal evidence needed by the compactor's telemetry.
+    pub async fn auto_promote_hot_keys_for_report(
         &self,
         table_ident: &TableIdent,
         min_fraction: f64,
         max_columns: usize,
         sample_files: usize,
         sample_rows_per_file: usize,
-    ) -> Result<Vec<siglake_core::PromotedColumn>> {
+    ) -> Result<AutoPromotionPassReport> {
         use arrow_array::Array;
         use futures::StreamExt;
 
         let entry = self.cached_table_entry(table_ident).await?;
         let existing = self.promoted_for_table(&entry.table);
+        let columns_before = existing.len();
         // Both are hard off-switches, checked before any IO: an operator who
         // sets the ceiling to zero, or a table already at it, must not pay a
-        // sampling pass for a verdict that cannot promote anything.
+        // sampling pass for a verdict that cannot promote anything. `None`
+        // preserves "not sampled" rather than inventing a zero-candidate pass.
         if existing.len() >= max_columns || threshold_is_off(min_fraction) {
-            return Ok(Vec::new());
+            return Ok(AutoPromotionPassReport {
+                candidates: None,
+                promoted: Vec::new(),
+                declined: Vec::new(),
+                columns_before,
+                columns_after: columns_before,
+            });
         }
         let schema = entry.table.metadata().current_schema();
 
@@ -14228,25 +14376,43 @@ impl IcebergContext {
                 .increment(census.dropped_keys as u64);
         }
 
-        let promoted_now =
-            select_promotions(&census, &existing, min_fraction, max_columns, &|name| {
-                schema.field_id_by_name(name).is_some()
-            });
-        if promoted_now.is_empty() {
-            return Ok(Vec::new());
+        let selection = select_promotions(&census, &existing, min_fraction, max_columns, &|name| {
+            schema.field_id_by_name(name).is_some()
+        });
+        if !selection.promoted.is_empty() {
+            let mut new_list = existing.clone();
+            new_list.extend(selection.promoted.iter().cloned());
+            self.declare_promotions_for(table_ident, &new_list).await?;
         }
-        let mut new_list = existing.clone();
-        new_list.extend(promoted_now.iter().cloned());
+        let columns_after = columns_before + selection.promoted.len();
+        Ok(AutoPromotionPassReport {
+            candidates: Some(selection.candidates),
+            promoted: selection.promoted,
+            declined: selection.declined,
+            columns_before,
+            columns_after,
+        })
+    }
 
-        self.declare_promotions_for(table_ident, &new_list).await?;
-        tracing::info!(
-            table = %table_ident,
-            newly = promoted_now.len(),
-            total = new_list.len(),
-            keys = ?promoted_now.iter().map(|c| c.attr_key.as_str()).collect::<Vec<_>>(),
-            "auto-promotion: hot attribute keys promoted"
-        );
-        Ok(promoted_now)
+    /// Compatibility wrapper for callers that only need the additions.
+    pub async fn auto_promote_hot_keys_for(
+        &self,
+        table_ident: &TableIdent,
+        min_fraction: f64,
+        max_columns: usize,
+        sample_files: usize,
+        sample_rows_per_file: usize,
+    ) -> Result<Vec<siglake_core::PromotedColumn>> {
+        Ok(self
+            .auto_promote_hot_keys_for_report(
+                table_ident,
+                min_fraction,
+                max_columns,
+                sample_files,
+                sample_rows_per_file,
+            )
+            .await?
+            .promoted)
     }
 
     /// Persist `promoted` as the events table's promotion list: widen the
