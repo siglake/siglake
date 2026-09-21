@@ -148,6 +148,28 @@ Each fork carries a floor on the number of tests that must run (`MIN_TESTS` in
 the script, `DOC_MIN_TESTS` for the doctests), because a filter, feature or
 mirror mistake that selects nothing exits 0 and prints "0 passed".
 
+### Reader regression inventory after the 0.10.1 rebase
+
+The monolithic reader tests at `a23756c` now live beside the split reader
+modules. This inventory records the old contract names whose first port left
+work behind:
+
+| Old contract | Current coverage or owner |
+| --- | --- |
+| `parsed_index_cache_honours_both_bounds_and_keeps_the_used_entry` | Same name in `arrow/reader/pruning.rs` |
+| `parsed_index_cache_keys_separate_storage_shapes_files_and_columns` | Same name in `arrow/reader/pruning.rs` |
+| `the_directory_cache_evicts_by_bytes_and_skips_an_oversized_entry` | Same name in `arrow/reader/pruning.rs` |
+| `concurrent_footer_reads_are_debounced` | Same name in `arrow/reader/pipeline.rs` |
+| `index_matches_row_selection_agrees_with_the_complement_form` | Same name in `arrow/reader/pruning.rs` |
+| `puffin_blob_cache_honours_both_bounds` | Renamed and extended as `blob_cache_holds_both_bounds_and_rejects_oversized_entries` in `puffin/reader.rs` |
+| `report_segmented_reader_read_cost` | Same ignored measurement reporter in `arrow/reader/pruning.rs` |
+| `segmented_index_reads_are_off_unless_asked_for`, `the_directory_budget_is_resolved_from_its_own_knob`, `parsed_index_cache_max_bytes_resolves`, `puffin_blob_cache_bounds_resolve`, `configured_text_index_budgets_beat_the_constants` | Resolver and configured-budget coverage belongs to #5737 |
+| `a_registered_segmented_sidecar_selects_the_scans_rows` | Seg2 discovery and Parquet integration coverage belongs to #5739 |
+
+The staged-reader tests restored by #5007 remain in
+`arrow/reader/pruning.rs`; this inventory does not replace their named
+contracts.
+
 The mirror is removed on exit, but its path is derived from the checkout and
 the sources under test rather than randomised: a path dependency's absolute
 path is part of cargo's unit hash, so a fresh path would mean recompiling the

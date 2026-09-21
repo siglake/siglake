@@ -81,9 +81,13 @@ impl ParsedIndexCache {
         Some(index)
     }
 
-    fn put(&mut self, key: ParsedIndexKey, index: Arc<siglake_index::InvertedIndex>) {
-        let max_bytes = crate::arrow::parsed_index_cache_max_bytes();
-        let max_entries = crate::arrow::puffin_blob_cache_max_entries();
+    fn put(
+        &mut self,
+        key: ParsedIndexKey,
+        index: Arc<siglake_index::InvertedIndex>,
+        max_bytes: usize,
+        max_entries: usize,
+    ) {
         if max_bytes == 0 || max_entries == 0 || self.entries.contains_key(&key) {
             return;
         }
@@ -167,7 +171,12 @@ fn parsed_index_cache_get(key: &ParsedIndexKey) -> Option<Arc<siglake_index::Inv
 }
 
 fn parsed_index_cache_put(key: ParsedIndexKey, index: Arc<siglake_index::InvertedIndex>) {
-    parsed_index_cache().lock().unwrap().put(key, index);
+    parsed_index_cache().lock().unwrap().put(
+        key,
+        index,
+        crate::arrow::parsed_index_cache_max_bytes(),
+        crate::arrow::puffin_blob_cache_max_entries(),
+    );
 }
 
 /// Current parsed-index cache occupancy and cumulative drops.
@@ -1382,9 +1391,13 @@ mod tests {
     use futures::StreamExt;
     use siglake_index::segmented::SEGMENTED_BLOB_TYPE;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
-    use parquet::file::metadata::{KeyValue, ParquetMetaData};
+    use parquet::file::metadata::{
+        ColumnChunkMetaData, KeyValue, ParquetMetaData, RowGroupMetaData,
+    };
     use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::schema::types::{SchemaDescPtr, SchemaDescriptor, Type as SchemaType};
+    use roaring::RoaringTreemap;
     use tempfile::TempDir;
 
     use super::{
@@ -1513,6 +1526,158 @@ mod tests {
         assert_eq!(index_load_concurrency_from(Some(" 7 ")), 7);
         assert_eq!(index_load_concurrency_from(Some("0")), 4);
         assert_eq!(index_load_concurrency_from(Some("invalid")), 4);
+    }
+
+    #[test]
+    fn parsed_index_cache_honours_both_bounds_and_keeps_the_used_entry() {
+        let index = Arc::new(siglake_index::InvertedIndex::from_rows([
+            "database timeout",
+            "request complete",
+        ]));
+        let size = index.heap_size_bytes();
+        let key = |n: u64| super::ParsedIndexKey::Puffin {
+            path: format!("s3://bucket/stats-{n}.puffin"),
+            offset: n,
+        };
+
+        let mut cache = super::ParsedIndexCache::default();
+        for n in 0..3 {
+            cache.put(key(n), Arc::clone(&index), size * 2, 128);
+        }
+        assert!(cache.get(&key(0)).is_none(), "oldest entry evicted");
+        assert!(cache.get(&key(1)).is_some());
+        assert!(cache.get(&key(2)).is_some());
+
+        let mut cache = super::ParsedIndexCache::default();
+        for n in 0..3 {
+            cache.put(key(n), Arc::clone(&index), usize::MAX, 2);
+        }
+        assert!(cache.get(&key(0)).is_none());
+        assert!(cache.get(&key(1)).is_some());
+
+        let mut cache = super::ParsedIndexCache::default();
+        cache.put(key(0), Arc::clone(&index), usize::MAX, 2);
+        cache.put(key(1), Arc::clone(&index), usize::MAX, 2);
+        assert!(cache.get(&key(0)).is_some());
+        cache.put(key(2), Arc::clone(&index), usize::MAX, 2);
+        assert!(cache.get(&key(0)).is_some(), "used entry survives");
+        assert!(cache.get(&key(1)).is_none(), "unused entry evicted");
+
+        let mut cache = super::ParsedIndexCache::default();
+        cache.put(key(0), Arc::clone(&index), size - 1, 128);
+        assert!(cache.get(&key(0)).is_none());
+        cache.put(key(0), Arc::clone(&index), usize::MAX, 128);
+        cache.put(key(0), Arc::clone(&index), usize::MAX, 128);
+        assert_eq!(cache.order.len(), 1);
+        assert_eq!(cache.bytes, size);
+        let hit = cache.get(&key(0)).unwrap();
+        assert!(Arc::ptr_eq(&hit, &index));
+        assert_eq!(cache.entries[&key(0)].hits, 1);
+    }
+
+    #[test]
+    fn parsed_index_cache_keys_separate_storage_shapes_files_and_columns() {
+        let raw = Arc::new(siglake_index::InvertedIndex::from_rows(["database timeout"]));
+        let body = Arc::new(siglake_index::InvertedIndex::from_rows(["request complete"]));
+        let footer = |path: &str, column: &str| super::ParsedIndexKey::FooterKv {
+            path: path.to_string(),
+            column: column.to_string(),
+        };
+        let puffin = |path: &str| super::ParsedIndexKey::Puffin {
+            path: path.to_string(),
+            offset: 0,
+        };
+
+        let mut cache = super::ParsedIndexCache::default();
+        let path = "s3://bucket/data/00000.parquet";
+        cache.put(footer(path, "raw"), Arc::clone(&raw), usize::MAX, 128);
+        cache.put(footer(path, "body"), Arc::clone(&body), usize::MAX, 128);
+        assert!(Arc::ptr_eq(
+            &cache.get(&footer(path, "raw")).unwrap(),
+            &raw,
+        ));
+        assert!(Arc::ptr_eq(
+            &cache.get(&footer(path, "body")).unwrap(),
+            &body,
+        ));
+        assert!(cache.get(&footer("s3://bucket/data/00001.parquet", "raw")).is_none());
+        assert!(cache.get(&puffin(path)).is_none());
+    }
+
+    fn test_row_groups(sizes: &[u32]) -> Vec<RowGroupMetaData> {
+        let schema = SchemaType::group_type_builder("schema")
+            .with_fields(vec![Arc::new(
+                SchemaType::primitive_type_builder("raw", parquet::basic::Type::BYTE_ARRAY)
+                    .build()
+                    .unwrap(),
+            )])
+            .build()
+            .unwrap();
+        let schema: SchemaDescPtr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
+        let columns: Vec<ColumnChunkMetaData> = schema
+            .columns()
+            .iter()
+            .map(|column| ColumnChunkMetaData::builder(column.clone()).build().unwrap())
+            .collect();
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(ordinal, rows)| {
+                RowGroupMetaData::builder(Arc::clone(&schema))
+                    .set_num_rows(i64::from(*rows))
+                    .set_total_byte_size(0)
+                    .set_column_metadata(columns.clone())
+                    .set_ordinal(ordinal as i16)
+                    .build()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn index_matches_row_selection_agrees_with_the_complement_form() {
+        let sizes = [1000, 500, 500, 1000, 500];
+        let total_rows: u64 = sizes.iter().map(|rows| u64::from(*rows)).sum();
+        let row_groups = test_row_groups(&sizes);
+        let shapes: Vec<(&str, Vec<u32>)> = vec![
+            ("empty", vec![]),
+            ("all", (0..total_rows as u32).collect()),
+            ("first row only", vec![0]),
+            ("last row only", vec![3499]),
+            ("row-group boundaries", vec![999, 1000, 1499, 1500, 1999, 2000]),
+            (
+                "runs and singletons",
+                vec![1, 3, 4, 5, 998, 999, 1010, 1011, 1012, 2100, 2200, 2201, 2999, 3000],
+            ),
+            ("one whole row group", (1000..1500).collect()),
+            ("sparse", (0..total_rows as u32).step_by(97).collect()),
+        ];
+        let selections = [
+            None,
+            Some(vec![1, 3]),
+            Some(vec![0]),
+            Some(vec![4]),
+            Some(vec![0, 1, 2, 3, 4]),
+            Some(vec![0, 2, 4]),
+        ];
+
+        for (label, matching) in &shapes {
+            for selected in &selections {
+                let mut complement = RoaringTreemap::new();
+                complement.insert_range(0..total_rows);
+                for ordinal in matching {
+                    complement.remove(u64::from(*ordinal));
+                }
+                let expected = ArrowReader::build_deletes_row_selection(
+                    &row_groups,
+                    selected,
+                    &DeleteVector::new(complement),
+                )
+                .unwrap();
+                let actual = super::index_matches_row_selection(&row_groups, selected, matching);
+                assert_eq!(actual, expected, "shape {label} over row groups {selected:?}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -2158,6 +2323,59 @@ mod tests {
             "it read the trailer and the directory itself: {} reads",
             cost.reads
         );
+    }
+
+    #[test]
+    fn the_directory_cache_evicts_by_bytes_and_skips_an_oversized_entry() {
+        fn directory(
+            rows: usize,
+            group_rows: u32,
+        ) -> Arc<siglake_index::segmented::SegmentedDirectory> {
+            let corpus = segmented_corpus(rows);
+            let blob = siglake_index::segmented::encode_from_rows(
+                corpus.iter().map(String::as_str),
+                group_rows,
+            );
+            Arc::new(
+                siglake_index::segmented::SegmentedDirectory::read(
+                    &siglake_index::segmented::SliceSource::new(blob),
+                )
+                .expect("the fixture blob parses"),
+            )
+        }
+
+        let small = directory(1_000, 500);
+        let key_size = std::mem::size_of::<super::SegmentedDirectoryKey>();
+        let entry_size = small.resident_bytes() + "/sidecar-0.puffin".len() + key_size;
+        let budget = entry_size * 2;
+        let mut cache = super::SegmentedDirectoryCache::default();
+        for index in 0..3 {
+            cache.put(
+                (format!("/sidecar-{index}.puffin"), 0),
+                Arc::clone(&small),
+                budget,
+            );
+        }
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.evictions, 1);
+        assert!(cache.bytes <= budget);
+        assert!(cache.get(&("/sidecar-0.puffin".to_string(), 0)).is_none());
+        assert!(cache.get(&("/sidecar-2.puffin".to_string(), 0)).is_some());
+
+        let before = cache.bytes;
+        cache.put(
+            ("/huge.puffin".to_string(), 0),
+            directory(1_000, 500),
+            small.resident_bytes() / 2,
+        );
+        assert_eq!(cache.oversized_skips, 1);
+        assert_eq!(cache.bytes, before, "nothing admitted, nothing evicted");
+        assert_eq!(cache.evictions, 1);
+
+        let held = cache.bytes;
+        let entries = cache.entries.len();
+        cache.put(("/sidecar-2.puffin".to_string(), 0), small, budget);
+        assert_eq!((cache.bytes, cache.entries.len()), (held, entries));
     }
 
     #[tokio::test]
