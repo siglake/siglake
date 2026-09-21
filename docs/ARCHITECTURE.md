@@ -329,7 +329,10 @@ moving between the two settles its held orphans as a migration step
 Every other failure is retried inside the pass, bounded per segment: a pass
 makes at most three claims on the same segment and then leaves it in `sealed/`
 for the next cycle, counting it under
-`siglake_compactor_pass_claim_attempts_exhausted_total`. That bound is what
+`siglake_compactor_pass_claim_attempts_exhausted_total`, whose series the same
+per-tenant publication creates at 0 for every tenant a completed sweep
+publishes, so a compactor that withheld nothing reads as a measured zero rather
+than as an absent series. That bound is what
 stops a cause which fails fast and names no file — a recurring catalog
 conflict, a store refusing writes — from spending a whole cycle budget on
 claim/release renames of one set. It is per segment name rather than per batch,

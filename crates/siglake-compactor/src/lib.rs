@@ -93,6 +93,12 @@ pub const DEFAULT_POISON_ATTEMPTS: u32 = 3;
 /// and it has to be at least 2 for the same-cycle retry a transient commit
 /// error gets (`a_transient_commit_error_is_retried_in_the_same_cycle`).
 const MAX_PASS_CLAIM_ATTEMPTS: u32 = 3;
+/// Segments a pass gave up re-claiming, per tenant. Incremented by
+/// [`withhold_spent_segment`] and created at 0 by [`SealedBacklog::publish`]
+/// for every tenant a sweep publishes, so a healthy round reads a measured
+/// zero rather than an absent series.
+pub const PASS_CLAIM_ATTEMPTS_EXHAUSTED: &str =
+    "siglake_compactor_pass_claim_attempts_exhausted_total";
 
 #[derive(Clone, Copy)]
 struct FsBatchConfig {
@@ -195,6 +201,19 @@ impl SealedBacklog {
 
     /// Publish one reading per tenant label seen this sweep, plus zero for
     /// labels that disappeared after the previous complete sweep.
+    ///
+    /// `siglake_compactor_pass_claim_attempts_exhausted_total{tenant}` (#4651)
+    /// is created here at 0 for each of those labels, because the only other
+    /// thing that writes it is [`withhold_spent_segment`], on a pass that gave
+    /// up on a segment. A round that reads the counter for zero cannot
+    /// otherwise tell a compactor that withheld nothing from one whose drain
+    /// never ran; registering the series at each sweep is what makes the
+    /// healthy reading a measurement. It is a counter, so the register is an
+    /// `increment(0)`: a tenant whose label is published again after a withheld
+    /// segment keeps its accumulated count. Retired labels are not registered —
+    /// the counter for a tenant that has gone away already exists from the
+    /// sweeps that published it, and the process has nothing further to say
+    /// about it.
     fn publish(&self, previously_published: &mut BTreeSet<String>) {
         let published_this_sweep: BTreeSet<_> = self.by_tenant.keys().cloned().collect();
         for tenant in previously_published.difference(&published_this_sweep) {
@@ -235,6 +254,11 @@ impl SealedBacklog {
                     .copied()
                     .unwrap_or(0) as f64,
             );
+            metrics::counter!(
+                PASS_CLAIM_ATTEMPTS_EXHAUSTED,
+                "tenant" => tenant.clone()
+            )
+            .increment(0);
         }
         *previously_published = published_this_sweep;
     }
@@ -4978,7 +5002,7 @@ fn withhold_spent_segment(
              next cycle instead of being re-claimed for the rest of this one"
         );
         metrics::counter!(
-            "siglake_compactor_pass_claim_attempts_exhausted_total",
+            PASS_CLAIM_ATTEMPTS_EXHAUSTED,
             "tenant" => tenant_label.to_string()
         )
         .increment(1);
