@@ -650,10 +650,24 @@ cat >"$standin_dir/date" <<'STANDIN'
 #!/usr/bin/env bash
 set -euo pipefail
 counter_file="$STANDIN_STATE/iso-clock"
+# A tick is a read-modify-write and the probe stamps concurrently: the
+# submission burst runs `submit_one &`, and each of those stamps its own
+# request. Unlocked, two callers read the same value, and a caller that reads
+# the file while another truncates it counts from zero, so a later event gets
+# an earlier stamp than the signal bounds the grader places it against. Take
+# the counter's own lock for both the tick and the read.
+read_counter() {
+  local counter
+  counter=$(cat "$counter_file" 2>/dev/null || true)
+  [[ "$counter" =~ ^[0-9]+$ ]] || counter=0
+  printf '%s' "$counter"
+}
 if [[ $# -eq 2 && $1 == -u && $2 == +%Y-%m-%dT%H:%M:%S.%3NZ ]]; then
-  counter=$(cat "$counter_file" 2>/dev/null || echo 0)
-  counter=$((counter + 1))
+  exec 9>"$counter_file.lock"
+  flock -w 10 9 || { echo "fixture clock: the tick lock timed out" >&2; exit 1; }
+  counter=$(($(read_counter) + 1))
   printf '%s' "$counter" >"$counter_file"
+  exec 9>&-
   python3 - "$counter" <<'PY'
 import datetime as dt
 import sys
@@ -665,7 +679,10 @@ PY
   exit 0
 fi
 if [[ $# -eq 1 && $1 == +%s.%N ]]; then
-  counter=$(cat "$counter_file" 2>/dev/null || echo 0)
+  exec 9>"$counter_file.lock"
+  flock -w 10 -s 9 || { echo "fixture clock: the read lock timed out" >&2; exit 1; }
+  counter=$(read_counter)
+  exec 9>&-
   python3 - "$counter" <<'PY'
 import datetime as dt
 import sys
@@ -733,6 +750,33 @@ STANDIN
 chmod +x \
   "$standin_dir/kubectl" "$standin_dir/docker" "$standin_dir/date" \
   "$standin_dir/curl"
+
+# The fixture clock carries the order of the whole offline trace: the grader
+# places each commit against the recorded signal bounds, so no two events may
+# share a tick and no later event may read an earlier one. The probe stamps
+# concurrently, so tick the stand-in the way the submission burst does before
+# any arm depends on it.
+clock_state="$fixture_dir/clock-state"
+mkdir -p "$clock_state"
+for _ in $(seq 1 40); do
+  for _ in 1 2 3 4; do
+    STANDIN_STATE="$clock_state" "$standin_dir/date" \
+      -u +%Y-%m-%dT%H:%M:%S.%3NZ &
+  done
+  wait
+done >"$fixture_dir/clock-ticks" 2>"$fixture_dir/clock-ticks.err" ||
+  fail "the fixture clock failed under concurrent ticks: $(<"$fixture_dir/clock-ticks.err")"
+python3 - "$fixture_dir/clock-ticks" <<'PY' ||
+import sys
+ticks = [line.strip() for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+assert len(ticks) == 160, len(ticks)
+assert len(set(ticks)) == 160, f"{len(ticks) - len(set(ticks))} repeated tick(s)"
+ordered = sorted(ticks)
+assert ordered[0] == "2026-09-20T12:00:00.001Z", ordered[0]
+assert ordered[-1] == "2026-09-20T12:00:00.160Z", ordered[-1]
+PY
+  fail "the fixture clock repeated or lost a tick under concurrency: $(sort "$fixture_dir/clock-ticks" | uniq -d | head -3 | tr '\n' ' ')"
+fixtures=$((fixtures + 1))
 
 standin_state="$fixture_dir/state"
 mkdir -p "$standin_state/results"

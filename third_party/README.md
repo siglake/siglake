@@ -163,7 +163,11 @@ work behind:
 | `index_matches_row_selection_agrees_with_the_complement_form` | Same name in `arrow/reader/pruning.rs` |
 | `puffin_blob_cache_honours_both_bounds` | Renamed and extended as `blob_cache_holds_both_bounds_and_rejects_oversized_entries` in `puffin/reader.rs` |
 | `report_segmented_reader_read_cost` | Same ignored measurement reporter in `arrow/reader/pruning.rs` |
-| `segmented_index_reads_are_off_unless_asked_for`, `the_directory_budget_is_resolved_from_its_own_knob`, `parsed_index_cache_max_bytes_resolves`, `puffin_blob_cache_bounds_resolve`, `configured_text_index_budgets_beat_the_constants` | Resolver and configured-budget coverage belongs to #5737 |
+| `segmented_index_reads_are_off_unless_asked_for` | Restored by #5737 as `segmented_reads_are_resolved_without_environment_mutation` in `arrow/reader/pruning.rs` |
+| `the_directory_budget_is_resolved_from_its_own_knob` | Restored by #5737 as `segmented_directory_budget_is_resolved_without_environment_mutation` in `arrow/reader/pruning.rs` |
+| `parsed_index_cache_max_bytes_resolves` | Restored by #5737 as `parsed_index_byte_budget_is_resolved_without_environment_mutation` in `arrow/mod.rs` |
+| `puffin_blob_cache_bounds_resolve` | Restored by #5737 as `puffin_blob_byte_budget_is_resolved_without_environment_mutation` and `puffin_blob_entry_limit_is_resolved_without_environment_mutation` in `arrow/mod.rs` |
+| `configured_text_index_budgets_beat_the_constants` | Restored by #5737 as `configured_byte_budget_takes_precedence_over_environment_resolution` in `arrow/mod.rs` |
 | `a_registered_segmented_sidecar_selects_the_scans_rows` | Same name in `arrow/reader/pruning.rs`, ported to the seg2 blob type the reader discovers (#5739) |
 
 The staged-reader tests restored by #5007 remain in
