@@ -110,20 +110,91 @@ left to win.
 * **Merge throughput: unmoved.** 321-350 K rows/s across every arm and both
   passes, with no ordering by target. Turning the tracking allocator off changed
   nothing, so the column is not an artifact of measuring.
-* **Query: better where pruning has room, and one shape got worse.** The needle
-  and narrow-range shapes read one row group at every target, so a smaller row
-  group is strictly less data: 0.80 -> 0.28 MB from 256 to 128 MiB. At 32 MiB
-  the same shape read 1.13 MB, more than the default — reproducibly, three times
-  — which is a page-level effect inside the group the reader selects and not
-  something this fixture explains (#5133). The full predicate scan reads every
-  row group by construction and cost 18.44 -> 18.82 MB (+2%) with wall times
-  inside the noise of a loaded box.
+* **Query: better where pruning has room; the needle column measures the
+  reader.** The needle and narrow-range shapes read one row
+  group at every target, so a smaller row group has less to offer them: 0.80 ->
+  0.28 MB from 256 to 128 MiB. At 32 MiB the same shape read 1.13 MB, more than
+  the default — reproducibly, three times. #5133 settled that ordering against
+  the page accounting below: the bytes follow the page the needle lands on and
+  the reader's 1 MiB range coalescer, and the row-group size only decides which
+  page that is. The full predicate scan reads every row group by construction
+  and cost 18.44 -> 18.82 MB (+2%) with wall times inside the noise of a loaded
+  box.
 * **If the native blooms ever come back, the target's cost changes class.**
   Parquet-native blooms are default-off (`native_blooms_enabled`, measured
   useless on this layout). Priced back on: 0.57 MB at 4 row groups, 2.00 MB at
   14 — ~146 KB per row group per file, so 0.45% of the file at 256 MiB against
   1.57% at 64 MiB. A decision to re-enable them and a decision to lower the
   target are not independent.
+
+### Where the needle shape's bytes go (#5133)
+
+`bytes_data` is the length of each MERGED fetch, not of what was asked for. The
+fork's `get_byte_ranges` runs the requested ranges through `merge_ranges` and
+charges each physical fetch
+(`third_party/iceberg/src/arrow/reader/file_reader.rs:229`, :247). siglake sets
+no range knobs, so `effective_reader_tuning` returns `None` for both and the
+fork's own `DEFAULT_RANGE_COALESCE_BYTES` of 1 MiB applies
+(`third_party/iceberg/src/arrow/reader/mod.rs:34`): two requested ranges less
+than 1 MiB apart become one fetch, and every byte between them is read and
+charged. The scan's `range_enabled=false` log field says siglake configured
+nothing, not that the reader stopped coalescing (#5806).
+
+`sum(length(raw)) WHERE host = 'host-needle'` takes two fetches on the row group
+it selects — the predicate column under the page-index selection, widened to
+8,192-row batch boundaries because parquet caches predicate columns, then `raw`
+under the selection the predicate produced. Each goes through the coalescer on
+its own. From the merged output's offset index, with the fetches traced:
+
+| arm | rows/rg | needle lands on | `host` asked / fetched | `raw` asked / fetched | `bytes_data` |
+|---|---|---|---|---|---|
+| 256 MiB | 574,808 | rg 1 row 300,192, `raw` page 15 of 30 | 89,442 / 456,579 | 384,473 / 384,473 | 841,052 |
+| 128 MiB | 287,404 | rg 3 row 12,788, `raw` page 0 of 15 | 61,815 / 61,815 | 236,089 / 236,089 | 297,904 |
+| 64 MiB | 143,702 | rg 6 row 12,788, `raw` page 0 of 8 | 61,815 / 61,815 | 236,089 / 236,089 | 297,904 |
+| 32 MiB | 131,072 | rg 6 row 88,568, `raw` page 5 of 8 | 89,436 / 174,727 | 389,046 / 1,006,851 | 1,181,578 |
+
+The fetched columns sum to the measured `bytes_data` to the byte in all four
+arms; `audit_needle_pages` in the fixture reconstructs the two fetches from the
+offset index and prints the prediction next to the measurement. Two mechanisms
+produce the spread, larger first:
+
+* **The coalescer charges the gap.** A column chunk's dictionary page sits at
+  the chunk start and the reader always asks for it, so a needle on page *k*
+  leaves pages 0..k-1 between the dictionary request and the page request.
+  Under 1 MiB of gap the two merge into one fetch. At 32 MiB the gaps are `raw`
+  pages 0..4 (617,805 B) and `host` pages 0..2 (85,291 B): 703,096 B, 59% of
+  everything the arm was charged. At 256 MiB the `raw` gap is 2.54 MB and stays
+  split, while the `host` gap — pages 0..12, 367,137 B, 44% of the arm — merges.
+  At 128 and 64 MiB the needle is on page 0 of both chunks and there is no gap
+  at all.
+* **`raw` page 0 is a fifth the size of a PLAIN page.** The corpus's `raw`
+  values are near-unique, so the dictionary reaches the writer's 1 MiB
+  uncompressed limit inside the first page and the column falls back to PLAIN:
+  page 0 is 38.4 KB of dictionary indices, page 1 is a 1.9 KB remnant flushed
+  at the fallback, and pages 2 and up are ~187 KB. The 128 and 64 MiB arms read
+  page 0; the other two read a PLAIN page.
+
+Which of these applies is decided by the needle's offset inside its row group,
+and that offset is arithmetic rather than a property of the target. The needle
+sits at merged row 875,000 in every arm, so the offset is `875,000 mod
+rows_per_group`, and 287,404 is exactly 2 x 143,702 — which is why the 128 and
+64 MiB arms land on the same offset (12,788) and agree to the byte. Reading the
+sweep as "131,072-row groups cost 4x 143,702-row groups" reads a fixture
+coincidence as a law about geometry.
+
+`RG_COALESCE_BYTES=1` is the control: it is the smallest value that survives the
+`.max(1)` in `query_provider.rs`, and it leaves only adjacent ranges merged, so
+`bytes_data` reports what the reader requested. With it, the arms read 473,915 /
+297,904 / 297,904 / 478,482 B. The 32 MiB arm reads 1.6x the 64 MiB arm instead
+of 4x, and lands within 1% of the 256 MiB default instead of 40% above it. What
+remains is the PLAIN page, which any arm pays whenever its needle misses page 0.
+
+Neither `merge_ranges` nor the page selection is wrong, so nothing is fixed here
+and no default moves. On object storage the coalescer is trading those bytes for
+request count, which is what it exists to do; this is a `file://` warehouse,
+where the trade has no upside. What the sweep table cannot show is the split
+itself — `bytes_data` reports fetched bytes and a reader of the column has no
+way to see how much of it was gap. That is #5805.
 
 ## The candidate: 64 MiB, compactor-only, in the chart
 
@@ -191,8 +262,10 @@ establishes that 256 MiB is unsafe at 1Gi — only that it is measurably closer 
 the limit than it needs to be, on a bin far smaller than the ones the fleet
 merges.
 
-The follow-ups this left open: #5132 is the chart change if a round supports it,
-and #5133 is the 32 MiB arm's backwards selective read.
+The follow-ups this left open: #5132 is the chart change if a round supports it.
+#5133 settled the 32 MiB arm's selective read against the page accounting above
+and left #5805 (requested versus fetched bytes in scan attribution) and #5806
+(the misleading `range_enabled` log field) behind it.
 
 ## Reproduce
 
@@ -212,4 +285,14 @@ RG_HEAP_TRACKING=0 RG_TARGET_MB=64 cargo test --release -p siglake-storage \
 # the native-bloom arms
 RG_NATIVE_BLOOMS=1 RG_TARGET_MB=64 cargo test --release -p siglake-storage \
   --test row_group_target_qualification -- --ignored --nocapture
+
+# #5133's control: `bytes_data` then reports requested bytes, not coalesced ones
+for mb in 0 128 64 32; do
+  RG_COALESCE_BYTES=1 RG_TARGET_MB=$mb cargo test --release -p siglake-storage \
+    --test row_group_target_qualification -- --ignored --nocapture
+done
 ```
+
+Every arm prints the needle row group's page layout and the two fetches
+`audit_needle_pages` reconstructs, ending in a `predict` line whose `fetched`
+total must equal the `needle host` row's `bytes_data`.

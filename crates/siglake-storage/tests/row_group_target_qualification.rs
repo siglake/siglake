@@ -53,6 +53,17 @@
 //! wall-clock and RSS columns want a second pass without it. `RG_FILES` (8) and
 //! `RG_ROWS_PER_FILE` (250_000) size the bin.
 //!
+//! WHERE THE NEEDLE SHAPE'S BYTES GO (#5133). `bytes_data` is the length of
+//! each MERGED fetch, and the reader coalesces requested ranges under 1 MiB
+//! apart whether or not siglake configured a range knob, so a needle a few
+//! pages into a column chunk is charged for the dictionary page, the pages
+//! between it and the one it wanted, and the page itself. `audit_needle_pages`
+//! reconstructs both of the needle query's fetches from the merged output's
+//! offset index and prints the predicted requested and fetched totals next to
+//! the measured `bytes_data`; `RG_COALESCE_BYTES=1` is the control that turns
+//! the coalescing off, after which the two agree. The readings and what they
+//! settle are in the design document's #5133 section.
+//!
 //! COMPACTOR-ONLY. The corpus is appended through the DEFAULT tuning and the
 //! arm's target is applied to the context afterwards, so every arm merges a
 //! byte-identical bin and only the compactor's writer changes. The flush
@@ -62,16 +73,25 @@
 //! `docs/DESIGN_row_group_target_qualification.md`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
-use datafusion::arrow::array::{Array, RecordBatch};
+use datafusion::arrow::array::{Array, RecordBatch, StringArray};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use futures::StreamExt;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
+};
+use parquet::arrow::ProjectionMask;
+use parquet::data_type::ByteArray;
+use parquet::file::metadata::PageIndexPolicy;
+use parquet::file::page_index::column_index::ColumnIndexIterators;
+use parquet::file::page_index::offset_index::PageLocation;
 
 use siglake_core::Event;
 use siglake_storage::iceberg::{
@@ -348,6 +368,309 @@ fn anatomy_of(paths: &[String]) -> Anatomy {
     a
 }
 
+// ------------------------------------------- needle page-level accounting ---
+
+/// Mirror of the fork's private `merge_ranges`
+/// (`third_party/iceberg/src/arrow/reader/file_reader.rs`). `bytes_data` charges
+/// the length of each MERGED fetch, not the length of what was asked for, so
+/// this is the function that turns requested page bytes into attributed bytes.
+fn merge_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
+    if ranges.is_empty() {
+        return vec![];
+    }
+    let mut ranges = ranges.to_vec();
+    ranges.sort_unstable_by_key(|r| r.start);
+
+    let mut merged = Vec::with_capacity(ranges.len());
+    let mut start_idx = 0;
+    let mut end_idx = 1;
+    while start_idx != ranges.len() {
+        let mut range_end = ranges[start_idx].end;
+        while end_idx != ranges.len()
+            && ranges[end_idx]
+                .start
+                .checked_sub(range_end)
+                .map(|delta| delta <= coalesce)
+                .unwrap_or(true)
+        {
+            range_end = range_end.max(ranges[end_idx].end);
+            end_idx += 1;
+        }
+        merged.push(ranges[start_idx].start..range_end);
+        start_idx = end_idx;
+        end_idx += 1;
+    }
+    merged
+}
+
+fn span(ranges: &[Range<u64>]) -> u64 {
+    ranges.iter().map(|r| r.end - r.start).sum()
+}
+
+/// The ranges `InMemoryRowGroup::fetch_ranges` asks for on one column chunk
+/// under `selection` (parquet 58.4.0, `arrow/in_memory_row_group.rs`): the
+/// dictionary page, when the first data page does not start at the chunk start,
+/// then the pages the selection touches.
+fn column_fetch_ranges(
+    chunk_start: u64,
+    locations: &[PageLocation],
+    selection: &RowSelection,
+) -> Vec<Range<u64>> {
+    let mut ranges = Vec::new();
+    if let Some(first) = locations.first() {
+        if first.offset as u64 != chunk_start {
+            ranges.push(chunk_start..first.offset as u64);
+        }
+    }
+    ranges.extend(selection.scan_ranges(locations));
+    ranges
+}
+
+/// The rows a whole page spans, as the fork's page-index evaluator selects them
+/// for an equality predicate: pages whose [min, max] brackets the literal.
+fn page_row_ranges(pages: &[usize], locations: &[PageLocation], rows: usize) -> Vec<Range<usize>> {
+    pages
+        .iter()
+        .map(|&page| {
+            let start = locations[page].first_row_index as usize;
+            let end = locations
+                .get(page + 1)
+                .map(|next| next.first_row_index as usize)
+                .unwrap_or(rows);
+            start..end
+        })
+        .collect()
+}
+
+/// Mirror of parquet's `RowSelection::expand_to_batch_boundaries`
+/// (`arrow_reader/selection.rs`, `pub(crate)`). The reader applies it to the
+/// predicate columns it caches, so the `host` fetch reaches whole batches and
+/// therefore pages the page index did not select.
+fn expand_to_batch_boundaries(
+    ranges: &[Range<usize>],
+    batch_size: usize,
+    rows: usize,
+) -> Vec<Range<usize>> {
+    let mut expanded: Vec<Range<usize>> = ranges
+        .iter()
+        .map(|range| {
+            (range.start / batch_size) * batch_size
+                ..(range.end.div_ceil(batch_size) * batch_size).min(rows)
+        })
+        .collect();
+    expanded.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in expanded {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+fn selection_over_rows(
+    ranges: impl IntoIterator<Item = Range<usize>>,
+    rows: usize,
+) -> RowSelection {
+    let mut selectors = Vec::new();
+    let mut cursor = 0usize;
+    for range in ranges {
+        if range.start > cursor {
+            selectors.push(RowSelector::skip(range.start - cursor));
+        }
+        selectors.push(RowSelector::select(range.end - range.start));
+        cursor = range.end;
+    }
+    if cursor < rows {
+        selectors.push(RowSelector::skip(rows - cursor));
+    }
+    RowSelection::from(selectors)
+}
+
+/// The rows of `row_group` whose `host` is the needle, decoded rather than
+/// inferred, so the post-filter selection the reader hands the `raw` fetch is
+/// the real one.
+fn needle_row_ranges(
+    bytes: &bytes::Bytes,
+    row_group: usize,
+    host_leaf: usize,
+) -> Vec<Range<usize>> {
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).expect("reader for host column");
+    let mask = ProjectionMask::leaves(builder.parquet_schema(), [host_leaf]);
+    let reader = builder
+        .with_row_groups(vec![row_group])
+        .with_projection(mask)
+        .with_batch_size(8192)
+        .build()
+        .expect("build host reader");
+
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut base = 0usize;
+    for batch in reader {
+        let batch = batch.expect("host batch");
+        let column = batch.column(0);
+        let utf8 = if column.data_type() == &DataType::Utf8 {
+            column.clone()
+        } else {
+            datafusion::arrow::compute::cast(column, &DataType::Utf8).expect("cast host to utf8")
+        };
+        let hosts = utf8
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("host as utf8");
+        for row in 0..hosts.len() {
+            if !hosts.is_null(row) && hosts.value(row) == NEEDLE_HOST {
+                let at = base + row;
+                match ranges.last_mut() {
+                    Some(last) if last.end == at => last.end = at + 1,
+                    _ => ranges.push(at..at + 1),
+                }
+            }
+        }
+        base += batch.num_rows();
+    }
+    ranges
+}
+
+/// Page-level accounting for the needle query's one selected row group: what
+/// the two fetches ask for, and what the range coalescer charges for them.
+///
+/// The needle query is `host = 'host-needle'` projecting `raw`, which the
+/// reader serves in two `get_byte_ranges` calls — the predicate column first,
+/// under the fork's page-index selection, then the output column under the
+/// selection the predicate produced. Coalescing happens inside each call
+/// (parquet `push_decoder/reader_builder/mod.rs`, the Filters and the final
+/// projection states), so the two are accounted separately here too.
+fn audit_needle_pages(paths: &[String], coalesce: u64, batch_size: usize, measured_data: usize) {
+    for path in paths {
+        let bytes = bytes::Bytes::from(std::fs::read(path).expect("read parquet"));
+        let md = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            bytes.clone(),
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
+        )
+        .expect("reader with page index")
+        .metadata()
+        .clone();
+
+        let descr = md.file_metadata().schema_descr_ptr();
+        let leaf = |name: &str| {
+            descr
+                .columns()
+                .iter()
+                .position(|c| c.name() == name)
+                .unwrap_or_else(|| panic!("no leaf column {name}"))
+        };
+        let host_leaf = leaf("host");
+        let raw_leaf = leaf("raw");
+        let column_index = md.column_index().expect("column index");
+        let offset_index = md.offset_index().expect("offset index");
+        let needle = NEEDLE_HOST.as_bytes();
+
+        for rg_idx in 0..md.num_row_groups() {
+            let host_colidx = &column_index[rg_idx][host_leaf];
+            let mins: Vec<Option<ByteArray>> = ByteArray::min_values_iter(host_colidx).collect();
+            let maxs: Vec<Option<ByteArray>> = ByteArray::max_values_iter(host_colidx).collect();
+            let host_pages: Vec<usize> = (0..mins.len())
+                .filter(|&page| {
+                    let lo = mins[page].as_ref().is_some_and(|v| v.data() <= needle);
+                    let hi = maxs[page].as_ref().is_some_and(|v| v.data() >= needle);
+                    lo && hi
+                })
+                .collect();
+            if host_pages.is_empty() {
+                continue;
+            }
+
+            let rg = md.row_group(rg_idx);
+            let rows = rg.num_rows() as usize;
+            let host_locs = offset_index[rg_idx][host_leaf].page_locations();
+            let raw_locs = offset_index[rg_idx][raw_leaf].page_locations();
+            let (host_start, _) = rg.column(host_leaf).byte_range();
+            let (raw_start, _) = rg.column(raw_leaf).byte_range();
+
+            let selected = page_row_ranges(&host_pages, host_locs, rows);
+            let expanded = expand_to_batch_boundaries(&selected, batch_size, rows);
+            let pre = selection_over_rows(expanded.iter().cloned(), rows);
+            let matched = needle_row_ranges(&bytes, rg_idx, host_leaf);
+            let post = selection_over_rows(matched.iter().cloned(), rows);
+
+            let host_ranges = column_fetch_ranges(host_start, host_locs, &pre);
+            let raw_ranges = column_fetch_ranges(raw_start, raw_locs, &post);
+            let host_fetched = merge_ranges(&host_ranges, coalesce);
+            let raw_fetched = merge_ranges(&raw_ranges, coalesce);
+
+            let raw_page_of = |row: usize| {
+                raw_locs
+                    .partition_point(|loc| (loc.first_row_index as usize) <= row)
+                    .saturating_sub(1)
+            };
+            let first_needle = matched.first().map(|r| r.start).unwrap_or(0);
+            let needle_rows: usize = matched.iter().map(|r| r.end - r.start).sum();
+
+            println!(
+                "   pages      file={} rg={rg_idx}/{} rows={rows} needle_rows={needle_rows} \
+                 at_row={first_needle} host_pages={host_pages:?} raw_page={} of {}",
+                path.rsplit('/').next().unwrap_or(path),
+                md.num_row_groups(),
+                raw_page_of(first_needle),
+                raw_locs.len(),
+            );
+            println!(
+                "   pages      host dict={:.0} KB pages={} | raw dict={:.0} KB pages={} \
+                 mean_page={:.0} KB",
+                (host_locs
+                    .first()
+                    .map(|l| l.offset as u64)
+                    .unwrap_or(host_start)
+                    - host_start) as f64
+                    / 1024.0,
+                host_locs.len(),
+                (raw_locs
+                    .first()
+                    .map(|l| l.offset as u64)
+                    .unwrap_or(raw_start)
+                    - raw_start) as f64
+                    / 1024.0,
+                raw_locs.len(),
+                raw_locs
+                    .iter()
+                    .map(|l| l.compressed_page_size as f64)
+                    .sum::<f64>()
+                    / raw_locs.len().max(1) as f64
+                    / 1024.0,
+            );
+            for (page, loc) in raw_locs.iter().enumerate() {
+                let selected = raw_page_of(first_needle) == page;
+                println!(
+                    "   raw page   [{page:>3}] first_row={:<9} offset={:<12} \
+                     compressed={:>8.1} KB{}",
+                    loc.first_row_index,
+                    loc.offset,
+                    loc.compressed_page_size as f64 / 1024.0,
+                    if selected { "  <- needle" } else { "" },
+                );
+            }
+            println!(
+                "   predict    coalesce={coalesce} B | host requested={:.2} MB fetched={:.2} MB \
+                 ({} ranges -> {}) | raw requested={:.2} MB fetched={:.2} MB ({} -> {}) | \
+                 total requested={} B fetched={} B measured={measured_data} B",
+                mb(span(&host_ranges)),
+                mb(span(&host_fetched)),
+                host_ranges.len(),
+                host_fetched.len(),
+                mb(span(&raw_ranges)),
+                mb(span(&raw_fetched)),
+                raw_ranges.len(),
+                raw_fetched.len(),
+                span(&host_ranges) + span(&raw_ranges),
+                span(&host_fetched) + span(&raw_fetched),
+            );
+        }
+    }
+}
+
 /// The two Arrow byte measures of the same rows, read off the merged output:
 /// the extent the writer's sizing prices a row with, and the whole buffers a
 /// buffered batch of those rows actually holds.
@@ -523,6 +846,8 @@ async fn measure_row_group_target_arm() {
     // are per row group and are the one overhead that scales with the count
     // independently of the data.
     let native_blooms = env_usize("RG_NATIVE_BLOOMS", 0) == 1;
+    // 0 leaves the reader's own default (1 MiB) in place; see the control below.
+    let coalesce_bytes = env_usize("RG_COALESCE_BYTES", 0) as u64;
     let target_bytes = (target_mb > 0).then(|| target_mb * 1024 * 1024);
     assert!(
         files > NEEDLE_FILE,
@@ -582,6 +907,19 @@ async fn measure_row_group_target_arm() {
     let out = ice.live_data_files(&ident).await.expect("live files after");
     let output = anatomy_of(&file_paths(&out));
 
+    // #5133's negative control. The reader coalesces requested byte ranges and
+    // `bytes_data` charges the merged fetch, so the shipped 1 MiB default
+    // (`DEFAULT_RANGE_COALESCE_BYTES`) can attribute bytes nobody asked for.
+    // `RG_COALESCE_BYTES=1` is the smallest value that survives the `.max(1)`
+    // in `query_provider.rs`, and it leaves only adjacent ranges merged, so
+    // `bytes_data` then reports what the reader actually requested.
+    if coalesce_bytes > 0 {
+        siglake_storage::configure_query_scan_tuning(siglake_storage::QueryScanTuning {
+            range_coalesce_bytes: Some(coalesce_bytes),
+            ..Default::default()
+        });
+    }
+
     // The two Arrow measures of the SAME rows, off the merged output: the
     // extent the writer's heuristic divides the target by, and the buffers a
     // batch of those rows holds.
@@ -598,13 +936,19 @@ async fn measure_row_group_target_arm() {
     drop(sample);
 
     println!(
-        "\n== arm target={} files_in={} rows={} heap_tracking={} native_blooms={native_blooms}",
+        "\n== arm target={} files_in={} rows={} heap_tracking={} native_blooms={native_blooms} \
+         coalesce={}",
         target_bytes
             .map(|b| format!("{} MiB", b / (1024 * 1024)))
             .unwrap_or_else(|| "default (256 MiB)".into()),
         input.files,
         output.rows,
         track_heap,
+        if coalesce_bytes > 0 {
+            format!("{coalesce_bytes} B")
+        } else {
+            "default (1 MiB)".into()
+        },
     );
     println!(
         "   input      files={} rgs={} rows/rg={:.0} bytes={:.1} MB",
@@ -693,17 +1037,22 @@ async fn measure_row_group_target_arm() {
             "SELECT sum(length(raw)) FROM events WHERE sourcetype = 'error'".to_string(),
         ),
     ];
+    let mut needle_data_bytes = 0usize;
     for (label, sql) in shapes {
         let cost = query_cost(&ctx, sql).await;
+        if *label == "needle host" {
+            needle_data_bytes = cost.bytes_data;
+        }
         println!(
             "   query      {label:<21} rgs {}/{} read (bloom -{} stats -{})  \
-             data={:.2} MB footer={:.0} KB index={:.0} KB  decoded={:.2} MB  \
+             data={:.2} MB ({} B) footer={:.0} KB index={:.0} KB  decoded={:.2} MB  \
              rows_pruned={}  reads={}  files={}  out_rows={}  {:.1} ms",
             cost.row_groups_read,
             cost.row_groups_considered,
             cost.row_groups_pruned_bloom,
             cost.row_groups_pruned_stats,
             cost.bytes_data as f64 / (1024.0 * 1024.0),
+            cost.bytes_data,
             cost.bytes_footer as f64 / 1024.0,
             cost.bytes_index as f64 / 1024.0,
             cost.decoded_bytes as f64 / (1024.0 * 1024.0),
@@ -714,6 +1063,22 @@ async fn measure_row_group_target_arm() {
             cost.millis,
         );
     }
+
+    // #5133: what the needle query's selected row group asks for, page by page,
+    // against what the coalescer charges it. The effective coalesce threshold
+    // is the reader default unless this arm set one.
+    audit_needle_pages(
+        &file_paths(&out),
+        if coalesce_bytes > 0 {
+            coalesce_bytes
+        } else {
+            1024 * 1024
+        },
+        // DataFusion's default, which nothing here overrides; the reader hands
+        // it to `expand_to_batch_boundaries` for the cached predicate column.
+        8192,
+        needle_data_bytes,
+    );
     println!();
 }
 
