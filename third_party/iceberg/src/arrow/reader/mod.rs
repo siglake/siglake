@@ -53,8 +53,9 @@ pub use pruning::{
     PARSED_INDEX_CACHE_DROP_REASONS, PARSED_INDEX_CACHE_OUTCOMES,
     SEGMENTED_DIRECTORY_CACHE_DROP_REASONS, SEGMENTED_DIRECTORY_CACHE_OUTCOMES,
     TEXT_INDEX_STARTUP_STAGES, TEXT_INDEX_STORAGE_FORMS, ParsedIndexCacheFootprint,
-    SegmentedDirectoryCacheFootprint, inverted_index_decode_counts,
-    parsed_inverted_index_cache_footprint, parsed_inverted_index_cache_stats,
+    SegmentedDirectoryCacheFootprint, clear_parsed_inverted_index_cache,
+    inverted_index_decode_counts, parsed_inverted_index_cache_footprint,
+    parsed_inverted_index_cache_stats,
     segmented_directory_cache_footprint, segmented_directory_cache_stats,
 };
 pub(crate) use pruning::parsed_index_puffin_twin_ranks;

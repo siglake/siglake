@@ -35,10 +35,74 @@
 //! a third of what parsed indexes cost, at a decode per file per query. Which
 //! way to spend the pair is #4102's (parsed sizing) and #4054's (retention),
 //! with these numbers as their input; nothing here changes a default.
+//!
+//! The regression and the measurement read the same process state — one
+//! metrics recorder, two process-wide cache budgets and what those caches hold
+//! — so they take [`CACHE_TESTS`] and run one at a time, which is what lets the
+//! binary run with `--include-ignored` (#5300).
+
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use siglake_core::Event;
 use siglake_storage::iceberg::{IcebergContext, IcebergTuning, ReclusterMergeOptions};
+
+/// Both tests below own the same process state — the metrics recorder, the two
+/// text-index cache budgets and what those caches hold — so they run one at a
+/// time, and the recorder is installed once for the binary.
+static CACHE_TESTS: Mutex<()> = Mutex::new(());
+
+fn setup() -> (MutexGuard<'static, ()>, &'static Snapshotter) {
+    static SNAPSHOTTER: OnceLock<Snapshotter> = OnceLock::new();
+    let guard = CACHE_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshotter = SNAPSHOTTER.get_or_init(|| {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        recorder.install().expect("install debugging recorder");
+        snapshotter
+    });
+    reset_process_state();
+    // Every read of a debugging recorder drains it, so this leaves each test
+    // with an empty recorder to fill.
+    let _ = snapshotter.snapshot();
+    (guard, snapshotter)
+}
+
+/// Both budgets back to their default resolution and both caches empty.
+///
+/// Clearing the budgets is not enough on its own: they are enforced on insert,
+/// so entries another test admitted stay resident, and the parsed footprint
+/// these measurements divide by entry count is process-wide.
+fn reset_process_state() {
+    iceberg::arrow::clear_text_index_cache_max_bytes();
+    iceberg::arrow::clear_text_index_caches();
+}
+
+/// Runs one test with this binary's process state to itself, and leaves that
+/// state as it was found for the next one.
+///
+/// A `#[test]` with its own runtime rather than `#[tokio::test]`: the lock has
+/// to span the whole measurement, and a std `MutexGuard` held across an
+/// `.await` inside an async test is what `clippy::await_holding_lock` exists to
+/// catch.
+fn serialized<F>(body: impl FnOnce(&'static Snapshotter) -> F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    let (_guard, snapshotter) = setup();
+    // Current-thread, which is what `#[tokio::test]` gave these measurements
+    // before they were serialized: a multi-thread runtime consults the six
+    // files' indexes concurrently, and the fixed query sequence these passes
+    // count is a sequential one.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime")
+        .block_on(body(snapshotter));
+    reset_process_state();
+}
 
 type SnapshotVec = Vec<(
     metrics_util::CompositeKey,
@@ -228,6 +292,9 @@ struct EntrySizes {
 }
 
 async fn entry_sizes(tmp: &std::path::Path, chunks: usize, rows_per_chunk: usize) -> EntrySizes {
+    // The per-file figures below come off a process-wide footprint, so the
+    // sizing warehouse has to be the only thing in it.
+    iceberg::arrow::clear_text_index_caches();
     siglake_storage::configure_text_index_caches(siglake_storage::TextIndexCacheConfig {
         parsed_index_max_bytes: u64::MAX / 2,
         puffin_blob_max_bytes: u64::MAX / 2,
@@ -247,8 +314,8 @@ async fn entry_sizes(tmp: &std::path::Path, chunks: usize, rows_per_chunk: usize
         "the sizing warehouse must hold one parsed index and one blob per file"
     );
     EntrySizes {
-        // The footprint is process-wide and this is the only warehouse queried
-        // so far, so its bytes are these files' bytes.
+        // The footprint is process-wide, and the clear above left the sizing
+        // warehouse as the only thing in it, so its bytes are these files'.
         parsed: footprint.bytes / parsed_entries,
         blob: blob_bytes / blob_entries,
     }
@@ -260,12 +327,12 @@ async fn entry_sizes(tmp: &std::path::Path, chunks: usize, rows_per_chunk: usize
 /// fetch of the file whose parsed entry displaced its own. Now a repeat
 /// execution fetches only the files the blob budget cannot hold, and the rows
 /// are the control's on every pass — eviction choice must not change an answer.
-#[tokio::test]
-async fn a_repeat_text_suite_stops_refetching_the_blobs_it_still_holds() {
-    let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    recorder.install().expect("install debugging recorder");
+#[test]
+fn a_repeat_text_suite_stops_refetching_the_blobs_it_still_holds() {
+    serialized(repeat_text_suite_stops_refetching_the_blobs_it_still_holds);
+}
 
+async fn repeat_text_suite_stops_refetching_the_blobs_it_still_holds(snapshotter: &Snapshotter) {
     let chunks = 6;
     let rows_per_chunk = 400;
     let held = 3;
@@ -302,7 +369,7 @@ async fn a_repeat_text_suite_stops_refetching_the_blobs_it_still_holds() {
     let warehouse = path.to_string_lossy().to_string();
     let mut passes = Vec::new();
     for pass in 0..8 {
-        let measurement = measure_pass(&ctx, &snapshotter, &warehouse, "rareneedle").await;
+        let measurement = measure_pass(&ctx, snapshotter, &warehouse, "rareneedle").await;
         assert_eq!(
             measurement.rows, expected,
             "pass {pass}: the rows must be the unindexed control's, whatever the \
@@ -364,10 +431,6 @@ async fn a_repeat_text_suite_stops_refetching_the_blobs_it_still_holds() {
             passes[1].index_bytes
         );
     }
-
-    // Leave the process as it was found: a configured budget wins over the
-    // environment for every later test in this binary.
-    iceberg::arrow::clear_text_index_cache_max_bytes();
 }
 
 /// What the pair's SPLIT is worth on the same layout, which the eviction fix
@@ -385,12 +448,12 @@ async fn a_repeat_text_suite_stops_refetching_the_blobs_it_still_holds() {
 ///   --ignored --nocapture
 /// ```
 #[ignore = "measurement, not a gate"]
-#[tokio::test]
-async fn report_text_index_cache_budget_split() {
-    let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    recorder.install().expect("install debugging recorder");
+#[test]
+fn report_text_index_cache_budget_split() {
+    serialized(text_index_cache_budget_split_report);
+}
 
+async fn text_index_cache_budget_split_report(snapshotter: &Snapshotter) {
     let chunks = 6;
     let rows_per_chunk = 400;
     let tmp = tempfile::tempdir().unwrap();
@@ -415,6 +478,10 @@ async fn report_text_index_cache_budget_split() {
     ] {
         let parsed_budget = (sizes.parsed * parsed_held) as u64;
         let blob_budget = (sizes.blob * blob_held) as u64;
+        // Empty caches per arm as well as fresh budgets: the sizing warehouse
+        // and the previous arm are resident until something evicts them, and
+        // the retained column below reads a process-wide footprint.
+        iceberg::arrow::clear_text_index_caches();
         siglake_storage::configure_text_index_caches(siglake_storage::TextIndexCacheConfig {
             parsed_index_max_bytes: parsed_budget,
             puffin_blob_max_bytes: blob_budget,
@@ -430,7 +497,7 @@ async fn report_text_index_cache_budget_split() {
         let warehouse = path.to_string_lossy().to_string();
         let mut passes = Vec::new();
         for _ in 0..8 {
-            passes.push(measure_pass(&ctx, &snapshotter, &warehouse, "rareneedle").await);
+            passes.push(measure_pass(&ctx, snapshotter, &warehouse, "rareneedle").await);
         }
         let steady = &passes[4..];
         let mean = |values: &[u64]| values.iter().sum::<u64>() as f64 / values.len() as f64;
@@ -460,8 +527,8 @@ async fn report_text_index_cache_budget_split() {
             .sum::<f64>()
             / steady.len() as f64;
         let (_, blob_bytes, _) = iceberg::arrow::puffin_blob_cache_stats(&warehouse);
-        // Process-global, and this arm's warehouse is the only one queried
-        // under this budget.
+        // Process-global, and the clear above left this arm's warehouse as the
+        // only one in it.
         let parsed_bytes = iceberg::arrow::parsed_inverted_index_cache_footprint().bytes;
         println!(
             "{arm:<24}  {parsed_budget:8}  {blob_budget:6}  {fetches:5.1}  {blob_hits:8.1}  \
@@ -474,8 +541,4 @@ async fn report_text_index_cache_budget_split() {
             "{arm}: the arm must return the fixture's rows"
         );
     }
-
-    // Leave the process as it was found: a configured budget wins over the
-    // environment for every later test in this binary.
-    iceberg::arrow::clear_text_index_cache_max_bytes();
 }

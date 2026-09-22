@@ -203,6 +203,17 @@ pub fn parsed_inverted_index_cache_footprint() -> ParsedIndexCacheFootprint {
     }
 }
 
+/// Drop every resident parsed index and the cumulative drop counts published
+/// beside them.
+///
+/// The bounds are enforced on insert, so an entry admitted under one budget
+/// outlives it; a caller that measures one warehouse against an explicit budget
+/// has to start from an empty cache, because
+/// [`parsed_inverted_index_cache_footprint`] is process-wide.
+pub fn clear_parsed_inverted_index_cache() {
+    *parsed_index_cache().lock().unwrap() = ParsedIndexCache::default();
+}
+
 /// Return resident entries and served hits for keys containing `path_substring`.
 pub fn parsed_inverted_index_cache_stats(path_substring: &str) -> (usize, u64) {
     parsed_index_cache()
