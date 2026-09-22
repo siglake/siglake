@@ -1785,6 +1785,21 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   begins at the ingest handler rather than at the load generator that issued
   the request. Client-to-ingest continuity requires both client injection and
   ingest-side extraction; neither half is implemented.
+- **A scan's `bytes_data` is what the reader fetched, not what it asked for.**
+  The vendored reader merges requested byte ranges that lie under 1 MiB apart
+  into one fetch and charges the length of that fetch
+  (`get_byte_ranges`/`merge_ranges` in
+  `third_party/iceberg/src/arrow/reader/file_reader.rs`); nothing set by
+  siglake turns this off, because leaving the range knobs unset selects the
+  reader's own 1 MiB default rather than no coalescing. A selective query whose
+  needle sits a few pages into a column chunk is therefore charged for the
+  dictionary page, the pages between it and the one it wanted, and the page
+  itself. On the #4772 fixture that was 44% and 59% of the charged bytes on two
+  of four arms, and it inverted the apparent cost ordering of two row-group
+  geometries (`DESIGN_row_group_target_qualification.md`, the #5133 section).
+  The counter is not wrong about physical reads; there is no second counter for
+  requested bytes beside it, so a comparison of two layouts cannot separate
+  "reads more" from "coalesces more". Adding the split is filed as #5805.
 - **Metrics do not leave as OTLP from the process.** `siglake_*` metrics are
   Prometheus, scraped from `/metrics`; the OTel metrics SDK is not wired, so an
   OTLP-only backend needs a collector with a Prometheus receiver. Moving the
