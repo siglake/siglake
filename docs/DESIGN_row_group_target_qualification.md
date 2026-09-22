@@ -176,7 +176,7 @@ produce the spread, larger first:
 * **`raw` page 0 is a fifth the size of a PLAIN page.** The corpus's `raw`
   values are near-unique, so the dictionary reaches the writer's 1 MiB
   uncompressed limit inside the first page and the column falls back to PLAIN:
-  page 0 is 38.4 KB of dictionary indices, page 1 is a 1.9 KB remnant flushed
+  page 0 is 38.4 KB of dictionary indices, page 1 is a 1.8-1.9 KB remnant flushed
   at the fallback, and pages 2 and up are ~187 KB. The 128 and 64 MiB arms read
   page 0; the other two read a PLAIN page.
 
