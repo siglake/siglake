@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **WAL recovery observability (chore)**: `siglake_wal_recover_skipped_total`
+  and `siglake_wal_recover_unreadable_total` are gone. `wal-recover` is a
+  one-shot subcommand that installs no metrics recorder and binds no
+  `/metrics`, so both counters went into the no-op global recorder and were
+  discarded at exit. The plan and report counts, the exit statuses and the
+  per-object WARN events (stderr always, OTLP when
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set) are unchanged and are now the whole
+  record; `docs/LIMITATIONS.md` says so. No flag, listener or default was
+  added. (#5246)
+
 - **WAL recovery (fix)**: `siglake wal-recover` now exits nonzero when every
   candidate body is unreadable and no segment is already present. Plan and
   apply still succeed for empty mirrors, idempotent re-runs and mixed mirrors

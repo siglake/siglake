@@ -58,6 +58,10 @@ fn run_recover(from: &str, to: &Path, apply: bool) -> (String, String, bool) {
         // `--from` also reads this env var; the caller's environment must not
         // be able to supply the source of a recovery test.
         .env_remove("SIGLAKE_WAL_MIRROR_URL")
+        // Unset too, so the child logs under the CLI's own default filter and
+        // the stderr WARN assertions below read what an operator's run prints
+        // rather than whatever this shell exported (#5246).
+        .env_remove("RUST_LOG")
         .output()
         .expect("spawning the siglake binary");
     (
@@ -312,6 +316,11 @@ fn recovering_from_an_empty_mirror_succeeds_quietly() {
 /// but the skip count is on stdout both times, and the re-run separates the
 /// three segments it already has from the two keys it still does not
 /// understand.
+///
+/// Each refused key also names itself in a WARN event on stderr. That event is
+/// the only machine-readable record of the refusal: `wal-recover` installs no
+/// metrics recorder, so the counters this used to increment were dropped at
+/// exit and are gone (#5246).
 #[test]
 fn a_mirror_with_unknown_keys_alongside_segments_restores_and_reports_both() {
     let tmp = tempfile::tempdir().unwrap();
@@ -332,6 +341,17 @@ fn a_mirror_with_unknown_keys_alongside_segments_restores_and_reports_both() {
     assert!(
         stdout.contains("pulled 3 segments") && stdout.contains("2 keys skipped"),
         "{stdout}{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .matches("wal-recover: unrecognised key, skipped")
+            .count(),
+        2,
+        "one WARN event per refused key, with nothing else recording them: {stderr}"
+    );
+    assert!(
+        stderr.contains("README.md") && stderr.contains("acme/orders/nested/"),
+        "and each event carries the key an operator has to look at: {stderr}"
     );
     assert_restored(&wal, &names);
 
@@ -427,12 +447,24 @@ fn recover_refuses_an_unreadable_active_object_and_says_so_in_both_forms() {
         stdout.contains("totals: 1 segments"),
         "and propose only what it would write: {stdout}"
     );
+    // The WARN event is the record outside the report (#5246): no counter is
+    // charged, because a one-shot subcommand installs no recorder.
+    assert!(
+        stderr.contains("candidate body is not a readable WAL segment, refused")
+            && stderr.contains("_active/widgets/s.arrow.partial"),
+        "the plan warns with the key and the reason: {stderr}"
+    );
 
     let (stdout, stderr, ok) = recover_apply(&from, &wal);
     assert!(ok, "{stdout}{stderr}");
     assert!(
         stdout.contains("pulled 1 segments") && stdout.contains("1 unreadable"),
         "the report separates the two: {stdout}"
+    );
+    assert!(
+        stderr.contains("candidate body is not a readable WAL segment, refused")
+            && stderr.contains("_active/widgets/s.arrow.partial"),
+        "and so does the apply, which plans on its own listing: {stderr}"
     );
     assert!(
         wal.join("acme").join(SEALED_DIR).join(&name).exists(),
@@ -572,6 +604,19 @@ fn recover_reports_unreadable_and_skipped_without_claiming_every_key_was_skipped
                 && !stderr.contains("all 1 keys")
                 && !stderr.contains("--from must name the MIRROR ROOT"),
             "{arm}: {stderr}"
+        );
+        // The two populations warn separately as well as counting separately,
+        // which is what a log-pipeline alert reads now that neither has a
+        // counter (#5246).
+        assert!(
+            stderr.contains("candidate body is not a readable WAL segment, refused")
+                && stderr.contains("_active/widgets/torn.arrow.partial"),
+            "{arm}: the unreadable body warns with its key: {stderr}"
+        );
+        assert!(
+            stderr.contains("wal-recover: unrecognised key, skipped")
+                && stderr.contains("acme/orders/nested/foreign.arrow"),
+            "{arm}: and so does the refused layout: {stderr}"
         );
         assert!(!wal.exists(), "{arm}: the failed run created --to");
     }

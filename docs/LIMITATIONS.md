@@ -1807,3 +1807,16 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   alerts, the KEDA scalers and the dashboard are written against, which is a
   migration and not a feature; the collector costs one deployment and nothing
   in the code.
+
+- **Mirror damage found by `siglake wal-recover` is reported, not measured.**
+  The command is a one-shot subcommand: it installs no metrics recorder and
+  binds no `/metrics`, so nothing can scrape a counter it increments and an
+  increment is discarded when the process exits (#5246). Refused and
+  unrecognised keys are counted in the printed plan and report, and each one
+  also emits a WARN event carrying the key and the decode error — on stderr
+  always, and over OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, flushed
+  before the command returns. Alerting on a damaged mirror is therefore a
+  log-pipeline rule, and a restore run whose logs are not collected leaves no
+  record of the refusal. Giving the command a metrics endpoint would mean
+  holding the process open for a scrape, which is a flag and a default this
+  cleanup deliberately did not add.

@@ -136,9 +136,9 @@ written, sealed and `_active/` alike (#5077): an `_active/` object is listable,
 and stat-able at zero bytes, before its body lands on any store whose PUT is
 not atomic, and restoring that published a zero-byte sealed segment the drain
 could not read. A body that does not decode is counted apart from `pulled`, in
-`unreadable` and `siglake_wal_recover_unreadable_total`, named in the output,
-and left in the mirror — nothing is created for it, and nothing is quarantined,
-because the command writes only under `--to`. A flushed prefix whose final
+`unreadable`, named in the output, and left in the mirror — nothing is created
+for it, and nothing is quarantined, because the command writes only under
+`--to`. A flushed prefix whose final
 Arrow IPC message is torn still restores: that is the case the active mirror is
 built around. The report carries the counts that separate a finished restore
 from one that understood nothing — segments already present, unreadable
@@ -147,7 +147,15 @@ plan and apply forms exit nonzero when every key was skipped and nothing was
 restored, which is `--from` naming an ancestor of the mirror root. They also
 exit nonzero when at least one candidate is unreadable and no segment can be
 restored or is already present; a mixed mirror still restores its readable
-segments and succeeds while reporting the unreadable count.
+segments and succeeds while reporting the unreadable count. The command emits
+no metrics of its own: it is a one-shot subcommand that installs no recorder
+and binds no `/metrics`, so a counter increment would be discarded at exit
+(#5246). Outside the printed report, one WARN event per refused or
+unrecognised key is the record — on stderr always, and shipped by the opt-in
+OTel log export (`OTEL_EXPORTER_OTLP_ENDPOINT`), which the process flushes
+before it returns. An alert on mirror damage found by a restore reads the log
+pipeline, and a run whose logs are not collected leaves nothing behind after
+the terminal scrolls.
 
 The same listing decides whether `--from` IS the mirror root, from the two
 markers siglake writes at a fixed depth under it: a first component `_active`
