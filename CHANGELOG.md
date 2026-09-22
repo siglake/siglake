@@ -15,9 +15,8 @@ chart and do not require a new engine release.
 
 The first minor release. This was going to ship as 0.1.1, a patch, but main
 picked up the rebased storage stack and four contract changes on the way, so
-it is a minor bump: 36 changes since the 0.1.1 write-up plus the 15
-that write-up covered, all on top of 0.1.0. Read the upgrade notes before
-rolling a 0.1.0 deployment forward.
+it is a minor bump. The earlier 0.1.1 write-up is included below, all on top of
+0.1.0. Read the upgrade notes before rolling a 0.1.0 deployment forward.
 
 Upgrade notes, what changes for an operator:
 
@@ -629,7 +628,7 @@ section first written up on 2026-09-16 as 0.1.1; that version was never tagged.
   are unchanged: the tag still says what the release is called, and the
   revision now says what is in it. (#4557)
 
-### The 15 changes first written up as 0.1.1
+### Changes first written up as 0.1.1
 
 - **Recovery**: `siglake wal-recover --from <url> --to <wal-root>` restores the
   segments under the URL's path. It built its object store rooted at the whole
