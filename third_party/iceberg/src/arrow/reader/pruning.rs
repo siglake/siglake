@@ -1402,6 +1402,7 @@ mod tests {
     use bytes::Bytes;
     use futures::StreamExt;
     use siglake_index::segmented::SEGMENTED_BLOB_TYPE;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::file::metadata::{
         ColumnChunkMetaData, KeyValue, ParquetMetaData, RowGroupMetaData,
@@ -1586,6 +1587,115 @@ mod tests {
         let hit = cache.get(&key(0)).unwrap();
         assert!(Arc::ptr_eq(&hit, &index));
         assert_eq!(cache.entries[&key(0)].hits, 1);
+    }
+
+    /// Eviction counts by `reason` for whatever the closure records. The
+    /// emitters are process-wide, as `parsed_inverted_index_cache_footprint`
+    /// above documents for the cache itself, so a thread-local recorder is
+    /// what keeps a count to the `put` calls made here while the rest of this
+    /// binary runs its own tests; `put` is synchronous, so nothing it records
+    /// escapes the thread the closure runs on.
+    fn drops_by_reason(exercise: impl FnOnce()) -> std::collections::BTreeMap<String, u64> {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, exercise);
+
+        let mut drops = std::collections::BTreeMap::new();
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            if key.key().name() != "siglake_iceberg_parsed_index_cache_evictions_total" {
+                continue;
+            }
+            let DebugValue::Counter(count) = value else {
+                continue;
+            };
+            let reason = key
+                .key()
+                .labels()
+                .find(|label| label.key() == "reason")
+                .expect("every drop names the bound that dropped it")
+                .value()
+                .to_string();
+            *drops.entry(reason).or_insert(0) += count;
+        }
+        drops
+    }
+
+    /// #4428: the test above proves the cache drops the right entries, but a
+    /// deployment cannot see that. A resident entry decoded and then thrown
+    /// away reads exactly like one that was never cached — same miss, same
+    /// decode — so the reason-labelled counter is the only thing separating a
+    /// thrashing cache from a cold one. Both resident bounds must reach it
+    /// under their own reason, and neither may be reported as `oversized`,
+    /// which is the refused-admission arm
+    /// (`crates/siglake-storage/tests/text_index_startup_metrics.rs`).
+    #[test]
+    fn parsed_index_evictions_name_the_bound_that_dropped_them() {
+        let index = Arc::new(siglake_index::InvertedIndex::from_rows([
+            "database timeout",
+            "request complete",
+        ]));
+        let size = index.heap_size_bytes();
+        let key = |n: u64| super::ParsedIndexKey::Puffin {
+            path: format!("s3://bucket/stats-{n}.puffin"),
+            offset: n,
+        };
+
+        // Room for two parsed indexes and an entry bound far above the four
+        // admissions: every drop here is the byte bound's.
+        let mut cache = super::ParsedIndexCache::default();
+        let byte_bound = drops_by_reason(|| {
+            for n in 0..4 {
+                cache.put(key(n), Arc::clone(&index), size * 2, 128);
+            }
+        });
+        assert_eq!(
+            byte_bound,
+            std::collections::BTreeMap::from([("byte_bound".to_string(), 2)]),
+            "two admissions over a two-index budget must count two byte-bound evictions"
+        );
+        assert_eq!(cache.evictions, 2, "the counter and the diagnostic disagree");
+        assert_eq!(cache.order.len(), 2);
+        assert_eq!(cache.bytes, size * 2);
+        assert!(cache.get(&key(0)).is_none(), "the evicted entry is gone");
+        assert!(cache.get(&key(3)).is_some(), "the newest entry is resident");
+
+        // The same four admissions under an unbounded byte budget: now it is
+        // the entry bound doing the dropping, and it has to say so.
+        let mut cache = super::ParsedIndexCache::default();
+        let entry_bound = drops_by_reason(|| {
+            for n in 0..4 {
+                cache.put(key(n), Arc::clone(&index), usize::MAX, 2);
+            }
+        });
+        assert_eq!(
+            entry_bound,
+            std::collections::BTreeMap::from([("entry_bound".to_string(), 2)]),
+            "a budget nothing can exceed leaves the entry bound as the only reason"
+        );
+        assert_eq!(cache.evictions, 2, "the counter and the diagnostic disagree");
+        assert_eq!(cache.order.len(), 2);
+        assert!(cache.get(&key(1)).is_none());
+        assert!(cache.get(&key(3)).is_some());
+
+        // Both bounds at once: the entry bound is reached first and names the
+        // drop, and the byte bound takes the run of admissions that follow it
+        // back under budget. Only that one sequence may report both reasons.
+        let mut cache = super::ParsedIndexCache::default();
+        let both = drops_by_reason(|| {
+            cache.put(key(0), Arc::clone(&index), size * 3, 2);
+            cache.put(key(1), Arc::clone(&index), size * 3, 2);
+            cache.put(key(2), Arc::clone(&index), size * 3, 2);
+            cache.put(key(3), Arc::clone(&index), size * 2, 128);
+        });
+        assert_eq!(
+            both,
+            std::collections::BTreeMap::from([
+                ("entry_bound".to_string(), 1),
+                ("byte_bound".to_string(), 1),
+            ]),
+            "each drop is attributed to the bound that was over when it happened"
+        );
+        assert_eq!(cache.evictions, 2);
     }
 
     #[test]
