@@ -62,8 +62,8 @@ fn counter_sum(snapshot: &SnapshotVec, name: &str, label: Option<(&str, &str)>) 
 /// `DebuggingRecorder` reports it as a delta since the last snapshot, so a test
 /// that attributes it to its own queries can only do so while no other test in
 /// this binary is running a Puffin-indexed text query. Both sides take this
-/// gate. Serializing them costs nothing: the whole file runs in under two
-/// seconds.
+/// gate. Serializing them is cheap next to the fixtures: the whole file runs in
+/// about nine seconds, most of it writing Parquet.
 ///
 /// That recorder window is all this gate still holds together.
 /// `streaming_recluster_rebuilds_once_and_survives_snapshot_expiry` reads the
