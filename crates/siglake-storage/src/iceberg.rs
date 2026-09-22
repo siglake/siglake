@@ -31048,9 +31048,10 @@ pub mod test_catalog {
 
     use futures::future::BoxFuture;
     use futures::FutureExt;
+    use iceberg::io::FileIO;
     use iceberg::table::Table;
     use iceberg::{
-        Catalog, Namespace, NamespaceIdent, Result, TableCommit, TableCreation, TableIdent,
+        Catalog, Namespace, NamespaceIdent, Result, Runtime, TableCommit, TableCreation, TableIdent,
     };
 
     /// A hook the decorator awaits inside a delegated call.
@@ -31071,6 +31072,7 @@ pub mod test_catalog {
         after_load_table: Option<Hook>,
         gate: Mutex<Option<Gate>>,
         before_update_with_base: Option<Hook>,
+        file_io: Option<FileIO>,
         fired: AtomicBool,
     }
 
@@ -31085,6 +31087,7 @@ pub mod test_catalog {
                     "before_update_with_base",
                     &self.before_update_with_base.is_some(),
                 )
+                .field("file_io", &self.file_io.is_some())
                 .field("fired", &self.fired)
                 .finish()
         }
@@ -31097,6 +31100,7 @@ pub mod test_catalog {
                 after_load_table: None,
                 gate: Mutex::new(None),
                 before_update_with_base: None,
+                file_io: None,
                 fired: AtomicBool::new(false),
             }
         }
@@ -31122,6 +31126,14 @@ pub mod test_catalog {
             Fut: Future<Output = ()> + Send + 'static,
         {
             self.before_update_with_base = Some(Box::new(move || hook().boxed()));
+            self
+        }
+
+        /// Replace the FileIO on every loaded table. Counted integration
+        /// fixtures use this to attribute manifest reads made inside retried
+        /// transaction actions without changing the catalog implementation.
+        pub fn with_file_io(mut self, file_io: FileIO) -> Self {
+            self.file_io = Some(file_io);
             self
         }
 
@@ -31154,7 +31166,20 @@ pub mod test_catalog {
     #[async_trait::async_trait]
     impl Catalog for TestCatalog {
         async fn load_table(&self, table: &TableIdent) -> Result<Table> {
-            let loaded = self.inner.load_table(table).await?;
+            let mut loaded = self.inner.load_table(table).await?;
+            if let Some(file_io) = &self.file_io {
+                let mut builder = Table::builder()
+                    .file_io(file_io.clone())
+                    .metadata(loaded.metadata_ref())
+                    .identifier(loaded.identifier().clone())
+                    .runtime(Runtime::try_current()?)
+                    .readonly(loaded.readonly())
+                    .disable_cache();
+                if let Some(location) = loaded.metadata_location() {
+                    builder = builder.metadata_location(location);
+                }
+                loaded = builder.build()?;
+            }
             if let Some(hook) = &self.after_load_table {
                 hook().await;
             }
