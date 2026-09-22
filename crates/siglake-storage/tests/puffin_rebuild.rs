@@ -64,6 +64,17 @@ fn counter_sum(snapshot: &SnapshotVec, name: &str, label: Option<(&str, &str)>) 
 /// this binary is running a Puffin-indexed text query. Both sides take this
 /// gate. Serializing them costs nothing: the whole file runs in under two
 /// seconds.
+///
+/// The same applies to `inverted_index_decode_counts`, which is likewise
+/// process-global (`third_party/iceberg/src/arrow/reader/pruning.rs`) while
+/// `parsed_inverted_index_cache_stats` beside it is filtered to one warehouse.
+/// A measuring test mixes the two — `consulted = cold_decodes + lookup delta` —
+/// so a decode from any other test landing in its cold window inflates only the
+/// global half and the test fails claiming the warm query consulted fewer files
+/// than the cold one. So the rule is: a test that runs a text query over an
+/// indexed file takes this gate, whether or not it reads a counter itself. Two
+/// did not, and the gate went red on
+/// `repeated_text_query_reuses_the_parsed_footer_index` (left 3, right 4).
 static PUFFIN_QUERY_GATE: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -491,6 +502,15 @@ async fn streaming_recluster_rebuilds_once_and_survives_snapshot_expiry() {
 
 #[tokio::test]
 async fn inram_recluster_keeps_footer_indexes_without_rebuilding_puffin() {
+    // This test ends in a `LIKE` query over footer-indexed files, so it decodes
+    // an inverted index and bumps `INVERTED_INDEX_DECODES`. That counter is
+    // process-global (`inverted_index_decode_counts`), while the cache stats
+    // beside it are filtered to one warehouse, so a decode from here landing
+    // inside a measuring test's cold window inflates that test's `consulted`
+    // arithmetic and nothing else — it reads as "the warm query consulted fewer
+    // files than the cold one". Take the gate even though this test measures no
+    // counters itself.
+    let _gate = PUFFIN_QUERY_GATE.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(&tmp.path().join("warehouse"))
         .await
@@ -1966,6 +1986,10 @@ async fn a_settled_clipped_index_query_cannot_charge_the_next_unindexed_arm() {
 /// covers regardless of where the default sits.
 #[tokio::test]
 async fn explicit_rebuild_opt_out_leaves_streaming_outputs_queryable() {
+    // Ends in a `LIKE` query that can decode an index; see the note on
+    // `inram_recluster_keeps_footer_indexes_without_rebuilding_puffin` for why
+    // a test that measures nothing still has to hold the gate.
+    let _gate = PUFFIN_QUERY_GATE.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(&tmp.path().join("warehouse"))
         .await

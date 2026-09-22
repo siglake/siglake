@@ -81,6 +81,9 @@ starts from a 349-413 MB baseline the corpus build leaves behind, so the 64 and
 delta reads as < 1 MB. Compare the absolute peaks, not the deltas. *needle read*
 is the settled `bytes_data` and wall of `sum(length(raw)) WHERE host =
 'host-needle'`, a host confined to one 4-second window of the ordered output.
+`bytes_data` is fetched bytes at the reader's 1 MiB coalesce default, so this
+column is not a row-group-geometry result on its own; see the #5133 section
+below for where the needle arms' bytes actually go.
 
 ### What the target buys
 
@@ -200,7 +203,8 @@ sweep as "131,072-row groups cost 4x 143,702-row groups" reads a fixture
 coincidence as a law about geometry.
 
 `RG_COALESCE_BYTES=1` is the control: it is the smallest value that survives the
-`.max(1)` in `query_provider.rs`, and it leaves only adjacent ranges merged, so
+`.max(1)` in `query_provider.rs`, and it leaves only ranges that are adjacent or
+one byte apart merged — immaterial for page ranges — so
 `bytes_data` reports what the reader requested. With it, the arms read 473,915 /
 297,904 / 297,904 / 478,482 B. The 32 MiB arm reads 1.6x the 64 MiB arm instead
 of 4x, and lands within 1% of the 256 MiB default instead of 40% above it. What
