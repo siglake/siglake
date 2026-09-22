@@ -6,8 +6,8 @@ description: |
   data-plane pods (ingester, compactor, query-server); per-service
   `enabled` toggles let customers turn off components they don't need.
 type: application
-version: 0.1.1
-appVersion: "0.1.1"
+version: 0.2.0
+appVersion: "0.2.0"
 kubeVersion: ">=1.27.0-0"
 home: https://github.com/siglake/siglake
 sources:

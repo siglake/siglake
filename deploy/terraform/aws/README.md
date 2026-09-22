@@ -80,7 +80,7 @@ terraform output -raw helm_values > /tmp/siglake.values.yaml
 helm install siglake ../../helm/siglake \
   --kube-context "$KUBE_CONTEXT" \
   -n siglake -f /tmp/siglake.values.yaml \
-  --set image.tag=0.1.1 \
+  --set image.tag=0.2.0 \
   --set wal.storageClassName=efs-sc
 ```
 

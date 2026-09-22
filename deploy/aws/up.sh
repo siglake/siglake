@@ -13,7 +13,7 @@
 # Environment overrides:
 #   SIGLAKE_RELEASE       Helm release name (default: siglake)
 #   SIGLAKE_NAMESPACE     k8s namespace     (default: siglake)
-#   SIGLAKE_IMAGE_TAG     image tag to deploy (default: 0.1.1)
+#   SIGLAKE_IMAGE_TAG     image tag to deploy (default: 0.2.0)
 #   SIGLAKE_VALUES_EXTRA  path to additional values file (default: ./config/values.smoke.yaml)
 #   TF_DIR               terraform working dir (default: deploy/terraform/aws)
 #
@@ -29,7 +29,7 @@ CHART_DIR="$ROOT/deploy/helm/siglake"
 
 RELEASE="${SIGLAKE_RELEASE:-siglake}"
 NAMESPACE="${SIGLAKE_NAMESPACE:-siglake}"
-IMAGE_TAG="${SIGLAKE_IMAGE_TAG:-0.1.1}"
+IMAGE_TAG="${SIGLAKE_IMAGE_TAG:-0.2.0}"
 VALUES_EXTRA="${SIGLAKE_VALUES_EXTRA:-$HERE/config/values.smoke.yaml}"
 case "$VALUES_EXTRA" in
   /*) ;;

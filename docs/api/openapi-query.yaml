@@ -7,7 +7,7 @@ info:
     Ingest lives on a separate server (`openapi-ingest.yaml`) — this one only reads, apart from index management and delete tasks.
   license:
     name: Apache-2.0
-  version: 0.1.1
+  version: 0.2.0
 servers:
 - url: http://localhost:8089
   description: Default `--bind` address

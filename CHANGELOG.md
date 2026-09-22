@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+## 0.2.0
+
+The first minor release. This was going to ship as 0.1.1, a patch, but main
+picked up the rebased storage stack and four contract changes on the way, so
+it is a minor bump: 36 changes since the 0.1.1 write-up plus the 15
+that write-up covered, all on top of 0.1.0. Read the upgrade notes before
+rolling a 0.1.0 deployment forward.
+
+Upgrade notes, what changes for an operator:
+
+- The vendored storage stack is rebased: Arrow and Parquet 58, DataFusion 53.1,
+  OpenDAL 0.57, Iceberg 0.10.1 (#745, landed as #1755). The engine reads and
+  writes the same tables; the crates underneath moved a major version each.
+- `siglake wal-recover` plans by default and writes only under `--apply`. A
+  script or runbook that calls the old single-command form stops writing and
+  prints a plan instead (#4973).
+- A novel `(tenant, index)` key past `ingester.maxLanes` is refused with HTTP
+  `503` or gRPC `Unavailable`, no longer `500` / `Internal`; there is no
+  `Retry-After` (#5531).
+- `IcebergContext::recluster_files{,_with}` refuses a bin that spans two
+  partition values on every dispatch. Both shipped planners already group by
+  partition value, so the compactor and the operator behave as before (#4720).
+- Scanning records responses can carry `stats.scan.file_attribution`, and
+  distributed workers must send a bounded attribution header; a missing or
+  malformed header fails the shard (#5727).
+- Four aggregate-maintenance counters and one related counter changed series
+  identity (labelled by Iceberg namespace). Dashboards and alerts keyed on the
+  old series need the new labels; the entries below name them.
+- The workspace version, both chart `version`/`appVersion` pairs, the pinned
+  image tags under `deploy/` and the two OpenAPI documents' `info.version` all
+  read `0.2.0`, and git tag `v0.2.0` publishes image tag `0.2.0`.
+
+The two lists below are in merge order, newest first. The second list is the
+section first written up on 2026-09-16 as 0.1.1; that version was never tagged.
+
 - **WAL recovery observability (chore)**: `siglake_wal_recover_skipped_total`
   and `siglake_wal_recover_unreadable_total` are gone. `wal-recover` is a
   one-shot subcommand that installs no metrics recorder and binds no
@@ -585,18 +620,7 @@
   are unchanged: the tag still says what the release is called, and the
   revision now says what is in it. (#4557)
 
-## 0.1.1
-
-Thirteen changes on top of 0.1.0. Nothing about the on-disk format or the HTTP
-surface moves, and a 0.1.0 warehouse is read and written unchanged: one values
-key and six environment knobs are added, and no flag or values key is removed.
-Two defaults move. The audit worker now gives each append 30 s instead of
-awaiting it forever, and every process except the query server budgets zero for
-the two text-index caches — a ceiling rather than a behaviour, since those
-processes were already holding nothing in them. The
-workspace version, both chart `version`/`appVersion` pairs, the pinned image
-tags under `deploy/` and the two OpenAPI documents' `info.version` all read
-`0.1.1`, and git tag `v0.1.1` publishes image tag `0.1.1`.
+### The 15 changes first written up as 0.1.1
 
 - **Recovery**: `siglake wal-recover --from <url> --to <wal-root>` restores the
   segments under the URL's path. It built its object store rooted at the whole
@@ -854,6 +878,7 @@ tags under `deploy/` and the two OpenAPI documents' `info.version` all read
   compatibility surface that was removed in 2026-06. The middleware is named in
   three shipped `429` descriptions, so `docs/api/openapi-ingest.yaml` is
   regenerated. No runtime behaviour changes. (#4569)
+
 ## 0.1.0 — initial public release
 
 siglake: a horizontally-scalable, OTLP-native log analytics platform on
