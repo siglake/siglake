@@ -4,6 +4,15 @@
 
 ## 0.2.0
 
+Release-note correction, 2026-09-22: two more warning alerts shipped in this
+release. `SiglakeAutoPromotionNearCeiling` fires when an enabled table's
+auto-promoted columns reach at least 80% of its limit for 10 minutes.
+`SiglakeBatchReconciliationBacklogStalled` fires when a query pod has finished
+batch jobs whose terminal state remains unpersisted for 15 seconds. The
+executor is still retrying those rows; restore the shared job store and
+inspect the reconciliation errors. These alerts were present in the tagged
+chart and do not require a new engine release.
+
 The first minor release. This was going to ship as 0.1.1, a patch, but main
 picked up the rebased storage stack and four contract changes on the way, so
 it is a minor bump: 36 changes since the 0.1.1 write-up plus the 15
