@@ -68,13 +68,15 @@ fn counter_sum(snapshot: &SnapshotVec, name: &str, label: Option<(&str, &str)>) 
 /// The same applies to `inverted_index_decode_counts`, which is likewise
 /// process-global (`third_party/iceberg/src/arrow/reader/pruning.rs`) while
 /// `parsed_inverted_index_cache_stats` beside it is filtered to one warehouse.
-/// A measuring test mixes the two — `consulted = cold_decodes + lookup delta` —
-/// so a decode from any other test landing in its cold window inflates only the
-/// global half and the test fails claiming the warm query consulted fewer files
-/// than the cold one. So the rule is: a test that runs a text query over an
-/// indexed file takes this gate, whether or not it reads a counter itself. Two
-/// did not, and the gate went red on
-/// `repeated_text_query_reuses_the_parsed_footer_index` (left 3, right 4).
+/// `clipped_text_limit_shapes_decline_the_whole_file_index`,
+/// `a_settled_clipped_index_query_cannot_charge_the_next_unindexed_arm` and the
+/// `report_*` measurements attribute that global counter to their own
+/// executions, and a decode from anywhere else inside their window is charged
+/// to them. So the rule is: a test that runs a text query over an indexed file
+/// takes this gate, whether or not it reads a counter itself. Two did not, and
+/// the gate went red on `repeated_text_query_reuses_the_parsed_footer_index`
+/// (left 3, right 4) — #5811 then took the global counter out of the two
+/// reuse tests' arithmetic, so a lapse in the rule can no longer reach them.
 static PUFFIN_QUERY_GATE: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -504,12 +506,10 @@ async fn streaming_recluster_rebuilds_once_and_survives_snapshot_expiry() {
 async fn inram_recluster_keeps_footer_indexes_without_rebuilding_puffin() {
     // This test ends in a `LIKE` query over footer-indexed files, so it decodes
     // an inverted index and bumps `INVERTED_INDEX_DECODES`. That counter is
-    // process-global (`inverted_index_decode_counts`), while the cache stats
-    // beside it are filtered to one warehouse, so a decode from here landing
-    // inside a measuring test's cold window inflates that test's `consulted`
-    // arithmetic and nothing else — it reads as "the warm query consulted fewer
-    // files than the cold one". Take the gate even though this test measures no
-    // counters itself.
+    // process-global (`inverted_index_decode_counts`), so a decode from here
+    // landing inside the window of a test that attributes it — the declined and
+    // settled shapes, and the measurements — is charged to that test. Take the
+    // gate even though this test measures no counters itself.
     let _gate = PUFFIN_QUERY_GATE.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(&tmp.path().join("warehouse"))
@@ -745,20 +745,27 @@ async fn footer_text_fixture(
 ///
 /// THE DEFECT THIS GUARDS. Repeat the same text query over footer-indexed
 /// files and the second execution must deserialize nothing: the entry count
-/// stays put while the lookups it served grow, and the process's decode
-/// counter does not move. One entry per file is the key-separation half — a
-/// key that collapsed the files onto each other would leave a single entry and
-/// wrong rows. (The column half of the key is a fork unit test,
-/// `parsed_index_cache_keys_separate_storage_shapes_files_and_columns`: the
-/// events table indexes `raw` alone.)
+/// stays put while the lookups it served grow. One entry per file is the
+/// key-separation half — a key that collapsed the files onto each other would
+/// leave a single entry and wrong rows. (The column half of the key is a fork
+/// unit test, `parsed_index_cache_keys_separate_storage_shapes_files_and_columns`:
+/// the events table indexes `raw` alone.)
+///
+/// Every number here is read from `parsed_inverted_index_cache_stats`, which is
+/// filtered to this test's warehouse; #5811 removed the process-global decode
+/// counter this used to mix in, and the foreign decode below is the standing
+/// check that it stays out.
 ///
 /// Run it with `SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES=0` for the pre-change
-/// arm, where every execution decodes again and the warm assertions fail.
+/// arm, where every execution decodes again, nothing stays resident and the
+/// first residency assertion fails on 0 entries against the file count.
 #[tokio::test]
 async fn repeated_text_query_reuses_the_parsed_footer_index() {
     use chrono::{Duration, TimeZone, Utc};
 
-    // This test attributes a process-wide decode counter to its own queries.
+    // Nothing here reads a process-global counter, but this test's own queries
+    // land in the global windows the tests listed on `PUFFIN_QUERY_GATE` still
+    // measure, so it holds the gate from the other side.
     let _gate = PUFFIN_QUERY_GATE.lock().await;
 
     let base = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
@@ -776,6 +783,12 @@ async fn repeated_text_query_reuses_the_parsed_footer_index() {
     let warehouse = tmp.path().join("indexed");
     let indexed = footer_text_fixture(&warehouse, true, &events).await;
     let control = footer_text_fixture(&tmp.path().join("control"), false, &events).await;
+    // A second indexed warehouse, queried inside the measured window below: it
+    // does to the shared cache what another test in this binary does, in this
+    // thread and without waiting for an interleaving. Same events chunked the
+    // same way, so it has the same file count.
+    let foreign_warehouse = tmp.path().join("foreign");
+    let foreign = footer_text_fixture(&foreign_warehouse, true, &events).await;
 
     let table = indexed
         .catalog()
@@ -806,35 +819,74 @@ async fn repeated_text_query_reuses_the_parsed_footer_index() {
         .register_with_datafusion(&control_ctx)
         .await
         .unwrap();
+    let foreign_ctx = SessionContext::new();
+    foreign
+        .register_with_datafusion(&foreign_ctx)
+        .await
+        .unwrap();
 
     // Data-file paths under this warehouse only: other tests in this binary
-    // query their own warehouses.
+    // query their own warehouses. An admission under this prefix is a decode
+    // this test's queries paid for: the fixture runs on the default gigabyte
+    // budget, its key is per file and per column, and its handful of entries
+    // stays far below the 128-entry bound, so a decode always admits and
+    // nothing of ours is evicted. `entries == files.len()` below is what holds
+    // that condition to account.
     let warehouse = warehouse.to_string_lossy().to_string();
+    let foreign_warehouse = foreign_warehouse.to_string_lossy().to_string();
     let cache_stats = || iceberg::arrow::parsed_inverted_index_cache_stats(&warehouse);
-    let decodes = || iceberg::arrow::inverted_index_decode_counts().0;
+    let foreign_stats = || iceberg::arrow::parsed_inverted_index_cache_stats(&foreign_warehouse);
     assert_eq!(
         cache_stats(),
         (0, 0),
         "nothing cached before the first query"
     );
+    assert_eq!(foreign_stats(), (0, 0), "nor under the foreign warehouse");
 
     for (position, term) in ["rareneedle", "common", "absentterm"].iter().enumerate() {
         let expected = text_rows(&control_ctx, term).await;
 
-        let before_decodes = decodes();
-        let (_, before_lookups) = cache_stats();
+        let (before_entries, before_lookups) = cache_stats();
         let cold = text_rows(&ctx, term).await;
-        let cold_decodes = decodes() - before_decodes;
         let (entries, cold_lookups) = cache_stats();
+        assert_eq!(
+            entries,
+            files.len(),
+            "{term}: every file's index must be resident and none evicted, or an \
+             admission count is not a decode count"
+        );
+        if position == 0 {
+            // Inside the measured window, on purpose: another warehouse's
+            // indexes decode here, which is what an ungated test's concurrent
+            // query did to #5133's gate run. A process-global decode counter
+            // read where `cold_decodes` is taken below charges them to
+            // `consulted`, and the warm query then reads as having consulted
+            // fewer files than the cold one.
+            assert_eq!(text_rows(&foreign_ctx, "rareneedle").await.len(), 12);
+            let (foreign_entries, foreign_lookups) = foreign_stats();
+            assert_eq!(
+                (foreign_entries, foreign_lookups),
+                (files.len(), 0),
+                "the foreign query must decode its own files inside this window"
+            );
+            assert_eq!(
+                cache_stats(),
+                (entries, cold_lookups),
+                "a foreign warehouse's decode must leave this warehouse's \
+                 statistics alone"
+            );
+        }
+        // Files this warehouse admitted to the cache during the cold execution,
+        // which under the condition just asserted is the count it decoded.
+        let cold_decodes = entries - before_entries;
 
         let warm = text_rows(&ctx, term).await;
-        let warm_decodes = decodes() - before_decodes - cold_decodes;
         let (warm_entries, warm_lookups) = cache_stats();
 
         // Files whose index the cold execution actually consulted — decoded or
         // read from the cache. A term the file-level trigram bloom rules out
         // never reaches the index, and then neither execution looks one up.
-        let consulted = cold_decodes + (cold_lookups - before_lookups);
+        let consulted = cold_decodes as u64 + (cold_lookups - before_lookups);
 
         assert_eq!(
             cold, expected,
@@ -845,12 +897,9 @@ async fn repeated_text_query_reuses_the_parsed_footer_index() {
             "warm {term} result diverged from the control"
         );
         assert_eq!(
-            warm_decodes, 0,
-            "the warm {term} query must not hex-decode and parse a footer index again"
-        );
-        assert_eq!(
             warm_entries, entries,
-            "the warm {term} query must reuse the cached indexes, not decode new ones"
+            "the warm {term} query must reuse the cached indexes, not hex-decode \
+             and parse a footer index again"
         );
         assert_eq!(
             warm_lookups - cold_lookups,
@@ -863,7 +912,7 @@ async fn repeated_text_query_reuses_the_parsed_footer_index() {
             // per file, which is what every execution used to pay.
             assert_eq!(
                 cold_decodes,
-                files.len() as u64,
+                files.len(),
                 "{term}: the first query parses each file's footer index exactly once"
             );
             assert_eq!(
@@ -1500,7 +1549,9 @@ fn raw_column_from_batches(batches: &[arrow_array::RecordBatch]) -> Vec<String> 
 async fn unordered_text_limit_shapes_keep_the_index_and_parse_it_once() {
     use chrono::{Duration, TimeZone, Utc};
 
-    // This test attributes a process-wide decode counter to its own queries.
+    // Nothing here reads a process-global counter since #5811, but this test's
+    // own queries land in the global windows the tests listed on
+    // `PUFFIN_QUERY_GATE` still measure, so it holds the gate from that side.
     let _gate = PUFFIN_QUERY_GATE.lock().await;
 
     let base = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
@@ -1601,10 +1652,12 @@ async fn unordered_text_limit_shapes_keep_the_index_and_parse_it_once() {
     ];
 
     // Statistics paths under this warehouse only: other tests in this binary
-    // query their own warehouses.
+    // query their own warehouses. An admission under this prefix is a decode
+    // these shapes paid for — default gigabyte budget, one key per file, three
+    // entries against the 128-entry bound — and the residency assertion in the
+    // loop is what holds that condition to account.
     let warehouse = warehouse.to_string_lossy().to_string();
     let cache_stats = || iceberg::arrow::parsed_inverted_index_cache_stats(&warehouse);
-    let decodes = || iceberg::arrow::inverted_index_decode_counts().0;
     assert_eq!(
         cache_stats(),
         (0, 0),
@@ -1619,13 +1672,16 @@ async fn unordered_text_limit_shapes_keep_the_index_and_parse_it_once() {
             expected.len()
         );
 
-        let before_decodes = decodes();
-        let (_, before_lookups) = cache_stats();
+        let (before_entries, before_lookups) = cache_stats();
         let cold = raw_column(&ctx, sql).await;
-        let cold_decodes = decodes() - before_decodes;
         let (entries, cold_lookups) = cache_stats();
+        assert_eq!(
+            entries, TEXT_SHAPE_FILES,
+            "{name}: every file's index must be resident and none evicted, or an \
+             admission count is not a decode count"
+        );
+        let cold_decodes = (entries - before_entries) as u64;
         let warm = raw_column(&ctx, sql).await;
-        let warm_decodes = decodes() - before_decodes - cold_decodes;
         let (warm_entries, warm_lookups) = cache_stats();
 
         assert_eq!(
@@ -1643,12 +1699,9 @@ async fn unordered_text_limit_shapes_keep_the_index_and_parse_it_once() {
              each planned file, once per file"
         );
         assert_eq!(
-            warm_decodes, 0,
-            "{name}: repeating the shape must not deserialize an index again"
-        );
-        assert_eq!(
             warm_entries, entries,
-            "{name}: the warm execution must reuse the cached indexes"
+            "{name}: the warm execution must reuse the cached indexes, not \
+             deserialize an index again"
         );
         if position == 0 {
             // Nothing is cached yet, so this one execution pays the whole-index
@@ -1660,10 +1713,6 @@ async fn unordered_text_limit_shapes_keep_the_index_and_parse_it_once() {
             assert_eq!(
                 cold_lookups, before_lookups,
                 "{name}: a decode is not a cache hit"
-            );
-            assert_eq!(
-                entries, TEXT_SHAPE_FILES,
-                "{name}: one cached index per file"
             );
         } else {
             assert_eq!(
