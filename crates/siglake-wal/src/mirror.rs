@@ -2135,10 +2135,13 @@ pub async fn plan_recovery(op: &Operator, prefix: &str, wal_root: &Path) -> Resu
             }
         }
     }
-    if skipped > 0 {
-        metrics::counter!("siglake_wal_recover_skipped_total").increment(skipped as u64);
-    }
-
+    // No counter is charged here, and none is charged for the unreadable
+    // bodies below (#5246). `wal-recover` runs as a one-shot CLI subcommand
+    // that installs no metrics recorder and binds no `/metrics`, so an
+    // increment went into the no-op global recorder and was discarded at exit.
+    // What an operator can read is the `RecoveryPlan`/`RecoverySummary` counts
+    // in the printed report and the per-object WARN events, which the CLI's
+    // stderr layer always prints and its opt-in OTel log export ships.
     // Contradiction wins over confirmation: a listing holding markers at two
     // depths is not a mirror root under either reading, and the misplaced one
     // is the evidence that `--from` is too high.
@@ -2214,10 +2217,6 @@ pub async fn plan_recovery(op: &Operator, prefix: &str, wal_root: &Path) -> Resu
     // the same sequence.
     work.sort_by(|a, b| a.key.cmp(&b.key));
     unreadable.sort_by(|a, b| a.key.cmp(&b.key));
-    if !unreadable.is_empty() {
-        metrics::counter!("siglake_wal_recover_unreadable_total")
-            .increment(unreadable.len() as u64);
-    }
     Ok(RecoveryPlan {
         groups: by_dest.into_values().collect(),
         skipped,
@@ -2386,7 +2385,8 @@ pub async fn apply_plan(
             summary
                 .sample_unreadable_key
                 .get_or_insert_with(|| selected_key.clone());
-            metrics::counter!("siglake_wal_recover_unreadable_total").increment(1);
+            // The WARN below and `summary.unreadable` are the whole record of
+            // this refusal: see the note in `plan_recovery` (#5246).
             tracing::warn!(
                 key = %selected_key,
                 error = %format!("{e:#}"),
