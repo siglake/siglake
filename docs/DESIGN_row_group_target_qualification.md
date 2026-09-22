@@ -148,9 +148,12 @@ The batch is parquet's own `DEFAULT_BATCH_SIZE` of 1,024, not DataFusion's
 8,192: the fork calls `with_batch_size` only when siglake configured one
 (`third_party/iceberg/src/arrow/reader/pipeline.rs`), and nothing here sets
 `QueryScanTuning::batch_size`. On this layout the distinction does not move a
-byte — the page rows the index selects are already batch-aligned at both sizes —
-but the model has to name the right one to stay right on another geometry.
-From the merged output's offset index, with the fetches traced:
+byte, but not because the expansion is a no-op: pages here run ~20,000 rows and
+are not batch-aligned, so both 1,024 and 8,192 widen the request past both edges
+of the selected page and both land on exactly one neighbouring page either side.
+A geometry with smaller pages would separate them, which is why the model has to
+name the right one. From the merged output's offset index, with the fetches
+traced:
 
 | arm | rows/rg | needle lands on | `host` asked / fetched | `raw` asked / fetched | `bytes_data` |
 |---|---|---|---|---|---|
@@ -169,12 +172,17 @@ first:
 * **The coalescer charges the gap.** A column chunk's dictionary page sits at
   the chunk start and the reader always asks for it, so a needle on page *k*
   leaves pages 0..k-1 between the dictionary request and the page request.
-  Under 1 MiB of gap the two merge into one fetch. At 32 MiB the needle is on
-  `raw` page 5 and `host` page 4, so the gaps are `raw` pages 0..4 (617,805 B)
-  and `host` pages 0..3 (85,291 B): 703,096 B, 59% of everything the arm was
-  charged. At 256 MiB the `raw` gap is 2.54 MB and stays split, while the `host`
-  gap — pages 0..13 below the needle's page 14, 367,137 B, 44% of the arm —
-  merges.
+  Under 1 MiB of gap the two merge into one fetch. At 32 MiB the gaps are `raw`
+  pages 0..4 (617,805 B) and `host` pages 0..2 (85,291 B): 703,096 B, 59% of
+  everything the arm was charged. At 256 MiB the `raw` gap is 2.54 MB and stays
+  split, while the `host` gap — pages 0..12, 367,137 B, 44% of the arm — merges.
+  The `host` gap stops one page short of the needle's own page because the
+  batch expansion above widens the predicate request past both edges of the
+  page the index picked: page boundaries are not batch-aligned, so the needle's
+  `host` page 4 (page 14 at 256 MiB) is requested as pages 3..5 (13..15), four
+  ranges counting the dictionary. That is visible in the control, where those
+  three adjacent page ranges merge to one fetch and the dictionary stays its
+  own: `4 ranges -> 2`.
   At 128 and 64 MiB the needle is on page 0 of both chunks and there is no gap
   at all.
 * **`raw` page 0 is a fifth the size of a PLAIN page.** The corpus's `raw`
