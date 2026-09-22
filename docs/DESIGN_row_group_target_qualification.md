@@ -176,15 +176,14 @@ first:
   pages 0..4 (617,805 B) and `host` pages 0..2 (85,291 B): 703,096 B, 59% of
   everything the arm was charged. At 256 MiB the `raw` gap is 2.54 MB and stays
   split, while the `host` gap — pages 0..12, 367,137 B, 44% of the arm — merges.
-  The `host` gap stops one page short of the needle's own page because the
-  batch expansion above widens the predicate request past both edges of the
+  At 128 and 64 MiB the needle is on page 0 of both chunks and there is no gap
+  at all. The `host` gap stops one page short of the needle's own page because
+  the batch expansion above widens the predicate request past both edges of the
   page the index picked: page boundaries are not batch-aligned, so the needle's
   `host` page 4 (page 14 at 256 MiB) is requested as pages 3..5 (13..15), four
-  ranges counting the dictionary. That is visible in the control, where those
-  three adjacent page ranges merge to one fetch and the dictionary stays its
-  own: `4 ranges -> 2`.
-  At 128 and 64 MiB the needle is on page 0 of both chunks and there is no gap
-  at all.
+  ranges counting the dictionary. The control shows it directly — those three
+  adjacent page ranges merge to one fetch and the dictionary stays its own,
+  `4 ranges -> 2`.
 * **`raw` page 0 is a fifth the size of a PLAIN page.** The corpus's `raw`
   values are near-unique, so the dictionary reaches the writer's 1 MiB
   uncompressed limit inside the first page and the column falls back to PLAIN:
