@@ -160,17 +160,21 @@ From the merged output's offset index, with the fetches traced:
 | 32 MiB | 131,072 | rg 6 row 88,568, `raw` page 5 of 8 | 89,436 / 174,727 | 389,046 / 1,006,851 | 1,181,578 |
 
 The fetched columns sum to the measured `bytes_data` to the byte in all four
-arms; `audit_needle_pages` in the fixture reconstructs the two fetches from the
-offset index and prints the prediction next to the measurement. Two mechanisms
-produce the spread, larger first:
+arms, and in all four again under the control below — eight agreements, which is
+what makes this an accounting and not a story. `audit_needle_pages` in the
+fixture reconstructs the two fetches from the offset index and prints the
+prediction next to the measurement. Two mechanisms produce the spread, larger
+first:
 
 * **The coalescer charges the gap.** A column chunk's dictionary page sits at
   the chunk start and the reader always asks for it, so a needle on page *k*
   leaves pages 0..k-1 between the dictionary request and the page request.
-  Under 1 MiB of gap the two merge into one fetch. At 32 MiB the gaps are `raw`
-  pages 0..4 (617,805 B) and `host` pages 0..2 (85,291 B): 703,096 B, 59% of
-  everything the arm was charged. At 256 MiB the `raw` gap is 2.54 MB and stays
-  split, while the `host` gap — pages 0..12, 367,137 B, 44% of the arm — merges.
+  Under 1 MiB of gap the two merge into one fetch. At 32 MiB the needle is on
+  `raw` page 5 and `host` page 4, so the gaps are `raw` pages 0..4 (617,805 B)
+  and `host` pages 0..3 (85,291 B): 703,096 B, 59% of everything the arm was
+  charged. At 256 MiB the `raw` gap is 2.54 MB and stays split, while the `host`
+  gap — pages 0..13 below the needle's page 14, 367,137 B, 44% of the arm —
+  merges.
   At 128 and 64 MiB the needle is on page 0 of both chunks and there is no gap
   at all.
 * **`raw` page 0 is a fifth the size of a PLAIN page.** The corpus's `raw`
