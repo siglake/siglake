@@ -28,6 +28,39 @@ reachable set and the existing `min_age` rule controls deletion. The GC report
 includes the retirement classification, and
 `siglake_iceberg_statistics_removed_total` counts committed removals.
 
+### Retained-manifest cost qualification
+
+Task #5261 measured the retirement walk with a counted local FileIO fixture in
+the unoptimized test profile (2026-09-22, one run per shape). The counts cover
+only manifest-list and manifest Avro reads made by retirement; catalog reads,
+Puffin/data reads and orphan GC's later reachability walk are excluded.
+
+| shape | retirement attempts (requests / bytes) | wall time |
+|---|---:|---:|
+| no statistics | none (fast path) | 1.558 ms |
+| one live snapshot, all unowned | 2 / 5,918 | 4.711 ms |
+| one live snapshot, all live | 2 / 5,906 | 4.396 ms |
+| one retained snapshot, two obsolete owned + one live | 5 / 19,320 | 13.650 ms |
+| retain-last=100, forced catalog retry | 202 / 1,540,735; 203 / 1,563,261 | 754.041 ms total |
+
+The retain-last=100 fixture starts with snapshots eligible for expiry, then
+lands an append in the first conditional-update window. The retry therefore
+re-evaluates retirement against a refreshed base and adds one manifest list
+and one distinct manifest. Within each attempt, request count equals distinct
+path count: the walk reads shared manifests once. For comparison, orphan GC's
+separate reachability walk over the resulting table made 5,450 requests for
+24,007,756 bytes across the same 203 distinct Avro paths and took 11.960 s; it
+rereads manifests shared by retained snapshots.
+
+**Disposition: keep the retirement walk and its defaults.** The walk is the
+proof that an owned statistics entry has no live reference, and its existing
+distinct-manifest set reduces the normal shape from 5,450 reads to about 203.
+The no-statistics path already avoids manifest IO. The remaining disposition
+cases cost 4-14 ms in this fixture, while skipping the walk for a known foreign
+entry would help only the all-unowned case and would add a second classification
+path. These local test-profile times are qualification numbers, not object-store
+latency estimates.
+
 ## Why hand-rolled
 
 We own the vendored `iceberg` fork and do **not** wait on an upstream
