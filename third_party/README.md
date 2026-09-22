@@ -88,7 +88,11 @@ Upstream base: 0.10.1. Key divergences:
   `#[tokio::main]` doctests need, are a `[dev-dependencies.tokio]` entry
   instead. `scripts/check-fork-tests.sh` runs this fork's doctests, so a doc
   example that needs a dev-dependency the manifest does not declare fails the
-  gate.
+  gate. `metrics-util` is a dev-dependency for the same reason: the
+  parsed-index cache emits its eviction counter through `metrics`, and
+  `arrow/reader/pruning.rs`'s bound tests read it back through a thread-local
+  `DebuggingRecorder` (#4428), as `iceberg-storage-opendal` already does for
+  the write-path gauges.
 
 ### Running the fork's own unit tests
 
