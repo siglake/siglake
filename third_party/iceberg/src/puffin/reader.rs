@@ -260,6 +260,13 @@ fn blob_cache_put(key: BlobKey, bytes: Arc<[u8]>) {
         .put(key, bytes, max_entries, max_bytes);
 }
 
+/// Drop every cached blob, including the admission counter the protection
+/// window is measured against, so the next entry is admitted into an empty
+/// cache rather than one still holding an earlier budget's blobs.
+pub(crate) fn clear_puffin_blob_cache() {
+    *blob_cache().lock().unwrap() = BlobCache::default();
+}
+
 pub(crate) fn puffin_blob_cache_stats(path_substring: &str) -> (usize, usize, usize) {
     let cache = blob_cache().lock().unwrap();
     let (entries, bytes) = cache

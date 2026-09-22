@@ -86,6 +86,19 @@ pub fn clear_text_index_cache_max_bytes() {
     set_text_index_cache_max_bytes(TEXT_INDEX_CACHE_UNCONFIGURED, TEXT_INDEX_CACHE_UNCONFIGURED);
 }
 
+/// Empty both text-index caches: the parsed indexes and the serialized Puffin
+/// blobs they were decoded from.
+///
+/// [`clear_text_index_cache_max_bytes`] only drops the overrides. Both bounds
+/// are enforced on insert, so entries admitted under an earlier budget stay
+/// resident under a smaller one and are still counted by the process-wide
+/// [`parsed_inverted_index_cache_footprint`]. A test that reads one warehouse's
+/// occupancy off that figure needs both.
+pub fn clear_text_index_caches() {
+    clear_parsed_inverted_index_cache();
+    crate::puffin::clear_puffin_blob_cache();
+}
+
 fn configured_cache_bytes(
     configured: &std::sync::atomic::AtomicU64,
     raw: Option<&str>,

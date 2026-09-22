@@ -50,8 +50,8 @@ pub use metadata::{BlobMetadata, CREATED_BY_PROPERTY, FileMetadata};
 mod reader;
 pub use reader::{BlobRangeReader, PuffinReader};
 pub(crate) use reader::{
-    PUFFIN_BLOB_CACHE_DROP_REASONS, PUFFIN_BLOB_CACHE_OUTCOMES, puffin_blob_cache_stats,
-    puffin_blob_fetch_counts,
+    PUFFIN_BLOB_CACHE_DROP_REASONS, PUFFIN_BLOB_CACHE_OUTCOMES, clear_puffin_blob_cache,
+    puffin_blob_cache_stats, puffin_blob_fetch_counts,
 };
 
 mod writer;
