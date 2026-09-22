@@ -27,7 +27,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -49,36 +49,37 @@ use siglake_storage::iceberg::{
 mod fixture_clock;
 use fixture_clock::fixture_base;
 
-/// Peak live heap bytes between [`start_tracking`] and [`peak_tracked`].
+/// Live heap bytes, counted from process start, and their peak over a
+/// measurement window.
 ///
-/// A test-only wrapper around the system allocator. Tracking is off unless a
-/// test turns it on, and every test in this binary holds [`SIZE_GATE_TESTS`]
-/// while it does, so the number belongs to one arm of one A/B.
+/// `LIVE` is maintained unconditionally so that a window has a real starting
+/// live-heap figure to measure against. Every test in this binary holds
+/// [`SIZE_GATE_TESTS`] while it measures, so a window belongs to one arm of one
+/// A/B.
 struct PeakTracking;
 
 static TRACKING: AtomicBool = AtomicBool::new(false);
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
+static LIVE: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicIsize = AtomicIsize::new(0);
 
 unsafe impl GlobalAlloc for PeakTracking {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() && TRACKING.load(Ordering::Relaxed) {
-            let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK.fetch_max(live, Ordering::Relaxed);
+        if !ptr.is_null() {
+            let size = layout.size() as isize;
+            let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
+            if TRACKING.load(Ordering::Relaxed) {
+                PEAK.fetch_max(live, Ordering::Relaxed);
+            }
         }
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if TRACKING.load(Ordering::Relaxed) {
-            // Saturating, not wrapping: tracking starts mid-process, so some
-            // of what is freed here was allocated before LIVE existed. A
-            // wrapping subtraction would make PEAK meaningless.
-            let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
-                Some(live.saturating_sub(layout.size()))
-            });
-        }
+        // Signed, and never clamped: every allocation this process makes passes
+        // through `alloc` above first, so the counter is symmetric. A clamp
+        // would silently absorb the one thing that would prove it is not.
+        LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -86,15 +87,61 @@ unsafe impl GlobalAlloc for PeakTracking {
 #[global_allocator]
 static ALLOCATOR: PeakTracking = PeakTracking;
 
-fn start_tracking() {
-    LIVE.store(0, Ordering::Relaxed);
-    PEAK.store(0, Ordering::Relaxed);
-    TRACKING.store(true, Ordering::Relaxed);
+/// An open live-heap measurement window: what was live when it opened.
+#[derive(Clone, Copy, Debug)]
+struct HeapWindow {
+    baseline: isize,
 }
 
-fn peak_tracked() -> usize {
-    TRACKING.store(false, Ordering::Relaxed);
-    PEAK.load(Ordering::Relaxed)
+/// What one window saw.
+#[derive(Clone, Copy, Debug)]
+struct HeapReading {
+    /// Live heap when the window opened.
+    baseline: usize,
+    /// The largest live heap seen inside the window.
+    peak: usize,
+    /// `peak - baseline`: what the measured work added over existing live heap.
+    above_baseline: usize,
+}
+
+fn start_tracking() -> HeapWindow {
+    let baseline = LIVE.load(Ordering::Relaxed);
+    PEAK.store(baseline, Ordering::Relaxed);
+    TRACKING.store(true, Ordering::Relaxed);
+    HeapWindow { baseline }
+}
+
+impl HeapWindow {
+    fn finish(self) -> HeapReading {
+        TRACKING.store(false, Ordering::Relaxed);
+        let peak = PEAK.load(Ordering::Relaxed);
+        HeapReading {
+            baseline: self.baseline.max(0) as usize,
+            peak: peak.max(0) as usize,
+            above_baseline: (peak - self.baseline).max(0) as usize,
+        }
+    }
+}
+
+#[test]
+fn heap_window_accounts_for_freeing_a_preexisting_allocation() {
+    let (_guard, _snapshotter) = setup();
+    let old_layout = Layout::from_size_align(1024 * 1024, 8).unwrap();
+    let new_layout = Layout::from_size_align(2 * 1024 * 1024, 8).unwrap();
+
+    // Use the global allocator directly so no unrelated allocation lands in
+    // the window. The first block deliberately predates it.
+    let old = unsafe { std::alloc::alloc(old_layout) };
+    assert!(!old.is_null());
+    let window = start_tracking();
+    unsafe { std::alloc::dealloc(old, old_layout) };
+    let new = unsafe { std::alloc::alloc(new_layout) };
+    assert!(!new.is_null());
+    let reading = window.finish();
+    unsafe { std::alloc::dealloc(new, new_layout) };
+
+    assert_eq!(reading.peak, reading.baseline + 1024 * 1024);
+    assert_eq!(reading.above_baseline, 1024 * 1024);
 }
 
 /// Serialises this binary's tests: they share the metrics recorder and the
@@ -658,8 +705,8 @@ fn a_guard_failure_mid_write_commits_no_partial_deletion() {
 /// What one sweep of [`sweep_peak`] measured.
 #[derive(Debug, Clone, Copy)]
 struct SweepPeak {
-    /// Peak live heap between the start and the end of the delete sweep.
-    peak: usize,
+    /// Baseline, peak live heap, and peak growth during the delete sweep.
+    heap: HeapReading,
     /// `get_array_memory_size` of the appended batch — the decoded size of the
     /// one candidate the sweep rewrites.
     decoded: usize,
@@ -677,7 +724,7 @@ struct SweepPeak {
     /// Rows in the rewrite output's first row group, and how many groups it
     /// wrote: what the byte target resolved to for this fixture's rows. The
     /// open row group is what the arm buffers decoded, so this is the number
-    /// [`Self::peak`] is supposed to follow.
+    /// [`HeapReading::above_baseline`] is supposed to follow.
     first_row_group: usize,
     row_groups: usize,
 }
@@ -752,9 +799,9 @@ async fn sweep_peak(
         .await
         .unwrap();
 
-    start_tracking();
+    let heap_window = start_tracking();
     let outcome = ice.execute_delete_tasks("logs").await.unwrap();
-    let peak = peak_tracked();
+    let heap = heap_window.finish();
 
     let survivors = rows.div_ceil(survivor_in_n);
     assert_eq!(outcome.tasks_completed, 1, "{outcome:?}");
@@ -767,7 +814,7 @@ async fn sweep_peak(
     assert_eq!(count_index_rows(&ice, "logs", None).await, survivors as i64);
     let groups = index_output_row_groups(&ice, "logs").await;
     SweepPeak {
-        peak,
+        heap,
         decoded,
         decoded_slice,
         file_bytes,
@@ -787,31 +834,34 @@ async fn sweep_peak(
 ///     measure_peak_allocation_per_arm -- --ignored --nocapture
 /// ```
 ///
-/// What it records is net heap growth across one delete sweep, per arm, over
-/// ONE candidate file — [`sweep_peak`] asserts the fixture is one, which is
-/// the correction #4703 made. Measured 2026-09-16, debug build, 1 KiB of raw
-/// text per row (~1,200 B decoded), half the rows deleted:
+/// What it records is peak live heap above the heap already live when each
+/// delete sweep starts, per arm, over ONE candidate file — [`sweep_peak`]
+/// asserts the fixture is one, which is the correction #4703 made. Corrected
+/// 2026-09-22 after replacing the reset-to-zero counter with a continuous live
+/// counter; debug build, 1 KiB of raw text per row (~1,200 B decoded), half the
+/// rows deleted:
 ///
 /// ```text
-/// rows    file     decoded   survivors   in-RAM peak   streaming peak
-/// 16 Ki   113 KB   19.7 MB     9.8 MB       54.2 MB          27.4 MB
-/// 32 Ki   222 KB   39.3 MB    19.7 MB       95.1 MB          36.9 MB
-/// 64 Ki   443 KB   78.7 MB    39.3 MB      187.8 MB          55.7 MB
-/// 64 Ki   443 KB   78.7 MB     9.8 MB            —           28.1 MB   (⅛ survive)
+/// rows    file     decoded   survivors   in-RAM above baseline   streaming above baseline
+/// 16 Ki   113 KB   19.7 MB     9.8 MB                 53.9 MB                      27.1 MB
+/// 32 Ki   222 KB   39.3 MB    19.7 MB                 94.4 MB                      36.4 MB
+/// 64 Ki   443 KB   78.7 MB    39.3 MB                184.4 MB                      55.0 MB
+/// 64 Ki   443 KB   78.7 MB     9.8 MB                       —                      27.8 MB   (⅛ survive)
 /// ```
 ///
-/// WHAT THE STREAMING ARM HOLDS, per decoded byte: **0.96 of its OUTPUT, plus
-/// a fixed ~18 MB**, and nothing per decoded byte of its input. The fit is
-/// `peak ≈ 0.96 × survivor_decoded + 18.0 MB` — 0.05% off at 32 Ki, 2.7% at
-/// the fourth row. The fourth row is the one that separates input from output:
+/// WHAT THE STREAMING ARM HOLDS, per decoded byte: **0.94 of its OUTPUT, plus
+/// a fixed ~17.8 MB**, and nothing per decoded byte of its input. The fit is
+/// `peak above baseline ≈ 0.94 × survivor_decoded + 17.8 MB`. The fourth row
+/// is the one that separates input from output:
 /// it rewrites the SAME 78.7 MB candidate as the third but keeps an eighth of
-/// the rows, and lands at 28.1 MB, within 2.7% of the 16 Ki sweep's 27.4 MB
+/// the rows, and lands at 27.8 MB, within 2.7% of the 16 Ki sweep's 27.1 MB
 /// over the same 9.8 MB of survivors off a candidate a quarter the size. Per
 /// decoded byte of the candidate the streaming arm therefore reads at
-/// 1.39 / 0.94 / 0.71 / 0.36 — a ratio that says nothing on its own, which is
+/// 1.38 / 0.93 / 0.70 / 0.35 — a ratio that says nothing on its own, which is
 /// why it is not what the assertions use.
 ///
-/// 0.96 of the output is one whole decoded copy, and the code says where: the
+/// Roughly one output's decoded bytes is one whole decoded copy, and the code
+/// says where: the
 /// fork's `ParquetWriter` buffers the open row group as decoded Arrow batches
 /// in `pending` whenever a row-group bloom column is set, which `with_footers`
 /// always sets here. The answer to #4703's question is yes: the rolling writer
@@ -829,11 +879,19 @@ async fn sweep_peak(
 /// The model above says the opposite is the thing to check — 1 Mi rows at this
 /// fixture's 1,200 decoded bytes per row is ~1.2 GB of buffered survivors
 /// before the cap engages at all — but these numbers cannot carry that
-/// extrapolation: they are net heap growth, biased down by pre-sweep
-/// allocations freed during the sweep, taken in a debug build on fixtures
-/// three orders of magnitude smaller, over uniform `xxx…` raw text that
-/// compresses 174:1 and so has no representative relationship between file
-/// bytes and decoded bytes. What the gate below pins is the shape.
+/// extrapolation: they are peak growth above each sweep's baseline, taken in a
+/// debug build on fixtures three orders of magnitude smaller, over uniform
+/// `xxx…` raw text that compresses 174:1 and so has no representative
+/// relationship between file bytes and decoded bytes. What the gate below pins
+/// is the shape.
+///
+/// HISTORICAL COUNTER READING. The 2026-09-16 run printed 54.2 / 95.1 /
+/// 187.8 MB for the three in-RAM arms, 27.4 / 36.9 / 55.7 MB for their
+/// streaming controls and 28.1 MB for the narrow-survivor arm. Those figures
+/// came from a counter reset to zero at the start of each sweep: frees of heap
+/// allocated before the sweep pulled it down, so they were lower bounds on
+/// growth rather than live heap or exact growth above a baseline. They remain
+/// the source of the historical 0.96 × survivors + 18.0 MB fit.
 ///
 /// SUPERSEDED. #3999's reading, taken the same day, recorded 125.4 MB in-RAM
 /// and 41.6 MB streaming at 64 Ki, and read the arm as near-flat (13% for a
@@ -852,15 +910,22 @@ fn measure_peak_allocation_per_arm() {
             let ram = sweep_peak(rows, 1024, 2, IcebergTuning::default()).await;
             let stream = sweep_peak(rows, 1024, 2, force_streaming()).await;
             println!(
-                "rows={rows} file_bytes={} decoded={} survivor_decoded={} in_ram_peak={} \
-                 streaming_peak={} streaming_per_decoded={:.2} streaming_per_survivor={:.2}",
+                "rows={rows} file_bytes={} decoded={} survivor_decoded={} \
+                 in_ram_baseline={} in_ram_peak_live={} in_ram_peak_above_baseline={} \
+                 streaming_baseline={} streaming_peak_live={} \
+                 streaming_peak_above_baseline={} streaming_per_decoded={:.2} \
+                 streaming_per_survivor={:.2}",
                 stream.file_bytes,
                 stream.decoded,
                 stream.survivor_decoded(),
-                ram.peak,
-                stream.peak,
-                stream.peak as f64 / stream.decoded as f64,
-                stream.peak as f64 / stream.survivor_decoded() as f64,
+                ram.heap.baseline,
+                ram.heap.peak,
+                ram.heap.above_baseline,
+                stream.heap.baseline,
+                stream.heap.peak,
+                stream.heap.above_baseline,
+                stream.heap.above_baseline as f64 / stream.decoded as f64,
+                stream.heap.above_baseline as f64 / stream.survivor_decoded() as f64,
             );
             streaming.push(stream);
             in_ram.push(ram);
@@ -872,49 +937,52 @@ fn measure_peak_allocation_per_arm() {
         // the smallest.
         let narrow = sweep_peak(64 * 1024, 1024, 8, force_streaming()).await;
         println!(
-            "rows={} survivors={} decoded={} survivor_decoded={} streaming_peak={} \
+            "rows={} survivors={} decoded={} survivor_decoded={} streaming_baseline={} \
+             streaming_peak_live={} streaming_peak_above_baseline={} \
              streaming_per_decoded={:.2} streaming_per_survivor={:.2}",
             narrow.rows,
             narrow.survivors,
             narrow.decoded,
             narrow.survivor_decoded(),
-            narrow.peak,
-            narrow.peak as f64 / narrow.decoded as f64,
-            narrow.peak as f64 / narrow.survivor_decoded() as f64,
+            narrow.heap.baseline,
+            narrow.heap.peak,
+            narrow.heap.above_baseline,
+            narrow.heap.above_baseline as f64 / narrow.decoded as f64,
+            narrow.heap.above_baseline as f64 / narrow.survivor_decoded() as f64,
         );
 
         // WHAT THE GATE EXISTS FOR, at every size: under 0.6 of the arm it
-        // replaced, over the same candidate. Measured at 0.51 / 0.39 / 0.30 —
+        // replaced, over the same candidate. Measured at 0.50 / 0.39 / 0.30 —
         // the margin is widest where it matters, on the largest candidate.
         for (stream, ram) in streaming.iter().zip(in_ram.iter()) {
             assert!(
-                stream.peak * 5 < ram.peak * 3,
+                stream.heap.above_baseline * 5 < ram.heap.above_baseline * 3,
                 "the streaming arm peaked at {} B against the in-RAM arm's {} B over the \
                  same {}-byte candidate; the gate is not buying what it exists for",
-                stream.peak,
-                ram.peak,
+                stream.heap.above_baseline,
+                ram.heap.above_baseline,
                 stream.decoded,
             );
         }
 
         // THE GROWTH TERM IS THE OUTPUT, NOT THE INPUT. Doubling the candidate
         // at a fixed survivor fraction costs a fixed share of the added decoded
-        // bytes; measured at 0.48 (see the table above), so 0.7 leaves room for
+        // bytes; measured at 0.47 (see the table above), so 0.7 leaves room for
         // allocator noise while still failing if the arm starts holding the
         // whole input. The in-RAM arm fails this by construction.
         for pair in streaming.windows(2) {
             let (small, large) = (pair[0], pair[1]);
-            let marginal_peak = large.peak - small.peak;
+            let marginal_peak = large.heap.above_baseline - small.heap.above_baseline;
             let marginal_decoded = large.decoded - small.decoded;
             assert!(
                 marginal_peak * 10 < marginal_decoded * 7,
                 "the streaming arm took {marginal_peak} B of peak for {marginal_decoded} \
                  added decoded bytes ({} B over {} at {} rows, {} B over {} at {}); above \
                  half the input it is holding more than the survivors it writes",
-                small.peak,
+                small.heap.above_baseline,
                 small.decoded,
                 small.rows,
-                large.peak,
+                large.heap.above_baseline,
                 large.decoded,
                 large.rows,
             );
@@ -932,17 +1000,23 @@ fn measure_peak_allocation_per_arm() {
             "the two sweeps must write the same survivor bytes to be comparable"
         );
         let (lo, hi) = (
-            narrow.peak.min(same_output.peak),
-            narrow.peak.max(same_output.peak),
+            narrow
+                .heap
+                .above_baseline
+                .min(same_output.heap.above_baseline),
+            narrow
+                .heap
+                .above_baseline
+                .max(same_output.heap.above_baseline),
         );
         assert!(
             hi * 100 < lo * 115,
             "the same {} survivor bytes peaked at {} B off a {}-byte candidate and {} B \
              off a {}-byte one; the arm is holding the input, not the output",
             narrow.survivor_decoded(),
-            same_output.peak,
+            same_output.heap.above_baseline,
             same_output.decoded,
-            narrow.peak,
+            narrow.heap.above_baseline,
             narrow.decoded,
         );
     });
@@ -965,21 +1039,25 @@ fn measure_peak_allocation_per_arm() {
 /// why the numbers there are unchanged by this fix and why this measurement
 /// needs 256 Ki survivors of its own.
 ///
-/// Recorded 2026-09-16 post-fix, debug build, 512 Ki rows of 128 B raw text,
-/// half deleted — 262,144 survivors, 113.2 MB decoded by
+/// Corrected 2026-09-22 with the continuous live counter, debug build, 512 Ki
+/// rows of 128 B raw text, half deleted — 262,144 survivors, 113.2 MB decoded by
 /// `get_array_memory_size`, 201 B/row by extent:
 ///
 /// ```text
-/// target             row groups        peak
-/// default (256 MB)   1 x 262,144    80.4 MB
-/// 26.3 MB            2 x 131,727    56.5 MB   ratio 0.70
+/// target             row groups   peak above baseline
+/// default (256 MB)   1 x 262,144                 76.0 MB
+/// 26.3 MB            2 x 131,727                 54.1 MB   ratio 0.71
 /// ```
 ///
-/// Halving the row group took 23.8 MB off the peak, against a fixed ~18 MB the
-/// arm pays either way: ~300 B per row no longer buffered. That is above the
-/// 201 B/row the writer's sample priced, because a buffered batch keeps whole
-/// buffers and the rows' extent is not their allocation — the target bounds the
-/// rows, and the bytes resident for them run over it.
+/// Halving the row group took 21.9 MB off the peak, against a fixed term the arm
+/// pays either way: ~168 B per row no longer buffered. The target bounds rows,
+/// not resident bytes; the buffered batches keep their backing buffers.
+///
+/// HISTORICAL COUNTER READING. The 2026-09-16 run reported 80.4 MB and 56.5 MB
+/// (ratio 0.70), using the reset-to-zero counter described above. Those values
+/// and the old 23.8 MB / ~300 B-per-row interpretation are retained here as the
+/// record that led to this gate, but they were lower bounds rather than exact
+/// growth above a baseline.
 ///
 /// The first reading of this measurement sized its target off
 /// `get_array_memory_size` (432 B/row here, twice the extent), asked for a row
@@ -1011,29 +1089,35 @@ fn measure_peak_against_row_group_target() {
         )
         .await;
         println!(
-            "survivors={} survivor_decoded={} per_row={per_row} whole_peak={} \
-             whole_groups={}x{} floor_target={floor_target} floored_peak={} \
+            "survivors={} survivor_decoded={} per_row={per_row} \
+             whole_baseline={} whole_peak_live={} whole_peak_above_baseline={} \
+             whole_groups={}x{} floor_target={floor_target} \
+             floored_baseline={} floored_peak_live={} floored_peak_above_baseline={} \
              floored_groups={}x{} ratio={:.2}",
             whole.survivors,
             whole.survivor_decoded(),
-            whole.peak,
+            whole.heap.baseline,
+            whole.heap.peak,
+            whole.heap.above_baseline,
             whole.row_groups,
             whole.first_row_group,
-            floored.peak,
+            floored.heap.baseline,
+            floored.heap.peak,
+            floored.heap.above_baseline,
             floored.row_groups,
             floored.first_row_group,
-            floored.peak as f64 / whole.peak as f64,
+            floored.heap.above_baseline as f64 / whole.heap.above_baseline as f64,
         );
         // Half the row group, so about half of the growth term and all of the
         // fixed ~18 MB. 0.85 fails a target that never reaches the writer
         // (identical arms, ratio ~1.0) while leaving room for the fixed term.
         assert!(
-            floored.peak * 100 < whole.peak * 85,
+            floored.heap.above_baseline * 100 < whole.heap.above_baseline * 85,
             "a target sized for the {MIN_ROW_GROUP_ROWS}-row floor peaked at {} B \
              against the default target's {} B over the same {} survivor bytes; the \
              target is not reaching the survivor writer",
-            floored.peak,
-            whole.peak,
+            floored.heap.above_baseline,
+            whole.heap.above_baseline,
             whole.survivor_decoded(),
         );
     });

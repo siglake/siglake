@@ -103,9 +103,11 @@ use siglake_storage::SiglakeIcebergTableScan;
 
 // ------------------------------------------------------------- allocator ---
 
-/// Peak live heap bytes between [`start_tracking`] and [`peak_tracked`], the
-/// same shape `delete_task_size_gate.rs` uses — quoted here so this binary's
-/// heap column is comparable with the 80.4/56.5 MB reading that opened #4772.
+/// The historical reset-counter estimate of peak heap growth between
+/// [`start_tracking`] and [`peak_tracked`]. The 80.4/56.5 MB delete reading
+/// that opened #4772 used the same method. `delete_task_size_gate.rs` replaced
+/// its copy with a continuous live counter on 2026-09-22; these separate merge
+/// measurements have not been rerun with that method.
 struct PeakTracking;
 
 static TRACKING: AtomicBool = AtomicBool::new(false);

@@ -11,9 +11,11 @@ matched-round evidence a 0.2.0 change would have to produce first.
 `IcebergTuning::target_row_group_bytes` reach the merge, re-cluster and
 delete-rewrite writers and deliberately changed no default. The question it set
 aside: at the packaged 1Gi limit, is 256 MiB the right thing for a compactor to
-ask for? The only evidence was net heap growth over one delete fixture of
-262,144 survivors (`delete_task_size_gate.rs:991`), which is three orders of
-magnitude below a cold-target file and was measured in a debug build.
+ask for? The only evidence was a reset-counter estimate of net heap growth over
+one delete fixture of 262,144 survivors (`delete_task_size_gate.rs`), which is
+three orders of magnitude below a cold-target file and was measured in a debug
+build. That delete measurement was corrected on 2026-09-22; the separate merge
+measurements below were not rerun.
 
 ## Where the target binds
 
@@ -73,10 +75,14 @@ column not to read closely.
 | **64 MiB** | 14 | 143,702 | 63.7 MB | 295.3 MB | 412-413 MB | 125.4 MB | 44.8 KB | 0.28 MB / 3.4-4.2 ms | 160-186 ms |
 | 32 MiB (floor binds) | 16 | 131,072 | 55.8 MB | 284.6 MB | 403-414 MB | 125.5 MB | 51.1 KB | 1.13 MB / 5.3-6.3 ms | 161-196 ms |
 
-*peak heap* is net live-heap growth across the merge, the same measure
-`delete_task_size_gate.rs` reports. *peak RSS* is the process high-water mark
-sampled every 10 ms during the merge, over four readings per arm; the merge
-starts from a 349-413 MB baseline the corpus build leaves behind, so the 64 and
+*peak heap* is what the row-group qualification binary's historical reset
+counter labeled net live-heap growth across the merge. Pre-window frees made it
+a lower bound on window growth, not live heap or an exact delta above a
+baseline. The 2026-09-22 correction to `delete_task_size_gate.rs` did not rerun
+or reinterpret these separate merge measurements; this table retains their
+original method and values. *peak RSS* is the process high-water mark sampled
+every 10 ms during the merge, over four readings per arm; the merge starts from
+a 349-413 MB baseline the corpus build leaves behind, so the 64 and
 32 MiB arms' merges fit inside arenas the allocator already held and their RSS
 delta reads as < 1 MB. Compare the absolute peaks, not the deltas. *needle read*
 is the settled `bytes_data` and wall of `sum(length(raw)) WHERE host =

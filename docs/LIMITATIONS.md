@@ -1600,11 +1600,18 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   the writer it streams into buffers the open row group as decoded Arrow
   batches — so a rewrite whose survivors fit in one row group holds all of
   them. Measured 2026-09-16 in a debug build over single-candidate fixtures of
-  16 Ki to 64 Ki rows: peak ≈ 0.96 × the survivors' decoded bytes + ~18 MB, and
-  flat in the candidate's own size (an eighth of a 78.7 MB candidate's rows
-  costs what half of a 19.7 MB one does). Against the in-RAM arm's four copies
-  of the whole decoded file that is the gate's win. Since #4754 the row group
-  is `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` (or
+  16 Ki to 64 Ki rows. The original 2026-09-16 reading used a reset-to-zero
+  allocator counter and reported peak ≈ 0.96 × the survivors' decoded bytes +
+  ~18 MB. Corrected on 2026-09-22 with a continuous live counter and a baseline
+  per arm, the fit is peak above baseline ≈ 0.94 × survivors + ~17.8 MB:
+  27.1, 36.4 and 55.0 MB for the streaming arms, against 53.9, 94.4 and
+  184.4 MB for the in-RAM arms. The original 27.4/36.9/55.7 MB streaming and
+  54.2/95.1/187.8 MB in-RAM readings remain historical lower bounds, because
+  frees of allocations predating their windows pulled the reset counter down.
+  Both readings are flat in the candidate's own size (an eighth of a 78.7 MB
+  candidate's rows costs what half of a 19.7 MB one does). Against the in-RAM
+  arm's four copies of the whole decoded file that is the gate's win. Since
+  #4754, the row group is `SIGLAKE_PARQUET_TARGET_ROW_GROUP_BYTES` (or
   `IcebergTuning::target_row_group_bytes`) divided by the first written batch's
   row size — the extent its rows span, `sampled_row_bytes` — so lowering the
   target lowers what a rewrite holds; until then the merge-output writer asked
@@ -1615,9 +1622,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   those fixtures carry, the smallest row group any target can ask for still
   holds ~157 MB of survivors, and a narrow GDPR delete leaves nearly every row a
   survivor. What a 256 MiB cold-target candidate costs a compactor packaged at
-  1Gi is not established: the measurement is net heap growth on fixtures three
-  orders of magnitude smaller. The merge path's side of the same question is
-  measured in `docs/DESIGN_row_group_target_qualification.md`.
+  1Gi is not established: the measurement is peak heap growth above a recorded
+  baseline on fixtures three orders of magnitude smaller. The merge path's side
+  of the same question is measured separately in
+  `docs/DESIGN_row_group_target_qualification.md`.
 - **The packaged compactor's row-group target is qualified locally and nowhere
   else.** `TARGET_ROW_GROUP_UNCOMPRESSED_BYTES` is 256 MiB and the packaged
   compactor limit is 1Gi (`deploy/helm/siglake/values.yaml:325`); #4772 measured
