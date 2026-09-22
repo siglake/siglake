@@ -65,18 +65,25 @@ fn counter_sum(snapshot: &SnapshotVec, name: &str, label: Option<(&str, &str)>) 
 /// gate. Serializing them costs nothing: the whole file runs in under two
 /// seconds.
 ///
-/// The same applies to `inverted_index_decode_counts`, which is likewise
-/// process-global (`third_party/iceberg/src/arrow/reader/pruning.rs`) while
-/// `parsed_inverted_index_cache_stats` beside it is filtered to one warehouse.
-/// `clipped_text_limit_shapes_decline_the_whole_file_index`,
-/// `a_settled_clipped_index_query_cannot_charge_the_next_unindexed_arm` and the
-/// `report_*` measurements attribute that global counter to their own
-/// executions, and a decode from anywhere else inside their window is charged
-/// to them. So the rule is: a test that runs a text query over an indexed file
+/// That recorder window is all this gate still holds together.
+/// `streaming_recluster_rebuilds_once_and_survives_snapshot_expiry` reads the
+/// counter twice, once directly and once through
+/// `assert_ordered_limit_declines_puffin_row_selection`, and `DebuggingRecorder`
+/// is installed once for the process, so it cannot filter the counter to its own
+/// warehouse. The rule stays: a test that runs a text query over an indexed file
 /// takes this gate, whether or not it reads a counter itself. Two did not, and
 /// the gate went red on `repeated_text_query_reuses_the_parsed_footer_index`
-/// (left 3, right 4) — #5811 then took the global counter out of the two
-/// reuse tests' arithmetic, so a lapse in the rule can no longer reach them.
+/// (left 3, right 4).
+///
+/// Nothing a default `cargo test` run reads here is process-global any more.
+/// The other decode attribution came from `inverted_index_decode_counts`, which counts
+/// every warehouse in the process; #5811 took it out of the two reuse tests and
+/// #5821 out of the decline and settlement tests, which read
+/// `parsed_inverted_index_cache_stats` for their own warehouse instead and each
+/// run a foreign warehouse's query inside their measured window to prove it.
+/// The `report_*` measurements still read the global counter: they run alone
+/// under `--ignored`, and their eviction accounting needs a count that does not
+/// vanish with the entry.
 static PUFFIN_QUERY_GATE: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -504,12 +511,11 @@ async fn streaming_recluster_rebuilds_once_and_survives_snapshot_expiry() {
 
 #[tokio::test]
 async fn inram_recluster_keeps_footer_indexes_without_rebuilding_puffin() {
-    // This test ends in a `LIKE` query over footer-indexed files, so it decodes
-    // an inverted index and bumps `INVERTED_INDEX_DECODES`. That counter is
-    // process-global (`inverted_index_decode_counts`), so a decode from here
-    // landing inside the window of a test that attributes it — the declined and
-    // settled shapes, and the measurements — is charged to that test. Take the
-    // gate even though this test measures no counters itself.
+    // This test ends in a `LIKE` query over footer-indexed files, which the
+    // recorder counts under `siglake_iceberg_inverted_index_used_total`. That
+    // counter is process-global, so a query from here landing inside the window
+    // of the test that attributes it is charged to that test. Take the gate even
+    // though this test measures no counters itself.
     let _gate = PUFFIN_QUERY_GATE.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(&tmp.path().join("warehouse"))
@@ -1765,7 +1771,9 @@ async fn unordered_text_limit_shapes_keep_the_index_and_parse_it_once() {
 async fn clipped_text_limit_shapes_decline_the_whole_file_index() {
     use chrono::{Duration, TimeZone, Utc};
 
-    // This test attributes process-wide decode counters to its own queries.
+    // Nothing here reads a process-global counter, but this test's own queries
+    // land in the global recorder windows the tests listed on
+    // `PUFFIN_QUERY_GATE` measure, so it holds the gate from that side.
     let _gate = PUFFIN_QUERY_GATE.lock().await;
 
     let base = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
@@ -1773,6 +1781,14 @@ async fn clipped_text_limit_shapes_decline_the_whole_file_index() {
     let warehouse = tmp.path().join("indexed");
     let indexed = bench_shaped_fixture(&warehouse, true, base).await;
     let control = bench_shaped_fixture(&tmp.path().join("control"), false, base).await;
+    // Two more indexed warehouses, queried inside the measured windows below:
+    // each does to the shared cache what another test in this binary does, in
+    // this thread and without waiting for an interleaving. One per window,
+    // because a warehouse already resident would only be looked up again.
+    let declined_foreign_warehouse = tmp.path().join("foreign-declined");
+    let declined_foreign = bench_shaped_fixture(&declined_foreign_warehouse, true, base).await;
+    let unclipped_foreign_warehouse = tmp.path().join("foreign-unclipped");
+    let unclipped_foreign = bench_shaped_fixture(&unclipped_foreign_warehouse, true, base).await;
 
     let table = indexed
         .catalog()
@@ -1803,6 +1819,16 @@ async fn clipped_text_limit_shapes_decline_the_whole_file_index() {
     let control_ctx = unordered_text_context();
     control
         .register_with_datafusion(&control_ctx)
+        .await
+        .unwrap();
+    let declined_foreign_ctx = unordered_text_context();
+    declined_foreign
+        .register_with_datafusion(&declined_foreign_ctx)
+        .await
+        .unwrap();
+    let unclipped_foreign_ctx = unordered_text_context();
+    unclipped_foreign
+        .register_with_datafusion(&unclipped_foreign_ctx)
         .await
         .unwrap();
 
@@ -1841,39 +1867,65 @@ async fn clipped_text_limit_shapes_decline_the_whole_file_index() {
     ];
 
     // Statistics scoped to this warehouse; the control arm has no index to
-    // parse and the other tests in this binary query their own warehouses.
+    // parse and the other tests in this binary query their own warehouses. An
+    // index this warehouse deserializes is admitted here: the fixture runs on
+    // the default gigabyte budget with three per-file keys, far below the
+    // 128-entry bound, so nothing of ours is evicted and no decode goes
+    // unadmitted. The unclipped arm at the end holds that to account — the same
+    // files, admitted once each, from the same process.
     let warehouse = warehouse.to_string_lossy().to_string();
+    let declined_foreign_warehouse = declined_foreign_warehouse.to_string_lossy().to_string();
+    let unclipped_foreign_warehouse = unclipped_foreign_warehouse.to_string_lossy().to_string();
     let cache_stats = || iceberg::arrow::parsed_inverted_index_cache_stats(&warehouse);
-    let decodes = || iceberg::arrow::inverted_index_decode_counts().0;
+    let declined_foreign_stats =
+        || iceberg::arrow::parsed_inverted_index_cache_stats(&declined_foreign_warehouse);
+    let unclipped_foreign_stats =
+        || iceberg::arrow::parsed_inverted_index_cache_stats(&unclipped_foreign_warehouse);
     assert_eq!(
         cache_stats(),
         (0, 0),
         "nothing parsed before the first query"
     );
+    assert_eq!(
+        (declined_foreign_stats(), unclipped_foreign_stats()),
+        ((0, 0), (0, 0)),
+        "nor under either foreign warehouse"
+    );
 
-    for (name, sql) in &shapes {
+    for (position, (name, sql)) in shapes.iter().enumerate() {
         let plan = plan_of(&clipped_ctx, sql).await;
         assert!(
             plan.contains("text_index:[declined:clipped_limit]"),
             "{name}: the plan must say which path it took:\n{plan}"
         );
 
-        let before_decodes = decodes();
         let rows = raw_column(&clipped_ctx, sql).await;
         assert_eq!(
             rows,
             raw_column(&control_ctx, sql).await,
             "{name}: declining the index changed the result"
         );
-        assert_eq!(
-            decodes() - before_decodes,
-            0,
-            "{name}: a declined shape must not deserialize an index"
-        );
+        if position == 0 {
+            // Inside the measured window, on purpose: another warehouse's
+            // indexes deserialize here, which is what an ungated test's query
+            // does. Read from a process-global decode counter, they are charged
+            // to the declined shape and this window stops meaning anything.
+            assert!(!raw_column(
+                &declined_foreign_ctx,
+                "SELECT timestamp, raw FROM events WHERE match_terms(raw, 'queen')"
+            )
+            .await
+            .is_empty());
+            assert_eq!(
+                declined_foreign_stats(),
+                (TEXT_SHAPE_FILES, 0),
+                "the foreign query must deserialize its own files inside this window"
+            );
+        }
         assert_eq!(
             cache_stats(),
             (0, 0),
-            "{name}: and must not look one up either"
+            "{name}: a declined shape must not deserialize an index, nor look one up"
         );
     }
 
@@ -1885,16 +1937,29 @@ async fn clipped_text_limit_shapes_decline_the_whole_file_index() {
         plan.contains("text_index:[allowed]"),
         "an unclipped text scan keeps the index:\n{plan}"
     );
-    let before_decodes = decodes();
     assert_eq!(
         raw_column(&unclipped_ctx, unclipped).await,
         raw_column(&control_ctx, unclipped).await,
         "the index path must agree with the control"
     );
+    // The second foreign decode, inside this window for the same reason: read
+    // globally, it doubles the count the assertion below pins.
+    assert!(!raw_column(
+        &unclipped_foreign_ctx,
+        "SELECT timestamp, raw FROM events WHERE match_terms(raw, 'queen')"
+    )
+    .await
+    .is_empty());
     assert_eq!(
-        decodes() - before_decodes,
-        TEXT_SHAPE_FILES as u64,
-        "the unclipped scan selects its rows from each planned file's index"
+        unclipped_foreign_stats(),
+        (TEXT_SHAPE_FILES, 0),
+        "the foreign query must deserialize its own files inside this window"
+    );
+    assert_eq!(
+        cache_stats(),
+        (TEXT_SHAPE_FILES, 0),
+        "the unclipped scan selects its rows from each planned file's index, \
+         deserializing each one once"
     );
 }
 
@@ -1966,6 +2031,70 @@ async fn a_settled_clipped_index_query_cannot_charge_the_next_unindexed_arm() {
         .await
         .unwrap();
 
+    // Four small indexed warehouses, one per measured window below. Each is
+    // queried inside a window on purpose: it does to the shared cache what
+    // another test in this binary does, in this thread and without waiting for
+    // an interleaving, and a process-global decode counter read at the window's
+    // edges charges it to this test. One per window because a warehouse already
+    // resident would only be looked up again, never deserialized again.
+    const FOREIGN_FILES: usize = 2;
+    let mut foreign = Vec::new();
+    for slot in 0..4 {
+        let path = tmp.path().join(format!("foreign-{slot}"));
+        let ice = sized_bench_fixture(
+            &path,
+            BenchFixtureIndexing {
+                rebuild: true,
+                segmented: false,
+                segmented_block_bytes: block_bytes,
+            },
+            base,
+            FOREIGN_FILES,
+            2_000,
+            usize::MAX,
+        )
+        .await;
+        let ctx = unordered_text_context();
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        foreign.push((path.to_string_lossy().to_string(), ctx));
+    }
+    let foreign_decode = |slot: usize| {
+        let (prefix, ctx) = &foreign[slot];
+        async move {
+            assert!(!raw_column(
+                ctx,
+                "SELECT timestamp, raw FROM events WHERE match_terms(raw, 'queen')"
+            )
+            .await
+            .is_empty());
+            assert_eq!(
+                iceberg::arrow::parsed_inverted_index_cache_stats(prefix),
+                (FOREIGN_FILES, 0),
+                "foreign arm {slot} must deserialize its own files inside this window"
+            );
+        }
+    };
+
+    // Statistics scoped per warehouse; "indexed" is not a substring of the
+    // sibling paths, which all carry their own leading directory. Every consult
+    // of a parsed index passes through this cache — a hit raises the entry's hit
+    // count, a miss deserializes and admits — so any index work landing under a
+    // prefix moves one of the two numbers, and reading the pair across a wait is
+    // the same absence claim the process counter used to make. The one shape it
+    // does not see is a second deserialization of a key another partition
+    // admitted in the same window; the arm below pins one per file, which is
+    // what forecloses it.
+    let indexed_warehouse = tmp.path().join("indexed").to_string_lossy().to_string();
+    let unindexed_warehouse = tmp.path().join("unindexed").to_string_lossy().to_string();
+    let indexed_stats = || iceberg::arrow::parsed_inverted_index_cache_stats(&indexed_warehouse);
+    let unindexed_stats =
+        || iceberg::arrow::parsed_inverted_index_cache_stats(&unindexed_warehouse);
+    assert_eq!(
+        (indexed_stats(), unindexed_stats()),
+        ((0, 0), (0, 0)),
+        "neither arm has parsed an index before the setup query"
+    );
+
     // Warm one file only. The full-table LIMIT below can then return from that
     // parsed index while the other partitions are still loading cold ones,
     // making the cancellation window deterministic without a timing hook.
@@ -1974,11 +2103,11 @@ async fn a_settled_clipped_index_query_cannot_charge_the_next_unindexed_arm() {
         "SELECT timestamp, raw FROM events WHERE match_terms(raw, 'queen') \
          AND timestamp < TIMESTAMP '{warm_end}'"
     );
-    let before_warm = iceberg::arrow::inverted_index_decode_counts();
     assert!(!raw_column(&indexed_ctx, &warm_sql).await.is_empty());
+    foreign_decode(0).await;
     assert_eq!(
-        iceberg::arrow::inverted_index_decode_counts().0 - before_warm.0,
-        1,
+        indexed_stats(),
+        (1, 0),
         "the setup must warm exactly one file's parsed index"
     );
 
@@ -1993,8 +2122,16 @@ async fn a_settled_clipped_index_query_cannot_charge_the_next_unindexed_arm() {
         clip: Some(1),
     };
 
-    let (_, indexed_rows, indexed_delta, _) =
-        time_ab_shape(&shape, "indexed", &indexed_ctx, true, None).await;
+    let (_, indexed_rows, indexed_delta, _) = time_ab_shape(
+        &shape,
+        "indexed",
+        &indexed_ctx,
+        true,
+        None,
+        IndexAttribution::Warehouse(&indexed_warehouse),
+        Some(&|| boxed(foreign_decode(1))),
+    )
+    .await;
     assert_eq!(indexed_rows.len(), 1, "the LIMIT must stop the root early");
     assert!(
         indexed_delta.0 > 0,
@@ -2006,16 +2143,28 @@ async fn a_settled_clipped_index_query_cannot_charge_the_next_unindexed_arm() {
         "settlement must charge every cold load and the warm handout to this execution"
     );
 
-    let after_settle = iceberg::arrow::inverted_index_decode_counts();
+    // Every file resident and none evicted, so an admission under this prefix
+    // counts a deserialization and the comparisons below read as absence.
+    let after_settle = indexed_stats();
+    assert_eq!(after_settle, (CANCELLED_FILES, 1));
+    foreign_decode(2).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
-        iceberg::arrow::inverted_index_decode_counts(),
+        indexed_stats(),
         after_settle,
         "an index decode landed after the indexed plan reported complete settlement"
     );
 
-    let (_, unindexed_rows, unindexed_delta, _) =
-        time_ab_shape(&shape, "unindexed", &unindexed_ctx, true, None).await;
+    let (_, unindexed_rows, unindexed_delta, _) = time_ab_shape(
+        &shape,
+        "unindexed",
+        &unindexed_ctx,
+        true,
+        None,
+        IndexAttribution::Warehouse(&unindexed_warehouse),
+        Some(&|| boxed(foreign_decode(3))),
+    )
+    .await;
     assert_eq!(unindexed_rows.len(), 1);
     assert_eq!(
         unindexed_delta,
@@ -2023,11 +2172,22 @@ async fn a_settled_clipped_index_query_cannot_charge_the_next_unindexed_arm() {
         "an arm whose fixture carries no v1 index received leaked index work"
     );
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // The unindexed arm has no index of its own to move its own numbers, so the
+    // leak it is watching for shows up on the indexed warehouse: a partition of
+    // the previous arm still loading during this one admits or looks up an entry
+    // here, after the plan claimed to have settled.
     assert_eq!(
-        iceberg::arrow::inverted_index_decode_counts(),
+        indexed_stats(),
         after_settle,
-        "the indexed arm changed the process counters after the unindexed arm finished"
+        "the indexed arm parsed an index after the unindexed arm finished"
     );
+}
+
+/// Box a future for [`InsideWindow`], which cannot name the caller's borrow.
+fn boxed<'a>(
+    future: impl std::future::Future<Output = ()> + 'a,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(future)
 }
 
 /// The opt-out spelled out. Since #4162 this is also what the shipped default
@@ -3156,8 +3316,16 @@ async fn report_rebuild_on_off_text_shapes() {
                     }
                     _ => &arm.ctx,
                 };
-                let (elapsed, found, delta, seg) =
-                    time_ab_shape(shape, arm.label, ctx, run == 0, snapshotter.as_ref()).await;
+                let (elapsed, found, delta, seg) = time_ab_shape(
+                    shape,
+                    arm.label,
+                    ctx,
+                    run == 0,
+                    snapshotter.as_ref(),
+                    IndexAttribution::Process,
+                    None,
+                )
+                .await;
                 samples
                     .entry((shape.name, arm.label))
                     .or_default()
@@ -3340,9 +3508,16 @@ async fn report_rebuild_on_off_text_shapes() {
                 Default::default();
             for _ in 0..runs {
                 for shape in &shapes {
-                    let (elapsed, _, delta, seg) =
-                        time_ab_shape(shape, pass_name, &indexed.ctx, false, snapshotter.as_ref())
-                            .await;
+                    let (elapsed, _, delta, seg) = time_ab_shape(
+                        shape,
+                        pass_name,
+                        &indexed.ctx,
+                        false,
+                        snapshotter.as_ref(),
+                        IndexAttribution::Process,
+                        None,
+                    )
+                    .await;
                     pass_samples.entry(shape.name).or_default().push(elapsed);
                     let counted = pass_decodes.entry(shape.name).or_default();
                     counted.0 += delta.0;
@@ -3402,20 +3577,56 @@ async fn report_rebuild_on_off_text_shapes() {
     iceberg::arrow::clear_text_index_cache_max_bytes();
 }
 
+/// Where an execution's index work is read from.
+enum IndexAttribution<'a> {
+    /// The process-wide decode and parsed-cache hit counters. A decode from
+    /// anywhere else in the process lands in the window, so only the `report_*`
+    /// measurements use this — they run alone under `--ignored`, and they need
+    /// a count that survives eviction: an arm that decodes again on every run
+    /// held nothing between them, and its entry count would not say so.
+    Process,
+    /// Entries admitted to the parsed-index cache under one warehouse prefix,
+    /// and the hits they served. Another warehouse's decode does not appear
+    /// here. An admission counts a decode only while nothing under the prefix
+    /// is evicted, which the caller holds to account by asserting the absolute
+    /// residency; a shrinking entry count fails below rather than wrapping.
+    Warehouse(&'a str),
+}
+
+impl IndexAttribution<'_> {
+    fn read(&self) -> (u64, u64) {
+        match self {
+            Self::Process => iceberg::arrow::inverted_index_decode_counts(),
+            Self::Warehouse(prefix) => {
+                let (entries, hits) = iceberg::arrow::parsed_inverted_index_cache_stats(prefix);
+                (entries as u64, hits)
+            }
+        }
+    }
+}
+
+/// A body run inside an execution's attribution window, after its partitions
+/// settle and before its counters are read. The isolation A/B uses it to make
+/// another warehouse decode exactly where a foreign decode would be charged to
+/// this execution; nothing else passes one.
+type InsideWindow<'a> =
+    &'a dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>;
+
 /// One execution of one shape against one arm: time it, attribute the whole
 /// index decodes and parsed-cache hits it caused, and — on the first run —
 /// check the result against the shape's contract. Returns the elapsed
 /// milliseconds, the rows, and `(decodes, cache hits)` for this execution
-/// alone, which is how an eviction shows itself: a shape that decodes again on
-/// every run held nothing between them.
+/// alone, read through `attribution`.
 async fn time_ab_shape(
     shape: &AbShape,
     label: &str,
     ctx: &SessionContext,
     first: bool,
     snapshotter: Option<&Snapshotter>,
+    attribution: IndexAttribution<'_>,
+    interleave: Option<InsideWindow<'_>>,
 ) -> (f64, Vec<String>, (u64, u64), SegmentedArmCost) {
-    let before = iceberg::arrow::inverted_index_decode_counts();
+    let before = attribution.read();
     // Clear the recorder so what it holds after the query is this execution's.
     let _ = drain_segmented_cost(snapshotter);
     let started = std::time::Instant::now();
@@ -3442,9 +3653,17 @@ async fn time_ab_shape(
         "{}/{label}: scan partitions did not settle before the attribution deadline: {settle:?}",
         shape.name
     );
+    if let Some(interleave) = interleave {
+        interleave().await;
+    }
     let segmented = drain_segmented_cost(snapshotter);
-    let after = iceberg::arrow::inverted_index_decode_counts();
+    let after = attribution.read();
     let name = shape.name;
+    assert!(
+        after.0 >= before.0,
+        "{name}/{label}: the attribution lost entries during the execution, so its \
+         admissions no longer count decodes ({before:?} -> {after:?})"
+    );
     if first {
         assert!(
             !found.is_empty(),
