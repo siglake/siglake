@@ -747,9 +747,16 @@ printf '{"metric":{"pod":"siglake-query-0"},"value":[%s,"%s"]},' "$(date +%s)" "
 printf '{"metric":{"pod":"siglake-query-1"},"value":[%s,"%s"]}' "$(date +%s)" "$value"
 printf ']}}'
 STANDIN
+cat >"$standin_dir/git" <<'STANDIN'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'called\n' >>"$STANDIN_STATE/git-calls"
+[[ "$*" == *'rev-parse HEAD' ]] || exit 64
+printf '%s\n' '1111111111111111111111111111111111111111'
+STANDIN
 chmod +x \
   "$standin_dir/kubectl" "$standin_dir/docker" "$standin_dir/date" \
-  "$standin_dir/curl"
+  "$standin_dir/curl" "$standin_dir/git"
 
 # The fixture clock carries the order of the whole offline trace: the grader
 # places each commit against the recorded signal bounds, so no two events may
@@ -921,6 +928,9 @@ import datetime as dt
 import json, sys
 document = json.load(open(sys.argv[1], encoding="utf-8"))
 assert document["schema_version"] == 5, document["schema_version"]
+revisions = document["revisions"]
+assert revisions["repository_commit"] == "1" * 40, revisions
+assert revisions["repository_commit_source"] == "git_rev_parse_head", revisions
 evidence = document["evidence"]
 assert evidence["grade"] == "verified", evidence["problems"]
 summary = evidence["summary"]
@@ -971,6 +981,56 @@ assert target["container_init_pid"] == 100, target
 assert [row["node_pid"] for row in target["processes"]] == [100, 142, 143], target
 PY
   fail "the stand-in probe run did not retain the evidence the grader needs: $(<"$fixture_dir/standin.log")"
+fixtures=$((fixtures + 1))
+
+# Repeat the actual writer with an injected source revision distinct from the
+# stand-in git answer. The second run must retain the injection and leave the
+# git call count unchanged.
+injected_state="$fixture_dir/state-injected"
+mkdir -p "$injected_state/results"
+cp "$standin_state/query-pods.json" "$injected_state/query-pods.json"
+cp "$standin_state/postgres-pod.json" "$injected_state/postgres-pod.json"
+injected_rc=0
+PATH="$standin_dir:$PATH" \
+  STANDIN_STATE="$injected_state" \
+  PROC_ROOT="$paused_tree" \
+  WRITE_PROBE_PSQL="$fixture_dir/psql-standin" \
+  WRITE_PROBE_ERRORS="$fixture_dir/injected-psql.err" \
+  COMMIT_TIMES_PSQL="$fixture_dir/psql-commit-standin" \
+  COMMIT_TIMES_ERRORS="$fixture_dir/injected-commit.err" \
+  COMMIT_TIMES_ROWS="$fixture_dir/injected-commit.rows" \
+  JOB_HISTORY_PSQL="$fixture_dir/psql-history-standin" \
+  JOB_HISTORY_INSTALL_ERRORS="$fixture_dir/injected-history-install.err" \
+  JOB_HISTORY_ERRORS="$fixture_dir/injected-history.err" \
+  JOB_HISTORY_ROWS="$fixture_dir/injected-history.rows" \
+  WRITE_PROBE_TIMES_PSQL="$fixture_dir/psql-probe-times-standin" \
+  WRITE_PROBE_TIMES_ERRORS="$fixture_dir/injected-probe-times.err" \
+  WRITE_PROBE_TIMES_ROWS="$fixture_dir/injected-probe-times.rows" \
+  SIGLAKE_SOURCE_COMMIT=2222222222222222222222222222222222222222 \
+  KUBE_CONTEXT=kind-fixture NAMESPACE=fixture PROM_URL=http://fixture.invalid \
+  RESULTS_DIR="$injected_state/results" \
+  POSTGRES_OUTAGE_JOBS=2 POSTGRES_OUTAGE_SECONDS=4 \
+  POSTGRES_OUTAGE_SAMPLE_INTERVAL_SECONDS=1 \
+  POSTGRES_OUTAGE_DRAIN_TIMEOUT_SECONDS=2 \
+  POSTGRES_OUTAGE_WRITE_PROBE_SECONDS=1 \
+  "$PROBE" >"$fixture_dir/injected.log" 2>&1 || injected_rc=$?
+[[ "$injected_rc" -eq 0 ]] ||
+  fail "the injected-revision probe failed (exit $injected_rc): $(<"$fixture_dir/injected.log")"
+python3 - "$injected_state/results/postgres-outage-reconnect.json" <<'PY' ||
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+revisions = document["revisions"]
+assert revisions["repository_commit"] == "2" * 40, revisions
+assert revisions["repository_commit_source"] == "siglake_source_commit_env", revisions
+assert document["evidence"]["grade"] == "verified", document["evidence"]
+PY
+  fail "the outage artifact writer did not retain the injected revision origin"
+[[ $(wc -l <"$standin_state/git-calls") -eq 1 ]] ||
+  fail "the fallback outage run did not call git exactly once"
+[[ ! -e "$injected_state/git-calls" ]] ||
+  fail "the injected outage revision still called git"
 fixtures=$((fixtures + 1))
 
 signals=$(<"$standin_state/signals")

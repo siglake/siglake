@@ -111,6 +111,22 @@ die() {
 }
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+SIGLAKE_SOURCE_COMMIT="${SIGLAKE_SOURCE_COMMIT:-}"
+source_commit() {
+  if [[ -n "$SIGLAKE_SOURCE_COMMIT" ]]; then
+    printf '%s\n' "$SIGLAKE_SOURCE_COMMIT"
+  else
+    git -C "$ROOT" rev-parse HEAD 2>/dev/null || true
+  fi
+}
+source_commit_origin() {
+  if [[ -n "$SIGLAKE_SOURCE_COMMIT" ]]; then
+    printf 'siglake_source_commit_env\n'
+  else
+    printf 'git_rev_parse_head\n'
+  fi
+}
+
 stop_forward() {
   [[ -n "$ACTIVE_PF_PID" ]] || return 0
   kill "$ACTIVE_PF_PID" 2>/dev/null || true
@@ -991,10 +1007,10 @@ python3 - "$ROOT" "$CHART_STEPS" "$OPERATOR_STEPS" "$TMP_DIR/raw.json" \
   "$IMAGE_A" "$IMAGE_A_ID" "$IMAGE_B" "$IMAGE_B_ID" "$OPERATOR_IMAGE" \
   "$OPERATOR_IMAGE_ID" "$PROBE_FEATURE" "$PROBE_COLUMN" "$PROBE_VALUE" \
   "$NAMESPACE" "$RELEASE" "$OPERATOR_NAMESPACE" "$OPERATOR_RELEASE" "$CR_NAME" \
-  "$CR_SCHEMA_VERSION" "$CHART_START_REVISION" "$INGEST_BATCH" "$QUERY_URL" <<'PY'
+  "$CR_SCHEMA_VERSION" "$CHART_START_REVISION" "$INGEST_BATCH" "$QUERY_URL" \
+  "$(source_commit)" "$(source_commit_origin)" <<'PY'
 import datetime
 import json
-import subprocess
 import sys
 
 (
@@ -1002,6 +1018,7 @@ import sys
     image_b_id, operator_image, operator_image_id, probe_feature, probe_column,
     probe_value, namespace, release, operator_namespace, operator_release,
     cr_name, cr_schema_version, start_revision, ingest_batch, query_url,
+    repository_commit, repository_commit_source,
 ) = sys.argv[1:]
 
 
@@ -1009,9 +1026,6 @@ def steps(path):
     return [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
 
 
-repository_commit = subprocess.check_output(
-    ["git", "-C", root, "rev-parse", "HEAD"], text=True
-).strip()
 document = {
     "schema_version": 1,
     "generated_at": datetime.datetime.now(datetime.timezone.utc)
@@ -1019,6 +1033,7 @@ document = {
     .replace("+00:00", "Z"),
     "revisions": {
         "repository_commit": repository_commit,
+        "repository_commit_source": repository_commit_source,
         "image_a": {
             "tag": image_a,
             "id": image_a_id,

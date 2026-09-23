@@ -1901,18 +1901,19 @@ write_mirror_reclaim_launch() {
     "$CATALOG_CLAIM_ENABLED" "$WAL_MIRROR_ENABLED" \
     "$WAL_MIRROR_ACTIVE_INTERVAL_SECS" "$COMMITTED_RETENTION_SECS" \
     "$MIRROR_LEDGER_RECLAIM" "$LOAD_SECONDS" "$MIRROR_RECLAIM_RESULTS_DIR" \
-    "$(git -C "$ROOT" rev-parse HEAD)" "$@" <<'PY'
+    "$(source_commit)" "$(source_commit_origin)" "$@" <<'PY'
 import json
 import sys
 
 (
     path, arm, catalog_claim, mirror, active_interval, retention, reclaim,
-    load_seconds, results_dir, commit, *helm_args,
+    load_seconds, results_dir, commit, commit_source, *helm_args,
 ) = sys.argv[1:]
 document = {
     "schema": "siglake.kind.mirror_reclaim_launch.v1",
     "arm": arm,
     "source_commit": commit,
+    "source_commit_source": commit_source,
     "results_directory": results_dir,
     "inputs": {
         "KIND_ROUND_MIRROR_RECLAIM_ARM": arm,

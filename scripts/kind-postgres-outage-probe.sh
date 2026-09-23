@@ -34,6 +34,22 @@ log() { printf '==> postgres-outage: %s\n' "$*" >&2; }
 die() { printf 'ERROR: postgres-outage: %s\n' "$*" >&2; exit 1; }
 iso_now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
 
+SIGLAKE_SOURCE_COMMIT="${SIGLAKE_SOURCE_COMMIT:-}"
+source_commit() {
+  if [[ -n "$SIGLAKE_SOURCE_COMMIT" ]]; then
+    printf '%s\n' "$SIGLAKE_SOURCE_COMMIT"
+  else
+    git -C "$ROOT" rev-parse HEAD 2>/dev/null || true
+  fi
+}
+source_commit_origin() {
+  if [[ -n "$SIGLAKE_SOURCE_COMMIT" ]]; then
+    printf 'siglake_source_commit_env\n'
+  else
+    printf 'git_rev_parse_head\n'
+  fi
+}
+
 restore_postgres() {
   [[ "$POSTGRES_PAUSED" -eq 1 ]] || return 0
   log "restore Postgres after interrupted probe"
@@ -887,9 +903,9 @@ python3 - "$ROOT" "$TMP_DIR" "$SAMPLES_FILE" "$SUBMISSIONS_DIR" \
   "$JOB_HISTORY_AT" "$JOB_HISTORY_INSTALL_STATUS" "$JOB_HISTORY_STATUS" \
   "$TMP_DIR/job-history-install" "$TMP_DIR/job-history" \
   "$WRITE_PROBE_TIMES_AT" "$WRITE_PROBE_TIMES_STATUS" \
-  "$TMP_DIR/write-probe-times" \
+  "$TMP_DIR/write-probe-times" "$(source_commit)" "$(source_commit_origin)" \
   "$TMP_DIR/raw.json" <<'PY'
-import datetime, json, pathlib, subprocess, sys
+import datetime, json, pathlib, sys
 (
     root, tmp, samples_path, submissions_dir, submission_started, submission_finished,
     outage_started, restoration_started, postgres_ready, sampling_ended,
@@ -900,7 +916,7 @@ import datetime, json, pathlib, subprocess, sys
     postgres_pid_namespace, postgres_processes_path, job_history_at,
     job_history_install_status, job_history_status, job_history_install_path,
     job_history_path, write_probe_times_at, write_probe_times_status,
-    write_probe_times_path, output,
+    write_probe_times_path, repository_commit, repository_commit_source, output,
 ) = sys.argv[1:]
 tmp = pathlib.Path(tmp)
 
@@ -1083,9 +1099,8 @@ document = {
     "schema_version": 5,
     "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
     "revisions": {
-        "repository_commit": subprocess.check_output(
-            ["git", "-C", root, "rev-parse", "HEAD"], text=True
-        ).strip(),
+        "repository_commit": repository_commit,
+        "repository_commit_source": repository_commit_source,
         "query_pods": [container_revision(item) for item in query_items if item["metadata"]["name"] in expected],
         "postgres": container_revision(postgres_item),
     },
