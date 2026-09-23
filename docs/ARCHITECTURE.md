@@ -1517,7 +1517,22 @@ parsed side's own `oversized`). A budget one blob short of the plan's per-file
 index charts a rising fetch rate with no eviction and no hit otherwise, which
 is what a cold cache and a switched-off one chart. A zero bound is not charged
 there — a disabled cache is never consulted, and its flat lookup series says
-so. A fetch rate that
+so. The blob side's resident set is charted against its bound the same way, on
+`siglake_iceberg_puffin_blob_cache_bytes` and
+`siglake_iceberg_puffin_blob_cache_max_bytes` (#5374), but on different timing
+from the parsed pair: the parsed gauges are published only after a successful
+insert, and these are published on every admission attempt, refusals included.
+That is what makes an eviction rate readable at all — the same `redundant` rate
+under a budget that holds the plan and under half of it are the same series
+without the budget beside them — and it is the only direct reading of the two
+pods that admit nothing: one whose blobs each exceed the whole budget, charting
+resident bytes above a budget that refuses every new blob, and one with the
+cache switched off, charting a budget of 0 where nothing else is charted at all.
+The budget published is the one in force, which is not always the byte knob: an
+entry bound of zero refuses every blob whatever the byte budget says, so both
+the gauge and `text_index_cache_max_bytes_in_force` resolve it through
+`enforced_puffin_blob_budget` rather than reading the knob twice. A fetch rate
+that
 tracks the parsed miss rate is #4182's regression, which had to be inferred
 from index-phase object-store bytes and `first_batch_ms` for a round because
 these three were process diagnostics and nothing exported them.

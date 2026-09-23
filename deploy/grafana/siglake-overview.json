@@ -1687,7 +1687,7 @@
   {
    "id": 161,
    "type": "timeseries",
-   "title": "Parsed text-index cache resident / budget",
+   "title": "Text-index cache resident / budget",
    "datasource": {
     "type": "prometheus",
     "uid": "${datasource}"
@@ -1701,13 +1701,23 @@
    "targets": [
     {
      "expr": "max(siglake_iceberg_parsed_index_cache_bytes{namespace=~\"$namespace\"})",
-     "legendFormat": "resident",
+     "legendFormat": "parsed resident",
      "refId": "A"
     },
     {
      "expr": "max(siglake_iceberg_parsed_index_cache_max_bytes{namespace=~\"$namespace\"})",
-     "legendFormat": "budget",
+     "legendFormat": "parsed budget",
      "refId": "B"
+    },
+    {
+     "expr": "max(siglake_iceberg_puffin_blob_cache_bytes{namespace=~\"$namespace\"})",
+     "legendFormat": "blob resident",
+     "refId": "C"
+    },
+    {
+     "expr": "max(siglake_iceberg_puffin_blob_cache_max_bytes{namespace=~\"$namespace\"})",
+     "legendFormat": "blob budget",
+     "refId": "D"
     }
    ],
    "fieldConfig": {
@@ -1716,7 +1726,7 @@
      "min": 0
     }
    },
-   "description": "The parsed working set against the bound that evicts it. Both are published where the bounds are enforced — on admission to the cache — so neither exists before the pod's first indexed text query and both hold their last value while no text query runs; read them with the eviction arms beside them, not on their own. Resident pinned at the budget with byte_bound drops beside it is the case for raising SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES (or the query pod's memory limit, which the resolved budget follows when it is set)."
+   "description": "Each text-index cache's working set against the bound that evicts it. All four series are published where the bounds are enforced — on admission to the cache — so each holds its last value while no text query runs; read them with the eviction arms beside them, not on their own. The two pairs differ in when they appear. The parsed pair is published only after a successful insert, so it does not exist before the pod's first indexed text query. The blob pair is published on every admission attempt including the refused ones, so it appears at the first Puffin blob decode and a pod that admits nothing still charts its budget: blob resident above blob budget is a cache still holding entries a larger budget admitted while the current one refuses every new blob, the shape dropped oversized is read against, and blob budget flat at 0 is SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES or _MAX_ENTRIES switched off, which is the one pod the lookup and eviction families are both silent on. Without the budget beside it a dropped redundant rate says nothing: the same rate under a budget that holds the plan and under half of it draw the same series. Parsed resident pinned at the parsed budget with byte_bound drops beside it is the case for raising SIGLAKE_PARSED_INDEX_CACHE_MAX_BYTES (or the query pod's memory limit, which the resolved budget follows when it is set)."
   },
   {
    "id": 165,
@@ -1755,7 +1765,7 @@
      "min": 0
     }
    },
-   "description": "Whether a re-decode also had to re-read the blob. fetch is the object-store read this cache exists to stop; lookup hit is a decode handed bytes the cache still held and lookup miss is one that had to fetch. Every arm is pre-registered at 0 on the query server, so a tier serving no text query charts zero rather than No data. Read it beside the parsed-index panel: a parsed miss is what brings a query here at all, so hits climbing with parsed misses is a working set past the parsed budget but inside the blob budget, which costs a decode and no read. A fetch rate that tracks the parsed miss rate is the #4182 shape — every execution re-reading every blob — and it was inferred from index-phase bytes and first_batch_ms for a whole round before these counters existed. fetch above miss is index reading that consulted no cache: a rebuild that bypasses it, or a pod with SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES or _MAX_ENTRIES at 0. dropped oversized is the other reading this panel owes an operator: a file whose index blob alone exceeds SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES is never admitted, so it re-reads on every decode while the cache holds it never \u2014 a pod one blob short of its plan's per-file index otherwise charts exactly what a cold cache and a disabled one chart. The other dropped arms name the eviction rule that chose each victim: redundant is a blob whose parsed twin is resident, which cannot be read until that twin goes, stale is one nothing read while the cache turned over four times (its file has left the plan), and fifo is the fallback for a cache holding nothing live and recent — a steady fifo rate beside a fetch rate is the pre-#4182 behaviour, which dropped a blob one step before the query that wanted it. On run #81's keyword_and_label plan that difference was 4.60 GB over 183 index-phase reads against 0.50 GB over 73."
+   "description": "Whether a re-decode also had to re-read the blob. fetch is the object-store read this cache exists to stop; lookup hit is a decode handed bytes the cache still held and lookup miss is one that had to fetch. Every arm is pre-registered at 0 on the query server, so a tier serving no text query charts zero rather than No data. Read it beside the parsed-index panel: a parsed miss is what brings a query here at all, so hits climbing with parsed misses is a working set past the parsed budget but inside the blob budget, which costs a decode and no read. A fetch rate that tracks the parsed miss rate is the #4182 shape — every execution re-reading every blob — and it was inferred from index-phase bytes and first_batch_ms for a whole round before these counters existed. fetch above miss is index reading that consulted no cache: a rebuild that bypasses it, or a pod with SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES or _MAX_ENTRIES at 0, which the blob budget series on the resident/budget panel now reads directly rather than by inference. dropped oversized is the other reading this panel owes an operator: a file whose index blob alone exceeds SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES is never admitted, so it re-reads on every decode while the cache holds it never \u2014 a pod one blob short of its plan's per-file index otherwise charts exactly what a cold cache and a disabled one chart. The other dropped arms name the eviction rule that chose each victim: redundant is a blob whose parsed twin is resident, which cannot be read until that twin goes, stale is one nothing read while the cache turned over four times (its file has left the plan), and fifo is the fallback for a cache holding nothing live and recent — a steady fifo rate beside a fetch rate is the pre-#4182 behaviour, which dropped a blob one step before the query that wanted it. On run #81's keyword_and_label plan that difference was 4.60 GB over 183 index-phase reads against 0.50 GB over 73."
   },
   {
    "id": 162,

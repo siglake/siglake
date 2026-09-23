@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Query observability (feature)**: the Puffin blob cache publishes what it
+  holds against the budget being enforced on it, as
+  `siglake_iceberg_puffin_blob_cache_bytes` and
+  `siglake_iceberg_puffin_blob_cache_max_bytes`, and panel 161 (renamed
+  "Text-index cache resident / budget") charts the pair beside the parsed one.
+  #4718's eviction arms could not be read without it: the same `redundant` rate
+  under a budget that holds the plan and under half of it are the same series.
+  Unlike the parsed pair, which is published only after a successful insert,
+  these are published on every admission attempt including the refused ones, so
+  the two pods that admit nothing chart directly rather than by inference — one
+  whose blobs each exceed the budget shows resident bytes above a budget that
+  refuses every new blob, and one with `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES` or
+  `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_ENTRIES` at 0 shows a budget of 0. The budget
+  published is the one in force: an entry bound of zero refuses every blob
+  whatever the byte knob says. Resident bytes come from the figure the cache
+  already maintains, so the gauges cost no walk of the cache and admission,
+  eviction and every bound are unchanged. (#5374)
+
 ## 0.2.0
 
 Release-note correction, 2026-09-22: two more warning alerts shipped in this

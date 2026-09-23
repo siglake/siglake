@@ -27,6 +27,8 @@ type SnapshotVec = Vec<(
 const FETCHES_TOTAL: &str = "siglake_iceberg_puffin_blob_fetches_total";
 const LOOKUPS_TOTAL: &str = "siglake_iceberg_puffin_blob_cache_lookups_total";
 const EVICTIONS_TOTAL: &str = "siglake_iceberg_puffin_blob_cache_evictions_total";
+const RESIDENT_BYTES: &str = "siglake_iceberg_puffin_blob_cache_bytes";
+const BUDGET_BYTES: &str = "siglake_iceberg_puffin_blob_cache_max_bytes";
 
 fn counter_sum(snapshot: &SnapshotVec, name: &str, label_match: Option<(&str, &str)>) -> u64 {
     snapshot
@@ -44,6 +46,31 @@ fn counter_sum(snapshot: &SnapshotVec, name: &str, label_match: Option<(&str, &s
             _ => 0,
         })
         .sum()
+}
+
+/// The last value a gauge was set to within the phase this snapshot covers.
+///
+/// `Snapshotter::snapshot()` swaps gauges to zero the way it swaps counters, so
+/// a pair read from a later snapshot than the execution that emitted it reads
+/// zero and asserts nothing. `None` is a gauge that has never been set at all.
+fn gauge_value(snapshot: &SnapshotVec, name: &str) -> Option<f64> {
+    snapshot
+        .iter()
+        .find(|(key, _, _, _)| key.key().name() == name)
+        .map(|(_, _, _, value)| match value {
+            DebugValue::Gauge(value) => **value,
+            other => panic!("{name} is {other:?}, not a gauge"),
+        })
+}
+
+/// The resident/budget pair the panel charts, from one phase's snapshot.
+fn blob_cache_pair(snapshot: &SnapshotVec, phase: &str) -> (f64, f64) {
+    (
+        gauge_value(snapshot, RESIDENT_BYTES)
+            .unwrap_or_else(|| panic!("{phase} published no resident bytes")),
+        gauge_value(snapshot, BUDGET_BYTES)
+            .unwrap_or_else(|| panic!("{phase} published no enforced budget")),
+    )
 }
 
 /// A warehouse of `appends` Puffin-indexed files: `index_footer_max_bytes: 1`
@@ -162,6 +189,22 @@ async fn a_text_query_reports_its_blob_fetches_hits_and_the_rule_that_evicted() 
     );
     let blob = bytes / 2;
 
+    // The pair the panel charts, from the execution that admitted those blobs:
+    // the maintained resident figure, not a walk of the map, and the budget
+    // this phase configured rather than the 256 MiB environment default.
+    let (resident, budget) = blob_cache_pair(&cold, "the cold execution");
+    assert_eq!(
+        resident as usize, total,
+        "resident bytes must be what the cache actually holds"
+    );
+    assert_eq!(
+        budget as usize,
+        64 * 1024 * 1024,
+        "and the budget must be the one in force, which is what makes an \
+         eviction rate readable: the same rate under half this budget is a \
+         different pod"
+    );
+
     // Phase 2. Parsed indexes are kept this time, so every blob admitted has a
     // resident twin and cannot be read while that twin lives: the `redundant`
     // arm. The budget leaves room for one more blob than the two already held,
@@ -201,6 +244,26 @@ async fn a_text_query_reports_its_blob_fetches_hits_and_the_rule_that_evicted() 
         counter_sum(&crowded, FETCHES_TOTAL, None),
         2,
         "a warehouse this cache has never seen costs one read per file"
+    );
+
+    // Nothing is admitted between the snapshot and this read, so the cache's
+    // own total is the truth value for the gauge the phase last published.
+    let crowded_total = iceberg::arrow::puffin_blob_cache_stats("").2;
+    let (resident, budget) = blob_cache_pair(&crowded, "the crowded execution");
+    assert_eq!(
+        resident as usize, crowded_total,
+        "the eviction has to come off the resident figure: a gauge that only \
+         ever rose would chart this cache as permanently over its budget"
+    );
+    assert_eq!(
+        budget as usize,
+        bytes + blob + blob / 2,
+        "against the budget that produced the eviction"
+    );
+    assert!(
+        resident <= budget,
+        "{resident} resident over a {budget} budget means the bound was not \
+         enforced where it is published"
     );
 
     // Phase 3. A budget one byte short of a single blob, which is the pod this
@@ -268,6 +331,34 @@ async fn a_text_query_reports_its_blob_fetches_hits_and_the_rule_that_evicted() 
         "and re-reads both blobs, which is the cost the counter attributes"
     );
 
+    // The refusal arm the parsed side has no equivalent of. Nothing was
+    // admitted, so a pair published only after a successful insert would hold
+    // phase 2's budget here and chart this pod as the one before it — the
+    // reading `dropped oversized` is meant to be read against.
+    for (phase, snapshot) in [
+        ("the first refused execution", &refused_once),
+        ("the second refused execution", &refused_twice),
+    ] {
+        let (resident, budget) = blob_cache_pair(snapshot, phase);
+        assert_eq!(
+            budget as usize,
+            blob - 1,
+            "{phase} must publish the budget that refused it, not the larger \
+             one the resident entries were admitted under"
+        );
+        assert_eq!(
+            resident as usize, crowded_total,
+            "{phase} admits and evicts nothing, so the resident figure is \
+             exactly what the previous budget left behind"
+        );
+        assert!(
+            resident > budget,
+            "{phase} is the shape this pair exists to make legible: entries \
+             admitted under a larger budget, sitting over a smaller one that \
+             now refuses every new blob"
+        );
+    }
+
     // Phase 4. The same query with the cache switched off. A disabled cache
     // refuses every blob of every file, which the absent lookup series already
     // says (#4718); charging that as a refusal would make `oversized` track the
@@ -297,6 +388,20 @@ async fn a_text_query_reports_its_blob_fetches_hits_and_the_rule_that_evicted() 
         counter_sum(&disabled, EVICTIONS_TOTAL, None),
         0,
         "a zero bound is not a refusal this family charges"
+    );
+
+    // A switched-off cache is the one pod the eviction and lookup families are
+    // all silent on, and it is the reading the budget gauge gives directly: 0,
+    // not the 256 MiB environment default and not the 64 MiB this process
+    // configured earlier. The entry bound's own zero is unreachable in-process
+    // — it is read from the environment at the cache — and is held instead by
+    // `a_zero_entry_bound_enforces_no_blob_budget` in the Iceberg fork.
+    let (resident, budget) = blob_cache_pair(&disabled, "the disabled execution");
+    assert_eq!(budget as usize, 0, "a disabled cache enforces no budget");
+    assert_eq!(
+        resident as usize, crowded_total,
+        "while the blobs earlier budgets admitted are still held and still \
+         costing the pod memory, which is the other half of the reading"
     );
 
     iceberg::arrow::clear_text_index_cache_max_bytes();
