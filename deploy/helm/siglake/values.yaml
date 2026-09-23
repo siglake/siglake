@@ -480,9 +480,18 @@ compactor:
   # deletes the object and the row. It never registers an object it did not
   # commit, so a segment no local drain ever committed — a dropped index
   # incarnation's, or one whose ingester volume was lost — is still left for an
-  # object-store lifecycle rule. Needs `catalogUri` and `s3.warehouseUrl` set
-  # and a non-empty `wal.mirror.prefix`; the compactor warns and keeps draining
-  # if they are not.
+  # object-store lifecycle rule. The two connections it needs are already on
+  # every pod: `SIGLAKE_CATALOG_URI` comes from `postgres.existingSecret` and
+  # `postgres.secretKeys`, `SIGLAKE_WAREHOUSE_URL` from `s3.bucket` and
+  # `s3.warehousePrefix`, and all of those are required for any install. The
+  # mirror prefix is the input you may have to supply yourself:
+  # `wal.mirror.prefix` reaches the compactor only under
+  # `catalogClaim.enabled` (as `--mirror-prefix`), so the filesystem drain
+  # reads `SIGLAKE_WAL_MIRROR_PREFIX` from the pod env and falls back to the
+  # binary default `wal-mirror`. If you changed `wal.mirror.prefix`, repeat it
+  # as `SIGLAKE_WAL_MIRROR_PREFIX` under `compactor.extraEnv`. An empty
+  # effective prefix is the mirror opt-out: the compactor warns and keeps
+  # draining, as it does when a connection is missing.
   #
   # Being opt-in is deliberate: it deletes objects, and it gives a drain that
   # needs no claim-store connection today a dependency on one.
