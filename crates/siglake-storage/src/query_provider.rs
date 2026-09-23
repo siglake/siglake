@@ -617,11 +617,11 @@ impl QueryFileBatchCache {
         }
         if let Some(prev) = self.entries.insert(key.clone(), entry.clone()) {
             self.bytes = self.bytes.saturating_sub(prev.bytes);
-            decoded_file_cache_accounted_bytes().fetch_sub(prev.bytes, Relaxed);
+            release_accounted_bytes(prev.bytes);
         }
         self.bytes = self.bytes.saturating_add(entry.bytes);
         if !population_reserved {
-            decoded_file_cache_accounted_bytes().fetch_add(entry.bytes, Relaxed);
+            charge_accounted_bytes(entry.bytes);
         }
         self.order.push_back(key);
 
@@ -642,7 +642,7 @@ impl QueryFileBatchCache {
             if should_remove {
                 if let Some(evicted) = self.entries.remove(&oldest) {
                     self.bytes = self.bytes.saturating_sub(evicted.bytes);
-                    decoded_file_cache_accounted_bytes().fetch_sub(evicted.bytes, Relaxed);
+                    release_accounted_bytes(evicted.bytes);
                     metrics::counter!(
                         "siglake_query_scan_file_cache_requests_total",
                         "outcome" => "evict"
@@ -671,7 +671,7 @@ impl QueryFileBatchCache {
                 continue;
             };
             self.bytes = self.bytes.saturating_sub(evicted.bytes);
-            decoded_file_cache_accounted_bytes().fetch_sub(evicted.bytes, Relaxed);
+            release_accounted_bytes(evicted.bytes);
             metrics::counter!(
                 "siglake_query_scan_file_cache_requests_total",
                 "outcome" => "evict"
@@ -687,13 +687,55 @@ impl QueryFileBatchCache {
 
 impl Drop for QueryFileBatchCache {
     fn drop(&mut self) {
-        decoded_file_cache_accounted_bytes().fetch_sub(self.bytes, Relaxed);
+        release_accounted_bytes(self.bytes);
     }
 }
 
 fn decoded_file_cache_accounted_bytes() -> &'static std::sync::atomic::AtomicU64 {
     static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     &BYTES
+}
+
+/// The total [`decoded_file_cache_accounted_bytes`] holds, as a gauge.
+///
+/// `siglake_query_scan_file_cache_bytes` reports COMPLETED entries, which is
+/// the smaller half of what the byte budget refuses against: since #5786 a
+/// live population's admitted batches are charged to the same total, and a
+/// query tier serving nothing but clipped scans holds them and inserts none.
+/// Without this series an operator reading a pod that refuses populations sees
+/// a resident total far below the budget and no reason for the refusals.
+fn publish_accounted_bytes(total: u64) {
+    metrics::gauge!("siglake_query_scan_file_cache_accounted_bytes").set(total as f64);
+}
+
+/// Add to the accounted total and publish it. For charges that are not already
+/// bounded by an admission check: a completed entry the population did not
+/// reserve for.
+fn charge_accounted_bytes(bytes: u64) {
+    let total = decoded_file_cache_accounted_bytes().fetch_add(bytes, Relaxed);
+    publish_accounted_bytes(total.wrapping_add(bytes));
+}
+
+/// Give bytes back to the accounted total and publish it. `wrapping_sub`
+/// mirrors the `fetch_sub` exactly, so an accounting bug charts as the absurd
+/// number it is rather than as a saturated zero.
+fn release_accounted_bytes(bytes: u64) {
+    let total = decoded_file_cache_accounted_bytes().fetch_sub(bytes, Relaxed);
+    publish_accounted_bytes(total.wrapping_sub(bytes));
+}
+
+/// Create the accounted-bytes gauge at 0 before the first scan, so a pod that
+/// never populates charts an empty cache rather than No data. Call once per
+/// process, beside [`siglake_core::metrics::preregister`].
+///
+/// Its two siblings are deliberately left absent until the first insert: they
+/// are written from the insert path, and their absence is the evidence that
+/// distinguishes "populated nothing" from "inserted nothing" in a round export
+/// (`docs/LIMITATIONS.md`). This one has to exist from startup for the opposite
+/// reason — it is the only series that moves for a population that never
+/// inserts, so a flat 0 on it is a reading, not a gap.
+pub fn initialize_decoded_file_cache_metrics() {
+    publish_accounted_bytes(decoded_file_cache_accounted_bytes().load(Relaxed));
 }
 
 fn query_file_batch_cache() -> &'static std::sync::Mutex<QueryFileBatchCache> {
@@ -988,6 +1030,10 @@ impl PopulationCharge {
             population_meter()
                 .peak_accounted_bytes
                 .fetch_max(total, Relaxed);
+            // The one place a live population raises the total: both admission
+            // rules reserve against the same atomic, and the unbounded control
+            // reserves nothing and so publishes nothing.
+            publish_accounted_bytes(total);
         }
         self.priced_bytes = self.priced_bytes.saturating_add(priced);
         debug_assert!(
@@ -1017,8 +1063,7 @@ impl PopulationCharge {
             .fetch_sub(std::mem::take(&mut self.retained_bytes), Relaxed);
         self.priced_bytes = 0;
         if self.reserved_bytes > 0 {
-            decoded_file_cache_accounted_bytes()
-                .fetch_sub(std::mem::take(&mut self.reserved_bytes), Relaxed);
+            release_accounted_bytes(std::mem::take(&mut self.reserved_bytes));
         }
     }
 
@@ -1496,6 +1541,9 @@ impl CachePopulateStream {
 /// - `oversized` is excluded because the `poll_next` arm that set it already
 ///   charged `skip_oversized`; counting the drop as well would bill one
 ///   abandoned population twice;
+/// - `population_refused` is excluded for the same reason since #5801: the arm
+///   that set it charged `population_refused`, and a refused population retains
+///   nothing to abandon;
 /// - a stream that failed sets `insert_done` in its error arm, and a key another
 ///   partition populated first leaves `insert_buffered` with nothing to do but
 ///   still sets `insert_done` — both are finished, not abandoned.
@@ -1569,6 +1617,19 @@ impl Stream for CachePopulateStream {
                     } else {
                         this.discard_buffered();
                         this.population_refused = true;
+                        // Once per population, not once per refused batch: the
+                        // flag above stops this arm being reached again, so the
+                        // count is populations the budget turned away. WHY it
+                        // was turned away is not in the label — a full budget
+                        // and a busy replacement lock refuse the same way
+                        // (`try_reserve_population_with_replacement`), and the
+                        // contended-insert arm is a different moment in the
+                        // population's life.
+                        metrics::counter!(
+                            "siglake_query_scan_file_cache_requests_total",
+                            "outcome" => "population_refused"
+                        )
+                        .increment(1);
                     }
                 }
                 Poll::Ready(Some(Ok(batch)))
@@ -8217,6 +8278,117 @@ mod tests {
         });
         decoded_file_cache_accounted_bytes().fetch_sub(padding, Relaxed);
         drop(cache_guard);
+    }
+
+    /// #5801: a refused population is one `population_refused`, whatever it
+    /// polls afterwards, and never also an `abandoned`.
+    ///
+    /// The abandoned control is what makes the second half a claim rather than
+    /// an artefact of where the recorder is installed: both streams are dropped
+    /// mid-population inside the same recorder scope, and only the one that
+    /// retained batches is billed for dropping them.
+    #[test]
+    fn a_refused_population_is_counted_once_and_never_as_abandoned() {
+        let batch = string_batch(64);
+        let tuning = EffectiveFileCacheTuning {
+            max_bytes: Some(u64::MAX),
+            max_entries: Some(8),
+            row_group_prototype: false,
+            predicate_key_prototype: false,
+            population_bound_prototype: false,
+            unbounded_population_prototype: false,
+            file_attribution_prototype: false,
+        };
+        let stream = |key: &str, inner, admission| CachePopulateStream {
+            key: key.to_string(),
+            tuning,
+            inner,
+            buffered: Vec::new(),
+            buffered_bytes: 0,
+            oversized: false,
+            population_refused: false,
+            insert_done: false,
+            charge: PopulationCharge::open(admission),
+            yielded_rows: 0,
+            end: PopulateEnd::Unpolled,
+            cache_counters: Arc::new(FileCacheCounters::default()),
+        };
+        let three = || -> TaskBatchStream {
+            futures::stream::iter([
+                Ok::<_, DataFusionError>(batch.clone()),
+                Ok(batch.clone()),
+                Ok(batch.clone()),
+            ])
+            .boxed()
+        };
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            // Control: admitted, then dropped two batches into the file.
+            futures::executor::block_on(async {
+                let mut clipped = stream(
+                    "abandoned-control",
+                    three(),
+                    PopulationAdmission::Replacement {
+                        max_bytes: u64::MAX,
+                    },
+                );
+                assert!(clipped.next().await.unwrap().is_ok());
+                assert!(clipped.charge.reserved_bytes > 0);
+                assert!(!clipped.insert_done, "the control must not reach EOF");
+            });
+
+            // Refused: a budget one byte short of the first batch, with the
+            // replacement lock held so admission cannot evict its way to room
+            // either. Stating the budget rather than padding the process-wide
+            // total keeps the arm deterministic beside the other tests in this
+            // binary, which charge that total concurrently. Every later batch
+            // takes the same path and must not be billed again.
+            let priced = batch.get_array_memory_size() as u64;
+            let cache_guard = query_file_batch_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let max_bytes = priced.saturating_sub(1);
+            futures::executor::block_on(async {
+                let mut refused = stream(
+                    "refused-population",
+                    three(),
+                    PopulationAdmission::Replacement { max_bytes },
+                );
+                for _ in 0..3 {
+                    assert!(refused.next().await.unwrap().is_ok());
+                }
+                assert!(refused.population_refused);
+                assert_eq!(refused.charge.reserved_bytes, 0);
+                assert!(!refused.insert_done, "the refusal must not reach EOF");
+                assert!(
+                    !refused.oversized,
+                    "{priced} bytes against an unbounded entry rule is not oversized"
+                );
+            });
+            drop(cache_guard);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let arm = |outcome: &str| {
+            counter_sum(
+                &snapshot,
+                "siglake_query_scan_file_cache_requests_total",
+                Some(("outcome", outcome)),
+            )
+        };
+        assert_eq!(
+            (
+                arm("population_refused"),
+                arm("abandoned"),
+                arm("skip_oversized"),
+                arm("insert")
+            ),
+            (1, 1, 0, 0),
+            "three refused batches must bill one refusal and no abandonment, \
+             beside the one control population that was abandoned"
+        );
     }
 
     #[test]

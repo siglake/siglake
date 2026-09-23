@@ -807,6 +807,14 @@ pub const QUERY_SERVER_ALERTED_COUNTERS: &[AlertedCounter] = &[
             &[("outcome", "skip_oversized")],
             &[("outcome", "abandoned")],
             &[("outcome", "evict")],
+            // #5801: a population the byte budget turned away, which retains
+            // nothing and inserts nothing. It is the second outcome a `miss`
+            // can have and the only one that says the budget is the reason the
+            // cache is not filling — `abandoned` deliberately excludes it, so
+            // before this arm a refused population charted as a miss with no
+            // consequence at all. Not always exhaustion: admission also refuses
+            // when the replacement lock is busy.
+            &[("outcome", "population_refused")],
         ],
     },
 ];
