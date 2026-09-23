@@ -4228,6 +4228,50 @@ fn print_batches(batches: &[datafusion::arrow::array::RecordBatch]) -> Result<()
     Ok(())
 }
 
+/// Build the compactor's mirror-side configuration: the claim store, the
+/// object store holding the mirror, and the prefix both of them key on.
+///
+/// The prefix goes through [`wal_mirror_prefix_from`], the resolver the
+/// ingester's writer already uses, because the two sides have to agree on the
+/// string. Everything the compactor does against the mirror — the owner stamp
+/// (`classify_mirror_owner`), the recovery sweep that re-registers abandoned
+/// uploads (`sync_mirror_to_catalog`) and ledger reclamation — addresses
+/// objects as `<prefix>/<name>`, so a padded `SIGLAKE_WAL_MIRROR_PREFIX` that
+/// the writer trims and the reader keeps leaves the reader working under a
+/// prefix nothing was ever written to.
+///
+/// `None` from the resolver is the ingester's mirror opt-out (an empty, or
+/// whitespace-only, value). Claiming refuses it rather than listing the bucket
+/// root; the ledger path filters it out before calling here.
+async fn catalog_claim_config(
+    claim_uri: &str,
+    warehouse_url: &str,
+    mirror_prefix: &str,
+    batch_size: usize,
+    claimer: String,
+) -> Result<siglake_compactor::CatalogClaimConfig> {
+    let prefix =
+        wal_mirror_prefix_from(Some(mirror_prefix), Some(warehouse_url)).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--catalog-claim requires a non-empty --mirror-prefix \
+                 (SIGLAKE_WAL_MIRROR_PREFIX is empty, which is the ingester's mirror opt-out: \
+                 catalog-claim drains read the mirror, so there would be nothing to claim)"
+            )
+        })?;
+    let store = build_opendal_operator(warehouse_url)?;
+    let claim = siglake_storage::catalog_claim::SqlSegmentClaim::connect(claim_uri, claimer)
+        .await
+        .with_context(|| format!("connect claim DB at {claim_uri}"))?;
+    Ok(siglake_compactor::CatalogClaimConfig {
+        claim,
+        store,
+        prefix,
+        batch_size,
+        last_mirror_sync: Default::default(),
+        last_reclaim: std::sync::Arc::new(std::sync::Mutex::new(None)),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_compactor(
     data_dir: &std::path::Path,
@@ -4269,35 +4313,25 @@ async fn run_compactor(
         // and that variable reaches this flag too — a deployment that sets it
         // cluster-wide (the operator's `spec.extraEnv` goes to every tier) would
         // otherwise claim from the bucket ROOT and list the whole warehouse.
-        if mirror_prefix.trim().is_empty() {
-            anyhow::bail!(
-                "--catalog-claim requires a non-empty --mirror-prefix \
-                 (SIGLAKE_WAL_MIRROR_PREFIX is empty, which is the ingester's mirror opt-out: \
-                 catalog-claim drains read the mirror, so there would be nothing to claim)"
-            );
-        }
-        let store = build_opendal_operator(url)?;
+        // `catalog_claim_config` refuses that, and trims what it keeps.
         let claimer = std::env::var("SIGLAKE_COMPACTOR_ID")
             .or_else(|_| hostname_lossy())
             .unwrap_or_else(|_| format!("comp-{}", &Uuid::new_v4().to_string()[..8]));
-        tracing::info!(
+        let cfg = catalog_claim_config(
+            claim_uri,
+            url,
             mirror_prefix,
+            catalog_claim_batch,
+            claimer.clone(),
+        )
+        .await?;
+        tracing::info!(
+            mirror_prefix = %cfg.prefix,
             batch_size = catalog_claim_batch,
             claimer,
             "compactor catalog-claim mode enabled"
         );
-        let claim = siglake_storage::catalog_claim::SqlSegmentClaim::connect(claim_uri, claimer)
-            .await
-            .with_context(|| format!("connect claim DB at {claim_uri}"))?;
-        Compactor::new(&wal_dir, ice).with_catalog_claim(siglake_compactor::CatalogClaimConfig {
-            claim,
-            store,
-            prefix: mirror_prefix.to_string(),
-            batch_size: catalog_claim_batch,
-            last_mirror_sync: Default::default(),
-
-            last_reclaim: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        })
+        Compactor::new(&wal_dir, ice).with_catalog_claim(cfg)
     } else {
         let mut fs = Compactor::new(&wal_dir, ice)
             .with_fs_batch_limits(fs_claim_max_segments, fs_claim_max_bytes);
@@ -4307,27 +4341,22 @@ async fn run_compactor(
         // per object. Opt-in: it adds a claim-store dependency this path does
         // not otherwise have, and it deletes objects.
         if siglake_compactor::mirror_ledger_reclaim_enabled() {
-            match (catalog_uri, warehouse_url, mirror_prefix.trim()) {
-                (Some(claim_uri), Some(url), prefix) if !prefix.is_empty() => {
-                    let store = build_opendal_operator(url)?;
+            // Resolved through the same resolver the claim path and the
+            // ingester use, so the objects this deletes are the ones the
+            // ingester wrote.
+            let ledger_prefix = warehouse_url
+                .and_then(|url| wal_mirror_prefix_from(Some(mirror_prefix), Some(url)));
+            match (catalog_uri, warehouse_url, ledger_prefix.as_deref()) {
+                (Some(claim_uri), Some(url), Some(prefix)) => {
                     let marker = std::env::var("SIGLAKE_COMPACTOR_ID")
                         .or_else(|_| hostname_lossy())
                         .unwrap_or_else(|_| format!("comp-{}", &Uuid::new_v4().to_string()[..8]));
-                    let claim =
-                        siglake_storage::catalog_claim::SqlSegmentClaim::connect(claim_uri, marker)
-                            .await
-                            .with_context(|| {
-                                format!("connect claim DB at {claim_uri} for mirror reclamation")
-                            })?;
-                    fs = fs.with_mirror_ledger(siglake_compactor::CatalogClaimConfig {
-                        claim,
-                        store,
-                        prefix: prefix.to_string(),
-                        // Read by the claim path only; this mode never claims.
-                        batch_size: 0,
-                        last_mirror_sync: Default::default(),
-                        last_reclaim: std::sync::Arc::new(std::sync::Mutex::new(None)),
-                    });
+                    // Batch size is read by the claim path only; this mode
+                    // never claims.
+                    let cfg = catalog_claim_config(claim_uri, url, prefix, 0, marker)
+                        .await
+                        .context("configure mirror reclamation")?;
+                    fs = fs.with_mirror_ledger(cfg);
                 }
                 // A cluster-wide env var reaches every tier (the operator's
                 // `spec.extraEnv`), and an empty mirror prefix is the
@@ -4337,7 +4366,7 @@ async fn run_compactor(
                     tracing::warn!(
                         catalog_uri = claim.is_some(),
                         warehouse_url = url.is_some(),
-                        mirror_prefix = prefix,
+                        mirror_prefix = prefix.unwrap_or(""),
                         "SIGLAKE_MIRROR_LEDGER_RECLAIM is set but mirror reclamation needs \
                          --catalog-uri, --warehouse-url and a non-empty --mirror-prefix; \
                          mirror objects will keep accumulating"
@@ -5294,6 +5323,66 @@ mod default_policy_tests {
             wal_mirror_prefix_from(Some("wal-dr"), None).as_deref(),
             Some("wal-dr")
         );
+    }
+
+    /// The claim drain's own wiring, not just the resolver: a padded
+    /// `SIGLAKE_WAL_MIRROR_PREFIX` (`wal.mirror.prefix: " wal-dr "` in the
+    /// chart, or an `extraEnv` entry with whitespace) used to reach
+    /// `CatalogClaimConfig` verbatim while the ingester wrote under the
+    /// trimmed name. The compactor then stamped its owner marker, ran its
+    /// recovery sweep and reclaimed under `" wal-dr "/…`, a prefix nothing was
+    /// ever written to.
+    #[tokio::test]
+    async fn the_claim_config_keys_on_the_trimmed_mirror_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claim_uri = format!(
+            "sqlite://{}?mode=rwc",
+            tmp.path().join("claim.db").display()
+        );
+        let warehouse = format!("file://{}", tmp.path().join("warehouse").display());
+
+        let cfg = catalog_claim_config(&claim_uri, &warehouse, " wal-dr ", 64, "comp-0".into())
+            .await
+            .expect("claim config");
+        assert_eq!(cfg.prefix, "wal-dr");
+        assert_eq!(cfg.batch_size, 64);
+
+        // And the default arrives unchanged, padded or not.
+        let cfg = catalog_claim_config(
+            &claim_uri,
+            &warehouse,
+            DEFAULT_WAL_MIRROR_PREFIX,
+            64,
+            "comp-0".into(),
+        )
+        .await
+        .expect("claim config");
+        assert_eq!(cfg.prefix, DEFAULT_WAL_MIRROR_PREFIX);
+    }
+
+    /// The opt-out still refuses: an empty — or whitespace-only — prefix is
+    /// how the chart disables mirroring, and a claim drain that accepted it
+    /// would list the warehouse root.
+    #[tokio::test]
+    async fn the_claim_config_refuses_the_mirror_opt_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claim_uri = format!(
+            "sqlite://{}?mode=rwc",
+            tmp.path().join("claim.db").display()
+        );
+        let warehouse = format!("file://{}", tmp.path().join("warehouse").display());
+
+        for raw in ["", "   "] {
+            let Err(err) =
+                catalog_claim_config(&claim_uri, &warehouse, raw, 64, "comp-0".into()).await
+            else {
+                panic!("empty prefix {raw:?} must be refused");
+            };
+            assert!(
+                format!("{err:#}").contains("non-empty --mirror-prefix"),
+                "unexpected error for {raw:?}: {err:#}"
+            );
+        }
     }
 
     /// The writer and the reader have to name the SAME prefix: the ingester
