@@ -258,6 +258,7 @@ else
   scripts/check-file-cache-populate-depth-reader.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-ingester-pod-labels.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-compactor-pod-labels.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  scripts/check-kind-compactor-wakeup.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-round-diagnostics.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   # The release tag is `v0.1.0` and both charts ask for the numeric appVersion,
   # so the first published chart would have pulled a tag the registry does not

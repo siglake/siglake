@@ -294,6 +294,13 @@ jobs:
       # cluster, helm or kubectl is used.
       - name: compactor per-pod capture proves one shared queue
         run: scripts/check-kind-compactor-pod-labels.sh
+      # The zero-replica compactor wake-up arm (#6012 runs it live). This
+      # keeps it off by default, refuses to share a round with the captures
+      # that move the same tier, pins the activation expression to the one the
+      # reconciler runs, and drives the grader over a verified capture and
+      # twelve hollow ones. No cluster and no cluster CLI is used.
+      - name: compactor wake-up capture cannot grade a hollow round
+        run: scripts/check-kind-compactor-wakeup.sh
       # A failed round's diagnostics dump every not-Ready pod's logs except the
       # ones already carried by a Job dump above them. That membership test used
       # to be `printf '%s\n' "${jobs[@]}" | grep -qx`, where `grep -q` exits at

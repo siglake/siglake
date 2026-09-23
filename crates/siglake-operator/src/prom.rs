@@ -485,6 +485,21 @@ mod tests {
         assert_eq!(parked.query_in_flight, defaults.query_in_flight);
     }
 
+    /// The activation expression, written out for one release and namespace.
+    ///
+    /// `scripts/check-kind-compactor-wakeup.sh` lifts this literal out of the
+    /// source and compares it to the string the kind capture evaluates, so the
+    /// round cannot retain evidence for a query the reconciler does not run.
+    /// Changing `compactor_activation` means changing this line, and then the
+    /// capture's fixture — which is the point.
+    #[test]
+    fn the_activation_expression_is_the_one_the_kind_capture_evaluates() {
+        assert_eq!(
+            Queries::compactor_activation("siglake", "default"),
+            "avg(sum by (pod) (siglake_wal_segments_sealed{namespace=\"default\",app_kubernetes_io_instance=\"siglake\",app_kubernetes_io_component=\"ingester\"}) and on (pod) (max by (pod) (siglake_wal_segments_sealed_sample_age_seconds{namespace=\"default\",app_kubernetes_io_instance=\"siglake\",app_kubernetes_io_component=\"ingester\"}) <= 120)) or avg(sum by (pod) (siglake_compactor_sealed_pending{namespace=\"default\",app_kubernetes_io_instance=\"siglake\",app_kubernetes_io_component=\"compactor\"}))"
+        );
+    }
+
     #[test]
     fn same_release_name_in_different_namespaces_has_disjoint_queries() {
         let tenant_a = Queries::defaults("siglake", "tenant-a");
