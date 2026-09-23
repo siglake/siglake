@@ -5269,22 +5269,6 @@ mod aggregate_coverage_chain_tests {
             .collect()
     }
 
-    async fn pinned_side_aggregates(
-        reader: &IcebergContext,
-        ident: &TableIdent,
-        phase: usize,
-    ) -> Arc<SnapshotAggregates> {
-        let cached = reader.cached_table_entry(ident).await.unwrap();
-        let pin = cached.side_aggs.lock().await.clone().unwrap_or_else(|| {
-            panic!("phase {phase}: the first consult must leave a side-aggregate pin")
-        });
-        assert!(
-            aggregate_covers_current_snapshot(&cached.table, pin.aggs.coverage),
-            "phase {phase}: the pin must cover the reader's current snapshot"
-        );
-        pin.aggs
-    }
-
     /// Task #3770. The link an append publishes must name the snapshot the
     /// append actually landed on, not the one its handle was loaded from.
     ///
@@ -5413,16 +5397,16 @@ mod aggregate_coverage_chain_tests {
     /// arriving after an append, with no compactor running, serves the
     /// group-count shape from Tier-1.
     ///
-    /// Two consults: the first must load and pin the object, and the second must
-    /// leave that same `Arc` pinned. A rejected aggregate can never be pinned;
-    /// reloading the object on the second consult replaces the pin with a new
-    /// `Arc`. Checking both conditions directly avoids making this correctness
-    /// test depend on when a process metric is drained.
+    /// Two consults: the first must return the inline object's `Arc`, and the
+    /// second must return that same `Arc`. Inspect the response itself: exact
+    /// counts from the per-file fallback prove nothing about Tier-1, and a
+    /// separate cache lookup after the response can observe a different cache
+    /// generation from the one the query consulted.
     ///
     /// Run under a local recorder on a current-thread runtime because the
     /// stale-base sequence needs the private append handle and deterministic
     /// write-behind polling. The recorder keeps this test's emissions isolated;
-    /// correctness is read from the cache entry itself.
+    /// correctness is read from the query result itself.
     fn tier1_serves_after_a_contended_append(write_behind: bool) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5513,6 +5497,7 @@ mod aggregate_coverage_chain_tests {
                             ..Default::default()
                         },
                     );
+                    let current = reader.catalog.load_table(&ident).await.unwrap();
                     let expected = vec![
                         (Some("app:json".to_string()), (appended / 2) as u64),
                         (Some("syslog".to_string()), (appended / 2) as u64),
@@ -5526,13 +5511,23 @@ mod aggregate_coverage_chain_tests {
                             .unwrap_or_else(|| {
                                 panic!("Tier-1 must serve phase {phase} consult {consult}")
                             });
+                        let pin = match &counts {
+                            GroupCounts::Inline { aggs, .. } => aggs.clone(),
+                            other => panic!(
+                                "phase {phase} consult {consult}: Tier-1 inline must serve, got {}",
+                                other.source_label()
+                            ),
+                        };
+                        assert!(
+                            aggregate_covers_current_snapshot(&current, pin.coverage),
+                            "phase {phase}: the returned aggregate must cover the current snapshot"
+                        );
                         let mut rows = counts.to_rows();
                         rows.sort();
                         assert_eq!(
                             rows, expected,
                             "phase {phase} consult {consult} must be exact"
                         );
-                        let pin = pinned_side_aggregates(&reader, &ident, phase).await;
                         if let Some(first) = &first_pin {
                             assert!(
                                 Arc::ptr_eq(first, &pin),
