@@ -611,6 +611,15 @@ index: every aggregate artifact — this object, the folded wide base, the
 per-commit deltas and the rebuild markers — is addressed under the UUID of the
 table that wrote it, so a table recreated at the same location reads only what
 its own incarnation built (see [`LIMITATIONS.md`](LIMITATIONS.md)).
+Before a managed index is dropped, Siglake confirms a warehouse-root record at
+`_siglake/config/dropped_indexes/<namespace>/<drop-id>.json`. It captures the
+loaded table's UUID and location, its retained committed-file inventory, and
+the exact `metadata/siglake-agg/<table-uuid>/` target. The sweeper validates
+that relationship and inventories only that UUID prefix without resolving the
+reusable index name. Records created by the product are report-only; aggregate
+deletion has no production authority-changing API while its retention and
+failure policy remain open
+([design](DESIGN_dropped_index_aggregate_reclamation.md)).
 
 **Group-count repair and limits.** The per-commit group-count delta write makes
 four attempts, waiting 250, 500 and 750 ms between attempts. A write that
