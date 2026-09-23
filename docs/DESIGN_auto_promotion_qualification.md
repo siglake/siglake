@@ -173,14 +173,14 @@ This qualification says the bounds hold and the behaviour is what the code
 claims. It does not say the feature should be on. Missing:
 
 1. **Fleet-scale evidence.** Every number here is one local process on a
-   filesystem warehouse. Against S3 the sampling pass is `files × 1` object
-   reads of one column per pass per table, and the backfill it triggers is a
-   full rewrite of every live file — the cost that matters, and the one this
-   card did not measure.
+   filesystem warehouse. Sampling requests and bytes are now attributable per
+   pass, and backfill files, input/output bytes and duration are attributable
+   per bin. Their cost against S3 remains unmeasured until #5065's round.
 2. **The backfill wave.** Each promotion makes every live file eligible for a
    re-clustering rewrite. On a large table that is a whole-table rewrite per
-   promotion wave, competing with the drain for the same compactor. Nothing
-   paces promotions against that.
+   promotion wave, competing with the drain for the same compactor. The cost is
+   now attributable per committed backfill bin, but nothing paces promotions
+   against it and #5065 has not measured a wave against S3.
 3. **Reach and scope.** The pass runs on the compactor's own namespace and its
    managed indexes. On a multi-tenant install nothing extends it to the
    `tenant_*` namespaces the drain commits into, and the 300 s cadence gate is
@@ -203,3 +203,13 @@ publishes usage against the effective configured cap per Iceberg namespace and
 table. The packaged dashboard reads all of these and
 `SiglakeAutoPromotionNearCeiling` warns at 80%. One INFO line per sampled pass
 retains bounded key names by refusal reason and an exact truncation count.
+`siglake_auto_promotion_sample_reads_total` and
+`siglake_auto_promotion_sample_bytes_total{phase="footer|index|data"}` attribute
+the sampling reads per Iceberg namespace and table, while
+`siglake_auto_promotion_pass_duration_seconds` records one duration per sampled
+pass. A round prices the rewrite wave from
+`siglake_compactor_promotion_backfill_files_total`, the paired
+`siglake_compactor_promotion_backfill_bytes_in_total` and
+`siglake_compactor_promotion_backfill_bytes_out_total`, and
+`siglake_compactor_promotion_backfill_duration_seconds`; those series are
+recorded per committed backfill bin and retain the table label.

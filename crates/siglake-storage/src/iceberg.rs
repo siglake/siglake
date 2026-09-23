@@ -2900,6 +2900,7 @@ async fn pruned_window_batch_stream(
     columns: &[&str],
     lo: Option<i64>,
     hi: Option<i64>,
+    scan_metrics: Option<iceberg::arrow::ScanMetrics>,
 ) -> Result<(
     parquet::arrow::async_reader::ParquetRecordBatchStream<iceberg::arrow::ArrowFileReader>,
     WindowTimeColumn,
@@ -2922,6 +2923,9 @@ async fn pruned_window_batch_stream(
         .await
         .with_context(|| format!("reader {path}"))?;
     let mut reader = ArrowFileReader::new(file_meta, read);
+    if let Some(scan_metrics) = scan_metrics {
+        reader = reader.with_scan_metrics(scan_metrics);
+    }
     let meta = ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::new())
         .await
         .with_context(|| format!("load parquet metadata {path}"))?;
@@ -2969,7 +2973,7 @@ async fn scan_file_group_counts_windowed(
     use futures::StreamExt;
 
     let (mut reader, time_column) =
-        pruned_window_batch_stream(file_io, path, &[column], lo, hi).await?;
+        pruned_window_batch_stream(file_io, path, &[column], lo, hi, None).await?;
     #[cfg(feature = "experimental-exact-point-rollup")]
     record_exact_point_boundary_read(1);
     let mut counts: HashMap<Option<String>, u64> = HashMap::new();
@@ -3069,7 +3073,8 @@ async fn scan_file_timestamp_buckets_windowed(
     use arrow_array::Array;
     use futures::StreamExt;
 
-    let (mut reader, time_column) = pruned_window_batch_stream(file_io, path, &[], lo, hi).await?;
+    let (mut reader, time_column) =
+        pruned_window_batch_stream(file_io, path, &[], lo, hi, None).await?;
     let mut decoded_bytes = 0u64;
     let bucket_of =
         |ts: i64| -> i64 { origin_ns + (ts - origin_ns).div_euclid(interval_ns) * interval_ns };
@@ -6717,6 +6722,12 @@ pub struct AutoPromotionPassReport {
     pub declined: Vec<AutoPromotionDecline>,
     pub columns_before: usize,
     pub columns_after: usize,
+    /// Data files selected for this pass's bounded sample.
+    pub sample_files: usize,
+    /// Physical object-store reads made by the sampled Parquet readers.
+    pub reads: u64,
+    /// Footer, index, and data bytes read by the sampled Parquet readers.
+    pub bytes: u64,
 }
 
 fn select_promotions(
@@ -8849,7 +8860,7 @@ mod pruned_window_tests {
     async fn window_rows(path: &str, lo: Option<i64>, hi: Option<i64>) -> (usize, usize) {
         use futures::StreamExt;
         let io = FileIOBuilder::new(storage_factory_for("file:///").unwrap()).build();
-        let (mut stream, _) = pruned_window_batch_stream(&io, path, &[], lo, hi)
+        let (mut stream, _) = pruned_window_batch_stream(&io, path, &[], lo, hi, None)
             .await
             .unwrap();
         let (mut decoded, mut in_window) = (0usize, 0usize);
@@ -12149,6 +12160,7 @@ impl IcebergContext {
                 &[group_column],
                 None,
                 None,
+                None,
             )
             .await?;
             while let Some(batch) = stream.next().await {
@@ -14307,8 +14319,13 @@ impl IcebergContext {
                 declined: Vec::new(),
                 columns_before,
                 columns_after: columns_before,
+                sample_files: 0,
+                reads: 0,
+                bytes: 0,
             });
         }
+        let pass_start = std::time::Instant::now();
+        let scan_metrics = iceberg::arrow::ScanMetrics::default();
         let schema = entry.table.metadata().current_schema();
 
         // Newest data first: see `newest_sample_files`. A table with no
@@ -14339,6 +14356,7 @@ impl IcebergContext {
                 &["attributes"],
                 None,
                 None,
+                Some(scan_metrics.clone()),
             )
             .await?;
             let mut remaining = sample_rows_per_file;
@@ -14380,12 +14398,63 @@ impl IcebergContext {
             self.declare_promotions_for(table_ident, &new_list).await?;
         }
         let columns_after = columns_before + selection.promoted.len();
+        let counters = scan_metrics.scan_counters();
+        let reads = counters
+            .object_store_reads
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let phase_bytes = [
+            (
+                "footer",
+                counters
+                    .bytes_footer
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            (
+                "index",
+                counters
+                    .bytes_index
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            (
+                "data",
+                counters
+                    .bytes_data
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        ];
+        let bytes = phase_bytes.iter().map(|(_, bytes)| bytes).sum();
+        let iceberg_namespace = table_ident.namespace().to_string();
+        let table = table_ident.name().to_string();
+        metrics::counter!(
+            "siglake_auto_promotion_sample_reads_total",
+            "iceberg_namespace" => iceberg_namespace.clone(),
+            "table" => table.clone()
+        )
+        .increment(reads);
+        for (phase, phase_bytes) in phase_bytes {
+            metrics::counter!(
+                "siglake_auto_promotion_sample_bytes_total",
+                "iceberg_namespace" => iceberg_namespace.clone(),
+                "table" => table.clone(),
+                "phase" => phase
+            )
+            .increment(phase_bytes);
+        }
+        metrics::histogram!(
+            "siglake_auto_promotion_pass_duration_seconds",
+            "iceberg_namespace" => iceberg_namespace,
+            "table" => table
+        )
+        .record(pass_start.elapsed().as_secs_f64());
         Ok(AutoPromotionPassReport {
             candidates: Some(selection.candidates),
             promoted: selection.promoted,
             declined: selection.declined,
             columns_before,
             columns_after,
+            sample_files: sampled.len(),
+            reads,
+            bytes,
         })
     }
 
@@ -19679,10 +19748,26 @@ impl IcebergContext {
         // (score first, merge second — under a bounded bin budget the highest
         // file-count-reduction-per-byte work runs first, so a single throttled slot
         // spends its one merge where it buys the most layout healing.)
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ScoredBinKind {
+            Merge,
+            Backfill,
+        }
+
+        impl ScoredBinKind {
+            fn label(self) -> &'static str {
+                match self {
+                    Self::Merge => "merge",
+                    Self::Backfill => "backfill",
+                }
+            }
+        }
+
         struct ScoredBin {
             score: u64,
             level: usize,
             files: Vec<DataFile>,
+            kind: ScoredBinKind,
         }
         let mut scored: Vec<ScoredBin> = Vec::new();
         let mut gen_capped = 0u64;
@@ -19832,6 +19917,7 @@ impl IcebergContext {
                         score,
                         level,
                         files: slice,
+                        kind: ScoredBinKind::Merge,
                     });
                 }
             }
@@ -19948,6 +20034,7 @@ impl IcebergContext {
                             score,
                             level: max_level,
                             files: slice,
+                            kind: ScoredBinKind::Merge,
                         });
                     }
                 }
@@ -20006,12 +20093,17 @@ impl IcebergContext {
                     tracing::info!(
                         table = %table_label,
                         files = slice.len(),
+                        bytes_in = slice
+                            .iter()
+                            .map(|file| file.file_size_in_bytes())
+                            .sum::<u64>(),
                         "promotion backfill: rewriting pre-promotion files"
                     );
                     scored.push(ScoredBin {
                         score: 0,
                         level,
                         files: slice,
+                        kind: ScoredBinKind::Backfill,
                     });
                 }
             }
@@ -20117,6 +20209,7 @@ impl IcebergContext {
             }
             let bin_files = bin.files.len();
             let bin_level = bin.level;
+            let bin_kind = bin.kind;
             let bin_start = std::time::Instant::now();
             // Account this bin's uploads to the COMPACTION class so they cannot
             // starve the drain's (and vice versa). See `UploadClass`.
@@ -20151,6 +20244,28 @@ impl IcebergContext {
             metrics::counter!("siglake_compactor_bin_rows_total").increment(stats.rows as u64);
             metrics::counter!("siglake_compactor_bins_committed_total").increment(1);
             metrics::histogram!("siglake_compactor_bin_duration_seconds").record(bin_secs);
+            if bin_kind == ScoredBinKind::Backfill {
+                metrics::counter!(
+                    "siglake_compactor_promotion_backfill_files_total",
+                    "table" => table_label.clone()
+                )
+                .increment(bin_files as u64);
+                metrics::counter!(
+                    "siglake_compactor_promotion_backfill_bytes_in_total",
+                    "table" => table_label.clone()
+                )
+                .increment(stats.bytes_in);
+                metrics::counter!(
+                    "siglake_compactor_promotion_backfill_bytes_out_total",
+                    "table" => table_label.clone()
+                )
+                .increment(stats.bytes_out);
+                metrics::histogram!(
+                    "siglake_compactor_promotion_backfill_duration_seconds",
+                    "table" => table_label.clone()
+                )
+                .record(bin_secs);
+            }
             // A single bin is the freshness floor under preemption — make slow
             // ones visible so bench rounds can attribute probe latency. `path`
             // and `rows_per_sec` are what turn this line from "compaction is
@@ -20159,6 +20274,7 @@ impl IcebergContext {
             if bin_secs > 10.0 {
                 tracing::info!(
                     table = %table_label,
+                    kind = bin_kind.label(),
                     level = bin_level,
                     files = bin_files,
                     rows = stats.rows,
@@ -30879,7 +30995,8 @@ async fn decode_file_time_group_counts(
 ) -> Result<(TimeGroupCounts, u64)> {
     use futures::StreamExt;
 
-    let (mut reader, _) = pruned_window_batch_stream(file_io, path, columns, None, None).await?;
+    let (mut reader, _) =
+        pruned_window_batch_stream(file_io, path, columns, None, None, None).await?;
     let mut out = TimeGroupCounts {
         width_ns,
         columns: BTreeMap::new(),
