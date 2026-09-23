@@ -503,6 +503,14 @@ mkdir -p "$work/bin" "$work/state" "$work/results"
 for tool in curl docker helm kind kubectl; do
   ln -s "$PWD/$STANDIN" "$work/bin/$tool"
 done
+cat >"$work/bin/git" <<'STANDIN'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'called\n' >>"$SCHEMA_ROLLBACK_STANDIN_STATE/git-calls"
+[[ "$*" == *'rev-parse HEAD' ]] || exit 64
+printf '%s\n' '1111111111111111111111111111111111111111'
+STANDIN
+chmod +x "$work/bin/git"
 : >"$work/state/calls.log"
 PATH="$work/bin:$PATH" \
 SCHEMA_ROLLBACK_STANDIN_STATE="$work/state" \
@@ -531,6 +539,11 @@ if ! python3 - "$work/results/schema-rollback.json" "$work/state/calls.log" \
 import json, sys
 evidence = json.load(open(sys.argv[1], encoding="utf-8"))
 assert evidence["evidence"]["grade"] == "verified", evidence["evidence"]["problems"]
+revisions = evidence["revisions"]
+assert revisions["repository_commit"] == "1" * 40, revisions
+assert revisions["repository_commit_source"] == "git_rev_parse_head", revisions
+assert revisions["image_a"]["source_revision"] == "1" * 40, revisions
+assert revisions["image_b"]["source_revision"] == "1" * 40, revisions
 for step in evidence["operator_arm"]["steps"]:
     assert {pod["component"] for pod in step["pods"]} == {"ingester", "compactor", "query"}, step
 calls = [json.loads(line) for line in open(sys.argv[2], encoding="utf-8") if line.strip()]
@@ -574,6 +587,50 @@ PY
 then
   fail "stand-in probe command sequence or evidence is wrong"
 fi
+
+# Drive the complete writer again with an injected source revision different
+# from the stand-in git SHA. All three schema-rollback revision fields must
+# stay equal, and the injected path must not execute git.
+injected="$work/injected"
+mkdir -p "$injected/bin" "$injected/state" "$injected/results"
+for tool in curl docker helm kind kubectl; do
+  ln -s "$PWD/$STANDIN" "$injected/bin/$tool"
+done
+ln -s "$work/bin/git" "$injected/bin/git"
+: >"$injected/state/calls.log"
+PATH="$injected/bin:$PATH" \
+SCHEMA_ROLLBACK_STANDIN_STATE="$injected/state" \
+SCHEMA_ROLLBACK_STANDIN_GROUP_BEHAVIOR=delay:2 \
+SCHEMA_ROLLBACK_STANDIN_ROLLOUT_BEHAVIOR=delay:2 \
+SIGLAKE_SOURCE_COMMIT=2222222222222222222222222222222222222222 \
+KUBE_CONTEXT=kind-siglake \
+RESULTS_DIR="$injected/results" \
+SCHEMA_ROLLBACK_CONVERGE_TIMEOUT_SECONDS=5 \
+SCHEMA_ROLLBACK_CONVERGE_INTERVAL_SECONDS=1 \
+SCHEMA_ROLLBACK_RECONCILE_TIMEOUT_SECONDS=5 \
+SCHEMA_ROLLBACK_INGEST_BATCH=2 \
+  setsid "$PROBE" >"$injected/probe.stdout" 2>"$injected/probe.stderr" &
+probe_pgid=$!
+wait "$probe_pgid" ||
+  fail "injected-revision probe failed: $(<"$injected/probe.stderr")"
+probe_pgid=
+python3 - "$injected/results/schema-rollback.json" <<'PY' ||
+import json
+import sys
+
+evidence = json.load(open(sys.argv[1], encoding="utf-8"))
+assert evidence["evidence"]["grade"] == "verified", evidence["evidence"]
+revisions = evidence["revisions"]
+assert revisions["repository_commit"] == "2" * 40, revisions
+assert revisions["repository_commit_source"] == "siglake_source_commit_env", revisions
+assert revisions["image_a"]["source_revision"] == "2" * 40, revisions
+assert revisions["image_b"]["source_revision"] == "2" * 40, revisions
+PY
+  fail "the schema-rollback artifact writer did not retain the injected revision origin"
+[[ $(wc -l <"$work/state/git-calls") -eq 1 ]] ||
+  fail "the fallback schema-rollback run did not call git exactly once"
+[[ ! -e "$injected/state/git-calls" ]] ||
+  fail "the injected schema-rollback revision still called git"
 
 echo "ok (5 grader fixtures; delayed GROUP BY and operator reconcile converged;" \
   "permanent mismatch, missing bucket and stuck rollout failed with retained diagnostics; probe passed without" \

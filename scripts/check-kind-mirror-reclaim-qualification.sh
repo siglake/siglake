@@ -48,6 +48,8 @@ contains "$body" 'write_mirror_reclaim_launch "${SIGLAKE_HELM_ARGS[@]}"' ||
   fail "$ROUND does not retain the launch argument array"
 contains "$body" '"$ROOT/deploy/helm/siglake" "${SIGLAKE_HELM_ARGS[@]}"' ||
   fail "$ROUND does not execute the retained launch argument array"
+contains "$body" '"$(source_commit)" "$(source_commit_origin)" "$@"' ||
+  fail "$ROUND does not resolve the retained launch revision through the source resolver"
 
 for artifact in \
   'launch.json' \
@@ -99,6 +101,65 @@ mkdir -p "$sandbox/scripts" "$sandbox/tmp"
 grep -qxF "$TRAP_LINE" "$ROUND" || fail "$ROUND lost the setup boundary"
 sed -n "1,/^${TRAP_LINE}\$/p" "$ROUND" | sed '$d' >"$sandbox/scripts/prelude.bash"
 cp scripts/kind-common.bash "$sandbox/scripts/kind-common.bash"
+
+# Exercise the actual launch writer through both revision paths. The stand-in
+# SHA deliberately differs from the injection, and the injected arm must not
+# ask git for a second answer.
+mkdir -p "$sandbox/bin" "$sandbox/results"
+sed -n '/^SIGLAKE_SOURCE_COMMIT=/,/^# --- #1838/p' "$ROUND" | sed '$d' \
+  >"$sandbox/scripts/source-commit.bash"
+sed -n '/^write_mirror_reclaim_launch()/,/^capture_mirror_reclaim_effective_config()/p' \
+  "$ROUND" | sed '$d' >"$sandbox/scripts/write-launch.bash"
+cat >"$sandbox/bin/git" <<'STANDIN'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'called\n' >>"$STANDIN_GIT_CALLS"
+[[ "$*" == *'rev-parse HEAD' ]] || exit 64
+printf '%s\n' "$STANDIN_GIT_COMMIT"
+STANDIN
+chmod +x "$sandbox/bin/git"
+
+write_launch_fixture() {
+  local output=$1
+  shift
+  env PATH="$sandbox/bin:$PATH" STANDIN_GIT_CALLS="$sandbox/git-calls" \
+    STANDIN_GIT_COMMIT=1111111111111111111111111111111111111111 "$@" \
+    bash -c '
+      set -euo pipefail
+      ROOT=$1
+      MIRROR_RECLAIM_ARM=off
+      MIRROR_RECLAIM_LAUNCH_JSON=$2
+      CATALOG_CLAIM_ENABLED=false
+      WAL_MIRROR_ENABLED=true
+      WAL_MIRROR_ACTIVE_INTERVAL_SECS=0
+      COMMITTED_RETENTION_SECS=901
+      MIRROR_LEDGER_RECLAIM=false
+      LOAD_SECONDS=3600
+      MIRROR_RECLAIM_RESULTS_DIR=$ROOT/results/mirror-reclaim-off
+      source "$ROOT/scripts/source-commit.bash"
+      source "$ROOT/scripts/write-launch.bash"
+      write_mirror_reclaim_launch --set fixture=true
+    ' _ "$sandbox" "$output"
+}
+
+write_launch_fixture "$sandbox/results/fallback.json"
+write_launch_fixture "$sandbox/results/injected.json" \
+  SIGLAKE_SOURCE_COMMIT=2222222222222222222222222222222222222222
+python3 - "$sandbox/results/fallback.json" "$sandbox/results/injected.json" <<'PY' ||
+import json
+import sys
+
+fallback, injected = (json.load(open(path, encoding="utf-8")) for path in sys.argv[1:])
+assert fallback["source_commit"] == "1" * 40, fallback
+assert fallback["source_commit_source"] == "git_rev_parse_head", fallback
+assert injected["source_commit"] == "2" * 40, injected
+assert injected["source_commit_source"] == "siglake_source_commit_env", injected
+assert fallback["helm_command"][-2:] == ["--set", "fixture=true"], fallback
+assert injected["helm_command"][-2:] == ["--set", "fixture=true"], injected
+PY
+  fail "$ROUND launch writer did not retain both revision origins"
+[[ $(wc -l <"$sandbox/git-calls") -eq 1 ]] ||
+  fail "the injected launch revision still called git"
 
 run_prelude() {
   local mode=$1
