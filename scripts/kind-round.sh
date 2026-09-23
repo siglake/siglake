@@ -150,6 +150,7 @@ COMPACTOR_WAKEUP_PARK_SECONDS=900
 COMPACTOR_WAKEUP_WAKE_SECONDS=300
 COMPACTOR_WAKEUP_BATCH=500
 COMPACTOR_WAKEUP_POLL_SECONDS=10
+COMPACTOR_WAKEUP_SIGNAL_POLL_SECONDS=2
 # Must equal `SEALED_SAMPLE_MAX_AGE_SECS` in crates/siglake-operator/src/prom.rs:
 # the capture evaluates the operator's own expression, and the offline check
 # compares the two strings character for character.
@@ -275,6 +276,7 @@ COMPACTOR_SAMPLE_TIMES_JSON="$RESULTS_DIR/compactor-pod-labels-sample-times.json
 COMPACTOR_PER_POD_JSON="$RESULTS_DIR/compactor-pod-labels-per-pod.json"
 COMPACTOR_EXPRESSION_JSON="$RESULTS_DIR/compactor-pod-labels-expression.json"
 COMPACTOR_WAKEUP_JSON="$RESULTS_DIR/compactor-wakeup.json"
+COMPACTOR_WAKEUP_PARKED_EXPRESSION_JSON="$RESULTS_DIR/compactor-wakeup-parked-expression.json"
 COMPACTOR_WAKEUP_DEPTH_JSON="$RESULTS_DIR/compactor-wakeup-depth.json"
 COMPACTOR_WAKEUP_AGE_JSON="$RESULTS_DIR/compactor-wakeup-sample-age.json"
 COMPACTOR_WAKEUP_EXPRESSION_JSON="$RESULTS_DIR/compactor-wakeup-expression.json"
@@ -1967,6 +1969,62 @@ compactor_wakeup_operator_expression() {
     "$ingester" "$ingester" "$COMPACTOR_WAKEUP_SAMPLE_MAX_AGE_SECONDS" "$compactor"
 }
 
+# Whether the three post-ingest captures carry a fresh positive depth that the
+# operator expression also sees. This is only the loop's readiness check; the
+# grader below re-reads the retained responses and applies the full proof.
+compactor_wakeup_signal_is_positive() {
+  python3 - "$COMPACTOR_WAKEUP_DEPTH_JSON" "$COMPACTOR_WAKEUP_AGE_JSON" \
+    "$COMPACTOR_WAKEUP_EXPRESSION_JSON" "$COMPACTOR_WAKEUP_SAMPLE_MAX_AGE_SECONDS" <<'PY'
+import json
+import math
+import sys
+
+depth_path, age_path, operator_path, allowance = sys.argv[1:]
+allowance = float(allowance)
+
+
+def vector(path):
+    try:
+        response = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    data = response.get("data") or {}
+    if response.get("status") != "success" or data.get("resultType") != "vector":
+        return []
+    return data.get("result") or []
+
+
+def per_pod(rows, combine):
+    out = {}
+    for row in rows:
+        pod = (row.get("metric") or {}).get("pod", "").strip()
+        try:
+            value = float(row["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return {}
+        if not pod or not math.isfinite(value):
+            return {}
+        if combine == "sum":
+            out[pod] = out.get(pod, 0.0) + value
+        else:
+            out[pod] = max(out.get(pod, value), value)
+    return out
+
+
+depth = per_pod(vector(depth_path), "sum")
+age = per_pod(vector(age_path), "max")
+fresh = [value for pod, value in depth.items() if age.get(pod, allowance + 1) <= allowance]
+operator = vector(operator_path)
+try:
+    operator_value = float(operator[0]["value"][1]) if len(operator) == 1 else 0.0
+except (KeyError, IndexError, TypeError, ValueError):
+    operator_value = 0.0
+if fresh and min(fresh) > 0.0 and math.isfinite(operator_value) and operator_value > 0.0:
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 # The compactor Deployment's desired replica count, empty when the operator has
 # not rendered it yet.
 compactor_wakeup_replicas() {
@@ -2008,8 +2066,8 @@ PY
 }
 
 capture_compactor_wakeup() {
-  local next=$1 at rc=0 deadline replicas
-  local parked_pods="" parked=0 woken=0
+  local next=$1 at parked_at rc=0 deadline replicas pods
+  local parked_pods="" parked=0 signal_seen=0 woken=0
   mkdir -p "$RESULTS_DIR"
   : >"$COMPACTOR_WAKEUP_REPLICAS_JSONL"
 
@@ -2031,21 +2089,59 @@ capture_compactor_wakeup() {
   fi
   parked_pods=$(compactor_wakeup_pods)
 
+  # Retain the reading that kept the tier parked before ingest. Without this
+  # control a positive capture says there was work, but not that the signal
+  # advanced after this arm drove it.
+  parked_at=$(date -u +%s)
+  prometheus_capture "$(compactor_wakeup_operator_expression)" "$parked_at" \
+    "$COMPACTOR_WAKEUP_PARKED_EXPRESSION_JSON" ||
+    compactor_wakeup_failure "the parked operator-expression query failed"
+
   # The signal half: with no compactor process in existence, the depth the
   # INGESTERS publish still has to move when a segment is registered. That is
   # the reading `siglake_compactor_sealed_pending` cannot give.
   log "drive ingest with the compactor parked"
-  ingest_events "$next" "$COMPACTOR_WAKEUP_BATCH" || true
+  if ! ingest_events "$next" "$COMPACTOR_WAKEUP_BATCH"; then
+    compactor_wakeup_failure "ingest failed while the compactor was parked"
+    return 1
+  fi
   next=$((next + COMPACTOR_WAKEUP_BATCH))
-  at=$(date -u +%s)
-  compactor_wakeup_sample ingested
-  prometheus_capture "$(compactor_wakeup_depth_expression)" "$at" "$COMPACTOR_WAKEUP_DEPTH_JSON" ||
-    compactor_wakeup_failure "the published depth query failed"
-  prometheus_capture "$(compactor_wakeup_age_expression)" "$at" "$COMPACTOR_WAKEUP_AGE_JSON" ||
-    compactor_wakeup_failure "the sample-age query failed"
-  prometheus_capture "$(compactor_wakeup_operator_expression)" "$at" \
-    "$COMPACTOR_WAKEUP_EXPRESSION_JSON" ||
-    compactor_wakeup_failure "the operator activation expression query failed"
+
+  # The publisher and Prometheus each run on a 15-second cadence. Poll until a
+  # fresh positive reading has crossed both, retaining it only while the
+  # Deployment is still at zero and no terminating compactor pod exists. The
+  # old one-shot query happened immediately after ingest and normally captured
+  # the pre-ingest zero.
+  log "wait for the ingester-published depth while the compactor stays parked"
+  deadline=$((SECONDS + COMPACTOR_WAKEUP_WAKE_SECONDS))
+  while ((SECONDS < deadline)); do
+    replicas=$(compactor_wakeup_replicas)
+    pods=$(compactor_wakeup_pods)
+    if [[ "$replicas" != 0 || -n "$pods" ]]; then
+      compactor_wakeup_failure \
+        "the compactor started before a fresh positive activation reading was retained"
+      break
+    fi
+    at=$(date -u +%s)
+    prometheus_capture "$(compactor_wakeup_depth_expression)" "$at" \
+      "$COMPACTOR_WAKEUP_DEPTH_JSON" || true
+    prometheus_capture "$(compactor_wakeup_age_expression)" "$at" \
+      "$COMPACTOR_WAKEUP_AGE_JSON" || true
+    prometheus_capture "$(compactor_wakeup_operator_expression)" "$at" \
+      "$COMPACTOR_WAKEUP_EXPRESSION_JSON" || true
+    if compactor_wakeup_signal_is_positive &&
+      [[ "$(compactor_wakeup_replicas)" == 0 && -z "$(compactor_wakeup_pods)" ]]; then
+      signal_seen=1
+      compactor_wakeup_sample ingested
+      break
+    fi
+    sleep "$COMPACTOR_WAKEUP_SIGNAL_POLL_SECONDS"
+  done
+  if ((signal_seen == 0)); then
+    compactor_wakeup_failure \
+      "no fresh positive activation reading was retained while the compactor stayed parked"
+    return 1
+  fi
 
   log "wait for the operator to bring the compactor back (bound ${COMPACTOR_WAKEUP_WAKE_SECONDS}s)"
   deadline=$((SECONDS + COMPACTOR_WAKEUP_WAKE_SECONDS))
@@ -2062,10 +2158,11 @@ capture_compactor_wakeup() {
   ((woken == 1)) ||
     compactor_wakeup_failure "the compactor tier did not come back within ${COMPACTOR_WAKEUP_WAKE_SECONDS}s"
 
-  python3 - "$TMP_DIR/compactor-wakeup-capture.json" "$(iso_now)" "$at" \
+  python3 - "$TMP_DIR/compactor-wakeup-capture.json" "$(iso_now)" "$parked_at" "$at" \
     "$(source_commit)" "$(source_commit_origin)" "$NAMESPACE" "$COMPACTOR_WAKEUP_CLUSTER" \
     "$parked_pods" "$COMPACTOR_WAKEUP_SAMPLE_MAX_AGE_SECONDS" "$COMPACTOR_WAKEUP_BATCH" \
     "$COMPACTOR_WAKEUP_REPLICAS_JSONL" \
+    "$(compactor_wakeup_operator_expression)" "$COMPACTOR_WAKEUP_PARKED_EXPRESSION_JSON" \
     "$(compactor_wakeup_depth_expression)" "$COMPACTOR_WAKEUP_DEPTH_JSON" \
     "$(compactor_wakeup_age_expression)" "$COMPACTOR_WAKEUP_AGE_JSON" \
     "$(compactor_wakeup_operator_expression)" "$COMPACTOR_WAKEUP_EXPRESSION_JSON" <<'PY' || rc=$?
@@ -2073,8 +2170,9 @@ import json
 import sys
 
 (
-    out_path, generated_at, at, commit, commit_source, namespace, cluster,
+    out_path, generated_at, parked_at, at, commit, commit_source, namespace, cluster,
     parked_pods, max_age, batch, replicas_path,
+    parked_operator_expression, parked_operator_path,
     depth_expression, depth_path,
     age_expression, age_path,
     operator_expression, operator_path,
@@ -2098,7 +2196,7 @@ except (OSError, ValueError):
     history = []
 
 document = {
-    "schema_version": 1,
+    "schema_version": 2,
     "generated_at": generated_at,
     "evaluated_at": int(at),
     "revisions": {
@@ -2114,6 +2212,10 @@ document = {
     },
     "replica_history": history,
     "queries": {
+        "parked_operator_expression": {
+            "expression": parked_operator_expression, "time": int(parked_at),
+            "response": response(parked_operator_path),
+        },
         "published_depth": {
             "expression": depth_expression, "time": int(at), "response": response(depth_path),
         },

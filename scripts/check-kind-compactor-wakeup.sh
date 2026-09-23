@@ -80,6 +80,8 @@ for phase in before-park parking parked ingested waking woken; do
 done
 contains "$round_body" 'grade-kind-compactor-wakeup.py' ||
   fail "$ROUND does not grade the capture"
+contains "$round_body" 'compactor_wakeup_signal_is_positive' ||
+  fail "$ROUND does not wait for the publisher and scrape before retaining the signal"
 
 python3 - "$ROUND" <<'PY' || fail "the opt-in phase is not last or its verdict is not deferred"
 import sys
@@ -100,6 +102,27 @@ verdict = next(i for i, line in enumerate(lines)
 if not pod_labels < call < verdict:
     raise SystemExit(f"expected the ordinary captures, then this one, then the verdict; "
                      f"got {pod_labels}, {call}, {verdict}")
+PY
+
+python3 - "$ROUND" <<'PY' || fail "the wake-up capture does not retain a zero control then wait for a positive signal"
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+baseline = next(i for i, line in enumerate(lines)
+                if '"$COMPACTOR_WAKEUP_PARKED_EXPRESSION_JSON" ||' in line)
+ingest = next(i for i, line in enumerate(lines)
+              if 'ingest_events "$next" "$COMPACTOR_WAKEUP_BATCH"' in line)
+positive = next(i for i, line in enumerate(lines)
+                if line.strip().startswith("if compactor_wakeup_signal_is_positive"))
+sample = next(i for i, line in enumerate(lines)
+              if line.strip() == "compactor_wakeup_sample ingested")
+wake = next(i for i, line in enumerate(lines)
+            if 'log "wait for the operator to bring the compactor back' in line)
+if not baseline < ingest < positive < sample < wake:
+    raise SystemExit(
+        f"expected parked control, ingest, positive-signal wait, retained sample, wake; "
+        f"got {baseline}, {ingest}, {positive}, {sample}, {wake}"
+    )
 PY
 
 # --- the expression the capture evaluates ----------------------------------
@@ -162,9 +185,12 @@ import sys
 fixture, expected = sys.argv[1:]
 document = json.loads(pathlib.Path(fixture).read_text(encoding="utf-8"))
 want = pathlib.Path(expected).read_text(encoding="utf-8").strip()
-got = document["queries"]["operator_expression"]["expression"]
-if got != want:
-    raise SystemExit(f"fixture expression\n  {got}\ndiffers from the operator's\n  {want}")
+for name in ("parked_operator_expression", "operator_expression"):
+    got = document["queries"][name]["expression"]
+    if got != want:
+        raise SystemExit(
+            f"fixture {name} expression\n  {got}\ndiffers from the operator's\n  {want}"
+        )
 PY
 
 # --- the grader, on a verified capture and on every hollow one --------------
@@ -178,6 +204,7 @@ import sys
 evidence = json.load(open(sys.argv[1], encoding="utf-8"))["evidence"]
 assert evidence["grade"] == "verified", evidence
 assert evidence["summary"]["parked_replicas"] == 0, evidence
+assert evidence["summary"]["parked_operator_value"] == 0, evidence
 assert evidence["summary"]["woken_replicas"] == 1, evidence
 assert evidence["summary"]["published_depth"] == 6.0, evidence
 assert evidence["summary"]["operator_value"] == 6.0, evidence
@@ -197,6 +224,7 @@ history = document["replica_history"]
 depth = document["queries"]["published_depth"]["response"]["data"]["result"]
 age = document["queries"]["sample_age"]["response"]["data"]["result"]
 operator = document["queries"]["operator_expression"]["response"]["data"]["result"]
+parked_operator = document["queries"]["parked_operator_expression"]["response"]["data"]["result"]
 if mutation == "pod-still-terminating":
     history[2]["pods"] = ["siglake-compactor-6d4c9b9f8c-h2xq7"]
 elif mutation == "never-parked":
@@ -224,6 +252,8 @@ elif mutation == "unpinned-commit":
     document["revisions"]["repository_commit_source"] = "unknown"
 elif mutation == "no-ingest":
     document["settings"]["ingest_batch"] = 0
+elif mutation == "baseline-already-positive":
+    parked_operator[0]["value"][1] = "6"
 else:
     raise SystemExit(mutation)
 json.dump(document, open(out, "w", encoding="utf-8"), indent=2)
@@ -256,5 +286,6 @@ expect_unverified operator-reads-nothing 'returned 0 series, not one scalar'
 expect_unverified operator-disagrees 'not reading the depth this capture saw'
 expect_unverified unpinned-commit "provenance is unknown"
 expect_unverified no-ingest 'drove no ingest while the tier was parked'
+expect_unverified baseline-already-positive 'already read 6 before ingest'
 
 echo "ok ($fixtures offline compactor wake-up fixtures; the live wake-up needs an operator-managed kind round, #6012)"

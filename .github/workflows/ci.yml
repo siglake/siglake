@@ -298,7 +298,7 @@ jobs:
       # keeps it off by default, refuses to share a round with the captures
       # that move the same tier, pins the activation expression to the one the
       # reconciler runs, and drives the grader over a verified capture and
-      # twelve hollow ones. No cluster and no cluster CLI is used.
+      # thirteen hollow ones. No cluster and no cluster CLI is used.
       - name: compactor wake-up capture cannot grade a hollow round
         run: scripts/check-kind-compactor-wakeup.sh
       # A failed round's diagnostics dump every not-Ready pod's logs except the

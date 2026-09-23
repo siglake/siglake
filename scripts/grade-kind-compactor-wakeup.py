@@ -10,7 +10,9 @@ checks for it:
    whose `spec.replicas` is 0 while a pod is still terminating is not a parked
    tier: that pod holds a claim and publishes the compactor's own gauge, so
    anything read in that window proves nothing about an independent signal.
-2. **The published depth was positive AND fresh while nothing was running.**
+2. **The reading advanced from zero to a positive, fresh published depth while
+   nothing was running.** The parked control prevents an unrelated pre-existing
+   backlog from being credited to the ingest this arm drives.
    The depth gauge keeps answering with its last value for the whole scrape
    staleness window after its publisher stops, so a depth without a sample age
    under the operator's allowance is not a current reading. A depth of zero,
@@ -75,7 +77,28 @@ def per_pod(rows: list, what: str, combine: str) -> dict[str, float]:
     return out
 
 
+def scalar(queries: dict, name: str, what: str) -> float:
+    rows = vector(queries, name, what)
+    if len(rows) != 1:
+        raise Unverified(
+            f"the {what} returned {len(rows)} series, not one scalar — "
+            "an empty result is refused as a reading by the reconciler"
+        )
+    try:
+        value = float(rows[0]["value"][1])
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise Unverified(f"the {what} carries no parseable sample: {exc}") from exc
+    if not math.isfinite(value):
+        raise Unverified(f"the {what} carries a non-finite sample ({value})")
+    return value
+
+
 def grade(document: dict) -> dict:
+    if document.get("schema_version") != 2:
+        raise Unverified(
+            f"schema_version is {document.get('schema_version')!r}, not 2; "
+            "the capture has no required pre-ingest control"
+        )
     settings = document.get("settings") or {}
     revisions = document.get("revisions") or {}
     if not revisions.get("repository_commit"):
@@ -129,6 +152,17 @@ def grade(document: dict) -> dict:
         )
 
     queries = document.get("queries") or {}
+    parked_operator_value = scalar(
+        queries,
+        "parked_operator_expression",
+        "parked operator activation expression",
+    )
+    if parked_operator_value != 0.0:
+        raise Unverified(
+            f"the operator's expression already read {parked_operator_value:g} before ingest: "
+            "the capture does not show this arm advancing the activation signal"
+        )
+
     depth = per_pod(vector(queries, "published_depth", "published depth"), "published depth", "sum")
     age = per_pod(vector(queries, "sample_age", "sample age"), "sample age", "max")
     allowance = float(settings.get("sample_max_age_seconds") or 0)
@@ -146,16 +180,7 @@ def grade(document: dict) -> dict:
             "queue is not a reason to start a worker"
         )
 
-    operator = vector(queries, "operator_expression", "operator activation expression")
-    if len(operator) != 1:
-        raise Unverified(
-            f"the operator's expression returned {len(operator)} series, not one scalar — "
-            "an empty result is refused as a reading by the reconciler"
-        )
-    try:
-        operator_value = float(operator[0]["value"][1])
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
-        raise Unverified(f"the operator's expression carries no parseable sample: {exc}") from exc
+    operator_value = scalar(queries, "operator_expression", "operator activation expression")
     expected = sum(fresh.values()) / len(fresh)
     if not math.isclose(operator_value, expected, rel_tol=1e-9):
         raise Unverified(
@@ -171,6 +196,7 @@ def grade(document: dict) -> dict:
         "grade": "verified",
         "summary": {
             "parked_replicas": 0,
+            "parked_operator_value": parked_operator_value,
             "woken_replicas": woken["replicas"],
             "publishers": len(depth),
             "fresh_publishers": len(fresh),
