@@ -38,6 +38,31 @@ fail() { echo "FAIL $*" >&2; exit 1; }
 contains() { case "$1" in *"$2"*) ;; *) return 1 ;; esac; }
 lines() { printf '%s' "$1" | grep -c . || true; }
 
+# #5556: the SHA the stand-in `git` answers with, and the different SHA a
+# launcher injects. Under the aws-runner the checkout's HEAD is the box's own
+# throwaway `git init` commit, so the two must not be the same string here.
+STANDIN_COMMIT=0123456789abcdef0123456789abcdef01234567
+INJECTED_COMMIT=5f3a51489c46f0bd38b3c28da1c1e0c8f5a7de21
+expect_revision() {
+  local file=$1 want_commit=$2 want_source=$3
+  python3 - "$file" "$want_commit" "$want_source" <<'PY' || fail "$file does not pin the source revision the capture was given"
+import json
+import sys
+
+path, want_commit, want_source = sys.argv[1:]
+revisions = json.load(open(path, encoding="utf-8"))["revisions"]
+if revisions.get("repository_commit") != want_commit:
+    raise SystemExit(
+        f"repository_commit is {revisions.get('repository_commit')!r}, expected {want_commit!r}"
+    )
+if revisions.get("repository_commit_source") != want_source:
+    raise SystemExit(
+        f"repository_commit_source is {revisions.get('repository_commit_source')!r}, "
+        f"expected {want_source!r}"
+    )
+PY
+}
+
 for file in "$ROUND" "$GRADER" "$FIXTURE" "$PROM_SOURCE" "$CHART_VALUES"; do
   [[ -f "$file" ]] || fail "$file does not exist"
 done
@@ -213,10 +238,10 @@ case "$*" in
 *"get pods"*) cat "$FIXTURE_INGESTER_PODS" ;;
 esac
 EOF
-cat >"$sandbox/bin/git" <<'EOF'
+cat >"$sandbox/bin/git" <<EOF
 #!/usr/bin/env bash
-printf 'git %s\n' "$*" >>"$CALLS"
-printf '%s\n' "0123456789abcdef0123456789abcdef01234567"
+printf 'git %s\n' "\$*" >>"\$CALLS"
+printf '%s\n' "$STANDIN_COMMIT"
 EOF
 # The one stand-in with logic: it answers the Prometheus API out of the passing
 # fixture, re-stamped to whatever `time=` it was given, and accepts the ingest
@@ -405,6 +430,8 @@ if len(series) < 2 or len(pods) < 2 or not all(pods):
 if graded["evidence"]["grade"] != "verified":
     raise SystemExit(f"graded {graded['evidence']}")
 PY
+# With nothing injected the capture pins the checkout's own HEAD and says so.
+expect_revision "$sandbox/results/ingester-pod-labels.json" "$STANDIN_COMMIT" git_rev_parse_head
 fixtures=$((fixtures + 1))
 
 # --- arm 3: one ready ingester pod -------------------------------------------
@@ -434,6 +461,28 @@ contains "$one_pod" 'only 1 ready ingester pods' ||
   fail "the one-pod arm failed for the wrong reason: $one_pod"
 contains "$(<"$calls")" 'minReplicaCount":1' ||
   fail "the one-pod arm left the ingester floor raised"
+fixtures=$((fixtures + 1))
+
+# --- arm 4: the launcher injects the source revision (#5556) -----------------
+# The aws-runner ships a snapshot without `.git` and commits it on the box, so
+# the checkout's HEAD there names nothing. An injected SIGLAKE_SOURCE_COMMIT
+# must reach the retained evidence instead of that commit, and the capture must
+# record which of the two it took.
+: >"$calls"
+env -i PATH="$sandbox/bin:/usr/bin:/bin" HOME="$HOME" \
+  TMPDIR="$sandbox/tmp" SANDBOX="$sandbox" CALLS="$calls" \
+  INGESTER_POD_LABEL_CAPTURE=1 RESULTS_DIR="$sandbox/results-injected-commit" \
+  SIGLAKE_SOURCE_COMMIT="$INJECTED_COMMIT" \
+  FIXTURE_CAPTURE="$PWD/$FIXTURE" FIXTURE_INGESTER_PODS="$sandbox/ingester-pods.json" \
+  "$sandbox/scripts/drive.bash" >"$sandbox/injected-commit.out" 2>&1 ||
+  fail "the injected-commit arm exited nonzero: $(<"$sandbox/injected-commit.out")"
+injected=$(<"$sandbox/injected-commit.out")
+contains "$injected" 'DRIVE_FAILURE=0' ||
+  fail "the injected-commit arm recorded a capture failure: $injected"
+contains "$injected" 'grade=verified' ||
+  fail "the injected-commit arm did not grade verified: $injected"
+expect_revision "$sandbox/results-injected-commit/ingester-pod-labels.json" \
+  "$INJECTED_COMMIT" siglake_source_commit_env
 fixtures=$((fixtures + 1))
 
 # --- the grader, on the passing fixture and eight mutations ------------------
