@@ -86,8 +86,6 @@ spec:
             - --catalog-claim
             - --catalog-claim-batch
             - {{ .Values.compactor.catalogClaim.batch | quote }}
-            - --mirror-prefix
-            - {{ .Values.wal.mirror.prefix | quote }}
             {{- end }}
             {{- range .Values.compactor.promoteAttrs }}
             - --promote-attr
@@ -134,6 +132,19 @@ spec:
               value: {{ .Values.compactor.snapshotExpire.retainLast | quote }}
             - name: SIGLAKE_COMMITTED_RETENTION_SECS
               value: {{ .Values.compactor.committedRetentionSecs | quote }}
+            # The mirror prefix, for BOTH drain modes: the claim drain reads its
+            # segments from this prefix, and the filesystem drain's ledger
+            # reclamation (below) marks and deletes the objects under it. One
+            # variable rather than a `--mirror-prefix` argument in claim mode
+            # only, because the filesystem drain otherwise fell back to the
+            # binary default `wal-mirror` and inserted rows naming a prefix the
+            # ingester does not write to. Rendered either way, like the
+            # ingester's copy: `wal.mirror.enabled: false` has to say so with an
+            # EMPTY value, which the filesystem drain reports and keeps draining
+            # through and `--catalog-claim` refuses at startup.
+            # `compactor.extraEnv` is spliced after this, so it still wins.
+            - name: SIGLAKE_WAL_MIRROR_PREFIX
+              value: {{ ternary .Values.wal.mirror.prefix "" .Values.wal.mirror.enabled | quote }}
             # Ledger-only mirror reclamation for the filesystem drain. Rendered
             # in both states: the opt-out has to be explicit, because turning
             # this on gives that drain a claim-store dependency and lets it

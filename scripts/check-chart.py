@@ -235,9 +235,9 @@ DEFAULT_FILE_CACHE_ENV = {
 # The WAL mirror. Default-on in the binary since 2026-09-11, so the chart has
 # to render the prefix in BOTH arms: an ingester with no
 # SIGLAKE_WAL_MIRROR_PREFIX mirrors, and `wal.mirror.enabled: false` would then
-# be a value that changes nothing. The reader side is the compactor's
-# `--mirror-prefix`, which has to name the same string or a catalog-claim drain
-# claims from a prefix nobody writes to.
+# be a value that changes nothing. The reader side is the compactor's copy of
+# the same variable, which has to name the same string or a catalog-claim drain
+# claims from a prefix nobody writes to and a filesystem drain reclaims one.
 INGEST_CONTAINER = "ingester"
 COMPACTOR_CONTAINER = "compactor"
 INDEX_REBUILD_ENV = "SIGLAKE_INDEX_REBUILD"
@@ -1267,17 +1267,24 @@ def check_query_env(docs: list[dict], expected: dict[str, str]) -> list[str]:
 
 
 def check_wal_mirror_env(docs: list[dict], expected_prefix: str) -> list[str]:
-    """The ingester states the mirror prefix, and the drain claims from it.
+    """The ingester states the mirror prefix, and the drain reads the same one.
 
-    Two failures this catches, both silent:
+    Three failures this catches, all silent:
 
     * The ingester renders no ``SIGLAKE_WAL_MIRROR_PREFIX``. The binary
       defaults the mirror ON wherever a warehouse URL is set, so an omitted
       variable is not "off" — ``wal.mirror.enabled: false`` would upload
       anyway, and the operator who set it would never know.
-    * The compactor's ``--mirror-prefix`` names a different string. In
-      catalog-claim mode the drain reads that prefix and local ``sealed/``
-      never, so a mismatch stops compaction with no error.
+    * The compactor renders no ``SIGLAKE_WAL_MIRROR_PREFIX``, or a different
+      string. Both drain modes resolve the prefix from it: the claim drain
+      reads its segments from that prefix and local ``sealed/`` never, so a
+      mismatch stops compaction with no error, and the filesystem drain's
+      ledger reclamation (``compactor.mirrorLedgerReclaim``) inserts rows
+      naming it. #5880: the chart passed it as ``--mirror-prefix`` under
+      ``catalogClaim.enabled`` alone, so the filesystem drain fell back to the
+      binary default whatever ``wal.mirror.prefix`` said.
+    * A ``--mirror-prefix`` argument naming something else. It would win over
+      the variable, since clap prefers an argument to its environment.
 
     The claim-with-no-mirror arm below is now a backstop: since #2955 the
     chart refuses that pair at render time (``siglake.compactorScaleGuard``),
@@ -1285,7 +1292,9 @@ def check_wal_mirror_env(docs: list[dict], expected_prefix: str) -> list[str]:
     would catch a guard that stopped firing.
     """
     rendered = False
+    compactor_rendered = False
     values: list[str] = []
+    compactor_values: list[str] = []
     claim_prefixes: list[str] = []
     for d in docs:
         if d.get("kind") != "Deployment":
@@ -1301,6 +1310,12 @@ def check_wal_mirror_env(docs: list[dict], expected_prefix: str) -> list[str]:
                     if e.get("name") == WAL_MIRROR_ENV
                 ]
             if c.get("name") == COMPACTOR_CONTAINER:
+                compactor_rendered = True
+                compactor_values = [
+                    str(e.get("value"))
+                    for e in c.get("env") or []
+                    if e.get("name") == WAL_MIRROR_ENV
+                ]
                 args = c.get("args") or []
                 claim_prefixes = [
                     args[i + 1]
@@ -1322,6 +1337,20 @@ def check_wal_mirror_env(docs: list[dict], expected_prefix: str) -> list[str]:
         problems.append(
             f"Deployment container '{INGEST_CONTAINER}' renders {WAL_MIRROR_ENV}="
             f"{values[-1]!r}; expected {expected_prefix!r}"
+        )
+    if compactor_rendered and not compactor_values:
+        problems.append(
+            f"Deployment container '{COMPACTOR_CONTAINER}' renders no "
+            f"{WAL_MIRROR_ENV}; both drain modes resolve the mirror prefix from "
+            f"it, so the chart has to state {expected_prefix!r} — an omitted "
+            f"variable is the binary default {DEFAULT_WAL_MIRROR_PREFIX!r} "
+            f"whatever wal.mirror.prefix says, and an empty value is the opt-out"
+        )
+    elif compactor_values and compactor_values[-1] != expected_prefix:
+        problems.append(
+            f"Deployment container '{COMPACTOR_CONTAINER}' renders {WAL_MIRROR_ENV}="
+            f"{compactor_values[-1]!r} while the ingester writes to "
+            f"{expected_prefix!r}"
         )
     for got in claim_prefixes:
         if not expected_prefix:
@@ -3748,6 +3777,20 @@ def main(argv: list[str] | None = None) -> int:
         ("mirror-claimed", ["--set", "compactor.catalogClaim.enabled=true"]),
         ("mirror-renamed", ["--set", "compactor.catalogClaim.enabled=true",
                             "--set", "wal.mirror.prefix=wal-dr"]),
+        # #5880: the same renamed prefix on the FILESYSTEM drain, which is the
+        # arm the chart used to leave at the binary default — that drain is the
+        # one `mirrorLedgerReclaim` gives a mirror store to mark and delete
+        # under, so a prefix it invented is a row pointing at nothing. With the
+        # mirror off, the same drain must receive the empty opt-out instead and
+        # not the default, which is what makes it report and keep draining.
+        ("mirror-renamed-filesystem",
+         ["--set", "compactor.catalogClaim.enabled=false",
+          "--set", "compactor.mirrorLedgerReclaim=true",
+          "--set", "wal.mirror.prefix=wal-dr"]),
+        ("mirror-disabled-reclaim",
+         ["--set", "compactor.catalogClaim.enabled=false",
+          "--set", "compactor.mirrorLedgerReclaim=true",
+          "--set", "wal.mirror.enabled=false"]),
         # The binary defaults gRPC on, so false must pass its explicit opt-out
         # and remove both Kubernetes ports rather than merely omitting the
         # listener argument.
@@ -3851,6 +3894,8 @@ def main(argv: list[str] | None = None) -> int:
     expected_wal_mirror_prefix = {
         "mirror-disabled": "",
         "mirror-renamed": "wal-dr",
+        "mirror-renamed-filesystem": "wal-dr",
+        "mirror-disabled-reclaim": "",
     }
     expected_otlp_grpc_port = {
         "otlp-grpc-disabled": None,
