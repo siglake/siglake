@@ -748,11 +748,23 @@ impl TraceQueryContext {
         // `/api/v1/sql` carries it: dropping the request future cancels the
         // future, but the plan's spawned partition pumps keep scanning until
         // this flag ends the source stream they drain from.
+        //
+        // The execution id rides the same way, for the same reason it does on
+        // `/api/v1/sql`: it is what attributes the scan's tuning and partition
+        // profile events to this request. ONE id covers the whole render —
+        // a trace search plans two statements out of this one context — so
+        // the start line below names no statement and `scan_id` is what tells
+        // the render's scans apart.
+        let execution_id = siglake_storage::QueryExecutionId::next();
+        crate::sql::log_query_execution_start("jaeger", execution_id, None, None);
         let ctx = {
             let mut hinted = state.query_scan.session_context().state();
             hinted
                 .config_mut()
                 .set_extension(std::sync::Arc::new(cancel.clone()));
+            hinted
+                .config_mut()
+                .set_extension(std::sync::Arc::new(execution_id));
             SessionContext::new_with_state(hinted)
         };
         let table = ice.index_table_ident(index_id);

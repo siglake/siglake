@@ -547,6 +547,54 @@ pub struct ClippedScanLimit {
     pub limit: usize,
 }
 
+/// Identity of ONE query execution, injected through `SessionConfig` by
+/// whoever starts it (the query server mints one per request; the ordered warm
+/// probe mints one per probe).
+///
+/// Read at PLANNING time like every other session hint, for the reason
+/// [`SiglakeIcebergTableScan`]'s `cancel` field states: a plan is executed
+/// through whatever `TaskContext` the caller supplies, and only one of them is
+/// the session's.
+///
+/// It exists because the scan's two log events — the planning-time
+/// `siglake query scan reader tuning` and the per-partition
+/// `siglake query source partition profile` — are emitted from spawned pumps
+/// that carry no request span, and the partition event can be emitted after
+/// the request's own terminal line. Without an id on the events themselves,
+/// a reader can only attribute them by their position in the log, which is
+/// wrong whenever two executions overlap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryExecutionId(pub u64);
+
+/// `query_execution_id` for a scan whose session carries no
+/// [`QueryExecutionId`]: internal and test scans. Distinct from every minted
+/// id, so a reader can tell "no execution claimed this scan" from "this
+/// execution did" instead of guessing. The scan's own `scan_id` is still
+/// unique, so the partition events stay attributable to their scan node.
+pub const UNATTRIBUTED_QUERY_EXECUTION_ID: u64 = 0;
+
+impl QueryExecutionId {
+    /// Mint the next id in this process. Never [`UNATTRIBUTED_QUERY_EXECUTION_ID`].
+    ///
+    /// Process-local, so it identifies an execution within ONE pod's log. A
+    /// distributed query is joined across pods by its W3C trace context, which
+    /// the fan-out already propagates.
+    pub fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Process-unique identity of one scan NODE, minted in
+/// [`SiglakeIcebergTableScan::try_new`]. Two scan nodes in one execution (the
+/// residual twin plan is the standing case) and the same query planned again
+/// for a later execution never share one, so `(scan_id, partition)` names
+/// exactly one partition profile event.
+fn next_scan_node_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Per-session override of the clipped-limit admission ramp factor (#4865).
 /// `0` disables the ramp, so every partition starts decoding at once.
 ///
@@ -2345,6 +2393,14 @@ pub struct SiglakeIcebergTableScan {
     /// plan so an EXPLAIN says which path the shape takes without reading a
     /// process-wide counter.
     text_index_decline: Option<&'static str>,
+    /// The execution that planned this scan ([`QueryExecutionId`]), captured
+    /// from the session, or [`UNATTRIBUTED_QUERY_EXECUTION_ID`] when the
+    /// session carries none.
+    query_execution_id: u64,
+    /// This scan node's own id ([`next_scan_node_id`]). Stamped on the tuning
+    /// event and on every partition profile event this node emits, so the two
+    /// join without reading the lines between them.
+    scan_id: u64,
 }
 
 /// The Iceberg field-id stamped in an Arrow field's Parquet metadata, if any.
@@ -2833,7 +2889,18 @@ impl SiglakeIcebergTableScan {
         let est_decoded_per_file =
             estimated_decoded_bytes_per_file(planned_files, planned_bytes, decompression_factor);
         let applied_range = reader_tuning.applied_range();
+        // Identity FIRST, so a reader that only needs to attribute the event
+        // does not have to parse the tuning it carries. `scan_id` is what the
+        // partition profiles below carry back; `query_execution_id` is what
+        // ties this scan to the request that planned it.
+        let query_execution_id = state
+            .config()
+            .get_extension::<QueryExecutionId>()
+            .map_or(UNATTRIBUTED_QUERY_EXECUTION_ID, |id| id.0);
+        let scan_id = next_scan_node_id();
         tracing::info!(
+            query_execution_id,
+            scan_id,
             planned_files,
             planned_bytes,
             partition_count,
@@ -2923,7 +2990,22 @@ impl SiglakeIcebergTableScan {
             ordered_source_limit_safe: preserve_task_order
                 && (!has_pushed_filters || time_only_filters(filters)),
             text_index_decline,
+            query_execution_id,
+            scan_id,
         })
+    }
+
+    /// The execution this scan was planned for, or
+    /// [`UNATTRIBUTED_QUERY_EXECUTION_ID`] when its session carried no
+    /// [`QueryExecutionId`].
+    pub fn query_execution_id(&self) -> u64 {
+        self.query_execution_id
+    }
+
+    /// This scan node's id, as stamped on its tuning and partition profile
+    /// events.
+    pub fn scan_id(&self) -> u64 {
+        self.scan_id
     }
 
     /// Partition streams this node has handed out that have not yet finished
@@ -4838,6 +4920,12 @@ struct SourceMetricsStream {
     _decode_reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
     schema: ArrowSchemaRef,
     baseline: BaselineMetrics,
+    /// Copied from the scan node so the profile event names its execution and
+    /// its scan node. Copied rather than read at finish time because `finish`
+    /// runs from a spawned pump (no request span) and, on the streaming path,
+    /// after the request's own terminal log line.
+    query_execution_id: u64,
+    scan_id: u64,
     partition: usize,
     projected_columns: Arc<Vec<String>>,
     planned_files: usize,
@@ -5057,6 +5145,8 @@ impl SourceMetricsStream {
         };
         let max_batch_gap_ms = self.inter_batch_gap_max_secs * 1000.0;
         tracing::info!(
+            query_execution_id = self.query_execution_id,
+            scan_id = self.scan_id,
             partition = self.partition,
             planned_files = self.planned_files,
             planned_bytes = self.planned_bytes,
@@ -6022,6 +6112,8 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
             _decode_reservation: decode_reservation,
             schema,
             baseline: BaselineMetrics::new(&metrics, partition),
+            query_execution_id: self.query_execution_id,
+            scan_id: self.scan_id,
             partition,
             projected_columns,
             planned_files,
