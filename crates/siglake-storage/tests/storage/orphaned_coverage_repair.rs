@@ -36,6 +36,8 @@ use siglake_storage::iceberg::{
     SNAPSHOT_TIME_BUCKET_BASE_NS,
 };
 
+use crate::fixture_clock::fixture_base;
+
 const INDEX: &str = "logs-orphan-coverage";
 
 /// Result caches off: both consumers memoize per (table, snapshot, spec), so a
@@ -65,9 +67,13 @@ fn index_config() -> IndexConfig {
 }
 
 fn hourly_retention_config() -> IndexConfig {
+    hourly_retention_config_with_period(2 * 60 * 60)
+}
+
+fn hourly_retention_config_with_period(period_secs: u64) -> IndexConfig {
     let mut config = index_config();
     config.retention = Some(RetentionPolicy {
-        period_secs: 2 * 60 * 60,
+        period_secs,
         schedule: Some("0 * * * *".to_string()),
     });
     config
@@ -231,6 +237,39 @@ fn remove_time_bucket_footer(path: &str) {
         writer.write(batch).unwrap();
     }
     writer.close().unwrap();
+}
+
+fn time_bucket_footer(path: &str) -> BTreeMap<i64, u64> {
+    let path = std::path::Path::new(path.strip_prefix("file://").unwrap_or(path));
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap()).unwrap();
+    let json = builder
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kvs| {
+            kvs.iter()
+                .find(|kv| kv.key == siglake_storage::iceberg::TIME_BUCKETS_KV_KEY)
+        })
+        .and_then(|kv| kv.value.as_deref())
+        .expect("live fixture file has a time-bucket footer");
+    let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        parsed.get("nulls").and_then(serde_json::Value::as_u64),
+        Some(0),
+        "fixture footer has no null timestamps"
+    );
+    parsed
+        .get("buckets")
+        .and_then(serde_json::Value::as_object)
+        .expect("fixture footer has a buckets object")
+        .iter()
+        .map(|(start, count)| {
+            (
+                start.parse::<i64>().unwrap(),
+                count.as_u64().expect("fixture bucket count is a u64"),
+            )
+        })
+        .collect()
 }
 
 /// The trailing quarter of the span, snapped to the aggregate's hourly bucket
@@ -773,6 +812,89 @@ fn print_cost(label: &str, samples: &[RebuildCost]) {
     );
 }
 
+#[derive(Debug)]
+struct HourlyRetentionRebuildFixture {
+    hour: chrono::DateTime<Utc>,
+    expired: Vec<Vec<chrono::DateTime<Utc>>>,
+    live: Vec<Vec<chrono::DateTime<Utc>>>,
+    period_secs: u64,
+}
+
+fn hourly_retention_rebuild_fixture(now: chrono::DateTime<Utc>) -> HourlyRetentionRebuildFixture {
+    let hour = fixture_base();
+    debug_assert_eq!(hour.timestamp().rem_euclid(3_600), 0);
+
+    // This report intentionally reaches six hours back, past fixture_clock's
+    // general three-hour single-partition margin. Noon still leaves every row
+    // on the fixed day, and the assertions below lock that geometry down.
+    let expired = (0..8)
+        .map(|append_no| {
+            (0..200)
+                .map(|row| hour - Duration::hours(6) + Duration::seconds(append_no * 200 + row))
+                .collect()
+        })
+        .collect();
+    let live = (0..16)
+        .map(|append_no| {
+            (0..200)
+                .map(|row| {
+                    let bucket = if row % 2 == 0 {
+                        hour - Duration::minutes(90)
+                    } else {
+                        hour - Duration::minutes(30)
+                    };
+                    bucket + Duration::seconds(append_no)
+                })
+                .collect()
+        })
+        .collect();
+    let intended_cutoff = hour - Duration::hours(2);
+    let period_secs = now
+        .signed_duration_since(intended_cutoff)
+        .num_seconds()
+        .try_into()
+        .expect("fixture base precedes the retention run");
+
+    HourlyRetentionRebuildFixture {
+        hour,
+        expired,
+        live,
+        period_secs,
+    }
+}
+
+#[test]
+fn hourly_retention_rebuild_fixture_is_stable_at_utc_boundaries() {
+    for now in [
+        Utc.with_ymd_and_hms(2026, 9, 23, 1, 35, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 9, 23, 0, 1, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 9, 23, 23, 59, 0).unwrap(),
+    ] {
+        let fixture = hourly_retention_rebuild_fixture(now);
+        let event_times: Vec<_> = fixture
+            .expired
+            .iter()
+            .chain(&fixture.live)
+            .flatten()
+            .copied()
+            .collect();
+        assert!(
+            event_times
+                .iter()
+                .all(|timestamp| timestamp.date_naive() == fixture.hour.date_naive()),
+            "{now}: fixture events crossed a UTC day"
+        );
+
+        let cutoff = now - Duration::seconds(i64::try_from(fixture.period_secs).unwrap());
+        let last_expired = fixture.expired.iter().flatten().max().unwrap();
+        let first_live = fixture.live.iter().flatten().min().unwrap();
+        assert!(
+            *last_expired < cutoff && cutoff < *first_live,
+            "{now}: cutoff {cutoff} did not separate {last_expired} from {first_live}"
+        );
+    }
+}
+
 /// Local decision input for #4675. The table models an operator invoking the
 /// CLI hourly: one retention trigger drops old files and leaves 16 live files,
 /// each spanning two aggregate buckets so the full 2-D pass must decode them.
@@ -783,37 +905,71 @@ fn print_cost(label: &str, samples: &[RebuildCost]) {
 async fn hourly_retention_rebuild_cost_report() {
     let tmp = tempfile::tempdir().unwrap();
     let ice = open(tmp.path()).await;
-    let config = hourly_retention_config();
+    let fixture = hourly_retention_rebuild_fixture(Utc::now());
+    let config = hourly_retention_config_with_period(fixture.period_secs);
     ice.create_index(&config).await.unwrap();
-    let now = Utc::now();
-    let hour = Utc
-        .timestamp_opt(now.timestamp().div_euclid(3_600) * 3_600, 0)
-        .unwrap();
 
-    for append_no in 0..8 {
-        let times: Vec<_> = (0..200)
-            .map(|row| hour - Duration::hours(6) + Duration::seconds(append_no * 200 + row))
-            .collect();
-        append_times(&ice, &config, &times, "expired").await;
+    for times in &fixture.expired {
+        append_times(&ice, &config, times, "expired").await;
     }
-    for append_no in 0..16 {
-        let times: Vec<_> = (0..200)
-            .map(|row| {
-                let base = if row % 2 == 0 {
-                    hour - Duration::minutes(90)
-                } else {
-                    hour - Duration::minutes(30)
-                };
-                base + Duration::seconds(append_no)
-            })
-            .collect();
-        append_times(&ice, &config, &times, "live").await;
+    for times in &fixture.live {
+        append_times(&ice, &config, times, "live").await;
     }
     let retained = ice.enforce_index_retention(INDEX).await.unwrap();
-    assert!(retained.files_dropped >= 8, "{retained:?}");
+    assert_eq!(retained.files_dropped, 8, "{retained:?}");
+    assert_eq!(retained.rows_dropped, 1_600, "{retained:?}");
+    assert_eq!(retained.straddling_files_kept, 0, "{retained:?}");
     let ident = ice.index_table_ident(INDEX);
     let files = ice.live_data_files(&ident).await.unwrap();
     assert_eq!(files.len(), 16, "fixture drifted: {retained:?}");
+    assert_eq!(
+        files.iter().map(|file| file.record_count()).sum::<u64>(),
+        3_200,
+        "retention kept the wrong live-row population"
+    );
+    let expected_buckets = BTreeMap::from([
+        (
+            (fixture.hour - Duration::hours(2))
+                .timestamp_nanos_opt()
+                .unwrap(),
+            100,
+        ),
+        (
+            (fixture.hour - Duration::hours(1))
+                .timestamp_nanos_opt()
+                .unwrap(),
+            100,
+        ),
+    ]);
+    for file in &files {
+        let footer = time_bucket_footer(file.file_path());
+        assert_eq!(
+            footer.len(),
+            2,
+            "live fixture file {} does not have exactly two footer buckets: {footer:?}",
+            file.file_path()
+        );
+        assert!(
+            footer.values().all(|count| *count == 100),
+            "live fixture file {} does not split its rows 100/100: {footer:?}",
+            file.file_path()
+        );
+        let hourly_buckets = footer.into_iter().fold(
+            BTreeMap::<i64, u64>::new(),
+            |mut buckets, (start, count)| {
+                let hour =
+                    start.div_euclid(SNAPSHOT_TIME_BUCKET_BASE_NS) * SNAPSHOT_TIME_BUCKET_BASE_NS;
+                *buckets.entry(hour).or_default() += count;
+                buckets
+            },
+        );
+        assert_eq!(
+            hourly_buckets,
+            expected_buckets,
+            "live fixture file {} does not span both intended hourly buckets",
+            file.file_path()
+        );
+    }
     let paths: Vec<String> = files
         .iter()
         .map(|file| file.file_path().to_string())
