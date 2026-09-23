@@ -200,7 +200,11 @@ quarantines ambiguous `processing/` segments rather than risk double commits.
 The Helm chart refuses to render a compactor tier that can hold more than one
 pod — `compactor.replicas` or `autoscaling.compactor.maxReplicas` above 1 —
 without `compactor.catalogClaim.enabled`, and refuses that claim without the
-mirror it claims from. The operator uses `wal-mirror` unless the final
+mirror it claims from. It renders `wal.mirror.prefix` as
+`SIGLAKE_WAL_MIRROR_PREFIX` on the ingester and on the compactor in either
+drain mode, so the filesystem drain's ledger reclamation marks and deletes
+under the prefix the ingester writes (#5880; it used to see the binary default
+outside claim mode). The operator uses `wal-mirror` unless the final
 `SIGLAKE_WAL_MIRROR_PREFIX` in `spec.extraEnv` selects another trimmed prefix;
 the ingester writes and the catalog-claim compactor reads that same namespace.
 A blank value remains the mirror opt-out for a compactor maximum of one. If

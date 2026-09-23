@@ -296,16 +296,17 @@ It never registers an object it did not commit, so a dropped index
 incarnation's quarantined segments, and an ingester whose volume was lost
 before its segments drained, are still left to an object-store lifecycle rule.
 
-The catalog and the store are already wired: the chart renders
-`SIGLAKE_CATALOG_URI` from `postgres.existingSecret` and `postgres.secretKeys`,
-and `SIGLAKE_WAREHOUSE_URL` from `s3.bucket` and `s3.warehousePrefix`, on every
-component. The mirror prefix is the part it does not render on the compactor —
-`wal.mirror.prefix` becomes `--mirror-prefix` only under
-`compactor.catalogClaim.enabled`, so this filesystem path reads
-`SIGLAKE_WAL_MIRROR_PREFIX` and otherwise uses the binary default `wal-mirror`.
-If `wal.mirror.prefix` is not that default, repeat it as
-`SIGLAKE_WAL_MIRROR_PREFIX` in `compactor.extraEnv`. With an empty effective
-prefix, or a missing connection, the compactor warns and keeps draining.
+All three inputs are wired: the chart renders `SIGLAKE_CATALOG_URI` from
+`postgres.existingSecret` and `postgres.secretKeys`, and `SIGLAKE_WAREHOUSE_URL`
+from `s3.bucket` and `s3.warehousePrefix`, on every component, and
+`wal.mirror.prefix` as `SIGLAKE_WAL_MIRROR_PREFIX` on the compactor in both
+drain modes. A changed prefix no longer needs a `compactor.extraEnv` entry repeating it
+(#5880 — until then it reached the compactor under
+`compactor.catalogClaim.enabled` alone, and this drain used the binary default
+`wal-mirror`). An entry left over from that workaround still wins, since
+`compactor.extraEnv` is rendered last. With an empty effective prefix —
+`wal.mirror.enabled: false` renders the variable empty — or a missing
+connection, the compactor warns and keeps draining.
 
 Off by default: it deletes objects, and it gives a drain that needs no
 claim-store connection today a dependency on one. Watch

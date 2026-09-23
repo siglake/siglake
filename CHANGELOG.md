@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Chart (fix)**: the compactor now receives `wal.mirror.prefix` as
+  `SIGLAKE_WAL_MIRROR_PREFIX` in both drain modes, instead of getting it as
+  `--mirror-prefix` under `compactor.catalogClaim.enabled` alone. A filesystem
+  drain with `compactor.mirrorLedgerReclaim: true` was resolving its prefix from
+  the binary default `wal-mirror` whatever the chart said, so at a changed
+  prefix any row it inserted carried a `segment_url` under a prefix nothing
+  writes to, and `wal.mirror.enabled: false` never reached it at all. A
+  `compactor.extraEnv` entry repeating the prefix — what the chart README,
+  `values.yaml` and `docs/LIMITATIONS.md` asked for until now — is no longer
+  needed, and still wins where one is left in place. Claim-mode behaviour at the
+  default prefix is unchanged, and the chart still refuses a claim with the
+  mirror off. (#5880)
+
 - **Query observability (feature)**: the decoded-file cache publishes the total
   its byte budget is enforced against, as
   `siglake_query_scan_file_cache_accounted_bytes`, and counts the populations

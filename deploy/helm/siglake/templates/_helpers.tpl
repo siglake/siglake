@@ -76,10 +76,12 @@ quietly, which is why they are render-time refusals rather than notes:
     catalog table and NEVER local `sealed/`, and rows land there only from an
     ingester that mirrors. Zero segments are claimed, compaction stops, and
     `siglake_compactor_sealed_pending` reads zero, because the local sealed
-    count is not what the claim path looks at. The binary cannot catch this
-    one: it refuses `--catalog-claim` with an EMPTY `--mirror-prefix`
-    (siglake-cli), and the prefix rendered here is non-empty whether or not
-    anything writes to it.
+    count is not what the claim path looks at. The binary's own refusal is a
+    weaker version of this one: it refuses `--catalog-claim` with an EMPTY
+    mirror prefix (siglake-cli), and since #5880 `wal.mirror.enabled: false`
+    does render the compactor an empty `SIGLAKE_WAL_MIRROR_PREFIX` — but that
+    is a pod crash-looping after install rather than an install that stops,
+    and it says nothing about the ingester half of the pair.
 
 `autoscaling.compactor.maxReplicas` counts as a replica count: an HPA ceiling
 above one reaches the same state a few minutes after install rather than at
