@@ -306,21 +306,31 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   times, grouped answer and operator expression. The offline grader accounts
   for independently refreshed gauges and rejects a sum of the replicas'
   copies, but no kind round has supplied the live capture yet (#5548).
-- **No tier can be scaled to zero.** Every `spec.autoscaling.<component>.min`
-  must be 1 or more; `0` is refused with `InvalidSpec=True` /
+- **Only the compactor can be scaled to zero, and the wake-up is unproven in a
+  cluster.** `spec.autoscaling.ingester.min` and `…query.min` must be 1 or
+  more; `0` is refused with `InvalidSpec=True` /
   `AutoscalingZeroFloorUnsupported` before the operator touches a child
-  resource, so the cluster keeps running unchanged until the floor is raised.
-  The reason is that each component's scaling signal — ingest requests/sec,
-  pending segments, in-flight queries — is exported by the pods of the
-  component it scales. A tier parked at zero publishes nothing, so nothing can
-  ask for it back, and because the decision needs all three readings, the
-  stopped tier's missing series also holds the two healthy ones at their
-  current size. An activation signal that outlives the stopped pods (a
-  catalog-side backlog probe, a request-driven wake-up) is not implemented.
-  `docs/DESIGN_compactor_wakeup_signal.md` designs one for the compactor —
-  the catalog queue depth published by the ingester, per-component
-  observations, and a refusal narrowed to the drain modes that still lack a
-  signal. Nothing of it is implemented, and the refusal above is unchanged.
+  resource. Their scaling signals — ingest requests/sec, in-flight queries —
+  are exported by the pods of the tier they size, so a tier parked at zero
+  publishes nothing and nothing can ask for it back.
+  `spec.autoscaling.compactor.min: 0` is accepted since #6011, but only under
+  the catalog-claim drain (`compactor.max` above 1) and with
+  `ewmaHalfLifeSecs` above 0: the ingesters publish the shared queue depth
+  (`siglake_wal_segments_sealed`, with a sample-age companion the operator
+  uses to drop stale publishers), so the reading survives the stopped tier.
+  `compactor.max: 1` keeps `AutoscalingZeroFloorUnsupported` — the filesystem
+  drain never reads the shared queue — and `ewmaHalfLifeSecs: 0` is refused as
+  `AutoscalingZeroFloorNeedsSmoothing`, because without smoothing one idle
+  scrape parks the tier. A parked tier is woken for one 10-minute maintenance
+  window after an hour at zero so retention, delete tasks, claim reclaim and
+  the mirror recovery sweep still run, and a zero-floor tier whose reading is
+  missing entirely goes to 1 rather than staying parked. WHAT IS NOT PROVEN:
+  the live wake-up. No kind or AWS round has yet retained a compactor
+  Deployment reaching `spec.replicas: 0` and being brought back by the
+  ingester-published depth (#6012); the unit tests and the offline capture
+  grader are not that evidence. Leave the packaged `compactor.min: 1` in place
+  until a round supplies it. `docs/DESIGN_compactor_wakeup_signal.md` is the
+  design.
 - **An audit batch can be lost at append.** Query responses never
   wait for the best-effort audit worker, its retained rows and conversion
   working set are bounded by count and charged bytes, and each append is
