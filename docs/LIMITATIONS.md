@@ -317,6 +317,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   stopped tier's missing series also holds the two healthy ones at their
   current size. An activation signal that outlives the stopped pods (a
   catalog-side backlog probe, a request-driven wake-up) is not implemented.
+  `docs/DESIGN_compactor_wakeup_signal.md` designs one for the compactor —
+  the catalog queue depth published by the ingester, per-component
+  observations, and a refusal narrowed to the drain modes that still lack a
+  signal. Nothing of it is implemented, and the refusal above is unchanged.
 - **An audit batch can be lost at append.** Query responses never
   wait for the best-effort audit worker, its retained rows and conversion
   working set are bounded by count and charged bytes, and each append is

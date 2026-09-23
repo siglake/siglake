@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
@@ -52,18 +52,52 @@ struct Captured {
     endpoint: Option<String>,
 }
 
+/// How long a start event waits for its partner before giving up.
+const OVERLAP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Clone, Default)]
 struct Recorder {
     events: Arc<Mutex<Vec<Captured>>>,
-    sql_start_barrier: Option<Arc<Barrier>>,
     sql_starts: Arc<AtomicUsize>,
 }
 
 impl Recorder {
     fn with_overlapping_sql_starts() -> Self {
-        Self {
-            sql_start_barrier: Some(Arc::new(Barrier::new(2))),
-            ..Self::default()
+        Self::default()
+    }
+
+    /// Hold each of the first two `sql` start events until both have arrived,
+    /// so the two executions are in flight together and a reader grouping scan
+    /// events by position would mix them.
+    ///
+    /// The overlap is REQUIRED, not decorative: the two requests run the same
+    /// SQL, so a second one that starts after the first has finished is
+    /// answered from the result cache, executes nothing, and logs no start
+    /// line at all. `SIGLAKE_QUERY_RESULT_CACHE` is a process-wide `OnceLock`
+    /// over the environment and tests do not write the environment, and
+    /// `IcebergTuning::result_caches` does not reach this path — the SQL
+    /// handler asks the free function. Holding both requests at their start
+    /// events is what keeps the second one a real execution.
+    ///
+    /// BOUNDED all the same, because this blocks the thread it runs on. As an
+    /// unbounded `std::sync::Barrier::wait` on a worker thread it deadlocked
+    /// 10 of 240 runs under load — first start parked in `futex_do_wait`, the
+    /// other worker asleep in `ep_poll` still holding the second request, no
+    /// second start line, no CPU consumed — and took a CI gate down for 85
+    /// minutes. The caller now drives each request from its own thread, so
+    /// this wait cannot starve the runtime; the bound is what turns a
+    /// pathological case into a failed assertion rather than a hung gate.
+    fn await_overlap(&self) {
+        let deadline = std::time::Instant::now() + OVERLAP_WAIT;
+        while self.sql_starts.load(Ordering::SeqCst) < 2 {
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "OVERLAP TIMEOUT after {OVERLAP_WAIT:?}: {} sql start(s) arrived",
+                    self.sql_starts.load(Ordering::SeqCst)
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
@@ -128,10 +162,7 @@ impl<S: tracing::Subscriber> Layer<S> for Recorder {
         if visitor.message == START && visitor.endpoint.as_deref() == Some("sql") {
             let index = self.sql_starts.fetch_add(1, Ordering::SeqCst);
             if index < 2 {
-                self.sql_start_barrier
-                    .as_ref()
-                    .expect("overlap barrier")
-                    .wait();
+                self.await_overlap();
             }
         }
         self.events.lock().expect("recorder").push(Captured {
@@ -222,17 +253,25 @@ async fn scan_events_name_the_request_that_produced_them() {
     //    each request at its start event until the other has reached its own.
     let buffered_query =
         serde_json::json!({ "query": format!("SELECT host, raw FROM events WHERE {PREDICATE}") });
-    let first = tokio::spawn({
+    //
+    //    ONE OS THREAD PER REQUEST, not `tokio::spawn`. The hold blocks the
+    //    thread the start event is logged on, and a blocked worker polls
+    //    nothing else: with both requests spawned onto a two-worker runtime,
+    //    the first one's hold left the second sitting in a run queue that only
+    //    a work-steal could empty, and when the steal did not happen the pair
+    //    never formed. That deadlocked 10 of 240 runs under load and hung a CI
+    //    gate for 85 minutes. Driving each request from its own thread through
+    //    the runtime handle keeps both workers free, so the second request
+    //    always reaches its start event and releases the first.
+    let drive = |query: serde_json::Value| {
+        let handle = tokio::runtime::Handle::current();
         let app = app.clone();
-        let query = buffered_query.clone();
-        async move { post(&app, "/api/v1/sql", query).await }
-    });
-    let second = tokio::spawn({
-        let app = app.clone();
-        async move { post(&app, "/api/v1/sql", buffered_query).await }
-    });
-    let ((first_status, _), (second_status, _)) =
-        tokio::try_join!(first, second).expect("buffered request task");
+        std::thread::spawn(move || handle.block_on(post(&app, "/api/v1/sql", query)))
+    };
+    let first = drive(buffered_query.clone());
+    let second = drive(buffered_query);
+    let (first_status, _) = first.join().expect("buffered request thread");
+    let (second_status, _) = second.join().expect("buffered request thread");
     assert_eq!(first_status, StatusCode::OK);
     assert_eq!(second_status, StatusCode::OK);
 
