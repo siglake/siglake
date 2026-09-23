@@ -237,7 +237,22 @@ and an operator value equal to that shared total. A sum of the replicas' copies
 therefore fails. `scripts/check-kind-compactor-pod-labels.sh` pins the
 expression to `crates/siglake-operator/src/prom.rs`, checks that the chart's
 claim, mirror and custom-metric refusals remain in force, drives the settling
-helper, and grades mutation fixtures without a cluster.
+helper, drives the enabled capture end to end against stand-in `kubectl`,
+`curl`, `helm` and `git`, and grades mutation fixtures without a cluster.
+
+Both captures pin the revision their evidence came from, and
+`SIGLAKE_SOURCE_COMMIT` says what that revision is. Unset, the round reads
+`git rev-parse HEAD` in this checkout. That answer is wrong wherever the round
+runs over a copy of the source rather than the repository: a runner that
+copies the tree to a remote box without its `.git` and commits it there leaves
+a HEAD that resolves in no repository, and captures taken that way named a SHA
+nobody could look up. A launcher that knows the source revision exports it
+instead, and the retained `revisions.repository_commit_source` names which of
+the two answered — `siglake_source_commit_env` or `git_rev_parse_head` — so a
+reader never has to guess which repository a SHA belongs to. Nothing validates
+the exported string: a launcher that exports the wrong revision retains the
+wrong revision, which is why the capture records where it came from rather
+than only what it was.
 
 The command exits non-zero when required panel/trigger data is absent or a
 ScaledObject is unhealthy. Before the cluster is deleted the script prints the

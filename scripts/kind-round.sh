@@ -664,6 +664,32 @@ query_pinned_total() {
 
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# --- #5556: the source revision a capture pins -------------------------------
+#
+# `git rev-parse HEAD` is the right answer only when the round runs in the
+# repository the source came from. The aws-runner rsyncs a snapshot without
+# `.git` and commits it fresh on the box, so HEAD there names a commit that
+# resolves in no repository -- run 82 retained
+# 0653a6824db17b08b19bf8c2847e6326a40e2eda for snapshot 5f3a51489c46. A launcher
+# that knows the real revision exports it in SIGLAKE_SOURCE_COMMIT and the
+# captures prefer it. Which of the two answered is recorded beside the commit,
+# so a reader never has to guess whether a SHA is a checkout or an injection.
+SIGLAKE_SOURCE_COMMIT="${SIGLAKE_SOURCE_COMMIT:-}"
+source_commit() {
+  if [[ -n "$SIGLAKE_SOURCE_COMMIT" ]]; then
+    printf '%s\n' "$SIGLAKE_SOURCE_COMMIT"
+  else
+    git -C "$ROOT" rev-parse HEAD 2>/dev/null || true
+  fi
+}
+source_commit_origin() {
+  if [[ -n "$SIGLAKE_SOURCE_COMMIT" ]]; then
+    printf 'siglake_source_commit_env\n'
+  else
+    printf 'git_rev_parse_head\n'
+  fi
+}
+
 # --- #1838: 2 → 4 → 2 query scaling under load -------------------------------
 #
 # Six kind rounds read #968 "unverified" because this script pinned the query
@@ -1432,7 +1458,7 @@ capture_ingester_pod_labels() {
   printf '%s\n' "${pods[@]}" >"$TMP_DIR/ingester-expected-pods"
 
   python3 - "$TMP_DIR/ingester-capture.json" "$at" "$NAMESPACE" "$RELEASE" \
-    "$(iso_now)" "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)" \
+    "$(iso_now)" "$(source_commit)" "$(source_commit_origin)" \
     "$TMP_DIR/ingester-pods.json" "$TMP_DIR/ingester-expected-pods" \
     "$INGESTER_SCALE_BASE" "$INGESTER_SCALE_TARGET" "$INGESTER_POD_LABEL_SECONDS" \
     "$(ingester_raw_expression)" "$INGESTER_RAW_JSON" \
@@ -1449,6 +1475,7 @@ import sys
     release,
     generated_at,
     commit,
+    commit_source,
     pods_path,
     expected_path,
     base,
@@ -1496,7 +1523,11 @@ document = {
     "schema_version": 1,
     "generated_at": generated_at,
     "evaluated_at": int(at),
-    "revisions": {"repository_commit": commit, "ingester_pods": revisions},
+    "revisions": {
+        "repository_commit": commit,
+        "repository_commit_source": commit_source,
+        "ingester_pods": revisions,
+    },
     "settings": {
         "namespace": namespace,
         "release": release,
@@ -1759,7 +1790,7 @@ capture_compactor_pod_labels() {
     --sort-by=.metadata.name -o json >"$TMP_DIR/compactor-pods.json" 2>/dev/null || true
 
   python3 - "$TMP_DIR/compactor-capture.json" "$at" "$NAMESPACE" "$RELEASE" \
-    "$(iso_now)" "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)" \
+    "$(iso_now)" "$(source_commit)" "$(source_commit_origin)" \
     "$TMP_DIR/compactor-pods.json" "$TMP_DIR/compactor-expected-pods" "$settling" \
     "$COMPACTOR_SCALE_TARGET" "$COMPACTOR_POD_LABEL_LOAD_SECONDS" \
     "$COMPACTOR_INTERVAL_SECONDS" "$COMPACTOR_SCRAPE_INTERVAL_SECONDS" \
@@ -1772,8 +1803,8 @@ import json
 import sys
 
 (
-    out_path, at, namespace, release, generated_at, commit, pods_path, expected_path,
-    settling_path, target, load_seconds, compactor_interval, scrape_interval,
+    out_path, at, namespace, release, generated_at, commit, commit_source, pods_path,
+    expected_path, settling_path, target, load_seconds, compactor_interval, scrape_interval,
     batch_target, batch_max_age, raw_expression, raw_path, times_expression,
     times_path, per_pod_expression, per_pod_path, operator_expression, operator_path,
 ) = sys.argv[1:]
@@ -1808,7 +1839,11 @@ document = {
     "schema_version": 1,
     "generated_at": generated_at,
     "evaluated_at": int(at),
-    "revisions": {"repository_commit": commit, "compactor_pods": revisions},
+    "revisions": {
+        "repository_commit": commit,
+        "repository_commit_source": commit_source,
+        "compactor_pods": revisions,
+    },
     "settings": {
         "namespace": namespace,
         "release": release,

@@ -15,6 +15,12 @@ FIRST_ROUND_LINE='log "bring up the base kind deployment"'
 fail() { echo "FAIL $*" >&2; exit 1; }
 contains() { case "$1" in *"$2"*) ;; *) return 1 ;; esac; }
 
+# #5556: the SHA the stand-in `git` answers with, and the different SHA a
+# launcher injects. The two must not be the same string, or the injected arm
+# would pass on the checkout's answer.
+STANDIN_COMMIT=0123456789abcdef0123456789abcdef01234567
+INJECTED_COMMIT=5f3a51489c46f0bd38b3c28da1c1e0c8f5a7de21
+
 for file in "$ROUND" "$GRADER" "$FIXTURE" "$PROM_SOURCE" "$HELPERS"; do
   [[ -f "$file" ]] || fail "$file does not exist"
 done
@@ -170,6 +176,212 @@ settled=$(env "${common[@]}" "$sandbox/scripts/settle.bash" 2>/dev/null)
 [[ "$settled" == 0 && -s "$sandbox/settled.json" ]] ||
   fail "two advancing equal scrape generations did not settle"
 
+# --- the enabled capture, end to end against stand-ins ----------------------
+#
+# #5556: the retained `repository_commit` has to be the revision the source
+# came from. Under the aws-runner the checkout on the box is an rsynced
+# snapshot committed there by a throwaway `git init`, so its HEAD resolves in
+# no repository; a launcher that knows the real revision injects it. Both paths
+# are driven here against a stand-in `git` answering a different SHA.
+mkdir -p "$sandbox/bin"
+cp "$GRADER" "$sandbox/scripts/"
+cat >"$sandbox/bin/kubectl" <<'EOF'
+#!/usr/bin/env bash
+printf 'kubectl %s\n' "$*" >>"$CALLS"
+case "$*" in
+*"get pods"*) cat "$FIXTURE_COMPACTOR_PODS" ;;
+esac
+EOF
+cat >"$sandbox/bin/git" <<EOF
+#!/usr/bin/env bash
+printf 'git %s\n' "\$*" >>"\$CALLS"
+printf '%s\n' "$STANDIN_COMMIT"
+EOF
+cat >"$sandbox/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+url=
+query=
+at=
+body=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  --data-urlencode)
+    case "$2" in
+    query=*) query="${2#query=}" ;;
+    time=*) at="${2#time=}" ;;
+    esac
+    shift 2
+    ;;
+  --data-binary) body="${2#@}"; shift 2 ;;
+  -H | -X | --connect-timeout | --max-time) shift 2 ;;
+  -*) shift ;;
+  *) url=$1; shift ;;
+  esac
+done
+printf 'curl %s query=%s time=%s body=%s\n' "$url" "$query" "$at" "$body" >>"$CALLS"
+case "$url" in
+*/api/v1/query) python3 "$SANDBOX/prom-answer.py" "$query" "$at" ;;
+*/v1/logs)
+  [ -s "$body" ] || { echo "empty ingest payload" >&2; exit 1; }
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$body" ||
+    { echo "malformed ingest payload" >&2; exit 1; }
+  printf '{"partialSuccess":{}}'
+  ;;
+*) printf 'STUB curl %s\n' "$url" ;;
+esac
+EOF
+for stub in helm kind; do
+  printf '#!/usr/bin/env bash\nprintf "%s %%s\\n" "$*" >>"$CALLS"\n' "$stub" >"$sandbox/bin/$stub"
+done
+chmod +x "$sandbox"/bin/*
+
+cat >"$sandbox/prom-answer.py" <<'EOF'
+"""Answer one compactor Prometheus instant query from the passing fixture."""
+
+import json
+import os
+import sys
+
+query, at = sys.argv[1], float(sys.argv[2] or 0)
+queries = json.load(open(os.environ["FIXTURE_CAPTURE"], encoding="utf-8"))["queries"]
+for name in ("raw", "sample_times", "per_pod", "operator_expression"):
+    if queries[name]["expression"] != query:
+        continue
+    response = json.loads(json.dumps(queries[name]["response"]))
+    shift = 0
+    if name == "sample_times":
+        # Every scrape generation the round polls carries later source sample
+        # times, as a live Prometheus would; the round settles on the second.
+        state = os.environ["GENERATION_STATE"]
+        try:
+            generation = int(open(state, encoding="utf-8").read())
+        except (OSError, ValueError):
+            generation = 0
+        open(state, "w", encoding="utf-8").write(str(generation + 1))
+        shift = 15 * generation
+    for row in response["data"]["result"]:
+        row["value"] = [at, f"{float(row['value'][1]) + shift:.0f}"]
+    print(json.dumps(response))
+    raise SystemExit(0)
+print(f"unexpected query: {query}", file=sys.stderr)
+raise SystemExit(1)
+EOF
+
+python3 - "$FIXTURE" "$sandbox/compactor-pods.json" <<'PY'
+import json
+import sys
+
+source, out = sys.argv[1:]
+document = json.load(open(source, encoding="utf-8"))
+items = [
+    {
+        "metadata": {"name": row["pod"]},
+        "status": {
+            "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [
+                {"name": row["container"], "image": row["image"], "imageID": row["image_id"]}
+            ],
+        },
+    }
+    for row in document["revisions"]["compactor_pods"]
+]
+json.dump({"items": items}, open(out, "w", encoding="utf-8"))
+PY
+
+python3 - "$ROUND" "$sandbox/scripts/drive.bash" <<'PY'
+import pathlib
+import sys
+
+source, output = map(pathlib.Path, sys.argv[1:])
+lines = source.read_text(encoding="utf-8").splitlines()
+opens = next(i for i, line in enumerate(lines)
+             if line == 'if [[ "$COMPACTOR_POD_LABEL_CAPTURE" == 1 ]]; then')
+closes = next(i for i, line in enumerate(lines[opens + 1:], opens + 1) if line == "fi")
+script = [
+    "#!/usr/bin/env bash",
+    "set -euo pipefail",
+    "# shellcheck source=/dev/null",
+    'source "$(dirname "${BASH_SOURCE[0]}")/prelude.bash"',
+    "trap - EXIT INT TERM",
+    "COMPACTOR_POD_LABEL_LOAD_SECONDS=1",
+    "COMPACTOR_POD_LABEL_GRACE_SECONDS=30",
+    "next_event=900000",
+    *lines[opens:closes + 1],
+    "printf 'DRIVE_FAILURE=%s\\n' \"$COMPACTOR_POD_LABEL_FAILURE\"",
+    'rm -rf -- "$TMP_DIR"',
+]
+output.write_text("\n".join(script) + "\n", encoding="utf-8")
+PY
+chmod +x "$sandbox/scripts/drive.bash"
+
+drive_capture() {
+  local name=$1 results=$2
+  shift 2
+  : >"$sandbox/$name.calls"
+  rm -f "$sandbox/$name.generation"
+  env -i PATH="$sandbox/bin:/usr/bin:/bin" HOME="$HOME" \
+    TMPDIR="$sandbox/tmp" SANDBOX="$sandbox" CALLS="$sandbox/$name.calls" \
+    GENERATION_STATE="$sandbox/$name.generation" \
+    COMPACTOR_POD_LABEL_CAPTURE=1 RESULTS_DIR="$results" \
+    FIXTURE_CAPTURE="$PWD/$FIXTURE" FIXTURE_COMPACTOR_PODS="$sandbox/compactor-pods.json" \
+    "$@" "$sandbox/scripts/drive.bash" >"$sandbox/$name.out" 2>&1 ||
+    fail "the $name arm exited nonzero: $(<"$sandbox/$name.out")"
+  local output
+  output=$(<"$sandbox/$name.out")
+  contains "$output" 'DRIVE_FAILURE=0' ||
+    fail "the $name arm recorded a capture failure: $output"
+  contains "$output" 'grade=verified' ||
+    fail "the $name arm did not grade verified: $output"
+  [[ -s "$results/compactor-pod-labels.json" ]] ||
+    fail "the $name arm wrote no results/compactor-pod-labels.json"
+}
+
+expect_revision() {
+  local file=$1 want_commit=$2 want_source=$3
+  python3 - "$file" "$want_commit" "$want_source" <<'PY' || fail "$file does not pin the source revision the capture was given"
+import json
+import sys
+
+path, want_commit, want_source = sys.argv[1:]
+revisions = json.load(open(path, encoding="utf-8"))["revisions"]
+if revisions.get("repository_commit") != want_commit:
+    raise SystemExit(
+        f"repository_commit is {revisions.get('repository_commit')!r}, expected {want_commit!r}"
+    )
+if revisions.get("repository_commit_source") != want_source:
+    raise SystemExit(
+        f"repository_commit_source is {revisions.get('repository_commit_source')!r}, "
+        f"expected {want_source!r}"
+    )
+PY
+}
+
+# Nothing injected: the checkout's HEAD, recorded as such.
+drive_capture checkout-commit "$sandbox/results-checkout-commit"
+expect_revision "$sandbox/results-checkout-commit/compactor-pod-labels.json" \
+  "$STANDIN_COMMIT" git_rev_parse_head
+# Injected: the launcher's revision wins over the box's own commit.
+drive_capture injected-commit "$sandbox/results-injected-commit" \
+  SIGLAKE_SOURCE_COMMIT="$INJECTED_COMMIT"
+expect_revision "$sandbox/results-injected-commit/compactor-pod-labels.json" \
+  "$INJECTED_COMMIT" siglake_source_commit_env
+
+# The default path stays off: no capture, no evidence, no stand-in reached.
+: >"$sandbox/default-off.calls"
+env -i PATH="$sandbox/bin:/usr/bin:/bin" HOME="$HOME" \
+  TMPDIR="$sandbox/tmp" SANDBOX="$sandbox" CALLS="$sandbox/default-off.calls" \
+  GENERATION_STATE="$sandbox/default-off.generation" \
+  RESULTS_DIR="$sandbox/results-default-off" \
+  FIXTURE_CAPTURE="$PWD/$FIXTURE" FIXTURE_COMPACTOR_PODS="$sandbox/compactor-pods.json" \
+  "$sandbox/scripts/drive.bash" >"$sandbox/default-off.out" 2>&1 ||
+  fail "the default-off arm exited nonzero: $(<"$sandbox/default-off.out")"
+contains "$(<"$sandbox/default-off.out")" 'DRIVE_FAILURE=0' ||
+  fail "the default-off arm recorded a capture failure: $(<"$sandbox/default-off.out")"
+[[ ! -s "$sandbox/default-off.calls" ]] ||
+  fail "the default-off arm reached the capture stand-ins: $(<"$sandbox/default-off.calls")"
+[[ ! -e "$sandbox/results-default-off/compactor-pod-labels.json" ]] ||
+  fail "the default-off arm wrote shared-queue evidence"
+
 verified="$sandbox/verified.json"
 python3 "$GRADER" "$FIXTURE" --output "$verified" 2>"$sandbox/verified.log" ||
   fail "the verified fixture failed: $(<"$sandbox/verified.log")"
@@ -232,4 +444,4 @@ expect_unverified timestamps-did-not-advance 'scrape timestamp did not advance'
 expect_unverified operator-doubled 'not the shared queue'
 expect_unverified zero-queue 'shared queue was not positive'
 
-echo "ok ($fixtures offline compactor shared-queue fixtures; live install needs a kind round)"
+echo "ok ($fixtures offline compactor shared-queue fixtures and 3 driven capture arms; live install needs a kind round)"
