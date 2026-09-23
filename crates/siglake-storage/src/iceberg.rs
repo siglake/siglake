@@ -497,6 +497,7 @@ const SIGLAKE_PUFFIN_INVERTED_CODEC: PuffinCompressionCodec =
     PuffinCompressionCodec::zstd_default();
 const DEFAULT_SIGLAKE_INDEX_FOOTER_MAX_BYTES: usize = 1024 * 1024;
 const DELETE_TASKS_CONFIG_DIR: &str = "_siglake/config/delete_tasks";
+const DROPPED_INDEXES_CONFIG_DIR: &str = "_siglake/config/dropped_indexes";
 
 /// Attempts a delete-task record write gets before it is reported lost. Same
 /// linear policy as the group-count deltas: a credential refresh recovers in
@@ -526,6 +527,14 @@ fn delete_task_record_rel_path(namespace: &NamespaceIdent, task_id: Uuid) -> Str
 /// suffix would turn every listing of the namespace into that error.
 fn delete_task_claim_rel_path(namespace: &NamespaceIdent, task_id: Uuid) -> String {
     format!("{}{task_id}.claim", delete_task_records_rel_dir(namespace))
+}
+
+fn dropped_index_records_rel_dir(namespace: &NamespaceIdent) -> String {
+    format!("{DROPPED_INDEXES_CONFIG_DIR}/{namespace}/")
+}
+
+fn dropped_index_record_rel_path(namespace: &NamespaceIdent, drop_id: Uuid) -> String {
+    format!("{}{drop_id}.json", dropped_index_records_rel_dir(namespace))
 }
 
 /// Options for [`IcebergContext::gc_orphans`] (BIG-3 orphan-file GC).
@@ -1111,6 +1120,75 @@ pub struct RetentionOutcome {
     pub bytes_dropped: u64,
     pub rows_dropped: u64,
     pub straddling_files_kept: usize,
+}
+
+/// Authority attached to one class of a dropped index's storage. The initial
+/// writer emits only `ReportOnly`; changing one target never grants authority
+/// over another target in the same record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DroppedIndexTargetAuthorization {
+    ReportOnly,
+    AggregateDelete,
+    OperatorReview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DroppedAggregateTarget {
+    pub relative_path: String,
+    pub authorization: DroppedIndexTargetAuthorization,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DroppedCommittedFilesTarget {
+    pub authorization: DroppedIndexTargetAuthorization,
+    /// Exact objects reachable from every retained snapshot at drop time,
+    /// plus the current table metadata JSON. Paths are absolute Iceberg paths.
+    pub inventory: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DroppedStaleWalTarget {
+    pub authorization: DroppedIndexTargetAuthorization,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DroppedIndexCleanupTargets {
+    pub aggregate_prefix: DroppedAggregateTarget,
+    pub committed_files: DroppedCommittedFilesTarget,
+    pub stale_wal: DroppedStaleWalTarget,
+}
+
+/// Durable, incarnation-bound cleanup route written before a managed index's
+/// catalog entry is dropped. `namespace` and `index_id` are labels only; a
+/// sweeper addresses the recorded location and UUID prefix directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DroppedIndexCleanupRecord {
+    pub version: u8,
+    pub drop_id: Uuid,
+    pub namespace: String,
+    pub index_id: String,
+    pub table_uuid: String,
+    pub table_location: String,
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
+    pub targets: DroppedIndexCleanupTargets,
+}
+
+/// One dropped UUID prefix's observation from a cleanup sweep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DroppedAggregateSweepOutcome {
+    pub drop_id: Uuid,
+    pub table_uuid: String,
+    pub authorization: DroppedIndexTargetAuthorization,
+    pub objects_observed: usize,
+    pub bytes_observed: u64,
+    pub objects_deleted: usize,
+    pub empty: bool,
 }
 
 /// Delete-task lifecycle state. The ledger is immutable apart from state
@@ -2045,6 +2123,210 @@ fn warehouse_operator(location: &str) -> Result<opendal::Operator> {
     }
 }
 
+fn validate_dropped_index_cleanup_record(
+    namespace: &NamespaceIdent,
+    record: &DroppedIndexCleanupRecord,
+) -> Result<()> {
+    anyhow::ensure!(
+        record.version == 1,
+        "unsupported dropped-index record version {}",
+        record.version
+    );
+    anyhow::ensure!(
+        record.namespace == namespace.to_string(),
+        "dropped-index record {} belongs to namespace `{}`, not `{namespace}`",
+        record.drop_id,
+        record.namespace
+    );
+    let uuid = Uuid::parse_str(&record.table_uuid).with_context(|| {
+        format!(
+            "invalid table UUID in dropped-index record {}",
+            record.drop_id
+        )
+    })?;
+    anyhow::ensure!(
+        uuid.to_string() == record.table_uuid,
+        "dropped-index record {} table UUID is not canonical",
+        record.drop_id
+    );
+    let location = url::Url::parse(&record.table_location).with_context(|| {
+        format!(
+            "invalid table location in dropped-index record {}",
+            record.drop_id
+        )
+    })?;
+    anyhow::ensure!(
+        matches!(location.scheme(), "file" | "s3" | "s3a")
+            && location.query().is_none()
+            && location.fragment().is_none(),
+        "dropped-index record {} has unsupported table location `{}`",
+        record.drop_id,
+        record.table_location
+    );
+    let expected = format!("{}/", aggregate_prefix_rel_path(&record.table_uuid));
+    anyhow::ensure!(
+        record.targets.aggregate_prefix.relative_path == expected,
+        "dropped-index record {} aggregate prefix `{}` does not equal `{expected}`",
+        record.drop_id,
+        record.targets.aggregate_prefix.relative_path
+    );
+    anyhow::ensure!(
+        matches!(
+            record.targets.aggregate_prefix.authorization,
+            DroppedIndexTargetAuthorization::ReportOnly
+                | DroppedIndexTargetAuthorization::AggregateDelete
+        ),
+        "dropped-index record {} aggregate target has non-aggregate authority",
+        record.drop_id
+    );
+    anyhow::ensure!(
+        record.targets.committed_files.authorization == DroppedIndexTargetAuthorization::ReportOnly,
+        "dropped-index record {} grants unsupported committed-file authority",
+        record.drop_id
+    );
+    anyhow::ensure!(
+        record.targets.stale_wal.authorization == DroppedIndexTargetAuthorization::OperatorReview,
+        "dropped-index record {} grants unsupported stale-WAL authority",
+        record.drop_id
+    );
+    Ok(())
+}
+
+async fn list_dropped_aggregate_page(
+    op: &opendal::Operator,
+    prefix: &str,
+    limit: Option<usize>,
+) -> Result<Vec<(String, u64)>> {
+    use futures::StreamExt;
+
+    let mut request = op.lister_with(prefix).recursive(true);
+    if let Some(limit) = limit {
+        request = request.limit(limit.max(1));
+    }
+    let mut lister = request
+        .await
+        .with_context(|| format!("list dropped aggregate prefix {prefix}"))?;
+    let mut objects = Vec::new();
+    while let Some(entry) = lister.next().await {
+        let entry = entry.with_context(|| format!("list dropped aggregate prefix {prefix}"))?;
+        if !entry.metadata().is_file() {
+            continue;
+        }
+        let path = entry.path().to_string();
+        anyhow::ensure!(
+            path.starts_with(prefix),
+            "listing `{prefix}` returned out-of-prefix object `{path}`"
+        );
+        let bytes = op
+            .stat(&path)
+            .await
+            .with_context(|| format!("stat dropped aggregate object {path}"))?
+            .content_length();
+        objects.push((path, bytes));
+        if limit.is_some_and(|limit| objects.len() >= limit.max(1)) {
+            break;
+        }
+    }
+    Ok(objects)
+}
+
+fn remove_empty_directory_tree(path: &std::path::Path) -> Result<()> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("read directory {}", path.display())),
+    };
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("read directory entry under {}", path.display()))?;
+        if entry
+            .file_type()
+            .with_context(|| format!("read file type for {}", entry.path().display()))?
+            .is_dir()
+        {
+            remove_empty_directory_tree(&entry.path())?;
+        }
+    }
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err).with_context(|| format!("remove directory {}", path.display())),
+    }
+}
+
+fn remove_empty_dropped_aggregate_directories(record: &DroppedIndexCleanupRecord) -> Result<()> {
+    let location = url::Url::parse(&record.table_location)?;
+    if location.scheme() != "file" {
+        return Ok(());
+    }
+    let table_path = location.to_file_path().map_err(|_| {
+        anyhow::anyhow!(
+            "dropped-index record {} file location cannot be converted to a path",
+            record.drop_id
+        )
+    })?;
+    remove_empty_directory_tree(&table_path.join(&record.targets.aggregate_prefix.relative_path))
+}
+
+async fn sweep_dropped_aggregate_record(
+    record: &DroppedIndexCleanupRecord,
+    page_size: usize,
+) -> Result<DroppedAggregateSweepOutcome> {
+    let authorization = record.targets.aggregate_prefix.authorization;
+    let prefix = record.targets.aggregate_prefix.relative_path.as_str();
+    let op = warehouse_operator(&record.table_location)?;
+    let mut outcome = DroppedAggregateSweepOutcome {
+        drop_id: record.drop_id,
+        table_uuid: record.table_uuid.clone(),
+        authorization,
+        objects_observed: 0,
+        bytes_observed: 0,
+        objects_deleted: 0,
+        empty: false,
+    };
+    if authorization == DroppedIndexTargetAuthorization::ReportOnly {
+        let objects = list_dropped_aggregate_page(&op, prefix, None).await?;
+        outcome.objects_observed = objects.len();
+        outcome.bytes_observed = objects.iter().map(|(_, bytes)| bytes).sum();
+        outcome.empty = objects.is_empty();
+        return Ok(outcome);
+    }
+
+    loop {
+        // Restart at the UUID prefix root after every mutated page;
+        // continuation tokens describe a listing that the deletes changed.
+        let page = list_dropped_aggregate_page(&op, prefix, Some(page_size)).await?;
+        if page.is_empty() {
+            remove_empty_dropped_aggregate_directories(record)?;
+            outcome.empty = true;
+            break;
+        }
+        outcome.objects_observed += page.len();
+        outcome.bytes_observed += page.iter().map(|(_, bytes)| bytes).sum::<u64>();
+        for (path, _) in page {
+            match op.delete(&path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == opendal::ErrorKind::NotFound => {}
+                Err(err) => {
+                    metrics::counter!("siglake_dropped_index_aggregate_cleanup_failures_total")
+                        .increment(1);
+                    return Err(err).with_context(|| format!("delete dropped aggregate {path}"));
+                }
+            }
+            outcome.objects_deleted += 1;
+            metrics::counter!("siglake_dropped_index_aggregate_objects_deleted_total").increment(1);
+        }
+    }
+    Ok(outcome)
+}
+
 /// File name (under the warehouse root) of the SQLite catalog database
 /// when using [`IcebergContext::open`].
 pub const DEFAULT_CATALOG_FILE: &str = "_catalog.db";
@@ -2766,6 +3048,49 @@ async fn live_data_files_of(table: &Table) -> Result<Vec<DataFile>> {
     Ok(live_data_files_within(table, None)
         .await?
         .expect("live_data_files_within returns None only when given a deadline"))
+}
+
+/// Objects the dropped table's retained snapshots can still read. This is a
+/// recorded inventory, not deletion authority: committed-file reclamation has
+/// a separate policy from aggregate reclamation.
+async fn dropped_table_committed_file_inventory(table: &Table) -> Result<Vec<String>> {
+    let metadata_ref = table.metadata_ref();
+    let file_io = table.file_io();
+    let mut inventory = HashSet::new();
+    if let Some(location) = table.metadata_location() {
+        inventory.insert(location.to_string());
+    }
+    for metadata in metadata_ref.metadata_log() {
+        inventory.insert(metadata.metadata_file.clone());
+    }
+    for statistics in metadata_ref.statistics_iter() {
+        inventory.insert(statistics.statistics_path.clone());
+    }
+    for statistics in metadata_ref.partition_statistics_iter() {
+        inventory.insert(statistics.statistics_path.clone());
+    }
+    for snapshot in metadata_ref.snapshots() {
+        inventory.insert(snapshot.manifest_list().to_string());
+        let manifest_list = snapshot
+            .load_manifest_list(file_io, &metadata_ref)
+            .await
+            .context("dropped-index inventory: load manifest list")?;
+        for manifest_file in manifest_list.entries() {
+            inventory.insert(manifest_file.manifest_path.clone());
+            let manifest = manifest_file
+                .load_manifest(file_io)
+                .await
+                .context("dropped-index inventory: load manifest")?;
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    inventory.insert(entry.data_file().file_path().to_string());
+                }
+            }
+        }
+    }
+    let mut inventory: Vec<_> = inventory.into_iter().collect();
+    inventory.sort();
+    Ok(inventory)
 }
 
 /// [`live_data_files_of`] under a deadline: `Ok(None)` when the clock passes
@@ -16629,6 +16954,91 @@ impl IcebergContext {
         self.enforce_all_index_retention_inner(false).await
     }
 
+    /// Persist and confirm the incarnation-bound cleanup route for a managed
+    /// index before its catalog entry is dropped. Every target starts without
+    /// destructive authority.
+    pub(crate) async fn record_dropped_index_cleanup(
+        &self,
+        index_id: &str,
+        table: &Table,
+    ) -> Result<DroppedIndexCleanupRecord> {
+        let table_uuid = table.metadata().uuid().to_string();
+        let record = DroppedIndexCleanupRecord {
+            version: 1,
+            drop_id: Uuid::now_v7(),
+            namespace: self.namespace().to_string(),
+            index_id: index_id.to_string(),
+            table_uuid: table_uuid.clone(),
+            table_location: table.metadata().location().to_string(),
+            recorded_at: chrono::Utc::now(),
+            targets: DroppedIndexCleanupTargets {
+                aggregate_prefix: DroppedAggregateTarget {
+                    relative_path: format!("{}/", aggregate_prefix_rel_path(&table_uuid)),
+                    authorization: DroppedIndexTargetAuthorization::ReportOnly,
+                },
+                committed_files: DroppedCommittedFilesTarget {
+                    authorization: DroppedIndexTargetAuthorization::ReportOnly,
+                    inventory: dropped_table_committed_file_inventory(table).await?,
+                },
+                stale_wal: DroppedStaleWalTarget {
+                    authorization: DroppedIndexTargetAuthorization::OperatorReview,
+                },
+            },
+        };
+        validate_dropped_index_cleanup_record(self.namespace(), &record)?;
+        self.create_dropped_index_cleanup_record(&record).await?;
+        metrics::counter!("siglake_dropped_index_cleanup_records_total").increment(1);
+        Ok(record)
+    }
+
+    /// List this namespace's durable dropped-index records. A malformed object
+    /// is a hard error, so it can never disappear from operator inventory.
+    pub async fn list_dropped_index_cleanup_records(
+        &self,
+    ) -> Result<Vec<DroppedIndexCleanupRecord>> {
+        let records = self.read_dropped_index_cleanup_records().await?;
+        for record in &records {
+            validate_dropped_index_cleanup_record(self.namespace(), record)?;
+        }
+        Ok(records)
+    }
+
+    /// Inventory or reclaim each recorded aggregate prefix. Production-created
+    /// records are report-only. An externally reviewed record must grant
+    /// `aggregate_delete` on the aggregate target alone before this removes an
+    /// object; committed files and stale WAL are never touched here.
+    pub async fn sweep_dropped_index_aggregates(
+        &self,
+        page_size: usize,
+    ) -> Result<Vec<DroppedAggregateSweepOutcome>> {
+        let records = self.read_dropped_index_cleanup_records().await?;
+        // Validate the complete input set before the first DELETE. A corrupt
+        // sibling record therefore cannot leave a half-executed sweep.
+        for record in &records {
+            validate_dropped_index_cleanup_record(self.namespace(), record)?;
+        }
+        let mut outcomes = Vec::with_capacity(records.len());
+        for record in &records {
+            outcomes.push(sweep_dropped_aggregate_record(record, page_size).await?);
+        }
+        Ok(outcomes)
+    }
+
+    /// Test hook for exercising the separately-authorized branch and malformed
+    /// persisted records. Production code has no authority-changing API yet.
+    #[doc(hidden)]
+    pub async fn write_dropped_index_cleanup_record_for_test(
+        &self,
+        record: &DroppedIndexCleanupRecord,
+    ) -> Result<()> {
+        let op = self.warehouse_object_store()?;
+        let rel = dropped_index_record_rel_path(self.namespace(), record.drop_id);
+        op.write(&rel, serde_json::to_vec(record)?)
+            .await
+            .with_context(|| format!("write dropped-index test record {rel}"))?;
+        Ok(())
+    }
+
     /// Record one pending delete task as its own warehouse object. The task is
     /// immutable apart from later state transitions and terminal stats, and the
     /// write touches no other task's key, so a concurrent submitter in another
@@ -17928,6 +18338,73 @@ impl IcebergContext {
             tasks.push(task);
         }
         Ok(tasks)
+    }
+
+    async fn create_dropped_index_cleanup_record(
+        &self,
+        record: &DroppedIndexCleanupRecord,
+    ) -> Result<()> {
+        let op = self.warehouse_object_store()?;
+        anyhow::ensure!(
+            op.info().full_capability().write_with_if_not_exists,
+            "warehouse store does not support create-only writes; refusing to record dropped index {}",
+            record.drop_id
+        );
+        let rel = dropped_index_record_rel_path(self.namespace(), record.drop_id);
+        let body = serde_json::to_vec(record)
+            .with_context(|| format!("serialize dropped-index record {}", record.drop_id))?;
+        op.write_with(&rel, body)
+            .if_not_exists(true)
+            .await
+            .with_context(|| format!("create dropped-index record {rel}"))?;
+        let confirmed = op
+            .read(&rel)
+            .await
+            .with_context(|| format!("confirm dropped-index record {rel}"))?;
+        let confirmed: DroppedIndexCleanupRecord = serde_json::from_slice(&confirmed.to_bytes())
+            .with_context(|| format!("parse confirmed dropped-index record {rel}"))?;
+        anyhow::ensure!(
+            confirmed == *record,
+            "confirmed dropped-index record {rel} differs from the record written"
+        );
+        Ok(())
+    }
+
+    async fn read_dropped_index_cleanup_records(&self) -> Result<Vec<DroppedIndexCleanupRecord>> {
+        let op = self.warehouse_object_store()?;
+        let dir = dropped_index_records_rel_dir(self.namespace());
+        let entries = match op.list(&dir).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == opendal::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => {
+                return Err(err).with_context(|| format!("list dropped-index records {dir}"))
+            }
+        };
+        let mut records = Vec::new();
+        for entry in entries {
+            let rel = entry.path();
+            if !rel.ends_with(".json") {
+                continue;
+            }
+            let bytes = op
+                .read(rel)
+                .await
+                .with_context(|| format!("read dropped-index record {rel}"))?;
+            let record: DroppedIndexCleanupRecord = serde_json::from_slice(&bytes.to_bytes())
+                .with_context(|| format!("parse dropped-index record {rel}"))?;
+            let file_id = rel
+                .rsplit_once('/')
+                .map_or(rel, |(_, name)| name)
+                .trim_end_matches(".json");
+            anyhow::ensure!(
+                file_id == record.drop_id.to_string(),
+                "dropped-index record {rel} contains drop_id {}",
+                record.drop_id
+            );
+            records.push(record);
+        }
+        records.sort_by_key(|record| record.drop_id);
+        Ok(records)
     }
 
     /// Take exclusive ownership of one pending delete task, or report that

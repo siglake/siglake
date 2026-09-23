@@ -338,20 +338,23 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   is full, as before. Per-row delivery is therefore best-effort in both
   directions: the `query_audit` table is an operational record, not an
   accounting one.
-- **Dropping an index does not reclaim its committed storage.** `DELETE
-  /api/v1/indexes/{id}` removes the catalog entry only. The retention and
+- **Dropping an index records cleanup inventory but does not reclaim storage.**
+  Before `DELETE /api/v1/indexes/{id}` removes the catalog entry, it writes and
+  confirms a warehouse-root record containing the loaded table's UUID, exact
+  location, retained committed-file inventory and UUID aggregate prefix. The
+  record is report-only. The retention and
   orphan-GC paths both need to load that entry, so neither can reclaim the
   dropped table's files afterward. In the local committed-data regression,
   recreating the same index id reuses the table location but creates a fresh
   table UUID: the replacement exposes only its own rows while the dropped
-  incarnation's files remain alongside it. A future cleanup record must
-  preserve the dropped table's immutable UUID and exact location plus an
-  incarnation-specific file inventory (or equivalent retained metadata tree),
-  so cleanup never resolves the same-name replacement or deletes its files.
+  incarnation's files remain alongside it. The aggregate sweeper inventories
+  only the recorded UUID prefix and never resolves the reusable index name.
+  Destructive aggregate authority has no production enablement API yet; the
+  design's retention, recovery-delay and store-failure policies remain open.
   [`DESIGN_dropped_index_aggregate_reclamation.md`](DESIGN_dropped_index_aggregate_reclamation.md)
   specifies how that record addresses the dropped UUID's aggregate prefix,
   catches delayed publications, and excludes the replacement and unowned
-  legacy paths. It is a design only; current builds still delete none of them.
+  legacy paths. Current production-created records delete none of them.
   The index's **WAL** is keyed by tenant and index name, so it survives the
   deletion too. It is separated by a per-directory owner marker holding the
   table's UUID, written by the drain and compared by every reader: a directory

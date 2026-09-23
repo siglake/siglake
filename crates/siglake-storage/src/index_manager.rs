@@ -620,9 +620,10 @@ impl IcebergContext {
 
     /// Drop a managed index table's catalog entry.
     ///
-    /// Committed files remain at the table location. The current orphan-GC
-    /// entry point first reloads the table from the catalog, so it cannot
-    /// reclaim those files after this removes the entry.
+    /// Before the drop, durably record the table UUID, location, committed-file
+    /// inventory and UUID-scoped aggregate target outside the table location.
+    /// Committed files and aggregate objects remain in place: newly-created
+    /// records are report-only.
     pub async fn delete_index(&self, index_id: &str) -> Result<bool> {
         let table_ident = self.index_table_ident(index_id);
         if !self.catalog().table_exists(&table_ident).await? {
@@ -636,6 +637,10 @@ impl IcebergContext {
         if index_config_from_table(index_id, &table)?.is_none() {
             return Err(IndexManagerError::NotAnIndex(index_id.to_string()).into());
         }
+
+        self.record_dropped_index_cleanup(index_id, &table)
+            .await
+            .with_context(|| format!("record dropped index `{index_id}` cleanup route"))?;
 
         self.catalog()
             .drop_table(&table_ident)
