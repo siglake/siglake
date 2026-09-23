@@ -49,6 +49,61 @@ pub struct ObservedMetrics {
     pub query_in_flight_per_pod: f64,
 }
 
+/// One cycle's readings, PER SIGNAL: `None` is "this component has no usable
+/// reading", which puts that component — and only that component — on
+/// [`replicas_without_signal`].
+///
+/// The all-or-nothing shape this replaced took the whole snapshot down on the
+/// first bad query, so a compactor whose series had gone absent froze ingest
+/// and query sizing with it (#6011, `docs/DESIGN_compactor_wakeup_signal.md`).
+/// A whole Prometheus outage is the case where all three are `None`, which is
+/// byte-for-byte the old behaviour.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ObservedSamples {
+    pub ingester_rps_per_pod: Option<f64>,
+    pub compactor_backlog: Option<f64>,
+    pub query_in_flight_per_pod: Option<f64>,
+}
+
+impl ObservedSamples {
+    /// No component has a reading — a Prometheus outage rather than one stale
+    /// series.
+    pub fn all_absent(&self) -> bool {
+        self.ingester_rps_per_pod.is_none()
+            && self.compactor_backlog.is_none()
+            && self.query_in_flight_per_pod.is_none()
+    }
+}
+
+impl From<ObservedMetrics> for ObservedSamples {
+    fn from(m: ObservedMetrics) -> Self {
+        Self {
+            ingester_rps_per_pod: Some(m.ingester_rps_per_pod),
+            compactor_backlog: Some(m.compactor_backlog),
+            query_in_flight_per_pod: Some(m.query_in_flight_per_pod),
+        }
+    }
+}
+
+impl From<&ObservedMetrics> for ObservedSamples {
+    fn from(m: &ObservedMetrics) -> Self {
+        m.clone().into()
+    }
+}
+
+/// `None` is the whole-outage reading: every signal absent.
+impl From<Option<ObservedMetrics>> for ObservedSamples {
+    fn from(m: Option<ObservedMetrics>) -> Self {
+        m.map(Into::into).unwrap_or_default()
+    }
+}
+
+impl From<&ObservedSamples> for ObservedSamples {
+    fn from(s: &ObservedSamples) -> Self {
+        s.clone()
+    }
+}
+
 /// How a component's observed reading relates to one replica.
 ///
 /// Both arms divide by `target` and clamp to `[min, max]`; they differ in
@@ -100,25 +155,38 @@ pub struct DesiredReplicas {
 /// 1.0. Avoids flapping at the boundary.
 pub const SCALE_DEADBAND: f64 = 0.10;
 
+/// The desired size of each tier, one component at a time.
+///
+/// A component with a reading takes the ordinary proportional decision; a
+/// component whose reading is absent takes [`replicas_without_signal`] on its
+/// own, leaving the other two untouched. Takes anything convertible into
+/// [`ObservedSamples`], so a caller holding a complete [`ObservedMetrics`] —
+/// every test that predates the per-signal split — passes it directly.
 pub fn reconcile_replicas(
     spec: &SiglakeClusterSpec,
-    observed: &ObservedMetrics,
+    observed: impl Into<ObservedSamples>,
     current: &CurrentReplicas,
 ) -> DesiredReplicas {
+    let observed = observed.into();
+    let sized =
+        |policy: &ComponentAutoscale, sample: Option<f64>, current: i32, load: Load| match sample {
+            Some(value) => decide(policy, value, current, load),
+            None => replicas_without_signal(policy, current),
+        };
     DesiredReplicas {
-        ingester: decide(
+        ingester: sized(
             &spec.autoscaling.ingester,
             observed.ingester_rps_per_pod,
             current.ingester,
             Load::PerPod,
         ),
-        compactor: decide(
+        compactor: sized(
             &spec.autoscaling.compactor,
             observed.compactor_backlog,
             current.compactor,
             compactor_load(&spec.autoscaling.compactor),
         ),
-        query: decide(
+        query: sized(
             &spec.autoscaling.query,
             observed.query_in_flight_per_pod,
             current.query,
@@ -228,36 +296,58 @@ pub struct IdleSeconds {
     pub query: f64,
 }
 
+/// Per-signal "the interval ending here was not observed", set by an unusable
+/// reading of that signal and cleared by its next usable one. A marked signal
+/// cannot extend an idle window and reseeds its average rather than blending
+/// across the gap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Interrupted {
+    pub ingester: bool,
+    pub compactor: bool,
+    pub query: bool,
+}
+
+impl Interrupted {
+    /// Every signal marked — what a whole-outage cycle leaves behind.
+    pub const ALL: Self = Self {
+        ingester: true,
+        compactor: true,
+        query: true,
+    };
+}
+
 /// One cluster's EWMA history.
 #[derive(Clone, Debug)]
 pub struct SmoothingState {
-    /// The instant of the last USABLE reading.
+    /// The instant of the last cycle that carried at least one usable reading.
     pub at: std::time::Instant,
-    /// The smoothed metrics at that instant.
-    pub smoothed: ObservedMetrics,
+    /// The smoothed value of each signal that has had a usable reading.
+    /// `None` for a signal that has never been read, or whose history was
+    /// never seeded.
+    pub smoothed: ObservedSamples,
     /// Idle window per signal, accumulated up to `at`.
     pub idle: IdleSeconds,
-    /// Set by an unusable reading and cleared by the next usable one: the
-    /// interval it spans was not observed, so it cannot extend an idle window.
-    pub interrupted: bool,
+    /// Per-signal gap marker; see [`Interrupted`].
+    pub interrupted: Interrupted,
 }
 
 /// What one reconcile cycle does with an observation.
 #[derive(Clone, Debug)]
 pub struct Smoothed {
-    /// Metrics for the scaling decision. `None` when the reading was unusable,
-    /// which puts every tier on [`replicas_without_signal`].
-    pub observed: Option<ObservedMetrics>,
+    /// Readings for the scaling decision, per signal. A `None` signal puts its
+    /// own tier on [`replicas_without_signal`]; all three `None` is the whole
+    /// outage that holds the fleet.
+    pub observed: ObservedSamples,
     /// The history to carry into the next cycle. `None` clears the entry.
     pub state: Option<SmoothingState>,
 }
 
 /// Fold one Prometheus observation into a cluster's EWMA history.
 ///
-/// `observation` is `None` when the reading was unusable: a query error, an
-/// empty result vector, or a non-finite sample (`prom::observed` rejects all
-/// three). An unusable reading leaves the smoothed value and its timestamp as
-/// they were — it neither seeds them nor advances them, and only marks the
+/// A signal's `observation` is `None` when its reading was unusable: a query
+/// error, an empty result vector, or a non-finite sample (`prom::observed`
+/// rejects all three, per signal). An unusable reading leaves that signal's
+/// smoothed value, and the history's timestamp, as they were — it neither seeds them nor advances them, and only marks the
 /// history `interrupted`. Recording the outage as a sample is what made the
 /// fleet downscale on recovery: zeros decayed the smoothed signal toward idle
 /// while the fleet was still hot, and the first reading after the outage was
@@ -278,93 +368,125 @@ pub struct Smoothed {
 /// restarts it.
 pub fn fold_observation(
     previous: Option<SmoothingState>,
-    observation: Option<ObservedMetrics>,
+    observation: impl Into<ObservedSamples>,
     now: std::time::Instant,
     half_life_secs: f64,
 ) -> Smoothed {
+    let raw = observation.into();
     if half_life_secs <= 0.0 {
         return Smoothed {
-            observed: observation,
+            observed: raw,
             state: None,
         };
     }
-    let Some(raw) = observation else {
+    // Every signal unusable is the whole-outage cycle: the history is held
+    // exactly as it was — not seeded, not advanced — and every signal is
+    // marked so the gap cannot extend an idle window.
+    if raw.all_absent() {
         return Smoothed {
-            observed: None,
+            observed: ObservedSamples::default(),
             state: previous.map(|prev| SmoothingState {
-                interrupted: true,
+                interrupted: Interrupted::ALL,
                 ..prev
             }),
         };
-    };
+    }
     let idle_window = IDLE_HALF_LIVES * half_life_secs;
-    // `None` means the interval ending in this sample was not observed: a cold
-    // seed, or the first reading after an outage. Either way the window starts
-    // over at this sample rather than counting the gap behind it.
-    let (prev_smoothed, alpha, observed) = match &previous {
-        Some(prev) => {
-            let dt = now.saturating_duration_since(prev.at).as_secs_f64();
-            let observed = (!prev.interrupted).then_some((prev.idle, dt));
-            (
-                prev.smoothed.clone(),
-                ewma_alpha(half_life_secs, dt),
-                observed,
-            )
-        }
-        // First usable sample seeds the average.
-        None => (raw.clone(), 1.0, None),
-    };
-    // The window each signal reaches if this sample reads idle.
-    let extended = observed
-        .map(|(prev, dt)| IdleSeconds {
-            ingester: prev.ingester + dt,
-            compactor: prev.compactor + dt,
-            query: prev.query + dt,
-        })
+    // The interval behind this cycle. It ends at the last cycle that carried
+    // any usable reading, so a signal usable then and now has exactly this
+    // much observed time behind it.
+    let dt = previous
+        .as_ref()
+        .map(|prev| now.saturating_duration_since(prev.at).as_secs_f64())
         .unwrap_or_default();
-    let blended = ewma_smooth(&prev_smoothed, &raw, alpha);
-    // Per signal: a positive raw sample clears the window, an idle one extends
-    // it, and a window past `idle_window` settles the residual to zero.
-    let settle = |blended: f64, raw: f64, extended: f64| -> (f64, f64) {
-        if raw > 0.0 {
+    let alpha = ewma_alpha(half_life_secs, dt);
+    // One signal's fold: `(reading for the decision, smoothed history, idle
+    // window, gap marker)`.
+    //
+    // An unusable reading of THIS signal leaves its history alone and marks
+    // it, whatever the other two did. A usable one blends against the history
+    // it has — an interruption does not throw the EWMA residual away, it only
+    // restarts the idle window, because the residual is what keeps the last
+    // pod until a window of *observed* idleness has run its course.
+    let fold = |raw: Option<f64>,
+                prev_smoothed: Option<f64>,
+                prev_idle: f64,
+                prev_interrupted: bool|
+     -> (Option<f64>, Option<f64>, f64, bool) {
+        let Some(raw) = raw else {
+            return (None, prev_smoothed, prev_idle, true);
+        };
+        // `None` means the interval ending in this sample was not observed: a
+        // cold seed, or the first reading after this signal's outage. Either
+        // way the window starts over at this sample rather than counting the
+        // gap behind it.
+        let (blended, extended) = match prev_smoothed {
+            Some(prev) if !prev_interrupted => (prev + alpha * (raw - prev), prev_idle + dt),
+            // First usable sample of this signal seeds its average.
+            Some(prev) => (prev + alpha * (raw - prev), 0.0),
+            None => (raw, 0.0),
+        };
+        // A positive raw sample clears the window, an idle one extends it, and
+        // a window past `idle_window` settles the residual to zero.
+        let (value, idle) = if raw > 0.0 {
             (blended, 0.0)
         } else if extended >= idle_window {
             (0.0, extended)
         } else {
             (blended, extended)
-        }
+        };
+        (Some(value), Some(value), idle, false)
     };
-    let (ingester, ingester_idle) = settle(
-        blended.ingester_rps_per_pod,
+    let prev_smoothed = previous
+        .as_ref()
+        .map(|prev| prev.smoothed.clone())
+        .unwrap_or_default();
+    let prev_idle = previous.as_ref().map(|prev| prev.idle).unwrap_or_default();
+    let prev_interrupted = previous
+        .as_ref()
+        .map(|prev| prev.interrupted)
+        .unwrap_or_default();
+    let (ingester, ingester_smoothed, ingester_idle, ingester_interrupted) = fold(
         raw.ingester_rps_per_pod,
-        extended.ingester,
+        prev_smoothed.ingester_rps_per_pod,
+        prev_idle.ingester,
+        prev_interrupted.ingester,
     );
-    let (compactor, compactor_idle) = settle(
-        blended.compactor_backlog,
+    let (compactor, compactor_smoothed, compactor_idle, compactor_interrupted) = fold(
         raw.compactor_backlog,
-        extended.compactor,
+        prev_smoothed.compactor_backlog,
+        prev_idle.compactor,
+        prev_interrupted.compactor,
     );
-    let (query, query_idle) = settle(
-        blended.query_in_flight_per_pod,
+    let (query, query_smoothed, query_idle, query_interrupted) = fold(
         raw.query_in_flight_per_pod,
-        extended.query,
+        prev_smoothed.query_in_flight_per_pod,
+        prev_idle.query,
+        prev_interrupted.query,
     );
-    let smoothed = ObservedMetrics {
-        ingester_rps_per_pod: ingester,
-        compactor_backlog: compactor,
-        query_in_flight_per_pod: query,
-    };
     Smoothed {
-        observed: Some(smoothed.clone()),
+        observed: ObservedSamples {
+            ingester_rps_per_pod: ingester,
+            compactor_backlog: compactor,
+            query_in_flight_per_pod: query,
+        },
         state: Some(SmoothingState {
             at: now,
-            smoothed,
+            smoothed: ObservedSamples {
+                ingester_rps_per_pod: ingester_smoothed,
+                compactor_backlog: compactor_smoothed,
+                query_in_flight_per_pod: query_smoothed,
+            },
             idle: IdleSeconds {
                 ingester: ingester_idle,
                 compactor: compactor_idle,
                 query: query_idle,
             },
-            interrupted: false,
+            interrupted: Interrupted {
+                ingester: ingester_interrupted,
+                compactor: compactor_interrupted,
+                query: query_interrupted,
+            },
         }),
     }
 }
@@ -667,7 +789,7 @@ mod tests {
         // And the floor is still the floor when the tier goes idle.
         let desired = reconcile_replicas(
             &spec,
-            &ObservedMetrics::default(),
+            ObservedMetrics::default(),
             &CurrentReplicas {
                 query: 8,
                 ..Default::default()
@@ -816,6 +938,81 @@ mod tests {
         );
     }
 
+    /// #6011 slice 1's acceptance. One absent reading sizes ITS OWN tier by
+    /// `replicas_without_signal` while the other two take the ordinary
+    /// proportional decision.
+    ///
+    /// The pre-fix arm is the last assertion: all three absent, which is what
+    /// a single failed query used to produce, holds the whole fleet.
+    #[test]
+    fn one_absent_reading_sizes_its_own_tier_and_leaves_the_others_deciding() {
+        let mut spec = cluster_with(ComponentAutoscale {
+            min: 1,
+            max: 8,
+            target: 5.0,
+        });
+        spec.autoscaling.ingester = ComponentAutoscale {
+            min: 1,
+            max: 8,
+            target: 100.0,
+        };
+        spec.autoscaling.query = ComponentAutoscale {
+            min: 1,
+            max: 8,
+            target: 4.0,
+        };
+        let current = CurrentReplicas {
+            ingester: 2,
+            compactor: 3,
+            query: 2,
+        };
+
+        // The compactor's series has gone absent — a tier stopped at zero, a
+        // scrape that missed. Ingest is at twice its target and query is idle.
+        let desired = reconcile_replicas(
+            &spec,
+            &ObservedSamples {
+                ingester_rps_per_pod: Some(200.0),
+                compactor_backlog: None,
+                query_in_flight_per_pod: Some(0.0),
+            },
+            &current,
+        );
+        assert_eq!(desired.ingester, 4, "2 pods at 2x target ⇒ 4");
+        assert_eq!(
+            desired.compactor, 3,
+            "the tier with no reading holds its size"
+        );
+        assert_eq!(desired.query, 1, "an idle query tier falls to its floor");
+
+        // And the other way round: ingest absent, compactor reading a queue.
+        let desired = reconcile_replicas(
+            &spec,
+            &ObservedSamples {
+                ingester_rps_per_pod: None,
+                compactor_backlog: Some(20.0),
+                query_in_flight_per_pod: Some(8.0),
+            },
+            &current,
+        );
+        assert_eq!(desired.ingester, 2, "held");
+        assert_eq!(desired.compactor, 4, "a shared queue of 20 at 5 per worker");
+        assert_eq!(desired.query, 4, "2 pods at 2x target ⇒ 4");
+
+        // The control: every reading absent is the whole outage, and every
+        // tier holds — the behaviour one failed query used to produce for all
+        // three.
+        let held = reconcile_replicas(&spec, ObservedSamples::default(), &current);
+        assert_eq!(
+            held,
+            DesiredReplicas {
+                ingester: 2,
+                compactor: 3,
+                query: 2
+            }
+        );
+    }
+
     #[test]
     fn ewma_alpha_honors_half_life() {
         assert_eq!(
@@ -879,20 +1076,22 @@ mod outage_tests {
         }
     }
 
+    /// A cycle in which no query answered: every signal absent.
+    fn outage() -> ObservedSamples {
+        ObservedSamples::default()
+    }
+
     /// The decision one cycle takes, given the folded observation.
     fn ingester_decision(
         spec: &SiglakeClusterSpec,
-        observed: &Option<ObservedMetrics>,
+        observed: impl Into<ObservedSamples>,
         current: i32,
     ) -> i32 {
         let current = CurrentReplicas {
             ingester: current,
             ..Default::default()
         };
-        match observed {
-            Some(o) => reconcile_replicas(spec, o, &current).ingester,
-            None => replicas_without_signal(&spec.autoscaling.ingester, current.ingester),
-        }
+        reconcile_replicas(spec, observed, &current).ingester
     }
 
     /// The pre-fix fold, kept as the control arm: an unusable reading was
@@ -918,33 +1117,112 @@ mod outage_tests {
     fn an_unusable_reading_neither_seeds_nor_updates_the_history() {
         let t0 = Instant::now();
 
-        let cold = fold_observation(None, None, t0, HALF_LIFE);
-        assert!(cold.observed.is_none(), "no metrics reach the decision");
+        let cold = fold_observation(None, outage(), t0, HALF_LIFE);
+        assert!(cold.observed.all_absent(), "no metrics reach the decision");
         assert!(cold.state.is_none(), "an outage does not seed the history");
 
         let previous = SmoothingState {
             at: t0,
-            smoothed: hot(500.0),
+            smoothed: hot(500.0).into(),
             idle: IdleSeconds::default(),
-            interrupted: false,
+            interrupted: Interrupted::default(),
         };
         let held = fold_observation(
             Some(previous.clone()),
-            None,
+            outage(),
             t0 + Duration::from_secs(300),
             HALF_LIFE,
         );
-        assert!(held.observed.is_none());
+        assert!(held.observed.all_absent());
         let state = held.state.expect("the last valid sample is retained");
         assert_eq!(state.at, previous.at, "the timestamp does not advance");
         assert_eq!(
-            state.smoothed.ingester_rps_per_pod, 500.0,
+            state.smoothed.ingester_rps_per_pod,
+            Some(500.0),
             "the value is unchanged"
         );
-        assert!(
+        assert_eq!(
             state.interrupted,
-            "the gap is marked, so it cannot extend an idle window"
+            Interrupted::ALL,
+            "the gap is marked on every signal, so it cannot extend an idle window"
         );
+    }
+
+    /// #6011 slice 1, through the smoothing history. One signal's gap marks,
+    /// holds and reseeds THAT signal only: the other two keep blending and
+    /// keep accumulating their idle windows across the same cycles.
+    #[test]
+    fn one_signal_s_gap_does_not_interrupt_the_other_two() {
+        let t0 = Instant::now();
+        let all = ObservedSamples {
+            ingester_rps_per_pod: Some(100.0),
+            compactor_backlog: Some(8.0),
+            query_in_flight_per_pod: Some(0.0),
+        };
+        let seeded = fold_observation(None, all.clone(), t0, HALF_LIFE)
+            .state
+            .expect("a seeded history");
+
+        // The compactor query fails; the other two answer as before.
+        let partial = fold_observation(
+            Some(seeded),
+            ObservedSamples {
+                compactor_backlog: None,
+                ..all.clone()
+            },
+            t0 + Duration::from_secs(60),
+            HALF_LIFE,
+        );
+        assert_eq!(
+            partial.observed.compactor_backlog, None,
+            "the failed signal reaches no decision"
+        );
+        assert_eq!(
+            partial.observed.ingester_rps_per_pod,
+            Some(100.0),
+            "a steady sample smooths to itself"
+        );
+        let state = partial.state.expect("history");
+        assert_eq!(
+            state.interrupted,
+            Interrupted {
+                compactor: true,
+                ..Interrupted::default()
+            },
+            "only the compactor's gap is marked"
+        );
+        assert_eq!(
+            state.smoothed.compactor_backlog,
+            Some(8.0),
+            "the failed signal's smoothed value is held, not decayed toward zero"
+        );
+        assert_eq!(
+            state.idle.query, 60.0,
+            "the query signal's idle window keeps accumulating through another \
+             component's gap"
+        );
+        assert_eq!(state.idle.compactor, 0.0, "the compactor's does not");
+        assert_eq!(
+            state.at,
+            t0 + Duration::from_secs(60),
+            "a cycle with any usable reading advances the history's clock"
+        );
+
+        // The compactor's next reading opens a fresh window behind it, while
+        // the query signal's window is 120 s of continuously observed idleness.
+        let recovered = fold_observation(
+            Some(state),
+            ObservedSamples {
+                compactor_backlog: Some(0.0),
+                ..all
+            },
+            t0 + Duration::from_secs(120),
+            HALF_LIFE,
+        );
+        let state = recovered.state.expect("history");
+        assert_eq!(state.interrupted, Interrupted::default(), "all cleared");
+        assert_eq!(state.idle.compactor, 0.0, "the gap cannot count as idle");
+        assert_eq!(state.idle.query, 120.0);
     }
 
     /// Hot load, a monitoring outage, then the IDENTICAL hot load again. The
@@ -966,20 +1244,20 @@ mod outage_tests {
         let first = fold_observation(None, Some(load.clone()), t0, HALF_LIFE);
         assert_eq!(ingester_decision(&spec, &first.observed, fleet), fleet);
 
-        let outage = fold_observation(
+        let interrupted = fold_observation(
             first.state.clone(),
-            None,
+            outage(),
             t0 + Duration::from_secs(30),
             HALF_LIFE,
         );
         assert_eq!(
-            ingester_decision(&spec, &outage.observed, fleet),
+            ingester_decision(&spec, &interrupted.observed, fleet),
             fleet,
             "#3488: the outage cycle itself holds the fleet"
         );
 
         let recovered = fold_observation(
-            outage.state,
+            interrupted.state,
             Some(load.clone()),
             t0 + Duration::from_secs(60),
             HALF_LIFE,
@@ -1022,14 +1300,18 @@ mod outage_tests {
 
         let mut state = None;
         for cycle in 0..3 {
-            let outage =
-                fold_observation(state, None, t0 + Duration::from_secs(30 * cycle), HALF_LIFE);
+            let missed = fold_observation(
+                state,
+                outage(),
+                t0 + Duration::from_secs(30 * cycle),
+                HALF_LIFE,
+            );
             assert_eq!(
-                ingester_decision(&spec, &outage.observed, 0),
+                ingester_decision(&spec, &missed.observed, 0),
                 1,
                 "a cold tier still bootstraps to its configured floor"
             );
-            state = outage.state;
+            state = missed.state;
         }
 
         let first = fold_observation(
@@ -1041,9 +1323,8 @@ mod outage_tests {
         assert_eq!(
             first
                 .observed
-                .as_ref()
-                .expect("a usable reading")
-                .ingester_rps_per_pod,
+                .ingester_rps_per_pod
+                .expect("a usable reading"),
             400.0,
             "seeded raw, not blended against the outage"
         );
@@ -1103,24 +1384,19 @@ mod outage_tests {
 
         /// One reconcile cycle, a minute after the last. `None` is an unusable
         /// reading, which takes the tier down the no-signal path.
-        fn cycle(&mut self, observation: Option<ObservedMetrics>) -> i32 {
+        fn cycle(&mut self, observation: impl Into<ObservedSamples>) -> i32 {
             self.at += Duration::from_secs(60);
             let half_life = self.spec.autoscaling.ewma_half_life_secs;
             let folded = fold_observation(self.state.take(), observation, self.at, half_life);
-            self.replicas = match &folded.observed {
-                Some(observed) => {
-                    reconcile_replicas(
-                        &self.spec,
-                        observed,
-                        &CurrentReplicas {
-                            compactor: self.replicas,
-                            ..Default::default()
-                        },
-                    )
-                    .compactor
-                }
-                None => replicas_without_signal(&self.spec.autoscaling.compactor, self.replicas),
-            };
+            self.replicas = reconcile_replicas(
+                &self.spec,
+                &folded.observed,
+                &CurrentReplicas {
+                    compactor: self.replicas,
+                    ..Default::default()
+                },
+            )
+            .compactor;
             self.state = folded.state;
             self.replicas
         }
@@ -1136,6 +1412,7 @@ mod outage_tests {
                 .expect("smoothing is on and the last reading was usable")
                 .smoothed
                 .compactor_backlog
+                .expect("the compactor signal has been read at least once")
         }
     }
 
@@ -1323,7 +1600,10 @@ mod outage_tests {
 
         let passed = fold_observation(None, Some(raw.clone()), t0, 0.0);
         assert_eq!(
-            passed.observed.expect("raw sample").ingester_rps_per_pod,
+            passed
+                .observed
+                .ingester_rps_per_pod
+                .expect("raw sample passes through"),
             37.0
         );
         assert!(passed.state.is_none(), "no history when smoothing is off");
@@ -1332,12 +1612,12 @@ mod outage_tests {
         // and an outage still reports "no signal" rather than a zero sample.
         let stale = SmoothingState {
             at: t0,
-            smoothed: raw,
+            smoothed: raw.into(),
             idle: IdleSeconds::default(),
-            interrupted: false,
+            interrupted: Interrupted::default(),
         };
-        let cleared = fold_observation(Some(stale), None, t0 + Duration::from_secs(30), 0.0);
-        assert!(cleared.observed.is_none());
+        let cleared = fold_observation(Some(stale), outage(), t0 + Duration::from_secs(30), 0.0);
+        assert!(cleared.observed.all_absent());
         assert!(cleared.state.is_none());
     }
 
@@ -1397,12 +1677,12 @@ mod outage_tests {
              decision and it proceeds to the multiply"
         );
         assert_eq!(
-            ingester_decision(&spec, &Some(hot(f64::NAN)), fleet),
+            ingester_decision(&spec, hot(f64::NAN), fleet),
             1,
             "NaN casts to 0 and clamps to the floor"
         );
         assert_eq!(
-            ingester_decision(&spec, &Some(hot(f64::INFINITY)), fleet),
+            ingester_decision(&spec, hot(f64::INFINITY), fleet),
             10,
             "an infinity saturates the cast and clamps to the ceiling"
         );

@@ -1,14 +1,14 @@
 //! Tiny Prometheus instant-query client.
 //!
 //! The operator polls four queries per cycle (per-component load
-//! signals) and folds the results into [`ObservedMetrics`]. We don't
+//! signals) and folds the results into [`ObservedSamples`]. We don't
 //! pull in `prometheus-http-query` for this — a single GET on
 //! `/api/v1/query` is enough and keeps the operator binary small.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::scaling::ObservedMetrics;
+use crate::scaling::ObservedSamples;
 
 pub struct PromClient {
     base_url: String,
@@ -80,25 +80,47 @@ impl PromClient {
     /// also poisons every later reading, because `NaN` propagates through the
     /// blend forever.
     ///
-    /// Returning Err puts all of these on the same path as a Prometheus outage,
-    /// where the reconciler holds the current replica counts and leaves the
-    /// smoothing history untouched.
-    pub async fn observed(&self, queries: &Queries) -> Result<ObservedMetrics> {
-        async fn required(this: &PromClient, q: &str, what: &str) -> Result<f64> {
-            let value = this
-                .instant_value(q)
-                .await
-                .with_context(|| format!("query `{q}`"))?;
-            usable_sample(value, q, what)
+    /// An unusable reading is absent FOR ITS OWN SIGNAL. It puts that
+    /// component on the same path as a Prometheus outage — the reconciler
+    /// holds its replica count and leaves its smoothing history untouched —
+    /// and leaves the other two components deciding on their own readings.
+    ///
+    /// This used to take all three samples or fail the snapshot, so one stale
+    /// series froze the whole fleet's sizing. That is the second defect behind
+    /// the zero-floor refusal: a compactor stopped at zero publishes nothing,
+    /// and its absence would have held ingest and query at their current size
+    /// for as long as it stayed stopped (`docs/DESIGN_compactor_wakeup_signal.md`).
+    /// All three absent is still today's whole-outage behaviour exactly.
+    pub async fn observed(&self, queries: &Queries, namespace: &str) -> ObservedSamples {
+        async fn sample(this: &PromClient, q: &str, what: &str, namespace: &str) -> Option<f64> {
+            let read = async {
+                let value = this
+                    .instant_value(q)
+                    .await
+                    .with_context(|| format!("query `{q}`"))?;
+                usable_sample(value, q, what)
+            };
+            match read.await {
+                Ok(value) => Some(value),
+                Err(e) => {
+                    tracing::warn!(error = %e, component = what,
+                        "prometheus reading unusable; HOLDING this component's replica count \
+                         rather than reading the gap as idleness");
+                    metrics::counter!("siglake_operator_prom_query_errors_total",
+                        "namespace" => namespace.to_string(),
+                        "component" => what.to_string())
+                    .increment(1);
+                    None
+                }
+            }
         }
-        let ing = required(self, &queries.ingester_rps, "ingester").await?;
-        let cmp = required(self, &queries.compactor_backlog, "compactor").await?;
-        let qry = required(self, &queries.query_in_flight, "query").await?;
-        Ok(ObservedMetrics {
-            ingester_rps_per_pod: ing,
-            compactor_backlog: cmp,
-            query_in_flight_per_pod: qry,
-        })
+        ObservedSamples {
+            ingester_rps_per_pod: sample(self, &queries.ingester_rps, "ingester", namespace).await,
+            compactor_backlog: sample(self, &queries.compactor_backlog, "compactor", namespace)
+                .await,
+            query_in_flight_per_pod: sample(self, &queries.query_in_flight, "query", namespace)
+                .await,
+        }
     }
 }
 
@@ -188,7 +210,118 @@ impl Queries {
 
 #[cfg(test)]
 mod tests {
-    use super::{usable_sample, Queries};
+    use super::{usable_sample, PromClient, Queries};
+
+    /// A stand-in Prometheus that answers each query with a canned body,
+    /// chosen by the `query=` parameter in the request line. Returns the base
+    /// URL to point a [`PromClient`] at.
+    ///
+    /// The per-signal split is about what happens to the OTHER two readings
+    /// when one query fails, so the fixture has to fail exactly one of three
+    /// live HTTP requests — a client pointed at a dead host fails all three
+    /// and cannot tell the new behaviour from the old.
+    async fn canned_prometheus(answers: Vec<(&str, String)>) -> String {
+        let answers: Vec<(String, String)> = answers
+            .into_iter()
+            .map(|(name, body)| (name.to_string(), body))
+            .collect();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let answers = answers.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let body = answers
+                        .iter()
+                        .find(|(name, _)| request.contains(&format!("query={name}")))
+                        .map(|(_, body)| body.clone());
+                    let response = match body {
+                        Some(body) => format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        ),
+                        // Every query this fixture was not given fails the way
+                        // a Prometheus that is up but cannot serve does.
+                        None => "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn scalar(value: &str) -> String {
+        format!(
+            r#"{{"status":"success","data":{{"resultType":"vector","result":[{{"metric":{{}},"value":[1700000000,"{value}"]}}]}}}}"#
+        )
+    }
+
+    fn named_queries() -> Queries {
+        Queries {
+            ingester_rps: "ing".into(),
+            compactor_backlog: "cmp".into(),
+            query_in_flight: "qry".into(),
+        }
+    }
+
+    /// #6011 slice 1. One unusable reading is absent for ITS OWN signal and
+    /// leaves the other two as readings. Before this, `observed` returned the
+    /// first error and the reconciler held all three tiers.
+    #[tokio::test]
+    async fn one_failing_query_leaves_the_other_two_readings_intact() {
+        // No answer for `cmp`: that request gets the 500.
+        let base = canned_prometheus(vec![("ing", scalar("42.5")), ("qry", scalar("3"))]).await;
+        let client = PromClient::new(base).expect("client");
+
+        let samples = client.observed(&named_queries(), "logs").await;
+        assert_eq!(samples.ingester_rps_per_pod, Some(42.5));
+        assert_eq!(
+            samples.compactor_backlog, None,
+            "the failing query is absent for the compactor alone"
+        );
+        assert_eq!(samples.query_in_flight_per_pod, Some(3.0));
+        assert!(!samples.all_absent(), "this is not a whole outage");
+    }
+
+    /// An empty result vector and a non-finite sample are unusable for their
+    /// own signal too — the checks `usable_sample` already made, now applied
+    /// per query rather than to the snapshot.
+    #[tokio::test]
+    async fn an_empty_vector_and_a_nan_are_absent_only_for_their_own_signal() {
+        let empty = r#"{"status":"success","data":{"resultType":"vector","result":[]}}"#;
+        let base = canned_prometheus(vec![
+            ("ing", empty.to_string()),
+            ("cmp", scalar("NaN")),
+            ("qry", scalar("7")),
+        ])
+        .await;
+        let client = PromClient::new(base).expect("client");
+
+        let samples = client.observed(&named_queries(), "logs").await;
+        assert_eq!(samples.ingester_rps_per_pod, None, "an empty vector");
+        assert_eq!(samples.compactor_backlog, None, "a NaN sample");
+        assert_eq!(samples.query_in_flight_per_pod, Some(7.0));
+    }
+
+    /// Every query failing reproduces the outage reading exactly: all three
+    /// absent, which the reconciler still turns into "hold every tier".
+    #[tokio::test]
+    async fn a_prometheus_that_answers_nothing_is_still_a_whole_outage() {
+        let base = canned_prometheus(vec![]).await;
+        let client = PromClient::new(base).expect("client");
+        assert!(client.observed(&named_queries(), "logs").await.all_absent());
+    }
 
     /// The sample strings Prometheus actually writes for undefined arithmetic
     /// parse to non-finite floats, so `usable_sample`'s rejection is on the

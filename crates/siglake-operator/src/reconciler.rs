@@ -30,9 +30,7 @@ use kube::{
 use crate::crd::{Condition, ReplicaStatus, SiglakeCluster, SiglakeClusterStatus};
 use crate::prom::{PromClient, Queries};
 use crate::render;
-use crate::scaling::{
-    fold_observation, reconcile_replicas, replicas_without_signal, CurrentReplicas, DesiredReplicas,
-};
+use crate::scaling::{fold_observation, reconcile_replicas, CurrentReplicas, DesiredReplicas};
 
 /// Anything the reconciler needs to share across the controller loop.
 pub struct Context {
@@ -135,22 +133,12 @@ pub async fn reconcile(cluster: Arc<SiglakeCluster>, ctx: Arc<Context>) -> Resul
     // has no series until its pods start, and a transient PromQL outage should
     // not stall every reconcile. Without a signal, cold tiers converge to
     // their positive floors while already-running tiers hold their size.
-    let observation = match ctx.prom.observed(&queries).await {
-        Ok(o) => Some(o),
-        Err(e) => {
-            // Preserve a running fleet during a monitoring outage. Cold tiers
-            // are handled below: a positive floor bootstraps the pods needed
-            // to begin exporting metrics. Every accepted spec has one —
-            // `invalid_spec_condition` refuses a zero floor above.
-            tracing::warn!(error = %e,
-                "prometheus query failed; HOLDING replica counts rather than reading the \
-                 outage as idleness");
-            metrics::counter!("siglake_operator_prom_query_errors_total",
-                "namespace" => namespace.clone())
-            .increment(1);
-            None
-        }
-    };
+    // Per signal: a component whose query failed or read nothing is absent on
+    // its own, and `prom::observed` logs and counts it with a `component`
+    // label. Preserve a running fleet during a monitoring outage — cold tiers
+    // are handled below, where a positive floor bootstraps the pods that begin
+    // exporting metrics.
+    let observation = ctx.prom.observed(&queries, &namespace).await;
 
     // EWMA-smooth the saturation signals when configured, carrying the smoothed
     // state across cycles. Damps autoscaler flapping. (The idle window it also
@@ -180,20 +168,11 @@ pub async fn reconcile(cluster: Arc<SiglakeCluster>, ctx: Arc<Context>) -> Resul
         folded.observed
     };
 
-    let desired = match &observed {
-        Some(observed) => reconcile_replicas(&cluster.spec, observed, &current),
-        // Every tier holds its current size but still converges up to its
-        // floor, which an accepted spec guarantees is positive — so a tier at
-        // zero comes back even while the reading is missing.
-        None => DesiredReplicas {
-            ingester: replicas_without_signal(&cluster.spec.autoscaling.ingester, current.ingester),
-            compactor: replicas_without_signal(
-                &cluster.spec.autoscaling.compactor,
-                current.compactor,
-            ),
-            query: replicas_without_signal(&cluster.spec.autoscaling.query, current.query),
-        },
-    };
+    // A component with a reading takes the ordinary decision; one without
+    // holds its current size and still converges up to its floor, which an
+    // accepted spec guarantees is positive — so a tier at zero comes back even
+    // while its reading is missing.
+    let desired = reconcile_replicas(&cluster.spec, &observed, &current);
 
     // PVC for the shared WAL. Has to land before the Deployments so
     // their pods can bind on first roll-out (without WaitForFirstConsumer
