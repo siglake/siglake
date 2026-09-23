@@ -839,6 +839,61 @@ impl SqlSegmentClaim {
         })
     }
 
+    /// The queue depth an ACTIVATION signal has to read: [`Self::peek_pending`]'s
+    /// sealed rows plus claims nobody is left to reclaim.
+    ///
+    /// Scaling a compactor tier to zero sends SIGTERM to a worker that may
+    /// hold a claim. Its rows stay `status = 'processing'`, which
+    /// [`Self::peek_pending`] excludes, and the reclaim that would reset them
+    /// ([`Self::abandoned_claims`]) runs inside the compactor. The last worker
+    /// to stop can therefore strand its batch where a `status = 'sealed'`
+    /// count cannot see it and nothing will free it.
+    ///
+    /// `reclaim_cutoff` is the same age [`Self::abandoned_claims`] uses, so a
+    /// row a live worker is committing right now is excluded and a warm tier's
+    /// reading is unchanged; a stranded batch becomes visible one cutoff after
+    /// the last pod stops, wakes the tier, and is then reclaimed by the worker
+    /// that starts. Served by the same `(status, registered_at_ms)` index as
+    /// the sealed count.
+    ///
+    /// Kept separate from [`Self::peek_pending`] deliberately: that one gates
+    /// the compactor's commit accumulation and feeds
+    /// `siglake_compactor_sealed_pending`, and a stranded row is not work the
+    /// gate should accumulate against.
+    pub async fn peek_activation_depth(&self, reclaim_cutoff: Duration) -> Result<PendingStats> {
+        let q = self.dialect.rewrite(
+            r#"
+            SELECT
+                CAST(COUNT(*) AS BIGINT),
+                CAST(COALESCE(SUM(bytes), 0) AS BIGINT),
+                CAST(COALESCE(SUM(rows), 0) AS BIGINT),
+                MIN(registered_at_ms)
+                FROM wal_segments
+                WHERE status = 'sealed'
+                   OR (status = 'processing' AND claimed_at_ms IS NOT NULL
+                       AND claimed_at_ms < ?)
+            "#,
+        );
+        let cutoff = now_millis() - reclaim_cutoff.as_millis() as i64;
+        let (segments, bytes, rows, oldest): (i64, i64, i64, Option<i64>) = sqlx::query_as(&q)
+            .bind(cutoff)
+            .fetch_one(&self.pool)
+            .await
+            .context("peek wal segment activation depth")?;
+        let oldest_age = oldest
+            .map(|ms| {
+                let age_ms = now_millis().saturating_sub(ms).max(0);
+                Duration::from_millis(age_ms as u64)
+            })
+            .unwrap_or_default();
+        Ok(PendingStats {
+            segments: segments.max(0) as u64,
+            bytes: bytes.max(0) as u64,
+            rows: rows.max(0) as u64,
+            oldest_age,
+        })
+    }
+
     pub async fn mark_committed(&self, id: &str) -> Result<()> {
         let q = self.dialect.rewrite(
             r#"
@@ -2439,6 +2494,71 @@ mod tests {
         let p2 = c.peek_pending().await.unwrap();
         assert_eq!(p2.segments, 1, "claimed segment excluded from peek");
         assert!(p2.bytes == 1000 || p2.bytes == 2500);
+    }
+
+    /// #6011 slice 2. The depth an ingester publishes for a stopped compactor
+    /// counts a claim nobody is left to reclaim, and does not count one a live
+    /// worker took a moment ago.
+    ///
+    /// `peek_pending` is the control arm on the same rows: it reports only the
+    /// sealed ones, which is why a batch stranded by the last compactor to
+    /// stop would be invisible to an activation signal built on it.
+    #[tokio::test]
+    async fn the_activation_depth_counts_a_stranded_claim_but_not_a_fresh_one() {
+        let (c, _tmp) = fresh().await;
+        for i in 0..3 {
+            c.register(
+                &format!("seg-{i}"),
+                "default",
+                "",
+                &format!("url-{i}"),
+                100,
+                5,
+            )
+            .await
+            .unwrap();
+        }
+        let cutoff = Duration::from_secs(900);
+
+        // Nothing claimed: the two reads agree.
+        assert_eq!(c.peek_activation_depth(cutoff).await.unwrap().segments, 3);
+
+        // One worker claims two segments and is still working on them.
+        let claimed = c.try_claim(2).await.unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(c.peek_pending().await.unwrap().segments, 1);
+        assert_eq!(
+            c.peek_activation_depth(cutoff).await.unwrap().segments,
+            1,
+            "a fresh claim is live work, not a stranded batch"
+        );
+
+        // The worker is killed mid-claim (a tier scaled to zero). One of its
+        // rows ages past the reclaim cutoff with nothing running to reset it.
+        let stranded = &claimed[0].id;
+        let backdated = now_millis() - cutoff.as_millis() as i64 - 1_000;
+        sqlx::query("UPDATE wal_segments SET claimed_at_ms = ? WHERE id = ?")
+            .bind(backdated)
+            .bind(stranded)
+            .execute(&c.pool)
+            .await
+            .unwrap();
+
+        let depth = c.peek_activation_depth(cutoff).await.unwrap();
+        assert_eq!(
+            depth.segments, 2,
+            "the sealed row plus the stranded claim; the other claim is still fresh"
+        );
+        assert_eq!(depth.bytes, 200, "the stranded claim brings its bytes");
+        assert_eq!(
+            c.peek_pending().await.unwrap().segments,
+            1,
+            "the control arm the compactor's own gauge uses cannot see it"
+        );
+
+        // And the tier that comes back reclaims exactly that row.
+        assert_eq!(c.reclaim_abandoned(cutoff).await.unwrap(), 1);
+        assert_eq!(c.peek_pending().await.unwrap().segments, 2);
     }
 
     #[tokio::test]

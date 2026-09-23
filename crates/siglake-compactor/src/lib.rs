@@ -6641,7 +6641,12 @@ enum ClaimReclaimMaxAgeFallback {
 /// unparseable value, and this wrapper logs the substitution once per process.
 /// Positive values below the default are honoured: an operator who has
 /// measured short appends may tighten it.
-fn claim_reclaim_max_age() -> Duration {
+///
+/// `pub` because the ingest server's activation-depth publisher has to exclude
+/// exactly the claims this fleet still considers live (#6011). Reading the
+/// same variable through the same resolver is what keeps the publisher's
+/// cutoff and the reclaim sweep's from drifting apart.
+pub fn claim_reclaim_max_age() -> Duration {
     let raw = std::env::var("SIGLAKE_CLAIM_RECLAIM_MAX_AGE_SECS").ok();
     let (max_age, fallback) = claim_reclaim_max_age_from(raw.as_deref());
     if let Some(reason) = fallback {
