@@ -1089,11 +1089,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `committed` for each file in local `committed/`, and lets the same retention
   pass delete the object and then the row — bounded by
   `committedRetentionSecs`, whose `0` still means delete nothing. It needs
-  `catalogUri`, `s3.warehouseUrl` and a non-empty `wal.mirror.prefix`; without
-  them the compactor warns and keeps draining. Being opt-in is deliberate: it
-  deletes objects, and it gives a drain that needs no claim-store connection
-  today a dependency on one. Default-on waits on a retained object-store
-  acceptance run and a separate release decision.
+  `SIGLAKE_CATALOG_URI`, `SIGLAKE_WAREHOUSE_URL` and a non-empty
+  `SIGLAKE_WAL_MIRROR_PREFIX`; the chart renders the first two on every pod,
+  and passes `wal.mirror.prefix` to the compactor only in catalog-claim mode,
+  so the filesystem drain uses the binary default `wal-mirror` unless
+  `compactor.extraEnv` repeats a changed prefix. Without them the compactor
+  warns and keeps draining.
+  Being opt-in is deliberate: it deletes objects, and it gives a drain that
+  needs no claim-store connection today a dependency on one. Default-on waits
+  on a retained object-store acceptance run and a separate release decision.
 
   Two sealed-segment populations stay outside it either way. A segment no
   local drain ever committed — a dropped index incarnation's, quarantined into
