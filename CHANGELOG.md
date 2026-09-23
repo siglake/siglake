@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **Operator (feature)**: `spec.autoscaling.compactor.min: 0` is accepted under
+  the catalog-claim drain (`compactor.max` above 1) with `ewmaHalfLifeSecs`
+  above 0. The reading that asks a parked tier back is published by the
+  ingesters: the ingest server reads the shared `wal_segments` queue over the
+  claim connection its mirror registrar already holds and exports
+  `siglake_wal_segments_sealed{tenant}` with a
+  `siglake_wal_segments_sealed_sample_age_seconds` companion, so the signal
+  outlives the tier it sizes. The depth counts sealed rows plus claims older
+  than `SIGLAKE_CLAIM_RECLAIM_MAX_AGE_SECS`, which makes a batch stranded in
+  `processing` by the last worker to stop visible without counting live work; a
+  failed catalog read holds the last depth and lets the age rise rather than
+  publishing a zero. The operator selects that reading only for a zero floor,
+  drops publishers whose sample is over two minutes old, and falls back to
+  `siglake_compactor_sealed_pending`. Each load signal is now observed on its
+  own — `siglake_operator_prom_query_errors_total` gains a `component` label —
+  so a component whose series is absent holds its own replica count instead of
+  freezing the other two, and a zero-floor tier with no usable reading goes to
+  1 rather than staying parked. A parked tier is woken for ten minutes after an
+  hour at zero so retention, delete tasks, claim reclaim and the mirror
+  recovery sweep still run. `compactor.max: 1` keeps
+  `AutoscalingZeroFloorUnsupported`, `ewmaHalfLifeSecs: 0` alongside a zero
+  floor is refused as `AutoscalingZeroFloorNeedsSmoothing`, and ingest and
+  query floors stay refused at 0. The packaged floors do not change, and no
+  round has yet woken a parked tier in a cluster — see `docs/LIMITATIONS.md`.
+  (#6011)
+
 - **Chart (fix)**: the compactor now receives `wal.mirror.prefix` as
   `SIGLAKE_WAL_MIRROR_PREFIX` in both drain modes, instead of getting it as
   `--mirror-prefix` under `compactor.catalogClaim.enabled` alone. A filesystem
