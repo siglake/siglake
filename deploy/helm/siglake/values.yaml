@@ -484,14 +484,11 @@ compactor:
   # every pod: `SIGLAKE_CATALOG_URI` comes from `postgres.existingSecret` and
   # `postgres.secretKeys`, `SIGLAKE_WAREHOUSE_URL` from `s3.bucket` and
   # `s3.warehousePrefix`, and all of those are required for any install. The
-  # mirror prefix is the input you may have to supply yourself:
-  # `wal.mirror.prefix` reaches the compactor only under
-  # `catalogClaim.enabled` (as `--mirror-prefix`), so the filesystem drain
-  # reads `SIGLAKE_WAL_MIRROR_PREFIX` from the pod env and falls back to the
-  # binary default `wal-mirror`. If you changed `wal.mirror.prefix`, repeat it
-  # as `SIGLAKE_WAL_MIRROR_PREFIX` under `compactor.extraEnv`. An empty
-  # effective prefix is the mirror opt-out: the compactor warns and keeps
-  # draining, as it does when a connection is missing.
+  # third input is `wal.mirror.prefix`, which the chart renders on the compactor
+  # as `SIGLAKE_WAL_MIRROR_PREFIX` in both drain modes — nothing to repeat under
+  # `compactor.extraEnv`. `wal.mirror.enabled: false` renders that variable
+  # empty, which is the mirror opt-out: the compactor warns and keeps draining,
+  # as it does when a connection is missing.
   #
   # Being opt-in is deliberate: it deletes objects, and it gives a drain that
   # needs no claim-store connection today a dependency on one.
@@ -906,7 +903,9 @@ wal:
   #    `?commit=wait_for` (the default) and query for visibility.
   #
   # `enabled: false` renders an EMPTY SIGLAKE_WAL_MIRROR_PREFIX, which is the
-  # binary's opt-out; omitting the variable would leave the mirror running.
+  # binary's opt-out; omitting the variable would leave the mirror running. The
+  # ingester and the compactor both carry it, so the writer and whichever drain
+  # reads or reclaims the prefix cannot disagree about which one it is.
   mirror:
     enabled: true
     # Relative to the warehouse URL, so the objects land under
