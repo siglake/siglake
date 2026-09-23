@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
@@ -34,6 +34,7 @@ use tracing_subscriber::Layer;
 
 const START: &str = "query execution start";
 const SQL_PROFILE: &str = "sql query profile";
+const EXECUTION_PROFILE: &str = "sql execution profile";
 const TUNING: &str = "siglake query scan reader tuning";
 const PARTITION_PROFILE: &str = "siglake query source partition profile";
 
@@ -52,11 +53,22 @@ struct Captured {
 }
 
 #[derive(Clone, Default)]
-struct Recorder(Arc<Mutex<Vec<Captured>>>);
+struct Recorder {
+    events: Arc<Mutex<Vec<Captured>>>,
+    sql_start_barrier: Option<Arc<Barrier>>,
+    sql_starts: Arc<AtomicUsize>,
+}
 
 impl Recorder {
+    fn with_overlapping_sql_starts() -> Self {
+        Self {
+            sql_start_barrier: Some(Arc::new(Barrier::new(2))),
+            ..Self::default()
+        }
+    }
+
     fn all(&self) -> Vec<Captured> {
-        self.0.lock().expect("recorder").clone()
+        self.events.lock().expect("recorder").clone()
     }
 }
 
@@ -102,10 +114,27 @@ impl<S: tracing::Subscriber> Layer<S> for Recorder {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let mut visitor = Visitor::default();
         event.record(&mut visitor);
-        if ![START, SQL_PROFILE, TUNING, PARTITION_PROFILE].contains(&visitor.message.as_str()) {
+        if ![
+            START,
+            SQL_PROFILE,
+            EXECUTION_PROFILE,
+            TUNING,
+            PARTITION_PROFILE,
+        ]
+        .contains(&visitor.message.as_str())
+        {
             return;
         }
-        self.0.lock().expect("recorder").push(Captured {
+        if visitor.message == START && visitor.endpoint.as_deref() == Some("sql") {
+            let index = self.sql_starts.fetch_add(1, Ordering::SeqCst);
+            if index < 2 {
+                self.sql_start_barrier
+                    .as_ref()
+                    .expect("overlap barrier")
+                    .wait();
+            }
+        }
+        self.events.lock().expect("recorder").push(Captured {
             seq: SEQ.fetch_add(1, Ordering::SeqCst),
             message: visitor.message,
             execution_id: visitor.execution_id,
@@ -178,9 +207,9 @@ fn of_execution<'a>(log: &'a [Captured], id: u64, message: &str) -> Vec<&'a Capt
 
 // ------------------------------------------------------------------ test
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scan_events_name_the_request_that_produced_them() {
-    let recorder = Recorder::default();
+    let recorder = Recorder::with_overlapping_sql_starts();
     tracing_subscriber::registry().with(recorder.clone()).init();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -188,15 +217,45 @@ async fn scan_events_name_the_request_that_produced_them() {
     needle_table(&ice).await;
     let app = router(AppState::new(Arc::new(ice), AuthConfig::open()));
 
-    // 1. A buffered request: start line, terminal line and scan events all
-    //    carry one id.
-    let (status, _) = post(
-        &app,
-        "/api/v1/sql",
-        serde_json::json!({ "query": format!("SELECT host, raw FROM events WHERE {PREDICATE}") }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    // 1. Two buffered requests overlap: their start, execution-profile and
+    //    terminal lines must still form two exact id joins. The recorder holds
+    //    each request at its start event until the other has reached its own.
+    let buffered_query =
+        serde_json::json!({ "query": format!("SELECT host, raw FROM events WHERE {PREDICATE}") });
+    let first = tokio::spawn({
+        let app = app.clone();
+        let query = buffered_query.clone();
+        async move { post(&app, "/api/v1/sql", query).await }
+    });
+    let second = tokio::spawn({
+        let app = app.clone();
+        async move { post(&app, "/api/v1/sql", buffered_query).await }
+    });
+    let ((first_status, _), (second_status, _)) =
+        tokio::try_join!(first, second).expect("buffered request task");
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(second_status, StatusCode::OK);
+
+    let buffered_log = recorder.all();
+    let buffered_ids: Vec<u64> = buffered_log
+        .iter()
+        .filter(|e| e.message == START && e.endpoint.as_deref() == Some("sql"))
+        .map(|e| e.execution_id.expect("start line names an id"))
+        .collect();
+    assert_eq!(buffered_ids.len(), 2, "buffered starts: {buffered_log:?}");
+    assert_ne!(buffered_ids[0], buffered_ids[1]);
+    for id in &buffered_ids {
+        assert_eq!(
+            of_execution(&buffered_log, *id, EXECUTION_PROFILE).len(),
+            1,
+            "buffered execution {id} logged its execution profile"
+        );
+        assert_eq!(
+            of_execution(&buffered_log, *id, SQL_PROFILE).len(),
+            1,
+            "buffered execution {id} logged its terminal profile"
+        );
+    }
 
     // 2. The worker endpoint, which logs no terminal line: its scan events are
     //    attributable only through its own start line.
@@ -235,8 +294,8 @@ async fn scan_events_name_the_request_that_produced_them() {
                 acc
             });
 
-    // The two `/api/v1/sql` requests both took the local path, so they are the
-    // two `sql` start lines; the worker request is the one `sql_shard` line.
+    // All three `/api/v1/sql` requests took the local path; the worker request
+    // is the one `sql_shard` line.
     assert_eq!(
         endpoints.get("sql_shard").copied(),
         Some(1),
@@ -244,7 +303,7 @@ async fn scan_events_name_the_request_that_produced_them() {
     );
     assert_eq!(
         endpoints.get("sql").copied(),
-        Some(2),
+        Some(3),
         "local start lines: {endpoints:?}"
     );
 
@@ -254,15 +313,17 @@ async fn scan_events_name_the_request_that_produced_them() {
         .filter(|e| e.message == START && e.endpoint.as_deref() == Some("sql"))
         .map(|e| e.execution_id.expect("start line names an id"))
         .collect();
-    let (buffered_id, streamed_id) = (sql_ids[0], sql_ids[1]);
-    assert_ne!(buffered_id, streamed_id);
-    assert_ne!(buffered_id, shard_id);
+    let streamed_id = *sql_ids.last().expect("streamed execution start");
+    assert_eq!(&sql_ids[..2], buffered_ids.as_slice());
+    assert!(!buffered_ids.contains(&streamed_id));
+    assert!(!buffered_ids.contains(&shard_id));
 
-    for (label, id) in [
-        ("buffered", buffered_id),
-        ("worker shard", shard_id),
-        ("streamed", streamed_id),
-    ] {
+    for (label, id) in buffered_ids
+        .iter()
+        .copied()
+        .map(|id| ("buffered", id))
+        .chain([("worker shard", shard_id), ("streamed", streamed_id)])
+    {
         assert_eq!(
             of_execution(&log, id, TUNING).len(),
             1,

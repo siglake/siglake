@@ -1916,6 +1916,12 @@ one could be written, and a streamed body outlives its handler. An empty
 `query` on that line means the execution runs more than one statement (the
 Jaeger render), which `scan_id` separates.
 
+A successful buffered `/api/v1/sql` execution carries that same id on both
+its `sql execution profile` line (physical plan and phase timings) and its
+terminal `sql query profile` line. Concurrent buffered executions can
+therefore join their plan, collect and render timings by id instead of by log
+position. Streaming and refused executions keep their existing event set.
+
 Ids are process-local. A distributed query's coordinator and worker halves
 each mint their own and are joined by the W3C trace context the fan-out
 already propagates, not by a shared id. `crates/siglake-storage/tests/scan_event_attribution.rs`

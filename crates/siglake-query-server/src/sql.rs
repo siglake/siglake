@@ -4891,6 +4891,7 @@ async fn handle_local_inner(
             _admission,
             buffer_delta_micros,
             residual_fallback,
+            execution_id,
             // Ownership moves out of this scope: for NDJSON it travels into the
             // response body, for Records it is held across the collect. Taking
             // it here is what stops the handler's own guard cancelling a stream
@@ -9654,6 +9655,7 @@ async fn execute_with_limits(
     admission: Option<crate::admission::AdmissionGuard>,
     buffer_delta_micros: u64,
     residual_fallback: Option<DataFrame>,
+    execution_id: siglake_storage::QueryExecutionId,
     cancel: Option<siglake_storage::CancelOnDrop>,
     deadline: tokio::time::Instant,
     started: Instant,
@@ -9672,6 +9674,7 @@ async fn execute_with_limits(
                     cache_ctx,
                     buffer_delta_micros,
                     residual_fallback,
+                    execution_id,
                 )
                 .await
             }
@@ -9790,6 +9793,7 @@ async fn render_records(
     cache_ctx: Option<SqlResultCacheCtx>,
     buffer_delta_micros: u64,
     residual_fallback: Option<DataFrame>,
+    execution_id: siglake_storage::QueryExecutionId,
 ) -> Result<Response, ApiError> {
     let plan_started = Instant::now();
     // Before `create_physical_plan`, which consumes the DataFrame: execution
@@ -9853,6 +9857,7 @@ async fn render_records(
                         cache_ctx,
                         buffer_delta_micros,
                         None,
+                        execution_id,
                     ))
                     .await;
                 }
@@ -9949,6 +9954,7 @@ async fn render_records(
     }
     tracing::info!(
         endpoint = "sql",
+        query_execution_id = execution_id.0,
         format = "records",
         root_plan = %displayable(plan.as_ref()).one_line(),
         plan_nodes = runtime.nodes,
