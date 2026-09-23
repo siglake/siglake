@@ -35,6 +35,7 @@ use futures::future::{BoxFuture, FutureExt};
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::arrow::{
     schema_to_arrow_schema, ArrowReaderBuilder, PromotedPruneSpec, RawPruneSpec, ScanCounters,
+    DEFAULT_RANGE_COALESCE_BYTES, DEFAULT_RANGE_FETCH_CONCURRENCY,
 };
 use iceberg::expr::{BinaryExpression, Predicate, PredicateOperator, Reference, UnaryExpression};
 use iceberg::scan::{FileScanTask, FileScanTaskStream};
@@ -156,9 +157,41 @@ struct EffectiveReaderTuning {
     ordered_drain_buffer_bytes: Option<u64>,
 }
 
+/// What the Iceberg reader will actually do with byte ranges on one scan, as
+/// opposed to what siglake configured. #5806: leaving both range knobs unset
+/// does not turn coalescing off — the fork's builder still applies
+/// [`DEFAULT_RANGE_COALESCE_BYTES`] / [`DEFAULT_RANGE_FETCH_CONCURRENCY`] — so
+/// the scan's tuning log reports these resolved values and flags separately
+/// whether an override survived [`effective_reader_tuning`]'s adaptive gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AppliedRangeTuning {
+    /// Gap below which the reader merges two requested ranges.
+    coalesce_bytes: u64,
+    /// Coalesced ranges the reader fetches concurrently.
+    fetch_concurrency: usize,
+    /// Whether either value comes from siglake rather than the fork default.
+    override_applied: bool,
+}
+
 impl EffectiveReaderTuning {
-    fn range_enabled(self) -> bool {
-        self.range_coalesce_bytes.is_some() || self.range_fetch_concurrency.is_some()
+    /// Resolve the range settings the reader will run with. Pure, so the tests
+    /// drive it directly (project convention for env-derived knobs). Mirrors
+    /// the three `with_range_*` call sites, including their `max(1)`
+    /// normalization: an override of `0` reaches the reader as `1`, and that is
+    /// what the log must say.
+    fn applied_range(self) -> AppliedRangeTuning {
+        AppliedRangeTuning {
+            coalesce_bytes: self
+                .range_coalesce_bytes
+                .map(|bytes| bytes.max(1))
+                .unwrap_or(DEFAULT_RANGE_COALESCE_BYTES),
+            fetch_concurrency: self
+                .range_fetch_concurrency
+                .map(|limit| limit.max(1))
+                .unwrap_or(DEFAULT_RANGE_FETCH_CONCURRENCY),
+            override_applied: self.range_coalesce_bytes.is_some()
+                || self.range_fetch_concurrency.is_some(),
+        }
     }
 }
 
@@ -2799,6 +2832,7 @@ impl SiglakeIcebergTableScan {
         let data_file_concurrency_limit = (aggregate_reader_budget / partition_count.max(1)).max(1);
         let est_decoded_per_file =
             estimated_decoded_bytes_per_file(planned_files, planned_bytes, decompression_factor);
+        let applied_range = reader_tuning.applied_range();
         tracing::info!(
             planned_files,
             planned_bytes,
@@ -2809,9 +2843,9 @@ impl SiglakeIcebergTableScan {
             aggregate_reader_budget,
             est_decoded_per_file,
             batch_size = reader_tuning.batch_size,
-            range_enabled = reader_tuning.range_enabled(),
-            range_coalesce_bytes = reader_tuning.range_coalesce_bytes,
-            range_fetch_concurrency = reader_tuning.range_fetch_concurrency,
+            range_override_applied = applied_range.override_applied,
+            range_coalesce_bytes = applied_range.coalesce_bytes,
+            range_fetch_concurrency = applied_range.fetch_concurrency,
             adaptive_min_bytes = tuning.range_adaptive_min_bytes,
             adaptive_min_files = tuning.range_adaptive_min_files,
             file_cache_enabled = file_cache_tuning.enabled(),
@@ -8656,7 +8690,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_reader_tuning_leaves_ranges_disabled_when_unconfigured() {
+    fn effective_reader_tuning_leaves_range_overrides_unset_when_unconfigured() {
         let tuning = effective_reader_tuning(
             crate::QueryScanTuning::default(),
             200,
@@ -8672,6 +8706,100 @@ mod tests {
                 ..Default::default()
             }
         );
+        // #5806: unset is not "no coalescing" — the reader still runs the
+        // fork's 1 MiB gap and 10-way fetch, and that is what the scan logs.
+        assert_eq!(
+            tuning.applied_range(),
+            AppliedRangeTuning {
+                coalesce_bytes: 1_048_576,
+                fetch_concurrency: 10,
+                override_applied: false,
+            }
+        );
+    }
+
+    #[test]
+    fn applied_range_reports_each_override_beside_the_fork_default() {
+        let coalesce_only = EffectiveReaderTuning {
+            range_coalesce_bytes: Some(4 * 1024 * 1024),
+            ..Default::default()
+        };
+        assert_eq!(
+            coalesce_only.applied_range(),
+            AppliedRangeTuning {
+                coalesce_bytes: 4 * 1024 * 1024,
+                fetch_concurrency: 10,
+                override_applied: true,
+            }
+        );
+        let concurrency_only = EffectiveReaderTuning {
+            range_fetch_concurrency: Some(32),
+            ..Default::default()
+        };
+        assert_eq!(
+            concurrency_only.applied_range(),
+            AppliedRangeTuning {
+                coalesce_bytes: 1_048_576,
+                fetch_concurrency: 32,
+                override_applied: true,
+            }
+        );
+    }
+
+    #[test]
+    fn applied_range_normalizes_zero_overrides_the_way_the_builder_is_called() {
+        let zeroed = EffectiveReaderTuning {
+            range_coalesce_bytes: Some(0),
+            range_fetch_concurrency: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            zeroed.applied_range(),
+            AppliedRangeTuning {
+                coalesce_bytes: 1,
+                fetch_concurrency: 1,
+                override_applied: true,
+            }
+        );
+    }
+
+    #[test]
+    fn applied_range_reports_the_fork_default_when_adaptive_thresholds_suppress_overrides() {
+        let base = crate::QueryScanTuning {
+            range_coalesce_bytes: Some(4 * 1024 * 1024),
+            range_fetch_concurrency: Some(32),
+            range_adaptive_min_files: Some(128),
+            range_adaptive_min_bytes: Some(320 * 1024 * 1024),
+            ..Default::default()
+        };
+        let suppressed =
+            effective_reader_tuning(base, 93, 260_334_769, OrderedScanTuning::default())
+                .applied_range();
+        assert_eq!(
+            suppressed,
+            AppliedRangeTuning {
+                coalesce_bytes: 1_048_576,
+                fetch_concurrency: 10,
+                override_applied: false,
+            }
+        );
+        let admitted =
+            effective_reader_tuning(base, 186, 520_669_538, OrderedScanTuning::default())
+                .applied_range();
+        assert_eq!(
+            admitted,
+            AppliedRangeTuning {
+                coalesce_bytes: 4 * 1024 * 1024,
+                fetch_concurrency: 32,
+                override_applied: true,
+            }
+        );
+    }
+
+    #[test]
+    fn applied_range_defaults_track_the_fork_constants() {
+        assert_eq!(DEFAULT_RANGE_COALESCE_BYTES, 1_048_576);
+        assert_eq!(DEFAULT_RANGE_FETCH_CONCURRENCY, 10);
     }
 
     #[test]

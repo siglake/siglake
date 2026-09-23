@@ -31,11 +31,16 @@ pub type FileOpenedObserver = Arc<dyn Fn(&FileScanTask) + Send + Sync>;
 
 /// Default gap between byte ranges below which they are coalesced into a
 /// single request. Matches object_store's `OBJECT_STORE_COALESCE_DEFAULT`.
-const DEFAULT_RANGE_COALESCE_BYTES: u64 = 1024 * 1024;
+///
+/// Public so a caller that leaves [`ArrowReaderBuilder::with_range_coalesce_bytes`]
+/// unset can still report the threshold this reader will apply.
+pub const DEFAULT_RANGE_COALESCE_BYTES: u64 = 1024 * 1024;
 
 /// Default maximum number of coalesced byte ranges fetched concurrently.
 /// Matches object_store's `OBJECT_STORE_COALESCE_PARALLEL`.
-const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 10;
+///
+/// Public for the same reason as [`DEFAULT_RANGE_COALESCE_BYTES`].
+pub const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 10;
 
 /// Default number of bytes to prefetch when parsing Parquet footer metadata.
 /// Matches DataFusion's default `ParquetOptions::metadata_size_hint`.
