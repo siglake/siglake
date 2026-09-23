@@ -131,6 +131,26 @@ async fn the_accounted_gauge_tracks_live_charges_handoff_eviction_and_release() 
     recorder.install().expect("install debugging recorder");
     let mut last = Gauges::default();
 
+    // What the query server does at startup: the series exists at 0 before any
+    // scan, so a pod with the cache switched off reads an empty cache rather
+    // than No data.
+    siglake_storage::initialize_decoded_file_cache_metrics();
+    let created: Vec<f64> = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, _, _, _)| key.key().name() == ACCOUNTED)
+        .map(|(_, _, _, value)| match value {
+            DebugValue::Gauge(value) => value.into_inner(),
+            other => panic!("{ACCOUNTED} is not a gauge: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        created,
+        vec![0.0],
+        "startup must create the accounted gauge at 0, once"
+    );
+
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(tmp.path())
         .await
