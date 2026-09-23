@@ -48,7 +48,7 @@ operator render the variable in both states, so a pod's env says which way it
 runs rather than leaving the reader to know the binary's default.
 
 Why off: a parsed index costs about 40 bytes per indexed row (≈294 MB for a
-7.3M-row compacted file, `third_party/iceberg/src/arrow/reader.rs`), so a
+7.3M-row compacted file, `third_party/iceberg/src/arrow/reader/pruning.rs`), so a
 50G-class text plan over 14 such files needs ~4 GB of parsed index against a
 1 GiB cache and a 256 MiB blob cache. AWS rounds 78, 80 and 81 put `keyword`,
 `keyword_last25`, `keyword_last5` and `substring_scan` 2-45x over ceilings that
@@ -472,7 +472,8 @@ until then the exact scan is the documented fallback
 
 ### Slice B — consume at query time ✅
 
-`Reader::inverted_index_row_selection` (in the vendored `arrow/reader.rs`):
+`ArrowReader::inverted_index_row_selection` (in the vendored
+`third_party/iceberg/src/arrow/reader/pruning.rs`):
 for a normalizable `raw LIKE '%substr%'`, loads the blob, `rows_containing`, and
 builds a `RowSelection` over the matching file-physical ordinals — one run per
 matching stretch within each selected row group (`row_selection_runs`), in the
@@ -620,7 +621,8 @@ names four matching rows
 
 So the Puffin path's failure mode is a failed query, not a fallback and not a
 short answer: `PuffinReader::blob` returns the decompression error and
-`ArrowReader` propagates it (`third_party/iceberg/src/arrow/reader.rs`). No
+`ArrowReader` propagates it
+(`third_party/iceberg/src/arrow/reader/pruning.rs`). No
 writer selects `CompressionCodec::None` for an inverted-index blob, so that arm
 prices the cover rather than describing a shipped state — and it is the reason
 the cover is worth a guard if the codec is ever made configurable.

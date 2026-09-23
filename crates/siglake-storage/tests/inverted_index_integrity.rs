@@ -12,7 +12,8 @@
 //! - **Puffin sidecar, as written** (`CompressionCodec::Zstd`,
 //!   `include_checksum(true)`): the flip hits the Zstd frame and
 //!   `PuffinReader::blob` errors. `ArrowReader` propagates it
-//!   (`third_party/iceberg/src/arrow/reader.rs`), so the **query fails**. It is
+//!   (`third_party/iceberg/src/arrow/reader/pruning.rs`), so the **query fails**.
+//!   It is
 //!   not a fallback to a scan, and it is not a short answer.
 //! - **warm**: a footer checksum is verified before a parsed-cache handout, so
 //!   an observed mismatch cannot be hidden by an existing cached parse. Puffin
