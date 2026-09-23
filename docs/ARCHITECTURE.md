@@ -1469,6 +1469,19 @@ An idle pod reads 0% beside zero raw insert rates. There is no alert threshold;
 #3053's representative cache measurements must supply one and its sustain
 window.
 
+Both sides of that shared budget are exported (#5801).
+`siglake_query_scan_file_cache_accounted_bytes` is the total admission enforces
+the ceiling against — completed entries plus every admitted in-flight
+population — published wherever that total moves and created at 0 when the
+query server starts. `siglake_query_scan_file_cache_bytes` remains the
+completed entries alone, written from the insert path, so the gap between the
+two is population the cache is holding and has not kept. A population the
+ceiling turns away charges
+`siglake_query_scan_file_cache_requests_total{outcome="population_refused"}`
+once, whatever it polls afterwards, and is not also counted `abandoned`. The
+arm does not name a cause: admission refuses both when nothing can be evicted
+to make room and when the replacement lock is held by another population.
+
 **Which budget a process gets is its role.** The query server derives both from
 its pod's limit. The `siglake` binary resolves its own at startup, and for the
 maintenance roles — the compactor pod, the ingest server, the sweeps and the

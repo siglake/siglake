@@ -703,10 +703,17 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   another partition is finished, not abandoned. The outcomes still do not
   partition `miss` — `miss` is charged before the populate stream is built, so a
   construction error leaves a miss with no outcome, and `hit` and `bypass` never
-  build one. The query server pre-registers all eight arms at 0 and panel 162
+  build one. The query server pre-registers all nine arms at 0 and panel 162
   ("Decoded-file cache populations") in `deploy/grafana/siglake-overview.json`
   charts them; on a default install, where the cache is off, every arm stays at
-  zero.
+  zero. The ninth is `outcome="population_refused"` (#5801), one increment per
+  population the shared byte bound turned away, from either a bound with no room
+  left to make or a held replacement lock; a refused population retains nothing
+  and is not also counted `abandoned`. The total that bound is enforced against
+  is `siglake_query_scan_file_cache_accounted_bytes`, published from every site
+  that moves it and created at 0 at startup, so the two rounds above — which
+  exported neither it nor the insert-path gauges — would now separate a
+  population that was never kept from one that never happened.
   Population buffers now share the configured cache byte bound with completed
   entries (#5786). Each retained batch charges its exact decoded bytes with a
   lock-free atomic fast path; only a charge that lacks room tries the cache mutex

@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **Query observability (feature)**: the decoded-file cache publishes the total
+  its byte budget is enforced against, as
+  `siglake_query_scan_file_cache_accounted_bytes`, and counts the populations
+  that budget turns away, as
+  `siglake_query_scan_file_cache_requests_total{outcome="population_refused"}`.
+  Panel 175 ("Decoded-file cache bytes (accounted vs entries)") charts the new
+  gauge per query pod against the resident-entry gauge beside it. #5786 made
+  completed entries and live populations share
+  `SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_BYTES`, and until now neither side of that
+  bound was visible on a running pod: `siglake_query_scan_file_cache_bytes`
+  reports completed entries, so a tier serving clipped browses — which populate
+  and never insert — read as an empty cache while the bound was being enforced
+  against something larger, and a refused population charted as nothing at all.
+  A refusal is one increment per population, not per batch, and a refused
+  population is not also counted `abandoned`. The label does not say why: the
+  same arm counts a full budget and a busy replacement lock. The gauge is
+  created at 0 on the query server, so an idle pod and a switched-off cache read
+  zero rather than No data. Cache defaults, admission and eviction are
+  unchanged. (#5801)
+
 - **Query observability (feature)**: the Puffin blob cache publishes what it
   holds against the budget being enforced on it, as
   `siglake_iceberg_puffin_blob_cache_bytes` and
