@@ -142,7 +142,8 @@ impl ArrowFileReader {
         self
     }
 
-    pub(crate) fn with_scan_metrics(mut self, scan_metrics: ScanMetrics) -> Self {
+    /// Attribute this reader's physical reads to the supplied scan metrics.
+    pub fn with_scan_metrics(mut self, scan_metrics: ScanMetrics) -> Self {
         self.scan_metrics = scan_metrics;
         self
     }

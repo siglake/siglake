@@ -825,9 +825,12 @@ reading and four per-pass outcomes. A sampled pass retains the number of keys
 that cleared the frequency bar in `siglake_auto_promotion_candidates`; the
 availability sibling is zero when the feature is disabled or the table is
 already at its cap, because those paths preserve the no-sampling boundary and
-have no candidate verdict. The structured INFO line names a bounded set of
-keys refused for the cap, a schema-name collision or mixed sampled types and
-reports how many names were truncated. `SiglakeAutoPromotionNearCeiling` reads
+have no candidate verdict. Successful sampling passes also publish per-table
+read, byte and duration attribution, and committed promotion-backfill bins
+publish rewritten files, input/output bytes and duration. The structured INFO
+line names a bounded set of keys refused for the cap, a schema-name collision
+or mixed sampled types and reports how many names were truncated.
+`SiglakeAutoPromotionNearCeiling` reads
 the per-table configured cap at 80%; it does not infer a universal schema
 column ceiling.
 

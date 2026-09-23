@@ -2178,6 +2178,9 @@ impl Compactor {
                         %table,
                         outcome,
                         candidates,
+                        sample_files = report.sample_files,
+                        reads = report.reads,
+                        bytes = report.bytes,
                         columns_before = report.columns_before,
                         columns_after = report.columns_after,
                         max_columns,
@@ -6230,6 +6233,21 @@ fn preregister_auto_promotion_passes(iceberg_namespace: &str, table: &str) {
         )
         .increment(0);
     }
+    metrics::counter!(
+        "siglake_auto_promotion_sample_reads_total",
+        "iceberg_namespace" => iceberg_namespace.to_string(),
+        "table" => table.to_string()
+    )
+    .increment(0);
+    for phase in ["footer", "index", "data"] {
+        metrics::counter!(
+            "siglake_auto_promotion_sample_bytes_total",
+            "iceberg_namespace" => iceberg_namespace.to_string(),
+            "table" => table.to_string(),
+            "phase" => phase
+        )
+        .increment(0);
+    }
 }
 
 fn publish_auto_promotion_table_state(
@@ -7201,8 +7219,10 @@ mod auto_promotion_telemetry_tests {
                 DebugValue::Counter(value) => {
                     counters.insert(
                         (
+                            key.key().name().to_string(),
                             labels.get("table").cloned().unwrap_or_default(),
                             labels.get("outcome").cloned().unwrap_or_default(),
+                            labels.get("phase").cloned().unwrap_or_default(),
                         ),
                         value,
                     );
@@ -7223,14 +7243,54 @@ mod auto_promotion_telemetry_tests {
 
         for outcome in AUTO_PROMOTION_OUTCOMES {
             assert_eq!(
-                counters.get(&("disabled".into(), (*outcome).into())),
+                counters.get(&(
+                    "siglake_auto_promotion_passes_total".into(),
+                    "disabled".into(),
+                    (*outcome).into(),
+                    "".into()
+                )),
                 Some(&0)
             );
-            assert_eq!(counters.get(&("never".into(), (*outcome).into())), Some(&0));
             assert_eq!(
-                counters.get(&("completed".into(), (*outcome).into())),
+                counters.get(&(
+                    "siglake_auto_promotion_passes_total".into(),
+                    "never".into(),
+                    (*outcome).into(),
+                    "".into()
+                )),
+                Some(&0)
+            );
+            assert_eq!(
+                counters.get(&(
+                    "siglake_auto_promotion_passes_total".into(),
+                    "completed".into(),
+                    (*outcome).into(),
+                    "".into()
+                )),
                 Some(&1)
             );
+        }
+        for table in ["disabled", "never", "completed"] {
+            assert_eq!(
+                counters.get(&(
+                    "siglake_auto_promotion_sample_reads_total".into(),
+                    table.into(),
+                    "".into(),
+                    "".into()
+                )),
+                Some(&0)
+            );
+            for phase in ["footer", "index", "data"] {
+                assert_eq!(
+                    counters.get(&(
+                        "siglake_auto_promotion_sample_bytes_total".into(),
+                        table.into(),
+                        "".into(),
+                        phase.into()
+                    )),
+                    Some(&0)
+                );
+            }
         }
         assert_eq!(
             gauges.get(&(
