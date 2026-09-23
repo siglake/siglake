@@ -953,15 +953,25 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   opt-in, bounded local-kind probe now retains the per-pod outage/reconnect
   trace in `results/postgres-outage-reconnect.json` and grades missing or
   non-draining observations `unverified`
-  (`POSTGRES_OUTAGE_PROBE=1 scripts/kind-round.sh`). Earlier rounds did not
-  measure what they claimed: the retained
-  traces carried no evidence that the paused process set stayed stopped, and no
-  Prometheus scrape timestamp, so a counter that moved could not be placed
-  against the pause. Run #76's trace is kept under `scripts/testdata/` as a
-  fixture that has to stay red: its backlog emptied ten seconds before
-  restoration while the samples were still labelled `outage`, and the grader
-  called it `verified` with a 0.0s drain. The probe now reads every postgres
-  process's state and start time on each sample, attempts one bounded write
+  (`POSTGRES_OUTAGE_PROBE=1 scripts/kind-round.sh`). The three rounds before
+  #5610's repair paused nothing at all: the probe sent `kill -STOP 1` through
+  `kubectl exec`, inside the Postgres container's private PID namespace, and a
+  PID-namespace init ignores a SIGSTOP raised from within its own namespace
+  (`pid_namespaces(7)`). Run #123's samples show every postgres process in
+  state `S` across the whole 60-second window, with all six accepted jobs
+  committing inside it (`results/run-123/postgres-outage-reconnect.json`). The
+  signal now goes through the kind node that owns the pod, whose PID namespace
+  is an ancestor of the container's: `docker exec` enters that node, `crictl
+  inspect` supplies the container's init PID bound to the selected pod's UID,
+  every target is matched on PID-namespace inode, `comm`, container cgroup and
+  start time before a signal reaches it, and the pause is claimed only once
+  every selected process reads state `T` with an unchanged start time
+  (`scripts/kind-postgres-outage-probe.sh`). Run #76's trace is kept under
+  `scripts/testdata/` as a fixture that has to stay red: its backlog emptied
+  ten seconds before restoration while the samples were still labelled
+  `outage`, and the grader called it `verified` with a 0.0s drain. The probe
+  now reads every postgres process's state and start time on each sample,
+  attempts one bounded write
   before, during and after the pause, and records the container's identity and
   restart count across the window; the grader rejects a trace missing any of
   that, and flags an outage sample with zero backlog and rising completions —
@@ -994,9 +1004,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   from each timestamp's recorded precision; historical second-only traces keep
   their full one-second uncertainty. A commit is a stopped-window failure only
   when its own interval lies after the verified pause and before restoration
-  starts. Run #129 supplied those boundaries and had no commit inside the
-  pause; run #76 remains an intentionally red regression fixture, not evidence
-  of a persistence failure.
+  starts. Run #129, the frozen-SHA qualification of the repaired injection
+  (#5615), supplied those boundaries and had no commit inside the pause. Run
+  #76 is explained by the inert fault rather than left open: nothing was ever
+  stopped, so the backlog that drained ten seconds before restoration drained
+  against a running Postgres. Its trace remains an intentionally red grader
+  fixture, not evidence of a persistence failure.
 - **The query server's `/healthz` is a constant 200, so no probe acts on the
   one known query degradation.** `/healthz` answers `ok` for as long as the
   process is serving and `/readyz` only round-trips the catalog. The still-open

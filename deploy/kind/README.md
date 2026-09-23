@@ -119,10 +119,24 @@ completion-counter series; and derives submission/completion rates, peak
 backlog, and restoration-to-drain time. The probe is off by default and its
 durations and burst size are bounded by `POSTGRES_OUTAGE_*` environment knobs.
 
-The first three rounds to run it could not show that the pause held. Each sample
-now also carries the state and start time of every postgres process in the
-paused container and the Prometheus scrape timestamp behind each value, one
-bounded write is attempted before, during and after the pause, and the
+The first three rounds to run it paused nothing. The probe sent `kill -STOP 1`
+through `kubectl exec`, inside the Postgres container's private PID namespace,
+and a PID-namespace init ignores a SIGSTOP raised from within its own namespace
+(`pid_namespaces(7)`). Run #123's samples show every postgres process in state
+`S` across the whole 60-second window, with all six accepted jobs committing
+inside it (`results/run-123/postgres-outage-reconnect.json`).
+
+The signal now goes through the kind node that owns the pod, whose PID
+namespace is an ancestor of the container's. `docker exec` enters that node,
+`crictl inspect` supplies the container's init PID bound to the selected pod's
+UID, and every target is matched on PID-namespace inode, `comm`, container
+cgroup and start time before a signal reaches it. The postmaster is frozen
+first, and the pause is claimed only once every selected process reads state
+`T` with an unchanged start time; anything else aborts the probe and the trap
+continues the set. Each sample also carries the state and start time of every
+postgres process in the paused container and the Prometheus scrape timestamp
+behind each value, one bounded write is attempted before, during and after the
+pause, and the
 container's identity and restart count are recorded across the window. Counters
 say what was counted, not when the row was written, so the scrape timestamp is
 what separates a write that landed during the pause from the delayed
@@ -184,7 +198,8 @@ so is one whose amended row is dated by its retained write history. The same
 check runs the probe's remote readers against a synthetic `/proc` and psql
 stand-ins — including the history DDL, whose dollar-quoted plpgsql body has to
 reach psql unexpanded — and drives the probe end to end against recording
-stand-ins for `kubectl` and `curl`. No cluster is involved.
+stand-ins for `kubectl`, `docker` (the `crictl inspect` and node signal
+snippets) and `curl`. No cluster is involved.
 
 Only rounds launched with `INGESTER_POD_LABEL_CAPTURE=1` collect the ingester
 per-pod label evidence; ordinary rounds leave the phase off. After every other
