@@ -146,8 +146,11 @@ no range knobs, so `effective_reader_tuning` returns `None` for both and the
 fork's own `DEFAULT_RANGE_COALESCE_BYTES` of 1 MiB applies
 (`third_party/iceberg/src/arrow/reader/mod.rs:34`): two requested ranges less
 than 1 MiB apart become one fetch, and every byte between them is read and
-charged. The scan's `range_enabled=false` log field says siglake configured
-nothing, not that the reader stopped coalescing (#5806).
+charged. At the time of the measurement the scan logged `range_enabled=false`,
+which said siglake configured nothing, not that the reader stopped coalescing.
+#5806 renamed that field to `range_override_applied` and made
+`range_coalesce_bytes` / `range_fetch_concurrency` report the values the reader
+will apply, so the same scan now logs the 1 MiB it really coalesces at.
 
 `sum(length(raw)) WHERE host = 'host-needle'` takes two fetches on the row group
 it selects — the predicate column under the page-index selection, widened to
@@ -299,7 +302,7 @@ merges.
 The follow-ups this left open: #5132 is the chart change if a round supports it.
 #5133 settled the 32 MiB arm's selective read against the page accounting above
 and left #5805 (requested versus fetched bytes in scan attribution) and #5806
-(the misleading `range_enabled` log field) behind it.
+(the misleading `range_enabled` log field, since renamed) behind it.
 
 ## Reproduce
 
