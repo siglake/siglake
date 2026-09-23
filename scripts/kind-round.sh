@@ -1992,8 +1992,16 @@ if selected != expected:
     raise SystemExit(f"effective Helm values differ: expected={expected!r} got={selected!r}")
 if "--catalog-claim" in compactor_container.get("args", []):
     raise SystemExit("filesystem-drain arm rendered --catalog-claim")
-if ingester_env.get("SIGLAKE_WAL_MIRROR_PREFIX") != values["wal"]["mirror"]["prefix"]:
-    raise SystemExit("ingester did not render the enabled WAL mirror prefix")
+# Since #5880 the chart renders the prefix on the compactor too, in both drain
+# modes. The arm exists for the drain whose prefix was wrong, so all three
+# readings — the value, the writer, the reclaimer — have to be the same string.
+mirror_prefixes = {
+    "values.wal.mirror.prefix": values["wal"]["mirror"]["prefix"],
+    "ingester": ingester_env.get("SIGLAKE_WAL_MIRROR_PREFIX"),
+    "compactor": compactor_env.get("SIGLAKE_WAL_MIRROR_PREFIX"),
+}
+if len(set(mirror_prefixes.values())) != 1:
+    raise SystemExit(f"WAL mirror prefixes differ: {mirror_prefixes!r}")
 if ingester_env.get("SIGLAKE_REMOTE_WAL_DRAIN") != "0":
     raise SystemExit("ingester did not render the filesystem-drain arm")
 if "SIGLAKE_WAL_ACTIVE_MIRROR_INTERVAL_SECS" in ingester_env:
@@ -2023,6 +2031,7 @@ document = {
                 compactor_env["SIGLAKE_COMMITTED_RETENTION_SECS"]
             ),
             "mirror_ledger_reclaim": compactor_env["SIGLAKE_MIRROR_LEDGER_RECLAIM"],
+            "wal_mirror_prefix": compactor_env["SIGLAKE_WAL_MIRROR_PREFIX"],
         },
     },
 }
