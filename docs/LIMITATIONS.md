@@ -348,6 +348,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   preserve the dropped table's immutable UUID and exact location plus an
   incarnation-specific file inventory (or equivalent retained metadata tree),
   so cleanup never resolves the same-name replacement or deletes its files.
+  [`DESIGN_dropped_index_aggregate_reclamation.md`](DESIGN_dropped_index_aggregate_reclamation.md)
+  specifies how that record addresses the dropped UUID's aggregate prefix,
+  catches delayed publications, and excludes the replacement and unowned
+  legacy paths. It is a design only; current builds still delete none of them.
   The index's **WAL** is keyed by tenant and index name, so it survives the
   deletion too. It is separated by a per-directory owner marker holding the
   table's UUID, written by the drain and compared by every reader: a directory
