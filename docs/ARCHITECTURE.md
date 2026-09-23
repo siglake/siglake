@@ -1893,6 +1893,35 @@ so a fan-out's worker spans are children of the coordinator's span rather than
 unrelated roots. `crates/siglake-query-server/tests/otel_traceparent_propagation.rs`
 pins that over a real socket.
 
+**A scan's log events name their execution, not their position in the log.**
+The scan emits `siglake query scan reader tuning` once per scan node when the
+node is built (planning) and `siglake query source partition profile` once per
+partition when that partition's stream ends, fails or is dropped. Both come
+out of DataFusion pumps that carry no request span, and the partition event
+can be written after the request's own `sql query profile` line: an early
+`LIMIT` leaves partitions unwinding, and an NDJSON body streams after its
+handler returns. Two fields make the join exact anyway.
+
+| Field | Minted | Meaning |
+| --- | --- | --- |
+| `query_execution_id` | Once per execution, by the handler that starts it (`QueryExecutionId::next`), and injected through `SessionConfig` | The request. `0` (`UNATTRIBUTED_QUERY_EXECUTION_ID`) means the session carried none — an internal scan. |
+| `scan_id` | Once per scan node, in `SiglakeIcebergTableScan::try_new` | The node. Separates two scan nodes of one execution (the residual twin plan) and the same query planned again later. |
+
+Each execution also logs one `query execution start` line carrying its id, its
+`endpoint` (`sql`, `sql_coordinator`, `sql_shard`, `sql_batch`, `jaeger`,
+`warm_ordered_edges`) and its SQL. It is emitted at the start because that is
+the point every path reaches: the coordinator fan-out writes no terminal line,
+the worker `/api/v1/sql/shard` endpoint refuses on paths that return before
+one could be written, and a streamed body outlives its handler. An empty
+`query` on that line means the execution runs more than one statement (the
+Jaeger render), which `scan_id` separates.
+
+Ids are process-local. A distributed query's coordinator and worker halves
+each mint their own and are joined by the W3C trace context the fan-out
+already propagates, not by a shared id. `crates/siglake-storage/tests/scan_event_attribution.rs`
+and `crates/siglake-query-server/tests/query_execution_attribution.rs` pin
+the concurrent, early-`LIMIT` and streaming cases.
+
 **Configuration for instrumented processes is the standard OTel environment,
 and it is off by default.**
 

@@ -1854,3 +1854,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   record of the refusal. Giving the command a metrics endpoint would mean
   holding the process open for a scrape, which is a flag and a default this
   cleanup deliberately did not add.
+
+- **A query execution's log id does not cross pods.** `query_execution_id` is
+  minted from a process-local counter, so a coordinator's fan-out and the
+  workers' shards carry unrelated ids in their own logs; only the W3C trace
+  context the fan-out already propagates joins the two halves, and that needs
+  OTel configured. Within one pod's log the id is exact, which is what the
+  scan's tuning and partition profile events need to be attributable at all.
+  Carrying the coordinator's id in the shard request body would make a
+  log-only join possible without OTel, at the cost of another versioned field
+  on the worker wire contract for a value that is not comparable across
+  processes on its own.

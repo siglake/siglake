@@ -4359,6 +4359,16 @@ async fn handle_local_inner(
     // scanning; setting this flag ends the source stream they drain from, and
     // they unwind. See QueryCancel for the measurement that forced this.
     let cancel = siglake_storage::QueryCancel::new();
+    // This execution's identity, minted beside the cancellation flag because
+    // the two have the same scope: one request, one plan, one set of scans.
+    // The scan stamps it on its tuning and partition profile events, and the
+    // terminal `sql query profile` line below carries it too — that is the
+    // whole join. It has to be an event FIELD rather than a span: the scan's
+    // partition events are emitted from DataFusion's spawned pumps, which
+    // carry no request span, and on the NDJSON path they are emitted after
+    // this handler has already logged its terminal line.
+    let execution_id = siglake_storage::QueryExecutionId::next();
+    log_query_execution_start("sql", execution_id, Some(&effective_query.sql), None);
     // ARMED ONLY FOR BUFFERED RESPONSES. An NDJSON response STREAMS its body
     // after this function returns, so a handler-scoped guard would cancel the
     // scan out from under a perfectly healthy request -- caught by three e2e
@@ -4379,6 +4389,9 @@ async fn handle_local_inner(
         hinted
             .config_mut()
             .set_extension(std::sync::Arc::new(cancel.clone()));
+        hinted
+            .config_mut()
+            .set_extension(std::sync::Arc::new(execution_id));
         if residual_ordered_hint {
             hinted.config_mut().set_extension(std::sync::Arc::new(
                 siglake_storage::OrderedResidualHint { allow: true },
@@ -4898,6 +4911,10 @@ async fn handle_local_inner(
 
     tracing::info!(
         endpoint = "sql",
+        // The join key for this execution's scan events. NOT a boundary: on
+        // the NDJSON path the body streams after this line, so partition
+        // profiles carrying this id still arrive below it.
+        query_execution_id = execution_id.0,
         format = match format {
             QueryFormat::Records => "records",
             QueryFormat::Ndjson => "ndjson",
@@ -4926,6 +4943,37 @@ async fn handle_local_inner(
     );
     record_metrics("sql", start, &result, &cost);
     result
+}
+
+/// One line naming a query execution's id and the SQL it will run.
+///
+/// Emitted at the START of the execution, not at its end, because start is the
+/// only point every path reaches. `/api/v1/sql` ends with `sql query profile`,
+/// but the coordinator fan-out logs no terminal line at all, the worker shard
+/// endpoint refuses on a dozen paths that return before one could be written,
+/// and an NDJSON body outlives the handler that would write it. With this
+/// line, every `query_execution_id` stamped on a scan event has exactly one
+/// place in the log that says what it was — so a partition profile is
+/// attributable without reading the lines around it.
+///
+/// An EMPTY `query` field means the execution runs more than one statement
+/// under one id (the Jaeger render is the only such caller): its scan events
+/// are attributable to the request but not to one of its statements, which
+/// `scan_id` separates.
+pub(crate) fn log_query_execution_start(
+    endpoint: &'static str,
+    execution_id: siglake_storage::QueryExecutionId,
+    query: Option<&str>,
+    shard: Option<(usize, usize)>,
+) {
+    tracing::info!(
+        endpoint,
+        query_execution_id = execution_id.0,
+        shard_index = shard.map(|(index, _)| index).unwrap_or_default(),
+        shard_count = shard.map(|(_, count)| count).unwrap_or_default(),
+        query = %query.map(compact_query).unwrap_or_default(),
+        "query execution start"
+    );
 }
 
 fn emit_terminal_audit(
@@ -5883,6 +5931,7 @@ enum BatchOutcome {
 fn cancellable_batch_context(
     query_scan: crate::QueryScanConfig,
     preferred_scan_order: Option<siglake_storage::PreferredScanOrder>,
+    execution_id: siglake_storage::QueryExecutionId,
 ) -> (
     datafusion::prelude::SessionContext,
     siglake_storage::CancelOnDrop,
@@ -5895,6 +5944,9 @@ fn cancellable_batch_context(
         state
             .config_mut()
             .set_extension(std::sync::Arc::new(cancel.clone()));
+        state
+            .config_mut()
+            .set_extension(std::sync::Arc::new(execution_id));
         datafusion::prelude::SessionContext::new_with_state(state)
     };
     (ctx, cancel_guard)
@@ -6009,7 +6061,10 @@ async fn run_batch_query(
     // Dropping the batch future (timeout or DELETE) must stop the scan pumps,
     // not just their parent future. The scan captures this extension while it
     // is planned; CancelOnDrop flips it on every return path.
-    let (ctx, cancel_guard) = cancellable_batch_context(query_scan, query.preferred_scan_order);
+    let execution_id = siglake_storage::QueryExecutionId::next();
+    log_query_execution_start("sql_batch", execution_id, Some(&query.sql), None);
+    let (ctx, cancel_guard) =
+        cancellable_batch_context(query_scan, query.preferred_scan_order, execution_id);
     run_batch_query_in(
         ice,
         query,
@@ -15111,10 +15166,22 @@ pub async fn shard(
     // handler returns.
     let cancel = siglake_storage::QueryCancel::new();
     let _cancel_guard = siglake_storage::CancelOnDrop(cancel.clone());
-    let ctx = state.query_scan.session_context_sharded_with_order(
-        req.shard.and_then(ShardParam::resolve),
-        preferred_scan_order,
+    // A worker's shard is its own execution, with its own id in ITS pod's log.
+    // The coordinator's id is not carried across the hop: the shard body is a
+    // versioned wire contract and a pod-local counter would not be comparable
+    // anyway. What joins the two halves is the W3C trace context the fan-out
+    // already propagates (see `HttpShardRunner::run_detailed`).
+    let execution_id = siglake_storage::QueryExecutionId::next();
+    let resolved_shard = req.shard.and_then(ShardParam::resolve);
+    log_query_execution_start(
+        "sql_shard",
+        execution_id,
+        Some(&query),
+        resolved_shard.map(|s| (s.index, s.count)),
     );
+    let ctx = state
+        .query_scan
+        .session_context_sharded_with_order(resolved_shard, preferred_scan_order);
     // Injected BEFORE planning: the scan node captures the flag at PLANNING
     // time, because the collect path builds its own `TaskContext` and session
     // extensions do not survive to `execute()`.
@@ -15123,6 +15190,9 @@ pub async fn shard(
         hinted
             .config_mut()
             .set_extension(std::sync::Arc::new(cancel.clone()));
+        hinted
+            .config_mut()
+            .set_extension(std::sync::Arc::new(execution_id));
         datafusion::prelude::SessionContext::new_with_state(hinted)
     };
     // Registration reads table metadata from the catalog and object store — the
@@ -15575,6 +15645,17 @@ async fn distributed_inner(
     // battery -- and that work must stop when the request goes away.
     let cancel = siglake_storage::QueryCancel::new();
     let _cancel_guard = siglake_storage::CancelOnDrop(cancel.clone());
+    // The coordinator's PRE-DISPATCH work is its own execution: it plans, it
+    // cost-estimates and it runs the Tier-1 battery, all of which scan. Its
+    // scan events are a different execution from the workers' shards and from
+    // anything this pod serves locally, and this id is what says so.
+    let planning_execution_id = siglake_storage::QueryExecutionId::next();
+    log_query_execution_start(
+        "sql_coordinator",
+        planning_execution_id,
+        Some(&effective_query.sql),
+        None,
+    );
     let planning = {
         let mut st = state
             .query_scan
@@ -15582,6 +15663,8 @@ async fn distributed_inner(
             .state();
         st.config_mut()
             .set_extension(std::sync::Arc::new(cancel.clone()));
+        st.config_mut()
+            .set_extension(std::sync::Arc::new(planning_execution_id));
         datafusion::prelude::SessionContext::new_with_state(st)
     };
     register_tables_for_query(&ice, &planning, &effective_query.sql).await?;
@@ -16956,7 +17039,11 @@ mod batch_cancel_guard_tests {
 
     #[test]
     fn batch_context_arms_query_cancel_until_execution_is_dropped() {
-        let (ctx, guard) = cancellable_batch_context(crate::QueryScanConfig::default(), None);
+        let (ctx, guard) = cancellable_batch_context(
+            crate::QueryScanConfig::default(),
+            None,
+            siglake_storage::QueryExecutionId::next(),
+        );
         let planned_cancel = ctx
             .state()
             .config()
@@ -17034,7 +17121,11 @@ mod batch_run_deadline_tests {
         ice: Arc<siglake_storage::iceberg::IcebergContext>,
         limits: crate::limits::ResolvedLimits,
     ) -> (BatchOutcome, siglake_storage::QueryCancel) {
-        let (ctx, guard) = cancellable_batch_context(crate::QueryScanConfig::default(), None);
+        let (ctx, guard) = cancellable_batch_context(
+            crate::QueryScanConfig::default(),
+            None,
+            siglake_storage::QueryExecutionId::next(),
+        );
         let cancel = siglake_storage::QueryCancel::clone(
             &ctx.state()
                 .config()
