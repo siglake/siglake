@@ -30,7 +30,10 @@ use kube::{
 use crate::crd::{Condition, ReplicaStatus, SiglakeCluster, SiglakeClusterStatus};
 use crate::prom::{PromClient, Queries};
 use crate::render;
-use crate::scaling::{fold_observation, reconcile_replicas, CurrentReplicas, DesiredReplicas};
+use crate::scaling::{
+    fold_observation, maintenance_wake, reconcile_replicas, CurrentReplicas, DesiredReplicas,
+    MAINTENANCE_WAKE_AFTER, MAINTENANCE_WAKE_HOLD,
+};
 
 /// Anything the reconciler needs to share across the controller loop.
 pub struct Context {
@@ -44,6 +47,14 @@ pub struct Context {
     /// [`crate::scaling::fold_observation`].
     pub scaling_state:
         std::sync::Mutex<std::collections::HashMap<String, crate::scaling::SmoothingState>>,
+    /// Where each zero-floor compactor tier is in the park / maintenance-wake
+    /// cycle (`namespace/name` → phase). Only a `min: 0` policy ever has an
+    /// entry, and the phase is dropped as soon as the reading wants the tier
+    /// running — see [`crate::scaling::maintenance_wake`]. Held in memory: an
+    /// operator restart starts the hour again, which delays a maintenance wake
+    /// rather than skipping one.
+    pub zero_floor_state:
+        std::sync::Mutex<std::collections::HashMap<String, crate::scaling::ZeroFloorPhase>>,
 }
 
 /// Invalid specs are watched, so an edit wakes the controller immediately.
@@ -128,11 +139,13 @@ pub async fn reconcile(cluster: Arc<SiglakeCluster>, ctx: Arc<Context>) -> Resul
     }
     let current = current_workloads.replicas;
 
-    let queries = Queries::defaults(&name, &namespace);
+    // A zero-floor compactor reads the depth the ingesters publish; every
+    // other policy keeps the compactor's own gauge.
+    let queries = Queries::for_policy(&name, &namespace, &cluster.spec.autoscaling.compactor);
     // Prometheus unavailability should not block reconciliation. A new cluster
     // has no series until its pods start, and a transient PromQL outage should
     // not stall every reconcile. Without a signal, cold tiers converge to
-    // their positive floors while already-running tiers hold their size.
+    // their floors while already-running tiers hold their size.
     // Per signal: a component whose query failed or read nothing is absent on
     // its own, and `prom::observed` logs and counts it with a `component`
     // label. Preserve a running fleet during a monitoring outage — cold tiers
@@ -169,10 +182,42 @@ pub async fn reconcile(cluster: Arc<SiglakeCluster>, ctx: Arc<Context>) -> Resul
     };
 
     // A component with a reading takes the ordinary decision; one without
-    // holds its current size and still converges up to its floor, which an
-    // accepted spec guarantees is positive — so a tier at zero comes back even
-    // while its reading is missing.
-    let desired = reconcile_replicas(&cluster.spec, &observed, &current);
+    // holds its current size and still converges up to its floor — and never
+    // below one replica, so a zero-floor tier comes back rather than reading a
+    // monitoring outage as idleness.
+    let mut desired = reconcile_replicas(&cluster.spec, &observed, &current);
+
+    // Bound how long a parked compactor stays parked: retention, delete tasks,
+    // claim reclaim and the mirror recovery sweep are all compactor-resident.
+    if cluster.spec.autoscaling.compactor.min == 0 {
+        let key = format!("{namespace}/{name}");
+        let mut phases = ctx
+            .zero_floor_state
+            .lock()
+            .expect("zero_floor_state poisoned");
+        let (replicas, phase) = maintenance_wake(
+            phases.get(&key).copied(),
+            desired.compactor,
+            std::time::Instant::now(),
+            MAINTENANCE_WAKE_AFTER,
+            MAINTENANCE_WAKE_HOLD,
+        );
+        if replicas > desired.compactor {
+            tracing::info!(%namespace, %name,
+                "waking the parked compactor for maintenance (retention, delete tasks, \
+                 claim reclaim, mirror sync)");
+        }
+        desired.compactor = replicas;
+        match phase {
+            Some(phase) => {
+                phases.insert(key, phase);
+            }
+            None => {
+                phases.remove(&key);
+            }
+        }
+    }
+    let desired = desired;
 
     // PVC for the shared WAL. Has to land before the Deployments so
     // their pods can bind on first roll-out (without WaitForFirstConsumer
@@ -853,6 +898,9 @@ const INVALID_SPEC_MESSAGE_PATHS: &[&str] = &[
     "spec.catalogUri",
     "spec.autoscaling.{component}.min",
     "spec.autoscaling.{component}.min",
+    "spec.autoscaling.compactor.min",
+    "spec.autoscaling.compactor.min",
+    "spec.autoscaling.ewmaHalfLifeSecs",
     "spec.autoscaling.compactor.max",
     "spec.extraEnv",
     "spec.autoscaling.query.max",
@@ -907,20 +955,48 @@ fn invalid_spec_condition(spec: &crate::crd::SiglakeClusterSpec, now: &str) -> O
                 ),
             );
         }
-        // A zero floor is a one-way door. Every policy the operator ships reads
-        // a per-pod signal exported BY the pods it scales, so a tier parked at
-        // zero publishes no series and nothing can ask for it back; worse,
-        // `prom::observed` requires all three readings, so the stopped tier's
-        // missing series also freezes the two healthy ones. Refusing the spec
-        // before any child resource changes leaves the cluster exactly as it
-        // is until the floor is raised. Independent activation (a queue-depth
-        // probe that survives the stopped tier) is not implemented.
-        if policy.min == 0 {
+        // A zero floor needs a signal that SURVIVES the stopped tier. The
+        // ingest and query signals are per-pod readings exported by the pods
+        // they size, so a tier parked at zero publishes nothing and nothing
+        // can ask for it back. The compactor is the one component with an
+        // independent reading: under the catalog claim the ingesters publish
+        // the shared queue depth themselves (#6011), and they keep running
+        // because every accepted spec holds their floor at 1 or more.
+        if policy.min == 0 && component != "compactor" {
             return invalid(
                 "AutoscalingZeroFloorUnsupported",
                 format!(
-                    "spec.autoscaling.{component}.min is 0, and no supported policy can restart a tier from zero: the {component} load signal is published by the {component} pods themselves, so once they stop nothing requests them back, and the missing reading also holds the other two tiers at their current size. Set a floor of 1 or more (max is {})",
+                    "spec.autoscaling.{component}.min is 0, and no supported policy can restart a {component} tier from zero: the {component} load signal is published by the {component} pods themselves, so once they stop nothing requests them back. Set a floor of 1 or more (max is {})",
                     policy.max
+                ),
+            );
+        }
+        // The filesystem drain has no such reading. It sweeps the local
+        // `sealed/` directory and never consults `wal_segments`, and while the
+        // ingester's registrar still inserts rows, nothing transitions them
+        // unless the mirror ledger is enabled — so a catalog depth under that
+        // drain climbs forever and can never read idle.
+        if policy.min == 0 && !crate::render::uses_catalog_claim(policy) {
+            return invalid(
+                "AutoscalingZeroFloorUnsupported",
+                format!(
+                    "spec.autoscaling.compactor.min is 0 with max {}, which is the filesystem drain: that mode sweeps each ingester's local sealed directory and never reads the shared `wal_segments` queue, so the catalog depth that would ask for a worker back never falls to zero and never rises for work the drain has not seen. A zero floor needs the catalog-claim drain — raise max above 1 — or a floor of 1",
+                    policy.max
+                ),
+            );
+        }
+        // At `ewmaHalfLifeSecs: 0` the raw sample passes straight through to
+        // the decision, so ONE idle scrape parks the tier and the next
+        // registered segment starts it again. Smoothing's idle window is what
+        // makes parking a decision about a quiet period rather than about a
+        // single sample.
+        if policy.min == 0 && spec.autoscaling.ewma_half_life_secs <= 0.0 {
+            return invalid(
+                "AutoscalingZeroFloorNeedsSmoothing",
+                format!(
+                    "spec.autoscaling.compactor.min is 0 while spec.autoscaling.ewmaHalfLifeSecs is {}: with smoothing off the raw sample decides on its own, so a single idle scrape parks the tier and it flaps against continuous ingest. Set ewmaHalfLifeSecs above 0 — the tier then parks after {} half-lives of observed idleness — or set a compactor floor of 1",
+                    spec.autoscaling.ewma_half_life_secs,
+                    crate::scaling::IDLE_HALF_LIVES,
                 ),
             );
         }
@@ -1220,6 +1296,7 @@ mod tests {
             client,
             prom,
             scaling_state: Default::default(),
+            zero_floor_state: Default::default(),
         });
 
         reconcile(Arc::new(wanted), context)
@@ -1459,13 +1536,16 @@ mod tests {
     /// but leaves the tier with no way back — the signal that would reactivate
     /// it is published by the pods it just stopped. Refuse it per component,
     /// naming the repair.
+    ///
+    /// #6011 narrowed this to everything except the compactor, which now has a
+    /// reading published by the ingesters; the compactor's own two refusals
+    /// are next.
     #[test]
     fn a_zero_autoscaling_floor_is_unsupported_for_every_component() {
-        for component in ["ingester", "compactor", "query"] {
+        for component in ["ingester", "query"] {
             let mut spec = valid_spec();
             match component {
                 "ingester" => spec.autoscaling.ingester.min = 0,
-                "compactor" => spec.autoscaling.compactor.min = 0,
                 _ => spec.autoscaling.query.min = 0,
             }
             let condition = invalid_spec_condition(&spec, "now")
@@ -1496,17 +1576,80 @@ mod tests {
         );
     }
 
+    /// #6011's two narrowed refusals, with distinct reasons, and the one
+    /// shape that is now accepted.
+    ///
+    /// The zero floor is supported only where an independent reading exists:
+    /// the catalog-claim drain, whose shared queue the ingesters publish,
+    /// smoothed so that a quiet period rather than a single scrape parks the
+    /// tier.
+    #[test]
+    fn a_zero_compactor_floor_is_accepted_only_under_the_claim_drain_with_smoothing() {
+        let woken = |min: i32, max: i32, half_life: f64| {
+            let mut spec = valid_spec();
+            spec.autoscaling.compactor = ComponentAutoscale {
+                min,
+                max,
+                target: spec.autoscaling.compactor.target,
+            };
+            spec.autoscaling.ewma_half_life_secs = half_life;
+            invalid_spec_condition(&spec, "now")
+        };
+
+        assert!(
+            woken(0, 4, 60.0).is_none(),
+            "a claim-drain compactor with smoothing may park"
+        );
+
+        let drain = woken(0, 1, 60.0).expect("the filesystem drain cannot read the catalog");
+        assert_eq!(drain.reason, "AutoscalingZeroFloorUnsupported");
+        assert!(
+            drain.message.contains("filesystem drain"),
+            "the message names the drain mode: {}",
+            drain.message
+        );
+        assert!(
+            drain.message.contains("raise max above 1"),
+            "and the repair: {}",
+            drain.message
+        );
+
+        let unsmoothed = woken(0, 4, 0.0).expect("an unsmoothed zero floor flaps");
+        assert_eq!(
+            unsmoothed.reason, "AutoscalingZeroFloorNeedsSmoothing",
+            "the two refusals are distinguishable by reason, not only by prose"
+        );
+        assert!(
+            unsmoothed
+                .message
+                .contains("spec.autoscaling.ewmaHalfLifeSecs"),
+            "the message names the field to repair: {}",
+            unsmoothed.message
+        );
+
+        // A positive compactor floor is unaffected by either check, smoothing
+        // or not.
+        assert!(woken(1, 1, 0.0).is_none());
+        assert!(woken(1, 4, 0.0).is_none());
+    }
+
     /// The refusal has to land before any child resource changes, so it covers
     /// the fresh install and the cluster whose compactor is already at zero
     /// replicas with a stale series: neither is touched, the workloads are not
     /// even read, and the cluster waits at `Ready=False` until the floor goes
     /// back up.
+    ///
+    /// The refused floor here is the filesystem drain's, which #6011 left
+    /// refused: that mode never reads the shared queue, so nothing can ask the
+    /// tier back however the reading is published.
     #[tokio::test]
     async fn a_zero_floor_reconcile_changes_no_child_resource() {
         let mut cluster = SiglakeCluster::new("acme", valid_spec());
         cluster.metadata.namespace = Some("test".into());
         cluster.metadata.generation = Some(9);
         cluster.spec.autoscaling.compactor.min = 0;
+        cluster.spec.autoscaling.compactor.max = 1;
+        cluster.spec.autoscaling.ewma_half_life_secs = 60.0;
 
         let requests = Arc::new(Mutex::new(Vec::<RecordedRequest>::new()));
         let recorded = Arc::clone(&requests);
@@ -1546,6 +1689,7 @@ mod tests {
             client,
             prom,
             scaling_state: Default::default(),
+            zero_floor_state: Default::default(),
         });
 
         reconcile(Arc::new(cluster), context)

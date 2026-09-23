@@ -469,3 +469,194 @@ fn the_compactor_query_reads_the_sealed_queue_once() {
         ),
     );
 }
+
+// --- #6011: the zero-floor compactor's activation reading -------------------
+
+/// One ingester's published view of the shared catalog queue: the depth it
+/// last read, and how long ago that read succeeded.
+struct ActivationSeries {
+    pod: &'static str,
+    depth: u64,
+    sample_age: u64,
+}
+
+struct ActivationCase {
+    name: &'static str,
+    ingesters: Vec<ActivationSeries>,
+    /// What the compactor tier itself is publishing, if any pod is running.
+    compactor: Vec<(&'static str, u64)>,
+    expect: Option<u64>,
+    /// The same reading without the `and on (pod)` staleness guard — the
+    /// control arm, which reads a frozen gauge as a current one.
+    expect_unguarded: Option<u64>,
+}
+
+fn activation_cases() -> Vec<ActivationCase> {
+    vec![
+        ActivationCase {
+            name: "two ingesters publishing the same fresh depth read it once",
+            ingesters: vec![
+                ActivationSeries {
+                    pod: "ingester-0",
+                    depth: 6,
+                    sample_age: 10,
+                },
+                ActivationSeries {
+                    pod: "ingester-1",
+                    depth: 6,
+                    sample_age: 15,
+                },
+            ],
+            compactor: vec![],
+            expect: Some(6),
+            expect_unguarded: Some(6),
+        },
+        // The case the guard exists for: an ingester whose catalog reads have
+        // been failing keeps answering with the depth it last saw. Averaging
+        // that frozen copy in halves the reading, and a frozen ZERO would read
+        // as an empty queue and park the tier.
+        ActivationCase {
+            name: "an ingester whose catalog reads stopped is dropped, not averaged",
+            ingesters: vec![
+                ActivationSeries {
+                    pod: "ingester-0",
+                    depth: 6,
+                    sample_age: 10,
+                },
+                ActivationSeries {
+                    pod: "ingester-1",
+                    depth: 0,
+                    sample_age: 600,
+                },
+            ],
+            compactor: vec![],
+            expect: Some(6),
+            expect_unguarded: Some(3),
+        },
+        // Every publisher stale and no compactor pod running: an empty vector,
+        // which `usable_sample` refuses as a reading. The tier is then sized by
+        // `replicas_without_signal`, which restores a zero-floor tier to one.
+        ActivationCase {
+            name: "every publisher stale and no compactor running is no reading at all",
+            ingesters: vec![ActivationSeries {
+                pod: "ingester-0",
+                depth: 4,
+                sample_age: 600,
+            }],
+            compactor: vec![],
+            expect: None,
+            expect_unguarded: Some(4),
+        },
+        // The fail-safe's other half: the tier restored to one replica
+        // publishes `siglake_compactor_sealed_pending` itself, and the `or`
+        // falls back to it, so the woken pod can still size its own tier while
+        // the independent signal is missing.
+        ActivationCase {
+            name: "a stale publisher falls back to the compactor's own gauge",
+            ingesters: vec![ActivationSeries {
+                pod: "ingester-0",
+                depth: 4,
+                sample_age: 600,
+            }],
+            compactor: vec![("compactor-0", 9)],
+            expect: Some(9),
+            expect_unguarded: Some(4),
+        },
+        // And the fallback is consulted ONLY when the left side is empty: a
+        // fresh depth wins over whatever a running compactor is publishing.
+        ActivationCase {
+            name: "a fresh published depth wins over the compactor's own gauge",
+            ingesters: vec![ActivationSeries {
+                pod: "ingester-0",
+                depth: 6,
+                sample_age: 10,
+            }],
+            compactor: vec![("compactor-0", 9)],
+            expect: Some(6),
+            expect_unguarded: Some(6),
+        },
+    ]
+}
+
+/// The activation expression without its staleness guard, as the control arm.
+fn activation_unguarded_expression() -> String {
+    format!(
+        "avg(sum by (pod) (siglake_wal_segments_sealed{{namespace=\"{NAMESPACE}\",\
+         app_kubernetes_io_instance=\"{RELEASE}\",app_kubernetes_io_component=\"ingester\"}}))"
+    )
+}
+
+fn activation_fixture(expr: &str, unguarded: &str) -> String {
+    let mut out = String::from("evaluation_interval: 1m\ntests:\n");
+    for case in activation_cases() {
+        out.push_str(&format!(
+            "  - name: {}\n    interval: 5m\n    input_series:\n",
+            case.name
+        ));
+        for s in &case.ingesters {
+            out.push_str(&format!(
+                "      - series: 'siglake_wal_segments_sealed{{namespace=\"{NAMESPACE}\",\
+                 app_kubernetes_io_instance=\"{RELEASE}\",app_kubernetes_io_component=\"ingester\",\
+                 pod=\"{pod}\",tenant=\"default\"}}'\n        values: '_ {depth}'\n",
+                pod = s.pod,
+                depth = s.depth,
+            ));
+            out.push_str(&format!(
+                "      - series: 'siglake_wal_segments_sealed_sample_age_seconds{{namespace=\"{NAMESPACE}\",\
+                 app_kubernetes_io_instance=\"{RELEASE}\",app_kubernetes_io_component=\"ingester\",\
+                 pod=\"{pod}\",tenant=\"default\"}}'\n        values: '_ {age}'\n",
+                pod = s.pod,
+                age = s.sample_age,
+            ));
+        }
+        for (pod, pending) in &case.compactor {
+            out.push_str(&format!(
+                "      - series: 'siglake_compactor_sealed_pending{{namespace=\"{NAMESPACE}\",\
+                 app_kubernetes_io_instance=\"{RELEASE}\",app_kubernetes_io_component=\"compactor\",\
+                 pod=\"{pod}\",tenant=\"default\"}}'\n        values: '_ {pending}'\n",
+            ));
+        }
+        out.push_str("    promql_expr_test:\n");
+        out.push_str(&expr_test(expr, case.expect));
+        out.push_str(&expr_test(unguarded, case.expect_unguarded));
+    }
+    out
+}
+
+/// #6011 slice 3. The reading a `min: 0` compactor is sized by: the depth the
+/// INGESTERS publish, with any publisher whose last catalog read is stale
+/// dropped, falling back to the compactor's own gauge when none is left.
+#[test]
+fn the_activation_query_reads_the_fresh_published_depth() {
+    let expr = Queries::compactor_activation(RELEASE, NAMESPACE);
+    assert_eq!(
+        Queries::for_policy(
+            RELEASE,
+            NAMESPACE,
+            &siglake_operator::crd::ComponentAutoscale {
+                min: 0,
+                max: 4,
+                target: 4.0,
+            }
+        )
+        .compactor_backlog,
+        expr,
+        "a zero floor is what selects this query",
+    );
+    assert!(
+        activation_cases()
+            .iter()
+            .any(|c| c.expect != c.expect_unguarded),
+        "no case separates the guarded reading from the unguarded one"
+    );
+    for e in [&expr, &activation_unguarded_expression()] {
+        assert!(!e.contains('\''), "expression needs YAML escaping: {e}");
+    }
+
+    assert_promtool_fixture(
+        "compactor-activation.test.yaml",
+        &expr,
+        "the catalog depth the ingesters publish, ignoring stale publishers",
+        activation_fixture(&expr, &activation_unguarded_expression()),
+    );
+}

@@ -195,18 +195,88 @@ pub fn reconcile_replicas(
     }
 }
 
-/// A tier's size when the load signal is unusable (Prometheus down or the
-/// scrape empty). A cold tier starts at `min`, while an existing tier holds its
-/// size unless it is outside the configured range. This converges every tier
-/// up to its floor without scaling down a running fleet blindly. A `min` of 0
-/// would leave a cold tier off here; the reconciler refuses such a spec
-/// (`AutoscalingZeroFloorUnsupported`), so the zero branch is unreachable from
-/// an accepted spec and is kept as pure-function behaviour only.
+/// A tier's size when its load signal is unusable (Prometheus down, the scrape
+/// empty, or this component's series absent). A cold tier starts at `min` —
+/// but never below ONE — while an existing tier holds its size unless it is
+/// outside the configured range. This converges every tier up to its floor
+/// without scaling down a running fleet blindly.
+///
+/// A ZERO-FLOOR TIER WITH NO READING IS RESTORED TO ONE REPLICA, not held at
+/// zero. Returning `policy.min` there would read a monitoring outage as
+/// idleness and leave the tier stopped for as long as the signal was missing,
+/// with backlog accumulating unobserved — the exact failure the surrounding
+/// code exists to prevent. One pod is the bounded cost, and it republishes
+/// `siglake_compactor_sealed_pending`, which the activation query falls back
+/// to, so the tier can still size itself while the independent signal is
+/// missing (#6011). The positive-floor arm is unchanged.
 pub(crate) fn replicas_without_signal(policy: &ComponentAutoscale, current: i32) -> i32 {
     if current <= 0 {
-        policy.min
+        policy.min.max(1)
     } else {
         current.clamp(policy.min, policy.max.max(policy.min))
+    }
+}
+
+/// How long a zero-floor tier may stay parked before the operator runs it
+/// anyway, and how long that wake lasts.
+///
+/// Retention, delete tasks, orphan disposal, claim reclaim and the
+/// `sync_mirror_to_catalog` recovery sweep are all compactor-resident, and at
+/// zero replicas none of them run. The sweep is the only repair for a mirror
+/// object whose registration was abandoned — a segment that is durable,
+/// unregistered, and therefore invisible to the catalog-depth signal that
+/// would otherwise ask for a worker.
+///
+/// An hour bounds that repair delay to the same order as the mirror sync
+/// interval while keeping the tier off for most of an idle day. The wake holds
+/// ten minutes so the sweeps that run on their own cadences inside the pod —
+/// claim reclaim and mirror sync, both a minute by default — come round
+/// several times before the tier is allowed to park again.
+pub const MAINTENANCE_WAKE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+pub const MAINTENANCE_WAKE_HOLD: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Where a zero-floor tier is in the park / maintenance-wake cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZeroFloorPhase {
+    /// Parked at zero since this instant.
+    Parked { since: std::time::Instant },
+    /// Woken for maintenance, held at one replica until this instant whatever
+    /// the reading says.
+    Waking { until: std::time::Instant },
+}
+
+/// Bound how long a tier stays at zero.
+///
+/// Takes the decision the reading asked for and returns the one to apply,
+/// with the phase to carry into the next cycle. A tier the reading wants
+/// running is not in the cycle at all: whatever maintenance is due runs
+/// alongside the work.
+pub fn maintenance_wake(
+    phase: Option<ZeroFloorPhase>,
+    desired: i32,
+    now: std::time::Instant,
+    wake_after: std::time::Duration,
+    hold: std::time::Duration,
+) -> (i32, Option<ZeroFloorPhase>) {
+    if desired > 0 {
+        return (desired, None);
+    }
+    match phase {
+        // The wake is a floor, not a decision: it holds the pod for `hold`
+        // even though the reading keeps saying zero, which is what gives the
+        // in-pod sweeps time to come round.
+        Some(ZeroFloorPhase::Waking { until }) if now < until => {
+            (1, Some(ZeroFloorPhase::Waking { until }))
+        }
+        Some(ZeroFloorPhase::Waking { .. }) => (0, Some(ZeroFloorPhase::Parked { since: now })),
+        Some(ZeroFloorPhase::Parked { since })
+            if now.saturating_duration_since(since) >= wake_after =>
+        {
+            (1, Some(ZeroFloorPhase::Waking { until: now + hold }))
+        }
+        Some(parked @ ZeroFloorPhase::Parked { .. }) => (0, Some(parked)),
+        // First cycle that parks the tier starts its clock.
+        None => (0, Some(ZeroFloorPhase::Parked { since: now })),
     }
 }
 
@@ -828,14 +898,27 @@ mod tests {
         assert_eq!(replicas_without_signal(&raised_floor, 1), 2);
     }
 
+    /// #6011's fail-safe. A monitoring outage is not idleness: a zero-floor
+    /// tier with no usable reading is RESTORED TO ONE, not held at zero, so
+    /// the backlog it cannot see is not accumulating behind a stopped tier.
+    /// One pod is the bounded cost, and it publishes the compactor gauge the
+    /// activation query falls back to.
     #[test]
-    fn without_a_signal_compactor_respects_zero_floor() {
+    fn without_a_signal_a_zero_floor_tier_is_restored_to_one() {
         let policy = ComponentAutoscale {
             min: 0,
             max: 4,
             target: 5.0,
         };
-        assert_eq!(replicas_without_signal(&policy, 0), 0);
+        assert_eq!(
+            replicas_without_signal(&policy, 0),
+            1,
+            "the pre-#6011 arm returned policy.min — 0 — and left the tier stopped for as \
+             long as the signal was missing"
+        );
+        // A running tier still holds its size; the floor only decides a cold
+        // one, and a zero floor does not scale a warm fleet down.
+        assert_eq!(replicas_without_signal(&policy, 3), 3);
 
         let positive_floor = ComponentAutoscale { min: 1, ..policy };
         assert_eq!(replicas_without_signal(&positive_floor, 0), 1);
@@ -902,15 +985,16 @@ mod tests {
         assert_eq!(at(&busy, 6), 4, "and back down from above it");
     }
 
-    /// #3693's dead end and its exit. A compactor already parked at zero
-    /// replicas exports no series, so `prom::observed` fails and every tier
-    /// takes `replicas_without_signal`: with a zero floor the compactor stays
-    /// at zero forever, since the only thing that would raise it is the
-    /// reading its own stopped pods would have published. Raising the floor is
-    /// the exit, and it works on the no-signal path — the user does not have
-    /// to restore Prometheus first.
+    /// #3693's dead end, and the two ways out #6011 built.
+    ///
+    /// The dead end is on the READING, not on the floor: an idle backlog reads
+    /// 0.0 and a stopped tier's own gauge can never read anything else, so a
+    /// zero-floor tier that only ever sees its own signal stays at zero
+    /// forever. What changed is where the reading comes from — the ingesters
+    /// publish the queue — and what an ABSENT reading means, which is now one
+    /// replica rather than zero.
     #[test]
-    fn a_zero_replica_tier_needs_a_raised_floor_to_come_back() {
+    fn a_zero_replica_tier_comes_back_on_an_absent_reading_or_a_raised_floor() {
         let stuck = ComponentAutoscale {
             min: 0,
             max: 4,
@@ -918,12 +1002,17 @@ mod tests {
         };
         assert_eq!(
             replicas_without_signal(&stuck, 0),
-            0,
-            "a zero floor has no way back while the series is stale"
+            1,
+            "no reading is a monitoring outage, not an idle queue"
         );
-        // Even a usable reading does not help: an idle backlog reads 0.0, and a
-        // backlog only becomes visible once a compactor pod publishes it.
+        // A reading of exactly zero is still a decision to stay parked: that
+        // is the whole point of an activation signal that reaches zero.
         assert_eq!(decide(&stuck, 0.0, 0, compactor_load(&stuck)), 0);
+        assert_eq!(
+            decide(&stuck, 3.0, 0, compactor_load(&stuck)),
+            1,
+            "and a queue the ingesters publish starts one worker"
+        );
 
         let repaired = ComponentAutoscale { min: 1, ..stuck };
         assert_eq!(
@@ -936,6 +1025,65 @@ mod tests {
             1,
             "and the same on the usable-but-idle path"
         );
+    }
+
+    /// #6011's maintenance wake. Retention, delete tasks, claim reclaim and
+    /// the mirror recovery sweep are compactor-resident, so a tier parked at
+    /// zero owes the warehouse a pod now and then whatever the queue says.
+    #[test]
+    fn a_parked_tier_is_woken_for_maintenance_and_then_parks_again() {
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        let after = Duration::from_secs(3600);
+        let hold = Duration::from_secs(600);
+        let at = |phase, desired, secs: u64| {
+            maintenance_wake(phase, desired, t0 + Duration::from_secs(secs), after, hold)
+        };
+
+        // The first cycle that parks the tier starts its clock.
+        let (replicas, phase) = at(None, 0, 0);
+        assert_eq!(replicas, 0);
+        assert_eq!(phase, Some(ZeroFloorPhase::Parked { since: t0 }));
+
+        // An hour short, nothing happens.
+        let (replicas, phase) = at(phase, 0, 3599);
+        assert_eq!(replicas, 0, "still parked");
+        assert_eq!(
+            phase,
+            Some(ZeroFloorPhase::Parked { since: t0 }),
+            "and the clock is not restarted by a cycle that changes nothing"
+        );
+
+        // At the bound, one pod — and the wake is a floor, so it holds even
+        // though the reading keeps asking for zero.
+        let (replicas, phase) = at(phase, 0, 3600);
+        assert_eq!(replicas, 1);
+        assert_eq!(
+            phase,
+            Some(ZeroFloorPhase::Waking {
+                until: t0 + Duration::from_secs(3600) + hold
+            })
+        );
+        let (replicas, phase) = at(phase, 0, 3900);
+        assert_eq!(replicas, 1, "held through the wake");
+
+        // The hold ends and the tier parks again, with the hour starting over.
+        let (replicas, phase) = at(phase, 0, 4200);
+        assert_eq!(replicas, 0);
+        assert_eq!(
+            phase,
+            Some(ZeroFloorPhase::Parked {
+                since: t0 + Duration::from_secs(4200)
+            })
+        );
+        assert_eq!(at(phase, 0, 4201).0, 0, "not woken again for another hour");
+
+        // A tier the reading wants running is not in the cycle at all: the
+        // maintenance runs alongside the work, and the phase is dropped so the
+        // next park starts a fresh hour.
+        let (replicas, phase) = at(phase, 3, 4500);
+        assert_eq!(replicas, 3, "the wake never lowers a decision");
+        assert_eq!(phase, None);
     }
 
     /// #6011 slice 1's acceptance. One absent reading sizes ITS OWN tier by

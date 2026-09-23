@@ -229,6 +229,30 @@ claim on, and claim-mode HPA scaling there is CPU-only. It also refuses
 takes no claim and the chart renders none for it, and a rolling update alone
 puts two of them on one table.
 
+**Parking the compactor.** `spec.autoscaling.compactor.min: 0` is accepted
+under the catalog claim, and only there, because the reading that asks for the
+tier back is published by someone else: the ingest server reads the shared
+queue over the claim connection its mirror registrar already holds and exports
+it as `siglake_wal_segments_sealed{tenant}` with a
+`siglake_wal_segments_sealed_sample_age_seconds` companion. The depth is the
+sealed rows plus claims older than `SIGLAKE_CLAIM_RECLAIM_MAX_AGE_SECS`, so a
+batch stranded in `processing` by the last worker to stop is visible and live
+work is not; a failed catalog read holds the depth and lets the age rise
+rather than publishing a zero. The operator selects that reading only for a
+zero floor, drops any publisher whose sample is over two minutes old, and
+falls back to `siglake_compactor_sealed_pending` when none is left — the tier
+restored to one replica by a missing reading is then sized by its own gauge.
+Each load signal is now observed independently, so a component whose series is
+absent holds its own replica count while the other two decide on theirs. Two
+refusals bound the mode: the filesystem drain (`compactor.max: 1`) keeps
+`AutoscalingZeroFloorUnsupported` because it never reads the shared queue, and
+`ewmaHalfLifeSecs: 0` is `AutoscalingZeroFloorNeedsSmoothing` because the raw
+sample would park the tier on a single idle scrape. A parked tier is woken for
+ten minutes after an hour at zero so the compactor-resident maintenance —
+retention, delete tasks, claim reclaim, `sync_mirror_to_catalog` — still runs.
+The packaged floor stays at 1 until a kind round retains the live wake-up
+(#6012); `docs/DESIGN_compactor_wakeup_signal.md` is the design.
+
 The kind evidence round has a default-off check for that shared-queue shape.
 It installs two compactors through the guarded chart path only after the
 round's ordinary observations, holds a positive sealed queue below a temporary

@@ -190,7 +190,70 @@ pub struct Queries {
     pub query_in_flight: String,
 }
 
+/// How stale an ingester's catalog-depth sample may be and still count as a
+/// reading, in seconds.
+///
+/// The gauge keeps answering with its last value for the whole scrape
+/// staleness window after its publisher stops refreshing it, so the reader
+/// needs the companion age series to tell a current depth from a frozen one.
+/// Two publish intervals plus two scrapes is 60 s; the allowance is double
+/// that, so an ingester that misses a read or two still counts.
+pub const SEALED_SAMPLE_MAX_AGE_SECS: u64 = 120;
+
 impl Queries {
+    /// The queries for a cluster, given its compactor policy.
+    ///
+    /// A zero-floor compactor reads the depth the INGESTERS publish, because
+    /// the tier it sizes may be stopped and `siglake_compactor_sealed_pending`
+    /// is published by that tier. Every other policy keeps the compactor's own
+    /// gauge, so no existing cluster's sizing moves and an upgrade that has not
+    /// yet rolled its ingesters cannot lose its compactor signal.
+    pub fn for_policy(
+        release: &str,
+        namespace: &str,
+        compactor: &crate::crd::ComponentAutoscale,
+    ) -> Self {
+        let mut queries = Self::defaults(release, namespace);
+        if compactor.min == 0 {
+            queries.compactor_backlog = Self::compactor_activation(release, namespace);
+        }
+        queries
+    }
+
+    /// The activation reading for a zero-floor compactor: the ingester-published
+    /// catalog depth, falling back to the compactor's own gauge.
+    ///
+    /// `and on (pod)` drops any ingester whose last successful catalog read is
+    /// older than [`SEALED_SAMPLE_MAX_AGE_SECS`]; the depth is one shared
+    /// queue that every ingester publishes in full, so `avg` over the pods
+    /// that remain reads it once ([`crate::scaling::Load::Shared`]).
+    ///
+    /// THE `or` IS THE FAIL-SAFE'S OTHER HALF. With no usable reading a
+    /// zero-floor tier is restored to one replica rather than held at zero
+    /// ([`crate::scaling::replicas_without_signal`]), and that pod publishes
+    /// `siglake_compactor_sealed_pending` itself. Without the fallback the
+    /// operator would not be reading the series the pod it just started
+    /// publishes, so a broken depth publisher would pin the tier at exactly
+    /// one worker however deep the queue got. `or` returns the right side only
+    /// when the left is an empty vector, so while the ingesters are publishing
+    /// a fresh depth nothing else is consulted (#6011; the design's query
+    /// selection and its fail-safe paragraph disagreed on this point, and the
+    /// expression is where it is settled).
+    pub fn compactor_activation(release: &str, namespace: &str) -> String {
+        let ingester = format!(
+            "namespace=\"{namespace}\",app_kubernetes_io_instance=\"{release}\",app_kubernetes_io_component=\"ingester\""
+        );
+        let compactor = format!(
+            "namespace=\"{namespace}\",app_kubernetes_io_instance=\"{release}\",app_kubernetes_io_component=\"compactor\""
+        );
+        format!(
+            "avg(sum by (pod) (siglake_wal_segments_sealed{{{ingester}}}) and on (pod) \
+             (max by (pod) (siglake_wal_segments_sealed_sample_age_seconds{{{ingester}}}) <= \
+             {SEALED_SAMPLE_MAX_AGE_SECS})) \
+             or avg(sum by (pod) (siglake_compactor_sealed_pending{{{compactor}}}))"
+        )
+    }
+
     /// Defaults for a deployment where the chart's labels apply —
     /// matches by namespace, release, and component selectors.
     pub fn defaults(release: &str, namespace: &str) -> Self {
@@ -210,7 +273,7 @@ impl Queries {
 
 #[cfg(test)]
 mod tests {
-    use super::{usable_sample, PromClient, Queries};
+    use super::{usable_sample, PromClient, Queries, SEALED_SAMPLE_MAX_AGE_SECS};
 
     /// A stand-in Prometheus that answers each query with a canned body,
     /// chosen by the `query=` parameter in the request line. Returns the base
@@ -371,6 +434,55 @@ mod tests {
             queries.query_in_flight,
             "avg(siglake_query_in_flight{namespace=\"tenant-a\",app_kubernetes_io_instance=\"siglake\",app_kubernetes_io_component=\"query\"})"
         );
+    }
+
+    /// Only a zero floor moves the compactor query. Every positive-floor
+    /// policy keeps `siglake_compactor_sealed_pending`, so no existing
+    /// cluster's sizing changes and an upgrade that has not yet rolled its
+    /// ingesters cannot lose its compactor signal.
+    #[test]
+    fn only_a_zero_floor_selects_the_activation_query() {
+        let policy = |min: i32| crate::crd::ComponentAutoscale {
+            min,
+            max: 4,
+            target: 4.0,
+        };
+        let defaults = Queries::defaults("siglake", "logs");
+
+        for min in [1, 2] {
+            let queries = Queries::for_policy("siglake", "logs", &policy(min));
+            assert_eq!(queries.compactor_backlog, defaults.compactor_backlog);
+        }
+
+        let parked = Queries::for_policy("siglake", "logs", &policy(0));
+        assert_eq!(
+            parked.compactor_backlog,
+            Queries::compactor_activation("siglake", "logs")
+        );
+        assert!(
+            parked
+                .compactor_backlog
+                .contains("siglake_wal_segments_sealed"),
+            "the zero-floor reading is the ingester-published depth: {}",
+            parked.compactor_backlog
+        );
+        assert!(
+            parked
+                .compactor_backlog
+                .contains(&format!("<= {SEALED_SAMPLE_MAX_AGE_SECS}")),
+            "with the staleness guard: {}",
+            parked.compactor_backlog
+        );
+        assert!(
+            parked
+                .compactor_backlog
+                .contains("or avg(sum by (pod) (siglake_compactor_sealed_pending"),
+            "and the fail-safe fallback: {}",
+            parked.compactor_backlog
+        );
+        // The other two signals are untouched by the compactor's policy.
+        assert_eq!(parked.ingester_rps, defaults.ingester_rps);
+        assert_eq!(parked.query_in_flight, defaults.query_in_flight);
     }
 
     #[test]
