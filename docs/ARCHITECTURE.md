@@ -1306,7 +1306,11 @@ the alias — DataFusion rejects `ORDER BY t.timestamp` under such a projection
 as an ambiguous reference. An explicit `LIMIT` is preserved, and a query with no
 `LIMIT` gets `max_rows_returned + 1` so the truncation signal still fires.
 `default_order: false` on the request turns it off. Counted by
-`siglake_query_default_order_applied_total`.
+`siglake_query_default_order_applied_total`. The field-by-field proof required
+to extend this to another mapped event-time name is recorded in
+[`DESIGN_per_index_event_time_ordering.md`](DESIGN_per_index_event_time_ordering.md);
+the current restriction stays in force until that complete planner and storage
+change ships.
 
 **Distributed by default.** Query replicas form a StatefulSet; the classifier
 splits eligible plans into per-shard scans (`ScanShard` file sharding),

@@ -7725,6 +7725,222 @@ mod tests {
         assert!(!bound_is_strictly_behind(100, None, false));
     }
 
+    /// #4073 qualification: a managed index is physically sorted by its
+    /// declared custom event-time field, but the ordered scan must keep
+    /// refusing that order until every timestamp-specific reader path carries
+    /// the field identity. The blocking SQL sort remains the correctness path,
+    /// including when LIMIT cuts through duplicate event times.
+    #[tokio::test]
+    async fn custom_event_time_sort_is_stored_but_not_advertised() {
+        use arrow_array::{StringArray, TimestampMicrosecondArray};
+        use datafusion::physical_plan::displayable;
+        use siglake_core::index_config::{
+            DocMapping, FieldMapping, FieldType, IndexConfig, MappingMode,
+        };
+
+        fn datetime_field(name: &str) -> FieldMapping {
+            FieldMapping {
+                name: name.to_string(),
+                field_type: FieldType::Datetime,
+                required: true,
+            }
+        }
+
+        fn text_field(name: &str) -> FieldMapping {
+            FieldMapping {
+                name: name.to_string(),
+                field_type: FieldType::Text {
+                    tokenizer: Some("raw".to_string()),
+                },
+                required: true,
+            }
+        }
+
+        fn batch(config: &IndexConfig, rows: &[(i64, i64, &str)]) -> RecordBatch {
+            RecordBatch::try_new(
+                config.to_arrow_schema(),
+                vec![
+                    Arc::new(
+                        TimestampMicrosecondArray::from(
+                            rows.iter().map(|(ts, _, _)| Some(*ts)).collect::<Vec<_>>(),
+                        )
+                        .with_timezone(siglake_core::TIMESTAMP_TZ),
+                    ),
+                    // Deliberately unrelated to the mapping's event time. Its
+                    // presence gets past the projection guard and proves that
+                    // the refusal is specifically `non_timestamp_sort`.
+                    Arc::new(
+                        TimestampMicrosecondArray::from(
+                            rows.iter()
+                                .map(|(_, timestamp, _)| Some(*timestamp))
+                                .collect::<Vec<_>>(),
+                        )
+                        .with_timezone(siglake_core::TIMESTAMP_TZ),
+                    ),
+                    Arc::new(StringArray::from(
+                        rows.iter()
+                            .map(|(_, _, message)| Some(*message))
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(vec![None::<&str>; rows.len()])),
+                ],
+            )
+            .unwrap()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = crate::iceberg::IcebergContext::open(tmp.path())
+            .await
+            .unwrap();
+        let config = IndexConfig {
+            index_id: "custom-time".to_string(),
+            doc_mapping: DocMapping {
+                mode: MappingMode::Dynamic,
+                field_mappings: vec![
+                    datetime_field("ts"),
+                    datetime_field("timestamp"),
+                    text_field("message"),
+                ],
+                timestamp_field: "ts".to_string(),
+                tag_fields: Vec::new(),
+                default_search_fields: vec!["message".to_string()],
+            },
+            retention: None,
+            index_at_flush: None,
+        };
+        let ident = ice.create_index(&config).await.unwrap();
+        let table = ice.catalog().load_table(&ident).await.unwrap();
+        let lead = table
+            .metadata()
+            .default_sort_order()
+            .fields
+            .first()
+            .expect("custom event-time sort");
+        assert_eq!(
+            table
+                .metadata()
+                .current_schema()
+                .field_by_id(lead.source_id)
+                .unwrap()
+                .name,
+            "ts",
+            "storage must declare the mapped event-time field as its sort lead"
+        );
+        assert_eq!(table.metadata().default_sort_order().fields.len(), 1);
+
+        let ctx = crate::session_context_with_order(
+            Some(2),
+            None,
+            Some(PreferredScanOrder { descending: true }),
+        );
+        let state = ctx.state();
+
+        let canonical_config = IndexConfig {
+            index_id: "canonical-time".to_string(),
+            ..IndexConfig::builtin_events()
+        };
+        let canonical_ident = ice.create_index(&canonical_config).await.unwrap();
+        let canonical_table = ice.catalog().load_table(&canonical_ident).await.unwrap();
+        let canonical_decision = scan_output_ordering(
+            &canonical_table,
+            None,
+            &canonical_config.to_arrow_schema(),
+            &mut Vec::new(),
+            &state,
+        )
+        .await;
+        assert_eq!(canonical_decision.outcome, "advertised");
+        assert!(canonical_decision.plan.is_some());
+
+        let decision = scan_output_ordering(
+            &table,
+            None,
+            &config.to_arrow_schema(),
+            &mut Vec::new(),
+            &state,
+        )
+        .await;
+        assert_eq!(decision.outcome, "non_timestamp_sort");
+        assert!(decision.plan.is_none());
+
+        ice.append_to_table(
+            &ident,
+            batch(
+                &config,
+                &[(30, 1, "a"), (10, 2, "b"), (20, 3, "c"), (20, 4, "d")],
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        ice.append_to_table(
+            &ident,
+            batch(&config, &[(40, 5, "e"), (20, 6, "f"), (35, 7, "g")]),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let refreshed = ice.catalog().load_table(&ident).await.unwrap();
+        for file in ice.live_data_files(&ident).await.unwrap() {
+            let input = refreshed.file_io().new_input(file.file_path()).unwrap();
+            let bytes = input.read().await.unwrap();
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+            let times = reader
+                .map(|batch| {
+                    let batch = batch.unwrap();
+                    let ts = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap();
+                    (0..ts.len()).map(|row| ts.value(row)).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+                .concat();
+            assert!(
+                times.windows(2).all(|pair| pair[0] <= pair[1]),
+                "custom event-time file is not physically ts-ascending: {times:?}"
+            );
+        }
+
+        ice.register_index_with_datafusion(&ctx, "custom-time")
+            .await
+            .unwrap();
+        let df = ctx
+            .sql(
+                "SELECT ts, timestamp, message FROM \"custom-time\" \
+                 ORDER BY ts DESC LIMIT 5",
+            )
+            .await
+            .unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
+        let plan = format!("{}", displayable(plan.as_ref()).indent(true));
+        assert!(
+            plan.contains("SortExec"),
+            "the unadvertised custom event-time order must keep its blocking sort:\n{plan}"
+        );
+        let times = df
+            .collect()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|batch| {
+                let ts = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                (0..ts.len()).map(|row| ts.value(row)).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(times, vec![40, 35, 30, 20, 20]);
+    }
+
     /// The decline is a three-input decision and the scan that consumes it
     /// needs a warehouse, a text corpus and a plan to reach. Driving the
     /// resolver directly is what makes each arm — including the two that must
