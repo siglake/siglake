@@ -64,7 +64,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   so the same way: one `siglake_iceberg_puffin_blob_fetches_total` per
   acquisition, and `siglake_iceberg_puffin_blob_cache_lookups_total` flat at the
   zero it was pre-registered at, since a disabled cache is never consulted
-  (#4718).
+  (#4718). Since #5374 that pod has a direct reading as well:
+  `siglake_iceberg_puffin_blob_cache_max_bytes` is published on refused
+  admissions too, so a floor pod charts a blob budget of 0 rather than leaving
+  the operator to infer it from two flat series.
   The caps that bind above 16Gi were chosen as policy; the parsed one has since
   been timed against a budget eight times its size and kept at 1 GiB on that
   evidence (#4102, below). The working set beneath them has been sized too, and
