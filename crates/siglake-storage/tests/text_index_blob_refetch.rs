@@ -36,10 +36,11 @@
 //! way to spend the pair is #4102's (parsed sizing) and #4054's (retention),
 //! with these numbers as their input; nothing here changes a default.
 //!
-//! The regression and the measurement read the same process state — one
-//! metrics recorder, two process-wide cache budgets and what those caches hold
-//! — so they take [`CACHE_TESTS`] and run one at a time, which is what lets the
-//! binary run with `--include-ignored` (#5300).
+//! The regressions and the measurement read the same process state — one
+//! metrics recorder, two process-wide cache budgets, what those caches hold and
+//! the cumulative counters beside them — so they take [`CACHE_TESTS`] and run
+//! one at a time, which is what lets the binary run with `--include-ignored`
+//! (#5300).
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -47,9 +48,10 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use siglake_core::Event;
 use siglake_storage::iceberg::{IcebergContext, IcebergTuning, ReclusterMergeOptions};
 
-/// Both tests below own the same process state — the metrics recorder, the two
-/// text-index cache budgets and what those caches hold — so they run one at a
-/// time, and the recorder is installed once for the binary.
+/// Every test below owns the same process state — the metrics recorder, the
+/// two text-index cache budgets, what those caches hold and the cumulative
+/// counters beside them — so they run one at a time, and the recorder is
+/// installed once for the binary.
 static CACHE_TESTS: Mutex<()> = Mutex::new(());
 
 fn setup() -> (MutexGuard<'static, ()>, &'static Snapshotter) {
@@ -87,21 +89,42 @@ fn reset_process_state() {
 /// to span the whole measurement, and a std `MutexGuard` held across an
 /// `.await` inside an async test is what `clippy::await_holding_lock` exists to
 /// catch.
+///
+/// Current-thread, which is what `#[tokio::test]` gave these measurements
+/// before they were serialized: a multi-thread runtime consults the files'
+/// indexes concurrently, and the per-pass figures these measurements report are
+/// those of a sequential query sequence.
 fn serialized<F>(body: impl FnOnce(&'static Snapshotter) -> F)
 where
     F: std::future::Future<Output = ()>,
 {
+    serialized_on(tokio::runtime::Builder::new_current_thread(), body);
+}
+
+/// The same, on a caller-chosen runtime: what a measurement reports depends on
+/// the order the files are consulted in, but what the counters account for does
+/// not, and the accounting tests below run on both builders.
+fn serialized_on<F>(
+    mut builder: tokio::runtime::Builder,
+    body: impl FnOnce(&'static Snapshotter) -> F,
+) where
+    F: std::future::Future<Output = ()>,
+{
     let (_guard, snapshotter) = setup();
-    // Current-thread, which is what `#[tokio::test]` gave these measurements
-    // before they were serialized: a multi-thread runtime consults the six
-    // files' indexes concurrently, and the fixed query sequence these passes
-    // count is a sequential one.
-    tokio::runtime::Builder::new_current_thread()
+    builder
         .enable_all()
         .build()
-        .expect("build current-thread runtime")
+        .expect("build runtime")
         .block_on(body(snapshotter));
     reset_process_state();
+}
+
+/// Four workers rather than the machine's core count, so the concurrency the
+/// accounting tests run under does not depend on which box runs them.
+fn multi_thread() -> tokio::runtime::Builder {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(4);
+    builder
 }
 
 type SnapshotVec = Vec<(
@@ -256,19 +279,28 @@ struct Pass {
     rows: Vec<String>,
 }
 
+/// All three of a pass's acquisition counts are deltas of cumulative process
+/// counters, so that what a pass was served is not revised by what it evicted
+/// afterwards. The parsed side used to be a delta of the hits summed over
+/// resident entries: an entry evicted later in the pass took its hits out of
+/// that sum, and the accounting below then undercounted (#5300 saw 3 + 0 + 0
+/// against six files under a multi-thread runtime). Resident-entry statistics
+/// stay where they belong, on occupancy and per-entry sizing.
+///
+/// The counters are process-wide and these tests hold [`CACHE_TESTS`] for their
+/// whole execution, so a pass's delta is its own query's work.
 async fn measure_pass(
     ctx: &datafusion::prelude::SessionContext,
     snapshotter: &Snapshotter,
-    warehouse: &str,
     term: &str,
 ) -> Pass {
     let (fetches_before, hits_before) = iceberg::arrow::puffin_blob_fetch_counts();
-    let (_, parsed_before) = iceberg::arrow::parsed_inverted_index_cache_stats(warehouse);
+    let (_, parsed_before) = iceberg::arrow::inverted_index_decode_counts();
     let started = std::time::Instant::now();
     let rows = needle_rows(ctx, term).await;
     let elapsed = started.elapsed();
     let (fetches_after, hits_after) = iceberg::arrow::puffin_blob_fetch_counts();
-    let (_, parsed_after) = iceberg::arrow::parsed_inverted_index_cache_stats(warehouse);
+    let (_, parsed_after) = iceberg::arrow::inverted_index_decode_counts();
     let snapshot = snapshotter.snapshot().into_vec();
     Pass {
         fetches: fetches_after - fetches_before,
@@ -332,7 +364,97 @@ fn a_repeat_text_suite_stops_refetching_the_blobs_it_still_holds() {
     serialized(repeat_text_suite_stops_refetching_the_blobs_it_still_holds);
 }
 
+/// The same layout and budgets on a multi-thread runtime, which consults the
+/// six files' indexes concurrently. What each pass is served then depends on
+/// the interleaving, so only the accounting is asserted here — and it is the
+/// accounting that a resident-entry hit sum got wrong (#5300).
+#[test]
+fn a_repeat_text_suite_accounts_for_every_index_on_a_multi_thread_runtime() {
+    serialized_on(multi_thread(), |snapshotter| async move {
+        let shape = packaged_shape_passes(snapshotter).await;
+        assert_every_index_acquired_once(&shape);
+    });
+}
+
+/// The eight passes of the packaged shape, and what the arms assert them
+/// against.
+struct PackagedShape {
+    chunks: usize,
+    held: usize,
+    sizes: EntrySizes,
+    warehouse: String,
+    passes: Vec<Pass>,
+}
+
+/// Every file's index comes from exactly one of the three places, whatever the
+/// caches dropped and whatever order the runtime consulted the files in.
+fn assert_every_index_acquired_once(shape: &PackagedShape) {
+    for (pass, measurement) in shape.passes.iter().enumerate().skip(2) {
+        let accounted = measurement.fetches + measurement.blob_hits + measurement.parsed_hits;
+        assert_eq!(
+            accounted, shape.chunks as u64,
+            "pass {pass}: every file's index is acquired exactly once, from a \
+             fetch, the blob cache or the parsed cache ({} + {} + {})",
+            measurement.fetches, measurement.blob_hits, measurement.parsed_hits
+        );
+    }
+}
+
 async fn repeat_text_suite_stops_refetching_the_blobs_it_still_holds(snapshotter: &Snapshotter) {
+    let shape = packaged_shape_passes(snapshotter).await;
+    let (chunks, held, sizes, passes) = (shape.chunks, shape.held, &shape.sizes, &shape.passes);
+
+    let (_, blob_bytes, _) = iceberg::arrow::puffin_blob_cache_stats(&shape.warehouse);
+    let footprint = iceberg::arrow::parsed_inverted_index_cache_footprint();
+    assert!(
+        blob_bytes <= sizes.blob * held && footprint.bytes <= sizes.parsed * held,
+        "both caches must stay inside the budgets set for them ({blob_bytes} B of \
+         blobs against {}, {} B parsed against {})",
+        sizes.blob * held,
+        footprint.bytes,
+        sizes.parsed * held
+    );
+    assert!(
+        footprint.evictions > 0,
+        "the plan is meant to exceed the parsed budget; no eviction means the \
+         measurement proved nothing"
+    );
+
+    assert_every_index_acquired_once(&shape);
+
+    // Measured 2026-09-16, per pass of the six-file plan: 6 fetches and 0 blob
+    // hits cold, then 4/2 and 3/3 alternating with the protection window, and
+    // 3,348–4,464 index-phase bytes against the cold pass's 26,082. Before
+    // #4182 every pass of this layout paid 6 fetches, 0 blob hits and 6,696
+    // bytes. The parsed cache serves nothing here: six files against a budget
+    // for three is a working set its LRU cannot keep (#4102), which is why
+    // every pass decodes six times in both arms.
+    for (pass, measurement) in passes.iter().enumerate().skip(2) {
+        assert!(
+            measurement.fetches < chunks as u64 && measurement.blob_hits + 1 >= held as u64,
+            "pass {pass} fetched {} of {chunks} blobs and was served {} from \
+             memory; the {held} the budget holds must not be re-fetched",
+            measurement.fetches,
+            measurement.blob_hits
+        );
+        assert!(
+            measurement.index_reads >= measurement.fetches,
+            "pass {pass}: index-phase reads ({}) cannot be fewer than the blob \
+             fetches ({}) they include",
+            measurement.index_reads,
+            measurement.fetches
+        );
+        assert!(
+            measurement.index_bytes < passes[1].index_bytes,
+            "pass {pass} read {} index-phase bytes, no better than the \
+             whole-plan re-fetch of pass 1 ({})",
+            measurement.index_bytes,
+            passes[1].index_bytes
+        );
+    }
+}
+
+async fn packaged_shape_passes(snapshotter: &Snapshotter) -> PackagedShape {
     let chunks = 6;
     let rows_per_chunk = 400;
     let held = 3;
@@ -369,7 +491,7 @@ async fn repeat_text_suite_stops_refetching_the_blobs_it_still_holds(snapshotter
     let warehouse = path.to_string_lossy().to_string();
     let mut passes = Vec::new();
     for pass in 0..8 {
-        let measurement = measure_pass(&ctx, snapshotter, &warehouse, "rareneedle").await;
+        let measurement = measure_pass(&ctx, snapshotter, "rareneedle").await;
         assert_eq!(
             measurement.rows, expected,
             "pass {pass}: the rows must be the unindexed control's, whatever the \
@@ -378,59 +500,128 @@ async fn repeat_text_suite_stops_refetching_the_blobs_it_still_holds(snapshotter
         passes.push(measurement);
     }
 
-    let (_, blob_bytes, _) = iceberg::arrow::puffin_blob_cache_stats(&warehouse);
-    let footprint = iceberg::arrow::parsed_inverted_index_cache_footprint();
-    assert!(
-        blob_bytes <= sizes.blob * held && footprint.bytes <= sizes.parsed * held,
-        "both caches must stay inside the budgets set for them ({blob_bytes} B of \
-         blobs against {}, {} B parsed against {})",
-        sizes.blob * held,
-        footprint.bytes,
-        sizes.parsed * held
+    PackagedShape {
+        chunks,
+        held,
+        sizes,
+        warehouse,
+        passes,
+    }
+}
+
+/// The accounting a resident-entry hit sum cannot do: a window whose parsed
+/// hits are all gone by the time it is read.
+///
+/// Three indexed files are warmed under a budget that holds exactly them, and
+/// the measured window then covers two queries — the warm one, served entirely
+/// from the parsed cache, and one over a second warehouse whose three decodes
+/// displace every entry that just served a hit. Summing `hits` over resident
+/// entries reports the warm query as having been served nothing; the cumulative
+/// counter keeps what the evicted entries served.
+#[test]
+fn parsed_hits_evicted_inside_the_window_are_still_accounted_for() {
+    serialized(parsed_hits_evicted_inside_the_window_are_still_accounted_for_body);
+}
+
+/// The same window on a multi-thread runtime: the queries are sequential, the
+/// files inside each are not.
+#[test]
+fn parsed_hits_evicted_inside_the_window_are_accounted_for_on_a_multi_thread_runtime() {
+    serialized_on(
+        multi_thread(),
+        parsed_hits_evicted_inside_the_window_are_still_accounted_for_body,
     );
-    assert!(
-        footprint.evictions > 0,
-        "the plan is meant to exceed the parsed budget; no eviction means the \
-         measurement proved nothing"
+}
+
+async fn parsed_hits_evicted_inside_the_window_are_still_accounted_for_body(
+    _snapshotter: &Snapshotter,
+) {
+    let chunks = 3;
+    let rows_per_chunk = 400;
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Budgets that hold everything, to start with: the budget set below is read
+    // off the warmed cache rather than divided out of it, so it is exactly
+    // those entries and not a rounded per-entry figure.
+    iceberg::arrow::clear_text_index_caches();
+    siglake_storage::configure_text_index_caches(siglake_storage::TextIndexCacheConfig {
+        parsed_index_max_bytes: u64::MAX / 2,
+        puffin_blob_max_bytes: u64::MAX / 2,
+    });
+
+    let warm_path = tmp.path().join("warm");
+    let warm = puffin_files_fixture(&warm_path, chunks, rows_per_chunk, true).await;
+    let displacing =
+        puffin_files_fixture(&tmp.path().join("displacing"), chunks, rows_per_chunk, true).await;
+    let warm_ctx = datafusion::prelude::SessionContext::new();
+    warm.register_with_datafusion(&warm_ctx).await.unwrap();
+    let displacing_ctx = datafusion::prelude::SessionContext::new();
+    displacing
+        .register_with_datafusion(&displacing_ctx)
+        .await
+        .unwrap();
+
+    let expected_rows = chunks * rows_per_chunk / 10;
+    assert_eq!(
+        needle_rows(&warm_ctx, "rareneedle").await.len(),
+        expected_rows
+    );
+    let warehouse = warm_path.to_string_lossy().to_string();
+    let warmed = iceberg::arrow::parsed_inverted_index_cache_footprint();
+    assert_eq!(
+        (
+            warmed.entries,
+            iceberg::arrow::parsed_inverted_index_cache_stats(&warehouse).0
+        ),
+        (chunks, chunks),
+        "the warmed warehouse must be the only thing in the parsed cache, one \
+         index per file"
+    );
+    // Exactly what it holds: the warm query below evicts nothing, and every
+    // index the second warehouse decodes displaces one that just served a hit.
+    siglake_storage::configure_text_index_caches(siglake_storage::TextIndexCacheConfig {
+        parsed_index_max_bytes: warmed.bytes as u64,
+        puffin_blob_max_bytes: u64::MAX / 2,
+    });
+
+    let (fetches_before, blob_hits_before) = iceberg::arrow::puffin_blob_fetch_counts();
+    let (_, parsed_before) = iceberg::arrow::inverted_index_decode_counts();
+    let warm_rows = needle_rows(&warm_ctx, "rareneedle").await;
+    let displacing_rows = needle_rows(&displacing_ctx, "rareneedle").await;
+    let (fetches_after, blob_hits_after) = iceberg::arrow::puffin_blob_fetch_counts();
+    let (_, parsed_after) = iceberg::arrow::inverted_index_decode_counts();
+    let parsed_hits = parsed_after - parsed_before;
+    let accounted =
+        (fetches_after - fetches_before) + (blob_hits_after - blob_hits_before) + parsed_hits;
+    assert_eq!(
+        (warm_rows.len(), displacing_rows.len()),
+        (expected_rows, expected_rows),
+        "both queries must return the fixture's rows"
     );
 
-    // Measured 2026-09-16, per pass of the six-file plan: 6 fetches and 0 blob
-    // hits cold, then 4/2 and 3/3 alternating with the protection window, and
-    // 3,348–4,464 index-phase bytes against the cold pass's 26,082. Before
-    // #4182 every pass of this layout paid 6 fetches, 0 blob hits and 6,696
-    // bytes. The parsed cache serves nothing here: six files against a budget
-    // for three is a working set its LRU cannot keep (#4102), which is why
-    // every pass decodes six times in both arms.
-    for (pass, measurement) in passes.iter().enumerate().skip(2) {
-        let accounted = measurement.fetches + measurement.blob_hits + measurement.parsed_hits;
-        assert_eq!(
-            accounted, chunks as u64,
-            "pass {pass}: every file's index is acquired exactly once, from a \
-             fetch, the blob cache or the parsed cache ({} + {} + {})",
-            measurement.fetches, measurement.blob_hits, measurement.parsed_hits
-        );
-        assert!(
-            measurement.fetches < chunks as u64 && measurement.blob_hits + 1 >= held as u64,
-            "pass {pass} fetched {} of {chunks} blobs and was served {} from \
-             memory; the {held} the budget holds must not be re-fetched",
-            measurement.fetches,
-            measurement.blob_hits
-        );
-        assert!(
-            measurement.index_reads >= measurement.fetches,
-            "pass {pass}: index-phase reads ({}) cannot be fewer than the blob \
-             fetches ({}) they include",
-            measurement.index_reads,
-            measurement.fetches
-        );
-        assert!(
-            measurement.index_bytes < passes[1].index_bytes,
-            "pass {pass} read {} index-phase bytes, no better than the \
-             whole-plan re-fetch of pass 1 ({})",
-            measurement.index_bytes,
-            passes[1].index_bytes
-        );
-    }
+    let resident = iceberg::arrow::parsed_inverted_index_cache_stats(&warehouse);
+    assert_eq!(
+        resident,
+        (0, 0),
+        "the window is meant to evict every entry that served it a hit; {} of \
+         the warm warehouse's indexes are still resident, so this no longer \
+         covers the undercount it guards",
+        resident.0
+    );
+    assert_eq!(
+        parsed_hits, chunks as u64,
+        "the warm query was served every one of its {chunks} indexes from the \
+         parsed cache, and the decodes that evicted them afterwards do not take \
+         those hits back"
+    );
+    assert_eq!(
+        accounted,
+        2 * chunks as u64,
+        "both queries acquire every file's index exactly once, from a fetch, \
+         the blob cache or the parsed cache ({} + {} + {parsed_hits})",
+        fetches_after - fetches_before,
+        blob_hits_after - blob_hits_before
+    );
 }
 
 /// What the pair's SPLIT is worth on the same layout, which the eviction fix
@@ -497,7 +688,7 @@ async fn text_index_cache_budget_split_report(snapshotter: &Snapshotter) {
         let warehouse = path.to_string_lossy().to_string();
         let mut passes = Vec::new();
         for _ in 0..8 {
-            passes.push(measure_pass(&ctx, snapshotter, &warehouse, "rareneedle").await);
+            passes.push(measure_pass(&ctx, snapshotter, "rareneedle").await);
         }
         let steady = &passes[4..];
         let mean = |values: &[u64]| values.iter().sum::<u64>() as f64 / values.len() as f64;
