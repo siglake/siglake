@@ -80,10 +80,10 @@ Upstream base: 0.10.1. Key divergences:
 - `Cargo.toml`: tokio with `rt` and `time` where upstream asks only for
   `sync` — `rt` for `tokio::task::coop::consume_budget` in `io/file_io.rs`,
   `time` for the `tokio::time::timeout` around the reversed-chunk in-flight
-  wait in `arrow/reader.rs` and the `tokio::time::sleep` handed to backon in
-  `transaction/mod.rs`. Upstream's manifest under-declares the same two:
-  reqwest turns `time` on and parquet turns `macros` on, so a workspace build
-  compiles either way and only a standalone build of the fork can tell.
+  wait in `arrow/reader/reverse.rs` and the `tokio::time::sleep` handed to
+  backon in `transaction/mod.rs`. Upstream's manifest under-declares the same
+  two: reqwest turns `time` on and parquet turns `macros` on, so a workspace
+  build compiles either way and only a standalone build of the fork can tell.
   `macros` and `rt-multi-thread`, which only the tests and the five
   `#[tokio::main]` doctests need, are a `[dev-dependencies.tokio]` entry
   instead. `scripts/check-fork-tests.sh` runs this fork's doctests, so a doc
