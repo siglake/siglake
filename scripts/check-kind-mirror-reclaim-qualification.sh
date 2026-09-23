@@ -161,6 +161,135 @@ PY
 [[ $(wc -l <"$sandbox/git-calls") -eq 1 ]] ||
   fail "the injected launch revision still called git"
 
+# Exercise the actual effective-config capture against fixture cluster state.
+# Since #5880 the chart renders SIGLAKE_WAL_MIRROR_PREFIX on the compactor in
+# both drain modes, and this arm qualifies the drain whose prefix was wrong, so
+# a compactor prefix that is missing or differs from the ingester's has to fail
+# the arm instead of being recorded.
+sed -n '/^capture_mirror_reclaim_effective_config()/,/^start_mirror_reclaim_observer()/p' \
+  "$ROUND" | sed '$d' >"$sandbox/scripts/capture-config.bash"
+cat >"$sandbox/bin/helm" <<'STANDIN'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == *'get values siglake'* ]] || exit 64
+cat "$STANDIN_FIXTURES/helm-values.json"
+STANDIN
+cat >"$sandbox/bin/kubectl" <<'STANDIN'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *siglake-ingester*) cat "$STANDIN_FIXTURES/ingester.json" ;;
+  *siglake-compactor*) cat "$STANDIN_FIXTURES/compactor.json" ;;
+  *) exit 64 ;;
+esac
+STANDIN
+chmod +x "$sandbox/bin/helm" "$sandbox/bin/kubectl"
+
+write_capture_fixtures() {
+  python3 - "$sandbox/fixtures" <<'PY'
+import json
+import os
+import sys
+
+root = sys.argv[1]
+values = {
+    "compactor": {
+        "catalogClaim": {"enabled": False},
+        "committedRetentionSecs": 901,
+        "mirrorLedgerReclaim": True,
+    },
+    "wal": {
+        "mirror": {"enabled": True, "activeIntervalSecs": 0, "prefix": "wal-mirror"},
+    },
+}
+
+
+def deployment(uid, name, env):
+    container = {
+        "name": name,
+        "args": ["--warehouse", "s3://bucket/warehouse"],
+        "env": [{"name": key, "value": value} for key, value in env.items()],
+    }
+    return {
+        "metadata": {"uid": uid},
+        "spec": {"template": {"spec": {"containers": [container]}}},
+    }
+
+
+for case, compactor_prefix in (
+    ("match", "wal-mirror"),
+    ("mismatch", "wal-mirror-stale"),
+    ("absent", None),
+):
+    compactor_env = {
+        "SIGLAKE_COMMITTED_RETENTION_SECS": "901",
+        "SIGLAKE_MIRROR_LEDGER_RECLAIM": "1",
+    }
+    if compactor_prefix is not None:
+        compactor_env["SIGLAKE_WAL_MIRROR_PREFIX"] = compactor_prefix
+    directory = os.path.join(root, case)
+    os.makedirs(directory, exist_ok=True)
+    written = {
+        "helm-values.json": values,
+        "ingester.json": deployment(
+            "uid-ingester",
+            "ingester",
+            {
+                "SIGLAKE_WAL_MIRROR_PREFIX": "wal-mirror",
+                "SIGLAKE_REMOTE_WAL_DRAIN": "0",
+            },
+        ),
+        "compactor.json": deployment("uid-compactor", "compactor", compactor_env),
+    }
+    for name, document in written.items():
+        with open(os.path.join(directory, name), "w", encoding="utf-8") as out:
+            json.dump(document, out, indent=2)
+            out.write("\n")
+PY
+}
+
+run_capture() {
+  local case=$1
+  local output=$2
+  env PATH="$sandbox/bin:$PATH" STANDIN_FIXTURES="$sandbox/fixtures/$case" bash -c '
+    set -euo pipefail
+    TMP_DIR=$1
+    MIRROR_RECLAIM_ARM=on
+    MIRROR_RECLAIM_CONFIG_JSON=$2
+    KUBE_CONTEXT=kind-fixture
+    NAMESPACE=siglake
+    source "$3"
+    capture_mirror_reclaim_effective_config
+  ' _ "$sandbox/tmp" "$output" "$sandbox/scripts/capture-config.bash"
+}
+
+write_capture_fixtures
+run_capture match "$sandbox/results/effective-match.json" 2>"$sandbox/match.err" ||
+  fail "the capture rejected a compactor prefix equal to the ingester's: $(cat "$sandbox/match.err")"
+python3 - "$sandbox/results/effective-match.json" <<'PY' ||
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+deployed = document["deployed"]
+assert deployed["ingester"]["wal_mirror_prefix"] == "wal-mirror", document
+assert deployed["compactor"]["wal_mirror_prefix"] == "wal-mirror", document
+assert deployed["compactor"]["mirror_ledger_reclaim"] == "1", document
+PY
+  fail "$ROUND does not retain the compactor's rendered mirror prefix"
+
+for case in mismatch absent; do
+  if run_capture "$case" "$sandbox/results/effective-$case.json" 2>"$sandbox/$case.err"; then
+    fail "the capture accepted a $case compactor mirror prefix"
+  fi
+  grep -Fq 'WAL mirror prefixes differ' "$sandbox/$case.err" ||
+    fail "the $case refusal did not name the mirror-prefix disagreement"
+  grep -Fq 'compactor' "$sandbox/$case.err" ||
+    fail "the $case refusal did not report the compactor's reading"
+  [[ ! -e "$sandbox/results/effective-$case.json" ]] ||
+    fail "the $case arm still retained an effective-config document"
+done
+
 run_prelude() {
   local mode=$1
   shift

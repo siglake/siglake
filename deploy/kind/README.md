@@ -106,7 +106,11 @@ configuration, one-minute mirror object/byte and scoped `wal_segments` series,
 the retention-purge, unreclaimed, mark-error and committed-row counters, the
 actual load window, raw start/end compactor metrics, and sent-versus-Iceberg-
 committed row reconciliation. Pod identity and restart count accompany every
-counter sample. This mode changes no chart default and is off when
+counter sample. The rendered configuration includes the WAL mirror prefix from
+both deployments: the ingester writes the objects and the compactor reclaims
+them, so an arm whose two rendered prefixes disagree with `wal.mirror.prefix`
+fails before the load rather than measuring reclamation of a prefix nobody
+writes to. This mode changes no chart default and is off when
 `KIND_ROUND_MIRROR_RECLAIM_ARM` is unset.
 
 `POSTGRES_OUTAGE_PROBE=1` also enables `query.jobs.persistent` for this
