@@ -320,8 +320,9 @@ grade_case stale-rollout "$work/stale-rollout.input.json" 1 'still runs image'
 # rot: everything the arm adds is inside a block conditioned on
 # SCHEMA_ROLLBACK_PROBE, so the default path reaches none of it, and that block
 # sits after the panel and scaling evidence and before the round's verdict.
-if ! python3 - "$ROUND" <<'PY'
+cat >"$work/arm-is-opt-in.py" <<'PY'
 import pathlib
+import re
 import sys
 
 lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
@@ -333,14 +334,26 @@ declared = next(i for i, line in enumerate(lines)
 settings_end = next(i for i, line in enumerate(lines[declared:], declared)
                     if line == "}")
 
-# Another opt-in may refuse being combined with this arm. That reference is a
-# launch-time validation, not a second path into the schema probe.
-qualification_settings = next(i for i, line in enumerate(lines)
-                              if line == 'case "$MIRROR_RECLAIM_ARM" in')
-qualification_settings_end = next(
-    i for i, line in enumerate(lines[qualification_settings:], qualification_settings)
-    if line == "esac"
-)
+# Another opt-in may refuse being combined with this arm, and each new one adds
+# its own refusal, so the exemption is by shape rather than by which opt-in
+# wrote it: the header of a `for … in NAME NAME…; do` loop over knob names,
+# continued over backslashes. A header of bare upper-case names runs nothing —
+# only the loop BODY could, and the body is not exempt.
+name_list = re.compile(r"[A-Z][A-Z0-9_]*")
+opens_loop = re.compile(r"^for [A-Za-z_][A-Za-z0-9_]* in (?=\S)")
+refusal_names = set()
+continued = False
+for i, line in enumerate(lines):
+    text = line.strip()
+    if not continued:
+        text, headers = opens_loop.subn("", text)
+        if not headers:
+            continue
+    continues = text.endswith("\\")
+    words = text.removesuffix("\\").removesuffix("; do").split()
+    continued = continues and all(name_list.fullmatch(w) for w in words)
+    if all(name_list.fullmatch(w) for w in words):
+        refusal_names.add(i)
 
 # The opt-in block, and where it ends: a `fi` in the first column, so an `if`
 # nested inside the block cannot close it early.
@@ -359,7 +372,7 @@ stray = [
     if any(token in line for token in tokens)
     and not line.lstrip().startswith("#")
     and not declared <= i <= settings_end
-    and not qualification_settings <= i <= qualification_settings_end
+    and i not in refusal_names
     and not opens <= i <= closes
 ]
 if stray:
@@ -383,9 +396,45 @@ if not (evidence < opens < closes < verdict):
         f"verdict ({verdict + 1}): block at {opens + 1}-{closes + 1}"
     )
 PY
-then
+
+python3 "$work/arm-is-opt-in.py" "$ROUND" ||
   fail "SCHEMA_ROLLBACK_PROBE is not the only way to reach the arm"
-fi
+
+# The name-list exemption is the part of that check most likely to be widened
+# by accident, so it is exercised both ways against derived copies of the round:
+# a refusal another arm could add tomorrow passes, and the same arm's commands
+# placed in the loop body or on the default path do not.
+arm_is_opt_in_case() {
+  local name=$1 want=$2 anchor=$3
+  shift 3
+  python3 - "$ROUND" "$work/$name.sh" "$anchor" "$@" <<'PY'
+import pathlib
+import sys
+
+round_path, out, anchor, *inserted = sys.argv[1:]
+lines = pathlib.Path(round_path).read_text(encoding="utf-8").splitlines()
+at = next(i for i, line in enumerate(lines) if line == anchor)
+pathlib.Path(out).write_text(
+    "\n".join(lines[:at + 1] + inserted + lines[at + 1:]) + "\n", encoding="utf-8"
+)
+PY
+  local status=0
+  python3 "$work/arm-is-opt-in.py" "$work/$name.sh" >"$work/$name.out" 2>&1 || status=$?
+  [[ "$status" == "$want" ]] ||
+    fail "arm-is-opt-in $name: exit $status, want $want: $(cat "$work/$name.out")"
+}
+
+arm_is_opt_in_case future-refusal 0 'COMPACTOR_SCALE_TARGET=2' \
+  'for future_incompatible in POSTGRES_OUTAGE_PROBE \' \
+  '  SCHEMA_ROLLBACK_PROBE; do' \
+  '  [[ "${!future_incompatible}" == 0 ]] || exit 1' \
+  'done'
+arm_is_opt_in_case probe-in-a-refusal-body 1 'COMPACTOR_SCALE_TARGET=2' \
+  'for future_incompatible in POSTGRES_OUTAGE_PROBE; do' \
+  '  bash scripts/kind-schema-rollback-probe.sh' \
+  'done'
+arm_is_opt_in_case probe-on-the-default-path 1 'COMPACTOR_SCALE_TARGET=2' \
+  'bash scripts/kind-schema-rollback-probe.sh'
 
 # A permanent aggregate mismatch must exhaust the bounded poll and retain both
 # raw responses. A missing probe bucket must do the same even when its grouped
@@ -637,4 +686,4 @@ echo "ok (5 grader fixtures; delayed GROUP BY and operator reconcile converged;"
   "port-forward leaks; the operator binary and both charts agree on the built-in Prometheus address;" \
   "the round, the probe and the chart agree on the round's operator" \
   "Prometheus address and every operator step retained the operator log; the arm is reachable only through" \
-  "SCHEMA_ROLLBACK_PROBE, between the round's evidence and its verdict)"
+  "SCHEMA_ROLLBACK_PROBE, between the round's evidence and its verdict; 3 opt-in fixtures)"
