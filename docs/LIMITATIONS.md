@@ -7,6 +7,12 @@ moved here from the README on 2026-09-15; the docs site's
 user-facing summary of the same list. The mechanisms named below are described
 in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
+- **The Iceberg 0.10.1 / Arrow 58 / DataFusion 53.1 / OpenDAL 0.57 stack has
+  no matched AWS performance comparison yet.** Its strict local gate passed in
+  run #136 at `bfc1fe5`, but the retained AWS candidate and pre-adoption round
+  differ in query memory, peer count and storage layout. The pre-registered
+  identities, launch contract, tolerances and pending verdict are in the
+  [slice 8 performance ledger](../bench/fork-rebase/README.md#slice-8-ledger--performance-acceptance-pre-registered).
 - **The persistent ingest lane cap has no timed reclamation.** Once
   `ingester.maxLanes` admits a `(tenant, index)` lane, an empty queue does not
   release its slot; only process shutdown drains the map. A novel key past the
