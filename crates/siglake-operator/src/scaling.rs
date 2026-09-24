@@ -285,10 +285,15 @@ fn decide(policy: &ComponentAutoscale, observed: f64, current: i32, load: Load) 
     let max = policy.max;
     if current <= 0 {
         // Cold start, or a tier the user has just given a floor back. With
-        // `min >= 1` — the only shape the reconciler accepts — bootstrap at
-        // min. The `min == 0` branch below stays as pure-function behaviour:
-        // no spec reaches it, because a zero floor has no way to ask for the
-        // pod that would publish the signal this branch reads.
+        // `min >= 1` bootstrap at min. The `min == 0` branch below is how a
+        // parked compactor comes back: since #6011 an accepted compactor spec
+        // can carry a zero floor (catalog-claim drain, `ewmaHalfLifeSecs`
+        // above 0), and the queue depth the ingesters publish survives the
+        // stopped tier, so a positive reading here starts one worker. The
+        // ingester and query tiers still cannot reach it — the reconciler
+        // refuses their zero floors with `AutoscalingZeroFloorUnsupported`,
+        // because each reads a per-pod signal its own stopped pods would have
+        // to publish.
         return if min == 0 {
             if observed > 0.0 {
                 1
@@ -315,8 +320,9 @@ fn decide(policy: &ComponentAutoscale, observed: f64, current: i32, load: Load) 
     // Anything above zero rounds up to at least one pod, so the clamp to `min`
     // is what holds the floor. With `min == 0` a zero signal drives `wanted` to
     // 0, gated by `fold_observation`'s idle window — the EWMA residual delays
-    // the decision and the window ends it. No accepted spec sets a zero floor,
-    // so that path is exercised by the unit tests only.
+    // the decision and the window ends it. That is the shipped path for an
+    // accepted compactor zero floor; the ingester and query tiers never take
+    // it, since the reconciler refuses a zero floor for them.
     let desired = wanted.ceil() as i32;
     desired.clamp(min, max)
 }
@@ -336,11 +342,13 @@ pub fn ewma_alpha(half_life_secs: f64, dt_secs: f64) -> f64 {
 /// per field: `smoothed = prev + alpha * (raw - prev)`. `alpha == 1.0` returns
 /// `raw` (no smoothing); the reconciler persists the result as the next cycle's
 /// `prev`. Smoothing the saturation signal damps autoscaler flapping. On a
-/// zero-floor tier it would also be the delay before the last pod goes away —
+/// zero-floor tier it is also the delay before the last pod goes away —
 /// the blend only decays toward 0 and never arrives, so [`fold_observation`]
 /// ends the decay itself once the raw signal has read idle for
-/// [`IDLE_HALF_LIVES`] half-lives. The operator refuses a zero floor, so that
-/// part carries no shipped behaviour today.
+/// [`IDLE_HALF_LIVES`] half-lives. An accepted compactor spec can set that
+/// floor since #6011 (catalog-claim drain, `ewmaHalfLifeSecs` above 0), so the
+/// delay is shipped behaviour for the compactor; the ingester and query tiers
+/// still have their zero floors refused, and never reach it.
 pub fn ewma_smooth(prev: &ObservedMetrics, raw: &ObservedMetrics, alpha: f64) -> ObservedMetrics {
     let blend = |p: f64, r: f64| p + alpha * (r - p);
     ObservedMetrics {
@@ -430,9 +438,11 @@ pub struct Smoothed {
 ///
 /// A signal whose raw sample has read zero for [`IDLE_HALF_LIVES`] half-lives
 /// of observed time is reported as exactly 0.0 rather than as the decaying
-/// residual. That is what would let a `min: 0` tier reach zero at all, since
-/// `decide` rounds any positive ratio up to one pod — the operator refuses a
-/// zero floor, so on a shipped spec this only stops a long-idle signal from
+/// residual. That is what lets a `min: 0` tier reach zero at all, since
+/// `decide` rounds any positive ratio up to one pod, and since #6011 it is the
+/// step that parks an accepted compactor zero floor (catalog-claim drain,
+/// `ewmaHalfLifeSecs` above 0). On the ingester and query tiers, whose zero
+/// floors the reconciler still refuses, it only stops a long-idle signal from
 /// reporting a residual. Only an exactly-zero raw sample extends the window,
 /// so a backlog that is small but real keeps its pod, and an unusable reading
 /// restarts it.
@@ -944,11 +954,16 @@ mod tests {
     }
 
     /// Scale-to-zero (`min == 0`): an idle component scales down to and stays at
-    /// 0, then re-activates to 1 when the signal returns. Pure-function
-    /// coverage only — since #3693 the reconciler refuses a zero floor, because
-    /// the returning signal this test hands `decide` cannot exist in a cluster
-    /// whose pods are stopped (see
-    /// `a_zero_replica_tier_needs_a_raised_floor_to_come_back`).
+    /// 0, then re-activates to 1 when the signal returns. Since #6011 the
+    /// reconciler accepts this shape on the compactor — the ingesters publish
+    /// the queue depth that brings the tier back — and still refuses it on the
+    /// ingester and query tiers, whose signals stop with their pods (see
+    /// `a_zero_replica_tier_comes_back_on_an_absent_reading_or_a_raised_floor`).
+    /// The fixture leaves `ewmaHalfLifeSecs` at 0, which admission refuses for
+    /// a zero floor; `reconcile_replicas` does not validate, and the smoothing
+    /// an accepted spec must carry is covered by `fold_observation`'s tests.
+    /// The live park-and-wake is not qualified yet (#6012), so the packaged
+    /// spec ships `compactor.min: 1`.
     #[test]
     fn scale_to_zero_idles_at_zero_and_reactivates() {
         let spec = cluster_with(ComponentAutoscale {
