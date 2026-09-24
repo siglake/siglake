@@ -940,24 +940,23 @@ fn time_bound_from_filters(
     (found && lo < hi).then_some((lo, hi))
 }
 
-/// Sort the buffer batches by the FIRST column of `ordering` when it is a
-/// `timestamp` sort (the only ordering siglake scans advertise). Returns
-/// `None` when the ordering is anything else — the caller unions unsorted.
+/// Sort the buffer batches by the FIRST column of `ordering` when that is a
+/// single column of this schema — the scan's advertised event-time order,
+/// whichever field the index's mapping declares (#6020). Returns the sorted
+/// batches, the options and the column's NAME; `None` when the ordering is
+/// anything else, and the caller unions unsorted.
 fn sort_batches_like(
     batches: &[RecordBatch],
     ordering: &datafusion::physical_expr::LexOrdering,
     schema: &SchemaRef,
-) -> Option<(Vec<RecordBatch>, arrow_schema::SortOptions)> {
+) -> Option<(Vec<RecordBatch>, arrow_schema::SortOptions, String)> {
     use arrow::compute::{concat_batches, lexsort_to_indices, take_record_batch, SortColumn};
     let first = ordering.first();
     let col = first
         .expr
         .as_any()
         .downcast_ref::<datafusion::physical_expr::expressions::Column>()?;
-    if col.name() != "timestamp" {
-        return None;
-    }
-    let ts_idx = schema.index_of("timestamp").ok()?;
+    let ts_idx = schema.index_of(col.name()).ok()?;
     let combined = concat_batches(schema, batches).ok()?;
     let sort_col = SortColumn {
         values: combined.column(ts_idx).clone(),
@@ -966,12 +965,12 @@ fn sort_batches_like(
     let indices = lexsort_to_indices(&[sort_col], None).ok()?;
     take_record_batch(&combined, &indices)
         .ok()
-        .map(|b| (vec![b], first.options))
+        .map(|b| (vec![b], first.options, col.name().to_string()))
 }
 
-/// Rebuild the timestamp ordering against `plan`'s (possibly projected)
-/// schema. `None` when `timestamp` didn't survive the projection.
-fn projected_timestamp_ordering(
+/// Rebuild the base scan's event-time ordering against `plan`'s (possibly
+/// projected) schema. `None` when that column didn't survive the projection.
+fn projected_event_time_ordering(
     plan: &Arc<dyn ExecutionPlan>,
     base_ordering: &Option<datafusion::physical_expr::LexOrdering>,
 ) -> Option<datafusion::physical_expr::LexOrdering> {
@@ -979,10 +978,16 @@ fn projected_timestamp_ordering(
         expressions::Column as PhysColumn, LexOrdering, PhysicalSortExpr,
     };
     let first = base_ordering.as_ref()?.first();
+    let name = first
+        .expr
+        .as_any()
+        .downcast_ref::<PhysColumn>()?
+        .name()
+        .to_string();
     let schema = plan.schema();
-    let idx = schema.index_of("timestamp").ok()?;
+    let idx = schema.index_of(&name).ok()?;
     LexOrdering::new(vec![PhysicalSortExpr::new(
-        Arc::new(PhysColumn::new("timestamp", idx)),
+        Arc::new(PhysColumn::new(&name, idx)),
         first.options,
     )])
 }
@@ -1087,15 +1092,20 @@ impl TableProvider for UnionEventsProvider {
         );
         let (buffer, sorted) = match &base_ordering {
             Some(ordering) => match sort_batches_like(&batches, ordering, &self.schema) {
-                Some((sorted_batches, options)) => {
+                Some((sorted_batches, options, field)) => {
                     // Physically sorted AND declared: the physical optimizer
                     // re-plans around whatever we return (it replaced an
                     // undeclared-but-sorted memtable with a full-scan TopK on
                     // the live cluster), so the DECLARATION is what lets
                     // EnforceSorting turn the query's Sort into a fetch-
                     // limited merge over the union's sorted partitions.
+                    // `col()` would normalize an unquoted mixed-case mapping
+                    // field to lower case and name a column that isn't there;
+                    // the sorted column is known exactly here.
                     let sort_expr = datafusion::logical_expr::SortExpr::new(
-                        datafusion::prelude::col("timestamp"),
+                        datafusion::logical_expr::Expr::Column(
+                            datafusion::common::Column::new_unqualified(&field),
+                        ),
                         !options.descending,
                         options.nulls_first,
                     );
@@ -1130,7 +1140,7 @@ impl TableProvider for UnionEventsProvider {
             // Re-derive the ordering against the PROJECTED schema (column
             // indices shift under projection); fall back to the plain union
             // when the sort column was projected out.
-            if let Some(ordering) = projected_timestamp_ordering(&union, &base_ordering) {
+            if let Some(ordering) = projected_event_time_ordering(&union, &base_ordering) {
                 tracing::debug!("wal-buffer union: SPM applied");
                 return Ok(Arc::new(
                     datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec::new(

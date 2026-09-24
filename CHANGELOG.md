@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Query (feature, behaviour change)**: a managed index whose doc mapping
+  names its own `timestamp_field` now browses newest-first on that field. A
+  bare interactive `SELECT` over such an index is rewritten with a quoted
+  `ORDER BY "<field>" DESC` (the canonical `timestamp` is still written bare),
+  and the scan hint the planner sends storage carries the field as well as the
+  direction. The scan advertises an ordering only after proving that field is
+  the table's identity sort lead and reads as a timestamp, and then uses it for
+  filter eligibility, projection, per-file bounds, reverse reading, the overlap
+  merge, frontier pruning and the ordered-plan cache key; a mismatch keeps
+  DataFusion's blocking sort, so a column merely NAMED `timestamp` on such an
+  index is never mistaken for a time order. Explicit `ORDER BY`,
+  `default_order: false`, batch requests, alias shadowing and canonical indexes
+  behave as before. No schema field is added and no tie order is promised:
+  rows sharing a custom event time may come back in any order among themselves
+  (`docs/LIMITATIONS.md`). (#6020)
+
 - **Operator (feature)**: `spec.autoscaling.compactor.min: 0` is accepted under
   the catalog-claim drain (`compactor.max` above 1) with `ewmaHalfLifeSecs`
   above 0. The reading that asks a parked tier back is published by the

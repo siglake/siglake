@@ -608,13 +608,45 @@ pub struct ClippedAdmissionWave {
     pub factor: usize,
 }
 
-/// Per-request preferred output direction for a `timestamp`-ordered scan.
-/// Injected through `SessionConfig` so the scan can serve the opposite of the
-/// declared on-disk direction when it can still prove correctness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Per-request preferred output order for an event-time-ordered scan: the
+/// exact field the query orders by, and the direction. Injected through
+/// `SessionConfig` so the scan can serve the opposite of the declared on-disk
+/// direction when it can still prove correctness.
+///
+/// The FIELD is part of the hint because a managed index's event time is
+/// whatever its mapping's `timestamp_field` names, not necessarily `timestamp`
+/// (#6020). A direction-only hint cannot prove that the query's `ORDER BY` and
+/// the table's identity sort lead describe the same value, and a custom mapping
+/// may carry an unrelated column called `timestamp` beside its real event time.
+/// [`scan_output_ordering`] accepts the hint only when this field IS the
+/// identity sort lead of the scanned table; anything else keeps the blocking
+/// sort.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreferredScanOrder {
     pub descending: bool,
+    /// The event-time field the query orders by, exactly as it is spelled in
+    /// the table schema (case-sensitive).
+    pub field: Arc<str>,
 }
+
+impl PreferredScanOrder {
+    /// A hint naming `field` explicitly.
+    pub fn new(field: impl Into<Arc<str>>, descending: bool) -> Self {
+        Self {
+            descending,
+            field: field.into(),
+        }
+    }
+
+    /// A hint for the canonical `timestamp` event time.
+    pub fn timestamp(descending: bool) -> Self {
+        Self::new(CANONICAL_EVENT_TIME_FIELD, descending)
+    }
+}
+
+/// The event-time field of the canonical `events` table and of every managed
+/// index whose mapping does not name another one.
+pub const CANONICAL_EVENT_TIME_FIELD: &str = "timestamp";
 
 /// Per-session override of the ordered-merge GLOBAL fan-in budget: the total
 /// overlap streams one ordered scan may hold open across all its partitions
@@ -2353,6 +2385,12 @@ pub struct SiglakeIcebergTableScan {
     preserve_task_order: bool,
     /// Requested lead direction (for building the merge sort expr).
     sort_descending: bool,
+    /// The event-time field this scan orders on — the session hint's field,
+    /// proven against the table's identity sort lead by
+    /// [`scan_output_ordering`]. Every execute-time ordered path (the k-way
+    /// merge's sort expression, the frontier values that prune merge inputs,
+    /// the eager cluster sort) reads this column and no other.
+    sort_field: Arc<str>,
     /// True when the reader must iterate files / row groups / rows in reverse
     /// to serve the opposite of the table's declared on-disk direction.
     reverse_scan: bool,
@@ -2591,6 +2629,18 @@ impl SiglakeIcebergTableScan {
         let projected_columns = Arc::new(get_schema_column_names(&output_schema));
         let projection = get_column_names(schema.clone(), projection);
         let has_pushed_filters = !filters.is_empty();
+        // The event-time field this request's order contract is about (#6020).
+        // The session hint names it; a session without one is either unordered
+        // or one of the pre-#6020 internal callers, and those mean the
+        // canonical column. Every ordered-read dependency below reads THIS
+        // name, and `scan_output_ordering` refuses unless it is the table's
+        // identity sort lead — so a hint naming the wrong field costs the
+        // advertisement, never a wrong answer.
+        let order_field: Arc<str> = state
+            .config()
+            .get_extension::<PreferredScanOrder>()
+            .map(|order| order.field.clone())
+            .unwrap_or_else(|| Arc::from(CANONICAL_EVENT_TIME_FIELD));
         let predicates = PredicateConverter::new(&schema).convert_filters(filters);
         let text_tokenizers = loaded_table_index_config(&table)
             .map_err(|e| DataFusionError::External(e.into()))?
@@ -2698,7 +2748,7 @@ impl SiglakeIcebergTableScan {
             .get_extension::<OrderedResidualHint>()
             .map(|h| h.allow)
             .unwrap_or(false);
-        let filtered_scan = ((has_pushed_filters && !time_only_filters(filters))
+        let filtered_scan = ((has_pushed_filters && !time_only_filters(filters, &order_field))
             || raw_prune_spec.is_some()
             || !promoted_prune.is_empty())
             && !allow_residual;
@@ -2732,6 +2782,7 @@ impl SiglakeIcebergTableScan {
                     &table,
                     snapshot_id,
                     desc,
+                    &order_field,
                     small_limit_hint,
                     &task_partitions,
                     cache_tuning,
@@ -2739,8 +2790,11 @@ impl SiglakeIcebergTableScan {
             });
             let cached = cache_key.and_then(ordered_plan_cache_get);
             let mut served_from_cache = None;
+            // A cache hit rebuilds the physical expression for the SAME field
+            // whose proof was cached — the key carries the field, so a hit can
+            // only be an entry proven for `order_field`.
             if let (Some(cached_plan), Ok(idx)) =
-                (cached.as_ref(), output_schema.index_of("timestamp"))
+                (cached.as_ref(), output_schema.index_of(&order_field))
             {
                 if apply_cached_ordered_plan(cached_plan, &mut task_partitions).is_some() {
                     metrics::counter!(
@@ -2751,7 +2805,7 @@ impl SiglakeIcebergTableScan {
                     served_from_cache = Some(ScanOrderingDecision::advertised(
                         ScanOrderingPlan {
                             exprs: vec![PhysicalSortExpr::new(
-                                Arc::new(Column::new("timestamp", idx)),
+                                Arc::new(Column::new(&order_field, idx)),
                                 SortOptions {
                                     descending: cached_plan.descending,
                                     nulls_first: cached_plan.descending,
@@ -2778,6 +2832,7 @@ impl SiglakeIcebergTableScan {
                         &table,
                         snapshot_id,
                         &output_schema,
+                        &order_field,
                         &mut task_partitions,
                         state,
                     )
@@ -2976,6 +3031,7 @@ impl SiglakeIcebergTableScan {
             ts_bounds,
             preserve_task_order,
             sort_descending,
+            sort_field: order_field.clone(),
             reverse_scan,
             partition_clusters: Arc::new(partition_clusters),
             ordering_outcome,
@@ -2988,7 +3044,7 @@ impl SiglakeIcebergTableScan {
                 .map(|l| l.limit)
                 .filter(|&l| l > 0),
             ordered_source_limit_safe: preserve_task_order
-                && (!has_pushed_filters || time_only_filters(filters)),
+                && (!has_pushed_filters || time_only_filters(filters, &order_field)),
             text_index_decline,
             query_execution_id,
             scan_id,
@@ -3171,6 +3227,7 @@ impl SiglakeIcebergTableScan {
         Ok(eager_sort_record_batch_stream(
             streams,
             schema,
+            self.sort_field.clone(),
             self.sort_descending,
             reservation,
         ))
@@ -3189,7 +3246,7 @@ impl SiglakeIcebergTableScan {
         schema: ArrowSchemaRef,
     ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
         let reader_tuning = self.reader_tuning;
-        let col = Column::new_with_schema("timestamp", schema.as_ref())?;
+        let col = Column::new_with_schema(&self.sort_field, schema.as_ref())?;
         let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
             Arc::new(col),
             SortOptions {
@@ -3231,15 +3288,17 @@ impl SiglakeIcebergTableScan {
             .max(1)
             .min(limit.expect("checked above"));
         let prepare_schema = schema.clone();
+        let sort_field = self.sort_field.clone();
         let prepared = async move {
             let admitted = frontier_pruned_merge_inputs(
                 inputs,
                 limit.expect("checked above"),
                 descending,
                 prepare_schema.clone(),
+                &sort_field,
             )
             .await?;
-            let col = Column::new_with_schema("timestamp", prepare_schema.as_ref())?;
+            let col = Column::new_with_schema(&sort_field, prepare_schema.as_ref())?;
             let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
                 Arc::new(col),
                 SortOptions {
@@ -3296,8 +3355,9 @@ async fn frontier_pruned_merge_inputs(
     limit: usize,
     descending: bool,
     schema: ArrowSchemaRef,
+    sort_field: &str,
 ) -> DFResult<Vec<SendableRecordBatchStream>> {
-    let timestamp_idx = schema.index_of("timestamp")?;
+    let timestamp_idx = schema.index_of(sort_field)?;
     let mut admitted = Vec::new();
     let mut frontier_values = Vec::new();
     let mut inputs = inputs.into_iter().peekable();
@@ -3383,18 +3443,19 @@ fn bound_is_strictly_behind(nth: i64, bound: Option<i64>, descending: bool) -> b
 ///
 /// Soundness — all three must hold, else we return `None` (the optimizer keeps
 /// its `Sort`, correct but not early-stopping):
-/// Whether every pushed filter references ONLY the `timestamp` column (the
-/// gate's required sort lead). Such predicates are time windows — consumed by
-/// manifest file-pruning, invisible to row order within the surviving files —
-/// so they don't disqualify ordered advertisement the way residual
-/// dimensional/FTS filters do. Empty column sets (literal-only exprs) count
-/// as NOT time-only, conservatively.
-fn time_only_filters(filters: &[Expr]) -> bool {
+/// Whether every pushed filter references ONLY `order_field`, the event-time
+/// column this request's order contract is about (the gate's required sort
+/// lead). Such predicates are time windows — consumed by manifest
+/// file-pruning, invisible to row order within the surviving files — so they
+/// don't disqualify ordered advertisement the way residual dimensional/FTS
+/// filters do. Empty column sets (literal-only exprs) count as NOT time-only,
+/// conservatively.
+fn time_only_filters(filters: &[Expr], order_field: &str) -> bool {
     filters.iter().all(|f| {
         let mut cols = std::collections::HashSet::new();
         datafusion::logical_expr::utils::expr_to_columns(f, &mut cols).is_ok()
             && !cols.is_empty()
-            && cols.iter().all(|c| c.name == "timestamp")
+            && cols.iter().all(|c| c.name == order_field)
     })
 }
 
@@ -3427,19 +3488,38 @@ async fn scan_output_ordering(
     table: &Table,
     snapshot_id: Option<i64>,
     output_schema: &ArrowSchemaRef,
+    order_field: &str,
     task_partitions: &mut Vec<Vec<FileScanTask>>,
     state: &dyn Session,
 ) -> ScanOrderingDecision {
     let global_fan_in_budget = ordered_merge_global_fanin_for(state);
     let merge_max_fan_in = ordered_merge_max_fanin_for(state);
     let sort_cluster_max_rows = ordered_sort_cluster_max_rows_for(state);
-    // (2) timestamp projected.
-    let idx = match output_schema.index_of("timestamp") {
+    // (2) the event-time field is projected.
+    let idx = match output_schema.index_of(order_field) {
         Ok(idx) => idx,
         Err(_) => {
             return ScanOrderingDecision::refused("not_projected", 0, 0, global_fan_in_budget);
         }
     };
+    // (2b) …and reads as a timestamp. Every ordered-read dependency below
+    // treats the column's values and its manifest bounds as `i64` microseconds
+    // (see [`timestamp_bound_values`] and [`per_file_timestamp_bounds`]); a
+    // field of some other Arrow type would compare fine inside the merge but
+    // could not be pruned against those bounds. A managed mapping compiles its
+    // event time to a required microsecond timestamp, so this only refuses a
+    // hint that named something else.
+    if !matches!(
+        output_schema.field(idx).data_type(),
+        arrow_schema::DataType::Timestamp(_, _)
+    ) {
+        metrics::counter!(
+            "siglake_query_scan_output_ordering_total",
+            "outcome" => "unsupported_sort_type"
+        )
+        .increment(1);
+        return ScanOrderingDecision::refused("unsupported_sort_type", 0, 0, global_fan_in_budget);
+    }
     // (1) declared sort order leads with timestamp under the identity
     // transform; the declared direction is the direction we advertise.
     let meta = table.metadata();
@@ -3454,8 +3534,18 @@ async fn scan_output_ordering(
     let Some(lead_field) = iceberg_schema.field_by_id(lead.source_id) else {
         return ScanOrderingDecision::refused("missing_sort_field", 0, 0, global_fan_in_budget);
     };
-    if lead_field.name != "timestamp" {
-        return ScanOrderingDecision::refused("non_timestamp_sort", 0, 0, global_fan_in_budget);
+    // The field identity proof: the column the request orders by must BE the
+    // table's identity sort lead. Without it a plan could omit its blocking
+    // sort while the reader merges a different column (#6020). A canonical
+    // request keeps its own refusal label so the existing counter series means
+    // what it always did.
+    if lead_field.name != order_field {
+        let outcome = if order_field == CANONICAL_EVENT_TIME_FIELD {
+            "non_timestamp_sort"
+        } else {
+            "sort_field_mismatch"
+        };
+        return ScanOrderingDecision::refused(outcome, 0, 0, global_fan_in_budget);
     }
     // (1b) On-disk direction. A table that has ever REPLACED its sort order
     // (the DESC→ASC convergence migration) can hold files written under
@@ -3867,7 +3957,7 @@ async fn scan_output_ordering(
             global_fan_in_budget,
         );
     }
-    let Some(col) = Column::new_with_schema("timestamp", output_schema).ok() else {
+    let Some(col) = Column::new_with_schema(order_field, output_schema).ok() else {
         metrics::counter!(
             "siglake_query_scan_output_ordering_total",
             "outcome" => "missing_sort_column"
@@ -4171,6 +4261,7 @@ impl Stream for ReservedEagerSortStream {
 fn eager_sort_record_batch_stream(
     streams: Vec<TaskBatchStream>,
     schema: ArrowSchemaRef,
+    sort_field: Arc<str>,
     descending: bool,
     mut reservation: datafusion::execution::memory_pool::MemoryReservation,
 ) -> TaskBatchStream {
@@ -4211,7 +4302,7 @@ fn eager_sort_record_batch_stream(
         }
 
         let ts_idx = schema
-            .index_of("timestamp")
+            .index_of(&sort_field)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         if batches.is_empty() {
             let output = RecordBatch::new_empty(schema);
@@ -4332,6 +4423,7 @@ fn ordered_plan_cache_key(
     table: &Table,
     snapshot_id: Option<i64>,
     requested_descending: bool,
+    order_field: &str,
     small_limit: bool,
     task_partitions: &[Vec<FileScanTask>],
     tuning: OrderedPlanCacheTuning,
@@ -4343,6 +4435,9 @@ fn ordered_plan_cache_key(
     table.metadata().uuid().hash(&mut h);
     snapshot.hash(&mut h);
     requested_descending.hash(&mut h);
+    // The arrangement is proven for ONE event-time field; an entry may only be
+    // reconstructed for the field it was planned on (#6020).
+    order_field.hash(&mut h);
     small_limit.hash(&mut h);
     task_partitions.len().hash(&mut h);
     // The tuning knobs are inputs to the plan function too — hashing them
@@ -7725,13 +7820,14 @@ mod tests {
         assert!(!bound_is_strictly_behind(100, None, false));
     }
 
-    /// #4073 qualification: a managed index is physically sorted by its
-    /// declared custom event-time field, but the ordered scan must keep
-    /// refusing that order until every timestamp-specific reader path carries
-    /// the field identity. The blocking SQL sort remains the correctness path,
-    /// including when LIMIT cuts through duplicate event times.
+    /// #6020: a managed index is physically sorted by its declared custom
+    /// event-time field, and the ordered scan advertises exactly that field
+    /// when the request's hint names it — including across overlapping files
+    /// whose LIMIT cuts through duplicate event times. A hint for any other
+    /// field (the canonical `timestamp`, which this mapping also carries as an
+    /// unrelated column) keeps the blocking sort.
     #[tokio::test]
-    async fn custom_event_time_sort_is_stored_but_not_advertised() {
+    async fn custom_event_time_sort_is_advertised_for_its_own_field() {
         use arrow_array::{StringArray, TimestampMicrosecondArray};
         use datafusion::physical_plan::displayable;
         use siglake_core::index_config::{
@@ -7767,8 +7863,20 @@ mod tests {
                         .with_timezone(siglake_core::TIMESTAMP_TZ),
                     ),
                     // Deliberately unrelated to the mapping's event time. Its
-                    // presence gets past the projection guard and proves that
-                    // the refusal is specifically `non_timestamp_sort`.
+                    // presence gets past the projection guard, so a hint that
+                    // names it is refused on the sort lead and not on a missing
+                    // column.
+                    Arc::new(
+                        TimestampMicrosecondArray::from(
+                            rows.iter()
+                                .map(|(_, timestamp, _)| Some(*timestamp))
+                                .collect::<Vec<_>>(),
+                        )
+                        .with_timezone(siglake_core::TIMESTAMP_TZ),
+                    ),
+                    // A second datetime column that is neither the event time
+                    // nor the canonical name: the control for a hint that names
+                    // a real timestamp field the table is not sorted by.
                     Arc::new(
                         TimestampMicrosecondArray::from(
                             rows.iter()
@@ -7799,6 +7907,7 @@ mod tests {
                 field_mappings: vec![
                     datetime_field("ts"),
                     datetime_field("timestamp"),
+                    datetime_field("other_ts"),
                     text_field("message"),
                 ],
                 timestamp_field: "ts".to_string(),
@@ -7831,9 +7940,15 @@ mod tests {
         let ctx = crate::session_context_with_order(
             Some(2),
             None,
-            Some(PreferredScanOrder { descending: true }),
+            Some(PreferredScanOrder::new("ts", true)),
         );
         let state = ctx.state();
+        let canonical_ctx = crate::session_context_with_order(
+            Some(2),
+            None,
+            Some(PreferredScanOrder::timestamp(true)),
+        );
+        let canonical_state = canonical_ctx.state();
 
         let canonical_config = IndexConfig {
             index_id: "canonical-time".to_string(),
@@ -7845,23 +7960,78 @@ mod tests {
             &canonical_table,
             None,
             &canonical_config.to_arrow_schema(),
+            "timestamp",
             &mut Vec::new(),
-            &state,
+            &canonical_state,
         )
         .await;
         assert_eq!(canonical_decision.outcome, "advertised");
         assert!(canonical_decision.plan.is_some());
 
+        // The custom table, hinted with its own field: advertised, on `ts`.
         let decision = scan_output_ordering(
             &table,
             None,
             &config.to_arrow_schema(),
+            "ts",
             &mut Vec::new(),
             &state,
         )
         .await;
-        assert_eq!(decision.outcome, "non_timestamp_sort");
-        assert!(decision.plan.is_none());
+        assert_eq!(decision.outcome, "advertised");
+        let plan = decision.plan.expect("custom event-time ordering plan");
+        assert_eq!(
+            plan.exprs
+                .iter()
+                .map(|expr| expr.expr.to_string())
+                .collect::<Vec<_>>(),
+            vec!["ts@0".to_string()],
+            "the advertised order must name the mapping's event-time field"
+        );
+        assert!(plan.descending);
+
+        // The unrelated `timestamp` column of the same table is NOT a time
+        // order: its sort lead is `ts`, so the canonical hint is refused.
+        let mismatched = scan_output_ordering(
+            &table,
+            None,
+            &config.to_arrow_schema(),
+            "timestamp",
+            &mut Vec::new(),
+            &canonical_state,
+        )
+        .await;
+        assert_eq!(mismatched.outcome, "non_timestamp_sort");
+        assert!(mismatched.plan.is_none());
+
+        // Another real timestamp column of the same table is refused too — the
+        // proof is the identity sort lead, not the column's type.
+        let crossed = scan_output_ordering(
+            &table,
+            None,
+            &config.to_arrow_schema(),
+            "other_ts",
+            &mut Vec::new(),
+            &state,
+        )
+        .await;
+        assert_eq!(crossed.outcome, "sort_field_mismatch");
+        assert!(crossed.plan.is_none());
+
+        // A hint naming a column that is not a timestamp at all never reaches
+        // the sort-lead question: the bounds machinery below it reads i64
+        // microseconds.
+        let untyped = scan_output_ordering(
+            &table,
+            None,
+            &config.to_arrow_schema(),
+            "message",
+            &mut Vec::new(),
+            &state,
+        )
+        .await;
+        assert_eq!(untyped.outcome, "unsupported_sort_type");
+        assert!(untyped.plan.is_none());
 
         ice.append_to_table(
             &ident,
@@ -7908,37 +8078,96 @@ mod tests {
             );
         }
 
+        // End to end over the two OVERLAPPING files (10..30 and 20..40), with
+        // the LIMIT cutting through three equal `ts` values. The hinted field
+        // is the sort lead, so the plan early-stops without a blocking sort and
+        // still returns the newest five event times. WHICH rows carry the
+        // boundary 20s is deliberately unspecified — a custom event time has no
+        // `timestamp_ns` tiebreak — but the VALUES are determined.
         ice.register_index_with_datafusion(&ctx, "custom-time")
             .await
             .unwrap();
-        let df = ctx
-            .sql(
-                "SELECT ts, timestamp, message FROM \"custom-time\" \
-                 ORDER BY ts DESC LIMIT 5",
-            )
-            .await
-            .unwrap();
+        let sql = "SELECT ts, timestamp, message FROM \"custom-time\" ORDER BY ts DESC LIMIT 5";
+        let df = ctx.sql(sql).await.unwrap();
         let plan = df.clone().create_physical_plan().await.unwrap();
         let plan = format!("{}", displayable(plan.as_ref()).indent(true));
         assert!(
-            plan.contains("SortExec"),
-            "the unadvertised custom event-time order must keep its blocking sort:\n{plan}"
+            !plan.contains("SortExec"),
+            "the advertised custom event-time order must elide the blocking sort:\n{plan}"
         );
-        let times = df
-            .collect()
+        let event_times = |batches: &[RecordBatch]| {
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    let ts = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap();
+                    (0..ts.len()).map(|row| ts.value(row)).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            event_times(&df.collect().await.unwrap()),
+            vec![40, 35, 30, 20, 20]
+        );
+
+        // The same rows through the k-way overlap merge and its source-level
+        // frontier pruning: one partition, a small ordered LIMIT. Both read the
+        // custom field's values and bounds.
+        let merged_ctx = {
+            let mut merged = crate::session_context_with_order(
+                Some(1),
+                None,
+                Some(PreferredScanOrder::new("ts", true)),
+            )
+            .state();
+            merged
+                .config_mut()
+                .set_extension(Arc::new(OrderedScanLimit { limit: 5 }));
+            datafusion::prelude::SessionContext::new_with_state(merged)
+        };
+        ice.register_index_with_datafusion(&merged_ctx, "custom-time")
+            .await
+            .unwrap();
+        let merged = merged_ctx.sql(sql).await.unwrap();
+        let merged_plan = merged.clone().create_physical_plan().await.unwrap();
+        let merged_plan = format!("{}", displayable(merged_plan.as_ref()).indent(true));
+        assert!(
+            !merged_plan.contains("SortExec"),
+            "the coalesced ordered scan must early-stop too:\n{merged_plan}"
+        );
+        assert_eq!(
+            event_times(&merged.collect().await.unwrap()),
+            vec![40, 35, 30, 20, 20]
+        );
+
+        // A canonical-field request over the same index keeps its sort: the
+        // column exists, but nothing proves it is a time order.
+        let unrelated_ctx = crate::session_context_with_order(
+            Some(2),
+            None,
+            Some(PreferredScanOrder::timestamp(true)),
+        );
+        ice.register_index_with_datafusion(&unrelated_ctx, "custom-time")
+            .await
+            .unwrap();
+        let unrelated_plan = unrelated_ctx
+            .sql(
+                "SELECT ts, timestamp, message FROM \"custom-time\" \
+                 ORDER BY timestamp DESC LIMIT 5",
+            )
             .await
             .unwrap()
-            .iter()
-            .flat_map(|batch| {
-                let ts = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()
-                    .unwrap();
-                (0..ts.len()).map(|row| ts.value(row)).collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(times, vec![40, 35, 30, 20, 20]);
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let unrelated_plan = format!("{}", displayable(unrelated_plan.as_ref()).indent(true));
+        assert!(
+            unrelated_plan.contains("SortExec"),
+            "an unrelated `timestamp` column must keep its blocking sort:\n{unrelated_plan}"
+        );
     }
 
     /// The decline is a three-input decision and the scan that consumes it
@@ -9494,6 +9723,7 @@ mod tests {
         let mut refused = eager_sort_record_batch_stream(
             ordered_sort_test_streams(&batches),
             schema.clone(),
+            Arc::from("timestamp"),
             false,
             refused_reservation,
         );
@@ -9522,6 +9752,7 @@ mod tests {
         let mut admitted = eager_sort_record_batch_stream(
             ordered_sort_test_streams(&batches),
             schema,
+            Arc::from("timestamp"),
             false,
             admitted_reservation,
         );

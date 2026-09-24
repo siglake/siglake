@@ -21233,36 +21233,43 @@ impl IcebergContext {
         Ok(true)
     }
 
-    /// Whether `index_id` names a managed index whose event-time field is the
-    /// canonical `timestamp` column — the eligibility test for the query
-    /// server's implicit newest-first rewrite.
+    /// The event-time field of `index_id`: the exact column a newest-first
+    /// browse of that index orders by, and the field its identity sort order
+    /// leads with (`create_index` declares the two together).
     ///
-    /// `false` for a name that is not a table in this context's namespace, for
-    /// a namespace table that carries no doc mapping (`webhook_dlq` and
-    /// friends), and for an index whose mapping names some other
-    /// `timestamp_field`: such an index may still carry an unrelated column
-    /// called `timestamp`, and ordering by it would stamp an order that is not
-    /// a time order — the same reason [`Self::create_index`] withholds the
-    /// `timestamp_ns` sort tiebreak there.
+    /// `None` for a name that is not a table in this context's namespace and
+    /// for a namespace table that carries no doc mapping (`webhook_dlq` and
+    /// friends). `Some("timestamp")` for the canonical `events` table. For a
+    /// managed index it is the mapping's `timestamp_field` — validated at
+    /// create time as a required, non-optional `Datetime` and immutable for
+    /// the table incarnation (`IndexConfig::validate`, `validate_index_update`),
+    /// so the name alone is authority for the field's identity and type.
+    ///
+    /// A mapping that names something other than `timestamp` may still carry
+    /// an unrelated column CALLED `timestamp`; a caller must order by the name
+    /// returned here and nothing else — the same reason [`Self::create_index`]
+    /// withholds the `timestamp_ns` sort tiebreak from such an index.
     ///
     /// Reads the bounded-staleness table cache, never `load_table`: the
     /// uncached lookup re-reads the (bloated) metadata.json from S3 on every
     /// query, measured at ~59 ms and documented on
     /// [`Self::register_index_with_datafusion`].
-    pub async fn index_orders_by_canonical_timestamp(&self, index_id: &str) -> Result<bool> {
+    pub async fn index_event_time_field(&self, index_id: &str) -> Result<Option<String>> {
         if index_id == TABLE_NAME {
-            return Ok(true);
+            return Ok(Some(
+                crate::query_provider::CANONICAL_EVENT_TIME_FIELD.to_string(),
+            ));
         }
         let table_ident = self.index_table_ident(index_id);
         if !self.catalog().table_exists(&table_ident).await? {
-            return Ok(false);
+            return Ok(None);
         }
         let cached = self.cached_table_entry(&table_ident).await?;
         let Some(config) = crate::index_manager::index_config_from_table(index_id, &cached.table)?
         else {
-            return Ok(false);
+            return Ok(None);
         };
-        Ok(config.doc_mapping.timestamp_field == "timestamp")
+        Ok(Some(config.doc_mapping.timestamp_field))
     }
 
     /// One managed index's stored configuration for a query-time mapping read.

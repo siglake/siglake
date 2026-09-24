@@ -53,7 +53,7 @@ fn browse_context() -> SessionContext {
     let base = siglake_storage::session_context_with_order(
         Some(8),
         None,
-        Some(PreferredScanOrder { descending: true }),
+        Some(PreferredScanOrder::timestamp(true)),
     );
     let mut state = base.state();
     state
