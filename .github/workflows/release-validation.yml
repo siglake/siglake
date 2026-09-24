@@ -1,0 +1,67 @@
+name: Public release validation
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Workload duration (long runs require a dedicated self-hosted runner)
+        type: choice
+        options: [smoke, 24h, 72h]
+        default: smoke
+      version:
+        description: Published version, or both
+        type: choice
+        options: [both, v0.1.0, v0.2.0]
+        default: both
+permissions:
+  contents: read
+jobs:
+  smoke:
+    if: inputs.profile == 'smoke'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [v0.1.0, v0.2.0]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate published artifact
+        if: inputs.version == 'both' || inputs.version == matrix.version
+        run: python3 scripts/release-validation/run.py --version '${{ matrix.version }}' --profile smoke --out '${{ runner.temp }}/release-validation'
+      - name: Recover interrupted resources
+        if: always()
+        run: python3 scripts/release-validation/recover.py '${{ runner.temp }}/release-validation'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-validation-${{ matrix.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-validation
+          retention-days: 90
+  burn-in:
+    if: inputs.profile != 'smoke'
+    # Dedicated trusted runner; never triggered by untrusted pull requests.
+    runs-on: [self-hosted, linux, siglake-validation]
+    timeout-minutes: 4500
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        version: [v0.1.0, v0.2.0]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Sustained public-artifact validation
+        if: inputs.version == 'both' || inputs.version == matrix.version
+        run: python3 scripts/release-validation/run.py --version '${{ matrix.version }}' --profile '${{ inputs.profile }}' --out '${{ runner.temp }}/release-validation-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.version }}'
+      - name: Recover interrupted resources
+        if: always()
+        run: python3 scripts/release-validation/recover.py '${{ runner.temp }}/release-validation-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.version }}'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-validation-${{ matrix.version }}-${{ inputs.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-validation-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.version }}
+          retention-days: 90
