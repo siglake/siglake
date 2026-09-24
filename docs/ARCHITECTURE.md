@@ -101,9 +101,15 @@ lane's task-owned writer, and uploads one
 `_active/<tenant>[/<index>]/<segment>.arrow.partial` per writer whose segment
 grew since the last tick. The flush happens under the writer's own lock (or
 inside its lane task) and the PUT outside it, so no acknowledgement waits on
-object storage. Once the matching sealed object is confirmed — by the normal
-uploader, its ambiguous-error STAT, or the catch-up sweep — the uploader
-deletes that exact active sibling. The active PUT also checks for its sealed
+object storage. Each uploader counts its own requests and bytes —
+`siglake_wal_mirror_upload_attempts_total{path="sealed"|"active"}` moves once
+per PUT attempt, retries included, and
+`siglake_wal_mirror_active_bytes_uploaded_total` is the active loop's share of
+the shared `siglake_wal_mirror_bytes_uploaded_total` — so what active mirroring
+adds to an object-store bill is readable without running it alone. Once the
+matching sealed object is confirmed — by the normal uploader, its
+ambiguous-error STAT, or the catch-up sweep — the uploader deletes that exact
+active sibling. The active PUT also checks for its sealed
 sibling after writing, which closes the ordering where it started before the
 seal but landed after the sealed uploader's delete. Cleanup retries transient
 DELETE errors without delaying or suppressing catalog registration. It does

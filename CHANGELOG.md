@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **WAL mirror observability (feature)**: the two uploaders now report their
+  own object-store cost. `siglake_wal_mirror_upload_attempts_total{path}` counts
+  one per PUT attempt on each path, so a sealed segment that succeeds on its
+  third try counts three where `siglake_wal_mirror_segments_total{outcome="ok"}`
+  counts one, and `siglake_wal_mirror_active_bytes_uploaded_total` carries the
+  active loop's share of `siglake_wal_mirror_bytes_uploaded_total` — which keeps
+  counting both paths, so the sealed bytes are the difference. Both series, and
+  both `path` values, are created at 0 when either uploader starts, so a flat
+  series reads as an uploader that sent nothing rather than one that is not
+  exporting. `path="sealed"` counts retry-loop iterations, which exceeds the
+  requests made in the rare case where an attempt fails before its PUT (a local
+  segment that vanished or would not read). No existing metric name, label set
+  or increment changes. (#6034)
+
 - **Query (feature, behaviour change)**: a managed index whose doc mapping
   names its own `timestamp_field` now browses newest-first on that field. A
   bare interactive `SELECT` over such an index is rewritten with a quoted

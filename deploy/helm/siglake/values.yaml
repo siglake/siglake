@@ -890,6 +890,22 @@ wal:
   # tick — see `activeIntervalSecs`), which is what an S3 bill sees; on S3 the
   # backlog follows remote PUT latency, and no AWS measurement has been taken.
   #
+  # What the pods export for that bill:
+  #  - `siglake_wal_mirror_upload_attempts_total{path="sealed"|"active"}` —
+  #    one per PUT ATTEMPT, so a sealed segment retried twice counts twice.
+  #    Every other counter here records a result, and a request that failed is
+  #    charged all the same. `path="sealed"` counts a retry loop's iterations,
+  #    which is one more than its requests in the rare case where the attempt
+  #    failed before its PUT (the local file vanished or would not read);
+  #    those come with `siglake_wal_mirror_failures_total`.
+  #  - `siglake_wal_mirror_active_bytes_uploaded_total` — the active loop's
+  #    share of `siglake_wal_mirror_bytes_uploaded_total`, which keeps counting
+  #    both paths, so the sealed bytes are the difference. An open segment is
+  #    re-sent whole on every tick it grew, so this rises faster than the rows
+  #    do; at `activeIntervalSecs: 0` it stays at 0.
+  # All of these exist at 0 before the first upload, so a flat series means the
+  # uploader sent nothing rather than that nothing is exporting.
+  #
   # Two things to set alongside it:
   #  - Nothing deletes mirror objects unless `compactor.catalogClaim.enabled`
   #    is on: that drain claims from the mirror and purges what it committed.
