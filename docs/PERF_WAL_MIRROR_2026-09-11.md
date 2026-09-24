@@ -104,7 +104,14 @@ none of its own.
   default single-replica FS drain never reads the mirror, which is the README
   limitation this flip makes reachable.
 - **The active-segment mirror** (`activeIntervalSecs > 0`), off by default and
-  off here.
+  off here. A later round can separate it without a second arm: since #6034 the
+  active loop charges its bodies to
+  `siglake_wal_mirror_active_bytes_uploaded_total` and its PUTs to
+  `siglake_wal_mirror_upload_attempts_total{path="active"}`, so the sealed
+  bytes are `siglake_wal_mirror_bytes_uploaded_total` minus the active ones and
+  the request count is read per path rather than inferred from seals. The
+  numbers above predate those counters and were taken with the loop off, so
+  they report the sealed path alone either way.
 - **Multi-tenant fan-out.** One writer, one index; per-tenant writers each hold
   their own mirror handle.
 
