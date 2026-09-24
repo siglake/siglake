@@ -8064,6 +8064,29 @@ pub fn query_prewarm_enabled() -> bool {
 ///   `hit` — parsed; `absent` — no object yet, the legitimate first commit;
 ///   `unreadable` / `parse_error` — a base that EXISTS and was lost.
 async fn load_side_aggregates(file_io: &FileIO, path: &str) -> Result<Option<SnapshotAggregates>> {
+    load_side_aggregates_inner(file_io, path, false)
+        .await
+        .map(|(aggregates, _)| aggregates)
+}
+
+/// Load the side object while attributing the census's own object-store cost.
+///
+/// The request counters move immediately before each request. In particular, a
+/// GET whose read fails still counts as an attempt and attributes zero bytes.
+/// The ordinary loader stays uncounted so fold, publish and query loads retain
+/// their existing metric semantics.
+async fn load_side_aggregates_counted(
+    file_io: &FileIO,
+    path: &str,
+) -> Result<(Option<SnapshotAggregates>, u64)> {
+    load_side_aggregates_inner(file_io, path, true).await
+}
+
+async fn load_side_aggregates_inner(
+    file_io: &FileIO,
+    path: &str,
+    count_census_cost: bool,
+) -> Result<(Option<SnapshotAggregates>, u64)> {
     let outcome = |o: &'static str| {
         metrics::counter!("siglake_side_aggregates_load_total", "outcome" => o).increment(1);
     };
@@ -8073,26 +8096,35 @@ async fn load_side_aggregates(file_io: &FileIO, path: &str) -> Result<Option<Sna
             path,
             "side aggregates: cannot open input; base will be LOST"
         );
-        return Ok(None);
+        return Ok((None, 0));
     };
+    if count_census_cost {
+        metrics::counter!("siglake_inline_coverage_census_requests_total", "op" => "head")
+            .increment(1);
+    }
     match input.exists().await {
         Ok(true) => {}
         Ok(false) => {
             outcome("absent");
-            return Ok(None);
+            return Ok((None, 0));
         }
         Err(e) => {
             outcome("unreadable");
             tracing::warn!(path, error = %e, "side aggregates: exists() failed; base will be LOST");
-            return Ok(None);
+            return Ok((None, 0));
         }
     }
+    if count_census_cost {
+        metrics::counter!("siglake_inline_coverage_census_requests_total", "op" => "get")
+            .increment(1);
+    }
     let bytes = input.read().await.with_context(|| format!("read {path}"))?;
+    let bytes_read = bytes.len() as u64;
     match serde_json::from_slice::<SnapshotAggregates>(&bytes) {
         Ok(v) => {
             outcome("hit");
             metrics::histogram!("siglake_side_aggregates_bytes").record(bytes.len() as f64);
-            Ok(Some(v))
+            Ok((Some(v), bytes_read))
         }
         Err(e) => {
             outcome("parse_error");
@@ -8105,7 +8137,7 @@ async fn load_side_aggregates(file_io: &FileIO, path: &str) -> Result<Option<Sna
                 "side aggregates: PARSE FAILED — the accumulated aggregate is being \
                  discarded and will be replaced by this commit's delta alone"
             );
-            Ok(None)
+            Ok((None, bytes_read))
         }
     }
 }
@@ -14430,12 +14462,12 @@ impl IcebergContext {
             // a whole-warehouse sweep on a timer, and a namespace whose base
             // `events` table was never created is the ordinary case on an
             // index-only warehouse.
-            let outcome = match self.inline_coverage_census(&ident).await {
-                Ok(outcome) => outcome,
+            let (outcome, bytes_read) = match self.inline_coverage_census(&ident).await {
+                Ok(result) => result,
                 Err(error) => {
                     tracing::warn!(error = ?error, table = %ident,
                         "inline-coverage census failed");
-                    InlineCoverageOutcome::Undetermined
+                    (InlineCoverageOutcome::Undetermined, 0)
                 }
             };
             match &outcome {
@@ -14469,7 +14501,14 @@ impl IcebergContext {
             // and overwriting a standing 1 with a 0 on a failed GET would hide
             // exactly the state this exists to report.
             if let Some(unproven) = outcome.gauge_value() {
-                report_inline_coverage(&self.namespace().to_string(), ident.name(), unproven);
+                let namespace = self.namespace().to_string();
+                report_inline_coverage(&namespace, ident.name(), unproven);
+                metrics::counter!(
+                    "siglake_inline_coverage_census_bytes_total",
+                    "iceberg_namespace" => namespace,
+                    "table" => ident.name().to_string()
+                )
+                .increment(bytes_read);
             }
             out.push((ident.name().to_string(), outcome));
         }
@@ -14480,17 +14519,22 @@ impl IcebergContext {
     ///
     /// The predicate is the read guard's, called on the same object the guard
     /// reads: `aggregate_covers_current_snapshot` walks table metadata only, so
-    /// what this costs is the object — one HEAD and, when it is there, one GET.
+    /// what this costs is the object — one direct HEAD, then the loader's HEAD
+    /// and, when it is there, one GET. The duplicate existence probe is the
+    /// shipped request pattern and remains deliberate here.
     /// Read straight from storage rather than through
     /// [`Self::cached_side_aggregates`], which collapses every refusal into
     /// `None` and so cannot say WHY a table is off Tier-1.
-    async fn inline_coverage_census(&self, ident: &TableIdent) -> Result<InlineCoverageOutcome> {
+    async fn inline_coverage_census(
+        &self,
+        ident: &TableIdent,
+    ) -> Result<(InlineCoverageOutcome, u64)> {
         let cached = self.cached_table_entry(ident).await?;
         // Incarnation fence (#2919): a table with no provable incarnation reads
         // no aggregate at all, so it has no coverage claim to refuse, and the
         // object at the shared path is somebody else's.
         let Some(path) = side_aggregates_path(&cached.table) else {
-            return Ok(InlineCoverageOutcome::NotApplicable);
+            return Ok((InlineCoverageOutcome::NotApplicable, 0));
         };
         if cached
             .table
@@ -14501,27 +14545,31 @@ impl IcebergContext {
             .filter(|rc| *rc > 0)
             .is_none()
         {
-            return Ok(InlineCoverageOutcome::NotApplicable);
+            return Ok((InlineCoverageOutcome::NotApplicable, 0));
         }
         // `load_side_aggregates` returns `Ok(None)` for absent, unreadable and
         // unparseable alike — the distinction the census exists to draw. Probe
         // existence first so an `Ok(None)` after this point can only mean the
         // object is there and was lost.
         let input = cached.table.file_io().new_input(&path)?;
+        metrics::counter!("siglake_inline_coverage_census_requests_total", "op" => "head")
+            .increment(1);
         match input.exists().await {
             Ok(true) => {}
             // No object: nothing claims coverage, and `rebuild-time-aggregates`
             // refuses a table with no object to rebuild from. A table that
             // should have one and does not is
             // `SiglakeSideAggregatePublicationLost`, not this.
-            Ok(false) => return Ok(InlineCoverageOutcome::NotApplicable),
-            Err(_) => return Ok(InlineCoverageOutcome::Undetermined),
+            Ok(false) => return Ok((InlineCoverageOutcome::NotApplicable, 0)),
+            Err(_) => return Ok((InlineCoverageOutcome::Undetermined, 0)),
         }
-        let Some(side) = load_side_aggregates(cached.table.file_io(), &path).await? else {
-            return Ok(InlineCoverageOutcome::Undetermined);
+        let (side, bytes_read) =
+            load_side_aggregates_counted(cached.table.file_io(), &path).await?;
+        let Some(side) = side else {
+            return Ok((InlineCoverageOutcome::Undetermined, bytes_read));
         };
         if aggregate_covers_current_snapshot(&cached.table, side.coverage) {
-            return Ok(InlineCoverageOutcome::Covered);
+            return Ok((InlineCoverageOutcome::Covered, bytes_read));
         }
         // A commit whose link is written but not yet folded into the edge is a
         // second old, not broken. Reporting it would page on every busy table.
@@ -14530,9 +14578,9 @@ impl IcebergContext {
             side.coverage,
             &side.coverage_links,
         ) {
-            return Ok(InlineCoverageOutcome::Publishing);
+            return Ok((InlineCoverageOutcome::Publishing, bytes_read));
         }
-        Ok(InlineCoverageOutcome::Unproven)
+        Ok((InlineCoverageOutcome::Unproven, bytes_read))
     }
 
     /// WS-7 auto-promotion: sample the newest live files' `attributes` JSON,

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Compactor observability (feature, target 0.3.0)**: the inline-coverage
+  census now reports its object-store cost on four additive metric families.
+  `siglake_inline_coverage_census_requests_total{op="head"|"get"}` counts the
+  shipped two-HEAD, one-GET request pattern per table with an object,
+  `siglake_inline_coverage_census_bytes_total{iceberg_namespace,table}` counts
+  usable bytes by table, `siglake_inline_coverage_census_pass_duration_seconds`
+  measures a completed pass, and `siglake_inline_coverage_census_tables`
+  records its table count. A failed GET is still a request attempt and adds no
+  bytes. The bounded request series, histogram and table gauge start at zero.
+  The 900-second default, existing metric identities and request pattern are
+  unchanged. (#6104)
+
 - **WAL mirror observability (feature)**: the two uploaders now report their
   own object-store write activity.
   `siglake_wal_mirror_upload_attempts_total{path}` counts

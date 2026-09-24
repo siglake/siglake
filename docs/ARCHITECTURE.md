@@ -817,8 +817,10 @@ under the `agg_fold` lease and asks the read guard's own question — does its
 coverage edge reach the current snapshot? — and sets
 `siglake_inline_coverage_unproven{iceberg_namespace,table}` to 1 or 0 for every
 table it reaches a verdict on. A repaired table clears on the next pass. The
-census never rebuilds: it reads table metadata and one object per table, and
-automating the repair is separate work. An object it cannot READ writes no
+census never rebuilds: it reads table metadata and one object per table. It
+keeps the shipped two-HEAD, one-GET request pattern for a table whose object is
+present; automating the repair and removing the duplicate probe are separate
+work. An object it cannot READ writes no
 sample at all — a failed GET is not evidence about coverage in either direction
 — and a publication still in flight (the edge does not reach current, but one of
 the object's pending links does) is reported as covered, because the next commit
@@ -835,6 +837,18 @@ severity: the two beside it name events that automatic maintenance or an
 operator's `rebuild-group-counts` repairs, and this one names a state that
 persists for the life of the table until a human runs a command. Answers stay
 exact throughout — what is lost is Tier-1, not correctness.
+
+Four cost metrics price that read-only pass without changing its requests.
+`siglake_inline_coverage_census_requests_total{op="head"|"get"}` counts each
+request at its call site, including a GET attempt that fails.
+`siglake_inline_coverage_census_bytes_total{iceberg_namespace,table}` counts
+bytes from usable GETs beside the table's coverage reading; a failed or
+unparseable GET contributes zero bytes.
+`siglake_inline_coverage_census_pass_duration_seconds` measures completed pass
+time, and `siglake_inline_coverage_census_tables` is the number of tables seen
+by the last pass. The bounded request series, histogram and table gauge exist
+at zero before the maintenance loop starts, so a retained scrape distinguishes
+zero cost from missing data.
 
 **Residual attributes (WS-7).** OTLP resource/log attributes that aren't
 promoted columns are preserved losslessly in a JSON-string `attributes`
