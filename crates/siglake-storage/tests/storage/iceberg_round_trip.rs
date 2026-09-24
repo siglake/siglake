@@ -19,6 +19,15 @@ fn warehouse_dir(tmp: &tempfile::TempDir) -> std::path::PathBuf {
     tmp.path().to_path_buf()
 }
 
+/// File name of a data-file path, the way production recovers the rewrite
+/// generation (`iceberg.rs::file_rewrite_generation`). Assertions about the
+/// `siglake-g<N>-` marker must read this and not the whole path: a warehouse
+/// under a directory whose own name carries the marker (a `TMPDIR` below
+/// `…/siglake-gate-final`, say) otherwise answers for the file.
+fn data_file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 /// Recursively collect every regular file under `dir`.
 fn list_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -1973,7 +1982,13 @@ async fn rewrite_generation_is_stamped_and_caps_recompaction() {
         LevelPolicy, LeveledPassOptions, ReclusterPolicy, BLOOM_FILTER_COLUMNS,
     };
 
-    let tmp = tempfile::tempdir().unwrap();
+    // The warehouse sits under a directory whose own name carries the marker,
+    // so a path-wide `contains` would answer for every file here (#6126: a gate
+    // run with `TMPDIR` below `…/siglake-gate-final` failed exactly that way).
+    let tmp = tempfile::Builder::new()
+        .prefix("siglake-g1-parent-")
+        .tempdir()
+        .unwrap();
     let warehouse = warehouse_dir(&tmp);
     let ice = IcebergContext::open(&warehouse).await.unwrap();
     let base = Utc.from_utc_datetime(
@@ -1990,8 +2005,14 @@ async fn rewrite_generation_is_stamped_and_caps_recompaction() {
     let files = ice.live_data_files(&ident).await.unwrap();
     assert_eq!(files.len(), 4);
     assert!(
-        files.iter().all(|f| !f.file_path().contains("siglake-g")),
-        "ingest-written files carry no generation marker"
+        files
+            .iter()
+            .all(|f| !data_file_name(f.file_path()).starts_with("siglake-g")),
+        "ingest-written files carry no generation marker, got {:?}",
+        files
+            .iter()
+            .map(|f| data_file_name(f.file_path()))
+            .collect::<Vec<_>>()
     );
 
     // Rewrite of gen-0 inputs → gen-1 output, stamped in the name.
@@ -2001,7 +2022,7 @@ async fn rewrite_generation_is_stamped_and_caps_recompaction() {
     let after = ice.live_data_files(&ident).await.unwrap();
     assert_eq!(after.len(), 1);
     assert!(
-        after[0].file_path().contains("siglake-g1-"),
+        data_file_name(after[0].file_path()).starts_with("siglake-g1-"),
         "recluster output must carry generation 1, got {}",
         after[0].file_path()
     );
@@ -2042,7 +2063,7 @@ async fn rewrite_generation_is_stamped_and_caps_recompaction() {
     assert!(
         survivors
             .iter()
-            .any(|f| f.file_path().contains("siglake-g1-")),
+            .any(|f| data_file_name(f.file_path()).starts_with("siglake-g1-")),
         "the mature g1 file survives untouched"
     );
     assert_eq!(

@@ -58,7 +58,12 @@ fn has_index_keys(keys: &[String]) -> bool {
 
 #[tokio::test]
 async fn deferred_table_skips_index_at_flush_and_materializes_at_compaction() {
-    let tmp = tempfile::tempdir().unwrap();
+    // Marker-bearing parent (#6126): the gen-1 filter below reads the file name,
+    // so a directory called `siglake-g1-…` must not make every file look merged.
+    let tmp = tempfile::Builder::new()
+        .prefix("siglake-g1-parent-")
+        .tempdir()
+        .unwrap();
     let warehouse = tmp.path().join("warehouse");
     let ice = IcebergContext::open(&warehouse)
         .await
@@ -135,7 +140,11 @@ async fn deferred_table_skips_index_at_flush_and_materializes_at_compaction() {
         .unwrap();
     let merged: Vec<_> = find_parquet(&data_dir)
         .into_iter()
-        .filter(|p| p.to_string_lossy().contains("siglake-g1-"))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("siglake-g1-"))
+        })
         .collect();
     assert_eq!(merged.len(), 1, "one gen-1 merged output");
     let keys = footer_keys(&merged[0]);
