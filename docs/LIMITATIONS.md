@@ -25,18 +25,18 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   in this tree, not every collector, SDK or agent. Its evidence and recovery
   paths are in
   [`DESIGN_ingest_lane_cap_response_qualification.md`](DESIGN_ingest_lane_cap_response_qualification.md).
-- **The implicit newest-first ordering only knows the column name
-  `timestamp`.** An index whose doc mapping names some other
-  `timestamp_field` browses in file order unless the query writes its own
-  `ORDER BY`, and so does not reach the ordered early-stop path. Reading the
-  mapping's field name into the rewrite is the extension; it was left out
-  because ordering by a column named `timestamp` on an index whose event time
-  is something else would stamp an order that is not a time order, and the
-  safe half (the shipped templates and every bulk-created index, all of which
-  declare `timestamp`) covers what users actually have.
-- **Aliasing another projected column to `timestamp` opts out of implicit
-  newest-first ordering.** `SELECT raw AS timestamp FROM events LIMIT 100`
-  browses in file order. Injecting a bare `ORDER BY timestamp` would bind to
+- **Rows sharing a custom event time come back in an unspecified order.** An
+  index whose doc mapping names its own `timestamp_field` browses newest-first
+  on that field and early-stops like a canonical one, but it carries no
+  `timestamp_ns` tiebreak, so which rows of an equal-time group land at a
+  `LIMIT` boundary is not determined and need not repeat between executions.
+  The rows returned are still the newest ones: the merge admits every
+  equal-time candidate. A deterministic tie order would need a declared second
+  sort key and an explicit second key in the query.
+- **Aliasing another projected column to the table's event-time name opts out
+  of implicit newest-first ordering.** `SELECT raw AS timestamp FROM events
+  LIMIT 100` browses in file order, and so does `SELECT raw AS ts FROM <index
+  mapped on ts>`. Injecting a bare `ORDER BY timestamp` would bind to
   the output alias and select a different top-N; qualifying the source as
   `events.timestamp` is rejected as ambiguous by DataFusion 53.1.0. The
   newest crates.io release checked on 2026-09-20, DataFusion 55.1.0, retains

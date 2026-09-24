@@ -28,7 +28,7 @@ pub use query_provider::{
     DecodedFileCachePopulationStats, FileAttributionSnapshot, OrderedMergeGlobalBudget,
     OrderedResidualHint, OrderedScanLimit, OrderedScanTuning, PreferredScanOrder, QueryCancel,
     QueryExecutionId, ScanPartitionTracker, ScanSettle, ScanShard, SiglakeIcebergTableScan,
-    FILE_ATTRIBUTION_CAP, UNATTRIBUTED_QUERY_EXECUTION_ID,
+    CANONICAL_EVENT_TIME_FIELD, FILE_ATTRIBUTION_CAP, UNATTRIBUTED_QUERY_EXECUTION_ID,
 };
 
 /// Arrow field-metadata key carrying the configured text tokenizer name for a
@@ -1410,7 +1410,7 @@ mod tests {
         let ctx = session_context_with_order(
             Some(7),
             Some(ScanShard { index: 1, count: 3 }),
-            Some(PreferredScanOrder { descending: false }),
+            Some(PreferredScanOrder::timestamp(false)),
         );
         let state = ctx.state();
         let cfg = state.config();

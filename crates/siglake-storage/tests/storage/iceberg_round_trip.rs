@@ -3653,7 +3653,7 @@ async fn reversed_browse_on_index_table_early_stops() {
     let ctx = siglake_storage::session_context_with_order(
         Some(2),
         None,
-        Some(siglake_storage::PreferredScanOrder { descending: true }),
+        Some(siglake_storage::PreferredScanOrder::timestamp(true)),
     );
     ice.register_index_with_datafusion(&ctx, "rev-idx")
         .await
@@ -3724,7 +3724,7 @@ async fn reversed_browse_over_overlapping_files_early_stops() {
     let ctx = siglake_storage::session_context_with_order(
         Some(3),
         None,
-        Some(siglake_storage::PreferredScanOrder { descending: true }),
+        Some(siglake_storage::PreferredScanOrder::timestamp(true)),
     );
     ice.register_with_datafusion(&ctx).await.unwrap();
     let df = ctx
@@ -3962,7 +3962,7 @@ async fn ordered_browse_refuses_on_mixed_direction_files() {
     let ctx = siglake_storage::session_context_with_order(
         Some(2),
         None,
-        Some(siglake_storage::PreferredScanOrder { descending: true }),
+        Some(siglake_storage::PreferredScanOrder::timestamp(true)),
     );
     ice.register_with_datafusion(&ctx).await.unwrap();
     let df = ctx
@@ -4024,7 +4024,7 @@ async fn converged_table_advertises_once_files_agree() {
     let ctx = siglake_storage::session_context_with_order(
         Some(2),
         None,
-        Some(siglake_storage::PreferredScanOrder { descending: false }),
+        Some(siglake_storage::PreferredScanOrder::timestamp(false)),
     );
     ice.register_with_datafusion(&ctx).await.unwrap();
     let df = ctx

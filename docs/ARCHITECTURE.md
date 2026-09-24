@@ -1313,28 +1313,44 @@ turns it off. Measured in
 [`DESIGN_clipped_limit_admission.md`](DESIGN_clipped_limit_admission.md).
 
 **Implicit newest-first.** An interactive `SELECT` that names one table and
-asks for no ordering of its own is given `ORDER BY timestamp DESC` — the
+asks for no ordering of its own is given `ORDER BY <event time> DESC` — the
 browse a log reader means when they write `SELECT timestamp, raw FROM t LIMIT
 100` — which is also what puts the query on the ordered early-stop path above.
-It applies to `events`, `query_audit` and to any managed index whose doc
-mapping declares `timestamp` as its `timestamp_field`; an index that names
-some other event-time field is left alone, since a column called `timestamp`
-there need not be a time order (the same reason such an index gets no
-`timestamp_ns` sort tiebreak). An explicit `ORDER BY`, a `GROUP BY`, an
+It applies to `events`, `query_audit` and to any managed index, ordered by the
+field that index's doc mapping declares as its `timestamp_field`. That field is
+quoted in the injected clause (`ORDER BY "ts" DESC`), because mapping names keep
+their case and may collide with SQL keywords; the canonical `timestamp` is
+written bare as before. A column merely NAMED `timestamp` on an index whose
+event time is something else is not a time order and never receives the rewrite
+or the scan hint (the same reason such an index gets no `timestamp_ns` sort
+tiebreak). An explicit `ORDER BY`, a `GROUP BY`, an
 aggregate, a CTE, a join, `DISTINCT`, `EXPLAIN` and the batch tier are all
 left exactly as written. So is a projection that gives another column the
-output name `timestamp` (`SELECT raw AS timestamp FROM t LIMIT 2`): SQL
-resolves the injected bare identifier to that output name, which would order
-the browse by the aliased column, and the source column cannot be named around
-the alias — DataFusion rejects `ORDER BY t.timestamp` under such a projection
-as an ambiguous reference. An explicit `LIMIT` is preserved, and a query with no
+index's own event-time name (`SELECT raw AS timestamp FROM events LIMIT 2`,
+`SELECT raw AS ts FROM <ts-mapped index>`): SQL resolves the injected
+identifier to that output name, which would order the browse by the aliased
+column, and the source column cannot be named around the alias — DataFusion
+rejects `ORDER BY t.timestamp` under such a projection as an ambiguous
+reference. An explicit `LIMIT` is preserved, and a query with no
 `LIMIT` gets `max_rows_returned + 1` so the truncation signal still fires.
 `default_order: false` on the request turns it off. Counted by
-`siglake_query_default_order_applied_total`. The field-by-field proof required
-to extend this to another mapped event-time name is recorded in
-[`DESIGN_per_index_event_time_ordering.md`](DESIGN_per_index_event_time_ordering.md);
-the current restriction stays in force until that complete planner and storage
-change ships.
+`siglake_query_default_order_applied_total`.
+
+**The field identity contract.** The hint the planner sends storage
+(`PreferredScanOrder`) carries the FIELD as well as the direction, and the scan
+advertises an ordering only when that field is the table's identity sort lead in
+the current schema and reads as an Arrow timestamp; a mismatch, an unknown
+field or another type keeps DataFusion's blocking sort (outcomes
+`sort_field_mismatch`, `non_timestamp_sort`, `unsupported_sort_type` on
+`siglake_query_scan_output_ordering_total`). The proven field is what the scan
+projects, orders, bounds per file, reverse-reads, merges and prunes on, and it
+keys the ordered-plan cache, so a cache hit can only rebuild the expression it
+was planned for. A custom event time has no `timestamp_ns` tiebreak, and none is
+added: rows sharing an event time may come back in any order among themselves,
+while the merge's strict bound comparison keeps every equal-time candidate in
+the running so the ordered `LIMIT` stays sound. The design and its
+qualification are in
+[`DESIGN_per_index_event_time_ordering.md`](DESIGN_per_index_event_time_ordering.md).
 
 **Distributed by default.** Query replicas form a StatefulSet; the classifier
 splits eligible plans into per-shard scans (`ScanShard` file sharding),
