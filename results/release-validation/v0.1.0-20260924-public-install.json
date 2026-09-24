@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "started_at": "2026-09-24T19:35:20.558037+00:00",
+  "version": "v0.1.0",
+  "profile": "smoke",
+  "requested_seconds": 120,
+  "project": "llvalidate-4dc86447b310",
+  "status": "failed",
+  "cleanup": "not_needed",
+  "checks": [],
+  "limitations": [
+    "Single-node Compose; Kubernetes/operator, OIDC tenant isolation, multi-replica distribution, upgrades, retention/delete, schema evolution and expensive-query cancellation are separate required qualification tracks.",
+    "Bounded baseline load: 100 events per cycle, three simultaneous oracle queries; this is not saturation or a large-working-set performance benchmark."
+  ],
+  "source_commit": "227d3fbb2a858c8bee2c0669bb95c7de56563075",
+  "harness_commit": "aa4cf3556d16464e419d40b322781542711691b2",
+  "harness_sha256": "a6795198d4f8e5613e4e3615a39d62574a07fecdfe5a2edcbe28380508b1c611",
+  "image": "ghcr.io/siglake/siglake@sha256:c5fe5a6d414378c83b8977b3a8836db24c37a281383277cba9baf9e896136984",
+  "platform": "linux/x86_64",
+  "error": "RuntimeError: docker ['pull', 'quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z'] exited 1: Error response from daemon: unknown: failed to resolve reference \"quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z\": unexpected status from HEAD request to https://quay.io/v2/minio/minio/manifests/RELEASE.2025-09-07T16-13-09Z: 401 Unauthorized\n",
+  "finished_at": "2026-09-24T19:35:26.106574+00:00",
+  "_migration_notice": "Historical pre-rename evidence: product names were normalized during the Siglake history migration. Source IDs, artifact digests, measurements and outcomes refer to the archived original runs, not rebuilt Siglake artifacts."
+}

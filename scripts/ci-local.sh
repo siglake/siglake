@@ -218,6 +218,7 @@ else
     bash -n "$f" 2>>"$LOG_DIR/shell.log" || sh_rc=1
   done < <(git ls-files '*.sh' '*.sh.tpl' '*.bash')
   scripts/check-smoke.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  python3 -m unittest discover -s scripts/release-validation -p 'test_*.py' >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-aws-up-kubeconfig.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-aws-down-destroy.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-loadgen.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1

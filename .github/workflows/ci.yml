@@ -162,6 +162,8 @@ jobs:
           exit "$rc"
       - name: compose smoke formats host counts and propagates pipeline failures
         run: scripts/check-smoke.sh
+      - name: Release-validation isolation and cleanup
+        run: python3 -m unittest discover -s scripts/release-validation -p 'test_*.py'
       - name: aws up binds every cluster write to its private kubeconfig
         run: scripts/check-aws-up-kubeconfig.sh
       - name: aws down fails the run when terraform destroy fails
