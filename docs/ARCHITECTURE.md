@@ -101,12 +101,14 @@ lane's task-owned writer, and uploads one
 `_active/<tenant>[/<index>]/<segment>.arrow.partial` per writer whose segment
 grew since the last tick. The flush happens under the writer's own lock (or
 inside its lane task) and the PUT outside it, so no acknowledgement waits on
-object storage. Each uploader counts its own requests and bytes —
+object storage. Each uploader counts its own application-level writes and bytes —
 `siglake_wal_mirror_upload_attempts_total{path="sealed"|"active"}` moves once
-per PUT attempt, retries included, and
+immediately before each object-store write call, retries included, and
 `siglake_wal_mirror_active_bytes_uploaded_total` is the active loop's share of
-the shared `siglake_wal_mirror_bytes_uploaded_total` — so what active mirroring
-adds to an object-store bill is readable without running it alone. Once the
+the shared `siglake_wal_mirror_bytes_uploaded_total` — so the active uploader's
+share is readable without running it alone. The attempt counter excludes local
+source failures, but client- or service-side retries below the write call mean
+it is not an exact count of billed S3 requests. Once the
 matching sealed object is confirmed — by the normal uploader, its
 ambiguous-error STAT, or the catch-up sweep — the uploader deletes that exact
 active sibling. The active PUT also checks for its sealed
