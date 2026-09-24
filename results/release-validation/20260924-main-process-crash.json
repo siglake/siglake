@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "started_at": "2026-09-24T19:49:20.457969+00:00",
+  "version": "v0.2.0",
+  "profile": "smoke",
+  "dependency_policy": "cached-diagnostic",
+  "requested_seconds": 120,
+  "project": "llvalidate-870299a2f2a0",
+  "status": "interrupted",
+  "cleanup": "passed",
+  "checks": [],
+  "limitations": [
+    "Single-node Compose; Kubernetes/operator, OIDC tenant isolation, multi-replica distribution, upgrades, retention/delete, schema evolution and expensive-query cancellation are separate required qualification tracks.",
+    "Bounded baseline load: 100 events per cycle, three simultaneous oracle queries; this is not saturation or a large-working-set performance benchmark."
+  ],
+  "source_commit": "03eff142d3c23cad1d82b6a168bf9fe38b993745",
+  "harness_commit": "fe59e70f2f115bed8654893712f9d70e639d96f8",
+  "harness_sha256": "206f0e720bc325928556c7ce8b541d12151bb9d61f93bc35f8055f31be031f78",
+  "harness_dirty": false,
+  "image": "ghcr.io/siglake/siglake@sha256:9db3f04bbc9ee7d646a39955638b627dacf0126f4bec5e05ff80d7931e568d0a",
+  "platform": "linux/x86_64",
+  "dependency_images": {
+    "postgres:16-alpine": "postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
+    "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z": "minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+    "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z": "minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
+    "ghcr.io/siglake/siglake@sha256:9db3f04bbc9ee7d646a39955638b627dacf0126f4bec5e05ff80d7931e568d0a": "ghcr.io/siglake/siglake@sha256:9db3f04bbc9ee7d646a39955638b627dacf0126f4bec5e05ff80d7931e568d0a"
+  },
+  "compose_sha256": "4a9248bb6370192f7cd6936a3a3e72ea56ec4768df678ba0d57fc07712402d39",
+  "workload_started_at": "2026-09-24T19:49:30.844977+00:00",
+  "cycles": 1,
+  "acknowledged_events": 100,
+  "last_progress_at": "2026-09-24T19:49:54.902775+00:00",
+  "remaining_resources": {
+    "container": [],
+    "network": [],
+    "volume": []
+  },
+  "recovered_at": "2026-09-24T19:50:57.241814+00:00",
+  "injected_scenario": "SIGKILL of main runner; automatic ExecStopPost recovery",
+  "_migration_notice": "Historical pre-rename evidence: product names were normalized during the Siglake history migration. Source IDs, artifact digests, measurements and outcomes refer to the archived original runs, not rebuilt Siglake artifacts."
+}
