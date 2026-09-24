@@ -890,14 +890,12 @@ wal:
   # tick — see `activeIntervalSecs`), which is what an S3 bill sees; on S3 the
   # backlog follows remote PUT latency, and no AWS measurement has been taken.
   #
-  # What the pods export for that bill:
+  # What the pods export for attributing write activity:
   #  - `siglake_wal_mirror_upload_attempts_total{path="sealed"|"active"}` —
-  #    one per PUT ATTEMPT, so a sealed segment retried twice counts twice.
-  #    Every other counter here records a result, and a request that failed is
-  #    charged all the same. `path="sealed"` counts a retry loop's iterations,
-  #    which is one more than its requests in the rare case where the attempt
-  #    failed before its PUT (the local file vanished or would not read);
-  #    those come with `siglake_wal_mirror_failures_total`.
+  #    one immediately before each application-level object-store write call,
+  #    so a sealed segment retried twice counts twice. Local source resolution
+  #    and read failures do not move it. Retries inside the client or service
+  #    are outside this counter, so it is not an exact billed S3 request count.
   #  - `siglake_wal_mirror_active_bytes_uploaded_total` — the active loop's
   #    share of `siglake_wal_mirror_bytes_uploaded_total`, which keeps counting
   #    both paths, so the sealed bytes are the difference. An open segment is

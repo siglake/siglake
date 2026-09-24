@@ -215,20 +215,19 @@ async fn write_mirror_owner(
 /// Upload attempts before a segment is declared permanently failed.
 const MIRROR_UPLOAD_ATTEMPTS: u32 = 5;
 
-/// PUT attempts, by which uploader made them (`sealed` or `active`).
+/// Application-level object-store write attempts, by which uploader made them
+/// (`sealed` or `active`).
 ///
-/// An S3 bill is charged per request, and every other mirror counter here
-/// records a RESULT: `siglake_wal_mirror_segments_total` moves once per
-/// segment however many times its upload was retried, and the byte counters
-/// move only on success. A prefix whose cost is dominated by retries was
-/// therefore invisible — a retried sealed segment showed up as one `ok`.
+/// Every other mirror counter here records a RESULT:
+/// `siglake_wal_mirror_segments_total` moves once per segment however many
+/// times its upload was retried, and the byte counters move only on success.
+/// A prefix whose cost is dominated by retries was therefore invisible — a
+/// retried sealed segment showed up as one `ok`.
 ///
-/// The sealed arm counts loop iterations of [`WalMirror::upload_and_notify`],
-/// so a segment that succeeds on attempt 3 counts 3. That is one more than the
-/// PUTs it issued when the attempt failed BEFORE its request — a local source
-/// that vanished, or a local read error — which is rare and always accompanied
-/// by `siglake_wal_mirror_failures_total`; the post-exhaustion STAT is not
-/// counted here at all.
+/// Both arms increment immediately before calling [`Operator::write`]. This
+/// excludes failures while resolving or reading the sealed local source. It
+/// does not establish exact billed S3 requests: retries below this application
+/// call, in the client or service, are outside this counter.
 const MIRROR_UPLOAD_ATTEMPTS_COUNTER: &str = "siglake_wal_mirror_upload_attempts_total";
 
 /// Bytes the ACTIVE uploader put, the half of
@@ -455,7 +454,6 @@ impl WalMirror {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last_err = None;
         for attempt in 1..=MIRROR_UPLOAD_ATTEMPTS {
-            metrics::counter!(MIRROR_UPLOAD_ATTEMPTS_COUNTER, "path" => "sealed").increment(1);
             match self.upload(segment).await {
                 Ok(bytes) => {
                     metrics::counter!("siglake_wal_mirror_segments_total",
@@ -585,6 +583,7 @@ impl WalMirror {
         })?;
         let n = bytes.len() as u64;
         let key = mirror_key(&self.prefix, &segment.mirror_key_suffix);
+        metrics::counter!(MIRROR_UPLOAD_ATTEMPTS_COUNTER, "path" => "sealed").increment(1);
         self.op
             .write(&key, bytes)
             .await
@@ -4122,6 +4121,64 @@ mod tests {
             Some(0),
             "the sealed bytes are not charged to the active path"
         );
+    }
+
+    /// #6047: local source failures happen before the object-store write. They
+    /// remain terminal upload failures, but must not be priced as write
+    /// attempts. A directory at the source path supplies a stable local read
+    /// error without relying on platform permissions.
+    #[test]
+    fn local_source_failures_do_not_count_as_sealed_write_attempts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = WalSegment {
+            path: tmp.path().join("sealed/missing.arrow"),
+            rows: 1,
+            bytes: 1,
+            mirror_key_suffix: "missing.arrow".into(),
+        };
+        let unreadable_path = tmp.path().join("sealed/unreadable.arrow");
+        std::fs::create_dir_all(&unreadable_path).unwrap();
+        let unreadable = WalSegment {
+            path: unreadable_path,
+            rows: 1,
+            bytes: 1,
+            mirror_key_suffix: "unreadable.arrow".into(),
+        };
+
+        for (case, segment) in [("missing", missing), ("unreadable", unreadable)] {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            metrics::with_local_recorder(&recorder, || {
+                rt.block_on(async {
+                    let (mirror, _handle) = WalMirror::new(memory_op(), "wal-mirror");
+                    mirror.upload_and_notify(&segment).await;
+                })
+            });
+
+            let counters = counters(&snapshotter);
+            assert_eq!(
+                counter(
+                    &counters,
+                    MIRROR_UPLOAD_ATTEMPTS_COUNTER,
+                    &[("path", "sealed")]
+                ),
+                Some(0),
+                "{case} local source must not reach an object-store write"
+            );
+            assert_eq!(
+                counter(
+                    &counters,
+                    "siglake_wal_mirror_failures_total",
+                    &[("reason", "upload")]
+                ),
+                Some(1),
+                "{case} local source remains an upload failure"
+            );
+        }
     }
 
     /// #4914: the active PUT starts after the writer lock is released. Force it
