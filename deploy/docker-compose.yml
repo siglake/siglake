@@ -49,11 +49,16 @@ services:
       timeout: 2s
       retries: 30
 
-  # quay.io, not Docker Hub: on 2026-09-11 docker.io/minio/minio and
-  # docker.io/minio/mc began answering 401 to anonymous pulls, and the `docker`
-  # CI job died at `pull access denied` before either integration test started.
-  # quay.io is MinIO's own registry and still serves both anonymously. Pinned
-  # to a release tag rather than :latest so the next move is a deliberate one.
+  # These two MinIO repositories have no anonymous source left. Docker Hub's
+  # minio/minio and minio/mc began answering 401 on 2026-09-11, which is why
+  # these references moved to quay.io; quay.io's copies answer 401 as well as
+  # of 2026-09-24. A census that day found the pinned tags and the digests they
+  # had been resolving to refused or absent on quay.io, Docker Hub, ghcr.io,
+  # public.ecr.aws, mirror.gcr.io and registry.min.io (#6125). A host with a
+  # warm cache still brings this stack up; a fresh runner fails at the pull.
+  # The pins stay until a publication path is chosen -- see
+  # docs/LIMITATIONS.md -- and stay on a release tag rather than :latest so
+  # the next move is a deliberate one.
   minio:
     image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     command: server /data --console-address ":9001"

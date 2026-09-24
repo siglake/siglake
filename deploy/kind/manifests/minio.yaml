@@ -1,7 +1,10 @@
 # Minio (S3-compatible) for the Iceberg warehouse inside kind.
 #
-# Both images come from quay.io, MinIO's own registry: docker.io/minio/minio
-# and docker.io/minio/mc answer 401 to anonymous pulls as of 2026-09-11. Keep
+# Both images come from quay.io, which took docker.io/minio/minio and
+# docker.io/minio/mc's place when those started answering 401 to anonymous
+# pulls on 2026-09-11. quay.io answers 401 for the same two repositories as of
+# 2026-09-24 and no public registry serves the pinned digests (#6125,
+# docs/LIMITATIONS.md), so a node without a warm cache cannot pull them. Keep
 # these tags in step with deploy/docker-compose.yml.
 
 apiVersion: v1
