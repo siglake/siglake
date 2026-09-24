@@ -614,7 +614,13 @@ pod, so a compactor that has stopped censusing drops out of the alert instead of
 paging from a reading nobody is refreshing. There is no values key for it and
 nothing to opt into, because the pass only reads: a
 `compactor.extraEnv` entry setting `SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS`
-changes the cadence, and `off` switches the census off.
+changes the cadence, and `off` switches the census off. The pass keeps its
+two-HEAD, one-GET request pattern for each table with an object. Its cost is
+reported by `siglake_inline_coverage_census_requests_total{op="head"|"get"}`,
+`siglake_inline_coverage_census_bytes_total{iceberg_namespace,table}`,
+`siglake_inline_coverage_census_pass_duration_seconds` and
+`siglake_inline_coverage_census_tables`; the request series, histogram and
+table gauge are present at zero before the first pass.
 `SiglakeGroupCountAggregateShort` (warning) is the one that needs no lost write
 at all: every 15 minutes the maintenance pass censuses each maintained table
 and fires this when one is short of `total-records` with every commit's
