@@ -2355,7 +2355,6 @@ def file_cache_contention_fixture(expr: str) -> str:
     )
     out = (
         "evaluation_interval: 1m\n"
-        "fuzzy_compare: true\n"
         "tests:\n"
         "  - name: decoded-file cache contention per query pod\n"
         "    interval: 1m\n"
@@ -2745,7 +2744,7 @@ def index_build_fixture(exprs: dict[tuple[int, str], str]) -> str:
     reading. Panels 167 and 170 are evaluated with their own labelled counter
     and histogram inputs before the dashboard success line names them.
     """
-    out = "evaluation_interval: 1m\nfuzzy_compare: true\ntests:\n"
+    out = "evaluation_interval: 1m\ntests:\n"
     for key, expr in sorted(exprs.items()):
         panel, ref_id = key
         metric = INDEX_BUILD_TARGETS[key]
@@ -2848,9 +2847,15 @@ def index_build_fixture(exprs: dict[tuple[int, str], str]) -> str:
             out += "    promql_expr_test:\n"
             out += f"      - expr: '{expr.replace('$namespace', '.*')}'\n"
             out += "        eval_time: 6m\n        exp_samples:\n"
+            # Prometheus 2.45's interpolation returns the next float above 99.
+            # Spell it exactly so the distro promtool can run this fixture;
+            # `fuzzy_compare` was added after that release.
+            audit_value = (
+                "99.00000000000001" if quantile == 0.99 else str(100 * quantile)
+            )
             out += (
                 '          - labels: \'{table="audit"}\'\n'
-                f"            value: {100 * quantile}\n"
+                f"            value: {audit_value}\n"
                 '          - labels: \'{table="events"}\'\n'
                 f"            value: {100 + 900 * quantile}\n"
             )
