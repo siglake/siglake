@@ -49,27 +49,22 @@ services:
       timeout: 2s
       retries: 30
 
-  # These two MinIO repositories have no anonymous source left. Docker Hub's
-  # minio/minio and minio/mc began answering 401 on 2026-09-11, which is why
-  # these references moved to quay.io; quay.io's copies answer 401 as well as
-  # of 2026-09-24. A census that day found the pinned tags and the digests they
-  # had been resolving to refused or absent on quay.io, Docker Hub, ghcr.io,
-  # public.ecr.aws, mirror.gcr.io and registry.min.io (#6125). A host with a
-  # warm cache still brings this stack up; a fresh runner fails at the pull.
-  # The pins stay until a publication path is chosen -- see
-  # docs/LIMITATIONS.md -- and stay on a release tag rather than :latest so
-  # the next move is a deliberate one.
+  # MinIO stopped publishing community binaries in 2025 and withdrew its
+  # server and client repositories. These Bitnami Legacy images are public,
+  # source-traceable snapshots used only by the local, CI and kind stacks.
+  # Pin both the readable release tag and immutable multi-platform digest;
+  # docs/LIMITATIONS.md records that the archive receives no updates.
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
-    command: server /data --console-address ":9001"
+    image: docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_BROWSER: "on"
     ports:
       - "${SIGLAKE_MINIO_HOST_PORT:-9000}:9000"  # S3 API (native pagination integration test)
       - "${SIGLAKE_MINIO_CONSOLE_HOST_PORT:-9001}:9001"  # console (web UI)
     volumes:
-      - minio-data:/data
+      - minio-data:/bitnami/minio/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 2s
@@ -78,7 +73,7 @@ services:
 
   # One-shot bucket creation. Exits after the bucket exists.
   minio-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: docker.io/bitnamilegacy/minio-client:2025.7.21-debian-12-r3@sha256:73bd39f7899a0cef12b8dd5df13aa93a3ed1aaa44236542442e9ac76819ac158
     depends_on:
       minio:
         condition: service_healthy
@@ -122,7 +117,7 @@ services:
   # default key has no CreateBucket permission. Run by scripts/up.sh via
   # `compose run --rm` before the siglake services start.
   garage-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: docker.io/bitnamilegacy/minio-client:2025.7.21-debian-12-r3@sha256:73bd39f7899a0cef12b8dd5df13aa93a3ed1aaa44236542442e9ac76819ac158
     profiles: ["garage"]
     depends_on:
       garage:

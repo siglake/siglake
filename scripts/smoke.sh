@@ -56,7 +56,7 @@ sleep 8
 
 echo "==> minio bucket inventory"
 docker run --rm --network siglake-dev_default --entrypoint /bin/sh \
-  quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z -c \
+  docker.io/bitnamilegacy/minio-client:2025.7.21-debian-12-r3@sha256:73bd39f7899a0cef12b8dd5df13aa93a3ed1aaa44236542442e9ac76819ac158 -c \
   "mc alias set local http://minio:9000 minioadmin minioadmin --quiet && \
    mc ls --recursive local/siglake-warehouse" \
   | grep -E '\.(parquet|json|avro)$' \
