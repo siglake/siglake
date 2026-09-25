@@ -26,9 +26,8 @@ Six questions, all answered from tracked files with no registry and no helm:
 5. Every version-shaped image tag pinned in `deploy/` (the operator sample, the
    install examples and the AWS image defaults) is that same version, with no
    `v` prefix.
-6. Compose and kind pin the same MinIO server and client releases, including
-   compose's Garage readiness client, and every reference uses MinIO's quay.io
-   registry rather than Docker Hub.
+6. Compose, kind and their helper scripts pin the same Bitnami Legacy MinIO
+   server and client snapshots by readable tag and immutable digest.
 
 Stdlib only and no helm: this runs in the `shell` job, which installs nothing,
 and in the local gate's shell block, which must answer the same question. The
@@ -63,6 +62,8 @@ CHARTS = (
 PINNED_TAG_ROOT = pathlib.PurePath("deploy")
 COMPOSE_YML = pathlib.PurePath("deploy/docker-compose.yml")
 KIND_MINIO_YML = pathlib.PurePath("deploy/kind/manifests/minio.yaml")
+SMOKE_SH = pathlib.PurePath("scripts/smoke.sh")
+KIND_ROUND_SH = pathlib.PurePath("scripts/kind-round.sh")
 
 # `version = "0.1.0"` under `[workspace.package]`.
 TOML_SECTION = re.compile(r"^\[(?P<name>[^\]]+)\]\s*$")
@@ -101,15 +102,20 @@ SIGLAKE_IMAGE_TAG_DEFAULTS = (
 # must fail instead of shrinking the set the parity check compares.
 COMPOSE_MINIO_ROLES = {
     "minio": "minio",
-    "minio-init": "mc",
-    "garage-init": "mc",
+    "minio-init": "minio-client",
+    "garage-init": "minio-client",
 }
 KIND_MINIO_ROLES = {
     "minio": "minio",
-    "mc": "mc",
+    "mc": "minio-client",
 }
-QUAY_MINIO_REF = re.compile(
-    r"^quay\.io/minio/(?P<image>minio|mc):(?P<tag>[A-Za-z0-9._-]+)$"
+BITNAMI_LEGACY_MINIO_REF = re.compile(
+    r"^docker\.io/bitnamilegacy/(?P<image>minio|minio-client):"
+    r"(?P<tag>[A-Za-z0-9._-]+)@sha256:(?P<digest>[0-9a-f]{64})$"
+)
+MINIO_IMAGE_LITERAL = re.compile(
+    r"(?:[A-Za-z0-9.-]+/)+(?:minio|minio-client|mc):[A-Za-z0-9._-]+"
+    r"(?:@sha256:[0-9a-f]{64})?"
 )
 
 # A release version inside a tag: `0.1.0`, `0.1.0-rc.1`. Prefixed and suffixed
@@ -467,14 +473,29 @@ def named_list_item_images(text: str) -> dict[str, list[str]]:
     return images
 
 
-def minio_image_problems(compose: str, kind: str) -> list[str]:
-    """MinIO roles exist, use quay.io and pin matching server/client tags."""
+def minio_image_problems(
+    compose: str, kind: str, smoke: str, kind_round: str
+) -> list[str]:
+    """MinIO roles use matching Bitnami Legacy tag-and-digest references."""
     sources = (
         (str(COMPOSE_YML), compose_service_images(compose), COMPOSE_MINIO_ROLES),
         (str(KIND_MINIO_YML), named_list_item_images(kind), KIND_MINIO_ROLES),
+        (
+            str(SMOKE_SH),
+            {"client": MINIO_IMAGE_LITERAL.findall(smoke)},
+            {"client": "minio-client"},
+        ),
+        (
+            str(KIND_ROUND_SH),
+            {"client": MINIO_IMAGE_LITERAL.findall(kind_round)},
+            {"client": "minio-client"},
+        ),
     )
     problems: list[str] = []
-    tags: dict[str, list[tuple[str, str, str]]] = {"minio": [], "mc": []}
+    references: dict[str, list[tuple[str, str, str]]] = {
+        "minio": [],
+        "minio-client": [],
+    }
     for path, images, roles in sources:
         for role, expected_image in roles.items():
             declarations = images.get(role, [])
@@ -487,23 +508,23 @@ def minio_image_problems(compose: str, kind: str) -> list[str]:
                 )
                 continue
             reference = declarations[0]
-            match = QUAY_MINIO_REF.fullmatch(reference)
+            match = BITNAMI_LEGACY_MINIO_REF.fullmatch(reference)
             if not match or match.group("image") != expected_image:
                 problems.append(
                     f"{path}: `{role}` image `{reference}` must be "
-                    f"`quay.io/minio/{expected_image}:<pinned-tag>`"
+                    f"`docker.io/bitnamilegacy/{expected_image}:<tag>@sha256:<digest>`"
                 )
                 continue
-            tags[expected_image].append((path, role, match.group("tag")))
+            references[expected_image].append((path, role, reference))
 
-    for image, pins in tags.items():
-        distinct = {tag for _, _, tag in pins}
+    for image, pins in references.items():
+        distinct = {reference for _, _, reference in pins}
         if len(distinct) > 1:
             rendered = ", ".join(
-                f"{path} `{role}`={tag}" for path, role, tag in pins
+                f"{path} `{role}`={reference}" for path, role, reference in pins
             )
             problems.append(
-                f"MinIO `{image}` tags differ between deployment roles: {rendered}"
+                f"MinIO `{image}` references differ between deployment roles: {rendered}"
             )
     return problems
 
@@ -656,18 +677,26 @@ IMAGE_TAG="${SIGLAKE_IMAGE_TAG:-0.1.0}"
         raise AssertionError("fixture: release prose was treated as a pinned image")
     checked += 1
 
-    compose_minio = """\
+    server_digest = "1" * 64
+    client_digest = "2" * 64
+    server_ref = (
+        "docker.io/bitnamilegacy/minio:SERVER-1@sha256:" + server_digest
+    )
+    client_ref = (
+        "docker.io/bitnamilegacy/minio-client:CLIENT-1@sha256:" + client_digest
+    )
+    compose_minio = f"""\
 services:
   minio:
-    image: quay.io/minio/minio:SERVER-1
+    image: {server_ref}
   minio-init:
-    image: quay.io/minio/mc:CLIENT-1
+    image: {client_ref}
   garage-init:
-    image: quay.io/minio/mc:CLIENT-1
+    image: {client_ref}
   unrelated:
     image: example.invalid/other:latest
 """
-    kind_minio = """\
+    kind_minio = f"""\
 apiVersion: apps/v1
 kind: Deployment
 spec:
@@ -675,7 +704,7 @@ spec:
     spec:
       containers:
         - name: minio
-          image: quay.io/minio/minio:SERVER-1
+          image: {server_ref}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -684,39 +713,51 @@ spec:
     spec:
       containers:
         - name: mc
-          image: quay.io/minio/mc:CLIENT-1
+          image: {client_ref}
 """
-    if minio_image_problems(compose_minio, kind_minio):
+    smoke_minio = f"docker run {client_ref}\n"
+    kind_round_minio = f"kubectl run --image={client_ref}\n"
+    if minio_image_problems(
+        compose_minio, kind_minio, smoke_minio, kind_round_minio
+    ):
         raise AssertionError("fixture: matching MinIO pins were reported")
     checked += 1
     if not minio_image_problems(
-        compose_minio, kind_minio.replace("minio:SERVER-1", "minio:SERVER-2")
+        compose_minio,
+        kind_minio.replace("minio:SERVER-1", "minio:SERVER-2"),
+        smoke_minio,
+        kind_round_minio,
     ):
         raise AssertionError("fixture: a kind MinIO server tag mismatch passed")
     checked += 1
     if not minio_image_problems(
-        compose_minio, kind_minio.replace("mc:CLIENT-1", "mc:CLIENT-2")
+        compose_minio,
+        kind_minio.replace("minio-client:CLIENT-1", "minio-client:CLIENT-2"),
+        smoke_minio,
+        kind_round_minio,
     ):
         raise AssertionError("fixture: a kind MinIO client tag mismatch passed")
     checked += 1
     if not minio_image_problems(
         compose_minio.replace(
-            "garage-init:\n    image: quay.io/minio/mc:CLIENT-1",
-            "garage-init:\n    image: quay.io/minio/mc:CLIENT-2",
+            f"garage-init:\n    image: {client_ref}",
+            f"garage-init:\n    image: {client_ref.replace('CLIENT-1', 'CLIENT-2')}",
         ),
         kind_minio,
+        smoke_minio,
+        kind_round_minio,
     ):
         raise AssertionError("fixture: compose's Garage client tag mismatch passed")
     checked += 1
     for role, declaration in (
-        ("compose minio", "    image: quay.io/minio/minio:SERVER-1\n"),
-        ("compose minio-init", "    image: quay.io/minio/mc:CLIENT-1\n"),
+        ("compose minio", f"    image: {server_ref}\n"),
+        ("compose minio-init", f"    image: {client_ref}\n"),
         (
             "compose garage-init",
-            "  garage-init:\n    image: quay.io/minio/mc:CLIENT-1\n",
+            f"  garage-init:\n    image: {client_ref}\n",
         ),
-        ("kind minio", "          image: quay.io/minio/minio:SERVER-1\n"),
-        ("kind mc", "          image: quay.io/minio/mc:CLIENT-1\n"),
+        ("kind minio", f"          image: {server_ref}\n"),
+        ("kind mc", f"          image: {client_ref}\n"),
     ):
         compose_fixture = compose_minio
         kind_fixture = kind_minio
@@ -724,15 +765,34 @@ spec:
             compose_fixture = compose_fixture.replace(declaration, "", 1)
         else:
             kind_fixture = kind_fixture.replace(declaration, "", 1)
-        if not minio_image_problems(compose_fixture, kind_fixture):
+        if not minio_image_problems(
+            compose_fixture, kind_fixture, smoke_minio, kind_round_minio
+        ):
             raise AssertionError(f"fixture: missing {role} image declaration passed")
         checked += 1
-    for registry in ("minio/minio", "docker.io/minio/minio"):
+    for refused in ("quay.io/minio/minio", "docker.io/minio/minio"):
         if not minio_image_problems(
-            compose_minio.replace("quay.io/minio/minio", registry, 1), kind_minio
+            compose_minio.replace("docker.io/bitnamilegacy/minio", refused, 1),
+            kind_minio,
+            smoke_minio,
+            kind_round_minio,
         ):
-            raise AssertionError(f"fixture: `{registry}` MinIO server reference passed")
+            raise AssertionError(f"fixture: `{refused}` MinIO server reference passed")
         checked += 1
+    if not minio_image_problems(
+        compose_minio.replace(f"@sha256:{server_digest}", "", 1),
+        kind_minio,
+        smoke_minio,
+        kind_round_minio,
+    ):
+        raise AssertionError("fixture: a MinIO server reference without a digest passed")
+    checked += 1
+    if not minio_image_problems(compose_minio, kind_minio, "", kind_round_minio):
+        raise AssertionError("fixture: a missing smoke client reference passed")
+    checked += 1
+    if not minio_image_problems(compose_minio, kind_minio, smoke_minio, ""):
+        raise AssertionError("fixture: a missing kind-round client reference passed")
+    checked += 1
 
     for name, text, extract in (
         ("Cargo.toml without a workspace version", "[package]\nversion = \"9.9.9\"\n", workspace_version),
@@ -788,6 +848,8 @@ def main(argv: list[str]) -> int:
         problems += minio_image_problems(
             (root / COMPOSE_YML).read_text(),
             (root / KIND_MINIO_YML).read_text(),
+            (root / SMOKE_SH).read_text(),
+            (root / KIND_ROUND_SH).read_text(),
         )
         pinned = subprocess.run(
             ["git", "ls-files", "-z", str(PINNED_TAG_ROOT)],

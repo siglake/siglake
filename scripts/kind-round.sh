@@ -2402,7 +2402,7 @@ PY
 start_mirror_reclaim_observer() {
   [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
   kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" run "$MIRROR_RECLAIM_MC_POD" \
-    --image=quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z \
+    --image=docker.io/bitnamilegacy/minio-client:2025.7.21-debian-12-r3@sha256:73bd39f7899a0cef12b8dd5df13aa93a3ed1aaa44236542442e9ac76819ac158 \
     --restart=Never --command -- sleep 7200 >/dev/null
   kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" wait \
     --for=condition=Ready "pod/$MIRROR_RECLAIM_MC_POD" --timeout=120s >/dev/null

@@ -1893,27 +1893,18 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   on the worker wire contract for a value that is not comparable across
   processes on its own.
 
-- **The compose and kind stacks pin a MinIO server and client that no public
-  registry serves anonymously any more.** `deploy/docker-compose.yml:58,76,120`,
-  `deploy/kind/manifests/minio.yaml:50,84`, `scripts/smoke.sh:59` and
-  `scripts/kind-round.sh:2405` name
-  `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z` and
-  `quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z`. A registry census on
-  2026-09-24 found both quay.io repositories answering `401 UNAUTHORIZED` to an
-  anonymous tags list and manifest request, the Docker Hub copies answering the
-  same 401 with their repository pages gone (`404 object not found`), and the
-  two digests earlier cached runs recorded —
-  `minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`
-  and `minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727`
-  — resolving on none of quay.io, Docker Hub, `ghcr.io`, `public.ecr.aws`,
-  `mirror.gcr.io` or `registry.min.io`. `minio/operator` and `minio/aistor/*`
-  still serve anonymously on both registries, so the community server and
-  client were withdrawn per repository. A host with a warm cache still brings
-  the stack up; a runner without one fails at the pull, which is the hosted
-  `docker` job on every push. The pins are left where they are because moving
-  them means choosing a publication path, and each candidate needs authority
-  this tree does not have: a project-owned GHCR mirror of the two cached
-  digests needs publication rights and an AGPL-3.0 redistribution note, the
-  Garage arm still starts MinIO through the static `depends_on` described at
-  `scripts/compose-common.bash:19-21` and depends on #3201 and #3198, and a
-  third-party rebuild needs a provenance check. Tracked as #6125 and #6118.
+- **The local, CI and kind stacks use frozen Bitnami Legacy MinIO images.**
+  MinIO stopped publishing prebuilt community binaries, and its former Docker
+  Hub and quay.io server and client repositories now refuse anonymous pulls.
+  The replacement server (`2025.7.23-debian-12-r5`) and client
+  (`2025.7.21-debian-12-r3`) are public Bitnami snapshots built from the
+  Dockerfiles at Bitnami `containers` commits `481b8b2c` and `fa9a6149`.
+  Every use is pinned to the multi-platform manifest digest, including the
+  smoke and kind-round helper clients. Bitnami moved these Debian images to an
+  archive in August 2025 and does not update them, so they receive no MinIO,
+  base-image or security fixes. They run only in ephemeral development and
+  qualification stacks; the Siglake release images and production Helm charts
+  do not contain them. Moving the test dependency to a maintained distribution
+  still needs either a project-published build with an AGPL-3.0 redistribution
+  policy or a qualified replacement S3 implementation. Tracked as #6118 and
+  #6252.
