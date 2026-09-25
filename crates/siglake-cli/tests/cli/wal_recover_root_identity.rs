@@ -85,8 +85,10 @@ fn segment_name(mirror: &Path) -> String {
             let path = entry.path();
             let found = if path.is_dir() {
                 first(&path)
-            } else {
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("arrow") {
                 Some(path)
+            } else {
+                None
             };
             if found.is_some() {
                 return found;
