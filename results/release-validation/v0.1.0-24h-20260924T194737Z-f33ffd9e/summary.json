@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "started_at": "2026-09-24T19:47:37.842463+00:00",
+  "version": "v0.1.0",
+  "profile": "24h",
+  "dependency_policy": "cached-diagnostic",
+  "requested_seconds": 86400,
+  "project": "llvalidate-189bdc6533dc",
+  "status": "passed",
+  "cleanup": "passed",
+  "checks": [
+    "anonymous product image pull",
+    "fresh isolated install",
+    "unauthenticated refusal",
+    "exact committed IDs per cohort",
+    "exact total and grouped counts",
+    "filtered counts under concurrent queries",
+    "batch query result",
+    "persistence across component restart",
+    "no OOM or unexpected restarts",
+    "verified resource limits"
+  ],
+  "limitations": [
+    "Single-node Compose; Kubernetes/operator, OIDC tenant isolation, multi-replica distribution, upgrades, retention/delete, schema evolution and expensive-query cancellation are separate required qualification tracks.",
+    "Bounded baseline load: 100 events per cycle, three simultaneous oracle queries; this is not saturation or a large-working-set performance benchmark."
+  ],
+  "source_commit": "227d3fbb2a858c8bee2c0669bb95c7de56563075",
+  "harness_commit": "df7a83f6537ce42bcdd1676cf45734f341a6e956",
+  "harness_sha256": "206f0e720bc325928556c7ce8b541d12151bb9d61f93bc35f8055f31be031f78",
+  "harness_dirty": false,
+  "image": "ghcr.io/siglake/siglake@sha256:c5fe5a6d414378c83b8977b3a8836db24c37a281383277cba9baf9e896136984",
+  "platform": "linux/x86_64",
+  "dependency_images": {
+    "postgres:16-alpine": "postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
+    "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z": "minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+    "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z": "minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
+    "ghcr.io/siglake/siglake@sha256:c5fe5a6d414378c83b8977b3a8836db24c37a281383277cba9baf9e896136984": "ghcr.io/siglake/siglake@sha256:c5fe5a6d414378c83b8977b3a8836db24c37a281383277cba9baf9e896136984"
+  },
+  "compose_sha256": "361c0e200ccb2bf995938fcd29ae3af5ea7e098a936ca4320a797d59616d4b5f",
+  "workload_started_at": "2026-09-24T19:47:48.476487+00:00",
+  "cycles": 2720,
+  "acknowledged_events": 272000,
+  "last_progress_at": "2026-09-25T19:47:54.414195+00:00",
+  "workload_elapsed_seconds": 86434.198801844,
+  "resource_samples": 1359,
+  "remaining_resources": {
+    "container": [],
+    "network": [],
+    "volume": []
+  },
+  "finished_at": "2026-09-25T19:49:08.254542+00:00",
+  "_migration_notice": "Historical pre-rename evidence: product names were normalized during the Siglake history migration. Source IDs, artifact digests, measurements and outcomes refer to the archived original runs, not rebuilt Siglake artifacts."
+}
