@@ -9,9 +9,13 @@ published release image.
 ## Run a released artifact
 
 Requirements: Linux, Docker Compose v2, Python 3.10+, git release tags, at least
-16 GiB available RAM and 20 GiB free disk. This baseline allocates a 4 GiB, two-CPU
-limit to each product component, 1 GiB to each dependency, and no swap. It is a
-single-host validation configuration, not a claim to test stock Helm defaults.
+16 GiB available RAM and 20 GiB free disk for `smoke`. Duration profiles need a
+dedicated Docker backing filesystem sized for their rewrite volume. Concurrent
+duration runs share that filesystem even though their Compose projects and
+volumes are isolated, so budget their aggregate use and monitor free space. This
+baseline allocates a 4 GiB, two-CPU limit to each product component, 1 GiB to
+each dependency, and no swap. It is a single-host validation configuration, not
+a claim to test stock Helm defaults.
 
 ```sh
 python3 scripts/release-validation/run.py --version v0.2.0 --profile smoke \
