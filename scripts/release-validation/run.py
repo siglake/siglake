@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -23,10 +24,19 @@ ROOT = Path(__file__).resolve().parents[2]
 DURATIONS = {'smoke': 120, '24h': 86400, '72h': 259200}
 TOKEN = 'release-validation-fixture-token'  # disposable local fixture, not a credential
 SERVICES = ['postgres', 'minio', 'minio-init', 'ingester', 'compactor', 'query-server']
+LOG_TIMESTAMP = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})')
+
+
+class StorageCapacityExhausted(AssertionError):
+    pass
+
+
+def now_utc():
+    return dt.datetime.now(dt.timezone.utc)
 
 
 def utc():
-    return dt.datetime.now(dt.timezone.utc).isoformat()
+    return now_utc().isoformat()
 
 
 def write_json(path, value):
@@ -40,6 +50,64 @@ def run_command(argv, env=None, timeout=300):
     if result.returncode:
         raise RuntimeError(f'{argv[0]} {argv[1:3]} exited {result.returncode}: {result.stderr[-2500:]}')
     return result.stdout
+
+
+def parse_docker_root_dir(output):
+    try:
+        root = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise ValueError('docker info returned an invalid Docker root directory') from error
+    if not isinstance(root, str) or not Path(root).is_absolute():
+        raise ValueError('docker info returned a non-absolute Docker root directory')
+    return root
+
+
+def parse_filesystem_capacity(output):
+    lines = [line for line in output.splitlines() if line.strip()]
+    if len(lines) != 2:
+        raise ValueError('df returned an unexpected number of lines')
+    fields = lines[1].split(maxsplit=2)
+    if len(fields) != 3:
+        raise ValueError('df returned an incomplete backing-filesystem reading')
+    filesystem, available, mountpoint = fields
+    try:
+        available_bytes = int(available)
+    except ValueError as error:
+        raise ValueError('df returned a non-numeric available-byte reading') from error
+    if available_bytes < 0:
+        raise ValueError('df returned a negative available-byte reading')
+    return {'filesystem': filesystem, 'mountpoint': mountpoint, 'available_bytes': available_bytes}
+
+
+def filesystem_capacity(path, env=None):
+    output = run_command(
+        ['df', '--block-size=1', '--output=source,avail,target', '--', path],
+        env,
+    )
+    return parse_filesystem_capacity(output)
+
+
+def parse_log_time(line):
+    match = LOG_TIMESTAMP.search(line)
+    if not match:
+        return None
+    value = match.group(0)
+    if value.endswith('Z'):
+        value = value[:-1] + '+00:00'
+    parsed = dt.datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def classify_cohort_failure(logs, started_at, ended_at):
+    for line in logs.splitlines():
+        if 'XMinioStorageFull' not in line or not re.search(r'\b507\b', line):
+            continue
+        logged_at = parse_log_time(line)
+        if logged_at is not None and started_at <= logged_at <= ended_at:
+            return 'storage_capacity_exhausted'
+    return 'visibility_mismatch'
 
 
 def http(url, data=None, token=TOKEN, timeout=30):
@@ -119,6 +187,7 @@ class Run:
         self.resource_samples = 0
         self.start = None
         self.mutated = False
+        self.docker_root_dir = None
         self.save()
 
     def save(self):
@@ -142,6 +211,14 @@ class Run:
         (self.out / 'harness.py').write_bytes(Path(__file__).read_bytes())
         self.summary['image'] = anonymous_manifest(version)
         self.summary['platform'] = run_command(['docker', 'info', '--format', '{{.OSType}}/{{.Architecture}}'], self.env).strip()
+        self.docker_root_dir = parse_docker_root_dir(
+            run_command(['docker', 'info', '--format', '{{json .DockerRootDir}}'], self.env).strip()
+        )
+        backing = filesystem_capacity(self.docker_root_dir, self.env)
+        self.summary['docker_backing_filesystem'] = dict(
+            measured_at=utc(), docker_root_dir=self.docker_root_dir, **backing
+        )
+        self.save()
         template = run_command(['git', '-C', str(ROOT), 'show', version + ':deploy/docker-compose.yml'])
         source = self.out / 'release-compose.yml'
         source.write_text(template)
@@ -186,6 +263,7 @@ class Run:
 
     def ingest_and_check(self):
         prefix = f'validation-{self.cycles:07d}-'
+        cohort_started_at = now_utc()
         records = []
         now = time.time_ns()
         for i in range(100):
@@ -201,6 +279,23 @@ class Run:
             if rows == wanted:
                 break
             if time.monotonic() >= deadline:
+                cohort_ended_at = now_utc()
+                try:
+                    logs = self.cmd(
+                        'logs', '--no-color', '--timestamps',
+                        '--since', cohort_started_at.isoformat(),
+                        timeout=60,
+                    )
+                    (self.out / 'cohort-failure.log').write_text(logs)
+                except Exception as error:
+                    logs = ''
+                    self.summary['cohort_failure_log_error'] = str(error)
+                    self.save()
+                if classify_cohort_failure(logs, cohort_started_at, cohort_ended_at) == 'storage_capacity_exhausted':
+                    raise StorageCapacityExhausted(
+                        'Docker backing-store capacity exhausted during the failed cohort window: '
+                        f'MinIO returned HTTP 507 XMinioStorageFull; got {len(rows)} of 100 expected IDs'
+                    )
                 raise AssertionError(f'committed cohort differs from 100 expected IDs: got {len(rows)}')
             time.sleep(2)
         self.oracle()
@@ -249,8 +344,10 @@ class Run:
             if name in ('query-server', 'compactor', 'ingester'):
                 assert c['HostConfig']['Memory'] == 4 * 1024**3
         stats = run_command(['docker', 'stats', '--no-stream', '--format', '{{json .}}', *ids], self.env)
+        backing = filesystem_capacity(self.docker_root_dir, self.env)
         with (self.out / 'resources.jsonl').open('a') as stream:
-            stream.write(json.dumps(dict(at=utc(), containers=samples, stats=[json.loads(line) for line in stats.splitlines()])) + '\n')
+            stream.write(json.dumps(dict(at=utc(), docker_backing_filesystem=backing,
+                                         containers=samples, stats=[json.loads(line) for line in stats.splitlines()])) + '\n')
         with urllib.request.urlopen(self.metrics + '/metrics', timeout=15) as response:
             with (self.out / 'metrics.prom').open('a') as stream:
                 stream.write('# collected_at ' + utc() + '\n' + response.read().decode() + '\n')

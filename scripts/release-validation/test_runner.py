@@ -1,3 +1,4 @@
+import datetime as dt
 import importlib.util
 from pathlib import Path
 import tempfile
@@ -59,3 +60,43 @@ class IsolationTests(unittest.TestCase):
                 health.assert_called_once_with('http://127.0.0.1:40002/healthz', timeout=10)
                 oracle.assert_called_once()
                 self.assertEqual(run.ingest, 'http://127.0.0.1:40001')
+
+    def test_docker_capacity_parsers_retain_available_bytes(self):
+        self.assertEqual(v.parse_docker_root_dir('"/var/lib/docker"\n'), '/var/lib/docker')
+        self.assertEqual(
+            v.parse_filesystem_capacity(
+                'Filesystem          Avail Mounted on\n/dev/mapper/data  987654 /var/lib/docker\n'
+            ),
+            {'filesystem': '/dev/mapper/data', 'mountpoint': '/var/lib/docker', 'available_bytes': 987654},
+        )
+        with self.assertRaises(ValueError):
+            v.parse_filesystem_capacity('Filesystem Avail Mounted on\n/dev/data unknown /var/lib/docker\n')
+
+    def test_storage_full_classification_is_bounded_to_failed_cohort(self):
+        started = dt.datetime(2026, 9, 26, 12, 0, tzinfo=dt.timezone.utc)
+        ended = started + dt.timedelta(seconds=120)
+        earlier = 'minio | 2026-09-26T11:59:59Z HTTP 507 XMinioStorageFull'
+        current = 'compactor | 2026-09-26T12:00:30.123Z HTTP 507 XMinioStorageFull'
+        self.assertEqual(v.classify_cohort_failure(earlier, started, ended), 'visibility_mismatch')
+        self.assertEqual(v.classify_cohort_failure(current, started, ended), 'storage_capacity_exhausted')
+
+    def test_failed_cohort_reports_current_project_storage_exhaustion_without_docker(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = SimpleNamespace(out=str(Path(temp)/'run'), version='v0.2.0', profile='smoke', dependency_policy='public')
+            run = v.Run(args)
+            run.ingest = 'http://127.0.0.1:40001'
+            started = dt.datetime(2026, 9, 26, 12, 0, tzinfo=dt.timezone.utc)
+            ended = started + dt.timedelta(seconds=120)
+            logs = 'compactor | 2026-09-26T12:01:00Z HTTP 507 XMinioStorageFull\n'
+            with patch.object(v, 'now_utc', side_effect=[started, ended]), \
+                 patch.object(v, 'http', return_value={}), \
+                 patch.object(run, 'sql', return_value=[]), \
+                 patch.object(run, 'cmd', return_value=logs) as cmd, \
+                 patch.object(v.time, 'monotonic', side_effect=[0, 121]), \
+                 patch.object(v.time, 'sleep'):
+                with self.assertRaisesRegex(v.StorageCapacityExhausted, 'HTTP 507 XMinioStorageFull'):
+                    run.ingest_and_check()
+            cmd.assert_called_once_with(
+                'logs', '--no-color', '--timestamps', '--since', started.isoformat(), timeout=60
+            )
+            self.assertEqual((run.out/'cohort-failure.log').read_text(), logs)

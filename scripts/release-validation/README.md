@@ -85,8 +85,14 @@ no `count >= expected` shortcut accepts loss plus duplicates. No ingest retry is
 hidden: an uncertain acknowledgment fails this profile. A batch job must return
 the same oracle answer. Missing bearer credentials must be refused.
 
-The run captures container state, enforced limits, Docker statistics and query
-metrics each minute, refusing OOM, unexpected restarts or stopped services.
+Before setup, the run records the available bytes on the filesystem backing
+Docker's root directory. Each minute it captures that reading with container
+state, enforced limits, Docker statistics and query metrics, refusing OOM,
+unexpected restarts or stopped services. If a cohort's 120-second deadline
+contains a MinIO HTTP 507 `XMinioStorageFull` response from the same Compose
+project, the failure is reported as backing-store exhaustion instead of an
+unexplained visibility mismatch. No capacity threshold is inferred from that
+reading.
 Query and compactor restart hourly; all three product components restart at the
 end, with exact counts checked again. Load is bounded (100 events/cycle, three
 simultaneous queries), not a saturation or large-working-set benchmark. There is
