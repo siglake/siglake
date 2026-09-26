@@ -1,0 +1,11 @@
+{
+  "summary.json": "ed476c14e51dff060496e68df3c1062acda37cb588985d059d76a7e8e27980df",
+  "metrics.prom": "b9dbc02537708750e3ebe50e59d26af6d0698691a88b77ee1e28e593bfe78282",
+  "containers.log": "96ceb4cee914ade685c93241d9c890603f54f4b83b05e82cd49516be2b8cf339",
+  "compose.json": "4a9248bb6370192f7cd6936a3a3e72ea56ec4768df678ba0d57fc07712402d39",
+  "events.jsonl": "8c1d6e2031b72571fcf421527a0babd29d83b5555b4aaae6fb3213243ba1adbc",
+  "harness.py": "206f0e720bc325928556c7ce8b541d12151bb9d61f93bc35f8055f31be031f78",
+  "release-compose.yml": "b0de00f322ff098f1dc343680ac06f247f95acb18df070d13b77f907c105631b",
+  "resources.jsonl": "bad0b7a0229808dc4fca12b00a052812e0961c0fcd1b3966c23df6c2cc5ce78d",
+  "_migration_notice": "Historical pre-rename evidence: product names were normalized during the Siglake history migration. Source IDs, artifact digests, measurements and outcomes refer to the archived original runs, not rebuilt Siglake artifacts."
+}

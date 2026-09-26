@@ -7,7 +7,9 @@ Cargo.lock.bak
 /.siglake
 
 # Evidence a round writes for the manager to collect (scripts/kind-round.sh)
-/results
+# scripts/release-validation/README.md:114 commits reviewed summaries here; other round output under results/ stays ignored.
+/results/*
+!/results/release-validation/
 
 # Local reference clones for study (not part of siglake)
 /compare
