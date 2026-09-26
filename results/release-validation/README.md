@@ -16,9 +16,24 @@ The public operations docs are the release-wide coverage ledger.
 | v0.2.0 | Failed (MinIO HTTP 401) | Passed, 400 exact committed events | Passed, no owned resources left |
 
 Both engine images were pulled anonymously by immutable digest. Cached dependency
-smoke results do not qualify the failed public install path. Separate 24h and 72h
-diagnostics started for each version from committed harness `df7a83f` on September
-24 at approximately 19:47 UTC; completion is pending, not implied by this table.
+results do not qualify the failed public install path or resolve its anonymous
+MinIO pull failures.
+
+The four duration attempts used committed harness `df7a83f` and the
+`cached-diagnostic` dependency policy. Their requested profile is an attempt
+label, not the elapsed duration of a failed run.
+
+| Version | Requested profile | Started (UTC) | Finished (UTC) | Outcome | Cleanup | Original artifact directory |
+| --- | --- | --- | --- | --- | --- | --- |
+| v0.1.0 | 24h | 2026-09-24 19:47:37.842463 | 2026-09-25 19:49:08.254542 | Passed; workload elapsed 86,434.198801844 seconds | Passed; no owned resources remained | [`v0.1.0-24h-20260924T194737Z-f33ffd9e`](v0.1.0-24h-20260924T194737Z-f33ffd9e/) ([summary](v0.1.0-24h-20260924T194737Z-f33ffd9e/summary.json), [manifest](v0.1.0-24h-20260924T194737Z-f33ffd9e/sha256.json)) |
+| v0.1.0 | 72h | 2026-09-24 19:47:37.900289 | 2026-09-26 09:59:15.615274 | Failed: `AssertionError: committed cohort differs from 100 expected IDs: got 0` | Passed; no owned resources remained | [`v0.1.0-72h-20260924T194737Z-4ca40adf`](v0.1.0-72h-20260924T194737Z-4ca40adf/) ([summary](v0.1.0-72h-20260924T194737Z-4ca40adf/summary.json), [manifest](v0.1.0-72h-20260924T194737Z-4ca40adf/sha256.json)) |
+| v0.2.0 | 24h | 2026-09-24 19:46:40.254995 | 2026-09-25 13:02:23.539822 | Failed: `AssertionError: committed cohort differs from 100 expected IDs: got 0` | Passed; no owned resources remained | [`v0.2.0-24h-20260924T194640Z-85453c6f`](v0.2.0-24h-20260924T194640Z-85453c6f/) ([summary](v0.2.0-24h-20260924T194640Z-85453c6f/summary.json), [manifest](v0.2.0-24h-20260924T194640Z-85453c6f/sha256.json)) |
+| v0.2.0 | 72h | 2026-09-24 19:46:40.328836 | 2026-09-25 13:02:32.604195 | Failed: `AssertionError: committed cohort differs from 100 expected IDs: got 0` | Passed; no owned resources remained | [`v0.2.0-72h-20260924T194640Z-a38924a8`](v0.2.0-72h-20260924T194640Z-a38924a8/) ([summary](v0.2.0-72h-20260924T194640Z-a38924a8/summary.json), [manifest](v0.2.0-72h-20260924T194640Z-a38924a8/sha256.json)) |
+
+Each committed manifest also covers the raw metrics, logs, event records,
+rendered Compose configuration and harness files retained outside Git in its
+original artifact directory. These cached-diagnostic attempts are historical
+evidence, not full release qualification or a new v0.2.1 release gate.
 
 During harness development, an OTLP nullable partial-success field and Docker's
 changing randomly assigned host ports exposed harness bugs. Those attempts remain
