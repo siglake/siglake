@@ -1188,6 +1188,27 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   single-replica local drain supports force even while WAL mirroring is on.
   With `compactor.catalogClaim.enabled`, use `?commit=wait_for` (the default ack
   mode) and query for visibility.
+- **An endpoint which advertises conditional writes but silently accepts stale
+  overwrites is refused for conditional warehouse mutations.** Before the
+  first remote mutation in a process context, Siglake writes the fixed
+  non-JSON `_siglake/config/.conditional-write-probe-<process-id>` object and
+  independently tries a stale `If-Match` overwrite and an existing-key
+  `If-None-Match: *` overwrite. Each request must return a recognized
+  precondition error and preserve the existing bytes. An ignored header, a missing advertised
+  capability or an indeterminate response refuses inline side-aggregate
+  publication, wide group-count folds and rebuilds, snapshot-expiry coverage
+  re-rooting, inline time-aggregate rebuild publication, and dropped-index
+  cleanup-record creation. It never enters an unconditional remote-write
+  fallback. The `file://` backend keeps its separate in-process serialized
+  read-merge-write behavior. The verdict is cached only in the context for the
+  warehouse store it checked and shared by that context's tenant views. Garage
+  v2.4.1 returned HTTP 200 for both invalid preconditions in the matched signed
+  S3 run, so these operations fail closed there; this is refusal, not a Garage
+  support commitment. The check is sequential and detects ignored headers.
+  It does not prove concurrent atomic exclusion on an endpoint which passes,
+  which remains part of live qualification. The delete-task claim retains its
+  separate create-only probe from #3201; that probe does not repair or
+  establish stale-`If-Match` behavior.
 - **A claimed delete task is never un-claimed; a claim leaked by a crash
   strands the task.** Each task is its own warehouse object
   (`_siglake/config/delete_tasks/<namespace>/<task_id>.json`), so submissions
@@ -1198,14 +1219,13 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `<task_id>.claim` key (`if_not_exists`, which both the fs and S3 backends
   support), and only the winner runs it. A loser reports the task as
   `tasks_already_claimed` and touches nothing; a store that cannot do a
-  create-only write fails the sweep rather than executing unclaimed. OpenDAL's
-  S3 capability is static, so before the first claim a process context writes a
-  fixed probe object and attempts a create-only overwrite of it. A recognized
-  precondition rejection enables claims; an accepted overwrite or any other
-  response fails the sweep. The successful compatibility verdict is cached
-  across tenant contexts. This detects the ignored-header behavior measured on
-  Garage in run #145, but a sequential exchange cannot prove that another
-  endpoint implements the operation atomically under concurrent requests. The
+  create-only write fails the sweep rather than executing unclaimed. Before the
+  first claim, the process context writes a fixed `.create-only-probe` object
+  beside the task records and attempts a create-only overwrite. A recognized
+  precondition rejection enables claims; an accepted overwrite or another
+  response fails the sweep. The claim verdict is cached across tenant contexts.
+  It is independent of the warehouse guard above and says nothing about stale
+  `If-Match`. The
   claim covers every entry point, including `siglake delete-tasks execute` run
   by hand and a second control plane with no catalog configured, where the
   compactor's `delete_tasks` maintenance lease does not reach. What it does NOT do is

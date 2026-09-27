@@ -653,6 +653,20 @@ deletion has no production authority-changing API while its retention and
 failure policy remain open
 ([design](DESIGN_dropped_index_aggregate_reclamation.md)).
 
+Remote side-object writes and dropped-index record creation share one
+warehouse-scoped compatibility verdict. Before the process context's first
+conditional mutation, Siglake writes the fixed non-JSON
+`_siglake/config/.conditional-write-probe-<process-id>` scratch object. It
+requires a stale `If-Match` and an existing-key `If-None-Match: *` to receive recognized
+precondition errors, and confirms that each rejected request preserved the
+existing bytes. An ignored header or an indeterminate response refuses inline
+publication, wide folds and rebuilds, expiry coverage re-rooting, inline time
+rebuild publication, and dropped-index record creation. The `file://` backend
+keeps its separately serialized single-writer read-merge-write path. The
+cached verdict belongs to the context's warehouse store and is shared by its
+tenant contexts. This sequential exchange detects the behavior measured on
+Garage v2.4.1; concurrent atomic exclusion still requires live qualification.
+
 **Group-count repair and limits.** The per-commit group-count delta write makes
 four attempts, waiting 250, 500 and 750 ms between attempts. A write that
 eventually succeeds after retry increments

@@ -500,6 +500,8 @@ const DELETE_TASKS_CONFIG_DIR: &str = "_siglake/config/delete_tasks";
 const DROPPED_INDEXES_CONFIG_DIR: &str = "_siglake/config/dropped_indexes";
 const DELETE_TASK_CLAIM_PROBE: &str = ".create-only-probe";
 const DELETE_TASK_CLAIM_PROBE_BODY: &[u8] = b"siglake delete-task create-only probe v1\n";
+const CONDITIONAL_WRITE_PROBE: &str = "_siglake/config/.conditional-write-probe";
+static CONDITIONAL_WRITE_PROBE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Attempts a delete-task record write gets before it is reported lost. Same
 /// linear policy as the group-count deltas: a credential refresh recovers in
@@ -544,14 +546,8 @@ enum DeleteClaimCreateOnly {
     Ignored,
 }
 
-/// Detect the measured S3-compatible failure mode where the endpoint accepts
-/// an overwrite carrying `If-None-Match: *`. The static OpenDAL capability is
-/// necessary to issue the request, but it says nothing about what a custom S3
-/// endpoint does with the header.
-///
-/// This is a compatibility probe, not a proof that create-only writes are
-/// atomic under concurrency. It only lets the claim path reject an endpoint
-/// already shown to ignore the precondition in a sequential exchange.
+/// Claim-specific compatibility check from #3201. This covers only
+/// `If-None-Match: *`; it establishes nothing about stale `If-Match`.
 async fn probe_delete_claim_create_only(
     op: &opendal::Operator,
     namespace: &NamespaceIdent,
@@ -584,6 +580,158 @@ async fn probe_delete_claim_create_only(
             )
         }),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionalPrecondition {
+    Verified,
+    Ignored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConditionalWriteCompatibility {
+    if_match: Option<ConditionalPrecondition>,
+    if_not_exists: Option<ConditionalPrecondition>,
+}
+
+/// Detect the measured S3-compatible failure modes where the endpoint accepts
+/// either a stale `If-Match` overwrite or an existing-key `If-None-Match: *`
+/// overwrite. Static OpenDAL capabilities are necessary to issue the requests,
+/// but say nothing about what a custom endpoint does with the headers.
+///
+/// This bounded sequential check detects ignored headers; it does not prove
+/// atomic exclusion under concurrent requests. A concurrent probe which changes
+/// the fixed scratch object makes the result indeterminate and therefore fails
+/// closed. Only a complete verdict is cached by the owning context.
+async fn probe_conditional_write_compatibility(
+    op: &opendal::Operator,
+) -> Result<ConditionalWriteCompatibility> {
+    let _serialized = CONDITIONAL_WRITE_PROBE_LOCK.lock().await;
+    let capabilities = op.info().full_capability();
+    let rel = format!("{CONDITIONAL_WRITE_PROBE}-{}", claimant_id());
+    let nonce = Uuid::now_v7();
+
+    let if_match = if capabilities.write_with_if_match {
+        let current = format!("siglake conditional-write probe {nonce} match-current\n");
+        let stale = format!("siglake conditional-write probe {nonce} match-stale\n");
+        let stale_etag = format!("\"siglake-stale-{nonce}\"");
+        op.write(&rel, current.as_bytes().to_vec())
+            .await
+            .context("seed conditional-write If-Match probe")?;
+        let verdict = match op
+            .write_with(&rel, stale.as_bytes().to_vec())
+            .if_match(&stale_etag)
+            .await
+        {
+            Ok(_) => ConditionalPrecondition::Ignored,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    opendal::ErrorKind::ConditionNotMatch | opendal::ErrorKind::AlreadyExists
+                ) =>
+            {
+                ConditionalPrecondition::Verified
+            }
+            Err(err) => {
+                return Err(err).context(
+                    "warehouse store gave no recognized stale If-Match rejection for the \
+                     conditional-write probe",
+                )
+            }
+        };
+        let expected = if verdict == ConditionalPrecondition::Verified {
+            &current
+        } else {
+            &stale
+        };
+        let found = op
+            .read(&rel)
+            .await
+            .context("read conditional-write If-Match probe")?
+            .to_vec();
+        anyhow::ensure!(
+            found == expected.as_bytes(),
+            "conditional-write If-Match probe changed concurrently; refusing an indeterminate verdict"
+        );
+        Some(verdict)
+    } else {
+        None
+    };
+
+    let if_not_exists = if capabilities.write_with_if_not_exists {
+        let current = format!("siglake conditional-write probe {nonce} create-current\n");
+        let overwrite = format!("siglake conditional-write probe {nonce} create-overwrite\n");
+        op.write(&rel, current.as_bytes().to_vec())
+            .await
+            .context("seed conditional-write If-None-Match probe")?;
+        let verdict =
+            match op
+                .write_with(&rel, overwrite.as_bytes().to_vec())
+                .if_not_exists(true)
+                .await
+            {
+                Ok(_) => ConditionalPrecondition::Ignored,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        opendal::ErrorKind::ConditionNotMatch | opendal::ErrorKind::AlreadyExists
+                    ) =>
+                {
+                    ConditionalPrecondition::Verified
+                }
+                Err(err) => return Err(err).context(
+                    "warehouse store gave no recognized existing-key If-None-Match rejection for \
+                     the conditional-write probe",
+                ),
+            };
+        let expected = if verdict == ConditionalPrecondition::Verified {
+            &current
+        } else {
+            &overwrite
+        };
+        let found = op
+            .read(&rel)
+            .await
+            .context("read conditional-write If-None-Match probe")?
+            .to_vec();
+        anyhow::ensure!(
+            found == expected.as_bytes(),
+            "conditional-write If-None-Match probe changed concurrently; refusing an indeterminate verdict"
+        );
+        Some(verdict)
+    } else {
+        None
+    };
+
+    Ok(ConditionalWriteCompatibility {
+        if_match,
+        if_not_exists,
+    })
+}
+
+async fn require_conditional_write_compatibility(
+    op: &opendal::Operator,
+    compatibility: &tokio::sync::OnceCell<ConditionalWriteCompatibility>,
+    require_if_match: bool,
+    require_if_not_exists: bool,
+) -> Result<()> {
+    let verdict = compatibility
+        .get_or_try_init(|| probe_conditional_write_compatibility(op))
+        .await
+        .context("cannot establish warehouse conditional-write compatibility")?;
+    if require_if_match {
+        anyhow::ensure!(
+            verdict.if_match == Some(ConditionalPrecondition::Verified),
+            "warehouse store did not reject a stale If-Match overwrite; refusing an unsafe conditional mutation"
+        );
+    }
+    if require_if_not_exists {
+        anyhow::ensure!(
+            verdict.if_not_exists == Some(ConditionalPrecondition::Verified),
+            "warehouse store did not reject an existing-key If-None-Match overwrite; refusing an unsafe create-only mutation"
+        );
+    }
+    Ok(())
 }
 
 async fn claim_delete_task_with_operator(
@@ -639,27 +787,38 @@ async fn claim_delete_task_with_operator(
 }
 
 #[cfg(test)]
-mod delete_claim_create_only_tests {
+mod conditional_write_compatibility_tests {
     use super::*;
-    use opendal::raw::{Access, Layer, LayeredAccess, OpList, OpRead, OpWrite};
+    use opendal::raw::{Access, Layer, LayeredAccess, OpList, OpRead, OpStat, OpWrite};
 
-    #[derive(Clone, Debug)]
-    struct IgnoreIfNotExistsLayer;
-
-    #[derive(Debug)]
-    struct IgnoreIfNotExistsAccess<A> {
-        inner: A,
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum IgnoredPrecondition {
+        Neither,
+        IfMatch,
+        IfNotExists,
     }
 
-    impl<A: Access> Layer<A> for IgnoreIfNotExistsLayer {
-        type LayeredAccess = IgnoreIfNotExistsAccess<A>;
+    #[derive(Debug)]
+    struct IgnoreConditionalAccess<A> {
+        inner: A,
+        ignored: IgnoredPrecondition,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct IgnoreConditionalLayer(IgnoredPrecondition);
+
+    impl<A: Access> Layer<A> for IgnoreConditionalLayer {
+        type LayeredAccess = IgnoreConditionalAccess<A>;
 
         fn layer(&self, inner: A) -> Self::LayeredAccess {
-            IgnoreIfNotExistsAccess { inner }
+            IgnoreConditionalAccess {
+                inner,
+                ignored: self.0,
+            }
         }
     }
 
-    impl<A: Access> LayeredAccess for IgnoreIfNotExistsAccess<A> {
+    impl<A: Access> LayeredAccess for IgnoreConditionalAccess<A> {
         type Inner = A;
         type Reader = A::Reader;
         type Writer = A::Writer;
@@ -684,7 +843,41 @@ mod delete_claim_create_only_tests {
             path: &str,
             args: OpWrite,
         ) -> opendal::Result<(opendal::raw::RpWrite, Self::Writer)> {
-            self.inner.write(path, args.with_if_not_exists(false)).await
+            if self.ignored != IgnoredPrecondition::IfMatch {
+                if let Some(expected) = args.if_match() {
+                    let actual = self
+                        .inner
+                        .stat(path, OpStat::default())
+                        .await?
+                        .into_metadata()
+                        .etag()
+                        .map(str::to_string);
+                    if actual.as_deref() != Some(expected) {
+                        return Err(opendal::Error::new(
+                            opendal::ErrorKind::ConditionNotMatch,
+                            "deterministic fixture rejected stale If-Match",
+                        ));
+                    }
+                }
+            }
+            let mut forwarded = OpWrite::default();
+            match self.ignored {
+                IgnoredPrecondition::Neither | IgnoredPrecondition::IfMatch => {
+                    forwarded = forwarded.with_if_not_exists(args.if_not_exists());
+                    if let Some(value) = args.if_none_match() {
+                        forwarded = forwarded.with_if_none_match(value);
+                    }
+                }
+                IgnoredPrecondition::IfNotExists => {
+                    if let Some(value) = args.if_match() {
+                        forwarded = forwarded.with_if_match(value);
+                    }
+                    if let Some(value) = args.if_none_match() {
+                        forwarded = forwarded.with_if_none_match(value);
+                    }
+                }
+            }
+            self.inner.write(path, forwarded).await
         }
 
         async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
@@ -700,47 +893,107 @@ mod delete_claim_create_only_tests {
         }
     }
 
-    #[tokio::test]
-    async fn probe_accepts_a_recognized_create_only_rejection() {
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
-        let namespace = NamespaceIdent::new("probe-rejects".to_string());
+    fn operator(ignored: IgnoredPrecondition) -> (tempfile::TempDir, opendal::Operator) {
+        let root = tempfile::tempdir().unwrap();
+        let op = opendal::Operator::new(
+            opendal::services::Fs::default().root(root.path().to_str().unwrap()),
+        )
+        .unwrap()
+        .layer(IgnoreConditionalLayer(ignored))
+        .layer(opendal::layers::CapabilityOverrideLayer::new(|mut cap| {
+            cap.write_with_if_match = true;
+            cap
+        }))
+        .finish();
+        (root, op)
+    }
 
+    #[tokio::test]
+    async fn probe_accepts_recognized_rejections_and_preserves_the_object() {
+        let (_root, op) = operator(IgnoredPrecondition::Neither);
+        let verdict = probe_conditional_write_compatibility(&op).await.unwrap();
         assert_eq!(
-            probe_delete_claim_create_only(&op, &namespace)
-                .await
-                .unwrap(),
-            DeleteClaimCreateOnly::Verified
+            verdict,
+            ConditionalWriteCompatibility {
+                if_match: Some(ConditionalPrecondition::Verified),
+                if_not_exists: Some(ConditionalPrecondition::Verified),
+            }
+        );
+        let body = op
+            .read(&format!("{CONDITIONAL_WRITE_PROBE}-{}", claimant_id()))
+            .await
+            .unwrap()
+            .to_vec();
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .ends_with("create-current\n"),
+            "the rejected create-only write must preserve the existing object"
         );
     }
 
-    /// The regression: OpenDAL still advertises create-only support, while the
-    /// stand-in endpoint accepts the conditional overwrite. A static
-    /// capability check alone would let the caller claim and execute.
     #[tokio::test]
-    async fn claim_refuses_a_store_that_ignores_if_not_exists() {
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .layer(IgnoreIfNotExistsLayer)
-            .finish();
-        assert!(op.info().full_capability().write_with_if_not_exists);
-        let namespace = NamespaceIdent::new("probe-ignores".to_string());
-        let task_id = Uuid::new_v4();
-        let create_only = tokio::sync::OnceCell::new();
+    async fn probe_independently_detects_ignored_if_match() {
+        let (_root, op) = operator(IgnoredPrecondition::IfMatch);
+        let verdict = probe_conditional_write_compatibility(&op).await.unwrap();
+        assert_eq!(verdict.if_match, Some(ConditionalPrecondition::Ignored));
+        assert_eq!(
+            verdict.if_not_exists,
+            Some(ConditionalPrecondition::Verified)
+        );
+    }
 
-        let err = claim_delete_task_with_operator(&op, &namespace, task_id, &create_only)
+    #[tokio::test]
+    async fn probe_independently_detects_ignored_if_not_exists() {
+        let (_root, op) = operator(IgnoredPrecondition::IfNotExists);
+        let verdict = probe_conditional_write_compatibility(&op).await.unwrap();
+        assert_eq!(verdict.if_match, Some(ConditionalPrecondition::Verified));
+        assert_eq!(
+            verdict.if_not_exists,
+            Some(ConditionalPrecondition::Ignored)
+        );
+    }
+
+    /// The regression: the advertised capability stays true while the stand-in
+    /// endpoint accepts the stale overwrite. The application guard must refuse
+    /// before the real publication key is touched.
+    #[tokio::test]
+    async fn unsafe_store_is_refused_before_publication() {
+        let (_root, op) = operator(IgnoredPrecondition::IfMatch);
+        let compatibility = tokio::sync::OnceCell::new();
+        let publication = "real-publication";
+        op.write(publication, b"preserved".to_vec()).await.unwrap();
+
+        let err = require_conditional_write_compatibility(&op, &compatibility, true, true)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("stale If-Match"), "{err:#}");
+        assert!(
+            op.read(publication).await.unwrap().to_vec() == b"preserved",
+            "the refused endpoint must not receive the real publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsafe_create_only_store_is_refused_before_cleanup_record_overwrite() {
+        let (_root, op) = operator(IgnoredPrecondition::IfNotExists);
+        let compatibility = tokio::sync::OnceCell::new();
+        let cleanup_record = "_siglake/config/dropped_indexes/siglake/existing.json";
+        op.write(cleanup_record, b"existing authority".to_vec())
+            .await
+            .unwrap();
+
+        let err = require_conditional_write_compatibility(&op, &compatibility, false, true)
             .await
             .unwrap_err();
         assert!(
-            format!("{err:#}").contains("accepted an overwrite"),
+            format!("{err:#}").contains("existing-key If-None-Match"),
             "{err:#}"
         );
-        assert!(
-            !op.exists(&delete_task_claim_rel_path(&namespace, task_id))
-                .await
-                .unwrap(),
-            "the refused endpoint must not receive a real claim"
+        assert_eq!(
+            op.read(cleanup_record).await.unwrap().to_vec(),
+            b"existing authority",
+            "the refused endpoint must not overwrite cleanup authority"
         );
     }
 }
@@ -7779,8 +8032,6 @@ enum CasWrite {
     Written,
     /// Another writer landed since our read — reload and re-apply.
     Conflict,
-    /// The store rejects conditional writes — fall back to plain RMW.
-    Unsupported,
 }
 
 /// The versioned-object seam the CAS loop runs against: opendal in production
@@ -7796,7 +8047,7 @@ trait SideCasStore {
         body: Vec<u8>,
         version: Option<&str>,
     ) -> Result<CasWrite>;
-    /// Unconditional write (the Unsupported fallback).
+    /// Unconditional write for the separately serialized local-filesystem path.
     async fn store(&self, rel_path: &str, body: Vec<u8>) -> Result<()>;
     /// Whether conditional writes are worth attempting at all.
     fn conditional(&self) -> bool;
@@ -7920,7 +8171,6 @@ impl SideCasStore for OpendalSideCas<'_> {
             // Some S3-compatible stores accept the header family but return
             // AlreadyExists for a failed If-Not-Exists — treat as conflict.
             Err(e) if e.kind() == opendal::ErrorKind::AlreadyExists => Ok(CasWrite::Conflict),
-            Err(e) if e.kind() == opendal::ErrorKind::Unsupported => Ok(CasWrite::Unsupported),
             Err(e) => Err(e).context("conditional side-aggregate write"),
         }
     }
@@ -7934,24 +8184,17 @@ impl SideCasStore for OpendalSideCas<'_> {
     }
 
     fn conditional(&self) -> bool {
-        use std::sync::atomic::Ordering;
         self.0.info().full_capability().write_with_if_match
-            && !CONDITIONAL_UNSUPPORTED.load(Ordering::Relaxed)
     }
 }
-
-/// Sticky per-process fallback for stores that advertise conditional-write
-/// capability but reject the headers at runtime.
-static CONDITIONAL_UNSUPPORTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Cross-process-safe side-aggregate update (fleet prerequisite): read the
 /// object capturing its version, apply `deltas`, and conditionally write back,
 /// retrying on conflict — so N drain pods folding into one cumulative object
-/// lose nothing. Stores without conditional writes (local fs; non-conforming
-/// S3-compat) fall back to plain read-merge-write, where in-process
-/// serialization is the correctness story (single-writer-per-table
-/// deployments).
+/// lose nothing. The local filesystem uses plain read-merge-write, where
+/// in-process serialization is the correctness story (single-writer-per-table
+/// deployments). Remote stores are compatibility-checked before reaching this
+/// loop and never fall back from an indeterminate conditional write.
 async fn cas_merge_side_aggregates_in<S: SideCasStore>(
     store: &S,
     rel_path: &str,
@@ -7983,25 +8226,6 @@ async fn cas_merge_side_aggregates_in<S: SideCasStore>(
         match store.store_if(rel_path, body, version.as_deref()).await? {
             CasWrite::Written => return Ok(SidePublication::Written),
             CasWrite::Conflict => continue,
-            CasWrite::Unsupported => {
-                tracing::warn!(
-                    "store rejects conditional writes; side-aggregate updates fall back to \
-                     plain read-merge-write (single-writer-per-table deployments only)"
-                );
-                CONDITIONAL_UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
-                let (existing, _) = store.load(rel_path).await?;
-                if existing
-                    .as_ref()
-                    .is_some_and(|side| deltas.already_published(side))
-                {
-                    return Ok(SidePublication::AlreadyPublished);
-                }
-                let mut side = existing.unwrap_or_default();
-                deltas.apply_to(&mut side, group_count_cap);
-                let body = serde_json::to_vec(&side).context("serialize side aggregates")?;
-                store.store(rel_path, body).await?;
-                return Ok(SidePublication::Written);
-            }
         }
     }
     anyhow::bail!("side-aggregate CAS exhausted {MAX_ATTEMPTS} attempts on {rel_path}")
@@ -8974,9 +9198,10 @@ type FoldedWide = Option<WideGroupCounts>;
 /// and redo its work rather than merge by hand.
 ///
 /// Extracted from the fold so the rebuild path writes through the same
-/// conditional logic, including the two fallbacks: stores without conditional
-/// writes (local fs) do a plain read-modify-write, which is the whole
-/// correctness story there because the compactor is the object's only writer.
+/// conditional logic. The local filesystem does a plain read-modify-write,
+/// which is the whole correctness story there because the compactor is the
+/// object's only writer. Remote callers verify both conditional forms before
+/// entering this helper and never fall back from an indeterminate request.
 async fn store_wide_group_counts(
     op: &opendal::Operator,
     wide: &WideGroupCounts,
@@ -8984,12 +9209,16 @@ async fn store_wide_group_counts(
 ) -> Result<bool> {
     let body = serde_json::to_vec(wide).context("serialize wide group counts")?;
     if !op.info().full_capability().write_with_if_match {
+        anyhow::ensure!(
+            op.info().scheme() == "fs",
+            "remote store does not advertise conditional overwrites; refusing an unconditional wide group-count write"
+        );
         op.write(WIDE_GROUP_COUNTS_REL_PATH, body)
             .await
             .context("write wide group counts")?;
         return Ok(true);
     }
-    let mut writer = op.write_with(WIDE_GROUP_COUNTS_REL_PATH, body.clone());
+    let mut writer = op.write_with(WIDE_GROUP_COUNTS_REL_PATH, body);
     writer = match version {
         Some(tag) => writer.if_match(tag),
         None => writer.if_not_exists(true),
@@ -9003,12 +9232,6 @@ async fn store_wide_group_counts(
             ) =>
         {
             Ok(false)
-        }
-        Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
-            op.write(WIDE_GROUP_COUNTS_REL_PATH, body)
-                .await
-                .context("write wide group counts")?;
-            Ok(true)
         }
         Err(e) => Err(e).context("conditional wide group-count write"),
     }
@@ -11034,11 +11257,15 @@ pub struct IcebergContext {
     table_ident: TableIdent, // events; preserved for back-compat helpers
     warehouse_url: Arc<String>,
     warehouse_file_io: FileIO,
-    /// Result of the delete-claim store compatibility probe. OpenDAL's S3
-    /// capability is static for every S3-compatible endpoint, so the claim
-    /// path verifies that an existing object rejects `if_not_exists` once per
-    /// process context. Per-tenant contexts share this cell.
+    /// Claim-only create-only verdict retained from #3201. It deliberately
+    /// does not stand in for the stale-If-Match compatibility guard below.
     delete_claim_create_only: Arc<tokio::sync::OnceCell<DeleteClaimCreateOnly>>,
+    /// Result of the warehouse conditional-write compatibility probe. OpenDAL's
+    /// S3 capabilities are static for every S3-compatible endpoint, so the
+    /// mutation paths verify the endpoint's actual stale-`If-Match` and
+    /// existing-key-`If-None-Match` behavior once per process context.
+    /// Per-tenant contexts share this store-scoped cell.
+    conditional_write_compatibility: Arc<tokio::sync::OnceCell<ConditionalWriteCompatibility>>,
     table_cache: Arc<RwLock<HashMap<String, CachedTableEntry>>>,
     /// Table-cache keys with a background refresh in flight, so a burst of
     /// stale-serving reads spawns exactly one reload per key (stale-while-
@@ -12382,6 +12609,7 @@ impl IcebergContext {
             warehouse_url: self.warehouse_url.clone(),
             warehouse_file_io: self.warehouse_file_io.clone(),
             delete_claim_create_only: self.delete_claim_create_only.clone(),
+            conditional_write_compatibility: self.conditional_write_compatibility.clone(),
             table_cache: self.table_cache.clone(),
             table_cache_refreshing: self.table_cache_refreshing.clone(),
             table_cache_epochs: self.table_cache_epochs.clone(),
@@ -12456,6 +12684,7 @@ impl IcebergContext {
             warehouse_url: Arc::new(warehouse_url.to_string()),
             warehouse_file_io,
             delete_claim_create_only: Arc::new(tokio::sync::OnceCell::new()),
+            conditional_write_compatibility: Arc::new(tokio::sync::OnceCell::new()),
             table_cache: Arc::new(RwLock::new(HashMap::new())),
             table_cache_refreshing: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
@@ -13895,6 +14124,9 @@ impl IcebergContext {
         if !self.group_count_deltas_enabled() {
             return Ok(Vec::new());
         }
+        self.require_safe_side_object_conditionals()
+            .await
+            .context("refusing group-count fold on an unsafe conditional-write store")?;
         let idents = self.aggregate_table_idents().await;
         let mut out = Vec::new();
         for ident in idents {
@@ -15719,6 +15951,14 @@ impl IcebergContext {
         delta_tb: Option<TimeBucketCounts>,
         delta_tg: Option<TimeGroupCounts>,
     ) {
+        if let Err(error) = self.require_safe_side_object_conditionals().await {
+            tracing::error!(
+                error = %error,
+                table = %target.table_ident,
+                "refusing side-aggregate publication because the warehouse did not verify conditional writes"
+            );
+            return;
+        }
         let SideAggregatePublication {
             table_ident,
             side_path,
@@ -16631,6 +16871,9 @@ impl IcebergContext {
         proven: AggregateCoverage,
         target: AggregateCoverage,
     ) -> Result<()> {
+        self.require_safe_side_object_conditionals()
+            .await
+            .context("refusing coverage re-root on an unsafe conditional-write store")?;
         let op = aggregate_operator(table)?.ok_or_else(|| {
             anyhow::anyhow!("{table_ident} has no UUID; its aggregate has no incarnation to bind")
         })?;
@@ -16655,12 +16898,6 @@ impl IcebergContext {
                     metrics::counter!("siglake_inline_coverage_reroot_conflicts_total")
                         .increment(1);
                     return Ok(());
-                }
-                CasWrite::Unsupported => {
-                    CONDITIONAL_UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let body =
-                        serde_json::to_vec(&side).context("serialize re-rooted side aggregates")?;
-                    store.store(SIDE_AGGREGATES_REL_PATH, body).await?;
                 }
             }
         } else {
@@ -18616,11 +18853,19 @@ impl IcebergContext {
         record: &DroppedIndexCleanupRecord,
     ) -> Result<()> {
         let op = self.warehouse_object_store()?;
-        anyhow::ensure!(
-            op.info().full_capability().write_with_if_not_exists,
-            "warehouse store does not support create-only writes; refusing to record dropped index {}",
-            record.drop_id
-        );
+        require_conditional_write_compatibility(
+            &op,
+            &self.conditional_write_compatibility,
+            false,
+            true,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "warehouse store cannot safely create dropped-index record {}; refusing to drop the index",
+                record.drop_id
+            )
+        })?;
         let rel = dropped_index_record_rel_path(self.namespace(), record.drop_id);
         let body = serde_json::to_vec(record)
             .with_context(|| format!("serialize dropped-index record {}", record.drop_id))?;
@@ -18788,6 +19033,23 @@ impl IcebergContext {
     pub(crate) fn warehouse_object_store(&self) -> Result<opendal::Operator> {
         warehouse_operator(self.warehouse_url())
             .with_context(|| format!("open warehouse store {}", self.warehouse_url()))
+    }
+
+    /// Require both conditional-overwrite forms before a remote side-object
+    /// mutation. The local filesystem keeps its documented in-process
+    /// serialization path and never enters this compatibility decision.
+    async fn require_safe_side_object_conditionals(&self) -> Result<()> {
+        if self.warehouse_url().starts_with("file://") {
+            return Ok(());
+        }
+        let op = self.warehouse_object_store()?;
+        require_conditional_write_compatibility(
+            &op,
+            &self.conditional_write_compatibility,
+            true,
+            true,
+        )
+        .await
     }
 
     fn legacy_delete_tasks_location(&self) -> String {
@@ -23314,6 +23576,9 @@ impl IcebergContext {
         options: GroupCountRebuildOptions,
         request: GroupCountRebuildRequest<'_>,
     ) -> Result<GroupCountRebuild> {
+        self.require_safe_side_object_conditionals()
+            .await
+            .context("refusing group-count rebuild on an unsafe conditional-write store")?;
         let GroupCountRebuildRequest {
             repair_columns,
             repair_sketch_columns,
@@ -23689,6 +23954,9 @@ impl IcebergContext {
         S: SideCasStore,
         F: Fn(&opendal::Operator) -> S,
     {
+        self.require_safe_side_object_conditionals().await.context(
+            "refusing inline time-aggregate rebuild on an unsafe conditional-write store",
+        )?;
         let ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
         let mut moved = 0u32;
         loop {
@@ -23902,12 +24170,6 @@ impl IcebergContext {
             {
                 CasWrite::Written => {}
                 CasWrite::Conflict => return Ok(None),
-                CasWrite::Unsupported => {
-                    CONDITIONAL_UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let body =
-                        serde_json::to_vec(&side).context("serialize rebuilt side aggregates")?;
-                    store.store(SIDE_AGGREGATES_REL_PATH, body).await?;
-                }
             }
         } else {
             store.store(SIDE_AGGREGATES_REL_PATH, body).await?;
