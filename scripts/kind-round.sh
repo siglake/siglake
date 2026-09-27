@@ -290,6 +290,10 @@ if [[ -n "$MIRROR_RECLAIM_ARM" ]]; then
   MIRROR_RECLAIM_ROWS_JSON="$MIRROR_RECLAIM_RESULTS_DIR/row-reconciliation.json"
   MIRROR_RECLAIM_METRICS_START="$MIRROR_RECLAIM_RESULTS_DIR/compactor-metrics-start.prom"
   MIRROR_RECLAIM_METRICS_END="$MIRROR_RECLAIM_RESULTS_DIR/compactor-metrics-end.prom"
+  MIRROR_RECLAIM_ALIAS_STDOUT="$MIRROR_RECLAIM_RESULTS_DIR/minio-alias-setup.stdout"
+  MIRROR_RECLAIM_ALIAS_STDERR="$MIRROR_RECLAIM_RESULTS_DIR/minio-alias-setup.stderr"
+  MIRROR_RECLAIM_LISTING_FAILURE_RAW="$MIRROR_RECLAIM_RESULTS_DIR/mirror-prefix-listing-failure.raw"
+  MIRROR_RECLAIM_LISTING_FAILURE_DIAGNOSTIC="$MIRROR_RECLAIM_RESULTS_DIR/mirror-prefix-listing-failure.txt"
 fi
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/siglake-kind-round.XXXXXX")"
@@ -2406,12 +2410,70 @@ start_mirror_reclaim_observer() {
     --restart=Never --command -- sleep 7200 >/dev/null
   kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" wait \
     --for=condition=Ready "pod/$MIRROR_RECLAIM_MC_POD" --timeout=120s >/dev/null
+  if ! kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" exec "$MIRROR_RECLAIM_MC_POD" -- \
+    mc alias set local http://minio:9000 minioadmin minioadmin --quiet \
+    >"$MIRROR_RECLAIM_ALIAS_STDOUT" 2>"$MIRROR_RECLAIM_ALIAS_STDERR"; then
+    die "mirror-reclaim MinIO alias setup failed; output retained under $MIRROR_RECLAIM_RESULTS_DIR"
+  fi
   : >"$MIRROR_RECLAIM_SERIES_JSONL"
+}
+
+parse_mirror_reclaim_listing() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+object_count = 0
+object_bytes = 0
+seen_record = False
+
+
+def refuse(reason, line_number, raw):
+    raise SystemExit(
+        f"mirror-prefix listing {reason} at line {line_number}: {raw!r}"
+    )
+
+
+for line_number, raw in enumerate(open(path, encoding="utf-8"), start=1):
+    raw = raw.strip()
+    if not raw:
+        continue
+    if not seen_record and raw == "Added `local` successfully.":
+        # Older mc builds can print this alias-set acknowledgement on stdout.
+        # Alias setup now has its own capture, but accepting the exact banner
+        # keeps a mixed historical fixture from becoming an object record.
+        continue
+    try:
+        item = json.loads(raw)
+    except json.JSONDecodeError:
+        refuse("is not JSON", line_number, raw)
+    seen_record = True
+    if not isinstance(item, dict):
+        refuse("is not an object record", line_number, raw)
+    if item.get("status") == "error":
+        refuse("reports an error", line_number, raw)
+    item_type = item.get("type")
+    if item_type == "file" or (item_type is None and "size" in item):
+        try:
+            size = int(item.get("size", 0))
+        except (TypeError, ValueError):
+            refuse("has an invalid size", line_number, raw)
+        if size < 0:
+            refuse("has a negative size", line_number, raw)
+        object_count += 1
+        object_bytes += size
+    elif item_type not in ("folder", "directory"):
+        refuse("has an unknown record type", line_number, raw)
+
+print(object_count, object_bytes, sep="\t")
+PY
 }
 
 capture_mirror_reclaim_sample() {
   [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
-  local now_epoch metrics_file objects_file ledger_file pod pod_uid restart_count
+  local now_epoch metrics_file objects_file objects_error objects_totals ledger_file
+  local pod pod_uid restart_count
   now_epoch=$(date +%s)
   metrics_file="$TMP_DIR/mirror-reclaim-compactor.metrics"
   objects_file="$TMP_DIR/mirror-reclaim-objects.jsonl"
@@ -2427,9 +2489,19 @@ capture_mirror_reclaim_sample() {
   start_query_pod_forward "$pod" 19102 9101 mirror-reclaim
   curl -fsS http://127.0.0.1:19102/metrics >"$metrics_file"
   stop_active_forward
-  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" exec "$MIRROR_RECLAIM_MC_POD" -- \
-    sh -c 'mc alias set local http://minio:9000 minioadmin minioadmin --quiet && mc ls --recursive --json local/siglake-warehouse/warehouse/wal-mirror/' \
-    >"$objects_file"
+  objects_error="$TMP_DIR/mirror-reclaim-objects.error"
+  if ! kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" exec "$MIRROR_RECLAIM_MC_POD" -- \
+    mc ls --recursive --json local/siglake-warehouse/warehouse/wal-mirror/ \
+    >"$objects_file" 2>"$objects_error"; then
+    cp "$objects_file" "$MIRROR_RECLAIM_LISTING_FAILURE_RAW"
+    cp "$objects_error" "$MIRROR_RECLAIM_LISTING_FAILURE_DIAGNOSTIC"
+    die "mirror-prefix listing failed; raw output retained at $MIRROR_RECLAIM_LISTING_FAILURE_RAW"
+  fi
+  if ! objects_totals="$(parse_mirror_reclaim_listing "$objects_file" 2>"$objects_error")"; then
+    cp "$objects_file" "$MIRROR_RECLAIM_LISTING_FAILURE_RAW"
+    cp "$objects_error" "$MIRROR_RECLAIM_LISTING_FAILURE_DIAGNOSTIC"
+    die "mirror-prefix listing parse failed; raw output retained at $MIRROR_RECLAIM_LISTING_FAILURE_RAW: $(<"$objects_error")"
+  fi
   kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" exec postgres-0 -- \
     psql -U siglake -d siglake -At -F $'\t' -c \
     "SELECT status, count(*), coalesce(sum(rows), 0) FROM wal_segments WHERE tenant = 'default' AND index_id = '' GROUP BY status ORDER BY status" \
@@ -2437,7 +2509,7 @@ capture_mirror_reclaim_sample() {
   IFS=$'\t' read -r MIRROR_RECLAIM_SAMPLE_OBJECTS MIRROR_RECLAIM_SAMPLE_BYTES \
     MIRROR_RECLAIM_SAMPLE_LEDGER MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED < <(
     python3 - "$MIRROR_RECLAIM_SERIES_JSONL" "$MIRROR_RECLAIM_ARM" \
-      "$now_epoch" "$MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH" "$objects_file" \
+      "$now_epoch" "$MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH" "$objects_totals" \
       "$ledger_file" "$metrics_file" "$pod" "$pod_uid" "$restart_count" <<'PY'
 import datetime
 import json
@@ -2445,22 +2517,13 @@ import re
 import sys
 
 (
-    out_path, arm, epoch, first_epoch, objects_path, ledger_path, metrics_path,
+    out_path, arm, epoch, first_epoch, objects_totals, ledger_path, metrics_path,
     pod, pod_uid, restart_count,
 ) = sys.argv[1:]
 epoch = int(epoch)
 first_epoch = int(first_epoch) or epoch
 
-object_count = 0
-object_bytes = 0
-for raw in open(objects_path, encoding="utf-8"):
-    raw = raw.strip()
-    if not raw:
-        continue
-    item = json.loads(raw)
-    if item.get("type") == "file" or "size" in item:
-        object_count += 1
-        object_bytes += int(item.get("size", 0))
+object_count, object_bytes = map(int, objects_totals.split("\t"))
 
 ledger = {}
 ledger_rows = 0

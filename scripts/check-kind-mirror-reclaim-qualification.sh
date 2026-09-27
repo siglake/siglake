@@ -58,7 +58,11 @@ for artifact in \
   'load-window.json' \
   'row-reconciliation.json' \
   'compactor-metrics-start.prom' \
-  'compactor-metrics-end.prom'; do
+  'compactor-metrics-end.prom' \
+  'minio-alias-setup.stdout' \
+  'minio-alias-setup.stderr' \
+  'mirror-prefix-listing-failure.raw' \
+  'mirror-prefix-listing-failure.txt'; do
   count=$(grep -Fc "$artifact" "$ROUND" || true)
   ((count == 1)) || fail "$ROUND names $artifact $count times, expected once"
 done
@@ -90,6 +94,17 @@ contains "$body" 'MIRROR_RECLAIM_LOAD_FINISHED_EPOCH=$(date +%s)' ||
   fail "$ROUND does not record the actual load finish"
 contains "$body" 'finish_mirror_reclaim_evidence "$next_event" "$rounds"' ||
   fail "$ROUND does not reconcile every sent row after the load"
+contains "$body" 'mc alias set local http://minio:9000 minioadmin minioadmin --quiet' ||
+  fail "$ROUND does not set up the MinIO alias separately"
+contains "$body" 'mc ls --recursive --json local/siglake-warehouse/warehouse/wal-mirror/' ||
+  fail "$ROUND does not request a JSON-only mirror-prefix listing"
+if contains "$body" "sh -c 'mc alias set"; then
+  fail "$ROUND still combines MinIO alias setup with the JSON listing"
+fi
+contains "$body" 'cp "$objects_file" "$MIRROR_RECLAIM_LISTING_FAILURE_RAW"' ||
+  fail "$ROUND does not retain the raw mirror-prefix listing on failure"
+contains "$body" '$(<"$objects_error")' ||
+  fail "$ROUND does not emit the offending mirror-prefix line"
 
 # Drive the setup prelude only. This proves ordinary-round defaults stay at the
 # old 330-second/catalog-claim shape and both qualification launch forms resolve
@@ -289,6 +304,55 @@ for case in mismatch absent; do
   [[ ! -e "$sandbox/results/effective-$case.json" ]] ||
     fail "the $case arm still retained an effective-config document"
 done
+
+# Exercise the production line parser without a cluster. The first fixture is
+# the hypothesized old mc shape: a harmless alias acknowledgement followed by
+# valid JSON records. Every other non-record line, malformed record and mc
+# error must fail with the exact offending line instead of becoming a zero.
+sed -n '/^parse_mirror_reclaim_listing()/,/^capture_mirror_reclaim_sample()/p' \
+  "$ROUND" | sed '$d' >"$sandbox/scripts/parse-listing.bash"
+source "$sandbox/scripts/parse-listing.bash"
+cat >"$sandbox/listing-prologue.jsonl" <<'EOF'
+Added `local` successfully.
+{"status":"success","type":"file","size":5}
+{"status":"success","type":"folder","size":0}
+{"status":"success","type":"file","size":7}
+EOF
+totals=$(parse_mirror_reclaim_listing "$sandbox/listing-prologue.jsonl") ||
+  fail "the parser rejected the recognized mc setup prologue"
+[[ "$totals" == $'2\t12' ]] ||
+  fail "the parser counted the prologue fixture as $totals, expected 2 objects and 12 bytes"
+
+assert_listing_refused() {
+  local fixture=$1 expected=$2
+  if parse_mirror_reclaim_listing "$fixture" >"$sandbox/parser.out" 2>"$sandbox/parser.err"; then
+    fail "the parser accepted $(basename "$fixture") as a successful listing"
+  fi
+  grep -Fq "$expected" "$sandbox/parser.err" ||
+    fail "the refusal for $(basename "$fixture") did not include the offending line: $(cat "$sandbox/parser.err")"
+  [[ ! -s "$sandbox/parser.out" ]] ||
+    fail "the refused $(basename "$fixture") produced successful totals"
+}
+
+cat >"$sandbox/listing-unknown-prologue.jsonl" <<'EOF'
+An unexpected MinIO client banner
+{"status":"success","type":"file","size":5}
+EOF
+assert_listing_refused "$sandbox/listing-unknown-prologue.jsonl" \
+  "line 1: 'An unexpected MinIO client banner'"
+
+cat >"$sandbox/listing-malformed.jsonl" <<'EOF'
+{"status":"success","type":"file","size":5}
+{this is not JSON}
+EOF
+assert_listing_refused "$sandbox/listing-malformed.jsonl" \
+  "line 2: '{this is not JSON}'"
+
+cat >"$sandbox/listing-error.jsonl" <<'EOF'
+{"status":"error","error":{"message":"Access Denied"}}
+EOF
+assert_listing_refused "$sandbox/listing-error.jsonl" \
+  'line 1: '\''{"status":"error","error":{"message":"Access Denied"}}'\'''
 
 run_prelude() {
   local mode=$1
