@@ -23,14 +23,10 @@ kube-prometheus-stack the Service is named after the release and listens on
 ```
 
 A URL that resolves to nothing is not fatal and not loud: the reconciler holds
-every replica count at its current size and logs `prometheus reading unusable;
-HOLDING` once per cycle per component while incrementing
-`siglake_operator_prom_query_errors_total{component}`. Read that counter to
-tell a wrong address from a quiet cluster. The `component` label says which
-readings are missing: all three is the address or the Prometheus, one of them
-is that component's series — a selector the scrape does not satisfy, or a tier
-whose pods are not publishing. A component without a reading holds its own
-replica count and leaves the other two sizing on theirs.
+every replica count at its current size and logs `prometheus query failed;
+HOLDING` once per cycle while incrementing
+`siglake_operator_prom_query_errors_total`. Read that counter to tell a wrong
+address from a quiet cluster.
 
 The chart's `crds/siglakecluster.yaml` is applied by Helm *before*
 the rest of the manifests, so the operator's Deployment never

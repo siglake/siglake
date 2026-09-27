@@ -104,16 +104,15 @@ none of its own.
   default single-replica FS drain never reads the mirror, which is the README
   limitation this flip makes reachable.
 - **The active-segment mirror** (`activeIntervalSecs > 0`), off by default and
-  off here. A later round can separate it without a second arm: since #6034 the
-  active loop charges its bodies to
-  `siglake_wal_mirror_active_bytes_uploaded_total` and its PUTs to
-  `siglake_wal_mirror_upload_attempts_total{path="active"}`, so the sealed
-  bytes are `siglake_wal_mirror_bytes_uploaded_total` minus the active ones and
-  application-level write count is read per path rather than inferred from
-  seals. Client- or service-side retries remain outside that count, so it does
-  not establish exact billed request volume. The numbers above predate those
-  counters and were taken with the loop off, so they report the sealed path
-  alone either way.
+  off here. A later two-path run should separate active and sealed write bodies
+  and application-level object-store write attempts. Instrumentation merges
+  `1e17957f6263365e8b39df045cf747c92960e419` and
+  `890c79d0354fdb88cf06edae8cf9738e5dbec691` provide the per-path counters for
+  that method; #6344 defers them from the 0.2.1 candidate to 0.3.0. The numbers
+  above predate those counters and were taken with the active loop off, so they
+  still describe the sealed path alone. Client- or service-side retries remain
+  outside the attempt count when the instrumentation returns, so it does not
+  establish exact billed request volume.
 - **Multi-tenant fan-out.** One writer, one index; per-tenant writers each hold
   their own mirror handle.
 

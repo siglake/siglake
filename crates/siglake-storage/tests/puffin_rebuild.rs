@@ -122,7 +122,7 @@ fn ordered_text_context() -> SessionContext {
     let base = siglake_storage::session_context_with_order(
         Some(1),
         None,
-        Some(siglake_storage::PreferredScanOrder::timestamp(true)),
+        Some(siglake_storage::PreferredScanOrder { descending: true }),
     );
     let mut state = base.state();
     state

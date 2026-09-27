@@ -245,44 +245,19 @@ fn blob_cache_peek(key: &BlobKey) -> Option<Arc<[u8]>> {
     blob_cache().lock().unwrap().get(key)
 }
 
-/// Publish what the cache holds against the budget being enforced on it.
-///
-/// `resident` is [`BlobCache::bytes`], the figure `put` maintains as it admits
-/// and evicts, so this costs a field read rather than a walk of the map. The
-/// budget is resolved through [`crate::arrow::enforced_puffin_blob_budget`]:
-/// a pod with the entry bound at zero admits nothing, and charting its nominal
-/// byte knob would draw a cache with room to spare.
-fn record_blob_cache_residency(resident: usize, max_entries: usize, max_bytes: usize) {
-    metrics::gauge!("siglake_iceberg_puffin_blob_cache_bytes").set(resident as f64);
-    metrics::gauge!("siglake_iceberg_puffin_blob_cache_max_bytes")
-        .set(crate::arrow::enforced_puffin_blob_budget(max_entries, max_bytes) as f64);
-}
-
 fn blob_cache_put(key: BlobKey, bytes: Arc<[u8]>) {
     let (max_entries, max_bytes) = blob_cache_bounds();
-    // Every exit publishes the pair, including the two that admit nothing. The
-    // parsed side publishes only after a successful insert, which is enough
-    // there because a refusal is the pod's own configuration; here the refusals
-    // are the readings the pair exists for — a `redundant` rate at a budget
-    // that holds the plan and one at half that budget are the same series
-    // otherwise, and a disabled cache would publish no budget at all (#5374).
     if max_entries == 0 || max_bytes == 0 {
-        let resident = blob_cache().lock().unwrap().bytes;
-        record_blob_cache_residency(resident, max_entries, max_bytes);
         return;
     }
     if bytes.len() > max_bytes {
         record_blob_cache_drop("oversized");
-        let resident = blob_cache().lock().unwrap().bytes;
-        record_blob_cache_residency(resident, max_entries, max_bytes);
         return;
     }
-    let resident = {
-        let mut cache = blob_cache().lock().unwrap();
-        cache.put(key, bytes, max_entries, max_bytes);
-        cache.bytes
-    };
-    record_blob_cache_residency(resident, max_entries, max_bytes);
+    blob_cache()
+        .lock()
+        .unwrap()
+        .put(key, bytes, max_entries, max_bytes);
 }
 
 /// Drop every cached blob, including the admission counter the protection

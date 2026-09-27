@@ -1,11 +1,9 @@
 # An independent compactor wake-up signal (task #3712)
 
-**Status:** implemented by #6011 on 2026-09-23, except the live proof: no kind
-or AWS round has yet retained a compactor Deployment reaching zero replicas and
-being woken by the published depth (#6012). The paragraphs below are the design
-as written; "Resolved while implementing" near the end records the one point
-where the implementation had to choose between two of them. **Date:**
-2026-09-23.
+**Status:** design only. No operator behaviour, CRD text or generated artifact
+changes with this document, and
+`InvalidSpec` / `AutoscalingZeroFloorUnsupported` keeps refusing every
+`spec.autoscaling.<component>.min == 0`. **Date:** 2026-09-23.
 
 `spec.autoscaling.compactor.min: 0` is refused because the signal that would
 ask for a compactor back is published by the compactor
@@ -273,32 +271,12 @@ single idle scrape parks the tier, which flaps against continuous ingest. A
 zero floor therefore requires `ewmaHalfLifeSecs > 0`, refused as `InvalidSpec`
 with its own reason alongside the narrowed zero-floor check.
 
-## Resolved while implementing (#6011)
+## What this design does not change
 
-Two paragraphs above disagreed. "Recommendation" says a `min == 0` policy
-reads the catalog-depth expression and nothing else; "Fail-safe" says the
-replica restored by a missing reading "republishes
-`siglake_compactor_sealed_pending` itself, so the tier can size correctly from
-its own signal". Both cannot hold: the operator would not be reading the series
-that pod publishes, and the tier would sit at exactly one worker however deep
-the queue grew.
-
-Settled in the expression, which ends in
-`or avg(sum by (pod) (siglake_compactor_sealed_pending{…}))`. PromQL's `or`
-yields the right side only when the left is an empty vector, so a fresh
-published depth is still the only thing consulted while the ingesters are
-reading the catalog; the compactor's own gauge is a fallback for exactly the
-window the fail-safe describes. `crates/siglake-operator/src/prom.rs`
-(`Queries::compactor_activation`) carries the reasoning, and the promtool
-fixture in `crates/siglake-operator/tests/operator/prom_fixture.rs` evaluates
-both halves.
-
-## What this design did not change on its own
-
-The refusal stayed exactly as it was until the implementation landed; #6011
-narrowed it. A document is not a proof, and neither is a released tag: the
-packaged compactor floor remains 1, and `docs/LIMITATIONS.md` still records
-that no round has yet woken a parked tier.
+The refusal at `crates/siglake-operator/src/reconciler.rs:939-947` stays exactly
+as it is until the implementation lands and a kind round proves the wake-up. A
+document is not a proof, and neither is a released tag. `docs/LIMITATIONS.md`
+keeps its "No tier can be scaled to zero" entry, with a pointer here.
 
 ## Implementation slices
 

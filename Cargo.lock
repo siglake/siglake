@@ -6318,7 +6318,6 @@ dependencies = [
  "iceberg",
  "libc",
  "metrics",
- "metrics-util",
  "object_store",
  "opendal",
  "reqsign-core",

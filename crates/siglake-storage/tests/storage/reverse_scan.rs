@@ -75,7 +75,7 @@ async fn ascending_declared_table_serves_desc_limit_without_sort() {
     let ctx = siglake_storage::session_context_with_order(
         Some(2),
         None,
-        Some(PreferredScanOrder::timestamp(true)),
+        Some(PreferredScanOrder { descending: true }),
     );
     ice.register_with_datafusion(&ctx).await.unwrap();
 
@@ -124,7 +124,7 @@ async fn descending_declared_table_serves_asc_limit_without_sort() {
     let ctx = siglake_storage::session_context_with_order(
         Some(2),
         None,
-        Some(PreferredScanOrder::timestamp(false)),
+        Some(PreferredScanOrder { descending: false }),
     );
     ice.register_with_datafusion(&ctx).await.unwrap();
 
@@ -172,7 +172,7 @@ async fn reverse_scan_merges_overlapping_files_in_requested_direction() {
     let ctx = siglake_storage::session_context_with_order(
         Some(1),
         None,
-        Some(PreferredScanOrder::timestamp(true)),
+        Some(PreferredScanOrder { descending: true }),
     );
     ice.register_with_datafusion(&ctx).await.unwrap();
 
