@@ -215,42 +215,6 @@ async fn write_mirror_owner(
 /// Upload attempts before a segment is declared permanently failed.
 const MIRROR_UPLOAD_ATTEMPTS: u32 = 5;
 
-/// Application-level object-store write attempts, by which uploader made them
-/// (`sealed` or `active`).
-///
-/// Every other mirror counter here records a RESULT:
-/// `siglake_wal_mirror_segments_total` moves once per segment however many
-/// times its upload was retried, and the byte counters move only on success.
-/// A prefix whose cost is dominated by retries was therefore invisible — a
-/// retried sealed segment showed up as one `ok`.
-///
-/// Both arms increment immediately before calling [`Operator::write`]. This
-/// excludes failures while resolving or reading the sealed local source. It
-/// does not establish exact billed S3 requests: retries below this application
-/// call, in the client or service, are outside this counter.
-const MIRROR_UPLOAD_ATTEMPTS_COUNTER: &str = "siglake_wal_mirror_upload_attempts_total";
-
-/// Bytes the ACTIVE uploader put, the half of
-/// `siglake_wal_mirror_bytes_uploaded_total` that re-uploads a growing open
-/// segment. The shared counter keeps counting both paths, so
-/// sealed = shared - active.
-const MIRROR_ACTIVE_BYTES_COUNTER: &str = "siglake_wal_mirror_active_bytes_uploaded_total";
-
-/// Create #6034's series at 0 before either uploader runs, the way
-/// [`WalMirror::new`] already creates the queue-depth gauge and the pin
-/// histogram: in a round export an absent series and a flat one read the same,
-/// and "the active mirror uploaded nothing" is exactly the reading an operator
-/// needs from a default install with `activeIntervalSecs: 0`.
-///
-/// Both `path` values are created wherever either uploader starts: an ingester
-/// running only the sealed uploader still has to show `path="active"` at 0
-/// rather than absent.
-fn preregister_upload_counters() {
-    metrics::counter!(MIRROR_UPLOAD_ATTEMPTS_COUNTER, "path" => "sealed").increment(0);
-    metrics::counter!(MIRROR_UPLOAD_ATTEMPTS_COUNTER, "path" => "active").increment(0);
-    metrics::counter!(MIRROR_ACTIVE_BYTES_COUNTER).increment(0);
-}
-
 /// Active-partial DELETE attempts after a sealed object is confirmed. The
 /// cleanup is best-effort and must not turn a successful sealed upload into a
 /// failed registration, but a transient object-store error should not leave a
@@ -390,7 +354,6 @@ impl WalMirror {
         let prefix = prefix.into().trim_matches('/').to_string();
         metrics::gauge!("siglake_wal_mirror_queue_depth").set(0.0);
         let _ = metrics::histogram!("siglake_wal_mirror_pin_duration_seconds");
-        preregister_upload_counters();
         (
             Self {
                 rx,
@@ -583,7 +546,6 @@ impl WalMirror {
         })?;
         let n = bytes.len() as u64;
         let key = mirror_key(&self.prefix, &segment.mirror_key_suffix);
-        metrics::counter!(MIRROR_UPLOAD_ATTEMPTS_COUNTER, "path" => "sealed").increment(1);
         self.op
             .write(&key, bytes)
             .await
@@ -1114,12 +1076,6 @@ pub fn active_mirror_interval(secs: u64) -> Option<std::time::Duration> {
 /// its segment stays open. Failures emit
 /// `siglake_wal_mirror_failures_total{reason="active_upload"}` and a tracing
 /// warn; the loop continues.
-///
-/// Each PUT is counted before it is issued
-/// (`siglake_wal_mirror_upload_attempts_total{path="active"}`) and its body on
-/// success (`siglake_wal_mirror_active_bytes_uploaded_total`), so this loop's
-/// share of the object-store bill — requests and bytes — is separable from the
-/// sealed uploader's without running it alone.
 pub async fn active_mirror_loop(
     sources: Vec<Arc<dyn ActiveMirrorSource>>,
     op: Operator,
@@ -1127,7 +1083,6 @@ pub async fn active_mirror_loop(
     interval: std::time::Duration,
 ) {
     let prefix = prefix.trim_matches('/').to_string();
-    preregister_upload_counters();
     let mut ticker = tokio::time::interval(interval);
     // Skip the immediate first fire: we want the first upload to happen
     // *after* one interval, not at startup before any events have arrived.
@@ -1191,11 +1146,9 @@ pub async fn active_mirror_loop(
             let Some(key) = active_partial_key(&prefix, &sealed_suffix) else {
                 continue;
             };
-            metrics::counter!(MIRROR_UPLOAD_ATTEMPTS_COUNTER, "path" => "active").increment(1);
             match op.write(&key, body).await {
                 Ok(_) => {
                     metrics::counter!("siglake_wal_mirror_active_uploads_total").increment(1);
-                    metrics::counter!(MIRROR_ACTIVE_BYTES_COUNTER).increment(n);
                     metrics::counter!("siglake_wal_mirror_bytes_uploaded_total").increment(n);
                     tracing::debug!(%key, bytes = n, "WAL active mirror upload ok");
                     // The bytes that reached the object store, not the count
@@ -2506,7 +2459,6 @@ mod tests {
     };
     use opendal::services::Memory;
 
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use siglake_core::Event;
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2769,96 +2721,6 @@ mod tests {
             }
             self.second_tick.notify_one();
             Vec::new()
-        }
-    }
-
-    /// A store whose first `failures_left` PUTs are refused before the request
-    /// is made, counting every one it saw. An upload retried against a
-    /// transient object-store error is the shape #6034's attempt counter
-    /// exists for, and no other fixture here fails a write without failing it
-    /// permanently (the sweep test blocks a key with a directory).
-    #[derive(Clone, Debug, Default)]
-    struct WriteFault {
-        failures_left: Arc<AtomicUsize>,
-        attempts: Arc<AtomicUsize>,
-    }
-
-    #[derive(Clone, Debug)]
-    struct WriteFaultLayer(WriteFault);
-
-    #[derive(Debug)]
-    struct WriteFaultAccess<A> {
-        inner: A,
-        fault: WriteFault,
-    }
-
-    impl<A: Access> Layer<A> for WriteFaultLayer {
-        type LayeredAccess = WriteFaultAccess<A>;
-
-        fn layer(&self, inner: A) -> Self::LayeredAccess {
-            WriteFaultAccess {
-                inner,
-                fault: self.0.clone(),
-            }
-        }
-    }
-
-    impl<A: Access> LayeredAccess for WriteFaultAccess<A> {
-        type Inner = A;
-        type Reader = A::Reader;
-        type Writer = A::Writer;
-        type Lister = A::Lister;
-        type Deleter = A::Deleter;
-        type Copier = A::Copier;
-
-        fn inner(&self) -> &Self::Inner {
-            &self.inner
-        }
-
-        async fn read(
-            &self,
-            path: &str,
-            args: OpRead,
-        ) -> opendal::Result<(opendal::raw::RpRead, Self::Reader)> {
-            self.inner.read(path, args).await
-        }
-
-        async fn write(
-            &self,
-            path: &str,
-            args: OpWrite,
-        ) -> opendal::Result<(opendal::raw::RpWrite, Self::Writer)> {
-            self.fault.attempts.fetch_add(1, Ordering::SeqCst);
-            if self
-                .fault
-                .failures_left
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                    (left > 0).then(|| left - 1)
-                })
-                .is_ok()
-            {
-                return Err(opendal::Error::new(
-                    opendal::ErrorKind::Unexpected,
-                    "injected mirror PUT failure",
-                ));
-            }
-            self.inner.write(path, args).await
-        }
-
-        async fn stat(&self, path: &str, args: OpStat) -> opendal::Result<opendal::raw::RpStat> {
-            self.inner.stat(path, args).await
-        }
-
-        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
-            self.inner.delete().await
-        }
-
-        async fn list(
-            &self,
-            path: &str,
-            args: OpList,
-        ) -> opendal::Result<(opendal::raw::RpList, Self::Lister)> {
-            self.inner.list(path, args).await
         }
     }
 
@@ -3852,333 +3714,6 @@ mod tests {
         }
         assert_eq!(found, 1, "expected exactly one active-mirror blob");
         assert!(total_bytes > 0, "active-mirror blob is empty");
-    }
-
-    /// Counter totals from one snapshot, keyed by name and sorted labels.
-    type CounterSnapshot = std::collections::HashMap<(String, Vec<(String, String)>), u64>;
-
-    /// Every counter series in ONE drained snapshot, by name and labels.
-    /// `snapshot()` drains, so a test takes exactly one per phase.
-    fn counters(snapshotter: &metrics_util::debugging::Snapshotter) -> CounterSnapshot {
-        snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .filter_map(|(key, _, _, value)| match value {
-                DebugValue::Counter(n) => {
-                    let mut labels: Vec<(String, String)> = key
-                        .key()
-                        .labels()
-                        .map(|l| (l.key().to_string(), l.value().to_string()))
-                        .collect();
-                    labels.sort();
-                    Some(((key.key().name().to_string(), labels), n))
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// One series out of [`counters`], or `None` when it does not exist at
-    /// all — which is what a counter nothing pre-registered and nothing
-    /// incremented looks like in an export.
-    fn counter(counters: &CounterSnapshot, name: &str, labels: &[(&str, &str)]) -> Option<u64> {
-        let mut labels: Vec<(String, String)> = labels
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        labels.sort();
-        counters.get(&(name.to_string(), labels)).copied()
-    }
-
-    /// The writer's single open partial: its name and its length on disk.
-    /// The active loop uploads exactly this file's bytes, so the length is an
-    /// independent measure of what each PUT sent.
-    fn active_partial(wal_dir: &Path) -> Option<(String, u64)> {
-        let mut found: Vec<(String, u64)> = std::fs::read_dir(wal_dir.join("active"))
-            .ok()?
-            .flatten()
-            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("partial"))
-            .map(|e| {
-                (
-                    e.file_name().to_str().unwrap().to_string(),
-                    e.metadata().unwrap().len(),
-                )
-            })
-            .collect();
-        assert!(found.len() <= 1, "one writer holds one partial: {found:?}");
-        found.pop()
-    }
-
-    /// Wait until the mirror object holds the WHOLE of the writer's partial
-    /// and that partial is longer than `more_than` — the state after one
-    /// upload of a file nothing is appending to. Returns the uploaded length.
-    ///
-    /// The length is compared rather than the presence of the object: opendal's
-    /// fs service writes in place, so the key exists at 0 bytes mid-PUT.
-    async fn wait_for_active_upload(op: &Operator, wal_dir: &Path, more_than: u64) -> u64 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        loop {
-            if let Some((name, local)) = active_partial(wal_dir) {
-                if local > more_than {
-                    let sealed_name = name.strip_suffix(".partial").expect("a partial");
-                    let key = active_partial_key("wal-mirror", sealed_name).expect("active key");
-                    if let Ok(body) = op.read(&key).await {
-                        if body.len() as u64 == local {
-                            return local;
-                        }
-                    }
-                }
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "no active-mirror upload above {more_than} bytes within 20s"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    }
-
-    /// #6034: the active uploader's requests and bytes are separable from the
-    /// sealed uploader's share of the same shared byte counter.
-    ///
-    /// Two ticks upload here, and the second re-sends the first tick's bytes:
-    /// the object holds a growing prefix of one open segment, so the bytes an
-    /// S3 bill sees are the sum of the prefixes, not the segment's size.
-    ///
-    /// The runtime is built by hand and single-threaded because the local
-    /// recorder is a thread-local: the loop runs as a spawned task and would
-    /// otherwise record into the global recorder from another worker.
-    #[test]
-    fn the_active_mirror_counts_its_own_attempts_and_bytes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let wal_dir = tmp.path().join("wal");
-        let mirror_dir = tmp.path().join("mirror");
-        std::fs::create_dir_all(&mirror_dir).unwrap();
-        let writer = crate::WalWriter::with_thresholds(
-            &wal_dir,
-            "ing-test",
-            1_000_000,
-            std::time::Duration::from_secs(3600),
-        )
-        .unwrap();
-        let writer = Arc::new(tokio::sync::Mutex::new(writer));
-        let op = Operator::new(opendal::services::Fs::default().root(mirror_dir.to_str().unwrap()))
-            .unwrap()
-            .finish();
-
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (first, second) = metrics::with_local_recorder(&recorder, || {
-            rt.block_on(async {
-                writer
-                    .lock()
-                    .await
-                    .append_events(&[synth_event(1), synth_event(2)])
-                    .unwrap();
-                let sources: Vec<Arc<dyn ActiveMirrorSource>> = vec![writer.clone()];
-                let task = tokio::spawn(active_mirror_loop(
-                    sources,
-                    op.clone(),
-                    "wal-mirror".to_string(),
-                    std::time::Duration::from_millis(20),
-                ));
-                let first = wait_for_active_upload(&op, &wal_dir, 0).await;
-                writer
-                    .lock()
-                    .await
-                    .append_events(&[synth_event(3), synth_event(4)])
-                    .unwrap();
-                let second = wait_for_active_upload(&op, &wal_dir, first).await;
-                task.abort();
-                (first, second)
-            })
-        });
-
-        let sent = first + second;
-        assert!(first > 0 && second > first, "{first} then {second}");
-        let counters = counters(&snapshotter);
-        assert_eq!(
-            counter(&counters, "siglake_wal_mirror_active_uploads_total", &[]),
-            Some(2),
-            "two ticks uploaded; a third would have had nothing new to send"
-        );
-        assert_eq!(
-            counter(
-                &counters,
-                MIRROR_UPLOAD_ATTEMPTS_COUNTER,
-                &[("path", "active")]
-            ),
-            Some(2),
-            "one attempt per PUT, and none of them was retried"
-        );
-        assert_eq!(
-            counter(&counters, MIRROR_ACTIVE_BYTES_COUNTER, &[]),
-            Some(sent),
-            "the active path sent both prefixes"
-        );
-        assert_eq!(
-            counter(&counters, "siglake_wal_mirror_bytes_uploaded_total", &[]),
-            Some(sent),
-            "no sealed upload ran, so the shared counter is the active one"
-        );
-        assert_eq!(
-            counter(
-                &counters,
-                MIRROR_UPLOAD_ATTEMPTS_COUNTER,
-                &[("path", "sealed")]
-            ),
-            Some(0),
-            "the sealed arm exists at 0 rather than being absent"
-        );
-    }
-
-    /// #6034: a retried sealed upload costs two PUTs and reports one segment.
-    /// Before the attempt counter, the request that failed left nothing behind
-    /// at all — `segments_total{outcome="ok"}` counts the segment, not what it
-    /// took to place it, and `failures_total` moves only on exhaustion.
-    #[test]
-    fn a_retried_sealed_upload_counts_every_put_attempt() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut writer = crate::WalWriter::with_thresholds(
-            tmp.path(),
-            "ing-test",
-            2,
-            std::time::Duration::from_secs(60),
-        )
-        .unwrap();
-        let sealed = writer
-            .append_events(&[synth_event(1), synth_event(2)])
-            .unwrap()
-            .expect("seal");
-
-        let fault = WriteFault::default();
-        fault.failures_left.store(1, Ordering::SeqCst);
-        let op = Operator::new(Memory::default())
-            .unwrap()
-            .layer(WriteFaultLayer(fault.clone()))
-            .finish();
-
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        metrics::with_local_recorder(&recorder, || {
-            rt.block_on(async {
-                let (mirror, _handle) = WalMirror::new(op.clone(), "wal-mirror");
-                mirror.upload_and_notify(&sealed).await;
-            })
-        });
-
-        assert_eq!(
-            fault.attempts.load(Ordering::SeqCst),
-            2,
-            "one PUT was retried"
-        );
-        let counters = counters(&snapshotter);
-        assert_eq!(
-            counter(
-                &counters,
-                MIRROR_UPLOAD_ATTEMPTS_COUNTER,
-                &[("path", "sealed")]
-            ),
-            Some(2)
-        );
-        assert_eq!(
-            counter(
-                &counters,
-                "siglake_wal_mirror_segments_total",
-                &[("outcome", "ok")]
-            ),
-            Some(1),
-            "the retry placed the segment"
-        );
-        assert_eq!(
-            counter(
-                &counters,
-                "siglake_wal_mirror_failures_total",
-                &[("reason", "upload")]
-            ),
-            None,
-            "a recovered upload is not a permanent failure"
-        );
-        assert_eq!(
-            counter(
-                &counters,
-                MIRROR_UPLOAD_ATTEMPTS_COUNTER,
-                &[("path", "active")]
-            ),
-            Some(0),
-            "no active upload ran, and its series still reads as zero"
-        );
-        assert_eq!(
-            counter(&counters, MIRROR_ACTIVE_BYTES_COUNTER, &[]),
-            Some(0),
-            "the sealed bytes are not charged to the active path"
-        );
-    }
-
-    /// #6047: local source failures happen before the object-store write. They
-    /// remain terminal upload failures, but must not be priced as write
-    /// attempts. A directory at the source path supplies a stable local read
-    /// error without relying on platform permissions.
-    #[test]
-    fn local_source_failures_do_not_count_as_sealed_write_attempts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let missing = WalSegment {
-            path: tmp.path().join("sealed/missing.arrow"),
-            rows: 1,
-            bytes: 1,
-            mirror_key_suffix: "missing.arrow".into(),
-        };
-        let unreadable_path = tmp.path().join("sealed/unreadable.arrow");
-        std::fs::create_dir_all(&unreadable_path).unwrap();
-        let unreadable = WalSegment {
-            path: unreadable_path,
-            rows: 1,
-            bytes: 1,
-            mirror_key_suffix: "unreadable.arrow".into(),
-        };
-
-        for (case, segment) in [("missing", missing), ("unreadable", unreadable)] {
-            let recorder = DebuggingRecorder::new();
-            let snapshotter = recorder.snapshotter();
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            metrics::with_local_recorder(&recorder, || {
-                rt.block_on(async {
-                    let (mirror, _handle) = WalMirror::new(memory_op(), "wal-mirror");
-                    mirror.upload_and_notify(&segment).await;
-                })
-            });
-
-            let counters = counters(&snapshotter);
-            assert_eq!(
-                counter(
-                    &counters,
-                    MIRROR_UPLOAD_ATTEMPTS_COUNTER,
-                    &[("path", "sealed")]
-                ),
-                Some(0),
-                "{case} local source must not reach an object-store write"
-            );
-            assert_eq!(
-                counter(
-                    &counters,
-                    "siglake_wal_mirror_failures_total",
-                    &[("reason", "upload")]
-                ),
-                Some(1),
-                "{case} local source remains an upload failure"
-            );
-        }
     }
 
     /// #4914: the active PUT starts after the writer lock is released. Force it

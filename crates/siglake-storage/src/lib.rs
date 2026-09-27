@@ -22,13 +22,12 @@ pub mod wal_ledger;
 
 pub use query_provider::{
     clear_decoded_file_cache, clear_row_group_layout_cache, decoded_file_cache_footprint,
-    decoded_file_cache_population_stats, initialize_decoded_file_cache_metrics,
-    reset_decoded_file_cache_population_peaks, settle_scan_partitions, CancelOnDrop,
-    ClippedAdmissionWave, ClippedScanLimit, DecodedFileCacheFootprint,
-    DecodedFileCachePopulationStats, FileAttributionSnapshot, OrderedMergeGlobalBudget,
-    OrderedResidualHint, OrderedScanLimit, OrderedScanTuning, PreferredScanOrder, QueryCancel,
-    QueryExecutionId, ScanPartitionTracker, ScanSettle, ScanShard, SiglakeIcebergTableScan,
-    CANONICAL_EVENT_TIME_FIELD, FILE_ATTRIBUTION_CAP, UNATTRIBUTED_QUERY_EXECUTION_ID,
+    decoded_file_cache_population_stats, reset_decoded_file_cache_population_peaks,
+    settle_scan_partitions, CancelOnDrop, ClippedAdmissionWave, ClippedScanLimit,
+    DecodedFileCacheFootprint, DecodedFileCachePopulationStats, FileAttributionSnapshot,
+    OrderedMergeGlobalBudget, OrderedResidualHint, OrderedScanLimit, OrderedScanTuning,
+    PreferredScanOrder, QueryCancel, ScanPartitionTracker, ScanSettle, ScanShard,
+    SiglakeIcebergTableScan, FILE_ATTRIBUTION_CAP,
 };
 
 /// Arrow field-metadata key carrying the configured text tokenizer name for a
@@ -1410,7 +1409,7 @@ mod tests {
         let ctx = session_context_with_order(
             Some(7),
             Some(ScanShard { index: 1, count: 3 }),
-            Some(PreferredScanOrder::timestamp(false)),
+            Some(PreferredScanOrder { descending: false }),
         );
         let state = ctx.state();
         let cfg = state.config();

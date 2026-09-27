@@ -174,7 +174,6 @@ fn test_context(client: &Client) -> Arc<Context> {
         client: client.clone(),
         prom,
         scaling_state: Default::default(),
-        zero_floor_state: Default::default(),
     })
 }
 

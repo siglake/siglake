@@ -101,17 +101,9 @@ lane's task-owned writer, and uploads one
 `_active/<tenant>[/<index>]/<segment>.arrow.partial` per writer whose segment
 grew since the last tick. The flush happens under the writer's own lock (or
 inside its lane task) and the PUT outside it, so no acknowledgement waits on
-object storage. Each uploader counts its own application-level writes and bytes —
-`siglake_wal_mirror_upload_attempts_total{path="sealed"|"active"}` moves once
-immediately before each object-store write call, retries included, and
-`siglake_wal_mirror_active_bytes_uploaded_total` is the active loop's share of
-the shared `siglake_wal_mirror_bytes_uploaded_total` — so the active uploader's
-share is readable without running it alone. The attempt counter excludes local
-source failures, but client- or service-side retries below the write call mean
-it is not an exact count of billed S3 requests. Once the
-matching sealed object is confirmed — by the normal uploader, its
-ambiguous-error STAT, or the catch-up sweep — the uploader deletes that exact
-active sibling. The active PUT also checks for its sealed
+object storage. Once the matching sealed object is confirmed — by the normal
+uploader, its ambiguous-error STAT, or the catch-up sweep — the uploader
+deletes that exact active sibling. The active PUT also checks for its sealed
 sibling after writing, which closes the ordering where it started before the
 seal but landed after the sealed uploader's delete. Cleanup retries transient
 DELETE errors without delaying or suppressing catalog registration. It does
@@ -236,30 +228,6 @@ claim on, and claim-mode HPA scaling there is CPU-only. It also refuses
 `ingester.extraArgs: [--with-compactor]` outright: that embedded compactor
 takes no claim and the chart renders none for it, and a rolling update alone
 puts two of them on one table.
-
-**Parking the compactor.** `spec.autoscaling.compactor.min: 0` is accepted
-under the catalog claim, and only there, because the reading that asks for the
-tier back is published by someone else: the ingest server reads the shared
-queue over the claim connection its mirror registrar already holds and exports
-it as `siglake_wal_segments_sealed{tenant}` with a
-`siglake_wal_segments_sealed_sample_age_seconds` companion. The depth is the
-sealed rows plus claims older than `SIGLAKE_CLAIM_RECLAIM_MAX_AGE_SECS`, so a
-batch stranded in `processing` by the last worker to stop is visible and live
-work is not; a failed catalog read holds the depth and lets the age rise
-rather than publishing a zero. The operator selects that reading only for a
-zero floor, drops any publisher whose sample is over two minutes old, and
-falls back to `siglake_compactor_sealed_pending` when none is left — the tier
-restored to one replica by a missing reading is then sized by its own gauge.
-Each load signal is now observed independently, so a component whose series is
-absent holds its own replica count while the other two decide on theirs. Two
-refusals bound the mode: the filesystem drain (`compactor.max: 1`) keeps
-`AutoscalingZeroFloorUnsupported` because it never reads the shared queue, and
-`ewmaHalfLifeSecs: 0` is `AutoscalingZeroFloorNeedsSmoothing` because the raw
-sample would park the tier on a single idle scrape. A parked tier is woken for
-ten minutes after an hour at zero so the compactor-resident maintenance —
-retention, delete tasks, claim reclaim, `sync_mirror_to_catalog` — still runs.
-The packaged floor stays at 1 until a kind round retains the live wake-up
-(#6012); `docs/DESIGN_compactor_wakeup_signal.md` is the design.
 
 The kind evidence round has a default-off check for that shared-queue shape.
 It installs two compactors through the guarded chart path only after the
@@ -643,25 +611,15 @@ index: every aggregate artifact — this object, the folded wide base, the
 per-commit deltas and the rebuild markers — is addressed under the UUID of the
 table that wrote it, so a table recreated at the same location reads only what
 its own incarnation built (see [`LIMITATIONS.md`](LIMITATIONS.md)).
-Before a managed index is dropped, Siglake confirms a warehouse-root record at
-`_siglake/config/dropped_indexes/<namespace>/<drop-id>.json`. It captures the
-loaded table's UUID and location, its retained committed-file inventory, and
-the exact `metadata/siglake-agg/<table-uuid>/` target. The sweeper validates
-that relationship and inventories only that UUID prefix without resolving the
-reusable index name. Records created by the product are report-only; aggregate
-deletion has no production authority-changing API while its retention and
-failure policy remain open
-([design](DESIGN_dropped_index_aggregate_reclamation.md)).
-
-Remote side-object writes and dropped-index record creation share one
-warehouse-scoped compatibility verdict. Before the process context's first
+Remote side-object writes share one warehouse-scoped compatibility verdict.
+Before the process context's first
 conditional mutation, Siglake writes the fixed non-JSON
 `_siglake/config/.conditional-write-probe-<process-id>` scratch object. It
 requires a stale `If-Match` and an existing-key `If-None-Match: *` to receive recognized
 precondition errors, and confirms that each rejected request preserved the
 existing bytes. An ignored header or an indeterminate response refuses inline
-publication, wide folds and rebuilds, expiry coverage re-rooting, inline time
-rebuild publication, and dropped-index record creation. The `file://` backend
+publication, wide folds and rebuilds, expiry coverage re-rooting, and inline
+time rebuild publication. The `file://` backend
 keeps its separately serialized single-writer read-merge-write path. The
 cached verdict belongs to the context's warehouse store and is shared by its
 tenant contexts. This sequential exchange detects the behavior measured on
@@ -831,10 +789,8 @@ under the `agg_fold` lease and asks the read guard's own question — does its
 coverage edge reach the current snapshot? — and sets
 `siglake_inline_coverage_unproven{iceberg_namespace,table}` to 1 or 0 for every
 table it reaches a verdict on. A repaired table clears on the next pass. The
-census never rebuilds: it reads table metadata and one object per table. It
-keeps the shipped two-HEAD, one-GET request pattern for a table whose object is
-present; automating the repair and removing the duplicate probe are separate
-work. An object it cannot READ writes no
+census never rebuilds: it reads table metadata and one object per table, and
+automating the repair is separate work. An object it cannot READ writes no
 sample at all — a failed GET is not evidence about coverage in either direction
 — and a publication still in flight (the edge does not reach current, but one of
 the object's pending links does) is reported as covered, because the next commit
@@ -851,18 +807,6 @@ severity: the two beside it name events that automatic maintenance or an
 operator's `rebuild-group-counts` repairs, and this one names a state that
 persists for the life of the table until a human runs a command. Answers stay
 exact throughout — what is lost is Tier-1, not correctness.
-
-Four cost metrics price that read-only pass without changing its requests.
-`siglake_inline_coverage_census_requests_total{op="head"|"get"}` counts each
-request at its call site, including a GET attempt that fails.
-`siglake_inline_coverage_census_bytes_total{iceberg_namespace,table}` counts
-bytes from usable GETs beside the table's coverage reading; a failed or
-unparseable GET contributes zero bytes.
-`siglake_inline_coverage_census_pass_duration_seconds` measures completed pass
-time, and `siglake_inline_coverage_census_tables` is the number of tables seen
-by the last pass. The bounded request series, histogram and table gauge exist
-at zero before the maintenance loop starts, so a retained scrape distinguishes
-zero cost from missing data.
 
 **Residual attributes (WS-7).** OTLP resource/log attributes that aren't
 promoted columns are preserved losslessly in a JSON-string `attributes`
@@ -894,12 +838,9 @@ reading and four per-pass outcomes. A sampled pass retains the number of keys
 that cleared the frequency bar in `siglake_auto_promotion_candidates`; the
 availability sibling is zero when the feature is disabled or the table is
 already at its cap, because those paths preserve the no-sampling boundary and
-have no candidate verdict. Successful sampling passes also publish per-table
-read, byte and duration attribution, and committed promotion-backfill bins
-publish rewritten files, input/output bytes and duration. The structured INFO
-line names a bounded set of keys refused for the cap, a schema-name collision
-or mixed sampled types and reports how many names were truncated.
-`SiglakeAutoPromotionNearCeiling` reads
+have no candidate verdict. The structured INFO line names a bounded set of
+keys refused for the cap, a schema-name collision or mixed sampled types and
+reports how many names were truncated. `SiglakeAutoPromotionNearCeiling` reads
 the per-table configured cap at 80%; it does not infer a universal schema
 column ceiling.
 
@@ -1356,44 +1297,28 @@ turns it off. Measured in
 [`DESIGN_clipped_limit_admission.md`](DESIGN_clipped_limit_admission.md).
 
 **Implicit newest-first.** An interactive `SELECT` that names one table and
-asks for no ordering of its own is given `ORDER BY <event time> DESC` — the
+asks for no ordering of its own is given `ORDER BY timestamp DESC` — the
 browse a log reader means when they write `SELECT timestamp, raw FROM t LIMIT
 100` — which is also what puts the query on the ordered early-stop path above.
-It applies to `events`, `query_audit` and to any managed index, ordered by the
-field that index's doc mapping declares as its `timestamp_field`. That field is
-quoted in the injected clause (`ORDER BY "ts" DESC`), because mapping names keep
-their case and may collide with SQL keywords; the canonical `timestamp` is
-written bare as before. A column merely NAMED `timestamp` on an index whose
-event time is something else is not a time order and never receives the rewrite
-or the scan hint (the same reason such an index gets no `timestamp_ns` sort
-tiebreak). An explicit `ORDER BY`, a `GROUP BY`, an
+It applies to `events`, `query_audit` and to any managed index whose doc
+mapping declares `timestamp` as its `timestamp_field`; an index that names
+some other event-time field is left alone, since a column called `timestamp`
+there need not be a time order (the same reason such an index gets no
+`timestamp_ns` sort tiebreak). An explicit `ORDER BY`, a `GROUP BY`, an
 aggregate, a CTE, a join, `DISTINCT`, `EXPLAIN` and the batch tier are all
 left exactly as written. So is a projection that gives another column the
-index's own event-time name (`SELECT raw AS timestamp FROM events LIMIT 2`,
-`SELECT raw AS ts FROM <ts-mapped index>`): SQL resolves the injected
-identifier to that output name, which would order the browse by the aliased
-column, and the source column cannot be named around the alias — DataFusion
-rejects `ORDER BY t.timestamp` under such a projection as an ambiguous
-reference. An explicit `LIMIT` is preserved, and a query with no
+output name `timestamp` (`SELECT raw AS timestamp FROM t LIMIT 2`): SQL
+resolves the injected bare identifier to that output name, which would order
+the browse by the aliased column, and the source column cannot be named around
+the alias — DataFusion rejects `ORDER BY t.timestamp` under such a projection
+as an ambiguous reference. An explicit `LIMIT` is preserved, and a query with no
 `LIMIT` gets `max_rows_returned + 1` so the truncation signal still fires.
 `default_order: false` on the request turns it off. Counted by
-`siglake_query_default_order_applied_total`.
-
-**The field identity contract.** The hint the planner sends storage
-(`PreferredScanOrder`) carries the FIELD as well as the direction, and the scan
-advertises an ordering only when that field is the table's identity sort lead in
-the current schema and reads as an Arrow timestamp; a mismatch, an unknown
-field or another type keeps DataFusion's blocking sort (outcomes
-`sort_field_mismatch`, `non_timestamp_sort`, `unsupported_sort_type` on
-`siglake_query_scan_output_ordering_total`). The proven field is what the scan
-projects, orders, bounds per file, reverse-reads, merges and prunes on, and it
-keys the ordered-plan cache, so a cache hit can only rebuild the expression it
-was planned for. A custom event time has no `timestamp_ns` tiebreak, and none is
-added: rows sharing an event time may come back in any order among themselves,
-while the merge's strict bound comparison keeps every equal-time candidate in
-the running so the ordered `LIMIT` stays sound. The design and its
-qualification are in
-[`DESIGN_per_index_event_time_ordering.md`](DESIGN_per_index_event_time_ordering.md).
+`siglake_query_default_order_applied_total`. The field-by-field proof required
+to extend this to another mapped event-time name is recorded in
+[`DESIGN_per_index_event_time_ordering.md`](DESIGN_per_index_event_time_ordering.md);
+the current restriction stays in force until that complete planner and storage
+change ships.
 
 **Distributed by default.** Query replicas form a StatefulSet; the classifier
 splits eligible plans into per-shard scans (`ScanShard` file sharding),
@@ -1572,19 +1497,6 @@ An idle pod reads 0% beside zero raw insert rates. There is no alert threshold;
 #3053's representative cache measurements must supply one and its sustain
 window.
 
-Both sides of that shared budget are exported (#5801).
-`siglake_query_scan_file_cache_accounted_bytes` is the total admission enforces
-the ceiling against — completed entries plus every admitted in-flight
-population — published wherever that total moves and created at 0 when the
-query server starts. `siglake_query_scan_file_cache_bytes` remains the
-completed entries alone, written from the insert path, so the gap between the
-two is population the cache is holding and has not kept. A population the
-ceiling turns away charges
-`siglake_query_scan_file_cache_requests_total{outcome="population_refused"}`
-once, whatever it polls afterwards, and is not also counted `abandoned`. The
-arm does not name a cause: admission refuses both when nothing can be evicted
-to make room and when the replacement lock is held by another population.
-
 **Which budget a process gets is its role.** The query server derives both from
 its pod's limit. The `siglake` binary resolves its own at startup, and for the
 maintenance roles — the compactor pod, the ingest server, the sweeps and the
@@ -1633,22 +1545,7 @@ parsed side's own `oversized`). A budget one blob short of the plan's per-file
 index charts a rising fetch rate with no eviction and no hit otherwise, which
 is what a cold cache and a switched-off one chart. A zero bound is not charged
 there — a disabled cache is never consulted, and its flat lookup series says
-so. The blob side's resident set is charted against its bound the same way, on
-`siglake_iceberg_puffin_blob_cache_bytes` and
-`siglake_iceberg_puffin_blob_cache_max_bytes` (#5374), but on different timing
-from the parsed pair: the parsed gauges are published only after a successful
-insert, and these are published on every admission attempt, refusals included.
-That is what makes an eviction rate readable at all — the same `redundant` rate
-under a budget that holds the plan and under half of it are the same series
-without the budget beside them — and it is the only direct reading of the two
-pods that admit nothing: one whose blobs each exceed the whole budget, charting
-resident bytes above a budget that refuses every new blob, and one with the
-cache switched off, charting a budget of 0 where nothing else is charted at all.
-The budget published is the one in force, which is not always the byte knob: an
-entry bound of zero refuses every blob whatever the byte budget says, so both
-the gauge and `text_index_cache_max_bytes_in_force` resolve it through
-`enforced_puffin_blob_budget` rather than reading the knob twice. A fetch rate
-that
+so. A fetch rate that
 tracks the parsed miss rate is #4182's regression, which had to be inferred
 from index-phase object-store bytes and `first_batch_ms` for a round because
 these three were process diagnostics and nothing exported them.
@@ -1991,41 +1888,6 @@ does not provide client-to-ingest trace continuity from either load generator.
 so a fan-out's worker spans are children of the coordinator's span rather than
 unrelated roots. `crates/siglake-query-server/tests/otel_traceparent_propagation.rs`
 pins that over a real socket.
-
-**A scan's log events name their execution, not their position in the log.**
-The scan emits `siglake query scan reader tuning` once per scan node when the
-node is built (planning) and `siglake query source partition profile` once per
-partition when that partition's stream ends, fails or is dropped. Both come
-out of DataFusion pumps that carry no request span, and the partition event
-can be written after the request's own `sql query profile` line: an early
-`LIMIT` leaves partitions unwinding, and an NDJSON body streams after its
-handler returns. Two fields make the join exact anyway.
-
-| Field | Minted | Meaning |
-| --- | --- | --- |
-| `query_execution_id` | Once per execution, by the handler that starts it (`QueryExecutionId::next`), and injected through `SessionConfig` | The request. `0` (`UNATTRIBUTED_QUERY_EXECUTION_ID`) means the session carried none — an internal scan. |
-| `scan_id` | Once per scan node, in `SiglakeIcebergTableScan::try_new` | The node. Separates two scan nodes of one execution (the residual twin plan) and the same query planned again later. |
-
-Each execution also logs one `query execution start` line carrying its id, its
-`endpoint` (`sql`, `sql_coordinator`, `sql_shard`, `sql_batch`, `jaeger`,
-`warm_ordered_edges`) and its SQL. It is emitted at the start because that is
-the point every path reaches: the coordinator fan-out writes no terminal line,
-the worker `/api/v1/sql/shard` endpoint refuses on paths that return before
-one could be written, and a streamed body outlives its handler. An empty
-`query` on that line means the execution runs more than one statement (the
-Jaeger render), which `scan_id` separates.
-
-A successful buffered `/api/v1/sql` execution carries that same id on both
-its `sql execution profile` line (physical plan and phase timings) and its
-terminal `sql query profile` line. Concurrent buffered executions can
-therefore join their plan, collect and render timings by id instead of by log
-position. Streaming and refused executions keep their existing event set.
-
-Ids are process-local. A distributed query's coordinator and worker halves
-each mint their own and are joined by the W3C trace context the fan-out
-already propagates, not by a shared id. `crates/siglake-storage/tests/scan_event_attribution.rs`
-and `crates/siglake-query-server/tests/query_execution_attribution.rs` pin
-the concurrent, early-`LIMIT` and streaming cases.
 
 **Configuration for instrumented processes is the standard OTel environment,
 and it is off by default.**

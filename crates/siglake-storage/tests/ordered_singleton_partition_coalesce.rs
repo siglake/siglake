@@ -95,7 +95,7 @@ fn browse_context(target_partitions: usize, limit: usize) -> SessionContext {
     let base = siglake_storage::session_context_with_order(
         Some(target_partitions),
         None,
-        Some(PreferredScanOrder::timestamp(true)),
+        Some(PreferredScanOrder { descending: true }),
     );
     let mut state = base.state();
     state
@@ -310,7 +310,7 @@ async fn ordered_scan_without_a_small_limit_keeps_its_singleton_partitions() {
     let ctx = siglake_storage::session_context_with_order(
         Some(8),
         None,
-        Some(PreferredScanOrder::timestamp(true)),
+        Some(PreferredScanOrder { descending: true }),
     );
     ice.register_with_datafusion(&ctx).await.unwrap();
 

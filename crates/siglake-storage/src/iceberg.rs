@@ -497,7 +497,6 @@ const SIGLAKE_PUFFIN_INVERTED_CODEC: PuffinCompressionCodec =
     PuffinCompressionCodec::zstd_default();
 const DEFAULT_SIGLAKE_INDEX_FOOTER_MAX_BYTES: usize = 1024 * 1024;
 const DELETE_TASKS_CONFIG_DIR: &str = "_siglake/config/delete_tasks";
-const DROPPED_INDEXES_CONFIG_DIR: &str = "_siglake/config/dropped_indexes";
 const DELETE_TASK_CLAIM_PROBE: &str = ".create-only-probe";
 const DELETE_TASK_CLAIM_PROBE_BODY: &[u8] = b"siglake delete-task create-only probe v1\n";
 const CONDITIONAL_WRITE_PROBE: &str = "_siglake/config/.conditional-write-probe";
@@ -975,11 +974,11 @@ mod conditional_write_compatibility_tests {
     }
 
     #[tokio::test]
-    async fn unsafe_create_only_store_is_refused_before_cleanup_record_overwrite() {
+    async fn unsafe_create_only_store_is_refused_before_side_object_overwrite() {
         let (_root, op) = operator(IgnoredPrecondition::IfNotExists);
         let compatibility = tokio::sync::OnceCell::new();
-        let cleanup_record = "_siglake/config/dropped_indexes/siglake/existing.json";
-        op.write(cleanup_record, b"existing authority".to_vec())
+        let side_object = "metadata/siglake-agg/existing.json";
+        op.write(side_object, b"existing aggregate".to_vec())
             .await
             .unwrap();
 
@@ -991,9 +990,9 @@ mod conditional_write_compatibility_tests {
             "{err:#}"
         );
         assert_eq!(
-            op.read(cleanup_record).await.unwrap().to_vec(),
-            b"existing authority",
-            "the refused endpoint must not overwrite cleanup authority"
+            op.read(side_object).await.unwrap().to_vec(),
+            b"existing aggregate",
+            "the refused endpoint must not overwrite the side object"
         );
     }
 }
@@ -1159,14 +1158,6 @@ mod conditional_write_live {
         }
         println!("CAS_RACE rounds={ROUNDS} winners=1 losers=1");
     }
-}
-
-fn dropped_index_records_rel_dir(namespace: &NamespaceIdent) -> String {
-    format!("{DROPPED_INDEXES_CONFIG_DIR}/{namespace}/")
-}
-
-fn dropped_index_record_rel_path(namespace: &NamespaceIdent, drop_id: Uuid) -> String {
-    format!("{}{drop_id}.json", dropped_index_records_rel_dir(namespace))
 }
 
 /// Options for [`IcebergContext::gc_orphans`] (BIG-3 orphan-file GC).
@@ -1752,75 +1743,6 @@ pub struct RetentionOutcome {
     pub bytes_dropped: u64,
     pub rows_dropped: u64,
     pub straddling_files_kept: usize,
-}
-
-/// Authority attached to one class of a dropped index's storage. The initial
-/// writer emits only `ReportOnly`; changing one target never grants authority
-/// over another target in the same record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DroppedIndexTargetAuthorization {
-    ReportOnly,
-    AggregateDelete,
-    OperatorReview,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DroppedAggregateTarget {
-    pub relative_path: String,
-    pub authorization: DroppedIndexTargetAuthorization,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DroppedCommittedFilesTarget {
-    pub authorization: DroppedIndexTargetAuthorization,
-    /// Exact objects reachable from every retained snapshot at drop time,
-    /// plus the current table metadata JSON. Paths are absolute Iceberg paths.
-    pub inventory: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DroppedStaleWalTarget {
-    pub authorization: DroppedIndexTargetAuthorization,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DroppedIndexCleanupTargets {
-    pub aggregate_prefix: DroppedAggregateTarget,
-    pub committed_files: DroppedCommittedFilesTarget,
-    pub stale_wal: DroppedStaleWalTarget,
-}
-
-/// Durable, incarnation-bound cleanup route written before a managed index's
-/// catalog entry is dropped. `namespace` and `index_id` are labels only; a
-/// sweeper addresses the recorded location and UUID prefix directly.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DroppedIndexCleanupRecord {
-    pub version: u8,
-    pub drop_id: Uuid,
-    pub namespace: String,
-    pub index_id: String,
-    pub table_uuid: String,
-    pub table_location: String,
-    pub recorded_at: chrono::DateTime<chrono::Utc>,
-    pub targets: DroppedIndexCleanupTargets,
-}
-
-/// One dropped UUID prefix's observation from a cleanup sweep.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DroppedAggregateSweepOutcome {
-    pub drop_id: Uuid,
-    pub table_uuid: String,
-    pub authorization: DroppedIndexTargetAuthorization,
-    pub objects_observed: usize,
-    pub bytes_observed: u64,
-    pub objects_deleted: usize,
-    pub empty: bool,
 }
 
 /// Delete-task lifecycle state. The ledger is immutable apart from state
@@ -2755,210 +2677,6 @@ fn warehouse_operator(location: &str) -> Result<opendal::Operator> {
     }
 }
 
-fn validate_dropped_index_cleanup_record(
-    namespace: &NamespaceIdent,
-    record: &DroppedIndexCleanupRecord,
-) -> Result<()> {
-    anyhow::ensure!(
-        record.version == 1,
-        "unsupported dropped-index record version {}",
-        record.version
-    );
-    anyhow::ensure!(
-        record.namespace == namespace.to_string(),
-        "dropped-index record {} belongs to namespace `{}`, not `{namespace}`",
-        record.drop_id,
-        record.namespace
-    );
-    let uuid = Uuid::parse_str(&record.table_uuid).with_context(|| {
-        format!(
-            "invalid table UUID in dropped-index record {}",
-            record.drop_id
-        )
-    })?;
-    anyhow::ensure!(
-        uuid.to_string() == record.table_uuid,
-        "dropped-index record {} table UUID is not canonical",
-        record.drop_id
-    );
-    let location = url::Url::parse(&record.table_location).with_context(|| {
-        format!(
-            "invalid table location in dropped-index record {}",
-            record.drop_id
-        )
-    })?;
-    anyhow::ensure!(
-        matches!(location.scheme(), "file" | "s3" | "s3a")
-            && location.query().is_none()
-            && location.fragment().is_none(),
-        "dropped-index record {} has unsupported table location `{}`",
-        record.drop_id,
-        record.table_location
-    );
-    let expected = format!("{}/", aggregate_prefix_rel_path(&record.table_uuid));
-    anyhow::ensure!(
-        record.targets.aggregate_prefix.relative_path == expected,
-        "dropped-index record {} aggregate prefix `{}` does not equal `{expected}`",
-        record.drop_id,
-        record.targets.aggregate_prefix.relative_path
-    );
-    anyhow::ensure!(
-        matches!(
-            record.targets.aggregate_prefix.authorization,
-            DroppedIndexTargetAuthorization::ReportOnly
-                | DroppedIndexTargetAuthorization::AggregateDelete
-        ),
-        "dropped-index record {} aggregate target has non-aggregate authority",
-        record.drop_id
-    );
-    anyhow::ensure!(
-        record.targets.committed_files.authorization == DroppedIndexTargetAuthorization::ReportOnly,
-        "dropped-index record {} grants unsupported committed-file authority",
-        record.drop_id
-    );
-    anyhow::ensure!(
-        record.targets.stale_wal.authorization == DroppedIndexTargetAuthorization::OperatorReview,
-        "dropped-index record {} grants unsupported stale-WAL authority",
-        record.drop_id
-    );
-    Ok(())
-}
-
-async fn list_dropped_aggregate_page(
-    op: &opendal::Operator,
-    prefix: &str,
-    limit: Option<usize>,
-) -> Result<Vec<(String, u64)>> {
-    use futures::StreamExt;
-
-    let mut request = op.lister_with(prefix).recursive(true);
-    if let Some(limit) = limit {
-        request = request.limit(limit.max(1));
-    }
-    let mut lister = request
-        .await
-        .with_context(|| format!("list dropped aggregate prefix {prefix}"))?;
-    let mut objects = Vec::new();
-    while let Some(entry) = lister.next().await {
-        let entry = entry.with_context(|| format!("list dropped aggregate prefix {prefix}"))?;
-        if !entry.metadata().is_file() {
-            continue;
-        }
-        let path = entry.path().to_string();
-        anyhow::ensure!(
-            path.starts_with(prefix),
-            "listing `{prefix}` returned out-of-prefix object `{path}`"
-        );
-        let bytes = op
-            .stat(&path)
-            .await
-            .with_context(|| format!("stat dropped aggregate object {path}"))?
-            .content_length();
-        objects.push((path, bytes));
-        if limit.is_some_and(|limit| objects.len() >= limit.max(1)) {
-            break;
-        }
-    }
-    Ok(objects)
-}
-
-fn remove_empty_directory_tree(path: &std::path::Path) -> Result<()> {
-    let entries = match std::fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err).with_context(|| format!("read directory {}", path.display())),
-    };
-    for entry in entries {
-        let entry =
-            entry.with_context(|| format!("read directory entry under {}", path.display()))?;
-        if entry
-            .file_type()
-            .with_context(|| format!("read file type for {}", entry.path().display()))?
-            .is_dir()
-        {
-            remove_empty_directory_tree(&entry.path())?;
-        }
-    }
-    match std::fs::remove_dir(path) {
-        Ok(()) => Ok(()),
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-            ) =>
-        {
-            Ok(())
-        }
-        Err(err) => Err(err).with_context(|| format!("remove directory {}", path.display())),
-    }
-}
-
-fn remove_empty_dropped_aggregate_directories(record: &DroppedIndexCleanupRecord) -> Result<()> {
-    let location = url::Url::parse(&record.table_location)?;
-    if location.scheme() != "file" {
-        return Ok(());
-    }
-    let table_path = location.to_file_path().map_err(|_| {
-        anyhow::anyhow!(
-            "dropped-index record {} file location cannot be converted to a path",
-            record.drop_id
-        )
-    })?;
-    remove_empty_directory_tree(&table_path.join(&record.targets.aggregate_prefix.relative_path))
-}
-
-async fn sweep_dropped_aggregate_record(
-    record: &DroppedIndexCleanupRecord,
-    page_size: usize,
-) -> Result<DroppedAggregateSweepOutcome> {
-    let authorization = record.targets.aggregate_prefix.authorization;
-    let prefix = record.targets.aggregate_prefix.relative_path.as_str();
-    let op = warehouse_operator(&record.table_location)?;
-    let mut outcome = DroppedAggregateSweepOutcome {
-        drop_id: record.drop_id,
-        table_uuid: record.table_uuid.clone(),
-        authorization,
-        objects_observed: 0,
-        bytes_observed: 0,
-        objects_deleted: 0,
-        empty: false,
-    };
-    if authorization == DroppedIndexTargetAuthorization::ReportOnly {
-        let objects = list_dropped_aggregate_page(&op, prefix, None).await?;
-        outcome.objects_observed = objects.len();
-        outcome.bytes_observed = objects.iter().map(|(_, bytes)| bytes).sum();
-        outcome.empty = objects.is_empty();
-        return Ok(outcome);
-    }
-
-    loop {
-        // Restart at the UUID prefix root after every mutated page;
-        // continuation tokens describe a listing that the deletes changed.
-        let page = list_dropped_aggregate_page(&op, prefix, Some(page_size)).await?;
-        if page.is_empty() {
-            remove_empty_dropped_aggregate_directories(record)?;
-            outcome.empty = true;
-            break;
-        }
-        outcome.objects_observed += page.len();
-        outcome.bytes_observed += page.iter().map(|(_, bytes)| bytes).sum::<u64>();
-        for (path, _) in page {
-            match op.delete(&path).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == opendal::ErrorKind::NotFound => {}
-                Err(err) => {
-                    metrics::counter!("siglake_dropped_index_aggregate_cleanup_failures_total")
-                        .increment(1);
-                    return Err(err).with_context(|| format!("delete dropped aggregate {path}"));
-                }
-            }
-            outcome.objects_deleted += 1;
-            metrics::counter!("siglake_dropped_index_aggregate_objects_deleted_total").increment(1);
-        }
-    }
-    Ok(outcome)
-}
-
 /// File name (under the warehouse root) of the SQLite catalog database
 /// when using [`IcebergContext::open`].
 pub const DEFAULT_CATALOG_FILE: &str = "_catalog.db";
@@ -3682,49 +3400,6 @@ async fn live_data_files_of(table: &Table) -> Result<Vec<DataFile>> {
         .expect("live_data_files_within returns None only when given a deadline"))
 }
 
-/// Objects the dropped table's retained snapshots can still read. This is a
-/// recorded inventory, not deletion authority: committed-file reclamation has
-/// a separate policy from aggregate reclamation.
-async fn dropped_table_committed_file_inventory(table: &Table) -> Result<Vec<String>> {
-    let metadata_ref = table.metadata_ref();
-    let file_io = table.file_io();
-    let mut inventory = HashSet::new();
-    if let Some(location) = table.metadata_location() {
-        inventory.insert(location.to_string());
-    }
-    for metadata in metadata_ref.metadata_log() {
-        inventory.insert(metadata.metadata_file.clone());
-    }
-    for statistics in metadata_ref.statistics_iter() {
-        inventory.insert(statistics.statistics_path.clone());
-    }
-    for statistics in metadata_ref.partition_statistics_iter() {
-        inventory.insert(statistics.statistics_path.clone());
-    }
-    for snapshot in metadata_ref.snapshots() {
-        inventory.insert(snapshot.manifest_list().to_string());
-        let manifest_list = snapshot
-            .load_manifest_list(file_io, &metadata_ref)
-            .await
-            .context("dropped-index inventory: load manifest list")?;
-        for manifest_file in manifest_list.entries() {
-            inventory.insert(manifest_file.manifest_path.clone());
-            let manifest = manifest_file
-                .load_manifest(file_io)
-                .await
-                .context("dropped-index inventory: load manifest")?;
-            for entry in manifest.entries() {
-                if entry.is_alive() {
-                    inventory.insert(entry.data_file().file_path().to_string());
-                }
-            }
-        }
-    }
-    let mut inventory: Vec<_> = inventory.into_iter().collect();
-    inventory.sort();
-    Ok(inventory)
-}
-
 /// [`live_data_files_of`] under a deadline: `Ok(None)` when the clock passes
 /// `deadline` between manifests, `Ok(Some(files))` when the walk completes.
 ///
@@ -3857,7 +3532,6 @@ async fn pruned_window_batch_stream(
     columns: &[&str],
     lo: Option<i64>,
     hi: Option<i64>,
-    scan_metrics: Option<iceberg::arrow::ScanMetrics>,
 ) -> Result<(
     parquet::arrow::async_reader::ParquetRecordBatchStream<iceberg::arrow::ArrowFileReader>,
     WindowTimeColumn,
@@ -3880,9 +3554,6 @@ async fn pruned_window_batch_stream(
         .await
         .with_context(|| format!("reader {path}"))?;
     let mut reader = ArrowFileReader::new(file_meta, read);
-    if let Some(scan_metrics) = scan_metrics {
-        reader = reader.with_scan_metrics(scan_metrics);
-    }
     let meta = ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::new())
         .await
         .with_context(|| format!("load parquet metadata {path}"))?;
@@ -3930,7 +3601,7 @@ async fn scan_file_group_counts_windowed(
     use futures::StreamExt;
 
     let (mut reader, time_column) =
-        pruned_window_batch_stream(file_io, path, &[column], lo, hi, None).await?;
+        pruned_window_batch_stream(file_io, path, &[column], lo, hi).await?;
     #[cfg(feature = "experimental-exact-point-rollup")]
     record_exact_point_boundary_read(1);
     let mut counts: HashMap<Option<String>, u64> = HashMap::new();
@@ -4030,8 +3701,7 @@ async fn scan_file_timestamp_buckets_windowed(
     use arrow_array::Array;
     use futures::StreamExt;
 
-    let (mut reader, time_column) =
-        pruned_window_batch_stream(file_io, path, &[], lo, hi, None).await?;
+    let (mut reader, time_column) = pruned_window_batch_stream(file_io, path, &[], lo, hi).await?;
     let mut decoded_bytes = 0u64;
     let bucket_of =
         |ts: i64| -> i64 { origin_ns + (ts - origin_ns).div_euclid(interval_ns) * interval_ns };
@@ -7683,12 +7353,6 @@ pub struct AutoPromotionPassReport {
     pub declined: Vec<AutoPromotionDecline>,
     pub columns_before: usize,
     pub columns_after: usize,
-    /// Data files selected for this pass's bounded sample.
-    pub sample_files: usize,
-    /// Physical object-store reads made by the sampled Parquet readers.
-    pub reads: u64,
-    /// Footer, index, and data bytes read by the sampled Parquet readers.
-    pub bytes: u64,
 }
 
 fn select_promotions(
@@ -8671,29 +8335,6 @@ pub fn query_prewarm_enabled() -> bool {
 ///   `hit` — parsed; `absent` — no object yet, the legitimate first commit;
 ///   `unreadable` / `parse_error` — a base that EXISTS and was lost.
 async fn load_side_aggregates(file_io: &FileIO, path: &str) -> Result<Option<SnapshotAggregates>> {
-    load_side_aggregates_inner(file_io, path, false)
-        .await
-        .map(|(aggregates, _)| aggregates)
-}
-
-/// Load the side object while attributing the census's own object-store cost.
-///
-/// The request counters move immediately before each request. In particular, a
-/// GET whose read fails still counts as an attempt and attributes zero bytes.
-/// The ordinary loader stays uncounted so fold, publish and query loads retain
-/// their existing metric semantics.
-async fn load_side_aggregates_counted(
-    file_io: &FileIO,
-    path: &str,
-) -> Result<(Option<SnapshotAggregates>, u64)> {
-    load_side_aggregates_inner(file_io, path, true).await
-}
-
-async fn load_side_aggregates_inner(
-    file_io: &FileIO,
-    path: &str,
-    count_census_cost: bool,
-) -> Result<(Option<SnapshotAggregates>, u64)> {
     let outcome = |o: &'static str| {
         metrics::counter!("siglake_side_aggregates_load_total", "outcome" => o).increment(1);
     };
@@ -8703,35 +8344,26 @@ async fn load_side_aggregates_inner(
             path,
             "side aggregates: cannot open input; base will be LOST"
         );
-        return Ok((None, 0));
+        return Ok(None);
     };
-    if count_census_cost {
-        metrics::counter!("siglake_inline_coverage_census_requests_total", "op" => "head")
-            .increment(1);
-    }
     match input.exists().await {
         Ok(true) => {}
         Ok(false) => {
             outcome("absent");
-            return Ok((None, 0));
+            return Ok(None);
         }
         Err(e) => {
             outcome("unreadable");
             tracing::warn!(path, error = %e, "side aggregates: exists() failed; base will be LOST");
-            return Ok((None, 0));
+            return Ok(None);
         }
     }
-    if count_census_cost {
-        metrics::counter!("siglake_inline_coverage_census_requests_total", "op" => "get")
-            .increment(1);
-    }
     let bytes = input.read().await.with_context(|| format!("read {path}"))?;
-    let bytes_read = bytes.len() as u64;
     match serde_json::from_slice::<SnapshotAggregates>(&bytes) {
         Ok(v) => {
             outcome("hit");
             metrics::histogram!("siglake_side_aggregates_bytes").record(bytes.len() as f64);
-            Ok((Some(v), bytes_read))
+            Ok(Some(v))
         }
         Err(e) => {
             outcome("parse_error");
@@ -8744,7 +8376,7 @@ async fn load_side_aggregates_inner(
                 "side aggregates: PARSE FAILED — the accumulated aggregate is being \
                  discarded and will be replaced by this commit's delta alone"
             );
-            Ok((None, bytes_read))
+            Ok(None)
         }
     }
 }
@@ -9823,7 +9455,7 @@ mod pruned_window_tests {
     async fn window_rows(path: &str, lo: Option<i64>, hi: Option<i64>) -> (usize, usize) {
         use futures::StreamExt;
         let io = FileIOBuilder::new(storage_factory_for("file:///").unwrap()).build();
-        let (mut stream, _) = pruned_window_batch_stream(&io, path, &[], lo, hi, None)
+        let (mut stream, _) = pruned_window_batch_stream(&io, path, &[], lo, hi)
             .await
             .unwrap();
         let (mut decoded, mut in_window) = (0usize, 0usize);
@@ -13136,7 +12768,6 @@ impl IcebergContext {
                 &[group_column],
                 None,
                 None,
-                None,
             )
             .await?;
             while let Some(batch) = stream.next().await {
@@ -15084,12 +14715,12 @@ impl IcebergContext {
             // a whole-warehouse sweep on a timer, and a namespace whose base
             // `events` table was never created is the ordinary case on an
             // index-only warehouse.
-            let (outcome, bytes_read) = match self.inline_coverage_census(&ident).await {
-                Ok(result) => result,
+            let outcome = match self.inline_coverage_census(&ident).await {
+                Ok(outcome) => outcome,
                 Err(error) => {
                     tracing::warn!(error = ?error, table = %ident,
                         "inline-coverage census failed");
-                    (InlineCoverageOutcome::Undetermined, 0)
+                    InlineCoverageOutcome::Undetermined
                 }
             };
             match &outcome {
@@ -15123,14 +14754,7 @@ impl IcebergContext {
             // and overwriting a standing 1 with a 0 on a failed GET would hide
             // exactly the state this exists to report.
             if let Some(unproven) = outcome.gauge_value() {
-                let namespace = self.namespace().to_string();
-                report_inline_coverage(&namespace, ident.name(), unproven);
-                metrics::counter!(
-                    "siglake_inline_coverage_census_bytes_total",
-                    "iceberg_namespace" => namespace,
-                    "table" => ident.name().to_string()
-                )
-                .increment(bytes_read);
+                report_inline_coverage(&self.namespace().to_string(), ident.name(), unproven);
             }
             out.push((ident.name().to_string(), outcome));
         }
@@ -15141,22 +14765,17 @@ impl IcebergContext {
     ///
     /// The predicate is the read guard's, called on the same object the guard
     /// reads: `aggregate_covers_current_snapshot` walks table metadata only, so
-    /// what this costs is the object — one direct HEAD, then the loader's HEAD
-    /// and, when it is there, one GET. The duplicate existence probe is the
-    /// shipped request pattern and remains deliberate here.
+    /// what this costs is the object — one HEAD and, when it is there, one GET.
     /// Read straight from storage rather than through
     /// [`Self::cached_side_aggregates`], which collapses every refusal into
     /// `None` and so cannot say WHY a table is off Tier-1.
-    async fn inline_coverage_census(
-        &self,
-        ident: &TableIdent,
-    ) -> Result<(InlineCoverageOutcome, u64)> {
+    async fn inline_coverage_census(&self, ident: &TableIdent) -> Result<InlineCoverageOutcome> {
         let cached = self.cached_table_entry(ident).await?;
         // Incarnation fence (#2919): a table with no provable incarnation reads
         // no aggregate at all, so it has no coverage claim to refuse, and the
         // object at the shared path is somebody else's.
         let Some(path) = side_aggregates_path(&cached.table) else {
-            return Ok((InlineCoverageOutcome::NotApplicable, 0));
+            return Ok(InlineCoverageOutcome::NotApplicable);
         };
         if cached
             .table
@@ -15167,31 +14786,27 @@ impl IcebergContext {
             .filter(|rc| *rc > 0)
             .is_none()
         {
-            return Ok((InlineCoverageOutcome::NotApplicable, 0));
+            return Ok(InlineCoverageOutcome::NotApplicable);
         }
         // `load_side_aggregates` returns `Ok(None)` for absent, unreadable and
         // unparseable alike — the distinction the census exists to draw. Probe
         // existence first so an `Ok(None)` after this point can only mean the
         // object is there and was lost.
         let input = cached.table.file_io().new_input(&path)?;
-        metrics::counter!("siglake_inline_coverage_census_requests_total", "op" => "head")
-            .increment(1);
         match input.exists().await {
             Ok(true) => {}
             // No object: nothing claims coverage, and `rebuild-time-aggregates`
             // refuses a table with no object to rebuild from. A table that
             // should have one and does not is
             // `SiglakeSideAggregatePublicationLost`, not this.
-            Ok(false) => return Ok((InlineCoverageOutcome::NotApplicable, 0)),
-            Err(_) => return Ok((InlineCoverageOutcome::Undetermined, 0)),
+            Ok(false) => return Ok(InlineCoverageOutcome::NotApplicable),
+            Err(_) => return Ok(InlineCoverageOutcome::Undetermined),
         }
-        let (side, bytes_read) =
-            load_side_aggregates_counted(cached.table.file_io(), &path).await?;
-        let Some(side) = side else {
-            return Ok((InlineCoverageOutcome::Undetermined, bytes_read));
+        let Some(side) = load_side_aggregates(cached.table.file_io(), &path).await? else {
+            return Ok(InlineCoverageOutcome::Undetermined);
         };
         if aggregate_covers_current_snapshot(&cached.table, side.coverage) {
-            return Ok((InlineCoverageOutcome::Covered, bytes_read));
+            return Ok(InlineCoverageOutcome::Covered);
         }
         // A commit whose link is written but not yet folded into the edge is a
         // second old, not broken. Reporting it would page on every busy table.
@@ -15200,9 +14815,9 @@ impl IcebergContext {
             side.coverage,
             &side.coverage_links,
         ) {
-            return Ok((InlineCoverageOutcome::Publishing, bytes_read));
+            return Ok(InlineCoverageOutcome::Publishing);
         }
-        Ok((InlineCoverageOutcome::Unproven, bytes_read))
+        Ok(InlineCoverageOutcome::Unproven)
     }
 
     /// WS-7 auto-promotion: sample the newest live files' `attributes` JSON,
@@ -15314,13 +14929,8 @@ impl IcebergContext {
                 declined: Vec::new(),
                 columns_before,
                 columns_after: columns_before,
-                sample_files: 0,
-                reads: 0,
-                bytes: 0,
             });
         }
-        let pass_start = std::time::Instant::now();
-        let scan_metrics = iceberg::arrow::ScanMetrics::default();
         let schema = entry.table.metadata().current_schema();
 
         // Newest data first: see `newest_sample_files`. A table with no
@@ -15351,7 +14961,6 @@ impl IcebergContext {
                 &["attributes"],
                 None,
                 None,
-                Some(scan_metrics.clone()),
             )
             .await?;
             let mut remaining = sample_rows_per_file;
@@ -15393,63 +15002,12 @@ impl IcebergContext {
             self.declare_promotions_for(table_ident, &new_list).await?;
         }
         let columns_after = columns_before + selection.promoted.len();
-        let counters = scan_metrics.scan_counters();
-        let reads = counters
-            .object_store_reads
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let phase_bytes = [
-            (
-                "footer",
-                counters
-                    .bytes_footer
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            ),
-            (
-                "index",
-                counters
-                    .bytes_index
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            ),
-            (
-                "data",
-                counters
-                    .bytes_data
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            ),
-        ];
-        let bytes = phase_bytes.iter().map(|(_, bytes)| bytes).sum();
-        let iceberg_namespace = table_ident.namespace().to_string();
-        let table = table_ident.name().to_string();
-        metrics::counter!(
-            "siglake_auto_promotion_sample_reads_total",
-            "iceberg_namespace" => iceberg_namespace.clone(),
-            "table" => table.clone()
-        )
-        .increment(reads);
-        for (phase, phase_bytes) in phase_bytes {
-            metrics::counter!(
-                "siglake_auto_promotion_sample_bytes_total",
-                "iceberg_namespace" => iceberg_namespace.clone(),
-                "table" => table.clone(),
-                "phase" => phase
-            )
-            .increment(phase_bytes);
-        }
-        metrics::histogram!(
-            "siglake_auto_promotion_pass_duration_seconds",
-            "iceberg_namespace" => iceberg_namespace,
-            "table" => table
-        )
-        .record(pass_start.elapsed().as_secs_f64());
         Ok(AutoPromotionPassReport {
             candidates: Some(selection.candidates),
             promoted: selection.promoted,
             declined: selection.declined,
             columns_before,
             columns_after,
-            sample_files: sampled.len(),
-            reads,
-            bytes,
         })
     }
 
@@ -17629,91 +17187,6 @@ impl IcebergContext {
         self.enforce_all_index_retention_inner(false).await
     }
 
-    /// Persist and confirm the incarnation-bound cleanup route for a managed
-    /// index before its catalog entry is dropped. Every target starts without
-    /// destructive authority.
-    pub(crate) async fn record_dropped_index_cleanup(
-        &self,
-        index_id: &str,
-        table: &Table,
-    ) -> Result<DroppedIndexCleanupRecord> {
-        let table_uuid = table.metadata().uuid().to_string();
-        let record = DroppedIndexCleanupRecord {
-            version: 1,
-            drop_id: Uuid::now_v7(),
-            namespace: self.namespace().to_string(),
-            index_id: index_id.to_string(),
-            table_uuid: table_uuid.clone(),
-            table_location: table.metadata().location().to_string(),
-            recorded_at: chrono::Utc::now(),
-            targets: DroppedIndexCleanupTargets {
-                aggregate_prefix: DroppedAggregateTarget {
-                    relative_path: format!("{}/", aggregate_prefix_rel_path(&table_uuid)),
-                    authorization: DroppedIndexTargetAuthorization::ReportOnly,
-                },
-                committed_files: DroppedCommittedFilesTarget {
-                    authorization: DroppedIndexTargetAuthorization::ReportOnly,
-                    inventory: dropped_table_committed_file_inventory(table).await?,
-                },
-                stale_wal: DroppedStaleWalTarget {
-                    authorization: DroppedIndexTargetAuthorization::OperatorReview,
-                },
-            },
-        };
-        validate_dropped_index_cleanup_record(self.namespace(), &record)?;
-        self.create_dropped_index_cleanup_record(&record).await?;
-        metrics::counter!("siglake_dropped_index_cleanup_records_total").increment(1);
-        Ok(record)
-    }
-
-    /// List this namespace's durable dropped-index records. A malformed object
-    /// is a hard error, so it can never disappear from operator inventory.
-    pub async fn list_dropped_index_cleanup_records(
-        &self,
-    ) -> Result<Vec<DroppedIndexCleanupRecord>> {
-        let records = self.read_dropped_index_cleanup_records().await?;
-        for record in &records {
-            validate_dropped_index_cleanup_record(self.namespace(), record)?;
-        }
-        Ok(records)
-    }
-
-    /// Inventory or reclaim each recorded aggregate prefix. Production-created
-    /// records are report-only. An externally reviewed record must grant
-    /// `aggregate_delete` on the aggregate target alone before this removes an
-    /// object; committed files and stale WAL are never touched here.
-    pub async fn sweep_dropped_index_aggregates(
-        &self,
-        page_size: usize,
-    ) -> Result<Vec<DroppedAggregateSweepOutcome>> {
-        let records = self.read_dropped_index_cleanup_records().await?;
-        // Validate the complete input set before the first DELETE. A corrupt
-        // sibling record therefore cannot leave a half-executed sweep.
-        for record in &records {
-            validate_dropped_index_cleanup_record(self.namespace(), record)?;
-        }
-        let mut outcomes = Vec::with_capacity(records.len());
-        for record in &records {
-            outcomes.push(sweep_dropped_aggregate_record(record, page_size).await?);
-        }
-        Ok(outcomes)
-    }
-
-    /// Test hook for exercising the separately-authorized branch and malformed
-    /// persisted records. Production code has no authority-changing API yet.
-    #[doc(hidden)]
-    pub async fn write_dropped_index_cleanup_record_for_test(
-        &self,
-        record: &DroppedIndexCleanupRecord,
-    ) -> Result<()> {
-        let op = self.warehouse_object_store()?;
-        let rel = dropped_index_record_rel_path(self.namespace(), record.drop_id);
-        op.write(&rel, serde_json::to_vec(record)?)
-            .await
-            .with_context(|| format!("write dropped-index test record {rel}"))?;
-        Ok(())
-    }
-
     /// Record one pending delete task as its own warehouse object. The task is
     /// immutable apart from later state transitions and terminal stats, and the
     /// write touches no other task's key, so a concurrent submitter in another
@@ -19013,81 +18486,6 @@ impl IcebergContext {
             tasks.push(task);
         }
         Ok(tasks)
-    }
-
-    async fn create_dropped_index_cleanup_record(
-        &self,
-        record: &DroppedIndexCleanupRecord,
-    ) -> Result<()> {
-        let op = self.warehouse_object_store()?;
-        require_conditional_write_compatibility(
-            &op,
-            &self.conditional_write_compatibility,
-            false,
-            true,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "warehouse store cannot safely create dropped-index record {}; refusing to drop the index",
-                record.drop_id
-            )
-        })?;
-        let rel = dropped_index_record_rel_path(self.namespace(), record.drop_id);
-        let body = serde_json::to_vec(record)
-            .with_context(|| format!("serialize dropped-index record {}", record.drop_id))?;
-        op.write_with(&rel, body)
-            .if_not_exists(true)
-            .await
-            .with_context(|| format!("create dropped-index record {rel}"))?;
-        let confirmed = op
-            .read(&rel)
-            .await
-            .with_context(|| format!("confirm dropped-index record {rel}"))?;
-        let confirmed: DroppedIndexCleanupRecord = serde_json::from_slice(&confirmed.to_bytes())
-            .with_context(|| format!("parse confirmed dropped-index record {rel}"))?;
-        anyhow::ensure!(
-            confirmed == *record,
-            "confirmed dropped-index record {rel} differs from the record written"
-        );
-        Ok(())
-    }
-
-    async fn read_dropped_index_cleanup_records(&self) -> Result<Vec<DroppedIndexCleanupRecord>> {
-        let op = self.warehouse_object_store()?;
-        let dir = dropped_index_records_rel_dir(self.namespace());
-        let entries = match op.list(&dir).await {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == opendal::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => {
-                return Err(err).with_context(|| format!("list dropped-index records {dir}"))
-            }
-        };
-        let mut records = Vec::new();
-        for entry in entries {
-            let rel = entry.path();
-            if !rel.ends_with(".json") {
-                continue;
-            }
-            let bytes = op
-                .read(rel)
-                .await
-                .with_context(|| format!("read dropped-index record {rel}"))?;
-            let record: DroppedIndexCleanupRecord = serde_json::from_slice(&bytes.to_bytes())
-                .with_context(|| format!("parse dropped-index record {rel}"))?;
-            let file_id = rel
-                .rsplit_once('/')
-                .map_or(rel, |(_, name)| name)
-                .trim_end_matches(".json");
-            anyhow::ensure!(
-                file_id == record.drop_id.to_string(),
-                "dropped-index record {rel} contains drop_id {}",
-                record.drop_id
-            );
-            records.push(record);
-        }
-        records.sort_by_key(|record| record.drop_id);
-        Ok(records)
     }
 
     /// Take exclusive ownership of one pending delete task, or report that
@@ -20896,26 +20294,10 @@ impl IcebergContext {
         // (score first, merge second — under a bounded bin budget the highest
         // file-count-reduction-per-byte work runs first, so a single throttled slot
         // spends its one merge where it buys the most layout healing.)
-        #[derive(Clone, Copy, PartialEq, Eq)]
-        enum ScoredBinKind {
-            Merge,
-            Backfill,
-        }
-
-        impl ScoredBinKind {
-            fn label(self) -> &'static str {
-                match self {
-                    Self::Merge => "merge",
-                    Self::Backfill => "backfill",
-                }
-            }
-        }
-
         struct ScoredBin {
             score: u64,
             level: usize,
             files: Vec<DataFile>,
-            kind: ScoredBinKind,
         }
         let mut scored: Vec<ScoredBin> = Vec::new();
         let mut gen_capped = 0u64;
@@ -21065,7 +20447,6 @@ impl IcebergContext {
                         score,
                         level,
                         files: slice,
-                        kind: ScoredBinKind::Merge,
                     });
                 }
             }
@@ -21182,7 +20563,6 @@ impl IcebergContext {
                             score,
                             level: max_level,
                             files: slice,
-                            kind: ScoredBinKind::Merge,
                         });
                     }
                 }
@@ -21241,17 +20621,12 @@ impl IcebergContext {
                     tracing::info!(
                         table = %table_label,
                         files = slice.len(),
-                        bytes_in = slice
-                            .iter()
-                            .map(|file| file.file_size_in_bytes())
-                            .sum::<u64>(),
                         "promotion backfill: rewriting pre-promotion files"
                     );
                     scored.push(ScoredBin {
                         score: 0,
                         level,
                         files: slice,
-                        kind: ScoredBinKind::Backfill,
                     });
                 }
             }
@@ -21357,7 +20732,6 @@ impl IcebergContext {
             }
             let bin_files = bin.files.len();
             let bin_level = bin.level;
-            let bin_kind = bin.kind;
             let bin_start = std::time::Instant::now();
             // Account this bin's uploads to the COMPACTION class so they cannot
             // starve the drain's (and vice versa). See `UploadClass`.
@@ -21392,28 +20766,6 @@ impl IcebergContext {
             metrics::counter!("siglake_compactor_bin_rows_total").increment(stats.rows as u64);
             metrics::counter!("siglake_compactor_bins_committed_total").increment(1);
             metrics::histogram!("siglake_compactor_bin_duration_seconds").record(bin_secs);
-            if bin_kind == ScoredBinKind::Backfill {
-                metrics::counter!(
-                    "siglake_compactor_promotion_backfill_files_total",
-                    "table" => table_label.clone()
-                )
-                .increment(bin_files as u64);
-                metrics::counter!(
-                    "siglake_compactor_promotion_backfill_bytes_in_total",
-                    "table" => table_label.clone()
-                )
-                .increment(stats.bytes_in);
-                metrics::counter!(
-                    "siglake_compactor_promotion_backfill_bytes_out_total",
-                    "table" => table_label.clone()
-                )
-                .increment(stats.bytes_out);
-                metrics::histogram!(
-                    "siglake_compactor_promotion_backfill_duration_seconds",
-                    "table" => table_label.clone()
-                )
-                .record(bin_secs);
-            }
             // A single bin is the freshness floor under preemption — make slow
             // ones visible so bench rounds can attribute probe latency. `path`
             // and `rows_per_sec` are what turn this line from "compaction is
@@ -21422,7 +20774,6 @@ impl IcebergContext {
             if bin_secs > 10.0 {
                 tracing::info!(
                     table = %table_label,
-                    kind = bin_kind.label(),
                     level = bin_level,
                     files = bin_files,
                     rows = stats.rows,
@@ -21904,43 +21255,36 @@ impl IcebergContext {
         Ok(true)
     }
 
-    /// The event-time field of `index_id`: the exact column a newest-first
-    /// browse of that index orders by, and the field its identity sort order
-    /// leads with (`create_index` declares the two together).
+    /// Whether `index_id` names a managed index whose event-time field is the
+    /// canonical `timestamp` column — the eligibility test for the query
+    /// server's implicit newest-first rewrite.
     ///
-    /// `None` for a name that is not a table in this context's namespace and
-    /// for a namespace table that carries no doc mapping (`webhook_dlq` and
-    /// friends). `Some("timestamp")` for the canonical `events` table. For a
-    /// managed index it is the mapping's `timestamp_field` — validated at
-    /// create time as a required, non-optional `Datetime` and immutable for
-    /// the table incarnation (`IndexConfig::validate`, `validate_index_update`),
-    /// so the name alone is authority for the field's identity and type.
-    ///
-    /// A mapping that names something other than `timestamp` may still carry
-    /// an unrelated column CALLED `timestamp`; a caller must order by the name
-    /// returned here and nothing else — the same reason [`Self::create_index`]
-    /// withholds the `timestamp_ns` sort tiebreak from such an index.
+    /// `false` for a name that is not a table in this context's namespace, for
+    /// a namespace table that carries no doc mapping (`webhook_dlq` and
+    /// friends), and for an index whose mapping names some other
+    /// `timestamp_field`: such an index may still carry an unrelated column
+    /// called `timestamp`, and ordering by it would stamp an order that is not
+    /// a time order — the same reason [`Self::create_index`] withholds the
+    /// `timestamp_ns` sort tiebreak there.
     ///
     /// Reads the bounded-staleness table cache, never `load_table`: the
     /// uncached lookup re-reads the (bloated) metadata.json from S3 on every
     /// query, measured at ~59 ms and documented on
     /// [`Self::register_index_with_datafusion`].
-    pub async fn index_event_time_field(&self, index_id: &str) -> Result<Option<String>> {
+    pub async fn index_orders_by_canonical_timestamp(&self, index_id: &str) -> Result<bool> {
         if index_id == TABLE_NAME {
-            return Ok(Some(
-                crate::query_provider::CANONICAL_EVENT_TIME_FIELD.to_string(),
-            ));
+            return Ok(true);
         }
         let table_ident = self.index_table_ident(index_id);
         if !self.catalog().table_exists(&table_ident).await? {
-            return Ok(None);
+            return Ok(false);
         }
         let cached = self.cached_table_entry(&table_ident).await?;
         let Some(config) = crate::index_manager::index_config_from_table(index_id, &cached.table)?
         else {
-            return Ok(None);
+            return Ok(false);
         };
-        Ok(Some(config.doc_mapping.timestamp_field))
+        Ok(config.doc_mapping.timestamp_field == "timestamp")
     }
 
     /// One managed index's stored configuration for a query-time mapping read.
@@ -32150,8 +31494,7 @@ async fn decode_file_time_group_counts(
 ) -> Result<(TimeGroupCounts, u64)> {
     use futures::StreamExt;
 
-    let (mut reader, _) =
-        pruned_window_batch_stream(file_io, path, columns, None, None, None).await?;
+    let (mut reader, _) = pruned_window_batch_stream(file_io, path, columns, None, None).await?;
     let mut out = TimeGroupCounts {
         width_ns,
         columns: BTreeMap::new(),

@@ -166,18 +166,6 @@ pub(crate) fn puffin_blob_cache_max_entries() -> usize {
     )
 }
 
-/// The blob byte budget the cache actually enforces, given both of its bounds.
-///
-/// The two bounds are independent knobs but not independent switches: an entry
-/// bound of zero refuses every blob whatever the byte knob says, so the budget
-/// in force is zero and the nominal byte figure is a number nothing is measured
-/// against. Both [`text_index_cache_max_bytes_in_force`] and the
-/// `siglake_iceberg_puffin_blob_cache_max_bytes` gauge resolve it here so a
-/// reported budget and an enforced one cannot drift apart.
-pub(crate) fn enforced_puffin_blob_budget(max_entries: usize, max_bytes: usize) -> usize {
-    if max_entries == 0 { 0 } else { max_bytes }
-}
-
 /// Return the text-index cache byte budgets currently in force.
 pub fn text_index_cache_max_bytes_in_force() -> (u64, u64) {
     let entries = puffin_blob_cache_max_entries();
@@ -186,14 +174,14 @@ pub fn text_index_cache_max_bytes_in_force() -> (u64, u64) {
     }
     (
         parsed_index_cache_max_bytes() as u64,
-        enforced_puffin_blob_budget(entries, puffin_blob_cache_max_bytes()) as u64,
+        puffin_blob_cache_max_bytes() as u64,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        TEXT_INDEX_CACHE_UNCONFIGURED, configured_cache_bytes_from, enforced_puffin_blob_budget,
+        TEXT_INDEX_CACHE_UNCONFIGURED, configured_cache_bytes_from,
         parsed_index_cache_max_bytes_from, puffin_blob_cache_max_bytes_from,
         puffin_blob_cache_max_entries_from,
     };
@@ -240,19 +228,6 @@ mod tests {
             puffin_blob_cache_max_entries_from(Some(&usize::MAX.to_string())),
             usize::MAX
         );
-    }
-
-    /// The entry bound is read from the environment at the cache with no
-    /// process-wide override, so a pod that sets `_MAX_ENTRIES=0` is only
-    /// reachable here. A gauge that published the nominal byte budget for it
-    /// would chart a cache with room against a cache that refuses everything.
-    #[test]
-    fn a_zero_entry_bound_enforces_no_blob_budget() {
-        assert_eq!(enforced_puffin_blob_budget(0, 64 * 1024 * 1024), 0);
-        assert_eq!(enforced_puffin_blob_budget(0, 0), 0);
-        assert_eq!(enforced_puffin_blob_budget(128, 0), 0);
-        assert_eq!(enforced_puffin_blob_budget(1, 4096), 4096);
-        assert_eq!(enforced_puffin_blob_budget(usize::MAX, 4096), 4096);
     }
 
     #[test]

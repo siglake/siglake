@@ -305,12 +305,9 @@ pub struct AutoscalingSpec {
     /// raw sample). A non-zero value damps flapping: a tier resizes on the
     /// blended signal rather than on a single busy or quiet sample, and a
     /// monitoring outage leaves the blend untouched instead of decaying it.
-    /// REQUIRED ABOVE 0 BY A ZERO COMPACTOR FLOOR: with smoothing off the raw
-    /// sample decides on its own, so one idle scrape parks the tier and the
-    /// next segment starts it again. With smoothing on, a tier parks after ten
-    /// half-lives of observed idleness, which is what `compactor.min: 0`
-    /// bounds its own flapping with; `0` alongside that floor is refused with
-    /// `InvalidSpec` / `AutoscalingZeroFloorNeedsSmoothing`.
+    /// Scaling a tier to zero is not supported — every component floor must be
+    /// 1 or more — so this setting never decides whether a last replica goes
+    /// away, only how quickly a tier moves within its range.
     #[serde(rename = "ewmaHalfLifeSecs", default)]
     pub ewma_half_life_secs: f64,
 }
@@ -339,25 +336,12 @@ fn default_query_autoscale() -> ComponentAutoscale {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct ComponentAutoscale {
     /// Floor on the replica count. The operator never scales below this even
-    /// when the workload signal goes to zero.
-    ///
-    /// `0` is supported for the COMPACTOR ONLY, and only under the
-    /// catalog-claim drain (`compactor.max` above 1) with
-    /// `ewmaHalfLifeSecs` above 0. The ingesters publish the shared queue
-    /// depth (`siglake_wal_segments_sealed`) from the catalog connection they
-    /// already hold, so a reading survives the stopped tier and asks for a
-    /// worker back when a segment is registered; the tier parks after ten
-    /// `ewmaHalfLifeSecs` half-lives of an empty queue, and is woken for
-    /// maintenance — retention, delete tasks, claim reclaim, mirror sync —
-    /// after an hour at zero. A zero-floor tier whose reading is missing
-    /// entirely is restored to 1: a monitoring outage is not idleness.
-    ///
-    /// Everywhere else `0` is refused with `InvalidSpec` /
-    /// `AutoscalingZeroFloorUnsupported` before any workload changes, because
-    /// the ingest and query signals are published by the pods they size and a
-    /// tier stopped at zero has nothing left to ask for it back. The
-    /// filesystem drain (`compactor.max: 1`) is refused for the same reason:
-    /// it never reads the shared queue.
+    /// when the workload signal goes to zero. Must be 1 or more: each
+    /// component's load signal is exported by the component's own pods, so a
+    /// tier stopped at zero has nothing left to ask for it back, and its
+    /// missing reading also holds the other two tiers at their current size.
+    /// `0` is refused with `InvalidSpec` /
+    /// `AutoscalingZeroFloorUnsupported` before any workload changes.
     pub min: i32,
 
     /// Ceiling on the replica count. Protects shared-cluster
