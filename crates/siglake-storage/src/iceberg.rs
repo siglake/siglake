@@ -498,6 +498,8 @@ const SIGLAKE_PUFFIN_INVERTED_CODEC: PuffinCompressionCodec =
 const DEFAULT_SIGLAKE_INDEX_FOOTER_MAX_BYTES: usize = 1024 * 1024;
 const DELETE_TASKS_CONFIG_DIR: &str = "_siglake/config/delete_tasks";
 const DROPPED_INDEXES_CONFIG_DIR: &str = "_siglake/config/dropped_indexes";
+const DELETE_TASK_CLAIM_PROBE: &str = ".create-only-probe";
+const DELETE_TASK_CLAIM_PROBE_BODY: &[u8] = b"siglake delete-task create-only probe v1\n";
 
 /// Attempts a delete-task record write gets before it is reported lost. Same
 /// linear policy as the group-count deltas: a credential refresh recovers in
@@ -527,6 +529,220 @@ fn delete_task_record_rel_path(namespace: &NamespaceIdent, task_id: Uuid) -> Str
 /// suffix would turn every listing of the namespace into that error.
 fn delete_task_claim_rel_path(namespace: &NamespaceIdent, task_id: Uuid) -> String {
     format!("{}{task_id}.claim", delete_task_records_rel_dir(namespace))
+}
+
+fn delete_task_claim_probe_rel_path(namespace: &NamespaceIdent) -> String {
+    format!(
+        "{}{DELETE_TASK_CLAIM_PROBE}",
+        delete_task_records_rel_dir(namespace)
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteClaimCreateOnly {
+    Verified,
+    Ignored,
+}
+
+/// Detect the measured S3-compatible failure mode where the endpoint accepts
+/// an overwrite carrying `If-None-Match: *`. The static OpenDAL capability is
+/// necessary to issue the request, but it says nothing about what a custom S3
+/// endpoint does with the header.
+///
+/// This is a compatibility probe, not a proof that create-only writes are
+/// atomic under concurrency. It only lets the claim path reject an endpoint
+/// already shown to ignore the precondition in a sequential exchange.
+async fn probe_delete_claim_create_only(
+    op: &opendal::Operator,
+    namespace: &NamespaceIdent,
+) -> Result<DeleteClaimCreateOnly> {
+    anyhow::ensure!(
+        op.info().full_capability().write_with_if_not_exists,
+        "warehouse store does not advertise create-only writes"
+    );
+    let rel = delete_task_claim_probe_rel_path(namespace);
+    op.write(&rel, DELETE_TASK_CLAIM_PROBE_BODY)
+        .await
+        .with_context(|| format!("write delete-task create-only probe {rel}"))?;
+    match op
+        .write_with(&rel, DELETE_TASK_CLAIM_PROBE_BODY)
+        .if_not_exists(true)
+        .await
+    {
+        Ok(_) => Ok(DeleteClaimCreateOnly::Ignored),
+        Err(err)
+            if matches!(
+                err.kind(),
+                opendal::ErrorKind::ConditionNotMatch | opendal::ErrorKind::AlreadyExists
+            ) =>
+        {
+            Ok(DeleteClaimCreateOnly::Verified)
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "warehouse store did not give a recognized create-only rejection for probe {rel}"
+            )
+        }),
+    }
+}
+
+async fn claim_delete_task_with_operator(
+    op: &opendal::Operator,
+    namespace: &NamespaceIdent,
+    task_id: Uuid,
+    create_only_cell: &tokio::sync::OnceCell<DeleteClaimCreateOnly>,
+) -> Result<DeleteTaskClaim> {
+    let rel = delete_task_claim_rel_path(namespace, task_id);
+    let create_only = create_only_cell
+        .get_or_try_init(|| probe_delete_claim_create_only(op, namespace))
+        .await
+        .with_context(|| {
+            format!(
+                "cannot verify create-only writes for delete task {task_id}; refusing to execute \
+                 it unclaimed"
+            )
+        })?;
+    anyhow::ensure!(
+        *create_only == DeleteClaimCreateOnly::Verified,
+        "warehouse store accepted an overwrite of the delete-task create-only probe, so delete \
+         task {task_id} cannot be claimed safely; refusing to execute it unclaimed (an \
+         unconditional claim would let two executors rewrite the same task)"
+    );
+    let body = serde_json::to_vec(&DeleteTaskClaimBody {
+        task_id,
+        claimed_at: chrono::Utc::now(),
+        claimant: claimant_id(),
+    })
+    .with_context(|| format!("serialize delete task claim {task_id}"))?;
+    match op.write_with(rel.as_str(), body).if_not_exists(true).await {
+        Ok(_) => Ok(DeleteTaskClaim::Won),
+        // fs maps `EEXIST` to `ConditionNotMatch`; S3 returns 412, and some
+        // S3-compatible stores answer a failed If-None-Match with
+        // `AlreadyExists`. All three mean the same thing: we lost.
+        Err(err)
+            if matches!(
+                err.kind(),
+                opendal::ErrorKind::ConditionNotMatch | opendal::ErrorKind::AlreadyExists
+            ) =>
+        {
+            Ok(DeleteTaskClaim::AlreadyClaimed)
+        }
+        Err(err) if err.kind() == opendal::ErrorKind::Unsupported => Err(anyhow::Error::from(err))
+            .with_context(|| {
+                format!(
+                    "warehouse store advertised create-only writes but rejected the claim for \
+                     delete task {task_id}; refusing to execute it unclaimed"
+                )
+            }),
+        Err(err) => Err(err).with_context(|| format!("claim delete task {rel}")),
+    }
+}
+
+#[cfg(test)]
+mod delete_claim_create_only_tests {
+    use super::*;
+    use opendal::raw::{Access, Layer, LayeredAccess, OpList, OpRead, OpWrite};
+
+    #[derive(Clone, Debug)]
+    struct IgnoreIfNotExistsLayer;
+
+    #[derive(Debug)]
+    struct IgnoreIfNotExistsAccess<A> {
+        inner: A,
+    }
+
+    impl<A: Access> Layer<A> for IgnoreIfNotExistsLayer {
+        type LayeredAccess = IgnoreIfNotExistsAccess<A>;
+
+        fn layer(&self, inner: A) -> Self::LayeredAccess {
+            IgnoreIfNotExistsAccess { inner }
+        }
+    }
+
+    impl<A: Access> LayeredAccess for IgnoreIfNotExistsAccess<A> {
+        type Inner = A;
+        type Reader = A::Reader;
+        type Writer = A::Writer;
+        type Lister = A::Lister;
+        type Deleter = A::Deleter;
+        type Copier = A::Copier;
+
+        fn inner(&self) -> &Self::Inner {
+            &self.inner
+        }
+
+        async fn read(
+            &self,
+            path: &str,
+            args: OpRead,
+        ) -> opendal::Result<(opendal::raw::RpRead, Self::Reader)> {
+            self.inner.read(path, args).await
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<(opendal::raw::RpWrite, Self::Writer)> {
+            self.inner.write(path, args.with_if_not_exists(false)).await
+        }
+
+        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
+            self.inner.delete().await
+        }
+
+        async fn list(
+            &self,
+            path: &str,
+            args: OpList,
+        ) -> opendal::Result<(opendal::raw::RpList, Self::Lister)> {
+            self.inner.list(path, args).await
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_a_recognized_create_only_rejection() {
+        let op = opendal::Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let namespace = NamespaceIdent::new("probe-rejects".to_string());
+
+        assert_eq!(
+            probe_delete_claim_create_only(&op, &namespace)
+                .await
+                .unwrap(),
+            DeleteClaimCreateOnly::Verified
+        );
+    }
+
+    /// The regression: OpenDAL still advertises create-only support, while the
+    /// stand-in endpoint accepts the conditional overwrite. A static
+    /// capability check alone would let the caller claim and execute.
+    #[tokio::test]
+    async fn claim_refuses_a_store_that_ignores_if_not_exists() {
+        let op = opendal::Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .layer(IgnoreIfNotExistsLayer)
+            .finish();
+        assert!(op.info().full_capability().write_with_if_not_exists);
+        let namespace = NamespaceIdent::new("probe-ignores".to_string());
+        let task_id = Uuid::new_v4();
+        let create_only = tokio::sync::OnceCell::new();
+
+        let err = claim_delete_task_with_operator(&op, &namespace, task_id, &create_only)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("accepted an overwrite"),
+            "{err:#}"
+        );
+        assert!(
+            !op.exists(&delete_task_claim_rel_path(&namespace, task_id))
+                .await
+                .unwrap(),
+            "the refused endpoint must not receive a real claim"
+        );
+    }
 }
 
 fn dropped_index_records_rel_dir(namespace: &NamespaceIdent) -> String {
@@ -10818,6 +11034,11 @@ pub struct IcebergContext {
     table_ident: TableIdent, // events; preserved for back-compat helpers
     warehouse_url: Arc<String>,
     warehouse_file_io: FileIO,
+    /// Result of the delete-claim store compatibility probe. OpenDAL's S3
+    /// capability is static for every S3-compatible endpoint, so the claim
+    /// path verifies that an existing object rejects `if_not_exists` once per
+    /// process context. Per-tenant contexts share this cell.
+    delete_claim_create_only: Arc<tokio::sync::OnceCell<DeleteClaimCreateOnly>>,
     table_cache: Arc<RwLock<HashMap<String, CachedTableEntry>>>,
     /// Table-cache keys with a background refresh in flight, so a burst of
     /// stale-serving reads spawns exactly one reload per key (stale-while-
@@ -12160,6 +12381,7 @@ impl IcebergContext {
             table_ident,
             warehouse_url: self.warehouse_url.clone(),
             warehouse_file_io: self.warehouse_file_io.clone(),
+            delete_claim_create_only: self.delete_claim_create_only.clone(),
             table_cache: self.table_cache.clone(),
             table_cache_refreshing: self.table_cache_refreshing.clone(),
             table_cache_epochs: self.table_cache_epochs.clone(),
@@ -12233,6 +12455,7 @@ impl IcebergContext {
             table_ident,
             warehouse_url: Arc::new(warehouse_url.to_string()),
             warehouse_file_io,
+            delete_claim_create_only: Arc::new(tokio::sync::OnceCell::new()),
             table_cache: Arc::new(RwLock::new(HashMap::new())),
             table_cache_refreshing: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
@@ -18466,9 +18689,11 @@ impl IcebergContext {
     ///
     /// FAIL CLOSED. A store that does not do create-only writes gets an error,
     /// never a plain write: an unconditional fallback would silently restore
-    /// the double-execution this exists to prevent. Both backends we ship on
-    /// advertise `write_with_if_not_exists` (fs takes `O_EXCL`; S3 sends
-    /// `If-None-Match: *`).
+    /// the double-execution this exists to prevent. Before its first claim the
+    /// context writes a fixed scratch object and requires a create-only rewrite
+    /// of it to fail with a recognized precondition error. This catches an S3-
+    /// compatible endpoint that advertises the operation but ignores
+    /// `If-None-Match: *`; it does not prove atomicity under concurrency.
     ///
     /// The claim is NEVER released — not on completion, not on failure, not on
     /// a crash mid-rewrite. An ambiguous failure (the process died somewhere
@@ -18497,44 +18722,13 @@ impl IcebergContext {
     /// commit checks — plus a measured reason to pay for it.
     async fn claim_delete_task(&self, task: &DeleteTask) -> Result<DeleteTaskClaim> {
         let op = self.warehouse_object_store()?;
-        let rel = delete_task_claim_rel_path(self.namespace(), task.task_id);
-        anyhow::ensure!(
-            op.info().full_capability().write_with_if_not_exists,
-            "warehouse store does not support create-only writes, so delete task {} cannot be \
-             claimed; refusing to execute it unclaimed (an unconditional claim would let two \
-             executors rewrite the same task)",
-            task.task_id
-        );
-        let body = serde_json::to_vec(&DeleteTaskClaimBody {
-            task_id: task.task_id,
-            claimed_at: chrono::Utc::now(),
-            claimant: claimant_id(),
-        })
-        .with_context(|| format!("serialize delete task claim {}", task.task_id))?;
-        match op.write_with(rel.as_str(), body).if_not_exists(true).await {
-            Ok(_) => Ok(DeleteTaskClaim::Won),
-            // fs maps `EEXIST` to `ConditionNotMatch`; S3 returns 412, and some
-            // S3-compatible stores answer a failed If-None-Match with
-            // `AlreadyExists`. All three mean the same thing: we lost.
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    opendal::ErrorKind::ConditionNotMatch | opendal::ErrorKind::AlreadyExists
-                ) =>
-            {
-                Ok(DeleteTaskClaim::AlreadyClaimed)
-            }
-            Err(err) if err.kind() == opendal::ErrorKind::Unsupported => {
-                Err(anyhow::Error::from(err)).with_context(|| {
-                    format!(
-                        "warehouse store advertised create-only writes but rejected the claim for \
-                         delete task {}; refusing to execute it unclaimed",
-                        task.task_id
-                    )
-                })
-            }
-            Err(err) => Err(err).with_context(|| format!("claim delete task {rel}")),
-        }
+        claim_delete_task_with_operator(
+            &op,
+            self.namespace(),
+            task.task_id,
+            &self.delete_claim_create_only,
+        )
+        .await
     }
 
     /// Persist one task. The key is the task's own uuid, so this replaces only

@@ -1074,10 +1074,17 @@ through 200 GB and 1 TB sustained-ingest rounds
   Ownership of a task is a second object: an executor create-only-writes
   `<task_id>.claim` beside the record before it runs the task, so two executors
   racing the same pending task produce exactly one execution and the loser
-  reports it as already claimed. That claim is kept in every state, terminal
-  included — a delayed executor's pending set predates its claim, so the claim
-  is the only thing that stops it re-running a task that already finished (see
-  [`LIMITATIONS.md`](LIMITATIONS.md)). `GET /api/v1/delete-tasks/{id}` adds a
+  reports it as already claimed. Before a process context's first claim it
+  writes a fixed non-JSON probe object, then create-only-writes the same key;
+  only a recognized precondition rejection enables claims. An endpoint that
+  accepts the overwrite, as Garage did in the matched run #145, fails the sweep
+  without executing the task. The result is cached across tenant contexts.
+  This sequential compatibility check detects ignored preconditions; it does
+  not establish atomicity under concurrent writes. The task's claim is kept in
+  every state, terminal included — a delayed executor's pending set predates
+  its claim, so the claim is the only thing that stops it re-running a task that
+  already finished (see [`LIMITATIONS.md`](LIMITATIONS.md)).
+  `GET /api/v1/delete-tasks/{id}` adds a
   read-only `claim` observation for pending tasks: whether the object was seen,
   when it was observed, and — when its diagnostic body is readable — its
   claimant UUID, creation time and age. Ledgers written by earlier builds stay

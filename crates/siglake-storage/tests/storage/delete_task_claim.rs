@@ -371,7 +371,8 @@ async fn claim_objects_do_not_break_listing_the_tasks() {
 
 /// Names of the objects in the namespace's delete-task record directory. The
 /// claim is a sibling of the record, so this is the LIST-entry cost the
-/// README's limitation quotes: two entries per task, one of them `*.json`.
+/// limitation quotes: two entries per task, one of them `*.json`, plus the
+/// fixed create-only compatibility probe.
 fn record_dir_entries(warehouse: &std::path::Path, namespace: &str) -> Vec<String> {
     let dir = warehouse
         .join("_siglake/config/delete_tasks")
@@ -464,7 +465,11 @@ async fn a_stale_pending_view_of_a_done_task_is_refused_by_its_claim() {
     // The claim is still there, in a terminal state, and is what did this.
     assert_eq!(
         record_dir_entries(&warehouse, &namespace),
-        vec![format!("{task_id}.claim"), format!("{task_id}.json")],
+        vec![
+            ".create-only-probe".to_string(),
+            format!("{task_id}.claim"),
+            format!("{task_id}.json"),
+        ],
         "claims are retained in every state: one extra LIST entry per task"
     );
 }
@@ -537,7 +542,11 @@ async fn a_stale_pending_view_of_a_failed_task_is_refused_by_its_claim() {
     );
     assert_eq!(
         record_dir_entries(&warehouse, &namespace),
-        vec![format!("{task_id}.claim"), format!("{task_id}.json")],
+        vec![
+            ".create-only-probe".to_string(),
+            format!("{task_id}.claim"),
+            format!("{task_id}.json"),
+        ],
         "a failed task keeps its claim too"
     );
 }
