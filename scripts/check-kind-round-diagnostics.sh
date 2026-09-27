@@ -25,9 +25,8 @@
 # change nothing, the mutation would go uncaught, and this guard would go red.
 #
 # The same stand-in-PATH sandbox also exercises kind-up.sh and kind-down.sh's
-# cluster-existence checks. Their fixtures pin exact-name matches and misses,
-# including a list larger than a pipe buffer with the match first: neither
-# decision may depend on a producer surviving an early-exiting reader.
+# cluster-existence checks, kind-up.sh's exists-then-ready bootstrap waits, and
+# the failed-round node-taint dump. Everything remains offline.
 
 set -euo pipefail
 
@@ -82,10 +81,56 @@ chmod +x "$sandbox/scripts/kind-down.sh"
 cat >"$sandbox/bin/kubectl" <<'EOF'
 #!/usr/bin/env bash
 args="$*"
+[ -z "${CALLS:-}" ] || printf 'kubectl %s\n' "$args" >>"$CALLS"
+
+bootstrap_get() {
+  local app=$1 appears_after state_file calls
+  case "$app" in
+  postgres) appears_after=${FIXTURE_POSTGRES_APPEARS_AFTER:-0} ;;
+  minio) appears_after=${FIXTURE_MINIO_APPEARS_AFTER:-0} ;;
+  esac
+  state_file="${CALLS}.bootstrap-${app}"
+  printf '.\n' >>"$state_file"
+  calls=$(wc -l <"$state_file")
+  if [ "$calls" -gt "$appears_after" ]; then
+    printf 'pod/%s-0\n' "$app"
+  fi
+}
+
+bootstrap_wait() {
+  local app=$1 appears_after ready_rc state_file calls=0
+  case "$app" in
+  postgres)
+    appears_after=${FIXTURE_POSTGRES_APPEARS_AFTER:-0}
+    ready_rc=${FIXTURE_POSTGRES_READY_RC:-0}
+    ;;
+  minio)
+    appears_after=${FIXTURE_MINIO_APPEARS_AFTER:-0}
+    ready_rc=${FIXTURE_MINIO_READY_RC:-0}
+    ;;
+  esac
+  state_file="${CALLS}.bootstrap-${app}"
+  [ ! -f "$state_file" ] || calls=$(wc -l <"$state_file")
+  if [ "$calls" -le "$appears_after" ]; then
+    echo 'error: no matching resources found' >&2
+    return 1
+  fi
+  if [ "$ready_rc" -ne 0 ]; then
+    printf 'error: timed out waiting for app=%s readiness\n' "$app" >&2
+    return "$ready_rc"
+  fi
+}
+
 case "$args" in
 *"get --raw /readyz"*) exit 0 ;;
+*"get pods -l app=postgres -o name"*) bootstrap_get postgres; exit 0 ;;
+*"get pods -l app=minio -o name"*) bootstrap_get minio; exit 0 ;;
+*"wait --for=condition=ready pod -l app=postgres"*) bootstrap_wait postgres; exit $? ;;
+*"wait --for=condition=ready pod -l app=minio"*) bootstrap_wait minio; exit $? ;;
 *"get pods -A -o json"*) cat "$FIXTURE_PODS"; exit 0 ;;
 *"get jobs -o name"*) cat "$FIXTURE_JOBS"; exit 0 ;;
+*"get nodes -o wide"*) cat "$FIXTURE_NODES"; exit 0 ;;
+*"get nodes -o jsonpath="*) cat "$FIXTURE_NODE_TAINTS"; exit 0 ;;
 *"-o jsonpath="*) exit 0 ;;
 esac
 printf 'STUB kubectl %s\n' "$args"
@@ -123,7 +168,19 @@ cat >"$sandbox/bin/helm" <<'EOF'
 #!/usr/bin/env bash
 printf 'helm %s\n' "$*" >>"$CALLS"
 EOF
-chmod +x "$sandbox/bin/kind" "$sandbox/bin/docker" "$sandbox/bin/helm"
+cat >"$sandbox/bin/sleep" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$sandbox/bin/kind" "$sandbox/bin/docker" "$sandbox/bin/helm" \
+  "$sandbox/bin/sleep"
+
+cat >"$sandbox/nodes" <<'EOF'
+NAME                         STATUS     ROLES           AGE   VERSION
+siglake-test-control-plane   NotReady   control-plane   9s    v1.32.0
+EOF
+printf 'siglake-test-control-plane\tnode.kubernetes.io/not-ready=:NoSchedule\tworkload=bootstrap:NoExecute\t\nuntainted-worker\t\n' \
+  >"$sandbox/node-taints"
 
 # Two not-Ready pods per fixture: `job` is the value of the pod's job-name
 # label, empty for a pod that belongs to no Job.
@@ -157,7 +214,8 @@ run_diagnostics() {
     TMPDIR="$sandbox/tmp"
     export PATH TMPDIR
     FIXTURE_JOBS=$jobs_file FIXTURE_PODS=$pods_file
-    export FIXTURE_JOBS FIXTURE_PODS
+    FIXTURE_NODES=$sandbox/nodes FIXTURE_NODE_TAINTS=$sandbox/node-taints
+    export FIXTURE_JOBS FIXTURE_PODS FIXTURE_NODES FIXTURE_NODE_TAINTS
     # shellcheck disable=SC1091
     source "$sandbox/scripts/prelude.bash"
     [ -z "$mutation" ] || eval "$mutation"
@@ -203,14 +261,23 @@ run_kind_script() {
   local docker_ps=${4:-$sandbox/docker-none}
   local docker_inspect=${5:-$sandbox/docker-inspect-unused}
   local inspect_rc=${6:-0} ownership_file=${7:-} expected_id=${8:-}
+  local postgres_after=${9:-0} minio_after=${10:-0}
+  local postgres_ready_rc=${11:-0} minio_ready_rc=${12:-0}
   : >"$calls"
+  rm -f -- "${calls}.bootstrap-postgres" "${calls}.bootstrap-minio"
   (
     PATH="$sandbox/bin:$PATH"
     FIXTURE_CLUSTERS="$fixture" CALLS="$calls" KIND_CLUSTER_NAME=siglake-test
     FIXTURE_DOCKER_PS="$docker_ps" FIXTURE_DOCKER_INSPECT="$docker_inspect"
     FIXTURE_DOCKER_INSPECT_RC="$inspect_rc"
+    FIXTURE_POSTGRES_APPEARS_AFTER=$postgres_after
+    FIXTURE_MINIO_APPEARS_AFTER=$minio_after
+    FIXTURE_POSTGRES_READY_RC=$postgres_ready_rc
+    FIXTURE_MINIO_READY_RC=$minio_ready_rc
     export PATH FIXTURE_CLUSTERS CALLS KIND_CLUSTER_NAME FIXTURE_DOCKER_PS
     export FIXTURE_DOCKER_INSPECT FIXTURE_DOCKER_INSPECT_RC
+    export FIXTURE_POSTGRES_APPEARS_AFTER FIXTURE_MINIO_APPEARS_AFTER
+    export FIXTURE_POSTGRES_READY_RC FIXTURE_MINIO_READY_RC
     if [[ -n "$ownership_file" ]]; then
       KIND_CLUSTER_OWNERSHIP_FILE=$ownership_file
       export KIND_CLUSTER_OWNERSHIP_FILE
@@ -272,6 +339,80 @@ cases=$((cases + 2))
   fail "the cluster SIGPIPE fixture is under a pipe buffer"
 assert_cluster_arms big-list "$sandbox/clusters-big"
 cases=$((cases + 2))
+
+# --- bootstrap pod existence and readiness ----------------------------------
+# The control-plane can accept the manifests before their pods appear. The
+# normal arm must poll through that gap and only then issue the readiness wait.
+calls="$sandbox/bootstrap-delayed-calls"
+run_kind_script scripts/kind-up.sh "$sandbox/clusters-exists" "$calls" \
+  "$sandbox/docker-none" "$sandbox/docker-inspect-unused" 0 '' '' 2 1 \
+  >/dev/null 2>&1
+[[ $(wc -l <"${calls}.bootstrap-postgres") == 3 ]] ||
+  fail "delayed creation: postgres was not polled until its third lookup"
+[[ $(wc -l <"${calls}.bootstrap-minio") == 2 ]] ||
+  fail "delayed creation: minio was not polled until its second lookup"
+recorded_call "$calls" \
+  'kubectl wait --for=condition=ready pod -l app=postgres --timeout=120s' ||
+  fail "delayed creation: postgres readiness was not checked after it appeared"
+recorded_call "$calls" \
+  'kubectl wait --for=condition=ready pod -l app=minio --timeout=120s' ||
+  fail "delayed creation: minio readiness was not checked after it appeared"
+cases=$((cases + 1))
+
+# A pod that never appears must exhaust the bounded existence poll and fail
+# without issuing a readiness wait against an empty selector.
+calls="$sandbox/bootstrap-absent-calls"
+rc=0
+out=$(run_kind_script scripts/kind-up.sh "$sandbox/clusters-exists" "$calls" \
+  "$sandbox/docker-none" "$sandbox/docker-inspect-unused" 0 '' '' 999 0 \
+  2>&1) || rc=$?
+[[ "$rc" -ne 0 ]] || fail "absent pod: kind-up.sh succeeded without postgres"
+[[ $(wc -l <"${calls}.bootstrap-postgres") == 120 ]] ||
+  fail "absent pod: postgres existence poll was not bounded at 120 attempts"
+case "$out" in
+*'timed out after 120s waiting for an app=postgres pod to exist'*) ;;
+*) fail "absent pod: failure did not name postgres and the existence timeout" ;;
+esac
+recorded_call "$calls" \
+  'kubectl wait --for=condition=ready pod -l app=postgres --timeout=120s' &&
+  fail "absent pod: readiness wait ran before a postgres pod existed"
+cases=$((cases + 1))
+
+# Existence does not imply readiness. Preserve kubectl wait's non-zero result
+# so a created but unready pod still fails bootstrap.
+calls="$sandbox/bootstrap-unready-calls"
+rc=0
+out=$(run_kind_script scripts/kind-up.sh "$sandbox/clusters-exists" "$calls" \
+  "$sandbox/docker-none" "$sandbox/docker-inspect-unused" 0 '' '' 0 0 17 0 \
+  2>&1) || rc=$?
+[[ "$rc" == 17 ]] ||
+  fail "readiness timeout: kind-up.sh returned $rc instead of kubectl's 17"
+case "$out" in
+*'timed out waiting for app=postgres readiness'*) ;;
+*) fail "readiness timeout: kubectl's postgres diagnostic was not retained" ;;
+esac
+cases=$((cases + 1))
+
+# Mutation guard: replacing the exists-then-ready call with the old bare wait
+# must fail the delayed-creation fixture with "no matching resources found".
+sed 's/^wait_for_pod_ready postgres 120$/kubectl wait --for=condition=ready pod -l app=postgres --timeout=120s/' \
+  scripts/kind-up.sh >"$sandbox/scripts/kind-up-bare-wait.sh"
+chmod +x "$sandbox/scripts/kind-up-bare-wait.sh"
+grep -q '^kubectl wait --for=condition=ready pod -l app=postgres --timeout=120s$' \
+  "$sandbox/scripts/kind-up-bare-wait.sh" ||
+  fail "bootstrap mutation did not replace the postgres helper call"
+calls="$sandbox/bootstrap-mutation-calls"
+rc=0
+out=$(run_kind_script "$sandbox/scripts/kind-up-bare-wait.sh" \
+  "$sandbox/clusters-exists" "$calls" "$sandbox/docker-none" \
+  "$sandbox/docker-inspect-unused" 0 '' '' 2 0 2>&1) || rc=$?
+[[ "$rc" -ne 0 ]] ||
+  fail "bootstrap mutation: the old bare readiness wait passed delayed creation"
+case "$out" in
+*'no matching resources found'*) ;;
+*) fail "bootstrap mutation: delayed creation did not expose the old selector race" ;;
+esac
+cases=$((cases + 1))
 
 # An exact-name container is removable only after Docker identifies it as this
 # cluster's exited kind control plane. Removal is by inspected ID and is never
@@ -397,6 +538,20 @@ recorded_call "$calls" "kind delete cluster --name siglake-test" &&
 case "$out" in
 *"now uses control-plane container $container_id"*'this round created deadbeef'*) ;;
 *) fail "expected ID: refusal omitted the observed and owned container IDs" ;;
+esac
+cases=$((cases + 1))
+
+# --- retained node taints ----------------------------------------------------
+# FailedScheduling only says a taint was untolerated. Keep the node name and
+# every key/value/effect tuple so the retained log identifies the exact cause.
+out=$(run_diagnostics "$sandbox/jobs-empty" "$sandbox/pods-mixed")
+case "$out" in
+*'NODES_BEFORE_TEARDOWN_BEGIN'*'siglake-test-control-plane   NotReady'*'NODES_BEFORE_TEARDOWN_END'*) ;;
+*) fail "node diagnostics: failed-round output omitted the named node list" ;;
+esac
+case "$out" in
+*'NODE_TAINTS_BEGIN'*$'siglake-test-control-plane\tnode.kubernetes.io/not-ready=:NoSchedule\tworkload=bootstrap:NoExecute\t'*$'untainted-worker\t'*'NODE_TAINTS_END'*) ;;
+*) fail "node diagnostics: failed-round output omitted a node or complete taint tuple" ;;
 esac
 cases=$((cases + 1))
 
@@ -530,4 +685,4 @@ rc=$(run_cleanup_ownership '' "$calls" 0)
 [[ ! -s "$calls" ]] || fail "unowned successful cleanup: called kind-down without an ownership marker"
 cases=$((cases + 1))
 
-echo "ok ($ROUND_SCRIPT: per-pod log dumps follow exact Job membership, cleanup preserves its status; $cases cases)"
+echo "ok ($ROUND_SCRIPT: bootstrap waits, node taints, exact Job membership and cleanup status; $cases cases)"

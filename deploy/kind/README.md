@@ -291,9 +291,10 @@ projected. Their previous tails end in `open /certs/tls.crt: no such file or
 directory` and `open /certs/ca.crt: no such file or directory`, respectively;
 these restarts also need no action. Any later restart, a restart count above
 one, or any other previous tail still needs action.
-On a failed exit the script also prints the release namespace's Jobs and events,
-`describe` and the last 200 log lines of every migrate-schema or failed Job, and
-`describe` plus logs of every pod that is not Ready, between
+On a failed exit the script also prints the node list and every node's complete
+taint list, the release namespace's Jobs and events, `describe` and the last 200
+log lines of every migrate-schema or failed Job, and `describe` plus logs of
+every pod that is not Ready, between
 `FAILURE_DIAGNOSTICS_BEGIN` /
 `FAILURE_DIAGNOSTICS_END`. A pod whose Job was dumped above keeps its
 `describe` but not a second copy of its logs, decided by exact membership in

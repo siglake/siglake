@@ -340,9 +340,10 @@ array_contains() {
 # dump must never change the status cleanup exits with.
 #
 # On every exit: pods with restart counts and BackOff events, which is what the
-# playbook's restart check reads. On a failed exit, additionally: the release
-# namespace's Jobs and events, describe + logs of every migrate-schema or
-# failed Job, and describe + logs of every pod that is not Ready.
+# playbook's restart check reads. On a failed exit, additionally: nodes and
+# their complete taint lists, the release namespace's Jobs and events, describe
+# + logs of every migrate-schema or failed Job, and describe + logs of every
+# pod that is not Ready.
 dump_cluster_state() {
   local status=$1
   local -a kc=(kubectl --context "$KUBE_CONTEXT" --request-timeout=30s)
@@ -401,6 +402,13 @@ for item in items:
 
   log "kind: failure diagnostics before teardown"
   printf 'FAILURE_DIAGNOSTICS_BEGIN status=%s\n' "$status"
+  printf 'NODES_BEFORE_TEARDOWN_BEGIN\n'
+  "${kc[@]}" get nodes -o wide || true
+  printf 'NODES_BEFORE_TEARDOWN_END\n'
+  printf 'NODE_TAINTS_BEGIN\n'
+  "${kc[@]}" get nodes \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.taints[*]}{.key}{"="}{.value}{":"}{.effect}{"\t"}{end}{"\n"}{end}' || true
+  printf 'NODE_TAINTS_END\n'
   dump_section "jobs in ${NAMESPACE}"
   "${kc[@]}" -n "$NAMESPACE" get jobs -o wide || true
   dump_section "events in ${NAMESPACE}"
