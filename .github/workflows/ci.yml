@@ -877,8 +877,12 @@ jobs:
           cache-from: type=gha,scope=siglake-operator
           cache-to: type=gha,scope=siglake-operator,mode=max
 
-      # All seven suites need the compose stack, so they share one lifecycle.
-      # The second is SQL that no hermetic test can reach: shared-store batch
+      # All eight suites need the compose stack, so they share one lifecycle.
+      # The second records the application's conditional-write guard beside
+      # the raw S3 probe and races two side-object writers when the guard
+      # accepts the store. The raw and application verdicts must agree.
+      #
+      # The third is SQL that no hermetic test can reach: shared-store batch
       # job ownership (#1845), where getting it wrong destroys a live
       # replica's job result on every query scale-out, and the cancellation
       # half (#1846), where a DELETE persisted by one replica has to stop the
@@ -887,38 +891,61 @@ jobs:
       # here or nowhere. Recovery is fleet-wide, so the tests sharing this
       # scratch database must be serialized.
       #
-      # The third is the same argument for the local drain's mirror-reclamation
+      # The fourth is the same argument for the local drain's mirror-reclamation
       # mark (#4913, #4956): it decides which mirror objects retention may
       # delete, the deployed catalog is Postgres, and its hermetic cases all run
       # on SQLite. It creates a schema per case, so it neither sees nor moves
       # the rows compose's own ingest and compactor keep in the public schema,
       # and it needs no serialization against the suite above.
       #
-      # The fourth exercises wal-recover's read-only catalog connection at the
+      # The fifth exercises wal-recover's read-only catalog connection at the
       # two Postgres boundaries SQLite cannot cover: the 256-wide `$N` rewrite
       # and the server-enforced read-only transaction. It also keeps a missing
       # wal_segments table distinct from an existing empty ledger.
       #
-      # The fifth is the candidate-local claim gate (#5189), which no hermetic
+      # The sixth is the candidate-local claim gate (#5189), which no hermetic
       # test reaches at all: it needs a CTE, FOR UPDATE SKIP LOCKED and an
       # UPDATE ... FROM agg, and returns an empty vec before the statement on
       # SQLite. It reuses the third's scratch-schema isolation and its already
       # linked test binary.
       #
-      # The sixth covers the older Postgres claim statement's multi-shard
+      # The seventh covers the older Postgres claim statement's multi-shard
       # release: it claims before the Rust shard filter, unlike SQLite, and a
       # foreign row must return to sealed before its owner can claim it. The
-      # seventh covers the consumed-proof transaction: the segment state and
+      # eighth covers the consumed-proof transaction: the segment state and
       # watermark advance must commit or roll back together after a Postgres
       # statement error. Both reuse the same isolated scratch schemas.
-      - name: MinIO pagination and the Postgres catalog suites
+      - name: MinIO conditional writes, pagination and the Postgres catalog suites
         env:
           SIGLAKE_TEST_S3_ENDPOINT: http://localhost:9000
+          SIGLAKE_TEST_S3_ACCESS_KEY: minioadmin
+          SIGLAKE_TEST_S3_SECRET_KEY: minioadmin
           SIGLAKE_TEST_JOBS_POSTGRES_URI: postgres://siglake:siglake@localhost:5433/siglake
         run: |
           trap 'scripts/down.sh' EXIT
           scripts/up.sh
           cargo test -p siglake-compactor --test s3_mirror_pagination -- --ignored --nocapture
+          conditional_log=$(mktemp)
+          scripts/ci-local-conditional-write-probe.sh 2>&1 | tee "$conditional_log"
+          set +e
+          set -o pipefail
+          cargo test -p siglake-storage --lib conditional_write_live -- \
+            --ignored --nocapture 2>&1 | tee -a "$conditional_log"
+          conditional_rc=${PIPESTATUS[0]}
+          set +o pipefail
+          set -e
+          read -r conditional_passed conditional_failed conditional_results < <(
+            awk '/^test result: (ok|FAILED)\./ {p+=$4; f+=$6; n++} END {print p+0, f+0, n+0}' \
+              "$conditional_log"
+          )
+          if [ "$conditional_rc" -ne 0 ] \
+            || [ "$conditional_passed" -ne 2 ] \
+            || [ "$conditional_failed" -ne 0 ] \
+            || [ "$conditional_results" -ne 1 ]; then
+            echo "conditional-write live tests FAIL ($conditional_passed passed, $conditional_failed failed, $conditional_results result lines)"
+            exit 1
+          fi
+          scripts/ci-local-conditional-write-agreement.sh "$conditional_log"
           cargo test -p siglake-query-server --test jobs_postgres_ownership -- \
             --ignored --nocapture --test-threads=1
           cargo test -p siglake-storage --lib local_commit_mark_postgres -- \
