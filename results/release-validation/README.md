@@ -8,6 +8,15 @@ Raw metrics and logs live in the run's durable artifact directory; they are not
 benchmark leaderboard inputs. Preserve failed attempts and subsequent reruns.
 The public operations docs are the release-wide coverage ledger.
 
+## September 27, 2026
+
+Matched MinIO and Garage runs at `8bd9c312719d` passed S3 mirror pagination and
+all seven Postgres ownership tests on both arms. MinIO rejected both conditional
+overwrites with HTTP 412; Garage silently accepted both with HTTP 200, making
+the Garage Docker job red by design. The
+[matched S3 evidence](20260927-minio-garage-s3-evidence.md) records the image
+identities, raw responses and scope limits.
+
 ## September 24, 2026
 
 | Version | Public dependency pull | Cached-dependency baseline smoke | Cleanup |
