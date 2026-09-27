@@ -6258,29 +6258,34 @@ mod aggregate_coverage_chain_tests {
                     }
                     let appended = (3 + phase) * ROWS;
 
-                    // Write-behind publishes off the commit path; wait for it
-                    // the way `side_agg_write_behind.rs` does, through a
-                    // throwaway reader so the consulting context's caches stay
-                    // cold. This read is itself coverage-gated, so an
-                    // unprovable chain shows up here as `None` rather than as
-                    // a short total.
+                    // Write-behind publishes off the commit path; wait for the
+                    // inline object itself while leaving the consulting
+                    // context's caches cold. `table_group_counts_summary`
+                    // cannot be the readiness probe here: each append writes
+                    // its wide delta before enqueueing the inline publication,
+                    // and that helper may return the complete wide counts
+                    // while the inline object is still one commit behind.
+                    let current = ice.catalog.load_table(&ident).await.unwrap();
+                    let path = side_aggregates_path(&current).expect("side-object path");
                     let deadline = Instant::now() + Duration::from_secs(10);
                     loop {
-                        let total = IcebergContext::open(&warehouse)
+                        let side = load_side_aggregates(current.file_io(), &path)
                             .await
                             .unwrap()
-                            .table_group_counts_summary("events")
-                            .await
-                            .unwrap()
+                            .filter(|side| {
+                                aggregate_covers_current_snapshot(&current, side.coverage)
+                            });
+                        let total = side
+                            .as_ref()
+                            .and_then(|side| side.group_counts.as_ref())
                             .and_then(|gc| gc.column_total("sourcetype"));
                         if total == Some(appended as u64) {
                             break;
                         }
                         assert!(
                             Instant::now() < deadline,
-                            "phase {phase}: side object never served {appended} rows (saw \
-                             {total:?}; `None` means the coverage proof was rejected, not \
-                             that a delta was lost)"
+                            "phase {phase}: inline side object never covered and served \
+                             {appended} rows (saw {total:?})"
                         );
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
@@ -6296,7 +6301,6 @@ mod aggregate_coverage_chain_tests {
                             ..Default::default()
                         },
                     );
-                    let current = reader.catalog.load_table(&ident).await.unwrap();
                     let expected = vec![
                         (Some("app:json".to_string()), (appended / 2) as u64),
                         (Some("syslog".to_string()), (appended / 2) as u64),
