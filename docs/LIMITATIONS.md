@@ -1198,10 +1198,17 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `<task_id>.claim` key (`if_not_exists`, which both the fs and S3 backends
   support), and only the winner runs it. A loser reports the task as
   `tasks_already_claimed` and touches nothing; a store that cannot do a
-  create-only write fails the sweep rather than executing unclaimed. That covers
-  every entry point, including `siglake delete-tasks execute` run by hand and a
-  second control plane with no catalog configured, where the compactor's
-  `delete_tasks` maintenance lease does not reach. What it does NOT do is
+  create-only write fails the sweep rather than executing unclaimed. OpenDAL's
+  S3 capability is static, so before the first claim a process context writes a
+  fixed probe object and attempts a create-only overwrite of it. A recognized
+  precondition rejection enables claims; an accepted overwrite or any other
+  response fails the sweep. The successful compatibility verdict is cached
+  across tenant contexts. This detects the ignored-header behavior measured on
+  Garage in run #145, but a sequential exchange cannot prove that another
+  endpoint implements the operation atomically under concurrent requests. The
+  claim covers every entry point, including `siglake delete-tasks execute` run
+  by hand and a second control plane with no catalog configured, where the
+  compactor's `delete_tasks` maintenance lease does not reach. What it does NOT do is
   release: the claim survives completion, failure and a crash mid-rewrite, on
   purpose — an ambiguous failure is exactly when a second executor must not
   start, and a takeover on claim age alone, with no fencing token the Iceberg
@@ -1222,12 +1229,13 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   precondition for deletion; reclamation would need a protocol that excludes
   delayed executors — a fencing token or a generation the Iceberg commit checks
   — and a measured reason to pay for it. The price of keeping them is one extra
-  LIST entry per task: the prefix holds two objects per task, and listing costs
-  one LIST plus one GET per task (the reader takes `*.json` only, so claims
-  inflate the LIST and not the GETs), which is fine at GDPR request volumes and
-  is not a design for millions of tasks. Ledgers written by
-  builds before this layout are read (and merged under the per-task records) but
-  never rewritten, so nothing migrates itself.
+  LIST entry per task plus one fixed non-JSON probe entry in each namespace
+  where a context first checks the store: the prefix holds two objects per task,
+  and listing costs one LIST plus one GET per task (the reader takes `*.json`
+  only, so claims and the probe inflate the LIST and not the GETs), which is fine
+  at GDPR request volumes and is not a design for millions of tasks. Ledgers
+  written by builds before this layout are read (and merged under the per-task
+  records) but never rewritten, so nothing migrates itself.
   The tenant-scoped `GET /api/v1/delete-tasks/{id}` exposes these facts for a
   pending task under a `claim` object. `present` means only that the sibling was
   observed at `observed_at`; a readable body also supplies `claimant`,

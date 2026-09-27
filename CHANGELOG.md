@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Delete tasks (fix)**: the ownership claim now checks create-only writes at
+  runtime before the first execution instead of trusting OpenDAL's static S3
+  capability. A fixed scratch object is written and then conditionally
+  overwritten; an endpoint that accepts the overwrite fails the sweep without
+  executing the task. This refuses Garage's measured ignored-precondition
+  behavior while preserving the existing filesystem and MinIO claim paths.
+  The sequential check detects ignored preconditions; it does not certify
+  atomicity under concurrent writes. (#3201)
+
 - **Compactor observability (feature, target 0.3.0)**: the inline-coverage
   census now reports its object-store cost on four additive metric families.
   `siglake_inline_coverage_census_requests_total{op="head"|"get"}` counts the
