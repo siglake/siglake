@@ -17,6 +17,13 @@ the Garage Docker job red by design. The
 [matched S3 evidence](20260927-minio-garage-s3-evidence.md) records the image
 identities, raw responses and scope limits.
 
+The follow-up
+[Garage kind safety review](20260927-garage-kind-safety-review.md) traces those
+responses through the remaining storage call sites. It finds that the normal
+kind workload reaches conditional side-object writes but has no contending
+writer, index deletion or delete-task claim, so a green round could not lift the
+Garage stop.
+
 ## September 24, 2026
 
 | Version | Public dependency pull | Cached-dependency baseline smoke | Cleanup |
