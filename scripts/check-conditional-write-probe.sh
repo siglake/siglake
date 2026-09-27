@@ -158,7 +158,43 @@ grep -Fq 'initial_put_status=403 initial_put_error_code=AccessDenied' <<<"$fixtu
 grep -Fq 'verdict=incomplete verdict_detail=setup' <<<"$fixture_output" \
   || fail "setup failure was not classified as incomplete evidence"
 
+run_agreement_fixture() { # <name> <raw verdict> <guard line> <pass|fail>
+  local name=$1 raw=$2 guard=$3 expected=$4 rc=0
+  local log="$check_dir/agreement-$name.log" output
+  printf '  cleanup_status=204 cleanup=deleted verdict=%s verdict_detail=none\n' "$raw" >"$log"
+  [ -z "$guard" ] || printf '%s\n' "$guard" >>"$log"
+  output=$(scripts/ci-local-conditional-write-agreement.sh "$log" 2>&1) || rc=$?
+  case "$expected:$rc" in
+    pass:0)
+      grep -Fq 'CONDITIONAL_WRITE_AGREEMENT ok' <<<"$output" \
+        || fail "$name did not print agreement: $output"
+      ;;
+    fail:0) fail "$name unexpectedly passed: $output" ;;
+    fail:*)
+      grep -Fq 'CONDITIONAL_WRITE_AGREEMENT mismatch' <<<"$output" \
+        || fail "$name did not print mismatch: $output"
+      ;;
+    *) fail "$name returned $rc: $output" ;;
+  esac
+}
+
+run_agreement_fixture agree-verified preconditions-rejected \
+  'CONDITIONAL_WRITE_GUARD if_match=verified if_not_exists=verified refusal=no' pass
+run_agreement_fixture agree-ignored silently-accepted \
+  'CONDITIONAL_WRITE_GUARD if_match=ignored if_not_exists=ignored refusal=yes' pass
+run_agreement_fixture mismatch preconditions-rejected \
+  'CONDITIONAL_WRITE_GUARD if_match=ignored if_not_exists=ignored refusal=yes' fail
+run_agreement_fixture missing-guard preconditions-rejected '' fail
+
 grep -Fq 'scripts/ci-local-conditional-write-probe.sh >>"$dlog" 2>&1 || dk_ok=0' \
   scripts/ci-local.sh || fail "ci-local's live docker job does not run the probe"
+grep -Fq 'cargo test -p siglake-storage --lib conditional_write_live --' \
+  scripts/ci-local.sh || fail "ci-local's live docker job does not run the application guard"
+grep -Fq 'scripts/ci-local-conditional-write-agreement.sh "$dlog"' \
+  scripts/ci-local.sh || fail "ci-local's live docker job does not compare the two verdicts"
+grep -Fq 'cargo test -p siglake-storage --lib conditional_write_live --' \
+  .github/workflows/ci.yml || fail "hosted Docker CI does not run the application guard"
+grep -Fq 'scripts/ci-local-conditional-write-agreement.sh "$conditional_log"' \
+  .github/workflows/ci.yml || fail "hosted Docker CI does not compare the two verdicts"
 
-echo "ok (selected-arm endpoints, SigV4 conditional headers, response classes and failure cleanup)"
+echo "ok (selected-arm endpoints, response classes, cleanup and guard agreement)"

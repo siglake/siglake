@@ -998,6 +998,169 @@ mod conditional_write_compatibility_tests {
     }
 }
 
+#[cfg(test)]
+mod conditional_write_live {
+    use super::*;
+    use opendal::services::S3;
+    use std::sync::{Arc, Barrier};
+
+    const BUCKET: &str = "siglake-warehouse";
+    const ROUNDS: usize = 20;
+
+    fn operator() -> Option<opendal::Operator> {
+        let endpoint = match std::env::var("SIGLAKE_TEST_S3_ENDPOINT") {
+            Ok(endpoint) => endpoint,
+            Err(std::env::VarError::NotPresent) => {
+                println!("skipped: SIGLAKE_TEST_S3_ENDPOINT is unset");
+                return None;
+            }
+            Err(err) => panic!("read SIGLAKE_TEST_S3_ENDPOINT: {err}"),
+        };
+        let access_key = std::env::var("SIGLAKE_TEST_S3_ACCESS_KEY")
+            .expect("SIGLAKE_TEST_S3_ACCESS_KEY must accompany the endpoint");
+        let secret_key = std::env::var("SIGLAKE_TEST_S3_SECRET_KEY")
+            .expect("SIGLAKE_TEST_S3_SECRET_KEY must accompany the endpoint");
+        let root = format!("conditional-write-live-{}/", Uuid::now_v7());
+        let builder = S3::default()
+            .bucket(BUCKET)
+            .region("us-east-1")
+            .endpoint(&endpoint)
+            .access_key_id(&access_key)
+            .secret_access_key(&secret_key)
+            .disable_config_load()
+            .root(&root);
+        Some(opendal::Operator::new(builder).unwrap().finish())
+    }
+
+    fn verdict_name(verdict: Option<ConditionalPrecondition>) -> &'static str {
+        match verdict {
+            Some(ConditionalPrecondition::Verified) => "verified",
+            Some(ConditionalPrecondition::Ignored) => "ignored",
+            None => "unsupported",
+        }
+    }
+
+    async fn probe(op: &opendal::Operator) -> ConditionalWriteCompatibility {
+        probe_conditional_write_compatibility(op).await.unwrap()
+    }
+
+    async fn delete_probe(op: &opendal::Operator) {
+        let probe_rel = format!("{CONDITIONAL_WRITE_PROBE}-{}", claimant_id());
+        op.delete(&probe_rel).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the compose object store from scripts/up.sh"]
+    async fn guard_verdict() {
+        let Some(op) = operator() else {
+            return;
+        };
+        let verdict = probe(&op).await;
+        let compatibility = tokio::sync::OnceCell::new();
+        compatibility.set(verdict).unwrap();
+        let refusal = require_conditional_write_compatibility(&op, &compatibility, true, true)
+            .await
+            .is_err();
+        delete_probe(&op).await;
+        let fully_verified = verdict.if_match == Some(ConditionalPrecondition::Verified)
+            && verdict.if_not_exists == Some(ConditionalPrecondition::Verified);
+        assert_eq!(refusal, !fully_verified);
+        println!(
+            "CONDITIONAL_WRITE_GUARD if_match={} if_not_exists={} refusal={}",
+            verdict_name(verdict.if_match),
+            verdict_name(verdict.if_not_exists),
+            if refusal { "yes" } else { "no" }
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the compose object store from scripts/up.sh"]
+    fn two_writer_cas_race() {
+        let Some(op) = operator() else {
+            return;
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let verdict = runtime.block_on(probe(&op));
+        runtime.block_on(delete_probe(&op));
+        if verdict.if_match != Some(ConditionalPrecondition::Verified)
+            || verdict.if_not_exists != Some(ConditionalPrecondition::Verified)
+        {
+            println!("CAS_RACE skipped=guard-refuses-store");
+            return;
+        }
+
+        for round in 0..ROUNDS {
+            let rel = format!("cas-race-{round}.json");
+            let seed = serde_json::to_vec(&SnapshotAggregates::default()).unwrap();
+            let seeded = runtime
+                .block_on(OpendalSideCas(&op).store_if(&rel, seed, None))
+                .unwrap();
+            assert!(matches!(seeded, CasWrite::Written));
+            let (_, etag) = runtime.block_on(OpendalSideCas(&op).load(&rel)).unwrap();
+            let etag = etag.expect("the seeded S3 object must carry an ETag");
+
+            let bodies = [0, 1].map(|writer| {
+                serde_json::to_vec(&SnapshotAggregates {
+                    coverage: Some(AggregateCoverage {
+                        snapshot_id: (round * 2 + writer) as i64,
+                        sequence_number: writer as i64,
+                    }),
+                    ..SnapshotAggregates::default()
+                })
+                .unwrap()
+            });
+            let barrier = Arc::new(Barrier::new(2));
+            let results = std::thread::scope(|scope| {
+                let handles = bodies.clone().map(|body| {
+                    let op = op.clone();
+                    let rel = rel.clone();
+                    let etag = etag.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
+                        barrier.wait();
+                        let outcome = runtime
+                            .block_on(OpendalSideCas(&op).store_if(&rel, body.clone(), Some(&etag)))
+                            .unwrap();
+                        (outcome, body)
+                    })
+                });
+                handles.map(|handle| handle.join().unwrap())
+            });
+
+            let winners = results
+                .iter()
+                .filter(|(outcome, _)| matches!(outcome, CasWrite::Written))
+                .count();
+            let losers = results
+                .iter()
+                .filter(|(outcome, _)| matches!(outcome, CasWrite::Conflict))
+                .count();
+            assert_eq!(winners, 1, "round {round} had {winners} winners");
+            assert_eq!(losers, 1, "round {round} had {losers} losers");
+            let winner_body = results
+                .iter()
+                .find_map(|(outcome, body)| {
+                    matches!(outcome, CasWrite::Written).then_some(body.as_slice())
+                })
+                .unwrap();
+            let final_body = runtime.block_on(op.read(&rel)).unwrap().to_vec();
+            assert_eq!(
+                final_body, winner_body,
+                "round {round} stored the loser body"
+            );
+            runtime.block_on(op.delete(&rel)).unwrap();
+        }
+        println!("CAS_RACE rounds={ROUNDS} winners=1 losers=1");
+    }
+}
+
 fn dropped_index_records_rel_dir(namespace: &NamespaceIdent) -> String {
     format!("{DROPPED_INDEXES_CONFIG_DIR}/{namespace}/")
 }

@@ -863,8 +863,29 @@ if [ "$WITH_HEAVY" = 1 ]; then
         # Keep the selected endpoint alive long enough to record its raw S3
         # conditional-write behaviour. This establishes endpoint behaviour,
         # not OpenDAL's error mapping; the helper grades only complete,
-        # authenticated observations and always deletes its one disposable key.
+        # authenticated observations and always deletes its disposable object.
         scripts/ci-local-conditional-write-probe.sh >>"$dlog" 2>&1 || dk_ok=0
+        conditional_live_log="$LOG_DIR/conditional-write-live.log"
+        conditional_live_rc=0
+        SIGLAKE_TEST_S3_ENDPOINT="$SIGLAKE_S3_HOST_ENDPOINT" \
+        SIGLAKE_TEST_S3_ACCESS_KEY="$SIGLAKE_S3_ACCESS_KEY" \
+        SIGLAKE_TEST_S3_SECRET_KEY="$SIGLAKE_S3_SECRET_KEY" \
+          cargo test -p siglake-storage --lib conditional_write_live -- \
+            --ignored --nocapture >"$conditional_live_log" 2>&1 || conditional_live_rc=$?
+        cat "$conditional_live_log" >>"$dlog"
+        read -r conditional_passed conditional_failed conditional_results < <(
+          awk '/^test result: (ok|FAILED)\./ {p+=$4; f+=$6; n++} END {print p+0, f+0, n+0}' \
+            "$conditional_live_log"
+        )
+        if [ "$conditional_live_rc" -ne 0 ] \
+          || [ "$conditional_passed" -ne 2 ] \
+          || [ "$conditional_failed" -ne 0 ] \
+          || [ "$conditional_results" -ne 1 ]; then
+          echo "conditional-write live tests FAIL ($conditional_passed passed, $conditional_failed failed, $conditional_results result lines)" \
+            >>"$dlog"
+          dk_ok=0
+        fi
+        scripts/ci-local-conditional-write-agreement.sh "$dlog" >>"$dlog" 2>&1 || dk_ok=0
         # The shared-store job ownership rules (#1845) are the only thing
         # standing between a query scale-out and a destroyed batch result,
         # and no hermetic test can reach them: they are SQL. compose's
