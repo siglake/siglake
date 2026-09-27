@@ -70,6 +70,25 @@ record_cluster_ownership() {
     die "could not record ownership of kind cluster ${CLUSTER_NAME} in ${OWNERSHIP_FILE}"
 }
 
+wait_for_pod_ready() {
+  local app=$1 timeout_seconds=$2 pods elapsed=0
+
+  log "kubectl: wait up to ${timeout_seconds}s for an app=${app} pod to exist"
+  while ((elapsed < timeout_seconds)); do
+    pods=$(kubectl get pods -l "app=${app}" -o name)
+    if [[ -n "$pods" ]]; then
+      log "kubectl: wait for app=${app} pods to be ready"
+      kubectl wait --for=condition=ready pod -l "app=${app}" \
+        --timeout="${timeout_seconds}s"
+      return 0
+    fi
+    sleep 1
+    ((elapsed += 1))
+  done
+
+  die "timed out after ${timeout_seconds}s waiting for an app=${app} pod to exist"
+}
+
 for tool in kind kubectl helm docker; do
   command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
@@ -99,9 +118,8 @@ log "kubectl: apply postgres + minio manifests"
 kubectl apply -f "$KIND_DIR/manifests/postgres.yaml"
 kubectl apply -f "$KIND_DIR/manifests/minio.yaml"
 
-log "kubectl: wait for postgres + minio to be ready"
-kubectl wait --for=condition=ready pod -l app=postgres --timeout=120s
-kubectl wait --for=condition=ready pod -l app=minio --timeout=120s
+wait_for_pod_ready postgres 120
+wait_for_pod_ready minio 120
 
 log "kubectl: wait for the bucket-init Job to complete"
 kubectl wait --for=condition=complete job/minio-bucket-init --timeout=120s
