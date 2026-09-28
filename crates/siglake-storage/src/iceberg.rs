@@ -1000,6 +1000,7 @@ mod conditional_write_compatibility_tests {
 #[cfg(test)]
 mod conditional_write_live {
     use super::*;
+    use opendal::raw::Access;
     use opendal::services::S3;
     use std::sync::Arc;
 
@@ -1007,6 +1008,20 @@ mod conditional_write_live {
     const ROUNDS: usize = 20;
     const LIVE_TEST_TIMEOUT: Duration = Duration::from_secs(120);
     const LIVE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+    fn finish_operator(builder: S3) -> opendal::Operator {
+        let accessor = opendal::Operator::new(builder)
+            .unwrap()
+            .finish()
+            .into_inner();
+        // This operator has no layers whose clients need forwarding. Giving
+        // each live test its own pool keeps its connection dispatch tasks on
+        // the Tokio runtime that drives that test.
+        accessor
+            .info()
+            .update_http_client(|_| opendal::raw::HttpClient::with(opendal_reqwest::Client::new()));
+        opendal::Operator::from_inner(accessor)
+    }
 
     fn operator() -> Option<opendal::Operator> {
         let endpoint = match std::env::var("SIGLAKE_TEST_S3_ENDPOINT") {
@@ -1030,7 +1045,129 @@ mod conditional_write_live {
             .secret_access_key(&secret_key)
             .disable_config_load()
             .root(&root);
-        Some(opendal::Operator::new(builder).unwrap().finish())
+        Some(finish_operator(builder))
+    }
+
+    #[test]
+    fn operators_do_not_share_an_http_dispatch_runtime() {
+        use std::io::{Error, ErrorKind, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+        use std::thread;
+
+        const STEP_TIMEOUT: Duration = Duration::from_secs(5);
+
+        fn accept_before(listener: &TcpListener) -> std::io::Result<TcpStream> {
+            let deadline = Instant::now() + STEP_TIMEOUT;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => return Ok(stream),
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err(Error::new(
+                                ErrorKind::TimedOut,
+                                "timed out waiting for a distinct HTTP connection",
+                            ));
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        fn read_request(stream: &mut TcpStream) -> std::io::Result<()> {
+            stream.set_read_timeout(Some(STEP_TIMEOUT))?;
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk)?;
+                if read == 0 {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "HTTP request ended before its headers",
+                    ));
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    return Ok(());
+                }
+            }
+        }
+
+        fn not_found(stream: &mut TcpStream, connection: &str) -> std::io::Result<()> {
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: {connection}\r\n\r\n"
+            )?;
+            stream.flush()
+        }
+
+        fn loopback_operator(endpoint: &str) -> opendal::Operator {
+            finish_operator(
+                S3::default()
+                    .bucket(BUCKET)
+                    .region("us-east-1")
+                    .endpoint(endpoint)
+                    .disable_config_load()
+                    .skip_signature()
+                    .root("dispatch-runtime-regression/"),
+            )
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (second_request_tx, second_request_rx) = mpsc::channel();
+        let (runtime_a_dropped_tx, runtime_a_dropped_rx) = mpsc::channel();
+        let server = thread::spawn(move || -> std::io::Result<()> {
+            let mut first = accept_before(&listener)?;
+            read_request(&mut first)?;
+            not_found(&mut first, "keep-alive")?;
+
+            let mut second = accept_before(&listener)?;
+            read_request(&mut second)?;
+            second_request_tx
+                .send(())
+                .map_err(|_| Error::new(ErrorKind::BrokenPipe, "test stopped early"))?;
+            runtime_a_dropped_rx
+                .recv_timeout(STEP_TIMEOUT)
+                .map_err(|err| Error::new(ErrorKind::TimedOut, err))?;
+            not_found(&mut second, "close")
+        });
+
+        let runtime_a = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime_a.block_on(async {
+            let operator = loopback_operator(&endpoint);
+            assert!(!operator.exists("probe-a").await.unwrap());
+        });
+
+        let endpoint_b = endpoint.clone();
+        let runtime_b = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let operator = loopback_operator(&endpoint_b);
+                    operator.exists("probe-b").await
+                })
+        });
+
+        let second_request = second_request_rx.recv_timeout(STEP_TIMEOUT);
+        drop(runtime_a);
+        if second_request.is_ok() {
+            runtime_a_dropped_tx.send(()).unwrap();
+        }
+        let runtime_b_result = runtime_b.join().unwrap();
+        let server_result = server.join().unwrap();
+
+        second_request.expect("runtime B did not open its own HTTP connection");
+        server_result.unwrap();
+        assert!(!runtime_b_result.unwrap());
     }
 
     fn verdict_name(verdict: Option<ConditionalPrecondition>) -> &'static str {
