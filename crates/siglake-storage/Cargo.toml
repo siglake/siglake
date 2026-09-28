@@ -16,6 +16,9 @@ arrow-array = { workspace = true }
 chrono = { workspace = true }
 metrics-util = "0.20"
 proptest = { workspace = true }
+# OpenDAL 0.57's HttpClient accepts its Reqwest 0.13 type, while the workspace
+# application client remains on Reqwest 0.12.
+opendal_reqwest = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
 tempfile = "3"
 tokio = { workspace = true }
 # #1730 — the fenced-out table-cache WARN is the only place the table name
