@@ -208,6 +208,13 @@ case "$MIRROR_RECLAIM_ARM" in
     ;;
 esac
 MIRROR_RECLAIM_SAMPLE_SECONDS=60
+# Query-only processes can serve table metadata stale for at most 12 times the
+# shipped five-second metadata-cache TTL (60 seconds). Give both coordinator
+# and worker refreshes room to settle, but keep the final visibility check
+# bounded independently of the committed-drain wait.
+MIRROR_RECLAIM_COMMITTED_DRAIN_SECONDS=300
+MIRROR_RECLAIM_QUERY_VISIBILITY_SECONDS=120
+MIRROR_RECLAIM_QUERY_POLL_SECONDS=5
 
 # Evidence the manager's read_results run collects: `deploy/aws-runner/run.sh`
 # rsyncs the snapshot's results/ back off the throwaway box.
@@ -2251,27 +2258,98 @@ PY
   cp "$metrics_file" "$MIRROR_RECLAIM_METRICS_END"
 }
 
-finish_mirror_reclaim_evidence() {
-  [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
-  local sent_rows=$1 workload_rounds=$2 query_response query_rows deadline committed_rows
-  deadline=$((SECONDS + 300))
-  while ((SECONDS < deadline)); do
-    capture_mirror_reclaim_sample
-    if ((MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED - MIRROR_RECLAIM_BASE_ROWS_COMMITTED == sent_rows)); then
-      break
+mirror_reclaim_elapsed_seconds() {
+  printf '%s\n' "$SECONDS"
+}
+
+mirror_reclaim_sleep() {
+  sleep "$1"
+}
+
+record_mirror_reclaim_query_attempt() {
+  local path=$1 attempt=$2 elapsed=$3 observed=$4 error_stage=$5 error_message=$6
+  python3 - "$path" "$attempt" "$elapsed" "$observed" \
+    "$error_stage" "$error_message" <<'PY'
+import json
+import sys
+
+path, attempt, elapsed, observed, error_stage, error_message = sys.argv[1:]
+document = {
+    "attempt": int(attempt),
+    "elapsed_seconds": int(elapsed),
+    "observed_rows": int(observed) if observed else None,
+    "error": ({"stage": error_stage, "message": error_message}
+              if error_stage else None),
+}
+with open(path, "a", encoding="utf-8") as out:
+    json.dump(document, out, separators=(",", ":"))
+    out.write("\n")
+PY
+}
+
+MIRROR_RECLAIM_QUERY_ROWS=
+MIRROR_RECLAIM_QUERY_OUTCOME=not_run
+poll_mirror_reclaim_query_visibility() {
+  local sent_rows=$1 attempts_path=$2
+  local started deadline now wait_seconds attempt=0 query_response query_rows
+  local request_error="$TMP_DIR/mirror-reclaim-query-request.error"
+  local parse_error="$TMP_DIR/mirror-reclaim-query-parse.error"
+  MIRROR_RECLAIM_QUERY_ROWS=
+  MIRROR_RECLAIM_QUERY_OUTCOME=unavailable
+  : >"$attempts_path"
+  started=$(mirror_reclaim_elapsed_seconds)
+  deadline=$((started + MIRROR_RECLAIM_QUERY_VISIBILITY_SECONDS))
+  while :; do
+    now=$(mirror_reclaim_elapsed_seconds)
+    ((now <= deadline)) || break
+    attempt=$((attempt + 1))
+    : >"$request_error"
+    : >"$parse_error"
+    if query_response="$(run_sql 'SELECT count(*) AS n FROM events' 2>"$request_error")"; then
+      if query_rows="$(printf '%s' "$query_response" | python3 -c '
+import json
+import sys
+
+value = json.load(sys.stdin)["rows"][0]["n"]
+if isinstance(value, bool):
+    raise TypeError("count is boolean")
+print(int(value))
+' 2>"$parse_error")"; then
+        MIRROR_RECLAIM_QUERY_ROWS=$query_rows
+        record_mirror_reclaim_query_attempt "$attempts_path" "$attempt" \
+          "$((now - started))" "$query_rows" '' ''
+        if ((query_rows == sent_rows)); then
+          MIRROR_RECLAIM_QUERY_OUTCOME=matched
+          return 0
+        fi
+        MIRROR_RECLAIM_QUERY_OUTCOME=mismatch
+      else
+        record_mirror_reclaim_query_attempt "$attempts_path" "$attempt" \
+          "$((now - started))" '' parse "$(<"$parse_error")"
+      fi
+    else
+      record_mirror_reclaim_query_attempt "$attempts_path" "$attempt" \
+        "$((now - started))" '' query "$(<"$request_error")"
     fi
-    sleep 10
+    now=$(mirror_reclaim_elapsed_seconds)
+    ((now < deadline)) || break
+    wait_seconds=$MIRROR_RECLAIM_QUERY_POLL_SECONDS
+    ((now + wait_seconds <= deadline)) || wait_seconds=$((deadline - now))
+    mirror_reclaim_sleep "$wait_seconds"
   done
-  committed_rows=$((MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED - MIRROR_RECLAIM_BASE_ROWS_COMMITTED))
-  ((committed_rows == sent_rows)) ||
-    die "mirror-reclaim row reconciliation did not drain: sent=${sent_rows} committed=${committed_rows}"
-  query_response="$(run_sql 'SELECT count(*) AS n FROM events')"
-  query_rows="$(printf '%s' "$query_response" |
-    python3 -c 'import json,sys; print(json.load(sys.stdin)["rows"][0]["n"])')"
+  return 0
+}
+
+write_mirror_reclaim_final_evidence() {
+  local sent_rows=$1 workload_rounds=$2 committed_rows=$3 drain_completed=$4
+  local drain_elapsed=$5 query_rows=$6 query_outcome=$7 attempts_path=$8
   python3 - "$MIRROR_RECLAIM_LOAD_JSON" "$MIRROR_RECLAIM_ROWS_JSON" \
     "$MIRROR_RECLAIM_ARM" "$MIRROR_RECLAIM_LOAD_STARTED_EPOCH" \
     "$MIRROR_RECLAIM_LOAD_FINISHED_EPOCH" "$LOAD_SECONDS" "$workload_rounds" \
-    "$sent_rows" "$committed_rows" "$query_rows" \
+    "$sent_rows" "$committed_rows" "$drain_completed" "$drain_elapsed" \
+    "$query_rows" "$query_outcome" "$attempts_path" \
+    "$MIRROR_RECLAIM_COMMITTED_DRAIN_SECONDS" \
+    "$MIRROR_RECLAIM_QUERY_VISIBILITY_SECONDS" "$MIRROR_RECLAIM_QUERY_POLL_SECONDS" \
     "$MIRROR_RECLAIM_BASE_ROWS_COMMITTED" "$MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED" \
     "$MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH" "$MIRROR_RECLAIM_LAST_SAMPLE_EPOCH" <<'PY'
 import datetime
@@ -2280,14 +2358,25 @@ import sys
 
 (
     load_path, rows_path, arm, started, finished, configured, rounds, sent,
-    committed, query_rows, counter_start, counter_end, sample_start, sample_end,
+    committed, drain_completed, drain_elapsed, query_rows, query_outcome,
+    attempts_path, drain_budget, query_budget, query_poll, counter_start,
+    counter_end, sample_start, sample_end,
 ) = sys.argv[1:]
-started, finished, configured, rounds, sent, committed, query_rows = map(
-    int, (started, finished, configured, rounds, sent, committed, query_rows)
+started, finished, configured, rounds, sent, committed, drain_elapsed = map(
+    int, (started, finished, configured, rounds, sent, committed, drain_elapsed)
 )
 counter_start, counter_end, sample_start, sample_end = map(
     int, (counter_start, counter_end, sample_start, sample_end)
 )
+drain_budget, query_budget, query_poll = map(
+    int, (drain_budget, query_budget, query_poll)
+)
+query_rows = int(query_rows) if query_rows else None
+drain_completed = drain_completed == "true"
+attempts = []
+with open(attempts_path, encoding="utf-8") as source:
+    for raw in source:
+        attempts.append(json.loads(raw))
 
 
 def stamp(epoch):
@@ -2323,18 +2412,68 @@ rows = {
         "counter_delta": counter_end - counter_start,
         "meaning": "incremented only after a successful Iceberg commit",
     },
+    "committed_drain": {
+        "budget_seconds": drain_budget,
+        "elapsed_seconds": drain_elapsed,
+        "completed": drain_completed,
+    },
     "query_rows_after_committed_drain": query_rows,
-    "verified": committed == sent == query_rows,
+    "query_visibility": {
+        "budget_seconds": query_budget,
+        "poll_interval_seconds": query_poll,
+        "outcome": query_outcome,
+        "attempts": attempts,
+    },
+    "verified": drain_completed and committed == sent == query_rows,
 }
-if not rows["verified"]:
-    raise SystemExit(
-        f"row reconciliation differs: sent={sent} committed={committed} query={query_rows}"
-    )
+if rows["verified"]:
+    rows["failure_reason"] = None
+elif not drain_completed:
+    rows["failure_reason"] = "committed_drain_timeout"
+elif query_rows is None:
+    rows["failure_reason"] = "query_unavailable"
+else:
+    rows["failure_reason"] = "query_visibility_timeout"
 for path, document in ((load_path, load), (rows_path, rows)):
     with open(path, "w", encoding="utf-8") as out:
         json.dump(document, out, indent=2)
         out.write("\n")
 PY
+}
+
+finish_mirror_reclaim_evidence() {
+  [[ -n "$MIRROR_RECLAIM_ARM" ]] || return 0
+  local sent_rows=$1 workload_rounds=$2 deadline committed_rows
+  local drain_started drain_elapsed drain_completed=false
+  local attempts_path="$TMP_DIR/mirror-reclaim-query-attempts.jsonl"
+  : >"$attempts_path"
+  drain_started=$(mirror_reclaim_elapsed_seconds)
+  deadline=$((drain_started + MIRROR_RECLAIM_COMMITTED_DRAIN_SECONDS))
+  while (( $(mirror_reclaim_elapsed_seconds) < deadline )); do
+    capture_mirror_reclaim_sample
+    if ((MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED - MIRROR_RECLAIM_BASE_ROWS_COMMITTED == sent_rows)); then
+      drain_completed=true
+      break
+    fi
+    mirror_reclaim_sleep 10
+  done
+  drain_elapsed=$(($(mirror_reclaim_elapsed_seconds) - drain_started))
+  committed_rows=$((MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED - MIRROR_RECLAIM_BASE_ROWS_COMMITTED))
+  if [[ "$drain_completed" == true ]]; then
+    poll_mirror_reclaim_query_visibility "$sent_rows" "$attempts_path"
+  else
+    MIRROR_RECLAIM_QUERY_ROWS=
+    MIRROR_RECLAIM_QUERY_OUTCOME=not_run_committed_drain_timeout
+  fi
+  write_mirror_reclaim_final_evidence "$sent_rows" "$workload_rounds" \
+    "$committed_rows" "$drain_completed" "$drain_elapsed" \
+    "$MIRROR_RECLAIM_QUERY_ROWS" "$MIRROR_RECLAIM_QUERY_OUTCOME" "$attempts_path"
+  if [[ "$drain_completed" != true ]]; then
+    die "mirror-reclaim row reconciliation did not drain: sent=${sent_rows} committed=${committed_rows}"
+  fi
+  if [[ "$MIRROR_RECLAIM_QUERY_OUTCOME" != matched ]]; then
+    die "mirror-reclaim query visibility did not converge: sent=${sent_rows} committed=${committed_rows} query=${MIRROR_RECLAIM_QUERY_ROWS:-unavailable}"
+  fi
   printf 'MIRROR_RECLAIM_EVIDENCE arm=%s directory=%s sent=%s committed=%s status=ok\n' \
     "$MIRROR_RECLAIM_ARM" "${MIRROR_RECLAIM_RESULTS_DIR#"$ROOT/"}" \
     "$sent_rows" "$committed_rows"

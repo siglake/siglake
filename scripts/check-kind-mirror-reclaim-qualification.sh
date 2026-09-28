@@ -88,6 +88,10 @@ for evidence in \
 done
 contains "$body" 'MIRROR_RECLAIM_SAMPLE_SECONDS=60' ||
   fail "$ROUND does not sample the hour-long arm at one-minute intervals"
+contains "$body" 'MIRROR_RECLAIM_QUERY_VISIBILITY_SECONDS=120' ||
+  fail "$ROUND does not allow for the shipped 60-second metadata staleness ceiling"
+contains "$body" 'MIRROR_RECLAIM_QUERY_POLL_SECONDS=5' ||
+  fail "$ROUND does not poll final query visibility every five seconds"
 contains "$body" 'MIRROR_RECLAIM_LOAD_STARTED_EPOCH=$(date +%s)' ||
   fail "$ROUND does not record the actual load start"
 contains "$body" 'MIRROR_RECLAIM_LOAD_FINISHED_EPOCH=$(date +%s)' ||
@@ -353,6 +357,152 @@ cat >"$sandbox/listing-error.jsonl" <<'EOF'
 EOF
 assert_listing_refused "$sandbox/listing-error.jsonl" \
   'line 1: '\''{"status":"error","error":{"message":"Access Denied"}}'\'''
+
+# Exercise final reconciliation without a cluster. The fake clock lets each
+# fixture drive the production polling and timeout branches without sleeping.
+sed -n '/^mirror_reclaim_elapsed_seconds()/,/^log "bring up the base kind deployment"/p' \
+  "$ROUND" | sed '$d' >"$sandbox/scripts/finish-evidence.bash"
+
+run_reconciliation_fixture() {
+  local case=$1
+  local case_dir="$sandbox/reconciliation-$case"
+  mkdir -p "$case_dir/tmp" "$case_dir/results"
+  case "$case" in
+    delayed_visibility)
+      cat >"$case_dir/responses" <<'EOF'
+ok|{"rows":[{"n":8}]}
+ok|{"rows":[{"n":10}]}
+EOF
+      ;;
+    persistent_mismatch)
+      cat >"$case_dir/responses" <<'EOF'
+ok|{"rows":[{"n":8}]}
+ok|{"rows":[{"n":8}]}
+ok|{"rows":[{"n":8}]}
+EOF
+      ;;
+    query_failure)
+      cat >"$case_dir/responses" <<'EOF'
+ok|not-json
+fail|query endpoint refused
+fail|query endpoint still refused
+EOF
+      ;;
+    committed_drain_timeout)
+      : >"$case_dir/responses"
+      ;;
+    *) fail "unknown reconciliation fixture $case" ;;
+  esac
+  if env FIXTURE_CASE="$case" FIXTURE_DIR="$case_dir" bash -c '
+    set -euo pipefail
+    source "$1"
+    ROOT=$FIXTURE_DIR
+    TMP_DIR=$FIXTURE_DIR/tmp
+    MIRROR_RECLAIM_ARM=on
+    MIRROR_RECLAIM_RESULTS_DIR=$FIXTURE_DIR/results
+    MIRROR_RECLAIM_LOAD_JSON=$FIXTURE_DIR/results/load-window.json
+    MIRROR_RECLAIM_ROWS_JSON=$FIXTURE_DIR/results/row-reconciliation.json
+    MIRROR_RECLAIM_LOAD_STARTED_EPOCH=100
+    MIRROR_RECLAIM_LOAD_FINISHED_EPOCH=200
+    MIRROR_RECLAIM_FIRST_SAMPLE_EPOCH=100
+    MIRROR_RECLAIM_LAST_SAMPLE_EPOCH=200
+    MIRROR_RECLAIM_BASE_ROWS_COMMITTED=0
+    MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED=0
+    LOAD_SECONDS=3600
+    MIRROR_RECLAIM_COMMITTED_DRAIN_SECONDS=2
+    MIRROR_RECLAIM_QUERY_VISIBILITY_SECONDS=2
+    MIRROR_RECLAIM_QUERY_POLL_SECONDS=1
+    FIXTURE_NOW=0
+
+    mirror_reclaim_elapsed_seconds() { printf "%s\n" "$FIXTURE_NOW"; }
+    mirror_reclaim_sleep() { FIXTURE_NOW=$((FIXTURE_NOW + $1)); }
+    capture_mirror_reclaim_sample() {
+      if [[ "$FIXTURE_CASE" == committed_drain_timeout ]]; then
+        MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED=6
+      else
+        MIRROR_RECLAIM_SAMPLE_ROWS_COMMITTED=10
+      fi
+    }
+    run_sql() {
+      local calls_file=$FIXTURE_DIR/calls index line status payload
+      touch "$calls_file"
+      index=$(($(wc -l <"$calls_file") + 1))
+      printf "%s\n" "$index" >>"$calls_file"
+      line=$(sed -n "${index}p" "$FIXTURE_DIR/responses")
+      status=${line%%|*}
+      payload=${line#*|}
+      if [[ "$status" == ok ]]; then
+        printf "%s\n" "$payload"
+      else
+        printf "%s\n" "$payload" >&2
+        return 1
+      fi
+    }
+    finish_mirror_reclaim_evidence 10 4
+  ' _ "$sandbox/scripts/finish-evidence.bash" \
+      >"$case_dir/stdout" 2>"$case_dir/stderr"; then
+    [[ "$case" == delayed_visibility ]] ||
+      fail "$case unexpectedly passed final reconciliation"
+  else
+    [[ "$case" != delayed_visibility ]] ||
+      fail "delayed visibility did not converge: $(cat "$case_dir/stderr")"
+  fi
+  [[ -s "$case_dir/results/load-window.json" ]] ||
+    fail "$case did not retain load-window.json"
+  [[ -s "$case_dir/results/row-reconciliation.json" ]] ||
+    fail "$case did not retain row-reconciliation.json"
+}
+
+for fixture in delayed_visibility persistent_mismatch query_failure committed_drain_timeout; do
+  run_reconciliation_fixture "$fixture"
+done
+
+python3 - "$sandbox" <<'PY' || fail "final reconciliation fixtures differ from the contract"
+import json
+import os
+import sys
+
+root = sys.argv[1]
+
+
+def documents(case):
+    directory = os.path.join(root, f"reconciliation-{case}", "results")
+    load = json.load(open(os.path.join(directory, "load-window.json"), encoding="utf-8"))
+    rows = json.load(open(os.path.join(directory, "row-reconciliation.json"), encoding="utf-8"))
+    assert load["sent_rows"] == 10, (case, load)
+    assert load["workload_rounds"] == 4, (case, load)
+    return rows
+
+
+delayed = documents("delayed_visibility")
+assert delayed["verified"] is True, delayed
+assert delayed["query_rows_after_committed_drain"] == 10, delayed
+assert [attempt["observed_rows"] for attempt in delayed["query_visibility"]["attempts"]] == [8, 10], delayed
+assert [attempt["elapsed_seconds"] for attempt in delayed["query_visibility"]["attempts"]] == [0, 1], delayed
+
+mismatch = documents("persistent_mismatch")
+assert mismatch["verified"] is False, mismatch
+assert mismatch["failure_reason"] == "query_visibility_timeout", mismatch
+assert mismatch["query_rows_after_committed_drain"] == 8, mismatch
+assert len(mismatch["query_visibility"]["attempts"]) == 3, mismatch
+
+failed = documents("query_failure")
+assert failed["verified"] is False, failed
+assert failed["failure_reason"] == "query_unavailable", failed
+assert failed["query_rows_after_committed_drain"] is None, failed
+errors = [attempt["error"] for attempt in failed["query_visibility"]["attempts"]]
+assert [error["stage"] for error in errors] == ["parse", "query", "query"], failed
+assert "Expecting value" in errors[0]["message"], failed
+assert errors[1]["message"] == "query endpoint refused", failed
+
+drain = documents("committed_drain_timeout")
+assert drain["verified"] is False, drain
+assert drain["failure_reason"] == "committed_drain_timeout", drain
+assert drain["committed_rows"] == 6, drain
+assert drain["query_rows_after_committed_drain"] is None, drain
+assert drain["query_visibility"]["outcome"] == "not_run_committed_drain_timeout", drain
+assert drain["query_visibility"]["attempts"] == [], drain
+PY
 
 run_prelude() {
   local mode=$1
