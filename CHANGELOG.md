@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.2.1
+
+A fixes-only patch on 0.2.0. It adds the runtime conditional-write guard for
+delete-task ownership and corrects the chart's mirror-prefix forwarding. There
+is no schema, storage-format, API, configuration option or shipped-default
+change. The feature and telemetry work held for 0.3.0 remains in
+`docs/RELEASE_0_2_1_DEFERRED_REPLAY.md`.
+
+The workspace version, both chart `version`/`appVersion` pairs, the pinned
+image tags under `deploy/` and the two OpenAPI documents' `info.version` read
+`0.2.1`. Git tag `v0.2.1` publishes the engine and operator image tag `0.2.1`.
+
 - **Delete tasks (fix)**: the ownership claim now checks create-only writes at
   runtime before the first execution instead of trusting OpenDAL's static S3
   capability. A fixed scratch object is written and then conditionally

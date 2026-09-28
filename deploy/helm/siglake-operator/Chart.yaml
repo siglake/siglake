@@ -5,8 +5,8 @@ description: |
   ingester / compactor / query-server Deployments and drives
   per-tenant lifecycle + autoscaling.
 type: application
-version: 0.2.0
-appVersion: "0.2.0"
+version: 0.2.1
+appVersion: "0.2.1"
 home: https://github.com/siglake/siglake
 sources:
   - https://github.com/siglake/siglake

@@ -18,8 +18,8 @@ each dependency, and no swap. It is a single-host validation configuration, not
 a claim to test stock Helm defaults.
 
 ```sh
-python3 scripts/release-validation/run.py --version v0.2.0 --profile smoke \
-  --out "$HOME/siglake-validation/v0.2.0-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
+python3 scripts/release-validation/run.py --version v0.2.1 --profile smoke \
+  --out "$HOME/siglake-validation/v0.2.1-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
 Use `sg docker -c '...'` if your current session lacks the Docker group. Supported
@@ -29,9 +29,11 @@ The 72h profile records an intermediate 24h checkpoint; it is not a separately
 cleaned-up 24h run. Setup and final restart/cleanup time are outside the duration.
 A directory must be new: a failure or retry never overwrites earlier evidence.
 
-The harness resolves the released GHCR manifest **anonymously**, verifies its
-content digest and pulls that digest. Dependencies are also pulled with an empty
-Docker client auth configuration and pinned by digest. It extracts Compose
+The harness resolves the released engine and operator GHCR manifests
+**anonymously**, verifies their content digests and pulls those digests. Each
+binary's `--version` must name the selected release and the commit behind its
+git tag. Dependencies are also pulled with an empty Docker client auth
+configuration and pinned by digest. It extracts Compose
 settings from the selected release's git tag, removes builds and globally bound
 ports, and exposes only randomly assigned loopback API/metrics ports. It disables
 query result caching and the WAL query overlay so row assertions require committed
@@ -49,7 +51,7 @@ product image.
 For 24h/72h runs, commit the harness first and detach it from your terminal:
 
 ```sh
-python3 scripts/release-validation/start.py --version v0.2.0 --profile 72h \
+python3 scripts/release-validation/start.py --version v0.2.1 --profile 72h \
   --results-root "$HOME/siglake-validation"
 ```
 
@@ -103,7 +105,7 @@ and operator install; OIDC tenant isolation; distributed replicas; upgrades;
 retention/deletion and schema evolution; catalog/object-store outages; sustained
 large-working-set traffic; expensive-query cancellation. A baseline profile
 `passed` is **not** a full release gate. Backfill tracking includes all these
-tracks for v0.1.0/v0.2.0; do not mark them passed without retained evidence.
+tracks for v0.1.0/v0.2.0/v0.2.1; do not mark them passed without retained evidence.
 
 `cancellation-soak.sh` migrated from the benchmarks repository. It targets a
 separately provisioned dedicated endpoint and writes into a new `OUT`. Its slow

@@ -13,7 +13,7 @@ import uuid
 
 HERE = Path(__file__).resolve().parent
 p = argparse.ArgumentParser(description=__doc__)
-p.add_argument('--version', required=True, choices=['v0.1.0', 'v0.2.0'])
+p.add_argument('--version', required=True, choices=['v0.1.0', 'v0.2.0', 'v0.2.1'])
 p.add_argument('--profile', required=True, choices=['smoke', '24h', '72h'])
 p.add_argument('--dependency-policy', default='public', choices=['public', 'cached-diagnostic'])
 p.add_argument('--results-root', required=True)

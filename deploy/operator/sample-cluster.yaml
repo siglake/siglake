@@ -4,7 +4,7 @@ metadata:
   name: example
   namespace: default
 spec:
-  image: ghcr.io/siglake/siglake:0.2.0
+  image: ghcr.io/siglake/siglake:0.2.1
   warehouseUrl: s3://acme-prod/warehouse
   catalogUri: postgres://siglake:secret@postgres.siglake-system:5432/siglake
   autoscaling:
