@@ -22,6 +22,16 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 DURATIONS = {'smoke': 120, '24h': 86400, '72h': 259200}
+SUPPORTED_VERSIONS = ('v0.1.0', 'v0.2.0', 'v0.2.1')
+PROVENANCE_VERSIONS = frozenset({'v0.2.1'})
+PRODUCT_REPOSITORIES = {
+    'engine': 'siglake/siglake',
+    'operator': 'siglake/siglake-operator',
+}
+PRODUCT_BINARIES = {
+    'engine': 'siglake',
+    'operator': 'siglake-operator',
+}
 TOKEN = 'release-validation-fixture-token'  # disposable local fixture, not a credential
 SERVICES = ['postgres', 'minio', 'minio-init', 'ingester', 'compactor', 'query-server']
 LOG_TIMESTAMP = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})')
@@ -119,8 +129,7 @@ def http(url, data=None, token=TOKEN, timeout=30):
         return json.loads(response.read() or '{}')
 
 
-def anonymous_manifest(version):
-    repo = 'siglake/siglake'
+def anonymous_manifest(repo, version):
     url = 'https://ghcr.io/token?service=ghcr.io&scope=repository:' + repo + ':pull'
     token = http(url, token=None)['token']
     headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json'}
@@ -130,6 +139,35 @@ def anonymous_manifest(version):
         if response.headers.get('Docker-Content-Digest') != digest:
             raise RuntimeError('registry digest does not match manifest bytes')
     return 'ghcr.io/' + repo + '@' + digest
+
+
+def product_provenance(output, version, source_commit, expected_binary):
+    match = re.fullmatch(
+        r'(?P<binary>\S+) (?P<version>\d+\.\d+\.\d+(?:[-+][^\s]+)?) '
+        r'\((?P<revision>[0-9a-f]+)\)\s*',
+        output,
+    )
+    if not match:
+        raise ValueError(f'published product returned an invalid --version value: {output!r}')
+    if match.group('binary') != expected_binary:
+        raise ValueError(
+            f'published product reports binary {match.group("binary")}, expected {expected_binary}'
+        )
+    expected_version = version.removeprefix('v')
+    if match.group('version') != expected_version:
+        raise ValueError(
+            f'published product reports version {match.group("version")}, expected {expected_version}'
+        )
+    revision = match.group('revision')
+    if len(revision) < 7 or not source_commit.startswith(revision):
+        raise ValueError(
+            f'published product reports revision {revision}, expected release commit {source_commit}'
+        )
+    return {
+        'binary': match.group('binary'),
+        'version': match.group('version'),
+        'revision': revision,
+    }
 
 
 def isolated_config(config, image):
@@ -209,7 +247,27 @@ class Run:
         self.summary['harness_sha256'] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         self.summary['harness_dirty'] = bool(run_command(['git', '-C', str(ROOT), 'status', '--porcelain']).strip())
         (self.out / 'harness.py').write_bytes(Path(__file__).read_bytes())
-        self.summary['image'] = anonymous_manifest(version)
+        if version in PROVENANCE_VERSIONS:
+            self.summary['product_images'] = {
+                role: anonymous_manifest(repo, version)
+                for role, repo in PRODUCT_REPOSITORIES.items()
+            }
+            self.summary['image'] = self.summary['product_images']['engine']
+            self.summary['product_provenance'] = {}
+            for role, image in self.summary['product_images'].items():
+                run_command(['docker', 'pull', image], self.env, timeout=600)
+                output = run_command(
+                    ['docker', 'run', '--rm', '--network', 'none', '--pull', 'never', image, '--version'],
+                    self.env,
+                    timeout=60,
+                )
+                self.summary['product_provenance'][role] = product_provenance(
+                    output, version, self.summary['source_commit'], PRODUCT_BINARIES[role]
+                )
+        else:
+            self.summary['image'] = anonymous_manifest(
+                PRODUCT_REPOSITORIES['engine'], version
+            )
         self.summary['platform'] = run_command(['docker', 'info', '--format', '{{.OSType}}/{{.Architecture}}'], self.env).strip()
         self.docker_root_dir = parse_docker_root_dir(
             run_command(['docker', 'info', '--format', '{{json .DockerRootDir}}'], self.env).strip()
@@ -398,8 +456,22 @@ class Run:
             self.restart(service)
         self.batch()
         self.resources()
+        checks = [
+            'anonymous product image pull',
+            'fresh isolated install',
+            'unauthenticated refusal',
+            'exact committed IDs per cohort',
+            'exact total and grouped counts',
+            'filtered counts under concurrent queries',
+            'batch query result',
+            'persistence across component restart',
+            'no OOM or unexpected restarts',
+            'verified resource limits',
+        ]
+        if self.args.version in PROVENANCE_VERSIONS:
+            checks.insert(1, 'engine/operator provenance matches release tag')
         self.summary.update(status='passed', workload_elapsed_seconds=time.monotonic()-self.start,
-                            checks=['anonymous product image pull', 'fresh isolated install', 'unauthenticated refusal', 'exact committed IDs per cohort', 'exact total and grouped counts', 'filtered counts under concurrent queries', 'batch query result', 'persistence across component restart', 'no OOM or unexpected restarts', 'verified resource limits'], resource_samples=self.resource_samples)
+                            checks=checks, resource_samples=self.resource_samples)
 
     def cleanup(self):
         if self.mutated:
@@ -431,13 +503,17 @@ class Run:
         write_json(self.out / 'sha256.json', hashes)
 
 
-def main():
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--version', required=True, choices=['v0.1.0', 'v0.2.0'])
+    parser.add_argument('--version', required=True, choices=SUPPORTED_VERSIONS)
     parser.add_argument('--profile', required=True, choices=DURATIONS)
     parser.add_argument('--dependency-policy', choices=['public', 'cached-diagnostic'], default='public', help='cached-diagnostic uses existing dependency images; NEVER qualifies anonymous clean install')
     parser.add_argument('--out', required=True, help='new, durable results directory; must not already exist')
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = argument_parser().parse_args()
     run = Run(args)
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f'signal {signum}')

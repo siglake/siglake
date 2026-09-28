@@ -7,7 +7,7 @@
 # Assumes you've already run:
 #   - `deploy/aws/up.sh`         (terraform + main chart)
 #   - `helm install siglake-op deploy/helm/siglake-operator` (operator chart)
-#   - pushed `<ECR>:operator-0.2.0` and `<ECR>:0.2.0`
+#   - pushed `<ECR>:operator-0.2.1` and `<ECR>:0.2.1`
 #
 # What this script does:
 #   1. Read the necessary terraform outputs (ECR URL, warehouse URL,

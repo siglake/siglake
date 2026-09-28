@@ -10,7 +10,7 @@ on:
       version:
         description: Published version, or both
         type: choice
-        options: [both, v0.1.0, v0.2.0]
+        options: [both, v0.1.0, v0.2.0, v0.2.1]
         default: both
 permissions:
   contents: read
@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: [v0.1.0, v0.2.0]
+        version: [v0.1.0, v0.2.0, v0.2.1]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,7 +48,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        version: [v0.1.0, v0.2.0]
+        version: [v0.1.0, v0.2.0, v0.2.1]
     steps:
       - uses: actions/checkout@v4
         with:

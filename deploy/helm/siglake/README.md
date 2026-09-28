@@ -30,7 +30,7 @@ plug straight into `--values`.
 helm install siglake ./deploy/helm/siglake \
   --namespace siglake --create-namespace \
   --set image.repository=ghcr.io/siglake/siglake \
-  --set image.tag=0.2.0 \
+  --set image.tag=0.2.1 \
   --set s3.bucket=my-customer-warehouse \
   --set s3.region=us-east-1 \
   --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::123456789012:role/siglake-warehouse-rw \
@@ -38,8 +38,8 @@ helm install siglake ./deploy/helm/siglake \
 ```
 
 Image tags are numeric, matching the chart's `appVersion`: the release
-is tagged `v0.2.0` in git but published as
-`ghcr.io/siglake/siglake:0.2.0`. Leaving `image.tag` unset picks the
+is tagged `v0.2.1` in git but published as
+`ghcr.io/siglake/siglake:0.2.1`. Leaving `image.tag` unset picks the
 `appVersion` of the chart you installed, which is the paired image.
 
 For non-trivial deployments, write a `values.yaml` and pass `-f`

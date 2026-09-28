@@ -1,4 +1,6 @@
+import contextlib
 import datetime as dt
+import io
 import importlib.util
 from pathlib import Path
 import tempfile
@@ -30,6 +32,46 @@ class IsolationTests(unittest.TestCase):
         config['services']['postgres']['volumes'][0]['type'] = 'bind'
         with self.assertRaises(ValueError):
             v.isolated_config(config, 'release')
+
+    def test_version_selection_adds_0_2_1_without_changing_historical_versions(self):
+        self.assertEqual(v.SUPPORTED_VERSIONS, ('v0.1.0', 'v0.2.0', 'v0.2.1'))
+        self.assertEqual(v.PROVENANCE_VERSIONS, {'v0.2.1'})
+        args = v.argument_parser().parse_args([
+            '--version', 'v0.2.1', '--profile', 'smoke', '--out', '/unused'
+        ])
+        self.assertEqual(args.version, 'v0.2.1')
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            v.argument_parser().parse_args([
+                '--version', 'v0.3.0', '--profile', 'smoke', '--out', '/unused'
+            ])
+
+    def test_product_provenance_accepts_the_release_commit(self):
+        source = '5f14976533d79de60d31a727091241108ad1162e'
+        self.assertEqual(
+            v.product_provenance('siglake 0.2.1 (5f14976)\n', 'v0.2.1', source, 'siglake'),
+            {'binary': 'siglake', 'version': '0.2.1', 'revision': '5f14976'},
+        )
+        self.assertEqual(
+            v.product_provenance(
+                'siglake-operator 0.2.1 (5f14976533d7)\n',
+                'v0.2.1',
+                source,
+                'siglake-operator',
+            ),
+            {'binary': 'siglake-operator', 'version': '0.2.1', 'revision': '5f14976533d7'},
+        )
+
+    def test_product_provenance_refuses_wrong_or_unverifiable_identity(self):
+        source = '5f14976533d79de60d31a727091241108ad1162e'
+        for output in (
+            'siglake 0.2.0 (5f14976)\n',
+            'siglake 0.2.1 (aaaaaaaa)\n',
+            'siglake 0.2.1 (unknown)\n',
+            'siglake 0.2.1 (5f149)\n',
+            'wrong-binary 0.2.1 (5f14976)\n',
+        ):
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                v.product_provenance(output, 'v0.2.1', source, 'siglake')
 
     def test_cleanup_failure_overrides_success(self):
         with tempfile.TemporaryDirectory() as temp:
