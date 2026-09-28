@@ -52,10 +52,12 @@ call=$(wc -l <"$CURL_CALLS")
 status=200
 error_code=
 case "$FIXTURE_SCENARIO:$call" in
-  rejected:2|rejected:3) status=412; error_code=PreconditionFailed ;;
+  rejected:2|rejected:3|cleanup:2|cleanup:3) status=412; error_code=PreconditionFailed ;;
   accepted:2|accepted:3) status=200 ;;
   unsupported:2|unsupported:3) status=501; error_code=NotImplemented ;;
   setup:1) status=403; error_code=AccessDenied ;;
+  authentication:2|authentication:3) status=403; error_code=AccessDenied ;;
+  unexpected:2|unexpected:3) status=409; error_code=Conflict ;;
   transport:2)
     : >"$headers_file"
     : >"$body_file"
@@ -64,7 +66,12 @@ case "$FIXTURE_SCENARIO:$call" in
     ;;
 esac
 if [ "$call" -eq 5 ]; then
-  status=204
+  if [ "$FIXTURE_SCENARIO" = cleanup ]; then
+    status=500
+    error_code=InternalError
+  else
+    status=204
+  fi
 fi
 
 {
@@ -158,45 +165,104 @@ grep -Fq 'initial_put_status=403 initial_put_error_code=AccessDenied' <<<"$fixtu
 grep -Fq 'verdict=incomplete verdict_detail=setup' <<<"$fixture_output" \
   || fail "setup failure was not classified as incomplete evidence"
 
-run_agreement_fixture() { # <name> <raw verdict> <guard line> <pass|fail>
-  local name=$1 raw=$2 guard=$3 expected=$4 rc=0
-  local log="$check_dir/agreement-$name.log" output
-  printf '  cleanup_status=204 cleanup=deleted verdict=%s verdict_detail=none\n' "$raw" >"$log"
+run_fixture garage authentication
+[ "$fixture_rc" -ne 0 ] || fail "failed authentication passed the probe"
+grep -Fq 'verdict=incomplete verdict_detail=authentication' <<<"$fixture_output" \
+  || fail "conditional-request authentication failure was not classified"
+
+run_fixture garage cleanup
+[ "$fixture_rc" -ne 0 ] || fail "failed cleanup passed the probe"
+grep -Fq 'cleanup_status=500 cleanup_error_code=InternalError cleanup=failed' \
+  <<<"$fixture_output" || fail "cleanup failure observations were not retained"
+
+run_fixture garage unexpected
+[ "$fixture_rc" -ne 0 ] || fail "unexpected responses passed the probe"
+grep -Fq 'verdict=unexpected-response' <<<"$fixture_output" \
+  || fail "unexpected responses were not retained"
+
+run_qualification_fixture() { # <name> <store> <scenario> <guard> <cas> <pass|fail> <capability> <safety> <reason>
+  local name=$1 store=$2 scenario=$3 guard=$4 cas=$5 expected=$6
+  local expected_capability=$7 expected_safety=$8 expected_reason=$9 rc=0
+  local log="$check_dir/qualification-$name.log" output
+  run_fixture "$store" "$scenario"
+  printf '%s\n' "$fixture_output" >"$log"
   [ -z "$guard" ] || printf '%s\n' "$guard" >>"$log"
-  output=$(scripts/ci-local-conditional-write-agreement.sh "$log" 2>&1) || rc=$?
+  [ -z "$cas" ] || printf '%s\n' "$cas" >>"$log"
+  output=$(scripts/ci-local-conditional-write-agreement.sh "$log" "$fixture_rc" 2>&1) || rc=$?
   case "$expected:$rc" in
     pass:0)
-      grep -Fq 'CONDITIONAL_WRITE_AGREEMENT ok' <<<"$output" \
-        || fail "$name did not print agreement: $output"
+      grep -Fq 'CONDITIONAL_WRITE_QUALIFICATION ok' <<<"$output" \
+        || fail "$name did not print a passing qualification: $output"
       ;;
     fail:0) fail "$name unexpectedly passed: $output" ;;
     fail:*)
-      grep -Fq 'CONDITIONAL_WRITE_AGREEMENT mismatch' <<<"$output" \
-        || fail "$name did not print mismatch: $output"
+      grep -Fq 'CONDITIONAL_WRITE_QUALIFICATION fail' <<<"$output" \
+        || fail "$name did not print a failing qualification: $output"
       ;;
     *) fail "$name returned $rc: $output" ;;
   esac
+  grep -Fq "CONDITIONAL_WRITE_CAPABILITY verdict=$expected_capability" <<<"$output" \
+    || fail "$name capability verdict differs: $output"
+  grep -Fq "CONDITIONAL_WRITE_APPLICATION_SAFETY verdict=$expected_safety" <<<"$output" \
+    || fail "$name application-safety verdict differs: $output"
+  grep -Fq "reason=$expected_reason" <<<"$output" \
+    || fail "$name qualification reason differs: $output"
 }
 
-run_agreement_fixture agree-verified preconditions-rejected \
-  'CONDITIONAL_WRITE_GUARD if_match=verified if_not_exists=verified refusal=no' pass
-run_agreement_fixture agree-ignored silently-accepted \
-  'CONDITIONAL_WRITE_GUARD if_match=ignored if_not_exists=ignored refusal=yes' pass
-run_agreement_fixture mismatch preconditions-rejected \
-  'CONDITIONAL_WRITE_GUARD if_match=ignored if_not_exists=ignored refusal=yes' fail
-run_agreement_fixture missing-guard preconditions-rejected '' fail
+verified_guard='CONDITIONAL_WRITE_GUARD if_match=verified if_not_exists=verified refusal=no'
+refused_ignored_guard='CONDITIONAL_WRITE_GUARD if_match=ignored if_not_exists=ignored refusal=yes'
+accepted_ignored_guard='CONDITIONAL_WRITE_GUARD if_match=ignored if_not_exists=ignored refusal=no'
+refused_unsupported_guard='CONDITIONAL_WRITE_GUARD if_match=unsupported if_not_exists=unsupported refusal=yes'
+cas_complete='CAS_RACE rounds=20 winners=1 losers=1'
+cas_skipped='CAS_RACE skipped=guard-refuses-store'
 
-grep -Fq 'scripts/ci-local-conditional-write-probe.sh >>"$dlog" 2>&1 || dk_ok=0' \
-  scripts/ci-local.sh || fail "ci-local's live docker job does not run the probe"
+run_qualification_fixture minio-positive minio rejected "$verified_guard" "$cas_complete" \
+  pass safe accepted-safe positive-safety
+run_qualification_fixture garage-refused garage accepted "$refused_ignored_guard" "$cas_skipped" \
+  pass unsafe-ignored refused-unsafe negative-safety-only
+run_qualification_fixture garage-unsupported garage unsupported "$refused_unsupported_guard" "$cas_skipped" \
+  pass unsupported refused-unsafe negative-safety-only
+run_qualification_fixture minio-negative-is-not-enough minio accepted "$refused_ignored_guard" "$cas_skipped" \
+  fail unsafe-ignored refused-unsafe negative-safety-not-valid-for-store
+run_qualification_fixture unsafe-accepted garage accepted "$accepted_ignored_guard" "$cas_skipped" \
+  fail unsafe-ignored accepted-unsafe unsafe-endpoint-accepted
+run_qualification_fixture raw-guard-disagreement garage accepted "$verified_guard" "$cas_skipped" \
+  fail unsafe-ignored disagreement raw-guard-disagreement
+run_qualification_fixture safe-refused garage rejected \
+  'CONDITIONAL_WRITE_GUARD if_match=verified if_not_exists=verified refusal=yes' "$cas_complete" \
+  fail safe disagreement safe-endpoint-refused
+run_qualification_fixture missing-guard garage accepted '' "$cas_skipped" \
+  fail unsafe-ignored unverified incomplete-application-evidence
+run_qualification_fixture missing-positive-cas minio rejected "$verified_guard" '' \
+  fail safe incomplete incomplete-cas-evidence
+run_qualification_fixture skipped-positive-cas minio rejected "$verified_guard" "$cas_skipped" \
+  fail safe incomplete incomplete-cas-evidence
+run_qualification_fixture missing-refusal-cas garage accepted "$refused_ignored_guard" '' \
+  fail unsafe-ignored incomplete incomplete-refusal-evidence
+run_qualification_fixture raced-unsafe garage accepted "$refused_ignored_guard" "$cas_complete" \
+  fail unsafe-ignored incomplete incomplete-refusal-evidence
+run_qualification_fixture transport-incomplete garage transport "$refused_ignored_guard" "$cas_skipped" \
+  fail incomplete unverified incomplete-raw-evidence
+run_qualification_fixture setup-incomplete garage setup "$refused_ignored_guard" "$cas_skipped" \
+  fail incomplete unverified incomplete-raw-evidence
+run_qualification_fixture auth-incomplete garage authentication "$refused_ignored_guard" "$cas_skipped" \
+  fail incomplete unverified incomplete-raw-evidence
+run_qualification_fixture cleanup-incomplete garage cleanup "$verified_guard" "$cas_complete" \
+  fail safe unverified incomplete-raw-evidence
+run_qualification_fixture unexpected-incomplete garage unexpected "$refused_ignored_guard" "$cas_skipped" \
+  fail incomplete unverified incomplete-raw-evidence
+
+grep -Fq '|| conditional_probe_rc=$?' scripts/ci-local.sh \
+  || fail "ci-local does not retain the standalone raw-probe failure"
 grep -Fq 'cargo test -p siglake-storage --lib conditional_write_live --' \
   scripts/ci-local.sh || fail "ci-local's live docker job does not run the application guard"
 grep -Fq 'timeout --signal=TERM --kill-after=10s 180s' \
   scripts/ci-local.sh || fail "ci-local's conditional-write live tests have no process deadline"
-grep -Fq 'scripts/ci-local-conditional-write-agreement.sh "$dlog"' \
+grep -Fq 'scripts/ci-local-conditional-write-agreement.sh "$dlog" "$conditional_probe_rc"' \
   scripts/ci-local.sh || fail "ci-local's live docker job does not compare the two verdicts"
 grep -Fq 'cargo test -p siglake-storage --lib conditional_write_live --' \
   .github/workflows/ci.yml || fail "hosted Docker CI does not run the application guard"
-grep -Fq 'scripts/ci-local-conditional-write-agreement.sh "$conditional_log"' \
+grep -Fq 'scripts/ci-local-conditional-write-agreement.sh "$conditional_log" "$conditional_probe_rc"' \
   .github/workflows/ci.yml || fail "hosted Docker CI does not compare the two verdicts"
 
-echo "ok (selected-arm endpoints, response classes, cleanup and guard agreement)"
+echo "ok (raw capability, application safety, refusal and incomplete-evidence grading)"
