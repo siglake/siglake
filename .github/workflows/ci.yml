@@ -919,9 +919,10 @@ jobs:
           scripts/up.sh
           cargo test -p siglake-compactor --test s3_mirror_pagination -- --ignored --nocapture
           conditional_log=$(mktemp)
-          scripts/ci-local-conditional-write-probe.sh 2>&1 | tee "$conditional_log"
           set +e
           set -o pipefail
+          scripts/ci-local-conditional-write-probe.sh 2>&1 | tee "$conditional_log"
+          conditional_probe_rc=${PIPESTATUS[0]}
           cargo test -p siglake-storage --lib conditional_write_live -- \
             --ignored --nocapture 2>&1 | tee -a "$conditional_log"
           conditional_rc=${PIPESTATUS[0]}
@@ -938,7 +939,7 @@ jobs:
             echo "conditional-write live tests FAIL ($conditional_passed passed, $conditional_failed failed, $conditional_results result lines)"
             exit 1
           fi
-          scripts/ci-local-conditional-write-agreement.sh "$conditional_log"
+          scripts/ci-local-conditional-write-agreement.sh "$conditional_log" "$conditional_probe_rc"
           cargo test -p siglake-query-server --test jobs_postgres_ownership -- \
             --ignored --nocapture --test-threads=1
           cargo test -p siglake-storage --lib local_commit_mark_postgres -- \

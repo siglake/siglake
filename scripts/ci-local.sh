@@ -863,7 +863,9 @@ if [ "$WITH_HEAVY" = 1 ]; then
         # conditional-write behaviour. This establishes endpoint behaviour,
         # not OpenDAL's error mapping; the helper grades only complete,
         # authenticated observations and always deletes its disposable object.
-        scripts/ci-local-conditional-write-probe.sh >>"$dlog" 2>&1 || dk_ok=0
+        conditional_probe_rc=0
+        scripts/ci-local-conditional-write-probe.sh >>"$dlog" 2>&1 \
+          || conditional_probe_rc=$?
         conditional_live_log="$LOG_DIR/conditional-write-live.log"
         conditional_live_rc=0
         SIGLAKE_TEST_S3_ENDPOINT="$SIGLAKE_S3_HOST_ENDPOINT" \
@@ -885,7 +887,8 @@ if [ "$WITH_HEAVY" = 1 ]; then
             >>"$dlog"
           dk_ok=0
         fi
-        scripts/ci-local-conditional-write-agreement.sh "$dlog" >>"$dlog" 2>&1 || dk_ok=0
+        scripts/ci-local-conditional-write-agreement.sh "$dlog" "$conditional_probe_rc" \
+          >>"$dlog" 2>&1 || dk_ok=0
         # The shared-store job ownership rules (#1845) are the only thing
         # standing between a query scale-out and a destroyed batch result,
         # and no hermetic test can reach them: they are SQL. compose's
