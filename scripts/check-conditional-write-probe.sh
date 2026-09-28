@@ -190,6 +190,8 @@ grep -Fq 'scripts/ci-local-conditional-write-probe.sh >>"$dlog" 2>&1 || dk_ok=0'
   scripts/ci-local.sh || fail "ci-local's live docker job does not run the probe"
 grep -Fq 'cargo test -p siglake-storage --lib conditional_write_live --' \
   scripts/ci-local.sh || fail "ci-local's live docker job does not run the application guard"
+grep -Fq 'timeout --signal=TERM --kill-after=10s 180s' \
+  scripts/ci-local.sh || fail "ci-local's conditional-write live tests have no process deadline"
 grep -Fq 'scripts/ci-local-conditional-write-agreement.sh "$dlog"' \
   scripts/ci-local.sh || fail "ci-local's live docker job does not compare the two verdicts"
 grep -Fq 'cargo test -p siglake-storage --lib conditional_write_live --' \

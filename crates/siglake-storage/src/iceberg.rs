@@ -1001,10 +1001,12 @@ mod conditional_write_compatibility_tests {
 mod conditional_write_live {
     use super::*;
     use opendal::services::S3;
-    use std::sync::{Arc, Barrier};
+    use std::sync::Arc;
 
     const BUCKET: &str = "siglake-warehouse";
     const ROUNDS: usize = 20;
+    const LIVE_TEST_TIMEOUT: Duration = Duration::from_secs(120);
+    const LIVE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
     fn operator() -> Option<opendal::Operator> {
         let endpoint = match std::env::var("SIGLAKE_TEST_S3_ENDPOINT") {
@@ -1039,13 +1041,35 @@ mod conditional_write_live {
         }
     }
 
-    async fn probe(op: &opendal::Operator) -> ConditionalWriteCompatibility {
-        probe_conditional_write_compatibility(op).await.unwrap()
+    async fn cleanup(op: &opendal::Operator) -> Result<()> {
+        tokio::time::timeout(LIVE_CLEANUP_TIMEOUT, op.delete_with("").recursive(true))
+            .await
+            .context("timed out cleaning up the conditional-write live test prefix")?
+            .context("clean up the conditional-write live test prefix")
     }
 
-    async fn delete_probe(op: &opendal::Operator) {
-        let probe_rel = format!("{CONDITIONAL_WRITE_PROBE}-{}", claimant_id());
-        op.delete(&probe_rel).await.unwrap();
+    async fn guard_verdict_inner(op: &opendal::Operator) -> Result<()> {
+        let verdict = probe_conditional_write_compatibility(op).await?;
+        let compatibility = tokio::sync::OnceCell::new();
+        compatibility
+            .set(verdict)
+            .map_err(|_| anyhow::anyhow!("conditional-write verdict was already set"))?;
+        let refusal = require_conditional_write_compatibility(op, &compatibility, true, true)
+            .await
+            .is_err();
+        let fully_verified = verdict.if_match == Some(ConditionalPrecondition::Verified)
+            && verdict.if_not_exists == Some(ConditionalPrecondition::Verified);
+        anyhow::ensure!(
+            refusal != fully_verified,
+            "conditional-write guard refusal={refusal}, fully_verified={fully_verified}"
+        );
+        println!(
+            "CONDITIONAL_WRITE_GUARD if_match={} if_not_exists={} refusal={}",
+            verdict_name(verdict.if_match),
+            verdict_name(verdict.if_not_exists),
+            if refusal { "yes" } else { "no" }
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1054,54 +1078,49 @@ mod conditional_write_live {
         let Some(op) = operator() else {
             return;
         };
-        let verdict = probe(&op).await;
-        let compatibility = tokio::sync::OnceCell::new();
-        compatibility.set(verdict).unwrap();
-        let refusal = require_conditional_write_compatibility(&op, &compatibility, true, true)
+        let result = tokio::time::timeout(LIVE_TEST_TIMEOUT, guard_verdict_inner(&op))
             .await
-            .is_err();
-        delete_probe(&op).await;
-        let fully_verified = verdict.if_match == Some(ConditionalPrecondition::Verified)
-            && verdict.if_not_exists == Some(ConditionalPrecondition::Verified);
-        assert_eq!(refusal, !fully_verified);
-        println!(
-            "CONDITIONAL_WRITE_GUARD if_match={} if_not_exists={} refusal={}",
-            verdict_name(verdict.if_match),
-            verdict_name(verdict.if_not_exists),
-            if refusal { "yes" } else { "no" }
-        );
+            .context("conditional-write guard live test exceeded 120 seconds")
+            .and_then(|result| result);
+        cleanup(&op).await.unwrap();
+        result.unwrap();
     }
 
-    #[test]
-    #[ignore = "requires the compose object store from scripts/up.sh"]
-    fn two_writer_cas_race() {
-        let Some(op) = operator() else {
-            return;
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let verdict = runtime.block_on(probe(&op));
-        runtime.block_on(delete_probe(&op));
+    async fn cas_writer(
+        op: &opendal::Operator,
+        rel: &str,
+        etag: &str,
+        body: Vec<u8>,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Result<(CasWrite, Vec<u8>)> {
+        barrier.wait().await;
+        let outcome = OpendalSideCas(op)
+            .store_if(rel, body.clone(), Some(etag))
+            .await?;
+        Ok((outcome, body))
+    }
+
+    async fn two_writer_cas_race_inner(op: &opendal::Operator) -> Result<()> {
+        let verdict = probe_conditional_write_compatibility(op).await?;
         if verdict.if_match != Some(ConditionalPrecondition::Verified)
             || verdict.if_not_exists != Some(ConditionalPrecondition::Verified)
         {
             println!("CAS_RACE skipped=guard-refuses-store");
-            return;
+            return Ok(());
         }
 
         for round in 0..ROUNDS {
             let rel = format!("cas-race-{round}.json");
-            let seed = serde_json::to_vec(&SnapshotAggregates::default()).unwrap();
-            let seeded = runtime
-                .block_on(OpendalSideCas(&op).store_if(&rel, seed, None))
-                .unwrap();
-            assert!(matches!(seeded, CasWrite::Written));
-            let (_, etag) = runtime.block_on(OpendalSideCas(&op).load(&rel)).unwrap();
-            let etag = etag.expect("the seeded S3 object must carry an ETag");
+            let seed = serde_json::to_vec(&SnapshotAggregates::default())?;
+            let seeded = OpendalSideCas(op).store_if(&rel, seed, None).await?;
+            anyhow::ensure!(
+                matches!(seeded, CasWrite::Written),
+                "round {round} did not seed the CAS object"
+            );
+            let (_, etag) = OpendalSideCas(op).load(&rel).await?;
+            let etag = etag.context("the seeded S3 object must carry an ETag")?;
 
-            let bodies = [0, 1].map(|writer| {
+            let writer_body = |writer| {
                 serde_json::to_vec(&SnapshotAggregates {
                     coverage: Some(AggregateCoverage {
                         snapshot_id: (round * 2 + writer) as i64,
@@ -1109,29 +1128,14 @@ mod conditional_write_live {
                     }),
                     ..SnapshotAggregates::default()
                 })
-                .unwrap()
-            });
-            let barrier = Arc::new(Barrier::new(2));
-            let results = std::thread::scope(|scope| {
-                let handles = bodies.clone().map(|body| {
-                    let op = op.clone();
-                    let rel = rel.clone();
-                    let etag = etag.clone();
-                    let barrier = barrier.clone();
-                    scope.spawn(move || {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .unwrap();
-                        barrier.wait();
-                        let outcome = runtime
-                            .block_on(OpendalSideCas(&op).store_if(&rel, body.clone(), Some(&etag)))
-                            .unwrap();
-                        (outcome, body)
-                    })
-                });
-                handles.map(|handle| handle.join().unwrap())
-            });
+            };
+            let bodies = [writer_body(0)?, writer_body(1)?];
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let (first, second) = tokio::join!(
+                cas_writer(op, &rel, &etag, bodies[0].clone(), barrier.clone()),
+                cas_writer(op, &rel, &etag, bodies[1].clone(), barrier),
+            );
+            let results = [first?, second?];
 
             let winners = results
                 .iter()
@@ -1141,22 +1145,36 @@ mod conditional_write_live {
                 .iter()
                 .filter(|(outcome, _)| matches!(outcome, CasWrite::Conflict))
                 .count();
-            assert_eq!(winners, 1, "round {round} had {winners} winners");
-            assert_eq!(losers, 1, "round {round} had {losers} losers");
+            anyhow::ensure!(winners == 1, "round {round} had {winners} winners");
+            anyhow::ensure!(losers == 1, "round {round} had {losers} losers");
             let winner_body = results
                 .iter()
                 .find_map(|(outcome, body)| {
                     matches!(outcome, CasWrite::Written).then_some(body.as_slice())
                 })
-                .unwrap();
-            let final_body = runtime.block_on(op.read(&rel)).unwrap().to_vec();
-            assert_eq!(
-                final_body, winner_body,
+                .context("the winner count did not identify a winner")?;
+            let final_body = op.read(&rel).await?.to_vec();
+            anyhow::ensure!(
+                final_body == winner_body,
                 "round {round} stored the loser body"
             );
-            runtime.block_on(op.delete(&rel)).unwrap();
         }
         println!("CAS_RACE rounds={ROUNDS} winners=1 losers=1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the compose object store from scripts/up.sh"]
+    async fn two_writer_cas_race() {
+        let Some(op) = operator() else {
+            return;
+        };
+        let result = tokio::time::timeout(LIVE_TEST_TIMEOUT, two_writer_cas_race_inner(&op))
+            .await
+            .context("two-writer conditional-write live test exceeded 120 seconds")
+            .and_then(|result| result);
+        cleanup(&op).await.unwrap();
+        result.unwrap();
     }
 }
 
