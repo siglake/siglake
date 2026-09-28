@@ -6297,7 +6297,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "siglake-bloom"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "proptest",
@@ -6306,7 +6306,7 @@ dependencies = [
 
 [[package]]
 name = "siglake-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -6341,7 +6341,7 @@ dependencies = [
 
 [[package]]
 name = "siglake-compactor"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6366,7 +6366,7 @@ dependencies = [
 
 [[package]]
 name = "siglake-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6401,7 +6401,7 @@ dependencies = [
 
 [[package]]
 name = "siglake-index"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crc32fast",
  "siglake-bloom",
@@ -6410,7 +6410,7 @@ dependencies = [
 
 [[package]]
 name = "siglake-ingest"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -6450,7 +6450,7 @@ dependencies = [
 
 [[package]]
 name = "siglake-loadgen"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6469,7 +6469,7 @@ dependencies = [
 
 [[package]]
 name = "siglake-openapi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -6482,7 +6482,7 @@ dependencies = [
 
 [[package]]
 name = "siglake-operator"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6511,7 +6511,7 @@ dependencies = [
 
 [[package]]
 name = "siglake-query-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6564,7 +6564,7 @@ dependencies = [
 
 [[package]]
 name = "siglake-storage"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6611,7 +6611,7 @@ dependencies = [
 
 [[package]]
 name = "siglake-wal"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arrow",
