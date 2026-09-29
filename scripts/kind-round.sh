@@ -1274,6 +1274,22 @@ query_panel() {
   [[ "$count" -gt 0 ]] || PANEL_FAILURES=1
 }
 
+query_required_panels() {
+  query_panel 103 A 'histogram_quantile(0.99, sum by (le, endpoint) (rate(siglake_ingest_request_duration_seconds_bucket{namespace="default"}[5m])))'
+  query_panel 118 A 'histogram_quantile(0.99, sum by (le) (rate(siglake_compactor_commit_duration_seconds_bucket{namespace="default"}[5m])))'
+  query_panel 124 A 'histogram_quantile(0.50, sum by (le, endpoint) (rate(siglake_query_request_duration_seconds_bucket{namespace="default"}[5m])))'
+  query_panel 124 B 'histogram_quantile(0.99, sum by (le, endpoint) (rate(siglake_query_request_duration_seconds_bucket{namespace="default"}[5m])))'
+  query_panel 131 A 'histogram_quantile(0.50, sum by (le) (rate(siglake_group_count_tier2_files_per_call_bucket{namespace="default"}[5m])))'
+  query_panel 131 B 'histogram_quantile(0.99, sum by (le) (rate(siglake_group_count_tier2_files_per_call_bucket{namespace="default"}[5m])))'
+  if [[ "$CATALOG_CLAIM_ENABLED" == true ]]; then
+    query_panel 134 B 'histogram_quantile(0.99, sum by (le) (rate(siglake_compactor_mirror_sync_duration_seconds_bucket{namespace="default"}[15m])))'
+  else
+    printf 'PANEL id=134 ref=B status=not_applicable reason=catalog_claim_disabled_filesystem_drain\n'
+  fi
+  query_panel 141 A 'histogram_quantile(0.50, sum by (le) (rate(siglake_group_count_deltas_folded_bucket{namespace="default"}[5m])))'
+  query_panel 141 B 'histogram_quantile(0.99, sum by (le) (rate(siglake_group_count_deltas_folded_bucket{namespace="default"}[5m])))'
+}
+
 # --- #3647: per-pod ingester request series ----------------------------------
 #
 # `prometheus_result` above keeps a series COUNT and the first value, which is
@@ -2728,15 +2744,7 @@ fi
 
 log "dashboard panel evidence"
 printf 'PANEL_TABLE_BEGIN\n'
-query_panel 103 A 'histogram_quantile(0.99, sum by (le, endpoint) (rate(siglake_ingest_request_duration_seconds_bucket{namespace="default"}[5m])))'
-query_panel 118 A 'histogram_quantile(0.99, sum by (le) (rate(siglake_compactor_commit_duration_seconds_bucket{namespace="default"}[5m])))'
-query_panel 124 A 'histogram_quantile(0.50, sum by (le, endpoint) (rate(siglake_query_request_duration_seconds_bucket{namespace="default"}[5m])))'
-query_panel 124 B 'histogram_quantile(0.99, sum by (le, endpoint) (rate(siglake_query_request_duration_seconds_bucket{namespace="default"}[5m])))'
-query_panel 131 A 'histogram_quantile(0.50, sum by (le) (rate(siglake_group_count_tier2_files_per_call_bucket{namespace="default"}[5m])))'
-query_panel 131 B 'histogram_quantile(0.99, sum by (le) (rate(siglake_group_count_tier2_files_per_call_bucket{namespace="default"}[5m])))'
-query_panel 134 B 'histogram_quantile(0.99, sum by (le) (rate(siglake_compactor_mirror_sync_duration_seconds_bucket{namespace="default"}[15m])))'
-query_panel 141 A 'histogram_quantile(0.50, sum by (le) (rate(siglake_group_count_deltas_folded_bucket{namespace="default"}[5m])))'
-query_panel 141 B 'histogram_quantile(0.99, sum by (le) (rate(siglake_group_count_deltas_folded_bucket{namespace="default"}[5m])))'
+query_required_panels
 printf 'PANEL_TABLE_END\n'
 
 queue_result="$(prometheus_result 'histogram_quantile(0.95, sum(rate(siglake_query_exec_pool_queue_seconds_bucket[5m])) by (le))')"
