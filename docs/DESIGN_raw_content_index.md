@@ -79,7 +79,7 @@ both touching core paths and therefore **feature-flagged + heavily validated,
 not an unattended change**:
 
 1. **File-level token bloom (lower risk, coarser).** Write a per-file token
-   bloom into the Parquet file's key-value metadata at compaction; in siglake's
+   bloom into the Parquet file's key-value metadata at compaction; in Siglake's
    custom scan (`SiglakeIcebergTableScan`), after `plan_files`, read each
    `FileScanTask` file's footer metadata bloom and DROP tasks whose bloom
    lacks the query term before handing the surviving tasks to iceberg-rust's
@@ -90,7 +90,7 @@ not an unattended change**:
 2. **Row-group-level (finer, bigger).** Bypass iceberg-rust's `ArrowReader` in
    the custom scan and read Parquet directly via the `parquet` crate
    (`ParquetRecordBatchReaderBuilder` supports bloom filters +
-   `with_row_groups(...)` selection). siglake takes over the read path for
+   `with_row_groups(...)` selection). Siglake takes over the read path for
    raw-LIKE queries (behind a flag); reuse iceberg-rust for everything else.
 
 Recommended: prototype path 1 first (verify the writer metadata hook), keep it

@@ -117,7 +117,7 @@ a new NetworkPolicy surface. The probe's result would then have to be folded in
 beside the Prometheus readings, on a different failure path from the other three
 signals.
 
-For it: it works when no siglake pod runs at all, and it reads the queue with no
+For it: it works when no Siglake pod runs at all, and it reads the queue with no
 scrape or staleness window in between, which is the only wake-up path that would
 also serve a future ingest tier at zero.
 
@@ -136,7 +136,7 @@ paginating it is the unfinished work of #1107.
 
 **Option A.** It reuses a connection, a query and an index that exist, adds no
 dependency or credential to the operator, and keeps every scaling reading on one
-transport with one failure mode. Option B's advantage — working with no siglake
+transport with one failure mode. Option B's advantage — working with no Siglake
 pod running — buys nothing while ingest and query floors stay positive, and this
 design does not propose lowering those.
 

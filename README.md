@@ -1,10 +1,10 @@
-# siglake
+# Siglake
 
 A horizontally-scalable, OTLP-native log analytics platform built on
 **Parquet v2 + Apache Iceberg + DataFusion**, in Rust. Logs and traces go in
 over OTLP or an Elasticsearch-compatible bulk API; everything lands as open
-Parquet in an Iceberg catalog on object storage, queryable by siglake's own
-distributed SQL tier and, without siglake in the path, by any Iceberg reader.
+Parquet in an Iceberg catalog on object storage, queryable by Siglake's own
+distributed SQL tier and, without Siglake in the path, by any Iceberg reader.
 Tables are format version 2 with a microsecond `timestamptz` event time and the
 exact OTLP nanosecond beside it in `timestamp_ns`, so they carry no v3-only
 type; Trino 483, Spark 3.5.9, DuckDB 1.5.5 and PyIceberg 0.12.0 are
@@ -87,7 +87,7 @@ OTLP/gRPC :4317 ─►  └──────────────┬──�
 No Kafka, no Flink: the WAL is the streaming substrate. External consumers
 read sealed segments through `SegmentConsumer` with their own durable cursors,
 exactly like the drain does, sharing one Arrow `RecordBatch` representation end
-to end. siglake ships no consumer of its own; a detector, a router or a mirror
+to end. Siglake ships no consumer of its own; a detector, a router or a mirror
 is a separate process ([docs/CONSUMING_SEGMENTS.md](docs/CONSUMING_SEGMENTS.md)).
 
 ## Design decisions
@@ -98,7 +98,7 @@ written down.
 - **Open table formats, no private storage engine.** Everything is ZSTD
   Parquet v2 in Iceberg format-version-2 tables, day-partitioned by
   `timestamp`, in your object store and your catalog (SQLite for development,
-  Postgres in production). No siglake schema uses a v3-only type, so any
+  Postgres in production). No Siglake schema uses a v3-only type, so any
   current Iceberg reader can query the warehouse directly. The timestamp
   contract — microsecond `timestamptz` for `timestamp`, the exact OTLP
   nanosecond in `timestamp_ns` — exists for that reason
@@ -107,7 +107,7 @@ written down.
   accepted event is appended to a write-ahead log first; the drain reads
   sealed segments into Iceberg commits, and any other consumer reads the same
   segments through `SegmentConsumer` with its own durable cursor,
-  at-least-once delivery and retention that waits for it. siglake ships no
+  at-least-once delivery and retention that waits for it. Siglake ships no
   consumer of its own: a detector, a router or a mirror is a separate process
   ([`docs/CONSUMING_SEGMENTS.md`](docs/CONSUMING_SEGMENTS.md)).
 - **An acknowledgement means the WAL is durable.** Rows are acked after the

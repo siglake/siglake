@@ -1,6 +1,6 @@
-# siglake architecture
+# Siglake architecture
 
-The long-form description of how siglake is built: each subsystem's contract,
+The long-form description of how Siglake is built: each subsystem's contract,
 what it guarantees, what it costs, and where the numbers came from. It moved
 here from the README on 2026-09-15 so the README could stay a project
 overview; nothing was dropped in the move. For task-oriented documentation —
@@ -51,7 +51,7 @@ design.
 | **Compactor / drain** (`siglake compactor`) | Drains sealed WAL segments into Iceberg commits — continuous dispatch with N commits in flight, commit-accumulation batching — and runs **leveled compaction**, snapshot expiry, retention/delete sweeps, and orphan GC on the same budgeted loop, so maintenance never starves the commit path. Multi-pod-safe via SQL catalog claims. |
 | **Query** (`siglake-query-server`) | Distributed SQL: replicas behind a headless Service with stable DNS; any replica transparently coordinates (file-shard fan-out, two-phase merge, Arrow IPC transport). Replicas add throughput; fan-out engages for large scans, while small-`LIMIT` browses and Tier-1 aggregates are answered locally by design (see [`LIMITATIONS.md`](LIMITATIONS.md)). A process-wide memory pool bounds every sort, aggregate and join; when it refuses (rather than spills) the client gets `503` + `Retry-After`, the same capacity answer the ingester gives, forwarded from a worker rather than re-run on the coordinator. Serves uncommitted WAL data for `events` and for every managed user index a query references, via the real-time buffer (`--query-wal-buffer-dir`) plus hot last-value caches. |
 | **Operator** (`siglake-operator`) | `SiglakeCluster` CRD → renders the deployment; leader-elected; reports `observedGeneration` + schema versions. |
-| **Catalog** | Iceberg on SQLite (dev) or Postgres (prod), through siglake's **vendored Iceberg forks** (`third_party/iceberg`, `third_party/iceberg-catalog-sql`). |
+| **Catalog** | Iceberg on SQLite (dev) or Postgres (prod), through Siglake's **vendored Iceberg forks** (`third_party/iceberg`, `third_party/iceberg-catalog-sql`). |
 
 ## Ingest path
 
@@ -158,7 +158,7 @@ pipeline, and a run whose logs are not collected leaves nothing behind after
 the terminal scrolls.
 
 The same listing decides whether `--from` IS the mirror root, from the two
-markers siglake writes at a fixed depth under it: a first component `_active`
+markers Siglake writes at a fixed depth under it: a first component `_active`
 with a `.arrow.partial` tail, or a key ending `/owner` at depth 2. Either at
 its own depth confirms the root; either exactly one component deeper means
 `--from` is one component above it, and both forms of the command then exit
@@ -491,14 +491,14 @@ are byte-targeted (~256 MB uncompressed) from the in-flight batch's measured
 row size; every write path emits files through the same writer, but flush and
 merge measure that row size differently (see Compaction).
 Fresh tables stamp the minimum Iceberg format version required by their schema.
-Every schema siglake ships — `events`, `query_audit`, user indexes — is
+Every schema Siglake ships — `events`, `query_audit`, user indexes — is
 **format version 2**: event time is a microsecond `timestamptz`, and no Siglake
 schema uses a v3-only type. A schema that did would still be stamped v3.
 
 **Timestamp contract.** `timestamp` is `timestamptz` at microsecond precision
 (Parquet INT64 TIMESTAMP(MICROS, isAdjustedToUTC=true)); `events` also carries
 `timestamp_ns`, a required `long` holding the OTLP `time_unix_nano` value
-verbatim. siglake's own scans filter and order on `timestamp_ns`, so nothing is
+verbatim. Siglake's own scans filter and order on `timestamp_ns`, so nothing is
 lost internally, while external engines get a type they all understand. See
 `docs/DESIGN_time_ordered_storage.md` ("Timestamp contract"), including why
 pre-0.1.0 warehouses must be recreated rather than migrated.
@@ -844,7 +844,7 @@ reports how many names were truncated. `SiglakeAutoPromotionNearCeiling` reads
 the per-table configured cap at 80%; it does not infer a universal schema
 column ceiling.
 
-**Upgrades and schema versions.** A siglake binary declares the schema it
+**Upgrades and schema versions.** A Siglake binary declares the schema it
 wants; a table records the schema it is at, under the
 `siglake.schema_version.v1` table property. When the binary is newer than the
 table, the columns the table lacks **cannot be written** — so rather than
@@ -1707,7 +1707,7 @@ stale leading-edge answers and is prohibited.
 
 ## Consuming segments (external pipelines)
 
-siglake writes every accepted event to a write-ahead log before anything else
+Siglake writes every accepted event to a write-ahead log before anything else
 touches it. `siglake_wal::consumer::SegmentConsumer` is the supported way for a
 **separate process** to read that stream — a detector, a router, a mirror into
 another system — with a durable cursor, at-least-once delivery, reads that
@@ -1719,7 +1719,7 @@ is the whole contract. See **[docs/CONSUMING_SEGMENTS.md](CONSUMING_SEGMENTS.md)
 
 This interface is not speculative. A four-tier semantic detection pipeline
 (streaming detectors → episode correlation → webhook dispatch) shipped *inside*
-siglake until 2026-08-29 and was moved out to run entirely on top of it,
+Siglake until 2026-08-29 and was moved out to run entirely on top of it,
 consuming the WAL through these four calls and nothing else. That pipeline is
 maintained as the reference consumer deliberately: if the interface cannot build
 it, the interface is wrong.
@@ -2117,5 +2117,5 @@ surfaces, because the 50G text ceilings were measured on the scan path and the
 sidecar path does not meet them at that layout's index sizes.
 The design record lives in `docs/` (`DESIGN_*`).
 
-> siglake was renamed from **knulps** on 2026-06-12; pre-rename documents in
+> Siglake was renamed from **knulps** on 2026-06-12; pre-rename documents in
 > the internal history and older commits use the old name. Same system.

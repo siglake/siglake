@@ -36,7 +36,7 @@ const SPECS: &[Spec] = &[
 #[derive(Parser, Debug)]
 #[command(
     name = "siglake-openapi",
-    about = "Emit the committed OpenAPI 3.1 specs for the siglake HTTP servers."
+    about = "Emit the committed OpenAPI 3.1 specs for the Siglake HTTP servers."
 )]
 struct Cli {
     /// Directory to write the spec files into.

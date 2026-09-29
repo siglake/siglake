@@ -1,6 +1,6 @@
 # Things deliberately not yet done
 
-The engineering record of what siglake 0.1.0 leaves out on purpose, why, and
+The engineering record of what Siglake 0.1.0 leaves out on purpose, why, and
 what would change it — one entry per decision, kept current with the code. It
 moved here from the README on 2026-09-15; the docs site's
 [Limitations](https://docs.siglake.dev/about/limitations/) page is the
@@ -472,7 +472,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `metadata/siglake-agg-wide.json`, `metadata/siglake-agg-deltas/`) and nothing
   adopts them, because the name they share with the current table is exactly
   what proves nothing; nothing deletes them either — the orphan GC still counts
-  them as siglake's. So an upgraded table starts a fresh aggregate at its first
+  them as Siglake's. So an upgraded table starts a fresh aggregate at its first
   commit, which is short of `record_count` for every row that predates the
   upgrade: `GROUP BY` answers stay exact and fall to the per-file tiers. The
   maintenance census finds that state within 15 minutes and reports it
@@ -522,7 +522,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   read error and the attempts spent, and its batch siblings commit on the next
   pass. What is left out is any automatic way back. `poison/` is excluded from
   the `orphans/` disposition that runs every cycle, survives restarts, and is
-  never deleted or rewritten: requeueing is an operator running `siglake
+  never deleted or rewritten: requeueing is an operator running `Siglake
   wal-requeue --wal <wal-root>` once the cause is fixed, and a segment requeued
   unchanged simply spends its attempts again. Where the corruption is local and
   the WAL mirror holds a good copy, `siglake wal-recover --apply` is the other
@@ -552,7 +552,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   [`DESIGN_managed_index_put_preconditions.md`](DESIGN_managed_index_put_preconditions.md).
 - **Pre-0.1.0 warehouses are not migrated to the current timestamp contract.**
   Tables written before 2026-09-06 are Iceberg format version 3 with a
-  nanosecond `timestamp` and no `timestamp_ns` sibling. siglake still reads
+  nanosecond `timestamp` and no `timestamp_ns` sibling. Siglake still reads
   them, but no external v2-only engine can, and there is no in-place upgrade:
   Iceberg cannot change a column's precision and cannot downgrade a v3 table.
   **Recreate such a warehouse** (delete and re-ingest). A read-old/write-new
@@ -579,7 +579,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   attachment and Trino versions other than 483 are covered by no measurement.
   The object-storage external read remains open (#1560).
   `scripts/check-external-timestamp-contract.sh` is the regression check, but
-  only its siglake half (format version, Iceberg field types, the
+  only its Siglake half (format version, Iceberg field types, the
   `timestamp_ns` round-trip, the total order) runs without those engines
   installed, and the script does not include Trino. A run that verified nothing
   external no longer reads as green: `scripts/ci-local.sh --all --strict` passes
@@ -1349,7 +1349,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   skipped and the cursor advances past it, which is what keeps continuous
   compaction (re-cluster, retention, delete tasks — all Iceberg `overwrite`
   commits whose replacement files are `ADDED`) from re-delivering rows a
-  consumer already has. siglake marks its own rewrites with the
+  consumer already has. Siglake marks its own rewrites with the
   `siglake.rewrite` snapshot-summary property; a non-append commit written by
   another engine (Spark `INSERT OVERWRITE`, `MERGE`, a row-level delete) is
   skipped too, so any rows it genuinely added are never delivered. It is
@@ -1421,7 +1421,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   acknowledgement is not remotely durable. `wal.mirror.activeIntervalSecs`
   snapshots every in-flight segment every N seconds — one object per open
   writer, keyed `_active/<tenant>[/<index>]/<segment>` — which narrows that
-  window to N seconds on one recovery path: an operator runs `siglake
+  window to N seconds on one recovery path: an operator runs `Siglake
   wal-recover --apply` to rebuild the WAL root from the mirror, and the
   filesystem drain commits the recovered segments. Until #5055 that path
   narrowed nothing on a server: the loop was handed the ingester's root
@@ -1457,10 +1457,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   requires investigation. The file size is the whole of that bound, and in a
   segment with no frame CRC behind it a torn tail and deliberate corruption
   are the same bytes. The ack is also only as durable as the filesystem under
-  the WAL: siglake syncs the segment's bytes
+  the WAL: Siglake syncs the segment's bytes
   and every directory entry that names it, and assumes those syncs reach the
   device. A network filesystem answers `fsync(2)` on its own terms and
-  siglake measures none of them, so ext4 or xfs on a node-attached volume is
+  Siglake measures none of them, so ext4 or xfs on a node-attached volume is
   the substrate the power-loss claim is made for.
 - **`siglake wal-recover` can only tell the mirror root from its parent where
   the mirror has a marker, or where `--catalog` is given.** #4928 made a
@@ -1475,7 +1475,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   #4973 answers this in two parts. The command now PLANS unless it is given
   `--apply`, so the reconstructed destinations — the tenant an operator does
   not have, spelled out — are on screen before a byte is written. And where
-  the mirror carries one of siglake's own markers (`_active/…​.arrow.partial`,
+  the mirror carries one of Siglake's own markers (`_active/…​.arrow.partial`,
   or `<tenant>/<index>/owner` from the catalog-claim drain) the listing
   settles it: at its own depth the marker confirms the root, one component
   deeper it refuses the run and names the directory to pass instead.
@@ -1856,7 +1856,7 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   into one fetch and charges the length of that fetch
   (`get_byte_ranges`/`merge_ranges` in
   `third_party/iceberg/src/arrow/reader/file_reader.rs`); nothing set by
-  siglake turns this off, because leaving the range knobs unset selects the
+  Siglake turns this off, because leaving the range knobs unset selects the
   reader's own 1 MiB default rather than no coalescing. A selective query whose
   needle sits a few pages into a column chunk is therefore charged for the
   dictionary page, the pages between it and the one it wanted, and the page

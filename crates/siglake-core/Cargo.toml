@@ -3,7 +3,7 @@ name = "siglake-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Core types (events, schema, errors) shared across siglake crates."
+description = "Core types (events, schema, errors) shared across Siglake crates."
 
 [features]
 default = []

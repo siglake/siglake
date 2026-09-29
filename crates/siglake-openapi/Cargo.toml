@@ -3,7 +3,7 @@ name = "siglake-openapi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Emit the committed OpenAPI 3.1 specs for the siglake HTTP servers."
+description = "Emit the committed OpenAPI 3.1 specs for the Siglake HTTP servers."
 
 [[bin]]
 name = "siglake-openapi"

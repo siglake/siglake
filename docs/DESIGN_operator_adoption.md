@@ -8,7 +8,7 @@ GA'd operator had only ever been validated on clusters it CREATED.
 ## Problem
 
 `SiglakeCluster` reconciliation renders its own six-tier resource set.
-Pointing it at a namespace that already runs a helm-rendered siglake
+Pointing it at a namespace that already runs a helm-rendered Siglake
 would today either fight helm's objects (same names ⇒ ownership
 conflicts, dueling updates) or double-deploy (different names ⇒ two
 compactors claiming — safe via the claim table, but two ingesters

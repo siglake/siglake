@@ -1,6 +1,6 @@
-# Consuming siglake segments
+# Consuming Siglake segments
 
-siglake writes every accepted event to a write-ahead log before anything else
+Siglake writes every accepted event to a write-ahead log before anything else
 touches it, and the compactor drains that log into Iceberg. This document
 describes the supported way for a **separate process** to read the same stream —
 a detector, a router, a mirror into another system, an audit trail.
@@ -85,7 +85,7 @@ consumer would fill an ingester's disk. So the guarantee degrades to "you missed
 some", not "the cluster fell over". **Alert on your own lag.** If `read` returns
 an error saying a segment is no longer present, that is what happened.
 
-**One consumer, one directory.** siglake's layout is `<wal>/<tenant>/` and, for
+**One consumer, one directory.** Siglake's layout is `<wal>/<tenant>/` and, for
 user indexes, `<wal>/<tenant>/<index>/`. Use `list_tenant_dirs` and
 `list_index_dirs` to enumerate them and run a consumer per directory.
 
@@ -132,26 +132,26 @@ counted by `siglake_subscription_rewrite_commits_skipped_total{table,origin}` �
 in *your* recorder, if you installed one; see "Subscription metrics are
 library-only" below.
 
-**External overwrite semantics are not supported.** siglake stamps its own
+**External overwrite semantics are not supported.** Siglake stamps its own
 rewrites with the `siglake.rewrite` snapshot-summary property
 (`origin="siglake"`), and none of them adds a row a subscription has not already
-been offered. If *another* engine commits a non-append to a siglake table — a
+been offered. If *another* engine commits a non-append to a Siglake table — a
 Spark `INSERT OVERWRITE`, a `MERGE`, a row-level delete — the subscription skips
 it the same way, counts it with `origin="foreign"` and logs a WARN: any rows
 that commit genuinely added are **not delivered**, because nothing in the
 manifest distinguishes a replacement file from a new-row file. Recover those
 rows by querying the interval (`POST /api/v1/sql`), as with a history gap, or
-write through siglake's ingest path instead. If you are an embedded consumer
+write through Siglake's ingest path instead. If you are an embedded consumer
 exporting the counter, alert on the `origin="foreign"` series; under the
-`siglake subscribe` CLI the WARN line is the whole signal. (Re-clusters siglake
+`siglake subscribe` CLI the WARN line is the whole signal. (Re-clusters Siglake
 committed before the marker existed land in the same bucket; the treatment is
 identical.)
 
 **Subscription metrics are library-only.** `IcebergSubscription` increments
 these counters through the `metrics` facade, which records nothing until a
-process installs a recorder. Only `siglake ingest-server` and `siglake
-compactor` do that, and neither runs a subscription; the shipped `siglake
-subscribe` CLI installs no recorder and serves no `/metrics`, so no siglake
+process installs a recorder. Only `siglake ingest-server` and `Siglake
+compactor` do that, and neither runs a subscription; the shipped `Siglake
+subscribe` CLI installs no recorder and serves no `/metrics`, so no Siglake
 process exports `siglake_subscription_rewrite_commits_skipped_total` or
 `siglake_subscription_history_gap_total` and no shipped chart rule alerts on
 them. They are there for a consumer that embeds the crate and installs its own
@@ -159,7 +159,7 @@ recorder and exporter — every alerting suggestion on this page means "in your
 own monitoring". If you run the CLI instead, its operator signals are the WARN
 above and a poll that fails outright.
 
-**Snapshot expiry can break that chain.** siglake's compactor drops old
+**Snapshot expiry can break that chain.** Siglake's compactor drops old
 snapshots from table metadata on a timer — `SIGLAKE_SNAPSHOT_RETAIN_LAST`
 (default 100), swept every 60s — because the `snapshots` array is re-read on
 every commit. If you are down for more than `retain_last` commits, the ancestors
@@ -190,7 +190,7 @@ do:
   reclustering commits count too), and alert on the
   `siglake_subscription_history_gap_total` counter — it increments once per
   refused poll, per table. Same caveat as above: that counter only exists in a
-  process that installed its own recorder and exporter, which the `siglake
+  process that installed its own recorder and exporter, which the `Siglake
   subscribe` CLI does not; there a gap surfaces as the command failing with the
   `HistoryGap` error.
 
@@ -214,11 +214,11 @@ mounting the same volume the ingester writes to:
 Nothing about a consumer is privileged: it is an ordinary pod with a volume
 mount.
 
-## Building against siglake
+## Building against Siglake
 
 `siglake-wal` is a normal Rust crate. Note that if you also link
 `siglake-storage` — e.g. to write results into Iceberg tables — you must patch
-the `iceberg` crates the same way siglake does, because siglake builds against
+the `iceberg` crates the same way Siglake does, because Siglake builds against
 **vendored forks** under `third_party/`:
 
 ```toml
@@ -233,7 +233,7 @@ Without this you get the upstream crates and a wall of unresolved imports.
 ## This interface is not speculative
 
 A four-tier semantic detection pipeline — streaming detectors, episode
-correlation, webhook dispatch — shipped *inside* siglake until 2026-08-29. It
+correlation, webhook dispatch — shipped *inside* Siglake until 2026-08-29. It
 was moved out and now runs entirely on top of this interface, consuming the WAL
 through these four calls and nothing else.
 
@@ -245,9 +245,9 @@ and reads that survive the compactor's renames.
 
 ## History
 
-siglake used to contain its own detection pipeline, which read the WAL through
+Siglake used to contain its own detection pipeline, which read the WAL through
 the raw primitives (`list_visible`, `read_segment`,
-`publish_consumer_watermark`) and carried its own cursor. That made siglake a
+`publish_consumer_watermark`) and carried its own cursor. That made Siglake a
 storage engine with one particular detector welded to it, and left the
 guarantees above as things the in-tree consumer happened to do correctly rather
 than things any consumer could rely on.
@@ -260,7 +260,7 @@ interface makes the safe thing the easy thing — stop, and it is re-delivered.
 
 ### Nothing is still coupled
 
-siglake used to keep the detection pipeline's output tables too — `candidates`,
+Siglake used to keep the detection pipeline's output tables too — `candidates`,
 `episodes`, `episode_events`, `detector_runs`, `webhook_dlq` — with built-in
 schemas, `ensure_*`/`append_*` methods, DataFusion registration hooks, and
 reserved names so nobody could create an index that collided. A storage engine
@@ -280,11 +280,11 @@ anywhere: `SELECT … FROM candidates` registers through the generic index path,
 list of five names; any index works now), per-index retention applies, and
 `siglake sql-direct` sees it.
 
-A fresh siglake warehouse now contains `events` and `query_audit` and nothing
+A fresh Siglake warehouse now contains `events` and `query_audit` and nothing
 else. The only reserved index id is `query_audit`.
 
 `siglake_core::shard` went too — consistent `(host, sourcetype)` partitioning
-for replicated consumers. It had no callers inside siglake; sharding a consumer
+for replicated consumers. It had no callers inside Siglake; sharding a consumer
 is the consumer's business, and the chart's `siglake.shardEnv` helper still
 supplies `SIGLAKE_SHARD_INDEX`/`_COUNT` from StatefulSet ordinals for anyone who
 wants it.

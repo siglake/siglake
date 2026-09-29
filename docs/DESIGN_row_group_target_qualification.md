@@ -141,13 +141,13 @@ left to win.
 `bytes_data` is the length of each MERGED fetch, not of what was asked for. The
 fork's `get_byte_ranges` runs the requested ranges through `merge_ranges` and
 charges each physical fetch
-(`third_party/iceberg/src/arrow/reader/file_reader.rs:229`, :247). siglake sets
+(`third_party/iceberg/src/arrow/reader/file_reader.rs:229`, :247). Siglake sets
 no range knobs, so `effective_reader_tuning` returns `None` for both and the
 fork's own `DEFAULT_RANGE_COALESCE_BYTES` of 1 MiB applies
 (`third_party/iceberg/src/arrow/reader/mod.rs:34`): two requested ranges less
 than 1 MiB apart become one fetch, and every byte between them is read and
 charged. At the time of the measurement the scan logged `range_enabled=false`,
-which said siglake configured nothing, not that the reader stopped coalescing.
+which said Siglake configured nothing, not that the reader stopped coalescing.
 #5806 renamed that field to `range_override_applied` and made
 `range_coalesce_bytes` / `range_fetch_concurrency` report the values the reader
 will apply, so the same scan now logs the 1 MiB it really coalesces at.
@@ -157,7 +157,7 @@ it selects — the predicate column under the page-index selection, widened to
 batch boundaries because parquet caches predicate columns, then `raw` under the
 selection the predicate produced. Each goes through the coalescer on its own.
 The batch is parquet's own `DEFAULT_BATCH_SIZE` of 1,024, not DataFusion's
-8,192: the fork calls `with_batch_size` only when siglake configured one
+8,192: the fork calls `with_batch_size` only when Siglake configured one
 (`third_party/iceberg/src/arrow/reader/pipeline.rs`), and nothing here sets
 `QueryScanTuning::batch_size`. On this layout the distinction does not move a
 byte, but not because the expansion is a no-op: pages here run ~20,000 rows and

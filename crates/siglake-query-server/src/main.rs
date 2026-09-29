@@ -20,7 +20,7 @@ use siglake_storage::{configure_query_scan_tuning, iceberg::IcebergContext, Quer
 #[derive(Parser, Debug)]
 #[command(
     name = "siglake-query-server",
-    about = "HTTP query API for the siglake Iceberg warehouse",
+    about = "HTTP query API for the Siglake Iceberg warehouse",
     version = siglake_core::BUILD_VERSION
 )]
 struct Cli {

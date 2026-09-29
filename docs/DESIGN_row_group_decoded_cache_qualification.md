@@ -178,7 +178,7 @@ Checked against the cache-disabled control, not against expectations:
   appears in the control's unclipped answer, and that the unclipped answer over
   the partially populated cache equals the control's sorted row for row.
 
-Not verified: a task that is itself a sub-file split (siglake plans one task per
+Not verified: a task that is itself a sub-file split (Siglake plans one task per
 file today, so the derived-range arithmetic for a split's remainder is exercised
 only from index 0), the reversed/ordered path (refused by construction),
 eviction of row-group entries under a budget too small to hold them, files with

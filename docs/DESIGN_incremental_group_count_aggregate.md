@@ -39,7 +39,7 @@ proportional to total cardinality.
 
 ## Design: base + deltas, folded in the background
 
-The same LSM shape siglake already uses for data, applied to the aggregate.
+The same LSM shape Siglake already uses for data, applied to the aggregate.
 Four object classes per table incarnation. Every one of them is addressed
 under `metadata/siglake-agg/<table-uuid>/`, so an index recreated at the same
 location reads only what its own incarnation wrote (#2919; the paths below are

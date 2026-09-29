@@ -1,11 +1,11 @@
-# Contributing to siglake
+# Contributing to Siglake
 
-Thanks for your interest in siglake. This document covers the mechanics of
+Thanks for your interest in Siglake. This document covers the mechanics of
 building, testing, and submitting changes.
 
 ## Building
 
-siglake is a Rust workspace. The pinned toolchain is in `rust-toolchain.toml`
+Siglake is a Rust workspace. The pinned toolchain is in `rust-toolchain.toml`
 (currently rustc 1.95.0); `rustup` picks it up automatically.
 To bump it, update the channel in `rust-toolchain.toml`, then run
 `scripts/ci-local.sh` with the new toolchain before submitting the change.
@@ -71,7 +71,7 @@ external services.
 
 ## Local stack
 
-A full local deployment (Postgres catalog + MinIO warehouse + siglake) is one
+A full local deployment (Postgres catalog + MinIO warehouse + Siglake) is one
 command:
 
 ```sh

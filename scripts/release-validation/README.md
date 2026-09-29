@@ -1,6 +1,6 @@
 # Public release validation
 
-Customer-runnable release tests live in **siglake**. Comparative performance
+Customer-runnable release tests live in **Siglake**. Comparative performance
 benchmarks belong to **siglake/siglake-benchmarks**. Release acceptance, install
 checks, cancellation soaks and burn-ins must not be dependencies of that public
 comparison site. Source CI and a successful performance run do not certify the

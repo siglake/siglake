@@ -64,7 +64,7 @@ than we are to guess.
 This is deliberately narrower than the competition. Quickwit's terms aggregation
 is *always* approximate: its `top_hosts` on this corpus reported
 `sum_other_doc_count: 238,291,469` — it discarded **96.4%** of the corpus to
-answer in 7.7ms, and you only learn that by reading the raw response. siglake
+answer in 7.7ms, and you only learn that by reading the raw response. Siglake
 answering exactly where it can, approximately where it must, and saying which,
 is a stronger position than either mode alone.
 

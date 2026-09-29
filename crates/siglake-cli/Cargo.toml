@@ -3,7 +3,7 @@ name = "siglake-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "siglake CLI: smoke-test ingest and query for the siglake storage layer."
+description = "Siglake CLI: smoke-test ingest and query for the Siglake storage layer."
 
 [[bin]]
 name = "siglake"

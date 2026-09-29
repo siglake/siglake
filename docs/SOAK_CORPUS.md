@@ -1,4 +1,4 @@
-# siglake soak-test corpus
+# Siglake soak-test corpus
 
 A reusable, deterministic dataset + query suite for AWS soak testing.
 
@@ -61,7 +61,7 @@ tar -cz -f corpus-medium.tar.gz -C ~/corpus medium
 aws s3 cp --recursive ~/corpus/medium s3://my-soak-artifacts/corpus-medium/
 ```
 
-### 2. Load into a running siglake
+### 2. Load into a running Siglake
 
 ```bash
 cargo run --release -p siglake-loadgen --bin siglake-corpus -- \
@@ -138,7 +138,7 @@ s3://<your-corpus-bucket>/medium/
 └── queries.json
 ```
 
-Permissions: artifacts are non-sensitive (no real customer data) so a public-read prefix works, but the production pattern is per-account IAM. The `load` and `verify` subcommands talk only to your siglake deployment — they don't touch S3 directly; you pre-pull the corpus to local disk first.
+Permissions: artifacts are non-sensitive (no real customer data) so a public-read prefix works, but the production pattern is per-account IAM. The `load` and `verify` subcommands talk only to your Siglake deployment — they don't touch S3 directly; you pre-pull the corpus to local disk first.
 
 ## Backpressure baseline (Phase 4.13)
 

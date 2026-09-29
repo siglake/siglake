@@ -1,6 +1,6 @@
 # Design: time-ordered Parquet storage
 
-Status: **shipped 2026-06-05.** siglake is fundamentally a time-series store, so
+Status: **shipped 2026-06-05.** Siglake is fundamentally a time-series store, so
 data is physically ordered by its event-time column when written to Parquet —
 as a single, centralized, declared invariant of the storage layer.
 
@@ -24,9 +24,9 @@ uses one is closed to every v2-only reader. Spark cannot map them at all
 `TimestampType` is microseconds), DuckDB's iceberg extension rejects
 `timestamptz_ns`, and PyIceberg refuses the type. Microsecond `timestamptz` and
 `day()` are both v2 constructs, so `minimum_format_version` now stamps every
-schema siglake ships at **format version 2** and the whole reader matrix opens.
+schema Siglake ships at **format version 2** and the whole reader matrix opens.
 Nothing is lost: `timestamp_ns` carries the exact nanosecond as a plain `long`,
-which every engine reads, and siglake's own scans filter and order on it.
+which every engine reads, and Siglake's own scans filter and order on it.
 External SQL uses `to_timestamp_nanos(timestamp_ns)` when it needs exactness.
 
 **Migration: recreate, do not upgrade.** Warehouses written before 2026-09-06

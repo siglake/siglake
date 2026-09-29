@@ -1,9 +1,9 @@
 # Vendored apache/iceberg-rust 0.10.1
 
-This fork is based on the published `iceberg` crate 0.10.1. It is in-tree so siglake
+This fork is based on the published `iceberg` crate 0.10.1. It is in-tree so Siglake
 can own and modify the Parquet **read path** (the scan/arrow reader), which the
 published crate exposes only as a closed box. Wired via `[patch.crates-io]` in
-the workspace Cargo.toml so siglake + the iceberg-catalog-sql / -datafusion /
+the workspace Cargo.toml so Siglake + the iceberg-catalog-sql / -datafusion /
 -storage-opendal companions all build against this copy.
 
 Keep API additions backward-compatible so the companion crates keep compiling.

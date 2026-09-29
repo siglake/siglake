@@ -1,6 +1,6 @@
 # Durable backoff for short-aggregate repair
 
-Status: decision for 0.2.0; implementation is siglake task #5576. The 0.1.1
+Status: decision for 0.2.0; implementation is Siglake task #5576. The 0.1.1
 behavior and operator workaround remain unchanged.
 
 ## The failure to retain

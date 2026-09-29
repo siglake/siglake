@@ -1,6 +1,6 @@
-# siglake Helm chart
+# Siglake Helm chart
 
-Installs the siglake data plane (ingester, compactor, and query-server)
+Installs the Siglake data plane (ingester, compactor, and query-server)
 backed by a customer-provided RDS Postgres + S3 warehouse.
 
 This chart is intentionally light on managed infrastructure: it
@@ -549,7 +549,7 @@ metric would read double.
 autoscaling PromQL selects on.
 
 Set `prometheusRule.enabled=true` for alerts on the failure modes
-siglake has hit or pins with a deterministic loss regression: silent-loss counters (abandoned mirror
+Siglake has hit or pins with a deterministic loss regression: silent-loss counters (abandoned mirror
 registrations, CRC mismatches, refused writes, lost group-count
 deltas), a stalled drain, a non-converging layout, query-pool
 saturation, sustained pool refusals (`SiglakeQueryPoolRefusing`), incomplete

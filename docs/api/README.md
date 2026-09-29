@@ -1,6 +1,6 @@
 # OpenAPI specifications
 
-Machine-readable OpenAPI 3.1 descriptions of siglake's HTTP APIs:
+Machine-readable OpenAPI 3.1 descriptions of Siglake's HTTP APIs:
 
 - **`openapi-ingest.yaml`** — the ingest server (`siglake ingest-server`, default
   `:8088`): OTLP/HTTP logs and traces, plus an Elasticsearch 7.10-shaped

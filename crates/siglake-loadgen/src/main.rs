@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 #[derive(Parser, Debug, Clone)]
-#[command(about = "siglake OTLP ingest load generator", version)]
+#[command(about = "Siglake OTLP ingest load generator", version)]
 struct Args {
     /// Ingest base URL (without the `/v1/logs` path).
     #[arg(long, default_value = "http://localhost:8088")]

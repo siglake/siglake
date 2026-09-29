@@ -3,7 +3,7 @@ name = "siglake-loadgen"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "OTLP ingest load generator for siglake stress testing."
+description = "OTLP ingest load generator for Siglake stress testing."
 
 [[bin]]
 name = "siglake-loadgen"

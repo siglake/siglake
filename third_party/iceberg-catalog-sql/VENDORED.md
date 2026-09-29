@@ -1,6 +1,6 @@
 # Vendored apache/iceberg-rust `iceberg-catalog-sql` 0.10.1
 
-A fork of the `iceberg-catalog-sql` crate 0.10.1, kept in-tree so siglake can
+A fork of the `iceberg-catalog-sql` crate 0.10.1, kept in-tree so Siglake can
 own and modify the **commit path**. The published crate's `update_table`
 re-loads the table (one S3 GET + full `metadata.json` parse) on every commit,
 even though `Transaction::do_commit` in the (also-vendored) `iceberg` core has
@@ -24,7 +24,7 @@ crates.io `iceberg-catalog-sql` 0.10.1, upstream commit
 record. The sha comes from the pristine 0.10.1 package's own
 `.cargo_vcs_info.json` in the cargo registry
 (`~/.cargo/registry/src/index.crates.io-*/iceberg-catalog-sql-0.10.1/`); it is not
-derived from a siglake commit. Git history cannot supply an earlier vendoring
+derived from a Siglake commit. Git history cannot supply an earlier vendoring
 commit — the tree was squashed at 614c6cd (2026-06-12), the first commit that
 touches this directory.
 

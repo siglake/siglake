@@ -2,9 +2,9 @@
 
 **Status:** contract, from v0.1.0.
 
-siglake stores its data in Parquet under an Apache Iceberg table, both of which
+Siglake stores its data in Parquet under an Apache Iceberg table, both of which
 have their own compatibility stories. This document covers the layer *we* own:
-the accelerators siglake writes into Parquet footer key-value metadata, into
+the accelerators Siglake writes into Parquet footer key-value metadata, into
 Iceberg table/snapshot properties, and into side objects. Those are our formats,
 so their evolution is our problem.
 

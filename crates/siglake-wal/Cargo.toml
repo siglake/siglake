@@ -3,7 +3,7 @@ name = "siglake-wal"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Write-Ahead Log: Arrow IPC stream segments for the siglake ingest path."
+description = "Write-Ahead Log: Arrow IPC stream segments for the Siglake ingest path."
 
 [dependencies]
 siglake-core = { workspace = true }

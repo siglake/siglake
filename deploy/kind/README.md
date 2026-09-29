@@ -4,7 +4,7 @@ A single-node kind cluster running:
 
 - **postgres** for the Iceberg catalog
 - **minio** for the S3 warehouse
-- the **siglake** Helm chart (ingester, compactor, and query-server)
+- the **Siglake** Helm chart (ingester, compactor, and query-server)
 
 Unlike `deploy/aws/`, this does *not* exercise IRSA, EFS, or RDS — it
 exists for chart development and quick functional smoke testing

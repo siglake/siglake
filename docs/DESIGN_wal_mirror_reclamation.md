@@ -157,7 +157,7 @@ works with SQLite installs and with no catalog at all.
 It satisfies every requirement, and it duplicates machinery that exists and is
 already exercised: the purge query, the object-first ordering, the page budgets,
 the leases, the metrics and the two alerts. A second durable format with its own
-crash semantics is the part to weigh; siglake already carries the WAL, the pins,
+crash semantics is the part to weigh; Siglake already carries the WAL, the pins,
 the owner markers and the mirror-sync cursor.
 
 ## Option C — mark the ledger that already exists (recommended)

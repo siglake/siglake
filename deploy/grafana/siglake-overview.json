@@ -1,6 +1,6 @@
 {
  "uid": "siglake-overview",
- "title": "siglake overview",
+ "title": "Siglake overview",
  "tags": [
   "siglake",
   "logs",
@@ -87,7 +87,7 @@
     "graphMode": "none",
     "justifyMode": "auto"
    },
-   "description": "Build version and commit reported by each scraped siglake server process."
+   "description": "Build version and commit reported by each scraped Siglake server process."
   },
   {
    "id": 100,

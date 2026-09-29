@@ -478,7 +478,7 @@ section first written up on 2026-09-16 as 0.1.1; that version was never tagged.
   nothing under `--to`, `--to` itself included. A script or runbook calling
   the old single-command form stops writing and prints a plan instead.
 
-  The same listing settles whether `--from` is the mirror root. siglake writes
+  The same listing settles whether `--from` is the mirror root. Siglake writes
   two markers at a fixed depth under it — a first component `_active` with a
   `.arrow.partial` tail, and `<tenant>/<index>/owner` from the catalog-claim
   drain — so either at its own depth confirms the root, and either exactly one
@@ -650,7 +650,7 @@ section first written up on 2026-09-16 as 0.1.1; that version was never tagged.
   `events`, so a compactor that has never retried reads 0 beside the failure
   series rather than being absent. (#4759)
 
-- **Release images report the commit they were built from**: `siglake
+- **Release images report the commit they were built from**: `Siglake
   --version` and the `siglake_build_info` metric read a revision stamped in at
   build time, and the publish workflow passed none. The builds copy no Git
   metadata, so the fallback `git rev-parse` had nothing to read and every
@@ -923,7 +923,7 @@ section first written up on 2026-09-16 as 0.1.1; that version was never tagged.
 
 ## 0.1.0 — initial public release
 
-siglake: a horizontally-scalable, OTLP-native log analytics platform on
+Siglake: a horizontally-scalable, OTLP-native log analytics platform on
 Parquet v2 + Apache Iceberg + DataFusion.
 
 - **Ingest**: OTLP/HTTP logs and traces (`POST /v1/logs`, `/v1/traces`), a
@@ -1056,7 +1056,7 @@ Parquet v2 + Apache Iceberg + DataFusion.
   waits for slow consumers (bounded, so a stuck consumer degrades to "you
   missed some" rather than filling the disk), and CRC integrity. See
   `docs/CONSUMING_SEGMENTS.md`.
-  The four-tier semantic detection pipeline that shipped inside siglake
+  The four-tier semantic detection pipeline that shipped inside Siglake
   through 2026-08-29 was moved out to run entirely on top of this interface,
   and is maintained as its reference consumer.
 - **Schema evolution**: a table records the schema version it is at. When
@@ -1093,13 +1093,13 @@ Parquet v2 + Apache Iceberg + DataFusion.
   a microsecond `timestamptz` (Parquet INT64 TIMESTAMP(MICROS, UTC)) that every
   Iceberg reader maps; `events` also carries `timestamp_ns`, a required `long`
   holding the OTLP `time_unix_nano` value verbatim, so nanosecond exactness is
-  available externally via `to_timestamp_nanos(timestamp_ns)` and siglake's own
+  available externally via `to_timestamp_nanos(timestamp_ns)` and Siglake's own
   scans lose nothing. Removing the v3 nanosecond-timestamp type opened the
   reader matrix: the
   [local-fixture compatibility evidence](https://docs.siglake.dev/guides/external-engines/#compatibility-evidence)
   demonstrates Trino 483, Spark 3.5.9 (`iceberg-spark-runtime-3.5_2.12:1.11.0`),
   DuckDB 1.5.5 (core `iceberg` `45163a28`) and PyIceberg 0.12.0 + PyArrow 25.0.1
-  each reading a format-version-2 warehouse without siglake in the path and
+  each reading a format-version-2 warehouse without Siglake in the path and
   agreeing on its exact `timestamp_ns` bounds. The fixture is on local disk with
   a SQLite catalog; the Spark measurement went through a wrapper because the
   bundled driver then selected a Hadoop catalog. Warehouses written before this

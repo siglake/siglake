@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: siglake ingest
+  title: Siglake ingest
   description: |-
     OTLP/HTTP logs and traces, plus an Elasticsearch 7.10-shaped bulk-ingest surface for existing shippers.
 

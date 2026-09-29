@@ -28,7 +28,7 @@ const DEFAULT_OTLP_GRPC_LISTEN: &str = "0.0.0.0:4317";
 #[derive(Parser, Debug)]
 #[command(
     name = "siglake",
-    about = "siglake command-line interface: servers, maintenance jobs and a SQL client",
+    about = "Siglake command-line interface: servers, maintenance jobs and a SQL client",
     version = siglake_core::BUILD_VERSION
 )]
 struct Cli {
@@ -279,7 +279,7 @@ enum Command {
         #[arg(long, env = "SIGLAKE_INGEST_RATE_REDIS_URL")]
         ingest_rate_redis_url: Option<String>,
         /// Hash-key prefix the Redis rate budget uses. Defaults to
-        /// `siglake:rb`. Use a unique prefix per siglake deployment
+        /// `siglake:rb`. Use a unique prefix per Siglake deployment
         /// that shares a Redis with other tenants.
         #[arg(long, env = "SIGLAKE_INGEST_RATE_REDIS_PREFIX")]
         ingest_rate_redis_prefix: Option<String>,

@@ -6,7 +6,7 @@ This directory contains first-class forks of three Apache-licensed crates:
 - `iceberg-catalog-sql` avoids redundant metadata reloads during optimistic commits.
 - `iceberg-storage-opendal` makes multipart uploads configurable and observable.
 
-They are **forks, not pinned copies**: siglake depends on behavior that does
+They are **forks, not pinned copies**: Siglake depends on behavior that does
 not exist upstream, so we maintain the divergences here and periodically
 rebase against upstream. All retain their original `LICENSE` and `NOTICE`
 files (Apache-2.0).
@@ -52,7 +52,7 @@ Upstream base: 0.10.1. Key divergences:
   with_current_schema`, opt-in): upstream resolves a scan's columns and
   predicate against the schema the scanned snapshot was written under, so an
   additive schema evolution that commits no data leaves the new columns
-  unscannable until some later append. siglake's query provider exposes the
+  unscannable until some later append. Siglake's query provider exposes the
   current schema to DataFusion, so it plans and scans against the same one.
 - **Rewrite (overwrite) action** (`Transaction::rewrite_files`,
   `transaction/rewrite.rs`): one `Overwrite` snapshot whose live file set is
@@ -130,7 +130,7 @@ What the script sets up, and why, for whoever next has to change it:
      copy also gets a `[workspace.dependencies]` block holding the root
      manifest's line for `metrics`. The script lifts that line rather than
      pinning its own, and fails if the root stops pinning it.
-3. `cargo test --lib` there, with the fork's default features — what siglake
+3. `cargo test --lib` there, with the fork's default features — what Siglake
    ships — and `cargo test --doc` for the two forks that have doc examples:
    - `iceberg`, which since #2671's `[dev-dependencies.tokio]` builds its five
      `#[tokio::main]` doctests standalone (85 pass, 9 ignored, ~4 s of the job:
@@ -220,7 +220,7 @@ rebased to 0.10.1 on 2026-09-19.
 Upstream builds every writer as `op.writer(path)` with no options, and opendal's
 `WriteOptions` derives `Default` with `concurrent: 0`, which its `MultipartWrite`
 passes into `ConcurrentTasks::new(executor, concurrent, ..)`. So every Parquet
-file siglake writes to object storage sends its parts **one at a time** — the
+file Siglake writes to object storage sends its parts **one at a time** — the
 2026-08-08 1TB round measured flush (S3 PUT) at 30.2% of append time, the
 largest single stage, with ~534 MB files going up in ~133 MB parts serially.
 

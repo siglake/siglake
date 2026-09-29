@@ -7,7 +7,7 @@ production code carries every case this qualification made. **Date:**
 
 Option D of `docs/DESIGN_wal_recovery_root_identity.md`. #4973 shipped option
 C: the command plans unless it is given `--apply`, and the same listing carries
-a root verdict read off the two markers siglake writes at a fixed depth under
+a root verdict read off the two markers Siglake writes at a fixed depth under
 the mirror root. The population with neither marker — no managed index, active
 mirroring off — is the default install, and its listing one component above the
 mirror root is indistinguishable from a legitimate mirror whose first tenant is
@@ -168,7 +168,7 @@ A WAL-mode database needs a `-shm` file created beside it, which a read-only
 mount refuses, though every statement is a SELECT. sqlx does not set
 `journal_mode` unless it is asked to
 (`sqlx-sqlite-0.8.6/src/options/mod.rs:177-181`) and nothing in this workspace
-asks, so siglake's own SQLite catalogs are rollback-journal and `mode=ro`
+asks, so Siglake's own SQLite catalogs are rollback-journal and `mode=ro`
 covers them — including one a live deployment still holds open
 (`a_ledger_a_live_deployment_is_still_writing_opens_read_only`). `immutable=1`
 is what a WAL-mode catalog on a rescued read-only volume costs, and it is not

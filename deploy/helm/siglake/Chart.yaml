@@ -1,7 +1,7 @@
 apiVersion: v2
 name: siglake
 description: |
-  siglake — an OTLP-native log analytics platform in Rust, built on
+  Siglake — an OTLP-native log analytics platform in Rust, built on
   Parquet v2 + Apache Iceberg + DataFusion. One chart deploys the three
   data-plane pods (ingester, compactor, query-server); per-service
   `enabled` toggles let customers turn off components they don't need.
