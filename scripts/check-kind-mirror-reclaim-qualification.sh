@@ -121,6 +121,86 @@ grep -qxF "$TRAP_LINE" "$ROUND" || fail "$ROUND lost the setup boundary"
 sed -n "1,/^${TRAP_LINE}\$/p" "$ROUND" | sed '$d' >"$sandbox/scripts/prelude.bash"
 cp scripts/kind-common.bash "$sandbox/scripts/kind-common.bash"
 
+# Exercise the production panel gate with Prometheus reduced to deterministic
+# series counts. Catalog claim still requires its mirror-sync histogram, while
+# both mirror-reclaim arms use filesystem drain and report that panel as not
+# applicable. Every other panel remains required in either mode.
+sed -n '/^query_panel()/,/^# --- #3647/p' "$ROUND" | sed '$d' \
+  >"$sandbox/scripts/panel-gate.bash"
+
+run_panel_fixture() {
+  local case=$1 catalog_claim=$2 mirror_result=$3 required_result=$4
+  local case_dir="$sandbox/panel-$case"
+  mkdir -p "$case_dir"
+  env FIXTURE_CATALOG_CLAIM="$catalog_claim" \
+    FIXTURE_MIRROR_RESULT="$mirror_result" \
+    FIXTURE_REQUIRED_RESULT="$required_result" \
+    FIXTURE_DIR="$case_dir" bash -c '
+    set -euo pipefail
+    source "$1"
+    CATALOG_CLAIM_ENABLED=$FIXTURE_CATALOG_CLAIM
+    PANEL_FAILURES=0
+    prometheus_result() {
+      local expression=$1
+      printf "%s\n" "$expression" >>"$FIXTURE_DIR/queries"
+      if [[ "$expression" == *siglake_compactor_mirror_sync_duration_seconds_bucket* ]]; then
+        [[ "$FIXTURE_MIRROR_RESULT" != error ]] || return 23
+        printf "%s\n" "$FIXTURE_MIRROR_RESULT"
+      elif [[ "$expression" == *siglake_ingest_request_duration_seconds_bucket* ]]; then
+        printf "%s\n" "$FIXTURE_REQUIRED_RESULT"
+      else
+        printf "1\t1\n"
+      fi
+    }
+    query_required_panels
+    printf "PANEL_FAILURES=%s\n" "$PANEL_FAILURES"
+    [[ "$PANEL_FAILURES" -eq 0 ]]
+  ' _ "$sandbox/scripts/panel-gate.bash" \
+    >"$case_dir/stdout" 2>"$case_dir/stderr"
+}
+
+run_panel_fixture catalog-present true $'1\t0.25' $'1\t0.5' ||
+  fail "catalog mode rejected the present mirror-sync series"
+grep -Fq 'PANEL id=134 ref=B series=1 sample=0.25' \
+  "$sandbox/panel-catalog-present/stdout" ||
+  fail "catalog mode did not retain panel 134/B evidence"
+grep -Fq 'PANEL_FAILURES=0' "$sandbox/panel-catalog-present/stdout" ||
+  fail "catalog mode marked the present mirror-sync series missing"
+
+if run_panel_fixture catalog-missing true $'0\t-' $'1\t0.5'; then
+  fail "catalog mode accepted an absent mirror-sync series"
+fi
+grep -Fq 'PANEL_FAILURES=1' "$sandbox/panel-catalog-missing/stdout" ||
+  fail "catalog mode did not attribute the absent mirror-sync series"
+
+for arm in off on; do
+  run_panel_fixture "filesystem-$arm" false $'0\t-' $'1\t0.5' ||
+    fail "filesystem-drain $arm arm rejected an inapplicable mirror-sync series"
+  grep -Fq 'PANEL id=134 ref=B status=not_applicable reason=catalog_claim_disabled_filesystem_drain' \
+    "$sandbox/panel-filesystem-$arm/stdout" ||
+    fail "filesystem-drain $arm arm did not report why panel 134/B is inapplicable"
+  grep -Fq 'PANEL_FAILURES=0' "$sandbox/panel-filesystem-$arm/stdout" ||
+    fail "filesystem-drain $arm arm marked the inapplicable panel missing"
+  if grep -Fq 'siglake_compactor_mirror_sync_duration_seconds_bucket' \
+      "$sandbox/panel-filesystem-$arm/queries"; then
+    fail "filesystem-drain $arm arm still queried the catalog-only histogram"
+  fi
+done
+
+if run_panel_fixture required-missing false $'0\t-' $'0\t-'; then
+  fail "filesystem drain accepted a missing universally required panel"
+fi
+grep -Fq 'PANEL_FAILURES=1' "$sandbox/panel-required-missing/stdout" ||
+  fail "filesystem drain did not attribute the missing required panel"
+
+if run_panel_fixture catalog-query-error true error $'1\t0.5'; then
+  fail "catalog mode accepted a Prometheus error for panel 134/B"
+fi
+if grep -Eq 'PANEL id=134 ref=B|PANEL_FAILURES=' \
+    "$sandbox/panel-catalog-query-error/stdout"; then
+  fail "the failed Prometheus query produced completed panel 134/B evidence"
+fi
+
 # Exercise the actual launch writer through both revision paths. The stand-in
 # SHA deliberately differs from the injection, and the injected arm must not
 # ask git for a second answer.
