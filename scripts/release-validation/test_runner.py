@@ -122,6 +122,49 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(v.classify_cohort_failure(earlier, started, ended), 'visibility_mismatch')
         self.assertEqual(v.classify_cohort_failure(current, started, ended), 'storage_capacity_exhausted')
 
+    def test_audit_checkpoint_requires_persisted_probe_and_inline_coverage(self):
+        covered = {'stats': {'served_by': 'tier1_inline', 'rows_scanned': 0}}
+        self.assertIsNone(v.audit_checkpoint_problem([{'n': 1}], covered))
+        self.assertIn(
+            'exactly one',
+            v.audit_checkpoint_problem([{'n': 0}], covered),
+        )
+        self.assertIn(
+            'served_by=\'materialized\'',
+            v.audit_checkpoint_problem(
+                [{'n': 1}],
+                {'stats': {'served_by': 'materialized', 'rows_scanned': 0}},
+            ),
+        )
+
+    def test_cleanup_fails_on_unexpected_supported_store_guard_refusal(self):
+        refusal = (
+            'query-server | ERROR error=cannot establish compatibility: inner cause '
+            + v.SIDE_AGGREGATE_GUARD_REFUSAL
+            + '\n'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            args = SimpleNamespace(
+                out=str(Path(temp)/'run'),
+                version='v0.2.1',
+                profile='smoke',
+                dependency_policy='public',
+            )
+            run = v.Run(args)
+            run.mutated = True
+            run.summary['status'] = 'passed'
+            replies = iter([refusal, '', '', '', ''])
+            with patch.object(run, 'cmd', side_effect=lambda *a, **kw: next(replies)), \
+                 patch.object(v, 'run_command', return_value=''):
+                run.cleanup()
+            self.assertEqual(run.summary['status'], 'failed')
+            self.assertEqual(run.summary['artifact_review'], 'failed')
+            self.assertEqual(run.summary['side_aggregate_guard_refusals'], 1)
+            self.assertEqual(
+                (run.out/'side-aggregate-guard-refusals.log').read_text(),
+                refusal,
+            )
+
     def test_failed_cohort_reports_current_project_storage_exhaustion_without_docker(self):
         with tempfile.TemporaryDirectory() as temp:
             args = SimpleNamespace(out=str(Path(temp)/'run'), version='v0.2.0', profile='smoke', dependency_policy='public')

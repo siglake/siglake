@@ -795,6 +795,7 @@ mod conditional_write_compatibility_tests {
         Neither,
         IfMatch,
         IfNotExists,
+        UnexpectedIfMatch,
     }
 
     #[derive(Debug)]
@@ -842,6 +843,12 @@ mod conditional_write_compatibility_tests {
             path: &str,
             args: OpWrite,
         ) -> opendal::Result<(opendal::raw::RpWrite, Self::Writer)> {
+            if self.ignored == IgnoredPrecondition::UnexpectedIfMatch && args.if_match().is_some() {
+                return Err(opendal::Error::new(
+                    opendal::ErrorKind::Unexpected,
+                    "fixture conditional write transport failed",
+                ));
+            }
             if self.ignored != IgnoredPrecondition::IfMatch {
                 if let Some(expected) = args.if_match() {
                     let actual = self
@@ -861,7 +868,9 @@ mod conditional_write_compatibility_tests {
             }
             let mut forwarded = OpWrite::default();
             match self.ignored {
-                IgnoredPrecondition::Neither | IgnoredPrecondition::IfMatch => {
+                IgnoredPrecondition::Neither
+                | IgnoredPrecondition::IfMatch
+                | IgnoredPrecondition::UnexpectedIfMatch => {
                     forwarded = forwarded.with_if_not_exists(args.if_not_exists());
                     if let Some(value) = args.if_none_match() {
                         forwarded = forwarded.with_if_none_match(value);
@@ -995,6 +1004,64 @@ mod conditional_write_compatibility_tests {
             "the refused endpoint must not overwrite the side object"
         );
     }
+
+    #[derive(Clone)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn side_aggregate_refusal_log_retains_the_probe_error_chain() {
+        let (_root, op) = operator(IgnoredPrecondition::UnexpectedIfMatch);
+        let compatibility = tokio::sync::OnceCell::new();
+        let error = require_conditional_write_compatibility(&op, &compatibility, true, true)
+            .await
+            .unwrap_err();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(CapturedLog(captured.clone()))
+            .finish();
+        let table = TableIdent::new(
+            NamespaceIdent::new("siglake".to_string()),
+            QUERY_AUDIT_TABLE.to_string(),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_side_aggregate_conditional_refusal(&error, &table);
+        });
+
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("cannot establish warehouse conditional-write compatibility"),
+            "outer context missing from {log:?}"
+        );
+        assert!(
+            log.contains("warehouse store gave no recognized stale If-Match rejection"),
+            "probe context missing from {log:?}"
+        );
+        assert!(
+            log.contains("fixture conditional write transport failed"),
+            "underlying OpenDAL error missing from {log:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1046,6 +1113,23 @@ mod conditional_write_live {
             .disable_config_load()
             .root(&root);
         Some(finish_operator(builder))
+    }
+
+    fn production_operator() -> Option<opendal::Operator> {
+        let warehouse = match std::env::var("SIGLAKE_WAREHOUSE_URL") {
+            Ok(warehouse) => warehouse,
+            Err(std::env::VarError::NotPresent) => {
+                println!("skipped: SIGLAKE_WAREHOUSE_URL is unset");
+                return None;
+            }
+            Err(err) => panic!("read SIGLAKE_WAREHOUSE_URL: {err}"),
+        };
+        let location = format!(
+            "{}/conditional-write-production-{}/",
+            warehouse.trim_end_matches('/'),
+            Uuid::now_v7()
+        );
+        Some(warehouse_operator(&location).unwrap())
     }
 
     #[test]
@@ -1185,7 +1269,7 @@ mod conditional_write_live {
             .context("clean up the conditional-write live test prefix")
     }
 
-    async fn guard_verdict_inner(op: &opendal::Operator) -> Result<()> {
+    async fn guard_verdict_inner(op: &opendal::Operator, evidence: &str) -> Result<()> {
         let verdict = probe_conditional_write_compatibility(op).await?;
         let compatibility = tokio::sync::OnceCell::new();
         compatibility
@@ -1201,7 +1285,7 @@ mod conditional_write_live {
             "conditional-write guard refusal={refusal}, fully_verified={fully_verified}"
         );
         println!(
-            "CONDITIONAL_WRITE_GUARD if_match={} if_not_exists={} refusal={}",
+            "{evidence} if_match={} if_not_exists={} refusal={}",
             verdict_name(verdict.if_match),
             verdict_name(verdict.if_not_exists),
             if refusal { "yes" } else { "no" }
@@ -1215,10 +1299,30 @@ mod conditional_write_live {
         let Some(op) = operator() else {
             return;
         };
-        let result = tokio::time::timeout(LIVE_TEST_TIMEOUT, guard_verdict_inner(&op))
-            .await
-            .context("conditional-write guard live test exceeded 120 seconds")
-            .and_then(|result| result);
+        let result = tokio::time::timeout(
+            LIVE_TEST_TIMEOUT,
+            guard_verdict_inner(&op, "CONDITIONAL_WRITE_GUARD"),
+        )
+        .await
+        .context("conditional-write guard live test exceeded 120 seconds")
+        .and_then(|result| result);
+        cleanup(&op).await.unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the compose object store and production service environment"]
+    async fn production_builder_guard_verdict() {
+        let Some(op) = production_operator() else {
+            return;
+        };
+        let result = tokio::time::timeout(
+            LIVE_TEST_TIMEOUT,
+            guard_verdict_inner(&op, "CONDITIONAL_WRITE_PRODUCTION_GUARD"),
+        )
+        .await
+        .context("production-builder conditional-write guard live test exceeded 120 seconds")
+        .and_then(|result| result);
         cleanup(&op).await.unwrap();
         result.unwrap();
     }
@@ -12506,6 +12610,14 @@ mod statistics_retirement_tests {
     }
 }
 
+fn log_side_aggregate_conditional_refusal(error: &anyhow::Error, table: &TableIdent) {
+    tracing::error!(
+        error = ?error,
+        table = %table,
+        "refusing side-aggregate publication because the warehouse did not verify conditional writes"
+    );
+}
+
 impl IcebergContext {
     /// Open (or create) a siglake catalog rooted at `warehouse_dir`.
     ///
@@ -15832,11 +15944,7 @@ impl IcebergContext {
         delta_tg: Option<TimeGroupCounts>,
     ) {
         if let Err(error) = self.require_safe_side_object_conditionals().await {
-            tracing::error!(
-                error = %error,
-                table = %target.table_ident,
-                "refusing side-aggregate publication because the warehouse did not verify conditional writes"
-            );
+            log_side_aggregate_conditional_refusal(&error, target.table_ident);
             return;
         }
         let SideAggregatePublication {

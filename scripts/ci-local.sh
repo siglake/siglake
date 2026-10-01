@@ -871,6 +871,11 @@ if [ "$WITH_HEAVY" = 1 ]; then
         SIGLAKE_TEST_S3_ENDPOINT="$SIGLAKE_S3_HOST_ENDPOINT" \
         SIGLAKE_TEST_S3_ACCESS_KEY="$SIGLAKE_S3_ACCESS_KEY" \
         SIGLAKE_TEST_S3_SECRET_KEY="$SIGLAKE_S3_SECRET_KEY" \
+        SIGLAKE_WAREHOUSE_URL="s3://siglake-warehouse/" \
+        AWS_ACCESS_KEY_ID="$SIGLAKE_S3_ACCESS_KEY" \
+        AWS_SECRET_ACCESS_KEY="$SIGLAKE_S3_SECRET_KEY" \
+        AWS_REGION="$SIGLAKE_S3_REGION" \
+        AWS_ENDPOINT_URL="$SIGLAKE_S3_HOST_ENDPOINT" \
           timeout --signal=TERM --kill-after=10s 180s \
           cargo test -p siglake-storage --lib conditional_write_live -- \
             --ignored --nocapture >"$conditional_live_log" 2>&1 || conditional_live_rc=$?
@@ -880,7 +885,7 @@ if [ "$WITH_HEAVY" = 1 ]; then
             "$conditional_live_log"
         )
         if [ "$conditional_live_rc" -ne 0 ] \
-          || [ "$conditional_passed" -ne 2 ] \
+          || [ "$conditional_passed" -ne 3 ] \
           || [ "$conditional_failed" -ne 0 ] \
           || [ "$conditional_results" -ne 1 ]; then
           echo "conditional-write live tests FAIL ($conditional_passed passed, $conditional_failed failed, $conditional_results result lines)" \

@@ -29,6 +29,51 @@ The 72h profile records an intermediate 24h checkpoint; it is not a separately
 cleaned-up 24h run. Setup and final restart/cleanup time are outside the duration.
 A directory must be new: a failure or retry never overwrites earlier evidence.
 
+### Reproduce the v0.2.1 query-audit conditional refusal
+
+The publication control used engine
+`ghcr.io/siglake/siglake@sha256:ce00353961641ec44c7cc476c5a31b22f38514ab16798361b127a1137d42476a`
+and MinIO
+`docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20`.
+Run the smoke profile without changing either digest:
+
+```sh
+validation_out="$PWD/results-v0.2.1-query-audit-$(date -u +%Y%m%dT%H%M%SZ)"
+python3 scripts/release-validation/run.py --version v0.2.1 --profile smoke \
+  --out "$validation_out"
+python3 - "$validation_out/summary.json" <<'PY'
+import json, sys
+summary = json.load(open(sys.argv[1]))
+assert summary['image'] == 'ghcr.io/siglake/siglake@sha256:ce00353961641ec44c7cc476c5a31b22f38514ab16798361b127a1137d42476a'
+assert any('sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20' in image
+           for image in summary['dependency_images'].values())
+PY
+grep -F 'refusing side-aggregate publication' \
+  "$validation_out/containers.log" "$validation_out/side-aggregate-guard-refusals.log"
+```
+
+This control is expected to fail artifact review while the published image
+emits the refusal. The harness separately checks that its marked audit row is
+committed before and after the query-server restart and that `GROUP BY status`
+is served by the complete inline aggregate. A passing event-count oracle alone
+does not satisfy either check.
+
+To retain the underlying chain from an instrumented source build, start the
+same pinned MinIO Compose dependency, then run the production-builder probe
+with the service environment (use the host-reachable endpoint):
+
+```sh
+SIGLAKE_WAREHOUSE_URL=s3://siglake-warehouse/ \
+AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://127.0.0.1:9000 \
+cargo test -p siglake-storage --lib \
+  conditional_write_live::production_builder_guard_verdict -- \
+  --ignored --nocapture
+```
+
+Keep this output separate from the published-image control. The error log now
+records the full cause chain while leaving credentials out of the event.
+
 The harness resolves the released engine and operator GHCR manifests
 **anonymously**, verifies their content digests and pulls those digests. Each
 binary's `--version` must name the selected release and the commit behind its
