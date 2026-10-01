@@ -48,6 +48,11 @@ pub struct ScanCounters {
     pub bytes_index: AtomicU64,
     /// Physical Parquet column data bytes.
     pub bytes_data: AtomicU64,
+    /// Logical Parquet column data bytes requested before range coalescing.
+    ///
+    /// Repeated and overlapping ranges are counted each time they are requested.
+    /// Cache hits count as demand even though they add no physical bytes.
+    pub bytes_data_requested: AtomicU64,
     /// Physical bytes without a more specific class.
     pub bytes_other: AtomicU64,
 }

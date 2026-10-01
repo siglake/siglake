@@ -156,6 +156,15 @@ impl ArrowFileReader {
         record_object_store_reads(phase, 1, bytes);
     }
 
+    fn record_requested_data_bytes(&self, phase: ObjectStoreReadPhase, bytes: u64) {
+        if phase == ObjectStoreReadPhase::Data {
+            self.scan_metrics
+                .counters()
+                .bytes_data_requested
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub(super) async fn load_parquet_metadata(
         &mut self,
         decryption_properties: Option<Arc<FileDecryptionProperties>>,
@@ -199,12 +208,14 @@ impl ArrowFileReader {
 impl AsyncFileReader for ArrowFileReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
         let phase = self.current_phase;
+        let requested_bytes = range.end.saturating_sub(range.start);
         async move {
             let outcome = self
                 .r
                 .read_with_outcome(range.start..range.end)
                 .await
                 .map_err(|error| parquet::errors::ParquetError::External(Box::new(error)))?;
+            self.record_requested_data_bytes(phase, requested_bytes);
             if outcome.fetched {
                 self.record_read(phase, outcome.bytes.len() as u64);
             }
@@ -223,6 +234,9 @@ impl AsyncFileReader for ArrowFileReader {
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
         let coalesce_bytes = self.parquet_read_options.range_coalesce_bytes();
         let concurrency = self.parquet_read_options.range_fetch_concurrency().max(1);
+        let requested_bytes = ranges.iter().fold(0_u64, |total, range| {
+            total.saturating_add(range.end.saturating_sub(range.start))
+        });
 
         async move {
             // Merge nearby ranges to reduce the number of object store requests.
@@ -253,6 +267,8 @@ impl AsyncFileReader for ArrowFileReader {
                 .buffered(concurrency)
                 .try_collect()
                 .await?;
+
+            self.record_requested_data_bytes(phase, requested_bytes);
 
             // Slice the fetched data back into the originally requested ranges.
             Ok(ranges
@@ -330,6 +346,7 @@ mod tests {
 
     use super::{ArrowFileReader, ParquetReadOptions, merge_ranges};
     use crate::arrow::ScanMetrics;
+    use crate::io::read_observability::ObjectStoreReadPhase;
     use crate::io::{FileMetadata, FileRead};
 
     #[test]
@@ -445,7 +462,125 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             300
         );
+        assert_eq!(
+            counters
+                .bytes_data_requested
+                .load(std::sync::atomic::Ordering::Relaxed),
+            200
+        );
         assert_eq!(metrics.bytes_read(), 300);
+    }
+
+    #[tokio::test]
+    async fn requested_data_bytes_cover_single_and_non_coalesced_ranges() {
+        let metrics = ScanMetrics::default();
+        let mut reader = ArrowFileReader::new(
+            FileMetadata { size: 2_048 },
+            Box::new(MockFileRead::new(2_048)),
+        )
+        .with_scan_metrics(metrics.clone())
+        .with_parquet_read_options(
+            ParquetReadOptions::builder()
+                .with_range_coalesce_bytes(0)
+                .build(),
+        );
+
+        reader.get_bytes(0..75).await.unwrap();
+        reader
+            .get_byte_ranges(vec![100..200, 1_500..1_600])
+            .await
+            .unwrap();
+
+        let counters = metrics.scan_counters();
+        assert_eq!(
+            counters
+                .bytes_data_requested
+                .load(std::sync::atomic::Ordering::Relaxed),
+            275
+        );
+        assert_eq!(
+            counters
+                .bytes_data
+                .load(std::sync::atomic::Ordering::Relaxed),
+            275
+        );
+        assert_eq!(metrics.bytes_read(), 275);
+    }
+
+    #[tokio::test]
+    async fn requested_data_bytes_count_overlap_and_cache_hits_as_logical_demand() {
+        struct CachedFileRead(MockFileRead);
+
+        #[async_trait::async_trait]
+        impl FileRead for CachedFileRead {
+            async fn read(&self, range: Range<u64>) -> crate::Result<bytes::Bytes> {
+                self.0.read(range).await
+            }
+
+            async fn read_with_outcome(
+                &self,
+                range: Range<u64>,
+            ) -> crate::Result<crate::io::ReadOutcome> {
+                Ok(crate::io::ReadOutcome {
+                    bytes: self.read(range).await?,
+                    fetched: false,
+                })
+            }
+        }
+
+        let metrics = ScanMetrics::default();
+        let mut reader = ArrowFileReader::new(
+            FileMetadata { size: 512 },
+            Box::new(CachedFileRead(MockFileRead::new(512))),
+        )
+        .with_scan_metrics(metrics.clone());
+
+        reader
+            .get_byte_ranges(vec![0..200, 100..300, 0..200])
+            .await
+            .unwrap();
+
+        let counters = metrics.scan_counters();
+        assert_eq!(
+            counters
+                .bytes_data_requested
+                .load(std::sync::atomic::Ordering::Relaxed),
+            600
+        );
+        assert_eq!(
+            counters
+                .bytes_data
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(counters.object_store_reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(metrics.bytes_read(), 0);
+    }
+
+    #[tokio::test]
+    async fn requested_data_bytes_exclude_footer_and_index_phases() {
+        let metrics = ScanMetrics::default();
+        let mut reader = ArrowFileReader::new(
+            FileMetadata { size: 512 },
+            Box::new(MockFileRead::new(512)),
+        )
+        .with_scan_metrics(metrics.clone());
+
+        reader.current_phase = ObjectStoreReadPhase::Footer;
+        reader.get_bytes(0..100).await.unwrap();
+        reader.current_phase = ObjectStoreReadPhase::Index;
+        reader.get_byte_ranges(vec![100..200]).await.unwrap();
+
+        let counters = metrics.scan_counters();
+        assert_eq!(
+            counters
+                .bytes_data_requested
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(counters.bytes_footer.load(std::sync::atomic::Ordering::Relaxed), 100);
+        assert_eq!(counters.bytes_index.load(std::sync::atomic::Ordering::Relaxed), 100);
+        assert_eq!(metrics.bytes_read(), 200);
     }
 
     #[tokio::test]

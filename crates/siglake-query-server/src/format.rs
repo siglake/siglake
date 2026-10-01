@@ -147,6 +147,7 @@ impl ScanDetail {
         self.bytes_footer += o.bytes_footer;
         self.bytes_index += o.bytes_index;
         self.bytes_data += o.bytes_data;
+        self.bytes_data_requested += o.bytes_data_requested;
         self.bytes_other += o.bytes_other;
         self.file_cache_hits += o.file_cache_hits;
         self.file_cache_misses += o.file_cache_misses;
@@ -248,6 +249,13 @@ pub struct ScanDetail {
     pub bytes_index: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub bytes_data: u64,
+    /// Logical data-page bytes requested before the reader coalesces ranges.
+    /// This counts successful data-phase requests, including cache hits and
+    /// repeated or overlapping ranges. It excludes footer and index reads.
+    /// Because logical demand may overlap or be cache-served, subtracting this
+    /// from `bytes_data` is not in general a gap-byte measurement.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub bytes_data_requested: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub bytes_other: u64,
     pub fetched_bytes: u64,
@@ -1062,6 +1070,24 @@ mod tests {
         assert_eq!(left.files.last().unwrap().object_key, "data/031.parquet");
         assert_eq!(left.files_omitted, FILE_ATTRIBUTION_CAP as u64 + 3);
         assert!(!left.identity_complete);
+    }
+
+    #[test]
+    fn scan_detail_defaults_requested_bytes_for_older_shards() {
+        let detail = ScanDetail {
+            bytes_data: 300,
+            bytes_data_requested: 200,
+            ..Default::default()
+        };
+        let mut encoded = serde_json::to_value(detail).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("bytes_data_requested");
+
+        let decoded: ScanDetail = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.bytes_data, 300);
+        assert_eq!(decoded.bytes_data_requested, 0);
     }
 
     #[test]

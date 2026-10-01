@@ -58,6 +58,7 @@ pub struct PlanRuntimeStats {
     pub bytes_footer: u64,
     pub bytes_index: u64,
     pub bytes_data: u64,
+    pub bytes_data_requested: u64,
     pub bytes_other: u64,
     /// Decoded file-batch cache outcomes: tasks served from cached Arrow
     /// batches (no reader built, so `files_read` and the byte counters do not
@@ -658,6 +659,7 @@ pub fn summarize_plan_runtime(plan: &Arc<dyn ExecutionPlan>) -> PlanRuntimeStats
             out.bytes_footer += sum("bytes_footer");
             out.bytes_index += sum("bytes_index");
             out.bytes_data += sum("bytes_data");
+            out.bytes_data_requested += sum("bytes_data_requested");
             out.bytes_other += sum("bytes_other");
             out.file_cache_hits += sum("file_cache_hits");
             out.file_cache_misses += sum("file_cache_misses");

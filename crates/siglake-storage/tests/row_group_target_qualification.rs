@@ -53,18 +53,17 @@
 //! wall-clock and RSS columns want a second pass without it. `RG_FILES` (8) and
 //! `RG_ROWS_PER_FILE` (250_000) size the bin.
 //!
-//! WHERE THE NEEDLE SHAPE'S BYTES GO (#5133). `bytes_data` is the length of
-//! each MERGED fetch, and the reader coalesces requested ranges under 1 MiB
+//! WHERE THE NEEDLE SHAPE'S BYTES GO (#5133, #5805). `bytes_data` is the length
+//! of each MERGED fetch, while `bytes_data_requested` is logical data-page
+//! demand before coalescing. The reader coalesces requested ranges under 1 MiB
 //! apart whether or not siglake configured a range knob, so a needle a few
 //! pages into a column chunk is charged for the dictionary page, the pages
 //! between it and the one it wanted, and the page itself. `audit_needle_pages`
 //! reconstructs both of the needle query's fetches from the merged output's
-//! offset index and prints the predicted requested and fetched totals next to
-//! the measured `bytes_data`. `fetched` equals `measured` in every arm at both
-//! thresholds — that equality is what makes the model evidence rather than a
-//! story; `RG_COALESCE_BYTES=1` is the control that turns the coalescing off,
-//! after which `requested` equals them too. The readings and what they settle
-//! are in the design document's #5133 section.
+//! offset index and checks the predicted requested and fetched totals against
+//! both counters. `RG_COALESCE_BYTES=1` is the control that turns the
+//! coalescing off, after which requested and fetched are equal. The readings
+//! and what they settle are in the design document's #5133 section.
 //!
 //! COMPACTOR-ONLY. The corpus is appended through the DEFAULT tuning and the
 //! arm's target is applied to the context afterwards, so every arm merges a
@@ -555,7 +554,13 @@ fn needle_row_ranges(
 /// selection the predicate produced. Coalescing happens inside each call
 /// (parquet `push_decoder/reader_builder/mod.rs`, the Filters and the final
 /// projection states), so the two are accounted separately here too.
-fn audit_needle_pages(paths: &[String], coalesce: u64, batch_size: usize, measured_data: usize) {
+fn audit_needle_pages(
+    paths: &[String],
+    coalesce: u64,
+    batch_size: usize,
+    measured_requested: usize,
+    measured_fetched: usize,
+) {
     for path in paths {
         let bytes = bytes::Bytes::from(std::fs::read(path).expect("read parquet"));
         let md = ParquetRecordBatchReaderBuilder::try_new_with_options(
@@ -667,7 +672,7 @@ fn audit_needle_pages(paths: &[String], coalesce: u64, batch_size: usize, measur
             println!(
                 "   predict    coalesce={coalesce} B | host requested={:.2} MB fetched={:.2} MB \
                  ({} ranges -> {}) | raw requested={:.2} MB fetched={:.2} MB ({} -> {}) | \
-                 total requested={} B fetched={} B measured={measured_data} B",
+                 total requested={} B fetched={} B measured requested/fetched={measured_requested}/{measured_fetched} B",
                 mb(span(&host_ranges)),
                 mb(span(&host_fetched)),
                 host_ranges.len(),
@@ -678,6 +683,16 @@ fn audit_needle_pages(paths: &[String], coalesce: u64, batch_size: usize, measur
                 raw_fetched.len(),
                 span(&host_ranges) + span(&raw_ranges),
                 span(&host_fetched) + span(&raw_fetched),
+            );
+            assert_eq!(
+                span(&host_ranges) + span(&raw_ranges),
+                measured_requested as u64,
+                "bytes_data_requested must match the fixture's page-level reconstruction"
+            );
+            assert_eq!(
+                span(&host_fetched) + span(&raw_fetched),
+                measured_fetched as u64,
+                "bytes_data must retain physical fetched-byte attribution"
             );
         }
     }
@@ -753,6 +768,7 @@ struct ScanCost {
     bytes_footer: usize,
     bytes_index: usize,
     bytes_data: usize,
+    bytes_data_requested: usize,
     rows_out: usize,
     millis: f64,
 }
@@ -825,6 +841,7 @@ async fn query_cost(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Sca
         cost.bytes_footer += sum("bytes_footer");
         cost.bytes_index += sum("bytes_index");
         cost.bytes_data += sum("bytes_data");
+        cost.bytes_data_requested += sum("bytes_data_requested");
     }
     cost
 }
@@ -1050,21 +1067,24 @@ async fn measure_row_group_target_arm() {
         ),
     ];
     let mut needle_data_bytes = 0usize;
+    let mut needle_data_requested = 0usize;
     for (label, sql) in shapes {
         let cost = query_cost(&ctx, sql).await;
         if *label == "needle host" {
             needle_data_bytes = cost.bytes_data;
+            needle_data_requested = cost.bytes_data_requested;
         }
         println!(
             "   query      {label:<21} rgs {}/{} read (bloom -{} stats -{})  \
-             data={:.2} MB ({} B) footer={:.0} KB index={:.0} KB  decoded={:.2} MB  \
+             data requested/fetched={}/{} B ({:.2} MB fetched) footer={:.0} KB index={:.0} KB  decoded={:.2} MB  \
              rows_pruned={}  reads={}  files={}  out_rows={}  {:.1} ms",
             cost.row_groups_read,
             cost.row_groups_considered,
             cost.row_groups_pruned_bloom,
             cost.row_groups_pruned_stats,
-            cost.bytes_data as f64 / (1024.0 * 1024.0),
+            cost.bytes_data_requested,
             cost.bytes_data,
+            cost.bytes_data as f64 / (1024.0 * 1024.0),
             cost.bytes_footer as f64 / 1024.0,
             cost.bytes_index as f64 / 1024.0,
             cost.decoded_bytes as f64 / (1024.0 * 1024.0),
@@ -1093,6 +1113,7 @@ async fn measure_row_group_target_arm() {
         // The reader hands it to `expand_to_batch_boundaries` for the cached
         // predicate column.
         1024,
+        needle_data_requested,
         needle_data_bytes,
     );
     println!();

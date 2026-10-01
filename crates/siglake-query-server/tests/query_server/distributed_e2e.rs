@@ -2534,6 +2534,8 @@ async fn scan_detail_attributes_the_read() {
         "nothing prunes an equality host filter here: {body}"
     );
     assert!(scan["object_store_reads"].as_u64().unwrap() > 0, "{body}");
+    assert!(scan["bytes_data"].as_u64().unwrap() > 0, "{body}");
+    assert!(scan["bytes_data_requested"].as_u64().unwrap() > 0, "{body}");
     assert!(scan["decoded_bytes"].as_u64().unwrap() > 0, "{body}");
     // Planning-time attribution rides on the cost block.
     assert_eq!(body["cost"]["files_considered"].as_u64(), Some(4), "{body}");
