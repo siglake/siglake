@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Time-aggregate rebuild costs**: `siglake rebuild-time-aggregates` now ends
+  its stdout report with one `rebuild_cost` JSON line containing publication
+  and conflict counts plus per-component duration, projected Arrow-memory
+  decoded bytes and footer/decode file counts. Totals include discarded retry
+  attempts. Failed commands print the observations collected so far as an
+  incomplete measurement and retain their existing nonzero exit status. No
+  listener, network exporter or flag was added. (#5702)
+
 ## 0.2.1
 
 A fixes-only patch on 0.2.0. It adds the runtime conditional-write guard for

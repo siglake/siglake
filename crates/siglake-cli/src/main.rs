@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use datafusion::prelude::SessionContext;
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshot};
 use object_store::path::Path as ObjectPath;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -5980,15 +5981,25 @@ async fn run_rebuild_time_aggregates(
     namespace: &str,
     table: &str,
 ) -> Result<()> {
-    let ice = open_iceberg(
-        data_dir,
-        "warehouse",
-        warehouse_url,
-        catalog_uri,
-        Some(namespace),
-    )
-    .await?;
-    let report = ice.rebuild_inline_time_aggregates(table).await?;
+    let (result, costs) = capture_inline_time_rebuild(async {
+        let ice = open_iceberg(
+            data_dir,
+            "warehouse",
+            warehouse_url,
+            catalog_uri,
+            Some(namespace),
+        )
+        .await?;
+        ice.rebuild_inline_time_aggregates(table).await
+    })
+    .await;
+    let report = match result {
+        Ok(report) => report,
+        Err(error) => {
+            print_inline_time_rebuild_costs(&costs, false);
+            return Err(error);
+        }
+    };
 
     if report.already_covered {
         println!(
@@ -5996,6 +6007,7 @@ async fn run_rebuild_time_aggregates(
              (sequence {}); nothing to rebuild",
             report.coverage.snapshot_id, report.coverage.sequence_number
         );
+        print_inline_time_rebuild_costs(&costs, true);
         return Ok(());
     }
     println!(
@@ -6049,6 +6061,7 @@ async fn run_rebuild_time_aggregates(
              answering exactly from the per-file tiers.",
             report.record_count
         );
+        print_inline_time_rebuild_costs(&costs, true);
         return Ok(());
     }
     if !short.is_empty() {
@@ -6065,5 +6078,224 @@ async fn run_rebuild_time_aggregates(
          `GROUP BY` without a time window is served exactly as it was. Commits after this one \
          extend the coverage chain normally."
     );
+    print_inline_time_rebuild_costs(&costs, true);
     Ok(())
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct InlineTimeRebuildCosts {
+    publications: u64,
+    conflicts: u64,
+    time_buckets: InlineTimeRebuildComponentCosts,
+    time_group_counts: InlineTimeRebuildComponentCosts,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct InlineTimeRebuildComponentCosts {
+    seconds: f64,
+    decoded_bytes: u64,
+    footer_files: u64,
+    decoded_files: u64,
+}
+
+impl InlineTimeRebuildCosts {
+    fn from_snapshot(snapshot: Snapshot) -> Self {
+        let snapshot = snapshot.into_vec();
+        Self {
+            publications: rebuild_metric_counter(
+                &snapshot,
+                "siglake_inline_time_aggregate_rebuilds_total",
+                None,
+            ),
+            conflicts: rebuild_metric_counter(
+                &snapshot,
+                "siglake_inline_time_aggregate_rebuild_conflicts_total",
+                None,
+            ),
+            time_buckets: InlineTimeRebuildComponentCosts::from_snapshot(
+                &snapshot,
+                "time_buckets",
+                "siglake_inline_time_rebuild_files_total",
+            ),
+            time_group_counts: InlineTimeRebuildComponentCosts::from_snapshot(
+                &snapshot,
+                "time_group_counts",
+                "siglake_inline_time_group_rebuild_files_total",
+            ),
+        }
+    }
+
+    fn json(&self, complete: bool) -> serde_json::Value {
+        serde_json::json!({
+            "measurement": if complete { "complete" } else { "incomplete" },
+            "publications": self.publications,
+            "conflicts": self.conflicts,
+            "components": {
+                "time_buckets": self.time_buckets.json(),
+                "time_group_counts": self.time_group_counts.json(),
+            },
+        })
+    }
+}
+
+impl InlineTimeRebuildComponentCosts {
+    fn from_snapshot(
+        snapshot: &[RebuildMetricSnapshot],
+        component: &str,
+        files_metric: &str,
+    ) -> Self {
+        Self {
+            seconds: rebuild_metric_histogram(
+                snapshot,
+                "siglake_inline_time_rebuild_seconds",
+                component,
+            ),
+            decoded_bytes: rebuild_metric_histogram(
+                snapshot,
+                "siglake_inline_time_rebuild_decoded_bytes",
+                component,
+            ) as u64,
+            footer_files: rebuild_metric_counter(
+                snapshot,
+                files_metric,
+                Some(("source", "footer")),
+            ),
+            decoded_files: rebuild_metric_counter(
+                snapshot,
+                files_metric,
+                Some(("source", "decode")),
+            ),
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "seconds": self.seconds,
+            "decoded_bytes": self.decoded_bytes,
+            "files": {
+                "footer": self.footer_files,
+                "decode": self.decoded_files,
+            },
+        })
+    }
+}
+
+type RebuildMetricSnapshot = (
+    metrics_util::CompositeKey,
+    Option<metrics::Unit>,
+    Option<metrics::SharedString>,
+    DebugValue,
+);
+
+fn rebuild_metric_counter(
+    snapshot: &[RebuildMetricSnapshot],
+    name: &str,
+    label: Option<(&str, &str)>,
+) -> u64 {
+    snapshot
+        .iter()
+        .filter(|(key, _, _, _)| {
+            key.key().name() == name
+                && label.is_none_or(|(label_key, label_value)| {
+                    key.key()
+                        .labels()
+                        .any(|value| value.key() == label_key && value.value() == label_value)
+                })
+        })
+        .filter_map(|(_, _, _, value)| match value {
+            DebugValue::Counter(value) => Some(*value),
+            _ => None,
+        })
+        .fold(0, u64::saturating_add)
+}
+
+fn rebuild_metric_histogram(
+    snapshot: &[RebuildMetricSnapshot],
+    name: &str,
+    component: &str,
+) -> f64 {
+    snapshot
+        .iter()
+        .filter(|(key, _, _, _)| {
+            key.key().name() == name
+                && key
+                    .key()
+                    .labels()
+                    .any(|value| value.key() == "component" && value.value() == component)
+        })
+        .filter_map(|(_, _, _, value)| match value {
+            DebugValue::Histogram(samples) => Some(
+                samples
+                    .iter()
+                    .map(|sample| sample.into_inner())
+                    .sum::<f64>(),
+            ),
+            _ => None,
+        })
+        .sum()
+}
+
+async fn capture_inline_time_rebuild<T>(
+    rebuild: impl std::future::Future<Output = Result<T>>,
+) -> (Result<T>, InlineTimeRebuildCosts) {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    // `main` drives this root future with `Runtime::block_on`, and the rebuild
+    // uses buffered futures without spawning them, so every observation stays
+    // on the thread covered by this command-local recorder.
+    let guard = metrics::set_default_local_recorder(&recorder);
+    let result = rebuild.await;
+    let costs = InlineTimeRebuildCosts::from_snapshot(snapshotter.snapshot());
+    drop(guard);
+    (result, costs)
+}
+
+fn print_inline_time_rebuild_costs(costs: &InlineTimeRebuildCosts, complete: bool) {
+    println!("rebuild_cost {}", costs.json(complete));
+}
+
+#[cfg(test)]
+mod inline_time_rebuild_cost_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_retry_costs_are_retained_and_marked_incomplete() {
+        let (result, costs) = capture_inline_time_rebuild(async {
+            for files in 1..=3 {
+                metrics::counter!(
+                    "siglake_inline_time_rebuild_files_total",
+                    "source" => "footer"
+                )
+                .increment(files);
+                metrics::counter!(
+                    "siglake_inline_time_group_rebuild_files_total",
+                    "source" => "decode"
+                )
+                .increment(files);
+                metrics::histogram!(
+                    "siglake_inline_time_rebuild_seconds",
+                    "component" => "time_buckets"
+                )
+                .record(0.25);
+                metrics::histogram!(
+                    "siglake_inline_time_rebuild_decoded_bytes",
+                    "component" => "time_group_counts"
+                )
+                .record((files * 100) as f64);
+                metrics::counter!("siglake_inline_time_aggregate_rebuild_conflicts_total")
+                    .increment(1);
+            }
+            Err::<(), anyhow::Error>(anyhow::anyhow!("retry budget exhausted"))
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(costs.publications, 0);
+        assert_eq!(costs.conflicts, 3);
+        assert_eq!(costs.time_buckets.footer_files, 6);
+        assert_eq!(costs.time_buckets.seconds, 0.75);
+        assert_eq!(costs.time_group_counts.decoded_files, 6);
+        assert_eq!(costs.time_group_counts.decoded_bytes, 600);
+        assert_eq!(costs.json(false)["measurement"], "incomplete");
+    }
 }
