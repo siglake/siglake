@@ -15,12 +15,13 @@ application_safety=unverified
 raw_verdict=missing
 store=missing
 guard_values=missing
+production_guard_values=missing
 cas_evidence=missing
 
 report() { # <ok|fail> <reason>
   local outcome=$1 reason=$2
   echo "CONDITIONAL_WRITE_CAPABILITY verdict=$capability store=$store raw=$raw_verdict"
-  echo "CONDITIONAL_WRITE_APPLICATION_SAFETY verdict=$application_safety guard=$guard_values cas=$cas_evidence"
+  echo "CONDITIONAL_WRITE_APPLICATION_SAFETY verdict=$application_safety guard=$guard_values production_guard=$production_guard_values cas=$cas_evidence"
   echo "CONDITIONAL_WRITE_QUALIFICATION $outcome reason=$reason"
   [ "$outcome" = ok ]
 }
@@ -49,6 +50,7 @@ mapfile -t raw_summaries < <(grep -E 'cleanup_status=.* verdict=' "$log" || true
 mapfile -t if_none_lines < <(grep -E '^  if_none_match_status=' "$log" || true)
 mapfile -t if_match_lines < <(grep -E '^  stale_if_match_status=' "$log" || true)
 mapfile -t guard_lines < <(grep -E '^CONDITIONAL_WRITE_GUARD ' "$log" || true)
+mapfile -t production_guard_lines < <(grep -E '^CONDITIONAL_WRITE_PRODUCTION_GUARD ' "$log" || true)
 mapfile -t cas_lines < <(grep -E '^CAS_RACE ' "$log" || true)
 
 if [ "${#raw_headers[@]}" -ne 1 ] || [ "${#raw_summaries[@]}" -ne 1 ] \
@@ -103,6 +105,25 @@ guard_values=${guard_lines[0]#CONDITIONAL_WRITE_GUARD }
 guard_if_match=$(field " ${guard_lines[0]}" if_match)
 guard_if_none=$(field " ${guard_lines[0]}" if_not_exists)
 guard_refusal=$(field " ${guard_lines[0]}" refusal)
+
+if [ "${#production_guard_lines[@]}" -gt 1 ]; then
+  application_safety=incomplete
+  report fail incomplete-production-builder-evidence
+  exit 1
+fi
+if [ "${#production_guard_lines[@]}" -eq 1 ]; then
+  production_if_match=$(field " ${production_guard_lines[0]}" if_match)
+  production_if_none=$(field " ${production_guard_lines[0]}" if_not_exists)
+  production_refusal=$(field " ${production_guard_lines[0]}" refusal)
+  production_guard_values=${production_guard_lines[0]#CONDITIONAL_WRITE_PRODUCTION_GUARD }
+  if [ "$production_if_match" != "$guard_if_match" ] \
+    || [ "$production_if_none" != "$guard_if_none" ] \
+    || [ "$production_refusal" != "$guard_refusal" ]; then
+    application_safety=disagreement
+    report fail production-builder-guard-disagreement
+    exit 1
+  fi
+fi
 
 if [ "$guard_if_match" != "$if_match" ] || [ "$guard_if_none" != "$if_none" ]; then
   application_safety=disagreement

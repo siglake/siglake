@@ -913,6 +913,11 @@ jobs:
           SIGLAKE_TEST_S3_ENDPOINT: http://localhost:9000
           SIGLAKE_TEST_S3_ACCESS_KEY: minioadmin
           SIGLAKE_TEST_S3_SECRET_KEY: minioadmin
+          SIGLAKE_WAREHOUSE_URL: s3://siglake-warehouse/
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+          AWS_ENDPOINT_URL: http://localhost:9000
           SIGLAKE_TEST_JOBS_POSTGRES_URI: postgres://siglake:siglake@localhost:5433/siglake
         run: |
           trap 'scripts/down.sh' EXIT
@@ -933,7 +938,7 @@ jobs:
               "$conditional_log"
           )
           if [ "$conditional_rc" -ne 0 ] \
-            || [ "$conditional_passed" -ne 2 ] \
+            || [ "$conditional_passed" -ne 3 ] \
             || [ "$conditional_failed" -ne 0 ] \
             || [ "$conditional_results" -ne 1 ]; then
             echo "conditional-write live tests FAIL ($conditional_passed passed, $conditional_failed failed, $conditional_results result lines)"

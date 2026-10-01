@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DURATIONS = {'smoke': 120, '24h': 86400, '72h': 259200}
 SUPPORTED_VERSIONS = ('v0.1.0', 'v0.2.0', 'v0.2.1')
 PROVENANCE_VERSIONS = frozenset({'v0.2.1'})
+QUERY_AUDIT_AGGREGATE_VERSIONS = frozenset({'v0.2.1'})
 PRODUCT_REPOSITORIES = {
     'engine': 'siglake/siglake',
     'operator': 'siglake/siglake-operator',
@@ -35,6 +36,9 @@ PRODUCT_BINARIES = {
 TOKEN = 'release-validation-fixture-token'  # disposable local fixture, not a credential
 SERVICES = ['postgres', 'minio', 'minio-init', 'ingester', 'compactor', 'query-server']
 LOG_TIMESTAMP = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})')
+SIDE_AGGREGATE_GUARD_REFUSAL = (
+    'refusing side-aggregate publication because the warehouse did not verify conditional writes'
+)
 
 
 class StorageCapacityExhausted(AssertionError):
@@ -118,6 +122,22 @@ def classify_cohort_failure(logs, started_at, ended_at):
         if logged_at is not None and started_at <= logged_at <= ended_at:
             return 'storage_capacity_exhausted'
     return 'visibility_mismatch'
+
+
+def side_aggregate_guard_refusals(logs):
+    return [line for line in logs.splitlines() if SIDE_AGGREGATE_GUARD_REFUSAL in line]
+
+
+def audit_checkpoint_problem(probe_rows, aggregate_response):
+    if probe_rows != [{'n': 1}]:
+        return f'audit probe row count is not exactly one: {probe_rows!r}'
+    stats = aggregate_response.get('stats') or {}
+    if stats.get('served_by') != 'tier1_inline':
+        return (
+            'query_audit aggregate is not covered by the inline side aggregate: '
+            f'served_by={stats.get("served_by")!r}, rows_scanned={stats.get("rows_scanned")!r}'
+        )
+    return None
 
 
 def http(url, data=None, token=TOKEN, timeout=30):
@@ -307,8 +327,30 @@ class Run:
         self.query = 'http://' + self.cmd('port', 'query-server', '8089').strip()
         self.metrics = 'http://' + self.cmd('port', 'query-server', '9105').strip()
 
+    def sql_response(self, query):
+        return http(self.query + '/api/v1/sql', {'query': query})
+
     def sql(self, query):
-        return http(self.query + '/api/v1/sql', {'query': query})['rows']
+        return self.sql_response(query)['rows']
+
+    def await_audit_checkpoint(self, marker_query, phase):
+        escaped = marker_query.replace("'", "''")
+        deadline = time.monotonic() + 120
+        last_problem = 'audit checkpoint was not attempted'
+        while True:
+            probe_rows = self.sql(
+                "SELECT count(*) AS n FROM query_audit WHERE query = '" + escaped + "'"
+            )
+            aggregate = self.sql_response(
+                'SELECT status, count(*) AS n FROM query_audit GROUP BY status ORDER BY status'
+            )
+            last_problem = audit_checkpoint_problem(probe_rows, aggregate)
+            if last_problem is None:
+                self.event('query_audit_checkpoint', phase=phase, result='pass')
+                return
+            if time.monotonic() >= deadline:
+                raise AssertionError(f'{phase} query_audit checkpoint failed: {last_problem}')
+            time.sleep(2)
 
     def refused(self, url, body, code):
         try:
@@ -452,8 +494,17 @@ class Run:
                 self.event('24h_checkpoint', result='pass', elapsed_seconds=now-self.start, cleanup='pending')
                 checkpoint = True
             time.sleep(10)
+        audit_marker_query = None
+        if self.args.version in QUERY_AUDIT_AGGREGATE_VERSIONS:
+            audit_marker_query = (
+                'SELECT 1 AS audit_probe /* release-validation-audit-' + self.project + ' */'
+            )
+            assert self.sql(audit_marker_query) == [{'audit_probe': 1}]
+            self.await_audit_checkpoint(audit_marker_query, 'before_restart')
         for service in ('query-server', 'ingester', 'compactor'):
             self.restart(service)
+            if service == 'query-server' and audit_marker_query is not None:
+                self.await_audit_checkpoint(audit_marker_query, 'after_query_server_restart')
         self.batch()
         self.resources()
         checks = [
@@ -468,6 +519,11 @@ class Run:
             'no OOM or unexpected restarts',
             'verified resource limits',
         ]
+        if audit_marker_query is not None:
+            checks.extend([
+                'query audit row persistence across query-server restart',
+                'query audit inline aggregate coverage across query-server restart',
+            ])
         if self.args.version in PROVENANCE_VERSIONS:
             checks.insert(1, 'engine/operator provenance matches release tag')
         self.summary.update(status='passed', workload_elapsed_seconds=time.monotonic()-self.start,
@@ -476,9 +532,26 @@ class Run:
     def cleanup(self):
         if self.mutated:
             try:
-                (self.out / 'containers.log').write_text(self.cmd('logs', '--no-color', '--timestamps', timeout=60))
+                logs = self.cmd('logs', '--no-color', '--timestamps', timeout=60)
+                (self.out / 'containers.log').write_text(logs)
+                refusals = side_aggregate_guard_refusals(logs)
+                self.summary['side_aggregate_guard_refusals'] = len(refusals)
+                if refusals:
+                    (self.out / 'side-aggregate-guard-refusals.log').write_text(
+                        '\n'.join(refusals) + '\n'
+                    )
+                    self.summary['status'] = 'failed'
+                    self.summary['artifact_review'] = 'failed'
+                    self.summary['artifact_review_error'] = (
+                        f'{len(refusals)} unexpected side-aggregate conditional guard refusals '
+                        'on the supported MinIO path'
+                    )
+                else:
+                    self.summary['artifact_review'] = 'passed'
             except Exception as error:
                 self.summary['log_collection_error'] = str(error)
+                self.summary['artifact_review'] = 'failed'
+                self.summary['status'] = 'failed'
             try:
                 self.cmd('down', '--volumes', '--remove-orphans', '--timeout', '30', timeout=180)
                 remains = {}

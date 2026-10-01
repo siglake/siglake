@@ -180,13 +180,14 @@ run_fixture garage unexpected
 grep -Fq 'verdict=unexpected-response' <<<"$fixture_output" \
   || fail "unexpected responses were not retained"
 
-run_qualification_fixture() { # <name> <store> <scenario> <guard> <cas> <pass|fail> <capability> <safety> <reason>
+run_qualification_fixture() { # <name> <store> <scenario> <guard> <cas> <pass|fail> <capability> <safety> <reason> [production-guard]
   local name=$1 store=$2 scenario=$3 guard=$4 cas=$5 expected=$6
   local expected_capability=$7 expected_safety=$8 expected_reason=$9 rc=0
-  local log="$check_dir/qualification-$name.log" output
+  local production_guard=${10-} log="$check_dir/qualification-$name.log" output
   run_fixture "$store" "$scenario"
   printf '%s\n' "$fixture_output" >"$log"
   [ -z "$guard" ] || printf '%s\n' "$guard" >>"$log"
+  [ -z "$production_guard" ] || printf '%s\n' "$production_guard" >>"$log"
   [ -z "$cas" ] || printf '%s\n' "$cas" >>"$log"
   output=$(scripts/ci-local-conditional-write-agreement.sh "$log" "$fixture_rc" 2>&1) || rc=$?
   case "$expected:$rc" in
@@ -213,6 +214,8 @@ verified_guard='CONDITIONAL_WRITE_GUARD if_match=verified if_not_exists=verified
 refused_ignored_guard='CONDITIONAL_WRITE_GUARD if_match=ignored if_not_exists=ignored refusal=yes'
 accepted_ignored_guard='CONDITIONAL_WRITE_GUARD if_match=ignored if_not_exists=ignored refusal=no'
 refused_unsupported_guard='CONDITIONAL_WRITE_GUARD if_match=unsupported if_not_exists=unsupported refusal=yes'
+production_verified_guard='CONDITIONAL_WRITE_PRODUCTION_GUARD if_match=verified if_not_exists=verified refusal=no'
+production_refused_guard='CONDITIONAL_WRITE_PRODUCTION_GUARD if_match=ignored if_not_exists=ignored refusal=yes'
 cas_complete='CAS_RACE rounds=20 winners=1 losers=1'
 cas_skipped='CAS_RACE skipped=guard-refuses-store'
 
@@ -228,6 +231,10 @@ run_qualification_fixture unsafe-accepted garage accepted "$accepted_ignored_gua
   fail unsafe-ignored accepted-unsafe unsafe-endpoint-accepted
 run_qualification_fixture raw-guard-disagreement garage accepted "$verified_guard" "$cas_skipped" \
   fail unsafe-ignored disagreement raw-guard-disagreement
+run_qualification_fixture production-builder-disagreement minio rejected "$verified_guard" "$cas_complete" \
+  fail safe disagreement production-builder-guard-disagreement "$production_refused_guard"
+run_qualification_fixture production-builder-agreement minio rejected "$verified_guard" "$cas_complete" \
+  pass safe accepted-safe positive-safety "$production_verified_guard"
 run_qualification_fixture safe-refused garage rejected \
   'CONDITIONAL_WRITE_GUARD if_match=verified if_not_exists=verified refusal=yes' "$cas_complete" \
   fail safe disagreement safe-endpoint-refused
@@ -262,6 +269,10 @@ grep -Fq 'scripts/ci-local-conditional-write-agreement.sh "$dlog" "$conditional_
   scripts/ci-local.sh || fail "ci-local's live docker job does not compare the two verdicts"
 grep -Fq 'cargo test -p siglake-storage --lib conditional_write_live --' \
   .github/workflows/ci.yml || fail "hosted Docker CI does not run the application guard"
+grep -Fq 'SIGLAKE_WAREHOUSE_URL: s3://siglake-warehouse/' \
+  .github/workflows/ci.yml || fail "hosted Docker CI does not exercise the production warehouse builder"
+grep -Fq 'SIGLAKE_WAREHOUSE_URL="s3://siglake-warehouse/"' \
+  scripts/ci-local.sh || fail "ci-local does not exercise the production warehouse builder"
 grep -Fq 'scripts/ci-local-conditional-write-agreement.sh "$conditional_log" "$conditional_probe_rc"' \
   .github/workflows/ci.yml || fail "hosted Docker CI does not compare the two verdicts"
 

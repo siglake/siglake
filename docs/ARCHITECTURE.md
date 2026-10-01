@@ -624,6 +624,15 @@ keeps its separately serialized single-writer read-merge-write path. The
 cached verdict belongs to the context's warehouse store and is shared by its
 tenant contexts. This sequential exchange detects the behavior measured on
 Garage v2.4.1; concurrent atomic exclusion still requires live qualification.
+A refusal log includes the complete probe error chain, so authentication,
+endpoint, transport and unrecognized-precondition failures remain distinct in
+retained service logs without logging credentials. The ignored live probe has
+two builders: its isolated static-credential fixture and the production
+`warehouse_operator` path driven by the same AWS and warehouse environment as
+the services. Public release validation also treats any guard refusal on its
+pinned MinIO path as a failed artifact review. It proves `query_audit` row
+persistence and inline aggregate coverage independently on both sides of a
+query-server restart; event-table assertions do not stand in for those checks.
 
 **Group-count repair and limits.** The per-commit group-count delta write makes
 four attempts, waiting 250, 500 and 750 ms between attempts. A write that
