@@ -782,6 +782,15 @@ merged, so the command retries and then exits without writing, asking for a
 window with no ingest. Details in
 `docs/DESIGN_inline_time_aggregate_rebuild.md`.
 
+The report ends with one machine-readable `rebuild_cost {JSON}` line on
+stdout. It gives publication and conflict counts plus, for `time_buckets` and
+`time_group_counts`, total seconds, projected Arrow-memory bytes decoded, and
+file counts split between footer and decode sources. The totals include work
+from attempts discarded after a concurrent commit. `measurement` is
+`complete` after every successful command, including an already-covered pass
+whose values are all zero; an error prints the observations collected so far
+with `measurement: "incomplete"` before preserving the command's nonzero exit.
+
 **Which table needs it.** The state that command repairs is reported by name.
 Every 15 minutes (`SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS`, `off` to
 disable) the maintenance compactor reads each maintained table's inline object

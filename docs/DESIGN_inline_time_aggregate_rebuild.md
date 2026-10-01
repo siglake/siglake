@@ -302,8 +302,11 @@ retry wins against: a warm table's per-file fallback measured ~2ms.
   `siglake_inline_time_{,group_}rebuild_files_total{source="footer"|"decode"}`
   says which arm each file took.
 - `siglake rebuild-time-aggregates --table <t>`, reporting per component
-  whether it was restored, because exiting 0 is not the same as the fast path
-  being back.
+  whether it was restored and ending with a `rebuild_cost {JSON}` line. The
+  structured line sums publication/conflict counts, footer/decode file counts,
+  component seconds and projected Arrow-memory decoded bytes across every
+  attempt. Failed runs retain the observations collected before the error and
+  mark the measurement incomplete; a successful no-op is complete zero work.
 - `crates/siglake-storage/tests/storage/pre_coverage_time_agg.rs`: the refusal
   and its permanence, the repair restoring Tier-1 with byte-identical answers,
   coverage advancing on the appends that follow, the second pass as a reported
@@ -349,7 +352,9 @@ doing more decode work. Millisecond differences at this size are noise; the
 read source and decoded-byte columns are the portable result. The measurement
 adds `siglake_inline_time_rebuild_decoded_bytes{component}` and
 `siglake_inline_time_rebuild_seconds{component}` beside the existing file
-counters so a later operator pass reports the same split on its real table.
+counters. The command now captures those six metric families for its own
+invocation and writes their totals in the `rebuild_cost` line, so an operator
+gets the same split on the real table without a metrics listener or exporter.
 
 The deterministic publication-fence fixture measured the discarded-work case
 separately. Three appends force all three attempts to lose their final fence.

@@ -171,6 +171,16 @@ fn line_for<'a>(stdout: &'a str, component: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no report line for `{component}` in:\n{stdout}"))
 }
 
+fn rebuild_cost(stdout: &str) -> serde_json::Value {
+    let line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("rebuild_cost "))
+        .unwrap_or_else(|| panic!("no structured rebuild cost in:\n{stdout}"));
+    serde_json::from_str(line).unwrap_or_else(|error| {
+        panic!("invalid structured rebuild cost ({error}): {line:?}\n{stdout}")
+    })
+}
+
 #[tokio::test]
 async fn rebuild_time_aggregates_reports_each_component_then_no_ops() {
     let tmp = tempfile::tempdir().unwrap();
@@ -211,6 +221,29 @@ async fn rebuild_time_aggregates_reports_each_component_then_no_ops() {
         read_side(&warehouse).coverage.is_some(),
         "no coverage edge was published"
     );
+    let cost = rebuild_cost(&stdout);
+    assert_eq!(cost["measurement"], "complete", "{cost}");
+    assert_eq!(cost["publications"], 1, "{cost}");
+    assert_eq!(cost["conflicts"], 0, "{cost}");
+    let mut attributed_files = None;
+    for component in ["time_buckets", "time_group_counts"] {
+        let component = &cost["components"][component];
+        assert!(component["seconds"].as_f64().is_some(), "{cost}");
+        let files = component["files"]["footer"].as_u64().unwrap()
+            + component["files"]["decode"].as_u64().unwrap();
+        assert!(files > 0, "the rebuild must attribute live files: {cost}");
+        if let Some(expected) = attributed_files {
+            assert_eq!(files, expected, "both components read the live set: {cost}");
+        } else {
+            attributed_files = Some(files);
+        }
+    }
+    assert!(
+        cost["components"]["time_group_counts"]["decoded_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "the spanning-file fixture must report projected Arrow decode memory: {cost}"
+    );
 
     // Second run, against its own output.
     let again = run(&data_dir);
@@ -218,4 +251,19 @@ async fn rebuild_time_aggregates_reports_each_component_then_no_ops() {
         again.contains("already proves coverage") && again.contains("nothing to rebuild"),
         "a second run must report the no-op rather than repeat the work:\n{again}"
     );
+    let no_op_cost = rebuild_cost(&again);
+    assert_eq!(no_op_cost["measurement"], "complete", "{no_op_cost}");
+    assert_eq!(no_op_cost["publications"], 0, "{no_op_cost}");
+    assert_eq!(no_op_cost["conflicts"], 0, "{no_op_cost}");
+    for component in ["time_buckets", "time_group_counts"] {
+        assert_eq!(
+            no_op_cost["components"][component],
+            serde_json::json!({
+                "seconds": 0.0,
+                "decoded_bytes": 0,
+                "files": {"footer": 0, "decode": 0},
+            }),
+            "an already-covered pass is complete zero work: {no_op_cost}"
+        );
+    }
 }

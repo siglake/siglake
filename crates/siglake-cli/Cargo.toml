@@ -28,6 +28,7 @@ siglake-compactor = { workspace = true }
 
 anyhow = { workspace = true }
 metrics = { workspace = true }
+metrics-util = "0.20"
 clap = { workspace = true }
 chrono = { workspace = true }
 datafusion = { workspace = true }
