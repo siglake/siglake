@@ -6477,6 +6477,7 @@ fn scan_detail_from_runtime(
         bytes_footer: runtime.bytes_footer,
         bytes_index: runtime.bytes_index,
         bytes_data: runtime.bytes_data,
+        bytes_data_requested: runtime.bytes_data_requested,
         bytes_other: runtime.bytes_other,
         fetched_bytes: runtime.bytes_scanned,
         decoded_bytes: runtime.decoded_bytes,

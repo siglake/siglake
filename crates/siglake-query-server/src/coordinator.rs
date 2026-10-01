@@ -1483,6 +1483,8 @@ mod tests {
                         vec![Arc::new(Int64Array::from(vec![1_i64]))],
                     )?],
                     scan: Some(crate::format::ScanDetail {
+                        bytes_data: (index as u64 + 1) * 150,
+                        bytes_data_requested: (index as u64 + 1) * 100,
                         file_attribution: Some(crate::format::FileAttribution {
                             files: vec![file],
                             files_omitted: 0,
@@ -1512,7 +1514,10 @@ mod tests {
         .await
         .unwrap();
 
-        let attribution = stats.scan.unwrap().file_attribution.unwrap();
+        let scan = stats.scan.unwrap();
+        assert_eq!(scan.bytes_data, 450);
+        assert_eq!(scan.bytes_data_requested, 300);
+        let attribution = scan.file_attribution.unwrap();
         assert_eq!(attribution.files.len(), 1);
         let file = &attribution.files[0];
         assert!(file.cache_candidate && file.reader_opened && file.cache_hit);

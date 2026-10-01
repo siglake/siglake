@@ -2703,6 +2703,16 @@ components:
           type: integer
           format: int64
           minimum: 0
+        bytes_data_requested:
+          type: integer
+          format: int64
+          description: |-
+            Logical data-page bytes requested before the reader coalesces ranges.
+            This counts successful data-phase requests, including cache hits and
+            repeated or overlapping ranges. It excludes footer and index reads.
+            Because logical demand may overlap or be cache-served, subtracting this
+            from `bytes_data` is not in general a gap-byte measurement.
+          minimum: 0
         bytes_footer:
           type: integer
           format: int64

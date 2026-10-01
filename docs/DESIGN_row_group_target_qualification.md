@@ -214,7 +214,7 @@ coincidence as a law about geometry.
 `RG_COALESCE_BYTES=1` is the control: it is the smallest value that survives the
 `.max(1)` in `query_provider.rs`, and it leaves only ranges that are adjacent or
 one byte apart merged — immaterial for page ranges — so
-`bytes_data` reports what the reader requested. With it, the arms read 473,915 /
+`bytes_data` equals what the reader requested. With it, the arms read 473,915 /
 297,904 / 297,904 / 478,482 B. The 32 MiB arm reads 1.6x the 64 MiB arm instead
 of 4x, and lands within 1% of the 256 MiB default instead of 40% above it. What
 remains is the PLAIN page, which any arm pays whenever its needle misses page 0.
@@ -229,9 +229,13 @@ and 703 KB.
 Neither `merge_ranges` nor the page selection is wrong, so nothing is fixed here
 and no default moves. On object storage the coalescer is trading those bytes for
 request count, which is what it exists to do; this is a `file://` warehouse,
-where the trade has no upside. What the sweep table cannot show is the split
-itself — `bytes_data` reports fetched bytes and a reader of the column has no
-way to see how much of it was gap. That is #5805.
+where the trade has no upside. Scan attribution now reports the split directly
+(#5805): `bytes_data_requested` is successful logical data-page demand before
+coalescing, while `bytes_data` remains fetched bytes. The fixture's
+`query_cost` reader prints both values and checks the requested value against
+its page-level reconstruction. Cache hits and repeated or overlapping ranges
+still count as logical demand, so subtraction measures gap bytes only for a
+cold scan whose requested ranges do not overlap.
 
 ## The candidate: 64 MiB, compactor-only, in the chart
 
@@ -299,10 +303,10 @@ establishes that 256 MiB is unsafe at 1Gi — only that it is measurably closer 
 the limit than it needs to be, on a bin far smaller than the ones the fleet
 merges.
 
-The follow-ups this left open: #5132 is the chart change if a round supports it.
-#5133 settled the 32 MiB arm's selective read against the page accounting above
-and left #5805 (requested versus fetched bytes in scan attribution) and #5806
-(the misleading `range_enabled` log field, since renamed) behind it.
+The follow-up this left open is #5132, the chart change if a round supports it.
+#5133 settled the 32 MiB arm's selective read against the page accounting above.
+#5805 added requested-versus-fetched scan attribution, and #5806 renamed the
+misleading `range_enabled` log field.
 
 ## Reproduce
 
@@ -323,13 +327,14 @@ RG_HEAP_TRACKING=0 RG_TARGET_MB=64 cargo test --release -p siglake-storage \
 RG_NATIVE_BLOOMS=1 RG_TARGET_MB=64 cargo test --release -p siglake-storage \
   --test row_group_target_qualification -- --ignored --nocapture
 
-# #5133's control: `bytes_data` then reports requested bytes, not coalesced ones
+# #5133's control: requested and fetched data bytes become equal
 for mb in 0 128 64 32; do
   RG_COALESCE_BYTES=1 RG_TARGET_MB=$mb cargo test --release -p siglake-storage \
     --test row_group_target_qualification -- --ignored --nocapture
 done
 ```
 
-Every arm prints the needle row group's page layout and the two fetches
-`audit_needle_pages` reconstructs, ending in a `predict` line whose `fetched`
-total must equal the `needle host` row's `bytes_data`.
+Every arm reports `bytes_data_requested` beside fetched `bytes_data`, then
+prints the needle row group's page layout and the two fetches
+`audit_needle_pages` reconstructs. The fixture asserts that the reconstructed
+requested and fetched totals equal those two scan counters.

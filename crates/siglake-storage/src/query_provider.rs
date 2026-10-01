@@ -4834,6 +4834,7 @@ struct ScanDetailMetrics {
     bytes_footer: Count,
     bytes_index: Count,
     bytes_data: Count,
+    bytes_data_requested: Count,
     bytes_other: Count,
     /// File tasks served from the decoded file-batch cache (no reader built,
     /// so nothing else in this block moves for them) and tasks that consulted
@@ -4864,6 +4865,7 @@ impl ScanDetailMetrics {
             bytes_footer: c("bytes_footer"),
             bytes_index: c("bytes_index"),
             bytes_data: c("bytes_data"),
+            bytes_data_requested: c("bytes_data_requested"),
             bytes_other: c("bytes_other"),
             file_cache_hits: c("file_cache_hits"),
             file_cache_misses: c("file_cache_misses"),
@@ -4904,6 +4906,8 @@ impl ScanDetailMetrics {
             .add(counters.bytes_index.load(Relaxed) as usize);
         self.bytes_data
             .add(counters.bytes_data.load(Relaxed) as usize);
+        self.bytes_data_requested
+            .add(counters.bytes_data_requested.load(Relaxed) as usize);
         self.bytes_other
             .add(counters.bytes_other.load(Relaxed) as usize);
     }

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Requested scan bytes**: SQL `stats.scan` now reports
+  `bytes_data_requested`, the logical data-page bytes requested before range
+  coalescing, beside the existing physical `bytes_data`. Distributed queries
+  sum the field across shards; older shard payloads deserialize it as zero.
+  Cache hits and repeated or overlapping ranges count as logical demand, so
+  subtracting it from `bytes_data` is not always a gap-byte measurement.
+  (#5805)
+
 - **Time-aggregate rebuild costs**: `siglake rebuild-time-aggregates` now ends
   its stdout report with one `rebuild_cost` JSON line containing publication
   and conflict counts plus per-component duration, projected Arrow-memory
