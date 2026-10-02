@@ -2178,6 +2178,9 @@ impl Compactor {
                         %table,
                         outcome,
                         candidates,
+                        sample_files = report.sample_files,
+                        reads = report.reads,
+                        bytes = report.bytes,
                         columns_before = report.columns_before,
                         columns_after = report.columns_after,
                         max_columns,
@@ -2414,6 +2417,7 @@ impl Compactor {
     /// so a pod that stopped looking drops out of the alert instead of paging
     /// from a stale reading.
     async fn run_inline_coverage_census_once(&self) {
+        let started = std::time::Instant::now();
         let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
         for ice in self.aggregate_contexts("inline-coverage census").await {
             let namespace = ice.namespace().to_string();
@@ -2431,6 +2435,7 @@ impl Compactor {
         // and zeroing its tables would read as "repaired" when the truth is
         // "unvisited". `aggregate_contexts` warns and skips such a namespace,
         // so hold the previous set when the pass reached nothing at all.
+        let tables_seen = seen.len();
         if !seen.is_empty() {
             let mut published = self.published_inline_coverage.lock().unwrap();
             for (namespace, table) in vanished_inline_coverage(&published, &seen) {
@@ -2438,6 +2443,9 @@ impl Compactor {
             }
             *published = seen;
         }
+        metrics::gauge!(INLINE_COVERAGE_CENSUS_TABLES).set(tables_seen as f64);
+        metrics::histogram!(INLINE_COVERAGE_CENSUS_DURATION)
+            .record(started.elapsed().as_secs_f64());
         metrics::counter!("siglake_inline_coverage_census_total").increment(1);
     }
 
@@ -3572,6 +3580,7 @@ impl Compactor {
 
     /// Run forever, polling `wal/sealed/` every `poll_interval`.
     pub async fn run_loop(self: std::sync::Arc<Self>, poll_interval: Duration) -> Result<()> {
+        preregister_inline_coverage_census_metrics();
         // Maintenance (re-clustering, snapshot expiry) runs on its own cadence,
         // only while ingest is idle, so it never contends with the commit hot
         // path.
@@ -6230,6 +6239,21 @@ fn preregister_auto_promotion_passes(iceberg_namespace: &str, table: &str) {
         )
         .increment(0);
     }
+    metrics::counter!(
+        "siglake_auto_promotion_sample_reads_total",
+        "iceberg_namespace" => iceberg_namespace.to_string(),
+        "table" => table.to_string()
+    )
+    .increment(0);
+    for phase in ["footer", "index", "data"] {
+        metrics::counter!(
+            "siglake_auto_promotion_sample_bytes_total",
+            "iceberg_namespace" => iceberg_namespace.to_string(),
+            "table" => table.to_string(),
+            "phase" => phase
+        )
+        .increment(0);
+    }
 }
 
 fn publish_auto_promotion_table_state(
@@ -6512,6 +6536,22 @@ fn agg_short_repair_max_tables_from(configured: Option<&str>) -> usize {
         .unwrap_or(1)
 }
 
+const INLINE_COVERAGE_CENSUS_REQUESTS: &str = "siglake_inline_coverage_census_requests_total";
+const INLINE_COVERAGE_CENSUS_DURATION: &str =
+    "siglake_inline_coverage_census_pass_duration_seconds";
+const INLINE_COVERAGE_CENSUS_TABLES: &str = "siglake_inline_coverage_census_tables";
+
+/// Create the census's bounded cost series before the maintenance loop runs.
+///
+/// These are round-cost readings, not alerted counters, so they stay beside
+/// the loop that owns them instead of entering siglake-core's alert catalog.
+fn preregister_inline_coverage_census_metrics() {
+    metrics::counter!(INLINE_COVERAGE_CENSUS_REQUESTS, "op" => "head").increment(0);
+    metrics::counter!(INLINE_COVERAGE_CENSUS_REQUESTS, "op" => "get").increment(0);
+    let _ = metrics::histogram!(INLINE_COVERAGE_CENSUS_DURATION);
+    metrics::gauge!(INLINE_COVERAGE_CENSUS_TABLES).set(0.0);
+}
+
 /// How often to census the maintained tables for an inline aggregate object
 /// that cannot prove coverage (`SIGLAKE_INLINE_COVERAGE_SCAN_INTERVAL_SECS`,
 /// default 900s; `0`, `off`, `disabled` or `never` switch the census off).
@@ -6623,7 +6663,12 @@ enum ClaimReclaimMaxAgeFallback {
 /// unparseable value, and this wrapper logs the substitution once per process.
 /// Positive values below the default are honoured: an operator who has
 /// measured short appends may tighten it.
-fn claim_reclaim_max_age() -> Duration {
+///
+/// `pub` because the ingest server's activation-depth publisher has to exclude
+/// exactly the claims this fleet still considers live (#6011). Reading the
+/// same variable through the same resolver is what keeps the publisher's
+/// cutoff and the reclaim sweep's from drifting apart.
+pub fn claim_reclaim_max_age() -> Duration {
     let raw = std::env::var("SIGLAKE_CLAIM_RECLAIM_MAX_AGE_SECS").ok();
     let (max_age, fallback) = claim_reclaim_max_age_from(raw.as_deref());
     if let Some(reason) = fallback {
@@ -7201,8 +7246,10 @@ mod auto_promotion_telemetry_tests {
                 DebugValue::Counter(value) => {
                     counters.insert(
                         (
+                            key.key().name().to_string(),
                             labels.get("table").cloned().unwrap_or_default(),
                             labels.get("outcome").cloned().unwrap_or_default(),
+                            labels.get("phase").cloned().unwrap_or_default(),
                         ),
                         value,
                     );
@@ -7223,14 +7270,54 @@ mod auto_promotion_telemetry_tests {
 
         for outcome in AUTO_PROMOTION_OUTCOMES {
             assert_eq!(
-                counters.get(&("disabled".into(), (*outcome).into())),
+                counters.get(&(
+                    "siglake_auto_promotion_passes_total".into(),
+                    "disabled".into(),
+                    (*outcome).into(),
+                    "".into()
+                )),
                 Some(&0)
             );
-            assert_eq!(counters.get(&("never".into(), (*outcome).into())), Some(&0));
             assert_eq!(
-                counters.get(&("completed".into(), (*outcome).into())),
+                counters.get(&(
+                    "siglake_auto_promotion_passes_total".into(),
+                    "never".into(),
+                    (*outcome).into(),
+                    "".into()
+                )),
+                Some(&0)
+            );
+            assert_eq!(
+                counters.get(&(
+                    "siglake_auto_promotion_passes_total".into(),
+                    "completed".into(),
+                    (*outcome).into(),
+                    "".into()
+                )),
                 Some(&1)
             );
+        }
+        for table in ["disabled", "never", "completed"] {
+            assert_eq!(
+                counters.get(&(
+                    "siglake_auto_promotion_sample_reads_total".into(),
+                    table.into(),
+                    "".into(),
+                    "".into()
+                )),
+                Some(&0)
+            );
+            for phase in ["footer", "index", "data"] {
+                assert_eq!(
+                    counters.get(&(
+                        "siglake_auto_promotion_sample_bytes_total".into(),
+                        table.into(),
+                        "".into(),
+                        phase.into()
+                    )),
+                    Some(&0)
+                );
+            }
         }
         assert_eq!(
             gauges.get(&(
@@ -9000,6 +9087,8 @@ mod agg_short_repair_knob_tests {
         agg_short_repair_enabled_from, agg_short_repair_max_tables_from,
         agg_short_scan_interval_from,
     };
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// Unlike the mirror sweep, `0` here IS off: a census on every compactor
@@ -9124,6 +9213,58 @@ mod agg_short_repair_knob_tests {
                     && c.series == siglake_core::metrics::UNLABELLED),
             "the compactor catalog must create the census counter at 0"
         );
+    }
+
+    #[tokio::test]
+    async fn the_inline_coverage_census_cost_series_start_at_zero_and_record_one_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = Arc::new(
+            siglake_storage::iceberg::IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        ice.append_events(&[siglake_core::Event::now("census-cost")])
+            .await
+            .unwrap();
+        let compactor = super::Compactor::new(tmp.path().join("wal"), ice);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        super::preregister_inline_coverage_census_metrics();
+
+        let initial = snapshotter.snapshot().into_vec();
+        let request = |op: &str| {
+            initial
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == super::INLINE_COVERAGE_CENSUS_REQUESTS
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "op" && label.value() == op)
+                })
+                .map(|(_, _, _, value)| value)
+                .unwrap_or_else(|| panic!("missing preregistered {op} request series"))
+        };
+        assert!(matches!(request("head"), DebugValue::Counter(0)));
+        assert!(matches!(request("get"), DebugValue::Counter(0)));
+        assert!(initial.iter().any(|(key, _, _, value)| key.key().name()
+            == super::INLINE_COVERAGE_CENSUS_DURATION
+            && matches!(value, DebugValue::Histogram(samples) if samples.is_empty())));
+        assert!(initial.iter().any(|(key, _, _, value)| key.key().name()
+            == super::INLINE_COVERAGE_CENSUS_TABLES
+            && matches!(value, DebugValue::Gauge(v) if v.into_inner() == 0.0)));
+
+        compactor.run_inline_coverage_census_once().await;
+        drop(guard);
+        let pass = snapshotter.snapshot().into_vec();
+        assert!(pass.iter().any(|(key, _, _, value)| key.key().name()
+            == super::INLINE_COVERAGE_CENSUS_DURATION
+            && matches!(value, DebugValue::Histogram(samples) if samples.len() == 1)));
+        assert!(pass.iter().any(|(key, _, _, value)| key.key().name()
+            == super::INLINE_COVERAGE_CENSUS_TABLES
+            && matches!(value, DebugValue::Gauge(v) if v.into_inner() == 1.0)));
     }
 }
 

@@ -1,6 +1,7 @@
 # Reclaiming aggregates after an index is dropped (task #3001)
 
-**Status:** design only; no deletion path is implemented. **Date:** 2026-09-23.
+**Status:** report-only record and sweeper implemented; automatic deletion is
+not enabled. **Date:** 2026-09-23.
 
 Dropping a managed index removes its catalog entry and keeps its committed
 storage. Recreating the index id uses the same table location with a new Iceberg
@@ -177,3 +178,26 @@ ordering, report-only inventory, the explicit aggregate-deletion authority,
 the repeated sweeper, metrics, and the proof above. It must not delete legacy
 flat aggregate artifacts. Committed-file and stale-WAL deletion remain separate
 targets even if the same record eventually inventories them.
+
+## Implementation status (task #6007)
+
+`DELETE /api/v1/indexes/{id}` now writes and reads back one v1 record before
+dropping the catalog entry. The record captures the UUID and location from the
+loaded table, the exact UUID aggregate prefix, the current metadata JSON and
+every object reachable through its retained snapshots. All committed-file
+entries remain inventory only, and the stale-WAL target remains operator
+review.
+
+`IcebergContext::sweep_dropped_index_aggregates` validates every record before
+the first delete and lists only the recorded UUID prefix. Report-only records
+return object and byte counts without mutation. An `aggregate_delete` record
+is page-bounded and starts each new page at the prefix root; an absent object
+is success on retry, and the record remains for later passes. There is no
+production API that grants `aggregate_delete` while the retention, recovery
+delay and store-failure policy above remain open.
+
+The storage fixture covers a same-location A→B replacement, byte preservation
+under B, a delayed A delta and marker after an empty pass, legacy flat-path
+preservation, Tier-1 agreement with a direct scan, malformed-target refusal,
+and restart after an already-applied delete. Committed-file and stale-WAL
+deletion remain out of scope.

@@ -111,7 +111,7 @@ async fn explicit_desc_order_uses_reverse_scan_without_sortexec() {
 
     let ctx = state
         .query_scan
-        .session_context_with_order(Some(PreferredScanOrder { descending: true }));
+        .session_context_with_order(Some(PreferredScanOrder::timestamp(true)));
     state.ice.register_with_datafusion(&ctx).await.unwrap();
     let df = ctx.sql(query).await.unwrap();
     let plan = df.create_physical_plan().await.unwrap();
@@ -214,7 +214,7 @@ async fn clustered_overlap_advertises_and_orders_exactly() {
     for descending in [true, false] {
         let ctx = state
             .query_scan
-            .session_context_with_order(Some(PreferredScanOrder { descending }));
+            .session_context_with_order(Some(PreferredScanOrder::timestamp(descending)));
         state.ice.register_with_datafusion(&ctx).await.unwrap();
         let dir = if descending { "DESC" } else { "ASC" };
         let df = ctx
@@ -288,7 +288,7 @@ async fn wide_file_chain_advertises_via_layering() {
     // And the plan advertises (no blocking sort) despite the 23-file chain.
     let ctx = state
         .query_scan
-        .session_context_with_order(Some(PreferredScanOrder { descending: true }));
+        .session_context_with_order(Some(PreferredScanOrder::timestamp(true)));
     state.ice.register_with_datafusion(&ctx).await.unwrap();
     let df = ctx
         .sql("SELECT timestamp FROM events ORDER BY timestamp DESC LIMIT 6")

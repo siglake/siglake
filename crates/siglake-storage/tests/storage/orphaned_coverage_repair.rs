@@ -307,9 +307,17 @@ async fn windowed_groups(
 /// No query runs here. That is the point of the census — the only other signal
 /// for this state, `siglake_query_side_aggs_cache_total{result="unproven_coverage"}`,
 /// needs a query to arrive and names no table.
-async fn census_samples(
-    ice: &IcebergContext,
-) -> (InlineCoverageOutcome, Vec<(f64, BTreeMap<String, String>)>) {
+#[derive(Debug)]
+struct CensusSamples {
+    outcome: InlineCoverageOutcome,
+    coverage: Vec<(f64, BTreeMap<String, String>)>,
+    requests: BTreeMap<String, u64>,
+    bytes: u64,
+    bytes_labels: Vec<BTreeMap<String, String>>,
+    side_loads: BTreeMap<String, u64>,
+}
+
+async fn census_samples(ice: &IcebergContext) -> CensusSamples {
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     let guard = metrics::set_default_local_recorder(&recorder);
@@ -322,37 +330,112 @@ async fn census_samples(
         .map(|(_, outcome)| *outcome)
         .unwrap_or_else(|| panic!("the census skipped {INDEX}: {outcomes:?}"));
 
-    let samples: Vec<(f64, BTreeMap<String, String>)> = snapshotter
-        .snapshot()
-        .into_vec()
-        .into_iter()
-        .filter(|(k, _, _, _)| k.key().name() == "siglake_inline_coverage_unproven")
-        .filter_map(|(k, _, _, v)| {
-            let labels: BTreeMap<String, String> = k
-                .key()
-                .labels()
-                .map(|l| (l.key().to_string(), l.value().to_string()))
-                .collect();
-            (labels.get("table").map(String::as_str) == Some(INDEX)).then_some(match v {
-                DebugValue::Gauge(g) => (*g, labels),
-                other => panic!("{other:?} is not a gauge"),
-            })
-        })
-        .collect();
-    (outcome, samples)
+    let mut coverage = Vec::new();
+    let mut requests = BTreeMap::new();
+    let mut bytes = 0;
+    let mut bytes_labels = Vec::new();
+    let mut side_loads = BTreeMap::new();
+    for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+        let labels: BTreeMap<String, String> = key
+            .key()
+            .labels()
+            .map(|l| (l.key().to_string(), l.value().to_string()))
+            .collect();
+        match key.key().name() {
+            "siglake_inline_coverage_unproven"
+                if labels.get("table").map(String::as_str) == Some(INDEX) =>
+            {
+                let DebugValue::Gauge(value) = value else {
+                    panic!("{value:?} is not a gauge");
+                };
+                coverage.push((value.into_inner(), labels));
+            }
+            "siglake_inline_coverage_census_requests_total" => {
+                let DebugValue::Counter(value) = value else {
+                    panic!("{value:?} is not a counter");
+                };
+                *requests
+                    .entry(labels.get("op").expect("request op label").clone())
+                    .or_default() += value;
+            }
+            "siglake_inline_coverage_census_bytes_total"
+                if labels.get("table").map(String::as_str) == Some(INDEX) =>
+            {
+                let DebugValue::Counter(value) = value else {
+                    panic!("{value:?} is not a counter");
+                };
+                bytes += value;
+                bytes_labels.push(labels);
+            }
+            "siglake_side_aggregates_load_total" => {
+                let DebugValue::Counter(value) = value else {
+                    panic!("{value:?} is not a counter");
+                };
+                *side_loads
+                    .entry(labels.get("outcome").expect("load outcome label").clone())
+                    .or_default() += value;
+            }
+            _ => {}
+        }
+    }
+    CensusSamples {
+        outcome,
+        coverage,
+        requests,
+        bytes,
+        bytes_labels,
+        side_loads,
+    }
 }
 
 /// The same pass, for the tables the census reaches a verdict on: exactly one
 /// gauge sample, and its value and labels.
 async fn census(ice: &IcebergContext) -> (InlineCoverageOutcome, f64, BTreeMap<String, String>) {
-    let (outcome, mut samples) = census_samples(ice).await;
+    let samples = census_samples(ice).await;
+    let mut coverage = samples.coverage;
     assert_eq!(
-        samples.len(),
+        coverage.len(),
         1,
-        "one gauge sample per table per pass: {samples:?}"
+        "one gauge sample per table per pass: {coverage:?}"
     );
-    let (value, labels) = samples.pop().unwrap();
-    (outcome, value, labels)
+    let (value, labels) = coverage.pop().unwrap();
+    (samples.outcome, value, labels)
+}
+
+#[tokio::test]
+async fn the_census_attributes_its_object_store_cost_to_the_table() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = seed(tmp.path()).await;
+    let side_path = aggregate_dir(&tmp.path().join("warehouse")).join("siglake-aggregates.json");
+    let side_bytes = std::fs::metadata(&side_path).unwrap().len();
+
+    let samples = census_samples(&ice).await;
+    assert_eq!(samples.outcome, InlineCoverageOutcome::Covered);
+    assert_eq!(samples.requests.get("head"), Some(&2));
+    assert_eq!(samples.requests.get("get"), Some(&1));
+    assert_eq!(samples.bytes, side_bytes);
+    assert_eq!(
+        samples.bytes_labels,
+        vec![BTreeMap::from([
+            ("iceberg_namespace".to_string(), "siglake".to_string()),
+            ("table".to_string(), INDEX.to_string()),
+        ])]
+    );
+    assert_eq!(samples.side_loads.get("hit"), Some(&1));
+}
+
+#[tokio::test]
+async fn the_census_counts_only_the_existence_probe_when_the_object_is_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = seed(tmp.path()).await;
+    let side_path = aggregate_dir(&tmp.path().join("warehouse")).join("siglake-aggregates.json");
+    std::fs::remove_file(side_path).unwrap();
+
+    let samples = census_samples(&ice).await;
+    assert_eq!(samples.outcome, InlineCoverageOutcome::NotApplicable);
+    assert_eq!(samples.requests.get("head"), Some(&1));
+    assert_eq!(samples.requests.get("get"), None);
+    assert_eq!(samples.bytes, 0);
 }
 
 /// #4674: the state every remaining orphaning trigger ends in has a name on it.
@@ -435,12 +518,16 @@ async fn a_census_that_cannot_read_the_object_reports_nothing() {
     std::fs::write(&path, b"{not json").unwrap();
 
     let ice = open(tmp.path()).await;
-    let (outcome, samples) = census_samples(&ice).await;
-    assert_eq!(outcome, InlineCoverageOutcome::Undetermined);
+    let samples = census_samples(&ice).await;
+    assert_eq!(samples.outcome, InlineCoverageOutcome::Undetermined);
     assert!(
-        samples.is_empty(),
-        "a failed read wrote a coverage verdict: {samples:?}"
+        samples.coverage.is_empty(),
+        "a failed read wrote a coverage verdict: {:?}",
+        samples.coverage
     );
+    assert_eq!(samples.requests.get("head"), Some(&2));
+    assert_eq!(samples.requests.get("get"), Some(&1));
+    assert_eq!(samples.bytes, 0);
 }
 
 /// THE REPRODUCTION, and then the fix: expiring the snapshot the coverage edge

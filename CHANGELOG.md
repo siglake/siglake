@@ -18,6 +18,112 @@
   incomplete measurement and retain their existing nonzero exit status. No
   listener, network exporter or flag was added. (#5702)
 
+- **Compactor observability (feature, target 0.3.0)**: the inline-coverage
+  census now reports its object-store cost on four additive metric families.
+  `siglake_inline_coverage_census_requests_total{op="head"|"get"}` counts the
+  shipped two-HEAD, one-GET request pattern per table with an object,
+  `siglake_inline_coverage_census_bytes_total{iceberg_namespace,table}` counts
+  usable bytes by table, `siglake_inline_coverage_census_pass_duration_seconds`
+  measures a completed pass, and `siglake_inline_coverage_census_tables`
+  records its table count. A failed GET is still a request attempt and adds no
+  bytes. The bounded request series, histogram and table gauge start at zero.
+  The 900-second default, existing metric identities and request pattern are
+  unchanged. (#6104)
+
+- **WAL mirror observability (feature)**: the two uploaders now report their
+  own object-store write activity.
+  `siglake_wal_mirror_upload_attempts_total{path}` counts
+  once immediately before each application-level object-store write call, so a
+  sealed segment that succeeds on its third try counts three where
+  `siglake_wal_mirror_segments_total{outcome="ok"}` counts one. Local source
+  resolution and read failures do not move it; retries inside the client or
+  service remain outside it, so it is not an exact billed S3 request count.
+  `siglake_wal_mirror_active_bytes_uploaded_total` carries the active loop's
+  share of `siglake_wal_mirror_bytes_uploaded_total`, which keeps counting both
+  paths. Both series and both `path` values are created at 0 when either
+  uploader starts. The existing metric name and labels are unchanged. (#6034,
+  #6047)
+
+- **Query (feature, behaviour change)**: a managed index whose doc mapping
+  names its own `timestamp_field` now browses newest-first on that field. A
+  bare interactive `SELECT` over such an index is rewritten with a quoted
+  `ORDER BY "<field>" DESC` (the canonical `timestamp` is still written bare),
+  and the scan hint the planner sends storage carries the field as well as the
+  direction. The scan advertises an ordering only after proving that field is
+  the table's identity sort lead and reads as a timestamp, and then uses it for
+  filter eligibility, projection, per-file bounds, reverse reading, the overlap
+  merge, frontier pruning and the ordered-plan cache key; a mismatch keeps
+  DataFusion's blocking sort, so a column merely NAMED `timestamp` on such an
+  index is never mistaken for a time order. Explicit `ORDER BY`,
+  `default_order: false`, batch requests, alias shadowing and canonical indexes
+  behave as before. No schema field is added and no tie order is promised:
+  rows sharing a custom event time may come back in any order among themselves
+  (`docs/LIMITATIONS.md`). (#6020)
+
+- **Operator (feature)**: `spec.autoscaling.compactor.min: 0` is accepted under
+  the catalog-claim drain (`compactor.max` above 1) with `ewmaHalfLifeSecs`
+  above 0. The reading that asks a parked tier back is published by the
+  ingesters: the ingest server reads the shared `wal_segments` queue over the
+  claim connection its mirror registrar already holds and exports
+  `siglake_wal_segments_sealed{tenant}` with a
+  `siglake_wal_segments_sealed_sample_age_seconds` companion, so the signal
+  outlives the tier it sizes. The depth counts sealed rows plus claims older
+  than `SIGLAKE_CLAIM_RECLAIM_MAX_AGE_SECS`, which makes a batch stranded in
+  `processing` by the last worker to stop visible without counting live work; a
+  failed catalog read holds the last depth and lets the age rise rather than
+  publishing a zero. The operator selects that reading only for a zero floor,
+  drops publishers whose sample is over two minutes old, and falls back to
+  `siglake_compactor_sealed_pending`. Each load signal is now observed on its
+  own — `siglake_operator_prom_query_errors_total` gains a `component` label —
+  so a component whose series is absent holds its own replica count instead of
+  freezing the other two, and a zero-floor tier with no usable reading goes to
+  1 rather than staying parked. A parked tier is woken for ten minutes after an
+  hour at zero so retention, delete tasks, claim reclaim and the mirror
+  recovery sweep still run. `compactor.max: 1` keeps
+  `AutoscalingZeroFloorUnsupported`, `ewmaHalfLifeSecs: 0` alongside a zero
+  floor is refused as `AutoscalingZeroFloorNeedsSmoothing`, and ingest and
+  query floors stay refused at 0. The packaged floors do not change, and no
+  round has yet woken a parked tier in a cluster — see `docs/LIMITATIONS.md`.
+  (#6011)
+
+- **Query observability (feature)**: the decoded-file cache publishes the total
+  its byte budget is enforced against, as
+  `siglake_query_scan_file_cache_accounted_bytes`, and counts the populations
+  that budget turns away, as
+  `siglake_query_scan_file_cache_requests_total{outcome="population_refused"}`.
+  Panel 175 ("Decoded-file cache bytes (accounted vs entries)") charts the new
+  gauge per query pod against the resident-entry gauge beside it. #5786 made
+  completed entries and live populations share
+  `SIGLAKE_QUERY_SCAN_FILE_CACHE_MAX_BYTES`, and until now neither side of that
+  bound was visible on a running pod: `siglake_query_scan_file_cache_bytes`
+  reports completed entries, so a tier serving clipped browses — which populate
+  and never insert — read as an empty cache while the bound was being enforced
+  against something larger, and a refused population charted as nothing at all.
+  A refusal is one increment per population, not per batch, and a refused
+  population is not also counted `abandoned`. The label does not say why: the
+  same arm counts a full budget and a busy replacement lock. The gauge is
+  created at 0 on the query server, so an idle pod and a switched-off cache read
+  zero rather than No data. Cache defaults, admission and eviction are
+  unchanged. (#5801)
+
+- **Query observability (feature)**: the Puffin blob cache publishes what it
+  holds against the budget being enforced on it, as
+  `siglake_iceberg_puffin_blob_cache_bytes` and
+  `siglake_iceberg_puffin_blob_cache_max_bytes`, and panel 161 (renamed
+  "Text-index cache resident / budget") charts the pair beside the parsed one.
+  #4718's eviction arms could not be read without it: the same `redundant` rate
+  under a budget that holds the plan and under half of it are the same series.
+  Unlike the parsed pair, which is published only after a successful insert,
+  these are published on every admission attempt including the refused ones, so
+  the two pods that admit nothing chart directly rather than by inference — one
+  whose blobs each exceed the budget shows resident bytes above a budget that
+  refuses every new blob, and one with `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_BYTES` or
+  `SIGLAKE_PUFFIN_BLOB_CACHE_MAX_ENTRIES` at 0 shows a budget of 0. The budget
+  published is the one in force: an entry bound of zero refuses every blob
+  whatever the byte knob says. Resident bytes come from the figure the cache
+  already maintains, so the gauges cost no walk of the cache and admission,
+  eviction and every bound are unchanged. (#5374)
+
 ## 0.2.1
 
 A fixes-only patch on 0.2.0. It adds the runtime conditional-write guard for

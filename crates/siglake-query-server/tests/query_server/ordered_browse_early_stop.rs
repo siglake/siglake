@@ -331,3 +331,126 @@ async fn ordered_plan_cache_hit_stays_exact() {
         "all runs must agree on the newest row: {last_first_ts:?}"
     );
 }
+
+/// #6020 end to end: a managed index whose mapping declares `ts` as its event
+/// time. A BARE interactive SELECT is rewritten to browse that field
+/// newest-first, the scan advertises the order (no blocking sort), and the rows
+/// are the newest event times across two overlapping files whose LIMIT boundary
+/// falls inside a group of equal `ts` values.
+#[tokio::test]
+async fn bare_browse_of_a_custom_event_time_index_is_newest_first() {
+    use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
+    use siglake_core::index_config::{
+        DocMapping, FieldMapping, FieldType, IndexConfig, MappingMode,
+    };
+
+    let datetime_field = |name: &str| FieldMapping {
+        name: name.to_string(),
+        field_type: FieldType::Datetime,
+        required: true,
+    };
+    let config = IndexConfig {
+        index_id: "ts-logs".to_string(),
+        doc_mapping: DocMapping {
+            mode: MappingMode::Dynamic,
+            field_mappings: vec![
+                datetime_field("ts"),
+                // Unrelated to the event time, and deliberately named
+                // `timestamp`: ordering by it would not be a time order.
+                datetime_field("timestamp"),
+                FieldMapping {
+                    name: "message".to_string(),
+                    field_type: FieldType::Text {
+                        tokenizer: Some("raw".to_string()),
+                    },
+                    required: true,
+                },
+            ],
+            timestamp_field: "ts".to_string(),
+            tag_fields: Vec::new(),
+            default_search_fields: vec!["message".to_string()],
+        },
+        retention: None,
+        index_at_flush: None,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = Arc::new(
+        IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap(),
+    );
+    let ident = ice.create_index(&config).await.unwrap();
+    let base = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+    let at = |secs: i64| base + Duration::seconds(secs);
+    let append = |offsets: Vec<i64>| {
+        let config = config.clone();
+        let ice = ice.clone();
+        let ident = ident.clone();
+        async move {
+            let micros: Vec<Option<i64>> = offsets
+                .iter()
+                .map(|secs| Some(at(*secs).timestamp_micros()))
+                .collect();
+            let batch = RecordBatch::try_new(
+                config.to_arrow_schema(),
+                vec![
+                    Arc::new(
+                        TimestampMicrosecondArray::from(micros.clone())
+                            .with_timezone(siglake_core::TIMESTAMP_TZ),
+                    ),
+                    // The unrelated column runs the OTHER way, so a browse
+                    // that ordered by it would return different rows.
+                    Arc::new(
+                        TimestampMicrosecondArray::from(
+                            micros.iter().map(|m| m.map(|m| -m)).collect::<Vec<_>>(),
+                        )
+                        .with_timezone(siglake_core::TIMESTAMP_TZ),
+                    ),
+                    Arc::new(StringArray::from(
+                        offsets
+                            .iter()
+                            .map(|secs| format!("row {secs}"))
+                            .collect::<Vec<_>>(),
+                    )),
+                    // The dynamic mapping's overflow column.
+                    Arc::new(StringArray::from(vec![None::<&str>; offsets.len()])),
+                ],
+            )
+            .unwrap();
+            ice.append_to_table(&ident, batch, &[]).await.unwrap();
+        }
+    };
+    // Two OVERLAPPING files (10..30 and 20..40) with three rows at +20.
+    append(vec![30, 10, 20, 20]).await;
+    append(vec![40, 20, 35]).await;
+
+    let app = router(AppState::new(ice, AuthConfig::open()));
+    let (status, body) = request_json(
+        &app,
+        serde_json::json!({ "query": "SELECT ts, message FROM \"ts-logs\" LIMIT 5" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["row_count"].as_u64(), Some(5), "{body}");
+    assert_eq!(
+        body["stats"]["scan"]["ordering"].as_str(),
+        Some("advertised"),
+        "a bare browse of a `ts`-mapped index must reach the ordered scan: {}",
+        body["stats"]
+    );
+    let got: Vec<chrono::DateTime<Utc>> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["ts"].as_str().unwrap().parse().unwrap())
+        .collect();
+    // The equal +20 rows are interchangeable at the boundary — a custom event
+    // time has no `timestamp_ns` tiebreak — but the VALUES are determined.
+    assert_eq!(
+        got,
+        vec![at(40), at(35), at(30), at(20), at(20)],
+        "{}",
+        body["rows"]
+    );
+}

@@ -1338,15 +1338,56 @@ async fn apply_query_rewrites(
     } else {
         search_rewritten
     };
+    // The table whose event-time field this query's order contract turns on.
+    // The implicit rewrite needs it to inject an order; a query that ALREADY
+    // orders by a non-canonical column needs it to decide whether that column
+    // is the index's event time and may therefore carry a scan hint.
     let ordered_index =
-        resolve_default_order_index(ice, &search_rewritten, default_order, priority).await;
+        match resolve_default_order_index(ice, &search_rewritten, default_order, priority).await {
+            Some(resolved) => Some(resolved),
+            None => resolve_explicit_order_index(ice, &search_rewritten).await,
+        };
     Ok(apply_default_order_if_needed(
         &search_rewritten,
         default_order,
         priority,
         max_rows,
-        ordered_index.as_deref(),
+        ordered_index
+            .as_ref()
+            .map(|(table, field)| (table.as_str(), field.as_str())),
     ))
+}
+
+/// The managed index and event-time field behind a query that already carries
+/// its own `ORDER BY <field>` over a non-canonical column. `None` — and the
+/// canonical column — for every other shape; see
+/// [`resolve_query_event_time_field`] for what that costs.
+async fn resolve_explicit_order_index(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    query: &str,
+) -> Option<(String, String)> {
+    let field = resolve_query_event_time_field(ice, query).await?;
+    let table = single_scan_table(&sole_query_statement(query)?)?;
+    Some((table, field))
+}
+
+/// The one `SELECT` a request is, seen through an `EXPLAIN` when it is one.
+fn sole_query_statement(sql: &str) -> Option<SqlQuery> {
+    let dialect = GenericDialect {};
+    let mut stmts = Parser::parse_sql(&dialect, sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    match stmts.pop()? {
+        Statement::Query(query) => Some(*query),
+        // #91: EXPLAIN inherits the inner query's hint, so it inherits the
+        // field that hint is about.
+        Statement::Explain { statement, .. } => match *statement {
+            Statement::Query(inner) => Some(*inner),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The managed index a bare SELECT may be ordered by, resolved against the
@@ -1359,17 +1400,19 @@ async fn apply_query_rewrites(
 /// `OrderedScanLimit`) without the caller spelling `ORDER BY` out (#4038).
 ///
 /// `None` — no index-driven rewrite — when the query's shape disqualifies it
-/// anyway, when the table is one this module already knows, when the name is
-/// not a managed index of this tenant, or when its mapping's event-time field
-/// is not `timestamp`. Eligibility comes from the bounded-staleness table
-/// cache, so the warm path adds a catalog row lookup and no S3 metadata read;
-/// a shape that would not be rewritten never asks at all.
+/// anyway, when the table is one this module already knows, or when the name is
+/// not a managed index of this tenant. A mapping that names its own
+/// `timestamp_field` is eligible like any other and comes back WITH that field,
+/// which the rewrite quotes and the scan hint carries (#6020). Eligibility
+/// comes from the bounded-staleness table cache, so the warm path adds a
+/// catalog row lookup and no S3 metadata read; a shape that would not be
+/// rewritten never asks at all.
 async fn resolve_default_order_index(
     ice: &siglake_storage::iceberg::IcebergContext,
     query: &str,
     default_order: bool,
     priority: Priority,
-) -> Option<String> {
+) -> Option<(String, String)> {
     if !default_order || priority == Priority::Batch {
         return None;
     }
@@ -1378,22 +1421,82 @@ async fn resolve_default_order_index(
     let [Statement::Query(sql_query)] = stmts.as_slice() else {
         return None;
     };
-    let table = default_order_target_table(sql_query)?;
+    // The alias-shadow half of the shape test is deliberately left to the
+    // rewrite: it compares against the very field this lookup resolves.
+    let table = default_order_shape_table(sql_query)?;
     if query_table_has_timestamp(&table) {
         return None;
     }
-    match ice.index_orders_by_canonical_timestamp(&table).await {
-        Ok(true) => Some(table),
-        Ok(false) => None,
+    index_event_time_field(ice, &table)
+        .await
+        .map(|field| (table, field))
+}
+
+/// One managed index's event-time field, or `None` when the name is not a
+/// managed index of this tenant.
+///
+/// A catalog hiccup answers `None`: the order contract is an optimisation of
+/// presentation, never a correctness gate, so a failed lookup leaves the query
+/// unordered rather than failing it, and planning reports a missing table.
+async fn index_event_time_field(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    table: &str,
+) -> Option<String> {
+    match ice.index_event_time_field(table).await {
+        Ok(field) => field,
         Err(err) => {
-            // Eligibility is an optimisation of presentation, never a
-            // correctness gate: a catalog hiccup leaves the query unordered
-            // rather than failing it, and planning reports a missing table.
-            tracing::debug!(table = %table, error = %err, "default-order eligibility lookup failed");
+            tracing::debug!(table = %table, error = %err, "event-time field lookup failed");
             None
         }
     }
 }
+
+/// The event-time field to judge a query's order contract by, when it is not
+/// the canonical `timestamp`.
+///
+/// `None` — meaning `timestamp`, today's behavior exactly — for a query that
+/// names no single table, one that carries no `ORDER BY` of its own (the
+/// implicit rewrite resolves its own field, and a query with neither has no
+/// order contract to judge), one whose lead `ORDER BY` is already the canonical
+/// column or is not a column at all, one over a table this module knows, and
+/// one whose table is not a managed index. Only the remaining shape pays the
+/// (cached-metadata) mapping lookup.
+async fn resolve_query_event_time_field(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    sql: &str,
+) -> Option<String> {
+    let query = sole_query_statement(sql)?;
+    let order_by = query.order_by.as_ref()?;
+    let OrderByKind::Expressions(exprs) = &order_by.kind else {
+        return None;
+    };
+    let lead = exprs.first()?;
+    if sql_order_expr_is_field(&lead.expr, CANONICAL_EVENT_TIME) || sql_ident(&lead.expr).is_none()
+    {
+        return None;
+    }
+    let table = single_scan_table(&query)?;
+    if query_table_has_timestamp(&table) {
+        return None;
+    }
+    index_event_time_field(ice, &table)
+        .await
+        .filter(|field| field != CANONICAL_EVENT_TIME)
+}
+
+/// The event-time field the order contract for `query` is about: the resolved
+/// index field when this query reads that index, the canonical column
+/// otherwise.
+fn query_order_field<'a>(query: &SqlQuery, ordered_index: Option<(&'a str, &'a str)>) -> &'a str {
+    match (ordered_index, single_scan_table(query)) {
+        (Some((index, field)), Some(table)) if index == table => field,
+        _ => CANONICAL_EVENT_TIME,
+    }
+}
+
+/// The event-time field of the canonical `events` table, and the fallback for
+/// every table whose mapping does not name another one.
+const CANONICAL_EVENT_TIME: &str = siglake_storage::CANONICAL_EVENT_TIME_FIELD;
 
 type AttrRewriteMap = HashMap<String, (String, siglake_core::PromotedType)>;
 
@@ -1808,16 +1911,17 @@ struct RewrittenQuery {
 
 /// Inject the implicit newest-first ordering into a qualifying bare SELECT.
 ///
-/// `ordered_index` is the managed index the caller already resolved as
-/// carrying the canonical `timestamp` column (see
-/// [`resolve_default_order_index`]); `events` and `query_audit` are known
-/// without it.
+/// `ordered_index` is the managed index the caller already resolved, paired
+/// with its event-time field (see [`resolve_default_order_index`]); `events`
+/// and `query_audit` are known to carry `timestamp` without it. Every order
+/// judgement below — the injected `ORDER BY`, the alias-shadow guard, the scan
+/// hint — is made against that one field.
 fn apply_default_order_if_needed(
     query: &str,
     enabled: bool,
     priority: Priority,
     max_rows: usize,
-    ordered_index: Option<&str>,
+    ordered_index: Option<(&str, &str)>,
 ) -> RewrittenQuery {
     let dialect = GenericDialect {};
     let mut stmts = match Parser::parse_sql(&dialect, query) {
@@ -1840,7 +1944,10 @@ fn apply_default_order_if_needed(
         if let Statement::Query(inner) = statement.as_ref() {
             return RewrittenQuery {
                 sql: query.to_string(),
-                preferred_scan_order: preferred_scan_order_from_query(inner),
+                preferred_scan_order: preferred_scan_order_from_query(
+                    inner,
+                    query_order_field(inner, ordered_index),
+                ),
                 // The hints an EXPLAIN carries are the ones that decide the
                 // PLAN the caller asked to see. `clipping_scan_limit` decides
                 // the text-index path and prints in the scan's display; a
@@ -1865,22 +1972,32 @@ fn apply_default_order_if_needed(
             clipped_limit: None,
         };
     };
-    let table_has_timestamp = |table: &str| {
-        query_table_has_timestamp(table)
-            // Index ids are catalog table names: matched exactly, unlike the
-            // case-folded system names.
-            || ordered_index == Some(table)
+    // The event-time field of a table this rewrite may order, or `None` when
+    // it may not order that table at all.
+    let table_order_field = |table: &str| -> Option<&str> {
+        if query_table_has_timestamp(table) {
+            return Some(CANONICAL_EVENT_TIME);
+        }
+        // Index ids are catalog table names: matched exactly, unlike the
+        // case-folded system names.
+        match ordered_index {
+            Some((index, field)) if index == table => Some(field),
+            _ => None,
+        }
     };
     if enabled
         && priority != Priority::Batch
-        && apply_default_order_to_query(sql_query, max_rows, table_has_timestamp).is_some()
+        && apply_default_order_to_query(sql_query, max_rows, table_order_field).is_some()
     {
-        let preferred_scan_order = preferred_scan_order_from_query(sql_query);
+        let preferred_scan_order =
+            preferred_scan_order_from_query(sql_query, query_order_field(sql_query, ordered_index));
         let sql = Statement::Query(sql_query.clone()).to_string();
         if preferred_scan_order.is_some() {
             metrics::counter!("siglake_query_default_order_applied_total").increment(1);
         }
-        let ordered_limit = preferred_scan_order.and_then(|_| explicit_limit_value(sql_query));
+        let ordered_limit = preferred_scan_order
+            .as_ref()
+            .and_then(|_| explicit_limit_value(sql_query));
         return RewrittenQuery {
             sql,
             preferred_scan_order,
@@ -1891,11 +2008,14 @@ fn apply_default_order_if_needed(
             clipped_limit: clipping_scan_limit(sql_query),
         };
     }
-    let preferred_scan_order = preferred_scan_order_from_query(sql_query);
+    let preferred_scan_order =
+        preferred_scan_order_from_query(sql_query, query_order_field(sql_query, ordered_index));
     RewrittenQuery {
+        ordered_limit: preferred_scan_order
+            .as_ref()
+            .and_then(|_| explicit_limit_value(sql_query)),
         sql: query.to_string(),
         preferred_scan_order,
-        ordered_limit: preferred_scan_order.and_then(|_| explicit_limit_value(sql_query)),
         clipped_limit: clipping_scan_limit(sql_query),
     }
 }
@@ -1904,7 +2024,7 @@ fn apply_default_order_if_needed(
 fn rewrite_query_with_default_order(
     query: &str,
     max_rows: usize,
-    table_has_timestamp: impl Fn(&str) -> bool,
+    table_order_field: impl Fn(&str) -> Option<&'static str>,
 ) -> Option<String> {
     let dialect = GenericDialect {};
     let mut stmts = Parser::parse_sql(&dialect, query).ok()?;
@@ -1914,23 +2034,27 @@ fn rewrite_query_with_default_order(
     let Statement::Query(sql_query) = &mut stmts[0] else {
         return None;
     };
-    apply_default_order_to_query(sql_query, max_rows, table_has_timestamp)?;
+    apply_default_order_to_query(sql_query, max_rows, table_order_field)?;
     Some(Statement::Query(sql_query.clone()).to_string())
 }
 
-fn apply_default_order_to_query(
+/// Rewrite `query` in place to browse its table newest-first. `Some(field)` —
+/// the event-time field it ordered by — when it rewrote.
+fn apply_default_order_to_query<'a>(
     query: &mut SqlQuery,
     max_rows: usize,
-    table_has_timestamp: impl Fn(&str) -> bool,
-) -> Option<()> {
-    let table = default_order_target_table(query)?;
-    if !table_has_timestamp(&table) {
-        return None;
-    }
+    table_order_field: impl Fn(&str) -> Option<&'a str>,
+) -> Option<&'a str> {
+    let table = default_order_shape_table(query)?;
+    let field = table_order_field(&table)?;
+    // The alias-shadow guard, now that the field is known: `SELECT raw AS "ts"`
+    // over a `ts`-mapped index captures the injected order exactly as an alias
+    // named `timestamp` captures the canonical one.
+    default_order_target_table(query, field)?;
 
     query.order_by = Some(OrderBy {
         kind: OrderByKind::Expressions(vec![OrderByExpr {
-            expr: SqlAstExpr::Identifier("timestamp".into()),
+            expr: SqlAstExpr::Identifier(order_by_ident(field)),
             options: OrderByOptions {
                 asc: Some(false),
                 nulls_first: None,
@@ -1965,7 +2089,18 @@ fn apply_default_order_to_query(
             },
         });
     }
-    Some(())
+    Some(field)
+}
+
+/// The single table a default-order rewrite would act on once its event-time
+/// field is known: [`default_order_shape_table`] plus the alias-shadow guard,
+/// which can only be judged against that field.
+fn default_order_target_table(query: &SqlQuery, order_field: &str) -> Option<String> {
+    let table = default_order_shape_table(query)?;
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    (!projection_shadows_order_field(select, order_field)).then_some(table)
 }
 
 /// The single table a default-order rewrite would act on, or `None` when the
@@ -1973,7 +2108,11 @@ fn apply_default_order_to_query(
 /// join, …). Says nothing about whether that table is eligible — the caller
 /// decides that, and for a managed index deciding it needs `await`, which is
 /// why the shape test is separate from the rewrite.
-fn default_order_target_table(query: &SqlQuery) -> Option<String> {
+///
+/// The alias-shadow guard is NOT here: it compares against the table's
+/// event-time field, which the caller resolves from this table name. See
+/// [`default_order_target_table`].
+fn default_order_shape_table(query: &SqlQuery) -> Option<String> {
     if query.with.is_some()
         || query.order_by.is_some()
         || query.fetch.is_some()
@@ -2014,18 +2153,24 @@ fn default_order_target_table(query: &SqlQuery) -> Option<String> {
     {
         return None;
     }
-    if projection_shadows_timestamp(select) {
-        return None;
-    }
-    let from = &select.from[0];
-    if !from.joins.is_empty() {
-        return None;
-    }
-    let TableFactor::Table { name, .. } = &from.relation else {
+    single_scan_table(query)
+}
+
+/// The one table a query reads, when it reads exactly one plain table with no
+/// join. Says nothing about the rest of the query's shape — the order contract
+/// needs the table name to resolve its event-time field before any judgement
+/// about ordering can be made.
+fn single_scan_table(query: &SqlQuery) -> Option<String> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
         return None;
     };
-    let table_name = name.to_string();
-    Some(object_name_tail(&table_name)?.to_string())
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, .. } = &select.from[0].relation else {
+        return None;
+    };
+    Some(object_name_tail(&name.to_string())?.to_string())
 }
 
 /// True when the projection binds the OUTPUT name `timestamp` to something
@@ -2041,22 +2186,22 @@ fn default_order_target_table(query: &SqlQuery) -> Option<String> {
 /// unqualified alias), so a qualified injection would turn a 200 into a 400.
 /// The shape therefore disqualifies the rewrite, exactly as `default_order:
 /// false` would: file order, and no scan-order hint.
-fn projection_shadows_timestamp(select: &Select) -> bool {
+fn projection_shadows_order_field(select: &Select, field: &str) -> bool {
     select.projection.iter().any(|item| match item {
         SelectItem::ExprWithAlias { expr, alias } => {
-            ident_is_timestamp(alias) && !sql_order_expr_is_timestamp(expr)
+            ident_is_field(alias, field) && !sql_order_expr_is_field(expr, field)
         }
         _ => false,
     })
 }
 
-/// A bare `timestamp` identifier in ORDER BY — the only form a projection
+/// A bare event-time identifier in ORDER BY — the only form a projection
 /// alias can capture. A qualified `t.timestamp` names the source column and
 /// cannot be shadowed (it is either unambiguous or rejected outright).
-fn sql_order_expr_is_bare_timestamp(expr: &SqlAstExpr) -> bool {
+fn sql_order_expr_is_bare_field(expr: &SqlAstExpr, field: &str) -> bool {
     match expr {
-        SqlAstExpr::Identifier(ident) => ident_is_timestamp(ident),
-        SqlAstExpr::Nested(expr) => sql_order_expr_is_bare_timestamp(expr),
+        SqlAstExpr::Identifier(ident) => ident_is_field(ident, field),
+        SqlAstExpr::Nested(expr) => sql_order_expr_is_bare_field(expr, field),
         _ => false,
     }
 }
@@ -2132,11 +2277,11 @@ fn normalized_sql_ident(ident: &Ident) -> String {
     IdentNormalizer::default().normalize(ident.clone())
 }
 
-/// A pure time-range conjunct: `timestamp <op> <anything>` (or flipped) for a
-/// range operator. The value side is deliberately loose — casts, literals,
+/// A pure time-range conjunct: `<event time> <op> <anything>` (or flipped) for
+/// a range operator. The value side is deliberately loose — casts, literals,
 /// and function calls all count; the point is only that the term constrains
 /// no dimension column.
-fn sql_expr_is_time_range(expr: &SqlAstExpr) -> bool {
+fn sql_expr_is_time_range(expr: &SqlAstExpr, time_field: &str) -> bool {
     use datafusion::sql::sqlparser::ast::BinaryOperator as Op;
     let SqlAstExpr::BinaryOp { left, op, right } = expr else {
         return false;
@@ -2146,13 +2291,16 @@ fn sql_expr_is_time_range(expr: &SqlAstExpr) -> bool {
     }
     [left, right]
         .iter()
-        .any(|side| sql_ident(side).is_some_and(ident_is_timestamp))
+        .any(|side| sql_ident(side).is_some_and(|i| ident_is_field(i, time_field)))
 }
 
 /// One dimensional term: `col = 'v'`, `col <> 'v'`, `col IN (…)`,
 /// `col NOT IN (…)` — string literals only (the group-count battery covers
 /// string dimensions). Returns `(column, values, negated)`.
-fn sql_expr_dimensional_term(expr: &SqlAstExpr) -> Option<(String, Vec<String>, bool)> {
+fn sql_expr_dimensional_term(
+    expr: &SqlAstExpr,
+    time_field: &str,
+) -> Option<(String, Vec<String>, bool)> {
     use datafusion::sql::sqlparser::ast::BinaryOperator as Op;
     match expr {
         SqlAstExpr::BinaryOp { left, op, right } if matches!(op, Op::Eq | Op::NotEq) => {
@@ -2160,7 +2308,7 @@ fn sql_expr_dimensional_term(expr: &SqlAstExpr) -> Option<(String, Vec<String>, 
                 (Some(c), Some(v)) => (c, v),
                 _ => (sql_ident(right)?, sql_string_literal(left)?),
             };
-            if ident_is_timestamp(col) {
+            if ident_is_field(col, time_field) {
                 return None;
             }
             Some((
@@ -2175,24 +2323,24 @@ fn sql_expr_dimensional_term(expr: &SqlAstExpr) -> Option<(String, Vec<String>, 
             negated,
         } => {
             let col = sql_ident(expr)?;
-            if ident_is_timestamp(col) {
+            if ident_is_field(col, time_field) {
                 return None;
             }
             let values: Option<Vec<String>> = list.iter().map(sql_string_literal).collect();
             Some((normalized_sql_ident(col), values?, *negated))
         }
-        SqlAstExpr::Nested(inner) => sql_expr_dimensional_term(inner),
+        SqlAstExpr::Nested(inner) => sql_expr_dimensional_term(inner, time_field),
         _ => None,
     }
 }
 
-fn detect_ordered_residual_browse(sql: &str) -> Option<ResidualBrowseShape> {
+fn detect_ordered_residual_browse(sql: &str, time_field: &str) -> Option<ResidualBrowseShape> {
     let dialect = GenericDialect {};
     let stmts = Parser::parse_sql(&dialect, sql).ok()?;
     let [Statement::Query(query)] = &stmts[..] else {
         return None;
     };
-    // Ordered by `timestamp` (sole sort key) with an explicit LIMIT.
+    // Ordered by the table's event time (sole sort key) with an explicit LIMIT.
     let order_by = query.order_by.as_ref()?;
     let OrderByKind::Expressions(exprs) = &order_by.kind else {
         return None;
@@ -2200,17 +2348,17 @@ fn detect_ordered_residual_browse(sql: &str) -> Option<ResidualBrowseShape> {
     let [lead] = &exprs[..] else {
         return None;
     };
-    if !sql_order_expr_is_timestamp(&lead.expr) || !query_has_explicit_limit(query) {
+    if !sql_order_expr_is_field(&lead.expr, time_field) || !query_has_explicit_limit(query) {
         return None;
     }
-    dim_browse_shape(query)
+    dim_browse_shape(query, time_field)
 }
 
 /// The same dimensional shape WITHOUT requiring an `ORDER BY`: a plain
 /// `WHERE <col> = 'v' [AND <time range>] LIMIT n` browse. The distribution gate
 /// needs this because its question is how much the scan must sift, which does
 /// not depend on how the rows come back ordered.
-fn detect_dim_browse(sql: &str) -> Option<ResidualBrowseShape> {
+fn detect_dim_browse(sql: &str, time_field: &str) -> Option<ResidualBrowseShape> {
     let dialect = GenericDialect {};
     let stmts = Parser::parse_sql(&dialect, sql).ok()?;
     let [Statement::Query(query)] = &stmts[..] else {
@@ -2219,14 +2367,17 @@ fn detect_dim_browse(sql: &str) -> Option<ResidualBrowseShape> {
     if !query_has_explicit_limit(query) {
         return None;
     }
-    dim_browse_shape(query)
+    dim_browse_shape(query, time_field)
 }
 
 /// The single dimensional term of a filtered browse: table, column, values and
 /// whether it is negated. Conservative by construction -- pure time ranges plus
 /// EXACTLY one dimensional term; an OR, a LIKE, a function or a second
 /// dimension all disqualify.
-fn dim_browse_shape(query: &datafusion::sql::sqlparser::ast::Query) -> Option<ResidualBrowseShape> {
+fn dim_browse_shape(
+    query: &datafusion::sql::sqlparser::ast::Query,
+    time_field: &str,
+) -> Option<ResidualBrowseShape> {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return None;
     };
@@ -2258,10 +2409,10 @@ fn dim_browse_shape(query: &datafusion::sql::sqlparser::ast::Query) -> Option<Re
     flatten_and_conjuncts(selection, &mut conjuncts);
     let mut dim: Option<(String, Vec<String>, bool)> = None;
     for conjunct in conjuncts {
-        if sql_expr_is_time_range(conjunct) {
+        if sql_expr_is_time_range(conjunct, time_field) {
             continue;
         }
-        let term = sql_expr_dimensional_term(conjunct)?;
+        let term = sql_expr_dimensional_term(conjunct, time_field)?;
         if dim.is_some() {
             return None;
         }
@@ -2325,7 +2476,11 @@ async fn browse_expected_scan_rows(
     sql: &str,
     limit: usize,
 ) -> Option<u64> {
-    let shape = detect_dim_browse(sql)?;
+    // The distribution gate asks how much a browse must sift, which turns on
+    // the same event-time field: a `ts` range bound is a window, not a
+    // dimensional term (#6020).
+    let time_field = resolve_query_event_time_field(ice, sql).await;
+    let shape = detect_dim_browse(sql, time_field.as_deref().unwrap_or(CANONICAL_EVENT_TIME))?;
     let rows = ice
         .grouped_counts_with_summary(&shape.table, &shape.column, None, None)
         .await
@@ -2459,8 +2614,16 @@ async fn residual_browse_low_selectivity_at(
     allow
 }
 
+/// The scan-order hint for a query ordered by `time_field`, the event-time
+/// field of the table it reads.
+///
+/// The hint carries the field as well as the direction: storage accepts it
+/// only after proving that field IS the scanned table's identity sort lead
+/// (#6020), so naming it here is what lets a `ts`-mapped index early-stop
+/// instead of falling to a blocking sort.
 fn preferred_scan_order_from_query(
     query: &SqlQuery,
+    time_field: &str,
 ) -> Option<siglake_storage::PreferredScanOrder> {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return None;
@@ -2476,61 +2639,98 @@ fn preferred_scan_order_from_query(
         return None;
     };
     let lead = exprs.first()?;
-    if !sql_order_expr_is_timestamp(&lead.expr) {
+    if !sql_order_expr_is_field(&lead.expr, time_field) {
         return None;
     }
     // A client's own `ORDER BY timestamp` over `SELECT <col> AS timestamp`
     // sorts the aliased column, not the source one (#4090). Keeping the hint
     // would ask the scan to produce an ordering nothing in the plan consumes.
-    if sql_order_expr_is_bare_timestamp(&lead.expr) && projection_shadows_timestamp(select) {
+    if sql_order_expr_is_bare_field(&lead.expr, time_field)
+        && projection_shadows_order_field(select, time_field)
+    {
         return None;
     }
-    Some(siglake_storage::PreferredScanOrder {
-        descending: lead.options.asc == Some(false),
-    })
+    Some(siglake_storage::PreferredScanOrder::new(
+        time_field,
+        lead.options.asc == Some(false),
+    ))
 }
 
-fn preferred_scan_order_from_sql(query: &str) -> Option<siglake_storage::PreferredScanOrder> {
+fn preferred_scan_order_from_sql(
+    query: &str,
+    time_field: &str,
+) -> Option<siglake_storage::PreferredScanOrder> {
     let dialect = GenericDialect {};
     let mut stmts = Parser::parse_sql(&dialect, query).ok()?;
     if stmts.len() != 1 {
         return None;
     }
     match stmts.pop()? {
-        Statement::Query(sql_query) => preferred_scan_order_from_query(&sql_query),
+        Statement::Query(sql_query) => preferred_scan_order_from_query(&sql_query, time_field),
         // #91: EXPLAIN inherits the inner query's hint.
         Statement::Explain { statement, .. } => match *statement {
-            Statement::Query(inner) => preferred_scan_order_from_query(&inner),
+            Statement::Query(inner) => preferred_scan_order_from_query(&inner, time_field),
             _ => None,
         },
         _ => None,
     }
 }
 
-fn sql_order_expr_is_timestamp(expr: &SqlAstExpr) -> bool {
+/// The same hint, for a caller that holds the tenant context and only the SQL
+/// text: resolves the event-time field of the single table the query reads
+/// before deriving the order. Used by the paths that plan a query the rewrite
+/// has already been through (`EXPLAIN`, the shard worker), so they hint the
+/// same field the coordinator did.
+async fn preferred_scan_order_for_sql(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    query: &str,
+) -> Option<siglake_storage::PreferredScanOrder> {
+    let field = resolve_query_event_time_field(ice, query).await;
+    preferred_scan_order_from_sql(query, field.as_deref().unwrap_or(CANONICAL_EVENT_TIME))
+}
+
+fn sql_order_expr_is_field(expr: &SqlAstExpr, field: &str) -> bool {
     match expr {
-        SqlAstExpr::Identifier(ident) => ident_is_timestamp(ident),
-        SqlAstExpr::CompoundIdentifier(idents) => idents.last().is_some_and(ident_is_timestamp),
-        SqlAstExpr::Nested(expr) => sql_order_expr_is_timestamp(expr),
+        SqlAstExpr::Identifier(ident) => ident_is_field(ident, field),
+        SqlAstExpr::CompoundIdentifier(idents) => {
+            idents.last().is_some_and(|i| ident_is_field(i, field))
+        }
+        SqlAstExpr::Nested(expr) => sql_order_expr_is_field(expr, field),
         _ => false,
     }
 }
 
-/// Does this identifier name the canonical `timestamp` column, under SQL's own
-/// case rules? An unquoted identifier is case-normalized (`TIMESTAMP` and
+/// Does this identifier name the column `field`, under SQL's own case rules?
+/// An unquoted identifier is case-normalized to lower case (`TIMESTAMP` and
 /// `timestamp` are the same column, as DataFusion's ident normalizer resolves
-/// them); a quoted one keeps exactly the case it was written with.
+/// them, and an unquoted `Ts` can only bind a column named `ts`); a quoted one
+/// keeps exactly the case it was written with.
 ///
 /// The distinction is not academic here: a managed mapping may declare both
 /// `timestamp` and `Timestamp`, because `IndexConfig::validate` preserves case
 /// and rejects duplicates by exact name (`siglake_core::index_config`). Reading
 /// `"Timestamp"` as the canonical column let `SELECT "Timestamp" AS timestamp`
 /// pass the #4090 shadowing guard, and the implicit browse then came back
-/// ordered by the text column (#4214).
-fn ident_is_timestamp(ident: &Ident) -> bool {
+/// ordered by the text column (#4214). The same rule decides a mapping's own
+/// event-time field, which may be spelled in any case (#6020).
+fn ident_is_field(ident: &Ident, field: &str) -> bool {
     match ident.quote_style {
-        Some(_) => ident.value == "timestamp",
-        None => ident.value.eq_ignore_ascii_case("timestamp"),
+        Some(_) => ident.value == field,
+        None => ident.value.to_ascii_lowercase() == field,
+    }
+}
+
+/// The identifier the implicit newest-first rewrite injects for `field`.
+///
+/// The canonical column is written bare, exactly as the rewrite always wrote
+/// it. Any other event-time field is QUOTED: mapping field names keep their
+/// case and may collide with SQL keywords, and an unquoted injection would
+/// case-fold to a different column or fail to parse (#6020).
+fn order_by_ident(field: &str) -> Ident {
+    if field == siglake_storage::CANONICAL_EVENT_TIME_FIELD {
+        Ident::new(field)
+    } else {
+        Ident::with_quote('"', field)
     }
 }
 
@@ -2711,7 +2911,10 @@ fn clipping_scan_limit(query: &SqlQuery) -> Option<usize> {
     if query_contains_subquery(query) {
         return None;
     }
-    default_order_target_table(query)?;
+    // Clipping has nothing to do with the order contract, so the shape test
+    // judges its alias guard against the canonical column, exactly as it did
+    // before per-index event times existed.
+    default_order_target_table(query, CANONICAL_EVENT_TIME)?;
     explicit_limit_value(query)
 }
 
@@ -4328,8 +4531,15 @@ async fn handle_local_inner(
         Ok::<_, ApiError>(
             !req.dry_run
                 && shard.is_none()
-                && effective_query.preferred_scan_order.is_some()
-                && match detect_ordered_residual_browse(&effective_query.sql) {
+                && match effective_query
+                    .preferred_scan_order
+                    .as_ref()
+                    .and_then(|order| {
+                        // The classifier judges the same event-time field the hint
+                        // is about: a pure `ts` range is a window, not a residual
+                        // dimension term (#6020).
+                        detect_ordered_residual_browse(&effective_query.sql, &order.field)
+                    }) {
                     Some(shape) => residual_browse_low_selectivity(&ice, &shape).await,
                     None => false,
                 },
@@ -4337,7 +4547,7 @@ async fn handle_local_inner(
     });
     let ctx = state
         .query_scan
-        .session_context_sharded_with_order(shard, effective_query.preferred_scan_order);
+        .session_context_sharded_with_order(shard, effective_query.preferred_scan_order.clone());
     // Ordered-scan session hints: the residual-selectivity override and the
     // explicit LIMIT (drives the gate's single-partition coalesce — an
     // early-stopping browse gains nothing from scan parallelism and pays an
@@ -4359,6 +4569,16 @@ async fn handle_local_inner(
     // scanning; setting this flag ends the source stream they drain from, and
     // they unwind. See QueryCancel for the measurement that forced this.
     let cancel = siglake_storage::QueryCancel::new();
+    // This execution's identity, minted beside the cancellation flag because
+    // the two have the same scope: one request, one plan, one set of scans.
+    // The scan stamps it on its tuning and partition profile events, and the
+    // terminal `sql query profile` line below carries it too — that is the
+    // whole join. It has to be an event FIELD rather than a span: the scan's
+    // partition events are emitted from DataFusion's spawned pumps, which
+    // carry no request span, and on the NDJSON path they are emitted after
+    // this handler has already logged its terminal line.
+    let execution_id = siglake_storage::QueryExecutionId::next();
+    log_query_execution_start("sql", execution_id, Some(&effective_query.sql), None);
     // ARMED ONLY FOR BUFFERED RESPONSES. An NDJSON response STREAMS its body
     // after this function returns, so a handler-scoped guard would cancel the
     // scan out from under a perfectly healthy request -- caught by three e2e
@@ -4379,6 +4599,9 @@ async fn handle_local_inner(
         hinted
             .config_mut()
             .set_extension(std::sync::Arc::new(cancel.clone()));
+        hinted
+            .config_mut()
+            .set_extension(std::sync::Arc::new(execution_id));
         if residual_ordered_hint {
             hinted.config_mut().set_extension(std::sync::Arc::new(
                 siglake_storage::OrderedResidualHint { allow: true },
@@ -4878,6 +5101,7 @@ async fn handle_local_inner(
             _admission,
             buffer_delta_micros,
             residual_fallback,
+            execution_id,
             // Ownership moves out of this scope: for NDJSON it travels into the
             // response body, for Records it is held across the collect. Taking
             // it here is what stops the handler's own guard cancelling a stream
@@ -4898,6 +5122,10 @@ async fn handle_local_inner(
 
     tracing::info!(
         endpoint = "sql",
+        // The join key for this execution's scan events. NOT a boundary: on
+        // the NDJSON path the body streams after this line, so partition
+        // profiles carrying this id still arrive below it.
+        query_execution_id = execution_id.0,
         format = match format {
             QueryFormat::Records => "records",
             QueryFormat::Ndjson => "ndjson",
@@ -4926,6 +5154,37 @@ async fn handle_local_inner(
     );
     record_metrics("sql", start, &result, &cost);
     result
+}
+
+/// One line naming a query execution's id and the SQL it will run.
+///
+/// Emitted at the START of the execution, not at its end, because start is the
+/// only point every path reaches. `/api/v1/sql` ends with `sql query profile`,
+/// but the coordinator fan-out logs no terminal line at all, the worker shard
+/// endpoint refuses on a dozen paths that return before one could be written,
+/// and an NDJSON body outlives the handler that would write it. With this
+/// line, every `query_execution_id` stamped on a scan event has exactly one
+/// place in the log that says what it was — so a partition profile is
+/// attributable without reading the lines around it.
+///
+/// An EMPTY `query` field means the execution runs more than one statement
+/// under one id (the Jaeger render is the only such caller): its scan events
+/// are attributable to the request but not to one of its statements, which
+/// `scan_id` separates.
+pub(crate) fn log_query_execution_start(
+    endpoint: &'static str,
+    execution_id: siglake_storage::QueryExecutionId,
+    query: Option<&str>,
+    shard: Option<(usize, usize)>,
+) {
+    tracing::info!(
+        endpoint,
+        query_execution_id = execution_id.0,
+        shard_index = shard.map(|(index, _)| index).unwrap_or_default(),
+        shard_count = shard.map(|(_, count)| count).unwrap_or_default(),
+        query = %query.map(compact_query).unwrap_or_default(),
+        "query execution start"
+    );
 }
 
 fn emit_terminal_audit(
@@ -5883,6 +6142,7 @@ enum BatchOutcome {
 fn cancellable_batch_context(
     query_scan: crate::QueryScanConfig,
     preferred_scan_order: Option<siglake_storage::PreferredScanOrder>,
+    execution_id: siglake_storage::QueryExecutionId,
 ) -> (
     datafusion::prelude::SessionContext,
     siglake_storage::CancelOnDrop,
@@ -5895,6 +6155,9 @@ fn cancellable_batch_context(
         state
             .config_mut()
             .set_extension(std::sync::Arc::new(cancel.clone()));
+        state
+            .config_mut()
+            .set_extension(std::sync::Arc::new(execution_id));
         datafusion::prelude::SessionContext::new_with_state(state)
     };
     (ctx, cancel_guard)
@@ -6009,7 +6272,10 @@ async fn run_batch_query(
     // Dropping the batch future (timeout or DELETE) must stop the scan pumps,
     // not just their parent future. The scan captures this extension while it
     // is planned; CancelOnDrop flips it on every return path.
-    let (ctx, cancel_guard) = cancellable_batch_context(query_scan, query.preferred_scan_order);
+    let execution_id = siglake_storage::QueryExecutionId::next();
+    log_query_execution_start("sql_batch", execution_id, Some(&query.sql), None);
+    let (ctx, cancel_guard) =
+        cancellable_batch_context(query_scan, query.preferred_scan_order.clone(), execution_id);
     run_batch_query_in(
         ice,
         query,
@@ -6286,7 +6552,7 @@ pub async fn explain(
     let query = rewrite_search_if_needed(&ice, &req.query).await?;
     let ctx = state
         .query_scan
-        .session_context_with_order(preferred_scan_order_from_sql(&query));
+        .session_context_with_order(preferred_scan_order_for_sql(&ice, &query).await);
     register_tables_for_query(&ice, &ctx, &query).await?;
     let df = plan_client_sql(&ctx, &query)
         .await
@@ -9600,6 +9866,7 @@ async fn execute_with_limits(
     admission: Option<crate::admission::AdmissionGuard>,
     buffer_delta_micros: u64,
     residual_fallback: Option<DataFrame>,
+    execution_id: siglake_storage::QueryExecutionId,
     cancel: Option<siglake_storage::CancelOnDrop>,
     deadline: tokio::time::Instant,
     started: Instant,
@@ -9618,6 +9885,7 @@ async fn execute_with_limits(
                     cache_ctx,
                     buffer_delta_micros,
                     residual_fallback,
+                    execution_id,
                 )
                 .await
             }
@@ -9736,6 +10004,7 @@ async fn render_records(
     cache_ctx: Option<SqlResultCacheCtx>,
     buffer_delta_micros: u64,
     residual_fallback: Option<DataFrame>,
+    execution_id: siglake_storage::QueryExecutionId,
 ) -> Result<Response, ApiError> {
     let plan_started = Instant::now();
     // Before `create_physical_plan`, which consumes the DataFrame: execution
@@ -9799,6 +10068,7 @@ async fn render_records(
                         cache_ctx,
                         buffer_delta_micros,
                         None,
+                        execution_id,
                     ))
                     .await;
                 }
@@ -9895,6 +10165,7 @@ async fn render_records(
     }
     tracing::info!(
         endpoint = "sql",
+        query_execution_id = execution_id.0,
         format = "records",
         root_plan = %displayable(plan.as_ref()).one_line(),
         plan_nodes = runtime.nodes,
@@ -10418,7 +10689,7 @@ mod tests {
         let rewritten = rewrite_query_with_default_order(
             "SELECT host FROM events WHERE host = 'host-1'",
             25,
-            |table| table == "events",
+            |table| (table == "events").then_some("timestamp"),
         )
         .expect("rewrite");
         assert!(rewritten.contains("ORDER BY timestamp DESC"));
@@ -10430,7 +10701,7 @@ mod tests {
     fn default_order_rewrite_preserves_existing_limit() {
         let rewritten =
             rewrite_query_with_default_order("SELECT host FROM events LIMIT 7", 25, |table| {
-                table == "events"
+                (table == "events").then_some("timestamp")
             })
             .expect("rewrite");
         assert!(rewritten.contains("ORDER BY timestamp DESC"));
@@ -10458,7 +10729,9 @@ mod tests {
             "SELECT row_number() OVER (ORDER BY timestamp) FROM events",
         ] {
             assert!(
-                rewrite_query_with_default_order(sql, 25, |table| table == "events").is_none(),
+                rewrite_query_with_default_order(sql, 25, |table| (table == "events")
+                    .then_some("timestamp"))
+                .is_none(),
                 "expected no rewrite for `{sql}`"
             );
         }
@@ -10479,7 +10752,9 @@ mod tests {
             "SELECT date_trunc('hour', timestamp) AS timestamp FROM events",
         ] {
             assert!(
-                rewrite_query_with_default_order(sql, 25, |table| table == "events").is_none(),
+                rewrite_query_with_default_order(sql, 25, |table| (table == "events")
+                    .then_some("timestamp"))
+                .is_none(),
                 "expected no rewrite for `{sql}`"
             );
         }
@@ -10491,8 +10766,10 @@ mod tests {
             "SELECT t.timestamp AS timestamp FROM events AS t LIMIT 2",
             "SELECT raw AS ts FROM events LIMIT 2",
         ] {
-            let rewritten = rewrite_query_with_default_order(sql, 25, |table| table == "events")
-                .unwrap_or_else(|| panic!("expected a rewrite for `{sql}`"));
+            let rewritten = rewrite_query_with_default_order(sql, 25, |table| {
+                (table == "events").then_some("timestamp")
+            })
+            .unwrap_or_else(|| panic!("expected a rewrite for `{sql}`"));
             assert!(rewritten.contains("ORDER BY timestamp DESC"), "{rewritten}");
         }
     }
@@ -10504,21 +10781,24 @@ mod tests {
     fn preferred_scan_order_declines_a_shadowed_timestamp_alias() {
         assert_eq!(
             preferred_scan_order_from_sql(
-                "SELECT raw AS timestamp FROM events ORDER BY timestamp DESC LIMIT 5"
+                "SELECT raw AS timestamp FROM events ORDER BY timestamp DESC LIMIT 5",
+                "timestamp",
             ),
             None
         );
         assert_eq!(
             preferred_scan_order_from_sql(
-                "SELECT raw AS ts FROM events ORDER BY timestamp DESC LIMIT 5"
+                "SELECT raw AS ts FROM events ORDER BY timestamp DESC LIMIT 5",
+                "timestamp",
             ),
-            Some(siglake_storage::PreferredScanOrder { descending: true })
+            Some(siglake_storage::PreferredScanOrder::timestamp(true))
         );
         assert_eq!(
             preferred_scan_order_from_sql(
-                "SELECT timestamp AS timestamp FROM events ORDER BY timestamp DESC LIMIT 5"
+                "SELECT timestamp AS timestamp FROM events ORDER BY timestamp DESC LIMIT 5",
+                "timestamp",
             ),
-            Some(siglake_storage::PreferredScanOrder { descending: true })
+            Some(siglake_storage::PreferredScanOrder::timestamp(true))
         );
     }
 
@@ -10536,7 +10816,9 @@ mod tests {
             "SELECT \"Timestamp\" AS TIMESTAMP FROM events LIMIT 2",
         ] {
             assert!(
-                rewrite_query_with_default_order(sql, 25, |table| table == "events").is_none(),
+                rewrite_query_with_default_order(sql, 25, |table| (table == "events")
+                    .then_some("timestamp"))
+                .is_none(),
                 "expected no rewrite for `{sql}`"
             );
         }
@@ -10551,8 +10833,10 @@ mod tests {
             // captured by the injected bare identifier.
             "SELECT raw AS \"Timestamp\" FROM events LIMIT 2",
         ] {
-            let rewritten = rewrite_query_with_default_order(sql, 25, |table| table == "events")
-                .unwrap_or_else(|| panic!("expected a rewrite for `{sql}`"));
+            let rewritten = rewrite_query_with_default_order(sql, 25, |table| {
+                (table == "events").then_some("timestamp")
+            })
+            .unwrap_or_else(|| panic!("expected a rewrite for `{sql}`"));
             assert!(rewritten.contains("ORDER BY timestamp DESC"), "{rewritten}");
         }
     }
@@ -10567,7 +10851,11 @@ mod tests {
             "SELECT raw FROM events ORDER BY events.\"Timestamp\" DESC LIMIT 5",
             "SELECT \"Timestamp\" AS timestamp FROM events ORDER BY timestamp DESC LIMIT 5",
         ] {
-            assert_eq!(preferred_scan_order_from_sql(sql), None, "{sql}");
+            assert_eq!(
+                preferred_scan_order_from_sql(sql, "timestamp"),
+                None,
+                "{sql}"
+            );
         }
         for sql in [
             "SELECT raw FROM events ORDER BY \"timestamp\" DESC LIMIT 5",
@@ -10575,8 +10863,8 @@ mod tests {
             "SELECT raw FROM events ORDER BY TIMESTAMP DESC LIMIT 5",
         ] {
             assert_eq!(
-                preferred_scan_order_from_sql(sql),
-                Some(siglake_storage::PreferredScanOrder { descending: true }),
+                preferred_scan_order_from_sql(sql, "timestamp"),
+                Some(siglake_storage::PreferredScanOrder::timestamp(true)),
                 "{sql}"
             );
         }
@@ -10667,8 +10955,13 @@ mod tests {
         // clipped decline is what keeps it off the whole-file index (#4375).
         assert_eq!(unresolved.clipped_limit, Some(100));
 
-        let resolved =
-            apply_default_order_if_needed(sql, true, Priority::Interactive, 25, Some("logs-bench"));
+        let resolved = apply_default_order_if_needed(
+            sql,
+            true,
+            Priority::Interactive,
+            25,
+            Some(("logs-bench", "timestamp")),
+        );
         assert!(
             resolved.sql.contains("ORDER BY timestamp DESC"),
             "{}",
@@ -10678,7 +10971,7 @@ mod tests {
         assert!(resolved.sql.ends_with("LIMIT 100"), "{}", resolved.sql);
         assert_eq!(
             resolved.preferred_scan_order,
-            Some(siglake_storage::PreferredScanOrder { descending: true })
+            Some(siglake_storage::PreferredScanOrder::timestamp(true))
         );
         assert_eq!(resolved.ordered_limit, Some(100));
         // Once the implicit newest-first ordering is injected the SAME query
@@ -10693,7 +10986,7 @@ mod tests {
                 true,
                 Priority::Interactive,
                 25,
-                Some("logs-bench"),
+                Some(("logs-bench", "timestamp")),
             )
             .sql,
             "SELECT timestamp FROM \"other-idx\" LIMIT 5"
@@ -10731,7 +11024,7 @@ mod tests {
             let dialect = GenericDialect {};
             let mut stmts = Parser::parse_sql(&dialect, sql).unwrap();
             match stmts.pop().unwrap() {
-                Statement::Query(query) => default_order_target_table(&query),
+                Statement::Query(query) => default_order_target_table(&query, "timestamp"),
                 _ => None,
             }
         };
@@ -10749,7 +11042,7 @@ mod tests {
     #[test]
     fn default_order_rewrite_requires_timestamp_table() {
         assert!(
-            rewrite_query_with_default_order("SELECT host FROM events", 25, |_| false).is_none()
+            rewrite_query_with_default_order("SELECT host FROM events", 25, |_| None).is_none()
         );
     }
 
@@ -10757,23 +11050,29 @@ mod tests {
     fn preferred_scan_order_only_applies_to_single_table_timestamp_order() {
         assert_eq!(
             preferred_scan_order_from_sql(
-                "SELECT timestamp FROM events ORDER BY timestamp DESC LIMIT 5"
+                "SELECT timestamp FROM events ORDER BY timestamp DESC LIMIT 5",
+                "timestamp",
             ),
-            Some(siglake_storage::PreferredScanOrder { descending: true })
+            Some(siglake_storage::PreferredScanOrder::timestamp(true))
         );
         assert_eq!(
             preferred_scan_order_from_sql(
-                "SELECT timestamp FROM events ORDER BY events.timestamp ASC"
+                "SELECT timestamp FROM events ORDER BY events.timestamp ASC",
+                "timestamp",
             ),
-            Some(siglake_storage::PreferredScanOrder { descending: false })
+            Some(siglake_storage::PreferredScanOrder::timestamp(false))
         );
         assert_eq!(
-            preferred_scan_order_from_sql("SELECT timestamp FROM events ORDER BY host DESC"),
+            preferred_scan_order_from_sql(
+                "SELECT timestamp FROM events ORDER BY host DESC",
+                "timestamp"
+            ),
             None
         );
         assert_eq!(
             preferred_scan_order_from_sql(
-                "SELECT timestamp FROM events JOIN candidates ON true ORDER BY timestamp DESC"
+                "SELECT timestamp FROM events JOIN candidates ON true ORDER BY timestamp DESC",
+                "timestamp",
             ),
             None
         );
@@ -10812,7 +11111,7 @@ mod tests {
 
     #[test]
     fn detect_ordered_residual_browse_matches_single_dim_ordered_limits() {
-        let shape = |sql: &str| detect_ordered_residual_browse(sql);
+        let shape = |sql: &str| detect_ordered_residual_browse(sql, "timestamp");
         // Equality with a time window (the attr_filter_provider_rows shape).
         assert_eq!(
             shape(
@@ -10881,8 +11180,8 @@ mod tests {
     /// lost the shape entirely. A quoted `"Timestamp"` stays a different column.
     #[test]
     fn browse_detectors_read_an_unquoted_timestamp_as_the_canonical_column() {
-        let ordered = |sql: &str| detect_ordered_residual_browse(sql);
-        let plain = |sql: &str| detect_dim_browse(sql);
+        let ordered = |sql: &str| detect_ordered_residual_browse(sql, "timestamp");
+        let plain = |sql: &str| detect_dim_browse(sql, "timestamp");
         let expected = Some(ResidualBrowseShape {
             table: "logs-bench".into(),
             column: "cloud_provider".into(),
@@ -11110,7 +11409,8 @@ mod tests {
                 "SELECT timestamp FROM \"case-distinct\" WHERE {predicate} \
                  ORDER BY timestamp DESC LIMIT 4"
             );
-            let shape = detect_ordered_residual_browse(&sql).expect("ordered browse shape");
+            let shape =
+                detect_ordered_residual_browse(&sql, "timestamp").expect("ordered browse shape");
             assert_eq!(
                 residual_browse_low_selectivity_at(&ice, &shape, 0.01).await,
                 expected,
@@ -11130,7 +11430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_order_resolves_a_managed_index_with_a_canonical_timestamp() {
+    async fn default_order_resolves_a_managed_index_and_its_event_time_field() {
         let tmp = tempfile::tempdir().unwrap();
         let ice = IcebergContext::open(&tmp.path().join("warehouse"))
             .await
@@ -11139,7 +11439,7 @@ mod tests {
             .await
             .unwrap();
         // `logs` declares `ts` as its event-time field: a column called
-        // `timestamp` there (if any) is not a time order.
+        // `timestamp` there (if any) is not a time order, and `ts` is.
         ice.create_index(&logs_config(vec![])).await.unwrap();
 
         let resolve = |sql: &'static str, enabled: bool, priority: Priority| {
@@ -11154,12 +11454,17 @@ mod tests {
                 Priority::Interactive
             )
             .await,
-            Some("logs-bench".to_string())
+            Some(("logs-bench".to_string(), "timestamp".to_string()))
         );
-        // Negative coverage: another timestamp_field, an unknown name, the
-        // statically known tables, the opt-out and batch.
+        // A mapping's own event-time field resolves as itself (#6020) — the
+        // rewrite and the scan hint then name `ts`, not `timestamp`.
+        assert_eq!(
+            resolve("SELECT ts FROM logs LIMIT 10", true, Priority::Interactive).await,
+            Some(("logs".to_string(), "ts".to_string()))
+        );
+        // Negative coverage: an unknown name, the statically known tables, the
+        // opt-out and batch.
         for (sql, enabled, priority) in [
-            ("SELECT ts FROM logs LIMIT 10", true, Priority::Interactive),
             (
                 "SELECT timestamp FROM \"no-such-index\" LIMIT 10",
                 true,
@@ -11221,12 +11526,14 @@ mod tests {
         );
         assert_eq!(
             rewritten.preferred_scan_order,
-            Some(siglake_storage::PreferredScanOrder { descending: true })
+            Some(siglake_storage::PreferredScanOrder::timestamp(true))
         );
         assert_eq!(rewritten.ordered_limit, Some(100));
 
-        // An index whose event-time field is not `timestamp` stays as written.
-        let untouched = apply_query_rewrites(
+        // An index whose event-time field is `ts` is ordered by `ts`, QUOTED
+        // so the injected identifier binds that exact column whatever its case
+        // (#6020). The hint names the field as well as the direction.
+        let custom = apply_query_rewrites(
             &ice,
             "SELECT ts, message FROM logs LIMIT 100",
             true,
@@ -11235,8 +11542,92 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(untouched.sql, "SELECT ts, message FROM logs LIMIT 100");
-        assert_eq!(untouched.preferred_scan_order, None);
+        assert_eq!(
+            custom.sql,
+            "SELECT ts, message FROM logs ORDER BY \"ts\" DESC LIMIT 100"
+        );
+        assert_eq!(
+            custom.preferred_scan_order,
+            Some(siglake_storage::PreferredScanOrder::new("ts", true))
+        );
+        assert_eq!(custom.ordered_limit, Some(100));
+
+        // The canonical column of a `ts`-mapped index is NOT its event time.
+        // The query stands as written and the hint names the column it asked
+        // for, `timestamp` — which the scan refuses against a `ts` sort lead,
+        // so the browse keeps its blocking sort exactly as it does today
+        // (`query_provider::tests::custom_event_time_sort_is_advertised_for_its_own_field`).
+        // Deciding that here instead would cost a mapping lookup on every
+        // `ORDER BY timestamp` over an index, to reach the same plan.
+        let unrelated = apply_query_rewrites(
+            &ice,
+            "SELECT ts, message FROM logs ORDER BY timestamp DESC LIMIT 100",
+            true,
+            Priority::Interactive,
+            25,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unrelated.sql,
+            "SELECT ts, message FROM logs ORDER BY timestamp DESC LIMIT 100"
+        );
+        assert_eq!(
+            unrelated.preferred_scan_order,
+            Some(siglake_storage::PreferredScanOrder::timestamp(true))
+        );
+
+        // An explicit order on the mapping's own field keeps the query as
+        // written and DOES carry the hint.
+        let explicit = apply_query_rewrites(
+            &ice,
+            "SELECT ts, message FROM logs ORDER BY ts DESC LIMIT 5",
+            true,
+            Priority::Interactive,
+            25,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            explicit.sql,
+            "SELECT ts, message FROM logs ORDER BY ts DESC LIMIT 5"
+        );
+        assert_eq!(
+            explicit.preferred_scan_order,
+            Some(siglake_storage::PreferredScanOrder::new("ts", true))
+        );
+        assert_eq!(explicit.ordered_limit, Some(5));
+
+        // `default_order: false` and a batch request keep file order and no
+        // hint, exactly as they do for a canonical index.
+        for (default_order, priority) in [(false, Priority::Interactive), (true, Priority::Batch)] {
+            let opted_out = apply_query_rewrites(
+                &ice,
+                "SELECT ts, message FROM logs LIMIT 100",
+                default_order,
+                priority,
+                25,
+            )
+            .await
+            .unwrap();
+            assert_eq!(opted_out.sql, "SELECT ts, message FROM logs LIMIT 100");
+            assert_eq!(opted_out.preferred_scan_order, None);
+        }
+
+        // Alias shadowing, on the mapping's field: `SELECT raw AS ts` captures
+        // the injected `ORDER BY "ts"`, so the rewrite declines (#4090's guard,
+        // per-index).
+        let shadowed = apply_query_rewrites(
+            &ice,
+            "SELECT message AS ts FROM logs LIMIT 100",
+            true,
+            Priority::Interactive,
+            25,
+        )
+        .await
+        .unwrap();
+        assert_eq!(shadowed.sql, "SELECT message AS ts FROM logs LIMIT 100");
+        assert_eq!(shadowed.preferred_scan_order, None);
     }
 
     #[tokio::test]
@@ -15095,7 +15486,7 @@ pub async fn shard(
             .map_err(ApiError::internal)
     });
     let query = under_shard_deadline!(rewrite_search_if_needed(&ice, &req.query));
-    let preferred_scan_order = preferred_scan_order_from_sql(&query);
+    let preferred_scan_order = preferred_scan_order_for_sql(&ice, &query).await;
     // PER-REQUEST CANCELLATION, which this path never had. On the default chart
     // config (`query.replicas: 2`, distributed on) every user query executes
     // here, so every coordinator timeout or client disconnect left a worker
@@ -15112,10 +15503,22 @@ pub async fn shard(
     // handler returns.
     let cancel = siglake_storage::QueryCancel::new();
     let _cancel_guard = siglake_storage::CancelOnDrop(cancel.clone());
-    let ctx = state.query_scan.session_context_sharded_with_order(
-        req.shard.and_then(ShardParam::resolve),
-        preferred_scan_order,
+    // A worker's shard is its own execution, with its own id in ITS pod's log.
+    // The coordinator's id is not carried across the hop: the shard body is a
+    // versioned wire contract and a pod-local counter would not be comparable
+    // anyway. What joins the two halves is the W3C trace context the fan-out
+    // already propagates (see `HttpShardRunner::run_detailed`).
+    let execution_id = siglake_storage::QueryExecutionId::next();
+    let resolved_shard = req.shard.and_then(ShardParam::resolve);
+    log_query_execution_start(
+        "sql_shard",
+        execution_id,
+        Some(&query),
+        resolved_shard.map(|s| (s.index, s.count)),
     );
+    let ctx = state
+        .query_scan
+        .session_context_sharded_with_order(resolved_shard, preferred_scan_order);
     // Injected BEFORE planning: the scan node captures the flag at PLANNING
     // time, because the collect path builds its own `TaskContext` and session
     // extensions do not survive to `execute()`.
@@ -15124,6 +15527,9 @@ pub async fn shard(
         hinted
             .config_mut()
             .set_extension(std::sync::Arc::new(cancel.clone()));
+        hinted
+            .config_mut()
+            .set_extension(std::sync::Arc::new(execution_id));
         datafusion::prelude::SessionContext::new_with_state(hinted)
     };
     // Registration reads table metadata from the catalog and object store — the
@@ -15576,13 +15982,26 @@ async fn distributed_inner(
     // battery -- and that work must stop when the request goes away.
     let cancel = siglake_storage::QueryCancel::new();
     let _cancel_guard = siglake_storage::CancelOnDrop(cancel.clone());
+    // The coordinator's PRE-DISPATCH work is its own execution: it plans, it
+    // cost-estimates and it runs the Tier-1 battery, all of which scan. Its
+    // scan events are a different execution from the workers' shards and from
+    // anything this pod serves locally, and this id is what says so.
+    let planning_execution_id = siglake_storage::QueryExecutionId::next();
+    log_query_execution_start(
+        "sql_coordinator",
+        planning_execution_id,
+        Some(&effective_query.sql),
+        None,
+    );
     let planning = {
         let mut st = state
             .query_scan
-            .session_context_sharded_with_order(None, effective_query.preferred_scan_order)
+            .session_context_sharded_with_order(None, effective_query.preferred_scan_order.clone())
             .state();
         st.config_mut()
             .set_extension(std::sync::Arc::new(cancel.clone()));
+        st.config_mut()
+            .set_extension(std::sync::Arc::new(planning_execution_id));
         datafusion::prelude::SessionContext::new_with_state(st)
     };
     register_tables_for_query(&ice, &planning, &effective_query.sql).await?;
@@ -16828,6 +17247,7 @@ mod dist_browse_gate_tests {
     fn detects_a_browse_without_an_order_by() {
         let shape = detect_dim_browse(
             "SELECT timestamp, raw FROM \"logs-bench\" WHERE region = 'probe' LIMIT 100",
+            "timestamp",
         )
         .expect("plain filtered browse is a dimensional browse");
         assert_eq!(shape.table, "logs-bench");
@@ -16838,9 +17258,11 @@ mod dist_browse_gate_tests {
 
     #[test]
     fn a_browse_without_a_limit_is_not_a_browse() {
-        assert!(
-            detect_dim_browse("SELECT raw FROM \"logs-bench\" WHERE region = 'probe'").is_none()
-        );
+        assert!(detect_dim_browse(
+            "SELECT raw FROM \"logs-bench\" WHERE region = 'probe'",
+            "timestamp"
+        )
+        .is_none());
     }
 
     /// Two dimensions, an OR, or a LIKE must NOT be treated as a known
@@ -16853,7 +17275,10 @@ mod dist_browse_gate_tests {
             "SELECT raw FROM \"logs-bench\" WHERE region = 'a' OR region = 'b' LIMIT 100",
             "SELECT raw FROM \"logs-bench\" WHERE raw LIKE '%x%' LIMIT 100",
         ] {
-            assert!(detect_dim_browse(sql).is_none(), "should refuse: {sql}");
+            assert!(
+                detect_dim_browse(sql, "timestamp").is_none(),
+                "should refuse: {sql}"
+            );
         }
     }
 
@@ -16957,7 +17382,11 @@ mod batch_cancel_guard_tests {
 
     #[test]
     fn batch_context_arms_query_cancel_until_execution_is_dropped() {
-        let (ctx, guard) = cancellable_batch_context(crate::QueryScanConfig::default(), None);
+        let (ctx, guard) = cancellable_batch_context(
+            crate::QueryScanConfig::default(),
+            None,
+            siglake_storage::QueryExecutionId::next(),
+        );
         let planned_cancel = ctx
             .state()
             .config()
@@ -17035,7 +17464,11 @@ mod batch_run_deadline_tests {
         ice: Arc<siglake_storage::iceberg::IcebergContext>,
         limits: crate::limits::ResolvedLimits,
     ) -> (BatchOutcome, siglake_storage::QueryCancel) {
-        let (ctx, guard) = cancellable_batch_context(crate::QueryScanConfig::default(), None);
+        let (ctx, guard) = cancellable_batch_context(
+            crate::QueryScanConfig::default(),
+            None,
+            siglake_storage::QueryExecutionId::next(),
+        );
         let cancel = siglake_storage::QueryCancel::clone(
             &ctx.state()
                 .config()

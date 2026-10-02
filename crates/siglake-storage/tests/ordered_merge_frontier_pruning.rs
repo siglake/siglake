@@ -46,7 +46,7 @@ fn browse_context(with_source_limit: bool) -> SessionContext {
     let base = siglake_storage::session_context_with_order(
         Some(1),
         None,
-        Some(PreferredScanOrder { descending: true }),
+        Some(PreferredScanOrder::timestamp(true)),
     );
     if !with_source_limit {
         return base;

@@ -214,6 +214,7 @@ async fn run() -> Result<()> {
         client: client.clone(),
         prom,
         scaling_state: Default::default(),
+        zero_floor_state: Default::default(),
     });
 
     if cli.watch_namespaces.is_empty() {

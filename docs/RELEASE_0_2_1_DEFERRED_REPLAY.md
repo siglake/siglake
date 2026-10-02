@@ -14,6 +14,19 @@ then reconcile against changes merged meanwhile. Replaying the original source
 merges one at a time is a fallback for conflict diagnosis, not the preferred
 procedure: the deferral commit already retains later patch fixes.
 
+## Replay record
+
+The replay started from
+`f93a31239664226ea2bb5a17675ff0053a927eef`, where the released v0.2.1 commit
+`b9f77f86fe03102784e8ff2575cb21ae4bd4eb1a` and the deferral above are both
+ancestors. It applies the inverse of the deferral and retains the later
+time-aggregate cost report (`2cbec74fecd8331c746a8e4ba5ddebe202e6a868`),
+conditional-write diagnostics
+(`cd9e8d3b615cf0ef47451c8138440e3428e32c44`), requested-byte attribution
+(`eec03d01a0f1f82ed34d4a8b5d21c477c240a025`), and public image authority
+alignment (`6e46b8f9f3d250c1e5dfa0aa6372bca1f3ffa954`). This record covers source
+restoration only; it is not field qualification and does not complete #6062.
+
 ## Source inventory
 
 | Work | Source merge | Follow-on | Restore with |
