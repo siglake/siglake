@@ -1,6 +1,6 @@
 # Optional ECR pull-through cache against GHCR. When enabled, the
 # Helm chart's `image.repository` can point at
-# `<account>.dkr.ecr.<region>.amazonaws.com/ghcr/limnion-ai/siglake`
+# `<account>.dkr.ecr.<region>.amazonaws.com/ghcr/siglake/siglake`
 # instead of `ghcr.io/siglake/siglake`, and ECR will fetch + cache
 # images on demand.
 

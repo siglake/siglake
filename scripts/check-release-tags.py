@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The published image tag, the chart defaults and the documented install agree.
+"""The published image repositories and tags agree with the install defaults.
 
 `.github/workflows/publish.yml` derives the image tag from the git tag, and the
 git tag is `v0.1.0`. Both charts ask for their numeric `appVersion` when
@@ -10,7 +10,7 @@ registry holding only `v0.1.0` -- an ImagePullBackOff on the first release. The
 kind scripts always pass `image.tag` explicitly, so the default was never
 exercised against a registry.
 
-Six questions, all answered from tracked files with no registry and no helm:
+Seven questions, all answered from tracked files with no registry and no helm:
 
 1. The workflow's tag-resolution step, evaluated over `v<workspace version>`,
    produces the workspace version. The step's shell body is EXECUTED, not
@@ -23,10 +23,14 @@ Six questions, all answered from tracked files with no registry and no helm:
 3. Both charts' default rendered image tag -- `image.tag` when set, otherwise
    `appVersion` through the chart's image helper -- is the workspace version.
 4. The first numbered release in `CHANGELOG.md` is the workspace version.
-5. Every version-shaped image tag pinned in `deploy/` (the operator sample, the
+5. Each chart's default image repository, the operator sample and Terraform's
+   generated Helm values use the repository that publishes that product.
+   Explicit chart repository overrides remain supported and are outside this
+   default-parity check.
+6. Every version-shaped image tag pinned in `deploy/` (the operator sample, the
    install examples and the AWS image defaults) is that same version, with no
    `v` prefix.
-6. Compose, kind and their helper scripts pin the same Bitnami Legacy MinIO
+7. Compose, kind and their helper scripts pin the same Bitnami Legacy MinIO
    server and client snapshots by readable tag and immutable digest.
 
 Stdlib only and no helm: this runs in the `shell` job, which installs nothing,
@@ -57,6 +61,12 @@ CHARTS = (
     pathlib.PurePath("deploy/helm/siglake"),
     pathlib.PurePath("deploy/helm/siglake-operator"),
 )
+PRODUCT_CHARTS = {
+    "siglake": CHARTS[0],
+    "siglake-operator": CHARTS[1],
+}
+OPERATOR_SAMPLE = pathlib.PurePath("deploy/operator/sample-cluster.yaml")
+TERRAFORM_OUTPUTS = pathlib.PurePath("deploy/terraform/aws/outputs.tf")
 # Tracked trees whose literal image tags ship to a user: operator samples,
 # launchers and install examples.
 PINNED_TAG_ROOT = pathlib.PurePath("deploy")
@@ -128,6 +138,13 @@ DEFINE = re.compile(r'\{\{-?\s*define\s+"(?P<name>[^"]+)"\s*-?\}\}')
 END = re.compile(r"\{\{-?\s*end\s*-?\}\}")
 
 APP_VERSION = re.compile(r'^appVersion:\s*"?(?P<value>[^"\s]+)"?\s*$')
+VALUES_REPOSITORY = re.compile(r"^\s+repository:\s*(?P<value>\S.*?)\s*$")
+TERRAFORM_OUTPUT = re.compile(
+    r'^output\s+"(?P<name>[^"]+)"\s*\{\s*$', re.MULTILINE
+)
+TERRAFORM_REPOSITORY = re.compile(
+    r'^\s+repository\s*=\s*"(?P<value>[^"]+)"\s*$', re.MULTILINE
+)
 CHANGELOG_RELEASE = re.compile(
     r"^##\s+(?P<version>\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)(?:\s|$)",
     re.MULTILINE,
@@ -205,6 +222,40 @@ def tag_resolution_step(text: str) -> str:
             "this gate evaluates exactly one"
         )
     return steps[0]
+
+
+def published_repositories(text: str) -> dict[str, str]:
+    """Canonical repository for each product pushed by the workflow."""
+    refs = [
+        (image, re.sub(r"\s+", " ", tag))
+        for image, tag in IMAGE_REF.findall(text)
+    ]
+    repositories: dict[str, str] = {}
+    for product in PRODUCT_CHARTS:
+        tagged = [
+            image
+            for image, tag in refs
+            if image.rsplit("/", 1)[-1] == product and tag == "${{ env.TAG }}"
+        ]
+        if len(tagged) != 1:
+            raise ExtractionError(
+                f"{PUBLISH_YML} has {len(tagged)} resolved-TAG repositories for "
+                f"`{product}`; expected one"
+            )
+        product_repositories = {
+            image
+            for image, tag in refs
+            if image.rsplit("/", 1)[-1] == product
+            and tag in ("${{ env.TAG }}", "latest")
+        }
+        if product_repositories != {tagged[0]}:
+            rendered = ", ".join(sorted(product_repositories)) or "(none)"
+            raise ExtractionError(
+                f"{PUBLISH_YML} sends `{product}` release tags to different "
+                f"repositories: {rendered}"
+            )
+        repositories[product] = tagged[0]
+    return repositories
 
 
 def evaluate_tag(step: str, ref: str) -> str:
@@ -288,6 +339,46 @@ def values_image_tag(text: str) -> str:
     raise ExtractionError("values.yaml has no `image.tag`")
 
 
+def values_image_repository(text: str) -> str:
+    """Top-level `image.repository` from a chart's values.yaml."""
+    in_image = False
+    for line in text.splitlines():
+        if re.match(r"^image:\s*$", line):
+            in_image = True
+            continue
+        if in_image:
+            if line and not line[0].isspace():
+                break
+            match = VALUES_REPOSITORY.match(line)
+            if match:
+                return match.group("value").strip("\"'")
+    raise ExtractionError("values.yaml has no `image.repository`")
+
+
+def chart_default_repository(
+    values_text: str,
+    helpers_text: str,
+    label: str,
+    override: str | None = None,
+) -> str:
+    """Repository rendered by the chart, with an optional install override."""
+    helpers = define_bodies(helpers_text)
+    image_helpers = {
+        name: body
+        for name, body in helpers.items()
+        if "image" in name.lower()
+        and ".Values.image.repository" in body
+        and ".Values.image.tag" in body
+    }
+    if not image_helpers:
+        raise ExtractionError(
+            f"{label}: no image helper renders the top-level image.repository "
+            "and image.tag values"
+        )
+    default = values_image_repository(values_text)
+    return override if override is not None else default
+
+
 def chart_default_tag(chart_text: str, values_text: str, helpers_text: str, label: str) -> str:
     """The image tag a default `helm install` of this chart would request.
 
@@ -308,6 +399,37 @@ def chart_default_tag(chart_text: str, values_text: str, helpers_text: str, labe
             )
     tag = values_image_tag(values_text)
     return tag if tag else chart_app_version(chart_text)
+
+
+def operator_sample_repository(text: str) -> str:
+    """Repository named by the canonical SiglakeCluster example."""
+    refs = [
+        image
+        for image, tag in IMAGE_REF.findall(text)
+        if SEMVER.fullmatch(tag)
+    ]
+    if len(refs) != 1:
+        raise ExtractionError(
+            f"{OPERATOR_SAMPLE} has {len(refs)} versioned GHCR images; expected one"
+        )
+    return refs[0]
+
+
+def terraform_helm_repository(text: str) -> str:
+    """image.repository in Terraform's generated `helm_values` output."""
+    outputs = list(TERRAFORM_OUTPUT.finditer(text))
+    for index, match in enumerate(outputs):
+        if match.group("name") != "helm_values":
+            continue
+        end = outputs[index + 1].start() if index + 1 < len(outputs) else len(text)
+        repositories = TERRAFORM_REPOSITORY.findall(text[match.end() : end])
+        if len(repositories) != 1:
+            raise ExtractionError(
+                f"{TERRAFORM_OUTPUTS}'s helm_values output has "
+                f"{len(repositories)} image repositories; expected one"
+            )
+        return repositories[0]
+    raise ExtractionError(f"{TERRAFORM_OUTPUTS} has no `helm_values` output")
 
 
 # --- checks ------------------------------------------------------------------
@@ -372,6 +494,16 @@ def publish_reference_problems(text: str) -> list[str]:
                 "which is the git ref that exists"
             )
     return problems
+
+
+def repository_problems(label: str, actual: str, published: str) -> list[str]:
+    """A shipped default or example names the product's publish repository."""
+    if actual == published:
+        return []
+    return [
+        f"{label}: image repository `{actual}` differs from the publisher's "
+        f"`{published}`"
+    ]
 
 
 def chart_problems(label: str, default_tag: str, version: str) -> list[str]:
@@ -605,8 +737,40 @@ jobs:
         raise AssertionError("fixture: a checkout of the normalized tag passed")
     checked += 1
 
+    repository_workflow = """
+jobs:
+  publish:
+    steps:
+      - with:
+          tags: |
+            ghcr.io/siglake/siglake:${{ env.TAG }}
+            ghcr.io/siglake/siglake:latest
+      - with:
+          tags: |
+            ghcr.io/siglake/siglake-operator:${{ env.TAG }}
+            ghcr.io/siglake/siglake-operator:latest
+"""
+    published = published_repositories(repository_workflow)
+    if published != {
+        "siglake": "ghcr.io/siglake/siglake",
+        "siglake-operator": "ghcr.io/siglake/siglake-operator",
+    }:
+        raise AssertionError("fixture: publish repositories were extracted incorrectly")
+    checked += 1
+    try:
+        published_repositories(
+            repository_workflow.replace(
+                "ghcr.io/siglake/siglake-operator:latest",
+                "ghcr.io/other/siglake-operator:latest",
+            )
+        )
+    except ExtractionError:
+        checked += 1
+    else:
+        raise AssertionError("fixture: split release and latest repositories passed")
+
     chart = 'name: c\nversion: 0.1.0\nappVersion: "0.1.0"\n'
-    values = "image:\n  repository: ghcr.io/example-invalid/siglake\n  tag: \"\"\n  pullPolicy: IfNotPresent\n"
+    values = "image:\n  repository: ghcr.io/siglake/siglake\n  tag: \"\"\n  pullPolicy: IfNotPresent\n"
     helpers = '{{- define "c.image" -}}\n{{- $tag := default .Chart.AppVersion .Values.image.tag -}}\n{{- end -}}\n'
     if chart_default_tag(chart, values, helpers, "fixture") != "0.1.0":
         raise AssertionError("fixture: an empty image.tag did not render appVersion")
@@ -616,6 +780,73 @@ jobs:
     checked += 1
     if not chart_problems("fixture", chart_default_tag(chart, values, helpers, "fixture"), "0.1.1"):
         raise AssertionError("fixture: an appVersion behind the workspace version passed")
+    checked += 1
+
+    repository_helpers = '''{{- define "c.image" -}}
+{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}
+{{- end -}}
+'''
+    if chart_default_repository(values, repository_helpers, "fixture") != published["siglake"]:
+        raise AssertionError("fixture: the matching chart repository was not extracted")
+    checked += 1
+    old_values = values.replace("ghcr.io/siglake/siglake", "ghcr.io/example-invalid/siglake")
+    if not repository_problems(
+        "fixture",
+        chart_default_repository(old_values, repository_helpers, "fixture"),
+        published["siglake"],
+    ):
+        raise AssertionError(
+            "fixture: equal numeric tags hid a chart/publisher repository mismatch"
+        )
+    checked += 1
+    override = "registry.example/customer/siglake"
+    if chart_default_repository(values, repository_helpers, "fixture", override) != override:
+        raise AssertionError("fixture: an explicit chart repository override did not win")
+    checked += 1
+    try:
+        chart_default_repository(values, '{{- define "c.image" -}}fixed{{- end -}}', "fixture")
+    except ExtractionError:
+        checked += 1
+    else:
+        raise AssertionError("fixture: a helper that ignores repository overrides passed")
+
+    operator_sample = "spec:\n  image: ghcr.io/siglake/siglake:0.1.0\n"
+    if repository_problems(
+        str(OPERATOR_SAMPLE),
+        operator_sample_repository(operator_sample),
+        published["siglake"],
+    ):
+        raise AssertionError("fixture: a matching operator example was reported")
+    checked += 1
+    if not repository_problems(
+        str(OPERATOR_SAMPLE),
+        operator_sample_repository(operator_sample.replace("ghcr.io/siglake", "ghcr.io/example-invalid")),
+        published["siglake"],
+    ):
+        raise AssertionError("fixture: an operator example repository mismatch passed")
+    checked += 1
+
+    terraform = '''output "helm_values" {
+  value = yamlencode({
+    image = {
+      repository = "ghcr.io/siglake/siglake"
+    }
+  })
+}
+'''
+    if repository_problems(
+        str(TERRAFORM_OUTPUTS),
+        terraform_helm_repository(terraform),
+        published["siglake"],
+    ):
+        raise AssertionError("fixture: matching Terraform Helm values were reported")
+    checked += 1
+    if not repository_problems(
+        str(TERRAFORM_OUTPUTS),
+        terraform_helm_repository(terraform.replace("ghcr.io/siglake", "ghcr.io/example-invalid")),
+        published["siglake"],
+    ):
+        raise AssertionError("fixture: a Terraform repository mismatch passed")
     checked += 1
     for name, args in (
         ("a helper that dropped its appVersion fallback", (chart, values, helpers.replace("default .Chart.AppVersion ", ""), "fixture")),
@@ -837,14 +1068,32 @@ def main(argv: list[str]) -> int:
         problems += normalization_problems(tag_resolution_step(publish), version)
         problems += trigger_problems(publish)
         problems += publish_reference_problems(publish)
-        for chart in CHARTS:
+        repositories = published_repositories(publish)
+        for product, chart in PRODUCT_CHARTS.items():
+            values_text = (root / chart / "values.yaml").read_text()
+            helpers_text = (root / chart / "templates/_helpers.tpl").read_text()
             default_tag = chart_default_tag(
                 (root / chart / "Chart.yaml").read_text(),
-                (root / chart / "values.yaml").read_text(),
-                (root / chart / "templates/_helpers.tpl").read_text(),
+                values_text,
+                helpers_text,
                 str(chart),
             )
             problems += chart_problems(str(chart), default_tag, version)
+            problems += repository_problems(
+                str(chart),
+                chart_default_repository(values_text, helpers_text, str(chart)),
+                repositories[product],
+            )
+        problems += repository_problems(
+            str(OPERATOR_SAMPLE),
+            operator_sample_repository((root / OPERATOR_SAMPLE).read_text()),
+            repositories["siglake"],
+        )
+        problems += repository_problems(
+            str(TERRAFORM_OUTPUTS),
+            terraform_helm_repository((root / TERRAFORM_OUTPUTS).read_text()),
+            repositories["siglake"],
+        )
         problems += minio_image_problems(
             (root / COMPOSE_YML).read_text(),
             (root / KIND_MINIO_YML).read_text(),
@@ -877,7 +1126,7 @@ def main(argv: list[str]) -> int:
             print(f"FAIL {problem}", file=sys.stderr)
             annotate(problem)
         print(
-            f"\n{len(problems)} release-version mismatch(es).",
+            f"\n{len(problems)} release mismatch(es).",
             file=sys.stderr,
         )
         return 1
@@ -885,9 +1134,12 @@ def main(argv: list[str]) -> int:
     if "--print-facts" in argv:
         print(f"workspace version: {version}")
         print(f"publish tag for v{version}: {evaluate_tag(tag_resolution_step(publish), f'v{version}')}")
+        for product, repository in repositories.items():
+            print(f"publish repository for {product}: {repository}")
     print(
         f"ok   changelog, {len(CHARTS)} charts and {len(pinned_files)} deploy files "
-        f"agree on release version {version}; MinIO pins agree; {fixtures} fixtures"
+        f"agree on release repositories and version {version}; MinIO pins agree; "
+        f"{fixtures} fixtures"
     )
     return 0
 

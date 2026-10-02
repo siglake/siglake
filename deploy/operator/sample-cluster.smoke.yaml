@@ -8,8 +8,8 @@
 # - **`image`**: placeholder `__ECR_REPO_URL__:0.2.1` — substituted
 #   by `deploy/aws/operator-smoke.sh` from `terraform output -raw
 #   ecr_repository_url`. The smoke pushes a fresh build to the
-#   per-account ECR; the canonical sample's `ghcr.io/siglake/siglake`
-#   isn't reachable from the smoke EKS without credentials.
+#   per-account ECR so the run qualifies that build instead of the
+#   released `ghcr.io/siglake/siglake` image.
 # - **`catalogUri`**: placeholder `__CATALOG_URI__` — substituted
 #   from the RDS endpoint + the postgres Secret materialized by
 #   `up.sh`. Real customer deployments resolve this via Secrets
