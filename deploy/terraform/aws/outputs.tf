@@ -49,7 +49,7 @@ output "ghcr_pull_through_repo_prefix" {
   description = "ECR pull-through cache prefix for GHCR (only useful when create_ecr_pull_through=true)."
   value = (
     var.create_ecr_pull_through
-    ? "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.region}.amazonaws.com/ghcr/limnion-ai/siglake"
+    ? "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.region}.amazonaws.com/ghcr/siglake/siglake"
     : null
   )
 }
