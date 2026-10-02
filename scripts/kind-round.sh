@@ -124,6 +124,53 @@ COMPACTOR_POD_LABEL_CAPTURE="${COMPACTOR_POD_LABEL_CAPTURE:-0}"
   printf 'ERROR: COMPACTOR_POD_LABEL_CAPTURE must be 0 or 1\n' >&2
   exit 1
 }
+# #6011/#6012: the zero-replica compactor wake-up. The operator may now park a
+# catalog-claim compactor at `spec.autoscaling.compactor.min: 0`, and the
+# reading that asks for it back is published by the INGESTERS
+# (`siglake_wal_segments_sealed`). This opt-in retains that the tier reached
+# zero, that the depth advanced while no compactor pod existed, and that the
+# tier came back and committed — the acceptance in
+# `docs/DESIGN_compactor_wakeup_signal.md`.
+#
+# It reads an OPERATOR-MANAGED cluster; the chart-managed release this round
+# installs has no `SiglakeCluster` and no reconciler to make the decision, so
+# the arm names the cluster explicitly rather than inventing one. Preparing
+# that cluster is #6012's, not this script's.
+COMPACTOR_WAKEUP_CAPTURE="${COMPACTOR_WAKEUP_CAPTURE:-0}"
+[[ "$COMPACTOR_WAKEUP_CAPTURE" == 0 || "$COMPACTOR_WAKEUP_CAPTURE" == 1 ]] || {
+  printf 'ERROR: COMPACTOR_WAKEUP_CAPTURE must be 0 or 1\n' >&2
+  exit 1
+}
+# The `SiglakeCluster` whose compactor Deployment the capture watches.
+COMPACTOR_WAKEUP_CLUSTER="${COMPACTOR_WAKEUP_CLUSTER:-}"
+# How long the tier may take to park, and how long the wake may take after
+# ingest resumes. The park bound has to exceed the operator's idle window
+# (ten `ewmaHalfLifeSecs` half-lives) plus a reconcile requeue.
+COMPACTOR_WAKEUP_PARK_SECONDS=900
+COMPACTOR_WAKEUP_WAKE_SECONDS=300
+COMPACTOR_WAKEUP_BATCH=500
+COMPACTOR_WAKEUP_POLL_SECONDS=10
+COMPACTOR_WAKEUP_SIGNAL_POLL_SECONDS=2
+# Must equal `SEALED_SAMPLE_MAX_AGE_SECS` in crates/siglake-operator/src/prom.rs:
+# the capture evaluates the operator's own expression, and the offline check
+# compares the two strings character for character.
+COMPACTOR_WAKEUP_SAMPLE_MAX_AGE_SECONDS=120
+if [[ "$COMPACTOR_WAKEUP_CAPTURE" == 1 ]]; then
+  [[ -n "$COMPACTOR_WAKEUP_CLUSTER" ]] || {
+    printf 'ERROR: COMPACTOR_WAKEUP_CAPTURE=1 requires COMPACTOR_WAKEUP_CLUSTER=<SiglakeCluster name>\n' >&2
+    exit 1
+  }
+  # Every other opt-in either moves the compactor tier itself or interrupts
+  # the ingest that drives the wake-up, and each one wants its own round.
+  for wakeup_incompatible in COMPACTOR_POD_LABEL_CAPTURE INGESTER_POD_LABEL_CAPTURE \
+    POSTGRES_OUTAGE_PROBE SCHEMA_ROLLBACK_PROBE; do
+    [[ "${!wakeup_incompatible}" == 0 ]] || {
+      printf 'ERROR: the compactor wake-up capture cannot run with %s=1\n' \
+        "$wakeup_incompatible" >&2
+      exit 1
+    }
+  done
+fi
 COMPACTOR_SCALE_TARGET=2
 COMPACTOR_POD_LABEL_LOAD_SECONDS=15
 COMPACTOR_POD_LABEL_GRACE_SECONDS=120
@@ -166,7 +213,8 @@ case "$MIRROR_RECLAIM_ARM" in
   '') ;;
   off | on)
     for incompatible_name in POSTGRES_OUTAGE_PROBE SCHEMA_ROLLBACK_PROBE \
-      INGESTER_POD_LABEL_CAPTURE COMPACTOR_POD_LABEL_CAPTURE; do
+      INGESTER_POD_LABEL_CAPTURE COMPACTOR_POD_LABEL_CAPTURE \
+      COMPACTOR_WAKEUP_CAPTURE; do
       incompatible_value="${!incompatible_name}"
       [[ "$incompatible_value" == 0 ]] || {
         printf 'ERROR: mirror-reclaim qualification cannot run with %s=1\n' \
@@ -234,6 +282,12 @@ COMPACTOR_RAW_JSON="$RESULTS_DIR/compactor-pod-labels-raw.json"
 COMPACTOR_SAMPLE_TIMES_JSON="$RESULTS_DIR/compactor-pod-labels-sample-times.json"
 COMPACTOR_PER_POD_JSON="$RESULTS_DIR/compactor-pod-labels-per-pod.json"
 COMPACTOR_EXPRESSION_JSON="$RESULTS_DIR/compactor-pod-labels-expression.json"
+COMPACTOR_WAKEUP_JSON="$RESULTS_DIR/compactor-wakeup.json"
+COMPACTOR_WAKEUP_PARKED_EXPRESSION_JSON="$RESULTS_DIR/compactor-wakeup-parked-expression.json"
+COMPACTOR_WAKEUP_DEPTH_JSON="$RESULTS_DIR/compactor-wakeup-depth.json"
+COMPACTOR_WAKEUP_AGE_JSON="$RESULTS_DIR/compactor-wakeup-sample-age.json"
+COMPACTOR_WAKEUP_EXPRESSION_JSON="$RESULTS_DIR/compactor-wakeup-expression.json"
+COMPACTOR_WAKEUP_REPLICAS_JSONL="$RESULTS_DIR/compactor-wakeup-replicas.jsonl"
 if [[ -n "$MIRROR_RECLAIM_ARM" ]]; then
   MIRROR_RECLAIM_RESULTS_DIR="$RESULTS_DIR/mirror-reclaim-$MIRROR_RECLAIM_ARM"
   MIRROR_RECLAIM_LAUNCH_JSON="$MIRROR_RECLAIM_RESULTS_DIR/launch.json"
@@ -1917,6 +1971,310 @@ PY
   ((COMPACTOR_POD_LABEL_FAILURE == 0))
 }
 
+# --- #6011/#6012: the zero-replica compactor wake-up ------------------------
+COMPACTOR_WAKEUP_FAILURE=0
+compactor_wakeup_failure() {
+  COMPACTOR_WAKEUP_FAILURE=1
+  printf 'COMPACTOR_WAKEUP_FAILURE %s\n' "$*"
+}
+
+compactor_wakeup_ingester_selector() {
+  printf 'namespace="%s",app_kubernetes_io_instance="%s",app_kubernetes_io_component="ingester"' \
+    "$NAMESPACE" "$COMPACTOR_WAKEUP_CLUSTER"
+}
+compactor_wakeup_compactor_selector() {
+  printf 'namespace="%s",app_kubernetes_io_instance="%s",app_kubernetes_io_component="compactor"' \
+    "$NAMESPACE" "$COMPACTOR_WAKEUP_CLUSTER"
+}
+compactor_wakeup_depth_expression() {
+  printf 'siglake_wal_segments_sealed{%s}' "$(compactor_wakeup_ingester_selector)"
+}
+compactor_wakeup_age_expression() {
+  printf 'siglake_wal_segments_sealed_sample_age_seconds{%s}' \
+    "$(compactor_wakeup_ingester_selector)"
+}
+# Character for character the expression `Queries::compactor_activation` builds
+# for a `min: 0` compactor. The offline check compares the two strings, so this
+# cannot become evidence for a query the reconciler does not run.
+compactor_wakeup_operator_expression() {
+  local ingester compactor
+  ingester=$(compactor_wakeup_ingester_selector)
+  compactor=$(compactor_wakeup_compactor_selector)
+  printf 'avg(sum by (pod) (siglake_wal_segments_sealed{%s}) and on (pod) (max by (pod) (siglake_wal_segments_sealed_sample_age_seconds{%s}) <= %s)) or avg(sum by (pod) (siglake_compactor_sealed_pending{%s}))' \
+    "$ingester" "$ingester" "$COMPACTOR_WAKEUP_SAMPLE_MAX_AGE_SECONDS" "$compactor"
+}
+
+# Whether the three post-ingest captures carry a fresh positive depth that the
+# operator expression also sees. This is only the loop's readiness check; the
+# grader below re-reads the retained responses and applies the full proof.
+compactor_wakeup_signal_is_positive() {
+  python3 - "$COMPACTOR_WAKEUP_DEPTH_JSON" "$COMPACTOR_WAKEUP_AGE_JSON" \
+    "$COMPACTOR_WAKEUP_EXPRESSION_JSON" "$COMPACTOR_WAKEUP_SAMPLE_MAX_AGE_SECONDS" <<'PY'
+import json
+import math
+import sys
+
+depth_path, age_path, operator_path, allowance = sys.argv[1:]
+allowance = float(allowance)
+
+
+def vector(path):
+    try:
+        response = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    data = response.get("data") or {}
+    if response.get("status") != "success" or data.get("resultType") != "vector":
+        return []
+    return data.get("result") or []
+
+
+def per_pod(rows, combine):
+    out = {}
+    for row in rows:
+        pod = (row.get("metric") or {}).get("pod", "").strip()
+        try:
+            value = float(row["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return {}
+        if not pod or not math.isfinite(value):
+            return {}
+        if combine == "sum":
+            out[pod] = out.get(pod, 0.0) + value
+        else:
+            out[pod] = max(out.get(pod, value), value)
+    return out
+
+
+depth = per_pod(vector(depth_path), "sum")
+age = per_pod(vector(age_path), "max")
+fresh = [value for pod, value in depth.items() if age.get(pod, allowance + 1) <= allowance]
+operator = vector(operator_path)
+try:
+    operator_value = float(operator[0]["value"][1]) if len(operator) == 1 else 0.0
+except (KeyError, IndexError, TypeError, ValueError):
+    operator_value = 0.0
+if fresh and min(fresh) > 0.0 and math.isfinite(operator_value) and operator_value > 0.0:
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# The compactor Deployment's desired replica count, empty when the operator has
+# not rendered it yet.
+compactor_wakeup_replicas() {
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get deployment \
+    "${COMPACTOR_WAKEUP_CLUSTER}-compactor" -o jsonpath='{.spec.replicas}' 2>/dev/null
+}
+
+# Compactor pods that still exist, terminating ones included: a pod on its way
+# out still holds its claim, which is what the stranded-claim half of the
+# published depth exists for, so "parked" has to mean no pod at all.
+compactor_wakeup_pods() {
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get pods \
+    -l "app.kubernetes.io/instance=${COMPACTOR_WAKEUP_CLUSTER},app.kubernetes.io/component=compactor" \
+    --sort-by=.metadata.name -o jsonpath='{.items[*].metadata.name}' 2>/dev/null
+}
+
+# One line of replica history: when, how many replicas the operator asked for,
+# and which compactor pods existed. The grader reads the whole file, so a
+# capture whose tier never reached zero cannot be read as one that did.
+compactor_wakeup_sample() {
+  local phase=$1 replicas pods
+  replicas=$(compactor_wakeup_replicas)
+  pods=$(compactor_wakeup_pods)
+  python3 - "$COMPACTOR_WAKEUP_REPLICAS_JSONL" "$phase" "${replicas:-}" "${pods:-}" <<'PY'
+import json
+import sys
+import time
+
+path, phase, replicas, pods = sys.argv[1:]
+row = {
+    "at": int(time.time()),
+    "phase": phase,
+    "replicas": int(replicas) if replicas.strip().isdigit() else None,
+    "pods": pods.split(),
+}
+with open(path, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(row) + "\n")
+PY
+}
+
+capture_compactor_wakeup() {
+  local next=$1 at parked_at rc=0 deadline replicas pods
+  local parked_pods="" parked=0 signal_seen=0 woken=0
+  mkdir -p "$RESULTS_DIR"
+  : >"$COMPACTOR_WAKEUP_REPLICAS_JSONL"
+
+  log "watch ${COMPACTOR_WAKEUP_CLUSTER}-compactor park at zero (bound ${COMPACTOR_WAKEUP_PARK_SECONDS}s)"
+  compactor_wakeup_sample before-park
+  deadline=$((SECONDS + COMPACTOR_WAKEUP_PARK_SECONDS))
+  while ((SECONDS < deadline)); do
+    if [[ "$(compactor_wakeup_replicas)" == 0 && -z "$(compactor_wakeup_pods)" ]]; then
+      parked=1
+      break
+    fi
+    sleep "$COMPACTOR_WAKEUP_POLL_SECONDS"
+    compactor_wakeup_sample parking
+  done
+  compactor_wakeup_sample parked
+  if ((parked == 0)); then
+    compactor_wakeup_failure "the compactor tier did not reach zero replicas within ${COMPACTOR_WAKEUP_PARK_SECONDS}s"
+    return 1
+  fi
+  parked_pods=$(compactor_wakeup_pods)
+
+  # Retain the reading that kept the tier parked before ingest. Without this
+  # control a positive capture says there was work, but not that the signal
+  # advanced after this arm drove it.
+  parked_at=$(date -u +%s)
+  prometheus_capture "$(compactor_wakeup_operator_expression)" "$parked_at" \
+    "$COMPACTOR_WAKEUP_PARKED_EXPRESSION_JSON" ||
+    compactor_wakeup_failure "the parked operator-expression query failed"
+
+  # The signal half: with no compactor process in existence, the depth the
+  # INGESTERS publish still has to move when a segment is registered. That is
+  # the reading `siglake_compactor_sealed_pending` cannot give.
+  log "drive ingest with the compactor parked"
+  if ! ingest_events "$next" "$COMPACTOR_WAKEUP_BATCH"; then
+    compactor_wakeup_failure "ingest failed while the compactor was parked"
+    return 1
+  fi
+  next=$((next + COMPACTOR_WAKEUP_BATCH))
+
+  # The publisher and Prometheus each run on a 15-second cadence. Poll until a
+  # fresh positive reading has crossed both, retaining it only while the
+  # Deployment is still at zero and no terminating compactor pod exists. The
+  # old one-shot query happened immediately after ingest and normally captured
+  # the pre-ingest zero.
+  log "wait for the ingester-published depth while the compactor stays parked"
+  deadline=$((SECONDS + COMPACTOR_WAKEUP_WAKE_SECONDS))
+  while ((SECONDS < deadline)); do
+    replicas=$(compactor_wakeup_replicas)
+    pods=$(compactor_wakeup_pods)
+    if [[ "$replicas" != 0 || -n "$pods" ]]; then
+      compactor_wakeup_failure \
+        "the compactor started before a fresh positive activation reading was retained"
+      break
+    fi
+    at=$(date -u +%s)
+    prometheus_capture "$(compactor_wakeup_depth_expression)" "$at" \
+      "$COMPACTOR_WAKEUP_DEPTH_JSON" || true
+    prometheus_capture "$(compactor_wakeup_age_expression)" "$at" \
+      "$COMPACTOR_WAKEUP_AGE_JSON" || true
+    prometheus_capture "$(compactor_wakeup_operator_expression)" "$at" \
+      "$COMPACTOR_WAKEUP_EXPRESSION_JSON" || true
+    if compactor_wakeup_signal_is_positive &&
+      [[ "$(compactor_wakeup_replicas)" == 0 && -z "$(compactor_wakeup_pods)" ]]; then
+      signal_seen=1
+      compactor_wakeup_sample ingested
+      break
+    fi
+    sleep "$COMPACTOR_WAKEUP_SIGNAL_POLL_SECONDS"
+  done
+  if ((signal_seen == 0)); then
+    compactor_wakeup_failure \
+      "no fresh positive activation reading was retained while the compactor stayed parked"
+    return 1
+  fi
+
+  log "wait for the operator to bring the compactor back (bound ${COMPACTOR_WAKEUP_WAKE_SECONDS}s)"
+  deadline=$((SECONDS + COMPACTOR_WAKEUP_WAKE_SECONDS))
+  while ((SECONDS < deadline)); do
+    replicas=$(compactor_wakeup_replicas)
+    if [[ -n "$replicas" ]] && ((replicas > 0)); then
+      woken=1
+      break
+    fi
+    sleep "$COMPACTOR_WAKEUP_POLL_SECONDS"
+    compactor_wakeup_sample waking
+  done
+  compactor_wakeup_sample woken
+  ((woken == 1)) ||
+    compactor_wakeup_failure "the compactor tier did not come back within ${COMPACTOR_WAKEUP_WAKE_SECONDS}s"
+
+  python3 - "$TMP_DIR/compactor-wakeup-capture.json" "$(iso_now)" "$parked_at" "$at" \
+    "$(source_commit)" "$(source_commit_origin)" "$NAMESPACE" "$COMPACTOR_WAKEUP_CLUSTER" \
+    "$parked_pods" "$COMPACTOR_WAKEUP_SAMPLE_MAX_AGE_SECONDS" "$COMPACTOR_WAKEUP_BATCH" \
+    "$COMPACTOR_WAKEUP_REPLICAS_JSONL" \
+    "$(compactor_wakeup_operator_expression)" "$COMPACTOR_WAKEUP_PARKED_EXPRESSION_JSON" \
+    "$(compactor_wakeup_depth_expression)" "$COMPACTOR_WAKEUP_DEPTH_JSON" \
+    "$(compactor_wakeup_age_expression)" "$COMPACTOR_WAKEUP_AGE_JSON" \
+    "$(compactor_wakeup_operator_expression)" "$COMPACTOR_WAKEUP_EXPRESSION_JSON" <<'PY' || rc=$?
+import json
+import sys
+
+(
+    out_path, generated_at, parked_at, at, commit, commit_source, namespace, cluster,
+    parked_pods, max_age, batch, replicas_path,
+    parked_operator_expression, parked_operator_path,
+    depth_expression, depth_path,
+    age_expression, age_path,
+    operator_expression, operator_path,
+) = sys.argv[1:]
+
+
+def response(path):
+    try:
+        return json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"status": "error", "data": {"resultType": "vector", "result": []}}
+
+
+history = []
+try:
+    for line in open(replicas_path, encoding="utf-8"):
+        line = line.strip()
+        if line:
+            history.append(json.loads(line))
+except (OSError, ValueError):
+    history = []
+
+document = {
+    "schema_version": 2,
+    "generated_at": generated_at,
+    "evaluated_at": int(at),
+    "revisions": {
+        "repository_commit": commit,
+        "repository_commit_source": commit_source,
+    },
+    "settings": {
+        "namespace": namespace,
+        "cluster": cluster,
+        "sample_max_age_seconds": int(max_age),
+        "ingest_batch": int(batch),
+        "pods_while_parked": parked_pods.split(),
+    },
+    "replica_history": history,
+    "queries": {
+        "parked_operator_expression": {
+            "expression": parked_operator_expression, "time": int(parked_at),
+            "response": response(parked_operator_path),
+        },
+        "published_depth": {
+            "expression": depth_expression, "time": int(at), "response": response(depth_path),
+        },
+        "sample_age": {
+            "expression": age_expression, "time": int(at), "response": response(age_path),
+        },
+        "operator_expression": {
+            "expression": operator_expression, "time": int(at),
+            "response": response(operator_path),
+        },
+    },
+}
+json.dump(document, open(out_path, "w", encoding="utf-8"), indent=2)
+open(out_path, "a", encoding="utf-8").write("\n")
+PY
+  if ((rc != 0)); then
+    compactor_wakeup_failure "could not assemble the wake-up capture document"
+  elif ! python3 "$ROOT/scripts/grade-kind-compactor-wakeup.py" \
+    "$TMP_DIR/compactor-wakeup-capture.json" --output "$COMPACTOR_WAKEUP_JSON"; then
+    compactor_wakeup_failure "the capture did not grade verified; see ${COMPACTOR_WAKEUP_JSON#"$ROOT/"}"
+  fi
+  ((COMPACTOR_WAKEUP_FAILURE == 0))
+}
+
 # --- #4953: filesystem-drain mirror-reclamation qualification ---------------
 MIRROR_RECLAIM_MC_POD=siglake-mirror-reclaim-mc
 MIRROR_RECLAIM_SAMPLE_OBJECTS=0
@@ -2813,9 +3171,15 @@ if [[ "$COMPACTOR_POD_LABEL_CAPTURE" == 1 ]]; then
   capture_compactor_pod_labels "$next_event" || true
 fi
 
+if [[ "$COMPACTOR_WAKEUP_CAPTURE" == 1 ]]; then
+  log "run the opt-in zero-replica compactor wake-up capture"
+  capture_compactor_wakeup "$next_event" || true
+fi
+
 [[ "$PANEL_FAILURES" -eq 0 ]] || die "one or more required panel/trigger queries returned zero series"
 [[ "$SCALE_FAILURES" -eq 0 ]] || die "the ${QUERY_SCALE_BASE} -> ${QUERY_SCALE_TARGET} -> ${QUERY_SCALE_BASE} query scaling step failed; see the SCALE_FAILURE lines and ${SCALE_JSON#"$ROOT/"}"
 [[ "$POSTGRES_OUTAGE_FAILURE" -eq 0 ]] || die "the requested Postgres outage probe failed with exit status ${POSTGRES_OUTAGE_FAILURE}; see POSTGRES_OUTAGE_EVIDENCE and POSTGRES_OUTAGE_PROBE above"
 [[ "$INGESTER_POD_LABEL_FAILURE" -eq 0 ]] || die "the ingester per-pod label capture failed; see the INGESTER_POD_LABEL_FAILURE lines and ${INGESTER_POD_LABEL_JSON#"$ROOT/"}"
 [[ "$COMPACTOR_POD_LABEL_FAILURE" -eq 0 ]] || die "the compactor shared-queue capture failed; see the COMPACTOR_POD_LABEL_FAILURE lines and ${COMPACTOR_POD_LABEL_JSON#"$ROOT/"}"
+[[ "$COMPACTOR_WAKEUP_FAILURE" -eq 0 ]] || die "the compactor wake-up capture failed; see the COMPACTOR_WAKEUP_FAILURE lines and ${COMPACTOR_WAKEUP_JSON#"$ROOT/"}"
 log "kind evidence round passed"

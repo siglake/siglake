@@ -639,6 +639,7 @@ async fn run() -> Result<()> {
     // abandoned warm cycle or exec-pool task is a delta `increase()` can see.
     siglake_core::metrics::preregister(siglake_core::metrics::QUERY_SERVER_ALERTED_COUNTERS);
     siglake_query_server::jobs::initialize_metrics();
+    siglake_storage::initialize_decoded_file_cache_metrics();
     let build = siglake_core::build_info();
     metrics::gauge!(
         "siglake_build_info",

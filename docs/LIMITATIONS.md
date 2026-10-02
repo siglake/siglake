@@ -25,18 +25,18 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   in this tree, not every collector, SDK or agent. Its evidence and recovery
   paths are in
   [`DESIGN_ingest_lane_cap_response_qualification.md`](DESIGN_ingest_lane_cap_response_qualification.md).
-- **The implicit newest-first ordering only knows the column name
-  `timestamp`.** An index whose doc mapping names some other
-  `timestamp_field` browses in file order unless the query writes its own
-  `ORDER BY`, and so does not reach the ordered early-stop path. Reading the
-  mapping's field name into the rewrite is the extension; it was left out
-  because ordering by a column named `timestamp` on an index whose event time
-  is something else would stamp an order that is not a time order, and the
-  safe half (the shipped templates and every bulk-created index, all of which
-  declare `timestamp`) covers what users actually have.
-- **Aliasing another projected column to `timestamp` opts out of implicit
-  newest-first ordering.** `SELECT raw AS timestamp FROM events LIMIT 100`
-  browses in file order. Injecting a bare `ORDER BY timestamp` would bind to
+- **Rows sharing a custom event time come back in an unspecified order.** An
+  index whose doc mapping names its own `timestamp_field` browses newest-first
+  on that field and early-stops like a canonical one, but it carries no
+  `timestamp_ns` tiebreak, so which rows of an equal-time group land at a
+  `LIMIT` boundary is not determined and need not repeat between executions.
+  The rows returned are still the newest ones: the merge admits every
+  equal-time candidate. A deterministic tie order would need a declared second
+  sort key and an explicit second key in the query.
+- **Aliasing another projected column to the table's event-time name opts out
+  of implicit newest-first ordering.** `SELECT raw AS timestamp FROM events
+  LIMIT 100` browses in file order, and so does `SELECT raw AS ts FROM <index
+  mapped on ts>`. Injecting a bare `ORDER BY timestamp` would bind to
   the output alias and select a different top-N; qualifying the source as
   `events.timestamp` is rejected as ambiguous by DataFusion 53.1.0. The
   newest crates.io release checked on 2026-09-20, DataFusion 55.1.0, retains
@@ -70,7 +70,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   so the same way: one `siglake_iceberg_puffin_blob_fetches_total` per
   acquisition, and `siglake_iceberg_puffin_blob_cache_lookups_total` flat at the
   zero it was pre-registered at, since a disabled cache is never consulted
-  (#4718).
+  (#4718). Since #5374 that pod has a direct reading as well:
+  `siglake_iceberg_puffin_blob_cache_max_bytes` is published on refused
+  admissions too, so a floor pod charts a blob budget of 0 rather than leaving
+  the operator to infer it from two flat series.
   The caps that bind above 16Gi were chosen as policy; the parsed one has since
   been timed against a budget eight times its size and kept at 1 GiB on that
   evidence (#4102, below). The working set beneath them has been sized too, and
@@ -303,21 +306,31 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   times, grouped answer and operator expression. The offline grader accounts
   for independently refreshed gauges and rejects a sum of the replicas'
   copies, but no kind round has supplied the live capture yet (#5548).
-- **No tier can be scaled to zero.** Every `spec.autoscaling.<component>.min`
-  must be 1 or more; `0` is refused with `InvalidSpec=True` /
+- **Only the compactor can be scaled to zero, and the wake-up is unproven in a
+  cluster.** `spec.autoscaling.ingester.min` and `…query.min` must be 1 or
+  more; `0` is refused with `InvalidSpec=True` /
   `AutoscalingZeroFloorUnsupported` before the operator touches a child
-  resource, so the cluster keeps running unchanged until the floor is raised.
-  The reason is that each component's scaling signal — ingest requests/sec,
-  pending segments, in-flight queries — is exported by the pods of the
-  component it scales. A tier parked at zero publishes nothing, so nothing can
-  ask for it back, and because the decision needs all three readings, the
-  stopped tier's missing series also holds the two healthy ones at their
-  current size. An activation signal that outlives the stopped pods (a
-  catalog-side backlog probe, a request-driven wake-up) is not implemented.
-  `docs/DESIGN_compactor_wakeup_signal.md` designs one for the compactor —
-  the catalog queue depth published by the ingester, per-component
-  observations, and a refusal narrowed to the drain modes that still lack a
-  signal. Nothing of it is implemented, and the refusal above is unchanged.
+  resource. Their scaling signals — ingest requests/sec, in-flight queries —
+  are exported by the pods of the tier they size, so a tier parked at zero
+  publishes nothing and nothing can ask for it back.
+  `spec.autoscaling.compactor.min: 0` is accepted since #6011, but only under
+  the catalog-claim drain (`compactor.max` above 1) and with
+  `ewmaHalfLifeSecs` above 0: the ingesters publish the shared queue depth
+  (`siglake_wal_segments_sealed`, with a sample-age companion the operator
+  uses to drop stale publishers), so the reading survives the stopped tier.
+  `compactor.max: 1` keeps `AutoscalingZeroFloorUnsupported` — the filesystem
+  drain never reads the shared queue — and `ewmaHalfLifeSecs: 0` is refused as
+  `AutoscalingZeroFloorNeedsSmoothing`, because without smoothing one idle
+  scrape parks the tier. A parked tier is woken for one 10-minute maintenance
+  window after an hour at zero so retention, delete tasks, claim reclaim and
+  the mirror recovery sweep still run, and a zero-floor tier whose reading is
+  missing entirely goes to 1 rather than staying parked. WHAT IS NOT PROVEN:
+  the live wake-up. No kind or AWS round has yet retained a compactor
+  Deployment reaching `spec.replicas: 0` and being brought back by the
+  ingester-published depth (#6012); the unit tests and the offline capture
+  grader are not that evidence. Leave the packaged `compactor.min: 1` in place
+  until a round supplies it. `docs/DESIGN_compactor_wakeup_signal.md` is the
+  design.
 - **An audit batch can be lost at append.** Query responses never
   wait for the best-effort audit worker, its retained rows and conversion
   working set are bounded by count and charged bytes, and each append is
@@ -339,20 +352,23 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   is full, as before. Per-row delivery is therefore best-effort in both
   directions: the `query_audit` table is an operational record, not an
   accounting one.
-- **Dropping an index does not reclaim its committed storage.** `DELETE
-  /api/v1/indexes/{id}` removes the catalog entry only. The retention and
+- **Dropping an index records cleanup inventory but does not reclaim storage.**
+  Before `DELETE /api/v1/indexes/{id}` removes the catalog entry, it writes and
+  confirms a warehouse-root record containing the loaded table's UUID, exact
+  location, retained committed-file inventory and UUID aggregate prefix. The
+  record is report-only. The retention and
   orphan-GC paths both need to load that entry, so neither can reclaim the
   dropped table's files afterward. In the local committed-data regression,
   recreating the same index id reuses the table location but creates a fresh
   table UUID: the replacement exposes only its own rows while the dropped
-  incarnation's files remain alongside it. A future cleanup record must
-  preserve the dropped table's immutable UUID and exact location plus an
-  incarnation-specific file inventory (or equivalent retained metadata tree),
-  so cleanup never resolves the same-name replacement or deletes its files.
+  incarnation's files remain alongside it. The aggregate sweeper inventories
+  only the recorded UUID prefix and never resolves the reusable index name.
+  Destructive aggregate authority has no production enablement API yet; the
+  design's retention, recovery-delay and store-failure policies remain open.
   [`DESIGN_dropped_index_aggregate_reclamation.md`](DESIGN_dropped_index_aggregate_reclamation.md)
   specifies how that record addresses the dropped UUID's aggregate prefix,
   catches delayed publications, and excludes the replacement and unowned
-  legacy paths. It is a design only; current builds still delete none of them.
+  legacy paths. Current production-created records delete none of them.
   The index's **WAL** is keyed by tenant and index name, so it survives the
   deletion too. It is separated by a per-directory owner marker holding the
   table's UUID, written by the drain and compared by every reader: a directory
@@ -714,10 +730,17 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   another partition is finished, not abandoned. The outcomes still do not
   partition `miss` — `miss` is charged before the populate stream is built, so a
   construction error leaves a miss with no outcome, and `hit` and `bypass` never
-  build one. The query server pre-registers all eight arms at 0 and panel 162
+  build one. The query server pre-registers all nine arms at 0 and panel 162
   ("Decoded-file cache populations") in `deploy/grafana/siglake-overview.json`
   charts them; on a default install, where the cache is off, every arm stays at
-  zero.
+  zero. The ninth is `outcome="population_refused"` (#5801), one increment per
+  population the shared byte bound turned away, from either a bound with no room
+  left to make or a held replacement lock; a refused population retains nothing
+  and is not also counted `abandoned`. The total that bound is enforced against
+  is `siglake_query_scan_file_cache_accounted_bytes`, published from every site
+  that moves it and created at 0 at startup, so the two rounds above — which
+  exported neither it nor the insert-path gauges — would now separate a
+  population that was never kept from one that never happened.
   Population buffers now share the configured cache byte bound with completed
   entries (#5786). Each retained batch charges its exact decoded bytes with a
   lock-free atomic fast path; only a charge that lacks room tries the cache mutex
@@ -1171,14 +1194,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   non-JSON `_siglake/config/.conditional-write-probe-<process-id>` object and
   independently tries a stale `If-Match` overwrite and an existing-key
   `If-None-Match: *` overwrite. Each request must return a recognized
-  precondition error and preserve the existing bytes. An ignored header, a
-  missing advertised capability or an indeterminate response refuses inline side-aggregate
+  precondition error and preserve the existing bytes. An ignored header, a missing advertised
+  capability or an indeterminate response refuses inline side-aggregate
   publication, wide group-count folds and rebuilds, snapshot-expiry coverage
-  re-rooting, and inline time-aggregate rebuild publication. It never enters an
-  unconditional remote-write fallback. The `file://` backend keeps its separate
-  in-process serialized read-merge-write behavior. The verdict is cached only
-  in the context for the warehouse store it checked and shared by that
-  context's tenant views. Garage
+  re-rooting, inline time-aggregate rebuild publication, and dropped-index
+  cleanup-record creation. It never enters an unconditional remote-write
+  fallback. The `file://` backend keeps its separate in-process serialized
+  read-merge-write behavior. The verdict is cached only in the context for the
+  warehouse store it checked and shared by that context's tenant views. Garage
   v2.4.1 returned HTTP 200 for both invalid preconditions in the matched signed
   S3 run, so these operations fail closed there; this is refusal, not a Garage
   support commitment. The check is sequential and detects ignored headers.
@@ -1871,6 +1894,17 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   record of the refusal. Giving the command a metrics endpoint would mean
   holding the process open for a scrape, which is a flag and a default this
   cleanup deliberately did not add.
+
+- **A query execution's log id does not cross pods.** `query_execution_id` is
+  minted from a process-local counter, so a coordinator's fan-out and the
+  workers' shards carry unrelated ids in their own logs; only the W3C trace
+  context the fan-out already propagates joins the two halves, and that needs
+  OTel configured. Within one pod's log the id is exact, which is what the
+  scan's tuning and partition profile events need to be attributable at all.
+  Carrying the coordinator's id in the shard request body would make a
+  log-only join possible without OTel, at the cost of another versioned field
+  on the worker wire contract for a value that is not comparable across
+  processes on its own.
 
 - **The local, CI and kind stacks use frozen Bitnami Legacy MinIO images.**
   MinIO stopped publishing prebuilt community binaries, and its former Docker

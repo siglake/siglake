@@ -938,6 +938,13 @@ fn warm_probe_timeout_from(configured: Option<&str>) -> std::time::Duration {
 }
 
 async fn warm_ordered_edges(ice: &IcebergContext, table: &str) -> anyhow::Result<()> {
+    // The probe browses the table's OWN event time, which for a managed index
+    // is whatever its mapping declares (#6020). Reading `timestamp` on a
+    // `ts`-mapped index probed a column the table may not even have, and hinted
+    // a plan-cache entry no browse of that index could hit.
+    let Some(event_time) = ice.index_event_time_field(table).await? else {
+        return Ok(()); // not a managed index
+    };
     for descending in [true, false] {
         // Same session hints a real browse carries: PreferredScanOrder keys
         // the ordered-plan cache (the warm probe PRE-POPULATES the entry the
@@ -947,7 +954,10 @@ async fn warm_ordered_edges(ice: &IcebergContext, table: &str) -> anyhow::Result
         let mut state = siglake_storage::session_context_with(None, None).state();
         state
             .config_mut()
-            .set_extension(Arc::new(siglake_storage::PreferredScanOrder { descending }));
+            .set_extension(Arc::new(siglake_storage::PreferredScanOrder::new(
+                event_time.as_str(),
+                descending,
+            )));
         state
             .config_mut()
             .set_extension(Arc::new(siglake_storage::OrderedScanLimit { limit: 1 }));
@@ -960,6 +970,12 @@ async fn warm_ordered_edges(ice: &IcebergContext, table: &str) -> anyhow::Result
         let cancel = siglake_storage::QueryCancel::new();
         state.config_mut().set_extension(Arc::new(cancel.clone()));
         let _cancel_guard = siglake_storage::CancelOnDrop(cancel.clone());
+        // The probe scans, so it logs the same two scan events a request does
+        // and needs the same identity — otherwise a warm cycle's events are
+        // indistinguishable from the request whose log lines they land
+        // between. Every probe is its own execution.
+        let execution_id = siglake_storage::QueryExecutionId::next();
+        state.config_mut().set_extension(Arc::new(execution_id));
         let ctx = datafusion::prelude::SessionContext::new_with_state(state);
         if table == "events" {
             ice.register_with_datafusion(&ctx).await?;
@@ -972,8 +988,10 @@ async fn warm_ordered_edges(ice: &IcebergContext, table: &str) -> anyhow::Result
             }
         }
         let dir = if descending { "DESC" } else { "ASC" };
-        let sql =
-            format!("SELECT \"timestamp\" FROM \"{table}\" ORDER BY \"timestamp\" {dir} LIMIT 1");
+        let sql = format!(
+            "SELECT \"{event_time}\" FROM \"{table}\" ORDER BY \"{event_time}\" {dir} LIMIT 1"
+        );
+        crate::sql::log_query_execution_start("warm_ordered_edges", execution_id, Some(&sql), None);
         let probe = async { ctx.sql(&sql).await?.collect().await };
         match tokio::time::timeout(warm_probe_timeout(), probe).await {
             Ok(Ok(_)) => {}

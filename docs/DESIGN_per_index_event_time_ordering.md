@@ -1,10 +1,14 @@
 # Per-index event-time ordering qualification (task #4073)
 
-**Status:** design and local qualification only, 2026-09-23. **Verdict:
-REVISE.** Mapping-aware newest-first ordering is sound, but the proposed
-rewrite-only extension is incomplete. Implementation is scoped in #6020 for
-0.3.0. This record changes no query rewrite, storage order, schema or API, and
-the limitation in `LIMITATIONS.md` stays in force until that card passes.
+**Status:** implemented, 2026-09-24 (#6020). The verdict below was REVISE:
+mapping-aware newest-first ordering is sound, but a rewrite-only extension was
+incomplete. The implementation carries the field through planning and storage as
+this record requires; the `LIMITATIONS.md` entry it was holding open is gone,
+replaced by the one that survives — equal event times have no tiebreak. The
+sections below are kept as written, as the argument the implementation answers;
+"Local qualification" describes the pre-implementation controls, whose test is
+now the acceptance fixture
+(`query_provider::tests::custom_event_time_sort_is_advertised_for_its_own_field`).
 
 ## Question
 

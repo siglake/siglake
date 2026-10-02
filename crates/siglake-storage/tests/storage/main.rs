@@ -17,6 +17,7 @@ mod delete_task_null_nonmatches;
 mod delete_task_observation;
 mod delete_task_read_only_predicate;
 mod delta_write_retry;
+mod dropped_index_cleanup;
 mod fixture_clock;
 mod group_count_merge_cost;
 mod group_count_recluster;
