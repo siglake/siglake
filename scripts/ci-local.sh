@@ -51,6 +51,12 @@
 # filesystem. That scratch directory is removed on EXIT, while the job logs
 # above survive for diagnosis.
 #
+# The `docker` job is the long one and the one whose single number says least:
+# it builds two images, brings compose up, and runs six live suites. It writes
+# a named elapsed record per step into docker.log and closes with what those
+# add up to against the job's total and what is left over. See
+# scripts/ci-local-phases.sh.
+#
 # CI's helm job also runs check-public-tree.py; here that step is reported as
 # its own `public-tree` line, so a dead reference is not blamed on the chart.
 # Likewise the shell job's set_var guard is its own `set-var` line: a test that
@@ -68,6 +74,7 @@ cd "$(dirname "$0")/.."
 . scripts/ci-local-image-sizes.sh
 . scripts/ci-local-build-env.sh
 . scripts/ci-local-compose-port.sh
+. scripts/ci-local-phases.sh
 
 WITH_HEAVY=0
 STRICT=0
@@ -225,6 +232,7 @@ else
   scripts/check-compose-preflight.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-conditional-write-probe.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-ci-local-test-guard.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  scripts/check-ci-local-phases.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-bench-ports.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-jaeger-ui-recording.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   # The mold linker flag and the apt install of mold have to live in the same
@@ -832,41 +840,69 @@ if [ "$WITH_HEAVY" = 1 ]; then
     export SIGLAKE_GARAGE_HOST_PORT=13900
     export SIGLAKE_GARAGE_ADMIN_HOST_PORT=13903
     : >"$dlog"
+    # Every step below is wrapped in a named phase, and the block closes with
+    # what they add up to against this job's total. 471s of docker in nightly
+    # run #171 could not be attributed to anything: see ci-local-phases.sh.
+    ci_local_phases_reset "$dlog"
+    ci_local_phase_begin preflight
+    preflight_rc=0
     if ci_local_choose_compose_ingest_port "$dlog"; then
       # Resolve the store the stack will run on, so the S3 test below points at
       # whatever scripts/up.sh brought up. SIGLAKE_OBJECT_STORE=minio unless the
       # caller selected garage (task #2958); CI always takes the default.
       # shellcheck source=scripts/compose-common.bash
       source scripts/compose-common.bash
+      scripts/up.sh --preflight-only >>"$dlog" 2>&1 || preflight_rc=$?
     else
+      preflight_rc=1
+    fi
+    if ! ci_local_phase_end "$dlog" "$preflight_rc"; then
       dk_ok=0
       preflight_ok=0
     fi
-    if [ "$preflight_ok" = 1 ] && scripts/up.sh --preflight-only >>"$dlog" 2>&1; then
-      docker build -q -f deploy/Dockerfile -t siglake:ci-local . >>"$dlog" 2>&1 || dk_ok=0
+    if [ "$preflight_ok" = 1 ]; then
+      ci_local_phase_begin image-build
+      build_rc=0
+      docker build -q -f deploy/Dockerfile -t siglake:ci-local . >>"$dlog" 2>&1 \
+        || build_rc=$?
       docker build -q -f deploy/Dockerfile.operator -t siglake-operator:ci-local . \
-        >>"$dlog" 2>&1 || dk_ok=0
+        >>"$dlog" 2>&1 || build_rc=$?
+      ci_local_phase_end "$dlog" "$build_rc" || dk_ok=0
       # Measured before compose runs, so a red s3_mirror_pagination still
       # leaves the sizes of the images this run built in the log and the line.
       # See ci-local-image-sizes.sh: the measurement never decides the verdict,
       # and a half of it the daemon did not answer is named UNRECORDED rather
       # than dropped.
       if [ "$dk_ok" = 1 ]; then
+        ci_local_phase_begin image-sizes
         image_sizes=$(docker_image_sizes "$dlog")
+        ci_local_phase_end "$dlog" 0
       fi
-      if scripts/up.sh >>"$dlog" 2>&1; then
+      # Compose's own build/start and health-wait split is printed by
+      # scripts/up.sh inside this phase; the phase is the pair of them.
+      ci_local_phase_begin compose-up
+      compose_rc=0
+      scripts/up.sh >>"$dlog" 2>&1 || compose_rc=$?
+      ci_local_phase_end "$dlog" "$compose_rc" || true
+      if [ "$compose_rc" -eq 0 ]; then
+        ci_local_phase_begin s3-pagination
+        s3_rc=0
         SIGLAKE_TEST_S3_ENDPOINT="$SIGLAKE_S3_HOST_ENDPOINT" \
         SIGLAKE_TEST_S3_ACCESS_KEY="$SIGLAKE_S3_ACCESS_KEY" \
         SIGLAKE_TEST_S3_SECRET_KEY="$SIGLAKE_S3_SECRET_KEY" \
           cargo test -p siglake-compactor --test s3_mirror_pagination -- \
-            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+            --ignored --nocapture >>"$dlog" 2>&1 || s3_rc=$?
+        ci_local_phase_end "$dlog" "$s3_rc" || dk_ok=0
         # Keep the selected endpoint alive long enough to record its raw S3
         # conditional-write behaviour. This establishes endpoint behaviour,
         # not OpenDAL's error mapping; the helper grades only complete,
         # authenticated observations and always deletes its disposable object.
+        ci_local_phase_begin conditional-probe
         conditional_probe_rc=0
         scripts/ci-local-conditional-write-probe.sh >>"$dlog" 2>&1 \
           || conditional_probe_rc=$?
+        ci_local_phase_end "$dlog" "$conditional_probe_rc" || true
+        ci_local_phase_begin conditional-live
         conditional_live_log="$LOG_DIR/conditional-write-live.log"
         conditional_live_rc=0
         SIGLAKE_TEST_S3_ENDPOINT="$SIGLAKE_S3_HOST_ENDPOINT" \
@@ -892,9 +928,26 @@ if [ "$WITH_HEAVY" = 1 ]; then
           echo "conditional-write live tests FAIL ($conditional_passed passed, $conditional_failed failed, $conditional_results result lines)" \
             >>"$dlog"
           dk_ok=0
+          # cargo exited 0 with the wrong number of results: the phase record
+          # has to be red for the same reason the job is.
+          [ "$conditional_live_rc" -ne 0 ] || conditional_live_rc=1
         fi
+        ci_local_phase_end "$dlog" "$conditional_live_rc" || true
+        ci_local_phase_begin conditional-agreement
+        agreement_rc=0
         scripts/ci-local-conditional-write-agreement.sh "$dlog" "$conditional_probe_rc" \
-          >>"$dlog" 2>&1 || dk_ok=0
+          >>"$dlog" 2>&1 || agreement_rc=$?
+        ci_local_phase_end "$dlog" "$agreement_rc" || dk_ok=0
+        # The six Postgres-only suites are one phase with a record per suite
+        # inside it: five of them share the siglake-storage test binary, so
+        # whichever runs first pays for its compilation and the rest do not.
+        # Only the parent is summed.
+        ci_local_phase_begin postgres-suites
+        # Only the children below touch dk_ok inside this group, so comparing
+        # it against its value at entry gives the group its own status.
+        pg_group_dk_ok=$dk_ok
+        ci_local_phase_begin jobs-postgres-ownership
+        pg_rc=0
         # The shared-store job ownership rules (#1845) are the only thing
         # standing between a query scale-out and a destroyed batch result,
         # and no hermetic test can reach them: they are SQL. compose's
@@ -906,7 +959,10 @@ if [ "$WITH_HEAVY" = 1 ]; then
         # so run its cases serially.
         SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
           cargo test -p siglake-query-server --test jobs_postgres_ownership -- \
-            --ignored --nocapture --test-threads=1 >>"$dlog" 2>&1 || dk_ok=0
+            --ignored --nocapture --test-threads=1 >>"$dlog" 2>&1 || pg_rc=$?
+        ci_local_phase_end "$dlog" "$pg_rc" || dk_ok=0
+        ci_local_phase_begin local-commit-mark-postgres
+        pg_rc=0
         # Same argument for the local drain's mirror-reclamation mark (#4913,
         # #4956): it decides which mirror objects retention may delete, the
         # deployed catalog is Postgres, and its hermetic cases run on SQLite.
@@ -916,14 +972,20 @@ if [ "$WITH_HEAVY" = 1 ]; then
         # so its claim never takes a row compose's ingest registered.
         SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
           cargo test -p siglake-storage --lib local_commit_mark_postgres -- \
-            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+            --ignored --nocapture >>"$dlog" 2>&1 || pg_rc=$?
+        ci_local_phase_end "$dlog" "$pg_rc" || dk_ok=0
+        ci_local_phase_begin wal-ledger-postgres
+        pg_rc=0
         # wal-recover's catalog reader uses the same deployed backend and has
         # three properties a parser or SQLite cannot establish: all 256 `$N`
         # binds work, the server refuses a write on the reader's own fenced
         # connection, and a missing table differs from an empty ledger.
         SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
           cargo test -p siglake-storage --lib wal_ledger_postgres -- \
-            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+            --ignored --nocapture >>"$dlog" 2>&1 || pg_rc=$?
+        ci_local_phase_end "$dlog" "$pg_rc" || dk_ok=0
+        ci_local_phase_begin eligible-claim-postgres
+        pg_rc=0
         # The candidate-local claim gate (#5189) is Postgres-only by
         # construction — a CTE, FOR UPDATE SKIP LOCKED and an UPDATE ... FROM
         # agg — and returns an empty vec before the statement on SQLite, so no
@@ -932,29 +994,42 @@ if [ "$WITH_HEAVY" = 1 ]; then
         # logs read alike.
         SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
           cargo test -p siglake-storage --lib eligible_claim_postgres -- \
-            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+            --ignored --nocapture >>"$dlog" 2>&1 || pg_rc=$?
+        ci_local_phase_end "$dlog" "$pg_rc" || dk_ok=0
+        ci_local_phase_begin sharded-claim-postgres
+        pg_rc=0
         # Multi-shard Postgres claims transition rows before applying the Rust
         # ownership filter. Prove a foreign row is released and its owner can
         # claim it; SQLite filters before its per-row UPDATE and cannot cover
         # that ordering.
         SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
           cargo test -p siglake-storage --lib sharded_claim_postgres -- \
-            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+            --ignored --nocapture >>"$dlog" 2>&1 || pg_rc=$?
+        ci_local_phase_end "$dlog" "$pg_rc" || dk_ok=0
+        ci_local_phase_begin watermark-transaction-postgres
+        pg_rc=0
         # The consumed-proof watermark advances in the same transaction as the
         # segment transition. Exercise both its successful commit and rollback
         # after a Postgres statement failure; SQLite does not poison the open
         # transaction in the same way.
         SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
           cargo test -p siglake-storage --lib watermark_transaction_postgres -- \
-            --ignored --nocapture >>"$dlog" 2>&1 || dk_ok=0
+            --ignored --nocapture >>"$dlog" 2>&1 || pg_rc=$?
+        ci_local_phase_end "$dlog" "$pg_rc" || dk_ok=0
+        pg_group_rc=0
+        [ "$dk_ok" = "$pg_group_dk_ok" ] || pg_group_rc=1
+        ci_local_phase_end "$dlog" "$pg_group_rc" || true
       else
         dk_ok=0
       fi
-      scripts/down.sh >>"$dlog" 2>&1 || dk_ok=0
-    else
-      dk_ok=0
-      preflight_ok=0
+      # Teardown runs whether or not the stack came up or the suites passed,
+      # so it is a phase on both paths.
+      ci_local_phase_begin teardown
+      down_rc=0
+      scripts/down.sh >>"$dlog" 2>&1 || down_rc=$?
+      ci_local_phase_end "$dlog" "$down_rc" || dk_ok=0
     fi
+    ci_local_phases_report "$dlog" "$((SECONDS - job_started))"
     report docker "$(docker_job_status "$dk_ok" "$preflight_ok" "$image_sizes")"
     if [ "$preflight_ok" = 0 ]; then
       sed 's/^/  /' "$dlog" >&2
