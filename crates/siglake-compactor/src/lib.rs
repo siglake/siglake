@@ -6230,6 +6230,12 @@ const AUTO_PROMOTION_OUTCOMES: &[&str] = &["promoted", "nothing_cleared", "at_ce
 const AUTO_PROMOTION_LOGGED_KEYS: usize = 32;
 
 fn preregister_auto_promotion_passes(iceberg_namespace: &str, table: &str) {
+    // #5065's wave reader takes before/after deltas, so the cost series have to
+    // exist before the first pass and the first Backfill bin — on a young table
+    // those are the measurement itself. Registered here rather than at the
+    // recording sites in siglake-storage because this loop is the one place
+    // that visits every discovered table on every cycle, feature on or off.
+    siglake_storage::iceberg::preregister_auto_promotion_cost_series(iceberg_namespace, table);
     for outcome in AUTO_PROMOTION_OUTCOMES {
         metrics::counter!(
             "siglake_auto_promotion_passes_total",
@@ -7236,6 +7242,7 @@ mod auto_promotion_telemetry_tests {
 
         let mut counters = BTreeMap::new();
         let mut gauges = BTreeMap::new();
+        let mut histograms = BTreeMap::new();
         for (key, _, _, value) in snapshotter.snapshot().into_vec() {
             let labels = key
                 .key()
@@ -7264,7 +7271,15 @@ mod auto_promotion_telemetry_tests {
                         value.into_inner(),
                     );
                 }
-                other => panic!("unexpected metric value {other:?}"),
+                DebugValue::Histogram(samples) => {
+                    histograms.insert(
+                        (
+                            key.key().name().to_string(),
+                            labels.get("table").cloned().unwrap_or_default(),
+                        ),
+                        samples.len(),
+                    );
+                }
             }
         }
 
@@ -7316,6 +7331,34 @@ mod auto_promotion_telemetry_tests {
                         phase.into()
                     )),
                     Some(&0)
+                );
+            }
+        }
+        // #6482: the wave's COST series, created at zero by the same discovery
+        // loop. The `disabled` table is the one that matters here — a wave
+        // round scrapes its control arm too, and an arm that never promotes
+        // anything would otherwise have no backfill series to read at either
+        // boundary.
+        for table in ["disabled", "never", "completed"] {
+            for name in [
+                "siglake_compactor_promotion_backfill_files_total",
+                "siglake_compactor_promotion_backfill_bytes_in_total",
+                "siglake_compactor_promotion_backfill_bytes_out_total",
+            ] {
+                assert_eq!(
+                    counters.get(&(name.into(), table.into(), "".into(), "".into())),
+                    Some(&0),
+                    "{name} is not pre-registered for {table}"
+                );
+            }
+            for name in [
+                "siglake_auto_promotion_pass_duration_seconds",
+                "siglake_compactor_promotion_backfill_duration_seconds",
+            ] {
+                assert_eq!(
+                    histograms.get(&(name.into(), table.into())),
+                    Some(&0),
+                    "{name} is not registered unobserved for {table}"
                 );
             }
         }

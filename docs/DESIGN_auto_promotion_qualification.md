@@ -213,3 +213,16 @@ pass. A round prices the rewrite wave from
 `siglake_compactor_promotion_backfill_bytes_out_total`, and
 `siglake_compactor_promotion_backfill_duration_seconds`; those series are
 recorded per committed backfill bin and retain the table label.
+
+Those five cost series are pre-registered at zero as well (#6482), by the same
+discovery loop and for every table it finds, whether or not the feature is on:
+the sampling duration per Iceberg namespace and table, the backfill family per
+table. A wave is priced from the delta between two scrapes, and #5065's reader
+refuses a series absent at either boundary rather than reading absence as a
+zero — which, before this, made the first wave on a fresh namespace the one
+wave that could not be measured, because its before boundary preceded the pass
+and the bin that created the series. Registration records no sample: the
+counters are created at 0 and the histograms render `_sum 0` and `_count 0`
+until a real pass or bin observes one. The before-boundary scrape still has to
+follow the compactor's first discovery cycle; a scrape taken before any cycle
+sees nothing.
