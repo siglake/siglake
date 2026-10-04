@@ -288,4 +288,6 @@ expect_unverified unpinned-commit "provenance is unknown"
 expect_unverified no-ingest 'drove no ingest while the tier was parked'
 expect_unverified baseline-already-positive 'already read 6 before ingest'
 
-echo "ok ($fixtures offline compactor wake-up fixtures; the live wake-up needs an operator-managed kind round, #6012)"
+python3 scripts/test-kind-compactor-wakeup.py
+
+echo "ok ($fixtures offline compactor wake-up fixtures; full acceptance helper ready for the separate live round, #6012)"

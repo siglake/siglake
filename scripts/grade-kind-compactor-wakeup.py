@@ -32,6 +32,8 @@ document says a live cluster did this once, in this round.
 from __future__ import annotations
 
 import argparse
+import datetime
+import re
 import json
 import math
 import pathlib
@@ -209,9 +211,125 @@ def grade(document: dict) -> dict:
     }
 
 
+def grade_acceptance(document: dict) -> dict:
+    """Full #6012 proof; schema-2 captures remain historical activation-only evidence."""
+    if document.get("schema_version") != 3:
+        raise Unverified("full acceptance requires schema_version 3")
+    activation = dict(document, schema_version=2)
+    evidence = grade(activation)
+    revisions = document.get("revisions") or {}
+    if not re.fullmatch(r"[0-9a-f]{40}", revisions.get("repository_commit", "")):
+        raise Unverified("acceptance requires a full source commit")
+    settings = document["settings"]
+    batch = settings["ingest_batch"]
+    acceptance = document.get("acceptance") or {}
+
+    def require(condition, why):
+        if not condition:
+            raise Unverified(why)
+
+    def ledger(name):
+        rows = acceptance.get(name)
+        require(isinstance(rows, list) and bool(rows), f"missing {name}")
+        require(all(isinstance(r, dict) and isinstance(r.get("id"), str) and r["id"] and
+                    isinstance(r.get("rows"), int) and r["rows"] > 0 for r in rows),
+                f"malformed {name}")
+        require(len({r["id"] for r in rows}) == len(rows), f"duplicate IDs in {name}")
+        return {r["id"]: r for r in rows}
+
+    sha = revisions["repository_commit"]
+    images = document.get("images") or {}
+    versions = document.get("build_versions") or {}
+    expected_images = {f"{name}:{sha[:12]}" for name in ("siglake-wakeup", "siglake-wakeup-operator")}
+    require(set(images) == expected_images and set(versions) == expected_images and
+            all(re.fullmatch(r"sha256:[0-9a-f]{64}", digest) for digest in images.values()) and
+            all(sha in version for version in versions.values()), "image build provenance does not match pinned source")
+    initial = ledger("initial_ledger")
+    require(sum(r["rows"] for r in initial.values()) == batch and
+            all(r.get("status") == "committed" for r in initial.values()),
+            "initial load was not completely committed before parking")
+    sealed = {key: row for key, row in ledger("sealed_ledger").items() if key not in initial}
+    committed = ledger("committed_ledger")
+    require(bool(sealed) and all(r.get("status") == "sealed" for r in sealed.values()),
+            "new segments were not observed sealed while parked")
+    require(set(sealed) == set(committed), "committed segment IDs differ from the parked ingest")
+    require(sum(r["rows"] for r in sealed.values()) == batch, "sealed rows do not equal the sent batch")
+    require(all(r.get("status") == "committed" and isinstance(r.get("committed_at_ms"), int)
+                and r["committed_at_ms"] > 0 and r["rows"] == sealed[key]["rows"]
+                for key, r in committed.items()), "new segments lack durable committed certificates")
+    history = document["replica_history"]
+    woken_at = next(r["at"] for r in history if r["phase"] == "woken")
+    ingested_at = next(r["at"] for r in history if r["phase"] == "ingested")
+    positive_start = acceptance.get("positive_started_at", 0)
+    require(0 < positive_start <= ingested_at <= woken_at <= acceptance.get("committed_at", 0),
+            "committed evidence is outside the positive wake window")
+    require(all(r["committed_at_ms"] / 1000 >= positive_start for r in committed.values()),
+            "committed certificates predate this ingest")
+    response = acceptance.get("query_response") or {}
+    require(not response.get("truncated") and
+            [r.get("host") for r in response.get("rows", [])] == [f"wake-{i:04d}" for i in range(batch)],
+            "query does not return exactly the new row IDs")
+
+    absent = acceptance.get("absent_compactor_series") or {}
+    negative = acceptance.get("missing_activation") or {}
+    for name, query in (("absent compactor series", absent), ("missing activation", negative)):
+        response = query.get("response") or {}
+        data = response.get("data") or {}
+        require(response.get("status") == "success" and data.get("resultType") == "vector" and
+                data.get("result") == [], f"{name} must be a successful empty vector")
+    parked = acceptance.get("negative_parked") or {}
+    woken = acceptance.get("negative_woken") or {}
+    require(parked.get("replicas") == 0 and parked.get("pods") == [], "negative control did not begin parked")
+    require(woken.get("replicas") == 1, "missing publisher did not restore exactly one compactor")
+    disabled = acceptance.get("publisher_disabled") or {}
+    env = (disabled.get("spec") or {}).get("extraEnv") or []
+    require([r.get("value") for r in env if r.get("name") == "SIGLAKE_WAL_SEALED_PUBLISH_SECS"] == ["0"],
+            "negative control has no explicit disabled publisher")
+    started = acceptance.get("negative_started_at", 0)
+    require(0 < parked.get("at", 0) <= started <= negative.get("time", 0) <= woken.get("at", 0),
+            "negative control readings are out of order")
+    require(woken["at"] - started < 600, "fallback observation overlaps the scheduled maintenance wake")
+
+    # Parse the real operator's timestamped decision, not an agent-authored boolean.
+    # Both other tiers must have usable samples during the no-compactor-series window.
+    logs = re.sub(r"\x1b\[[0-9;]*m", "", acceptance.get("operator_log", ""))
+    decisions = []
+    timestamped = []
+    for line in logs.splitlines():
+        try:
+            at = datetime.datetime.fromisoformat(line.split()[0].replace("Z", "+00:00")).timestamp()
+        except (ValueError, IndexError):
+            continue
+        if f"name={settings['cluster']}" not in line:
+            continue
+        timestamped.append((at, line))
+        if "reconcile decision" in line:
+            decisions.append((at, line))
+    require(any(absent.get("time", 0) <= at <= acceptance.get("unaffected_until", 0) and
+                "ingester_rps_per_pod: Some(" in line and "query_in_flight_per_pod: Some(" in line
+                for at, line in decisions), "no ordinary ingester/query decisions while compactor series absent")
+    require(any(started <= at <= woken["at"] + 5 and "compactor_backlog: None" in line and
+                "comp 0→1" in line for at, line in decisions),
+            "no operator missing-signal decision restoring compactor 0 to 1")
+    require(not any(started <= at <= woken["at"] and "waking the parked compactor for maintenance" in line for at, line in timestamped),
+            "negative control was a maintenance wake")
+    workloads = (acceptance.get("workloads") or {}).get("items") or []
+    for component, kind in (("ingester", "Deployment"), ("query", "StatefulSet")):
+        matches = [w for w in workloads if w.get("kind") == kind and
+                   (w.get("metadata") or {}).get("name") == settings["cluster"] + "-" + component]
+        require(len(matches) == 1 and matches[0]["spec"]["replicas"] == 1 and
+                (matches[0].get("status") or {}).get("readyReplicas", 0) == 1,
+                f"{component} did not retain its ready floor")
+    evidence["summary"].update({"committed_rows": batch, "exact_row_ids": batch,
+                                "unaffected_tiers": ["ingester", "query"], "missing_publisher_woken_replicas": 1})
+    evidence["scope"] = "full wake-up acceptance; cleanup is recorded separately"
+    return evidence
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture", type=pathlib.Path, help="the capture document to grade")
+    parser.add_argument("--require-acceptance", action="store_true", help="require all #6012 controls and committed-row proof")
     parser.add_argument("--output", type=pathlib.Path, help="where to write the graded evidence")
     args = parser.parse_args()
 
@@ -222,8 +340,8 @@ def main() -> int:
         return 1
 
     try:
-        evidence = grade(document)
-    except Unverified as exc:
+        evidence = grade_acceptance(document) if args.require_acceptance else grade(document)
+    except (Unverified, TypeError, KeyError, ValueError, StopIteration) as exc:
         print(f"unverified: {exc}", file=sys.stderr)
         if args.output:
             args.output.write_text(

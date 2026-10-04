@@ -338,3 +338,60 @@ KEEP=1 SG_DOCKER=1 KIND_CLUSTER_NAME=siglake-lm scripts/kind-round.sh  # retain 
 
 `kind-down.sh` deletes the cluster entirely — `emptyDir` volumes are
 gone with it, so each up/down cycle is a clean slate.
+
+## Zero-replica compactor qualification
+
+The wake-up opt-in creates a separate, operator-managed cluster from the same
+source as both images. It does not reuse an existing cluster or the ordinary
+chart-managed deployment:
+
+```bash
+COMPACTOR_WAKEUP_CAPTURE=1 COMPACTOR_WAKEUP_CLUSTER=wakeup \
+  RESULTS_DIR="$PWD/results/wakeup-$(date -u +%Y%m%dT%H%M%S)" \
+  scripts/kind-round.sh
+```
+
+Run from a clean, pinned source. The remote runner's `SIGLAKE_SOURCE_COMMIT`
+identifies its original source when the synced checkout has a synthetic Git
+commit. Both image builds receive that full SHA and must report it in
+`--version`. The helper uses a private kubeconfig, a unique kind name, and
+loopback port-forwards with allocated ports. No host port mappings are needed.
+The supplied CR has compactor min 0/max 2, a five-second EWMA half-life, ingest
+and query floors of one, and the catalog-claim drain with mirrored WAL. These
+are qualification overrides; packaged defaults do not change.
+
+The capture first commits an initial 500-row batch, waits for the compactor to
+park without any remaining pod, then sends a new 500-row batch. It retains the
+fresh positive ingester signal before any compactor returns, the operator's
+activation expression and replica history, the new segment IDs changing from
+sealed to committed in the durable catalog ledger, and the exact newly ingested
+row IDs returned through SQL. Queryable WAL rows alone cannot pass the commit
+check. A timed-out or too-late positive observation fails; the harness never
+pauses the operator to manufacture an observation window.
+
+After the compactor parks again and its old scrape series disappears, the
+capture retains an ordinary ingester/query reconcile. It then disables the
+existing ingester publisher knob (`SIGLAKE_WAL_SEALED_PUBLISH_SECS=0`) through
+the CR, retains an empty activation result and the operator's missing-signal
+0-to-1 decision, and checks the other tiers remain ready at their floors. It
+does not stop the operator, change the compactor floor, or count its scheduled
+maintenance wake as the negative control.
+
+Artifacts are under `$RESULTS_DIR/compactor-wakeup/`: `capture.json`, the
+applied CR before/after disabling the publisher, PodMonitor, command log,
+operator decisions, workload logs and final Kubernetes objects. A failing
+capture remains `unverified`. The helper deletes only its recorded control
+plane and records cleanup separately; this opt-in always tears down, including
+when `KEEP` is set for ordinary rounds. Regrade the full capture with:
+
+```bash
+python3 scripts/grade-kind-compactor-wakeup.py \
+  "$RESULTS_DIR/compactor-wakeup/capture.json" --require-acceptance \
+  --output "$RESULTS_DIR/compactor-wakeup/graded.json"
+```
+
+The historical schema-2 fixture proves only the activation sub-check. The new
+schema-3 acceptance requires all controls above. Offline regressions run through
+`scripts/check-kind-compactor-wakeup.sh`; they do not constitute a live pass.
+Do not combine this opt-in with pod-label captures, mirror-reclaim arms,
+Postgres outage, or schema rollback probes.
