@@ -68,11 +68,17 @@ if [ "$SIGLAKE_OBJECT_STORE" = garage ]; then
   fi
 fi
 
+# Elapsed for the compose step and the health wait separately: in ci-local's
+# docker job these two are one phase, and the retained log needs to say which
+# of them a slow run spent its time in. `up --build` stays one command — the
+# image build and the container start are compose's to interleave.
 echo "==> docker compose up (build + start)"
+compose_started=$SECONDS
 if docker compose -p "$SIGLAKE_COMPOSE_PROJECT" -f "$COMPOSE" up --build -d; then
-  :
+  echo "  compose up (build + start) took $((SECONDS - compose_started))s"
 else
   compose_rc=$?
+  echo "  compose up (build + start) failed after $((SECONDS - compose_started))s" >&2
   echo "  docker compose startup failed; recent service logs:" >&2
   docker compose -p "$SIGLAKE_COMPOSE_PROJECT" -f "$COMPOSE" logs --tail 50 \
     || true
@@ -111,7 +117,7 @@ Send a test event (single-tenant by default, so no X-Scope-OrgID needed):
     -H 'Content-Type: application/json' \\
     -d '{"resourceLogs":[{"resource":{"attributes":[{"key":"host.name","value":{"stringValue":"h1"}}]},"scopeLogs":[{"logRecords":[{"body":{"stringValue":"hello"}}]}]}]}'
 
-Drive load (next phase):
+Drive load — NOT RUN by this script, copy it yourself when you want load:
   scripts/loadgen.sh --eps 5000 --duration 60s
 
 Watch logs:

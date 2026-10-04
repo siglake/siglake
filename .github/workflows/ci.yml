@@ -253,6 +253,14 @@ jobs:
         run: scripts/check-external-readers-report.sh
       - name: ci-local's image-size reporting never drops the store driver
         run: scripts/check-image-sizes-report.sh
+      # The docker job's 471s in nightly run #171 could not be attributed to
+      # any step. Its phase records run here with $SECONDS assigned between
+      # calls, so the arms are minutes long and take milliseconds: a failing
+      # phase still leaves a record, the status a phase was handed comes back
+      # unchanged (the whole job is wired `... || dk_ok=0`), nested records
+      # are not summed twice, and the residual names what no phase claimed.
+      - name: ci-local's docker phases account for the job's total
+        run: scripts/check-ci-local-phases.sh
       # The kind round installs the query tier with KEDA headroom (min at the
       # base, max at the target) and then drives the floor base -> target ->
       # base under load. With the ceiling back at the base the step still runs
