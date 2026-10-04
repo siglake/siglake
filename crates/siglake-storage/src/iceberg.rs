@@ -3264,6 +3264,47 @@ pub const LEGACY_SORT_ORDER_PROP: &str = "siglake.legacy_sort_order_id";
 /// hand.
 pub const PROMOTION_BACKFILL_PROP: &str = "siglake.promotion_backfill_complete.v1";
 
+/// Create one table's auto-promotion cost series at zero, before the sampling
+/// pass or the committed Backfill bin that would otherwise be their first
+/// sample.
+///
+/// A promotion wave is priced from DELTAS between two scrapes, and a reader
+/// that takes them refuses a series which is absent at the before boundary:
+/// absent is not zero, it is a series whose FIRST sample is the measurement,
+/// and such a sample carries no history (the argument in
+/// [`siglake_core::metrics::preregister`], here for a per-table family). On a
+/// fresh namespace `siglake_auto_promotion_pass_duration_seconds` exists only
+/// after a pass has been sampled and the four
+/// `siglake_compactor_promotion_backfill_*` series only after a Backfill bin
+/// has committed — so the first wave, the only one a young table ever has, was
+/// the one wave that could not be measured.
+///
+/// Labels match the recording sites exactly: the pass duration carries
+/// `iceberg_namespace` and `table`, the backfill family carries `table` alone.
+/// Nothing is observed here — the counters are incremented by 0 and the
+/// histograms are registered without a sample, which renders `_sum 0` and
+/// `_count 0` — so the first real pass or bin is a visible delta. Safe on
+/// every discovery cycle: re-registering returns the existing handle and
+/// preserves what it already holds.
+pub fn preregister_auto_promotion_cost_series(iceberg_namespace: &str, table: &str) {
+    let _ = metrics::histogram!(
+        "siglake_auto_promotion_pass_duration_seconds",
+        "iceberg_namespace" => iceberg_namespace.to_string(),
+        "table" => table.to_string()
+    );
+    for name in [
+        "siglake_compactor_promotion_backfill_files_total",
+        "siglake_compactor_promotion_backfill_bytes_in_total",
+        "siglake_compactor_promotion_backfill_bytes_out_total",
+    ] {
+        metrics::counter!(name, "table" => table.to_string()).increment(0);
+    }
+    let _ = metrics::histogram!(
+        "siglake_compactor_promotion_backfill_duration_seconds",
+        "table" => table.to_string()
+    );
+}
+
 /// Expected distinct-value count (NDV) per bloom-filtered column.
 /// Drives bloom-filter byte size — parquet's default of 1M NDV gives
 /// each column a ~1.2 MiB filter per row group, which dominates file
