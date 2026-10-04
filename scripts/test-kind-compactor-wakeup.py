@@ -136,6 +136,49 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(json.loads(out.read_text())["evidence"]["grade"], "verified")
 
 
+class PartialSuccessTests(unittest.TestCase):
+    """Run #173 crashed on `"partialSuccess": null` before collecting any evidence."""
+
+    def test_accepted_shapes_report_no_rejection(self):
+        for response in ({}, {"partialSuccess": None}, {"partial_success": None},
+                         {"partialSuccess": {}}, {"partial_success": {}},
+                         {"partialSuccess": {"rejectedLogRecords": None}},
+                         {"partialSuccess": {"rejectedLogRecords": 0}},
+                         {"partial_success": {"rejected_log_records": "0"}},
+                         {"partialSuccess": {"errorMessage": ""}}):
+            with self.subTest(response=response):
+                self.assertEqual(runner.rejected_log_records(response), 0)
+
+    def test_rejection_counts_are_still_read(self):
+        # Protobuf JSON writes int64 as a string; both spellings must count.
+        for response, count in (({"partialSuccess": {"rejectedLogRecords": "7"}}, 7),
+                                ({"partialSuccess": {"rejectedLogRecords": 7}}, 7),
+                                ({"partial_success": {"rejected_log_records": "7"}}, 7),
+                                ({"partialSuccess": {"rejectedLogRecords": "500", "errorMessage": "full"}}, 500)):
+            with self.subTest(response=response):
+                self.assertEqual(runner.rejected_log_records(response), count)
+
+    def ingest(self, response):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = runner.Round.__new__(runner.Round)
+            r.out, r.ingest_url = Path(tmp), "http://127.0.0.1:1/ignored"
+            r.http = lambda url, payload=None: response
+            try:
+                r.ingest("probe")
+            finally:
+                self.evidence = json.loads((r.out / "ingest-probe.json").read_text())
+
+    def test_null_partial_success_does_not_abort_the_capture(self):
+        # Siglake's own reply shape, as retained in run #173's ingest-initial.json.
+        self.ingest({"partialSuccess": None})
+        self.assertEqual(len(self.evidence["request"]["resourceLogs"]), runner.BATCH)
+
+    def test_rejected_records_still_abort_the_capture(self):
+        with self.assertRaisesRegex(RuntimeError, "partially rejected"):
+            self.ingest({"partialSuccess": {"rejectedLogRecords": "1"}})
+        self.assertEqual(self.evidence["response"]["partialSuccess"]["rejectedLogRecords"], "1")
+
+
 class BootstrapTests(unittest.TestCase):
     def test_activation_expression_matches_operator_fixture(self):
         fixture = json.loads((ROOT / "scripts/testdata/kind-compactor-wakeup-verified.json").read_text())
