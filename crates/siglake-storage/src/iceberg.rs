@@ -3274,10 +3274,15 @@ pub const PROMOTION_BACKFILL_PROP: &str = "siglake.promotion_backfill_complete.v
 /// and such a sample carries no history (the argument in
 /// [`siglake_core::metrics::preregister`], here for a per-table family). On a
 /// fresh namespace `siglake_auto_promotion_pass_duration_seconds` exists only
-/// after a pass has been sampled and the four
-/// `siglake_compactor_promotion_backfill_*` series only after a Backfill bin
-/// has committed — so the first wave, the only one a young table ever has, was
-/// the one wave that could not be measured.
+/// after a pass has been sampled and the `siglake_compactor_promotion_backfill_*`
+/// series only after a Backfill bin has committed — so the first wave, the only
+/// one a young table ever has, was the one wave that could not be measured.
+///
+/// The backfill family is registered whole, the bin count included (#6504),
+/// even though no reader takes a delta over it today: a young table's first
+/// bin is both the sample that creates the series and the event a window
+/// would count, so a panel or reader added later would hit the same absent
+/// before boundary the rest of the family no longer has.
 ///
 /// Labels match the recording sites exactly: the pass duration carries
 /// `iceberg_namespace` and `table`, the backfill family carries `table` alone.
@@ -3293,6 +3298,7 @@ pub fn preregister_auto_promotion_cost_series(iceberg_namespace: &str, table: &s
         "table" => table.to_string()
     );
     for name in [
+        "siglake_compactor_promotion_backfill_bins_total",
         "siglake_compactor_promotion_backfill_files_total",
         "siglake_compactor_promotion_backfill_bytes_in_total",
         "siglake_compactor_promotion_backfill_bytes_out_total",
