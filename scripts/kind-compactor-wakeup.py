@@ -53,6 +53,18 @@ def cluster_manifest(name: str, image: str) -> dict:
                     "SIGLAKE_QUERY_RESULT_CACHE": "off"}.items()]}}
 
 
+def rejected_log_records(response: dict) -> int:
+    """Rejected-record count carried by an OTLP/HTTP logs reply.
+
+    Siglake sends `"partialSuccess": null` instead of omitting the field, and
+    `dict.get(key, default)` returns that null rather than the default, so each
+    lookup here falls back on a missing key and on an explicit null alike.
+    """
+    partial = response.get("partialSuccess") or response.get("partial_success") or {}
+    rejected = partial.get("rejectedLogRecords") or partial.get("rejected_log_records") or 0
+    return int(rejected)
+
+
 def pod_monitor(name: str) -> dict:
     # PodMonitor avoids scraping the query pod twice via its two Services.
     return {"apiVersion": "monitoring.coreos.com/v1", "kind": "PodMonitor",
@@ -165,8 +177,7 @@ class Round:
                     "scopeLogs": [{"logRecords": [{"body": {"stringValue": f"wakeup {prefix} event={i}"}}]}]} for i in range(BATCH)]}
         response = self.http(self.ingest_url + "/v1/logs", payload)
         (self.out / f"ingest-{prefix}.json").write_text(json.dumps({"request": payload, "response": response}, indent=2))
-        partial = response.get("partialSuccess", response.get("partial_success", {}))
-        if int(partial.get("rejectedLogRecords", partial.get("rejected_log_records", 0))):
+        if rejected_log_records(response):
             raise RuntimeError("ingest partially rejected")
 
     def query(self, prefix):
