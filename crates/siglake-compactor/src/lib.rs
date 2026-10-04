@@ -7335,12 +7335,13 @@ mod auto_promotion_telemetry_tests {
             }
         }
         // #6482: the wave's COST series, created at zero by the same discovery
-        // loop. The `disabled` table is the one that matters here — a wave
-        // round scrapes its control arm too, and an arm that never promotes
-        // anything would otherwise have no backfill series to read at either
-        // boundary.
+        // loop, with the bin count among them since #6504. The `disabled`
+        // table is the one that matters here — a wave round scrapes its
+        // control arm too, and an arm that never promotes anything would
+        // otherwise have no backfill series to read at either boundary.
         for table in ["disabled", "never", "completed"] {
             for name in [
+                "siglake_compactor_promotion_backfill_bins_total",
                 "siglake_compactor_promotion_backfill_files_total",
                 "siglake_compactor_promotion_backfill_bytes_in_total",
                 "siglake_compactor_promotion_backfill_bytes_out_total",

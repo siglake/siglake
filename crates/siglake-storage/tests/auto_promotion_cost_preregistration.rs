@@ -1,14 +1,15 @@
 //! Task #6482: the auto-promotion cost series exist at zero before the first
-//! pass and the first Backfill bin.
+//! pass and the first Backfill bin. Task #6504 adds the bin count to them.
 //!
 //! #5065 prices a promotion wave from the DELTA between two `/metrics`
 //! scrapes, and its reader refuses a series that is absent at the before
 //! boundary rather than reading absence as zero. Until the registration this
 //! test covers, `siglake_auto_promotion_pass_duration_seconds` appeared only
-//! once a pass had been sampled and the four
-//! `siglake_compactor_promotion_backfill_*` series only once a Backfill bin
-//! had committed, which made the first wave on a fresh namespace — the only
-//! wave a young table ever has — the one wave that could not be measured.
+//! once a pass had been sampled and the `siglake_compactor_promotion_backfill_*`
+//! series only once a Backfill bin had committed, which made the first wave on
+//! a fresh namespace — the only wave a young table ever has — the one wave that
+//! could not be measured. The bin count has no reader today; it is registered
+//! with the rest of its family so one added later starts from a zero.
 //!
 //! The recorder here is the one the binaries install
 //! (`siglake_core::metrics::builder`), rendered as the reader scrapes it, so
@@ -28,14 +29,18 @@ const SAMPLE_ROWS: usize = 4096;
 const BACKFILL_FILE_COUNT: usize = 2;
 
 const PASS_DURATION: &str = "siglake_auto_promotion_pass_duration_seconds";
+const BACKFILL_BINS: &str = "siglake_compactor_promotion_backfill_bins_total";
 const BACKFILL_FILES: &str = "siglake_compactor_promotion_backfill_files_total";
 const BACKFILL_BYTES_IN: &str = "siglake_compactor_promotion_backfill_bytes_in_total";
 const BACKFILL_BYTES_OUT: &str = "siglake_compactor_promotion_backfill_bytes_out_total";
 const BACKFILL_DURATION: &str = "siglake_compactor_promotion_backfill_duration_seconds";
 
-/// Every series name the wave reader takes a delta over.
+/// Every series the registration creates: the five the wave reader takes a
+/// delta over, and the bin count (#6504), registered with them so a window
+/// over it has the same before boundary the rest of the family has.
 const COST_SERIES: &[&str] = &[
     PASS_DURATION,
+    BACKFILL_BINS,
     BACKFILL_FILES,
     BACKFILL_BYTES_IN,
     BACKFILL_BYTES_OUT,
@@ -116,7 +121,12 @@ async fn cost_series_start_at_zero_and_still_report_the_first_wave() {
     // render an empty distribution, so the scrape carries a before boundary
     // that is a real zero rather than a first sample.
     let registered = handle.render();
-    for name in [BACKFILL_FILES, BACKFILL_BYTES_IN, BACKFILL_BYTES_OUT] {
+    for name in [
+        BACKFILL_BINS,
+        BACKFILL_FILES,
+        BACKFILL_BYTES_IN,
+        BACKFILL_BYTES_OUT,
+    ] {
         assert_eq!(
             sample(&registered, &backfill_series(name, "", &ident)),
             Some(0.0),
@@ -172,6 +182,11 @@ async fn cost_series_start_at_zero_and_still_report_the_first_wave() {
     }
 
     let after = handle.render();
+    assert_eq!(
+        sample(&after, &backfill_series(BACKFILL_BINS, "", &ident)),
+        Some(bins.len() as f64),
+        "registration must leave the bin the pass formed countable:\n{after}"
+    );
     assert_eq!(
         sample(&after, &backfill_series(BACKFILL_FILES, "", &ident)),
         Some(BACKFILL_FILE_COUNT as f64),
