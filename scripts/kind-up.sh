@@ -10,6 +10,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIND_DIR="$ROOT/deploy/kind"
 CHART_DIR="$ROOT/deploy/helm/siglake"
+# shellcheck source=scripts/kind-common.bash
+source "$ROOT/scripts/kind-common.bash"
 
 CLUSTER_NAME="${KIND_CLUSTER_NAME:-siglake}"
 IMAGE_TAG="${SIGLAKE_KIND_IMAGE_TAG:-siglake:kind}"
@@ -17,6 +19,20 @@ OWNERSHIP_FILE="${KIND_CLUSTER_OWNERSHIP_FILE:-}"
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# One resolution of the warehouse selector, read by the manifest apply, the
+# readiness waits and the chart install below. An unknown store stops here,
+# before a cluster exists: leaving the MinIO defaults in place for a typo is
+# how an arm ends up measuring the store it was not asked for.
+OBJECT_STORE="$(siglake_kind_object_store "${SIGLAKE_OBJECT_STORE:-}")" ||
+  die "SIGLAKE_OBJECT_STORE must be 'minio' or 'garage' (got '${SIGLAKE_OBJECT_STORE:-}')"
+IFS=$'\t' read -r STORE_MANIFEST STORE_APP STORE_INIT_JOB STORE_CONFIG _ \
+  < <(siglake_kind_store_settings "$OBJECT_STORE")
+mapfile -t STORE_VALUES < <(siglake_kind_store_values "$OBJECT_STORE")
+STORE_VALUES_ARGS=()
+for store_values_file in "${STORE_VALUES[@]}"; do
+  STORE_VALUES_ARGS+=(--values "$ROOT/$store_values_file")
+done
 
 remove_exited_kind_control_plane() {
   local container_name="${CLUSTER_NAME}-control-plane"
@@ -114,31 +130,46 @@ docker build -t "$IMAGE_TAG" -f "$ROOT/deploy/Dockerfile" "$ROOT"
 log "kind: load image into the cluster"
 kind load docker-image "$IMAGE_TAG" --name "$CLUSTER_NAME"
 
-log "kubectl: apply postgres + minio manifests"
+log "kubectl: apply postgres + $OBJECT_STORE manifests"
 kubectl apply -f "$KIND_DIR/manifests/postgres.yaml"
-kubectl apply -f "$KIND_DIR/manifests/minio.yaml"
+if [[ -n "$STORE_CONFIG" ]]; then
+  # The store's own configuration stays in one file for both stacks: compose
+  # bind-mounts it, kind installs that same file as a ConfigMap.
+  log "kubectl: install $STORE_CONFIG as the ${OBJECT_STORE}-config ConfigMap"
+  kubectl create configmap "${OBJECT_STORE}-config" \
+    --from-file="$(basename "$STORE_CONFIG")=$ROOT/$STORE_CONFIG" \
+    --dry-run=client -o yaml | kubectl apply -f -
+fi
+kubectl apply -f "$ROOT/$STORE_MANIFEST"
 
 wait_for_pod_ready postgres 120
-wait_for_pod_ready minio 120
+wait_for_pod_ready "$STORE_APP" 120
 
-log "kubectl: wait for the bucket-init Job to complete"
-kubectl wait --for=condition=complete job/minio-bucket-init --timeout=120s
+log "kubectl: wait for the $STORE_INIT_JOB Job to complete"
+kubectl wait --for=condition=complete "job/$STORE_INIT_JOB" --timeout=120s
 
 log "helm: install siglake"
 helm upgrade --install siglake "$CHART_DIR" \
-  --values "$KIND_DIR/values.kind.yaml" \
+  "${STORE_VALUES_ARGS[@]}" \
   --wait --timeout 5m
 
 log "kubectl: apply NodePort fronts"
 kubectl apply -f "$KIND_DIR/manifests/services-nodeport.yaml"
 
+case "$OBJECT_STORE" in
+  minio) STORE_LINE='Minio console:       http://localhost:9001  (minioadmin / minioadmin)' ;;
+  # Garage has no web console; 3903 is its admin/metrics API, in-cluster only.
+  garage) STORE_LINE='Garage S3 endpoint:  http://garage:3900 (in-cluster; no console)' ;;
+esac
+
 cat <<EOF
 
 siglake (kind) is up.
 
+  Warehouse store:     $OBJECT_STORE
   OTLP ingest:         http://localhost:8088/v1/logs
   Query server:        http://localhost:8089
-  Minio console:       http://localhost:9001  (minioadmin / minioadmin)
+  $STORE_LINE
 
 Smoke test:
   scripts/kind-smoke.sh

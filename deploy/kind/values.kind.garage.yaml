@@ -1,0 +1,30 @@
+# siglake chart values for the kind Garage arm — an overlay on
+# values.kind.yaml, never a replacement for it.
+#
+# `scripts/kind-up.sh` and `scripts/kind-round.sh` pass this file AFTER
+# values.kind.yaml when SIGLAKE_OBJECT_STORE=garage, so the sizes, toggles and
+# Postgres secret of the MinIO arm still apply and only the warehouse endpoint
+# and its credentials change. Helm takes the last file's `extraEnv` list whole,
+# which is what replaces the MinIO credentials below.
+#
+# AWS_REGION and AWS_ENDPOINT_URL are not listed here: the chart renders both
+# into every tier from `s3.region` and `s3.endpoint`
+# (deploy/helm/siglake/templates/_helpers.tpl). Keep the bucket, region and
+# credentials in step with manifests/garage.yaml and deploy/garage/garage.toml;
+# scripts/check-kind-object-store.sh compares them.
+#
+# Garage is a comparison arm, not a supported warehouse — see
+# docs/LIMITATIONS.md.
+
+s3:
+  bucket: siglake-warehouse
+  region: us-east-1
+  endpoint: http://garage:3900
+  warehousePrefix: warehouse
+
+# Shared so the pre-upgrade schema-migration hook can reach Garage too.
+extraEnv:
+  - name: AWS_ACCESS_KEY_ID
+    value: GK0123456789abcdef0123456789abcdef
+  - name: AWS_SECRET_ACCESS_KEY
+    value: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

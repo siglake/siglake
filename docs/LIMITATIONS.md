@@ -1209,6 +1209,23 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   which remains part of live qualification. The delete-task claim retains its
   separate create-only probe from #3201; that probe does not repair or
   establish stale-`If-Match` behavior.
+- **The kind Garage arm is a comparison arm; Garage is not a supported
+  warehouse.** `SIGLAKE_OBJECT_STORE=garage` installs
+  `deploy/kind/manifests/garage.yaml` and layers
+  `deploy/kind/values.kind.garage.yaml` over the kind values, in both
+  `scripts/kind-up.sh` and both deployment stages of `scripts/kind-round.sh`;
+  `minio` stays the default and the only store any shipping default selects.
+  A deployment that comes up says nothing about correctness there. Garage is
+  refused for conditional warehouse mutations (above), so an arm running on it
+  leaves inline side aggregates unpublished and fails the other guarded
+  operations closed, and no matched MinIO/Garage kind round has been retained:
+  the repository preparation is checked offline by
+  `scripts/check-kind-object-store.sh`, which drives the selector, the
+  bootstrap and the manifest/values/`garage.toml` agreement without a cluster.
+  Two opt-ins address MinIO by name rather than through the selector — the
+  mirror-reclamation qualification's `mc` alias and the compactor wake-up
+  capture's own bootstrap — and refuse any other store rather than measure it
+  through MinIO's endpoint.
 - **A claimed delete task is never un-claimed; a claim leaked by a crash
   strands the task.** Each task is its own warehouse object
   (`_siglake/config/delete_tasks/<namespace>/<task_id>.json`), so submissions

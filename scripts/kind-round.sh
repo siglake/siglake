@@ -303,6 +303,38 @@ if [[ -n "$MIRROR_RECLAIM_ARM" ]]; then
   MIRROR_RECLAIM_LISTING_FAILURE_DIAGNOSTIC="$MIRROR_RECLAIM_RESULTS_DIR/mirror-prefix-listing-failure.txt"
 fi
 
+# #6332: which object store backs this round's warehouse. Resolved once, here,
+# and read by both deployment stages below -- the kind-up.sh bootstrap and the
+# monitoring upgrade -- so a round cannot bring up one store and install the
+# chart against the other. `minio` is the default and the only store a
+# shipping default selects.
+OBJECT_STORE="$(siglake_kind_object_store "${SIGLAKE_OBJECT_STORE:-}")" || {
+  printf "ERROR: SIGLAKE_OBJECT_STORE must be 'minio' or 'garage' (got '%s')\n" \
+    "${SIGLAKE_OBJECT_STORE:-}" >&2
+  exit 1
+}
+mapfile -t OBJECT_STORE_VALUES < <(siglake_kind_store_values "$OBJECT_STORE")
+# `log` is defined further down, with the rest of the round's helpers; this
+# runs during argument validation, where every other message is a bare printf.
+printf '==> warehouse object store for both deployment stages: %s\n' \
+  "$OBJECT_STORE" >&2
+# Two opt-ins address MinIO by name rather than through the selector: the
+# mirror-reclaim observer sets an `mc` alias to http://minio:9000, and the
+# wake-up helper applies manifests/minio.yaml itself. Refuse the combination
+# instead of measuring one store through the other's endpoint.
+if [[ "$OBJECT_STORE" != minio ]]; then
+  [[ -z "$MIRROR_RECLAIM_ARM" ]] || {
+    printf 'ERROR: the mirror-reclaim qualification addresses MinIO directly and cannot run with SIGLAKE_OBJECT_STORE=%s\n' \
+      "$OBJECT_STORE" >&2
+    exit 1
+  }
+  [[ "$COMPACTOR_WAKEUP_CAPTURE" == 0 ]] || {
+    printf 'ERROR: the compactor wake-up capture bootstraps its own MinIO cluster and cannot run with SIGLAKE_OBJECT_STORE=%s\n' \
+      "$OBJECT_STORE" >&2
+    exit 1
+  }
+fi
+
 # The wake-up qualification needs an operator-managed CR, not the chart-only
 # release below. All incompatibility checks above run before this branch. Its
 # isolated helper owns bootstrap, complete acceptance evidence, and cleanup.
@@ -2866,6 +2898,7 @@ finish_mirror_reclaim_evidence() {
 log "bring up the base kind deployment"
 KIND_CLUSTER_NAME="$CLUSTER_NAME" \
   KIND_CLUSTER_OWNERSHIP_FILE="$KIND_CLUSTER_OWNERSHIP_FILE" \
+  SIGLAKE_OBJECT_STORE="$OBJECT_STORE" \
   "$ROOT/scripts/kind-up.sh"
 
 log "install pinned kube-prometheus-stack ${PROM_CHART_VERSION} and KEDA ${KEDA_CHART_VERSION}"
@@ -2885,9 +2918,14 @@ helm --kube-context "$KUBE_CONTEXT" upgrade --install keda kedacore/keda \
   --wait --timeout 10m
 
 log "upgrade Siglake with monitoring, mirror reconciliation and a ${QUERY_SCALE_BASE}-${QUERY_SCALE_TARGET} query KEDA range"
-SIGLAKE_HELM_ARGS=(
-  --namespace "$NAMESPACE" \
-  --values "$ROOT/deploy/kind/values.kind.yaml" \
+SIGLAKE_HELM_ARGS=(--namespace "$NAMESPACE")
+# The same resolved selector the bootstrap above used: base values first, then
+# the store's overlay if it has one. The retained launch record carries the
+# whole command, so the arm an evidence directory came from is readable there.
+for object_store_values_file in "${OBJECT_STORE_VALUES[@]}"; do
+  SIGLAKE_HELM_ARGS+=(--values "$ROOT/$object_store_values_file")
+done
+SIGLAKE_HELM_ARGS+=(
   --set prometheusRule.enabled=true \
   --set prometheusRule.labels.release="$PROM_RELEASE" \
   --set serviceMonitor.enabled=true \

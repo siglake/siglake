@@ -1,0 +1,124 @@
+# Garage (S3-compatible) for the Iceberg warehouse inside kind — the opt-in
+# comparison arm of SIGLAKE_OBJECT_STORE (task #6332), installed instead of
+# manifests/minio.yaml when the selector says `garage`.
+#
+# This arm is a comparison, not a supported warehouse. Garage accepts both
+# invalid conditional preconditions the storage guard probes for, so siglake
+# refuses it for conditional writes and runs with side aggregates unpublished;
+# docs/LIMITATIONS.md records what that leaves unqualified.
+#
+# The server configuration is NOT duplicated here. `scripts/kind-up.sh` creates
+# the `garage-config` ConfigMap from deploy/garage/garage.toml — the same file
+# deploy/docker-compose.yml mounts — so the two stacks cannot drift apart.
+# Keep the image in step with that compose service, and the bucket and
+# credentials in step with values.kind.garage.yaml; the shell gate's
+# scripts/check-kind-object-store.sh compares all three.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage
+spec:
+  type: ClusterIP
+  selector:
+    app: garage
+  ports:
+    - name: s3
+      port: 3900
+      targetPort: 3900
+    - name: admin
+      port: 3903
+      targetPort: 3903
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: garage
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: garage
+  template:
+    metadata:
+      labels:
+        app: garage
+    spec:
+      containers:
+        - name: garage
+          image: dxflrs/garage:v2.4.1
+          # `--single-node` applies a one-node layout without replication and
+          # `--default-bucket` creates the bucket and access key named by the
+          # GARAGE_DEFAULT_* variables, so nothing here needs a
+          # `garage layout assign` / `garage key create` round trip.
+          command: ["/garage", "server", "--single-node", "--default-bucket"]
+          ports:
+            - containerPort: 3900
+            - containerPort: 3903
+          env:
+            - name: GARAGE_DEFAULT_ACCESS_KEY
+              value: GK0123456789abcdef0123456789abcdef
+            - name: GARAGE_DEFAULT_SECRET_KEY
+              value: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            - name: GARAGE_DEFAULT_BUCKET
+              value: siglake-warehouse
+          readinessProbe:
+            # The image ships the static `garage` binary and nothing else — no
+            # shell, no curl — so the probe is the binary's own status call,
+            # exactly as the compose healthcheck does it.
+            exec:
+              command: ["/garage", "status"]
+            initialDelaySeconds: 5
+            periodSeconds: 2
+          volumeMounts:
+            - name: config
+              mountPath: /etc/garage.toml
+              subPath: garage.toml
+              readOnly: true
+            - name: meta
+              mountPath: /var/lib/garage/meta
+            - name: data
+              mountPath: /var/lib/garage/data
+      volumes:
+        - name: config
+          configMap:
+            name: garage-config
+        - name: meta
+          emptyDir: {}
+        - name: data
+          emptyDir: {}
+---
+# One-shot readiness gate. `--default-bucket` creates the bucket, so this only
+# waits for it to answer over S3; it never creates anything, because the
+# default key has no CreateBucket permission. kind-up.sh waits for this Job
+# before installing the chart, the same way it waits for minio-bucket-init.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: garage-bucket-check
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: docker.io/bitnamilegacy/minio-client:2025.7.21-debian-12-r3@sha256:73bd39f7899a0cef12b8dd5df13aa93a3ed1aaa44236542442e9ac76819ac158
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until mc alias set garage http://garage:3900 \
+                GK0123456789abcdef0123456789abcdef \
+                0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; do
+                echo "waiting for garage…"
+                sleep 2
+              done
+              for _ in $(seq 1 60); do
+                if mc ls garage/siglake-warehouse >/dev/null 2>&1; then
+                  echo "bucket siglake-warehouse ready"
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "garage bucket siglake-warehouse never became listable" >&2
+              exit 1
