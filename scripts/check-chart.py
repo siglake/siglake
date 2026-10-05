@@ -3702,6 +3702,10 @@ def main(argv: list[str] | None = None) -> int:
     matrix = [
         ("defaults", []),
         ("kind", ["-f", "deploy/kind/values.kind.yaml"]),
+        # The Garage arm is an overlay, not a second copy of the kind values,
+        # so it only renders what the arm it is layered on already renders.
+        ("kind-garage", ["-f", "deploy/kind/values.kind.yaml",
+                         "-f", "deploy/kind/values.kind.garage.yaml"]),
         # The compactor HPA carries a ceiling of 4, and since #2955 a ceiling
         # above one pod is refused without the claim — so this arm enables the
         # claim, and the refusal itself is a guard in ci-local.sh / ci.yml.

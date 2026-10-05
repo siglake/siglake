@@ -260,6 +260,7 @@ else
   scripts/check-image-sizes-report.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-round-scale.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-round-events.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  scripts/check-kind-object-store.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-mirror-reclaim-qualification.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-postgres-outage-evidence.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-schema-rollback-evidence.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1

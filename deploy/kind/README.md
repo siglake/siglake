@@ -3,7 +3,7 @@
 A single-node kind cluster running:
 
 - **postgres** for the Iceberg catalog
-- **minio** for the S3 warehouse
+- **minio** for the S3 warehouse (or **garage**, see below)
 - the **Siglake** Helm chart (ingester, compactor, and query-server)
 
 Unlike `deploy/aws/`, this does *not* exercise IRSA, EFS, or RDS — it
@@ -27,6 +27,46 @@ POSTGRES_OUTAGE_PROBE=1 scripts/kind-round.sh  # also measure persistent-job
                                               # backlog through a bounded PG pause
 scripts/kind-down.sh       # helm uninstall + kind delete cluster
 ```
+
+## Warehouse object store
+
+`SIGLAKE_OBJECT_STORE` picks the store, exactly as it does for the compose
+stack: `minio` (the default, and the only store any shipping default selects)
+or `garage`. `kind-up.sh` and both of `kind-round.sh`'s deployment stages read
+one resolution of it from `scripts/kind-common.bash`, so a round cannot bring
+up one store and install the chart against the other. An unknown value is
+refused before a cluster exists rather than falling back to MinIO.
+
+```bash
+SIGLAKE_OBJECT_STORE=garage scripts/kind-up.sh
+SIGLAKE_OBJECT_STORE=garage scripts/kind-round.sh
+```
+
+The garage arm applies `manifests/garage.yaml` instead of `manifests/minio.yaml`
+and layers `values.kind.garage.yaml` over `values.kind.yaml`, which moves
+`s3.endpoint` to `http://garage:3900` and replaces the inline credentials; the
+chart renders `AWS_REGION` and `AWS_ENDPOINT_URL` from `s3.region` and
+`s3.endpoint`. The server configuration is not duplicated: `kind-up.sh`
+installs `deploy/garage/garage.toml` — the file compose bind-mounts — as the
+`garage-config` ConfigMap. Bucket readiness is `job/garage-bucket-check`, the
+counterpart of `job/minio-bucket-init`.
+
+Two opt-ins address MinIO by name rather than through the selector: the
+mirror-reclamation qualification sets an `mc` alias to `http://minio:9000`, and
+the compactor wake-up capture applies `manifests/minio.yaml` from its own
+helper. Both refuse a non-MinIO selector instead of measuring one store through
+the other's endpoint.
+
+Garage is a comparison arm, not a supported warehouse. It is refused for
+conditional warehouse mutations, so an arm running on it comes up with inline
+side aggregates unpublished and the other guarded operations failing closed
+(`docs/LIMITATIONS.md`), and no matched MinIO/Garage round has been retained.
+`scripts/check-kind-object-store.sh` (in CI's `shell` job and the local gate)
+drives the resolver, runs `kind-up.sh` end to end against recording stand-ins
+for `kind`, `kubectl`, `helm` and `docker`, drives both refusals, and compares
+the manifest, the values overlay, `garage.toml` and the compose service for
+bucket, credentials, region, endpoint and image. No cluster is involved, and a
+passing guard is repository preparation, not acceptance of the arm.
 
 ## Monitoring evidence round
 
@@ -327,10 +367,12 @@ KEEP=1 SG_DOCKER=1 KIND_CLUSTER_NAME=siglake-lm scripts/kind-round.sh  # retain 
    in the shape the chart expects (`siglake-postgres` with
    `host`/`port`/`user`/`password`/`database` keys).
 3. `manifests/minio.yaml` brings up minio + a one-shot Job that
-   creates the `siglake-warehouse` bucket.
+   creates the `siglake-warehouse` bucket. `SIGLAKE_OBJECT_STORE=garage`
+   applies `manifests/garage.yaml` and the `garage-config` ConfigMap instead.
 4. The chart installs with `values.kind.yaml` overrides — endpoint
    override `s3.endpoint=http://minio:9000` and inline
-   `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars for minio.
+   `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars for minio —
+   plus `values.kind.garage.yaml` on the garage arm.
 5. `manifests/services-nodeport.yaml` exposes the ingester + query-server
    via NodePort so the host port mappings can reach them.
 

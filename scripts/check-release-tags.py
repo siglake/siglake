@@ -72,6 +72,7 @@ TERRAFORM_OUTPUTS = pathlib.PurePath("deploy/terraform/aws/outputs.tf")
 PINNED_TAG_ROOT = pathlib.PurePath("deploy")
 COMPOSE_YML = pathlib.PurePath("deploy/docker-compose.yml")
 KIND_MINIO_YML = pathlib.PurePath("deploy/kind/manifests/minio.yaml")
+KIND_GARAGE_YML = pathlib.PurePath("deploy/kind/manifests/garage.yaml")
 SMOKE_SH = pathlib.PurePath("scripts/smoke.sh")
 KIND_ROUND_SH = pathlib.PurePath("scripts/kind-round.sh")
 
@@ -117,6 +118,11 @@ COMPOSE_MINIO_ROLES = {
 }
 KIND_MINIO_ROLES = {
     "minio": "minio",
+    "mc": "minio-client",
+}
+# The kind Garage arm's bucket-readiness Job runs the same client, the way
+# compose's garage-init does; its pin is held to the others.
+KIND_GARAGE_ROLES = {
     "mc": "minio-client",
 }
 BITNAMI_LEGACY_MINIO_REF = re.compile(
@@ -606,12 +612,13 @@ def named_list_item_images(text: str) -> dict[str, list[str]]:
 
 
 def minio_image_problems(
-    compose: str, kind: str, smoke: str, kind_round: str
+    compose: str, kind: str, smoke: str, kind_round: str, kind_garage: str
 ) -> list[str]:
     """MinIO roles use matching Bitnami Legacy tag-and-digest references."""
     sources = (
         (str(COMPOSE_YML), compose_service_images(compose), COMPOSE_MINIO_ROLES),
         (str(KIND_MINIO_YML), named_list_item_images(kind), KIND_MINIO_ROLES),
+        (str(KIND_GARAGE_YML), named_list_item_images(kind_garage), KIND_GARAGE_ROLES),
         (
             str(SMOKE_SH),
             {"client": MINIO_IMAGE_LITERAL.findall(smoke)},
@@ -946,10 +953,30 @@ spec:
         - name: mc
           image: {client_ref}
 """
+    kind_garage_minio = f"""\
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: garage
+          image: dxflrs/garage:v0.0.0
+---
+apiVersion: batch/v1
+kind: Job
+spec:
+  template:
+    spec:
+      containers:
+        - name: mc
+          image: {client_ref}
+"""
     smoke_minio = f"docker run {client_ref}\n"
     kind_round_minio = f"kubectl run --image={client_ref}\n"
     if minio_image_problems(
-        compose_minio, kind_minio, smoke_minio, kind_round_minio
+        compose_minio, kind_minio, smoke_minio, kind_round_minio,
+        kind_garage_minio,
     ):
         raise AssertionError("fixture: matching MinIO pins were reported")
     checked += 1
@@ -958,6 +985,7 @@ spec:
         kind_minio.replace("minio:SERVER-1", "minio:SERVER-2"),
         smoke_minio,
         kind_round_minio,
+        kind_garage_minio,
     ):
         raise AssertionError("fixture: a kind MinIO server tag mismatch passed")
     checked += 1
@@ -966,6 +994,7 @@ spec:
         kind_minio.replace("minio-client:CLIENT-1", "minio-client:CLIENT-2"),
         smoke_minio,
         kind_round_minio,
+        kind_garage_minio,
     ):
         raise AssertionError("fixture: a kind MinIO client tag mismatch passed")
     checked += 1
@@ -977,8 +1006,18 @@ spec:
         kind_minio,
         smoke_minio,
         kind_round_minio,
+        kind_garage_minio,
     ):
         raise AssertionError("fixture: compose's Garage client tag mismatch passed")
+    checked += 1
+    if not minio_image_problems(
+        compose_minio,
+        kind_minio,
+        smoke_minio,
+        kind_round_minio,
+        kind_garage_minio.replace("minio-client:CLIENT-1", "minio-client:CLIENT-2"),
+    ):
+        raise AssertionError("fixture: the kind Garage client tag mismatch passed")
     checked += 1
     for role, declaration in (
         ("compose minio", f"    image: {server_ref}\n"),
@@ -989,15 +1028,20 @@ spec:
         ),
         ("kind minio", f"          image: {server_ref}\n"),
         ("kind mc", f"          image: {client_ref}\n"),
+        ("kind-garage mc", f"          image: {client_ref}\n"),
     ):
         compose_fixture = compose_minio
         kind_fixture = kind_minio
+        kind_garage_fixture = kind_garage_minio
         if role.startswith("compose"):
             compose_fixture = compose_fixture.replace(declaration, "", 1)
+        elif role.startswith("kind-garage"):
+            kind_garage_fixture = kind_garage_fixture.replace(declaration, "", 1)
         else:
             kind_fixture = kind_fixture.replace(declaration, "", 1)
         if not minio_image_problems(
-            compose_fixture, kind_fixture, smoke_minio, kind_round_minio
+            compose_fixture, kind_fixture, smoke_minio, kind_round_minio,
+            kind_garage_fixture,
         ):
             raise AssertionError(f"fixture: missing {role} image declaration passed")
         checked += 1
@@ -1007,6 +1051,7 @@ spec:
             kind_minio,
             smoke_minio,
             kind_round_minio,
+            kind_garage_minio,
         ):
             raise AssertionError(f"fixture: `{refused}` MinIO server reference passed")
         checked += 1
@@ -1015,13 +1060,14 @@ spec:
         kind_minio,
         smoke_minio,
         kind_round_minio,
+        kind_garage_minio,
     ):
         raise AssertionError("fixture: a MinIO server reference without a digest passed")
     checked += 1
-    if not minio_image_problems(compose_minio, kind_minio, "", kind_round_minio):
+    if not minio_image_problems(compose_minio, kind_minio, "", kind_round_minio, kind_garage_minio):
         raise AssertionError("fixture: a missing smoke client reference passed")
     checked += 1
-    if not minio_image_problems(compose_minio, kind_minio, smoke_minio, ""):
+    if not minio_image_problems(compose_minio, kind_minio, smoke_minio, "", kind_garage_minio):
         raise AssertionError("fixture: a missing kind-round client reference passed")
     checked += 1
 
@@ -1099,6 +1145,7 @@ def main(argv: list[str]) -> int:
             (root / KIND_MINIO_YML).read_text(),
             (root / SMOKE_SH).read_text(),
             (root / KIND_ROUND_SH).read_text(),
+            (root / KIND_GARAGE_YML).read_text(),
         )
         pinned = subprocess.run(
             ["git", "ls-files", "-z", str(PINNED_TAG_ROOT)],

@@ -273,6 +273,17 @@ jobs:
         run: scripts/check-kind-round-scale.sh
       - name: the kind round validates and applies its initial event count
         run: scripts/check-kind-round-events.sh
+      # kind brings up one warehouse store and then installs the chart against
+      # it. A round that deployed Garage and signed the chart with MinIO's
+      # endpoint would come up, ingest and produce a full evidence directory
+      # for the store nobody asked for, so both deployment stages read one
+      # resolved selector and a typo stops before a cluster exists. This drives
+      # the resolver, kind-up.sh against recording stand-ins for kind, kubectl,
+      # helm and docker, the round's two MinIO-only refusals, and the agreement
+      # between the Garage manifest, its values overlay, deploy/garage/
+      # garage.toml and the compose service. No cluster, no container.
+      - name: the kind object-store selector reaches both deployment stages
+        run: scripts/check-kind-object-store.sh
       - name: the kind round retains the complete mirror-reclaim qualification
         run: scripts/check-kind-mirror-reclaim-qualification.sh
       - name: Postgres outage evidence rejects missing and non-draining traces

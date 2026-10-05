@@ -2128,8 +2128,13 @@ noise; against an empty request it is most of the cost.
   compactor + Prometheus; after `cargo build --release -p siglake-loadgen`,
   `scripts/loadgen.sh` sustains 5 k+ EPS on a laptop;
   `scripts/smoke.sh` validates correctness; `scripts/kind-*.sh` runs
-  the chart in kind. Single-process demo: `siglake ingest-server
-  --with-compactor`, POST OTLP to `/v1/logs`, then `siglake sql`.
+  the chart in kind. Both stacks read the same `SIGLAKE_OBJECT_STORE`
+  selector: `minio` (the default) or the opt-in `garage` comparison arm,
+  which kind installs from `deploy/kind/manifests/garage.yaml` and
+  `values.kind.garage.yaml`. Garage is a comparison arm, not a supported
+  warehouse — see docs/LIMITATIONS.md. Single-process demo: `siglake
+  ingest-server --with-compactor`, POST OTLP to `/v1/logs`, then
+  `siglake sql`.
 
 ## Diagnostics
 
