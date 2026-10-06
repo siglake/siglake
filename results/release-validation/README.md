@@ -8,6 +8,14 @@ Raw metrics and logs live in the run's durable artifact directory; they are not
 benchmark leaderboard inputs. Preserve failed attempts and subsequent reruns.
 The public operations docs are the release-wide coverage ledger.
 
+## October 4, 2026
+
+The public v0.2.1 24-hour and 72-hour attempts both failed and do not qualify
+the release. The [failure investigation](20261004-v0.2.1-burn-in-failures.md)
+identifies the final-checkpoint timeout, accounts for Docker backing-store
+growth, and separates the restart-triggered conditional-probe refusals from the
+event-table oracles.
+
 ## September 27, 2026
 
 Matched MinIO and Garage runs at `8bd9c312719d` passed S3 mirror pagination and

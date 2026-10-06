@@ -29,6 +29,39 @@ The 72h profile records an intermediate 24h checkpoint; it is not a separately
 cleaned-up 24h run. Setup and final restart/cleanup time are outside the duration.
 A directory must be new: a failure or retry never overwrites earlier evidence.
 
+### Repeat the v0.2.1 duration profiles after the October 4 failures
+
+Run these profiles serially. Put Docker's root directory on a dedicated backing
+filesystem with no other workload using its capacity. The failed paired run
+measured about 82 GiB for the 24-hour volume and about 198 GiB for the 72-hour
+volume by hour 37. The latter consumed about 113 GiB in its last 13 hours, so a
+linear projection reaches about 500 GiB at 72 hours. Use at least 256 GiB
+available for the 24-hour rerun and 640 GiB for the 72-hour rerun; the larger
+allowance leaves room for non-linear rewrite growth. Confirm the actual Docker
+root and its mount before each run:
+
+```sh
+docker_root=$(docker info --format '{{.DockerRootDir}}')
+findmnt --target "$docker_root"
+df --block-size=1 --output=source,size,used,avail,target -- "$docker_root"
+```
+
+Start each run in a new results directory and retain a 64 GiB safety reserve:
+
+```sh
+python3 scripts/release-validation/start.py --version v0.2.1 --profile 24h \
+  --docker-reserve-gib 64 --results-root /mnt/siglake-validation-results
+# Start the 72h profile only after the 24h result and cleanup have been reviewed.
+python3 scripts/release-validation/start.py --version v0.2.1 --profile 72h \
+  --docker-reserve-gib 64 --results-root /mnt/siglake-validation-results
+```
+
+`resources.jsonl` records available backing-store bytes each minute. The reserve
+option checks the same reading before setup and after every resource sample; a
+crossing is an infrastructure failure and still runs owned cleanup. Keep the
+failed October 4 directories unchanged. A rerun must still pass the exact
+cohort, total, grouped, audit-persistence, inline-aggregate and cleanup checks.
+
 ### Reproduce the v0.2.1 query-audit conditional refusal
 
 The publication control used engine
@@ -138,8 +171,9 @@ state, enforced limits, Docker statistics and query metrics, refusing OOM,
 unexpected restarts or stopped services. If a cohort's 120-second deadline
 contains a MinIO HTTP 507 `XMinioStorageFull` response from the same Compose
 project, the failure is reported as backing-store exhaustion instead of an
-unexplained visibility mismatch. No capacity threshold is inferred from that
-reading.
+unexplained visibility mismatch. `--docker-reserve-gib` adds an explicit
+operator-selected floor; its default is zero because smoke and duration hosts
+have different capacity budgets.
 Query and compactor restart hourly; all three product components restart at the
 end, with exact counts checked again. Load is bounded (100 events/cycle, three
 simultaneous queries), not a saturation or large-working-set benchmark. There is

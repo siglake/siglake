@@ -101,6 +101,15 @@ def filesystem_capacity(path, env=None):
     return parse_filesystem_capacity(output)
 
 
+def capacity_reserve_problem(available_bytes, reserve_bytes):
+    if reserve_bytes > 0 and available_bytes < reserve_bytes:
+        return (
+            f'Docker backing filesystem has {available_bytes} available bytes, below the '
+            f'configured {reserve_bytes}-byte reserve'
+        )
+    return None
+
+
 def parse_log_time(line):
     match = LOG_TIMESTAMP.search(line)
     if not match:
@@ -237,6 +246,7 @@ class Run:
         self.compose = ['docker', 'compose', '-p', self.project, '-f', str(self.out / 'compose.json')]
         self.summary = dict(schema_version=1, started_at=utc(), version=args.version,
                             profile=args.profile, dependency_policy=args.dependency_policy, requested_seconds=DURATIONS[args.profile],
+                            docker_capacity_reserve_bytes=getattr(args, 'docker_reserve_gib', 0) * 1024**3,
                             project=self.project, status='running', cleanup='pending',
                             checks=[], limitations=['Single-node Compose; Kubernetes/operator, OIDC tenant isolation, multi-replica distribution, upgrades, retention/delete, schema evolution and expensive-query cancellation are separate required qualification tracks.',
                             'Bounded baseline load: 100 events per cycle, three simultaneous oracle queries; this is not saturation or a large-working-set performance benchmark.'])
@@ -297,6 +307,11 @@ class Run:
             measured_at=utc(), docker_root_dir=self.docker_root_dir, **backing
         )
         self.save()
+        capacity_problem = capacity_reserve_problem(
+            backing['available_bytes'], self.summary['docker_capacity_reserve_bytes']
+        )
+        if capacity_problem:
+            raise StorageCapacityExhausted(capacity_problem)
         template = run_command(['git', '-C', str(ROOT), 'show', version + ':deploy/docker-compose.yml'])
         source = self.out / 'release-compose.yml'
         source.write_text(template)
@@ -327,24 +342,38 @@ class Run:
         self.query = 'http://' + self.cmd('port', 'query-server', '8089').strip()
         self.metrics = 'http://' + self.cmd('port', 'query-server', '9105').strip()
 
-    def sql_response(self, query):
-        return http(self.query + '/api/v1/sql', {'query': query})
+    def sql_response(self, query, timeout=30):
+        return http(self.query + '/api/v1/sql', {'query': query}, timeout=timeout)
 
-    def sql(self, query):
-        return self.sql_response(query)['rows']
+    def sql(self, query, timeout=30):
+        return self.sql_response(query, timeout=timeout)['rows']
 
     def await_audit_checkpoint(self, marker_query, phase):
         escaped = marker_query.replace("'", "''")
         deadline = time.monotonic() + 120
         last_problem = 'audit checkpoint was not attempted'
         while True:
-            probe_rows = self.sql(
-                "SELECT count(*) AS n FROM query_audit WHERE query = '" + escaped + "'"
-            )
-            aggregate = self.sql_response(
-                'SELECT status, count(*) AS n FROM query_audit GROUP BY status ORDER BY status'
-            )
-            last_problem = audit_checkpoint_problem(probe_rows, aggregate)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f'{phase} query_audit checkpoint failed: {last_problem}')
+            request_timeout = max(1, min(30, remaining))
+            try:
+                probe_rows = self.sql(
+                    "SELECT count(*) AS n FROM query_audit WHERE query = '" + escaped + "'",
+                    timeout=request_timeout,
+                )
+                aggregate = self.sql_response(
+                    'SELECT status, count(*) AS n FROM query_audit GROUP BY status ORDER BY status',
+                    timeout=request_timeout,
+                )
+                last_problem = audit_checkpoint_problem(probe_rows, aggregate)
+            except urllib.error.HTTPError:
+                raise
+            except (TimeoutError, urllib.error.URLError) as error:
+                last_problem = (
+                    'checkpoint HTTP request did not finish: '
+                    f'{type(error).__name__}: {error}'
+                )
             if last_problem is None:
                 self.event('query_audit_checkpoint', phase=phase, result='pass')
                 return
@@ -448,6 +477,11 @@ class Run:
         with (self.out / 'resources.jsonl').open('a') as stream:
             stream.write(json.dumps(dict(at=utc(), docker_backing_filesystem=backing,
                                          containers=samples, stats=[json.loads(line) for line in stats.splitlines()])) + '\n')
+        capacity_problem = capacity_reserve_problem(
+            backing['available_bytes'], self.summary['docker_capacity_reserve_bytes']
+        )
+        if capacity_problem:
+            raise StorageCapacityExhausted(capacity_problem)
         with urllib.request.urlopen(self.metrics + '/metrics', timeout=15) as response:
             with (self.out / 'metrics.prom').open('a') as stream:
                 stream.write('# collected_at ' + utc() + '\n' + response.read().decode() + '\n')
@@ -581,12 +615,16 @@ def argument_parser():
     parser.add_argument('--version', required=True, choices=SUPPORTED_VERSIONS)
     parser.add_argument('--profile', required=True, choices=DURATIONS)
     parser.add_argument('--dependency-policy', choices=['public', 'cached-diagnostic'], default='public', help='cached-diagnostic uses existing dependency images; NEVER qualifies anonymous clean install')
+    parser.add_argument('--docker-reserve-gib', type=int, default=0, help='fail before setup or a resource sample when Docker backing storage falls below this reserve')
     parser.add_argument('--out', required=True, help='new, durable results directory; must not already exist')
     return parser
 
 
 def main():
-    args = argument_parser().parse_args()
+    parser = argument_parser()
+    args = parser.parse_args()
+    if args.docker_reserve_gib < 0:
+        parser.error('--docker-reserve-gib must be non-negative')
     run = Run(args)
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f'signal {signum}')
