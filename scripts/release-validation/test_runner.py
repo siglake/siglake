@@ -114,6 +114,13 @@ class IsolationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             v.parse_filesystem_capacity('Filesystem Avail Mounted on\n/dev/data unknown /var/lib/docker\n')
 
+    def test_capacity_reserve_fails_before_minio_reaches_its_emergency_threshold(self):
+        reserve = 64 * 1024**3
+        self.assertIsNone(v.capacity_reserve_problem(reserve, reserve))
+        problem = v.capacity_reserve_problem(reserve - 1, reserve)
+        self.assertIn(str(reserve - 1), problem)
+        self.assertIn(str(reserve), problem)
+
     def test_storage_full_classification_is_bounded_to_failed_cohort(self):
         started = dt.datetime(2026, 9, 26, 12, 0, tzinfo=dt.timezone.utc)
         ended = started + dt.timedelta(seconds=120)
@@ -136,6 +143,56 @@ class IsolationTests(unittest.TestCase):
                 {'stats': {'served_by': 'materialized', 'rows_scanned': 0}},
             ),
         )
+
+    def test_audit_checkpoint_retries_one_transport_timeout_within_its_deadline(self):
+        covered = {'stats': {'served_by': 'tier1_inline', 'rows_scanned': 0}}
+        with tempfile.TemporaryDirectory() as temp:
+            args = SimpleNamespace(
+                out=str(Path(temp)/'run'),
+                version='v0.2.1',
+                profile='smoke',
+                dependency_policy='public',
+            )
+            run = v.Run(args)
+            run.query = 'http://127.0.0.1:40001'
+            with patch.object(
+                run,
+                'sql',
+                side_effect=[TimeoutError('timed out'), [{'n': 1}]],
+            ) as sql, patch.object(
+                run,
+                'sql_response',
+                return_value=covered,
+            ) as aggregate, patch.object(
+                v.time,
+                'monotonic',
+                side_effect=[0, 0, 1, 2],
+            ), patch.object(v.time, 'sleep') as sleep:
+                run.await_audit_checkpoint('SELECT 1 /* marker */', 'before_restart')
+            self.assertEqual(sql.call_count, 2)
+            aggregate.assert_called_once_with(
+                'SELECT status, count(*) AS n FROM query_audit GROUP BY status ORDER BY status',
+                timeout=30,
+            )
+            sleep.assert_called_once_with(2)
+            event = (run.out/'events.jsonl').read_text()
+            self.assertIn('"check": "query_audit_checkpoint"', event)
+
+    def test_audit_checkpoint_does_not_retry_product_http_errors(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = SimpleNamespace(
+                out=str(Path(temp)/'run'),
+                version='v0.2.1',
+                profile='smoke',
+                dependency_policy='public',
+            )
+            run = v.Run(args)
+            error = v.urllib.error.HTTPError('/api/v1/sql', 500, 'failed', {}, None)
+            with patch.object(run, 'sql', side_effect=error), patch.object(
+                v.time, 'monotonic', side_effect=[0, 0]
+            ), self.assertRaises(v.urllib.error.HTTPError):
+                run.await_audit_checkpoint('SELECT 1 /* marker */', 'before_restart')
+            error.close()
 
     def test_cleanup_fails_on_unexpected_supported_store_guard_refusal(self):
         refusal = (

@@ -16,8 +16,11 @@ p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--version', required=True, choices=['v0.1.0', 'v0.2.0', 'v0.2.1'])
 p.add_argument('--profile', required=True, choices=['smoke', '24h', '72h'])
 p.add_argument('--dependency-policy', default='public', choices=['public', 'cached-diagnostic'])
+p.add_argument('--docker-reserve-gib', type=int, default=0)
 p.add_argument('--results-root', required=True)
 a = p.parse_args()
+if a.docker_reserve_gib < 0:
+    p.error('--docker-reserve-gib must be non-negative')
 run_id = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+uuid.uuid4().hex[:8]
 root = Path(a.results_root).resolve(); root.mkdir(parents=True, exist_ok=True)
 out = root / (a.version+'-'+a.profile+'-'+run_id)
@@ -33,7 +36,8 @@ if not snapshot.exists():
     subprocess.run(['git', '-C', str(repo), 'worktree', 'add', '--detach', str(snapshot), head], check=True)
 runner = snapshot/'scripts/release-validation'
 command = [sys.executable, str(runner/'run.py'), '--version', a.version, '--profile', a.profile,
-           '--dependency-policy', a.dependency_policy, '--out', str(out)]
+           '--dependency-policy', a.dependency_policy, '--docker-reserve-gib',
+           str(a.docker_reserve_gib), '--out', str(out)]
 recovery = [sys.executable, str(runner/'recover.py'), str(out)]
 # User services inherit the user manager's old group list. sg supplies Docker
 # access without restarting the user's other services.
