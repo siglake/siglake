@@ -64,11 +64,14 @@ cohort, total, grouped, audit-persistence, inline-aggregate and cleanup checks.
 
 ### Reproduce the v0.2.1 query-audit conditional refusal
 
-The publication control used engine
-`ghcr.io/siglake/siglake@sha256:ce00353961641ec44c7cc476c5a31b22f38514ab16798361b127a1137d42476a`
-and MinIO
+The pre-rename publication control used engine digest
+`sha256:ce00353961641ec44c7cc476c5a31b22f38514ab16798361b127a1137d42476a`
+in the former registry namespace, and MinIO
 `docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20`.
-Run the smoke profile without changing either digest:
+That engine digest is historical evidence, not a rebuilt Siglake artifact.
+The following command resolves the current Siglake version anonymously and
+records its actual digest in `summary.json`; compare new results independently
+of the archived control. Keep the MinIO dependency pinned:
 
 ```sh
 validation_out="$PWD/results-v0.2.1-query-audit-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -77,7 +80,8 @@ python3 scripts/release-validation/run.py --version v0.2.1 --profile smoke \
 python3 - "$validation_out/summary.json" <<'PY'
 import json, sys
 summary = json.load(open(sys.argv[1]))
-assert summary['image'] == 'ghcr.io/siglake/siglake@sha256:ce00353961641ec44c7cc476c5a31b22f38514ab16798361b127a1137d42476a'
+assert summary['image'].startswith('ghcr.io/siglake/siglake@sha256:')
+print('Tested rebuilt engine:', summary['image'])
 assert any('sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20' in image
            for image in summary['dependency_images'].values())
 PY
@@ -85,7 +89,7 @@ grep -F 'refusing side-aggregate publication' \
   "$validation_out/containers.log" "$validation_out/side-aggregate-guard-refusals.log"
 ```
 
-This control is expected to fail artifact review while the published image
+The historical control failed artifact review. A rebuilt image also fails while it
 emits the refusal. The harness separately checks that its marked audit row is
 committed before and after the query-server restart and that `GROUP BY status`
 is served by the complete inline aggregate. A passing event-count oracle alone

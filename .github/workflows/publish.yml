@@ -12,6 +12,11 @@ on:
         description: "Release tag to publish (e.g. v0.1.0)"
         required: true
 
+# Serialize rebuilds so two releases cannot race over mutable registry tags.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -58,7 +63,9 @@ jobs:
           build-args: SIGLAKE_GIT_SHA=${{ env.REVISION }}
           tags: |
             ghcr.io/siglake/siglake:${{ env.TAG }}
-            ghcr.io/siglake/siglake:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/siglake/siglake
+            org.opencontainers.image.revision=${{ env.REVISION }}
           cache-from: type=gha,scope=siglake
           cache-to: type=gha,scope=siglake,mode=max
       - name: Build and push siglake-operator
@@ -70,6 +77,8 @@ jobs:
           build-args: SIGLAKE_GIT_SHA=${{ env.REVISION }}
           tags: |
             ghcr.io/siglake/siglake-operator:${{ env.TAG }}
-            ghcr.io/siglake/siglake-operator:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/siglake/siglake
+            org.opencontainers.image.revision=${{ env.REVISION }}
           cache-from: type=gha,scope=siglake-operator
           cache-to: type=gha,scope=siglake-operator,mode=max
