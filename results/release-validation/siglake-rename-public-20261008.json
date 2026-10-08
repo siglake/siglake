@@ -1,0 +1,107 @@
+{
+  "scope": "Public image rebuild verification after the Siglake rename; basic smoke only, not full burn-in or Kubernetes upgrade qualification",
+  "runs": [
+    {
+      "scope": "basic rename smoke; not full release qualification or burn-in",
+      "version": "v0.1.0",
+      "published": true,
+      "project": "siglake-rename-4d18779d3e98",
+      "status": "passed",
+      "checks": [
+        "engine version and commit match tag",
+        "operator version and commit match tag",
+        "all four binary entrypoints launch",
+        "operator emits renamed CRD",
+        "renamed Compose services healthy",
+        "100 ingested events committed to object storage; exact rows and grouped counts",
+        "committed rows survive query-server restart"
+      ],
+      "started_at": "2026-10-08T22:54:31.210857+00:00",
+      "source_commit": "65a0be9c61a202cdbbf84cda6cc4202b643cd4b5",
+      "images": {
+        "engine": "ghcr.io/siglake/siglake@sha256:56db77fe6abf5d1ba902a6faec3f69f3d7582cd2baae4bab53ea6d7a88808f34",
+        "operator": "ghcr.io/siglake/siglake-operator@sha256:2dd4ce30efc6b388038654d7d046c303883ec0fe97ba09cf40b76f5f7b370bbd"
+      },
+      "dependency_substitution": {
+        "reason": "Historical MinIO distribution is unavailable; use the pinned public fixture",
+        "fixture_source_commit": "ad2329ddd4a28521145824fbbec6e4e651b9ae1c",
+        "original": {
+          "minio": "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
+          "minio-init": "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z"
+        },
+        "replacement": {
+          "minio": "docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20",
+          "minio-init": "docker.io/bitnamilegacy/minio-client:2025.7.21-debian-12-r3@sha256:73bd39f7899a0cef12b8dd5df13aa93a3ed1aaa44236542442e9ac76819ac158"
+        }
+      },
+      "side_aggregate_guard_refusals": 0,
+      "artifact_review_note": "Guard-refusal count is recorded for follow-up; basic rename smoke does not qualify side-aggregate behavior.",
+      "cleanup": "passed",
+      "finished_at": "2026-10-08T22:55:44.730682+00:00"
+    },
+    {
+      "scope": "basic rename smoke; not full release qualification or burn-in",
+      "version": "v0.2.0",
+      "published": true,
+      "project": "siglake-rename-b230353bcbd5",
+      "status": "passed",
+      "checks": [
+        "engine version and commit match tag",
+        "operator version and commit match tag",
+        "all four binary entrypoints launch",
+        "operator emits renamed CRD",
+        "renamed Compose services healthy",
+        "100 ingested events committed to object storage; exact rows and grouped counts",
+        "committed rows survive query-server restart"
+      ],
+      "started_at": "2026-10-08T22:54:31.210834+00:00",
+      "source_commit": "dc9ace08ba4dd06a391b4b77aba982e8a4d6e9b6",
+      "images": {
+        "engine": "ghcr.io/siglake/siglake@sha256:eb71337eb3c0740b9a74a5a01ba53c85342a5bbbd408e410b888d5343f8c2e53",
+        "operator": "ghcr.io/siglake/siglake-operator@sha256:4235a7edba4e27041dac8c35660e8a88c922eb93632bc4abe5e46c7fcd18962c"
+      },
+      "dependency_substitution": {
+        "reason": "Historical MinIO distribution is unavailable; use the pinned public fixture",
+        "fixture_source_commit": "ad2329ddd4a28521145824fbbec6e4e651b9ae1c",
+        "original": {
+          "minio": "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
+          "minio-init": "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z"
+        },
+        "replacement": {
+          "minio": "docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20",
+          "minio-init": "docker.io/bitnamilegacy/minio-client:2025.7.21-debian-12-r3@sha256:73bd39f7899a0cef12b8dd5df13aa93a3ed1aaa44236542442e9ac76819ac158"
+        }
+      },
+      "side_aggregate_guard_refusals": 0,
+      "artifact_review_note": "Guard-refusal count is recorded for follow-up; basic rename smoke does not qualify side-aggregate behavior.",
+      "cleanup": "passed",
+      "finished_at": "2026-10-08T22:55:50.933536+00:00"
+    },
+    {
+      "scope": "basic rename smoke; not full release qualification or burn-in",
+      "version": "v0.2.1",
+      "published": true,
+      "project": "siglake-rename-1fa9d57bc81e",
+      "status": "passed",
+      "checks": [
+        "engine version and commit match tag",
+        "operator version and commit match tag",
+        "all four binary entrypoints launch",
+        "operator emits renamed CRD",
+        "renamed Compose services healthy",
+        "100 ingested events committed to object storage; exact rows and grouped counts",
+        "committed rows survive query-server restart"
+      ],
+      "started_at": "2026-10-08T22:54:31.214792+00:00",
+      "source_commit": "08cbeaa6d508eba1a4a6810de4002e004b8686b9",
+      "images": {
+        "engine": "ghcr.io/siglake/siglake@sha256:4ddeaf85826c18d6f225d433cac3488fa2b4ab118db51496340ef910764d6892",
+        "operator": "ghcr.io/siglake/siglake-operator@sha256:446f78f81b5ef52e6fccad477ff94ef13339c2acefb165b508b90f01f5eb2b1e"
+      },
+      "side_aggregate_guard_refusals": 5,
+      "artifact_review_note": "Guard-refusal count is recorded for follow-up; basic rename smoke does not qualify side-aggregate behavior.",
+      "cleanup": "passed",
+      "finished_at": "2026-10-08T22:55:50.507339+00:00"
+    }
+  ]
+}

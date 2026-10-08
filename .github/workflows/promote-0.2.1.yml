@@ -1,0 +1,47 @@
+name: Promote verified 0.2.1 images
+
+# One-time Siglake migration promotion. These immutable manifests are recorded
+# in results/release-validation/siglake-rename-public-20261008.json.
+# No source checkout or image rebuild is involved.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ENGINE_DIGEST: sha256:4ddeaf85826c18d6f225d433cac3488fa2b4ab118db51496340ef910764d6892
+      OPERATOR_DIGEST: sha256:446f78f81b5ef52e6fccad477ff94ef13339c2acefb165b508b90f01f5eb2b1e
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify both version tags still identify the tested manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(docker buildx imagetools inspect ghcr.io/siglake/siglake:0.2.1 --format '{{.Manifest.Digest}}')" = "$ENGINE_DIGEST"
+          test "$(docker buildx imagetools inspect ghcr.io/siglake/siglake-operator:0.2.1 --format '{{.Manifest.Digest}}')" = "$OPERATOR_DIGEST"
+      - name: Copy tested manifests to latest and verify their digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for product in siglake siglake-operator; do
+            digest="$ENGINE_DIGEST"
+            if [[ "$product" == siglake-operator ]]; then digest="$OPERATOR_DIGEST"; fi
+            image="ghcr.io/siglake/$product"
+            docker buildx imagetools create --prefer-index=false --tag "$image:latest" "$image@$digest"
+            test "$(docker buildx imagetools inspect "$image:latest" --format '{{.Manifest.Digest}}')" = "$digest"
+            echo "$image:latest = $digest" >> "$GITHUB_STEP_SUMMARY"
+          done
