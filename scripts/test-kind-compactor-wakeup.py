@@ -26,7 +26,9 @@ runner = module("runner", "kind-compactor-wakeup.py")
 
 def capture():
     result = json.loads((ROOT / "scripts/testdata/kind-compactor-wakeup-verified.json").read_text())
-    result["schema_version"] = 3
+    result["schema_version"] = 4
+    result["settings"]["observer_max_bracket_seconds"] = 1
+    next(row for row in result["replica_history"] if row["phase"] == "ingested")["at"] = 1789862039.8
     sha = result["revisions"]["repository_commit"]
     result["images"] = {f"{name}:{sha[:12]}": "sha256:" + digit * 64
                         for name, digit in (("siglake-wakeup", "a"), ("siglake-wakeup-operator", "b"))}
@@ -42,6 +44,19 @@ def capture():
     result["acceptance"] = {
         "initial_ledger": [initial], "sealed_ledger": [initial, sealed], "committed_ledger": [committed],
         "positive_started_at": 1789861921, "committed_at": 1789862140,
+        "positive_observer": {
+            "pre_trigger": {
+                "kind": "direct-signal",
+                "direct": {"time": 1789861920.25, "source": "operator-managed ingester /metrics",
+                           "published_depth": [{"labels": "{tenant=\"default\"}", "value": 0.0}],
+                           "sample_age": [{"labels": "{tenant=\"default\"}", "value": 0.5}]},
+                "state": {"at": 1789861920.5, "phase": "pre-trigger", "replicas": 0, "pods": []}},
+            "positive": {
+                "before": {"at": 1789862039.8, "phase": "waiting-for-direct-signal", "replicas": 0, "pods": []},
+                "direct": {"time": 1789862039.9, "source": "operator-managed ingester /metrics",
+                           "published_depth": [{"labels": "{tenant=\"default\"}", "value": 6.0}],
+                           "sample_age": [{"labels": "{tenant=\"default\"}", "value": 0.25}]},
+                "after": {"at": 1789862040, "phase": "waiting-for-direct-signal", "replicas": 0, "pods": []}}},
         "query_response": {"rows": [{"host": f"wake-{i:04d}"} for i in range(500)]},
         "absent_compactor_series": {"time": 1789862200, "response": copy.deepcopy(empty)},
         "unaffected_until": 1789862240,
@@ -51,6 +66,8 @@ def capture():
         "missing_activation": {"time": 1789862280, "response": copy.deepcopy(empty)},
         "negative_woken": {"at": 1789862300, "replicas": 1, "pods": []},
         "operator_log": (
+            f'{timestamp(1789862041)} INFO reconcile decision namespace=default name=siglake summary=scaled compactor (ing 1→1, comp 0→1, qry 1→1) '
+            'observed=ObservedSamples { ingester_rps_per_pod: Some(0.0), compactor_backlog: Some(0.1), query_in_flight_per_pod: Some(0.0) }\n'
             f'{timestamp(1789862220)} INFO reconcile decision namespace=default name=siglake summary=no-op '
             'observed=ObservedSamples { ingester_rps_per_pod: Some(0.0), compactor_backlog: Some(0.0), query_in_flight_per_pod: Some(0.0) }\n'
             f'{timestamp(1789862290)} INFO reconcile decision namespace=default name=siglake summary=scaled comp (ing 1→1, comp 0→1, qry 1→1) '
@@ -77,7 +94,7 @@ class EvidenceTests(unittest.TestCase):
         self.refuse(lambda d: d.update(build_versions={}), "image build provenance")
 
     def test_activation_only_is_not_complete_acceptance(self):
-        self.refuse(lambda d: d.update(schema_version=2), "schema_version 3")
+        self.refuse(lambda d: d.update(schema_version=2), "schema_version 4")
 
     def test_queryable_wal_is_not_commit(self):
         self.refuse(lambda d: d["acceptance"]["committed_ledger"][0].update(status="sealed"), "committed certificates")
@@ -125,6 +142,22 @@ class EvidenceTests(unittest.TestCase):
 
     def test_floors_must_remain_ready(self):
         self.refuse(lambda d: d["acceptance"]["workloads"]["items"][0]["status"].update(readyReplicas=0), "ready floor")
+
+    def test_direct_positive_requires_a_parked_bracket(self):
+        self.refuse(lambda d: d["acceptance"]["positive_observer"]["positive"]["before"].update(replicas=1),
+                    "preceding parked")
+
+    def test_direct_positive_requires_depth_and_age(self):
+        self.refuse(lambda d: d["acceptance"]["positive_observer"]["positive"]["direct"].update(sample_age=[]),
+                    "missing sample_age")
+
+    def test_direct_observer_must_precede_the_trigger(self):
+        self.refuse(lambda d: d["acceptance"]["positive_observer"]["pre_trigger"]["state"].update(at=1789861922),
+                    "start before")
+
+    def test_positive_wake_requires_operator_decision(self):
+        self.refuse(lambda d: d["acceptance"].update(operator_log=d["acceptance"]["operator_log"].replace(
+            "compactor_backlog: Some(0.1)", "compactor_backlog: None", 1)), "positive-signal decision")
 
     def test_cli_requires_full_capture(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -177,6 +210,42 @@ class PartialSuccessTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "partially rejected"):
             self.ingest({"partialSuccess": {"rejectedLogRecords": "1"}})
         self.assertEqual(self.evidence["response"]["partialSuccess"]["rejectedLogRecords"], "1")
+
+
+class PositiveObserverTests(unittest.TestCase):
+    def observation(self, depth=6, age=.25, replicas=0, pods=None, at=20):
+        return {"direct": {"time": at - .05,
+                           "published_depth": [{"labels": '{tenant="default"}', "value": depth}],
+                           "sample_age": [{"labels": '{tenant="default"}', "value": age}]},
+                "state": {"at": at, "replicas": replicas, "pods": [] if pods is None else pods}}
+
+    def test_direct_signal_wins_the_prometheus_wake_race(self):
+        # Run 176 sampled zero, then Prometheus and the operator won the next
+        # 43 ms. A direct scrape before that shared Prometheus scrape retains
+        # the positive signal while both replica observations still read zero.
+        before = {"at": 19.8, "replicas": 0, "pods": []}
+        self.assertTrue(runner.direct_observation_is_positive(before, self.observation()))
+
+    def test_following_wake_does_not_erase_the_preceding_parked_sample(self):
+        before = {"at": 19.8, "replicas": 0, "pods": []}
+        self.assertTrue(runner.direct_observation_is_positive(
+            before, self.observation(replicas=1, pods=["compactor"])))
+
+    def test_missing_or_stale_direct_evidence_is_not_positive(self):
+        before = {"at": 19.8, "replicas": 0, "pods": []}
+        missing = self.observation()
+        missing["direct"]["sample_age"] = []
+        self.assertFalse(runner.direct_observation_is_positive(before, missing))
+        self.assertFalse(runner.direct_observation_is_positive(before, self.observation(age=121)))
+        self.assertFalse(runner.direct_observation_is_positive(before, self.observation(depth=0)))
+
+    def test_metrics_parser_keeps_distinct_tenant_series(self):
+        text = (f'{runner.SEALED_DEPTH}{{tenant="a"}} 2\n'
+                f'{runner.SEALED_DEPTH}{{tenant="b"}} 3.5\n')
+        self.assertEqual(runner.metric_series(text, runner.SEALED_DEPTH), [
+            {"labels": '{tenant="a"}', "value": 2.0},
+            {"labels": '{tenant="b"}', "value": 3.5},
+        ])
 
 
 class BootstrapTests(unittest.TestCase):

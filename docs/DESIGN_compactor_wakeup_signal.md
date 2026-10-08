@@ -335,3 +335,13 @@ Run after the ordinary round, as an opt-in capture like
 5. Negative control: block the ingester's catalog reads (or stop the publisher)
    with the compactor at zero and retain that the tier goes to 1 rather than
    staying at 0.
+
+The positive-signal observer starts before step 3's ingest. It samples the
+ingester's `/metrics` endpoint independently of Prometheus, records the latest
+zero-replica state at least once per second, and writes every direct sample to
+`positive-observations.jsonl`. The acceptance grade requires a fresh positive
+depth after that parked state, the matching positive Prometheus expression,
+and the operator's later timestamped `comp 0→1` decision. This ordering avoids
+the observation race where the operator consumes a new Prometheus scrape and
+starts the compactor before a polling observer can issue its next query. The
+observer does not pause the operator or change its scrape interval.
