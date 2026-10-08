@@ -444,6 +444,14 @@ jobs:
       # dependency crates: 550s of the 777s `cargo test` step, on every push,
       # while a cache sat unwritten because the job it belonged to was fixing
       # the very failure that discarded it.
+      # Hosted runners have much less RAM/disk than the original Depot pool.
+      # Keep all test assertions; reduce compiler concurrency and debug artifacts.
+      - name: Bound build resources on GitHub-hosted runners
+        if: runner.environment == 'github-hosted'
+        run: |
+          echo 'CARGO_PROFILE_DEV_DEBUG=0' >> "$GITHUB_ENV"
+          echo 'CARGO_PROFILE_TEST_DEBUG=0' >> "$GITHUB_ENV"
+          echo 'CARGO_BUILD_JOBS=2' >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -846,6 +854,29 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@1.95.0
 
+      - name: Free disk (GitHub-hosted runners only)
+        if: runner.environment == 'github-hosted'
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL \
+                      /usr/share/swift \
+                      /usr/local/share/powershell \
+                      /usr/share/miniconda \
+                      /usr/local/julia* \
+                      /usr/local/share/chromium
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          echo "after:"; df -h / | tail -1
+      # Hosted runners have much less RAM/disk than the original Depot pool.
+      # Keep all test assertions; reduce compiler concurrency and debug artifacts.
+      - name: Bound build resources on GitHub-hosted runners
+        if: runner.environment == 'github-hosted'
+        run: |
+          echo 'CARGO_PROFILE_DEV_DEBUG=0' >> "$GITHUB_ENV"
+          echo 'CARGO_PROFILE_TEST_DEBUG=0' >> "$GITHUB_ENV"
+          echo 'CARGO_BUILD_JOBS=2' >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
