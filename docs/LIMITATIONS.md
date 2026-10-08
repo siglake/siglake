@@ -276,24 +276,31 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   into the shared queue once would need one aggregated series behind an
   `Object` or `External` metric and the prometheus-adapter rule that exposes
   it; the chart does not own that rule and does not render it.
-- **No live Prometheus has confirmed the ingester's per-pod scaling signal.**
-  The operator reads ingest load as
+- **The ingester's request-rate trigger has not demonstrated automatic
+  scale-out.** The operator reads ingest load as
   `avg(sum by (pod) (rate(siglake_ingest_requests_total{…}[1m])))`: a pod's
   endpoint/status/tenant/index series are summed before the pod totals are
   averaged, so the same traffic reads the same whether it arrives on one
   endpoint or spreads over logs and traces. The `pod` label that grouping needs
   is attached by Prometheus Operator's own target relabeling — the chart's
-  `targetLabels` add only the instance and the component — so nothing rendered
-  here proves it is on the series, and if it were missing `sum by (pod)` would
-  return one group holding the fleet total, which is replicas times too high.
-  `scripts/kind-round.sh` now holds the ingester at two pods for a bounded
-  phase, drives OTLP logs and traces at both, and retains four Prometheus
-  answers taken at one timestamp (`results/ingester-pod-labels*.json`): the raw
-  series with their label sets, the per-series rate, that rate summed by `pod`,
-  and the operator's own expression. The grader refuses a capture whose series
-  carry no `pod`, one where fewer than two pods carried traffic, and one whose
-  operator value is not the mean of the per-pod sums. No round has supplied
-  that capture yet (#3647).
+  `targetLabels` add only the instance and the component — so rendered manifests
+  alone cannot prove it is on the series, and if it were missing `sum by (pod)`
+  would return one group holding the fleet total, which is replicas times too
+  high. A recorded kind round validated that grouping from merged commit
+  `5f3a51489c46`, evaluated at 2026-09-14T05:40:32Z: four series from two active
+  pods, every series carrying a nonempty `pod` label. That revision's
+  `scripts/grade-kind-ingester-pod-labels.py` graded the capture `verified` with
+  no problems — the operator's value, 0.9556 requests/s, was the mean of the two
+  per-pod sums (0.8889 and 1.0222) and differed from both the fleet total
+  (1.9111) and the flat per-series average (0.4778) (#3647). What that settles
+  is the live `pod` label and the per-pod arithmetic. It is not evidence that
+  load moves the tier: the round raised the ScaledObject's `minReplicaCount`
+  from one to two before driving traffic (`patch_ingester_floor` in
+  `scripts/kind-round.sh`), so the second pod came from the floor and not from
+  the request-rate trigger. The capture is also historical. It predates the
+  rename and its series were published under the previous metric name, which
+  the grader in this tree refuses by name; no round built from a Siglake-named
+  image has repeated it.
 - **No live Prometheus has confirmed that every claim compactor exports one
   shared sealed queue.** The catalog query behind
   `siglake_compactor_sealed_pending` has no worker filter, and the operator
