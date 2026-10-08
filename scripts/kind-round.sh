@@ -134,8 +134,9 @@ COMPACTOR_POD_LABEL_CAPTURE="${COMPACTOR_POD_LABEL_CAPTURE:-0}"
 #
 # It needs an OPERATOR-MANAGED cluster. The opt-in helper bootstraps that
 # separate cluster with the named CR; the ordinary chart-managed round stays
-# unchanged. Its schema-3 evidence adds committed rows and the negative control
-# to the historical schema-2 activation capture retained below.
+# unchanged. Its schema-4 evidence adds the pre-trigger direct observer,
+# committed rows and the negative control to the historical schema-2
+# activation capture retained below.
 COMPACTOR_WAKEUP_CAPTURE="${COMPACTOR_WAKEUP_CAPTURE:-0}"
 [[ "$COMPACTOR_WAKEUP_CAPTURE" == 0 || "$COMPACTOR_WAKEUP_CAPTURE" == 1 ]] || {
   printf 'ERROR: COMPACTOR_WAKEUP_CAPTURE must be 0 or 1\n' >&2

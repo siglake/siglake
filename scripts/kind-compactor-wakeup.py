@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -17,6 +18,7 @@ import signal
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -26,6 +28,106 @@ ROOT = Path(__file__).resolve().parent.parent
 BATCH = 500
 PROM_RELEASE = "kube-prometheus-stack"
 PROM_VERSION = "77.11.1"  # Same pin as the ordinary kind round.
+SEALED_DEPTH = "siglake_wal_segments_sealed"
+SEALED_AGE = "siglake_wal_segments_sealed_sample_age_seconds"
+SAMPLE_MAX_AGE = 120
+OBSERVER_MAX_BRACKET_SECONDS = 1
+
+
+def metric_series(text: str, name: str) -> list[dict]:
+    """Parse one metric family from a Prometheus text exposition."""
+    rows = []
+    pattern = re.compile(
+        rf"^{re.escape(name)}(?P<labels>\{{[^}}]*\}})?[ \t]+"
+        r"(?P<value>[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?|[-+]?Inf|NaN)"
+        r"(?:[ \t]+[0-9]+)?$"
+    )
+    for line in text.splitlines():
+        match = pattern.fullmatch(line.strip())
+        if not match:
+            continue
+        try:
+            value = float(match.group("value"))
+        except ValueError:
+            continue
+        rows.append({"labels": match.group("labels") or "", "value": value})
+    return rows
+
+
+def direct_signal(direct: dict, allowance: float) -> tuple[float, float] | None:
+    """Return total depth and maximum age for one complete direct scrape."""
+    depth = direct.get("published_depth") or []
+    age = direct.get("sample_age") or []
+    depth_by_labels = {row.get("labels"): row.get("value") for row in depth}
+    age_by_labels = {row.get("labels"): row.get("value") for row in age}
+    if (not depth_by_labels or len(depth_by_labels) != len(depth) or
+            set(depth_by_labels) != set(age_by_labels) or len(age_by_labels) != len(age)):
+        return None
+    values = [*depth_by_labels.values(), *age_by_labels.values()]
+    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and
+               value >= 0 and math.isfinite(value) for value in values):
+        return None
+    maximum_age = max(age_by_labels.values())
+    if maximum_age > allowance:
+        return None
+    return sum(depth_by_labels.values()), maximum_age
+
+
+def parked_state(state: dict) -> bool:
+    return state.get("replicas") == 0 and state.get("pods") == []
+
+
+def direct_observation_is_positive(before: dict, observation: dict,
+                                   allowance: float = SAMPLE_MAX_AGE,
+                                   max_bracket: float = OBSERVER_MAX_BRACKET_SECONDS) -> bool:
+    """The direct signal follows a nearby parked observation and has a following state."""
+    after = observation.get("state") or {}
+    direct = observation.get("direct") or {}
+    signal = direct_signal(direct, allowance)
+    try:
+        bracket = after["at"] - before["at"]
+        ordered = before["at"] <= direct["time"] <= after["at"]
+    except (KeyError, TypeError):
+        return False
+    return (parked_state(before) and isinstance(after.get("replicas"), int) and
+            isinstance(after.get("pods"), list) and ordered and
+            0 <= bracket <= max_bracket and signal is not None and signal[0] > 0)
+
+
+def prom_signal_is_positive(queries: dict, allowance: float = SAMPLE_MAX_AGE) -> bool:
+    """Apply the operator expression's depth/age arithmetic to captured queries."""
+    def rows(name):
+        response = (queries.get(name) or {}).get("response") or {}
+        data = response.get("data") or {}
+        if response.get("status") != "success" or data.get("resultType") != "vector":
+            return []
+        return data.get("result") or []
+
+    def per_pod(values, combine):
+        result = {}
+        for row in values:
+            pod = (row.get("metric") or {}).get("pod")
+            try:
+                value = float(row["value"][1])
+            except (KeyError, IndexError, TypeError, ValueError):
+                return {}
+            if not pod or not math.isfinite(value):
+                return {}
+            result[pod] = result.get(pod, 0.0) + value if combine == "sum" else max(result.get(pod, value), value)
+        return result
+
+    depth = per_pod(rows("published_depth"), "sum")
+    age = per_pod(rows("sample_age"), "max")
+    fresh = {pod: value for pod, value in depth.items() if age.get(pod, allowance + 1) <= allowance}
+    operator = rows("operator_expression")
+    if not fresh or min(fresh.values()) <= 0 or len(operator) != 1:
+        return False
+    try:
+        operator_value = float(operator[0]["value"][1])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+    expected = sum(fresh.values()) / len(fresh)
+    return math.isfinite(operator_value) and operator_value > 0 and math.isclose(operator_value, expected, rel_tol=1e-9)
 
 
 def activation_expression(cluster: str) -> str:
@@ -95,9 +197,11 @@ class Round:
         self.image = f"siglake-wakeup:{self.sha[:12]}"
         self.operator_image = f"siglake-wakeup-operator:{self.sha[:12]}"
         self.cr = cluster_manifest(self.name, self.image)
-        self.doc = {"schema_version": 3, "revisions": {"repository_commit": self.sha,
+        self.doc = {"schema_version": 4, "revisions": {"repository_commit": self.sha,
                     "repository_commit_source": "siglake_source_commit_env" if os.environ.get("SIGLAKE_SOURCE_COMMIT") else "git_rev_parse_head"},
-                    "settings": {"cluster": self.name, "namespace": "default", "kind_cluster": self.kind, "sample_max_age_seconds": 120,
+                    "settings": {"cluster": self.name, "namespace": "default", "kind_cluster": self.kind,
+                                 "sample_max_age_seconds": SAMPLE_MAX_AGE,
+                                 "observer_max_bracket_seconds": OBSERVER_MAX_BRACKET_SECONDS,
                                  "ingest_batch": BATCH, "pods_while_parked": []},
                     "replica_history": [], "queries": {}, "acceptance": {}, "grade": "running"}
         self.save()
@@ -152,6 +256,10 @@ class Round:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.load(response)
 
+    def text(self, url):
+        with urllib.request.urlopen(url, timeout=30) as response:
+            return response.read().decode("utf-8")
+
     def prom(self, expression):
         at = time.time()
         response = self.http(self.prom_url + "/api/v1/query?" + urllib.parse.urlencode({"query": expression, "time": at}))
@@ -160,13 +268,50 @@ class Round:
         return {"expression": expression, "time": at, "response": response}
 
     def sample(self, phase):
-        dep = json.loads(self.kube("get", "deployment", self.name + "-compactor", "-o", "json"))
-        pods = json.loads(self.kube("get", "pods", "-l", f"app.kubernetes.io/instance={self.name},app.kubernetes.io/component=compactor", "-o", "json"))
-        row = {"at": time.time(), "phase": phase, "replicas": dep["spec"]["replicas"],
-               "pods": [p["metadata"]["name"] for p in pods["items"]]}
+        row = self.compactor_state(phase)
         self.doc["replica_history"].append(row)
         self.save()
         return row
+
+    def compactor_state(self, phase):
+        selector = f"app.kubernetes.io/instance={self.name},app.kubernetes.io/component=compactor"
+        items = json.loads(self.kube("get", "deployment,pods", "-l", selector, "-o", "json"))["items"]
+        deployments = [item for item in items if item["kind"] == "Deployment"]
+        if len(deployments) != 1:
+            raise RuntimeError(f"expected one compactor Deployment, found {len(deployments)}")
+        return {"at": time.time(), "phase": phase, "replicas": deployments[0]["spec"]["replicas"],
+                "pods": [item["metadata"]["name"] for item in items if item["kind"] == "Pod"]}
+
+    def record_observation(self, observation):
+        with open(self.out / "positive-observations.jsonl", "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(observation, separators=(",", ":")) + "\n")
+
+    def direct_scrape(self):
+        sampled_at = time.time()
+        text = self.text(self.ingester_metrics_url + "/metrics")
+        return {
+            "time": sampled_at,
+            "source": "operator-managed ingester /metrics",
+            "published_depth": metric_series(text, SEALED_DEPTH),
+            "sample_age": metric_series(text, SEALED_AGE),
+        }
+
+    def direct_observation(self, phase):
+        observation = {"kind": "direct-signal", "direct": self.direct_scrape(),
+                       "state": self.compactor_state(phase)}
+        self.record_observation(observation)
+        return observation
+
+    def prometheus_observation(self, selector, expression):
+        queries = {
+            "published_depth": self.prom(f"{SEALED_DEPTH}{{{selector}}}"),
+            "sample_age": self.prom(f"{SEALED_AGE}{{{selector}}}"),
+            "operator_expression": self.prom(expression),
+        }
+        observation = {"kind": "prometheus-signal", "queries": queries,
+                       "state": self.compactor_state("waiting-for-prometheus")}
+        self.record_observation(observation)
+        return observation
 
     def ledger(self):
         sql = "SELECT COALESCE(json_agg(t), '[]') FROM (SELECT id, rows, status, committed_at_ms FROM wal_segments WHERE tenant='default' ORDER BY id) t"
@@ -236,6 +381,7 @@ class Round:
         self.kube("rollout", "status", "statefulset/" + self.name + "-query", "--timeout=300s", timeout=320)
         self.prom_url = self.forward("svc/" + PROM_RELEASE + "-prometheus", 9090, "monitoring")
         self.ingest_url = self.forward("svc/" + self.name + "-ingester", 8088)
+        self.ingester_metrics_url = self.forward("svc/" + self.name + "-ingester", 9100)
         self.query_url = self.forward("svc/" + self.name + "-query", 8089)
         self.save()
 
@@ -260,28 +406,88 @@ class Round:
             return q if len(rows) == 1 and float(rows[0]["value"][1]) == 0 else None
         self.doc["queries"]["parked_operator_expression"] = self.wait("zero activation control", idle, 120)
         self.sample("parked")
-        self.doc["acceptance"]["positive_started_at"] = time.time()
-        self.ingest("wake")
         selector = f'namespace="default",app_kubernetes_io_instance="{self.name}",app_kubernetes_io_component="ingester"'
-        def positive():
-            before_row = self.sample("waiting-for-signal")
-            if before_row["replicas"] != 0 or before_row["pods"]:
-                raise RuntimeError("compactor woke before positive signal retained")
-            queries = {"published_depth": self.prom(f"siglake_wal_segments_sealed{{{selector}}}"),
-                       "sample_age": self.prom(f"siglake_wal_segments_sealed_sample_age_seconds{{{selector}}}"),
-                       "operator_expression": self.prom(expr)}
-            values = queries["operator_expression"]["response"]["data"]["result"]
-            if len(values) != 1 or float(values[0]["value"][1]) <= 0:
-                return None
-            ledger = self.ledger()
-            row = self.sample("ingested")
-            if row["replicas"] != 0 or row["pods"]:
-                raise RuntimeError("positive signal was not retained while compactor absent")
-            self.doc["queries"].update(queries)
-            self.doc["acceptance"]["sealed_ledger"] = ledger
-            return row
-        self.wait("fresh positive signal at zero", positive, 300, .25)
-        self.wait("operator wake", lambda: self.sample("woken") if self.sample("waking")["replicas"] > 0 else None, 300)
+        # Observe the publisher directly before triggering ingest. Prometheus and
+        # the operator read the same scrape: on run 176 the operator's 0→1 patch
+        # landed 43 ms after the last zero sample, before the next observer poll.
+        # The direct endpoint exposes the depth first, so it retains the last
+        # zero, the positive reading and the following state without delaying
+        # or changing the operator. The operator's timestamped 0→1 decision
+        # closes the other side of that interval in the offline grade.
+        def pre_trigger():
+            observation = self.direct_observation("pre-trigger")
+            signal = direct_signal(observation["direct"], SAMPLE_MAX_AGE)
+            return observation if parked_state(observation["state"]) and signal and signal[0] == 0 else None
+        baseline = self.wait("fresh direct zero before trigger", pre_trigger, 120, .05)
+        self.doc["acceptance"]["positive_observer"] = {"pre_trigger": baseline}
+        self.doc["acceptance"]["positive_started_at"] = time.time()
+        self.save()
+        ingest_error = []
+        def drive_ingest():
+            try:
+                self.ingest("wake")
+            except Exception as exc:
+                ingest_error.append(exc)
+        ingest_thread = threading.Thread(target=drive_ingest, name="wakeup-ingest", daemon=True)
+        ingest_thread.start()
+
+        deadline = time.monotonic() + 300
+        previous = baseline["state"]
+        state_sampled_at = time.monotonic()
+        positive_observation = None
+        while time.monotonic() < deadline:
+            direct = self.direct_scrape()
+            signal = direct_signal(direct, SAMPLE_MAX_AGE)
+            if signal is not None and signal[0] > 0:
+                observation = {"kind": "direct-signal", "direct": direct,
+                               "state": self.compactor_state("after-direct-signal")}
+                self.record_observation(observation)
+            elif time.monotonic() - state_sampled_at >= .2:
+                observation = {"kind": "direct-signal", "direct": direct,
+                               "state": self.compactor_state("waiting-for-direct-signal")}
+                self.record_observation(observation)
+                state_sampled_at = time.monotonic()
+            else:
+                self.record_observation({"kind": "direct-signal", "direct": direct})
+                time.sleep(.01)
+                continue
+            if direct_observation_is_positive(previous, observation):
+                positive_observation = {"before": previous, "direct": observation["direct"],
+                                        "after": observation["state"]}
+                break
+            if not parked_state(observation["state"]):
+                raise RuntimeError("compactor woke before the direct positive signal was retained")
+            if ingest_error:
+                raise ingest_error[0]
+            previous = observation["state"]
+            time.sleep(.01)
+        ingest_thread.join(timeout=30)
+        if ingest_thread.is_alive():
+            raise RuntimeError("wake ingest did not finish within 30 seconds")
+        if ingest_error:
+            raise ingest_error[0]
+        if positive_observation is None:
+            raise RuntimeError("no fresh direct positive signal was retained at zero replicas")
+        self.doc["acceptance"]["positive_observer"]["positive"] = positive_observation
+        ingested = dict(positive_observation["before"], phase="ingested")
+        self.doc["replica_history"].append(ingested)
+        self.doc["acceptance"]["sealed_ledger"] = self.ledger()
+        self.save()
+
+        def positive_prometheus():
+            observation = self.prometheus_observation(selector, expr)
+            return observation if prom_signal_is_positive(observation["queries"]) else None
+        prometheus = self.wait("matching positive Prometheus expression", positive_prometheus, 300, .05)
+        self.doc["queries"].update(prometheus["queries"])
+        def woken():
+            row = self.sample("waking")
+            if row["replicas"] > 0:
+                row["phase"] = "woken"
+                self.doc["replica_history"][-1] = row
+                self.save()
+                return row
+            return None
+        self.wait("operator wake", woken, 300)
         before_ids = {r["id"] for r in before}
         def committed():
             rows = [r for r in self.ledger() if r["id"] not in before_ids]

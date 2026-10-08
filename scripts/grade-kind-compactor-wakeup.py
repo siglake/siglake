@@ -213,8 +213,8 @@ def grade(document: dict) -> dict:
 
 def grade_acceptance(document: dict) -> dict:
     """Full #6012 proof; schema-2 captures remain historical activation-only evidence."""
-    if document.get("schema_version") != 3:
-        raise Unverified("full acceptance requires schema_version 3")
+    if document.get("schema_version") != 4:
+        raise Unverified("full acceptance requires schema_version 4")
     activation = dict(document, schema_version=2)
     evidence = grade(activation)
     revisions = document.get("revisions") or {}
@@ -227,6 +227,58 @@ def grade_acceptance(document: dict) -> dict:
     def require(condition, why):
         if not condition:
             raise Unverified(why)
+
+    observer = acceptance.get("positive_observer") or {}
+    pre_trigger = observer.get("pre_trigger") or {}
+    positive = observer.get("positive") or {}
+
+    def direct_values(observation, name):
+        direct = observation.get("direct") or observation
+        rows = direct.get(name)
+        require(isinstance(rows, list) and bool(rows), f"direct observer is missing {name}")
+        require(all(isinstance(row, dict) and isinstance(row.get("labels"), str) and
+                    isinstance(row.get("value"), (int, float)) and not isinstance(row.get("value"), bool) and
+                    math.isfinite(row["value"]) and row["value"] >= 0 for row in rows),
+                f"direct observer has malformed {name}")
+        require(len({row["labels"] for row in rows}) == len(rows),
+                f"direct observer has duplicate {name} label sets")
+        return {row["labels"]: row["value"] for row in rows}
+
+    def direct_reading(observation):
+        depth = direct_values(observation, "published_depth")
+        age = direct_values(observation, "sample_age")
+        require(set(depth) == set(age), "direct observer depth/age label sets differ")
+        require(max(age.values()) <= settings["sample_max_age_seconds"],
+                "direct observer sample is stale")
+        return sum(depth.values())
+
+    pre_state = pre_trigger.get("state") or {}
+    pre_direct = pre_trigger.get("direct") or {}
+    require(pre_state.get("replicas") == 0 and pre_state.get("pods") == [],
+            "direct observer did not start with the compactor parked")
+    require(direct_reading(pre_trigger) == 0, "direct observer baseline was already positive")
+    positive_before = positive.get("before") or {}
+    positive_after = positive.get("after") or {}
+    positive_direct = positive.get("direct") or {}
+    require(positive_before.get("replicas") == 0 and positive_before.get("pods") == [],
+            "direct positive signal has no preceding parked replica observation")
+    require(isinstance(positive_after.get("replicas"), int) and
+            isinstance(positive_after.get("pods"), list),
+            "direct positive signal has no following replica observation")
+    try:
+        bracket = positive_after["at"] - positive_before["at"]
+        direct_at = positive_direct["time"]
+        pre_at = pre_direct["time"]
+    except (KeyError, TypeError) as exc:
+        raise Unverified(f"direct observer timestamps are missing: {exc}") from exc
+    require(0 <= bracket <= settings.get("observer_max_bracket_seconds", 0),
+            "direct positive signal has no bounded replica bracket")
+    require(positive_before["at"] <= direct_at <= positive_after["at"],
+            "direct positive signal falls outside its replica bracket")
+    require(pre_at <= pre_state.get("at", 0) <= acceptance.get("positive_started_at", 0) <= direct_at,
+            "direct observer did not start before the ingest trigger")
+    direct_depth = direct_reading(positive_direct)
+    require(direct_depth > 0, "direct observer retained no positive queue depth")
 
     def ledger(name):
         rows = acceptance.get(name)
@@ -259,10 +311,17 @@ def grade_acceptance(document: dict) -> dict:
                 for key, r in committed.items()), "new segments lack durable committed certificates")
     history = document["replica_history"]
     woken_at = next(r["at"] for r in history if r["phase"] == "woken")
-    ingested_at = next(r["at"] for r in history if r["phase"] == "ingested")
+    ingested_row = next(r for r in history if r["phase"] == "ingested")
+    ingested_at = ingested_row["at"]
+    require(ingested_at == positive_before["at"] and ingested_row.get("replicas") == 0 and
+            ingested_row.get("pods") == [],
+            "replica history does not retain the direct observer's last parked sample")
     positive_start = acceptance.get("positive_started_at", 0)
-    require(0 < positive_start <= ingested_at <= woken_at <= acceptance.get("committed_at", 0),
+    require(0 < positive_start <= ingested_at <= direct_at <= woken_at <= acceptance.get("committed_at", 0),
             "committed evidence is outside the positive wake window")
+    require(all(direct_at <= (document["queries"].get(name) or {}).get("time", 0) <= woken_at
+                for name in ("published_depth", "sample_age", "operator_expression")),
+            "Prometheus evidence is outside the direct-signal/wake window")
     require(all(r["committed_at_ms"] / 1000 >= positive_start for r in committed.values()),
             "committed certificates predate this ingest")
     response = acceptance.get("query_response") or {}
@@ -311,6 +370,9 @@ def grade_acceptance(document: dict) -> dict:
     require(any(started <= at <= woken["at"] + 5 and "compactor_backlog: None" in line and
                 "comp 0→1" in line for at, line in decisions),
             "no operator missing-signal decision restoring compactor 0 to 1")
+    require(any(direct_at <= at <= woken_at + 5 and "compactor_backlog: Some(" in line and
+                "comp 0→1" in line for at, line in decisions),
+            "no operator positive-signal decision restoring compactor 0 to 1")
     require(not any(started <= at <= woken["at"] and "waking the parked compactor for maintenance" in line for at, line in timestamped),
             "negative control was a maintenance wake")
     workloads = (acceptance.get("workloads") or {}).get("items") or []
