@@ -1074,6 +1074,7 @@ mod conditional_write_live {
 
     const BUCKET: &str = "siglake-warehouse";
     const ROUNDS: usize = 20;
+    const READ_ATTEMPTS: usize = 4;
     const LIVE_TEST_TIMEOUT: Duration = Duration::from_secs(120);
     const LIVE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1342,6 +1343,61 @@ mod conditional_write_live {
         Ok((outcome, body))
     }
 
+    async fn retry_temporary_read<T, F, Fut>(mut read: F) -> opendal::Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = opendal::Result<T>>,
+    {
+        for attempt in 1..=READ_ATTEMPTS {
+            match read().await {
+                Err(error) if error.is_temporary() && attempt < READ_ATTEMPTS => {
+                    tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the final read attempt always returns")
+    }
+
+    #[tokio::test]
+    async fn cas_race_final_read_retries_only_temporary_errors() {
+        let mut attempts = 0;
+        let body = retry_temporary_read(|| {
+            attempts += 1;
+            let attempt = attempts;
+            async move {
+                if attempt < 3 {
+                    Err(opendal::Error::new(
+                        opendal::ErrorKind::Unexpected,
+                        "fixture connection closed",
+                    )
+                    .set_temporary())
+                } else {
+                    Ok(b"winner".to_vec())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(body, b"winner");
+        assert_eq!(attempts, 3);
+
+        let mut permanent_attempts = 0;
+        let error = retry_temporary_read(|| {
+            permanent_attempts += 1;
+            async {
+                Err::<Vec<u8>, _>(opendal::Error::new(
+                    opendal::ErrorKind::Unexpected,
+                    "fixture permanent failure",
+                ))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(!error.is_temporary());
+        assert_eq!(permanent_attempts, 1);
+    }
+
     async fn two_writer_cas_race_inner(op: &opendal::Operator) -> Result<()> {
         let verdict = probe_conditional_write_compatibility(op).await?;
         if verdict.if_match != Some(ConditionalPrecondition::Verified)
@@ -1395,7 +1451,11 @@ mod conditional_write_live {
                     matches!(outcome, CasWrite::Written).then_some(body.as_slice())
                 })
                 .context("the winner count did not identify a winner")?;
-            let final_body = op.read(&rel).await?.to_vec();
+            // The concurrent conditional PUTs can leave MinIO closing one of
+            // the pooled HTTP connections. OpenDAL marks that body-read error
+            // temporary; retry the idempotent observation rather than turning
+            // transport noise into a conditional-write verdict.
+            let final_body = retry_temporary_read(|| op.read(&rel)).await?.to_vec();
             anyhow::ensure!(
                 final_body == winner_body,
                 "round {round} stored the loser body"
