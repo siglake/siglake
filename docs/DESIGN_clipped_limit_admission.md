@@ -100,9 +100,10 @@ degrades to the ungated behavior rather than blocking.
 `the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit`: 16
 files × 3,000 rows, 64 matches in every file, `SELECT raw FROM events WHERE raw
 LIKE '%queen%' LIMIT 20`, 16 partitions. One layout; the arms differ only in the
-`ClippedAdmissionWave` session extension (`0` is the pre-#4865 scan). Three
-interleaved pairs, counters read after `settle_scan_partitions` so the cancelled
-partitions' folds are included.
+`ClippedAdmissionWave` session extension (`0` is the pre-#4865 scan). The
+regression runs seven interleaved pairs and reads counters after
+`settle_scan_partitions` so the cancelled partitions' folds are included. This
+table is the original three-pair local capture:
 
 | pair | gated files_read | gated decoded_bytes | gated drain | ungated files_read | ungated decoded_bytes | ungated drain |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -124,6 +125,13 @@ varied 10/5/6 in the run tabulated above and 7/4/5 in another on this box.
 store and is reported for the pair comparison only — it is not S3 traffic.
 
 Both arms return 20 rows and every row satisfies the predicate.
+
+The seven fixtures in this test binary run serially. Six own four-worker Tokio
+runtimes; running them together creates 24 runtime workers plus the mechanism
+test on a four-core hosted runner. Under that contention the admission ramp can
+widen before the root stream closes, and the median comparison measures sibling
+fixture load. The process-wide fixture lock leaves each assertion intact while
+giving the gated and ungated arms the same isolated CPU budget.
 
 The mechanism is asserted separately and without a scheduler in
 `a_partition_behind_the_ramp_reads_nothing`: the partition streams are executed

@@ -47,6 +47,11 @@ const MATCHES_PER_FILE: usize = 64;
 /// of the ramp.
 const FILES_LAST_MATCH: usize = FILES - 3;
 
+/// These fixtures each build 16 files and six of them own four-worker runtimes.
+/// Letting libtest run them together oversubscribes a four-core hosted runner
+/// and turns the gated/ungated comparison into a measurement of its siblings.
+static FIXTURE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A row wide enough that a decoded batch is worth counting, and a `raw` whose
 /// trigrams are the same in every file except for the needle.
 fn payload(file: usize, row: usize, needle: bool) -> String {
@@ -245,6 +250,8 @@ fn assert_all_qualify(rows: &[String], sql: &str) {
 /// in `a_partition_behind_the_ramp_reads_nothing`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
     // Odd, so the median is a pair that was actually measured.
     const PAIRS: usize = 7;
     const LIMIT: usize = 20;
@@ -349,6 +356,8 @@ async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit()
 /// not a source-row cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_needle_in_the_last_file_alone_still_fills_the_limit() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(tmp.path()).await.unwrap();
     table_with(&ice, |file| {
@@ -385,6 +394,8 @@ async fn a_needle_in_the_last_file_alone_still_fills_the_limit() {
 /// or return short.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn too_few_matches_return_every_qualifying_row() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(tmp.path()).await.unwrap();
     // Seven matches in total, spread across three files, none of them the first.
@@ -417,6 +428,8 @@ async fn too_few_matches_return_every_qualifying_row() {
 /// page that comes back must still be `LIMIT` distinct qualifying rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_offset_page_is_a_full_page_of_qualifying_rows() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(tmp.path()).await.unwrap();
     table_with(&ice, |_| MATCHES_PER_FILE).await;
@@ -442,6 +455,8 @@ async fn an_offset_page_is_a_full_page_of_qualifying_rows() {
 /// reader below the gate was never polled.
 #[tokio::test]
 async fn a_partition_behind_the_ramp_reads_nothing() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
     use futures::task::noop_waker_ref;
     use std::task::Context as TaskContext;
 
@@ -516,6 +531,8 @@ async fn a_partition_behind_the_ramp_reads_nothing() {
 /// rather than slow down.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_ordered_scan_is_outside_the_ramp() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(tmp.path()).await.unwrap();
     table_with(&ice, |_| MATCHES_PER_FILE).await;
@@ -537,6 +554,8 @@ async fn an_ordered_scan_is_outside_the_ramp() {
 /// than stall — and the answer must still be exact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_aggregate_under_the_hint_still_counts_every_row() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(tmp.path()).await.unwrap();
     table_with(&ice, |file| if file % 2 == 0 { 3 } else { 0 }).await;
