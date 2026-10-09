@@ -7697,19 +7697,31 @@ impl GroupEntryCmp {
 }
 
 /// Append one group entry, collapsing back to the best `k` whenever the buffer
-/// reaches `2k`. Unbounded (`bound` is `None`) this is a plain push, so the two
-/// paths differ only in how much memory they hold.
+/// reaches `2k`. After a partition, `cutoff` is the worst of the retained K:
+/// a candidate no better than it cannot enter the final top K. Between
+/// partitions this cutoff may be stale, but only in the conservative direction
+/// (the true Kth entry can improve, never worsen). Skip those candidates before
+/// writing or partitioning them. Unbounded (`bound` is `None`) is a plain push.
 #[inline]
 fn push_bounded<'k>(
     buf: &mut Vec<(Option<&'k str>, u64)>,
     entry: (Option<&'k str>, u64),
     bound: Option<(usize, GroupEntryCmp)>,
+    cutoff: &mut Option<GroupEntry<'k>>,
 ) {
+    if let (Some((_, cmp)), Some(worst)) = (bound, *cutoff) {
+        if !cmp.compare(&entry, &worst).is_lt() {
+            return;
+        }
+    }
     buf.push(entry);
     if let Some((k, cmp)) = bound {
         if buf.len() >= k.saturating_mul(2) {
             buf.select_nth_unstable_by(k - 1, |a, b| cmp.compare(a, b));
             buf.truncate(k);
+            // select_nth leaves the partition unsorted, with its Kth entry at
+            // k - 1; it is exactly the worst retained entry under this comparator.
+            *cutoff = Some(buf[k - 1]);
         }
     }
 }
@@ -7851,6 +7863,7 @@ async fn try_group_count_fast_path_records(
         Some((k, _)) => k.saturating_mul(2),
         None => rows.len() + delta_by_key.len() + 1,
     });
+    let mut cutoff = None;
     for (k, c) in rows.iter() {
         let entry = match k {
             Some(key) => match delta_by_key.get(key) {
@@ -7865,14 +7878,14 @@ async fn try_group_count_fast_path_records(
                 (None, c + delta_nulls)
             }
         };
-        push_bounded(&mut view, entry, bound);
+        push_bounded(&mut view, entry, bound, &mut cutoff);
     }
     // Buffered-only groups (not yet committed at all) join the view.
     for (k, v) in delta_by_key.iter().filter(|(k, _)| !matched.contains(*k)) {
-        push_bounded(&mut view, (Some(*k), *v), bound);
+        push_bounded(&mut view, (Some(*k), *v), bound, &mut cutoff);
     }
     if !saw_null && delta_nulls > 0 {
-        push_bounded(&mut view, (None, delta_nulls), bound);
+        push_bounded(&mut view, (None, delta_nulls), bound, &mut cutoff);
     }
     if let Some(cmp) = cmp {
         match fp.limit {
@@ -10386,8 +10399,9 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// What the bound is worth at the cardinality that motivated it: the 1TB
-    /// `host` column, 1.15M distinct values, `ORDER BY count DESC LIMIT 100`.
+    /// Compare the previous partition-every-2K implementation with the cutoff
+    /// over 1.15M distinct groups. Reports collector-only medians, not SQL or
+    /// HTTP latency; the real benchmark still needs an end-to-end round.
     /// `cargo test -p siglake-query-server --lib report_bounded_top_k -- --ignored --nocapture`
     #[test]
     #[ignore = "measurement, not a gate"]
@@ -10397,40 +10411,63 @@ mod tests {
             kind: GroupKeyKind::Str,
         };
         let keys: Vec<String> = (0..1_150_000).map(|i| format!("host-{i:07}")).collect();
-        let counts: Vec<u64> = (0..keys.len())
-            .map(|i| ((i * 2_654_435_761) % 1_000_000) as u64)
-            .collect();
         let k = 100usize;
-
-        let started = std::time::Instant::now();
-        let mut full: Vec<(Option<&str>, u64)> = Vec::with_capacity(keys.len());
-        for (key, count) in keys.iter().zip(&counts) {
-            full.push((Some(key.as_str()), *count));
+        for distribution in ["uniform", "long_tail", "ties", "improving"] {
+            let counts: Vec<u64> = (0..keys.len())
+                .map(|i| match distribution {
+                    "uniform" => ((i * 2_654_435_761) % 1_000_000) as u64,
+                    "long_tail" => 1_000_000 / (1 + ((i * 2_654_435_761) % 1_000_000)) as u64,
+                    "ties" => 1,
+                    _ => i as u64,
+                })
+                .collect();
+            let mut reference: Vec<_> = keys
+                .iter()
+                .zip(&counts)
+                .map(|(key, count)| (Some(key.as_str()), *count))
+                .collect();
+            reference.sort_unstable_by(|a, b| cmp.compare(a, b));
+            reference.truncate(k);
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            // Alternate order so one arm does not always follow the other.
+            for round in 0..12 {
+                for arm in [round % 2 == 0, round % 2 != 0] {
+                    let started = std::time::Instant::now();
+                    let mut bounded = Vec::with_capacity(k * 2);
+                    let mut cutoff = None;
+                    for (key, count) in keys.iter().zip(&counts) {
+                        let entry = (Some(key.as_str()), *count);
+                        if arm {
+                            push_bounded(&mut bounded, entry, Some((k, cmp)), &mut cutoff);
+                        } else {
+                            bounded.push(entry);
+                            if bounded.len() >= k * 2 {
+                                bounded.select_nth_unstable_by(k - 1, |a, b| cmp.compare(a, b));
+                                bounded.truncate(k);
+                            }
+                        }
+                    }
+                    bounded.sort_unstable_by(|a, b| cmp.compare(a, b));
+                    bounded.truncate(k);
+                    let elapsed = started.elapsed().as_nanos();
+                    assert_eq!(bounded, reference, "{distribution}");
+                    std::hint::black_box(&bounded);
+                    if round > 0 {
+                        if arm {
+                            after.push(elapsed);
+                        } else {
+                            before.push(elapsed);
+                        }
+                    }
+                }
+            }
+            before.sort_unstable();
+            after.sort_unstable();
+            let before = before[before.len() / 2] as f64 / 1_000_000.0;
+            let after = after[after.len() / 2] as f64 / 1_000_000.0;
+            println!("{distribution}: top-{k} over {} groups: previous {before:.3}ms, cutoff {after:.3}ms = {:.2}x", keys.len(), before / after);
         }
-        full.select_nth_unstable_by(k - 1, |a, b| cmp.compare(a, b));
-        full.truncate(k);
-        full.sort_unstable_by(|a, b| cmp.compare(a, b));
-        let full_us = started.elapsed().as_micros();
-
-        let started = std::time::Instant::now();
-        let mut bounded: Vec<(Option<&str>, u64)> = Vec::with_capacity(k * 2);
-        for (key, count) in keys.iter().zip(&counts) {
-            push_bounded(&mut bounded, (Some(key.as_str()), *count), Some((k, cmp)));
-        }
-        bounded.sort_unstable_by(|a, b| cmp.compare(a, b));
-        bounded.truncate(k);
-        let bounded_us = started.elapsed().as_micros();
-
-        assert_eq!(bounded, full, "the bound must not change the answer");
-        println!(
-            "top-{k} over {} groups: full view {:.2}ms ({} MB held), bounded {:.2}ms ({} KB held) = {:.1}x",
-            keys.len(),
-            full_us as f64 / 1000.0,
-            keys.len() * std::mem::size_of::<(Option<&str>, u64)>() / 1_048_576,
-            bounded_us as f64 / 1000.0,
-            k * 2 * std::mem::size_of::<(Option<&str>, u64)>() / 1024,
-            full_us as f64 / bounded_us.max(1) as f64,
-        );
     }
 
     const BUFFER_PARTIAL_SQL: &str = "SELECT host, count(*) AS n FROM events GROUP BY host";
@@ -10575,6 +10612,7 @@ mod tests {
         let descending = mk(GroupCountSort::Count { ascending: false });
         let ascending = mk(GroupCountSort::Count { ascending: true });
         let by_group = mk(GroupCountSort::Group { ascending: true });
+        let by_group_desc = mk(GroupCountSort::Group { ascending: false });
 
         let keys: Vec<String> = (0..5_000).map(|i| format!("host-{i:05}")).collect();
         let entries: Vec<(Option<&str>, u64)> = keys
@@ -10592,15 +10630,16 @@ mod tests {
             .chain(std::iter::once((None, 42u64)))
             .collect();
 
-        for cmp in [descending, ascending, by_group] {
+        for cmp in [descending, ascending, by_group, by_group_desc] {
             for k in [1usize, 2, 10, 100, 999, 5_001] {
                 let mut reference: Vec<(Option<&str>, u64)> = entries.clone();
                 reference.sort_unstable_by(|a, b| cmp.compare(a, b));
                 reference.truncate(k);
 
                 let mut bounded: Vec<(Option<&str>, u64)> = Vec::new();
+                let mut cutoff = None;
                 for e in &entries {
-                    push_bounded(&mut bounded, *e, Some((k, cmp)));
+                    push_bounded(&mut bounded, *e, Some((k, cmp)), &mut cutoff);
                 }
                 bounded.sort_unstable_by(|a, b| cmp.compare(a, b));
                 bounded.truncate(k);
@@ -10615,6 +10654,62 @@ mod tests {
             }
         }
     }
+    /// Exercise a moving cutoff in both input directions, numeric key ordering,
+    /// ties, NULL, and an eventual winner arriving last (as a buffer-only group
+    /// does). Compare with a full sort rather than a second cutoff algorithm.
+    #[test]
+    fn bounded_top_k_cutoff_matches_full_sort_for_typed_and_late_groups() {
+        let keys: Vec<_> = (-250..250).map(|i| i.to_string()).collect();
+        for kind in [GroupKeyKind::Str, GroupKeyKind::Int, GroupKeyKind::Float] {
+            for sort in [
+                GroupCountSort::Count { ascending: true },
+                GroupCountSort::Count { ascending: false },
+                GroupCountSort::Group { ascending: true },
+                GroupCountSort::Group { ascending: false },
+            ] {
+                let cmp = GroupEntryCmp { sort, kind };
+                for reverse in [false, true] {
+                    for ties in [false, true] {
+                        let mut entries: Vec<_> = keys
+                            .iter()
+                            .enumerate()
+                            .map(|(i, key)| (Some(key.as_str()), if ties { 1 } else { i as u64 }))
+                            .collect();
+                        if reverse {
+                            entries.reverse();
+                        }
+                        entries.push((None, 600));
+                        entries.push((Some("1000"), 1000));
+                        for k in [1, 2, 7, 100, 251, 502, 503] {
+                            let mut reference = entries.clone();
+                            reference.sort_unstable_by(|a, b| cmp.compare(a, b));
+                            reference.truncate(k);
+                            let mut bounded = Vec::new();
+                            let mut cutoff = None;
+                            for entry in &entries {
+                                push_bounded(&mut bounded, *entry, Some((k, cmp)), &mut cutoff);
+                                assert!(bounded.len() < k * 2);
+                            }
+                            bounded.sort_unstable_by(|a, b| cmp.compare(a, b));
+                            bounded.truncate(k);
+                            assert_eq!(
+                                bounded, reference,
+                                "{kind:?} {sort:?} reverse={reverse} ties={ties} k={k}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let mut unbounded = Vec::new();
+        let mut cutoff = None;
+        for key in &keys {
+            push_bounded(&mut unbounded, (Some(key), 1), None, &mut cutoff);
+        }
+        assert_eq!(unbounded.len(), keys.len());
+        assert!(cutoff.is_none());
+    }
+
     use datafusion::execution::context::SessionContext;
     use datafusion::physical_plan::displayable;
     use siglake_core::index_config::{
@@ -14186,6 +14281,52 @@ mod tests {
         assert_eq!(fast.columns, expected.columns);
         assert_eq!(fast.row_count, expected.row_count);
         assert_eq!(fast.rows, expected.rows);
+    }
+
+    #[tokio::test]
+    async fn group_count_cutoff_merges_buffer_before_selecting_winners() {
+        // More than four times K committed groups engages the bounded collector. One
+        // existing group becomes the winner only after its delta is added;
+        // another winner exists only in the buffer and arrives after the
+        // committed iteration established the cutoff.
+        let mut committed = Vec::new();
+        for host in 0..100 {
+            committed.extend(std::iter::repeat_n(smoke_event(host), host + 1));
+        }
+        let mut buffered = vec![smoke_event(0); 130];
+        buffered.extend(std::iter::repeat_n(smoke_event(100), 120));
+        let query = "SELECT host, count(*) AS n FROM events GROUP BY host ORDER BY n DESC LIMIT 3";
+        let (_tmp, ice, _ctx, df) = dataframe_for(query, committed.clone()).await;
+        let cost = estimate(&df, &ice).await.unwrap();
+        let delta = BufferDelta {
+            batches: std::collections::HashMap::from([(
+                "events".to_string(),
+                vec![siglake_core::events_to_record_batch(&buffered).unwrap()],
+            )]),
+        };
+        let fast = try_group_count_fast_path_records(
+            &df,
+            &ice,
+            None,
+            cost,
+            Some(&delta),
+            AllowApproximate(false),
+        )
+        .await
+        .unwrap()
+        .expect("exact group count fast path");
+        committed.extend(buffered);
+        let reference = SessionContext::new();
+        reference
+            .register_batch(
+                "events",
+                siglake_core::events_to_record_batch(&committed).unwrap(),
+            )
+            .unwrap();
+        let batches = reference.sql(query).await.unwrap().collect().await.unwrap();
+        let expected = crate::format::batches_to_records(&batches, None).unwrap();
+        assert_eq!(fast.rows, expected.rows);
+        assert!(fast.approximation.is_none());
     }
 
     #[tokio::test]

@@ -466,3 +466,35 @@ Remove the per-file footer cap so high-cardinality columns get *complete*
 footers, and merge at query time. Measured ~0.5s for 12M entries — far short of
 1.82ms, but roughly 6× better than today's 3,081ms, for a much smaller change
 that never touches the commit path.
+
+## Exact top-K candidate cutoff (0.3.0, 2026-10-09)
+
+The bounded collector still partitioned every 100 candidates for a LIMIT 100,
+including candidates already known to lose. After each partition it now retains
+the Kth entry as a cutoff and rejects candidates that are no better, using the
+same count/key/NULL comparator as the final sort. Between partitions the cutoff
+can only be too permissive: retaining better candidates cannot make the true
+Kth entry worse. Buffered counts are merged before comparison; buffered-only
+groups pass through the same collector. Storage coverage checks and result-cache
+behavior are unchanged. This does not cache a leaderboard or approximate it.
+
+The collector measurement `report_bounded_top_k_vs_full_view` compares the
+previous algorithm with the cutoff over 1,150,000 distinct, ascending host keys,
+with K=100. Each arm checks its answer against a full sort. It alternates arm
+order for 12 rounds, discards the first, and reports the median of 11. An
+optimized (`rustc --test -O`) extraction of the actual comparator, collector and
+tests on an AMD Ryzen 9 5950X measured:
+
+| Count distribution | Previous collector | Cutoff collector | Speedup |
+| --- | ---: | ---: | ---: |
+| Pseudorandom uniform | 15.38 ms | 2.47 ms | 6.23x |
+| Long tail | 21.46 ms | 2.39 ms | 8.97x |
+| All counts tied | 28.74 ms | 5.86 ms | 4.91x |
+| Strictly improving candidates | 13.86 ms | 15.54 ms | 0.89x |
+
+These are synthetic collector timings, not HTTP latency or published benchmark
+results. The improving-input case exposes the extra comparison cost when every
+candidate survives; it is deliberately retained in the measurement. The Sep 2
+published `top_hosts` p50 of 142.29 ms includes planning, storage and response
+work this measurement does not cover. A matched HTTP-logs run with result caches
+off is required before changing that published result.
