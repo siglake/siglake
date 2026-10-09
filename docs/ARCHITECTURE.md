@@ -552,12 +552,17 @@ reclustering completes (`docs/DESIGN_time_ordered_storage.md`).
 - **inverted indexes** per configured text column: small blobs and sibling
   CRC-32 values ride the Parquet footer KV, while large ones live in
   checksummed-Zstd **Puffin sidecars** registered to the snapshot;
-- per-file **group-count** and **time-bucket** footers powering the aggregate
+- per-file **group-count**, **grouped numeric**, and **time-bucket** footers powering the aggregate
   fast paths — group counts use a compact front-coded binary encoding a query
   can read one column out of without touching the rest. Inferred typed group
   dimensions omit the canonical `timestamp_ns` event-time twin; explicitly
   declared dimensions and unrelated user fields with that name remain eligible
-  (`docs/DESIGN_group_count_footer_encoding.md`);
+  (`docs/DESIGN_group_count_footer_encoding.md`). The 0.3.0 grouped-numeric
+  footer is deliberately bounded to the published `GROUP BY status` / `AVG(size)`
+  shape. It records per-group row count, non-null measure count and exact sum;
+  the reader uses it only when every live file validates, otherwise the whole
+  query takes the normal scan path. `SIGLAKE_GROUPED_NUMERIC_FAST_PATH=off`
+  disables only this read path for rollback and matched measurement;
 - file-layout metadata plus rewrite-generation markers in the file *names*
   (`siglake-g<N>-…`), so compaction policy is computable from the manifest
   alone — nothing lifecycle-like is persisted that could disagree with policy.

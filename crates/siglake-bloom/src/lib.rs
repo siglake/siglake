@@ -30,8 +30,13 @@ pub const RAW_TRIGRAM_BLOOM_KV_KEY: &str = "siglake.raw_trigram_bloom.v1";
 pub const RAW_TRIGRAM_ROWGROUP_BLOOM_KV_KEY: &str = "siglake.raw_trigram_rowgroup_blooms.v1";
 
 pub mod group_counts;
+pub mod grouped_numeric;
 
 pub use group_counts::{ColumnCounts, GroupCounts, GROUP_COUNTS_KV_KEY};
+pub use grouped_numeric::{
+    GroupedNumericKind, GroupedNumericSum, GroupedNumericSummary, GroupedNumericValue,
+    GROUPED_NUMERIC_KV_KEY,
+};
 
 /// Parquet footer KV key holding the per-file time-bucket histogram: the row
 /// count per fixed [`TIME_BUCKET_BASE_NS`]-aligned timestamp bucket. Lets a

@@ -5117,6 +5117,27 @@ fn group_count_columns_for(schema: &arrow_schema::Schema, bloom_columns: &[&str]
     cols
 }
 
+/// The first bounded grouped-numeric footer targets the published http_logs
+/// shape. Keeping the pair explicit prevents write cost from growing as the
+/// square of a user schema's numeric columns; unsupported or renamed schemas
+/// simply retain the exact scan path.
+fn grouped_numeric_pair_for(schema: &arrow_schema::Schema) -> Option<(&'static str, &'static str)> {
+    let (_, group) = schema.column_with_name("status")?;
+    let (_, value) = schema.column_with_name("size")?;
+    let group_supported = matches!(
+        group.data_type(),
+        arrow_schema::DataType::Utf8
+            | arrow_schema::DataType::Int64
+            | arrow_schema::DataType::Float64
+            | arrow_schema::DataType::Boolean
+    );
+    let value_supported = matches!(
+        value.data_type(),
+        arrow_schema::DataType::Int64 | arrow_schema::DataType::Float64
+    );
+    (group_supported && value_supported).then_some(("status", "size"))
+}
+
 fn schema_has_canonical_nanos_twin(schema: &arrow_schema::Schema) -> bool {
     schema
         .column_with_name("timestamp")
@@ -17679,6 +17700,9 @@ impl IcebergContext {
                 MAX_GROUP_COUNT_CARDINALITY,
             )
             .with_time_bucket_column("timestamp");
+            if let Some((group, value)) = grouped_numeric_pair_for(batch.schema().as_ref()) {
+                parquet_builder = parquet_builder.with_grouped_numeric_pair(group, value);
+            }
             if !defer_indexes {
                 if let Some(col) = raw_rowgroup_bloom_column(&batch) {
                     parquet_builder = parquet_builder.with_raw_rowgroup_bloom_column(col);
@@ -17789,6 +17813,9 @@ impl IcebergContext {
                         MAX_GROUP_COUNT_CARDINALITY,
                     )
                     .with_time_bucket_column("timestamp");
+                    if let Some((group, value)) = grouped_numeric_pair_for(sub.schema().as_ref()) {
+                        parquet_builder = parquet_builder.with_grouped_numeric_pair(group, value);
+                    }
                     if let Some(col) = rowgroup_col {
                         parquet_builder = parquet_builder.with_raw_rowgroup_bloom_column(col);
                     }
@@ -20038,6 +20065,9 @@ impl IcebergContext {
                     MAX_GROUP_COUNT_CARDINALITY,
                 )
                 .with_time_bucket_column("timestamp");
+            if let Some((group, value)) = grouped_numeric_pair_for(arrow_schema.as_ref()) {
+                parquet_builder = parquet_builder.with_grouped_numeric_pair(group, value);
+            }
             if let Some(col) = raw_rowgroup_bloom_column_for_schema(&arrow_schema) {
                 parquet_builder = parquet_builder.with_raw_rowgroup_bloom_column(col);
             }
@@ -23289,6 +23319,15 @@ pub struct ScanCost {
     pub exact: bool,
 }
 
+/// Exact result row produced by the optional grouped numeric footer path.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupedNumericAvgRow {
+    pub group: Option<String>,
+    /// `None` matches SQL AVG over a group whose measure is entirely NULL.
+    pub avg: Option<f64>,
+    pub rows: u64,
+}
+
 /// What a query is served FROM: the current snapshot, current schema id, and
 /// table incarnation from one metadata generation.
 ///
@@ -25098,6 +25137,114 @@ impl IcebergContext {
         Ok(Some(totals))
     }
 
+    /// Exact `GROUP BY group, AVG(value), COUNT(*)` from optional per-file
+    /// summaries. Every live file must carry a valid summary; old files,
+    /// unknown versions, deletes, or arithmetic overflow return `None` so the
+    /// caller executes the normal SQL scan over the whole snapshot.
+    pub async fn grouped_numeric_avg(
+        &self,
+        table_name: &str,
+        group_column: &str,
+        value_column: &str,
+    ) -> Result<Option<Vec<GroupedNumericAvgRow>>> {
+        use siglake_bloom::{GroupedNumericKind, GroupedNumericSum, GroupedNumericValue};
+
+        let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
+        let cached = self.cached_table_entry(&table_ident).await?;
+        let tasks = self
+            .live_file_scan_tasks_cached(&table_ident, &cached)
+            .await?;
+        if tasks.iter().any(|task| {
+            task.data_file_format != DataFileFormat::Parquet || !task.deletes.is_empty()
+        }) {
+            return Ok(None);
+        }
+        let concurrency = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .clamp(1, 16);
+        let file_io = cached.table.file_io().clone();
+        let group = group_column.to_string();
+        let value = value_column.to_string();
+        let summaries: Vec<Option<siglake_bloom::GroupedNumericSummary>> =
+            futures::stream::iter(
+                tasks.as_ref().clone().into_iter().map(|task| {
+                    let file_io = file_io.clone();
+                    let path = task.data_file_path().to_string();
+                    let group = group.clone();
+                    let value = value.clone();
+                    async move {
+                        read_file_grouped_numeric_for_path(&file_io, &path, &group, &value).await
+                    }
+                }),
+            )
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
+        let mut kind = None;
+        let mut totals: BTreeMap<Option<String>, GroupedNumericValue> = BTreeMap::new();
+        for summary in summaries {
+            let Some(summary) = summary else {
+                metrics::counter!(
+                    "siglake_query_grouped_numeric_fallback_total",
+                    "reason" => "missing_or_invalid_footer"
+                )
+                .increment(1);
+                return Ok(None);
+            };
+            if kind
+                .replace(summary.kind)
+                .is_some_and(|k| k != summary.kind)
+            {
+                return Ok(None);
+            }
+            for (group, partial) in summary.groups {
+                let zero = match summary.kind {
+                    GroupedNumericKind::Int64 => GroupedNumericSum::Int(0),
+                    GroupedNumericKind::Float64 => GroupedNumericSum::Float(0.0),
+                };
+                let total = totals.entry(group).or_insert(GroupedNumericValue {
+                    rows: 0,
+                    non_null: 0,
+                    sum: zero,
+                });
+                let (Some(rows), Some(non_null)) = (
+                    total.rows.checked_add(partial.rows),
+                    total.non_null.checked_add(partial.non_null),
+                ) else {
+                    return Ok(None);
+                };
+                total.rows = rows;
+                total.non_null = non_null;
+                total.sum = match (total.sum, partial.sum) {
+                    (GroupedNumericSum::Int(left), GroupedNumericSum::Int(right)) => {
+                        let Some(sum) = left.checked_add(right) else {
+                            return Ok(None);
+                        };
+                        GroupedNumericSum::Int(sum)
+                    }
+                    (GroupedNumericSum::Float(left), GroupedNumericSum::Float(right)) => {
+                        GroupedNumericSum::Float(left + right)
+                    }
+                    _ => return Ok(None),
+                };
+            }
+        }
+        let rows = totals
+            .into_iter()
+            .map(|(group, value)| GroupedNumericAvgRow {
+                group,
+                avg: (value.non_null != 0).then(|| match value.sum {
+                    GroupedNumericSum::Int(sum) => sum as f64 / value.non_null as f64,
+                    GroupedNumericSum::Float(sum) => sum / value.non_null as f64,
+                }),
+                rows: value.rows,
+            })
+            .collect();
+        metrics::counter!("siglake_query_grouped_numeric_fast_path_total").increment(1);
+        Ok(Some(rows))
+    }
+
     pub async fn grouped_counts_with_summary(
         &self,
         table_name: &str,
@@ -25785,6 +25932,36 @@ async fn read_file_group_counts_for_path(
         out.push((None, nulls));
     }
     Ok(Some(out))
+}
+
+async fn read_file_grouped_numeric_for_path(
+    file_io: &FileIO,
+    path: &str,
+    group_column: &str,
+    value_column: &str,
+) -> Result<Option<siglake_bloom::GroupedNumericSummary>> {
+    let input = file_io
+        .new_input(path)
+        .with_context(|| format!("new_input {path}"))?;
+    let metadata = raw_page_load_metadata(&input).await?;
+    let file_rows = metadata.file_metadata().num_rows().max(0) as u64;
+    let Some(encoded) = footer_kv(&metadata, siglake_bloom::GROUPED_NUMERIC_KV_KEY) else {
+        return Ok(None);
+    };
+    let Some(summary) = siglake_bloom::GroupedNumericSummary::decode(encoded) else {
+        return Ok(None);
+    };
+    if summary.group_column != group_column || summary.value_column != value_column {
+        return Ok(None);
+    }
+    let covered = summary
+        .groups
+        .values()
+        .try_fold(0u64, |total, value| total.checked_add(value.rows));
+    if covered != Some(file_rows) {
+        return Ok(None);
+    }
+    Ok(Some(summary))
 }
 
 /// Fix 2a-coarse-read: roll the per-snapshot time-bucket aggregate up into a

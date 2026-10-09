@@ -1930,6 +1930,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   on the worker wire contract for a value that is not comparable across
   processes on its own.
 
+- **Grouped numeric footer acceleration is limited to `status` and `size`.**
+  In 0.3.0 the exact footer path recognizes the published
+  `GROUP BY status, AVG(size), COUNT(*)` shape without a filter. Other grouped
+  measures and filtered variants use the normal exact scan. Files written
+  before 0.3.0 gain no footer through migration; a mixed old/new snapshot also
+  scans until ordinary compaction has rewritten every live file. No rewrite is
+  required for correctness.
+
 - **The local, CI and kind stacks use frozen Bitnami Legacy MinIO images.**
   MinIO stopped publishing prebuilt community binaries, and its former Docker
   Hub and quay.io server and client repositories now refuse anonymous pulls.

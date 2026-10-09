@@ -171,6 +171,7 @@ pub struct ParquetWriterBuilder {
     raw_rowgroup_bloom_column: Option<String>,
     group_count_columns: Vec<String>,
     group_count_cap: usize,
+    grouped_numeric_pair: Option<(String, String)>,
     time_bucket_column: Option<String>,
     sort_order_id: Option<i32>,
     /// siglake extension (#4377): build a segmented (`seg2`) inverted-index
@@ -204,6 +205,7 @@ impl ParquetWriterBuilder {
             raw_rowgroup_bloom_column: None,
             group_count_columns: Vec::new(),
             group_count_cap: 0,
+            grouped_numeric_pair: None,
             time_bucket_column: None,
             sort_order_id: None,
             segmented_index: None,
@@ -254,6 +256,16 @@ impl ParquetWriterBuilder {
         self
     }
 
+    /// Stamp exact grouped SUM/non-null-count statistics for one numeric pair.
+    pub fn with_grouped_numeric_pair(
+        mut self,
+        group_column: impl Into<String>,
+        value_column: impl Into<String>,
+    ) -> Self {
+        self.grouped_numeric_pair = Some((group_column.into(), value_column.into()));
+        self
+    }
+
     /// Stamp an epoch-aligned time-bucket histogram for one timestamp column.
     pub fn with_time_bucket_column(mut self, column: impl Into<String>) -> Self {
         self.time_bucket_column = Some(column.into());
@@ -298,6 +310,25 @@ impl FileWriterBuilder for ParquetWriterBuilder {
     type R = ParquetWriter;
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
+        let grouped_numeric = self.grouped_numeric_pair.as_ref().and_then(|(group, value)| {
+            let field = self.schema.field_by_name(value)?;
+            let kind = match field.field_type.as_ref() {
+                Type::Primitive(PrimitiveType::Long) => {
+                    siglake_bloom::GroupedNumericKind::Int64
+                }
+                Type::Primitive(PrimitiveType::Double) => {
+                    siglake_bloom::GroupedNumericKind::Float64
+                }
+                _ => return None,
+            };
+            Some(siglake_bloom::GroupedNumericSummary::new(
+                group.clone(),
+                value.clone(),
+                kind,
+            ))
+        });
+        let grouped_numeric_disabled =
+            self.grouped_numeric_pair.is_some() && grouped_numeric.is_none();
         Ok(ParquetWriter {
             schema: self.schema.clone(),
             inner_writer: None,
@@ -314,6 +345,8 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             group_count_cap: self.group_count_cap,
             group_counts: std::collections::BTreeMap::new(),
             group_count_dropped: std::collections::HashSet::new(),
+            grouped_numeric,
+            grouped_numeric_disabled,
             time_bucket_column: self.time_bucket_column.clone(),
             time_buckets: std::collections::BTreeMap::new(),
             time_bucket_nulls: 0,
@@ -479,6 +512,8 @@ pub struct ParquetWriter {
     group_count_cap: usize,
     group_counts: std::collections::BTreeMap<String, siglake_bloom::ColumnCounts>,
     group_count_dropped: std::collections::HashSet<String>,
+    grouped_numeric: Option<siglake_bloom::GroupedNumericSummary>,
+    grouped_numeric_disabled: bool,
     time_bucket_column: Option<String>,
     time_buckets: std::collections::BTreeMap<i64, u64>,
     time_bucket_nulls: u64,
@@ -818,6 +853,94 @@ impl ParquetWriter {
     /// on a high-cardinality column is the bulk of the writer's live state.
     fn group_counts_footer_blob(&self) -> Option<String> {
         siglake_bloom::group_counts::encode_columns(&self.group_counts)
+    }
+
+    fn accumulate_grouped_numeric(&mut self, batch: &arrow_array::RecordBatch) {
+        use arrow_array::{Array, Float64Array, Int64Array, StringArray};
+        use siglake_bloom::{GroupedNumericKind, GroupedNumericSum, GroupedNumericValue};
+
+        let Some(summary) = self.grouped_numeric.as_mut() else {
+            return;
+        };
+        let Some((group_idx, _)) = batch.schema().column_with_name(&summary.group_column) else {
+            self.grouped_numeric_disabled = true;
+            self.grouped_numeric = None;
+            return;
+        };
+        let Some((value_idx, _)) = batch.schema().column_with_name(&summary.value_column) else {
+            self.grouped_numeric_disabled = true;
+            self.grouped_numeric = None;
+            return;
+        };
+        let casted;
+        let groups = match batch.column(group_idx).as_any().downcast_ref::<StringArray>() {
+            Some(groups) => groups,
+            None => match arrow_cast::cast::cast(
+                batch.column(group_idx),
+                &arrow_schema::DataType::Utf8,
+            ) {
+                Ok(array) => {
+                    casted = array;
+                    casted
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("cast to Utf8 yields StringArray")
+                }
+                Err(_) => {
+                    self.grouped_numeric_disabled = true;
+                    self.grouped_numeric = None;
+                    return;
+                }
+            },
+        };
+        let ints = batch.column(value_idx).as_any().downcast_ref::<Int64Array>();
+        let floats = batch
+            .column(value_idx)
+            .as_any()
+            .downcast_ref::<Float64Array>();
+        if (summary.kind == GroupedNumericKind::Int64 && ints.is_none())
+            || (summary.kind == GroupedNumericKind::Float64 && floats.is_none())
+        {
+            self.grouped_numeric_disabled = true;
+            self.grouped_numeric = None;
+            return;
+        }
+        for row in 0..batch.num_rows() {
+            let key = (!groups.is_null(row)).then(|| groups.value(row).to_string());
+            if !summary.groups.contains_key(&key)
+                && summary.groups.len() >= self.group_count_cap
+            {
+                self.grouped_numeric_disabled = true;
+                self.grouped_numeric = None;
+                return;
+            }
+            let initial_sum = match summary.kind {
+                GroupedNumericKind::Int64 => GroupedNumericSum::Int(0),
+                GroupedNumericKind::Float64 => GroupedNumericSum::Float(0.0),
+            };
+            let entry = summary.groups.entry(key).or_insert(GroupedNumericValue {
+                rows: 0,
+                non_null: 0,
+                sum: initial_sum,
+            });
+            entry.rows = entry.rows.saturating_add(1);
+            match (ints, floats, entry.sum) {
+                (Some(values), _, GroupedNumericSum::Int(sum)) if !values.is_null(row) => {
+                    let Some(next) = sum.checked_add(i128::from(values.value(row))) else {
+                        self.grouped_numeric_disabled = true;
+                        self.grouped_numeric = None;
+                        return;
+                    };
+                    entry.sum = GroupedNumericSum::Int(next);
+                    entry.non_null = entry.non_null.saturating_add(1);
+                }
+                (_, Some(values), GroupedNumericSum::Float(sum)) if !values.is_null(row) => {
+                    entry.sum = GroupedNumericSum::Float(sum + values.value(row));
+                    entry.non_null = entry.non_null.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// siglake: accumulate this batch's row counts per
@@ -1203,6 +1326,9 @@ impl FileWriter for ParquetWriter {
         if !self.group_count_columns.is_empty() {
             self.accumulate_group_counts(batch);
         }
+        if self.grouped_numeric.is_some() && !self.grouped_numeric_disabled {
+            self.accumulate_grouped_numeric(batch);
+        }
         if self.time_bucket_column.is_some() && !self.time_bucket_disabled {
             self.accumulate_time_buckets(batch);
         }
@@ -1263,6 +1389,15 @@ impl FileWriter for ParquetWriter {
                 siglake_bloom::GROUP_COUNTS_KV_KEY.to_string(),
                 Some(blob),
             ));
+        }
+
+        if !self.grouped_numeric_disabled {
+            if let Some(blob) = self.grouped_numeric.as_ref().and_then(|summary| summary.encode()) {
+                writer.append_key_value_metadata(KeyValue::new(
+                    siglake_bloom::GROUPED_NUMERIC_KV_KEY.to_string(),
+                    Some(blob),
+                ));
+            }
         }
 
         if let Some(json) = self.time_buckets_footer_json() {

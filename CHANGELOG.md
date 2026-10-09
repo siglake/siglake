@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Exact grouped AVG (feature, target 0.3.0)**: new Parquet files carry a
+  bounded `status`/`size` grouped numeric footer. The published
+  `SELECT status, avg(size), count(*) ... GROUP BY status ORDER BY count(*) DESC`
+  shape reads per-group sums, non-null counts and row counts without scanning
+  data pages. Every live file must carry a valid footer; old files, unknown
+  versions, filters, deletes and incomplete coverage retain the exact scan.
+
 - **Requested scan bytes**: SQL `stats.scan` now reports
   `bytes_data_requested`, the logical data-page bytes requested before range
   coalescing, beside the existing physical `bytes_data`. Distributed queries

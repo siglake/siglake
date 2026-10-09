@@ -66,6 +66,7 @@ confidently wrong pruning against files already on disk.
 | Artifact | Key | Version | Class | Unknown version ⇒ |
 |---|---|---|---|---|
 | Group-count footer | `siglake.group_counts.v1` | key + `LGCF`\|ver | accelerator | scan |
+| Grouped numeric footer | `siglake.grouped_numeric.v1` | key + `LGNS`\|ver | accelerator | scan |
 | Time-bucket footer | `siglake.time_buckets.v1` | key | accelerator | scan |
 | File layout metadata | `siglake.layout.v1` | key | accelerator | ignore |
 | Per-file trigram bloom | `siglake.raw_trigram_bloom.v1` | key + `LKBF`\|ver | **pruning** | **scan (no prune)** |
