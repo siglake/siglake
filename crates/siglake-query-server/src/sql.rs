@@ -4855,6 +4855,43 @@ async fn handle_local_inner(
                 record_metrics("sql", start, &result_meta, &cost);
                 return result_meta;
             }
+            if let Some(mut body) = under_request_deadline!(try_grouped_numeric_fast_path_records(
+                &df,
+                &ice,
+                shard,
+                cost.clone(),
+                delta
+            )) {
+                attach_fast_path_phases(
+                    &mut body,
+                    fast_path_plan_micros,
+                    buffer_delta_micros,
+                    battery_started,
+                    None,
+                );
+                let body = Arc::new(body);
+                if let Some(cache_ctx) = cache_ctx.clone() {
+                    finish_result_cache(
+                        cache_ctx,
+                        CacheEligibility::SQL,
+                        Some(CachedBody::Records(Arc::clone(&body))),
+                    )
+                    .await;
+                }
+                let result_meta: Result<Response, ApiError> =
+                    Ok((StatusCode::OK, Json(body.as_ref())).into_response());
+                emit_terminal_audit(
+                    state.audit.as_ref(),
+                    &identity,
+                    "sql",
+                    &req,
+                    start,
+                    &result_meta,
+                    &cost,
+                );
+                record_metrics("sql", start, &result_meta, &cost);
+                return result_meta;
+            }
             if let Some(mut body) = under_request_deadline!(try_group_count_fast_path_records(
                 &df,
                 &ice,
@@ -6417,6 +6454,16 @@ async fn run_batch_query_in(
     }
     match under_run_deadline!(
         Some(cost.clone()),
+        try_grouped_numeric_fast_path_records(&df, &ice, None, cost.clone(), None)
+    ) {
+        Ok(Some(body)) => return BatchOutcome::Ok(body, cost),
+        Ok(None) => {}
+        Err(err) => {
+            return BatchOutcome::Failed(format!("grouped numeric fast path: {err:#?}"), Some(cost))
+        }
+    }
+    match under_run_deadline!(
+        Some(cost.clone()),
         try_group_count_fast_path_records(&df, &ice, None, cost.clone(), None, allow_approximate)
     ) {
         Ok(Some(body)) => return BatchOutcome::Ok(body, cost),
@@ -6604,6 +6651,18 @@ struct GroupCountFastPath {
     /// string) from a bare `GROUP BY status`. The plan's output type is exactly
     /// what the planner would have produced, which is the thing this path has to
     /// match.
+    group_kind: GroupKeyKind,
+}
+
+#[derive(Debug, Clone)]
+struct GroupedNumericFastPath {
+    table_name: String,
+    group_column: String,
+    value_column: String,
+    group_output_column: String,
+    avg_output_column: String,
+    count_output_column: String,
+    limit: Option<usize>,
     group_kind: GroupKeyKind,
 }
 
@@ -7549,6 +7608,88 @@ async fn try_windowed_count_fast_path_records(
     }))
 }
 
+async fn try_grouped_numeric_fast_path_records(
+    df: &DataFrame,
+    ice: &siglake_storage::iceberg::IcebergContext,
+    shard: Option<siglake_storage::ScanShard>,
+    cost: CostReport,
+    delta: Option<&BufferDelta>,
+) -> Result<Option<crate::format::RecordsResponse>, ApiError> {
+    if !grouped_numeric_fast_path_enabled() || shard.is_some() || delta.is_some() {
+        return Ok(None);
+    }
+    let Some(fp) = detect_grouped_numeric_fast_path(df.logical_plan()) else {
+        return Ok(None);
+    };
+    let Some(mut rows) = ice
+        .grouped_numeric_avg(&fp.table_name, &fp.group_column, &fp.value_column)
+        .await
+        .map_err(ApiError::internal)?
+    else {
+        return Ok(None);
+    };
+    rows.sort_by(|left, right| {
+        right.rows.cmp(&left.rows).then_with(|| {
+            match (left.group.as_deref(), right.group.as_deref()) {
+                (Some(left), Some(right)) => fp.group_kind.cmp_keys(left, right),
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        })
+    });
+    if let Some(limit) = fp.limit {
+        rows.truncate(limit);
+    }
+    let json_rows = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                fp.group_output_column.clone(): row.group.as_deref().map_or(serde_json::Value::Null, |key| fp.group_kind.render(key)),
+                fp.avg_output_column.clone(): row.avg,
+                fp.count_output_column.clone(): row.rows,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Some(crate::format::RecordsResponse {
+        columns: vec![
+            fp.group_output_column,
+            fp.avg_output_column,
+            fp.count_output_column,
+        ],
+        row_count: json_rows.len(),
+        rows: serde_json::Value::Array(json_rows),
+        truncated: false,
+        max_rows: None,
+        cost: Some(cost),
+        stats: Some(crate::format::ScanStats {
+            served_by: Some("grouped_numeric_footer".to_string()),
+            ..Default::default()
+        }),
+        approximation: None,
+    }))
+}
+
+fn grouped_numeric_fast_path_from(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
+}
+
+fn grouped_numeric_fast_path_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        grouped_numeric_fast_path_from(
+            std::env::var("SIGLAKE_GROUPED_NUMERIC_FAST_PATH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
 async fn try_group_count_fast_path_response(
     df: &DataFrame,
     ice: &siglake_storage::iceberg::IcebergContext,
@@ -8118,6 +8259,141 @@ fn detect_count_fast_path(plan: &LogicalPlan) -> Option<CountFastPath> {
         }
         _ => None,
     }
+}
+
+fn detect_grouped_numeric_fast_path(plan: &LogicalPlan) -> Option<GroupedNumericFastPath> {
+    let output_schema = plan.schema().clone();
+    let mut plan = plan;
+    let mut limit = None;
+    if let LogicalPlan::Limit(Limit {
+        skip, fetch, input, ..
+    }) = plan
+    {
+        let skip_zero = skip.as_deref().is_none()
+            || matches!(skip.as_deref(), Some(Expr::Literal(value, _)) if literal_nonnegative_usize(value) == Some(0));
+        if !skip_zero {
+            return None;
+        }
+        limit = match fetch.as_deref() {
+            Some(Expr::Literal(value, _)) => literal_nonnegative_usize(value),
+            None => None,
+            _ => return None,
+        };
+        plan = input.as_ref();
+    }
+    let LogicalPlan::Sort(Sort {
+        expr, input, fetch, ..
+    }) = plan
+    else {
+        return None;
+    };
+    if expr.len() != 1 || expr[0].asc || !expr[0].nulls_first {
+        return None;
+    }
+    let Expr::Column(sort_column) = &expr[0].expr else {
+        return None;
+    };
+    if let Some(fetch) = fetch {
+        limit = Some(limit.map_or(*fetch, |existing| existing.min(*fetch)));
+    }
+    plan = input.as_ref();
+    let (aggregate, projection) = match plan {
+        LogicalPlan::Projection(projection) => match projection.input.as_ref() {
+            LogicalPlan::Aggregate(aggregate) => (aggregate, Some(projection)),
+            _ => return None,
+        },
+        LogicalPlan::Aggregate(aggregate) => (aggregate, None),
+        _ => return None,
+    };
+    if aggregate.group_expr.len() != 1 || aggregate.aggr_expr.len() != 2 {
+        return None;
+    }
+    let group_column = unwrap_alias_to_column(&aggregate.group_expr[0])?;
+    let mut value_column = None;
+    let mut avg_index = None;
+    let mut count_index = None;
+    for (index, expr) in aggregate.aggr_expr.iter().enumerate() {
+        if is_exact_count_star(expr) {
+            count_index = Some(index + 1);
+        } else if let Some(column) = exact_avg_column(expr) {
+            value_column = Some(column);
+            avg_index = Some(index + 1);
+        } else {
+            return None;
+        }
+    }
+    let (value_column, avg_index, count_index) = (value_column?, avg_index?, count_index?);
+    let LogicalPlan::TableScan(scan) = aggregate.input.as_ref() else {
+        return None;
+    };
+    if !scan.filters.is_empty() || !is_count_fast_path_table(scan.table_name.table()) {
+        return None;
+    }
+    let internal = aggregate.schema.fields();
+    if internal.len() != 3 {
+        return None;
+    }
+    let output_names = if let Some(projection) = projection {
+        if projection.expr.len() != 3 {
+            return None;
+        }
+        for (expr, field) in projection.expr.iter().zip(internal) {
+            if passthrough_column_name(expr)?.as_str() != field.name() {
+                return None;
+            }
+        }
+        projection
+            .schema
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>()
+    } else {
+        internal
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>()
+    };
+    let count_output_column = output_names[count_index].clone();
+    if sort_column.name != count_output_column {
+        return None;
+    }
+    let group_output_column = output_names[0].clone();
+    let group_kind = GroupKeyKind::from_data_type(
+        output_schema
+            .field_with_unqualified_name(&group_output_column)
+            .ok()?
+            .data_type(),
+    )?;
+    Some(GroupedNumericFastPath {
+        table_name: scan.table_name.table().to_string(),
+        group_column: group_column.name.clone(),
+        value_column,
+        group_output_column,
+        avg_output_column: output_names[avg_index].clone(),
+        count_output_column,
+        limit,
+        group_kind,
+    })
+}
+
+fn exact_avg_column(expr: &Expr) -> Option<String> {
+    let mut expr = expr;
+    while let Expr::Alias(alias) = expr {
+        expr = alias.expr.as_ref();
+    }
+    let Expr::AggregateFunction(aggregate) = expr else {
+        return None;
+    };
+    if !aggregate.func.name().eq_ignore_ascii_case("avg")
+        || aggregate.params.distinct
+        || aggregate.params.filter.is_some()
+        || !aggregate.params.order_by.is_empty()
+        || aggregate.params.args.len() != 1
+    {
+        return None;
+    }
+    unwrap_alias_to_column(&aggregate.params.args[0]).map(|column| column.name.clone())
 }
 
 fn detect_group_count_fast_path(plan: &LogicalPlan) -> Option<GroupCountFastPath> {
@@ -10327,6 +10603,15 @@ mod tests {
 
     use chrono::{TimeZone, Utc};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+
+    #[test]
+    fn grouped_numeric_fast_path_switch_defaults_on_and_parses_off_values() {
+        assert!(grouped_numeric_fast_path_from(None));
+        assert!(grouped_numeric_fast_path_from(Some("on")));
+        for value in ["off", "0", "false", "NO"] {
+            assert!(!grouped_numeric_fast_path_from(Some(value)), "{value}");
+        }
+    }
 
     fn strip_table_metadata_for_test(warehouse: &std::path::Path, index_id: &str) -> usize {
         let mut removed = 0;
@@ -16152,6 +16437,10 @@ async fn distributed_inner(
             Some(body)
         } else if let Some(body) =
             try_count_distinct_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
+        {
+            Some(body)
+        } else if let Some(body) =
+            try_grouped_numeric_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
         {
             Some(body)
         } else if let Some(body) = try_group_count_fast_path_records(

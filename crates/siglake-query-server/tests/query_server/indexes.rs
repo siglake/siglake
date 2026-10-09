@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
@@ -958,14 +959,19 @@ async fn index_aggregate_result_caches_and_invalidates_on_commit() {
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{body:?}");
-            body.unwrap()["rows"].clone()
+            body.unwrap()
         }
     };
 
     let first = run().await;
-    assert_eq!(first[0]["status"].as_i64(), Some(200));
-    assert_eq!(first[0]["avg_size"].as_f64(), Some(20.0));
-    assert_eq!(first[0]["n"].as_i64(), Some(2));
+    assert_eq!(first["stats"]["rows_scanned"].as_u64(), Some(0));
+    assert_eq!(
+        first["stats"]["served_by"].as_str(),
+        Some("grouped_numeric_footer")
+    );
+    assert_eq!(first["rows"][0]["status"].as_i64(), Some(200));
+    assert_eq!(first["rows"][0]["avg_size"].as_f64(), Some(20.0));
+    assert_eq!(first["rows"][0]["n"].as_i64(), Some(2));
     // Repeat at the same snapshot: identical (served from the result cache —
     // correctness assertion; the caching itself is observable via the
     // siglake_query_sql_result_cache_requests_total{outcome} counters).
@@ -974,7 +980,7 @@ async fn index_aggregate_result_caches_and_invalidates_on_commit() {
     // A commit moves the snapshot: the cached entry must NOT be replayed.
     // (Both groups tie at n=2 afterward, so assert by group, not position.)
     append(vec![(404, 300)]).await;
-    let third = run().await;
+    let third = run().await["rows"].clone();
     let by_status = |code: i64| {
         third
             .as_array()
@@ -987,6 +993,228 @@ async fn index_aggregate_result_caches_and_invalidates_on_commit() {
     assert_eq!(by_status(200)["n"].as_i64(), Some(2));
     assert_eq!(by_status(404)["n"].as_i64(), Some(2));
     assert_eq!(by_status(404)["avg_size"].as_f64(), Some(200.0));
+}
+
+#[tokio::test]
+async fn grouped_numeric_footer_preserves_float_null_group_and_filter_semantics() {
+    let srv = spawn(AuthConfig::open()).await;
+    let mut config = logs_config("agg-float");
+    config
+        .doc_mapping
+        .field_mappings
+        .push(field("status", FieldType::Long, false));
+    config
+        .doc_mapping
+        .field_mappings
+        .push(field("size", FieldType::Double, false));
+    let (status, _) = request_json(
+        &srv.app,
+        Method::POST,
+        "/api/v1/indexes",
+        Some(serde_json::to_value(&config).unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let now = Utc::now();
+    let attributes = [
+        r#"{"status":200,"size":1.5}"#,
+        r#"{"status":200}"#,
+        r#"{"status":404,"size":2.5}"#,
+        r#"{"status":404,"size":3.5}"#,
+        r#"{"size":4.0}"#,
+        r#"{"status":500}"#,
+    ];
+    let events: Vec<Event> = attributes
+        .into_iter()
+        .map(|attributes| {
+            let mut event = log_event(now, "web", "line");
+            event.attributes = Some(attributes.to_string());
+            event
+        })
+        .collect();
+    let carrier = events_to_record_batch(&events).unwrap();
+    let mapped = siglake_core::mapping::map_carrier_batch(&carrier, &config).unwrap();
+    srv.ice
+        .append_to_table(&srv.ice.index_table_ident("agg-float"), mapped, &[])
+        .await
+        .unwrap();
+    let footer_rows = srv
+        .ice
+        .grouped_numeric_avg("agg-float", "status", "size")
+        .await
+        .unwrap();
+    assert!(
+        footer_rows.is_some(),
+        "grouped numeric footer was not readable"
+    );
+
+    let (status, body) = request_json(
+        &srv.app,
+        Method::POST,
+        "/api/v1/sql",
+        Some(serde_json::json!({
+            "query": "SELECT status, avg(size) AS avg_size, count(*) AS n FROM \"agg-float\" GROUP BY status ORDER BY n DESC LIMIT 20"
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let body = body.unwrap();
+    assert_eq!(
+        body["stats"]["served_by"].as_str(),
+        Some("grouped_numeric_footer")
+    );
+    let rows = body["rows"].as_array().unwrap();
+    let group = |status: Option<i64>| {
+        rows.iter()
+            .find(|row| {
+                row["status"].as_i64() == status && row["status"].is_null() == status.is_none()
+            })
+            .unwrap()
+    };
+    assert_eq!(group(Some(200))["n"].as_i64(), Some(2));
+    assert_eq!(group(Some(200))["avg_size"].as_f64(), Some(1.5));
+    assert_eq!(group(Some(404))["avg_size"].as_f64(), Some(3.0));
+    assert_eq!(group(None)["avg_size"].as_f64(), Some(4.0));
+    assert!(group(Some(500))["avg_size"].is_null());
+
+    // A dimensional filter is outside the footer contract and must keep the
+    // normal exact planner path.
+    let (status, filtered) = request_json(
+        &srv.app,
+        Method::POST,
+        "/api/v1/sql",
+        Some(serde_json::json!({
+            "query": "SELECT status, avg(size) AS avg_size, count(*) AS n FROM \"agg-float\" WHERE status = 200 GROUP BY status ORDER BY n DESC LIMIT 20"
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{filtered:?}");
+    let filtered = filtered.unwrap();
+    assert_eq!(filtered["stats"]["served_by"].as_str(), Some("scan"));
+    assert_eq!(filtered["rows"][0]["avg_size"].as_f64(), Some(1.5));
+}
+
+fn process_cpu_ticks() -> u64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let fields = stat
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+}
+
+fn resident_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// Local matched measurement for the published query. Run in separate
+/// processes with `SIGLAKE_GROUPED_NUMERIC_FAST_PATH=off` and `on`, and with
+/// `SIGLAKE_QUERY_RESULT_CACHE_CAP=0`; it prints raw per-request wall time,
+/// process CPU ticks, and sampled resident memory for retention with the SHA.
+#[tokio::test]
+#[ignore = "bounded local performance measurement"]
+async fn measure_avg_size_by_status_scan_and_footer() {
+    let srv = spawn(AuthConfig::open()).await;
+    let mut config = logs_config("httplogs");
+    config
+        .doc_mapping
+        .field_mappings
+        .push(field("status", FieldType::Long, false));
+    config
+        .doc_mapping
+        .field_mappings
+        .push(field("size", FieldType::Long, false));
+    let (status, _) = request_json(
+        &srv.app,
+        Method::POST,
+        "/api/v1/indexes",
+        Some(serde_json::to_value(&config).unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let now = Utc::now();
+    let events: Vec<Event> = (0..250_000)
+        .map(|row| {
+            let mut event = log_event(now, "web", "line");
+            event.attributes = Some(format!(
+                r#"{{"status":{},"size":{}}}"#,
+                [200, 201, 204, 301, 400, 404, 500, 502, 503][row % 9],
+                (row * 31) % 65_536
+            ));
+            event
+        })
+        .collect();
+    let carrier = events_to_record_batch(&events).unwrap();
+    let mapped = siglake_core::mapping::map_carrier_batch(&carrier, &config).unwrap();
+    srv.ice
+        .append_to_table(&srv.ice.index_table_ident("httplogs"), mapped, &[])
+        .await
+        .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler_stop = Arc::clone(&stop);
+    let sampler = std::thread::spawn(move || {
+        let mut peak = 0;
+        while !sampler_stop.load(Ordering::Relaxed) {
+            peak = peak.max(resident_kib());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        peak
+    });
+    let cpu_before = process_cpu_ticks();
+    let rss_before = resident_kib();
+    let sql = "SELECT status, avg(size) AS avg_size, count(*) AS n FROM \"httplogs\" GROUP BY status ORDER BY n DESC LIMIT 20";
+    let mut wall_ms = Vec::new();
+    let mut served_by = None;
+    for _ in 0..6 {
+        let started = std::time::Instant::now();
+        let (status, body) = request_json(
+            &srv.app,
+            Method::POST,
+            "/api/v1/sql",
+            Some(serde_json::json!({ "query": sql })),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        wall_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        served_by = body.unwrap()["stats"]["served_by"]
+            .as_str()
+            .map(str::to_string);
+    }
+    let cpu_ticks = process_cpu_ticks() - cpu_before;
+    stop.store(true, Ordering::Relaxed);
+    let peak_rss_kib = sampler.join().unwrap();
+    println!(
+        "{}",
+        serde_json::json!({
+            "query": sql,
+            "rows": 250_000,
+            "runs": 6,
+            "wall_ms": wall_ms,
+            "cpu_ticks": cpu_ticks,
+            "rss_before_kib": rss_before,
+            "peak_rss_kib": peak_rss_kib,
+            "served_by": served_by,
+            "result_cache": "disabled by command",
+            "state": "first request cold; remaining requests warm"
+        })
+    );
 }
 
 /// #61 per-index buffer serving: rows sealed in a user index's WAL but not yet
