@@ -367,6 +367,15 @@ job_started=$SECONDS
 # of the workspace from the gate report. A red run therefore still pays the
 # full ~6-7 minute workspace-test cost.
 : >"$LOG_DIR/test.log"
+test_refresh_failed=0
+if refreshed_workspace_source_count=$(refresh_workspace_sources 2>>"$LOG_DIR/test.log"); then
+  printf 'refreshed %s workspace sources before the test build\n' \
+    "$refreshed_workspace_source_count" >>"$LOG_DIR/test.log"
+else
+  echo "error: failed to refresh workspace sources before the test build" \
+    >>"$LOG_DIR/test.log"
+  test_refresh_failed=1
+fi
 test_attempt=1
 test_contamination=0
 test_contaminated_twice=0
@@ -439,6 +448,10 @@ while :; do
     break
   fi
 done
+
+if [ "$test_refresh_failed" -eq 1 ]; then
+  test_rc=1
+fi
 
 if [ "$test_contaminated_twice" -eq 1 ]; then
   contamination_red=1
@@ -689,20 +702,11 @@ run_generators() {
 
 run_generators
 if [ "$gen_differed" -eq 1 ]; then
-  workspace_sources=()
-  for manifest in crates/*/Cargo.toml third_party/*/Cargo.toml; do
-    crate_dir=${manifest%/Cargo.toml}
-    if [ -f "$crate_dir/src/lib.rs" ]; then
-      workspace_sources+=("$crate_dir/src/lib.rs")
-    elif [ -f "$crate_dir/src/main.rs" ]; then
-      workspace_sources+=("$crate_dir/src/main.rs")
-    fi
-  done
   # This confirmation still writes this checkout's units into the shared
   # target with newer mtimes, so another checkout can lose the same race in
   # reverse. Splitting manager target dirs is the complete fix; test binaries
   # are outside this generated-artifact check's scope.
-  if touch "${workspace_sources[@]}" >>"$glog" 2>&1; then
+  if refresh_workspace_sources >/dev/null 2>>"$glog"; then
     run_generators
     echo "first pass differed; rebuilt from this checkout and re-diffed (shared CARGO_TARGET_DIR race)" \
       >>"$glog"
