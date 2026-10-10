@@ -533,6 +533,12 @@ count by 99.87%, allocated bytes by 88% and peak heap growth by 87%. The test
 compares every streamed row with the full decoder and the streaming top 100
 with full decode plus sort before it passes.
 
+An exact-candidate rerun at `b436c4f` measured 113.80 / 113.73 ms for owned
+wall / CPU and 52.41 / 52.39 ms for streaming validation plus selection, with
+the same 1,149,552 versus 1,462 allocation counts. The regression from the
+three-run range below is retained rather than hidden; streaming still reduced
+this rerun's decoder-plus-selection wall time by 54%.
+
 The raw real-fixture readings were:
 
 | Run | Owned wall / CPU ms | Prepare wall / CPU ms | Select wall / CPU ms | Stream total wall / CPU ms |
