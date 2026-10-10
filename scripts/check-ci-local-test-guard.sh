@@ -10,6 +10,8 @@ check_dir=$(mktemp -d "${TMPDIR:-/tmp}/siglake-test-guard.XXXXXX")
 trap 'rm -rf -- "$check_dir"' EXIT
 
 workspace="$check_dir/workspace"
+fixture_doc_extension=md
+fixture_doc="$workspace/docs/x.${fixture_doc_extension}"
 mkdir -p \
   "$workspace/crates/a/src" \
   "$workspace/crates/b/src" \
@@ -24,7 +26,7 @@ touch \
   "$workspace/crates/b/src/main.rs" \
   "$workspace/third_party/c/Cargo.toml" \
   "$workspace/third_party/c/src/lib.rs" \
-  "$workspace/docs/x.md"
+  "$fixture_doc"
 git -C "$workspace" init -q
 git -C "$workspace" add .
 git -C "$workspace" \
@@ -39,10 +41,10 @@ touch -d '2 hours ago' \
   "$workspace/crates/b/src/main.rs" \
   "$workspace/third_party/c/Cargo.toml" \
   "$workspace/third_party/c/src/lib.rs" \
-  "$workspace/docs/x.md"
+  "$fixture_doc"
 marker="$check_dir/marker"
 touch -d '1 hour ago' "$marker"
-docs_mtime=$(stat -c '%Y' -- "$workspace/docs/x.md")
+docs_mtime=$(stat -c '%Y' -- "$fixture_doc")
 (
   cd "$workspace"
   refreshed_workspace_source_count=$(refresh_workspace_sources)
@@ -61,8 +63,8 @@ docs_mtime=$(stat -c '%Y' -- "$workspace/docs/x.md")
       exit 1
     fi
   done
-  if [ "$(stat -c '%Y' -- docs/x.md)" != "$docs_mtime" ]; then
-    echo "FAIL refresh changed docs/x.md" >&2
+  if [ "$(stat -c '%Y' -- "$fixture_doc")" != "$docs_mtime" ]; then
+    echo "FAIL refresh changed the documentation fixture" >&2
     exit 1
   fi
   if [ -n "$(git status --porcelain)" ]; then
