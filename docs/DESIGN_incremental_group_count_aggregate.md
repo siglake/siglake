@@ -521,14 +521,14 @@ The primary input is the read-only HTTP-logs capture at
 It carries 1,149,519 real host groups in a 3,515 KiB encoded blob. Set
 `SIGLAKE_GROUP_COUNT_PROFILE_FIXTURE` to that file and run
 `report_real_fixture_decode_materialization_cost`. Three release runs at
-`7b21dac` measured:
+`765731d` measured:
 
 | Real captured arm | Wall ms | Process CPU ms | Allocations | Allocated MiB | Peak heap growth MiB |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Owned targeted decode | 93.54–104.67 | 93.51–104.67 | 1,149,552 | 158.26 | 83.68 |
-| Streaming validation + top-100 selection | 48.36–49.61 | 48.36–49.61 | 1,462 | 18.72 | 10.70 |
+| Owned targeted decode | 101.00–102.85 | 100.94–102.83 | 1,149,552 | 158.26 | 83.68 |
+| Streaming validation + top-100 selection | 48.27–51.55 | 48.27–51.55 | 1,462 | 18.72 | 10.70 |
 
-The real input reduced decoder-plus-selection wall/CPU by 47–54%, allocation
+The real input reduced decoder-plus-selection wall/CPU by 49–53%, allocation
 count by 99.87%, allocated bytes by 88% and peak heap growth by 87%. The test
 compares every streamed row with the full decoder and the streaming top 100
 with full decode plus sort before it passes.
@@ -537,9 +537,9 @@ The raw real-fixture readings were:
 
 | Run | Owned wall / CPU ms | Prepare wall / CPU ms | Select wall / CPU ms | Stream total wall / CPU ms |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 98.28 / 98.26 | 28.72 / 28.72 | 19.64 / 19.64 | 48.36 / 48.36 |
-| 2 | 93.54 / 93.51 | 28.77 / 28.77 | 19.79 / 19.78 | 48.56 / 48.55 |
-| 3 | 104.67 / 104.67 | 28.84 / 28.84 | 20.78 / 20.77 | 49.61 / 49.61 |
+| 1 | 101.00 / 100.94 | 31.98 / 31.97 | 19.58 / 19.58 | 51.55 / 51.55 |
+| 2 | 102.85 / 102.83 | 28.79 / 28.79 | 19.49 / 19.48 | 48.27 / 48.27 |
+| 3 | 101.63 / 101.62 | 28.96 / 28.95 | 19.69 / 19.68 | 48.65 / 48.62 |
 
 The synthetic input remains as a repository-local reproduction. It has a
 1,453 KiB encoded payload with 1,149,520 non-NULL keys and one NULL group,
@@ -549,10 +549,10 @@ three-run invocation measured:
 
 | Synthetic arm | Wall ms | Process CPU ms | Allocations | Allocated MiB | Peak heap growth MiB |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Owned targeted decode | 63.30–67.70 | 63.30–67.70 | 1,149,553 | 157.62 | 84.56 |
-| Streaming validation + top-100 selection | 39.51–42.24 | 39.50–42.24 | 732 | 17.20 | 9.19 |
+| Owned targeted decode | 64.00–65.98 | 63.97–65.98 | 1,149,553 | 157.62 | 84.56 |
+| Streaming validation + top-100 selection | 39.93–40.50 | 39.93–40.49 | 732 | 17.20 | 9.19 |
 
-That input reduced decoder-plus-selection wall/CPU by 37–38%, allocation count
+That input reduced decoder-plus-selection wall/CPU by 37–39%, allocation count
 by 99.94% and peak heap growth by 89%. Both profiles are local codec/selection
 evidence, not a public HTTP result.
 
@@ -560,9 +560,9 @@ The raw synthetic readings were:
 
 | Run | Owned wall / CPU ms | Prepare wall / CPU ms | Select wall / CPU ms | Stream total wall / CPU ms |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 67.70 / 67.70 | 25.02 / 25.02 | 17.22 / 17.22 | 42.24 / 42.24 |
-| 2 | 66.71 / 66.71 | 25.01 / 25.00 | 16.70 / 16.70 | 41.71 / 41.70 |
-| 3 | 63.30 / 63.30 | 22.91 / 22.91 | 16.59 / 16.59 | 39.51 / 39.50 |
+| 1 | 64.00 / 63.97 | 23.51 / 23.51 | 16.99 / 16.99 | 40.50 / 40.49 |
+| 2 | 65.98 / 65.98 | 23.16 / 23.16 | 16.77 / 16.77 | 39.93 / 39.93 |
+| 3 | 65.02 / 65.02 | 23.27 / 23.27 | 16.78 / 16.78 | 40.06 / 40.06 |
 
 The read path now retains the decoded compact body, reconstructs every column's
 keys to validate the whole body before returning, and reconstructs the selected
