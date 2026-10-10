@@ -1944,9 +1944,16 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `sum / count` returned `31.458800533996442`, one binary64 unit in the last
   place apart. A footer function of exact `(sum, count)` cannot reproduce every
   layout-dependent scan answer: `[2^53, 1, -2^53]` sums to either `0` or `1`
-  in binary64 depending on addition order, despite one exact sum and count.
-  Strict bitwise qualification therefore remains open; Siglake does not round,
-  special-case a status or apply a tolerance.
+  in binary64 depending on addition order, despite one exact sum and count. A
+  bounded reproduction also found a renderer difference in the observed pair:
+  Arrow JSON writes `31.458800533996442`, but the scan records path's
+  serde_json parser, built without `float_roundtrip`, reads that token as the
+  adjacent lower value before the HTTP response is serialized. The footer path
+  constructs its JSON value directly. This reproduces both retained response
+  strings, although the AWS receipt has no pre-render scan bits or input bounds
+  with which to exclude a simultaneous accumulation difference. Strict bitwise
+  qualification therefore remains open; Siglake does not round, special-case a
+  status or apply a tolerance.
 
 - **The local, CI and kind stacks use frozen Bitnami Legacy MinIO images.**
   MinIO stopped publishing prebuilt community binaries, and its former Docker
