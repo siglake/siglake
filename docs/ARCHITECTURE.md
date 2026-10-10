@@ -554,7 +554,10 @@ reclustering completes (`docs/DESIGN_time_ordered_storage.md`).
   checksummed-Zstd **Puffin sidecars** registered to the snapshot;
 - per-file **group-count**, **grouped numeric**, and **time-bucket** footers powering the aggregate
   fast paths — group counts use a compact front-coded binary encoding a query
-  can read one column out of without touching the rest. Inferred typed group
+  can read one column out of without touching the rest. Wide Tier-1 reads keep
+  the decoded body and reconstruct that column's keys in one reusable buffer;
+  a top-K query owns only competitive keys, while count and predicate consumers
+  own none. The full decoder remains for folds and diagnostics. Inferred typed group
   dimensions omit the canonical `timestamp_ns` event-time twin; explicitly
   declared dimensions and unrelated user fields with that name remain eligible
   (`docs/DESIGN_group_count_footer_encoding.md`). The 0.3.0 grouped-numeric

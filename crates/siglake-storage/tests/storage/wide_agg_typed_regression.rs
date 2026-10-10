@@ -148,7 +148,8 @@ async fn a_wide_text_column_keeps_tier1_when_a_typed_measurement_is_present() {
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("counts for {column}"));
-        let total: u64 = g.iter().map(|(_, c)| c).sum();
+        let mut total = 0u64;
+        g.for_each(|_, count| total = total.saturating_add(count));
         println!(
             "column={column:<7} served_by={:<14} groups={:<6} total={total}",
             g.source_label(),

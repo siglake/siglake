@@ -14,6 +14,7 @@ experimental-exact-point-rollup = []
 [dev-dependencies]
 arrow-array = { workspace = true }
 chrono = { workspace = true }
+libc = "0.2"
 metrics-util = "0.20"
 proptest = { workspace = true }
 # OpenDAL 0.57's HttpClient accepts its Reqwest 0.13 type, while the workspace

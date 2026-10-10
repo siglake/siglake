@@ -221,7 +221,9 @@ async fn served(ice: &IcebergContext, index: &str) -> (String, u64) {
         .await
         .unwrap()
         .unwrap();
-    (g.source_label().to_string(), g.iter().map(|(_, c)| c).sum())
+    let mut total = 0u64;
+    g.for_each(|_, count| total = total.saturating_add(count));
+    (g.source_label().to_string(), total)
 }
 
 /// The motivating state: a table whose aggregate prefix starts empty mid-life

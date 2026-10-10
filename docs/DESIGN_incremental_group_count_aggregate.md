@@ -498,3 +498,47 @@ candidate survives; it is deliberately retained in the measurement. The Sep 2
 published `top_hosts` p50 of 142.29 ms includes planning, storage and response
 work this measurement does not cover. A matched HTTP-logs run with result caches
 off is required before changing that published result.
+
+## Wide-column streaming read (0.3.0, 2026-10-10)
+
+The matched HTTP run for the candidate cutoff improved exact `top_hosts` warm
+p50 from 149.65 to 124.47 ms and p95 from 173.93 to 148.61 ms, but collection
+still averaged 119.9 ms and `count_distinct_host` measured 116.09 ms. Cold
+`top_hosts` regressed from 745.03 to 840.38 ms, and the unchanged AVG control
+slowed 10.5%. The rounds used independent fresh ingests, so they do not isolate
+the collector as the cause. The retained system report is
+`siglake-benchmarks/results/20261010-httop-execution/comparison-report.md`.
+
+The next local profile isolated `WideGroupCounts::decode_column`: its targeted
+decoder still allocated one `String` per group before the bounded collector
+saw a key. The ignored release test
+`group_count_streaming_profile::report_decode_materialization_cost` consumes
+the same 1,453 KiB encoded, 1,149,520-group payload in both arms. Timing and
+allocation passes are separate, so allocator atomics do not inflate CPU or
+wall time. Three runs of the same streaming implementation measured:
+
+| Arm | Wall ms | Process CPU ms | Allocations | Allocated MiB | Peak heap growth MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Owned targeted decode | 61.35–65.11 | 61.35–65.11 | 1,149,553 | 157.62 | 84.56 |
+| Streaming validation + top-100 selection | 37.39–41.05 | 37.38–41.04 | 732 | 17.20 | 9.19 |
+
+The measured reduction is 37–39% in decoder-plus-selection wall/CPU, 99.94% in
+allocation count and 89% in peak heap growth. This is local codec/selection
+evidence, not a public HTTP result.
+
+The read path now retains the decoded compact body, validates the requested
+column and the complete body's structure, and reconstructs each key into one
+reusable buffer. Count and predicate consumers use the key only inside the
+callback. The bounded collector copies a key only when it remains competitive;
+the retained profile owned 709 keys across the entire 1.15M-key selection.
+Callers that need materialized values retain the full decoder. The on-disk
+format, SQL shapes, coverage and row-total guards, cardinality budgets,
+result-cache switch and aggregate-object cache are unchanged. A malformed,
+truncated or foreign payload returns no aggregate and takes the existing exact
+fallback; no callback runs until validation has succeeded.
+
+Differential tests compare the streaming rows with the full decoder and the
+owned bounded collector with a full sort. The latter covers string, integer and
+float ordering; ascending and descending count/key sorts; dense ties; NULL;
+forward and reverse input; LIMIT 1 through the full input; and a winner arriving
+last. The existing full decoder remains covered independently.

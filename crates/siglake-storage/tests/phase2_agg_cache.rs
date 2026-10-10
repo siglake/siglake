@@ -320,7 +320,8 @@ async fn warm_group_counts_primes_the_merged_cache() {
         .await
         .unwrap()
         .expect("host is footer-aggregated");
-    let total: u64 = direct.iter().map(|(_, c)| c).sum();
+    let mut total = 0u64;
+    direct.for_each(|_, count| total = total.saturating_add(count));
     let expected: u64 = 4 * 60; // multi_file_table writes 4 files x 60 rows
     assert_eq!(total, expected, "warmed merged counts must be exact");
 
@@ -336,6 +337,7 @@ async fn warm_group_counts_primes_the_merged_cache() {
         .await
         .unwrap()
         .expect("host still footer-aggregated");
-    let total_after: u64 = after.iter().map(|(_, c)| c).sum();
+    let mut total_after = 0u64;
+    after.for_each(|_, count| total_after = total_after.saturating_add(count));
     assert_eq!(total_after, expected + 10, "post-commit warm must be fresh");
 }

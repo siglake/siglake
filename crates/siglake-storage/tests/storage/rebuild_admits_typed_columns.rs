@@ -247,9 +247,10 @@ async fn assert_tier1_total(
         .unwrap_or_else(|| panic!("counts for {column}"));
     assert_eq!(counts.source_label(), tier);
     assert_eq!(counts.len(), FLOAT_DISTINCT);
+    let mut total = 0u64;
+    counts.for_each(|_, count| total = total.saturating_add(count));
     assert_eq!(
-        counts.iter().map(|(_, count)| count).sum::<u64>(),
-        record_count,
+        total, record_count,
         "per-key counts must sum to the table record count"
     );
 }
@@ -507,8 +508,10 @@ async fn admitting_typed_columns_restores_tier1_and_refuses_what_it_must() {
         .await
         .unwrap()
         .unwrap();
+    let mut total = 0u64;
+    g.for_each(|_, count| total = total.saturating_add(count));
     assert_eq!(
-        g.iter().map(|(_, c)| c).sum::<u64>(),
+        total,
         (ROWS * (BATCHES + 1)) as u64,
         "a post-rebuild commit must add its rows exactly once"
     );

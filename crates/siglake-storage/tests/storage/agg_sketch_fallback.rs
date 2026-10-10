@@ -295,7 +295,9 @@ async fn the_sketch_never_shadows_an_exact_answer() {
         .await
         .unwrap()
         .expect("exact path serves the low-cardinality column");
-    assert_eq!(exact.iter().map(|(_, c)| c).sum::<u64>(), rows);
+    let mut total = 0u64;
+    exact.for_each(|_, count| total = total.saturating_add(count));
+    assert_eq!(total, rows);
 }
 
 /// The failure the 2026-08-01 round found: a column that is UNDER the cap in
@@ -410,7 +412,9 @@ async fn an_over_cap_column_is_answerable_both_ways() {
         .await
         .unwrap()
         .expect("the raw-page path answers, slowly — that is the whole problem");
-    assert_eq!(slow_exact.iter().map(|(_, c)| c).sum::<u64>(), rows);
+    let mut total = 0u64;
+    slow_exact.for_each(|_, count| total = total.saturating_add(count));
+    assert_eq!(total, rows);
 
     // And the sketch can answer it too, so the choice is real.
     assert!(

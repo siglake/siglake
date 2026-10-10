@@ -105,13 +105,14 @@ async fn commit(ice: &IcebergContext, nth: usize) -> u64 {
 ///
 /// Exact `GROUP BY host` totals as served right now.
 async fn served_total(ice: &IcebergContext) -> u64 {
-    ice.grouped_counts_with_summary("events", "host", None, None)
+    let counts = ice
+        .grouped_counts_with_summary("events", "host", None, None)
         .await
         .unwrap()
-        .expect("grouped counts served")
-        .iter()
-        .map(|(_, c)| c)
-        .sum()
+        .expect("grouped counts served");
+    let mut total = 0u64;
+    counts.for_each(|_, count| total = total.saturating_add(count));
+    total
 }
 
 /// `host`'s total according to the AGGREGATE, or `None` when no aggregate
