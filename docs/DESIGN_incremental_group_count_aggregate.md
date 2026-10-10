@@ -511,19 +511,39 @@ the collector as the cause. The retained system report is
 
 The next local profile isolated `WideGroupCounts::decode_column`: its targeted
 decoder still allocated one `String` per group before the bounded collector
-saw a key. The ignored release test
-`group_count_streaming_profile::report_decode_materialization_cost` consumes
-the same 1,453 KiB encoded, 1,149,520-group payload in both arms. Timing and
-allocation passes are separate, so allocator atomics do not inflate CPU or
-wall time. Three runs of the same streaming implementation measured:
+saw a key. Both ignored release profiles consume the same bytes in their two
+arms, and timing and allocation passes are separate so allocator atomics do not
+inflate CPU or wall time.
 
-| Arm | Wall ms | Process CPU ms | Allocations | Allocated MiB | Peak heap growth MiB |
+The primary input is the read-only HTTP-logs capture at
+`siglake-benchmarks/results/20261010-httpavg-execution/wide-profile-fixture.json`
+(SHA-256 `04ab46c13dc5537f6c9e3f249e9c4da4bc148d05445c1a3c78ad43a09887cde0`).
+It carries 1,149,519 real host groups in a 3,515 KiB encoded blob. Set
+`SIGLAKE_GROUP_COUNT_PROFILE_FIXTURE` to that file and run
+`report_real_fixture_decode_materialization_cost`. Three runs measured:
+
+| Real captured arm | Wall ms | Process CPU ms | Allocations | Allocated MiB | Peak heap growth MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Owned targeted decode | 95.66–99.88 | 95.64–99.83 | 1,149,552 | 158.26 | 83.68 |
+| Streaming validation + top-100 selection | 46.61–47.57 | 46.61–47.57 | 1,462 | 18.72 | 10.70 |
+
+The real input reduced decoder-plus-selection wall/CPU by 49–52%, allocation
+count by 99.87%, allocated bytes by 88% and peak heap growth by 87%. The test
+compares every streamed row with the full decoder and the streaming top 100
+with full decode plus sort before it passes.
+
+The synthetic input remains as a repository-local reproduction. It has a
+1,453 KiB encoded, 1,149,520-group payload with uniform counts and tightly
+front-coded dotted-decimal keys, so its cutoff and compression are more
+favorable than the captured host distribution. Three runs measured:
+
+| Synthetic arm | Wall ms | Process CPU ms | Allocations | Allocated MiB | Peak heap growth MiB |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Owned targeted decode | 61.35–65.11 | 61.35–65.11 | 1,149,553 | 157.62 | 84.56 |
 | Streaming validation + top-100 selection | 37.39–41.05 | 37.38–41.04 | 732 | 17.20 | 9.19 |
 
-The measured reduction is 37–39% in decoder-plus-selection wall/CPU, 99.94% in
-allocation count and 89% in peak heap growth. This is local codec/selection
+That input reduced decoder-plus-selection wall/CPU by 37–39%, allocation count
+by 99.94% and peak heap growth by 89%. Both profiles are local codec/selection
 evidence, not a public HTTP result.
 
 The read path now retains the decoded compact body, validates the requested

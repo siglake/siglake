@@ -5,6 +5,9 @@
 //! ```text
 //! cargo test --release -p siglake-storage --test group_count_streaming_profile \
 //!   report_decode_materialization_cost -- --ignored --nocapture
+//! SIGLAKE_GROUP_COUNT_PROFILE_FIXTURE=/path/to/wide-profile-fixture.json \
+//! cargo test --release -p siglake-storage --test group_count_streaming_profile \
+//!   report_real_fixture_decode_materialization_cost -- --ignored --nocapture
 //! ```
 //!
 //! The two arms consume the same encoded bytes in one process. `owned_decode`
@@ -16,6 +19,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -28,6 +32,8 @@ static LIVE: AtomicIsize = AtomicIsize::new(0);
 static PEAK: AtomicIsize = AtomicIsize::new(0);
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+const REAL_FIXTURE_ENV: &str = "SIGLAKE_GROUP_COUNT_PROFILE_FIXTURE";
 
 fn record_alloc(size: usize) {
     let live = LIVE.fetch_add(size as isize, Ordering::Relaxed) + size as isize;
@@ -162,6 +168,24 @@ fn wide(keys: usize) -> WideGroupCounts {
     wide
 }
 
+fn fixture_path_from(value: Option<&str>) -> Option<PathBuf> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn real_fixture() -> WideGroupCounts {
+    let value = std::env::var(REAL_FIXTURE_ENV).ok();
+    let path = fixture_path_from(value.as_deref()).unwrap_or_else(|| {
+        panic!("set {REAL_FIXTURE_ENV} to the captured wide-profile-fixture.json path")
+    });
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("read real fixture {}: {error}", path.display()));
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("parse real fixture {}: {error}", path.display()))
+}
+
 fn print_reading(name: &str, reading: Reading) {
     println!(
         "{name:<16} wall_ms={:>8.2} cpu_ms={:>8.2} allocations={:>9} \
@@ -209,13 +233,9 @@ fn select_top(
     (selected, total)
 }
 
-#[test]
-#[ignore]
-fn report_decode_materialization_cost() {
-    const GROUPS: usize = 1_149_520;
+fn report_profile(label: &str, wide: &WideGroupCounts) {
     const K: usize = 100;
 
-    let wide = wide(GROUPS);
     let encoded_kib = wide.group_counts.as_ref().unwrap().len() / 1024;
 
     // Time without allocator atomics on the hot path, then repeat solely for
@@ -233,6 +253,24 @@ fn report_decode_materialization_cost() {
     let (_, select_allocations) = run(true, || select_top(&streamed, K));
     let select_reading = combine(select_time, select_allocations);
 
+    // Differential validation is deliberately outside every measurement
+    // window. Compare the complete streamed column, then compare its bounded
+    // answer with full decode + sort so an input distribution cannot make a
+    // faster but incomplete selection look successful.
+    let mut streamed_values = Vec::with_capacity(owned.values.len());
+    let mut streamed_nulls = 0;
+    streamed.for_each(|key, count| match key {
+        Some(key) => streamed_values.push((key.to_string(), count)),
+        None => streamed_nulls = count,
+    });
+    assert_eq!(streamed_values, owned.values);
+    assert_eq!(streamed_nulls, owned.nulls);
+
+    let groups = owned.values.len() + usize::from(owned.nulls > 0);
+    assert!(
+        owned.values.len() >= K,
+        "profile needs at least {K} host keys"
+    );
     let owned_total = owned.total();
     owned
         .values
@@ -240,7 +278,7 @@ fn report_decode_materialization_cost() {
     assert_eq!(streamed_total, owned_total);
     assert_eq!(selected, owned.values[..K]);
 
-    println!("groups={GROUPS} encoded_kib={encoded_kib} top_k={K}");
+    println!("fixture={label} groups={groups} encoded_kib={encoded_kib} top_k={K}");
     print_reading("owned_decode", owned_reading);
     print_reading("stream_prepare", prepare_reading);
     print_reading("stream_select", select_reading);
@@ -256,4 +294,28 @@ fn report_decode_materialization_cost() {
             .max(select_reading.peak_heap_growth) as f64
             / 1_048_576.0,
     );
+}
+
+#[test]
+fn fixture_path_resolver_rejects_absent_and_blank_values() {
+    assert_eq!(fixture_path_from(None), None);
+    assert_eq!(fixture_path_from(Some("  ")), None);
+    assert_eq!(
+        fixture_path_from(Some(" /fixtures/wide.json ")),
+        Some(PathBuf::from("/fixtures/wide.json"))
+    );
+}
+
+#[test]
+#[ignore]
+fn report_decode_materialization_cost() {
+    const GROUPS: usize = 1_149_520;
+    let wide = wide(GROUPS);
+    report_profile("synthetic", &wide);
+}
+
+#[test]
+#[ignore]
+fn report_real_fixture_decode_materialization_cost() {
+    report_profile("captured-http-logs", &real_fixture());
 }

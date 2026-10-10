@@ -265,26 +265,29 @@ pub fn streaming_column(s: &str, column: &str) -> Option<StreamingColumnCounts> 
     let mut found = None;
     for _ in 0..n_columns {
         let name = cur.bytes()?;
+        std::str::from_utf8(name).ok()?;
         let nulls = cur.uvarint()?;
         let n_values = cur.uvarint()?;
         let values_start = cur.pos;
-        if found.is_none() && name == column.as_bytes() {
-            let mut prev = Vec::new();
-            let mut total = nulls;
-            for _ in 0..n_values {
-                let shared = usize::try_from(cur.uvarint()?).ok()?;
-                if shared > prev.len() {
-                    return None;
-                }
-                let suffix = cur.bytes()?;
-                prev.truncate(shared);
-                prev.extend_from_slice(suffix);
-                std::str::from_utf8(&prev).ok()?;
-                total = total.saturating_add(cur.uvarint()?);
+        let target = found.is_none() && name == column.as_bytes();
+        let mut prev = Vec::new();
+        let mut total = nulls;
+        for _ in 0..n_values {
+            let shared = usize::try_from(cur.uvarint()?).ok()?;
+            if shared > prev.len() {
+                return None;
             }
+            let suffix = cur.bytes()?;
+            prev.truncate(shared);
+            prev.extend_from_slice(suffix);
+            std::str::from_utf8(&prev).ok()?;
+            let count = cur.uvarint()?;
+            if target {
+                total = total.saturating_add(count);
+            }
+        }
+        if target {
             found = Some((values_start, n_values, nulls, total));
-        } else {
-            skip_values(&mut cur, n_values)?;
         }
     }
     if cur.pos != body.len() {
@@ -649,6 +652,32 @@ mod tests {
         assert!(decode_column(&malformed, "level").is_some());
         // Streaming selection must validate the whole aggregate first so a
         // caller never mistakes a partial visit for an exact answer.
+        assert!(streaming_column(&malformed, "level").is_none());
+    }
+
+    #[test]
+    fn streaming_decode_rejects_invalid_later_column() {
+        let mut body = Vec::new();
+        put_uvarint(&mut body, 2);
+        put_bytes(&mut body, b"level");
+        put_uvarint(&mut body, 0);
+        put_uvarint(&mut body, 1);
+        put_uvarint(&mut body, 0);
+        put_bytes(&mut body, b"info");
+        put_uvarint(&mut body, 1);
+        put_bytes(&mut body, b"zone");
+        put_uvarint(&mut body, 0);
+        put_uvarint(&mut body, 1);
+        put_uvarint(&mut body, 1); // impossible prefix: no predecessor
+        put_bytes(&mut body, b"east");
+        put_uvarint(&mut body, 1);
+
+        let mut raw = Vec::from(MAGIC);
+        raw.extend_from_slice(&[FORMAT_VERSION, CODEC_RAW]);
+        raw.extend_from_slice(&body);
+        let malformed = base64::engine::general_purpose::STANDARD.encode(raw);
+
+        assert!(decode_column(&malformed, "level").is_some());
         assert!(streaming_column(&malformed, "level").is_none());
     }
 
