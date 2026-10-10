@@ -178,20 +178,23 @@ jobs:
       - name: the conditional-write probe retains and grades raw S3 responses
         run: scripts/check-conditional-write-probe.sh
       # ci-local.sh's own reporting is code, and until now the only thing that
-      # checked it was running the local gate. These three tests cover the
+      # checked it was running the local gate. These four tests cover the
       # helpers whose wrong answer is a gate that reports success: the
       # test-binary identity guard (a concurrent relink of the shared target
-      # binary turning a contaminated run green), the external-reader skip
-      # accounting (`ok (0 engine(s) agreed, 3 skipped)` under `--strict`), and
-      # the image-size block (a size recorded without its image store driver,
-      # which is ~4x apart between containerd and overlay2). All three are
-      # hermetic and take under four seconds total: the guard test sources
-      # ci-local-test-guard.sh and fakes the cargo JSON, the readers test builds
-      # its own stub PATH so the missing-engine arms are missing-engine arms
-      # even on a box that has duckdb, and the size test stubs `docker` -- no
-      # daemon, no engine, no cargo.
+      # binary turning a contaminated run green), the generated-artifact retry
+      # (a stale compiled unit turning a recoverable run red), the
+      # external-reader skip accounting (`ok (0 engine(s) agreed, 3 skipped)`
+      # under `--strict`), and the image-size block (a size recorded without its
+      # image store driver, which is ~4x apart between containerd and overlay2).
+      # All four are hermetic and take under four seconds total: the guard tests
+      # source their helpers and fake cargo's output or the generator outcomes,
+      # the readers test builds its own stub PATH so the missing-engine arms are
+      # missing-engine arms even on a box that has duckdb, and the size test
+      # stubs `docker` -- no daemon, no engine, no cargo.
       - name: the ci-local test-binary identity guard catches a relink
         run: scripts/check-ci-local-test-guard.sh
+      - name: the generated-artifact guard retries failures and drift once
+        run: scripts/check-ci-local-generated-guard.sh
       # The loopback bench scripts bind fixed ports and then poll /healthz for
       # two minutes; a bind collision reaches only the server's own log, after a
       # multi-GB corpus has been ingested. The knobs and the startup-death
