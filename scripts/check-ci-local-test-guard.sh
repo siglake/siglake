@@ -9,6 +9,71 @@ cd "$(dirname "$0")/.."
 check_dir=$(mktemp -d "${TMPDIR:-/tmp}/siglake-test-guard.XXXXXX")
 trap 'rm -rf -- "$check_dir"' EXIT
 
+workspace="$check_dir/workspace"
+fixture_doc_extension=md
+fixture_doc="$workspace/docs/x.${fixture_doc_extension}"
+mkdir -p \
+  "$workspace/crates/a/src" \
+  "$workspace/crates/b/src" \
+  "$workspace/third_party/c/src" \
+  "$workspace/docs"
+touch \
+  "$workspace/Cargo.toml" \
+  "$workspace/Cargo.lock" \
+  "$workspace/crates/a/Cargo.toml" \
+  "$workspace/crates/a/src/lib.rs" \
+  "$workspace/crates/b/Cargo.toml" \
+  "$workspace/crates/b/src/main.rs" \
+  "$workspace/third_party/c/Cargo.toml" \
+  "$workspace/third_party/c/src/lib.rs" \
+  "$fixture_doc"
+git -C "$workspace" init -q
+git -C "$workspace" add .
+git -C "$workspace" \
+  -c user.name='CI fixture' -c user.email='ci-fixture@example.invalid' \
+  commit -qm 'fixture'
+touch -d '2 hours ago' \
+  "$workspace/Cargo.toml" \
+  "$workspace/Cargo.lock" \
+  "$workspace/crates/a/Cargo.toml" \
+  "$workspace/crates/a/src/lib.rs" \
+  "$workspace/crates/b/Cargo.toml" \
+  "$workspace/crates/b/src/main.rs" \
+  "$workspace/third_party/c/Cargo.toml" \
+  "$workspace/third_party/c/src/lib.rs" \
+  "$fixture_doc"
+marker="$check_dir/marker"
+touch -d '1 hour ago' "$marker"
+docs_mtime=$(stat -c '%Y' -- "$fixture_doc")
+(
+  cd "$workspace"
+  refreshed_workspace_source_count=$(refresh_workspace_sources)
+  if [ "$refreshed_workspace_source_count" -ne 5 ]; then
+    echo "FAIL refreshed $refreshed_workspace_source_count workspace sources, expected 5" >&2
+    exit 1
+  fi
+  for source in \
+    Cargo.toml \
+    Cargo.lock \
+    crates/a/src/lib.rs \
+    crates/b/src/main.rs \
+    third_party/c/src/lib.rs; do
+    if [ ! "$source" -nt "$marker" ]; then
+      echo "FAIL workspace source was not refreshed: $source" >&2
+      exit 1
+    fi
+  done
+  if [ "$(stat -c '%Y' -- "$fixture_doc")" != "$docs_mtime" ]; then
+    echo "FAIL refresh changed the documentation fixture" >&2
+    exit 1
+  fi
+  if [ -n "$(git status --porcelain)" ]; then
+    echo "FAIL refresh made the git worktree dirty" >&2
+    git status --short >&2
+    exit 1
+  fi
+)
+
 executable="$check_dir/query server"
 printf 'first\n' >"$executable"
 build_messages="$check_dir/build.json"
@@ -120,4 +185,4 @@ if attribution=$(find_concurrent_test_run \
   exit 1
 fi
 
-echo "ok (replacement, never-executed summary, physical, caller-named, stale and self-pointer attribution fixtures)"
+echo "ok (source refresh, replacement, never-executed summary, physical, caller-named, stale and self-pointer attribution fixtures)"

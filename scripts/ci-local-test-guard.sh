@@ -1,7 +1,25 @@
 #!/usr/bin/env bash
-# Helpers for detecting another checkout relinking workspace test executables.
-# Sourced by ci-local.sh and exercised without compiling by
-# check-ci-local-test-guard.sh.
+# Helpers for refreshing this checkout's Cargo units and detecting another
+# checkout relinking workspace test executables. Sourced by ci-local.sh and
+# exercised without compiling by check-ci-local-test-guard.sh.
+
+refresh_workspace_sources() {
+  local manifest crate_dir
+  local -a workspace_sources=(Cargo.toml Cargo.lock)
+
+  for manifest in crates/*/Cargo.toml third_party/*/Cargo.toml; do
+    [ -f "$manifest" ] || continue
+    crate_dir=${manifest%/Cargo.toml}
+    if [ -f "$crate_dir/src/lib.rs" ]; then
+      workspace_sources+=("$crate_dir/src/lib.rs")
+    elif [ -f "$crate_dir/src/main.rs" ]; then
+      workspace_sources+=("$crate_dir/src/main.rs")
+    fi
+  done
+
+  touch -- "${workspace_sources[@]}" || return
+  printf '%s\n' "${#workspace_sources[@]}"
+}
 
 record_test_executables() {
   local build_messages=$1 identities=$2 executable identity
