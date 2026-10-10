@@ -10674,6 +10674,118 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn grouped_integer_avg_separates_arithmetic_and_renderer_differentials() {
+        use arrow_array::{Array, Float64Array, Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::SessionContext;
+
+        // Drive the real grouped DataFusion accumulator with two row orders
+        // that have the same exact integer (sum, count). This is deliberately
+        // separate from the status-304 receipt below: its much smaller retained
+        // sum does not establish that its inputs crossed this precision bound.
+        let high = 1_i64 << 53;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("status", DataType::Int64, false),
+            Field::new("size", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 1, 2, 2, 2])),
+                Arc::new(Int64Array::from(vec![high, 1, -high, high, -high, 1])),
+            ],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_batch("httplogs", batch).unwrap();
+        let batches = ctx
+            .sql(
+                "SELECT status, avg(size) AS avg_size, count(*) AS n \
+                 FROM httplogs GROUP BY status ORDER BY status",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let averages = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let raw_bits = [averages.value(0).to_bits(), averages.value(1).to_bits()];
+        assert_eq!(raw_bits, [0.0_f64.to_bits(), (1.0_f64 / 3.0).to_bits()]);
+
+        let scan = crate::format::batches_to_records(&batches, None).unwrap();
+        let scan_rows = scan.rows.as_array().unwrap();
+        let scan_bits = [
+            scan_rows[0]["avg_size"].as_f64().unwrap().to_bits(),
+            scan_rows[1]["avg_size"].as_f64().unwrap().to_bits(),
+        ];
+        assert_eq!(scan_bits, raw_bits, "Arrow JSON changed DataFusion bits");
+
+        // The footer path constructs a Value directly. Its final serde_json
+        // serialization and parse preserve the same exact quotient bits.
+        let exact_avg = 1.0_f64 / 3.0;
+        let fast = serde_json::json!({ "status": 1, "avg_size": exact_avg, "n": 3 });
+        let fast: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&fast).unwrap()).unwrap();
+        assert_eq!(
+            fast["avg_size"].as_f64().unwrap().to_bits(),
+            exact_avg.to_bits()
+        );
+
+        // The AWS receipt's exact footer quotient is one binary64 value above
+        // the scan response of 2026-10-10. Arrow JSON emits the round-trippable
+        // decimal, and serde_json built WITH `float_roundtrip` (#6659) parses
+        // it back to the same bits while collecting scan rows; before that
+        // feature it read the adjacent lower value and the two renderers
+        // disagreed. The footer path constructs its Value directly. Both now
+        // carry the quotient's bits, which is independent of the genuine
+        // accumulation-order example above: that one survives the renderers.
+        let footer_avg = 1_168_295_731_f64 / 37_137_326_f64;
+        let reference_avg = 31.45880053399644_f64;
+        assert_eq!(footer_avg.to_bits(), reference_avg.to_bits() + 1);
+        let footer_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "avg_size",
+                DataType::Float64,
+                false,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![footer_avg]))],
+        )
+        .unwrap();
+        let encoded_scan =
+            crate::format::batches_to_ndjson(std::slice::from_ref(&footer_batch)).unwrap();
+        assert_eq!(
+            encoded_scan,
+            br#"{"avg_size":31.458800533996442}
+"#
+        );
+        let scan = crate::format::batches_to_records(&[footer_batch], None).unwrap();
+        assert_eq!(
+            scan.rows[0]["avg_size"].as_f64().unwrap().to_bits(),
+            footer_avg.to_bits(),
+            "the records renderer lost the quotient's bits"
+        );
+        // ... and the response the client reads carries them too.
+        let served: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&scan.rows).unwrap()).unwrap();
+        assert_eq!(
+            served[0]["avg_size"].as_f64().unwrap().to_bits(),
+            footer_avg.to_bits()
+        );
+        let fast = serde_json::json!({ "avg_size": footer_avg });
+        let encoded_fast = serde_json::to_vec(&fast).unwrap();
+        assert_eq!(encoded_fast, br#"{"avg_size":31.458800533996442}"#);
+        assert_eq!(
+            fast["avg_size"].as_f64().unwrap().to_bits(),
+            footer_avg.to_bits()
+        );
+    }
+
     fn strip_table_metadata_for_test(warehouse: &std::path::Path, index_id: &str) -> usize {
         let mut removed = 0;
         for namespace in std::fs::read_dir(warehouse).unwrap() {

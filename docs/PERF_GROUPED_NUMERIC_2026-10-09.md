@@ -88,17 +88,42 @@ For status 304 the retained reference answer was `31.45880053399644`; the
 candidate returned `31.458800533996442`. Their binary64 encodings are adjacent.
 The candidate's count was 37,137,326 and its exact integer sum was
 1,168,295,731, whose correctly rounded binary64 quotient is the candidate
-value.
+value. The values have encodings `0x403f7573f3a8e6ec` and
+`0x403f7573f3a8e6ed`, respectively.
 
-DataFusion 53.1 coerces integer AVG input to binary64. Its `AvgAccumulator`
-sums each Arrow batch, sums those partials, then divides the binary64 sum by the
-count. Binary64 addition is not associative: `[2^53, 1, -2^53]` produces sum
-zero in that order, while `[2^53, -2^53, 1]` produces one. Both layouts have the
-same exact integer sum and count, so no function of the footer's exact
-`(sum, count)` can reproduce every scan layout's bit pattern. The unit test
-retains both this proof and the observed adjacent encodings. No arithmetic
-change was made: results are not rounded or status-specific, and qualification
-was not weakened.
+A local differential now feeds `0x403f7573f3a8e6ed` through both production
+records renderers. Arrow JSON writes the round-trippable token
+`31.458800533996442`. The scan records path then reparses that token at
+`format.rs:631` with serde_json 1.0.150, producing `0x403f7573f3a8e6ec`; its
+response therefore writes `31.45880053399644`. The footer path constructs its
+serde_json `Value` directly and retains `0x403f7573f3a8e6ed` through final
+serialization. `cargo tree -p siglake-query-server -e features -i serde_json
+--depth 1` reports only `default`, `raw_value` and `std`; `float_roundtrip` is
+not active. This serializer differential is sufficient to reproduce the two
+retained response values without changing arithmetic.
+
+The same test keeps the arithmetic limitation separate. It runs a real grouped
+DataFusion query over two groups containing `[2^53, 1, -2^53]` and `[2^53,
+-2^53, 1]`. DataFusion returns zero and one third, respectively, before JSON,
+despite equal exact integer sums and counts. DataFusion 53.1 coerces integer AVG
+input to binary64, accumulates group and partition sums there, and divides by
+the binary64 count. A footer function of exact `(sum, count)` therefore cannot
+reproduce every possible scan layout.
+
+The retained AWS receipt does not include the status-304 input minimum and
+maximum or the pre-render DataFusion sum and AVG bits. Its schema permits the
+full signed 64-bit range; the retained exact footer state establishes only the
+sum and count above. The local renderer differential reproduces the response
+pair, but the missing pre-render state prevents claiming that no arithmetic
+difference also occurred in that run. No arithmetic or response change was
+made: results are not rounded or status-specific, and qualification was not
+weakened. Run the retained local differential with:
+
+```sh
+cargo test -p siglake-query-server \
+  sql::tests::grouped_integer_avg_separates_arithmetic_and_renderer_differentials \
+  -- --exact --nocapture
+```
 
 Retained external evidence:
 
@@ -106,3 +131,29 @@ Retained external evidence:
 - `results/20261010-httpavg-execution/candidate/top-hosts-answer-evidence.json`
 - `results/20261009-avg-size/candidate/20261010-aws/siglake-core.json`
 - `results/20261009-top-hosts/baseline/20261010-aws/siglake-core.json`
+
+## Renderer repair, 2026-10-10 (#6659)
+
+The serializer half above is fixed. `Cargo.toml` now builds serde_json with
+`float_roundtrip`, whose exact parser reads `31.458800533996442` back as
+`0x403f7573f3a8e6ed`, so the scan records path returns the bits DataFusion
+computed. The differential test keeps both halves: the quotient assertion now
+requires preserved bits through records construction and the serialized
+response, and the two-layout DataFusion query still shows the arithmetic
+difference the renderer cannot explain.
+
+`format::tests::records_preserve_binary64_bits_through_both_collector_paths`
+drives twenty finite edge-case values — the status-304 quotient, both signed
+zeros, the subnormal boundary, `f64::MIN`/`MAX`, 17-digit tokens — through the
+complete-row and split-row collector paths and the final envelope
+serialization. `e2e::float_results_keep_their_bits_through_the_http_response`
+asserts the same over real HTTP in both response formats; with the feature
+removed it fails on the raw body. Nulls and non-finite values are unchanged
+(`records_keep_null_and_nonfinite_float_rendering`): a null is omitted from the
+row, NaN and the infinities are written as JSON null.
+
+The measurements, AWS receipts and the failed qualification above stand as
+retained. This repair does not establish that serialization was the only cause
+of the AWS mismatch; the missing pre-render state still prevents that claim.
+The strict gate and the unchanged AVG rerun run through #6643 on a frozen
+source containing this repair.
