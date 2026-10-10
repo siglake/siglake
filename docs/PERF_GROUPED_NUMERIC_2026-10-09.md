@@ -88,17 +88,42 @@ For status 304 the retained reference answer was `31.45880053399644`; the
 candidate returned `31.458800533996442`. Their binary64 encodings are adjacent.
 The candidate's count was 37,137,326 and its exact integer sum was
 1,168,295,731, whose correctly rounded binary64 quotient is the candidate
-value.
+value. The values have encodings `0x403f7573f3a8e6ec` and
+`0x403f7573f3a8e6ed`, respectively.
 
-DataFusion 53.1 coerces integer AVG input to binary64. Its `AvgAccumulator`
-sums each Arrow batch, sums those partials, then divides the binary64 sum by the
-count. Binary64 addition is not associative: `[2^53, 1, -2^53]` produces sum
-zero in that order, while `[2^53, -2^53, 1]` produces one. Both layouts have the
-same exact integer sum and count, so no function of the footer's exact
-`(sum, count)` can reproduce every scan layout's bit pattern. The unit test
-retains both this proof and the observed adjacent encodings. No arithmetic
-change was made: results are not rounded or status-specific, and qualification
-was not weakened.
+A local differential now feeds `0x403f7573f3a8e6ed` through both production
+records renderers. Arrow JSON writes the round-trippable token
+`31.458800533996442`. The scan records path then reparses that token at
+`format.rs:631` with serde_json 1.0.150, producing `0x403f7573f3a8e6ec`; its
+response therefore writes `31.45880053399644`. The footer path constructs its
+serde_json `Value` directly and retains `0x403f7573f3a8e6ed` through final
+serialization. `cargo tree -p siglake-query-server -e features -i serde_json
+--depth 1` reports only `default`, `raw_value` and `std`; `float_roundtrip` is
+not active. This serializer differential is sufficient to reproduce the two
+retained response values without changing arithmetic.
+
+The same test keeps the arithmetic limitation separate. It runs a real grouped
+DataFusion query over two groups containing `[2^53, 1, -2^53]` and `[2^53,
+-2^53, 1]`. DataFusion returns zero and one third, respectively, before JSON,
+despite equal exact integer sums and counts. DataFusion 53.1 coerces integer AVG
+input to binary64, accumulates group and partition sums there, and divides by
+the binary64 count. A footer function of exact `(sum, count)` therefore cannot
+reproduce every possible scan layout.
+
+The retained AWS receipt does not include the status-304 input minimum and
+maximum or the pre-render DataFusion sum and AVG bits. Its schema permits the
+full signed 64-bit range; the retained exact footer state establishes only the
+sum and count above. The local renderer differential reproduces the response
+pair, but the missing pre-render state prevents claiming that no arithmetic
+difference also occurred in that run. No arithmetic or response change was
+made: results are not rounded or status-specific, and qualification was not
+weakened. Run the retained local differential with:
+
+```sh
+cargo test -p siglake-query-server \
+  sql::tests::grouped_integer_avg_separates_arithmetic_and_renderer_differentials \
+  -- --exact --nocapture
+```
 
 Retained external evidence:
 
