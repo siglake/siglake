@@ -520,37 +520,66 @@ The primary input is the read-only HTTP-logs capture at
 (SHA-256 `04ab46c13dc5537f6c9e3f249e9c4da4bc148d05445c1a3c78ad43a09887cde0`).
 It carries 1,149,519 real host groups in a 3,515 KiB encoded blob. Set
 `SIGLAKE_GROUP_COUNT_PROFILE_FIXTURE` to that file and run
-`report_real_fixture_decode_materialization_cost`. Three runs measured:
+`report_real_fixture_decode_materialization_cost`. Three release runs at
+`7b21dac` measured:
 
 | Real captured arm | Wall ms | Process CPU ms | Allocations | Allocated MiB | Peak heap growth MiB |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Owned targeted decode | 95.66–99.88 | 95.64–99.83 | 1,149,552 | 158.26 | 83.68 |
-| Streaming validation + top-100 selection | 46.61–47.57 | 46.61–47.57 | 1,462 | 18.72 | 10.70 |
+| Owned targeted decode | 93.54–104.67 | 93.51–104.67 | 1,149,552 | 158.26 | 83.68 |
+| Streaming validation + top-100 selection | 48.36–49.61 | 48.36–49.61 | 1,462 | 18.72 | 10.70 |
 
-The real input reduced decoder-plus-selection wall/CPU by 49–52%, allocation
+The real input reduced decoder-plus-selection wall/CPU by 47–54%, allocation
 count by 99.87%, allocated bytes by 88% and peak heap growth by 87%. The test
 compares every streamed row with the full decoder and the streaming top 100
 with full decode plus sort before it passes.
 
+The raw real-fixture readings were:
+
+| Run | Owned wall / CPU ms | Prepare wall / CPU ms | Select wall / CPU ms | Stream total wall / CPU ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 98.28 / 98.26 | 28.72 / 28.72 | 19.64 / 19.64 | 48.36 / 48.36 |
+| 2 | 93.54 / 93.51 | 28.77 / 28.77 | 19.79 / 19.78 | 48.56 / 48.55 |
+| 3 | 104.67 / 104.67 | 28.84 / 28.84 | 20.78 / 20.77 | 49.61 / 49.61 |
+
 The synthetic input remains as a repository-local reproduction. It has a
-1,453 KiB encoded, 1,149,520-group payload with uniform counts and tightly
-front-coded dotted-decimal keys, so its cutoff and compression are more
-favorable than the captured host distribution. Three runs measured:
+1,453 KiB encoded payload with 1,149,520 non-NULL keys and one NULL group,
+uniform counts and tightly front-coded dotted-decimal keys, so its cutoff and
+compression are more favorable than the captured host distribution. The same
+three-run invocation measured:
 
 | Synthetic arm | Wall ms | Process CPU ms | Allocations | Allocated MiB | Peak heap growth MiB |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Owned targeted decode | 61.35–65.11 | 61.35–65.11 | 1,149,553 | 157.62 | 84.56 |
-| Streaming validation + top-100 selection | 37.39–41.05 | 37.38–41.04 | 732 | 17.20 | 9.19 |
+| Owned targeted decode | 63.30–67.70 | 63.30–67.70 | 1,149,553 | 157.62 | 84.56 |
+| Streaming validation + top-100 selection | 39.51–42.24 | 39.50–42.24 | 732 | 17.20 | 9.19 |
 
-That input reduced decoder-plus-selection wall/CPU by 37–39%, allocation count
+That input reduced decoder-plus-selection wall/CPU by 37–38%, allocation count
 by 99.94% and peak heap growth by 89%. Both profiles are local codec/selection
 evidence, not a public HTTP result.
 
-The read path now retains the decoded compact body, validates the requested
-column and the complete body's structure, and reconstructs each key into one
-reusable buffer. Count and predicate consumers use the key only inside the
-callback. The bounded collector copies a key only when it remains competitive;
-the retained profile owned 709 keys across the entire 1.15M-key selection.
+The raw synthetic readings were:
+
+| Run | Owned wall / CPU ms | Prepare wall / CPU ms | Select wall / CPU ms | Stream total wall / CPU ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 67.70 / 67.70 | 25.02 / 25.02 | 17.22 / 17.22 | 42.24 / 42.24 |
+| 2 | 66.71 / 66.71 | 25.01 / 25.00 | 16.70 / 16.70 | 41.71 / 41.70 |
+| 3 | 63.30 / 63.30 | 22.91 / 22.91 | 16.59 / 16.59 | 39.51 / 39.50 |
+
+The read path now retains the decoded compact body, reconstructs every column's
+keys to validate the whole body before returning, and reconstructs the selected
+column again into one reusable callback buffer. Count and predicate consumers
+use the key only inside the callback. The bounded collector copies a key only
+when it remains competitive; the synthetic profile owned 709 keys across the
+entire 1.15M-key selection.
+
+That whole-body validation is new work relative to `decode_column`, which
+stopped after the requested column. CPU therefore scales with every key in the
+blob even though retained allocations scale with the encoded bytes plus the
+selected top K. At the recorded 1 TB extreme (26.5 MiB, about 20 million keys
+across 22 columns) one cache-disabled read can reconstruct about 20 million
+keys for validation and the requested column a second time. No retained copy of
+that extreme exists to time, so the real one-column capture above does not bound
+its wall time. The trade keeps the rule that corruption anywhere in an
+aggregate refuses the aggregate before a callback can expose a partial answer.
 Callers that need materialized values retain the full decoder. The on-disk
 format, SQL shapes, coverage and row-total guards, cardinality budgets,
 result-cache switch and aggregate-object cache are unchanged. A malformed,
