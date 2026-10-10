@@ -8,6 +8,8 @@
 //! SIGLAKE_GROUP_COUNT_PROFILE_FIXTURE=/path/to/wide-profile-fixture.json \
 //! cargo test --release -p siglake-storage --test group_count_streaming_profile \
 //!   report_real_fixture_decode_materialization_cost -- --ignored --nocapture
+//! cargo test --release -p siglake-storage --test group_count_streaming_profile \
+//!   report_22_column_prepare_cost -- --ignored --nocapture
 //! ```
 //!
 //! The two arms consume the same encoded bytes in one process. `owned_decode`
@@ -23,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use siglake_storage::iceberg::{ColumnGroupCounts, FileGroupCounts, WideGroupCounts};
 
 struct TrackingAllocator;
@@ -168,6 +171,61 @@ fn wide(keys: usize) -> WideGroupCounts {
     wide
 }
 
+fn put_uvarint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_uvarint(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+fn wide_22_columns(keys_per_column: usize) -> WideGroupCounts {
+    // Build one front-coded value run and reuse its bytes for every column.
+    // The raw codec is a production codec and keeps fixture construction from
+    // materializing 22 million BTreeMap entries before the measured reads.
+    let mut value_frames = Vec::new();
+    let mut previous = String::new();
+    for i in 0..keys_per_column {
+        let value = format!("{i:07}");
+        let shared = previous
+            .bytes()
+            .zip(value.bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
+        put_uvarint(&mut value_frames, shared as u64);
+        put_bytes(&mut value_frames, &value.as_bytes()[shared..]);
+        put_uvarint(&mut value_frames, (i as u64 % 50) + 1);
+        previous = value;
+    }
+
+    let mut body = Vec::new();
+    put_uvarint(&mut body, 22);
+    for column in 0..21 {
+        put_bytes(&mut body, format!("column-{column:02}").as_bytes());
+        put_uvarint(&mut body, 3);
+        put_uvarint(&mut body, keys_per_column as u64);
+        body.extend_from_slice(&value_frames);
+    }
+    put_bytes(&mut body, b"z_target");
+    put_uvarint(&mut body, 3);
+    put_uvarint(&mut body, keys_per_column as u64);
+    body.extend_from_slice(&value_frames);
+
+    let mut raw = Vec::with_capacity(6 + body.len());
+    raw.extend_from_slice(b"LGCF");
+    raw.extend_from_slice(&[1, 0]);
+    raw.extend_from_slice(&body);
+    WideGroupCounts {
+        group_counts: Some(base64::engine::general_purpose::STANDARD.encode(raw)),
+        ..WideGroupCounts::default()
+    }
+}
+
 fn fixture_path_from(value: Option<&str>) -> Option<PathBuf> {
     value
         .map(str::trim)
@@ -233,7 +291,7 @@ fn select_top(
     (selected, total)
 }
 
-fn report_profile(label: &str, wide: &WideGroupCounts) {
+fn report_profile(label: &str, wide: &WideGroupCounts, column: &str) {
     const K: usize = 100;
 
     let encoded_kib = wide.group_counts.as_ref().unwrap().len() / 1024;
@@ -241,12 +299,12 @@ fn report_profile(label: &str, wide: &WideGroupCounts) {
     // Time without allocator atomics on the hot path, then repeat solely for
     // allocation counts/bytes. Combining those separate passes avoids making
     // 1.15M per-allocation atomics look like decoder CPU.
-    let (mut owned, owned_time) = run(false, || wide.decode_column("host").unwrap());
-    let (_, owned_allocations) = run(true, || wide.decode_column("host").unwrap());
+    let (mut owned, owned_time) = run(false, || wide.decode_column(column).unwrap());
+    let (_, owned_allocations) = run(true, || wide.decode_column(column).unwrap());
     let owned_reading = combine(owned_time, owned_allocations);
 
-    let (streamed, prepare_time) = run(false, || wide.streaming_column("host").unwrap());
-    let (_, prepare_allocations) = run(true, || wide.streaming_column("host").unwrap());
+    let (streamed, prepare_time) = run(false, || wide.streaming_column(column).unwrap());
+    let (_, prepare_allocations) = run(true, || wide.streaming_column(column).unwrap());
     let prepare_reading = combine(prepare_time, prepare_allocations);
 
     let ((selected, streamed_total), select_time) = run(false, || select_top(&streamed, K));
@@ -311,11 +369,19 @@ fn fixture_path_resolver_rejects_absent_and_blank_values() {
 fn report_decode_materialization_cost() {
     const GROUPS: usize = 1_149_520;
     let wide = wide(GROUPS);
-    report_profile("synthetic", &wide);
+    report_profile("synthetic", &wide, "host");
 }
 
 #[test]
 #[ignore]
 fn report_real_fixture_decode_materialization_cost() {
-    report_profile("captured-http-logs", &real_fixture());
+    report_profile("captured-http-logs", &real_fixture(), "host");
+}
+
+#[test]
+#[ignore]
+fn report_22_column_prepare_cost() {
+    const KEYS_PER_COLUMN: usize = 1_000_000;
+    let wide = wide_22_columns(KEYS_PER_COLUMN);
+    report_profile("synthetic-22-column", &wide, "z_target");
 }

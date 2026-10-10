@@ -270,6 +270,10 @@ pub fn streaming_column(s: &str, column: &str) -> Option<StreamingColumnCounts> 
         let n_values = cur.uvarint()?;
         let values_start = cur.pos;
         let target = found.is_none() && name == column.as_bytes();
+        if !target {
+            validate_value_frames(&mut cur, n_values)?;
+            continue;
+        }
         let mut prev = Vec::new();
         let mut total = nulls;
         for _ in 0..n_values {
@@ -282,13 +286,9 @@ pub fn streaming_column(s: &str, column: &str) -> Option<StreamingColumnCounts> 
             prev.extend_from_slice(suffix);
             std::str::from_utf8(&prev).ok()?;
             let count = cur.uvarint()?;
-            if target {
-                total = total.saturating_add(count);
-            }
+            total = total.saturating_add(count);
         }
-        if target {
-            found = Some((values_start, n_values, nulls, total));
-        }
+        found = Some((values_start, n_values, nulls, total));
     }
     if cur.pos != body.len() {
         return None;
@@ -301,6 +301,25 @@ pub fn streaming_column(s: &str, column: &str) -> Option<StreamingColumnCounts> 
         nulls,
         total,
     })
+}
+
+/// Validate front-coded entry framing without reconstructing key bytes.
+///
+/// The predecessor length is enough to prove that each shared prefix is in
+/// bounds. Non-target key bytes deliberately receive no UTF-8 validation,
+/// matching [`decode_column`]'s skip behavior.
+fn validate_value_frames(cur: &mut Cursor, n_values: u64) -> Option<()> {
+    let mut prev_len = 0usize;
+    for _ in 0..n_values {
+        let shared = usize::try_from(cur.uvarint()?).ok()?;
+        if shared > prev_len {
+            return None;
+        }
+        let suffix_len = cur.bytes()?.len();
+        prev_len = shared.checked_add(suffix_len)?;
+        cur.uvarint()?; // count
+    }
+    Some(())
 }
 
 /// Every column's name and ROW TOTAL (`Σ counts + nulls`), in one forward pass
@@ -668,7 +687,7 @@ mod tests {
         put_bytes(&mut body, b"zone");
         put_uvarint(&mut body, 0);
         put_uvarint(&mut body, 1);
-        put_uvarint(&mut body, 1); // impossible prefix: no predecessor
+        put_uvarint(&mut body, 1); // impossible prefix: tracked predecessor length is zero
         put_bytes(&mut body, b"east");
         put_uvarint(&mut body, 1);
 
@@ -678,7 +697,36 @@ mod tests {
         let malformed = base64::engine::general_purpose::STANDARD.encode(raw);
 
         assert!(decode_column(&malformed, "level").is_some());
+        // Non-target columns are checked by framing, including prefix bounds.
         assert!(streaming_column(&malformed, "level").is_none());
+    }
+
+    #[test]
+    fn streaming_decode_accepts_invalid_utf8_in_non_target_column() {
+        let mut body = Vec::new();
+        put_uvarint(&mut body, 2);
+        put_bytes(&mut body, b"level");
+        put_uvarint(&mut body, 0);
+        put_uvarint(&mut body, 1);
+        put_uvarint(&mut body, 0);
+        put_bytes(&mut body, b"info");
+        put_uvarint(&mut body, 1);
+        put_bytes(&mut body, b"zone");
+        put_uvarint(&mut body, 0);
+        put_uvarint(&mut body, 1);
+        put_uvarint(&mut body, 0);
+        put_bytes(&mut body, &[0xff]); // invalid UTF-8, but valid skipped framing
+        put_uvarint(&mut body, 1);
+
+        let mut raw = Vec::from(MAGIC);
+        raw.extend_from_slice(&[FORMAT_VERSION, CODEC_RAW]);
+        raw.extend_from_slice(&body);
+        let malformed = base64::engine::general_purpose::STANDARD.encode(raw);
+
+        // UTF-8 damage confined to a non-target column is accepted exactly as
+        // decode_column accepts it; only the requested column is interpreted.
+        assert!(decode_column(&malformed, "level").is_some());
+        assert!(streaming_column(&malformed, "level").is_some());
     }
 
     #[test]
