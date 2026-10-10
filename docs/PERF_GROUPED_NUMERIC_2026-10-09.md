@@ -131,3 +131,29 @@ Retained external evidence:
 - `results/20261010-httpavg-execution/candidate/top-hosts-answer-evidence.json`
 - `results/20261009-avg-size/candidate/20261010-aws/siglake-core.json`
 - `results/20261009-top-hosts/baseline/20261010-aws/siglake-core.json`
+
+## Renderer repair, 2026-10-10 (#6659)
+
+The serializer half above is fixed. `Cargo.toml` now builds serde_json with
+`float_roundtrip`, whose exact parser reads `31.458800533996442` back as
+`0x403f7573f3a8e6ed`, so the scan records path returns the bits DataFusion
+computed. The differential test keeps both halves: the quotient assertion now
+requires preserved bits through records construction and the serialized
+response, and the two-layout DataFusion query still shows the arithmetic
+difference the renderer cannot explain.
+
+`format::tests::records_preserve_binary64_bits_through_both_collector_paths`
+drives twenty finite edge-case values — the status-304 quotient, both signed
+zeros, the subnormal boundary, `f64::MIN`/`MAX`, 17-digit tokens — through the
+complete-row and split-row collector paths and the final envelope
+serialization. `e2e::float_results_keep_their_bits_through_the_http_response`
+asserts the same over real HTTP in both response formats; with the feature
+removed it fails on the raw body. Nulls and non-finite values are unchanged
+(`records_keep_null_and_nonfinite_float_rendering`): a null is omitted from the
+row, NaN and the infinities are written as JSON null.
+
+The measurements, AWS receipts and the failed qualification above stand as
+retained. This repair does not establish that serialization was the only cause
+of the AWS mismatch; the missing pre-render state still prevents that claim.
+The strict gate and the unchanged AVG rerun run through #6643 on a frozen
+source containing this repair.

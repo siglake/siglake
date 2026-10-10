@@ -1946,14 +1946,21 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   layout-dependent scan answer: `[2^53, 1, -2^53]` sums to either `0` or `1`
   in binary64 depending on addition order, despite one exact sum and count. A
   bounded reproduction also found a renderer difference in the observed pair:
-  Arrow JSON writes `31.458800533996442`, but the scan records path's
-  serde_json parser, built without `float_roundtrip`, reads that token as the
-  adjacent lower value before the HTTP response is serialized. The footer path
-  constructs its JSON value directly. This reproduces both retained response
-  strings, although the AWS receipt has no pre-render scan bits or input bounds
-  with which to exclude a simultaneous accumulation difference. Strict bitwise
-  qualification therefore remains open; Siglake does not round, special-case a
-  status or apply a tolerance.
+  Arrow JSON writes `31.458800533996442`, and the scan records path reparsed
+  that token with a serde_json built without `float_roundtrip`, which read the
+  adjacent lower value before the HTTP response was serialized. The footer path
+  constructs its JSON value directly and was unaffected. That half is fixed in
+  0.3.0 (#6659): the workspace builds serde_json with `float_roundtrip`, so
+  both renderers now return the bits the engine computed, pinned by
+  `format::tests::records_preserve_binary64_bits_through_both_collector_paths`
+  and the HTTP-level
+  `e2e::float_results_keep_their_bits_through_the_http_response`. The
+  arithmetic difference is not fixed and cannot be: the AWS receipt has no
+  pre-render scan bits or input bounds with which to exclude a simultaneous
+  accumulation difference in that run, and the footer's exact `(sum, count)`
+  still cannot reproduce every layout-dependent accumulation. Strict bitwise
+  qualification of the candidate therefore remains open; Siglake does not
+  round, special-case a status or apply a tolerance.
 
 - **The local, CI and kind stacks use frozen Bitnami Legacy MinIO images.**
   MinIO stopped publishing prebuilt community binaries, and its former Docker

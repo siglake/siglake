@@ -989,7 +989,7 @@ mod tests {
     use siglake_storage::FILE_ATTRIBUTION_CAP;
     use std::sync::Arc;
 
-    use arrow_array::StringArray;
+    use arrow_array::{Float64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::error::DataFusionError;
 
@@ -1088,6 +1088,159 @@ mod tests {
         let decoded: ScanDetail = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.bytes_data, 300);
         assert_eq!(decoded.bytes_data_requested, 0);
+    }
+
+    /// Finite binary64 values whose decimal form a fast parser is apt to land
+    /// one unit in the last place away from: the status-304 quotient of #6659,
+    /// both signed zeros, the subnormal boundary, the extremes of the range,
+    /// and 17-significant-digit values with a long exponent.
+    fn float_fixtures() -> Vec<f64> {
+        vec![
+            1_168_295_731_f64 / 37_137_326_f64,
+            31.45880053399644_f64,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.1,
+            1.0 / 3.0,
+            2.0_f64.powi(53),
+            -(2.0_f64.powi(53)) - 2.0,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::from_bits(0x000f_ffff_ffff_ffff),
+            f64::MAX,
+            f64::MIN,
+            f64::EPSILON,
+            0.1 + 0.2,
+            8.988465674311579e307,
+            // Arbitrary mantissas: their shortest round-trip decimals need
+            // every significant digit, which is where a fast parser drifts.
+            f64::from_bits(0x4d9a_2b3c_4d5e_6f70),
+            f64::from_bits(0x0123_4567_89ab_cdef),
+            f64::from_bits(0x7fef_ffff_ffff_fffe),
+        ]
+    }
+
+    fn float_batch(values: &[f64], filler: Option<&str>) -> RecordBatch {
+        let mut fields = vec![Field::new("value", DataType::Float64, true)];
+        let mut columns: Vec<arrow_array::ArrayRef> =
+            vec![Arc::new(Float64Array::from(values.to_vec()))];
+        if let Some(filler) = filler {
+            fields.push(Field::new("filler", DataType::Utf8, false));
+            columns.push(Arc::new(StringArray::from(vec![filler; values.len()])));
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    }
+
+    /// Every finite float a query produces must leave the server with the bits
+    /// DataFusion computed. The records path renders through arrow-json and
+    /// parses the result back, so this holds only while serde_json is built
+    /// with `float_roundtrip` (#6659). Both halves of the row collector are
+    /// covered: short rows parse from the input slice, and a row larger than
+    /// arrow-json's flush threshold arrives split and parses from `pending`.
+    #[test]
+    fn records_preserve_binary64_bits_through_both_collector_paths() {
+        let values = float_fixtures();
+        // 32 KiB is past arrow-json's internal flush threshold, so each of
+        // these rows reaches the collector in fragments.
+        let split_filler = "x".repeat(32 * 1024);
+        for filler in [None, Some(split_filler.as_str())] {
+            let batch = float_batch(&values, filler);
+            let split = filler.is_some();
+
+            let collector =
+                collect_record_rows(std::slice::from_ref(&batch), values.len()).unwrap();
+            assert_eq!(
+                collector.max_pending_len > 0,
+                split,
+                "collector path not exercised as intended (split={split})"
+            );
+            drop(collector);
+
+            let envelope = batches_to_records(&[batch], None).unwrap();
+            let rows = envelope.rows.as_array().unwrap();
+            assert_eq!(rows.len(), values.len());
+            for (row, expected) in rows.iter().zip(&values) {
+                assert_eq!(
+                    row["value"].as_f64().unwrap().to_bits(),
+                    expected.to_bits(),
+                    "records construction changed {expected:e} (split={split})"
+                );
+            }
+
+            // The client reads the serialized envelope, not the `Value`.
+            let served: RecordsResponse =
+                serde_json::from_slice(&serde_json::to_vec(&envelope).unwrap()).unwrap();
+            for (row, expected) in served.rows.as_array().unwrap().iter().zip(&values) {
+                assert_eq!(
+                    row["value"].as_f64().unwrap().to_bits(),
+                    expected.to_bits(),
+                    "HTTP serialization changed {expected:e} (split={split})"
+                );
+            }
+        }
+    }
+
+    /// NDJSON is the other records renderer and does not reparse; the two must
+    /// still agree, so the token the parser reads is the one a client sees.
+    #[test]
+    fn ndjson_and_records_renderers_agree_on_float_tokens() {
+        let values = float_fixtures();
+        let ndjson = batches_to_ndjson(&[float_batch(&values, None)]).unwrap();
+        let envelope = batches_to_records(&[float_batch(&values, None)], None).unwrap();
+        for (line, row) in ndjson
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .zip(envelope.rows.as_array().unwrap())
+        {
+            let streamed: serde_json::Value = serde_json::from_slice(line).unwrap();
+            assert_eq!(
+                streamed["value"].as_f64().unwrap().to_bits(),
+                row["value"].as_f64().unwrap().to_bits(),
+                "renderers disagree on {}",
+                String::from_utf8_lossy(line)
+            );
+        }
+    }
+
+    /// Nulls and non-finite values are unchanged by #6659: a null stays a JSON
+    /// null, and arrow-json's existing treatment of NaN and the infinities is
+    /// what it was. This pins the behavior rather than endorsing it.
+    #[test]
+    fn records_keep_null_and_nonfinite_float_rendering() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Float64,
+                true,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![
+                None,
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+                Some(1.5),
+            ]))],
+        )
+        .unwrap();
+
+        let envelope = batches_to_records(std::slice::from_ref(&batch), None).unwrap();
+        let rows = envelope.rows.as_array().unwrap();
+        assert_eq!(rows[0].get("value"), None, "null gained a key");
+        assert_eq!(rows[1]["value"], serde_json::json!(null));
+        assert_eq!(rows[2]["value"], serde_json::json!(null));
+        assert_eq!(rows[3]["value"], serde_json::json!(null));
+        assert_eq!(
+            rows[4]["value"].as_f64().unwrap().to_bits(),
+            1.5_f64.to_bits()
+        );
+        assert_eq!(
+            batches_to_ndjson(&[batch]).unwrap(),
+            // A null is omitted; a non-finite value is written as an explicit
+            // null, since JSON has no NaN or infinity.
+            b"{}\n{\"value\":null}\n{\"value\":null}\n{\"value\":null}\n{\"value\":1.5}\n"
+        );
     }
 
     #[test]
