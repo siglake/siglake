@@ -501,6 +501,7 @@ const DROPPED_INDEXES_CONFIG_DIR: &str = "_siglake/config/dropped_indexes";
 const DELETE_TASK_CLAIM_PROBE: &str = ".create-only-probe";
 const DELETE_TASK_CLAIM_PROBE_BODY: &[u8] = b"siglake delete-task create-only probe v1\n";
 const CONDITIONAL_WRITE_PROBE: &str = "_siglake/config/.conditional-write-probe";
+const CONDITIONAL_WRITE_READ_ATTEMPTS: usize = 4;
 static CONDITIONAL_WRITE_PROBE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Attempts a delete-task record write gets before it is reported lost. Same
@@ -594,6 +595,22 @@ struct ConditionalWriteCompatibility {
     if_not_exists: Option<ConditionalPrecondition>,
 }
 
+async fn retry_temporary_conditional_read<T, F, Fut>(mut read: F) -> opendal::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = opendal::Result<T>>,
+{
+    for attempt in 1..=CONDITIONAL_WRITE_READ_ATTEMPTS {
+        match read().await {
+            Err(error) if error.is_temporary() && attempt < CONDITIONAL_WRITE_READ_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final read attempt always returns")
+}
+
 /// Detect the measured S3-compatible failure modes where the endpoint accepts
 /// either a stale `If-Match` overwrite or an existing-key `If-None-Match: *`
 /// overwrite. Static OpenDAL capabilities are necessary to issue the requests,
@@ -644,8 +661,10 @@ async fn probe_conditional_write_compatibility(
         } else {
             &stale
         };
-        let found = op
-            .read(&rel)
+        // MinIO can close the pooled connection after returning a conditional
+        // PUT rejection. Retry only the idempotent observation when OpenDAL
+        // identifies that transport failure as temporary.
+        let found = retry_temporary_conditional_read(|| op.read(&rel))
             .await
             .context("read conditional-write If-Match probe")?
             .to_vec();
@@ -689,8 +708,7 @@ async fn probe_conditional_write_compatibility(
         } else {
             &overwrite
         };
-        let found = op
-            .read(&rel)
+        let found = retry_temporary_conditional_read(|| op.read(&rel))
             .await
             .context("read conditional-write If-None-Match probe")?
             .to_vec();
@@ -797,12 +815,14 @@ mod conditional_write_compatibility_tests {
         IfMatch,
         IfNotExists,
         UnexpectedIfMatch,
+        TemporaryFirstRead,
     }
 
     #[derive(Debug)]
     struct IgnoreConditionalAccess<A> {
         inner: A,
         ignored: IgnoredPrecondition,
+        read_attempts: std::sync::atomic::AtomicUsize,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -815,6 +835,7 @@ mod conditional_write_compatibility_tests {
             IgnoreConditionalAccess {
                 inner,
                 ignored: self.0,
+                read_attempts: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -836,6 +857,18 @@ mod conditional_write_compatibility_tests {
             path: &str,
             args: OpRead,
         ) -> opendal::Result<(opendal::raw::RpRead, Self::Reader)> {
+            if self.ignored == IgnoredPrecondition::TemporaryFirstRead
+                && self
+                    .read_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    == 0
+            {
+                return Err(opendal::Error::new(
+                    opendal::ErrorKind::Unexpected,
+                    "fixture connection closed before message completed",
+                )
+                .set_temporary());
+            }
             self.inner.read(path, args).await
         }
 
@@ -871,7 +904,8 @@ mod conditional_write_compatibility_tests {
             match self.ignored {
                 IgnoredPrecondition::Neither
                 | IgnoredPrecondition::IfMatch
-                | IgnoredPrecondition::UnexpectedIfMatch => {
+                | IgnoredPrecondition::UnexpectedIfMatch
+                | IgnoredPrecondition::TemporaryFirstRead => {
                     forwarded = forwarded.with_if_not_exists(args.if_not_exists());
                     if let Some(value) = args.if_none_match() {
                         forwarded = forwarded.with_if_none_match(value);
@@ -960,6 +994,19 @@ mod conditional_write_compatibility_tests {
         assert_eq!(
             verdict.if_not_exists,
             Some(ConditionalPrecondition::Ignored)
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_retries_a_temporary_verification_read() {
+        let (_root, op) = operator(IgnoredPrecondition::TemporaryFirstRead);
+        let verdict = probe_conditional_write_compatibility(&op).await.unwrap();
+        assert_eq!(
+            verdict,
+            ConditionalWriteCompatibility {
+                if_match: Some(ConditionalPrecondition::Verified),
+                if_not_exists: Some(ConditionalPrecondition::Verified),
+            }
         );
     }
 
@@ -1074,7 +1121,6 @@ mod conditional_write_live {
 
     const BUCKET: &str = "siglake-warehouse";
     const ROUNDS: usize = 20;
-    const READ_ATTEMPTS: usize = 4;
     const LIVE_TEST_TIMEOUT: Duration = Duration::from_secs(120);
     const LIVE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1343,26 +1389,10 @@ mod conditional_write_live {
         Ok((outcome, body))
     }
 
-    async fn retry_temporary_read<T, F, Fut>(mut read: F) -> opendal::Result<T>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = opendal::Result<T>>,
-    {
-        for attempt in 1..=READ_ATTEMPTS {
-            match read().await {
-                Err(error) if error.is_temporary() && attempt < READ_ATTEMPTS => {
-                    tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
-                }
-                result => return result,
-            }
-        }
-        unreachable!("the final read attempt always returns")
-    }
-
     #[tokio::test]
     async fn cas_race_final_read_retries_only_temporary_errors() {
         let mut attempts = 0;
-        let body = retry_temporary_read(|| {
+        let body = retry_temporary_conditional_read(|| {
             attempts += 1;
             let attempt = attempts;
             async move {
@@ -1383,7 +1413,7 @@ mod conditional_write_live {
         assert_eq!(attempts, 3);
 
         let mut permanent_attempts = 0;
-        let error = retry_temporary_read(|| {
+        let error = retry_temporary_conditional_read(|| {
             permanent_attempts += 1;
             async {
                 Err::<Vec<u8>, _>(opendal::Error::new(
@@ -1455,7 +1485,9 @@ mod conditional_write_live {
             // the pooled HTTP connections. OpenDAL marks that body-read error
             // temporary; retry the idempotent observation rather than turning
             // transport noise into a conditional-write verdict.
-            let final_body = retry_temporary_read(|| op.read(&rel)).await?.to_vec();
+            let final_body = retry_temporary_conditional_read(|| op.read(&rel))
+                .await?
+                .to_vec();
             anyhow::ensure!(
                 final_body == winner_body,
                 "round {round} stored the loser body"
