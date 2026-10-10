@@ -1936,7 +1936,17 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   measures and filtered variants use the normal exact scan. Files written
   before 0.3.0 gain no footer through migration; a mixed old/new snapshot also
   scans until ordinary compaction has rewritten every live file. No rewrite is
-  required for correctness.
+  required for correctness. Its integer footer sum is mathematically exact,
+  while DataFusion 53.1 coerces an integer `AVG` input to binary64 and combines
+  binary64 batch and partition sums. Those operations depend on row, batch and
+  partition order. The 2026-10-10 AWS candidate exposed the distinction for
+  status 304: the scan returned `31.45880053399644` and exact integer
+  `sum / count` returned `31.458800533996442`, one binary64 unit in the last
+  place apart. A footer function of exact `(sum, count)` cannot reproduce every
+  layout-dependent scan answer: `[2^53, 1, -2^53]` sums to either `0` or `1`
+  in binary64 depending on addition order, despite one exact sum and count.
+  Strict bitwise qualification therefore remains open; Siglake does not round,
+  special-case a status or apply a tolerance.
 
 - **The local, CI and kind stacks use frozen Bitnami Legacy MinIO images.**
   MinIO stopped publishing prebuilt community binaries, and its former Docker

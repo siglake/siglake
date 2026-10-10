@@ -11833,9 +11833,10 @@ pub struct IcebergContext {
     /// with `table_cache`; entries are never removed (one per table).
     table_cache_epochs: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     scan_cost_cache: Arc<RwLock<LruMap<String, CachedScanCostEntry>>>,
-    /// Phase 2 — per-file footer cache (group-counts + time-buckets), keyed by
-    /// file path (immutable → no TTL, LRU-evicted only). Shared via `Arc` so
-    /// per-tenant clones reuse it (the keyspace is file paths, globally unique).
+    /// Phase 2 — per-file footer cache (group-counts, grouped numeric summaries,
+    /// and time-buckets), keyed by file path (immutable → no TTL, LRU-evicted
+    /// only). Shared via `Arc` so per-tenant clones reuse it (the keyspace is file
+    /// paths, globally unique).
     footer_cache: Arc<std::sync::Mutex<FooterCache>>,
     /// Phase 2 — snapshot-keyed unwindowed group-count aggregate cache, keyed by
     /// `(table, snapshot_id, column)`. Invalidated on commit via
@@ -12098,20 +12099,23 @@ struct CachedScanCostEntry {
 
 /// Phase 2 (aggregation fast path) — bounded, TTL-free footer cache. siglake data
 /// files are immutable + UUID-named, so a given file PATH's parsed footers never
-/// change: the per-file group-count and time-bucket footers are cached keyed by
-/// path and never invalidated, only LRU-evicted when the cache is full. This lets
-/// a windowed aggregation reuse per-file partials across windows and across repeat
-/// queries — only the per-query boundary-file scan stays unique to the query.
+/// change: the per-file group-count, grouped-numeric and time-bucket footers are
+/// cached keyed by path and never invalidated, only LRU-evicted when the cache is
+/// full. This lets aggregations reuse per-file partials across repeat queries —
+/// only the per-query boundary-file scan stays unique to a windowed query.
 ///
-/// Entries are small (group-counts ≤ [`MAX_GROUP_COUNT_CARDINALITY`] entries/file;
-/// time-buckets ≤ #buckets/file), so the cap is on the number of cached
-/// file/column entries, not bytes. `Option<…>` is cached too: a footer *miss*
-/// (absent / invalid / over-claiming footer → caller scans) is itself stable per
-/// path and worth caching to avoid re-reading the metadata to re-discover the miss.
+/// Entry sizes follow footer cardinality, so every sub-map has both the common
+/// entry cap and a share of the derived metadata-cache byte budget. `Option<…>`
+/// is cached too: a footer *miss* (absent / invalid / over-claiming footer →
+/// caller scans) is itself stable per path and worth caching to avoid re-reading
+/// the metadata to re-discover the miss.
 #[derive(Debug, Default)]
 struct FooterCache {
     /// `(file_path, column)` → parsed group-count footer (or a cached miss).
     group_counts: LruMap<(String, String), Option<GroupCountRows>>,
+    /// `(file_path, group_column, value_column)` → parsed grouped-numeric
+    /// footer (or a cached stable miss).
+    grouped_numeric: LruMap<(String, String, String), Option<siglake_bloom::GroupedNumericSummary>>,
     /// `file_path` → parsed time-bucket footer (or a cached miss).
     time_buckets: LruMap<String, Option<Vec<(i64, u64)>>>,
 }
@@ -12120,7 +12124,8 @@ impl FooterCache {
     fn new(cap: usize) -> Self {
         Self {
             // Hot path for every windowed aggregate, so the largest share.
-            group_counts: LruMap::with_limits(cap, cache_budget(0.35), "footer_group_counts"),
+            group_counts: LruMap::with_limits(cap, cache_budget(0.30), "footer_group_counts"),
+            grouped_numeric: LruMap::with_limits(cap, cache_budget(0.05), "footer_grouped_numeric"),
             time_buckets: LruMap::with_limits(cap, cache_budget(0.05), "footer_time_buckets"),
         }
     }
@@ -12242,6 +12247,22 @@ impl<T: ApproxHeapBytes> ApproxHeapBytes for Vec<T> {
 impl ApproxHeapBytes for String {
     fn approx_heap_bytes(&self) -> usize {
         self.capacity()
+    }
+}
+
+impl ApproxHeapBytes for siglake_bloom::GroupedNumericSummary {
+    fn approx_heap_bytes(&self) -> usize {
+        self.group_column.capacity()
+            + self.value_column.capacity()
+            + self
+                .groups
+                .keys()
+                .map(|group| {
+                    group.as_ref().map_or(0, String::capacity)
+                        + std::mem::size_of::<siglake_bloom::GroupedNumericValue>()
+                        + 48
+                })
+                .sum::<usize>()
     }
 }
 
@@ -13788,6 +13809,11 @@ impl IcebergContext {
                 "footer_time_buckets",
                 c.time_buckets.bytes(),
                 c.time_buckets.map.len(),
+            );
+            set(
+                "footer_grouped_numeric",
+                c.grouped_numeric.bytes(),
+                c.grouped_numeric.map.len(),
             );
         }
         {
@@ -23328,6 +23354,19 @@ pub struct GroupedNumericAvgRow {
     pub rows: u64,
 }
 
+fn grouped_numeric_average(value: siglake_bloom::GroupedNumericValue) -> Option<f64> {
+    use siglake_bloom::GroupedNumericSum;
+
+    (value.non_null != 0).then(|| match value.sum {
+        GroupedNumericSum::Int(sum) => sum as f64 / value.non_null as f64,
+        GroupedNumericSum::Float(sum) => sum / value.non_null as f64,
+    })
+}
+
+fn grouped_numeric_file_supported(format: DataFileFormat, has_deletes: bool) -> bool {
+    format == DataFileFormat::Parquet && !has_deletes
+}
+
 /// What a query is served FROM: the current snapshot, current schema id, and
 /// table incarnation from one metadata generation.
 ///
@@ -25155,7 +25194,7 @@ impl IcebergContext {
             .live_file_scan_tasks_cached(&table_ident, &cached)
             .await?;
         if tasks.iter().any(|task| {
-            task.data_file_format != DataFileFormat::Parquet || !task.deletes.is_empty()
+            !grouped_numeric_file_supported(task.data_file_format, !task.deletes.is_empty())
         }) {
             return Ok(None);
         }
@@ -25167,17 +25206,22 @@ impl IcebergContext {
         let group = group_column.to_string();
         let value = value_column.to_string();
         let summaries: Vec<Option<siglake_bloom::GroupedNumericSummary>> =
-            futures::stream::iter(
-                tasks.as_ref().clone().into_iter().map(|task| {
-                    let file_io = file_io.clone();
-                    let path = task.data_file_path().to_string();
-                    let group = group.clone();
-                    let value = value.clone();
-                    async move {
-                        read_file_grouped_numeric_for_path(&file_io, &path, &group, &value).await
-                    }
-                }),
-            )
+            futures::stream::iter(tasks.as_ref().clone().into_iter().map(|task| {
+                let file_io = file_io.clone();
+                let path = task.data_file_path().to_string();
+                let group = group.clone();
+                let value = value.clone();
+                async move {
+                    cached_read_file_grouped_numeric_for_path(
+                        &self.footer_cache,
+                        &file_io,
+                        &path,
+                        &group,
+                        &value,
+                    )
+                    .await
+                }
+            }))
             .buffer_unordered(concurrency)
             .try_collect()
             .await?;
@@ -25234,10 +25278,7 @@ impl IcebergContext {
             .into_iter()
             .map(|(group, value)| GroupedNumericAvgRow {
                 group,
-                avg: (value.non_null != 0).then(|| match value.sum {
-                    GroupedNumericSum::Int(sum) => sum as f64 / value.non_null as f64,
-                    GroupedNumericSum::Float(sum) => sum / value.non_null as f64,
-                }),
+                avg: grouped_numeric_average(value),
                 rows: value.rows,
             })
             .collect();
@@ -25962,6 +26003,49 @@ async fn read_file_grouped_numeric_for_path(
         return Ok(None);
     }
     Ok(Some(summary))
+}
+
+/// Footer-cache-backed wrapper for [`read_file_grouped_numeric_for_path`].
+/// The full path and both column identities form the key because one footer
+/// carries exactly one pair. A valid summary and a stable absent/invalid footer
+/// are immutable properties of the data file; an I/O error returns before the
+/// put and is retried on the next request. The mutex is never held over I/O or
+/// the cooperative yield.
+async fn cached_read_file_grouped_numeric_for_path(
+    cache: &std::sync::Mutex<FooterCache>,
+    file_io: &FileIO,
+    path: &str,
+    group_column: &str,
+    value_column: &str,
+) -> Result<Option<siglake_bloom::GroupedNumericSummary>> {
+    let key = (
+        path.to_string(),
+        group_column.to_string(),
+        value_column.to_string(),
+    );
+    // The guard drops at the `;` — it must not live across the yield below.
+    let hit = cache.lock().unwrap().grouped_numeric.get(&key);
+    if let Some(hit) = hit {
+        metrics::counter!(
+            "siglake_footer_cache_hits_total",
+            "kind" => "grouped_numeric"
+        )
+        .increment(1);
+        return Ok(footer_cache_hit(hit).await);
+    }
+    metrics::counter!(
+        "siglake_footer_cache_misses_total",
+        "kind" => "grouped_numeric"
+    )
+    .increment(1);
+    let summary =
+        read_file_grouped_numeric_for_path(file_io, path, group_column, value_column).await?;
+    cache
+        .lock()
+        .unwrap()
+        .grouped_numeric
+        .put(key, summary.clone());
+    Ok(summary)
 }
 
 /// Fix 2a-coarse-read: roll the per-snapshot time-bucket aggregate up into a
@@ -29165,6 +29249,23 @@ mod cache_hit_coop_tests {
             (PATH.to_string(), "host".to_string()),
             Some(vec![(Some("h1".to_string()), 100)]),
         );
+        let mut numeric = siglake_bloom::GroupedNumericSummary::new(
+            "status".into(),
+            "size".into(),
+            siglake_bloom::GroupedNumericKind::Int64,
+        );
+        numeric.groups.insert(
+            Some("200".into()),
+            siglake_bloom::GroupedNumericValue {
+                rows: 100,
+                non_null: 100,
+                sum: siglake_bloom::GroupedNumericSum::Int(500),
+            },
+        );
+        cache.grouped_numeric.put(
+            (PATH.to_string(), "status".to_string(), "size".to_string()),
+            Some(numeric),
+        );
         std::sync::Mutex::new(cache)
     }
 
@@ -29186,6 +29287,12 @@ mod cache_hit_coop_tests {
                 .unwrap()
                 .expect("group-count entry is present");
             assert_eq!(counts, vec![(Some("h1".to_string()), 100)]);
+            let numeric =
+                cached_read_file_grouped_numeric_for_path(cache, file_io, PATH, "status", "size")
+                    .await
+                    .unwrap()
+                    .expect("grouped-numeric entry is present");
+            assert_eq!(numeric.groups.len(), 1);
         }
     }
 
@@ -29219,6 +29326,395 @@ mod cache_hit_coop_tests {
         tokio::time::timeout(Duration::from_secs(30), thousand_hits(&cache, &file_io))
             .await
             .expect("the hit loop completes under a real budget");
+    }
+}
+
+#[cfg(test)]
+mod grouped_numeric_footer_cache_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use iceberg::io::{FileMetadata, FileWrite, OutputFile, Storage, StorageConfig};
+    use siglake_bloom::{
+        GroupedNumericKind, GroupedNumericSum, GroupedNumericSummary, GroupedNumericValue,
+    };
+
+    const PATH_A: &str = "memory://warehouse/data/a.parquet";
+    const PATH_B: &str = "memory://warehouse/data/b.parquet";
+
+    #[derive(Debug)]
+    struct CountingState {
+        data: std::sync::Mutex<Bytes>,
+        metadata_calls: AtomicUsize,
+        range_reads: AtomicUsize,
+        fail_next_metadata: AtomicBool,
+        metadata_delay: Duration,
+    }
+
+    impl Default for CountingState {
+        fn default() -> Self {
+            Self {
+                data: std::sync::Mutex::new(Bytes::new()),
+                metadata_calls: AtomicUsize::new(0),
+                range_reads: AtomicUsize::new(0),
+                fail_next_metadata: AtomicBool::new(false),
+                metadata_delay: Duration::ZERO,
+            }
+        }
+    }
+
+    fn default_counting_state() -> Arc<CountingState> {
+        Arc::new(CountingState::default())
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct CountingFactory {
+        #[serde(skip, default = "default_counting_state")]
+        state: Arc<CountingState>,
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct CountingStorage {
+        #[serde(skip, default = "default_counting_state")]
+        state: Arc<CountingState>,
+    }
+
+    #[derive(Debug)]
+    struct CountingRead {
+        state: Arc<CountingState>,
+    }
+
+    #[async_trait]
+    impl FileRead for CountingRead {
+        async fn read(&self, range: Range<u64>) -> iceberg::Result<Bytes> {
+            self.state.range_reads.fetch_add(1, Ordering::SeqCst);
+            let data = self.state.data.lock().unwrap();
+            Ok(data.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoopWrite;
+
+    #[async_trait]
+    impl FileWrite for NoopWrite {
+        async fn write(&mut self, _bytes: Bytes) -> iceberg::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&mut self) -> iceberg::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[typetag::serde]
+    impl StorageFactory for CountingFactory {
+        fn build(&self, _config: &StorageConfig) -> iceberg::Result<Arc<dyn Storage>> {
+            Ok(Arc::new(CountingStorage {
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
+    #[async_trait]
+    #[typetag::serde]
+    impl Storage for CountingStorage {
+        async fn exists(&self, _path: &str) -> iceberg::Result<bool> {
+            Ok(true)
+        }
+
+        async fn metadata(&self, _path: &str) -> iceberg::Result<FileMetadata> {
+            self.state.metadata_calls.fetch_add(1, Ordering::SeqCst);
+            if self.state.fail_next_metadata.swap(false, Ordering::SeqCst) {
+                return Err(IcebergError::new(
+                    IcebergErrorKind::Unexpected,
+                    "injected transient metadata failure",
+                ));
+            }
+            tokio::time::sleep(self.state.metadata_delay).await;
+            Ok(FileMetadata {
+                size: self.state.data.lock().unwrap().len() as u64,
+            })
+        }
+
+        async fn read(&self, _path: &str) -> iceberg::Result<Bytes> {
+            Ok(self.state.data.lock().unwrap().clone())
+        }
+
+        async fn reader(&self, _path: &str) -> iceberg::Result<Box<dyn FileRead>> {
+            Ok(Box::new(CountingRead {
+                state: Arc::clone(&self.state),
+            }))
+        }
+
+        async fn write(&self, _path: &str, _bytes: Bytes) -> iceberg::Result<()> {
+            Ok(())
+        }
+
+        async fn writer(&self, _path: &str) -> iceberg::Result<Box<dyn FileWrite>> {
+            Ok(Box::new(NoopWrite))
+        }
+
+        async fn delete(&self, _path: &str) -> iceberg::Result<()> {
+            Ok(())
+        }
+
+        async fn delete_prefix(&self, _path: &str) -> iceberg::Result<()> {
+            Ok(())
+        }
+
+        async fn delete_stream(
+            &self,
+            _paths: futures::stream::BoxStream<'static, String>,
+        ) -> iceberg::Result<()> {
+            Ok(())
+        }
+
+        fn new_input(&self, path: &str) -> iceberg::Result<InputFile> {
+            Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+
+        fn new_output(&self, path: &str) -> iceberg::Result<OutputFile> {
+            Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+    }
+
+    fn summary(sum: i128, rows: u64) -> GroupedNumericSummary {
+        let mut summary =
+            GroupedNumericSummary::new("status".into(), "size".into(), GroupedNumericKind::Int64);
+        summary.groups.insert(
+            Some("304".into()),
+            GroupedNumericValue {
+                rows,
+                non_null: rows,
+                sum: GroupedNumericSum::Int(sum),
+            },
+        );
+        summary
+    }
+
+    fn parquet_bytes(footer: Option<&GroupedNumericSummary>) -> Bytes {
+        use arrow_array::{ArrayRef, Int64Array};
+
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "status",
+                Arc::new(Int64Array::from(vec![304, 304])) as ArrayRef,
+            ),
+            ("size", Arc::new(Int64Array::from(vec![31, 32])) as ArrayRef),
+        ])
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        if let Some(footer) = footer {
+            writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+                siglake_bloom::GROUPED_NUMERIC_KV_KEY.to_string(),
+                footer.encode(),
+            ));
+        }
+        writer.close().unwrap();
+        Bytes::from(bytes)
+    }
+
+    fn counting_file_io(state: &Arc<CountingState>) -> FileIO {
+        FileIOBuilder::new(Arc::new(CountingFactory {
+            state: Arc::clone(state),
+        }))
+        .build()
+    }
+
+    async fn cached_read(
+        cache: &std::sync::Mutex<FooterCache>,
+        file_io: &FileIO,
+        path: &str,
+    ) -> Result<Option<GroupedNumericSummary>> {
+        cached_read_file_grouped_numeric_for_path(cache, file_io, path, "status", "size").await
+    }
+
+    #[tokio::test]
+    async fn warm_hit_removes_footer_io_and_its_delay() {
+        let state = Arc::new(CountingState {
+            data: std::sync::Mutex::new(parquet_bytes(Some(&summary(63, 2)))),
+            metadata_delay: Duration::from_millis(40),
+            ..Default::default()
+        });
+        let file_io = counting_file_io(&state);
+        let cache = std::sync::Mutex::new(FooterCache::new(16));
+
+        let cold_started = Instant::now();
+        assert!(cached_read(&cache, &file_io, PATH_A)
+            .await
+            .unwrap()
+            .is_some());
+        let cold = cold_started.elapsed();
+        let reads_after_cold = state.range_reads.load(Ordering::SeqCst);
+        assert!(reads_after_cold > 0, "cold footer load made no range read");
+
+        let warm_started = Instant::now();
+        assert!(cached_read(&cache, &file_io, PATH_A)
+            .await
+            .unwrap()
+            .is_some());
+        let warm = warm_started.elapsed();
+
+        assert_eq!(state.metadata_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.range_reads.load(Ordering::SeqCst), reads_after_cold);
+        println!(
+            "grouped_numeric_footer_cache cold_us={} warm_us={} metadata_calls=1 range_reads={reads_after_cold}",
+            cold.as_micros(),
+            warm.as_micros()
+        );
+        assert!(
+            warm.as_nanos() * 4 < cold.as_nanos(),
+            "40ms delayed cold read was {cold:?}, cache hit was {warm:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stable_miss_is_cached_but_transient_error_is_not() {
+        let state = Arc::new(CountingState {
+            data: std::sync::Mutex::new(parquet_bytes(None)),
+            fail_next_metadata: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let file_io = counting_file_io(&state);
+        let cache = std::sync::Mutex::new(FooterCache::new(16));
+
+        assert!(cached_read(&cache, &file_io, PATH_A).await.is_err());
+        assert_eq!(state.metadata_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cached_read(&cache, &file_io, PATH_A).await.unwrap(), None);
+        assert_eq!(state.metadata_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(cached_read(&cache, &file_io, PATH_A).await.unwrap(), None);
+        assert_eq!(
+            state.metadata_calls.load(Ordering::SeqCst),
+            2,
+            "stable old-file miss should avoid another footer load"
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_evicts_lru_entry_and_new_path_cannot_serve_stale_summary() {
+        let state = Arc::new(CountingState {
+            data: std::sync::Mutex::new(parquet_bytes(Some(&summary(63, 2)))),
+            ..Default::default()
+        });
+        let file_io = counting_file_io(&state);
+        let cache = std::sync::Mutex::new(FooterCache::new(1));
+
+        let old = cached_read(&cache, &file_io, PATH_A)
+            .await
+            .unwrap()
+            .unwrap();
+        *state.data.lock().unwrap() = parquet_bytes(Some(&summary(600, 2)));
+        let new = cached_read(&cache, &file_io, PATH_B)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(old, new, "a new snapshot path replayed the old summary");
+        assert_eq!(state.metadata_calls.load(Ordering::SeqCst), 2);
+
+        assert!(cached_read(&cache, &file_io, PATH_A)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            state.metadata_calls.load(Ordering::SeqCst),
+            3,
+            "capacity one should have evicted the first path"
+        );
+    }
+
+    #[tokio::test]
+    async fn column_identity_is_part_of_the_cache_key() {
+        let state = Arc::new(CountingState {
+            data: std::sync::Mutex::new(parquet_bytes(Some(&summary(63, 2)))),
+            ..Default::default()
+        });
+        let file_io = counting_file_io(&state);
+        let cache = std::sync::Mutex::new(FooterCache::new(16));
+
+        assert!(cached_read(&cache, &file_io, PATH_A)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            cached_read_file_grouped_numeric_for_path(
+                &cache, &file_io, PATH_A, "status", "latency",
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert_eq!(state.metadata_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn incomplete_footer_is_a_cached_fallback() {
+        let state = Arc::new(CountingState {
+            // The Parquet file has two rows; this footer claims three.
+            data: std::sync::Mutex::new(parquet_bytes(Some(&summary(63, 3)))),
+            ..Default::default()
+        });
+        let file_io = counting_file_io(&state);
+        let cache = std::sync::Mutex::new(FooterCache::new(16));
+
+        assert_eq!(cached_read(&cache, &file_io, PATH_A).await.unwrap(), None);
+        assert_eq!(cached_read(&cache, &file_io, PATH_A).await.unwrap(), None);
+        assert_eq!(
+            state.metadata_calls.load(Ordering::SeqCst),
+            1,
+            "invalid coverage is immutable and should be a cached fallback"
+        );
+    }
+
+    #[test]
+    fn deletes_and_non_parquet_files_refuse_the_footer_path() {
+        assert!(grouped_numeric_file_supported(
+            DataFileFormat::Parquet,
+            false
+        ));
+        assert!(!grouped_numeric_file_supported(
+            DataFileFormat::Parquet,
+            true
+        ));
+        assert!(!grouped_numeric_file_supported(DataFileFormat::Avro, false));
+    }
+
+    #[test]
+    fn grouped_numeric_cache_has_entry_and_footprint_bounds() {
+        let cap = 7;
+        let mut cache = FooterCache::new(cap);
+        assert_eq!(cache.grouped_numeric.cap, cap);
+        assert_eq!(cache.grouped_numeric.max_bytes, cache_budget(0.05));
+
+        cache.grouped_numeric.put(
+            (PATH_A.into(), "status".into(), "size".into()),
+            Some(summary(63, 2)),
+        );
+        assert!(cache.grouped_numeric.bytes() > 0);
+        assert!(cache.grouped_numeric.bytes() <= cache.grouped_numeric.max_bytes);
+    }
+
+    #[test]
+    fn exact_integer_footer_and_datafusion_float_accumulation_can_differ() {
+        let candidate = grouped_numeric_average(GroupedNumericValue {
+            rows: 37_137_326,
+            non_null: 37_137_326,
+            sum: GroupedNumericSum::Int(1_168_295_731),
+        })
+        .unwrap();
+        let reference = 31.45880053399644_f64;
+        assert_eq!(candidate.to_bits(), reference.to_bits() + 1);
+
+        // DataFusion coerces integer AVG inputs to f64 and sums each Arrow batch,
+        // then sums the partials. IEEE-754 addition is layout/order-dependent:
+        // these two layouts have the same exact sum and count but different AVG.
+        let high = (1_u64 << 53) as f64;
+        let layout_a = ((high + 1.0) + -high) / 3.0;
+        let layout_b = ((high + -high) + 1.0) / 3.0;
+        assert_eq!(layout_a, 0.0);
+        assert_eq!(layout_b, 1.0 / 3.0);
     }
 }
 
