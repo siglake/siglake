@@ -690,6 +690,61 @@ async fn auth_required_accepts_valid_token() {
     assert_eq!(body["rows"].as_array().unwrap()[0]["n"], 1);
 }
 
+/// A float leaves the server with the bits the engine computed. The records
+/// renderer writes rows with arrow-json and parses them back, so a parser that
+/// rounds a decimal token to the nearest-but-one binary64 value silently
+/// rewrites results; `31.458800533996442` reached a client as
+/// `31.45880053399644` before #6659. Both response formats are checked against
+/// the raw body text, which no parser on this side can repair.
+#[tokio::test]
+async fn float_results_keep_their_bits_through_the_http_response() {
+    require_loopback!();
+    let srv = spawn(1).await;
+    // The 2026-10-10 status-304 quotient, a repeating fraction, and the sum
+    // whose shortest round-trip token needs all 17 significant digits — all
+    // computed in binary64 by DataFusion.
+    let query = "SELECT CAST(1168295731 AS DOUBLE) / CAST(37137326 AS DOUBLE) AS q, \
+                 CAST(1 AS DOUBLE) / CAST(3 AS DOUBLE) AS third, \
+                 CAST(0.1 AS DOUBLE) + CAST(0.2 AS DOUBLE) AS sum \
+                 FROM events LIMIT 1";
+    let expected = [
+        ("q", 1_168_295_731_f64 / 37_137_326_f64),
+        ("third", 1.0 / 3.0),
+        ("sum", 0.1_f64 + 0.2_f64),
+    ];
+
+    for format in ["records", "ndjson"] {
+        let resp = reqwest::Client::new()
+            .post(format!("{}/api/v1/sql", srv.base))
+            .json(&serde_json::json!({ "query": query, "format": format }))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status, 200, "{text}");
+        assert!(
+            text.contains("31.458800533996442"),
+            "{format} response lost the quotient's bits: {text}"
+        );
+
+        let row: serde_json::Value = match format {
+            "records" => {
+                let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                body["rows"][0].clone()
+            }
+            _ => serde_json::from_str(text.lines().next().unwrap()).unwrap(),
+        };
+        for (column, value) in expected {
+            assert_eq!(
+                row[column].as_f64().unwrap().to_bits(),
+                value.to_bits(),
+                "{format} response changed {column}: {text}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn auth_required_still_allows_healthz() {
     require_loopback!();

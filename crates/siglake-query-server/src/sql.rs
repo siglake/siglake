@@ -10690,11 +10690,13 @@ mod tests {
         );
 
         // The AWS receipt's exact footer quotient is one binary64 value above
-        // the scan response. Arrow JSON emits the round-trippable decimal, but
-        // serde_json without `float_roundtrip` parses it one value lower while
-        // collecting scan rows. The footer path constructs its Value directly
-        // and keeps the original bits. This is independent of the genuine
-        // accumulation-order example above.
+        // the scan response of 2026-10-10. Arrow JSON emits the round-trippable
+        // decimal, and serde_json built WITH `float_roundtrip` (#6659) parses
+        // it back to the same bits while collecting scan rows; before that
+        // feature it read the adjacent lower value and the two renderers
+        // disagreed. The footer path constructs its Value directly. Both now
+        // carry the quotient's bits, which is independent of the genuine
+        // accumulation-order example above: that one survives the renderers.
         let footer_avg = 1_168_295_731_f64 / 37_137_326_f64;
         let reference_avg = 31.45880053399644_f64;
         assert_eq!(footer_avg.to_bits(), reference_avg.to_bits() + 1);
@@ -10717,7 +10719,15 @@ mod tests {
         let scan = crate::format::batches_to_records(&[footer_batch], None).unwrap();
         assert_eq!(
             scan.rows[0]["avg_size"].as_f64().unwrap().to_bits(),
-            reference_avg.to_bits()
+            footer_avg.to_bits(),
+            "the records renderer lost the quotient's bits"
+        );
+        // ... and the response the client reads carries them too.
+        let served: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&scan.rows).unwrap()).unwrap();
+        assert_eq!(
+            served[0]["avg_size"].as_f64().unwrap().to_bits(),
+            footer_avg.to_bits()
         );
         let fast = serde_json::json!({ "avg_size": footer_avg });
         let encoded_fast = serde_json::to_vec(&fast).unwrap();

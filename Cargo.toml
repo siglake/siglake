@@ -48,7 +48,15 @@ tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip`: serde_json's default float parser is a fast approximation
+# that can land one unit in the last place away from the correctly rounded
+# binary64 value of a decimal token. The scan records path renders batches with
+# arrow-json and parses the result back into a `Value`
+# (crates/siglake-query-server/src/format.rs), so without this feature a
+# DataFusion `AVG` could leave the server with different bits than it computed:
+# `31.458800533996442` came back as `31.45880053399644` (#6659). The feature
+# switches the parser to an exact algorithm; it adds no dependency.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
