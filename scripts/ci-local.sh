@@ -70,6 +70,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 . scripts/ci-local-test-guard.sh
+. scripts/ci-local-generated-guard.sh
 . scripts/ci-local-external-readers.sh
 . scripts/ci-local-image-sizes.sh
 . scripts/ci-local-build-env.sh
@@ -232,6 +233,7 @@ else
   scripts/check-compose-preflight.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-conditional-write-probe.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-ci-local-test-guard.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  scripts/check-ci-local-generated-guard.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-ci-local-phases.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-bench-ports.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-jaeger-ui-recording.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
@@ -676,16 +678,13 @@ job_started=$SECONDS
 gen_why=()
 glog="$LOG_DIR/generated.log"
 : >"$glog"
-gen_differed=0
 run_generators() {
   local api_status f
   gen_why=()
-  gen_differed=0
   cargo run -q --locked -p siglake-openapi -- --out docs/api >>"$glog" 2>&1 \
     || gen_why+=("siglake-openapi failed to run")
   api_status=$(git status --porcelain --untracked-files=all -- docs/api)
   if [ -n "$api_status" ]; then
-    gen_differed=1
     gen_why+=("docs/api is stale (differs from HEAD):")
     while IFS= read -r line; do gen_why+=("  $line"); done < <(printf '%s\n' "$api_status" | head -5)
     { printf '%s\n' "$api_status"; git --no-pager diff --stat HEAD -- docs/api; } >>"$glog"
@@ -694,26 +693,12 @@ run_generators() {
     || gen_why+=("siglake-operator --print-crd failed")
   for f in deploy/operator/crd.yaml deploy/helm/siglake-operator/crds/siglakecluster.yaml; do
     if ! diff -u "$f" "$LOG_DIR/crd.yaml" >>"$glog" 2>&1; then
-      gen_differed=1
       gen_why+=("$f is stale")
     fi
   done
 }
 
-run_generators
-if [ "$gen_differed" -eq 1 ]; then
-  # This confirmation still writes this checkout's units into the shared
-  # target with newer mtimes, so another checkout can lose the same race in
-  # reverse. Splitting manager target dirs is the complete fix; test binaries
-  # are outside this generated-artifact check's scope.
-  if refresh_workspace_sources >/dev/null 2>>"$glog"; then
-    run_generators
-    echo "first pass differed; rebuilt from this checkout and re-diffed (shared CARGO_TARGET_DIR race)" \
-      >>"$glog"
-  else
-    gen_why=("failed to dirty workspace sources before regenerating")
-  fi
-fi
+run_generators_with_retry
 if [ "${#gen_why[@]}" -eq 0 ]; then
   report generated ok
 else
