@@ -6582,6 +6582,7 @@ dependencies = [
  "iceberg-catalog-sql",
  "iceberg-datafusion",
  "iceberg-storage-opendal",
+ "libc",
  "metrics",
  "metrics-util",
  "object_store",
