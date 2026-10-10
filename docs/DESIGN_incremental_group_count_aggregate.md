@@ -576,22 +576,36 @@ The raw synthetic readings were:
 | 2 | 65.98 / 65.98 | 23.16 / 23.16 | 16.77 / 16.77 | 39.93 / 39.93 |
 | 3 | 65.02 / 65.02 | 23.27 / 23.27 | 16.78 / 16.78 | 40.06 / 40.06 |
 
-The read path now retains the decoded compact body, reconstructs every column's
-keys to validate the whole body before returning, and reconstructs the selected
-column again into one reusable callback buffer. Count and predicate consumers
-use the key only inside the callback. The bounded collector copies a key only
-when it remains competitive; the synthetic profile owned 709 keys across the
-entire 1.15M-key selection.
+The read path retains the decoded compact body and fully reconstructs only the
+requested column during validation. Other columns are walked by framing: their
+shared-prefix bounds are checked against the tracked predecessor length, then
+their suffix and count bytes are skipped without copying or interpreting the
+key. The requested column is reconstructed again into one reusable callback
+buffer. Count and predicate consumers use the key only inside the callback.
+The bounded collector copies a key only when it remains competitive; the
+synthetic profile owned 709 keys across the entire 1.15M-key selection.
 
-That whole-body validation is new work relative to `decode_column`, which
-stopped after the requested column. CPU therefore scales with every key in the
-blob even though retained allocations scale with the encoded bytes plus the
-selected top K. At the recorded 1 TB extreme (26.5 MiB, about 20 million keys
-across 22 columns) one cache-disabled read can reconstruct about 20 million
-keys for validation and the requested column a second time. No retained copy of
-that extreme exists to time, so the real one-column capture above does not bound
-its wall time. The trade keeps the rule that corruption anywhere in an
-aggregate refuses the aggregate before a callback can expose a partial answer.
+The repository-local 22-column arm covers the former untimed extreme with
+1,000,000 non-NULL keys and one NULL group per column. It uses the format's raw
+codec and places the requested column last, so both decoders frame the same 21
+non-target columns before reconstructing the target. Three release runs from
+the task #6688 working tree at branch tip `97cc7e2` measured:
+
+| 22-column synthetic arm | Run 1 wall / CPU ms | Run 2 wall / CPU ms | Run 3 wall / CPU ms |
+| --- | ---: | ---: | ---: |
+| Owned targeted decode | 257.22 / 257.22 | 257.65 / 257.61 | 261.08 / 260.95 |
+| Streaming prepare | 208.24 / 208.24 | 227.61 / 227.54 | 206.90 / 206.87 |
+
+Streaming prepare stayed below targeted decode in all six comparisons. The
+encoded blob was 117,766 KiB; prepare retained 86.25 MiB and made two
+allocations, while targeted decode peaked at 124.93 MiB and made 1,000,011
+allocations. These are local raw-codec results, not timings for the compressed
+26.5 MiB production artifact cited above.
+
+Whole-body validation still frames every entry and rejects an impossible
+shared prefix, truncation or trailing bytes before a callback can expose a
+partial answer. UTF-8 is validated for the requested column only, matching
+`decode_column`: byte damage confined to a skipped value is not interpreted.
 Callers that need materialized values retain the full decoder. The on-disk
 format, SQL shapes, coverage and row-total guards, cardinality budgets,
 result-cache switch and aggregate-object cache are unchanged. A malformed,
