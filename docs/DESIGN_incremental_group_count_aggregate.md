@@ -539,6 +539,12 @@ the same 1,149,552 versus 1,462 allocation counts. The regression from the
 three-run range below is retained rather than hidden; streaming still reduced
 this rerun's decoder-plus-selection wall time by 54%.
 
+After replaying the candidate onto the current main line, the same captured
+fixture at `751907b` measured 90.07 / 90.07 ms for owned wall / CPU and 46.94 /
+46.93 ms for streaming validation plus selection. Allocation counts and peak
+heap stayed at 1,149,552 versus 1,462 and 83.68 versus 10.70 MiB. This is the
+final pre-gate measurement; the replay did not reverse the measured effect.
+
 The raw real-fixture readings were:
 
 | Run | Owned wall / CPU ms | Prepare wall / CPU ms | Select wall / CPU ms | Stream total wall / CPU ms |
