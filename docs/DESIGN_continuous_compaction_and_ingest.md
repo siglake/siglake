@@ -204,7 +204,7 @@ unbounded un-compacted layout's *read* amplification at query time.
     could cut until it ended. Fix chosen: every cache hit that stands in for
     I/O spends one unit of tokio's cooperative budget
     (`tokio::task::coop::consume_budget`), in the fork's two object-cache hit
-    paths and in siglake's two `FooterCache` wrappers. A task yields only once
+    paths and in siglake's three `FooterCache` wrappers. A task yields only once
     its per-poll budget (128) is gone, so an all-hit loop yields every 128 reads
     and every existing timeout above it becomes enforceable at that granularity,
     while a read path with a handful of hits pays a thread-local decrement on
@@ -258,7 +258,7 @@ unbounded un-compacted layout's *read* amplification at query time.
     | `iceberg.rs` `timeout(per_table, live_data_files_within(deadline))` | one snapshot's manifests | yes: deadline + `yield_now` per manifest | the #1002 template |
     | `iceberg.rs` `reachable_files` (no wrapper; CLI `gc-orphans` only) | every retained snapshot's manifest list and manifests via `load_manifest*` directly | before: not on a warm cache; now each hit spends budget | fork change; nothing above it to enforce |
     | `iceberg.rs` `live_file_scan_tasks_cached` miss → fork `plan_files` | manifests via the moka `ObjectCache` | yes: spawned producer behind bounded channels; the caller awaits a receive, the producer parks on a full channel | not needed |
-    | `iceberg.rs` footer sweeps: `warm_query_caches_sharing`, `date_histogram` Tier-2, windowed `GROUP BY` Tier-2, `grouped_counts_from_files` | `buffer_unordered` over `cached_read_file_time_buckets` / `cached_read_file_group_counts_for_path` / `raw_page_load_metadata` | before: a fully warm `FooterCache` set (≤ its 4,096-entry cap) was one poll; a miss does a `metadata()` HEAD (I/O) | `FooterCache` hits spend budget; byte-range hits spend budget (fork) |
+    | `iceberg.rs` footer sweeps: `warm_query_caches_sharing`, `date_histogram` Tier-2, windowed `GROUP BY` Tier-2, `grouped_counts_from_files`, grouped numeric AVG | `buffer_unordered` over the cached time-bucket / group-count / grouped-numeric readers | before: a fully warm `FooterCache` set (≤ its 4,096-entry cap) was one poll; a miss does a `metadata()` HEAD (I/O) | `FooterCache` hits spend budget; byte-range hits spend budget (fork) |
     | `iceberg.rs` `scan_cost` | `live_data_files_cached` (hit: one `Arc` clone; miss: the walk), then an in-memory prune over `DataFile`s | walk yields per manifest (#1002); the prune is µs per file, bounded by the live-file count | not needed |
     | query-server `timeout(cycle_cap, warm_all_query_caches)` | the footer sweep above per table, `cached_side_aggregates` (one read), `warm_group_counts` (`plan_files` + Tier-2) | yes, after this change | covered |
     | query-server `timeout(warm_probe_timeout, LIMIT 1 probe)` | DataFusion collect; footer and page reads through `CachingFileRead` | before: a fully cached single-partition probe was one poll; now byte-range hits spend budget | fork change |

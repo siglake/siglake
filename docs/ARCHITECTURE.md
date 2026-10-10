@@ -561,8 +561,12 @@ reclustering completes (`docs/DESIGN_time_ordered_storage.md`).
   footer is deliberately bounded to the published `GROUP BY status` / `AVG(size)`
   shape. It records per-group row count, non-null measure count and exact sum;
   the reader uses it only when every live file validates, otherwise the whole
-  query takes the normal scan path. `SIGLAKE_GROUPED_NUMERIC_FAST_PATH=off`
-  disables only this read path for rollback and matched measurement;
+  query takes the normal scan path. Parsed summaries and stable misses use the
+  immutable per-file footer cache under both column identities; transient read
+  errors do not enter the cache. The grouped-numeric sub-cache has the common
+  4,096-entry LRU cap and 5% of the derived metadata-cache byte budget.
+  `SIGLAKE_GROUPED_NUMERIC_FAST_PATH=off` disables only this read path for
+  rollback and matched measurement;
 - file-layout metadata plus rewrite-generation markers in the file *names*
   (`siglake-g<N>-…`), so compaction policy is computable from the manifest
   alone — nothing lifecycle-like is persisted that could disagree with policy.
@@ -1494,10 +1498,12 @@ with `SiglakeQueryPeerDiscoveryStalled` for a pod that never resolves one.
 Static `--query-peers` remains the non-Kubernetes compatibility mode (its
 contract is that the coordinator is peer zero); configuring both is refused.
 
-**Caches.** Per-file footer cache, snapshot-keyed aggregate + windowed-result
-caches, and a live-file cache holding both manifest-stat records and planned
-Tier-2 scan tasks — all keyed by `(table, snapshot, …)` and invalidated on
-commit. A text query's per-file inverted index is cached on both sides of its
+**Caches.** The per-file footer cache is keyed by immutable full paths and
+column identities, with no timer or commit invalidation. Snapshot-keyed
+aggregate + windowed-result caches and a live-file cache holding both
+manifest-stat records and planned Tier-2 scan tasks are keyed by
+`(table, snapshot, …)` and invalidated on commit. A text query's per-file
+inverted index is cached on both sides of its
 decode: the Puffin blob bytes and the parsed index, under the write-once
 identity each came from — `(statistics path, blob offset)` for a Puffin blob,
 `(data file, column)` for one carried in the Parquet footer — so neither can go
@@ -2281,6 +2287,9 @@ with explicit binary, Helm, and operator opt-outs. The post-rewrite rebuild
 went the other way for 0.1.0: it ships off, opt-in through the same three
 surfaces, because the 50G text ceilings were measured on the scan path and the
 sidecar path does not meet them at that layout's index sizes.
+The October grouped-numeric follow-up put its immutable per-file summaries in
+the bounded footer cache after the first AWS candidate re-read every remote
+footer on every warm request.
 The design record lives in `docs/` (`DESIGN_*`).
 
 > Siglake was renamed from **knulps** on 2026-06-12; pre-rename documents in
