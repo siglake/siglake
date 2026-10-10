@@ -53,6 +53,7 @@
 //! `None` as "scan this file instead". So a format change is a version bump
 //! plus, if the old encoding still matters, a branch on the version byte;
 //! never a silent reinterpretation.
+//! Streaming selection changes only the in-memory read shape, not these bytes.
 
 use std::collections::BTreeMap;
 
@@ -181,6 +182,125 @@ pub fn decode_column(s: &str, column: &str) -> Option<(Vec<(String, u64)>, u64)>
         return Some((values, nulls));
     }
     None
+}
+
+/// One validated column from a compact group-count blob, ready for an
+/// allocation-lean streaming read.
+///
+/// The decoded body is retained once, while values are reconstructed into one
+/// reusable scratch buffer by [`Self::for_each`]. Preparing the column validates
+/// the complete body and computes its row total before a caller can consume any
+/// value. A malformed or truncated aggregate therefore cannot yield a partial
+/// streamed answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingColumnCounts {
+    body: Vec<u8>,
+    values_start: usize,
+    n_values: u64,
+    nulls: u64,
+    total: u64,
+}
+
+impl StreamingColumnCounts {
+    /// Number of groups, including the NULL group when present.
+    pub fn len(&self) -> usize {
+        usize::try_from(self.n_values)
+            .unwrap_or(usize::MAX)
+            .saturating_add(usize::from(self.nulls > 0))
+    }
+
+    /// Whether this column has no value or NULL groups.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Rows accounted for by the values and NULL group.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// Approximate retained bytes for cache accounting.
+    pub fn retained_bytes(&self) -> usize {
+        self.body.capacity() + std::mem::size_of::<Self>()
+    }
+
+    /// Visit values in stored (ascending) order, followed by NULL when present.
+    ///
+    /// The `&str` is valid only for the callback invocation: the next value is
+    /// reconstructed in the same scratch buffer. A caller that retains a key
+    /// must copy that key, which lets a top-K selector own only its competitive
+    /// entries instead of every group.
+    pub fn for_each(&self, mut visit: impl FnMut(Option<&str>, u64)) {
+        let mut cur = Cursor {
+            buf: &self.body,
+            pos: self.values_start,
+        };
+        let mut value = Vec::new();
+        for _ in 0..self.n_values {
+            let shared = usize::try_from(cur.uvarint().expect("validated shared prefix"))
+                .expect("validated shared prefix fits usize");
+            let suffix = cur.bytes().expect("validated suffix");
+            value.truncate(shared);
+            value.extend_from_slice(suffix);
+            let count = cur.uvarint().expect("validated count");
+            let value = std::str::from_utf8(&value).expect("validated UTF-8");
+            visit(Some(value), count);
+        }
+        if self.nulls > 0 {
+            visit(None, self.nulls);
+        }
+    }
+}
+
+/// Validate a compact blob and prepare one column for a streaming read.
+///
+/// Unlike [`decode_column`], this walks the complete body before returning.
+/// That extra pass is required for selection directly from the codec: callers
+/// may retain only top-K candidates, so discovering corruption after emitting
+/// candidates must still fall back rather than return the partial selection.
+pub fn streaming_column(s: &str, column: &str) -> Option<StreamingColumnCounts> {
+    let body = blob_body(s)?;
+    let mut cur = Cursor { buf: &body, pos: 0 };
+    let n_columns = cur.uvarint()?;
+    let mut found = None;
+    for _ in 0..n_columns {
+        let name = cur.bytes()?;
+        std::str::from_utf8(name).ok()?;
+        let nulls = cur.uvarint()?;
+        let n_values = cur.uvarint()?;
+        let values_start = cur.pos;
+        let target = found.is_none() && name == column.as_bytes();
+        let mut prev = Vec::new();
+        let mut total = nulls;
+        for _ in 0..n_values {
+            let shared = usize::try_from(cur.uvarint()?).ok()?;
+            if shared > prev.len() {
+                return None;
+            }
+            let suffix = cur.bytes()?;
+            prev.truncate(shared);
+            prev.extend_from_slice(suffix);
+            std::str::from_utf8(&prev).ok()?;
+            let count = cur.uvarint()?;
+            if target {
+                total = total.saturating_add(count);
+            }
+        }
+        if target {
+            found = Some((values_start, n_values, nulls, total));
+        }
+    }
+    if cur.pos != body.len() {
+        return None;
+    }
+    let (values_start, n_values, nulls, total) = found?;
+    Some(StreamingColumnCounts {
+        body,
+        values_start,
+        n_values,
+        nulls,
+        total,
+    })
 }
 
 /// Every column's name and ROW TOTAL (`Σ counts + nulls`), in one forward pass
@@ -491,6 +611,77 @@ mod tests {
     }
 
     #[test]
+    fn streaming_decode_matches_owned_decode() {
+        let gc = sample();
+        let blob = gc.encode().unwrap();
+        for (name, col) in &gc.columns {
+            let streamed = streaming_column(&blob, name).expect("covered column streams");
+            let mut values = Vec::new();
+            streamed.for_each(|value, count| values.push((value.map(str::to_string), count)));
+            let mut want: Vec<(Option<String>, u64)> = col
+                .values
+                .iter()
+                .map(|(value, count)| (Some(value.clone()), *count))
+                .collect();
+            if col.nulls > 0 {
+                want.push((None, col.nulls));
+            }
+            assert_eq!(values, want, "column {name}");
+            assert_eq!(streamed.len(), want.len());
+            assert_eq!(
+                streamed.total(),
+                col.values
+                    .values()
+                    .fold(col.nulls, |total, count| total.saturating_add(*count))
+            );
+        }
+        assert!(streaming_column(&blob, "not_a_column").is_none());
+    }
+
+    #[test]
+    fn streaming_decode_rejects_damage_after_the_target() {
+        let columns = sample().columns;
+        let mut body = encode_body(&columns);
+        body.push(0); // valid target bytes followed by an unclaimed byte
+        let mut raw = Vec::from(MAGIC);
+        raw.extend_from_slice(&[FORMAT_VERSION, CODEC_RAW]);
+        raw.extend_from_slice(&body);
+        let malformed = base64::engine::general_purpose::STANDARD.encode(raw);
+
+        // The legacy targeted decoder intentionally returns after its column.
+        assert!(decode_column(&malformed, "level").is_some());
+        // Streaming selection must validate the whole aggregate first so a
+        // caller never mistakes a partial visit for an exact answer.
+        assert!(streaming_column(&malformed, "level").is_none());
+    }
+
+    #[test]
+    fn streaming_decode_rejects_invalid_later_column() {
+        let mut body = Vec::new();
+        put_uvarint(&mut body, 2);
+        put_bytes(&mut body, b"level");
+        put_uvarint(&mut body, 0);
+        put_uvarint(&mut body, 1);
+        put_uvarint(&mut body, 0);
+        put_bytes(&mut body, b"info");
+        put_uvarint(&mut body, 1);
+        put_bytes(&mut body, b"zone");
+        put_uvarint(&mut body, 0);
+        put_uvarint(&mut body, 1);
+        put_uvarint(&mut body, 1); // impossible prefix: no predecessor
+        put_bytes(&mut body, b"east");
+        put_uvarint(&mut body, 1);
+
+        let mut raw = Vec::from(MAGIC);
+        raw.extend_from_slice(&[FORMAT_VERSION, CODEC_RAW]);
+        raw.extend_from_slice(&body);
+        let malformed = base64::engine::general_purpose::STANDARD.encode(raw);
+
+        assert!(decode_column(&malformed, "level").is_some());
+        assert!(streaming_column(&malformed, "level").is_none());
+    }
+
+    #[test]
     fn column_totals_match_a_full_decode() {
         let gc = sample();
         let blob = gc.encode().unwrap();
@@ -545,6 +736,7 @@ mod tests {
     fn targeted_decode_rejects_garbage() {
         for bad in ["", "not base64 !!!", r#"{"columns":{}}"#] {
             assert_eq!(decode_column(bad, "level"), None);
+            assert_eq!(streaming_column(bad, "level"), None);
             assert_eq!(decode_column_names(bad), None);
         }
     }
@@ -579,6 +771,10 @@ mod tests {
             assert!(
                 GroupCounts::decode(&truncated).is_none(),
                 "truncation at {cut} must not decode"
+            );
+            assert!(
+                streaming_column(&truncated, "level").is_none(),
+                "truncation at {cut} must not stream"
             );
         }
     }

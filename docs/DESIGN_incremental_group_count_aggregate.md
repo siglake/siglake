@@ -498,3 +498,108 @@ candidate survives; it is deliberately retained in the measurement. The Sep 2
 published `top_hosts` p50 of 142.29 ms includes planning, storage and response
 work this measurement does not cover. A matched HTTP-logs run with result caches
 off is required before changing that published result.
+
+## Wide-column streaming read (0.3.0, 2026-10-10)
+
+The matched HTTP run for the candidate cutoff improved exact `top_hosts` warm
+p50 from 149.65 to 124.47 ms and p95 from 173.93 to 148.61 ms, but collection
+still averaged 119.9 ms and `count_distinct_host` measured 116.09 ms. Cold
+`top_hosts` regressed from 745.03 to 840.38 ms, and the unchanged AVG control
+slowed 10.5%. The rounds used independent fresh ingests, so they do not isolate
+the collector as the cause. The retained system report is
+`siglake-benchmarks/results/20261010-httop-execution/comparison-report.md`.
+
+The next local profile isolated `WideGroupCounts::decode_column`: its targeted
+decoder still allocated one `String` per group before the bounded collector
+saw a key. Both ignored release profiles consume the same bytes in their two
+arms, and timing and allocation passes are separate so allocator atomics do not
+inflate CPU or wall time.
+
+The primary input is the read-only HTTP-logs capture at
+`siglake-benchmarks/results/20261010-httpavg-execution/wide-profile-fixture.json`
+(SHA-256 `04ab46c13dc5537f6c9e3f249e9c4da4bc148d05445c1a3c78ad43a09887cde0`).
+It carries 1,149,519 real host groups in a 3,515 KiB encoded blob. Set
+`SIGLAKE_GROUP_COUNT_PROFILE_FIXTURE` to that file and run
+`report_real_fixture_decode_materialization_cost`. Three release runs at
+`765731d` measured:
+
+| Real captured arm | Wall ms | Process CPU ms | Allocations | Allocated MiB | Peak heap growth MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Owned targeted decode | 101.00–102.85 | 100.94–102.83 | 1,149,552 | 158.26 | 83.68 |
+| Streaming validation + top-100 selection | 48.27–51.55 | 48.27–51.55 | 1,462 | 18.72 | 10.70 |
+
+The real input reduced decoder-plus-selection wall/CPU by 49–53%, allocation
+count by 99.87%, allocated bytes by 88% and peak heap growth by 87%. The test
+compares every streamed row with the full decoder and the streaming top 100
+with full decode plus sort before it passes.
+
+An exact-candidate rerun at `b436c4f` measured 113.80 / 113.73 ms for owned
+wall / CPU and 52.41 / 52.39 ms for streaming validation plus selection, with
+the same 1,149,552 versus 1,462 allocation counts. The regression from the
+three-run range below is retained rather than hidden; streaming still reduced
+this rerun's decoder-plus-selection wall time by 54%.
+
+After replaying the candidate onto the current main line, the same captured
+fixture at `751907b` measured 90.07 / 90.07 ms for owned wall / CPU and 46.94 /
+46.93 ms for streaming validation plus selection. Allocation counts and peak
+heap stayed at 1,149,552 versus 1,462 and 83.68 versus 10.70 MiB. This is the
+final pre-gate measurement; the replay did not reverse the measured effect.
+
+The raw real-fixture readings were:
+
+| Run | Owned wall / CPU ms | Prepare wall / CPU ms | Select wall / CPU ms | Stream total wall / CPU ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 101.00 / 100.94 | 31.98 / 31.97 | 19.58 / 19.58 | 51.55 / 51.55 |
+| 2 | 102.85 / 102.83 | 28.79 / 28.79 | 19.49 / 19.48 | 48.27 / 48.27 |
+| 3 | 101.63 / 101.62 | 28.96 / 28.95 | 19.69 / 19.68 | 48.65 / 48.62 |
+
+The synthetic input remains as a repository-local reproduction. It has a
+1,453 KiB encoded payload with 1,149,520 non-NULL keys and one NULL group,
+uniform counts and tightly front-coded dotted-decimal keys, so its cutoff and
+compression are more favorable than the captured host distribution. The same
+three-run invocation measured:
+
+| Synthetic arm | Wall ms | Process CPU ms | Allocations | Allocated MiB | Peak heap growth MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Owned targeted decode | 64.00–65.98 | 63.97–65.98 | 1,149,553 | 157.62 | 84.56 |
+| Streaming validation + top-100 selection | 39.93–40.50 | 39.93–40.49 | 732 | 17.20 | 9.19 |
+
+That input reduced decoder-plus-selection wall/CPU by 37–39%, allocation count
+by 99.94% and peak heap growth by 89%. Both profiles are local codec/selection
+evidence, not a public HTTP result.
+
+The raw synthetic readings were:
+
+| Run | Owned wall / CPU ms | Prepare wall / CPU ms | Select wall / CPU ms | Stream total wall / CPU ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 64.00 / 63.97 | 23.51 / 23.51 | 16.99 / 16.99 | 40.50 / 40.49 |
+| 2 | 65.98 / 65.98 | 23.16 / 23.16 | 16.77 / 16.77 | 39.93 / 39.93 |
+| 3 | 65.02 / 65.02 | 23.27 / 23.27 | 16.78 / 16.78 | 40.06 / 40.06 |
+
+The read path now retains the decoded compact body, reconstructs every column's
+keys to validate the whole body before returning, and reconstructs the selected
+column again into one reusable callback buffer. Count and predicate consumers
+use the key only inside the callback. The bounded collector copies a key only
+when it remains competitive; the synthetic profile owned 709 keys across the
+entire 1.15M-key selection.
+
+That whole-body validation is new work relative to `decode_column`, which
+stopped after the requested column. CPU therefore scales with every key in the
+blob even though retained allocations scale with the encoded bytes plus the
+selected top K. At the recorded 1 TB extreme (26.5 MiB, about 20 million keys
+across 22 columns) one cache-disabled read can reconstruct about 20 million
+keys for validation and the requested column a second time. No retained copy of
+that extreme exists to time, so the real one-column capture above does not bound
+its wall time. The trade keeps the rule that corruption anywhere in an
+aggregate refuses the aggregate before a callback can expose a partial answer.
+Callers that need materialized values retain the full decoder. The on-disk
+format, SQL shapes, coverage and row-total guards, cardinality budgets,
+result-cache switch and aggregate-object cache are unchanged. A malformed,
+truncated or foreign payload returns no aggregate and takes the existing exact
+fallback; no callback runs until validation has succeeded.
+
+Differential tests compare the streaming rows with the full decoder and the
+owned bounded collector with a full sort. The latter covers string, integer and
+float ordering; ascending and descending count/key sorts; dense ties; NULL;
+forward and reverse input; LIMIT 1 through the full input; and a winner arriving
+last. The existing full decoder remains covered independently.

@@ -159,9 +159,9 @@ async fn a_wide_column_is_routed_to_deltas_and_kept_out_of_the_commit_path_objec
         .await
         .unwrap()
         .expect("grouped counts served");
-    let got: std::collections::HashMap<String, u64> = rows
-        .iter()
-        .map(|(v, c)| (v.unwrap_or_default().to_string(), c))
-        .collect();
+    let mut got = std::collections::HashMap::new();
+    rows.for_each(|value, count| {
+        got.insert(value.unwrap_or_default().to_string(), count);
+    });
     assert_eq!(got, expected, "counts must be exact for every host");
 }

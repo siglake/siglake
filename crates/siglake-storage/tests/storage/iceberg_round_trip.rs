@@ -1966,7 +1966,9 @@ async fn warm_query_caches_covers_live_files() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(counts.iter().map(|(_, c)| c).sum::<u64>(), 3);
+    let mut total = 0u64;
+    counts.for_each(|_, count| total = total.saturating_add(count));
+    assert_eq!(total, 3);
     // Idempotent.
     assert_eq!(ice.warm_query_caches("events").await.unwrap(), 3);
 }

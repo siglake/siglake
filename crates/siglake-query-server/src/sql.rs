@@ -2485,15 +2485,17 @@ async fn browse_expected_scan_rows(
         .grouped_counts_with_summary(&shape.table, &shape.column, None, None)
         .await
         .ok()??;
-    let total: u64 = rows.iter().map(|(_, c)| c).sum();
+    let mut total = 0u64;
+    let mut matching = 0u64;
+    rows.for_each(|value, count| {
+        total = total.saturating_add(count);
+        if value.is_some_and(|value| shape.values.iter().any(|want| want == value)) {
+            matching = matching.saturating_add(count);
+        }
+    });
     if total == 0 {
         return None;
     }
-    let matching: u64 = rows
-        .iter()
-        .filter(|(value, _)| value.is_some_and(|v| shape.values.iter().any(|want| want == v)))
-        .map(|(_, c)| c)
-        .sum();
     let matching = if shape.negated {
         total.saturating_sub(matching)
     } else {
@@ -2585,15 +2587,17 @@ async fn residual_browse_low_selectivity_at(
         Ok(Some(rows)) => rows,
         _ => return false,
     };
-    let total: u64 = rows.iter().map(|(_, c)| c).sum();
+    let mut total = 0u64;
+    let mut matching = 0u64;
+    rows.for_each(|value, count| {
+        total = total.saturating_add(count);
+        if value.is_some_and(|value| shape.values.iter().any(|want| want == value)) {
+            matching = matching.saturating_add(count);
+        }
+    });
     if total == 0 {
         return false;
     }
-    let matching: u64 = rows
-        .iter()
-        .filter(|(value, _)| value.is_some_and(|v| shape.values.iter().any(|want| want == v)))
-        .map(|(_, c)| c)
-        .sum();
     let matching = if shape.negated {
         total.saturating_sub(matching)
     } else {
@@ -7106,17 +7110,25 @@ async fn try_count_distinct_fast_path_records(
     // ~250ms of string clones here). A live buffer unions via a BORROWED set
     // (#61 hybrid).
     let distinct = match delta {
-        None => rows.iter().filter(|(key, _)| key.is_some()).count(),
+        None => {
+            let mut committed = 0usize;
+            rows.for_each(|key, _| committed += usize::from(key.is_some()));
+            committed
+        }
         Some(delta) => {
-            let committed: std::collections::HashSet<&str> =
-                rows.iter().filter_map(|(key, _)| key).collect();
-            let extra: std::collections::HashSet<String> = delta
+            let mut extra: std::collections::HashSet<String> = delta
                 .group_counts(&fp.table_name, &fp.column, None)
                 .into_keys()
                 .flatten()
-                .filter(|k| !committed.contains(k.as_str()))
                 .collect();
-            committed.len() + extra.len()
+            let mut committed = 0usize;
+            rows.for_each(|key, _| {
+                if let Some(key) = key {
+                    committed += 1;
+                    extra.remove(key);
+                }
+            });
+            committed + extra.len()
         }
     };
     let count = i64::try_from(distinct)
@@ -7486,12 +7498,12 @@ async fn try_negation_count_fast_path_records(
     // Negation: rows whose (non-NULL) value is NOT in the set. Equality/IN:
     // rows whose value IS in the set. Ranges: keys parsing into the bounds.
     // All from the same per-value counts.
-    let mut total: u64 = rows
-        .iter()
-        .filter_map(|(key, count)| key.map(|k| (k, count)))
-        .filter(|(k, _)| fp.predicate.matches(k))
-        .map(|(_, count)| count)
-        .sum();
+    let mut total = 0u64;
+    rows.for_each(|key, count| {
+        if key.is_some_and(|key| fp.predicate.matches(key)) {
+            total = total.saturating_add(count);
+        }
+    });
     // #61 hybrid: buffered rows count too (same predicate, NULLs excluded).
     if let Some(delta) = delta {
         total += delta
@@ -7844,6 +7856,7 @@ impl GroupEntryCmp {
 /// (the true Kth entry can improve, never worsen). Skip those candidates before
 /// writing or partitioning them. Unbounded (`bound` is `None`) is a plain push.
 #[inline]
+#[cfg(test)]
 fn push_bounded<'k>(
     buf: &mut Vec<(Option<&'k str>, u64)>,
     entry: (Option<&'k str>, u64),
@@ -7863,6 +7876,35 @@ fn push_bounded<'k>(
             // select_nth leaves the partition unsorted, with its Kth entry at
             // k - 1; it is exactly the worst retained entry under this comparator.
             *cutoff = Some(buf[k - 1]);
+        }
+    }
+}
+
+/// Owned counterpart of [`push_bounded`] for a streaming codec callback. The
+/// callback's key buffer is reused on its next invocation, so only an admitted
+/// candidate is copied. At a small LIMIT this owns O(K) keys rather than every
+/// group in the aggregate.
+#[inline]
+fn push_bounded_owned(
+    buf: &mut Vec<(Option<String>, u64)>,
+    entry: (Option<&str>, u64),
+    bound: Option<(usize, GroupEntryCmp)>,
+    cutoff: &mut Option<(Option<String>, u64)>,
+) {
+    let borrowed_cutoff = cutoff.as_ref().map(|(key, count)| (key.as_deref(), *count));
+    if let (Some((_, cmp)), Some(worst)) = (bound, borrowed_cutoff) {
+        if !cmp.compare(&entry, &worst).is_lt() {
+            return;
+        }
+    }
+    buf.push((entry.0.map(str::to_string), entry.1));
+    if let Some((k, cmp)) = bound {
+        if buf.len() >= k.saturating_mul(2) {
+            buf.select_nth_unstable_by(k - 1, |a, b| {
+                cmp.compare(&(a.0.as_deref(), a.1), &(b.0.as_deref(), b.1))
+            });
+            buf.truncate(k);
+            *cutoff = Some(buf[k - 1].clone());
         }
     }
 }
@@ -8000,16 +8042,16 @@ async fn try_group_count_fast_path_records(
         }
         _ => None,
     };
-    let mut view: Vec<(Option<&str>, u64)> = Vec::with_capacity(match bound {
+    let mut view: Vec<(Option<String>, u64)> = Vec::with_capacity(match bound {
         Some((k, _)) => k.saturating_mul(2),
         None => rows.len() + delta_by_key.len() + 1,
     });
     let mut cutoff = None;
-    for (k, c) in rows.iter() {
+    rows.for_each(|k, c| {
         let entry = match k {
-            Some(key) => match delta_by_key.get(key) {
-                Some(dv) => {
-                    matched.insert(key);
+            Some(key) => match delta_by_key.get_key_value(key) {
+                Some((delta_key, dv)) => {
+                    matched.insert(*delta_key);
                     (Some(key), c + *dv)
                 }
                 None => (Some(key), c),
@@ -8019,25 +8061,31 @@ async fn try_group_count_fast_path_records(
                 (None, c + delta_nulls)
             }
         };
-        push_bounded(&mut view, entry, bound, &mut cutoff);
-    }
+        push_bounded_owned(&mut view, entry, bound, &mut cutoff);
+    });
     // Buffered-only groups (not yet committed at all) join the view.
     for (k, v) in delta_by_key.iter().filter(|(k, _)| !matched.contains(*k)) {
-        push_bounded(&mut view, (Some(*k), *v), bound, &mut cutoff);
+        push_bounded_owned(&mut view, (Some(*k), *v), bound, &mut cutoff);
     }
     if !saw_null && delta_nulls > 0 {
-        push_bounded(&mut view, (None, delta_nulls), bound, &mut cutoff);
+        push_bounded_owned(&mut view, (None, delta_nulls), bound, &mut cutoff);
     }
     if let Some(cmp) = cmp {
         match fp.limit {
             // Top-K: O(n) partition to the K boundary, then sort only the
             // prefix — a LIMIT-100 leaderboard never sorts the 1.1M tail.
             Some(limit) if limit > 0 && limit < view.len() => {
-                view.select_nth_unstable_by(limit - 1, |a, b| cmp.compare(a, b));
+                view.select_nth_unstable_by(limit - 1, |a, b| {
+                    cmp.compare(&(a.0.as_deref(), a.1), &(b.0.as_deref(), b.1))
+                });
                 view.truncate(limit);
-                view.sort_unstable_by(|a, b| cmp.compare(a, b));
+                view.sort_unstable_by(|a, b| {
+                    cmp.compare(&(a.0.as_deref(), a.1), &(b.0.as_deref(), b.1))
+                });
             }
-            _ => view.sort_unstable_by(|a, b| cmp.compare(a, b)),
+            _ => view.sort_unstable_by(|a, b| {
+                cmp.compare(&(a.0.as_deref(), a.1), &(b.0.as_deref(), b.1))
+            }),
         }
     }
     if let Some(limit) = fp.limit {
@@ -8054,7 +8102,7 @@ async fn try_group_count_fast_path_records(
         // `indexes.rs` already asserts `as_i64() == 200` on the planner path,
         // so the two demonstrably disagreed.
         let key = match key {
-            Some(k) => fp.group_kind.render(k),
+            Some(k) => fp.group_kind.render(&k),
             None => serde_json::Value::Null,
         };
         json_rows.push(serde_json::json!({
@@ -11092,6 +11140,32 @@ mod tests {
                             assert_eq!(
                                 bounded, reference,
                                 "{kind:?} {sort:?} reverse={reverse} ties={ties} k={k}"
+                            );
+
+                            // The streaming decoder uses the owned collector:
+                            // its input key is valid for one callback only.
+                            let mut owned = Vec::new();
+                            let mut owned_cutoff = None;
+                            for entry in &entries {
+                                push_bounded_owned(
+                                    &mut owned,
+                                    *entry,
+                                    Some((k, cmp)),
+                                    &mut owned_cutoff,
+                                );
+                                assert!(owned.len() < k * 2);
+                            }
+                            owned.sort_unstable_by(|a, b| {
+                                cmp.compare(&(a.0.as_deref(), a.1), &(b.0.as_deref(), b.1))
+                            });
+                            owned.truncate(k);
+                            let owned: Vec<_> = owned
+                                .iter()
+                                .map(|(key, count)| (key.as_deref(), *count))
+                                .collect();
+                            assert_eq!(
+                                owned, reference,
+                                "owned {kind:?} {sort:?} reverse={reverse} ties={ties} k={k}"
                             );
                         }
                     }

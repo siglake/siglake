@@ -162,9 +162,9 @@ async fn summary_grouped_counts_shard_union_matches_full() {
             .await
             .unwrap()
             .unwrap();
-        for (k, v) in part.iter() {
+        part.for_each(|k, v| {
             *union.entry(k.map(str::to_string)).or_default() += v as i64;
-        }
+        });
     }
     assert_eq!(
         union, full,

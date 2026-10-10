@@ -96,10 +96,10 @@ async fn high_cardinality_column_survives_in_the_tier1_aggregate() {
         DISTINCT_HOSTS,
         "every distinct host must appear exactly once"
     );
-    let got: std::collections::HashMap<String, u64> = rows
-        .iter()
-        .map(|(v, c)| (v.unwrap_or_default().to_string(), c))
-        .collect();
+    let mut got = std::collections::HashMap::new();
+    rows.for_each(|value, count| {
+        got.insert(value.unwrap_or_default().to_string(), count);
+    });
     assert_eq!(got, expected, "counts must be exact for every host");
 
     // Top-K over that aggregate is the shape the board measures.

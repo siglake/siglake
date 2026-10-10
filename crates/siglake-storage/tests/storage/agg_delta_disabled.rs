@@ -104,5 +104,7 @@ async fn the_default_cap_writes_no_deltas_and_covers_no_wide_column() {
         .unwrap()
         .expect("grouped counts served");
     assert_eq!(rows.len(), DISTINCT_HOSTS);
-    assert_eq!(rows.iter().map(|(_, c)| c).sum::<u64>(), ROWS as u64);
+    let mut total = 0u64;
+    rows.for_each(|_, count| total = total.saturating_add(count));
+    assert_eq!(total, ROWS as u64);
 }

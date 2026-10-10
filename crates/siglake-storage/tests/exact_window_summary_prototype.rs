@@ -326,11 +326,11 @@ async fn result_cache_off_scans_all_four_depth_files_on_every_query() {
             .unwrap()
             .expect("windowed group counts");
         assert_eq!(got.source_label(), "tier1_windowed_agg");
-        let got: BTreeMap<String, u64> = got
-            .iter()
-            .map(|(value, count)| (value.expect("non-null level").to_string(), count))
-            .collect();
-        assert_eq!(got, expected);
+        let mut rows = BTreeMap::new();
+        got.for_each(|value, count| {
+            rows.insert(value.expect("non-null level").to_string(), count);
+        });
+        assert_eq!(rows, expected);
     }
 
     let snapshot = snapshotter.snapshot().into_vec();

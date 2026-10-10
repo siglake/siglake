@@ -7293,6 +7293,14 @@ impl WideGroupCounts {
         Some(SortedColumnCounts { values, nulls })
     }
 
+    /// Validate and retain one column for allocation-lean streaming reads.
+    pub fn streaming_column(
+        &self,
+        column: &str,
+    ) -> Option<siglake_bloom::group_counts::StreamingColumnCounts> {
+        siglake_bloom::group_counts::streaming_column(self.group_counts.as_deref()?, column)
+    }
+
     pub fn set_group_counts(&mut self, counts: Option<FileGroupCounts>) {
         self.group_counts = counts.and_then(|c| c.to_compact());
     }
@@ -12335,6 +12343,15 @@ impl ApproxHeapBytes for GroupCounts {
             GroupCounts::Inline { aggs, column } => aggs.approx_heap_bytes() + column.capacity(),
             GroupCounts::Wide { agg, column } => agg.approx_heap_bytes() + column.capacity(),
             GroupCounts::Column(c) => c.approx_heap_bytes(),
+            GroupCounts::Streaming {
+                column,
+                materialized,
+            } => {
+                column.retained_bytes()
+                    + materialized
+                        .get()
+                        .map_or(0, ApproxHeapBytes::approx_heap_bytes)
+            }
         }
     }
 }
@@ -22956,13 +22973,16 @@ impl IcebergContext {
         }
         // Decode ONLY this column out of the blob. Rebuilding all of them to
         // check one total is what made this seconds-per-generation at 1TB.
-        let Some(counts) = wide.decode_column(column) else {
+        let Some(counts) = wide.streaming_column(column) else {
             return Ok(None);
         };
         if counts.total() != record_count {
             return Ok(None);
         }
-        Ok(Some(GroupCounts::Column(Arc::new(counts))))
+        Ok(Some(GroupCounts::Streaming {
+            column: Arc::new(counts),
+            materialized: Arc::new(std::sync::OnceLock::new()),
+        }))
     }
 
     /// #89: a table provider PINNED to `snapshot_id` (time-travel), `schema_id`
@@ -25704,6 +25724,15 @@ pub enum GroupCounts {
     /// all of it to answer a question about one column cost seconds per
     /// snapshot generation. This is that column and nothing else.
     Column(Arc<SortedColumnCounts>),
+    /// ONE validated column retaining only the decoded compact body. Values are
+    /// reconstructed in a reusable buffer and handed to a callback, so a
+    /// selector owns only the keys it keeps.
+    Streaming {
+        column: Arc<siglake_bloom::group_counts::StreamingColumnCounts>,
+        /// Compatibility materialization for iterator callers. Query fast
+        /// paths visit `column` directly and never initialize this cell.
+        materialized: Arc<std::sync::OnceLock<SortedColumnCounts>>,
+    },
     /// Genuinely materialized counts (footer sums, windowed rollups).
     ///
     /// `source` because those two are NOT the same cost and were reported
@@ -25754,14 +25783,15 @@ impl GroupCounts {
         match self {
             GroupCounts::Inline { aggs, column } => aggs.group_counts.as_ref()?.columns.get(column),
             GroupCounts::Wide { agg, column } => agg.columns.get(column),
-            GroupCounts::Column(_) | GroupCounts::Owned { .. } => None,
+            GroupCounts::Column(_) | GroupCounts::Streaming { .. } | GroupCounts::Owned { .. } => {
+                None
+            }
         }
     }
 
-    /// `(value, count)` for every group, NULL as `None`. Ascending by value with
-    /// NULL last, matching what the materialized form produced — the ordering is
-    /// not load-bearing for any consumer, but changing it silently would be the
-    /// kind of thing a latency-only check misses.
+    /// `(value, count)` for every group, NULL as `None`. Streaming columns are
+    /// materialized only when a caller specifically requests this compatibility
+    /// iterator; hot query paths use [`Self::for_each`] instead.
     pub fn iter(&self) -> GroupCountsIter<'_> {
         match self {
             GroupCounts::Owned { rows, .. } => GroupCountsIter::Owned(rows.iter()),
@@ -25769,6 +25799,24 @@ impl GroupCounts {
                 values: c.values.iter(),
                 nulls: (c.nulls > 0).then_some(c.nulls),
             },
+            GroupCounts::Streaming {
+                column,
+                materialized,
+            } => {
+                let counts = materialized.get_or_init(|| {
+                    let mut values = Vec::with_capacity(column.len());
+                    let mut nulls = 0;
+                    column.for_each(|key, count| match key {
+                        Some(key) => values.push((key.to_string(), count)),
+                        None => nulls = count,
+                    });
+                    SortedColumnCounts { values, nulls }
+                });
+                GroupCountsIter::Sorted {
+                    values: counts.values.iter(),
+                    nulls: (counts.nulls > 0).then_some(counts.nulls),
+                }
+            }
             _ => match self.column_counts() {
                 Some(c) => GroupCountsIter::Aggregate {
                     values: c.values.iter(),
@@ -25779,10 +25827,43 @@ impl GroupCounts {
         }
     }
 
+    /// Visit `(value, count)` for every group, NULL as `None`. Values are
+    /// ascending with NULL last. A streaming value is borrowed only for the
+    /// callback invocation; callers retain only keys they actually need.
+    pub fn for_each(&self, mut visit: impl FnMut(Option<&str>, u64)) {
+        match self {
+            GroupCounts::Owned { rows, .. } => {
+                for (key, count) in rows.iter() {
+                    visit(key.as_deref(), *count);
+                }
+            }
+            GroupCounts::Column(c) => {
+                for (key, count) in &c.values {
+                    visit(Some(key), *count);
+                }
+                if c.nulls > 0 {
+                    visit(None, c.nulls);
+                }
+            }
+            GroupCounts::Streaming { column, .. } => column.for_each(visit),
+            _ => {
+                if let Some(c) = self.column_counts() {
+                    for (key, count) in &c.values {
+                        visit(Some(key), *count);
+                    }
+                    if c.nulls > 0 {
+                        visit(None, c.nulls);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             GroupCounts::Owned { rows, .. } => rows.len(),
             GroupCounts::Column(c) => c.values.len() + usize::from(c.nulls > 0),
+            GroupCounts::Streaming { column, .. } => column.len(),
             _ => match self.column_counts() {
                 Some(c) => c.values.len() + usize::from(c.nulls > 0),
                 None => 0,
@@ -25802,7 +25883,9 @@ impl GroupCounts {
     pub fn source_label(&self) -> &'static str {
         match self {
             GroupCounts::Inline { .. } => "tier1_inline",
-            GroupCounts::Wide { .. } | GroupCounts::Column(_) => "tier1_wide",
+            GroupCounts::Wide { .. } | GroupCounts::Column(_) | GroupCounts::Streaming { .. } => {
+                "tier1_wide"
+            }
             // Distinct labels: these differ by orders of magnitude and the
             // slow one is reached by a silent fallback.
             GroupCounts::Owned {
@@ -25828,9 +25911,9 @@ impl GroupCounts {
     /// this — doing so is precisely the per-key allocation this type exists to
     /// avoid, so a new call site on a hot path wants justifying.
     pub fn to_rows(&self) -> Vec<(Option<String>, u64)> {
-        self.iter()
-            .map(|(k, c)| (k.map(str::to_string), c))
-            .collect()
+        let mut rows = Vec::with_capacity(self.len());
+        self.for_each(|key, count| rows.push((key.map(str::to_string), count)));
+        rows
     }
 }
 
@@ -25868,15 +25951,17 @@ impl<'a> Iterator for GroupCountsIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             GroupCountsIter::Aggregate { values, nulls } => match values.next() {
-                Some((k, v)) => Some((Some(k.as_str()), *v)),
+                Some((key, count)) => Some((Some(key.as_str()), *count)),
                 // NULL is a real group and sorts last.
-                None => nulls.take().map(|n| (None, n)),
+                None => nulls.take().map(|count| (None, count)),
             },
             GroupCountsIter::Sorted { values, nulls } => match values.next() {
-                Some((k, v)) => Some((Some(k.as_str()), *v)),
-                None => nulls.take().map(|n| (None, n)),
+                Some((key, count)) => Some((Some(key.as_str()), *count)),
+                None => nulls.take().map(|count| (None, count)),
             },
-            GroupCountsIter::Owned(it) => it.next().map(|(k, v)| (k.as_deref(), *v)),
+            GroupCountsIter::Owned(rows) => {
+                rows.next().map(|(key, count)| (key.as_deref(), *count))
+            }
             GroupCountsIter::Empty => None,
         }
     }
@@ -28747,7 +28832,7 @@ mod group_count_tier1_tests {
             .await
             .unwrap()
             .unwrap();
-        let summed: u64 = counts.iter().map(|(_, n)| n).sum();
+        let summed: u64 = counts.iter().map(|(_, count)| count).sum();
         assert_eq!(summed, total);
     }
 
@@ -28964,10 +29049,10 @@ mod group_count_tier1_tests {
             .await
             .unwrap()
             .expect("windowed group-by served");
-        let got_map: std::collections::HashMap<String, u64> = got
-            .iter()
-            .map(|(v, n)| (v.unwrap_or_default().to_string(), n))
-            .collect();
+        let mut got_map = std::collections::HashMap::new();
+        got.for_each(|value, count| {
+            got_map.insert(value.unwrap_or_default().to_string(), count);
+        });
         assert_eq!(got_map, truth, "windowed group-by matches ground truth");
         assert_eq!(got_map["app:json"], 50);
         assert_eq!(got_map["syslog"], 50);
@@ -32198,7 +32283,7 @@ mod owned_counts_label_tests {
             let g = GroupCounts::owned(rows.clone(), source);
             assert_eq!(g.len(), 2);
             assert!(!g.is_empty());
-            let got: Vec<_> = g.iter().map(|(k, c)| (k.map(str::to_string), c)).collect();
+            let got = g.to_rows();
             assert_eq!(got, rows);
         }
     }

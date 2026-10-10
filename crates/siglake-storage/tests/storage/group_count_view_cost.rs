@@ -56,29 +56,27 @@ fn the_borrowed_view_matches_the_materialized_rows_exactly() {
     let owned = agg.column_rows("host").expect("column covered");
     let view = GroupCounts::wide(agg.clone(), "host");
 
-    let from_view: Vec<(Option<String>, u64)> = view
-        .iter()
-        .map(|(k, c)| (k.map(str::to_string), c))
-        .collect();
+    let from_view = view.to_rows();
     assert_eq!(from_view, owned, "same keys, same counts, same order");
     assert_eq!(view.len(), owned.len());
 
     // The NULL group is a real group and must survive.
     assert_eq!(
-        view.iter()
+        from_view
+            .iter()
             .filter(|(k, _)| k.is_none())
-            .map(|(_, c)| c)
+            .map(|(_, c)| *c)
             .sum::<u64>(),
         3,
         "NULL count must be carried, not dropped"
     );
     assert_eq!(
-        view.iter().map(|(_, c)| c).sum::<u64>(),
+        from_view.iter().map(|(_, c)| *c).sum::<u64>(),
         owned.iter().map(|(_, c)| *c).sum::<u64>()
     );
 
     // An uncovered column is absent, not empty — the guard distinguishes them.
-    assert!(GroupCounts::wide(agg, "nope").iter().next().is_none());
+    assert!(GroupCounts::wide(agg, "nope").is_empty());
 }
 
 /// What the EXACT path costs at each candidate cardinality cap.
@@ -105,13 +103,14 @@ fn report_cost_by_cap() {
         let view = GroupCounts::wide(agg.clone(), "host");
 
         let t = Instant::now();
-        let scanned: u64 = view.iter().map(|(_, c)| c).sum();
+        let mut scanned = 0u64;
+        view.for_each(|_, count| scanned = scanned.saturating_add(count));
         let scan_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         // What top_hosts actually does: materialize the borrowed view, then
         // select the top K.
         let t = Instant::now();
-        let mut v: Vec<(Option<&str>, u64)> = view.iter().collect();
+        let mut v = view.to_rows();
         if K < v.len() {
             v.select_nth_unstable_by_key(K - 1, |e| std::cmp::Reverse(e.1));
             v.truncate(K);
@@ -149,7 +148,8 @@ fn report_view_vs_materialize_cost() {
         // What it does now: borrow from the Arc'd aggregate and scan.
         let t = Instant::now();
         let view = GroupCounts::wide(agg.clone(), "host");
-        let sink2: u64 = view.iter().map(|(_, c)| c).sum();
+        let mut sink2 = 0u64;
+        view.for_each(|_, count| sink2 = sink2.saturating_add(count));
         let borrow_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         // Headroom: the same counts in a FLAT sorted Vec rather than a
@@ -253,7 +253,7 @@ fn report_targeted_decode_vs_whole_blob() {
 
 /// The targeted decode returns a `Vec` instead of a `BTreeMap`, so its ordering
 /// is now the CODEC's promise rather than a container's guarantee. That promise
-/// is load-bearing: [`GroupCounts::iter`] documents ascending values with NULL
+/// is load-bearing: [`GroupCounts::for_each`] documents ascending values with NULL
 /// last, and every consumer that pages, merges or diffs those rows would break
 /// quietly if the compact encoding ever stored values unsorted.
 ///

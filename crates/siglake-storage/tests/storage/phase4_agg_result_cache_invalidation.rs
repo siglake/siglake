@@ -81,8 +81,10 @@ async fn windowed_group_by_invalidated_on_in_window_append() {
         before_total + 5,
         "post-append windowed group-by must reflect the new in-window rows, not a stale cache"
     );
+    let mut found = false;
+    after.for_each(|host, count| found |= host == Some("h-new") && count == 5);
     assert!(
-        after.iter().any(|(h, c)| h == Some("h-new") && c == 5),
+        found,
         "the new host's 5 in-window rows must appear: {after:?}"
     );
 }

@@ -274,7 +274,8 @@ async fn tier2_says_whether_it_read_footers_or_decoded_raw_pages() {
         .await
         .unwrap()
         .expect("windowed counts for method");
-    let total: u64 = g.iter().map(|(_, c)| c).sum();
+    let mut total = 0u64;
+    g.for_each(|_, count| total = total.saturating_add(count));
     assert_eq!(total, 150, "60 + 60 + the 30 rows inside the window");
 
     let s = snapshotter.snapshot().into_vec();

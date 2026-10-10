@@ -247,7 +247,8 @@ async fn a_lost_delta_is_not_healed_by_later_deltas() {
          something repairs the aggregate and the operator-facing warning needs rewriting again"
     );
     // And the answer must still be RIGHT, just expensive: the footer path is exact.
-    let total: u64 = g.iter().map(|(_, c)| c).sum();
+    let mut total = 0u64;
+    g.for_each(|_, count| total = total.saturating_add(count));
     assert_eq!(total, (rows * 7) as u64, "the fallback is exact, only slow");
 }
 
@@ -395,7 +396,8 @@ async fn a_lost_delta_marker_automatically_rebuilds_from_files() {
         "tier1_wide",
         "the rebuild must restore the cheap tier"
     );
-    let total: u64 = g.iter().map(|(_, c)| c).sum();
+    let mut total = 0u64;
+    g.for_each(|_, count| total = total.saturating_add(count));
     assert_eq!(total, rows as u64);
 
     // And a later commit must not double-count: its delta is ABOVE the
@@ -406,7 +408,8 @@ async fn a_lost_delta_marker_automatically_rebuilds_from_files() {
         .await
         .unwrap()
         .unwrap();
-    let total: u64 = g.iter().map(|(_, c)| c).sum();
+    let mut total = 0u64;
+    g.for_each(|_, count| total = total.saturating_add(count));
     assert_eq!(
         total,
         (rows * 2) as u64,
