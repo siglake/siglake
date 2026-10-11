@@ -900,6 +900,28 @@ column, queryable via the `attr_get(attributes, key)` UDF (values come back as
 text so they `CAST` cleanly) and `LIKE`. Existing tables gain the column via
 the additive `siglake migrate-schema` — see **Upgrades** below.
 
+**One extraction rule, versioned.** A promoted column is a materialized
+`attr_get`: the query layer substitutes the column for the UDF once backfill
+completes, and prunes row groups from its statistics before that. Both are
+wrong the moment the two extractors disagree, so the rule is defined once —
+a literal (possibly dotted) key wins at every level of the walk, then a dotted
+key descends one segment at a time — and carries a version,
+`siglake_core::ATTR_EXTRACTOR_VERSION`. Tables record which rule wrote their
+promoted values in `siglake.promotion_extraction.v1`: `declared` when the
+promotions were first declared under the current rule (the columns did not
+exist before, so every file carrying one was written by it), or
+`after:<sequence>` for a table adopted later, whose files up to that sequence
+may hold another rule's values. The backfill-completion property
+(`siglake.promotion_backfill_complete.v1`) carries the version too, so a table
+qualified under an older rule is no longer qualified: the rewrite and the
+prune hints stay off and queries answer from the residual JSON — correct, and
+as slow as they were before the promotion — until every pre-adoption file has
+been rewritten, which normal compaction does on its own and an operator can
+force with a recluster pass. Nothing migrates data automatically. Version 1
+(0.2.1 and earlier) retried the literal key only at the top level, so a key
+`a.b.c` whose object under `a` held a literal `"b.c"` key promoted to NULL
+while `attr_get` returned the value (#6769).
+
 **Auto-promotion is the one schema mutation nobody requests.** Promoted columns
 are normally declared: an operator lists `(attr_key, column, type)` triples and
 the write path extracts them. The compactor can also choose them itself — it

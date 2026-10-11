@@ -453,9 +453,8 @@ mod tests {
             serde_json::from_str::<serde_json::Map<_, _>>(r#"{"a.b":1,"a":{"b":2}}"#).unwrap();
         assert_eq!(attr_lookup(&top, "a.b"), Some(&serde_json::json!(1)));
         // Inner level: same precedence one step down.
-        let inner =
-            serde_json::from_str::<serde_json::Map<_, _>>(r#"{"a":{"b.c":1,"b":{"c":2}}}"#)
-                .unwrap();
+        let inner = serde_json::from_str::<serde_json::Map<_, _>>(r#"{"a":{"b.c":1,"b":{"c":2}}}"#)
+            .unwrap();
         assert_eq!(attr_lookup(&inner, "a.b.c"), Some(&serde_json::json!(1)));
     }
 
@@ -474,7 +473,10 @@ mod tests {
         );
         // No backtracking: `a` resolves, the rest fails inside it, and the
         // top-level `a.b` is NOT retried. The UDF answers None here too.
-        assert_eq!(attr_lookup(&m(r#"{"a":{"x":1},"a.b":{"c":9}}"#), "a.b.c"), None);
+        assert_eq!(
+            attr_lookup(&m(r#"{"a":{"x":1},"a.b":{"c":9}}"#), "a.b.c"),
+            None
+        );
         // A scalar in the middle of a path is a miss, not a panic.
         assert_eq!(attr_lookup(&m(r#"{"a":"scalar"}"#), "a.b"), None);
         assert_eq!(attr_lookup(&m(r#"{"a":{"b":1}}"#), "a.b.c"), None);
@@ -496,7 +498,9 @@ mod tests {
         ];
         let events = vec![
             ev(Some(r#"{"a":{"b.c":7},"log.file.path":"/var/log/a"}"#)),
-            ev(Some(r#"{"a":{"b":{"c":8}},"log":{"file":{"path":"/var/log/b"}}}"#)),
+            ev(Some(
+                r#"{"a":{"b":{"c":8}},"log":{"file":{"path":"/var/log/b"}}}"#,
+            )),
             // Literal dotted key wins over the nested object at both levels.
             ev(Some(
                 r#"{"a":{"b.c":9,"b":{"c":1}},"log.file.path":"/lit","log":{"file":{"path":"/nested"}}}"#,

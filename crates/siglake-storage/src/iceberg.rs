@@ -3408,7 +3408,9 @@ pub(crate) fn promotion_adopted_stamp(sequence: i64) -> String {
 /// [`PROMOTION_BACKFILL_PROP`]'s value for `promoted` under the current
 /// extraction rule. A table qualified under an older rule carries a different
 /// value, so the rewrite stays off until its data converges (#6769).
-pub(crate) fn promotion_backfill_value(promoted: &[siglake_core::PromotedColumn]) -> Result<String> {
+pub(crate) fn promotion_backfill_value(
+    promoted: &[siglake_core::PromotedColumn],
+) -> Result<String> {
     let json = siglake_core::promoted_property_json(promoted)
         .map_err(|e| anyhow::anyhow!("promoted property json: {e}"))?;
     Ok(format!(
@@ -4250,13 +4252,16 @@ async fn live_files_carry_columns_after(
         .context("load_manifest_list")?;
     for mf in manifest_list.entries() {
         tokio::task::yield_now().await;
-        let manifest = mf.load_manifest(table.file_io()).await.context("load_manifest")?;
+        let manifest = mf
+            .load_manifest(table.file_io())
+            .await
+            .context("load_manifest")?;
         for entry in manifest.entries() {
             if !entry.is_alive() {
                 continue;
             }
             if let Some(after) = after_sequence {
-                if !entry.sequence_number().is_some_and(|seq| seq > after) {
+                if entry.sequence_number().is_none_or(|seq| seq <= after) {
                     return Ok(false);
                 }
             }
@@ -8355,7 +8360,15 @@ mod promotion_extraction_tests {
         // Another rule's stamp says nothing about this one's values.
         assert_eq!(promotion_extraction_from(Some("1:declared")), None);
         assert_eq!(promotion_extraction_from(Some("1:after:7")), None);
-        for junk in ["", "declared", "2", "2:", "2:after:", "2:after:x", "x:declared"] {
+        for junk in [
+            "",
+            "declared",
+            "2",
+            "2:",
+            "2:after:",
+            "2:after:x",
+            "x:declared",
+        ] {
             assert_eq!(promotion_extraction_from(Some(junk)), None, "{junk}");
         }
     }
@@ -14827,7 +14840,12 @@ impl IcebergContext {
         ) {
             Some(PromotionExtraction::Declared) => None,
             Some(PromotionExtraction::AdoptedAfter(seq)) => Some(seq),
-            None => return self.adopt_promotion_extraction(table_ident).await.map(|_| false),
+            None => {
+                return self
+                    .adopt_promotion_extraction(table_ident)
+                    .await
+                    .map(|_| false)
+            }
         };
         let table = self
             .catalog()

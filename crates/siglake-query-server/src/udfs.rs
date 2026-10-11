@@ -779,8 +779,9 @@ mod tests {
     /// back — the value a query sees once the `attr_get`→column rewrite fires.
     fn promoted_cell(attributes: &str, key: &str) -> Option<String> {
         use arrow_array::Array;
-        let batch = siglake_core::events_to_record_batch(&[siglake_core::Event::now("raw")
-            .with_attributes(Some(attributes.to_string()))])
+        let batch = siglake_core::events_to_record_batch(&[
+            siglake_core::Event::now("raw").with_attributes(Some(attributes.to_string()))
+        ])
         .unwrap();
         let col = siglake_core::PromotedColumn {
             attr_key: key.to_string(),
@@ -829,11 +830,7 @@ mod tests {
             ),
             (
                 r#"{"k8s":{"pod":"p-1","labels":{"app.kubernetes.io/name":"siglake"}}}"#,
-                &[
-                    "k8s.pod",
-                    "k8s.labels.app.kubernetes.io/name",
-                    "k8s.labels",
-                ],
+                &["k8s.pod", "k8s.labels.app.kubernetes.io/name", "k8s.labels"],
             ),
             // Unparseable / non-object attributes.
             ("not json", &["a.b"]),

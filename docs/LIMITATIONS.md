@@ -1600,6 +1600,22 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   per table, a sample bounded in files × rows, and a 4096-key census cap.
   Leaving it off is still the shipped answer — qualifying the bounds is not a
   decision to turn it on.
+- **Promoted columns written before 0.3.0 lose their speedup until the files
+  are rewritten.** Through 0.2.1 the promotion extractor retried a literal
+  dotted key only at the top level while `attr_get` retried it at every level,
+  so a key `a.b.c` whose object under `a` carried a literal `"b.c"` key
+  promoted to NULL and the UDF returned the value (#6769). 0.3.0 makes the two
+  extractors identical and versions the rule, which costs the older data its
+  qualification: a table whose promoted values were written before the stamp
+  existed is adopted at its current sequence number, and the
+  `attr_get`→column rewrite and the promoted-column prune stay off for it until
+  every file at or below that sequence has been rewritten. Those queries are
+  correct — they read the residual JSON, which is what they did before the
+  promotion — but they scan. Nothing rewrites the data on its own schedule:
+  compaction converges a table that keeps writing, and an operator who wants
+  the speedup back sooner forces it with a recluster pass over the table's live
+  files (the rewrite re-extracts every row through the current rule). There is
+  no repair that fixes the values in place, and no automatic migration.
 - **Tier-1 group counts serve only columns present since the table's first
   commit.** The serving guard is `column_total(column) == record_count`, so a
   column that starts accumulating mid-life — a typed column on a table created

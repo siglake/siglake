@@ -757,7 +757,8 @@ async fn promoted_values_from_an_older_extractor_neither_rewrite_nor_prune() {
     let server_ice = Arc::new(IcebergContext::open(&warehouse).await.unwrap());
     let app = router(AppState::new(server_ice, AuthConfig::open()));
     let sql = "SELECT count(*) AS n FROM events WHERE attr_get(attributes, 'k8s.pod') = 'pod-a'";
-    let (status, body) = request_json(&app, "/api/v1/sql", serde_json::json!({ "query": sql })).await;
+    let (status, body) =
+        request_json(&app, "/api/v1/sql", serde_json::json!({ "query": sql })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"][0]["n"].as_i64(), Some(25), "{body}");
     let scan = body["stats"]["scan"]
@@ -787,7 +788,8 @@ async fn promoted_values_from_an_older_extractor_neither_rewrite_nor_prune() {
 
     let server_ice = Arc::new(IcebergContext::open(&warehouse).await.unwrap());
     let app = router(AppState::new(server_ice, AuthConfig::open()));
-    let (status, body) = request_json(&app, "/api/v1/sql", serde_json::json!({ "query": sql })).await;
+    let (status, body) =
+        request_json(&app, "/api/v1/sql", serde_json::json!({ "query": sql })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"][0]["n"].as_i64(), Some(25), "{body}");
 }
