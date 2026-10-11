@@ -303,6 +303,15 @@ establishes that 256 MiB is unsafe at 1Gi — only that it is measurably closer 
 the limit than it needs to be, on a bin far smaller than the ones the fleet
 merges.
 
+The matched field attempt on 2026-10-11 subsequently OOM-killed both the
+256 MiB and 64 MiB arms before canonical ingest completed. That result did not
+distinguish the row-group targets: retained compactor logs end during filesystem
+drain startup, before a Parquet write or rewrite begins. #6744 traced the shared
+failure to claim admission counting 64 MiB of zstd-compressed WAL while the
+parallel readers allocated the much larger uncompressed Arrow IPC bodies. The
+repair bounds decoded WAL bytes independently of this row-group target. A fresh
+matched field qualification remains required for the target comparison.
+
 The follow-up this left open is #5132, the chart change if a round supports it.
 #5133 settled the 32 MiB arm's selective read against the page accounting above.
 #5805 added requested-versus-fetched scan attribution, and #5806 renamed the

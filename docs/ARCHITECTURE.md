@@ -338,8 +338,14 @@ prerequisites are in `deploy/helm/siglake-operator/README.md`.
 `docs/DESIGN_wal_mirror_reclamation.md` prices the three options and
 `docs/LIMITATIONS.md` states what remains uncollected.
 
-**Drain.** The drain claims bounded batches (default ≤64 segments / 64 MiB per
-commit) and keeps `SIGLAKE_DRAIN_CONCURRENCY` commits in flight
+**Drain.** The filesystem drain claims bounded batches (default ≤64 segments /
+64 MiB of compressed WAL per commit) and also bounds their summed uncompressed
+Arrow IPC bodies. The decoded bound is one eighth of the process memory limit,
+never above `SIGLAKE_DRAIN_INFLIGHT_BUDGET_MB`: 128 MiB in the packaged 1Gi
+compactor under the shipped 1024 MiB setting. New WAL zstd frames expose their
+uncompressed size without decoding; segments written by older builds are sized
+through a streaming decoder before claim. The drain keeps
+`SIGLAKE_DRAIN_CONCURRENCY` commits in flight
 *continuously* — topping up the moment one lands, re-listing `sealed/` as new
 segments arrive — bounded by a per-pass budget so compaction and gauges keep
 their cadence under backlog. Commit-accumulation batching (default on, 64 MiB

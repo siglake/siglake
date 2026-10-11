@@ -22,7 +22,7 @@
 pub mod mirror;
 
 use std::fs::{self, File};
-use std::io::{BufWriter, Read};
+use std::io::{BufWriter, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -854,8 +854,12 @@ impl WalWriter {
                 (0, 0)
             };
             // zstd-1 the body; the header CRC covers the compressed bytes on disk.
+            // One-shot compression records the uncompressed content size in
+            // the zstd frame. The compactor reads that field without decoding
+            // the body, so its claim budget follows the Arrow IPC bytes it
+            // will allocate rather than the much smaller compressed file.
             let comp =
-                zstd::encode_all(raw_body, WAL_ZSTD_LEVEL).context("zstd-compress WAL body")?;
+                zstd::bulk::compress(raw_body, WAL_ZSTD_LEVEL).context("zstd-compress WAL body")?;
             metrics::histogram!("siglake_wal_seal_compression_ratio")
                 .record(raw_body.len() as f64 / comp.len().max(1) as f64);
             let framed = build_wal_frame(
@@ -2549,6 +2553,80 @@ pub fn read_segment(path: &Path) -> Result<Vec<RecordBatch>> {
     }
 }
 
+/// Bytes in the uncompressed Arrow IPC body of a sealed WAL segment.
+///
+/// New framed segments carry this value in their zstd frame header. Older
+/// framed segments do not, so sizing them streams the decoder into a sink;
+/// this costs CPU and bounded decoder state, but never materializes the body.
+/// Legacy raw-IPC and recovered partial segments are already uncompressed.
+/// The compactor uses this before claiming a batch so compressed WAL bytes
+/// cannot bypass its decoded-memory admission bound.
+pub fn segment_uncompressed_bytes(path: &Path) -> Result<u64> {
+    const ZSTD_FRAME_HEADER_MAX: usize = 18;
+    let corrupt_charge = |bytes: u64| bytes.max(1).saturating_mul(16);
+
+    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    let mut fixed = [0u8; WAL_FRAME_HEADER_LEN];
+    let fixed_len = file_len.min(WAL_FRAME_HEADER_LEN as u64) as usize;
+    file.read_exact(&mut fixed[..fixed_len])
+        .with_context(|| format!("reading WAL header from {}", path.display()))?;
+    if fixed_len < WAL_FRAME_MAGIC.len() || &fixed[..4] != WAL_FRAME_MAGIC {
+        return Ok(file_len);
+    }
+    if fixed_len < WAL_FRAME_HEADER_LEN_V1 {
+        return Ok(corrupt_charge(file_len));
+    }
+    let version = fixed[4];
+    let Some(header_len) = frame_header_len(version) else {
+        return Ok(corrupt_charge(file_len));
+    };
+    if file_len < header_len as u64 {
+        return Ok(corrupt_charge(file_len));
+    }
+    let physical_body_len = file_len - header_len as u64;
+    let partial = fixed[5] & WAL_FRAME_FLAG_PARTIAL != 0;
+    if partial || fixed[5] & WAL_FRAME_FLAG_ZSTD == 0 {
+        return Ok(physical_body_len);
+    }
+
+    let declared_body_len = u64::from_le_bytes(fixed[24..32].try_into().unwrap());
+    if physical_body_len != declared_body_len {
+        return Ok(corrupt_charge(physical_body_len));
+    }
+    file.seek(std::io::SeekFrom::Start(header_len as u64))
+        .with_context(|| format!("seeking to WAL body in {}", path.display()))?;
+    let mut zstd_header = [0u8; ZSTD_FRAME_HEADER_MAX];
+    let prefix_len = file
+        .read(&mut zstd_header)
+        .with_context(|| format!("reading zstd header from {}", path.display()))?;
+    if let Ok(Some(content_size)) =
+        zstd::zstd_safe::get_frame_content_size(&zstd_header[..prefix_len])
+    {
+        return Ok(content_size);
+    }
+
+    // Segments written before the one-shot encoder did not stamp a content
+    // size. Count the decoded stream without retaining it, then decode it for
+    // real only if the compactor admits this segment.
+    file.seek(std::io::SeekFrom::Start(header_len as u64))
+        .with_context(|| format!("seeking to legacy zstd body in {}", path.display()))?;
+    let Ok(mut decoder) = zstd::stream::read::Decoder::new(file.take(declared_body_len)) else {
+        return Ok(corrupt_charge(declared_body_len));
+    };
+    match std::io::copy(&mut decoder, &mut std::io::sink()) {
+        Ok(bytes) => Ok(bytes),
+        // Sizing must not steal corrupt-segment disposition from the drain.
+        // Charge a conservative estimate so this object is eventually claimed;
+        // read_segment then verifies its CRC/decoder and the existing poison
+        // ledger names and contains it.
+        Err(_) => Ok(corrupt_charge(declared_body_len)),
+    }
+}
+
 /// Decode a sealed segment from its full file bytes, handling both framed
 /// (WS-8) and legacy raw-IPC formats. Framed bytes have their in-band CRC
 /// verified; legacy bytes decode directly (no off-disk sidecar to check). Use
@@ -3712,6 +3790,52 @@ mod crc_integrity_tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(rows, 4);
+    }
+
+    /// #6744: claim admission needs the allocation-side byte count, including
+    /// for segments produced before seals started stamping zstd content size.
+    #[test]
+    fn uncompressed_segment_sizing_handles_new_and_old_zstd_frames() {
+        let batch = events_to_record_batch(&[
+            Event::now("field-value-".repeat(32_768)),
+            Event::now("field-value-".repeat(32_768)),
+        ])
+        .unwrap();
+        let mut raw = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut raw, &batch.schema()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "content-size",
+                zstd::bulk::compress(&raw, WAL_ZSTD_LEVEL).unwrap(),
+            ),
+            (
+                "legacy-stream",
+                zstd::encode_all(raw.as_slice(), WAL_ZSTD_LEVEL).unwrap(),
+            ),
+        ];
+        for (name, compressed) in cases {
+            let path = tmp.path().join(format!("{name}.arrow"));
+            let frame = build_wal_frame(
+                WAL_FRAME_FLAG_ZSTD,
+                0,
+                0,
+                None,
+                &compressed,
+                crc32(&compressed),
+            );
+            fs::write(&path, &frame).unwrap();
+            assert_eq!(segment_uncompressed_bytes(&path).unwrap(), raw.len() as u64);
+            assert!(
+                raw.len() > frame.len() * 10,
+                "fixture must reproduce a compressed-byte admission bypass"
+            );
+            assert_eq!(read_segment(&path).unwrap()[0].num_rows(), 2);
+        }
     }
 
     /// A byte flipped in the framed body trips the in-band integrity check.

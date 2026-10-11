@@ -1728,8 +1728,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   holds ~157 MB of survivors, and a narrow GDPR delete leaves nearly every row a
   survivor. What a 256 MiB cold-target candidate costs a compactor packaged at
   1Gi is not established: the measurement is peak heap growth above a recorded
-  baseline on fixtures three orders of magnitude smaller. The merge path's side
-  of the same question is measured separately in
+  baseline on fixtures three orders of magnitude smaller. A 2026-10-11 matched
+  field attempt OOM-killed both the 256 MiB and 64 MiB arms during filesystem
+  drain startup, before either row-group target reached a Parquet write; #6744
+  corrected that shared compressed-WAL admission defect. The merge path's side
+  of the row-group question is measured separately in
   `docs/DESIGN_row_group_target_qualification.md`.
 - **The packaged compactor's row-group target is qualified locally and nowhere
   else.** `TARGET_ROW_GROUP_UNCOMPRESSED_BYTES` is 256 MiB and the packaged
