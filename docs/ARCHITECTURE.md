@@ -908,6 +908,22 @@ column, queryable via the `attr_get(attributes, key)` UDF (values come back as
 text so they `CAST` cleanly) and `LIKE`. Existing tables gain the column via
 the additive `siglake migrate-schema` — see **Upgrades** below.
 
+**A non-scalar value reads differently per mechanism, on purpose.** `attr_get`
+and a `Utf8` promotion of the same key both return an object's or array's
+compact JSON, and they return the same text: each parses the value and
+serializes it again, which canonicalises key order and whitespace instead of
+handing back the stored slice. A declared index mapping is stricter — a `Text`
+field takes scalars only, so an object leaves that field null and stays in the
+residual `attributes`, while a `Json` field serializes it the way promotion
+does. Changing `Text` would move extraction, residual retention and
+required-field validation together, so the three behaviours are pinned where
+they are: `crates/siglake-query-server/tests/promoted_object_parity.rs` holds
+the promotion/`attr_get` parity, including the nested
+`attr_get(attr_get(attributes,'aws.cloudwatch'),'log_stream')` shape before and
+after a promotion backfill, and `mapping.rs`'s
+`text_field_rejects_non_scalar_values_and_json_field_serializes_them` holds the
+declared-mapping side.
+
 **Auto-promotion is the one schema mutation nobody requests.** Promoted columns
 are normally declared: an operator lists `(attr_key, column, type)` triples and
 the write path extracts them. The compactor can also choose them itself — it
