@@ -3724,8 +3724,11 @@ fn table_sort_columns(
 /// "Field id N not found in struct array" against a freshly migrated table,
 /// so the migration would not actually be *live*.
 ///
-/// Zero-cost fast path when the batch already presents the schema's columns in
-/// order (the steady state), so the common write path is unchanged.
+/// Zero-cost fast path when the batch already presents the schema's fields in
+/// order with the table's field identities (the steady state), so the common
+/// write path is unchanged. Names alone are insufficient: a promoted column on
+/// a managed index receives its id from that index's current schema, while the
+/// extraction helper initially stamps the canonical events-table id.
 /// Columns the batch carries that the TABLE does not have, and which hold at
 /// least one non-null value.
 ///
@@ -3798,13 +3801,7 @@ fn align_batch_to_table_schema(table: &Table, batch: RecordBatch) -> Result<Reco
     let target = iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
         .context("table current schema to arrow")?;
     let bschema = batch.schema();
-    if bschema.fields().len() == target.fields().len()
-        && bschema
-            .fields()
-            .iter()
-            .zip(target.fields())
-            .all(|(a, b)| a.name() == b.name())
-    {
+    if bschema.fields() == target.fields() {
         return Ok(batch);
     }
     let n = batch.num_rows();
