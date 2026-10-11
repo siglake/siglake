@@ -3709,26 +3709,6 @@ fn table_sort_columns(
     out
 }
 
-/// Reorder `batch`'s rows into the table's declared Iceberg sort order. The
-/// storage layer applies this on every Parquet write (see
-/// [`IcebergContext::write_batch_to_data_files`]) so data is physically
-/// time-ordered on disk regardless of which path wrote it. No declared sort (or
-/// an empty/transform-only one) returns the batch untouched.
-/// Project `batch` onto `table`'s current schema, filling any column the batch
-/// lacks with all-nulls (and dropping any column the schema lacks). This keeps
-/// writers compiled against an *older, narrower* schema compatible with a table
-/// that an additive [`migrate_table_schema_additive`](IcebergContext::
-/// migrate_table_schema_additive) has since widened: the produced file carries
-/// the full current-schema columns — new ones null — with the field-ids the
-/// snapshot's schema expects. Without this, an old-code writer would fail with
-/// "Field id N not found in struct array" against a freshly migrated table,
-/// so the migration would not actually be *live*.
-///
-/// Zero-cost fast path when the batch already presents the schema's fields in
-/// order with the table's field identities (the steady state), so the common
-/// write path is unchanged. Names alone are insufficient: a promoted column on
-/// a managed index receives its id from that index's current schema, while the
-/// extraction helper initially stamps the canonical events-table id.
 /// Columns the batch carries that the TABLE does not have, and which hold at
 /// least one non-null value.
 ///
@@ -3821,6 +3801,20 @@ fn table_alignment_target(
     })
 }
 
+/// Project `batch` onto `table`'s current schema, filling any column the batch
+/// lacks with all-nulls (and dropping any column the schema lacks). This keeps
+/// writers compiled against an *older, narrower* schema compatible with a table
+/// that an additive [`IcebergContext::migrate_table_schema_additive`] has since
+/// widened: the produced file carries the full current-schema columns — new
+/// ones null — with the field-ids the snapshot's schema expects. Without this,
+/// an old-code writer would fail with
+/// "Field id N not found in struct array" against a freshly migrated table,
+/// so the migration would not actually be *live*.
+///
+/// Zero-cost fast path when the batch already presents the schema's fields in
+/// order with the table's field identities (the steady state). See
+/// [`table_alignment_target`] for why field identity, rather than names alone,
+/// determines whether alignment is needed.
 fn align_batch_to_table_schema(table: &Table, batch: RecordBatch) -> Result<RecordBatch> {
     let bschema = batch.schema();
     let Some(target) = table_alignment_target(table, bschema.as_ref())? else {
@@ -3854,6 +3848,11 @@ fn align_batch_to_table_schema(table: &Table, batch: RecordBatch) -> Result<Reco
     Ok(aligned)
 }
 
+/// Reorder `batch`'s rows into the table's declared Iceberg sort order. The
+/// storage layer applies this on every Parquet write (see
+/// [`IcebergContext::write_batch_to_data_files`]) so data is physically
+/// time-ordered on disk regardless of which path wrote it. No declared sort (or
+/// an empty/transform-only one) returns the batch untouched.
 fn sort_batch_to_table_order(table: &Table, batch: RecordBatch) -> Result<RecordBatch> {
     let cols = table_sort_columns(table, batch.schema().as_ref());
     if cols.is_empty() {
