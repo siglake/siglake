@@ -18,6 +18,7 @@
 //! process-global, and the test reads the whole captured log.
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +29,7 @@ use siglake_core::Event;
 use siglake_query_server::{router, AppState, AuthConfig};
 use siglake_storage::iceberg::IcebergContext;
 use tower::util::ServiceExt;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
@@ -58,6 +60,7 @@ const OVERLAP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 #[derive(Clone, Default)]
 struct Recorder {
     events: Arc<Mutex<Vec<Captured>>>,
+    formatted: Arc<Mutex<Vec<u8>>>,
     sql_starts: Arc<AtomicUsize>,
 }
 
@@ -103,6 +106,34 @@ impl Recorder {
 
     fn all(&self) -> Vec<Captured> {
         self.events.lock().expect("recorder").clone()
+    }
+
+    fn formatted(&self) -> Vec<u8> {
+        self.formatted.lock().expect("formatted log").clone()
+    }
+}
+
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for CapturedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("formatted log")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for Recorder {
+    type Writer = CapturedWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedWriter(Arc::clone(&self.formatted))
     }
 }
 
@@ -241,7 +272,14 @@ fn of_execution<'a>(log: &'a [Captured], id: u64, message: &str) -> Vec<&'a Capt
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scan_events_name_the_request_that_produced_them() {
     let recorder = Recorder::with_overlapping_sql_starts();
-    tracing_subscriber::registry().with(recorder.clone()).init();
+    let formatter = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(recorder.clone());
+    tracing_subscriber::registry()
+        .with(formatter)
+        .with(recorder.clone())
+        .init();
 
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(tmp.path()).await.unwrap();
@@ -400,5 +438,47 @@ async fn scan_events_name_the_request_that_produced_them() {
         !late.is_empty(),
         "no partition profile followed the streaming request's terminal line, \
          so this run does not exercise the late-event case"
+    );
+
+    // Exercise the real fmt layer as well as the structured Recorder above.
+    // DataFusion's `one_line()` includes a trailing newline; if the producer
+    // passes it through directly, each execution profile becomes a keyed head
+    // plus an unkeyed `plan_nodes` continuation. A collector cannot safely
+    // attribute that continuation once requests overlap.
+    let formatted = String::from_utf8(recorder.formatted()).expect("UTF-8 formatted log");
+    let execution_profile_lines: Vec<&str> = formatted
+        .lines()
+        .filter(|line| line.contains(EXECUTION_PROFILE))
+        .collect();
+    assert_eq!(
+        execution_profile_lines.len(),
+        buffered_ids.len(),
+        "one formatted execution profile per buffered request:\n{formatted}"
+    );
+    for id in buffered_ids {
+        let id_field = format!("query_execution_id={id}");
+        let lines: Vec<&str> = execution_profile_lines
+            .iter()
+            .copied()
+            .filter(|line| line.contains(&id_field))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "execution {id} has one formatted profile: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("root_plan=")
+                && lines[0].contains("plan_nodes=")
+                && lines[0].contains("physical_plan_ms="),
+            "execution {id} keeps its plan and timings on one physical line: {}",
+            lines[0]
+        );
+    }
+    assert!(
+        !formatted
+            .lines()
+            .any(|line| line.starts_with(" plan_nodes=")),
+        "execution-profile timings must not be unkeyed continuation lines:\n{formatted}"
     );
 }

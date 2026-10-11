@@ -2051,7 +2051,9 @@ A successful buffered `/api/v1/sql` execution carries that same id on both
 its `sql execution profile` line (physical plan and phase timings) and its
 terminal `sql query profile` line. Concurrent buffered executions can
 therefore join their plan, collect and render timings by id instead of by log
-position. Streaming and refused executions keep their existing event set.
+position. The execution profile is one physical log line: the root-plan
+summary cannot split its keyed head from the timing fields. Streaming and
+refused executions keep their existing event set.
 
 Ids are process-local. A distributed query's coordinator and worker halves
 each mint their own and are joined by the W3C trace context the fan-out
