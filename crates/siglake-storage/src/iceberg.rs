@@ -3346,15 +3346,76 @@ pub const REWRITE_COMMIT_PROP: &str = "siglake.rewrite";
 /// stamping existed) to this order's direction during the convergence.
 pub const LEGACY_SORT_ORDER_PROP: &str = "siglake.legacy_sort_order_id";
 
-/// Table property set (to the promoted-columns JSON) once EVERY live data
-/// file carries every promoted column — the gate for the query server's
-/// `attr_get(attributes, key)` → column rewrite, which is only sound when no
-/// pre-promotion file (column absent, key still in the residual JSON) can be
-/// scanned. The value is the full promotion list, so declaring a NEW
-/// promotion automatically invalidates the gate until backfill converges
-/// again. Flipped by the compactor after backfill passes; never unset by
-/// hand.
+/// Table property set once EVERY live data file carries every promoted column
+/// AND was written by the current extraction rule — the gate for the query
+/// server's `attr_get(attributes, key)` → column rewrite, which is only sound
+/// when no pre-promotion file (column absent, key still in the residual JSON)
+/// and no stale-rule file (column present, value not what `attr_get` returns)
+/// can be scanned. The value is the extractor version plus the full promotion
+/// list, so declaring a NEW promotion — or upgrading to a new extraction rule
+/// (#6769) — automatically invalidates the gate until the data converges
+/// again. Flipped by the compactor after backfill passes; never unset by hand.
 pub const PROMOTION_BACKFILL_PROP: &str = "siglake.promotion_backfill_complete.v1";
+
+/// Table property recording WHICH extraction rule materialized this table's
+/// promoted columns: `"<version>:declared"` when the promotions were first
+/// declared by a binary at that [`siglake_core::ATTR_EXTRACTOR_VERSION`] (the
+/// columns did not exist before, so every file carrying one was written by
+/// that rule), or `"<version>:after:<sequence>"` when a table whose promotions
+/// predate the stamp was adopted at that rule — files at or below `sequence`
+/// may hold values an older rule produced.
+pub const PROMOTION_EXTRACTION_PROP: &str = "siglake.promotion_extraction.v1";
+
+/// What [`PROMOTION_EXTRACTION_PROP`] says about a table's promoted values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromotionExtraction {
+    /// Promotions declared under the current rule: any file carrying a
+    /// promoted column was written by it.
+    Declared,
+    /// Adopted at the current rule after `sequence`: files written at or
+    /// below it may carry values of an older rule.
+    AdoptedAfter(i64),
+}
+
+/// Parse [`PROMOTION_EXTRACTION_PROP`]. `None` when it is absent, unparseable,
+/// or stamped at an extractor version other than the current one — all of
+/// which mean "this table's promoted values are not known to match `attr_get`".
+pub(crate) fn promotion_extraction_from(value: Option<&str>) -> Option<PromotionExtraction> {
+    let (version, rest) = value?.split_once(':')?;
+    if version.parse::<u32>().ok()? != siglake_core::ATTR_EXTRACTOR_VERSION {
+        return None;
+    }
+    match rest {
+        "declared" => Some(PromotionExtraction::Declared),
+        _ => rest
+            .strip_prefix("after:")
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(PromotionExtraction::AdoptedAfter),
+    }
+}
+
+/// [`PROMOTION_EXTRACTION_PROP`]'s value for a freshly declared promotion.
+pub(crate) fn promotion_declared_stamp() -> String {
+    format!("{}:declared", siglake_core::ATTR_EXTRACTOR_VERSION)
+}
+
+/// [`PROMOTION_EXTRACTION_PROP`]'s value for a table adopted at the current
+/// rule with `sequence` live at the time.
+pub(crate) fn promotion_adopted_stamp(sequence: i64) -> String {
+    format!("{}:after:{sequence}", siglake_core::ATTR_EXTRACTOR_VERSION)
+}
+
+/// [`PROMOTION_BACKFILL_PROP`]'s value for `promoted` under the current
+/// extraction rule. A table qualified under an older rule carries a different
+/// value, so the rewrite stays off until its data converges (#6769).
+pub(crate) fn promotion_backfill_value(promoted: &[siglake_core::PromotedColumn]) -> Result<String> {
+    let json = siglake_core::promoted_property_json(promoted)
+        .map_err(|e| anyhow::anyhow!("promoted property json: {e}"))?;
+    Ok(format!(
+        "extractor{}:{json}",
+        siglake_core::ATTR_EXTRACTOR_VERSION
+    ))
+}
 
 /// Create one table's auto-promotion cost series at zero, before the sampling
 /// pass or the committed Backfill bin that would otherwise be their first
@@ -4162,6 +4223,50 @@ async fn live_data_files_within(
         }
     }
     Ok(Some(files))
+}
+
+/// Does every live data file carry a manifest column entry for each of `ids`
+/// AND post-date `after_sequence`? The promotion-backfill verdict, as a walk
+/// that short-circuits on the first disqualifying entry instead of
+/// materializing the file list.
+///
+/// `after_sequence` is `None` for a table whose promotions were DECLARED under
+/// the current extraction rule: the columns did not exist before, so a file
+/// carrying them was written by that rule. It is `Some(seq)` for a table
+/// adopted later, where a file at or below `seq` may carry values an older
+/// rule produced (#6769). An entry with no sequence number at all is treated
+/// as pre-epoch — unknown provenance never qualifies.
+async fn live_files_carry_columns_after(
+    table: &Table,
+    ids: &[i32],
+    after_sequence: Option<i64>,
+) -> Result<bool> {
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return Ok(true);
+    };
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), &table.metadata_ref())
+        .await
+        .context("load_manifest_list")?;
+    for mf in manifest_list.entries() {
+        tokio::task::yield_now().await;
+        let manifest = mf.load_manifest(table.file_io()).await.context("load_manifest")?;
+        for entry in manifest.entries() {
+            if !entry.is_alive() {
+                continue;
+            }
+            if let Some(after) = after_sequence {
+                if !entry.sequence_number().is_some_and(|seq| seq > after) {
+                    return Ok(false);
+                }
+            }
+            let file = entry.data_file();
+            if !ids.iter().all(|id| file.column_sizes().contains_key(id)) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn data_file_timestamp_lower_ns(file: &DataFile, field: TimeBoundField) -> Option<i64> {
@@ -8221,6 +8326,60 @@ fn newest_sample_files(mut files: Vec<SampleCandidate>, limit: usize) -> Vec<Sam
     });
     files.truncate(limit.max(1));
     files
+}
+
+/// #6769: the pure half of the extraction-rule gate — which stamps count as
+/// "these promoted values match the current `attr_get`". The end-to-end
+/// behaviour (no rewrite, no prune, re-qualification after a rewrite) lives in
+/// `siglake-query-server`'s `promoted_prune.rs`.
+#[cfg(test)]
+mod promotion_extraction_tests {
+    use super::*;
+
+    #[test]
+    fn stamps_round_trip_at_the_current_version() {
+        assert_eq!(
+            promotion_extraction_from(Some(&promotion_declared_stamp())),
+            Some(PromotionExtraction::Declared)
+        );
+        assert_eq!(
+            promotion_extraction_from(Some(&promotion_adopted_stamp(41))),
+            Some(PromotionExtraction::AdoptedAfter(41))
+        );
+    }
+
+    #[test]
+    fn absent_unparseable_or_older_rule_is_not_current() {
+        // A table written before the stamp existed (every 0.2.1 table).
+        assert_eq!(promotion_extraction_from(None), None);
+        // Another rule's stamp says nothing about this one's values.
+        assert_eq!(promotion_extraction_from(Some("1:declared")), None);
+        assert_eq!(promotion_extraction_from(Some("1:after:7")), None);
+        for junk in ["", "declared", "2", "2:", "2:after:", "2:after:x", "x:declared"] {
+            assert_eq!(promotion_extraction_from(Some(junk)), None, "{junk}");
+        }
+    }
+
+    #[test]
+    fn backfill_value_carries_the_extractor_version() {
+        let promoted = vec![siglake_core::PromotedColumn {
+            attr_key: "a.b.c".into(),
+            name: "a_b_c".into(),
+            ty: siglake_core::PromotedType::Utf8,
+        }];
+        let value = promotion_backfill_value(&promoted).unwrap();
+        let json = siglake_core::promoted_property_json(&promoted).unwrap();
+        assert!(value.ends_with(&json), "{value}");
+        assert_ne!(
+            value, json,
+            "a table qualified under the old rule must not match the new value"
+        );
+        assert_eq!(
+            value,
+            promotion_backfill_value(&promoted).unwrap(),
+            "stable for an unchanged promotion list"
+        );
+    }
 }
 
 /// #3052 qualification: the bounded sampling and column-cap rules of WS-7
@@ -14642,16 +14801,9 @@ impl IcebergContext {
         if promoted.is_empty() {
             return Ok(false);
         }
-        let desired = siglake_core::promoted_property_json(&promoted)
-            .map_err(|e| anyhow::anyhow!("promoted property json: {e}"))?;
-        if entry
-            .table
-            .metadata()
-            .properties()
-            .get(PROMOTION_BACKFILL_PROP)
-            .map(String::as_str)
-            == Some(desired.as_str())
-        {
+        let desired = promotion_backfill_value(&promoted)?;
+        let props = entry.table.metadata().properties();
+        if props.get(PROMOTION_BACKFILL_PROP).map(String::as_str) == Some(desired.as_str()) {
             return Ok(false);
         }
         let schema = entry.table.metadata().current_schema();
@@ -14663,18 +14815,28 @@ impl IcebergContext {
                 None => return Ok(false),
             }
         }
-        let files = self.live_data_files(table_ident).await?;
-        let all_covered = files
-            .iter()
-            .all(|f| ids.iter().all(|id| f.column_sizes().contains_key(id)));
-        if !all_covered {
-            return Ok(false);
-        }
+        // Which extraction rule wrote the promoted values decides what the
+        // walk has to prove. Unstamped means the promotions were declared by a
+        // binary on an older rule (#6769): adopt the table at the current
+        // sequence, so only files written from here on can qualify. No data is
+        // rewritten — the gate simply stays shut, and the query path keeps
+        // answering from the residual JSON until compaction has turned the old
+        // files over.
+        let after_sequence = match promotion_extraction_from(
+            props.get(PROMOTION_EXTRACTION_PROP).map(String::as_str),
+        ) {
+            Some(PromotionExtraction::Declared) => None,
+            Some(PromotionExtraction::AdoptedAfter(seq)) => Some(seq),
+            None => return self.adopt_promotion_extraction(table_ident).await.map(|_| false),
+        };
         let table = self
             .catalog()
             .load_table(table_ident)
             .await
             .with_context(|| format!("load {table_ident} for backfill property"))?;
+        if !live_files_carry_columns_after(&table, &ids, after_sequence).await? {
+            return Ok(false);
+        }
         let tx = Transaction::new(&table);
         let tx = tx
             .update_table_properties()
@@ -14690,12 +14852,66 @@ impl IcebergContext {
         Ok(true)
     }
 
+    /// Stamp a table whose promoted columns were materialized by an unknown
+    /// (older, or unrecorded) extraction rule as adopted at the CURRENT rule,
+    /// recording the sequence number its stale values can hide behind. Only
+    /// files written after it can qualify the table for the `attr_get`
+    /// rewrite and the promoted-column prune hints.
+    ///
+    /// This writes a property; it never rewrites data. An operator who wants
+    /// the optimization back before natural turnover reaches the old files
+    /// must rewrite them deliberately (a full recluster pass re-extracts every
+    /// row through the current rule) — see `docs/LIMITATIONS.md`.
+    /// Returns `true` when this call wrote the stamp.
+    pub async fn adopt_promotion_extraction(&self, table_ident: &TableIdent) -> Result<bool> {
+        let table = self
+            .catalog()
+            .load_table(table_ident)
+            .await
+            .with_context(|| format!("load {table_ident} for extraction stamp"))?;
+        if promotion_extraction_from(
+            table
+                .metadata()
+                .properties()
+                .get(PROMOTION_EXTRACTION_PROP)
+                .map(String::as_str),
+        )
+        .is_some()
+        {
+            return Ok(false);
+        }
+        let sequence = table.metadata().last_sequence_number();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set(
+                PROMOTION_EXTRACTION_PROP.to_string(),
+                promotion_adopted_stamp(sequence),
+            )
+            .apply(tx)
+            .context("set promotion extraction stamp")?;
+        tx.commit(self.catalog().as_ref())
+            .await
+            .context("commit promotion extraction stamp")?;
+        self.invalidate_cached_table(table_ident).await;
+        tracing::warn!(
+            table = %table_ident, sequence,
+            version = siglake_core::ATTR_EXTRACTOR_VERSION,
+            "promoted columns predate the current attribute-extraction rule; \
+             attr_get rewrite and promoted-column pruning stay off for this table \
+             until every file written at or before this sequence has been rewritten"
+        );
+        Ok(true)
+    }
+
     /// WS-7: the `attr_get(attributes, key)` → promoted-column rewrite map for
     /// the events table — `Some` ONLY when the backfill-complete property
-    /// matches the recorded promotion list (the substitution is unsound while
-    /// any pre-promotion file is live: its column reads NULL, its JSON still
-    /// holds the key). Typed columns rewrite comparisons to typed
-    /// literals; other uses go through CAST back to VARCHAR (see the server).
+    /// matches the recorded promotion list AND the current extraction rule
+    /// (the substitution is unsound while any pre-promotion file is live — its
+    /// column reads NULL, its JSON still holds the key — and equally while any
+    /// file holds values an older rule extracted, #6769). Typed columns
+    /// rewrite comparisons to typed literals; other uses go through CAST back
+    /// to VARCHAR (see the server).
     /// Reads the cached entry — no IO on the warm path.
     pub async fn events_attr_rewrite_map(
         &self,
@@ -14721,8 +14937,7 @@ impl IcebergContext {
         if promoted.is_empty() {
             return Ok(None);
         }
-        let recorded = siglake_core::promoted_property_json(&promoted)
-            .map_err(|e| anyhow::anyhow!("promoted property json: {e}"))?;
+        let recorded = promotion_backfill_value(&promoted)?;
         if props.get(PROMOTION_BACKFILL_PROP).map(String::as_str) != Some(recorded.as_str()) {
             return Ok(None);
         }
@@ -16015,22 +16230,41 @@ impl IcebergContext {
             .load_table(table_ident)
             .await
             .with_context(|| format!("load {table_ident} for promoted property"))?;
-        if table
-            .metadata()
-            .properties()
+        let props = table.metadata().properties();
+        if props
             .get(siglake_core::PROMOTED_PROPERTY_KEY)
             .map(String::as_str)
             != Some(desired_json.as_str())
         {
+            // Record WHICH extraction rule will have written this table's
+            // promoted values (#6769), in the same transaction as the
+            // declaration itself. A table that holds no promotion yet gets
+            // `declared`: the columns do not exist, so every file that ends up
+            // carrying one was written by the current rule. A table that
+            // already holds one, declared by a binary that left no stamp, is
+            // adopted at the current sequence instead — its existing values
+            // may be an older rule's, and only files written after this
+            // declaration can qualify it.
+            let stamp = match promotion_extraction_from(
+                props.get(PROMOTION_EXTRACTION_PROP).map(String::as_str),
+            ) {
+                Some(_) => None,
+                None if !props.contains_key(siglake_core::PROMOTED_PROPERTY_KEY) => {
+                    Some(promotion_declared_stamp())
+                }
+                None => Some(promotion_adopted_stamp(
+                    table.metadata().last_sequence_number(),
+                )),
+            };
             let tx = Transaction::new(&table);
-            let tx = tx
-                .update_table_properties()
-                .set(
-                    siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
-                    desired_json.clone(),
-                )
-                .apply(tx)
-                .context("set promoted property")?;
+            let mut update = tx.update_table_properties().set(
+                siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
+                desired_json.clone(),
+            );
+            if let Some(stamp) = stamp {
+                update = update.set(PROMOTION_EXTRACTION_PROP.to_string(), stamp);
+            }
+            let tx = update.apply(tx).context("set promoted property")?;
             // Every query replica declares the SAME promotions on a tenant's
             // first request (`for_namespace`), so N of them CAS the same
             // catalog row at once and N−1 lose. `Transaction::commit` retries

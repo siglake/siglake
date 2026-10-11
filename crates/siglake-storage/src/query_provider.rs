@@ -6786,18 +6786,59 @@ fn extract_match_udf_prune(
 /// `siglake.promoted.v1` property (written by `ensure_promoted_columns`).
 /// Empty for tables without declared promotions. Utf8 only: `attr_get`
 /// yields strings, so only Utf8 promotions substitute value-for-value.
+///
+/// Also empty when the table's promoted values are not known to match the
+/// current `attr_get` extraction rule (#6769). The hint is a prune: a row
+/// group whose promoted column is all-NULL, or whose min/max excludes the
+/// literal, is skipped outright. That is only sound while a NULL column means
+/// the key is absent from the row's JSON — which an older extraction rule's
+/// values do not guarantee.
 fn promoted_utf8_columns(table: &Table) -> HashMap<String, String> {
-    siglake_core::promoted_columns_from_property(
+    let promoted = siglake_core::promoted_columns_from_property(
         table
             .metadata()
             .properties()
             .get(siglake_core::PROMOTED_PROPERTY_KEY)
             .map(String::as_str),
-    )
-    .into_iter()
-    .filter(|c| c.ty == siglake_core::PromotedType::Utf8)
-    .map(|c| (c.attr_key, c.name))
-    .collect()
+    );
+    if promoted.is_empty() || !promoted_extraction_matches_attr_get(table, &promoted) {
+        return HashMap::new();
+    }
+    promoted
+        .into_iter()
+        .filter(|c| c.ty == siglake_core::PromotedType::Utf8)
+        .map(|c| (c.attr_key, c.name))
+        .collect()
+}
+
+/// Were this table's promoted values written by the extraction rule the
+/// current `attr_get` implements?
+///
+/// `declared` says the promotions were first declared under this rule, so the
+/// columns cannot predate it: any file carrying one was written by it, and a
+/// file written before the declaration lacks the column entirely (never
+/// pruned). A table adopted at this rule later carries files from before the
+/// adoption sequence whose values may be an older rule's, and nothing in a
+/// row group distinguishes them — only full backfill qualification proves no
+/// such file is live.
+fn promoted_extraction_matches_attr_get(
+    table: &Table,
+    promoted: &[siglake_core::PromotedColumn],
+) -> bool {
+    let props = table.metadata().properties();
+    match crate::iceberg::promotion_extraction_from(
+        props
+            .get(crate::iceberg::PROMOTION_EXTRACTION_PROP)
+            .map(String::as_str),
+    ) {
+        Some(crate::iceberg::PromotionExtraction::Declared) => true,
+        _ => crate::iceberg::promotion_backfill_value(promoted).is_ok_and(|qualified| {
+            props
+                .get(crate::iceberg::PROMOTION_BACKFILL_PROP)
+                .map(String::as_str)
+                == Some(qualified.as_str())
+        }),
+    }
 }
 
 /// WS-7: extract `attr_get(attributes, 'key') = 'value'` (and non-negated

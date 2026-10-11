@@ -80,6 +80,9 @@ opentelemetry_sdk = { workspace = true }
 # middleware against the `TraceLayer` it replaced on this router.
 tower-http = { workspace = true }
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "gen-tonic-messages", "trace", "with-serde"] }
+# #6769 forges the catalog state a pre-fix binary leaves behind (promotion
+# qualified, no extraction stamp), which takes a catalog transaction of its own.
+iceberg = { workspace = true }
 parquet = { workspace = true }
 rcgen = "0.13"
 tempfile = "3"
