@@ -2028,7 +2028,7 @@ struct LazyMergeOutputWriter<'a> {
     files: &'a [DataFile],
     bloom_columns: &'a [&'a str],
     with_footers: bool,
-    rewrite_gen: u32,
+    stamp: MergeOutputStamp,
     /// Where this merge's segmented sidecars land (#4377), or `None` when the
     /// writer builds none. One sink per rewrite, shared by every output file
     /// the rolling writer opens, so a partition-split rewrite leaves one
@@ -2047,7 +2047,8 @@ impl LazyMergeOutputWriter<'_> {
                         self.files,
                         self.bloom_columns,
                         self.with_footers,
-                        self.rewrite_gen,
+                        self.stamp.rewrite_gen,
+                        self.stamp.extractor_version,
                         Some(&batch),
                         self.segmented_sink.clone(),
                     )
@@ -2068,6 +2069,16 @@ impl LazyMergeOutputWriter<'_> {
             None => Ok(Vec::new()),
         }
     }
+}
+
+/// Filename metadata for one merge-style output writer. Normal merge paths
+/// re-extract promoted values and use the current rule; delete-survivor paths
+/// copy values and preserve the input marker (including `None` for an old
+/// unprovenanced file).
+#[derive(Clone, Copy)]
+struct MergeOutputStamp {
+    rewrite_gen: u32,
+    extractor_version: Option<u32>,
 }
 
 /// Outcome of a tier-2 re-clustering rewrite. See [`IcebergContext::recluster_files`].
@@ -3941,7 +3952,7 @@ fn sort_batch_to_table_order(table: &Table, batch: RecordBatch) -> Result<Record
     // be trusted by every reader. A stable re-sort of already-sorted rows is the
     // identity permutation — if it isn't, the write path would emit a file whose
     // footer lies. Debug-only: it doubles the sort, so it never runs in release.
-    #[cfg(feature = "test-utils")]
+    #[cfg(debug_assertions)]
     {
         let check_cols: Vec<SortColumn> = cols
             .iter()
@@ -14954,6 +14965,20 @@ impl IcebergContext {
         table_ident: &TableIdent,
     ) -> Result<Option<std::collections::HashMap<String, (String, siglake_core::PromotedType)>>>
     {
+        Ok(self
+            .qualified_attr_rewrite_for(table_ident)
+            .await?
+            .map(|qualified| qualified.mapping))
+    }
+
+    /// The qualified rewrite map and the exact provider generation whose live
+    /// files established that qualification. A caller that substitutes the map
+    /// must register this provider (and use its WAL-consumption/config capture)
+    /// rather than reading the mutable table cache again later in the request.
+    pub async fn qualified_attr_rewrite_for(
+        &self,
+        table_ident: &TableIdent,
+    ) -> Result<Option<QualifiedAttrRewrite>> {
         let entry = self.cached_table_entry(table_ident).await?;
         let props = entry.table.metadata().properties();
         let promoted = siglake_core::promoted_columns_from_property(
@@ -14983,7 +15008,16 @@ impl IcebergContext {
             .into_iter()
             .map(|c| (c.attr_key, (c.name, c.ty)))
             .collect();
-        Ok(if map.is_empty() { None } else { Some(map) })
+        if map.is_empty() {
+            return Ok(None);
+        }
+        let index_config =
+            crate::index_manager::index_config_from_table(table_ident.name(), &entry.table)?;
+        Ok(Some(QualifiedAttrRewrite {
+            mapping: map,
+            snapshot: BufferedTableSnapshot::from_cached(entry),
+            index_config,
+        }))
     }
 
     /// Fold each table's outstanding group-count deltas into its wide base and
@@ -16680,10 +16714,11 @@ impl IcebergContext {
 
     /// Persist a batch exactly as a pre-#6769 writer could: do not recompute
     /// promoted columns and do not stamp extraction provenance on its files.
-    /// Debug-build regression support only; production writes always use
+    /// Regression support only; production builds do not expose this helper and
+    /// production writes always use
     /// [`Self::append_to_table`].
     #[doc(hidden)]
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-utils")]
     pub async fn append_unprovenanced_promoted_batch_for_test(
         &self,
         table_ident: &TableIdent,
@@ -19497,7 +19532,14 @@ impl IcebergContext {
         let survivor_batch = arrow::compute::concat_batches(&target_schema, &survivor_batches)
             .context("concat delete-task survivor batches")?;
         let write_output = self
-            .write_batch_to_data_files(table, survivor_batch, bloom_columns, index_spec, 0)
+            .write_batch_to_data_files_with_extractor_version(
+                table,
+                survivor_batch,
+                bloom_columns,
+                index_spec,
+                0,
+                file_extractor_version(file.file_path()),
+            )
             .await?;
         Ok(Some(DeleteTaskCandidateRewrite {
             rows_deleted: matches,
@@ -19596,7 +19638,10 @@ impl IcebergContext {
                 std::slice::from_ref(file),
                 bloom_columns,
                 true,
-                0,
+                MergeOutputStamp {
+                    rewrite_gen: 0,
+                    extractor_version: file_extractor_version(file.file_path()),
+                },
                 None,
             )
         });
@@ -20383,7 +20428,7 @@ impl IcebergContext {
         files: &'a [DataFile],
         bloom_columns: &'a [&'a str],
         with_footers: bool,
-        rewrite_gen: u32,
+        stamp: MergeOutputStamp,
         segmented_sink: Option<Arc<SegmentedIndexSink>>,
     ) -> LazyMergeOutputWriter<'a> {
         LazyMergeOutputWriter {
@@ -20392,7 +20437,7 @@ impl IcebergContext {
             files,
             bloom_columns,
             with_footers,
-            rewrite_gen,
+            stamp,
             segmented_sink,
             inner: None,
         }
@@ -20415,6 +20460,7 @@ impl IcebergContext {
         bloom_columns: &[&str],
         with_footers: bool,
         rewrite_gen: u32,
+        output_extractor_version: Option<u32>,
         // The first batch the caller is about to write, as the row-size sample
         // the byte target is divided by. `None` — no output batch exists yet —
         // is what every merge path used to pass, and it reaches the
@@ -20498,7 +20544,7 @@ impl IcebergContext {
         let name_gen = DefaultFileNameGenerator::new(
             rewrite_prefix(
                 if with_footers { rewrite_gen } else { 0 },
-                Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+                output_extractor_version,
             ),
             None,
             DataFileFormat::Parquet,
@@ -20599,7 +20645,10 @@ impl IcebergContext {
             files,
             bloom_columns,
             with_footers,
-            rewrite_gen,
+            MergeOutputStamp {
+                rewrite_gen,
+                extractor_version: Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+            },
             segmented_sink,
         );
 
@@ -20849,7 +20898,10 @@ impl IcebergContext {
             files,
             bloom_columns,
             true,
-            rewrite_gen,
+            MergeOutputStamp {
+                rewrite_gen,
+                extractor_version: Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+            },
             segmented_sink,
         );
         let mut rows_written = 0usize;
@@ -23815,6 +23867,7 @@ pub enum PinnedEmptySchema {
 /// `schema_id` and `table_uuid` ride along for the same reason (#2554/#2921):
 /// the coordinator ships its whole serving generation to workers, and reading
 /// either from a later cache entry could pair it with a different snapshot.
+#[derive(Clone)]
 pub struct BufferedTableSnapshot {
     pub provider: Arc<dyn datafusion::datasource::TableProvider>,
     pub consumed: Arc<std::collections::HashSet<String>>,
@@ -23826,6 +23879,19 @@ pub struct BufferedTableSnapshot {
     /// a dropped index's replacement starts at no snapshot and schema id 0,
     /// which is exactly what a never-written table looks like.
     pub table_uuid: String,
+}
+
+/// A promoted-attribute substitution qualified against one immutable table
+/// generation. Query registration and WAL wrapping consume this same capture,
+/// closing the interval in which cache refresh could otherwise swap in files
+/// whose promoted values were never qualified.
+#[derive(Clone)]
+pub struct QualifiedAttrRewrite {
+    pub mapping: HashMap<String, (String, siglake_core::PromotedType)>,
+    pub snapshot: BufferedTableSnapshot,
+    /// The carrier mapping from the same table generation. `None` for tables
+    /// that are not managed indexes; such tables have no index WAL override.
+    pub index_config: Option<IndexConfig>,
 }
 
 impl BufferedTableSnapshot {

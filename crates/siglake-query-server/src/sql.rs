@@ -1315,12 +1315,13 @@ async fn apply_query_rewrites(
     // substituted text flows everywhere downstream — the Tier-1 group-count
     // battery sees a plain `GROUP BY <column>` (~3ms metadata answer), the
     // provider prunes natively, shard fan-out ships the rewritten SQL.
-    let search_rewritten = if search_rewritten.contains("attr_get") {
+    let (search_rewritten, attr_rewrite_bindings) = if search_rewritten.contains("attr_get") {
         // The gate is table-local: a promoted column is sound only after that
         // table's backfill property matches its promotion list. Load every
         // referenced table's independently gated map, then let the AST scope
         // resolver apply a map only where the column owner is proven.
         let mut mappings = HashMap::new();
+        let mut bindings = HashMap::new();
         for name in referenced_tables(&search_rewritten).unwrap_or_default() {
             if name == "query_audit" {
                 continue;
@@ -1330,13 +1331,17 @@ async fn apply_query_rewrites(
             } else {
                 ice.index_table_ident(&name)
             };
-            if let Ok(Some(mapping)) = ice.attr_rewrite_map_for(&ident).await {
-                mappings.insert(name, mapping);
+            if let Ok(Some(qualified)) = ice.qualified_attr_rewrite_for(&ident).await {
+                mappings.insert(name.clone(), qualified.mapping.clone());
+                bindings.insert(name, qualified);
             }
         }
-        rewrite_attr_get_to_columns(&search_rewritten, &mappings).unwrap_or(search_rewritten)
+        match rewrite_attr_get_to_columns(&search_rewritten, &mappings) {
+            Some(rewritten) => (rewritten, bindings),
+            None => (search_rewritten, HashMap::new()),
+        }
     } else {
-        search_rewritten
+        (search_rewritten, HashMap::new())
     };
     // The table whose event-time field this query's order contract turns on.
     // The implicit rewrite needs it to inject an order; a query that ALREADY
@@ -1347,7 +1352,7 @@ async fn apply_query_rewrites(
             Some(resolved) => Some(resolved),
             None => resolve_explicit_order_index(ice, &search_rewritten).await,
         };
-    Ok(apply_default_order_if_needed(
+    let mut rewritten = apply_default_order_if_needed(
         &search_rewritten,
         default_order,
         priority,
@@ -1355,7 +1360,9 @@ async fn apply_query_rewrites(
         ordered_index
             .as_ref()
             .map(|(table, field)| (table.as_str(), field.as_str())),
-    ))
+    );
+    rewritten.attr_rewrite_bindings = attr_rewrite_bindings;
+    Ok(rewritten)
 }
 
 /// The managed index and event-time field behind a query that already carries
@@ -1897,6 +1904,10 @@ fn attr_get_rewrite_target(
 #[derive(Clone)]
 struct RewrittenQuery {
     sql: String,
+    /// Exact table generations whose files qualified every promoted-value
+    /// substitution in `sql`. Registration and WAL wrapping must use these
+    /// captures instead of consulting the mutable table cache again.
+    attr_rewrite_bindings: HashMap<String, siglake_storage::iceberg::QualifiedAttrRewrite>,
     preferred_scan_order: Option<siglake_storage::PreferredScanOrder>,
     /// Literal `LIMIT n` of a timestamp-ordered query — rides into the
     /// session as `OrderedScanLimit` so the gate can coalesce partitions.
@@ -1932,6 +1943,7 @@ fn apply_default_order_if_needed(
         _ => {
             return RewrittenQuery {
                 sql: query.to_string(),
+                attr_rewrite_bindings: HashMap::new(),
                 preferred_scan_order: None,
                 ordered_limit: None,
                 ordered_source_filter: None,
@@ -1948,6 +1960,7 @@ fn apply_default_order_if_needed(
         if let Statement::Query(inner) = statement.as_ref() {
             return RewrittenQuery {
                 sql: query.to_string(),
+                attr_rewrite_bindings: HashMap::new(),
                 preferred_scan_order: preferred_scan_order_from_query(
                     inner,
                     query_order_field(inner, ordered_index),
@@ -1964,6 +1977,7 @@ fn apply_default_order_if_needed(
         }
         return RewrittenQuery {
             sql: query.to_string(),
+            attr_rewrite_bindings: HashMap::new(),
             preferred_scan_order: None,
             ordered_limit: None,
             ordered_source_filter: None,
@@ -1973,6 +1987,7 @@ fn apply_default_order_if_needed(
     let Statement::Query(sql_query) = &mut stmts[0] else {
         return RewrittenQuery {
             sql: query.to_string(),
+            attr_rewrite_bindings: HashMap::new(),
             preferred_scan_order: None,
             ordered_limit: None,
             ordered_source_filter: None,
@@ -2010,6 +2025,7 @@ fn apply_default_order_if_needed(
             .and_then(|order| ordered_source_filter(sql_query, &order.field));
         return RewrittenQuery {
             sql,
+            attr_rewrite_bindings: HashMap::new(),
             preferred_scan_order,
             ordered_limit,
             ordered_source_filter,
@@ -2029,6 +2045,7 @@ fn apply_default_order_if_needed(
             .as_ref()
             .and_then(|_| explicit_limit_value(sql_query)),
         sql: query.to_string(),
+        attr_rewrite_bindings: HashMap::new(),
         preferred_scan_order,
         ordered_source_filter,
         clipped_limit: clipping_scan_limit(sql_query),
@@ -3016,6 +3033,7 @@ fn clipping_scan_limit(query: &SqlQuery) -> Option<usize> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn prepare_result_cache(
     ice: &siglake_storage::iceberg::IcebergContext,
     query: &str,
@@ -3026,6 +3044,34 @@ async fn prepare_result_cache(
     buffer_proof: BufferProof,
     scope: ResultCacheScope,
     deadline: tokio::time::Instant,
+) -> Result<SqlResultCacheDecision, ApiError> {
+    prepare_result_cache_with_bindings(
+        ice,
+        query,
+        dry_run,
+        format,
+        resolved,
+        buffer_delta,
+        buffer_proof,
+        scope,
+        deadline,
+        &HashMap::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_result_cache_with_bindings(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    query: &str,
+    dry_run: bool,
+    format: QueryFormat,
+    resolved: &ResolvedLimits,
+    buffer_delta: BufferDeltaState,
+    buffer_proof: BufferProof,
+    scope: ResultCacheScope,
+    deadline: tokio::time::Instant,
+    bindings: &HashMap<String, siglake_storage::iceberg::QualifiedAttrRewrite>,
 ) -> Result<SqlResultCacheDecision, ApiError> {
     if format != QueryFormat::Records || dry_run {
         return Ok(SqlResultCacheDecision::Skip);
@@ -3121,10 +3167,13 @@ async fn prepare_result_cache(
     // Snapshot AND schema id, from one metadata generation (#2494). Two
     // independent reads could straddle a refresh and produce a key that
     // describes no generation at all; see `TableGeneration`.
-    let generation = ice
-        .current_table_generation(table)
-        .await
-        .map_err(ApiError::internal)?;
+    let generation = match bindings.get(table) {
+        Some(binding) => binding.snapshot.generation(),
+        None => ice
+            .current_table_generation(table)
+            .await
+            .map_err(ApiError::internal)?,
+    };
     let Some(snapshot_id) = generation.snapshot_id else {
         return Ok(SqlResultCacheDecision::Skip);
     };
@@ -4522,12 +4571,14 @@ async fn handle_local_inner(
     // not by us, so a cancelled load simply leaves the next request to redo it.
     let (buffer_delta_state, buffer_load) = under_request_deadline!(async {
         Ok::<_, ApiError>(
-            resolve_buffer_delta(
+            resolve_buffer_delta_with_bindings(
                 &ice,
                 state.wal_buffer_dir.as_deref(),
                 &state.buffer_delta_cache,
                 &identity,
                 &effective_query.sql,
+                &effective_query.attr_rewrite_bindings,
+                None,
             )
             .await,
         )
@@ -4556,7 +4607,7 @@ async fn handle_local_inner(
     // too. Cancelling it cannot orphan a marker: nothing awaits between the
     // insert into the in-flight map and the `Leader` return, and every other
     // exit is covered by `SqlResultCacheCtx::drop`.
-    let cache_ctx = match under_request_deadline!(prepare_result_cache(
+    let cache_ctx = match under_request_deadline!(prepare_result_cache_with_bindings(
         &ice,
         &effective_query.sql,
         req.dry_run,
@@ -4566,6 +4617,7 @@ async fn handle_local_inner(
         buffer_proof,
         cache_scope,
         deadline,
+        &effective_query.attr_rewrite_bindings,
     )) {
         SqlResultCacheDecision::Skip => None,
         SqlResultCacheDecision::Leader(ctx) => Some(ctx),
@@ -4727,14 +4779,26 @@ async fn handle_local_inner(
     // well past the request budget. It ends on the deadline like everything
     // else; the half-registered session context dies with the request.
     let registered_tables = under_request_deadline!(async {
-        let registered = register_tables_for_query(&ice, &ctx, &effective_query.sql).await?;
+        let registered = register_tables_for_query_with_bindings(
+            &ice,
+            &ctx,
+            &effective_query.sql,
+            &effective_query.attr_rewrite_bindings,
+        )
+        .await?;
         // WS-6: if real-time buffering is on and this query touches `events`,
         // replace the plain Iceberg provider with a union over the un-committed
         // WAL segments so just-ingested rows are visible before the compaction
         // commit.
         if let Some(buffer_root) = state.wal_buffer_dir.as_deref() {
-            override_events_with_wal_buffer(&ice, &ctx, buffer_root, identity.tenant.as_deref())
-                .await?;
+            override_events_with_wal_buffer(
+                &ice,
+                &ctx,
+                buffer_root,
+                identity.tenant.as_deref(),
+                effective_query.attr_rewrite_bindings.get("events"),
+            )
+            .await?;
             // #61: same for every USER INDEX the query references.
             override_indexes_with_wal_buffer(
                 &ice,
@@ -4742,6 +4806,7 @@ async fn handle_local_inner(
                 buffer_root,
                 identity.tenant.as_deref(),
                 &effective_query.sql,
+                &effective_query.attr_rewrite_bindings,
             )
             .await?;
         }
@@ -6468,7 +6533,7 @@ async fn run_batch_query_in(
 
     if let Err(e) = under_run_deadline!(
         None,
-        register_tables_for_query_batch(&ice, &ctx, &query.sql)
+        register_tables_for_query_batch(&ice, &ctx, &query.sql, &query.attr_rewrite_bindings,)
     ) {
         return BatchOutcome::Failed(format!("register tables: {e:#}"), None);
     }
@@ -9187,10 +9252,19 @@ async fn register_tables_for_query(
     ctx: &SessionContext,
     query: &str,
 ) -> Result<usize, ApiError> {
+    register_tables_for_query_with_bindings(ice, ctx, query, &HashMap::new()).await
+}
+
+async fn register_tables_for_query_with_bindings(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    ctx: &SessionContext,
+    query: &str,
+    bindings: &HashMap<String, siglake_storage::iceberg::QualifiedAttrRewrite>,
+) -> Result<usize, ApiError> {
     let Some(tables) = referenced_tables(query) else {
         return register_all_tables(ice, ctx).await;
     };
-    register_selected_tables(ice, ctx, &tables)
+    register_selected_tables(ice, ctx, &tables, bindings)
         .await
         .map_err(registration_error_to_api)
 }
@@ -9199,21 +9273,27 @@ async fn register_tables_for_query_batch(
     ice: &siglake_storage::iceberg::IcebergContext,
     ctx: &SessionContext,
     query: &str,
+    bindings: &HashMap<String, siglake_storage::iceberg::QualifiedAttrRewrite>,
 ) -> anyhow::Result<usize> {
     let Some(tables) = referenced_tables(query) else {
         return register_all_tables(ice, ctx)
             .await
             .map_err(|e| anyhow::anyhow!(e.msg));
     };
-    register_selected_tables(ice, ctx, &tables).await
+    register_selected_tables(ice, ctx, &tables, bindings).await
 }
 
 async fn register_selected_tables(
     ice: &siglake_storage::iceberg::IcebergContext,
     ctx: &SessionContext,
     tables: &[String],
+    bindings: &HashMap<String, siglake_storage::iceberg::QualifiedAttrRewrite>,
 ) -> anyhow::Result<usize> {
     for table in tables {
+        if let Some(binding) = bindings.get(table) {
+            ctx.register_table(table, binding.snapshot.provider.clone())?;
+            continue;
+        }
         match table.as_str() {
             "events" => ice.register_with_datafusion(ctx).await?,
             "query_audit" => ice.register_query_audit_with_datafusion(ctx).await?,
@@ -9242,14 +9322,21 @@ async fn override_events_with_wal_buffer(
     ctx: &SessionContext,
     buffer_root: &std::path::Path,
     tenant: Option<&str>,
+    binding: Option<&siglake_storage::iceberg::QualifiedAttrRewrite>,
 ) -> Result<(), ApiError> {
     if !ctx.table_exist("events").unwrap_or(false) {
         return Ok(());
     }
-    let (base, consumed) = ice
-        .events_provider_with_consumed()
-        .await
-        .map_err(ApiError::internal)?;
+    let (base, consumed) = match binding {
+        Some(binding) => (
+            binding.snapshot.provider.clone(),
+            binding.snapshot.consumed.clone(),
+        ),
+        None => ice
+            .events_provider_with_consumed()
+            .await
+            .map_err(ApiError::internal)?,
+    };
     let wal_dir =
         crate::wal_buffer::resolve_tenant_wal_dir(buffer_root, tenant.unwrap_or("default"));
     match crate::wal_buffer::UnionEventsProvider::try_new(base, &wal_dir, &consumed) {
@@ -9486,6 +9573,7 @@ fn buffer_proof_of(load: Option<&BufferDeltaLoad>) -> BufferProof {
 /// Load this request's buffer delta and classify what the load proved. `None`
 /// for `buffer_root` is the unbuffered deployment: nothing can be in flight, so
 /// the delta is empty by construction.
+#[cfg(test)]
 async fn resolve_buffer_delta(
     ice: &siglake_storage::iceberg::IcebergContext,
     buffer_root: Option<&std::path::Path>,
@@ -9493,12 +9581,21 @@ async fn resolve_buffer_delta(
     identity: &CallerIdentity,
     query: &str,
 ) -> (BufferDeltaState, Option<BufferDeltaLoad>) {
-    resolve_buffer_delta_with_max(ice, buffer_root, cache, identity, query, None).await
+    resolve_buffer_delta_with_bindings(
+        ice,
+        buffer_root,
+        cache,
+        identity,
+        query,
+        &HashMap::new(),
+        None,
+    )
+    .await
 }
 
 /// [`resolve_buffer_delta`] with the decode ceiling injected, so the backlog
-/// classification is testable without a 2 GiB fixture (the sibling of
-/// [`load_buffer_delta_with_max`]).
+/// classification is testable without a 2 GiB fixture.
+#[cfg(test)]
 async fn resolve_buffer_delta_with_max(
     ice: &siglake_storage::iceberg::IcebergContext,
     buffer_root: Option<&std::path::Path>,
@@ -9507,10 +9604,41 @@ async fn resolve_buffer_delta_with_max(
     query: &str,
     max_bytes: Option<u64>,
 ) -> (BufferDeltaState, Option<BufferDeltaLoad>) {
+    resolve_buffer_delta_with_bindings(
+        ice,
+        buffer_root,
+        cache,
+        identity,
+        query,
+        &HashMap::new(),
+        max_bytes,
+    )
+    .await
+}
+
+async fn resolve_buffer_delta_with_bindings(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    buffer_root: Option<&std::path::Path>,
+    cache: &Arc<crate::wal_buffer::BufferDeltaCache>,
+    identity: &CallerIdentity,
+    query: &str,
+    bindings: &HashMap<String, siglake_storage::iceberg::QualifiedAttrRewrite>,
+    max_bytes: Option<u64>,
+) -> (BufferDeltaState, Option<BufferDeltaLoad>) {
     let Some(buffer_root) = buffer_root else {
         return (BufferDeltaState::Empty, None);
     };
-    match load_buffer_delta_with_max(ice, buffer_root, cache, identity, query, max_bytes).await {
+    match load_buffer_delta_with_max_and_bindings(
+        ice,
+        buffer_root,
+        cache,
+        identity,
+        query,
+        max_bytes,
+        bindings,
+    )
+    .await
+    {
         // Checked BEFORE `is_empty`: a refused buffer yields no batches, so the
         // emptiness test cannot tell the two apart, and only one of them is a
         // proof. A load that refused ONE table's buffer and read another's is
@@ -9681,18 +9809,9 @@ impl BufferDelta {
 /// count observations retain the snapshot and budget decision even when no
 /// delta is included, so whole-table counts can use one coherent base/buffer
 /// generation and explain committed-only fallbacks.
-async fn load_buffer_delta(
-    ice: &siglake_storage::iceberg::IcebergContext,
-    buffer_root: &std::path::Path,
-    cache: &Arc<crate::wal_buffer::BufferDeltaCache>,
-    identity: &CallerIdentity,
-    query: &str,
-) -> Result<BufferDeltaLoad, ApiError> {
-    load_buffer_delta_with_max(ice, buffer_root, cache, identity, query, None).await
-}
-
-/// [`load_buffer_delta`] with an injected byte ceiling for hermetic backlog
+/// The bound delta loader with an injected byte ceiling for hermetic backlog
 /// regressions. Production passes `None` and reads the configured ceiling.
+#[cfg(test)]
 async fn load_buffer_delta_with_max(
     ice: &siglake_storage::iceberg::IcebergContext,
     buffer_root: &std::path::Path,
@@ -9700,6 +9819,27 @@ async fn load_buffer_delta_with_max(
     identity: &CallerIdentity,
     query: &str,
     max_bytes: Option<u64>,
+) -> Result<BufferDeltaLoad, ApiError> {
+    load_buffer_delta_with_max_and_bindings(
+        ice,
+        buffer_root,
+        cache,
+        identity,
+        query,
+        max_bytes,
+        &HashMap::new(),
+    )
+    .await
+}
+
+async fn load_buffer_delta_with_max_and_bindings(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    buffer_root: &std::path::Path,
+    cache: &Arc<crate::wal_buffer::BufferDeltaCache>,
+    identity: &CallerIdentity,
+    query: &str,
+    max_bytes: Option<u64>,
+    bindings: &HashMap<String, siglake_storage::iceberg::QualifiedAttrRewrite>,
 ) -> Result<BufferDeltaLoad, ApiError> {
     let Some(tables) = referenced_tables(query) else {
         // Unparseable table list: no delta, and the caller's detect fns will
@@ -9716,7 +9856,18 @@ async fn load_buffer_delta_with_max(
     let mut counts = std::collections::HashMap::new();
     let mut proof = BufferProof::default();
     for name in tables {
-        let (dir, snapshot, carrier, owner) = if name == "events" {
+        let (dir, snapshot, carrier, owner) = if let Some(binding) = bindings.get(&name) {
+            let owner = (name != "events").then(|| binding.snapshot.table_uuid.clone());
+            let carrier = (name != "events")
+                .then(|| binding.index_config.clone())
+                .flatten();
+            let dir = if name == "events" {
+                crate::wal_buffer::resolve_tenant_wal_dir(buffer_root, tenant)
+            } else {
+                crate::wal_buffer::resolve_index_wal_dir(buffer_root, tenant, &name)
+            };
+            (dir, binding.snapshot.clone(), carrier, owner)
+        } else if name == "events" {
             let snapshot = ice
                 .events_provider_with_consumed_snapshot()
                 .await
@@ -9864,6 +10015,7 @@ async fn override_indexes_with_wal_buffer(
     buffer_root: &std::path::Path,
     tenant: Option<&str>,
     query: &str,
+    bindings: &HashMap<String, siglake_storage::iceberg::QualifiedAttrRewrite>,
 ) -> Result<(), ApiError> {
     // The tables siglake itself owns. Everything else is a managed index and
     // takes the index path below -- including a consumer's own output tables,
@@ -9876,12 +10028,23 @@ async fn override_indexes_with_wal_buffer(
         if BUILT_IN.contains(&name.as_str()) || !ctx.table_exist(&name).unwrap_or(false) {
             continue;
         }
-        let Some((snapshot, config)) = ice
-            .index_provider_with_consumed_snapshot(&name)
-            .await
-            .map_err(ApiError::internal)?
-        else {
-            continue;
+        let (snapshot, config) = match bindings.get(&name) {
+            Some(binding) => {
+                let Some(config) = binding.index_config.clone() else {
+                    continue;
+                };
+                (binding.snapshot.clone(), config)
+            }
+            None => {
+                let Some(current) = ice
+                    .index_provider_with_consumed_snapshot(&name)
+                    .await
+                    .map_err(ApiError::internal)?
+                else {
+                    continue;
+                };
+                current
+            }
         };
         // #2661: a directory left behind by a dropped incarnation of this id
         // serves nothing — the index reads its committed view only.
@@ -9937,8 +10100,16 @@ struct BufferedShardRead {
 async fn capture_buffered_shard_read(
     ice: &siglake_storage::iceberg::IcebergContext,
     table: String,
+    binding: Option<&siglake_storage::iceberg::QualifiedAttrRewrite>,
 ) -> Result<BufferedShardRead, ApiError> {
-    let (snapshot, carrier) = if table == "events" {
+    let (snapshot, carrier) = if let Some(binding) = binding {
+        (
+            binding.snapshot.clone(),
+            (table != "events")
+                .then(|| binding.index_config.clone())
+                .flatten(),
+        )
+    } else if table == "events" {
         (
             ice.events_provider_with_consumed_snapshot()
                 .await
@@ -12521,6 +12692,132 @@ mod tests {
                 .contains("SELECT event_k AS value FROM events"),
             "{}",
             rewritten.sql
+        );
+    }
+
+    /// Qualification and registration used to read the mutable table cache in
+    /// two phases. A commit in between could qualify snapshot S, substitute the
+    /// promoted column, then register S+1 containing an old-writer stale NULL.
+    #[tokio::test]
+    async fn attr_rewrite_registration_uses_the_exact_qualified_snapshot() {
+        use arrow_array::{ArrayRef, Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("warehouse");
+        let promotion = vec![siglake_core::PromotedColumn {
+            attr_key: "a.b.c".into(),
+            name: "a_b_c".into(),
+            ty: siglake_core::PromotedType::Utf8,
+        }];
+        let ice = IcebergContext::open(&warehouse)
+            .await
+            .unwrap()
+            .with_promoted_columns(promotion);
+        ice.ensure_promoted_columns().await.unwrap();
+        ice.append_events(&[
+            Event::now("old").with_attributes(Some(r#"{"a":{"b.c":"old"}}"#.into()))
+        ])
+        .await
+        .unwrap();
+        assert!(ice.ensure_promotion_backfill_property().await.unwrap());
+
+        let sql = "SELECT count(*) AS n FROM events \
+                   WHERE attr_get(attributes, 'a.b.c') = 'late'";
+        let qualified = apply_query_rewrites(&ice, sql, false, Priority::Interactive, 100)
+            .await
+            .unwrap();
+        assert!(qualified.sql.contains("a_b_c"), "{}", qualified.sql);
+        let qualified_snapshot = qualified.attr_rewrite_bindings["events"]
+            .snapshot
+            .snapshot_id;
+
+        // Deterministic barrier between qualification and registration: publish
+        // a pre-fix file carrying JSON `late` but a stale promoted NULL, which
+        // also invalidates and refreshes the mutable table cache.
+        let late = siglake_core::events_to_record_batch(&[
+            Event::now("late").with_attributes(Some(r#"{"a":{"b.c":"late"}}"#.into()))
+        ])
+        .unwrap();
+        let mut fields = late.schema().fields().to_vec();
+        fields.insert(0, Arc::new(Field::new("a_b_c", DataType::Utf8, true)));
+        let mut columns = late.columns().to_vec();
+        columns.insert(
+            0,
+            Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+        );
+        let stale =
+            arrow_array::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        ice.append_unprovenanced_promoted_batch_for_test(ice.events_table_ident(), stale)
+            .await
+            .unwrap();
+        assert_ne!(
+            ice.current_table_generation("events")
+                .await
+                .unwrap()
+                .snapshot_id,
+            qualified_snapshot,
+            "the mutable cache must observe the intervening commit"
+        );
+
+        let ctx = SessionContext::new();
+        register_tables_for_query_with_bindings(
+            &ice,
+            &ctx,
+            &qualified.sql,
+            &qualified.attr_rewrite_bindings,
+        )
+        .await
+        .unwrap();
+        let all = ctx
+            .sql("SELECT count(*) AS n FROM events")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            all[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1,
+            "registration must retain snapshot S rather than mix in S+1"
+        );
+
+        // A later request sees S+1, declines substitution, and answers the new
+        // row from residual JSON rather than trusting its stale NULL.
+        let fallback = apply_query_rewrites(&ice, sql, false, Priority::Interactive, 100)
+            .await
+            .unwrap();
+        assert!(fallback.sql.contains("attr_get"), "{}", fallback.sql);
+        let ctx = SessionContext::new();
+        register_tables_for_query_with_bindings(
+            &ice,
+            &ctx,
+            &fallback.sql,
+            &fallback.attr_rewrite_bindings,
+        )
+        .await
+        .unwrap();
+        crate::udfs::register_udfs(&ctx);
+        let rows = ctx
+            .sql(&fallback.sql)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
         );
     }
 
@@ -15705,7 +16002,7 @@ mod tests {
         assert_eq!(n_before, 4);
 
         // With override: union ⇒ 7.
-        override_events_with_wal_buffer(&ice, &ctx, &wal_root, None)
+        override_events_with_wal_buffer(&ice, &ctx, &wal_root, None, None)
             .await
             .unwrap();
         let n_after = count_events(&ctx).await;
@@ -16800,7 +17097,13 @@ async fn distributed_inner(
             .set_extension(std::sync::Arc::new(planning_execution_id));
         datafusion::prelude::SessionContext::new_with_state(st)
     };
-    register_tables_for_query(&ice, &planning, &effective_query.sql).await?;
+    register_tables_for_query_with_bindings(
+        &ice,
+        &planning,
+        &effective_query.sql,
+        &effective_query.attr_rewrite_bindings,
+    )
+    .await?;
     crate::udfs::register_udfs(&planning);
     // WS-6: a last_values()/distinct_values() query classifies as Local and runs
     // on this coordinator ctx, so its UDTFs must be registered here too.
@@ -16901,12 +17204,14 @@ async fn distributed_inner(
         match state.wal_buffer_dir.as_deref() {
             None => (true, None),
             Some(buffer_root) => {
-                match load_buffer_delta(
+                match load_buffer_delta_with_max_and_bindings(
                     &ice,
                     buffer_root,
                     &state.buffer_delta_cache,
                     &identity,
                     &effective_query.sql,
+                    None,
+                    &effective_query.attr_rewrite_bindings,
                 )
                 .await
                 {
@@ -17057,7 +17362,12 @@ async fn distributed_inner(
     let pin_table = referenced_tables(&effective_query.sql)
         .and_then(|t| t.into_iter().next())
         .unwrap_or_else(|| "events".to_string());
-    let buffered_read = capture_buffered_shard_read(&ice, pin_table.clone()).await?;
+    let buffered_read = capture_buffered_shard_read(
+        &ice,
+        pin_table.clone(),
+        effective_query.attr_rewrite_bindings.get(&pin_table),
+    )
+    .await?;
 
     // WS-6: compute the WAL-buffer partial once on the coordinator (the workers
     // scan only their Iceberg file shards). Folded into the merge so a
@@ -18252,6 +18562,7 @@ mod batch_run_deadline_tests {
     fn count_query() -> RewrittenQuery {
         RewrittenQuery {
             sql: "SELECT count(*) AS n FROM events".to_string(),
+            attr_rewrite_bindings: HashMap::new(),
             preferred_scan_order: None,
             ordered_limit: None,
             ordered_source_filter: None,
@@ -18661,6 +18972,7 @@ mod batch_lifecycle_tests {
     fn lifecycle_query() -> RewrittenQuery {
         RewrittenQuery {
             sql: LIFECYCLE_SQL.to_string(),
+            attr_rewrite_bindings: HashMap::new(),
             preferred_scan_order: None,
             ordered_limit: None,
             ordered_source_filter: None,

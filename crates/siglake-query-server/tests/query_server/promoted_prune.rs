@@ -14,7 +14,7 @@ use tower::util::ServiceExt;
 
 use siglake_core::{Event, PromotedColumn, PromotedType};
 use siglake_query_server::{router, AppState, AuthConfig};
-use siglake_storage::iceberg::IcebergContext;
+use siglake_storage::iceberg::{IcebergContext, IcebergTuning};
 
 async fn request_json(app: &Router, path: &str, body: Value) -> (StatusCode, Value) {
     let response = app
@@ -825,4 +825,63 @@ async fn promoted_values_from_an_older_extractor_neither_rewrite_nor_prune() {
         request_json(&app, "/api/v1/sql", serde_json::json!({ "query": sql })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"][0]["n"].as_i64(), Some(10), "{body}");
+}
+
+async fn partial_delete_keeps_stale_promotion_unqualified(streaming: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = tmp.path().join("warehouse");
+    let tuning = IcebergTuning {
+        delete_rewrite_inram_max_bytes: Some(if streaming { 0 } else { u64::MAX }),
+        delete_rewrite_inram_max_rows: Some(if streaming { 0 } else { u64::MAX }),
+        ..Default::default()
+    };
+    let ice = IcebergContext::open(&warehouse)
+        .await
+        .unwrap()
+        .with_tuning(tuning)
+        .with_promoted_columns(dotted_promotion());
+    ice.ensure_promoted_columns().await.unwrap();
+    let ident = ice.events_table_ident().clone();
+    ice.append_unprovenanced_promoted_batch_for_test(&ident, stale_dotted_batch(3))
+        .await
+        .unwrap();
+    assert!(!ice.ensure_promotion_backfill_property().await.unwrap());
+    assert!(ice.events_attr_rewrite_map().await.unwrap().is_none());
+
+    ice.create_delete_task("events", "raw = 'row 0'", None, None)
+        .await
+        .unwrap();
+    let outcome = ice.execute_delete_tasks("events").await.unwrap();
+    assert_eq!(outcome.tasks_completed, 1, "{outcome:?}");
+    assert_eq!(outcome.tasks_failed, 0, "{outcome:?}");
+    assert_eq!(outcome.files_rewritten, 1, "{outcome:?}");
+    assert_eq!(outcome.rows_deleted, 1, "{outcome:?}");
+
+    // The survivor writer copied the stale promoted NULLs. It must preserve
+    // unknown provenance instead of laundering the output as current-rule data.
+    assert!(!ice.ensure_promotion_backfill_property().await.unwrap());
+    assert!(ice.events_attr_rewrite_map().await.unwrap().is_none());
+    let server_ice = Arc::new(IcebergContext::open(&warehouse).await.unwrap());
+    let app = router(AppState::new(server_ice, AuthConfig::open()));
+    let (status, body) = request_json(
+        &app,
+        "/api/v1/sql",
+        serde_json::json!({
+            "query": "SELECT count(*) AS n FROM events \
+                      WHERE attr_get(attributes, 'a.b.c') = 'inner-literal'"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["n"].as_i64(), Some(2), "{body}");
+}
+
+#[tokio::test]
+async fn inram_partial_delete_does_not_launder_stale_promoted_values() {
+    partial_delete_keeps_stale_promotion_unqualified(false).await;
+}
+
+#[tokio::test]
+async fn streaming_partial_delete_does_not_launder_stale_promoted_values() {
+    partial_delete_keeps_stale_promotion_unqualified(true).await;
 }
