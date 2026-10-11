@@ -127,24 +127,11 @@ store and is reported for the pair comparison only — it is not S3 traffic.
 Both arms return 20 rows and every row satisfies the predicate.
 
 The seven fixtures in this test binary run serially. Six own four-worker Tokio
-runtimes; before serialization they created 24 runtime workers plus the
-mechanism test on a four-core hosted runner. A process-wide fixture lock removed
-that in-binary contention. The full workspace gate can still schedule other test
-binaries beside this one. Gate attempt #2911 then measured three gated row
-groups against four ungated groups, while the isolated rerun measured two
-against three. Both ratios describe the same scheduler race, but only the
-isolated run met the asserted one-third reduction.
-
-The A/B test is therefore an ignored measurement. Run it alone:
-
-```shell
-cargo test -p siglake-storage --test clipped_limit_admission \
-  the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit \
-  -- --ignored --nocapture
-```
-
-The regular test gate retains the exact query-result controls below and the
-scheduler-free mechanism assertion.
+runtimes; running them together creates 24 runtime workers plus the mechanism
+test on a four-core hosted runner. Under that contention the admission ramp can
+widen before the root stream closes, and the median comparison measures sibling
+fixture load. The process-wide fixture lock leaves each assertion intact while
+giving the gated and ungated arms the same isolated CPU budget.
 
 The mechanism is asserted separately and without a scheduler in
 `a_partition_behind_the_ramp_reads_nothing`: the partition streams are executed
