@@ -78,6 +78,19 @@ column *is* the extraction of the key (written by
 Pre-promotion files are never pruned. No backfill requirement, no
 gate, no semantic change.
 
+*2026-10-11 (#6769): that argument holds only while both extractors
+implement the SAME rule, and through 0.2.1 they did not — promotion
+retried a literal dotted key at the top level only, `attr_get` at every
+level, so a column NULL could hide a value the UDF returns and the prune
+dropped the row group holding it. The rule now carries a version
+(`siglake_core::ATTR_EXTRACTOR_VERSION`) and tables record which one wrote
+their values in `siglake.promotion_extraction.v1`. The prune keeps its "no
+backfill requirement" for a table whose promotions were declared under the
+current rule; a table carrying older values gets neither the prune nor the
+rewrite until its files have been rewritten, per this tree's standing rule
+that old files stop being accelerated rather than being migrated
+(`DESIGN_file_formats.md`).*
+
 ## Later slices (in order of value)
 
 - **Full column rewrite behind a backfill gate**: an explicit
