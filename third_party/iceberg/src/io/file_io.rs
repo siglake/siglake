@@ -717,7 +717,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutable_side_aggregate_overwrites_are_visible_without_restart() {
+    async fn mutable_side_aggregate_whole_object_overwrites_are_visible_without_restart() {
         super::set_object_cache_max_bytes(64 * 1024 * 1024);
         let tmp_dir = TempDir::new().unwrap();
         let path = format!(
@@ -732,12 +732,26 @@ mod tests {
 
         write_object(&file_io, &path, b"B").await;
         assert_eq!(input.read().await.unwrap(), Bytes::from_static(b"B"));
+    }
 
+    #[tokio::test]
+    async fn mutable_side_aggregate_range_overwrites_are_visible_without_restart() {
+        super::set_object_cache_max_bytes(64 * 1024 * 1024);
+        let tmp_dir = TempDir::new().unwrap();
+        let path = format!(
+            "memory://{}/metadata/siglake-agg/11111111-1111-1111-1111-111111111111/siglake-aggregates.json",
+            tmp_dir.path().display()
+        );
+        let file_io = FileIO::new_with_memory();
+        let input = file_io.new_input(&path).unwrap();
+
+        write_object(&file_io, &path, b"A").await;
+        let reader = input.reader().await.unwrap();
+        assert_eq!(reader.read(0..1).await.unwrap(), Bytes::from_static(b"A"));
+
+        write_object(&file_io, &path, b"B").await;
         let reader = input.reader().await.unwrap();
         assert_eq!(reader.read(0..1).await.unwrap(), Bytes::from_static(b"B"));
-        write_object(&file_io, &path, b"C").await;
-        let reader = input.reader().await.unwrap();
-        assert_eq!(reader.read(0..1).await.unwrap(), Bytes::from_static(b"C"));
     }
 
     #[tokio::test]
