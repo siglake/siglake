@@ -695,6 +695,97 @@ mod tests {
             .contains("mapped required field `service` produced null for 1 rows"));
     }
 
+    fn text_field(name: &str, required: bool) -> FieldMapping {
+        FieldMapping {
+            name: name.into(),
+            field_type: FieldType::Text {
+                tokenizer: Some("raw".into()),
+            },
+            required,
+        }
+    }
+
+    /// #6770. Three mechanisms read the same object-valued attribute and all
+    /// three stay as they are:
+    ///
+    /// - a declared `Text` field rejects it (NULL) and, having extracted
+    ///   nothing, leaves it in the residual `attributes` for `attr_get`;
+    /// - a declared `Json` field serializes it;
+    /// - a Utf8 promotion stringifies it, byte-identically to the `Json` field.
+    ///
+    /// Changing `Text` here would also move extraction, residual retention and
+    /// required-field validation, so the difference is pinned rather than
+    /// reconciled. Cross-path parity with the `attr_get` UDF is covered in
+    /// `siglake-query-server/tests/promoted_object_parity.rs`.
+    #[test]
+    fn text_field_rejects_non_scalar_values_and_json_field_serializes_them() {
+        let mut cfg = config(MappingMode::Dynamic);
+        cfg.doc_mapping
+            .field_mappings
+            .push(text_field("cw_text", false));
+        cfg.doc_mapping
+            .field_mappings
+            .push(text_field("arr_text", false));
+        let attributes = r#"{"cw_text":{"log_stream":"s","log_group":"g"},"meta":{"log_stream":"s","log_group":"g"},"arr_text":[1,2]}"#;
+        let batch = events_to_record_batch(&[carrier_event(Some(attributes))]).unwrap();
+        let out = map_carrier_batch_with_stats(&batch, &cfg).unwrap().batch;
+
+        let text = |name: &str| -> Option<String> {
+            let col = out
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (!col.is_null(0)).then(|| col.value(0).to_string())
+        };
+        assert_eq!(text("cw_text"), None);
+        assert_eq!(text("arr_text"), None);
+        // Both rejected keys are still in the residual; the Json field's key is
+        // not, because it extracted.
+        assert_eq!(
+            text("attributes").as_deref(),
+            Some(r#"{"arr_text":[1,2],"cw_text":{"log_group":"g","log_stream":"s"}}"#)
+        );
+        let meta = text("meta");
+        assert_eq!(
+            meta.as_deref(),
+            Some(r#"{"log_group":"g","log_stream":"s"}"#)
+        );
+
+        let promoted = [crate::PromotedColumn {
+            attr_key: "cw_text".into(),
+            name: "cw_promoted".into(),
+            ty: crate::PromotedType::Utf8,
+        }];
+        let widened = crate::promote_attributes(&batch, &promoted).unwrap();
+        let promoted_value = widened
+            .column_by_name("cw_promoted")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(Some(promoted_value.to_string()), meta);
+    }
+
+    /// The same rejection decides required-field validation: a required `Text`
+    /// field whose value is an object fails the batch rather than storing the
+    /// object's JSON.
+    #[test]
+    fn required_text_field_rejects_an_object_value() {
+        let mut cfg = config(MappingMode::Dynamic);
+        cfg.doc_mapping
+            .field_mappings
+            .push(text_field("service", true));
+        let batch = events_to_record_batch(&[carrier_event(Some(r#"{"service":{"name":"api"}}"#))])
+            .unwrap();
+        let err = map_carrier_batch_with_stats(&batch, &cfg).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("mapped required field `service` produced null for 1 rows"));
+    }
+
     fn timestamp_ns_field(required: bool) -> FieldMapping {
         FieldMapping {
             name: TIMESTAMP_NS_COLUMN.into(),

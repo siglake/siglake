@@ -299,6 +299,11 @@ drain is ~28–90 K/s and degrades. Order: exhaust single-node levers, then scal
 - **B.1.3 — Parallel drain.** Multiple concurrent WAL→Iceberg drain workers (the
   WAL is already per-tenant/segment-sharded). Iceberg optimistic concurrency +
   `update_table_with_base` handle parallel commits; UUID filenames avoid dup-check.
+  The decoded-memory correction in #6744 admits uncompressed Arrow IPC bytes,
+  not compressed WAL file lengths, across those workers. At the packaged 1Gi
+  limit the decoded input target is 128 MiB; the 1024 MiB shipped in-flight
+  setting caps that target for larger compactors. One oversized segment is
+  admitted alone for progress, so neither value is a hard memory guarantee.
 - **B.1.4 — Larger commits.** Raise the drain batch (bytes/segments) to amortize
   the per-commit `load_table` + manifest + catalog cost over more rows. *(Knob
   exists: `SIGLAKE_COMMIT_BATCH_TARGET_MB`, default-on at 32 MiB since round 60;

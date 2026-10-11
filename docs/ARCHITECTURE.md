@@ -338,8 +338,16 @@ prerequisites are in `deploy/helm/siglake-operator/README.md`.
 `docs/DESIGN_wal_mirror_reclamation.md` prices the three options and
 `docs/LIMITATIONS.md` states what remains uncollected.
 
-**Drain.** The drain claims bounded batches (default ≤64 segments / 64 MiB per
-commit) and keeps `SIGLAKE_DRAIN_CONCURRENCY` commits in flight
+**Drain.** The filesystem drain claims bounded batches (default ≤64 segments /
+64 MiB of compressed WAL per commit) and budgets their summed uncompressed
+Arrow IPC bodies. The decoded target is one eighth of the process memory limit,
+never above `SIGLAKE_DRAIN_INFLIGHT_BUDGET_MB`: 128 MiB in the packaged 1Gi
+compactor under the shipped 1024 MiB setting. New WAL zstd frames expose their
+uncompressed size without decoding; segments written by older builds are sized
+through a streaming decoder before claim. An oversized segment is admitted
+alone to preserve progress, so the target does not guarantee peak memory or
+prevent every OOM. The drain keeps
+`SIGLAKE_DRAIN_CONCURRENCY` commits in flight
 *continuously* — topping up the moment one lands, re-listing `sealed/` as new
 segments arrive — bounded by a per-pass budget so compaction and gauges keep
 their cadence under backlog. Commit-accumulation batching (default on, 64 MiB
@@ -921,6 +929,22 @@ force with a recluster pass. Nothing migrates data automatically. Version 1
 (0.2.1 and earlier) retried the literal key only at the top level, so a key
 `a.b.c` whose object under `a` held a literal `"b.c"` key promoted to NULL
 while `attr_get` returned the value (#6769).
+
+**A non-scalar value reads differently per mechanism, on purpose.** `attr_get`
+and a `Utf8` promotion of the same key both return an object's or array's
+compact JSON, and they return the same text: each parses the value and
+serializes it again, which canonicalises key order and whitespace instead of
+handing back the stored slice. A declared index mapping is stricter — a `Text`
+field takes scalars only, so an object leaves that field null and stays in the
+residual `attributes`, while a `Json` field serializes it the way promotion
+does. Changing `Text` would move extraction, residual retention and
+required-field validation together, so the three behaviours are pinned where
+they are: `crates/siglake-query-server/tests/promoted_object_parity.rs` holds
+the promotion/`attr_get` parity, including the nested
+`attr_get(attr_get(attributes,'aws.cloudwatch'),'log_stream')` shape before and
+after a promotion backfill, and `mapping.rs`'s
+`text_field_rejects_non_scalar_values_and_json_field_serializes_them` holds the
+declared-mapping side.
 
 **Auto-promotion is the one schema mutation nobody requests.** Promoted columns
 are normally declared: an operator lists `(attr_key, column, type)` triples and

@@ -176,6 +176,14 @@ pub(crate) fn promoted_field(col: &PromotedColumn, index: usize) -> Field {
 /// is absent, the JSON value is null, or it can't be coerced to the column type
 /// (e.g. a non-numeric string into an `Int64`) — lossless: the original value is
 /// still in `attributes`.
+///
+/// A `Utf8` promotion of an object- or array-valued key stores that value's
+/// compact JSON — the same text `attr_get(attributes, key)` returns, because
+/// both parse the value and serialize it again rather than copying the stored
+/// slice. That parity is what lets the query layer read an `attr_get` off the
+/// promoted column; it is pinned in
+/// `siglake-query-server/tests/promoted_object_parity.rs`. The declared-mapping
+/// `Text` builder deliberately differs: see [`json_scalar_as_string`].
 pub fn promote_attributes(batch: &RecordBatch, promoted: &[PromotedColumn]) -> Result<RecordBatch> {
     if promoted.is_empty() {
         return Ok(batch.clone());
@@ -271,6 +279,13 @@ pub(crate) fn json_as_bool(v: &serde_json::Value) -> Option<bool> {
     }
 }
 
+/// Scalar-only text extraction for a declared `Text` field: a string, number
+/// or bool becomes its literal, an object or array yields `None` so the field
+/// stays null and its key stays in the residual `attributes`. Unlike a `Utf8`
+/// promotion, which stringifies the whole value, this never puts JSON into a
+/// field an index mapping declared as text — and the same `None` is what
+/// required-field validation sees. A declared `Json` field is the mapping-side
+/// way to keep the structure (`mapping.rs`'s `Builder::Json`).
 pub(crate) fn json_scalar_as_string(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) => Some(s.clone()),
