@@ -7588,6 +7588,184 @@ mod poison_ledger_tests {
     }
 }
 
+/// #6763: the drain, end to end, over a `sealed/` directory whose FIRST entry
+/// is a file no WAL writer could have produced. Since #6744 the cycle sizes
+/// every candidate ([`segment_uncompressed_bytes`]) before it claims anything,
+/// so an unparsable header is reached one step earlier than the read that used
+/// to be the first thing to see it. An error at that step fails the cycle
+/// before a single batch is admitted, and the valid segment behind the
+/// malformed one never commits. Sizing instead charges a corrupt estimate and
+/// leaves the verdict to [`read_segment`] and #3143's poison ledger. The
+/// ledger tests above inject the read error; these drive the real bytes.
+#[cfg(test)]
+mod malformed_first_sealed_segment_tests {
+    use super::*;
+    use datafusion::prelude::SessionContext;
+    use siglake_core::Event;
+    use siglake_wal::{read_poison_note, SEALED_DIR, WAL_FRAME_MAGIC};
+
+    /// Consecutive failed cycles before the set-aside. Two, so a shape is
+    /// charged, released and re-claimed at least once before `poison/` takes
+    /// it — the one-failure case would never exercise the retry.
+    const POISON_ATTEMPTS: u32 = 2;
+    /// Rows in the one valid segment.
+    const VALID_ROWS: usize = 4;
+    /// Sorts before any `ing-1-<uuidv7>.arrow`, so the drain meets it first.
+    const MALFORMED_NAME: &str = "0000-malformed.arrow";
+
+    /// The framed-segment header `siglake-wal` keeps private: magic(4)
+    /// version(1) flags(1) reserved(2) min_ts(8) max_ts(8) body_len(8)
+    /// body_crc(4), and for v2 a 16-byte owner uuid. Spelled out here rather
+    /// than exported: nothing in the tree writes these shapes, and the WAL's
+    /// public surface should not grow a way to.
+    const V1_HEADER_LEN: usize = 36;
+    const V2_HEADER_LEN: usize = 52;
+    /// FLAGS bit0: the body is zstd-compressed.
+    const FLAG_ZSTD: u8 = 0b0000_0001;
+    const CURRENT_VERSION: u8 = 2;
+
+    /// A v2-sized header with `version`/`flags`/`body_len` as given, followed
+    /// by `body` verbatim. Timestamps and CRC stay zero: every shape built
+    /// here is rejected before either is consulted.
+    fn framed(version: u8, flags: u8, declared_body_len: u64, body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; V2_HEADER_LEN];
+        bytes[0..4].copy_from_slice(WAL_FRAME_MAGIC);
+        bytes[4] = version;
+        bytes[5] = flags;
+        bytes[24..32].copy_from_slice(&declared_body_len.to_le_bytes());
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    async fn committed_rows(ice: &IcebergContext) -> i64 {
+        let ctx = SessionContext::new();
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        let batches = ctx
+            .sql("SELECT count(*) AS n FROM events")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    /// Seal one valid segment, drop `malformed` ahead of it in `sealed/`, and
+    /// run enough cycles for the attempt budget to be spent. Every cycle must
+    /// return `Ok`, the valid segment's rows must land, and the malformed file
+    /// must end up in `poison/` alone.
+    async fn drain_past(shape: &str, malformed: Vec<u8>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let warehouse = tmp.path().join("warehouse");
+
+        let mut writer = siglake_wal::WalWriter::with_thresholds(
+            &wal,
+            "ing-1",
+            VALID_ROWS,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let events: Vec<Event> = (0..VALID_ROWS)
+            .map(|i| Event::now(format!("{shape}-{i}")))
+            .collect();
+        let valid = writer
+            .append_events(&events)
+            .unwrap()
+            .expect("VALID_ROWS events reach the seal threshold")
+            .path;
+
+        let bad = wal.join(SEALED_DIR).join(MALFORMED_NAME);
+        std::fs::write(&bad, &malformed).unwrap();
+
+        // Preconditions: the drain meets the malformed file first, sizing it
+        // does NOT error (that is the #6744 property under test), and reading
+        // it does.
+        assert_eq!(
+            list_sealed(&wal).unwrap(),
+            vec![bad.clone(), valid.clone()],
+            "{shape}: the malformed file must sort ahead of the valid segment"
+        );
+        segment_uncompressed_bytes(&bad)
+            .unwrap_or_else(|e| panic!("{shape}: sizing must not fail the cycle: {e:#}"));
+        let read_err = read_segment(&bad).unwrap_err();
+        assert!(
+            read_err.to_string().contains("WAL frame"),
+            "{shape}: the fixture must be rejected by the frame walk, got: {read_err:#}"
+        );
+
+        let ice = Arc::new(IcebergContext::open(&warehouse).await.unwrap());
+        let compactor = Compactor::new(&wal, ice.clone())
+            .with_poison_attempts(POISON_ATTEMPTS)
+            .with_drain_concurrency(1)
+            .with_drain_cycle_budget(Duration::from_secs(10));
+
+        let mut committed = 0usize;
+        for cycle in 0..POISON_ATTEMPTS + 2 {
+            committed += compactor
+                .run_once()
+                .await
+                .unwrap_or_else(|e| panic!("{shape}: cycle {cycle} returned an error: {e:#}"));
+        }
+
+        assert_eq!(
+            committed, 1,
+            "{shape}: the valid segment commits, exactly once"
+        );
+        assert_eq!(
+            committed_rows(&ice).await,
+            VALID_ROWS as i64,
+            "{shape}: the valid segment's rows must be in the table"
+        );
+        assert!(
+            list_sealed(&wal).unwrap().is_empty(),
+            "{shape}: nothing may be left in sealed/ once the attempts are spent"
+        );
+        let poisoned = list_poisoned(&wal).unwrap();
+        assert_eq!(
+            poisoned
+                .iter()
+                .map(|p| p.file_name().unwrap().to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![MALFORMED_NAME],
+            "{shape}: only the malformed file is set aside"
+        );
+        let note = read_poison_note(&poisoned[0]).unwrap();
+        assert_eq!(note.segment, MALFORMED_NAME);
+        assert_eq!(note.attempts, POISON_ATTEMPTS);
+    }
+
+    /// Magic, then a version this build has no header length for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_first_sealed_segment_with_an_unknown_version() {
+        drain_past("unknown_version", framed(0x7f, 0, 0, b"body")).await;
+    }
+
+    /// Magic, then fewer bytes than the shortest header the reader knows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_first_sealed_segment_truncated_below_the_v1_header() {
+        let mut bytes = WAL_FRAME_MAGIC.to_vec();
+        bytes.resize(V1_HEADER_LEN - 8, 0);
+        drain_past("truncated_header", bytes).await;
+    }
+
+    /// A current-version zstd frame whose declared body length is not the one
+    /// the file actually carries.
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_first_sealed_segment_with_a_disagreeing_zstd_body_length() {
+        drain_past(
+            "zstd_body_length_mismatch",
+            framed(CURRENT_VERSION, FLAG_ZSTD, 4096, b"eight..."),
+        )
+        .await;
+    }
+}
+
 #[cfg(test)]
 mod agg_fold_tests {
     use super::*;
