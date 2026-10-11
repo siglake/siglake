@@ -1730,8 +1730,9 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   1Gi is not established: the measurement is peak heap growth above a recorded
   baseline on fixtures three orders of magnitude smaller. A 2026-10-11 matched
   field attempt OOM-killed both the 256 MiB and 64 MiB arms during filesystem
-  drain startup, before either row-group target reached a Parquet write; #6744
-  corrected that shared compressed-WAL admission defect. The merge path's side
+  drain startup. #6744 adds decoded-WAL admission, but one oversized segment
+  still admits alone. This is not a hard peak-memory bound; fresh 1Gi field
+  qualification is required before claiming the OOM is resolved. The merge path's side
   of the row-group question is measured separately in
   `docs/DESIGN_row_group_target_qualification.md`.
 - **The packaged compactor's row-group target is qualified locally and nowhere

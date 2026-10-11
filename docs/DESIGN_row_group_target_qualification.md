@@ -305,12 +305,13 @@ merges.
 
 The matched field attempt on 2026-10-11 subsequently OOM-killed both the
 256 MiB and 64 MiB arms before canonical ingest completed. That result did not
-distinguish the row-group targets: retained compactor logs end during filesystem
-drain startup, before a Parquet write or rewrite begins. #6744 traced the shared
-failure to claim admission counting 64 MiB of zstd-compressed WAL while the
-parallel readers allocated the much larger uncompressed Arrow IPC bodies. The
-repair bounds decoded WAL bytes independently of this row-group target. A fresh
-matched field qualification remains required for the target comparison.
+distinguish the row-group targets. #6744 identified a shared admission weakness:
+a claim could count only 64 MiB of zstd-compressed WAL while readers allocated
+much larger uncompressed Arrow IPC bodies. Decoded admission now targets a
+budget independently of the row-group target, but admits one oversized segment
+alone for progress. A fresh matched field qualification must retain maximum
+decoded segment and claimed batch sizes, verify no OOM, and complete ingestion
+before this candidate can establish a fix or qualify the target comparison.
 
 The follow-up this left open is #5132, the chart change if a round supports it.
 #5133 settled the 32 MiB arm's selective read against the page accounting above.
