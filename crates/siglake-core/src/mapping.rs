@@ -578,6 +578,43 @@ mod tests {
         );
     }
 
+    /// Valid declared names are exact top-level keys. Extraction removes that
+    /// key alone; a nested object containing the same name stays in the
+    /// residual attributes.
+    #[test]
+    fn declared_field_extracts_exact_top_level_key_and_preserves_nested_residual() {
+        let mut cfg = config(MappingMode::Dynamic);
+        cfg.doc_mapping
+            .field_mappings
+            .push(text_field("namespace", false));
+        cfg.validate().unwrap();
+
+        let batch = events_to_record_batch(&[carrier_event(Some(
+            r#"{"namespace":"literal","k8s":{"namespace":"nested"},"left":"keep"}"#,
+        ))])
+        .unwrap();
+        let out = map_carrier_batch_with_stats(&batch, &cfg).unwrap().batch;
+
+        assert_eq!(
+            out.column_by_name("namespace")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "literal"
+        );
+        assert_eq!(
+            out.column_by_name("attributes")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            r#"{"k8s":{"namespace":"nested"},"left":"keep"}"#
+        );
+    }
+
     #[test]
     fn failed_parse_yields_null_and_retains_residual() {
         let batch = events_to_record_batch(&[carrier_event(Some(r#"{"status":"oops","left":1}"#))])

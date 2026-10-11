@@ -691,6 +691,18 @@ mod tests {
         );
     }
 
+    /// Declared field names become schema column identifiers, so a dot does
+    /// not opt a mapping into nested attribute-path extraction.
+    #[test]
+    fn validate_rejects_dotted_declared_field_name() {
+        let mut config = valid_config();
+        config.doc_mapping.field_mappings[1].name = "k8s.namespace".into();
+        assert_eq!(
+            config.validate(),
+            Err(IndexConfigError::InvalidFieldName("k8s.namespace".into()))
+        );
+    }
+
     #[test]
     fn validate_rejects_reserved_attributes_field_name() {
         let mut config = valid_config();
