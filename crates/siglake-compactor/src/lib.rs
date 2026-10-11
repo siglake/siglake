@@ -115,10 +115,84 @@ struct SelectedFsBatch {
     max_segment_decoded_bytes: u64,
 }
 
+struct RunOnceAtState<'a> {
+    owner: Option<&'a str>,
+    backlog: &'a mut SealedBacklog,
+    decoded_work: &'a Arc<DecodedWorkLease>,
+}
+
+/// Ownership of the packaged compactor's decoded-memory slot.
+///
+/// This is reference-counted by callers. Filesystem WAL reads run on Tokio's
+/// blocking pool, where aborting the async parent cannot stop a closure that
+/// has started. Each such closure therefore keeps a clone alive until its
+/// decoded Arrow batches leave the blocking thread.
+struct DecodedWorkLease {
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+#[cfg(test)]
+struct SegmentReadHold {
+    remaining: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::Notify,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl SegmentReadHold {
+    fn once() -> Arc<Self> {
+        Arc::new(Self {
+            remaining: std::sync::atomic::AtomicUsize::new(1),
+            entered: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        })
+    }
+
+    fn hold_after_read(&self) {
+        if self
+            .remaining
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_err()
+        {
+            return;
+        }
+        self.entered.notify_one();
+        let released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            self.release
+                .wait_while(released, |released| !*released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+
+    fn release(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.release.notify_all();
+    }
+}
+
 struct CommitOutcome {
     segments: usize,
     rows: u64,
     strict_residual_rows: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LoopDrainOutcome {
+    Completed(usize),
+    DecodedWorkBusy,
 }
 
 /// One filesystem sweep's sealed backlog, summed per tenant label.
@@ -726,10 +800,11 @@ pub struct Compactor {
     drain_cycle_budget: Option<Duration>,
     /// One permit shared by WAL drain and re-clustering on compactor processes
     /// at or below the packaged 1 GiB limit. Each path has its own decoded
-    /// memory bound, but those bounds are not additive: the retained field OOM
-    /// had a 128 MiB decoded WAL batch live while a page-bounded merge owned a
-    /// fetched chunk and an open writer row group. Larger processes retain the
-    /// concurrent scheduler; the packaged process serializes the two owners.
+    /// memory bound, but those bounds are not additive. The retained field logs
+    /// show sub-128 MiB WAL admissions followed by page-bounded merge plans;
+    /// they do not establish which allocation crossed the cgroup limit. Larger
+    /// processes retain the concurrent scheduler; the packaged process removes
+    /// the source scheduler's potential overlap.
     decoded_work_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// See [`Self::with_poison_attempts`]; `None` reads the environment.
     poison_attempts: Option<u32>,
@@ -753,6 +828,10 @@ pub struct Compactor {
     verified_owner_for_test: Option<String>,
     /// See [`Self::with_transient_fs_commit_failures_for_test`].
     transient_fs_commit_failures_for_test: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Deterministically keeps one decoded filesystem segment live in a
+    /// blocking reader after its async drain parent is cancelled.
+    #[cfg(test)]
+    segment_read_hold_for_test: Option<Arc<SegmentReadHold>>,
 }
 
 impl Compactor {
@@ -792,6 +871,8 @@ impl Compactor {
             segment_read_failures: Default::default(),
             verified_owner_for_test: None,
             transient_fs_commit_failures_for_test: None,
+            #[cfg(test)]
+            segment_read_hold_for_test: None,
         };
         s.quarantine_processing_orphans();
         s
@@ -837,13 +918,13 @@ impl Compactor {
         self
     }
 
-    async fn decoded_work_permit(
-        &self,
-        owner: &'static str,
-    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let gate = self.decoded_work_gate.as_ref()?.clone();
+    async fn decoded_work_permit(&self, owner: &'static str) -> Arc<DecodedWorkLease> {
+        let Some(gate) = self.decoded_work_gate.as_ref() else {
+            return Arc::new(DecodedWorkLease { _permit: None });
+        };
         let started = std::time::Instant::now();
         let permit = gate
+            .clone()
             .acquire_owned()
             .await
             .expect("decoded-work semaphore is never closed");
@@ -852,7 +933,29 @@ impl Compactor {
             "owner" => owner
         )
         .record(started.elapsed().as_secs_f64());
-        Some(permit)
+        Arc::new(DecodedWorkLease {
+            _permit: Some(permit),
+        })
+    }
+
+    /// Take the decoded-work slot without parking the maintenance loop.
+    ///
+    /// A running re-cluster pass owns the only packaged-process slot. The loop
+    /// must remain able to service that pass's watchdog while it waits, and the
+    /// drain watchdog starts only after this method succeeds.
+    fn try_decoded_work_permit(&self, owner: &'static str) -> Option<Arc<DecodedWorkLease>> {
+        let Some(gate) = self.decoded_work_gate.as_ref() else {
+            return Some(Arc::new(DecodedWorkLease { _permit: None }));
+        };
+        let permit = gate.clone().try_acquire_owned().ok()?;
+        metrics::histogram!(
+            "siglake_compactor_decoded_work_wait_seconds",
+            "owner" => owner
+        )
+        .record(0.0);
+        Some(Arc::new(DecodedWorkLease {
+            _permit: Some(permit),
+        }))
     }
 
     /// Pin how many consecutive failed reads a local segment gets before the
@@ -895,6 +998,12 @@ impl Compactor {
     pub fn with_transient_fs_commit_failures_for_test(mut self, failures: usize) -> Self {
         self.transient_fs_commit_failures_for_test =
             Some(Arc::new(std::sync::atomic::AtomicUsize::new(failures)));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_segment_read_hold_for_test(mut self, hold: Arc<SegmentReadHold>) -> Self {
+        self.segment_read_hold_for_test = Some(hold);
         self
     }
 
@@ -2677,7 +2786,14 @@ impl Compactor {
         // same permit, so its fetched chunks and writer row group cannot overlap
         // this allocation even though the run-loop schedules the pass on a
         // background task.
-        let _decoded_work = self.decoded_work_permit("drain").await;
+        let decoded_work = self.decoded_work_permit("drain").await;
+        self.run_once_with_decoded_work(decoded_work).await
+    }
+
+    async fn run_once_with_decoded_work(
+        &self,
+        decoded_work: Arc<DecodedWorkLease>,
+    ) -> Result<usize> {
         if self.catalog.is_some() {
             return self.run_once_catalog().await;
         }
@@ -2709,8 +2825,11 @@ impl Compactor {
                     "default",
                     &self.ice.clone(),
                     &CommitTarget::Events,
-                    None,
-                    &mut backlog,
+                    RunOnceAtState {
+                        owner: None,
+                        backlog: &mut backlog,
+                        decoded_work: &decoded_work,
+                    },
                 )
                 .await?;
         } else {
@@ -2733,8 +2852,11 @@ impl Compactor {
                     &tenant,
                     &ice,
                     &CommitTarget::Events,
-                    None,
-                    &mut backlog,
+                    RunOnceAtState {
+                        owner: None,
+                        backlog: &mut backlog,
+                        decoded_work: &decoded_work,
+                    },
                 )
                 .await?;
             for (index, index_dir) in list_index_dirs(&dir).context("list_index_dirs")? {
@@ -2850,8 +2972,11 @@ impl Compactor {
                         &tenant,
                         &ice,
                         &target,
-                        owner.as_deref(),
-                        &mut backlog,
+                        RunOnceAtState {
+                            owner: owner.as_deref(),
+                            backlog: &mut backlog,
+                            decoded_work: &decoded_work,
+                        },
                     )
                     .await?;
             }
@@ -3281,8 +3406,7 @@ impl Compactor {
         tenant_label: &str,
         ice: &Arc<IcebergContext>,
         target: &CommitTarget,
-        owner: Option<&str>,
-        backlog: &mut SealedBacklog,
+        state: RunOnceAtState<'_>,
     ) -> Result<usize> {
         let cycle_start = std::time::Instant::now();
         // #81: auto-dispose quarantined orphans before listing — a requeued
@@ -3291,18 +3415,18 @@ impl Compactor {
         // and reports everything it did not classify as held (#3267) rather
         // than as resolved.
         if let Err(e) = self
-            .dispose_orphans_at(dir, tenant_label, ice, target, backlog)
+            .dispose_orphans_at(dir, tenant_label, ice, target, state.backlog)
             .await
         {
             tracing::warn!(error = %e, dir = %dir.display(), "orphan auto-disposition failed");
         }
         let sealed = retain_owned_sealed(
             list_sealed(dir).context("listing sealed segments")?,
-            owner,
+            state.owner,
             tenant_label,
             target.index_label(),
         );
-        backlog.observe_dir(tenant_label, dir, sealed.len());
+        state.backlog.observe_dir(tenant_label, dir, sealed.len());
         if sealed.is_empty() {
             metrics::counter!("siglake_compactor_cycles_total",
                 "outcome" => "empty", "tenant" => tenant_label.to_string())
@@ -3389,7 +3513,7 @@ impl Compactor {
                     // cycle entry: a sub-target tail waits for bytes or age).
                     let fresh = retain_owned_sealed(
                         list_sealed(dir).context("re-listing sealed segments")?,
-                        owner,
+                        state.owner,
                         tenant_label,
                         target.index_label(),
                     );
@@ -3496,6 +3620,9 @@ impl Compactor {
                 let ice = ice.clone();
                 let wal_dir = dir.to_path_buf();
                 let transient_failures = self.transient_fs_commit_failures_for_test.clone();
+                #[cfg(test)]
+                let segment_read_hold = self.segment_read_hold_for_test.clone();
+                let decoded_work = Arc::clone(state.decoded_work);
                 inflight_decoded_bytes =
                     inflight_decoded_bytes.saturating_add(selected.decoded_bytes);
                 let selected_decoded_bytes = selected.decoded_bytes;
@@ -3514,7 +3641,16 @@ impl Compactor {
                             "injected transient filesystem commit failure"
                         ))
                     } else {
-                        commit_claimed(&ice, &wal_dir, &claimed, target).await
+                        commit_claimed(
+                            &ice,
+                            &wal_dir,
+                            &claimed,
+                            target,
+                            &decoded_work,
+                            #[cfg(test)]
+                            segment_read_hold.as_ref(),
+                        )
+                        .await
                     };
                     (claimed, selected_decoded_bytes, res)
                 });
@@ -3578,7 +3714,7 @@ impl Compactor {
                     // comes back is the rest of the batch — healthy siblings,
                     // and segments with attempts left.
                     let (claimed, set_aside) = self.set_aside_unreadable(claimed, &e, tenant_label);
-                    backlog.observe_poisoned(tenant_label, set_aside);
+                    state.backlog.observe_poisoned(tenant_label, set_aside);
                     // #4651: a set-aside is progress — the segment that failed
                     // this batch has left `sealed/` for good, so what is left of
                     // the batch faces a different queue and gets its pass
@@ -3655,6 +3791,51 @@ impl Compactor {
     }
 
     /// Run forever, polling `wal/sealed/` every `poll_interval`.
+    async fn run_loop_drain_cycle(&self, drain_watchdog: Option<Duration>) -> LoopDrainOutcome {
+        let Some(decoded_work) = self.try_decoded_work_permit("drain") else {
+            // A re-cluster pass owns the packaged process's slot. Do not await
+            // it here: the loop services that task's watchdog after this
+            // return, and queue time is not an executing drain timeout.
+            metrics::counter!(
+                "siglake_compactor_decoded_work_deferred_total",
+                "owner" => "drain"
+            )
+            .increment(1);
+            return LoopDrainOutcome::DecodedWorkBusy;
+        };
+        let cycle = async {
+            self.run_once_with_decoded_work(decoded_work)
+                .await
+                .unwrap_or_else(|e| {
+                    // `%e` prints only the outermost context. `{:#}` walks the
+                    // chain that identified the 2026-08-10 concat failure.
+                    tracing::error!(error = format!("{e:#}"), "compactor cycle failed");
+                    0
+                })
+        };
+        let n = match drain_watchdog {
+            None => cycle.await,
+            Some(limit) => match tokio::time::timeout(limit, cycle).await {
+                Ok(n) => n,
+                Err(_) => {
+                    tracing::error!(
+                        limit_secs = limit.as_secs(),
+                        "drain cycle exceeded the watchdog ceiling; aborting the pass and quarantining in-flight claims"
+                    );
+                    metrics::counter!("siglake_compactor_watchdog_trips_total",
+                        "stage" => "drain")
+                    .increment(1);
+                    // Stranded processing/ claims from the aborted cycle go
+                    // through the #81 disposition proof next cycle: deleted
+                    // if their commit had landed, requeued if not.
+                    self.quarantine_processing_orphans();
+                    0
+                }
+            },
+        };
+        LoopDrainOutcome::Completed(n)
+    }
+
     pub async fn run_loop(self: std::sync::Arc<Self>, poll_interval: Duration) -> Result<()> {
         preregister_inline_coverage_census_metrics();
         // Maintenance (re-clustering, snapshot expiry) runs on its own cadence,
@@ -3798,45 +3979,33 @@ impl Compactor {
                     }
                 }
             }
-            let cycle = async {
-                self.run_once().await.unwrap_or_else(|e| {
-                    // `%e` prints only the OUTERMOST context, so the 2026-08-10
-                    // drain wedge logged `error=concat_batches` every 80s for
-                    // five hours and said nothing about why. `{:#}` walks the
-                    // anyhow chain, which is the difference between a diagnosis
-                    // and a guess.
-                    tracing::error!(error = format!("{e:#}"), "compactor cycle failed");
-                    0
-                })
-            };
             let _cycle_t = std::time::Instant::now();
             let n = if !self.role.drains() {
                 0
             } else {
-                match drain_watchdog {
-                    None => cycle.await,
-                    Some(limit) => match tokio::time::timeout(limit, cycle).await {
-                        Ok(n) => n,
-                        Err(_) => {
-                            tracing::error!(
-                            limit_secs = limit.as_secs(),
-                            "drain cycle exceeded the watchdog ceiling; aborting the pass and quarantining in-flight claims"
-                        );
-                            metrics::counter!("siglake_compactor_watchdog_trips_total",
-                            "stage" => "drain")
-                            .increment(1);
-                            // Stranded processing/ claims from the aborted cycle go
-                            // through the #81 disposition proof next cycle: deleted
-                            // if their commit had landed, requeued if not — the
-                            // abort stays exactly-once.
-                            self.quarantine_processing_orphans();
-                            0
-                        }
-                    },
+                match self.run_loop_drain_cycle(drain_watchdog).await {
+                    LoopDrainOutcome::Completed(n) => n,
+                    LoopDrainOutcome::DecodedWorkBusy => 0,
                 }
             };
             metrics::histogram!("siglake_compactor_cycle_duration_seconds")
                 .record(_cycle_t.elapsed().as_secs_f64());
+            // Service the re-cluster watchdog before every early exit below.
+            // This placement matters when its task owns the packaged decoded
+            // slot: active ingest, hard backpressure and idle-drain branches
+            // can all continue the loop before maintenance shaping.
+            if service_recluster_watchdog(
+                &mut recluster_task,
+                &mut recluster_started,
+                recluster_watchdog,
+                &recluster_progress,
+                &mut recluster_progress_seen,
+            )
+            .await
+            {
+                draining = false;
+                drain_passes = 0;
+            }
             if n > 0 {
                 idle_backoff = idle_backoff_base;
                 tracing::info!(segments = n, "compactor commit complete");
@@ -3999,53 +4168,6 @@ impl Compactor {
             //   - leveled + paced: only the levels whose per-tier interval has
             //     elapsed (R1: L0 fast, cold levels slow); nothing due ⇒ no pass.
             //   - flat mode: the single legacy interval.
-            // #80: abort a hung re-clustering pass. One pass is in flight at a
-            // time, so a wedged one silently stops maintenance forever; past
-            // the ceiling we abort the task (its in-flight work cancels at the
-            // next await; rewrite commits are atomic, so the layout is simply
-            // left for the next pass) and clear the slot.
-            if let (Some(t), Some(started), Some(limit)) = (
-                recluster_task.as_ref(),
-                recluster_started,
-                recluster_watchdog,
-            ) {
-                // PROGRESS-guarded, not a fixed wall-clock cap. The ceiling
-                // exists to catch a WEDGED pass; a pass that is merely slow is
-                // doing exactly what it was asked to. At 2B rows one legitimate
-                // bin merge can outlast any fixed ceiling — especially with S3
-                // write retries — and aborting mid-merge discards every byte it
-                // uploaded, so the layout never improves and the next pass hits
-                // the same wall. That is what happened on 2026-08-03: four trips,
-                // zero completed settle passes, depth pinned at 30 for hours.
-                //
-                // Same lesson the drain tail learned when its fixed cap became
-                // progress-guarded. A time budget on work whose duration scales
-                // with data size will always break at some scale.
-                let progressed = recluster_progress.load(std::sync::atomic::Ordering::Relaxed)
-                    != recluster_progress_seen;
-                if progressed {
-                    // Committed at least one bin since the last check: restart
-                    // the clock rather than killing useful work.
-                    recluster_progress_seen =
-                        recluster_progress.load(std::sync::atomic::Ordering::Relaxed);
-                    recluster_started = Some(tokio::time::Instant::now());
-                } else if !t.is_finished() && started.elapsed() > limit {
-                    tracing::error!(
-                        limit_secs = limit.as_secs(),
-                        "re-clustering pass made no committed progress within the watchdog \
-                         ceiling; aborting"
-                    );
-                    metrics::counter!("siglake_compactor_watchdog_trips_total",
-                        "stage" => "recluster")
-                    .increment(1);
-                    t.abort();
-                    let t = recluster_task.take().expect("checked is_some");
-                    let _ = t.await; // resolves promptly (Cancelled) after abort
-                    recluster_started = None;
-                    draining = false;
-                    drain_passes = 0;
-                }
-            }
             // Harvest a finished background pass (non-blocking; the await
             // resolves immediately once is_finished).
             if recluster_task.as_ref().is_some_and(|t| t.is_finished()) {
@@ -4272,11 +4394,18 @@ impl Compactor {
 
     #[allow(dead_code)]
     async fn commit_claimed_legacy(&self, claimed: &[PathBuf]) -> Result<usize> {
-        Ok(
-            commit_claimed(&self.ice, &self.wal_dir, claimed, &CommitTarget::Events)
-                .await?
-                .segments,
+        let decoded_work = self.decoded_work_permit("drain").await;
+        Ok(commit_claimed(
+            &self.ice,
+            &self.wal_dir,
+            claimed,
+            &CommitTarget::Events,
+            &decoded_work,
+            #[cfg(test)]
+            self.segment_read_hold_for_test.as_ref(),
         )
+        .await?
+        .segments)
     }
 
     fn select_sealed_for_cycle(
@@ -5080,6 +5209,41 @@ fn emit_delete_task_observation(report: &DeleteTaskObservationReport) {
 /// blocks every future pass. Passes legitimately run for minutes (single
 /// L1→L2 bins measured 212–238s), hence the larger default.
 /// `SIGLAKE_RECLUSTER_WATCHDOG_SECS` (default 1800; `0` disables; min 60).
+async fn service_recluster_watchdog(
+    task: &mut Option<tokio::task::JoinHandle<Result<usize>>>,
+    started: &mut Option<tokio::time::Instant>,
+    ceiling: Option<Duration>,
+    progress: &std::sync::atomic::AtomicU64,
+    progress_seen: &mut u64,
+) -> bool {
+    let (Some(handle), Some(pass_started), Some(limit)) = (task.as_ref(), *started, ceiling) else {
+        return false;
+    };
+    // Progress-guarded rather than a fixed pass deadline: a large legitimate
+    // bin may exceed the ceiling while still committing bins. Only a full
+    // interval without committed progress trips.
+    let observed = progress.load(std::sync::atomic::Ordering::Relaxed);
+    if observed != *progress_seen {
+        *progress_seen = observed;
+        *started = Some(tokio::time::Instant::now());
+        return false;
+    }
+    if handle.is_finished() || pass_started.elapsed() <= limit {
+        return false;
+    }
+    tracing::error!(
+        limit_secs = limit.as_secs(),
+        "re-clustering pass made no committed progress within the watchdog ceiling; aborting"
+    );
+    metrics::counter!("siglake_compactor_watchdog_trips_total", "stage" => "recluster")
+        .increment(1);
+    handle.abort();
+    let handle = task.take().expect("checked is_some");
+    let _ = handle.await;
+    *started = None;
+    true
+}
+
 fn recluster_watchdog_ceiling() -> Option<Duration> {
     watchdog_ceiling_from(
         std::env::var("SIGLAKE_RECLUSTER_WATCHDOG_SECS")
@@ -5197,11 +5361,10 @@ fn drain_inflight_budget_bytes() -> u64 {
 /// Whether WAL drain and re-clustering must take turns owning decoded memory.
 ///
 /// The boundary is the shipped compactor shape, not a new sizing factor: the
-/// retained failure is from that exact 1 GiB cgroup, where the independently
-/// bounded 128 MiB WAL admission overlapped a page-bounded merge. A larger or
-/// unlimited process keeps the established concurrent scheduler. Operators who
-/// size below the packaged limit get the same containment rather than a less
-/// safe policy.
+/// retained failure is from that exact 1 GiB cgroup, where independently
+/// bounded WAL and merge paths could overlap. A larger or unlimited process
+/// keeps the established concurrent scheduler. Operators who size below the
+/// packaged limit get the same containment.
 fn serialize_drain_and_recluster_from(memory_limit: Option<u64>) -> bool {
     const PACKAGED_COMPACTOR_LIMIT: u64 = 1024 * 1024 * 1024;
     memory_limit.is_some_and(|limit| limit <= PACKAGED_COMPACTOR_LIMIT)
@@ -5435,6 +5598,8 @@ async fn commit_claimed(
     wal_dir: &Path,
     claimed: &[PathBuf],
     target: &CommitTarget,
+    decoded_work: &Arc<DecodedWorkLease>,
+    #[cfg(test)] segment_read_hold: Option<&Arc<SegmentReadHold>>,
 ) -> Result<CommitOutcome> {
     // Phase 4.13l: sub-stage histograms to identify which step
     // dominates the per-cycle commit cost. Without these, the only
@@ -5453,8 +5618,19 @@ async fn commit_claimed(
     let read_start = std::time::Instant::now();
     let read_futures = claimed.iter().map(|c| {
         let path = c.clone();
+        let decoded_work = Arc::clone(decoded_work);
+        #[cfg(test)]
+        let segment_read_hold = segment_read_hold.cloned();
         tokio::task::spawn_blocking(move || {
-            read_segment(&path).with_context(|| format!("reading {}", path.display()))
+            // Keep the lease inside the blocking closure. Dropping or aborting
+            // its JoinHandle does not cancel a closure that has started.
+            let _decoded_work = decoded_work;
+            let result = read_segment(&path).with_context(|| format!("reading {}", path.display()));
+            #[cfg(test)]
+            if let Some(hold) = segment_read_hold {
+                hold.hold_after_read();
+            }
+            result
         })
     });
     let read_results = futures::future::try_join_all(read_futures)
@@ -8306,6 +8482,215 @@ mod combined_memory_regression_tests {
         );
         drop(held);
         assert_eq!(task.await.unwrap().unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_recluster_does_not_charge_the_drain_watchdog_and_wal_progresses_after_abort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        let source = event(0, 0);
+        let mut writer =
+            WalWriter::with_thresholds(&wal, "watchdog", 1, Duration::from_secs(60)).unwrap();
+        assert!(writer
+            .append_events(std::slice::from_ref(&source))
+            .unwrap()
+            .is_some());
+        drop(writer);
+
+        let compactor = Arc::new(
+            Compactor::new(&wal, ice.clone())
+                .with_reclustering(ReclusterConfig::new(Duration::ZERO))
+                .with_serial_decoded_work_for_test(true),
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut stalled = Some({
+            let compactor = compactor.clone();
+            let entered = entered.clone();
+            tokio::spawn(async move {
+                let _decoded_work = compactor.decoded_work_permit("recluster").await;
+                entered.notify_one();
+                std::future::pending::<()>().await;
+                Ok(0)
+            })
+        });
+        entered.notified().await;
+
+        // The production loop performs this nonblocking admission before it
+        // starts the drain timeout. Both a disabled watchdog and the default
+        // ceiling therefore return to the recluster-watchdog block promptly;
+        // neither can quarantine an unclaimed WAL segment.
+        assert_eq!(
+            compactor.run_loop_drain_cycle(None).await,
+            LoopDrainOutcome::DecodedWorkBusy
+        );
+        assert_eq!(
+            compactor
+                .run_loop_drain_cycle(Some(Duration::from_secs(DRAIN_WATCHDOG_DEFAULT_SECS,)))
+                .await,
+            LoopDrainOutcome::DecodedWorkBusy
+        );
+        assert_eq!(list_sealed(&wal).unwrap().len(), 1);
+        assert!(
+            list_orphaned(&wal).unwrap().is_empty(),
+            "waiting for decoded work must not quarantine unclaimed WAL"
+        );
+
+        // Run the production watchdog cancellation. Dropping the stalled task
+        // releases its lease, and the next ordinary loop cycle drains the
+        // untouched segment.
+        let mut started = Some(tokio::time::Instant::now() - Duration::from_secs(1));
+        let progress = std::sync::atomic::AtomicU64::new(0);
+        let mut progress_seen = 0;
+        assert!(
+            service_recluster_watchdog(
+                &mut stalled,
+                &mut started,
+                Some(Duration::ZERO),
+                &progress,
+                &mut progress_seen,
+            )
+            .await
+        );
+        assert!(stalled.is_none());
+        assert!(started.is_none());
+        assert_eq!(
+            compactor
+                .run_loop_drain_cycle(Some(Duration::from_secs(DRAIN_WATCHDOG_DEFAULT_SECS,)))
+                .await,
+            LoopDrainOutcome::Completed(1)
+        );
+
+        let ctx = SessionContext::new();
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        let batches = ctx
+            .sql("SELECT timestamp_ns, raw, attributes FROM events")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let batch = &batches[0];
+        let timestamp = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let raw = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let attributes = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            timestamp.value(0),
+            source.timestamp.timestamp_nanos_opt().unwrap()
+        );
+        assert_eq!(raw.value(0), source.raw);
+        assert!(attributes.is_null(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_drain_reader_retains_the_slot_until_its_decoded_batches_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        let source = event(1, 7);
+        let mut writer =
+            WalWriter::with_thresholds(&wal, "cancel", 1, Duration::from_secs(60)).unwrap();
+        assert!(writer
+            .append_events(std::slice::from_ref(&source))
+            .unwrap()
+            .is_some());
+        drop(writer);
+
+        let hold = SegmentReadHold::once();
+        let compactor = Arc::new(
+            Compactor::new(&wal, ice.clone())
+                .with_reclustering(ReclusterConfig::new(Duration::ZERO))
+                .with_serial_decoded_work_for_test(true)
+                .with_segment_read_hold_for_test(hold.clone()),
+        );
+        let drain = {
+            let compactor = compactor.clone();
+            tokio::spawn(async move { compactor.run_once().await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), hold.entered.notified())
+            .await
+            .expect("blocking reader reached the post-decode hold");
+        drain.abort();
+        assert!(drain.await.unwrap_err().is_cancelled());
+        compactor.quarantine_processing_orphans();
+
+        let merge = {
+            let compactor = compactor.clone();
+            tokio::spawn(async move { compactor.run_recluster_once().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !merge.is_finished(),
+            "a live blocking reader's decoded batches must retain exclusion after parent cancellation"
+        );
+        hold.release();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), merge)
+                .await
+                .expect("recluster acquired the released slot")
+                .unwrap()
+                .unwrap(),
+            0
+        );
+
+        // The cancelled claim was quarantined without assuming whether its
+        // commit landed. The ordinary proof-driven disposition requeues it,
+        // then the same cycle commits it once with exact source values.
+        assert_eq!(compactor.run_once().await.unwrap(), 1);
+        assert!(list_orphaned(&wal).unwrap().is_empty());
+        let ctx = SessionContext::new();
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        let batches = ctx
+            .sql("SELECT timestamp_ns, raw, attributes FROM events")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let batch = &batches[0];
+        let timestamp = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let raw = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let attributes = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            timestamp.value(0),
+            source.timestamp.timestamp_nanos_opt().unwrap()
+        );
+        assert_eq!(raw.value(0), source.raw);
+        assert_eq!(attributes.value(0), source.attributes.unwrap());
     }
 
     /// The packaged combined role used to let the decoded WAL claim and a

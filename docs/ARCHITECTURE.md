@@ -349,9 +349,12 @@ alone to preserve progress, so the target does not guarantee peak memory or
 prevent every OOM. In a combined-role process whose cgroup limit is at or below
 the packaged 1Gi setting, a drain cycle and a re-clustering pass take one shared
 decoded-work permit. The permit spans the complete drain claim through append
-and the complete re-clustering pass, so a decoded WAL batch cannot remain live
-beside the merge's fetched chunk and open writer row group. Larger and unlimited
-processes retain drain/re-cluster overlap. The drain keeps
+and the complete re-clustering pass. Blocking WAL readers retain the permit
+themselves, because cancelling their asynchronous parent does not stop a reader
+that has started. A drain waiting behind a merge does not block the maintenance
+loop or consume its drain-watchdog interval, so the loop can still cancel a
+stalled merge. Larger and unlimited processes retain drain/re-cluster overlap.
+The drain keeps
 `SIGLAKE_DRAIN_CONCURRENCY` commits in flight
 *continuously* — topping up the moment one lands, re-listing `sealed/` as new
 segments arrive — bounded by a per-pass budget so compaction and gauges keep

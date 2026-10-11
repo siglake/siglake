@@ -1735,9 +1735,13 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   decoded WAL admission below 128 MiB and a page-bounded merge plan. The logs do
   not identify the allocation that crossed the cgroup limit. A combined-role
   process at or below 1Gi now serializes complete drain cycles and re-clustering
-  passes through one decoded-work permit, removing that simultaneous ownership.
-  The final local real-path regression observed 100,110,336 bytes RSS before the
-  raced operations and 133,320,704 bytes at peak, then proved exact row,
+  passes through one decoded-work permit, removing the scheduler's potential
+  simultaneous ownership. Blocking WAL readers keep that permit through
+  completion even if their asynchronous parent is cancelled. Permit queue time
+  does not count against the drain watchdog, so it cannot quarantine work that
+  was never claimed or prevent the re-clustering watchdog from running.
+  The final local real-path regression observed 106,029,056 bytes RSS before the
+  raced operations and 150,421,504 bytes at peak, then proved exact row,
   timestamp, NULL and attribute parity. It is not the shipped field workload:
   fresh 1Gi qualification on the retained canonical field remains required before
   claiming the OOM is resolved. One oversized WAL segment also still admits
