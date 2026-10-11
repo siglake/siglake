@@ -322,7 +322,10 @@ async fn commit_force_waits_until_segment_is_queryable() {
             tokens: None,
             rate_limiter: None,
             mem_guard: None,
-            commit_force_timeout: Duration::from_secs(2),
+            // This is a success-path assertion, so leave enough headroom for
+            // the compactor under full-workspace test contention. The timeout
+            // behavior itself is covered separately below with a short guard.
+            commit_force_timeout: Duration::from_secs(30),
             remote_wal_drain: false,
         })
     };
