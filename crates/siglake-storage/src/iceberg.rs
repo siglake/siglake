@@ -3797,13 +3797,35 @@ fn populated_columns_absent_from_table(
     lost
 }
 
-fn align_batch_to_table_schema(table: &Table, batch: RecordBatch) -> Result<RecordBatch> {
+/// The schema a batch carrying `file_schema` has to be rebuilt against to match
+/// `table`: `None` when the file already presents the table's own fields in
+/// order, so alignment is a no-op, `Some(table schema)` otherwise.
+///
+/// The comparison is full Arrow `Field` equality, not name equality:
+/// nullability and the `PARQUET:field_id` metadata belong to a field's
+/// identity, and a promoted column on a managed index takes its id from that
+/// index's current schema while the extraction helper stamps the canonical
+/// events-table id (#6745). [`align_batch_to_table_schema`] and
+/// [`declared_stream_schema`] both decide through this, so a stream's declared
+/// schema cannot disagree with the schema its batches end up carrying.
+fn table_alignment_target(
+    table: &Table,
+    file_schema: &arrow_schema::Schema,
+) -> Result<Option<arrow_schema::Schema>> {
     let target = iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
         .context("table current schema to arrow")?;
+    Ok(if file_schema.fields() == target.fields() {
+        None
+    } else {
+        Some(target)
+    })
+}
+
+fn align_batch_to_table_schema(table: &Table, batch: RecordBatch) -> Result<RecordBatch> {
     let bschema = batch.schema();
-    if bschema.fields() == target.fields() {
+    let Some(target) = table_alignment_target(table, bschema.as_ref())? else {
         return Ok(batch);
-    }
+    };
     let n = batch.num_rows();
     let by_name: HashMap<&str, usize> = bschema
         .fields()
@@ -4489,22 +4511,160 @@ fn ensure_candidate_fully_decoded(
 
 /// The schema the batches of a candidate-file stream will carry once
 /// [`align_batch_to_table_schema`] has seen them: the file's own schema when
-/// its field names already match the table's (alignment passes those through
-/// untouched), the table's otherwise.
+/// its fields already equal the table's — same names, types, nullability and
+/// `PARQUET:field_id` metadata — because alignment passes those through
+/// untouched, the table's otherwise.
 fn declared_stream_schema(table: &Table, file_schema: SchemaRef) -> Result<SchemaRef> {
-    let target = iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
-        .context("table current schema to arrow")?;
-    let matches = file_schema.fields().len() == target.fields().len()
-        && file_schema
+    Ok(match table_alignment_target(table, file_schema.as_ref())? {
+        Some(target) => Arc::new(target),
+        None => file_schema,
+    })
+}
+
+#[cfg(test)]
+mod declared_stream_schema_tests {
+    //! A delete-task provider declares `declared_stream_schema` and its stream
+    //! yields what `align_batch_to_table_schema` produced, so the two have to
+    //! agree on one predicate. #6745 made alignment compare whole Arrow fields
+    //! — a file whose columns match the table's by name but carry a different
+    //! `PARQUET:field_id` is rebuilt — while the declaration still compared
+    //! names, so for exactly those files the provider declared a schema the
+    //! stream never yielded.
+    use super::*;
+    use arrow_array::StringArray;
+    use arrow_schema::{Field, Schema as ArrowSchema};
+    use iceberg::spec::{NestedField, Schema as IcebergSchema};
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+    fn two_field_table() -> Table {
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "host",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "promoted",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let metadata = iceberg::spec::TableMetadataBuilder::from_table_creation(
+            TableCreation::builder()
+                .name("alignment".to_string())
+                .location("memory:///alignment".to_string())
+                .schema(schema)
+                .build(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        Table::builder()
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["ns", "alignment"]).unwrap())
+            .file_io(FileIOBuilder::new(Arc::new(iceberg::io::MemoryStorageFactory)).build())
+            .runtime(iceberg::Runtime::try_current().unwrap())
+            .build()
+            .unwrap()
+    }
+
+    fn table_arrow_schema(table: &Table) -> SchemaRef {
+        Arc::new(iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).unwrap())
+    }
+
+    /// The table's own Arrow schema with `promoted`'s field id restamped to the
+    /// canonical events-table id the extraction helper writes: same names, same
+    /// types, same nullability, one different `PARQUET:field_id`.
+    fn file_schema_with_foreign_field_id(table: &Table) -> SchemaRef {
+        let target = table_arrow_schema(table);
+        let fields: Vec<Field> = target
             .fields()
             .iter()
-            .zip(target.fields())
-            .all(|(a, b)| a.name() == b.name());
-    Ok(if matches {
-        file_schema
-    } else {
-        Arc::new(target)
-    })
+            .map(|f| {
+                let mut field = f.as_ref().clone();
+                if field.name() == "promoted" {
+                    let mut meta = field.metadata().clone();
+                    let id = meta.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "9".to_string());
+                    assert_ne!(
+                        id.as_deref(),
+                        Some("9"),
+                        "fixture must change the table's field id"
+                    );
+                    field = field.with_metadata(meta);
+                }
+                field
+            })
+            .collect();
+        Arc::new(ArrowSchema::new(fields))
+    }
+
+    fn one_row(schema: &SchemaRef) -> RecordBatch {
+        let columns: Vec<arrow_array::ArrayRef> = schema
+            .fields()
+            .iter()
+            .map(|f| Arc::new(StringArray::from(vec![f.name().as_str()])) as arrow_array::ArrayRef)
+            .collect();
+        RecordBatch::try_new(Arc::clone(schema), columns).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_foreign_field_id_declares_and_yields_the_table_schema() {
+        let table = two_field_table();
+        let file_schema = file_schema_with_foreign_field_id(&table);
+        assert_eq!(
+            file_schema
+                .fields()
+                .iter()
+                .map(|f| (f.name().clone(), f.data_type().clone(), f.is_nullable()))
+                .collect::<Vec<_>>(),
+            table_arrow_schema(&table)
+                .fields()
+                .iter()
+                .map(|f| (f.name().clone(), f.data_type().clone(), f.is_nullable()))
+                .collect::<Vec<_>>(),
+            "the fixture must differ from the table only in field-id metadata"
+        );
+
+        let declared = declared_stream_schema(&table, Arc::clone(&file_schema)).unwrap();
+        assert_eq!(
+            declared,
+            table_arrow_schema(&table),
+            "a file whose field ids are not the table's is rebuilt, so the \
+             declared schema is the table's"
+        );
+
+        let aligned = align_batch_to_table_schema(&table, one_row(&file_schema)).unwrap();
+        assert_eq!(
+            aligned.schema(),
+            declared,
+            "the stream yields exactly the schema the provider declared"
+        );
+        assert_eq!(aligned.num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn identical_fields_declare_and_pass_the_file_schema_through() {
+        let table = two_field_table();
+        let file_schema = table_arrow_schema(&table);
+
+        let declared = declared_stream_schema(&table, Arc::clone(&file_schema)).unwrap();
+        assert!(
+            Arc::ptr_eq(&declared, &file_schema),
+            "identical fields declare the file's own schema, untouched"
+        );
+
+        let batch = one_row(&file_schema);
+        let aligned = align_batch_to_table_schema(&table, batch).unwrap();
+        assert!(
+            Arc::ptr_eq(&aligned.schema(), &file_schema),
+            "identical fields take the pass-through path"
+        );
+        assert_eq!(aligned.num_rows(), 1);
+    }
 }
 
 /// One candidate data file as a DataFusion partition: a single-use, bounded
@@ -19372,10 +19532,11 @@ impl IcebergContext {
             .context("ParquetRecordBatchStreamBuilder")?
             .with_batch_size(DELETE_REWRITE_BATCH_ROWS);
         // `align_batch_to_table_schema` passes a batch through untouched when
-        // its field names already match the table's, and rebuilds it against
-        // the table schema otherwise. Declare whichever of the two the batches
-        // will actually carry, because a table provider's schema must be the
-        // one its stream yields.
+        // its fields already equal the table's (field ids and nullability
+        // included), and rebuilds it against the table schema otherwise.
+        // Declare whichever of the two the batches will actually carry,
+        // because a table provider's schema must be the one its stream yields;
+        // both decide through `table_alignment_target` so they cannot diverge.
         let schema = declared_stream_schema(table, Arc::clone(builder.schema()))?;
         let counted = Arc::new(AtomicU64::new(0));
         let rows = Arc::clone(&counted);
