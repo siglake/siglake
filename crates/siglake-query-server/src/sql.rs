@@ -2048,7 +2048,9 @@ fn ordered_source_filter(
     // inline it and omit unsupported residuals from TableProvider::scan, so
     // an empty outer WHERE is not proof that source rows satisfy the LIMIT.
     // Keep SQL's final LIMIT, but conservatively decline its source-level cap.
-    if query.with.is_some() {
+    if query.with.is_some() || query_contains_subquery(query) {
+        // The ordered-source hint is session-wide; do not apply the outer
+        // LIMIT to any additional scan hidden in a projection or predicate.
         return Some(false);
     }
     // Source LIMIT is valid only for a row-preserving SELECT. Reuse the
@@ -11706,6 +11708,7 @@ mod tests {
             "SELECT DISTINCT timestamp FROM events ORDER BY timestamp DESC LIMIT 10",
             "SELECT timestamp, COUNT(*) OVER () FROM events ORDER BY timestamp ASC LIMIT 10",
             "SELECT timestamp, raw FROM events ORDER BY timestamp DESC, raw DESC LIMIT 10",
+            "SELECT timestamp, EXISTS(SELECT 1 FROM events WHERE host = 'kernel') AS found FROM events ORDER BY timestamp ASC LIMIT 10",
         ] {
             assert_eq!(
                 apply_default_order_if_needed(sql, true, Priority::Interactive, 1_000, None)
