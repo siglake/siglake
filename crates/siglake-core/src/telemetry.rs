@@ -243,10 +243,15 @@ pub fn init(cfg: TelemetryConfig) -> Result<()> {
         Box::new(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
+                .log_internal_errors(true)
                 .with_writer(std::io::stderr),
         )
     } else {
-        Box::new(tracing_subscriber::fmt::layer().with_target(true))
+        Box::new(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .log_internal_errors(true),
+        )
     };
     let fmt_layer = fmt_inner.with_filter(filter.clone());
 
@@ -393,11 +398,13 @@ fn parse_kv_pairs(s: &str) -> HashMap<String, String> {
 mod tests {
     use super::*;
 
+    use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
 
     use opentelemetry::trace::Tracer;
     use opentelemetry_sdk::error::OTelSdkResult;
     use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+    use tracing_subscriber::fmt::MakeWriter;
 
     /// Records what the batch processor hands the exporter, and how many times
     /// the provider shuts it down. The SDK's own `InMemorySpanExporter` clears
@@ -419,6 +426,60 @@ mod tests {
             *self.shutdowns.lock().expect("shutdowns") += 1;
             Ok(())
         }
+    }
+
+    #[derive(Clone)]
+    struct FailOnceWriter {
+        fail_next: Arc<AtomicBool>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for FailOnceWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                return Err(io::Error::other("injected write failure"));
+            }
+            self.written.lock().expect("written").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for FailOnceWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn fmt_layer_continues_after_writer_failure() {
+        let writer = FailOnceWriter {
+            fail_next: Arc::new(AtomicBool::new(true)),
+            written: Arc::new(Mutex::new(Vec::new())),
+        };
+        let written = Arc::clone(&writer.written);
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .log_internal_errors(true)
+                .with_writer(writer)
+                .with_filter(EnvFilter::new("info")),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("event whose write fails");
+            tracing::info!("event after writer failure");
+        });
+
+        let output = String::from_utf8(written.lock().expect("written").clone())
+            .expect("fmt layer writes UTF-8");
+        assert!(!output.contains("event whose write fails"));
+        assert!(output.contains("event after writer failure"), "{output:?}");
     }
 
     /// A lookup over a fixed table, standing in for the process environment.

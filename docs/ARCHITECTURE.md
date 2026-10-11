@@ -2277,6 +2277,11 @@ tests drive directly; nothing mutates the process environment.
 `siglake-operator --print-crd` (which CI diffs), `migrate-schema --dry-run`,
 `gc-orphans`, the SQL client's rows.
 
+The console fmt layer sets `log_internal_errors(true)`. If event formatting
+fails, the layer writes `Unable to format the following event` through its
+configured writer. If that writer fails, tracing-subscriber writes
+`[tracing-subscriber] Unable to write an event` directly to process stderr.
+
 **Shutdown is explicit, because nothing else flushes.** The batch processors
 buffer, and the providers live in a `OnceLock` that never drops, so a
 drop-at-exit guard would ship nothing. Each entry point that uses
