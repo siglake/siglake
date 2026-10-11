@@ -29,9 +29,18 @@ fn ev(secs: i64, sourcetype: &str) -> Event {
 
 #[tokio::test]
 async fn page_bounded_recluster_conserves_rows_and_disjoins() {
+    let prefetch_one = run_page_bounded_recluster(1).await;
+    let prefetch_two = run_page_bounded_recluster(2).await;
+    assert_eq!(
+        prefetch_one, prefetch_two,
+        "prefetch depth must not change the sorted timestamp multiset"
+    );
+}
+
+async fn run_page_bounded_recluster(prefetch: usize) -> Vec<i64> {
     // Force a tiny fan-in so 8 files take the default >fan-in page-bounded
-    // route, and a tiny chunk so the 800-row merge runs through many chunks
-    // with run splits at chunk boundaries.
+    // route. At the 1,024-row floor, 4,800 rows span five chunks; the fifth is
+    // partial and the first four split runs at chunk boundaries.
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(&tmp.path().join("warehouse"))
         .await
@@ -41,18 +50,18 @@ async fn page_bounded_recluster_conserves_rows_and_disjoins() {
         .unwrap()
         .timestamp();
 
-    // 8 appends, each covering the SAME 100s range [base, base+99] → 8 files
+    // 8 appends, each covering the SAME 600s range [base, base+599] → 8 files
     // that all OVERLAP in time (the pathological cluster the merge must
     // disjoin — every chunk draws rows from all 8 inputs).
     let mut total = 0u64;
     for _ in 0..8 {
-        let batch: Vec<Event> = (0..100)
+        let batch: Vec<Event> = (0..600)
             .map(|i| ev(base + i, if i % 5 < 3 { "app:json" } else { "syslog" }))
             .collect();
         total += batch.len() as u64;
         ice.append_events(&batch).await.unwrap();
     }
-    assert_eq!(total, 800);
+    assert_eq!(total, 4_800);
 
     let ident = ice.events_table_ident().clone();
     let files = ice.live_data_files(&ident).await.unwrap();
@@ -61,6 +70,9 @@ async fn page_bounded_recluster_conserves_rows_and_disjoins() {
         "need the 8 overlapping files, got {}",
         files.len()
     );
+    let warehouse = tmp.path().join("warehouse");
+    let original_count = walk_parquet(&warehouse.join("siglake/events/data")).len();
+    assert_eq!(original_count, 8, "fixture must write one file per append");
 
     let stats = ice
         .recluster_files_with(
@@ -72,14 +84,15 @@ async fn page_bounded_recluster_conserves_rows_and_disjoins() {
                 merge_fanin: Some(2),
                 force_tiered: Some(false),
                 merge_chunk_rows: Some(1024),
+                merge_chunk_prefetch: Some(prefetch),
                 ..Default::default()
             },
         )
         .await
-        .expect("page-bounded recluster");
+        .unwrap_or_else(|err| panic!("page-bounded recluster at prefetch {prefetch}: {err:#}"));
     assert_eq!(
         stats.rows as u64, total,
-        "page-bounded merge conserves rows"
+        "page-bounded merge conserves rows at prefetch {prefetch}"
     );
 
     // The final output's group-count footers survive (else this falls to a scan).
@@ -93,22 +106,25 @@ async fn page_bounded_recluster_conserves_rows_and_disjoins() {
         v.sort();
         v
     };
-    // 60% app:json, 40% syslog of 800.
+    // 60% app:json, 40% syslog of 4,800.
     assert_eq!(
         counts,
-        vec![(Some("app:json".into()), 480), (Some("syslog".into()), 320)]
+        vec![
+            (Some("app:json".into()), 2_880),
+            (Some("syslog".into()), 1_920)
+        ],
+        "group-count footers must be readable at prefetch {prefetch}"
     );
 
     // The page-bounded merge writes NO intermediates at any point: on disk we
     // expect exactly the 8 GC-pending originals (rewrite_files un-references
     // but doesn't physically delete them) + the committed final output.
     let out = ice.live_data_files(&ident).await.unwrap();
-    let warehouse = tmp.path().join("warehouse");
     let on_disk = walk_parquet(&warehouse.join("siglake/events/data")).len();
     assert_eq!(
         on_disk,
-        8 + out.len(),
-        "expected 8 GC-pending originals + {} final output file(s) and nothing else",
+        original_count + out.len(),
+        "expected {original_count} GC-pending originals + {} final output file(s) and nothing else at prefetch {prefetch}",
         out.len()
     );
 
@@ -139,11 +155,15 @@ async fn page_bounded_recluster_conserves_rows_and_disjoins() {
             }
         }
     }
-    assert_eq!(all_ts.len(), 800);
-    let expected: Vec<i64> = (0..100)
+    assert_eq!(all_ts.len(), 4_800);
+    let expected: Vec<i64> = (0..600)
         .flat_map(|i| std::iter::repeat_n((base + i) * 1_000_000_000, 8))
         .collect();
-    assert_eq!(all_ts, expected, "sorted, lossless, duplicate-preserving");
+    assert_eq!(
+        all_ts, expected,
+        "sorted, lossless, duplicate-preserving at prefetch {prefetch}"
+    );
+    all_ts
 }
 
 fn walk_parquet(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
