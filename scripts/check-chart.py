@@ -163,6 +163,9 @@ STR_LITERAL = re.compile(r'"([a-z0-9_]+)"')
 ENV_NAME = re.compile(r"SIGLAKE_[A-Z0-9_]+")
 ENV_NAME_LITERAL = re.compile(r'"(SIGLAKE_[A-Z0-9_]+)"')
 CFG_TEST = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+CFG_TEST_NAMED_FIELD = re.compile(
+    r"\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*:"
+)
 RUST_PACKAGE_ROOTS = (pathlib.Path("crates"), pathlib.Path("third_party"))
 COMPOSE_FILE = pathlib.Path("deploy/docker-compose.yml")
 OPERATOR_RENDER_RS = pathlib.Path("crates/siglake-operator/src/render.rs")
@@ -640,6 +643,46 @@ def non_test_rust_source(source: str) -> str:
     search_from = 0
     while match := CFG_TEST.search(mask, search_from):
         item_start = match.end()
+        # A cfg attribute is also legal on one field of a production struct.
+        # That field starts inside the parent's braces, so the general item
+        # scanner below cannot use brace depth relative to item_start: the
+        # parent's closing brace would take it negative and everything after
+        # the field would be hidden from the production-source catalog.
+        field = CFG_TEST_NAMED_FIELD.match(mask, item_start)
+        if field is not None:
+            parens = brackets = braces = angles = 0
+            item_end = len(source)
+            for pos in range(field.end(), len(mask)):
+                char = mask[pos]
+                if char == "(":
+                    parens += 1
+                elif char == ")":
+                    parens -= 1
+                elif char == "[":
+                    brackets += 1
+                elif char == "]":
+                    brackets -= 1
+                elif char == "{":
+                    braces += 1
+                elif char == "}" and braces > 0:
+                    braces -= 1
+                elif char == "<":
+                    angles += 1
+                elif char == ">" and angles > 0:
+                    angles -= 1
+                elif char == "," and parens == brackets == braces == angles == 0:
+                    item_end = pos + 1
+                    break
+                elif char == "}" and parens == brackets == braces == angles == 0:
+                    # Rust permits the final named field to omit its comma.
+                    # Keep the parent's brace in production source.
+                    item_end = pos
+                    break
+            for pos in range(match.start(), item_end):
+                if out[pos] != "\n":
+                    out[pos] = " "
+            search_from = item_end
+            continue
         first_brace = mask.find("{", item_start)
         first_semi = mask.find(";", item_start)
         delimiters = [p for p in (first_brace, first_semi) if p >= 0]
@@ -681,8 +724,40 @@ def non_test_rust_source(source: str) -> str:
     return "".join(out)
 
 
+def check_non_test_rust_source_mask() -> None:
+    """Pin cfg(test) fields and items to their own source boundaries."""
+    fixture = '''
+struct Fixture {
+    production_before: usize,
+    #[cfg(test)]
+    test_only: Option<Result<&'static str, ()>>,
+    production_after: usize,
+}
+
+fn production_read() {
+    std::env::var("SIGLAKE_CFG_MASK_PRODUCTION");
+}
+
+#[cfg(test)]
+fn test_read() {
+    std::env::var("SIGLAKE_CFG_MASK_TEST_ONLY");
+}
+'''
+    masked = non_test_rust_source(fixture)
+    if (
+        "test_only" in masked
+        or "SIGLAKE_CFG_MASK_TEST_ONLY" in masked
+        or "production_after" not in masked
+        or "SIGLAKE_CFG_MASK_PRODUCTION" not in masked
+    ):
+        raise EnvCatalogError(
+            "the cfg(test) source mask did not isolate a test-only struct field"
+        )
+
+
 def env_name_catalog() -> frozenset[str]:
     """Every SIGLAKE_* string literal in crates/**/src and third_party/**/src."""
+    check_non_test_rust_source_mask()
     names: set[str] = set()
     source_count = 0
     for package_root in RUST_PACKAGE_ROOTS:
