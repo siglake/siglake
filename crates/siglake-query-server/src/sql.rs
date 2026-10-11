@@ -11679,7 +11679,11 @@ mod tests {
                  attr_get(attributes, 'process.name') = 'kernel') \
                  SELECT timestamp FROM chosen ORDER BY timestamp {direction} LIMIT 10"
             );
-            assert_eq!(rewritten(&sql).ordered_source_filter, Some(false));
+            assert_eq!(
+                apply_default_order_if_needed(&sql, true, Priority::Interactive, 1_000, None)
+                    .ordered_source_filter,
+                Some(false)
+            );
         }
         assert!(
             rewritten("SELECT timestamp FROM events ORDER BY timestamp ASC LIMIT 10")
