@@ -1901,6 +1901,9 @@ struct RewrittenQuery {
     /// Literal `LIMIT n` of a timestamp-ordered query — rides into the
     /// session as `OrderedScanLimit` so the gate can coalesce partitions.
     ordered_limit: Option<usize>,
+    /// SQL-side filter classification for source-limit safety. `None` means no
+    /// WHERE clause; `Some(true)` is time-only; `Some(false)` is residual.
+    ordered_source_filter: Option<bool>,
     /// Literal `LIMIT n` of an UNordered query whose limit clips the scan row
     /// for row (see [`clipping_scan_limit`]) — rides into the session as
     /// `ClippedScanLimit`. Disjoint from `ordered_limit` by construction: the
@@ -1931,6 +1934,7 @@ fn apply_default_order_if_needed(
                 sql: query.to_string(),
                 preferred_scan_order: None,
                 ordered_limit: None,
+                ordered_source_filter: None,
                 clipped_limit: None,
             };
         }
@@ -1954,6 +1958,7 @@ fn apply_default_order_if_needed(
                 // missing hint here would show an index the real query
                 // declines (#91's argument for the scan-order hint).
                 ordered_limit: None,
+                ordered_source_filter: None,
                 clipped_limit: clipping_scan_limit(inner),
             };
         }
@@ -1961,6 +1966,7 @@ fn apply_default_order_if_needed(
             sql: query.to_string(),
             preferred_scan_order: None,
             ordered_limit: None,
+            ordered_source_filter: None,
             clipped_limit: None,
         };
     }
@@ -1969,6 +1975,7 @@ fn apply_default_order_if_needed(
             sql: query.to_string(),
             preferred_scan_order: None,
             ordered_limit: None,
+            ordered_source_filter: None,
             clipped_limit: None,
         };
     };
@@ -1998,10 +2005,14 @@ fn apply_default_order_if_needed(
         let ordered_limit = preferred_scan_order
             .as_ref()
             .and_then(|_| explicit_limit_value(sql_query));
+        let ordered_source_filter = preferred_scan_order
+            .as_ref()
+            .and_then(|order| ordered_source_filter(sql_query, &order.field));
         return RewrittenQuery {
             sql,
             preferred_scan_order,
             ordered_limit,
+            ordered_source_filter,
             // The rewrite injected an ORDER BY, so the shape test refuses:
             // this browse is the ordered decline's business, not the clipped
             // one's.
@@ -2010,14 +2021,65 @@ fn apply_default_order_if_needed(
     }
     let preferred_scan_order =
         preferred_scan_order_from_query(sql_query, query_order_field(sql_query, ordered_index));
+    let ordered_source_filter = preferred_scan_order
+        .as_ref()
+        .and_then(|order| ordered_source_filter(sql_query, &order.field));
     RewrittenQuery {
         ordered_limit: preferred_scan_order
             .as_ref()
             .and_then(|_| explicit_limit_value(sql_query)),
         sql: query.to_string(),
         preferred_scan_order,
+        ordered_source_filter,
         clipped_limit: clipping_scan_limit(sql_query),
     }
+}
+
+/// A query LIMIT may cap its ordered source only when every selected source
+/// row is eligible for that LIMIT. Pure event-time ranges run in the Parquet
+/// reader; any other predicate is conservatively residual. This SQL-side fact
+/// complements the provider's pushed-filter check: unsupported expressions are
+/// absent from the slice DataFusion passes to `TableProvider::scan`.
+fn ordered_source_filter(
+    query: &datafusion::sql::sqlparser::ast::Query,
+    time_field: &str,
+) -> Option<bool> {
+    // A named CTE can hide predicates below this outer SELECT. DataFusion may
+    // inline it and omit unsupported residuals from TableProvider::scan, so
+    // an empty outer WHERE is not proof that source rows satisfy the LIMIT.
+    // Keep SQL's final LIMIT, but conservatively decline its source-level cap.
+    if query.with.is_some() || query_contains_subquery(query) {
+        // The ordered-source hint is session-wide; do not apply the outer
+        // LIMIT to any additional scan hidden in a projection or predicate.
+        return Some(false);
+    }
+    // Source LIMIT is valid only for a row-preserving SELECT. Reuse the
+    // conservative browse-shape proof, ignoring only this query's explicit
+    // ORDER BY: aggregate, DISTINCT, window, QUALIFY and derived shapes must
+    // consume their complete input before SQL's final LIMIT is applied.
+    let mut source_shape = query.clone();
+    source_shape.order_by = None;
+    if default_order_shape_table(&source_shape).is_none() {
+        return Some(false);
+    }
+    // The source advertises event-time order only. A secondary key can change
+    // which rows survive at a timestamp tie, so it cannot share the source cap.
+    if let Some(order) = &query.order_by {
+        if !matches!(&order.kind, OrderByKind::Expressions(expressions) if expressions.len() == 1) {
+            return Some(false);
+        }
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Some(false);
+    };
+    let selection = select.selection.as_ref()?;
+    let mut conjuncts = Vec::new();
+    flatten_and_conjuncts(selection, &mut conjuncts);
+    Some(
+        conjuncts
+            .into_iter()
+            .all(|expr| sql_expr_is_ordered_source_time_range(expr, time_field)),
+    )
 }
 
 #[cfg(test)]
@@ -2292,6 +2354,37 @@ fn sql_expr_is_time_range(expr: &SqlAstExpr, time_field: &str) -> bool {
     [left, right]
         .iter()
         .any(|side| sql_ident(side).is_some_and(|i| ident_is_field(i, time_field)))
+}
+
+/// An event-time range whose other side is fixed for the whole query. Ordered
+/// source limits need this stricter proof: a row-dependent bound may survive
+/// as a residual filter above the capped source even though it only compares
+/// the event-time column.
+fn sql_expr_is_ordered_source_time_range(expr: &SqlAstExpr, time_field: &str) -> bool {
+    use datafusion::sql::sqlparser::ast::BinaryOperator as Op;
+    let SqlAstExpr::BinaryOp { left, op, right } = expr else {
+        return false;
+    };
+    if !matches!(op, Op::Gt | Op::GtEq | Op::Lt | Op::LtEq) {
+        return false;
+    }
+    let left_is_time = sql_ident(left).is_some_and(|i| ident_is_field(i, time_field));
+    let right_is_time = sql_ident(right).is_some_and(|i| ident_is_field(i, time_field));
+    match (left_is_time, right_is_time) {
+        (true, false) => sql_expr_is_literal_bound(right),
+        (false, true) => sql_expr_is_literal_bound(left),
+        _ => false,
+    }
+}
+
+fn sql_expr_is_literal_bound(expr: &SqlAstExpr) -> bool {
+    match expr {
+        SqlAstExpr::Value(value) => !matches!(value.value, SqlValue::Placeholder(_)),
+        SqlAstExpr::TypedString(_) => true,
+        SqlAstExpr::Nested(inner) => sql_expr_is_literal_bound(inner),
+        SqlAstExpr::Cast { expr, .. } => sql_expr_is_literal_bound(expr),
+        _ => false,
+    }
 }
 
 /// One dimensional term: `col = 'v'`, `col <> 'v'`, `col IN (…)`,
@@ -4615,6 +4708,11 @@ async fn handle_local_inner(
             hinted.config_mut().set_extension(std::sync::Arc::new(
                 siglake_storage::OrderedScanLimit { limit },
             ));
+            if let Some(time_only) = effective_query.ordered_source_filter {
+                hinted.config_mut().set_extension(std::sync::Arc::new(
+                    siglake_storage::OrderedSourceFilter { time_only },
+                ));
+            }
         }
         if let Some(limit) = clipped_limit_hint {
             hinted.config_mut().set_extension(std::sync::Arc::new(
@@ -11590,6 +11688,87 @@ mod tests {
     }
 
     #[test]
+    fn ordered_source_limit_safety_includes_sql_residuals() {
+        let rewritten =
+            |sql| apply_default_order_if_needed(sql, true, Priority::Interactive, 1_000, None);
+        for direction in ["ASC", "DESC"] {
+            let sql = format!(
+                "WITH chosen AS (SELECT * FROM events WHERE \
+                 attr_get(attributes, 'process.name') = 'kernel') \
+                 SELECT timestamp FROM chosen ORDER BY timestamp {direction} LIMIT 10"
+            );
+            assert_eq!(
+                apply_default_order_if_needed(&sql, true, Priority::Interactive, 1_000, None)
+                    .ordered_source_filter,
+                Some(false)
+            );
+        }
+        for sql in [
+            "SELECT timestamp, COUNT(*) FROM events GROUP BY timestamp ORDER BY timestamp ASC LIMIT 10",
+            "SELECT DISTINCT timestamp FROM events ORDER BY timestamp DESC LIMIT 10",
+            "SELECT timestamp, COUNT(*) OVER () FROM events ORDER BY timestamp ASC LIMIT 10",
+            "SELECT timestamp, raw FROM events ORDER BY timestamp DESC, raw DESC LIMIT 10",
+            "SELECT timestamp, EXISTS(SELECT 1 FROM events WHERE host = 'kernel') AS found FROM events ORDER BY timestamp ASC LIMIT 10",
+        ] {
+            assert_eq!(
+                apply_default_order_if_needed(sql, true, Priority::Interactive, 1_000, None)
+                    .ordered_source_filter,
+                Some(false),
+                "{sql}"
+            );
+        }
+        assert!(
+            rewritten("SELECT timestamp FROM events ORDER BY timestamp ASC LIMIT 10")
+                .ordered_source_filter
+                .is_none()
+        );
+        assert!(
+            rewritten(
+                "SELECT timestamp FROM events WHERE timestamp >= '2026-01-01T00:00:00Z' \
+                 ORDER BY timestamp DESC LIMIT 10"
+            )
+            .ordered_source_filter
+                == Some(true)
+        );
+        assert!(
+            rewritten(
+                "SELECT timestamp FROM events \
+                 WHERE timestamp >= CAST('2026-01-01T00:00:00Z' AS TIMESTAMP) \
+                 ORDER BY timestamp ASC LIMIT 10"
+            )
+            .ordered_source_filter
+                == Some(true)
+        );
+        assert!(
+            rewritten(
+                "SELECT timestamp FROM events \
+                 WHERE timestamp >= '2026-01-01T00:00:00Z' \
+                 AND timestamp > CAST(attr_get(attributes, 'cutoff') AS TIMESTAMP) \
+                 ORDER BY timestamp DESC LIMIT 10"
+            )
+            .ordered_source_filter
+                == Some(false)
+        );
+        assert!(
+            rewritten(
+                "SELECT timestamp FROM events WHERE host = 'kernel' \
+                 ORDER BY timestamp ASC LIMIT 10"
+            )
+            .ordered_source_filter
+                == Some(false)
+        );
+        assert!(
+            rewritten(
+                "SELECT timestamp FROM events \
+                 WHERE attr_get(attributes, 'process.name') = 'kernel' \
+                 ORDER BY timestamp DESC LIMIT 10"
+            )
+            .ordered_source_filter
+                == Some(false)
+        );
+    }
+
+    #[test]
     fn default_order_target_table_reports_the_shape_qualifying_table() {
         let table = |sql: &str| {
             let dialect = GenericDialect {};
@@ -18075,6 +18254,7 @@ mod batch_run_deadline_tests {
             sql: "SELECT count(*) AS n FROM events".to_string(),
             preferred_scan_order: None,
             ordered_limit: None,
+            ordered_source_filter: None,
             clipped_limit: None,
         }
     }
@@ -18483,6 +18663,7 @@ mod batch_lifecycle_tests {
             sql: LIFECYCLE_SQL.to_string(),
             preferred_scan_order: None,
             ordered_limit: None,
+            ordered_source_filter: None,
             clipped_limit: None,
         }
     }

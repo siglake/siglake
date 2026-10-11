@@ -6536,6 +6536,7 @@ dependencies = [
  "opentelemetry-http",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "parquet",
  "rcgen",
  "regex",
  "reqwest 0.12.28",

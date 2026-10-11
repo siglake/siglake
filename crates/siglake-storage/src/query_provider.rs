@@ -469,6 +469,16 @@ pub struct OrderedResidualHint {
     pub allow: bool,
 }
 
+/// SQL-side filter classification for an ordered query. DataFusion omits
+/// unsupported predicates from `TableProvider::scan`, so the provider cannot
+/// infer "unfiltered" from an empty pushed-filter slice. A time-only query is
+/// source-limit-safe only when that filter reached the reader; every other
+/// filtered query may have a residual `FilterExec` above this source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderedSourceFilter {
+    pub time_only: bool,
+}
+
 /// Per-request cancellation flag, injected through `SessionConfig` and captured
 /// onto the scan node at planning time.
 ///
@@ -3044,7 +3054,14 @@ impl SiglakeIcebergTableScan {
                 .map(|l| l.limit)
                 .filter(|&l| l > 0),
             ordered_source_limit_safe: preserve_task_order
-                && (!has_pushed_filters || time_only_filters(filters, &order_field)),
+                && match state.config().get_extension::<OrderedSourceFilter>() {
+                    Some(filter) => {
+                        filter.time_only
+                            && has_pushed_filters
+                            && time_only_filters(filters, &order_field)
+                    }
+                    None => !has_pushed_filters || time_only_filters(filters, &order_field),
+                },
             text_index_decline,
             query_execution_id,
             scan_id,
