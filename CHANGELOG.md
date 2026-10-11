@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Compactor drain memory (bug fix, target 0.3.0)**: filesystem-drain claim
+  admission now counts uncompressed Arrow IPC bytes across in-flight commits,
+  beside the existing compressed-byte and segment caps. The packaged 1Gi
+  compactor admits at most 128 MiB of decoded WAL input under the shipped
+  1024 MiB setting. New zstd WAL frames expose their uncompressed size without
+  decoding; segments from older builds use a bounded streaming sizing pass.
+  This prevents compressible field records from expanding past the container
+  limit before Parquet writing starts. (#6744)
+
 - **Exact grouped AVG (feature, target 0.3.0)**: new Parquet files carry a
   bounded `status`/`size` grouped numeric footer. The published
   `SELECT status, avg(size), count(*) ... GROUP BY status ORDER BY count(*) DESC`
