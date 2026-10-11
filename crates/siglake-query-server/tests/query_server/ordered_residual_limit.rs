@@ -160,6 +160,49 @@ async fn residual_attr_get_filter_precedes_ordered_limit_in_both_directions() {
         matching.iter().rev().take(10).copied().collect::<Vec<_>>()
     );
 
+    // WITH hides the unsupported predicate from the outer WHERE. Inlining
+    // must not allow an outer LIMIT to truncate either ordered source before
+    // the residual filter. Check both directions against the persisted rows.
+    for direction in ["ASC", "DESC"] {
+        let body = query(
+            &app,
+            &format!(
+                "WITH chosen AS (SELECT * FROM events WHERE {attr}) \
+                 SELECT timestamp AS value FROM chosen ORDER BY timestamp {direction} LIMIT 10"
+            ),
+        )
+        .await;
+        let expected = if direction == "ASC" {
+            matching.iter().take(10).copied().collect::<Vec<_>>()
+        } else {
+            matching.iter().rev().take(10).copied().collect::<Vec<_>>()
+        };
+        assert_eq!(timestamps(&body), expected);
+        let unfiltered_cte = query(
+            &app,
+            &format!(
+                "WITH chosen AS (SELECT * FROM events) \
+                 SELECT timestamp AS value FROM chosen ORDER BY timestamp {direction} LIMIT 10"
+            ),
+        )
+        .await;
+        let expected_unfiltered = if direction == "ASC" {
+            events
+                .iter()
+                .take(10)
+                .map(|event| event.timestamp.timestamp_micros())
+                .collect::<Vec<_>>()
+        } else {
+            events
+                .iter()
+                .rev()
+                .take(10)
+                .map(|event| event.timestamp.timestamp_micros())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(timestamps(&unfiltered_cte), expected_unfiltered);
+    }
+
     // Controls: source-capped unfiltered scans and reader-pushed predicates
     // retain the same exact top-N contract in both directions.
     for direction in ["ASC", "DESC"] {

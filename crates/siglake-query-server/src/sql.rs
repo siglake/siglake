@@ -2044,6 +2044,13 @@ fn ordered_source_filter(
     query: &datafusion::sql::sqlparser::ast::Query,
     time_field: &str,
 ) -> Option<bool> {
+    // A named CTE can hide predicates below this outer SELECT. DataFusion may
+    // inline it and omit unsupported residuals from TableProvider::scan, so
+    // an empty outer WHERE is not proof that source rows satisfy the LIMIT.
+    // Keep SQL's final LIMIT, but conservatively decline its source-level cap.
+    if query.with.is_some() {
+        return Some(false);
+    }
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Some(false);
     };
@@ -11666,6 +11673,14 @@ mod tests {
     fn ordered_source_limit_safety_includes_sql_residuals() {
         let rewritten =
             |sql| apply_default_order_if_needed(sql, true, Priority::Interactive, 1_000, None);
+        for direction in ["ASC", "DESC"] {
+            let sql = format!(
+                "WITH chosen AS (SELECT * FROM events WHERE \
+                 attr_get(attributes, 'process.name') = 'kernel') \
+                 SELECT timestamp FROM chosen ORDER BY timestamp {direction} LIMIT 10"
+            );
+            assert_eq!(rewritten(&sql).ordered_source_filter, Some(false));
+        }
         assert!(
             rewritten("SELECT timestamp FROM events ORDER BY timestamp ASC LIMIT 10")
                 .ordered_source_filter
