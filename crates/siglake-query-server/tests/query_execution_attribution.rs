@@ -287,9 +287,9 @@ async fn scan_events_name_the_request_that_produced_them() {
         .init();
 
     let tmp = tempfile::tempdir().unwrap();
-    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    let ice = Arc::new(IcebergContext::open(tmp.path()).await.unwrap());
     needle_table(&ice).await;
-    let app = router(AppState::new(Arc::new(ice), AuthConfig::open()));
+    let app = router(AppState::new(ice.clone(), AuthConfig::open()));
 
     // 1. Two buffered requests overlap: their start, execution-profile and
     //    terminal lines must still form two exact id joins. The recorder holds
@@ -485,5 +485,32 @@ async fn scan_events_name_the_request_that_produced_them() {
             .lines()
             .any(|line| line.starts_with(" plan_nodes=")),
         "execution-profile timings must not be unkeyed continuation lines:\n{formatted}"
+    );
+
+    // 4. The transparent coordinator path classifies this small LIMIT as
+    //    scan_local. Coordinator planning and the local serve are separate
+    //    executions even though they run on one pod for one request.
+    let coordinator_app = router(
+        AppState::new(ice, AuthConfig::open())
+            .with_coordinator(vec!["http://unused.invalid:8089".to_string()], None),
+    );
+    let before = recorder.all().len();
+    let (status, _) = post(
+        &coordinator_app,
+        "/api/v1/sql",
+        serde_json::json!({
+            "query": format!("SELECT host, raw FROM events WHERE {PREDICATE} LIMIT 1"),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let coordinator_log = recorder.all();
+    let coordinator_log = &coordinator_log[before..];
+    let (_, planning_id) = started(coordinator_log, "sql_coordinator");
+    let (_, local_id) = started(coordinator_log, "sql");
+    assert_ne!(
+        planning_id, local_id,
+        "coordinator planning and scan_local serving are separate executions"
     );
 }

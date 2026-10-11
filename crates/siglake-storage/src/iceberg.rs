@@ -78,7 +78,7 @@ use crate::consumed_proof::{
     ReclaimProofSources,
 };
 use crate::index_manager::loaded_table_index_config;
-use crate::query_provider::SiglakeStaticTableProvider;
+use crate::query_provider::{current_query_execution_id, SiglakeStaticTableProvider};
 
 /// Default namespace name. All siglake tables live here.
 pub const NAMESPACE: &str = "siglake";
@@ -11318,6 +11318,80 @@ fn append_coverage_link(committed: &Table) -> Option<AggregateCoverageLink> {
         snapshot_id: snapshot.snapshot_id(),
         sequence_number: snapshot.sequence_number(),
     })
+}
+
+/// Classify the two generations after the coverage predicate refuses them.
+/// Kept pure so the diagnostic does not perform another object read.
+fn coverage_refusal_disposition(
+    reader: Option<(i64, i64)>,
+    coverage: Option<AggregateCoverage>,
+) -> &'static str {
+    let Some((reader_snapshot_id, reader_sequence_number)) = reader else {
+        return "reader_has_no_snapshot";
+    };
+    let Some(coverage) = coverage else {
+        return "object_has_no_coverage";
+    };
+    if coverage.snapshot_id == reader_snapshot_id {
+        return if coverage.sequence_number == reader_sequence_number {
+            "coverage_agrees"
+        } else {
+            "coverage_sequence_mismatch"
+        };
+    }
+    match coverage.sequence_number.cmp(&reader_sequence_number) {
+        std::cmp::Ordering::Less => "object_behind_reader",
+        std::cmp::Ordering::Greater => "object_ahead_of_reader",
+        std::cmp::Ordering::Equal => "coverage_snapshot_divergent",
+    }
+}
+
+#[cfg(test)]
+mod coverage_refusal_disposition_tests {
+    use super::*;
+
+    fn coverage(snapshot_id: i64, sequence_number: i64) -> Option<AggregateCoverage> {
+        Some(AggregateCoverage {
+            snapshot_id,
+            sequence_number,
+        })
+    }
+
+    #[test]
+    fn each_refusal_names_a_different_cause() {
+        assert_eq!(
+            coverage_refusal_disposition(Some((700, 37)), coverage(600, 36)),
+            "object_behind_reader"
+        );
+        assert_eq!(
+            coverage_refusal_disposition(Some((600, 36)), coverage(700, 37)),
+            "object_ahead_of_reader"
+        );
+        assert_eq!(
+            coverage_refusal_disposition(Some((700, 37)), coverage(700, 38)),
+            "coverage_sequence_mismatch"
+        );
+        assert_eq!(
+            coverage_refusal_disposition(Some((700, 37)), coverage(701, 37)),
+            "coverage_snapshot_divergent"
+        );
+        assert_eq!(
+            coverage_refusal_disposition(Some((700, 37)), None),
+            "object_has_no_coverage"
+        );
+        assert_eq!(
+            coverage_refusal_disposition(None, coverage(700, 37)),
+            "reader_has_no_snapshot"
+        );
+    }
+
+    #[test]
+    fn an_agreeing_pair_is_not_labelled_as_a_cause() {
+        assert_eq!(
+            coverage_refusal_disposition(Some((700, 37)), coverage(700, 37)),
+            "coverage_agrees"
+        );
+    }
 }
 
 /// Whether an artifact covering `coverage` also covers the table generation a
@@ -22994,6 +23068,14 @@ impl IcebergContext {
             return Ok(None);
         };
         let Some(agg) = load_side_aggregates(cached.table.file_io(), &path).await? else {
+            let query_execution_id = current_query_execution_id();
+            tracing::debug!(
+                table = %cached.table.identifier(),
+                path = %path,
+                consult = if query_execution_id.is_some() { "query" } else { "background" },
+                query_execution_id = query_execution_id.map(|id| id.0),
+                "side aggregates: no object at the incarnation's path"
+            );
             return Ok(None);
         };
         if !aggregate_covers_current_snapshot(&cached.table, agg.coverage) {
@@ -23002,6 +23084,31 @@ impl IcebergContext {
                 "result" => "unproven_coverage"
             )
             .increment(1);
+            let reader = cached
+                .table
+                .metadata()
+                .current_snapshot()
+                .map(|snapshot| (snapshot.snapshot_id(), snapshot.sequence_number()));
+            let query_execution_id = current_query_execution_id();
+            tracing::debug!(
+                table = %cached.table.identifier(),
+                path = %path,
+                consult = if query_execution_id.is_some() { "query" } else { "background" },
+                query_execution_id = query_execution_id.map(|id| id.0),
+                disposition = %coverage_refusal_disposition(reader, agg.coverage),
+                reader_snapshot_id = reader.map(|(id, _)| id),
+                reader_sequence_number = reader.map(|(_, sequence)| sequence),
+                coverage_snapshot_id = agg.coverage.map(|c| c.snapshot_id),
+                coverage_sequence_number = agg.coverage.map(|c| c.sequence_number),
+                pending_links = agg.coverage_links.len(),
+                pending_link_sequence_numbers = ?agg
+                    .coverage_links
+                    .iter()
+                    .map(|link| link.sequence_number)
+                    .collect::<Vec<_>>(),
+                record_count,
+                "side aggregates: coverage not proven for this generation"
+            );
             return Ok(None);
         }
         let agg = Arc::new(agg);
@@ -34281,6 +34388,83 @@ mod table_cache_fence_tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    /// The refusal line must join to the execution that actually consulted the
+    /// object, while the same read outside a request stays explicitly
+    /// background. Both use the generations already held by the read.
+    #[tokio::test]
+    async fn refused_coverage_distinguishes_query_from_background_consults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        ice.append_events(&[ev("first")]).await.unwrap();
+
+        let ident = ice.table_ident.clone();
+        let entry = ice.cached_table_entry(&ident).await.unwrap();
+        let reader_snapshot_id = entry.snapshot_id.expect("first snapshot");
+        ice.append_events(&[ev("second")]).await.unwrap();
+        let moved_on = ice
+            .cached_table_entry(&ident)
+            .await
+            .unwrap()
+            .snapshot_id
+            .expect("second snapshot");
+        assert_ne!(moved_on, reader_snapshot_id);
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new("siglake_storage=debug"))
+                .with_ansi(false)
+                .with_writer(CapturedLog(captured.clone()))
+                .finish(),
+        );
+        {
+            use tracing::instrument::WithSubscriber;
+            crate::with_query_execution_id(
+                crate::QueryExecutionId(777),
+                ice.cached_side_aggregates(&entry, AggNeed::GroupCounts),
+            )
+            .with_subscriber(subscriber.clone())
+            .await
+            .unwrap();
+            ice.cached_side_aggregates(&entry, AggNeed::GroupCounts)
+                .with_subscriber(subscriber)
+                .await
+                .unwrap();
+        }
+
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        let lines: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains("coverage not proven for this generation"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "each refused consult must emit one line: {log:?}"
+        );
+        assert!(
+            lines[0].contains("consult=\"query\"") && lines[0].contains("query_execution_id=777"),
+            "query refusal lost its execution: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("consult=\"background\"")
+                && !lines[1].contains("query_execution_id="),
+            "background refusal inherited the prior query: {:?}",
+            lines[1]
+        );
+        assert!(
+            lines[0].contains(&format!("reader_snapshot_id={reader_snapshot_id}"))
+                && lines[0].contains(&format!("coverage_snapshot_id={moved_on}"))
+                && lines[0].contains("disposition=object_ahead_of_reader")
+                && lines[0].contains("pending_links="),
+            "refusal lost the generations or disposition from its read: {:?}",
+            lines[0]
+        );
     }
 
     /// #1730 — `SiglakeTableCacheUnpublished` fires per pod off a counter with

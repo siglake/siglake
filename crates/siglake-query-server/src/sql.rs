@@ -4237,6 +4237,19 @@ pub async fn handle(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<SqlRequest>,
 ) -> Result<Response, ApiError> {
+    let execution_id = siglake_storage::QueryExecutionId::next();
+    siglake_storage::with_query_execution_id(
+        execution_id,
+        Box::pin(handle_scoped(state, identity, req)),
+    )
+    .await
+}
+
+async fn handle_scoped(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+) -> Result<Response, ApiError> {
     if req.query.trim().is_empty() {
         return handle_local(State(state), axum::extract::Extension(identity), Json(req)).await;
     }
@@ -4303,14 +4316,14 @@ pub async fn handle(
         // defaulting the selectivity gate off: a caller can retry a 504, and can
         // do nothing at all with a request that never returns.
         return apply_timeout(
-            distributed_inner(
+            Box::pin(distributed_inner(
                 state,
                 identity,
                 req,
                 Some(ice),
                 Some(effective_query),
                 peers,
-            ),
+            )),
             &resolved,
             &unknown_cost,
             clock.deadline,
@@ -4398,7 +4411,13 @@ pub async fn handle_local(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<SqlRequest>,
 ) -> Result<Response, ApiError> {
-    handle_local_inner(state, identity, req, None, None, None).await
+    let execution_id = siglake_storage::current_query_execution_id()
+        .unwrap_or_else(siglake_storage::QueryExecutionId::next);
+    siglake_storage::with_query_execution_id(
+        execution_id,
+        Box::pin(handle_local_inner(state, identity, req, None, None, None)),
+    )
+    .await
 }
 
 async fn handle_local_inner(
@@ -4674,7 +4693,8 @@ async fn handle_local_inner(
     // partition events are emitted from DataFusion's spawned pumps, which
     // carry no request span, and on the NDJSON path they are emitted after
     // this handler has already logged its terminal line.
-    let execution_id = siglake_storage::QueryExecutionId::next();
+    let execution_id = siglake_storage::current_query_execution_id()
+        .unwrap_or_else(siglake_storage::QueryExecutionId::next);
     log_query_execution_start("sql", execution_id, Some(&effective_query.sql), None);
     // ARMED ONLY FOR BUFFERED RESPONSES. An NDJSON response STREAMS its body
     // after this function returns, so a handler-scoped guard would cancel the
@@ -4846,13 +4866,12 @@ async fn handle_local_inner(
                 record_metrics("sql", start, &result_meta, &cost);
                 return result_meta;
             }
-            if let Some(mut body) = under_request_deadline!(try_windowed_count_fast_path_records(
-                &df,
-                &ice,
-                shard,
-                cost.clone(),
-                delta
-            )) {
+            if let Some(mut body) =
+                under_request_deadline!(siglake_storage::with_query_execution_id(
+                    execution_id,
+                    try_windowed_count_fast_path_records(&df, &ice, shard, cost.clone(), delta),
+                ))
+            {
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -4883,13 +4902,12 @@ async fn handle_local_inner(
                 record_metrics("sql", start, &result_meta, &cost);
                 return result_meta;
             }
-            if let Some(mut body) = under_request_deadline!(try_negation_count_fast_path_records(
-                &df,
-                &ice,
-                shard,
-                cost.clone(),
-                delta
-            )) {
+            if let Some(mut body) =
+                under_request_deadline!(siglake_storage::with_query_execution_id(
+                    execution_id,
+                    try_negation_count_fast_path_records(&df, &ice, shard, cost.clone(), delta),
+                ))
+            {
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -4920,13 +4938,12 @@ async fn handle_local_inner(
                 record_metrics("sql", start, &result_meta, &cost);
                 return result_meta;
             }
-            if let Some(mut body) = under_request_deadline!(try_count_distinct_fast_path_records(
-                &df,
-                &ice,
-                shard,
-                cost.clone(),
-                delta
-            )) {
+            if let Some(mut body) =
+                under_request_deadline!(siglake_storage::with_query_execution_id(
+                    execution_id,
+                    try_count_distinct_fast_path_records(&df, &ice, shard, cost.clone(), delta),
+                ))
+            {
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -4957,13 +4974,12 @@ async fn handle_local_inner(
                 record_metrics("sql", start, &result_meta, &cost);
                 return result_meta;
             }
-            if let Some(mut body) = under_request_deadline!(try_grouped_numeric_fast_path_records(
-                &df,
-                &ice,
-                shard,
-                cost.clone(),
-                delta
-            )) {
+            if let Some(mut body) =
+                under_request_deadline!(siglake_storage::with_query_execution_id(
+                    execution_id,
+                    try_grouped_numeric_fast_path_records(&df, &ice, shard, cost.clone(), delta),
+                ))
+            {
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -4994,14 +5010,19 @@ async fn handle_local_inner(
                 record_metrics("sql", start, &result_meta, &cost);
                 return result_meta;
             }
-            if let Some(mut body) = under_request_deadline!(try_group_count_fast_path_records(
-                &df,
-                &ice,
-                shard,
-                cost.clone(),
-                delta,
-                allow_approximate,
-            )) {
+            if let Some(mut body) =
+                under_request_deadline!(siglake_storage::with_query_execution_id(
+                    execution_id,
+                    try_group_count_fast_path_records(
+                        &df,
+                        &ice,
+                        shard,
+                        cost.clone(),
+                        delta,
+                        allow_approximate,
+                    ),
+                ))
+            {
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5032,13 +5053,12 @@ async fn handle_local_inner(
                 record_metrics("sql", start, &result_meta, &cost);
                 return result_meta;
             }
-            if let Some(mut body) = under_request_deadline!(try_date_histogram_fast_path_records(
-                &df,
-                &ice,
-                shard,
-                cost.clone(),
-                delta
-            )) {
+            if let Some(mut body) =
+                under_request_deadline!(siglake_storage::with_query_execution_id(
+                    execution_id,
+                    try_date_histogram_fast_path_records(&df, &ice, shard, cost.clone(), delta),
+                ))
+            {
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -6415,15 +6435,18 @@ async fn run_batch_query(
     log_query_execution_start("sql_batch", execution_id, Some(&query.sql), None);
     let (ctx, cancel_guard) =
         cancellable_batch_context(query_scan, query.preferred_scan_order.clone(), execution_id);
-    run_batch_query_in(
-        ice,
-        query,
-        ctx,
-        cancel_guard,
-        limits,
-        allow_approximate,
-        lifecycle,
-        deadline,
+    siglake_storage::with_query_execution_id(
+        execution_id,
+        Box::pin(run_batch_query_in(
+            ice,
+            query,
+            ctx,
+            cancel_guard,
+            limits,
+            allow_approximate,
+            lifecycle,
+            deadline,
+        )),
     )
     .await
 }
@@ -16191,6 +16214,19 @@ pub async fn shard(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<ShardQueryRequest>,
 ) -> Result<Response, ApiError> {
+    let execution_id = siglake_storage::QueryExecutionId::next();
+    siglake_storage::with_query_execution_id(
+        execution_id,
+        Box::pin(shard_scoped(state, identity, req)),
+    )
+    .await
+}
+
+async fn shard_scoped(
+    state: AppState,
+    identity: CallerIdentity,
+    req: ShardQueryRequest,
+) -> Result<Response, ApiError> {
     if req.query.trim().is_empty() {
         return Err(ApiError::bad_request("query is empty"));
     }
@@ -16304,7 +16340,8 @@ pub async fn shard(
     // versioned wire contract and a pod-local counter would not be comparable
     // anyway. What joins the two halves is the W3C trace context the fan-out
     // already propagates (see `HttpShardRunner::run_detailed`).
-    let execution_id = siglake_storage::QueryExecutionId::next();
+    let execution_id = siglake_storage::current_query_execution_id()
+        .unwrap_or_else(siglake_storage::QueryExecutionId::next);
     let resolved_shard = req.shard.and_then(ShardParam::resolve);
     log_query_execution_start(
         "sql_shard",
@@ -16704,7 +16741,12 @@ pub async fn distributed(
              for the first answer)",
         ));
     };
-    distributed_inner(state, identity, req, None, None, peers).await
+    let execution_id = siglake_storage::QueryExecutionId::next();
+    siglake_storage::with_query_execution_id(
+        execution_id,
+        Box::pin(distributed_inner(state, identity, req, None, None, peers)),
+    )
+    .await
 }
 
 #[tracing::instrument(skip_all, fields(otel.kind = "internal", query = %req.query))]
@@ -16750,8 +16792,15 @@ async fn distributed_inner(
         _ => false,
     };
     if !distributable {
-        return handle_local_inner(state, identity, req, Some(ice), pre_rewritten_query, None)
-            .await;
+        return Box::pin(handle_local_inner(
+            state,
+            identity,
+            req,
+            Some(ice),
+            pre_rewritten_query,
+            None,
+        ))
+        .await;
     }
     let start = Instant::now();
     let format = req.format.unwrap_or_default();
@@ -16781,8 +16830,11 @@ async fn distributed_inner(
     // The coordinator's PRE-DISPATCH work is its own execution: it plans, it
     // cost-estimates and it runs the Tier-1 battery, all of which scan. Its
     // scan events are a different execution from the workers' shards and from
-    // anything this pod serves locally, and this id is what says so.
-    let planning_execution_id = siglake_storage::QueryExecutionId::next();
+    // anything this pod serves locally, and this id is what says so. The
+    // scan_local branch below therefore mints and scopes a second id before it
+    // enters the ordinary local-serving path.
+    let planning_execution_id = siglake_storage::current_query_execution_id()
+        .unwrap_or_else(siglake_storage::QueryExecutionId::next);
     log_query_execution_start(
         "sql_coordinator",
         planning_execution_id,
@@ -16929,50 +16981,49 @@ async fn distributed_inner(
         // six 500s of the first round-2 board.
         let battery_started = Instant::now();
         let delta = tier1_load.as_ref().and_then(BufferDeltaLoad::delta);
-        let served = if let Some(body) = try_count_fast_path_records(
-            &df,
-            None,
-            cost.clone(),
-            delta,
-            tier1_load.as_ref(),
-            "coordinator_tier1_fast_path",
-        ) {
-            Some(body)
-        } else if let Some(body) =
-            try_windowed_count_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
-        {
-            Some(body)
-        } else if let Some(body) =
-            try_negation_count_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
-        {
-            Some(body)
-        } else if let Some(body) =
-            try_count_distinct_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
-        {
-            Some(body)
-        } else if let Some(body) =
-            try_grouped_numeric_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
-        {
-            Some(body)
-        } else if let Some(body) = try_group_count_fast_path_records(
-            &df,
-            &ice,
-            None,
-            cost.clone(),
-            delta,
-            // The caller's `exact` and the operator's kill switch, NOT a
-            // literal `true`. Both controls are documented as deliberate,
-            // and with distribution on by default the coordinator is the
-            // path every user query takes -- so hardcoding here made both
-            // of them inert wherever they actually mattered.
-            AllowApproximate::for_request(&req),
-        )
-        .await?
-        {
-            Some(body)
-        } else {
-            try_date_histogram_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
-        };
+        let served = siglake_storage::with_query_execution_id(planning_execution_id, async {
+            let served = if let Some(body) = try_count_fast_path_records(
+                &df,
+                None,
+                cost.clone(),
+                delta,
+                tier1_load.as_ref(),
+                "coordinator_tier1_fast_path",
+            ) {
+                Some(body)
+            } else if let Some(body) =
+                try_windowed_count_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
+            {
+                Some(body)
+            } else if let Some(body) =
+                try_negation_count_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
+            {
+                Some(body)
+            } else if let Some(body) =
+                try_count_distinct_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
+            {
+                Some(body)
+            } else if let Some(body) =
+                try_grouped_numeric_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
+            {
+                Some(body)
+            } else if let Some(body) = try_group_count_fast_path_records(
+                &df,
+                &ice,
+                None,
+                cost.clone(),
+                delta,
+                AllowApproximate::for_request(&req),
+            )
+            .await?
+            {
+                Some(body)
+            } else {
+                try_date_histogram_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
+            };
+            Ok::<_, ApiError>(served)
+        })
+        .await?;
         if let Some(mut body) = served {
             attach_fast_path_phases(
                 &mut body,
@@ -17050,8 +17101,19 @@ async fn distributed_inner(
     };
     if scan_local {
         metrics::counter!("siglake_query_coordinator_total", "mode" => "scan_local").increment(1);
-        return handle_local_inner(state, identity, req, Some(ice), Some(effective_query), None)
-            .await;
+        let local_execution_id = siglake_storage::QueryExecutionId::next();
+        return siglake_storage::with_query_execution_id(
+            local_execution_id,
+            Box::pin(handle_local_inner(
+                state,
+                identity,
+                req,
+                Some(ice),
+                Some(effective_query),
+                None,
+            )),
+        )
+        .await;
     }
 
     let pin_table = referenced_tables(&effective_query.sql)

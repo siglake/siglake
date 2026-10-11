@@ -583,6 +583,10 @@ pub struct QueryExecutionId(pub u64);
 /// unique, so the partition events stay attributable to their scan node.
 pub const UNATTRIBUTED_QUERY_EXECUTION_ID: u64 = 0;
 
+tokio::task_local! {
+    static QUERY_EXECUTION_CONTEXT: QueryExecutionId;
+}
+
 impl QueryExecutionId {
     /// Mint the next id in this process. Never [`UNATTRIBUTED_QUERY_EXECUTION_ID`].
     ///
@@ -592,6 +596,98 @@ impl QueryExecutionId {
     pub fn next() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Run request-owned work with its execution identity available to nested
+/// storage diagnostics.
+///
+/// Tokio task locals are scoped to this future: concurrent requests cannot
+/// overwrite one another, a dropped or failed future cannot leak its identity
+/// into later work on the same runtime worker, and separately spawned cache
+/// warmers do not inherit the request that happened to launch them.
+pub async fn with_query_execution_id<F>(execution_id: QueryExecutionId, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    QUERY_EXECUTION_CONTEXT.scope(execution_id, future).await
+}
+
+/// Identity attached to the current request-owned future, if this work belongs
+/// to a query rather than a background consult.
+pub fn current_query_execution_id() -> Option<QueryExecutionId> {
+    QUERY_EXECUTION_CONTEXT.try_with(|id| *id).ok()
+}
+
+#[cfg(test)]
+mod query_execution_context_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn concurrent_query_identities_do_not_cross_attribute() {
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let left_barrier = barrier.clone();
+        let right_barrier = barrier;
+        let left = with_query_execution_id(QueryExecutionId(101), async move {
+            left_barrier.wait().await;
+            tokio::task::yield_now().await;
+            current_query_execution_id()
+        });
+        let right = with_query_execution_id(QueryExecutionId(202), async move {
+            right_barrier.wait().await;
+            tokio::task::yield_now().await;
+            current_query_execution_id()
+        });
+
+        let (left, right) = tokio::join!(left, right);
+        assert_eq!(left, Some(QueryExecutionId(101)));
+        assert_eq!(right, Some(QueryExecutionId(202)));
+    }
+
+    #[tokio::test]
+    async fn background_consult_does_not_inherit_a_finished_or_spawn_parent_query() {
+        assert_eq!(current_query_execution_id(), None);
+        with_query_execution_id(QueryExecutionId(303), async {
+            assert_eq!(current_query_execution_id(), Some(QueryExecutionId(303)));
+        })
+        .await;
+        assert_eq!(current_query_execution_id(), None);
+
+        let spawned = with_query_execution_id(QueryExecutionId(404), async {
+            tokio::spawn(async { current_query_execution_id() })
+                .await
+                .unwrap()
+        })
+        .await;
+        assert_eq!(spawned, None);
+        assert_eq!(current_query_execution_id(), None);
+    }
+
+    #[tokio::test]
+    async fn nested_and_failed_scopes_restore_their_caller() {
+        let outer = with_query_execution_id(QueryExecutionId(505), async {
+            let inner = with_query_execution_id(QueryExecutionId(606), async {
+                assert_eq!(current_query_execution_id(), Some(QueryExecutionId(606)));
+                Err::<(), _>("failed")
+            })
+            .await;
+            assert_eq!(inner, Err("failed"));
+            current_query_execution_id()
+        })
+        .await;
+        assert_eq!(outer, Some(QueryExecutionId(505)));
+        assert_eq!(current_query_execution_id(), None);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_scoped_future_leaves_no_request_identity() {
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            with_query_execution_id(QueryExecutionId(707), std::future::pending::<()>()),
+        )
+        .await;
+        assert!(cancelled.is_err());
+        assert_eq!(current_query_execution_id(), None);
     }
 }
 
