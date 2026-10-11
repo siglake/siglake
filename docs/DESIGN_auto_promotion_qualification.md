@@ -1,8 +1,9 @@
 # Attribute auto-promotion: qualification of the opt-in path
 
-*2026-09-17 (#3052), observability added 2026-09-21 (#5060). Status: qualified
-as opt-in, at its bounds. No default change proposed, and this document does
-not authorize one.*
+*2026-09-17 (#3052), observability added 2026-09-21 (#5060), managed-index
+streaming field-ID repair 2026-10-11 (#6820). Status: qualified as opt-in, at
+its bounds. No default change proposed, and this document does not authorize
+one.*
 
 Prerequisite reading: `DESIGN_ws7_attr_get_pruning.md` (what promotion is for),
 `crates/siglake-core/src/promote.rs` (extraction), `LIMITATIONS.md`.
@@ -36,9 +37,12 @@ already does:
    results.
 5. **Materialize, backfill, gate.** The write path extracts the new columns on
    the next commit; re-clustering rewrites the older files, re-extracting from
-   their JSON; `ensure_promotion_backfill_property` flips the completion
-   property once every live file carries every promoted column; only then does
-   the query server rewrite `attr_get(attributes, k)` to the column.
+   their JSON. A streaming rewrite runs schema alignment again after extraction
+   because a managed index's catalog-assigned field IDs differ from the
+   canonical IDs the extractor stamps. `ensure_promotion_backfill_property`
+   flips the completion property once every live file carries every promoted
+   column; only then does the query server rewrite `attr_get(attributes, k)`
+   to the column.
 
 Step 4 is why this card exists. Nothing in steps 1–3 asks an operator
 anything, and step 5 is where a wrong answer would become visible — after the
@@ -147,6 +151,11 @@ typed, once in the residual JSON, which promotion does not prune).
   spellings; a promoted key's answer is exact before the promotion, mid-backfill
   (where the column is short by the pre-promotion files) and after the gate
   flips, when both spellings agree per group and in total.
+- `crates/siglake-storage/tests/promotion_backfill_field_ids.rs`: a narrow
+  managed index persists a four-type promotion wave across old files and a
+  later append, then takes the page-bounded backfill path. The committed files
+  carry every index-owned field ID, conserve every row, preserve nulls, and
+  match each residual JSON value and count.
 - Already covered before this card, and unchanged by it:
   `promoted_prune.rs` (pruning, the pre-promotion soundness case, the
   autonomous loop on the events table and on a user index, nested leaves, the
