@@ -112,6 +112,7 @@ struct SelectedFsBatch {
     paths: Vec<PathBuf>,
     physical_bytes: u64,
     decoded_bytes: u64,
+    max_segment_decoded_bytes: u64,
 }
 
 struct CommitOutcome {
@@ -3385,6 +3386,16 @@ impl Compactor {
                 ) {
                     break;
                 }
+                tracing::info!(
+                    tenant = tenant_label,
+                    segments = selected.paths.len(),
+                    physical_bytes = selected.physical_bytes,
+                    decoded_bytes = selected.decoded_bytes,
+                    max_segment_decoded_bytes = selected.max_segment_decoded_bytes,
+                    decoded_budget_bytes = decoded_byte_budget,
+                    inflight_decoded_bytes_before = inflight_decoded_bytes,
+                    "filesystem WAL batch admitted"
+                );
                 offset += selected.paths.len();
                 // #4651: charge the attempt before the claim, so a claim that
                 // fails half-way through the batch is counted too — that path
@@ -4226,6 +4237,7 @@ impl Compactor {
         let mut paths = Vec::new();
         let mut physical_bytes = 0u64;
         let mut decoded_bytes = 0u64;
+        let mut max_segment_decoded_bytes = 0u64;
         for path in sealed {
             let physical = std::fs::metadata(path)
                 .with_context(|| format!("stat {}", path.display()))?
@@ -4242,12 +4254,14 @@ impl Compactor {
             }
             physical_bytes = physical_bytes.saturating_add(physical);
             decoded_bytes = decoded_bytes.saturating_add(decoded);
+            max_segment_decoded_bytes = max_segment_decoded_bytes.max(decoded);
             paths.push(path.clone());
         }
         Ok(SelectedFsBatch {
             paths,
             physical_bytes,
             decoded_bytes,
+            max_segment_decoded_bytes,
         })
     }
 }
@@ -7931,6 +7945,7 @@ mod backpressure_gate_tests {
             .unwrap();
         assert_eq!(selected.paths.len(), 2);
         assert_eq!(selected.decoded_bytes, decoded_budget);
+        assert_eq!(selected.max_segment_decoded_bytes, decoded[0].max(decoded[1]));
 
         let selected_native_bytes: u64 = selected
             .paths
