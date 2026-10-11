@@ -12,6 +12,7 @@ mod indexes;
 mod limits;
 mod oidc;
 mod ordered_browse_early_stop;
+mod ordered_residual_limit;
 mod preflight_after_fastpath;
 mod promoted_prune;
 mod residual_browse;

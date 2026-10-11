@@ -80,6 +80,7 @@ opentelemetry_sdk = { workspace = true }
 # middleware against the `TraceLayer` it replaced on this router.
 tower-http = { workspace = true }
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "gen-tonic-messages", "trace", "with-serde"] }
+parquet = { workspace = true }
 rcgen = "0.13"
 tempfile = "3"
 
