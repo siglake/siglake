@@ -2051,6 +2051,22 @@ fn ordered_source_filter(
     if query.with.is_some() {
         return Some(false);
     }
+    // Source LIMIT is valid only for a row-preserving SELECT. Reuse the
+    // conservative browse-shape proof, ignoring only this query's explicit
+    // ORDER BY: aggregate, DISTINCT, window, QUALIFY and derived shapes must
+    // consume their complete input before SQL's final LIMIT is applied.
+    let mut source_shape = query.clone();
+    source_shape.order_by = None;
+    if default_order_shape_table(&source_shape).is_none() {
+        return Some(false);
+    }
+    // The source advertises event-time order only. A secondary key can change
+    // which rows survive at a timestamp tie, so it cannot share the source cap.
+    if let Some(order) = &query.order_by {
+        if !matches!(&order.kind, OrderByKind::Expressions(expressions) if expressions.len() == 1) {
+            return Some(false);
+        }
+    }
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Some(false);
     };
@@ -11683,6 +11699,19 @@ mod tests {
                 apply_default_order_if_needed(&sql, true, Priority::Interactive, 1_000, None)
                     .ordered_source_filter,
                 Some(false)
+            );
+        }
+        for sql in [
+            "SELECT timestamp, COUNT(*) FROM events GROUP BY timestamp ORDER BY timestamp ASC LIMIT 10",
+            "SELECT DISTINCT timestamp FROM events ORDER BY timestamp DESC LIMIT 10",
+            "SELECT timestamp, COUNT(*) OVER () FROM events ORDER BY timestamp ASC LIMIT 10",
+            "SELECT timestamp, raw FROM events ORDER BY timestamp DESC, raw DESC LIMIT 10",
+        ] {
+            assert_eq!(
+                apply_default_order_if_needed(sql, true, Priority::Interactive, 1_000, None)
+                    .ordered_source_filter,
+                Some(false),
+                "{sql}"
             );
         }
         assert!(

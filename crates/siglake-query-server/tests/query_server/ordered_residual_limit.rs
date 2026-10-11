@@ -248,3 +248,104 @@ async fn residual_attr_get_filter_precedes_ordered_limit_in_both_directions() {
         assert_eq!(timestamps(&time_bound), got_unfiltered);
     }
 }
+
+// These operators preserve neither the cardinality nor the complete-input
+// semantics needed by a source cap. Repeated timestamps make truncation visible
+// in group counts and DISTINCT cardinality; a window checks the full row count.
+#[tokio::test]
+async fn non_row_preserving_shapes_and_secondary_ties_precede_ordered_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = Arc::new(
+        IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap(),
+    );
+    let base = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
+    let mut events = Vec::new();
+    for day in 0..2i64 {
+        for bucket in 0..6i64 {
+            for copy in 0..4 {
+                let mut event = Event::now(format!("copy-{copy}"));
+                event.timestamp = base + Duration::days(day) + Duration::seconds(bucket);
+                events.push(event);
+            }
+        }
+    }
+    ice.append_events(&events).await.unwrap();
+    assert_eq!(
+        ice.live_data_files(ice.events_table_ident())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let app = router(AppState::new(ice, AuthConfig::open()));
+    let unique: Vec<i64> = events
+        .chunks(4)
+        .map(|group| group[0].timestamp.timestamp_micros())
+        .collect();
+    for direction in ["ASC", "DESC"] {
+        let expected: Vec<i64> = if direction == "ASC" {
+            unique.iter().take(10).copied().collect()
+        } else {
+            unique.iter().rev().take(10).copied().collect()
+        };
+        let grouped = query(&app, &format!("SELECT timestamp AS value, COUNT(*) AS n FROM events GROUP BY timestamp ORDER BY timestamp {direction} LIMIT 10")).await;
+        assert_eq!(timestamps(&grouped), expected);
+        assert!(
+            grouped["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["n"].as_u64() == Some(4)),
+            "{grouped}"
+        );
+        let distinct = query(&app, &format!("SELECT DISTINCT timestamp AS value FROM events ORDER BY timestamp {direction} LIMIT 10")).await;
+        assert_eq!(timestamps(&distinct), expected);
+        let window = query(&app, &format!("SELECT timestamp AS value, COUNT(*) OVER () AS n FROM events ORDER BY timestamp {direction} LIMIT 10")).await;
+        assert_eq!(window["row_count"].as_u64(), Some(10));
+        assert!(
+            window["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["n"].as_u64() == Some(48)),
+            "{window}"
+        );
+        let tied = query(&app, &format!("SELECT timestamp AS value, raw FROM events ORDER BY timestamp {direction}, raw DESC LIMIT 10")).await;
+        let mut expected_ties: Vec<_> = events
+            .iter()
+            .map(|event| (event.timestamp.timestamp_micros(), event.raw.clone()))
+            .collect();
+        expected_ties.sort_by(|a, b| {
+            let time = if direction == "ASC" {
+                a.0.cmp(&b.0)
+            } else {
+                b.0.cmp(&a.0)
+            };
+            time.then_with(|| b.1.cmp(&a.1))
+        });
+        let actual_ties: Vec<_> = timestamps(&tied)
+            .into_iter()
+            .zip(
+                tied["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["raw"].as_str().unwrap().to_owned()),
+            )
+            .collect();
+        assert_eq!(
+            actual_ties,
+            expected_ties.into_iter().take(10).collect::<Vec<_>>()
+        );
+        let plain = query(
+            &app,
+            &format!(
+                "SELECT timestamp AS value FROM events ORDER BY timestamp {direction} LIMIT 10"
+            ),
+        )
+        .await;
+        assert_eq!(plain["row_count"].as_u64(), Some(10));
+    }
+}
