@@ -924,8 +924,11 @@ may hold another rule's values. The backfill-completion property
 qualified under an older rule is no longer qualified: the rewrite and the
 prune hints stay off and queries answer from the residual JSON — correct, and
 as slow as they were before the promotion — until every pre-adoption file has
-been rewritten, which normal compaction does on its own and an operator can
-force with a recluster pass. Nothing migrates data automatically. Version 1
+been rewritten. Compaction gets there on a table that keeps being written to,
+and not at all on one whose files have settled at the terminal level or the
+merge-generation cap; the WS-7 backfill selector does not help, because it
+picks files by a missing promoted column and these carry theirs. Nothing
+migrates data automatically and no command forces it. Version 1
 (0.2.1 and earlier) retried the literal key only at the top level, so a key
 `a.b.c` whose object under `a` held a literal `"b.c"` key promoted to NULL
 while `attr_get` returned the value (#6769).

@@ -1611,11 +1611,19 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   `attr_get`→column rewrite and the promoted-column prune stay off for it until
   every file at or below that sequence has been rewritten. Those queries are
   correct — they read the residual JSON, which is what they did before the
-  promotion — but they scan. Nothing rewrites the data on its own schedule:
-  compaction converges a table that keeps writing, and an operator who wants
-  the speedup back sooner forces it with a recluster pass over the table's live
-  files (the rewrite re-extracts every row through the current rule). There is
-  no repair that fixes the values in place, and no automatic migration.
+  promotion — but they scan. A rewrite is what re-extracts the values through
+  the current rule, and nothing schedules one for this reason: the WS-7
+  backfill selector picks files by a MISSING promoted column
+  (`iceberg.rs`'s `ScoredBinKind::Backfill`), not by which rule wrote the
+  values it finds, and a pre-adoption file carries the column already. Level
+  and depth triggers rewrite what keeps being written to, so a table under
+  continuing ingest converges by itself; a file that has reached the terminal
+  level or the merge-generation cap in a disjoint partition is never selected
+  again and keeps its old values indefinitely. No operator command rewrites a
+  table's live files on demand — `siglake migrate-schema` widens the catalog
+  schema and rewrites nothing — so for a cold table the practical answer is to
+  leave it unqualified: the queries stay correct. There is no repair that fixes
+  the values in place, and no automatic migration.
 - **Tier-1 group counts serve only columns present since the table's first
   commit.** The serving guard is `column_total(column) == record_count`, so a
   column that starts accumulating mid-life — a typed column on a table created

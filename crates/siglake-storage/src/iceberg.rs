@@ -14876,10 +14876,13 @@ impl IcebergContext {
     /// files written after it can qualify the table for the `attr_get`
     /// rewrite and the promoted-column prune hints.
     ///
-    /// This writes a property; it never rewrites data. An operator who wants
-    /// the optimization back before natural turnover reaches the old files
-    /// must rewrite them deliberately (a full recluster pass re-extracts every
-    /// row through the current rule) — see `docs/LIMITATIONS.md`.
+    /// This writes a property; it never rewrites data, and nothing schedules a
+    /// rewrite for this reason: the WS-7 backfill selector picks files by a
+    /// MISSING promoted column, and these carry theirs. A table under
+    /// continuing ingest converges through the ordinary level and depth
+    /// triggers; one whose files have settled at the terminal level or the
+    /// merge-generation cap keeps its old values, and no operator command
+    /// rewrites them on demand — see `docs/LIMITATIONS.md`.
     /// Returns `true` when this call wrote the stamp.
     pub async fn adopt_promotion_extraction(&self, table_ident: &TableIdent) -> Result<bool> {
         let table = self
