@@ -7945,7 +7945,10 @@ mod backpressure_gate_tests {
             .unwrap();
         assert_eq!(selected.paths.len(), 2);
         assert_eq!(selected.decoded_bytes, decoded_budget);
-        assert_eq!(selected.max_segment_decoded_bytes, decoded[0].max(decoded[1]));
+        assert_eq!(
+            selected.max_segment_decoded_bytes,
+            decoded[0].max(decoded[1])
+        );
 
         let selected_native_bytes: u64 = selected
             .paths
