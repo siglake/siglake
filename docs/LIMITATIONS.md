@@ -1730,10 +1730,18 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   1Gi is not established: the measurement is peak heap growth above a recorded
   baseline on fixtures three orders of magnitude smaller. A 2026-10-11 matched
   field attempt OOM-killed both the 256 MiB and 64 MiB arms during filesystem
-  drain startup. #6744 adds decoded-WAL admission, but one oversized segment
-  still admits alone. This is not a hard peak-memory bound; fresh 1Gi field
-  qualification is required before claiming the OOM is resolved. The merge path's side
-  of the row-group question is measured separately in
+  drain startup. The follow-up packaged run, after decoded-WAL admission and the
+  one-chunk prefetch fix, still OOM-killed three times: every kill followed a
+  decoded WAL admission below 128 MiB and a page-bounded merge plan. The logs do
+  not identify the allocation that crossed the cgroup limit. A combined-role
+  process at or below 1Gi now serializes complete drain cycles and re-clustering
+  passes through one decoded-work permit, removing that simultaneous ownership.
+  The final local real-path regression observed 100,110,336 bytes RSS before the
+  raced operations and 133,320,704 bytes at peak, then proved exact row,
+  timestamp, NULL and attribute parity. It is not the shipped field workload:
+  fresh 1Gi qualification on the retained canonical field remains required before
+  claiming the OOM is resolved. One oversized WAL segment also still admits
+  alone. The merge path's row-group question is measured separately in
   `docs/DESIGN_row_group_target_qualification.md`.
 - **The packaged compactor's row-group target is qualified locally and nowhere
   else.** `TARGET_ROW_GROUP_UNCOMPRESSED_BYTES` is 256 MiB and the packaged

@@ -346,7 +346,12 @@ compactor under the shipped 1024 MiB setting. New WAL zstd frames expose their
 uncompressed size without decoding; segments written by older builds are sized
 through a streaming decoder before claim. An oversized segment is admitted
 alone to preserve progress, so the target does not guarantee peak memory or
-prevent every OOM. The drain keeps
+prevent every OOM. In a combined-role process whose cgroup limit is at or below
+the packaged 1Gi setting, a drain cycle and a re-clustering pass take one shared
+decoded-work permit. The permit spans the complete drain claim through append
+and the complete re-clustering pass, so a decoded WAL batch cannot remain live
+beside the merge's fetched chunk and open writer row group. Larger and unlimited
+processes retain drain/re-cluster overlap. The drain keeps
 `SIGLAKE_DRAIN_CONCURRENCY` commits in flight
 *continuously* — topping up the moment one lands, re-listing `sealed/` as new
 segments arrive — bounded by a per-pass budget so compaction and gauges keep
@@ -1104,6 +1109,10 @@ through 200 GB and 1 TB sustained-ingest rounds
   by partition value, but which merge a bin takes depends on its size, so it is
   held to the same one-partition contract (see
   [`LIMITATIONS.md`](LIMITATIONS.md)).
+  The packaged 1Gi combined role makes a merge pass and a WAL drain cycle take
+  turns in one decoded-work slot, rather than adding their independently
+  bounded working sets. This can delay WAL freshness for the duration of one
+  bounded pass; larger compactors keep the concurrent scheduler.
   Merged output is where deferred indexes materialize, in one of
   two shapes: an in-RAM merge writes the full inline set, including the footer
   inverted indexes (with Puffin overflow) and the whole-file raw trigram

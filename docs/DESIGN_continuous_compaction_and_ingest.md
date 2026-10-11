@@ -119,6 +119,11 @@ Coexistence without starving the commit path:
   tiered path remains behind `SIGLAKE_RECLUSTER_TIERED_MERGE=1`. Plan-phase
   cost is 8 bytes/row of timestamps; a pipelined next-chunk prefetch is the
   known follow-on if chunk-sequential fetch shows up in bench latency.
+  **Update (2026-10-11):** the packaged 1Gi combined role does not overlap a
+  drain cycle with a re-clustering pass. Each independently bounded path takes
+  one shared decoded-work permit for its full lifetime, after a retained field
+  run OOM-killed while a sub-128 MiB decoded WAL batch and page-bounded merge
+  were both active. Larger and unlimited processes keep the concurrent plan.
 - **Backpressure-aware sharing.** A shared signal from the WAL queue depth
   (`siglake_ingest_backpressure_*`, already exported): if drain falls behind (WAL
   growing), compaction throttles (fewer concurrent merges) to yield IO; if L0 piles

@@ -53,11 +53,11 @@ use siglake_storage::catalog_claim::{
 };
 use siglake_storage::consumed_proof::{ConsumedProofEntry, ConsumedProofRead, ReclaimProofSources};
 use siglake_storage::iceberg::{
-    AppendIncarnationMismatch, AutoPromotionDecline, AutoPromotionDeclineReason, DeleteTaskState,
-    IcebergContext, LevelPolicy, LeveledPassOptions, NonTerminalDeleteTask,
-    NonTerminalDeleteTaskObservation, ObservedDeleteTaskClaim, ProofMaintenanceIncarnationMismatch,
-    ReclusterPolicy, ShortAggregateAttemptReason, ShortAggregateAttemptStart,
-    ShortAggregateOutcome,
+    cgroup_memory_limit_bytes, AppendIncarnationMismatch, AutoPromotionDecline,
+    AutoPromotionDeclineReason, DeleteTaskState, IcebergContext, LevelPolicy, LeveledPassOptions,
+    NonTerminalDeleteTask, NonTerminalDeleteTaskObservation, ObservedDeleteTaskClaim,
+    ProofMaintenanceIncarnationMismatch, ReclusterPolicy, ShortAggregateAttemptReason,
+    ShortAggregateAttemptStart, ShortAggregateOutcome,
 };
 use siglake_wal::{
     claim_segment, finish_segment, list_committed, list_index_dirs, list_orphaned, list_poisoned,
@@ -724,6 +724,13 @@ pub struct Compactor {
     commit_batch: Option<CommitBatchPolicy>,
     drain_concurrency: Option<usize>,
     drain_cycle_budget: Option<Duration>,
+    /// One permit shared by WAL drain and re-clustering on compactor processes
+    /// at or below the packaged 1 GiB limit. Each path has its own decoded
+    /// memory bound, but those bounds are not additive: the retained field OOM
+    /// had a 128 MiB decoded WAL batch live while a page-bounded merge owned a
+    /// fetched chunk and an open writer row group. Larger processes retain the
+    /// concurrent scheduler; the packaged process serializes the two owners.
+    decoded_work_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// See [`Self::with_poison_attempts`]; `None` reads the environment.
     poison_attempts: Option<u32>,
     /// #3143: consecutive read failures charged to each local segment, by file
@@ -779,6 +786,8 @@ impl Compactor {
             commit_batch: None,
             drain_concurrency: None,
             drain_cycle_budget: None,
+            decoded_work_gate: serialize_drain_and_recluster_from(cgroup_memory_limit_bytes())
+                .then(|| Arc::new(tokio::sync::Semaphore::new(1))),
             poison_attempts: None,
             segment_read_failures: Default::default(),
             verified_owner_for_test: None,
@@ -815,6 +824,35 @@ impl Compactor {
     pub fn with_drain_cycle_budget(mut self, budget: Duration) -> Self {
         self.drain_cycle_budget = Some(budget.max(Duration::from_millis(100)));
         self
+    }
+
+    /// Pin whether WAL drain and re-clustering share one decoded-work slot.
+    ///
+    /// Production derives this from the process cgroup. This builder exists so
+    /// constrained-memory regression tests can exercise the packaged policy on
+    /// a development host whose cgroup is larger than 1 GiB.
+    #[doc(hidden)]
+    pub fn with_serial_decoded_work_for_test(mut self, serial: bool) -> Self {
+        self.decoded_work_gate = serial.then(|| Arc::new(tokio::sync::Semaphore::new(1)));
+        self
+    }
+
+    async fn decoded_work_permit(
+        &self,
+        owner: &'static str,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let gate = self.decoded_work_gate.as_ref()?.clone();
+        let started = std::time::Instant::now();
+        let permit = gate
+            .acquire_owned()
+            .await
+            .expect("decoded-work semaphore is never closed");
+        metrics::histogram!(
+            "siglake_compactor_decoded_work_wait_seconds",
+            "owner" => owner
+        )
+        .record(started.elapsed().as_secs_f64());
+        Some(permit)
     }
 
     /// Pin how many consecutive failed reads a local segment gets before the
@@ -1962,6 +2000,11 @@ impl Compactor {
         let Some(cfg) = self.recluster.as_ref() else {
             return Ok(0);
         };
+        // Paired with `run_once`. Keep the permit for the whole pass rather
+        // than one bin: releasing between bins would let a WAL batch start and
+        // remain live when the next bin begins, recreating the overlap this
+        // gate removes.
+        let _decoded_work = self.decoded_work_permit("recluster").await;
         self.compact_acknowledged_proofs(&self.ice).await?;
         tracing::debug!(?opts, "re-clustering pass starting");
         let pass_start = std::time::Instant::now();
@@ -2628,6 +2671,13 @@ impl Compactor {
     /// were none to process).
     #[tracing::instrument(skip_all)]
     pub async fn run_once(&self) -> Result<usize> {
+        // The permit covers selection through append and release: decoded WAL
+        // arrays are created below the claim and remain owned until the commit
+        // future returns. On the packaged compactor a re-cluster pass takes the
+        // same permit, so its fetched chunks and writer row group cannot overlap
+        // this allocation even though the run-loop schedules the pass on a
+        // background task.
+        let _decoded_work = self.decoded_work_permit("drain").await;
         if self.catalog.is_some() {
             return self.run_once_catalog().await;
         }
@@ -5142,6 +5192,19 @@ fn drain_inflight_budget_bytes() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .map(|mb| mb.clamp(64, 65_536).saturating_mul(1024 * 1024))
         .unwrap_or(1024 * 1024 * 1024)
+}
+
+/// Whether WAL drain and re-clustering must take turns owning decoded memory.
+///
+/// The boundary is the shipped compactor shape, not a new sizing factor: the
+/// retained failure is from that exact 1 GiB cgroup, where the independently
+/// bounded 128 MiB WAL admission overlapped a page-bounded merge. A larger or
+/// unlimited process keeps the established concurrent scheduler. Operators who
+/// size below the packaged limit get the same containment rather than a less
+/// safe policy.
+fn serialize_drain_and_recluster_from(memory_limit: Option<u64>) -> bool {
+    const PACKAGED_COMPACTOR_LIMIT: u64 = 1024 * 1024 * 1024;
+    memory_limit.is_some_and(|limit| limit <= PACKAGED_COMPACTOR_LIMIT)
 }
 
 /// Total decoded Arrow IPC admitted across every live filesystem-drain batch.
@@ -8071,6 +8134,18 @@ mod backpressure_gate_tests {
         );
     }
 
+    #[test]
+    fn shipped_one_gib_profile_serializes_drain_and_recluster() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert!(serialize_drain_and_recluster_from(Some(GIB)));
+        assert!(serialize_drain_and_recluster_from(Some(GIB / 2)));
+        assert!(!serialize_drain_and_recluster_from(Some(GIB + 1)));
+        assert!(
+            !serialize_drain_and_recluster_from(None),
+            "an unlimited or unreadable cgroup retains the established scheduler"
+        );
+    }
+
     /// Native Arrow allocation regression for #6744. Four field-shaped WAL
     /// segments compress beneath the old physical claim cap together, while
     /// their decoded arrays exceed the test budget. Selection must retain only
@@ -8149,6 +8224,280 @@ mod backpressure_gate_tests {
             old_physical_only_native_bytes,
             "two of four equal field segments must retain half the old native allocation"
         );
+    }
+}
+
+#[cfg(test)]
+mod combined_memory_regression_tests {
+    use super::*;
+    use arrow_array::{Array, Int64Array, StringArray};
+    use chrono::{TimeZone, Utc};
+    use datafusion::physical_plan::execute_stream;
+    use datafusion::prelude::SessionContext;
+    use futures::StreamExt;
+    use siglake_storage::iceberg::{MergePathKind, ReclusterMergeOptions, BLOOM_FILTER_COLUMNS};
+    use siglake_wal::WalWriter;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    const INPUT_FILES: usize = 8;
+    const ROWS_PER_FILE: usize = 2_000;
+    const WAL_FILE: usize = INPUT_FILES;
+    const TOTAL_ROWS: usize = (INPUT_FILES + 1) * ROWS_PER_FILE;
+
+    fn resident_bytes() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").expect("read process status");
+        let kib = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("VmRSS in /proc/self/status");
+        kib * 1024
+    }
+
+    fn event(file: usize, row: usize) -> siglake_core::Event {
+        let base = Utc.with_ymd_and_hms(2026, 10, 11, 0, 0, 0).unwrap();
+        let mut event = siglake_core::Event {
+            timestamp: base + chrono::Duration::milliseconds(row as i64),
+            host: format!("host-{}", row % 97),
+            source: format!("source-{}", file % 3),
+            sourcetype: if row.is_multiple_of(2) { "even" } else { "odd" }.into(),
+            index: "main".into(),
+            raw: format!("f{file:02}-r{row:05}:{}", "field-payload-".repeat(64)),
+            attributes: None,
+        };
+        if !(file + row).is_multiple_of(3) {
+            event.attributes = Some(format!(r#"{{"file":{file},"row":{row}}}"#));
+        }
+        event
+    }
+
+    fn parse_id(raw: &str) -> (usize, usize) {
+        let prefix = raw.split_once(':').expect("fixture raw prefix").0;
+        let (file, row) = prefix.split_once("-r").expect("fixture raw id");
+        (
+            file.trim_start_matches('f').parse().unwrap(),
+            row.parse().unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn recluster_entry_waits_for_the_packaged_decoded_work_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        let compactor = Arc::new(
+            Compactor::new(tmp.path().join("wal"), ice)
+                .with_reclustering(ReclusterConfig::new(Duration::ZERO))
+                .with_serial_decoded_work_for_test(true),
+        );
+        let held = compactor.decoded_work_permit("test").await;
+        let task = {
+            let compactor = compactor.clone();
+            tokio::spawn(async move { compactor.run_recluster_once().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "the production re-cluster entry must wait behind decoded WAL ownership"
+        );
+        drop(held);
+        assert_eq!(task.await.unwrap().unwrap(), 0);
+    }
+
+    /// The packaged combined role used to let the decoded WAL claim and a
+    /// page-bounded merge own memory at the same time. Drive both real paths
+    /// from one start barrier under the 1 GiB policy, retain the observed RSS
+    /// high-water mark, then validate every source row (including NULLs and the
+    /// exact nanosecond timestamp) in the committed output.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "process-wide RSS ceiling must run alone; use the exact test filter"]
+    async fn packaged_memory_serializes_real_page_merge_and_wal_with_exact_parity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+
+        for file in 0..INPUT_FILES {
+            let events: Vec<_> = (0..ROWS_PER_FILE).map(|row| event(file, row)).collect();
+            ice.append_events(&events).await.unwrap();
+        }
+        let merge_inputs = ice.live_data_files(ice.events_table_ident()).await.unwrap();
+        assert_eq!(merge_inputs.len(), INPUT_FILES);
+
+        let mut writer = WalWriter::with_thresholds(
+            &wal,
+            "combined-memory",
+            ROWS_PER_FILE,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let wal_events: Vec<_> = (0..ROWS_PER_FILE).map(|row| event(WAL_FILE, row)).collect();
+        assert!(writer.append_events(&wal_events).unwrap().is_some());
+        drop(wal_events);
+        drop(writer);
+
+        let compactor = Compactor::new(&wal, ice.clone())
+            .with_serial_decoded_work_for_test(true)
+            .with_fs_batch_limits(1, 0);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(resident_bytes()));
+        let baseline = resident_bytes();
+        let sampler = {
+            let stop = stop.clone();
+            let peak = peak.clone();
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    peak.fetch_max(resident_bytes(), Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                peak.fetch_max(resident_bytes(), Ordering::Relaxed);
+            })
+        };
+
+        let merge = {
+            let compactor = compactor.clone();
+            let ice = ice.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let _permit = compactor.decoded_work_permit("recluster").await;
+                ice.recluster_files_with(
+                    ice.events_table_ident(),
+                    merge_inputs,
+                    BLOOM_FILTER_COLUMNS,
+                    &ReclusterMergeOptions {
+                        force_streaming: Some(true),
+                        merge_fanin: Some(2),
+                        force_tiered: Some(false),
+                        merge_chunk_rows: Some(4_096),
+                        merge_chunk_prefetch: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+            })
+        };
+        let drain = {
+            let compactor = compactor.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                compactor.run_once().await
+            })
+        };
+        barrier.wait().await;
+        let (merge_stats, drained) = tokio::join!(merge, drain);
+        let merge_stats = merge_stats.unwrap().unwrap();
+        assert_eq!(merge_stats.merge_path, Some(MergePathKind::PageBounded));
+        assert_eq!(merge_stats.rows, INPUT_FILES * ROWS_PER_FILE);
+        assert_eq!(drained.unwrap().unwrap(), 1);
+
+        stop.store(true, Ordering::Relaxed);
+        sampler.await.unwrap();
+        let peak = peak.load(Ordering::Relaxed);
+        eprintln!(
+            "combined merge/WAL RSS baseline={} peak={} growth={}",
+            baseline,
+            peak,
+            peak.saturating_sub(baseline)
+        );
+        assert!(
+            peak < 1024 * 1024 * 1024,
+            "real merge/WAL fixture exceeded the packaged 1 GiB limit: baseline={baseline}, peak={peak}"
+        );
+
+        let ctx = SessionContext::new();
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        let plan = ctx
+            .sql(
+                "SELECT timestamp_ns, host, source, sourcetype, \"index\", raw, attributes \
+                 FROM events",
+            )
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let mut stream = execute_stream(plan, ctx.task_ctx()).unwrap();
+        let mut seen = vec![false; TOTAL_ROWS];
+        let base_ns = Utc
+            .with_ymd_and_hms(2026, 10, 11, 0, 0, 0)
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            let timestamps = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let hosts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let sources = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let sourcetypes = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let indexes = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let raws = batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let attributes = batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row_index in 0..batch.num_rows() {
+                let (file, row) = parse_id(raws.value(row_index));
+                assert!(file <= WAL_FILE && row < ROWS_PER_FILE);
+                let slot = file * ROWS_PER_FILE + row;
+                assert!(!seen[slot], "duplicate source row f{file}-r{row}");
+                seen[slot] = true;
+                assert_eq!(
+                    timestamps.value(row_index),
+                    base_ns + row as i64 * 1_000_000
+                );
+                assert_eq!(hosts.value(row_index), format!("host-{}", row % 97));
+                assert_eq!(sources.value(row_index), format!("source-{}", file % 3));
+                assert_eq!(
+                    sourcetypes.value(row_index),
+                    if row.is_multiple_of(2) { "even" } else { "odd" }
+                );
+                assert_eq!(indexes.value(row_index), "main");
+                if (file + row).is_multiple_of(3) {
+                    assert!(attributes.is_null(row_index));
+                } else {
+                    assert_eq!(
+                        attributes.value(row_index),
+                        format!(r#"{{"file":{file},"row":{row}}}"#)
+                    );
+                }
+            }
+        }
+        assert!(seen.into_iter().all(|present| present));
     }
 }
 
