@@ -249,7 +249,6 @@ fn assert_all_qualify(rows: &[String], sql: &str) {
 /// mechanism itself is therefore asserted separately and without a scheduler,
 /// in `a_partition_behind_the_ramp_reads_nothing`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "scheduler-dependent measurement; run alone with --ignored --nocapture"]
 async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit() {
     let _fixture_guard = FIXTURE_SERIAL.lock().await;
 

@@ -32,7 +32,7 @@ use tower::util::ServiceExt;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::Layer;
+use tracing_subscriber::{EnvFilter, Layer};
 
 const START: &str = "query execution start";
 const SQL_PROFILE: &str = "sql query profile";
@@ -275,7 +275,12 @@ async fn scan_events_name_the_request_that_produced_them() {
     let formatter = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .without_time()
-        .with_writer(recorder.clone());
+        .with_writer(recorder.clone())
+        // Match telemetry::init's fmt layer: its EnvFilter is per-layer, not
+        // a registry-wide filter. The structured recorder stays unfiltered so
+        // the assertion below distinguishes a produced event from one the
+        // production formatter omitted.
+        .with_filter(EnvFilter::new("info,siglake=debug,siglake_query=debug"));
     tracing_subscriber::registry()
         .with(formatter)
         .with(recorder.clone())
