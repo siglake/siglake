@@ -2059,7 +2059,7 @@ handler returns. Two fields make the join exact anyway.
 
 | Field | Minted | Meaning |
 | --- | --- | --- |
-| `query_execution_id` | Once per execution, by the handler that starts it (`QueryExecutionId::next`), and injected through `SessionConfig` | The request. `0` (`UNATTRIBUTED_QUERY_EXECUTION_ID`) means the session carried none — an internal scan. |
+| `query_execution_id` | Once per execution, by the handler that starts it (`QueryExecutionId::next`), and injected through `SessionConfig` | One execution within the request. `0` (`UNATTRIBUTED_QUERY_EXECUTION_ID`) means the session carried none — an internal scan. |
 | `scan_id` | Once per scan node, in `SiglakeIcebergTableScan::try_new` | The node. Separates two scan nodes of one execution (the residual twin plan) and the same query planned again later. |
 
 Each execution also logs one `query execution start` line carrying its id, its
@@ -2081,7 +2081,11 @@ refused executions keep their existing event set.
 
 Ids are process-local. A distributed query's coordinator and worker halves
 each mint their own and are joined by the W3C trace context the fan-out
-already propagates, not by a shared id. `crates/siglake-storage/tests/scan_event_attribution.rs`
+already propagates, not by a shared id. The coordinator's pre-dispatch work
+and a subsequent `scan_local` serve also mint separate ids, even though they
+run on one pod for one request; each id has its own `query execution start`
+line.
+`crates/siglake-storage/tests/scan_event_attribution.rs`
 and `crates/siglake-query-server/tests/query_execution_attribution.rs` pin
 the concurrent, early-`LIMIT` and streaming cases.
 

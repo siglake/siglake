@@ -21,15 +21,15 @@ pub mod subscribe;
 pub mod wal_ledger;
 
 pub use query_provider::{
-    clear_decoded_file_cache, clear_row_group_layout_cache, decoded_file_cache_footprint,
-    decoded_file_cache_population_stats, initialize_decoded_file_cache_metrics,
-    reset_decoded_file_cache_population_peaks, settle_scan_partitions, CancelOnDrop,
-    ClippedAdmissionWave, ClippedScanLimit, DecodedFileCacheFootprint,
-    DecodedFileCachePopulationStats, FileAttributionSnapshot, OrderedMergeGlobalBudget,
-    OrderedResidualHint, OrderedScanLimit, OrderedScanTuning, OrderedSourceFilter,
-    PreferredScanOrder, QueryCancel, QueryExecutionId, ScanPartitionTracker, ScanSettle, ScanShard,
-    SiglakeIcebergTableScan, CANONICAL_EVENT_TIME_FIELD, FILE_ATTRIBUTION_CAP,
-    UNATTRIBUTED_QUERY_EXECUTION_ID,
+    clear_decoded_file_cache, clear_row_group_layout_cache, current_query_execution_id,
+    decoded_file_cache_footprint, decoded_file_cache_population_stats,
+    initialize_decoded_file_cache_metrics, reset_decoded_file_cache_population_peaks,
+    settle_scan_partitions, with_query_execution_id, CancelOnDrop, ClippedAdmissionWave,
+    ClippedScanLimit, DecodedFileCacheFootprint, DecodedFileCachePopulationStats,
+    FileAttributionSnapshot, OrderedMergeGlobalBudget, OrderedResidualHint, OrderedScanLimit,
+    OrderedScanTuning, OrderedSourceFilter, PreferredScanOrder, QueryCancel, QueryExecutionId,
+    ScanPartitionTracker, ScanSettle, ScanShard, SiglakeIcebergTableScan,
+    CANONICAL_EVENT_TIME_FIELD, FILE_ATTRIBUTION_CAP, UNATTRIBUTED_QUERY_EXECUTION_ID,
 };
 
 /// Arrow field-metadata key carrying the configured text tokenizer name for a
