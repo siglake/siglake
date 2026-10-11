@@ -1606,16 +1606,16 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   so a key `a.b.c` whose object under `a` carried a literal `"b.c"` key
   promoted to NULL and the UDF returned the value (#6769). 0.3.0 makes the two
   extractors identical and versions the rule, which costs the older data its
-  qualification: a table whose promoted values were written before the stamp
-  existed is adopted at its current sequence number, and the
-  `attr_get`→column rewrite and the promoted-column prune stay off for it until
-  every file at or below that sequence has been rewritten. Those queries are
-  correct — they read the residual JSON, which is what they did before the
-  promotion — but they scan. A rewrite is what re-extracts the values through
+  qualification. New file names carry the extraction-rule version, and the
+  `attr_get`→column rewrite and promoted-column prune stay off until every live
+  file carries the current version. This also rejects a file that a
+  still-running old compactor commits after the table is adopted. Those
+  queries are correct — they read the residual JSON, which is what they did
+  before the promotion — but they scan. A rewrite re-extracts the values through
   the current rule, and nothing schedules one for this reason: the WS-7
   backfill selector picks files by a MISSING promoted column
   (`iceberg.rs`'s `ScoredBinKind::Backfill`), not by which rule wrote the
-  values it finds, and a pre-adoption file carries the column already. Level
+  values it finds, and an old-rule file carries the column already. Level
   and depth triggers rewrite what keeps being written to, so a table under
   continuing ingest converges by itself; a file that has reached the terminal
   level or the merge-generation cap in a disjoint partition is never selected

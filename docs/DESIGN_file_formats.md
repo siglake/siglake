@@ -76,6 +76,7 @@ confidently wrong pruning against files already on disk.
 | Promoted columns | `siglake.promoted.v1` | key | config | reject |
 | Promotion backfill marker | `siglake.promotion_backfill_complete.v1` | key + `extractor<ver>` | config | reject |
 | Promotion extraction rule | `siglake.promotion_extraction.v1` | key + `<ver>:` | config | reject |
+| Data-file extraction provenance | `siglake-[g<N>-]x<ver>-<uuid>` | file name | pruning | scan (no prune) |
 | Snapshot aggregates side object | `metadata/siglake-agg/<table-uuid>/siglake-aggregates.json` | JSON, additive | accelerator | scan |
 | Group-count delta | `metadata/siglake-agg/<table-uuid>/siglake-agg-deltas/<seq>.json` | JSON, additive | accelerator | scan |
 | Folded wide group counts | `metadata/siglake-agg/<table-uuid>/siglake-agg-wide.json` | JSON, additive | accelerator | scan |

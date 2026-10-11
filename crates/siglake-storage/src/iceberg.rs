@@ -2641,15 +2641,38 @@ fn file_rewrite_generation(path: &str) -> u32 {
     digits.parse::<u32>().unwrap_or(0)
 }
 
-/// Unique per-writer file-name prefix; rewrites (gen ≥ 1) embed their generation
-/// so [`file_rewrite_generation`] can recover it from the manifest path. UUIDs are
-/// hex, so a plain `siglake-<uuid>` prefix can never false-parse as `siglake-g…`.
-fn rewrite_prefix(rewrite_gen: u32) -> String {
-    if rewrite_gen == 0 {
-        format!("siglake-{}", Uuid::now_v7())
-    } else {
-        format!("siglake-g{rewrite_gen}-{}", Uuid::now_v7())
+/// Extraction-rule provenance carried by every data file this binary writes.
+///
+/// The marker lives in the file name because the manifest already carries the
+/// path. Qualification can therefore prove every live file without opening a
+/// Parquet footer. A pre-marker writer uses `siglake-<uuid>` or
+/// `siglake-g<N>-<uuid>`; UUIDs are hexadecimal, so neither can accidentally
+/// produce the `x<version>` component.
+pub(crate) fn file_extractor_version(path: &str) -> Option<u32> {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let mut rest = base.strip_prefix("siglake-")?;
+    if let Some(after_g) = rest.strip_prefix('g') {
+        let (_, after_generation) = after_g.split_once('-')?;
+        rest = after_generation;
     }
+    let after_x = rest.strip_prefix('x')?;
+    let (version, _) = after_x.split_once('-')?;
+    version.parse().ok()
+}
+
+/// Unique per-writer file-name prefix. Rewrites (gen ≥ 1) embed their
+/// generation and every current writer embeds the extraction-rule version.
+/// `extractor_version = None` exists only for the mixed-writer regression,
+/// which persists the exact unprovenanced shape a pre-#6769 writer produces.
+fn rewrite_prefix(rewrite_gen: u32, extractor_version: Option<u32>) -> String {
+    let generation = (rewrite_gen > 0).then(|| format!("g{rewrite_gen}-"));
+    let extractor = extractor_version.map(|version| format!("x{version}-"));
+    format!(
+        "siglake-{}{}{}",
+        generation.as_deref().unwrap_or_default(),
+        extractor.as_deref().unwrap_or_default(),
+        Uuid::now_v7()
+    )
 }
 
 impl LevelPolicy {
@@ -3359,21 +3382,18 @@ pub const PROMOTION_BACKFILL_PROP: &str = "siglake.promotion_backfill_complete.v
 
 /// Table property recording WHICH extraction rule materialized this table's
 /// promoted columns: `"<version>:declared"` when the promotions were first
-/// declared by a binary at that [`siglake_core::ATTR_EXTRACTOR_VERSION`] (the
-/// columns did not exist before, so every file carrying one was written by
-/// that rule), or `"<version>:after:<sequence>"` when a table whose promotions
-/// predate the stamp was adopted at that rule — files at or below `sequence`
-/// may hold values an older rule produced.
+/// declared by a binary at that [`siglake_core::ATTR_EXTRACTOR_VERSION`], or
+/// `"<version>:after:<sequence>"` when a table whose promotions predate the
+/// stamp was adopted at that rule. This is an upgrade record, not file-writer
+/// provenance; qualification uses each file name.
 pub const PROMOTION_EXTRACTION_PROP: &str = "siglake.promotion_extraction.v1";
 
 /// What [`PROMOTION_EXTRACTION_PROP`] says about a table's promoted values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromotionExtraction {
-    /// Promotions declared under the current rule: any file carrying a
-    /// promoted column was written by it.
+    /// Promotions declared under the current rule.
     Declared,
-    /// Adopted at the current rule after `sequence`: files written at or
-    /// below it may carry values of an older rule.
+    /// Adopted at the current rule after `sequence`.
     AdoptedAfter(i64),
 }
 
@@ -3921,7 +3941,7 @@ fn sort_batch_to_table_order(table: &Table, batch: RecordBatch) -> Result<Record
     // be trusted by every reader. A stable re-sort of already-sorted rows is the
     // identity permutation — if it isn't, the write path would emit a file whose
     // footer lies. Debug-only: it doubles the sort, so it never runs in release.
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-utils")]
     {
         let check_cols: Vec<SortColumn> = cols
             .iter()
@@ -4228,21 +4248,14 @@ async fn live_data_files_within(
 }
 
 /// Does every live data file carry a manifest column entry for each of `ids`
-/// AND post-date `after_sequence`? The promotion-backfill verdict, as a walk
-/// that short-circuits on the first disqualifying entry instead of
-/// materializing the file list.
+/// AND name the current extraction rule as its writer? The promotion-backfill
+/// verdict short-circuits on the first disqualifying entry.
 ///
-/// `after_sequence` is `None` for a table whose promotions were DECLARED under
-/// the current extraction rule: the columns did not exist before, so a file
-/// carrying them was written by that rule. It is `Some(seq)` for a table
-/// adopted later, where a file at or below `seq` may carry values an older
-/// rule produced (#6769). An entry with no sequence number at all is treated
-/// as pre-epoch — unknown provenance never qualifies.
-async fn live_files_carry_columns_after(
-    table: &Table,
-    ids: &[i32],
-    after_sequence: Option<i64>,
-) -> Result<bool> {
+/// Sequence numbers cannot prove this: a pre-upgrade compactor can commit a
+/// stale promoted value after a new binary adopts the table. Per-file writer
+/// provenance makes that later file unqualified too (#6769). An absent or
+/// unparseable marker is unknown provenance and never qualifies.
+async fn live_files_carry_current_promotions(table: &Table, ids: &[i32]) -> Result<bool> {
     let Some(snapshot) = table.metadata().current_snapshot() else {
         return Ok(true);
     };
@@ -4260,13 +4273,11 @@ async fn live_files_carry_columns_after(
             if !entry.is_alive() {
                 continue;
             }
-            if let Some(after) = after_sequence {
-                if entry.sequence_number().is_none_or(|seq| seq <= after) {
-                    return Ok(false);
-                }
-            }
             let file = entry.data_file();
-            if !ids.iter().all(|id| file.column_sizes().contains_key(id)) {
+            if file_extractor_version(file.file_path())
+                != Some(siglake_core::ATTR_EXTRACTOR_VERSION)
+                || !ids.iter().all(|id| file.column_sizes().contains_key(id))
+            {
                 return Ok(false);
             }
         }
@@ -6802,6 +6813,7 @@ mod aggregate_coverage_chain_tests {
             HashMap::new(),
             None,
             MergeConsumedProofAction::new(Vec::new(), None),
+            Some(siglake_core::ATTR_EXTRACTOR_VERSION),
         )
         .await
         .unwrap();
@@ -6934,6 +6946,7 @@ mod aggregate_coverage_chain_tests {
                     HashMap::new(),
                     Some(&default_events_inverted_index_spec()),
                     MergeConsumedProofAction::new(Vec::new(), None),
+                    Some(siglake_core::ATTR_EXTRACTOR_VERSION),
                 )
                 .await
                 .unwrap();
@@ -14816,9 +14829,8 @@ impl IcebergContext {
         }
         let desired = promotion_backfill_value(&promoted)?;
         let props = entry.table.metadata().properties();
-        if props.get(PROMOTION_BACKFILL_PROP).map(String::as_str) == Some(desired.as_str()) {
-            return Ok(false);
-        }
+        let already_recorded =
+            props.get(PROMOTION_BACKFILL_PROP).map(String::as_str) == Some(desired.as_str());
         let schema = entry.table.metadata().current_schema();
         let mut ids = Vec::with_capacity(promoted.len());
         for col in &promoted {
@@ -14828,31 +14840,23 @@ impl IcebergContext {
                 None => return Ok(false),
             }
         }
-        // Which extraction rule wrote the promoted values decides what the
-        // walk has to prove. Unstamped means the promotions were declared by a
-        // binary on an older rule (#6769): adopt the table at the current
-        // sequence, so only files written from here on can qualify. No data is
-        // rewritten — the gate simply stays shut, and the query path keeps
-        // answering from the residual JSON until compaction has turned the old
-        // files over.
-        let after_sequence = match promotion_extraction_from(
-            props.get(PROMOTION_EXTRACTION_PROP).map(String::as_str),
-        ) {
-            Some(PromotionExtraction::Declared) => None,
-            Some(PromotionExtraction::AdoptedAfter(seq)) => Some(seq),
-            None => {
-                return self
-                    .adopt_promotion_extraction(table_ident)
-                    .await
-                    .map(|_| false)
-            }
-        };
+        // Keep the table-level stamp as an upgrade record, but do not use its
+        // sequence as writer provenance: an old compactor can commit after it.
+        // The live-file walk below is the qualification proof.
+        if promotion_extraction_from(props.get(PROMOTION_EXTRACTION_PROP).map(String::as_str))
+            .is_none()
+        {
+            return self
+                .adopt_promotion_extraction(table_ident)
+                .await
+                .map(|_| false);
+        }
         let table = self
             .catalog()
             .load_table(table_ident)
             .await
             .with_context(|| format!("load {table_ident} for backfill property"))?;
-        if !live_files_carry_columns_after(&table, &ids, after_sequence).await? {
+        if !live_files_carry_current_promotions(&table, &ids).await? || already_recorded {
             return Ok(false);
         }
         let tx = Transaction::new(&table);
@@ -14920,7 +14924,7 @@ impl IcebergContext {
             version = siglake_core::ATTR_EXTRACTOR_VERSION,
             "promoted columns predate the current attribute-extraction rule; \
              attr_get rewrite and promoted-column pruning stay off for this table \
-             until every file written at or before this sequence has been rewritten"
+             until every live file carries current extraction provenance"
         );
         Ok(true)
     }
@@ -14933,7 +14937,9 @@ impl IcebergContext {
     /// file holds values an older rule extracted, #6769). Typed columns
     /// rewrite comparisons to typed literals; other uses go through CAST back
     /// to VARCHAR (see the server).
-    /// Reads the cached entry — no IO on the warm path.
+    /// Reads the cached table entry, then walks that snapshot's manifests to
+    /// verify per-file provenance. The rewrite and the scan therefore make the
+    /// same decision about the exact snapshot they serve.
     pub async fn events_attr_rewrite_map(
         &self,
     ) -> Result<Option<std::collections::HashMap<String, (String, siglake_core::PromotedType)>>>
@@ -14960,6 +14966,17 @@ impl IcebergContext {
         }
         let recorded = promotion_backfill_value(&promoted)?;
         if props.get(PROMOTION_BACKFILL_PROP).map(String::as_str) != Some(recorded.as_str()) {
+            return Ok(None);
+        }
+        let schema = entry.table.metadata().current_schema();
+        let ids: Option<Vec<i32>> = promoted
+            .iter()
+            .map(|column| schema.field_id_by_name(&column.name))
+            .collect();
+        let Some(ids) = ids else {
+            return Ok(None);
+        };
+        if !live_files_carry_current_promotions(&entry.table, &ids).await? {
             return Ok(None);
         }
         let map: std::collections::HashMap<String, (String, siglake_core::PromotedType)> = promoted
@@ -16260,12 +16277,10 @@ impl IcebergContext {
             // Record WHICH extraction rule will have written this table's
             // promoted values (#6769), in the same transaction as the
             // declaration itself. A table that holds no promotion yet gets
-            // `declared`: the columns do not exist, so every file that ends up
-            // carrying one was written by the current rule. A table that
-            // already holds one, declared by a binary that left no stamp, is
-            // adopted at the current sequence instead — its existing values
-            // may be an older rule's, and only files written after this
-            // declaration can qualify it.
+            // `declared`: the columns did not exist before this rule. A table
+            // that already holds one, declared by a binary that left no stamp,
+            // is adopted at the current sequence instead. Neither form proves
+            // a file's writer; qualification reads the file-name marker.
             let stamp = match promotion_extraction_from(
                 props.get(PROMOTION_EXTRACTION_PROP).map(String::as_str),
             ) {
@@ -16663,6 +16678,30 @@ impl IcebergContext {
             .await
     }
 
+    /// Persist a batch exactly as a pre-#6769 writer could: do not recompute
+    /// promoted columns and do not stamp extraction provenance on its files.
+    /// Debug-build regression support only; production writes always use
+    /// [`Self::append_to_table`].
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub async fn append_unprovenanced_promoted_batch_for_test(
+        &self,
+        table_ident: &TableIdent,
+        batch: RecordBatch,
+    ) -> Result<usize> {
+        let table = self.load_append_target(table_ident, None).await?;
+        self.append_to_loaded_table(
+            table,
+            batch,
+            &[],
+            HashMap::new(),
+            None,
+            MergeConsumedProofAction::new(Vec::new(), None),
+            None,
+        )
+        .await
+    }
+
     /// Like [`append_to_table`](Self::append_to_table) but attaches
     /// `snapshot_props` to the committed snapshot's summary (Iceberg
     /// `additional_properties`). WS-6 uses this to record which WAL segments a
@@ -16784,6 +16823,7 @@ impl IcebergContext {
             snapshot_props,
             index_spec,
             proof_action,
+            Some(siglake_core::ATTR_EXTRACTOR_VERSION),
         )
         .await
     }
@@ -16996,6 +17036,7 @@ impl IcebergContext {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn append_to_loaded_table(
         &self,
         table: Table,
@@ -17004,6 +17045,7 @@ impl IcebergContext {
         snapshot_props: HashMap<String, String>,
         index_spec: Option<&[InvertedIndexSpec]>,
         proof_action: MergeConsumedProofAction,
+        file_extractor_version: Option<u32>,
     ) -> Result<usize> {
         let rows = batch.num_rows();
         let table_ident = table.identifier().clone();
@@ -17017,6 +17059,10 @@ impl IcebergContext {
         // Promoted Utf8 columns join the bloom set.
         let promoted = self.promoted_for_table(&table);
         let (batch, bloom_owned): (RecordBatch, Vec<String>) = if promoted.is_empty() {
+            (batch, bloom_columns.iter().map(|s| s.to_string()).collect())
+        } else if file_extractor_version.is_none() {
+            // The mixed-writer regression supplies a physically stale promoted
+            // column. Recomputing it here would erase the state under test.
             (batch, bloom_columns.iter().map(|s| s.to_string()).collect())
         } else {
             let batch = siglake_core::repromote_attributes(&batch, &promoted)
@@ -17156,7 +17202,14 @@ impl IcebergContext {
 
         let write_start = std::time::Instant::now();
         let write_output = self
-            .write_batch_to_data_files(&table, batch, bloom_columns, index_spec, 0)
+            .write_batch_to_data_files_with_extractor_version(
+                &table,
+                batch,
+                bloom_columns,
+                index_spec,
+                0,
+                file_extractor_version,
+            )
             .await?;
         let data_file_count = write_output.data_files.len();
         metrics::histogram!(
@@ -17898,6 +17951,26 @@ impl IcebergContext {
         index_spec: Option<&[InvertedIndexSpec]>,
         rewrite_gen: u32,
     ) -> Result<WriteBatchOutput> {
+        self.write_batch_to_data_files_with_extractor_version(
+            table,
+            batch,
+            bloom_columns,
+            index_spec,
+            rewrite_gen,
+            Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+        )
+        .await
+    }
+
+    async fn write_batch_to_data_files_with_extractor_version(
+        &self,
+        table: &Table,
+        batch: RecordBatch,
+        bloom_columns: &[&str],
+        index_spec: Option<&[InvertedIndexSpec]>,
+        rewrite_gen: u32,
+        file_extractor_version: Option<u32>,
+    ) -> Result<WriteBatchOutput> {
         // Physically order rows by the table's declared Iceberg sort order
         // (time-first) before writing, so every write path — compactor append,
         // direct append, detection-table writes, tier-2 re-clustering — produces
@@ -17954,7 +18027,7 @@ impl IcebergContext {
         // unique to avoid filename collisions across commits. Rewrites (gen ≥ 1)
         // carry their generation in the name — see `file_rewrite_generation`.
         let name_gen = DefaultFileNameGenerator::new(
-            rewrite_prefix(rewrite_gen),
+            rewrite_prefix(rewrite_gen, file_extractor_version),
             None,
             DataFileFormat::Parquet,
         );
@@ -18154,7 +18227,7 @@ impl IcebergContext {
                         file_io,
                         location_gen,
                         DefaultFileNameGenerator::new(
-                            rewrite_prefix(rewrite_gen),
+                            rewrite_prefix(rewrite_gen, file_extractor_version),
                             None,
                             DataFileFormat::Parquet,
                         ),
@@ -20423,7 +20496,10 @@ impl IcebergContext {
         let location_gen = DefaultLocationGenerator::new(table.metadata())
             .context("default location generator")?;
         let name_gen = DefaultFileNameGenerator::new(
-            rewrite_prefix(if with_footers { rewrite_gen } else { 0 }),
+            rewrite_prefix(
+                if with_footers { rewrite_gen } else { 0 },
+                Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+            ),
             None,
             DataFileFormat::Parquet,
         );
@@ -30608,7 +30684,7 @@ mod recluster_binpack_tests {
 
     #[test]
     fn rewrite_generation_parses_from_file_names() {
-        use super::{file_rewrite_generation, rewrite_prefix};
+        use super::{file_extractor_version, file_rewrite_generation, rewrite_prefix};
         // Ingest-written files carry no marker → generation 0.
         assert_eq!(
             file_rewrite_generation(
@@ -30626,13 +30702,29 @@ mod recluster_binpack_tests {
         assert_eq!(file_rewrite_generation("siglake-g-uuid.parquet"), 0);
         assert_eq!(file_rewrite_generation("other-file.parquet"), 0);
         assert_eq!(file_rewrite_generation(""), 0);
+        // Old writers, including rewrites, carry no extraction provenance.
+        assert_eq!(file_extractor_version("siglake-019f-0.parquet"), None);
+        assert_eq!(file_extractor_version("siglake-g7-019f-0.parquet"), None);
+        assert_eq!(file_extractor_version("siglake-x1-019f-0.parquet"), Some(1));
+        assert_eq!(
+            file_extractor_version("siglake-g7-x2-019f-0.parquet"),
+            Some(2)
+        );
+        assert_eq!(file_extractor_version("siglake-g7-x-019f.parquet"), None);
+        assert_eq!(file_extractor_version("other-x2-file.parquet"), None);
         // Round-trip: prefix(g) parses back to g (uuid hex can't fake a marker).
         assert_eq!(
-            file_rewrite_generation(&format!("{}-0.parquet", rewrite_prefix(0))),
+            file_rewrite_generation(&format!(
+                "{}-0.parquet",
+                rewrite_prefix(0, Some(siglake_core::ATTR_EXTRACTOR_VERSION))
+            )),
             0
         );
         assert_eq!(
-            file_rewrite_generation(&format!("{}-0.parquet", rewrite_prefix(3))),
+            file_rewrite_generation(&format!(
+                "{}-0.parquet",
+                rewrite_prefix(3, Some(siglake_core::ATTR_EXTRACTOR_VERSION))
+            )),
             3
         );
     }
@@ -34972,6 +35064,7 @@ mod append_incarnation_tests {
                 )]),
                 None,
                 MergeConsumedProofAction::new(vec![proof_entry("seg-dropped.arrow")], None),
+                Some(siglake_core::ATTR_EXTRACTOR_VERSION),
             )
             .await
             .expect_err("the commit must refuse a table that changed under it");

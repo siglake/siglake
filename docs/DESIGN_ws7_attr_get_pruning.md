@@ -83,12 +83,12 @@ implement the SAME rule, and through 0.2.1 they did not — promotion
 retried a literal dotted key at the top level only, `attr_get` at every
 level, so a column NULL could hide a value the UDF returns and the prune
 dropped the row group holding it. The rule now carries a version
-(`siglake_core::ATTR_EXTRACTOR_VERSION`) and tables record which one wrote
-their values in `siglake.promotion_extraction.v1`. The prune keeps its "no
-backfill requirement" for a table whose promotions were declared under the
-current rule; a table carrying older values gets neither the prune nor the
-rewrite until its files have been rewritten, per this tree's standing rule
-that old files stop being accelerated rather than being migrated
+(`siglake_core::ATTR_EXTRACTOR_VERSION`) and every new data-file name records
+which rule wrote it. Pruning is disabled for the scan when any planned file is
+unmarked or names another rule, including a file an old writer commits after
+table adoption. Such a table gets neither the prune nor the rewrite until its
+files have been rewritten, per this tree's standing rule that old files stop
+being accelerated rather than being migrated
 (`DESIGN_file_formats.md`).*
 
 ## Later slices (in order of value)

@@ -704,11 +704,29 @@ async fn inner_literal_dotted_key_answers_match_before_and_after_backfill() {
     assert_eq!(after, before, "the rewrite changed the answer");
 }
 
-/// Already-materialized values: a table qualified by a pre-#6769 binary holds
-/// promoted columns whose NULLs may hide a value `attr_get` returns. Until the
-/// data is rewritten, the rewrite AND the promoted-column prune stay off — the
-/// query falls back to the residual JSON and answers correctly. Rewriting the
-/// files re-qualifies the table with no hand repair of the property.
+fn stale_dotted_batch(n: usize) -> arrow_array::RecordBatch {
+    use arrow_array::{ArrayRef, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    let batch =
+        siglake_core::events_to_record_batch(&attr_events(r#"{"a":{"b.c":"inner-literal"}}"#, n))
+            .unwrap();
+    let mut fields = batch.schema().fields().to_vec();
+    // Put the synthetic column first so storage aligns the batch to the table
+    // schema and applies the promoted field's Iceberg id metadata.
+    fields.insert(0, Arc::new(Field::new("a_b_c", DataType::Utf8, true)));
+    let mut columns = batch.columns().to_vec();
+    columns.insert(
+        0,
+        Arc::new(StringArray::from(vec![None::<&str>; n])) as ArrayRef,
+    );
+    arrow_array::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+}
+
+/// A pre-upgrade writer can commit AFTER the new reader adopts the table. Its
+/// actual stale NULL must keep both rewrite and prune disabled even after a
+/// later current-writer commit. Rewriting that file physically corrects the
+/// promoted value and restores qualification.
 #[tokio::test]
 async fn promoted_values_from_an_older_extractor_neither_rewrite_nor_prune() {
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -719,11 +737,11 @@ async fn promoted_values_from_an_older_extractor_neither_rewrite_nor_prune() {
     let ice = IcebergContext::open(&warehouse)
         .await
         .unwrap()
-        .with_promoted_columns(promotion());
+        .with_promoted_columns(dotted_promotion());
     ice.ensure_promoted_columns().await.unwrap();
-    for pod in ["pod-a", "pod-b", "pod-c"] {
-        ice.append_events(&pod_events(pod, 25)).await.unwrap();
-    }
+    ice.append_events(&attr_events(r#"{"a":{"b":{"c":"nested"}}}"#, 5))
+        .await
+        .unwrap();
     assert!(ice.ensure_promotion_backfill_property().await.unwrap());
     assert!(ice.events_attr_rewrite_map().await.unwrap().is_some());
 
@@ -737,7 +755,7 @@ async fn promoted_values_from_an_older_extractor_neither_rewrite_nor_prune() {
         .update_table_properties()
         .set(
             PROMOTION_BACKFILL_PROP.to_string(),
-            siglake_core::promoted_property_json(&promotion()).unwrap(),
+            siglake_core::promoted_property_json(&dotted_promotion()).unwrap(),
         )
         .remove(PROMOTION_EXTRACTION_PROP.to_string())
         .apply(tx)
@@ -746,21 +764,39 @@ async fn promoted_values_from_an_older_extractor_neither_rewrite_nor_prune() {
     let ice = IcebergContext::open(&warehouse)
         .await
         .unwrap()
-        .with_promoted_columns(promotion());
+        .with_promoted_columns(dotted_promotion());
     assert!(
         ice.events_attr_rewrite_map().await.unwrap().is_none(),
         "values of an unknown extraction rule must not be substituted"
     );
 
-    // The query answers from the JSON, and nothing prunes on the promoted
-    // column — a stale NULL there could hide a matching row.
+    // The new reader adopts at sequence S. A still-running old writer then
+    // commits an actual stale promoted NULL at S+1, and a current writer lands
+    // after it. The latest sequence is therefore no proof about the old file.
+    assert!(!ice.ensure_promotion_backfill_property().await.unwrap());
+    ice.append_unprovenanced_promoted_batch_for_test(&ident, stale_dotted_batch(10))
+        .await
+        .unwrap();
+    ice.append_events(&attr_events(r#"{"a":{"b":{"c":"current"}}}"#, 3))
+        .await
+        .unwrap();
+    assert!(!ice.ensure_promotion_backfill_property().await.unwrap());
+    assert!(ice.events_attr_rewrite_map().await.unwrap().is_none());
+
+    // The query answers from residual JSON. The projected physical column
+    // exposes the stale NULL, while the attr_get filter retains all ten rows
+    // and no promoted statistic prunes their file.
     let server_ice = Arc::new(IcebergContext::open(&warehouse).await.unwrap());
     let app = router(AppState::new(server_ice, AuthConfig::open()));
-    let sql = "SELECT count(*) AS n FROM events WHERE attr_get(attributes, 'k8s.pod') = 'pod-a'";
+    let before = dotted_key_answers(&app).await;
+    assert_eq!(before.0, 10, "fixture must persist stale promoted NULLs");
+    assert_eq!(before.1, 10, "residual attr_get must retain the stale rows");
+    let sql = "SELECT count(*) AS n FROM events \
+               WHERE attr_get(attributes, 'a.b.c') = 'inner-literal'";
     let (status, body) =
         request_json(&app, "/api/v1/sql", serde_json::json!({ "query": sql })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["rows"][0]["n"].as_i64(), Some(25), "{body}");
+    assert_eq!(body["rows"][0]["n"].as_i64(), Some(10), "{body}");
     let scan = body["stats"]["scan"]
         .as_object()
         .unwrap_or_else(|| panic!("unqualified table must scan: {body}"));
@@ -771,16 +807,10 @@ async fn promoted_values_from_an_older_extractor_neither_rewrite_nor_prune() {
     );
     assert_eq!(scan["row_groups_read"].as_u64(), Some(3), "{body}");
 
-    // First pass adopts the table at the current sequence; nothing qualifies
-    // while the old files are live, however many passes run.
-    assert!(!ice.ensure_promotion_backfill_property().await.unwrap());
-    assert!(!ice.ensure_promotion_backfill_property().await.unwrap());
-    assert!(ice.events_attr_rewrite_map().await.unwrap().is_none());
-
     // Rewriting the files re-extracts every row through the current rule, and
     // the next pass qualifies the table again.
     let files = ice.live_data_files(&ident).await.unwrap();
-    ice.recluster_files(&ident, files, &["host", "k8s_pod"])
+    ice.recluster_files(&ident, files, &["host", "a_b_c"])
         .await
         .unwrap();
     assert!(ice.ensure_promotion_backfill_property().await.unwrap());
@@ -788,8 +818,11 @@ async fn promoted_values_from_an_older_extractor_neither_rewrite_nor_prune() {
 
     let server_ice = Arc::new(IcebergContext::open(&warehouse).await.unwrap());
     let app = router(AppState::new(server_ice, AuthConfig::open()));
+    let after = dotted_key_answers(&app).await;
+    assert_eq!(after.0, 0, "rewrite must physically correct the stale NULL");
+    assert_eq!(after.1, 10);
     let (status, body) =
         request_json(&app, "/api/v1/sql", serde_json::json!({ "query": sql })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["rows"][0]["n"].as_i64(), Some(25), "{body}");
+    assert_eq!(body["rows"][0]["n"].as_i64(), Some(10), "{body}");
 }

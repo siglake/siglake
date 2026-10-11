@@ -62,6 +62,9 @@ utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 
 [dev-dependencies]
+# Enables the mixed-writer promotion fixture without exposing its unsafe write
+# helper in production builds.
+siglake-storage = { workspace = true, features = ["test-utils"] }
 # #2640 characterizes what a normal drain does to WAL segments that outlive an
 # index deletion, so the test needs the real `Compactor::run_once`, not a
 # hand-rolled stand-in for it.

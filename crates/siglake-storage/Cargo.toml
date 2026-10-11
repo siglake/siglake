@@ -10,6 +10,9 @@ default = []
 # Task #1990: isolated, disposable-warehouse measurement arm. This is not a
 # production format or configuration surface.
 experimental-exact-point-rollup = []
+# Cross-crate regressions that need to persist states an obsolete writer could
+# create. Never enabled by production binaries.
+test-utils = []
 
 [dev-dependencies]
 arrow-array = { workspace = true }

@@ -8,13 +8,13 @@
   UDF retried it at every level, so a key `a.b.c` whose object under `a` held a
   literal `"b.c"` key promoted to NULL and the UDF returned the value; once
   backfill completed, the column was substituted for the UDF and the answer
-  changed silently. The extraction rule now carries a version and tables record
-  which rule wrote their promoted values in `siglake.promotion_extraction.v1`.
-  A table whose promoted values predate the stamp is adopted at its current
-  sequence number: its queries keep answering from the residual JSON — correct,
-  and as slow as before the promotion — and neither the `attr_get`→column
-  rewrite nor the promoted-column prune applies until every pre-adoption file
-  has been rewritten. Compaction gets there on a table that keeps being written
+  changed silently. The extraction rule now carries a version in every new
+  data file's name; unmarked files and files from another rule are ineligible
+  even when an old writer commits them after the table is adopted. Queries keep
+  answering from the residual JSON — correct, and as slow as before the
+  promotion — and neither the `attr_get`→column rewrite nor the
+  promoted-column prune applies until every unqualified file has been
+  rewritten. Compaction gets there on a table that keeps being written
   to; files that have settled at the terminal level or the merge-generation cap
   are not rewritten for this reason and keep their old values, and no command
   forces a rewrite. No data is migrated automatically and no property needs

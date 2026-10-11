@@ -914,16 +914,17 @@ completes, and prunes row groups from its statistics before that. Both are
 wrong the moment the two extractors disagree, so the rule is defined once —
 a literal (possibly dotted) key wins at every level of the walk, then a dotted
 key descends one segment at a time — and carries a version,
-`siglake_core::ATTR_EXTRACTOR_VERSION`. Tables record which rule wrote their
-promoted values in `siglake.promotion_extraction.v1`: `declared` when the
-promotions were first declared under the current rule (the columns did not
-exist before, so every file carrying one was written by it), or
-`after:<sequence>` for a table adopted later, whose files up to that sequence
-may hold another rule's values. The backfill-completion property
+`siglake_core::ATTR_EXTRACTOR_VERSION`. Every new data-file name carries an
+`x<version>` component beside its rewrite generation. The manifest path is
+therefore per-file writer provenance: an unmarked file, including one a
+still-running old compactor commits after adoption, never feeds the rewrite or
+the promoted-column prune. `siglake.promotion_extraction.v1` records the table
+adoption, but its sequence is not treated as writer provenance. The
+backfill-completion property
 (`siglake.promotion_backfill_complete.v1`) carries the version too, so a table
 qualified under an older rule is no longer qualified: the rewrite and the
 prune hints stay off and queries answer from the residual JSON — correct, and
-as slow as they were before the promotion — until every pre-adoption file has
+as slow as they were before the promotion — until every unqualified file has
 been rewritten. Compaction gets there on a table that keeps being written to,
 and not at all on one whose files have settled at the terminal level or the
 merge-generation cap; the WS-7 backfill selector does not help, because it

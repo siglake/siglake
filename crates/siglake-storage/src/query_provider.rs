@@ -2687,7 +2687,7 @@ impl SiglakeIcebergTableScan {
             )
             .increment(1);
         }
-        let promoted_prune = extract_promoted_prune(filters, &promoted_utf8_columns(&table));
+        let mut promoted_prune = extract_promoted_prune(filters, &promoted_utf8_columns(&table));
         let tuning = crate::current_query_scan_tuning();
         // Per-request distributed-query shard, injected as a SessionConfig
         // extension by the query-server (absent for ordinary single-pod scans).
@@ -2706,6 +2706,20 @@ impl SiglakeIcebergTableScan {
             shard,
         )
         .await?;
+        // A promoted-column statistic is sound only for a file written by the
+        // current extraction rule. A pre-upgrade writer can commit after the
+        // table was adopted, so table properties and sequence numbers are not
+        // provenance. Disable the hint for the whole scan when any planned
+        // file lacks the per-file marker; the residual `attr_get` predicate
+        // remains and answers from JSON.
+        if !promoted_prune.is_empty()
+            && task_partitions.iter().flatten().any(|task| {
+                crate::iceberg::file_extractor_version(task.data_file_path())
+                    != Some(siglake_core::ATTR_EXTRACTOR_VERSION)
+            })
+        {
+            promoted_prune.clear();
+        }
         // `partition_count` is computed after the #4 unordered-limit re-split below,
         // since that can change the partition count. `planned_files`/`planned_bytes`
         // are invariant under re-partitioning (same file set), so compute them here.
@@ -6787,12 +6801,9 @@ fn extract_match_udf_prune(
 /// Empty for tables without declared promotions. Utf8 only: `attr_get`
 /// yields strings, so only Utf8 promotions substitute value-for-value.
 ///
-/// Also empty when the table's promoted values are not known to match the
-/// current `attr_get` extraction rule (#6769). The hint is a prune: a row
-/// group whose promoted column is all-NULL, or whose min/max excludes the
-/// literal, is skipped outright. That is only sound while a NULL column means
-/// the key is absent from the row's JSON — which an older extraction rule's
-/// values do not guarantee.
+/// Per-file extraction provenance is checked after file planning, before this
+/// hint reaches a reader. A row group whose promoted column is all-NULL can be
+/// skipped only when every planned file names the current rule (#6769).
 fn promoted_utf8_columns(table: &Table) -> HashMap<String, String> {
     let promoted = siglake_core::promoted_columns_from_property(
         table
@@ -6801,44 +6812,11 @@ fn promoted_utf8_columns(table: &Table) -> HashMap<String, String> {
             .get(siglake_core::PROMOTED_PROPERTY_KEY)
             .map(String::as_str),
     );
-    if promoted.is_empty() || !promoted_extraction_matches_attr_get(table, &promoted) {
-        return HashMap::new();
-    }
     promoted
         .into_iter()
         .filter(|c| c.ty == siglake_core::PromotedType::Utf8)
         .map(|c| (c.attr_key, c.name))
         .collect()
-}
-
-/// Were this table's promoted values written by the extraction rule the
-/// current `attr_get` implements?
-///
-/// `declared` says the promotions were first declared under this rule, so the
-/// columns cannot predate it: any file carrying one was written by it, and a
-/// file written before the declaration lacks the column entirely (never
-/// pruned). A table adopted at this rule later carries files from before the
-/// adoption sequence whose values may be an older rule's, and nothing in a
-/// row group distinguishes them — only full backfill qualification proves no
-/// such file is live.
-fn promoted_extraction_matches_attr_get(
-    table: &Table,
-    promoted: &[siglake_core::PromotedColumn],
-) -> bool {
-    let props = table.metadata().properties();
-    match crate::iceberg::promotion_extraction_from(
-        props
-            .get(crate::iceberg::PROMOTION_EXTRACTION_PROP)
-            .map(String::as_str),
-    ) {
-        Some(crate::iceberg::PromotionExtraction::Declared) => true,
-        _ => crate::iceberg::promotion_backfill_value(promoted).is_ok_and(|qualified| {
-            props
-                .get(crate::iceberg::PROMOTION_BACKFILL_PROP)
-                .map(String::as_str)
-                == Some(qualified.as_str())
-        }),
-    }
 }
 
 /// WS-7: extract `attr_get(attributes, 'key') = 'value'` (and non-negated
