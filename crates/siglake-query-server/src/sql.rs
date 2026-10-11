@@ -10500,11 +10500,16 @@ async fn render_records(
             .await;
         }
     }
+    // DataFusion's `one_line()` writes a trailing newline. Remove it before
+    // handing the field to tracing so the keyed head and its timings stay in
+    // one physical stderr record.
+    let root_plan = displayable(plan.as_ref()).one_line().to_string();
+    let root_plan = root_plan.trim_end_matches(['\r', '\n']);
     tracing::info!(
         endpoint = "sql",
         query_execution_id = execution_id.0,
         format = "records",
-        root_plan = %displayable(plan.as_ref()).one_line(),
+        root_plan = %root_plan,
         plan_nodes = runtime.nodes,
         leaf_rows_scanned = runtime.leaf_output_rows,
         df_output_rows = runtime.output_rows,
