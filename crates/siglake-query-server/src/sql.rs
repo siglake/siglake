@@ -1901,13 +1901,15 @@ fn attr_get_rewrite_target(
     Some((column, ty))
 }
 
+type AttrRewriteBindings = HashMap<String, siglake_storage::iceberg::QualifiedAttrRewrite>;
+
 #[derive(Clone)]
 struct RewrittenQuery {
     sql: String,
     /// Exact table generations whose files qualified every promoted-value
     /// substitution in `sql`. Registration and WAL wrapping must use these
     /// captures instead of consulting the mutable table cache again.
-    attr_rewrite_bindings: HashMap<String, siglake_storage::iceberg::QualifiedAttrRewrite>,
+    attr_rewrite_bindings: AttrRewriteBindings,
     preferred_scan_order: Option<siglake_storage::PreferredScanOrder>,
     /// Literal `LIMIT n` of a timestamp-ordered query — rides into the
     /// session as `OrderedScanLimit` so the gate can coalesce partitions.
@@ -4948,13 +4950,16 @@ async fn handle_local_inner(
                 record_metrics("sql", start, &result_meta, &cost);
                 return result_meta;
             }
-            if let Some(mut body) = under_request_deadline!(try_negation_count_fast_path_records(
-                &df,
-                &ice,
-                shard,
-                cost.clone(),
-                delta
-            )) {
+            if let Some(mut body) =
+                under_request_deadline!(try_negation_count_fast_path_records_with_bindings(
+                    &df,
+                    &ice,
+                    shard,
+                    cost.clone(),
+                    delta,
+                    &effective_query.attr_rewrite_bindings,
+                ))
+            {
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -4985,13 +4990,16 @@ async fn handle_local_inner(
                 record_metrics("sql", start, &result_meta, &cost);
                 return result_meta;
             }
-            if let Some(mut body) = under_request_deadline!(try_count_distinct_fast_path_records(
-                &df,
-                &ice,
-                shard,
-                cost.clone(),
-                delta
-            )) {
+            if let Some(mut body) =
+                under_request_deadline!(try_count_distinct_fast_path_records_with_bindings(
+                    &df,
+                    &ice,
+                    shard,
+                    cost.clone(),
+                    delta,
+                    &effective_query.attr_rewrite_bindings,
+                ))
+            {
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5022,13 +5030,16 @@ async fn handle_local_inner(
                 record_metrics("sql", start, &result_meta, &cost);
                 return result_meta;
             }
-            if let Some(mut body) = under_request_deadline!(try_grouped_numeric_fast_path_records(
-                &df,
-                &ice,
-                shard,
-                cost.clone(),
-                delta
-            )) {
+            if let Some(mut body) =
+                under_request_deadline!(try_grouped_numeric_fast_path_records_with_bindings(
+                    &df,
+                    &ice,
+                    shard,
+                    cost.clone(),
+                    delta,
+                    &effective_query.attr_rewrite_bindings,
+                ))
+            {
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5059,14 +5070,17 @@ async fn handle_local_inner(
                 record_metrics("sql", start, &result_meta, &cost);
                 return result_meta;
             }
-            if let Some(mut body) = under_request_deadline!(try_group_count_fast_path_records(
-                &df,
-                &ice,
-                shard,
-                cost.clone(),
-                delta,
-                allow_approximate,
-            )) {
+            if let Some(mut body) =
+                under_request_deadline!(try_group_count_fast_path_records_with_bindings(
+                    &df,
+                    &ice,
+                    shard,
+                    cost.clone(),
+                    delta,
+                    allow_approximate,
+                    &effective_query.attr_rewrite_bindings,
+                ))
+            {
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5160,15 +5174,18 @@ async fn handle_local_inner(
                 record_metrics("sql", start, &result_meta, &cost);
                 return Ok(resp);
             }
-            if let Some(resp) = under_request_deadline!(try_group_count_fast_path_response(
-                &df,
-                &ice,
-                shard,
-                format,
-                cost.clone(),
-                delta,
-                allow_approximate,
-            )) {
+            if let Some(resp) =
+                under_request_deadline!(try_group_count_fast_path_response_with_bindings(
+                    &df,
+                    &ice,
+                    shard,
+                    format,
+                    cost.clone(),
+                    delta,
+                    allow_approximate,
+                    &effective_query.attr_rewrite_bindings,
+                ))
+            {
                 let result_meta: Result<Response, ApiError> = Ok(Response::builder()
                     .status(resp.status())
                     .body(Body::empty())
@@ -6601,7 +6618,14 @@ async fn run_batch_query_in(
     }
     match under_run_deadline!(
         Some(cost.clone()),
-        try_negation_count_fast_path_records(&df, &ice, None, cost.clone(), None)
+        try_negation_count_fast_path_records_with_bindings(
+            &df,
+            &ice,
+            None,
+            cost.clone(),
+            None,
+            &query.attr_rewrite_bindings,
+        )
     ) {
         Ok(Some(body)) => return BatchOutcome::Ok(body, cost),
         Ok(None) => {}
@@ -6611,7 +6635,14 @@ async fn run_batch_query_in(
     }
     match under_run_deadline!(
         Some(cost.clone()),
-        try_count_distinct_fast_path_records(&df, &ice, None, cost.clone(), None)
+        try_count_distinct_fast_path_records_with_bindings(
+            &df,
+            &ice,
+            None,
+            cost.clone(),
+            None,
+            &query.attr_rewrite_bindings,
+        )
     ) {
         Ok(Some(body)) => return BatchOutcome::Ok(body, cost),
         Ok(None) => {}
@@ -6621,7 +6652,14 @@ async fn run_batch_query_in(
     }
     match under_run_deadline!(
         Some(cost.clone()),
-        try_grouped_numeric_fast_path_records(&df, &ice, None, cost.clone(), None)
+        try_grouped_numeric_fast_path_records_with_bindings(
+            &df,
+            &ice,
+            None,
+            cost.clone(),
+            None,
+            &query.attr_rewrite_bindings,
+        )
     ) {
         Ok(Some(body)) => return BatchOutcome::Ok(body, cost),
         Ok(None) => {}
@@ -6631,7 +6669,15 @@ async fn run_batch_query_in(
     }
     match under_run_deadline!(
         Some(cost.clone()),
-        try_group_count_fast_path_records(&df, &ice, None, cost.clone(), None, allow_approximate)
+        try_group_count_fast_path_records_with_bindings(
+            &df,
+            &ice,
+            None,
+            cost.clone(),
+            None,
+            allow_approximate,
+            &query.attr_rewrite_bindings,
+        )
     ) {
         Ok(Some(body)) => return BatchOutcome::Ok(body, cost),
         Ok(None) => {}
@@ -7245,12 +7291,13 @@ fn count_distinct_column(expr: &Expr) -> Option<String> {
 
 /// Serve `count(DISTINCT col)` from the guarded per-value counts. `None`
 /// (fall through to the planner) when the column has no aggregation path.
-async fn try_count_distinct_fast_path_records(
+async fn try_count_distinct_fast_path_records_with_bindings(
     df: &DataFrame,
     ice: &siglake_storage::iceberg::IcebergContext,
     shard: Option<siglake_storage::ScanShard>,
     cost: CostReport,
     delta: Option<&BufferDelta>,
+    bindings: &AttrRewriteBindings,
 ) -> Result<Option<crate::format::RecordsResponse>, ApiError> {
     // Same reasoning as the negation path: exactness comes from the per-value
     // counts' own `total == record_count` guards, not from cost-exactness.
@@ -7260,11 +7307,18 @@ async fn try_count_distinct_fast_path_records(
     let Some(fp) = detect_count_distinct_fast_path(df.logical_plan()) else {
         return Ok(None);
     };
-    let Some(rows) = ice
-        .grouped_counts_with_summary(&fp.table_name, &fp.column, shard, None)
-        .await
-        .map_err(ApiError::internal)?
-    else {
+    let rows = match bindings.get(&fp.table_name) {
+        Some(qualified) => {
+            ice.qualified_grouped_counts_with_summary(qualified, &fp.column, shard)
+                .await
+        }
+        None => {
+            ice.grouped_counts_with_summary(&fp.table_name, &fp.column, shard, None)
+                .await
+        }
+    }
+    .map_err(ApiError::internal)?;
+    let Some(rows) = rows else {
         return Ok(None);
     };
     // COUNT(DISTINCT col) counts distinct non-NULL values. The merged rows'
@@ -7633,12 +7687,13 @@ fn int_literal(expr: &Expr) -> Option<i64> {
 /// `total − Σ excluded`, with NULL groups excluded. Coordinator-local only
 /// (mirrors the group-count fast path's shard guard). Returns `None` (fall
 /// through) when the column isn't footer-aggregated.
-async fn try_negation_count_fast_path_records(
+async fn try_negation_count_fast_path_records_with_bindings(
     df: &DataFrame,
     ice: &siglake_storage::iceberg::IcebergContext,
     shard: Option<siglake_storage::ScanShard>,
     cost: CostReport,
     delta: Option<&BufferDelta>,
+    bindings: &AttrRewriteBindings,
 ) -> Result<Option<crate::format::RecordsResponse>, ApiError> {
     // NB: do NOT gate on `cost.exact` — a dimensional `!=`/`NOT IN` predicate is
     // never cost-exact (the cost estimate can't prune it), so requiring exactness
@@ -7651,11 +7706,18 @@ async fn try_negation_count_fast_path_records(
     let Some(fp) = detect_negation_count_fast_path(df.logical_plan()) else {
         return Ok(None);
     };
-    let Some(rows) = ice
-        .grouped_counts_with_summary(&fp.table_name, &fp.column, shard, None)
-        .await
-        .map_err(ApiError::internal)?
-    else {
+    let rows = match bindings.get(&fp.table_name) {
+        Some(qualified) => {
+            ice.qualified_grouped_counts_with_summary(qualified, &fp.column, shard)
+                .await
+        }
+        None => {
+            ice.grouped_counts_with_summary(&fp.table_name, &fp.column, shard, None)
+                .await
+        }
+    }
+    .map_err(ApiError::internal)?;
+    let Some(rows) = rows else {
         return Ok(None);
     };
     // Negation: rows whose (non-NULL) value is NOT in the set. Equality/IN:
@@ -7783,12 +7845,13 @@ async fn try_windowed_count_fast_path_records(
     }))
 }
 
-async fn try_grouped_numeric_fast_path_records(
+async fn try_grouped_numeric_fast_path_records_with_bindings(
     df: &DataFrame,
     ice: &siglake_storage::iceberg::IcebergContext,
     shard: Option<siglake_storage::ScanShard>,
     cost: CostReport,
     delta: Option<&BufferDelta>,
+    bindings: &AttrRewriteBindings,
 ) -> Result<Option<crate::format::RecordsResponse>, ApiError> {
     if !grouped_numeric_fast_path_enabled() || shard.is_some() || delta.is_some() {
         return Ok(None);
@@ -7796,11 +7859,18 @@ async fn try_grouped_numeric_fast_path_records(
     let Some(fp) = detect_grouped_numeric_fast_path(df.logical_plan()) else {
         return Ok(None);
     };
-    let Some(mut rows) = ice
-        .grouped_numeric_avg(&fp.table_name, &fp.group_column, &fp.value_column)
-        .await
-        .map_err(ApiError::internal)?
-    else {
+    let rows = match bindings.get(&fp.table_name) {
+        Some(qualified) => {
+            ice.qualified_grouped_numeric_avg(qualified, &fp.group_column, &fp.value_column)
+                .await
+        }
+        None => {
+            ice.grouped_numeric_avg(&fp.table_name, &fp.group_column, &fp.value_column)
+                .await
+        }
+    }
+    .map_err(ApiError::internal)?;
+    let Some(mut rows) = rows else {
         return Ok(None);
     };
     rows.sort_by(|left, right| {
@@ -7865,7 +7935,8 @@ fn grouped_numeric_fast_path_enabled() -> bool {
     })
 }
 
-async fn try_group_count_fast_path_response(
+#[allow(clippy::too_many_arguments)]
+async fn try_group_count_fast_path_response_with_bindings(
     df: &DataFrame,
     ice: &siglake_storage::iceberg::IcebergContext,
     shard: Option<siglake_storage::ScanShard>,
@@ -7873,9 +7944,18 @@ async fn try_group_count_fast_path_response(
     cost: CostReport,
     delta: Option<&BufferDelta>,
     allow_approximate: AllowApproximate,
+    bindings: &AttrRewriteBindings,
 ) -> Result<Option<Response>, ApiError> {
-    let Some(body) =
-        try_group_count_fast_path_records(df, ice, shard, cost, delta, allow_approximate).await?
+    let Some(body) = try_group_count_fast_path_records_with_bindings(
+        df,
+        ice,
+        shard,
+        cost,
+        delta,
+        allow_approximate,
+        bindings,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -8072,6 +8152,7 @@ fn push_bounded_owned(
     }
 }
 
+#[cfg(test)]
 async fn try_group_count_fast_path_records(
     df: &DataFrame,
     ice: &siglake_storage::iceberg::IcebergContext,
@@ -8079,6 +8160,28 @@ async fn try_group_count_fast_path_records(
     cost: CostReport,
     delta: Option<&BufferDelta>,
     allow_approximate: AllowApproximate,
+) -> Result<Option<crate::format::RecordsResponse>, ApiError> {
+    try_group_count_fast_path_records_with_bindings(
+        df,
+        ice,
+        shard,
+        cost,
+        delta,
+        allow_approximate,
+        &AttrRewriteBindings::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_group_count_fast_path_records_with_bindings(
+    df: &DataFrame,
+    ice: &siglake_storage::iceberg::IcebergContext,
+    shard: Option<siglake_storage::ScanShard>,
+    cost: CostReport,
+    delta: Option<&BufferDelta>,
+    allow_approximate: AllowApproximate,
+    bindings: &AttrRewriteBindings,
 ) -> Result<Option<crate::format::RecordsResponse>, ApiError> {
     if !group_count_fast_path_enabled() {
         return Ok(None);
@@ -8097,6 +8200,12 @@ async fn try_group_count_fast_path_records(
     let Some(fp) = detect_group_count_fast_path(df.logical_plan()) else {
         return Ok(None);
     };
+    let qualified = bindings.get(&fp.table_name);
+    if qualified.is_some() && fp.time_bounds.is_some() {
+        // Windowed helpers still resolve by table name. The bound provider is
+        // exact, so let DataFusion execute this narrower promoted shape.
+        return Ok(None);
+    }
     // The sketch preempts a Tier-1 MISS, not merely a refusal.
     //
     // The distinction decides whether any of this is reachable. On the 08-01
@@ -8105,12 +8214,17 @@ async fn try_group_count_fast_path_records(
     // refusal is therefore never consulted, and `top_hosts` was no faster than
     // before the feature existed. A cheap exact answer always wins; an
     // expensive one does not, unless the caller asked for it.
-    let tier1_only = shard.is_none()
+    let tier1_only = qualified.is_none()
+        && shard.is_none()
         && fp.time_bounds.is_none()
         && allow_approximate.get()
         && matches!(fp.sort, Some(GroupCountSort::Count { ascending: false }))
         && fp.limit.is_some();
-    let mut exact = if tier1_only {
+    let mut exact = if let Some(qualified) = qualified {
+        ice.qualified_grouped_counts_with_summary(qualified, &fp.group_column, shard)
+            .await
+            .map_err(ApiError::internal)?
+    } else if tier1_only {
         ice.tier1_group_counts(&fp.table_name, &fp.group_column)
             .await
             .map_err(ApiError::internal)?
@@ -12821,6 +12935,147 @@ mod tests {
         );
     }
 
+    /// The handler's metadata battery used to escape the snapshot pinned by
+    /// `attr_rewrite_registration_uses_the_exact_qualified_snapshot`: after
+    /// planning against S, grouped count/AVG reloaded S+1 by table name and
+    /// returned its stale promoted NULL. Drive the real handler on both sides
+    /// of that deterministic commit boundary.
+    #[tokio::test]
+    async fn attr_rewrite_handler_fast_paths_keep_the_qualified_snapshot() {
+        use arrow_array::{ArrayRef, Int64Array, StringArray};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let promotions = vec![
+            siglake_core::PromotedColumn {
+                attr_key: "a.b.c".into(),
+                name: "status".into(),
+                ty: siglake_core::PromotedType::Utf8,
+            },
+            siglake_core::PromotedColumn {
+                attr_key: "measure".into(),
+                name: "size".into(),
+                ty: siglake_core::PromotedType::Int64,
+            },
+        ];
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap()
+                .with_promoted_columns(promotions.clone()),
+        );
+        ice.ensure_promoted_columns().await.unwrap();
+        ice.append_events(&[
+            Event::now("old-10")
+                .with_attributes(Some(r#"{"a":{"b.c":"old"},"measure":10}"#.into())),
+            Event::now("old-20")
+                .with_attributes(Some(r#"{"a":{"b.c":"old"},"measure":20}"#.into())),
+        ])
+        .await
+        .unwrap();
+        assert!(ice.ensure_promotion_backfill_property().await.unwrap());
+
+        let grouped_avg = "SELECT attr_get(attributes, 'a.b.c') AS status, \
+                           AVG(size) AS avg_size, \
+                           COUNT(*) AS n FROM events \
+                           GROUP BY attr_get(attributes, 'a.b.c') ORDER BY n DESC";
+        let qualified = apply_query_rewrites(&ice, grouped_avg, false, Priority::Interactive, 100)
+            .await
+            .unwrap();
+        assert!(qualified.sql.contains("AVG(size)"), "{}", qualified.sql);
+        let qualified_snapshot = qualified.attr_rewrite_bindings["events"]
+            .snapshot
+            .snapshot_id;
+
+        // Publish the old-writer shape after qualification. Build the current
+        // promoted schema first, then replace both extracted values with NULL
+        // and persist it without an extraction stamp.
+        let late = siglake_core::events_to_record_batch(&[Event::now("late-30")
+            .with_attributes(Some(r#"{"a":{"b.c":"late"},"measure":30}"#.into()))])
+        .unwrap();
+        let stale = siglake_core::promote_attributes(&late, &promotions).unwrap();
+        let mut columns = stale.columns().to_vec();
+        let status = stale.schema().index_of("status").unwrap();
+        let size = stale.schema().index_of("size").unwrap();
+        columns[status] = Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef;
+        columns[size] = Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef;
+        let stale = arrow_array::RecordBatch::try_new(stale.schema(), columns).unwrap();
+        ice.append_unprovenanced_promoted_batch_for_test(ice.events_table_ident(), stale)
+            .await
+            .unwrap();
+        assert_ne!(
+            ice.current_table_generation("events")
+                .await
+                .unwrap()
+                .snapshot_id,
+            qualified_snapshot,
+            "the handler race needs an intervening S+1"
+        );
+
+        let request = |query: &str| SqlRequest {
+            query: query.into(),
+            format: Some(QueryFormat::Records),
+            priority: Priority::Interactive,
+            default_order: false,
+            dry_run: false,
+            limits: RequestLimits::default(),
+            shard: None,
+            exact: true,
+        };
+        let state = AppState::new(Arc::clone(&ice), crate::AuthConfig::open());
+        let response = handle_local_inner(
+            state.clone(),
+            CallerIdentity::default(),
+            request(grouped_avg),
+            Some(Arc::clone(&ice)),
+            Some(qualified),
+            None,
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: crate::format::RecordsResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.row_count, 1, "{}", body.rows);
+        assert_eq!(body.rows[0]["status"], "old");
+        assert_eq!(body.rows[0]["avg_size"].as_f64(), Some(15.0));
+        assert_eq!(body.rows[0]["n"].as_i64(), Some(2));
+        assert_eq!(
+            body.stats
+                .as_ref()
+                .and_then(|stats| stats.served_by.as_deref()),
+            Some("grouped_numeric_footer"),
+            "the bound snapshot should retain grouped-numeric acceleration"
+        );
+
+        // The next handler request sees S+1, declines substitution, and reads
+        // all three groups from residual JSON rather than the stale NULL.
+        let response = handle_local_inner(
+            state,
+            CallerIdentity::default(),
+            request(
+                "SELECT attr_get(attributes, 'a.b.c') AS status, COUNT(*) AS n \
+                 FROM events GROUP BY attr_get(attributes, 'a.b.c') ORDER BY status",
+            ),
+            Some(Arc::clone(&ice)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: crate::format::RecordsResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body.rows,
+            serde_json::json!([
+                {"status": "late", "n": 1},
+                {"status": "old", "n": 2}
+            ])
+        );
+    }
+
     #[test]
     fn attr_rewrite_preserves_qualifiers_and_each_tables_gate() {
         let sql = "SELECT attr_get(e.attributes, 'k'), attr_get(i.attributes, 'k') \
@@ -17247,19 +17502,40 @@ async fn distributed_inner(
             try_windowed_count_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
         {
             Some(body)
-        } else if let Some(body) =
-            try_negation_count_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
+        } else if let Some(body) = try_negation_count_fast_path_records_with_bindings(
+            &df,
+            &ice,
+            None,
+            cost.clone(),
+            delta,
+            &effective_query.attr_rewrite_bindings,
+        )
+        .await?
         {
             Some(body)
-        } else if let Some(body) =
-            try_count_distinct_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
+        } else if let Some(body) = try_count_distinct_fast_path_records_with_bindings(
+            &df,
+            &ice,
+            None,
+            cost.clone(),
+            delta,
+            &effective_query.attr_rewrite_bindings,
+        )
+        .await?
         {
             Some(body)
-        } else if let Some(body) =
-            try_grouped_numeric_fast_path_records(&df, &ice, None, cost.clone(), delta).await?
+        } else if let Some(body) = try_grouped_numeric_fast_path_records_with_bindings(
+            &df,
+            &ice,
+            None,
+            cost.clone(),
+            delta,
+            &effective_query.attr_rewrite_bindings,
+        )
+        .await?
         {
             Some(body)
-        } else if let Some(body) = try_group_count_fast_path_records(
+        } else if let Some(body) = try_group_count_fast_path_records_with_bindings(
             &df,
             &ice,
             None,
@@ -17271,6 +17547,7 @@ async fn distributed_inner(
             // path every user query takes -- so hardcoding here made both
             // of them inert wherever they actually mattered.
             AllowApproximate::for_request(&req),
+            &effective_query.attr_rewrite_bindings,
         )
         .await?
         {

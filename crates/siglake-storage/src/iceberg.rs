@@ -15015,8 +15015,9 @@ impl IcebergContext {
             crate::index_manager::index_config_from_table(table_ident.name(), &entry.table)?;
         Ok(Some(QualifiedAttrRewrite {
             mapping: map,
-            snapshot: BufferedTableSnapshot::from_cached(entry),
+            snapshot: BufferedTableSnapshot::from_cached(entry.clone()),
             index_config,
+            aggregate_entry: entry,
         }))
     }
 
@@ -23892,6 +23893,10 @@ pub struct QualifiedAttrRewrite {
     /// The carrier mapping from the same table generation. `None` for tables
     /// that are not managed indexes; such tables have no index WAL override.
     pub index_config: Option<IndexConfig>,
+    /// The same immutable table generation, retaining the metadata and lazy
+    /// aggregate pins needed by the query server's zero-scan paths. Kept
+    /// private so callers can only consume it through snapshot-bound methods.
+    aggregate_entry: CachedTableEntry,
 }
 
 impl BufferedTableSnapshot {
@@ -25635,12 +25640,41 @@ impl IcebergContext {
         group_column: &str,
         value_column: &str,
     ) -> Result<Option<Vec<GroupedNumericAvgRow>>> {
-        use siglake_bloom::{GroupedNumericKind, GroupedNumericSum, GroupedNumericValue};
-
         let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
         let cached = self.cached_table_entry(&table_ident).await?;
+        self.grouped_numeric_avg_for_cached(&table_ident, &cached, group_column, value_column)
+            .await
+    }
+
+    /// Snapshot-bound counterpart used after an `attr_get` substitution.
+    /// The footer summaries and provider then describe the same generation.
+    pub async fn qualified_grouped_numeric_avg(
+        &self,
+        qualified: &QualifiedAttrRewrite,
+        group_column: &str,
+        value_column: &str,
+    ) -> Result<Option<Vec<GroupedNumericAvgRow>>> {
+        let table_ident = qualified.aggregate_entry.table.identifier().clone();
+        self.grouped_numeric_avg_for_cached(
+            &table_ident,
+            &qualified.aggregate_entry,
+            group_column,
+            value_column,
+        )
+        .await
+    }
+
+    async fn grouped_numeric_avg_for_cached(
+        &self,
+        table_ident: &TableIdent,
+        cached: &CachedTableEntry,
+        group_column: &str,
+        value_column: &str,
+    ) -> Result<Option<Vec<GroupedNumericAvgRow>>> {
+        use siglake_bloom::{GroupedNumericKind, GroupedNumericSum, GroupedNumericValue};
+
         let tasks = self
-            .live_file_scan_tasks_cached(&table_ident, &cached)
+            .live_file_scan_tasks_cached(table_ident, cached)
             .await?;
         if tasks.iter().any(|task| {
             !grouped_numeric_file_supported(task.data_file_format, !task.deletes.is_empty())
@@ -25788,7 +25822,37 @@ impl IcebergContext {
 
         let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
         let cached = self.cached_table_entry(&table_ident).await?;
+        self.grouped_counts_unwindowed_for_cached(&table_ident, &cached, column, shard)
+            .await
+    }
 
+    /// Snapshot-bound unwindowed group counts for a qualified promoted-column
+    /// rewrite. Windowed aggregate helpers have their own table-name cache
+    /// lookups, so the query layer conservatively declines those shapes while
+    /// a rewrite binding is active.
+    pub async fn qualified_grouped_counts_with_summary(
+        &self,
+        qualified: &QualifiedAttrRewrite,
+        column: &str,
+        shard: Option<crate::ScanShard>,
+    ) -> Result<Option<GroupCounts>> {
+        let table_ident = qualified.aggregate_entry.table.identifier().clone();
+        self.grouped_counts_unwindowed_for_cached(
+            &table_ident,
+            &qualified.aggregate_entry,
+            column,
+            shard,
+        )
+        .await
+    }
+
+    async fn grouped_counts_unwindowed_for_cached(
+        &self,
+        table_ident: &TableIdent,
+        cached: &CachedTableEntry,
+        column: &str,
+        shard: Option<crate::ScanShard>,
+    ) -> Result<Option<GroupCounts>> {
         // Phase 2 — snapshot-keyed unwindowed-aggregate cache. The whole-table
         // (non-sharded) result is a pure function of `(table, snapshot, column)`;
         // snapshots are immutable between commits, so a warm hit skips the
@@ -25831,7 +25895,7 @@ impl IcebergContext {
                     .and_then(|v| v.parse::<u64>().ok());
                 if let Some(record_count) = record_count {
                     if let Some(rows) = self
-                        .tier1_group_count_rows(&cached, column, record_count)
+                        .tier1_group_count_rows(cached, column, record_count)
                         .await?
                     {
                         if let Some(key) = agg_key {
@@ -25849,7 +25913,7 @@ impl IcebergContext {
         // Tier 2 — sum the per-file footer summaries (with raw-page RLE
         // fallback), through the one implementation the rebuild path also uses.
         let Some(totals) = self
-            .grouped_counts_from_files(&cached, &table_ident, column, shard)
+            .grouped_counts_from_files(cached, table_ident, column, shard)
             .await?
         else {
             return Ok(None);
