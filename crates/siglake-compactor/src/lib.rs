@@ -62,7 +62,8 @@ use siglake_storage::iceberg::{
 use siglake_wal::{
     claim_segment, finish_segment, list_committed, list_index_dirs, list_orphaned, list_poisoned,
     list_sealed, list_tenant_dirs, list_visible, quarantine_poison_segment, read_segment,
-    read_segment_from_bytes, recover_orphaned_processing, release_segment, sweep_committed_gated,
+    read_segment_from_bytes, recover_orphaned_processing, release_segment,
+    segment_uncompressed_bytes, sweep_committed_gated,
 };
 
 /// How long to retain `committed/` segments before sweep deletes them.
@@ -105,6 +106,13 @@ pub const PASS_CLAIM_ATTEMPTS_EXHAUSTED: &str =
 struct FsBatchConfig {
     max_segments: usize,
     max_bytes: u64,
+}
+
+struct SelectedFsBatch {
+    paths: Vec<PathBuf>,
+    physical_bytes: u64,
+    decoded_bytes: u64,
+    max_segment_decoded_bytes: u64,
 }
 
 struct CommitOutcome {
@@ -3292,8 +3300,15 @@ impl Compactor {
 
         let workers = self.drain_concurrency.unwrap_or_else(drain_concurrency);
         let deadline = cycle_start + self.drain_cycle_budget.unwrap_or_else(drain_cycle_budget);
-        let byte_budget = drain_inflight_budget_bytes();
-        let mut inflight_bytes = 0u64;
+        // The configured budget historically counted compressed WAL bytes.
+        // Admission now counts the uncompressed Arrow IPC body instead: that
+        // is the allocation basis for read -> concat -> sort -> encode, and is
+        // the quantity zstd compression hid in the shipped 1 GiB OOM.
+        let decoded_byte_budget = drain_decoded_budget_bytes(
+            siglake_storage::memory_limit_for_sizing(),
+            drain_inflight_budget_bytes(),
+        );
+        let mut inflight_decoded_bytes = 0u64;
         let mut queue: Vec<PathBuf> = sealed;
         let mut offset = 0usize;
         // #4651: claim attempts this pass has spent on each segment, keyed by
@@ -3352,52 +3367,61 @@ impl Compactor {
                     offset = 0;
                 }
                 let selected = self
-                    .select_sealed_for_cycle(&queue[offset..])
+                    .select_sealed_for_cycle(&queue[offset..], decoded_byte_budget)
                     .context("selecting sealed segments for cycle")?;
-                if selected.is_empty() {
+                if selected.paths.is_empty() {
                     break;
                 }
-                let selected_bytes: u64 = selected
-                    .iter()
-                    .map(|c| std::fs::metadata(c).map(|m| m.len()))
-                    .collect::<std::io::Result<Vec<_>>>()
-                    .context("stat selected sealed segments")?
-                    .into_iter()
-                    .sum();
                 // Byte-budget admission (task #64): stop topping up rather than
-                // exceed the in-flight byte budget; the batch stays unclaimed
-                // (offset unadvanced) and is re-selected once a completion frees
-                // budget. An empty pipeline always admits — no deadlock.
+                // exceed the in-flight decoded-byte budget; the batch stays
+                // unclaimed (offset unadvanced) and is re-selected once a
+                // completion frees budget. An empty pipeline always admits —
+                // no deadlock for one oversized WAL segment.
                 if !admit_batch(
                     inflight.len(),
                     workers,
-                    inflight_bytes,
-                    selected_bytes,
-                    byte_budget,
+                    inflight_decoded_bytes,
+                    selected.decoded_bytes,
+                    decoded_byte_budget,
                 ) {
                     break;
                 }
-                offset += selected.len();
+                tracing::info!(
+                    tenant = tenant_label,
+                    segments = selected.paths.len(),
+                    physical_bytes = selected.physical_bytes,
+                    decoded_bytes = selected.decoded_bytes,
+                    max_segment_decoded_bytes = selected.max_segment_decoded_bytes,
+                    decoded_budget_bytes = decoded_byte_budget,
+                    inflight_decoded_bytes_before = inflight_decoded_bytes,
+                    "filesystem WAL batch admitted"
+                );
+                offset += selected.paths.len();
                 // #4651: charge the attempt before the claim, so a claim that
                 // fails half-way through the batch is counted too — that path
                 // releases its partial claims and resumes topping up, which is
                 // its own spin.
-                for s in &selected {
+                for s in &selected.paths {
                     charge_pass_attempt(&mut pass_attempts, s);
                 }
                 metrics::histogram!(
                     "siglake_compactor_claimed_segments",
                     "tenant" => tenant_label.to_string()
                 )
-                .record(selected.len() as f64);
+                .record(selected.paths.len() as f64);
                 metrics::histogram!(
                     "siglake_compactor_claimed_bytes",
                     "tenant" => tenant_label.to_string()
                 )
-                .record(selected_bytes as f64);
-                let mut claimed: Vec<PathBuf> = Vec::with_capacity(selected.len());
+                .record(selected.physical_bytes as f64);
+                metrics::histogram!(
+                    "siglake_compactor_claimed_decoded_bytes",
+                    "tenant" => tenant_label.to_string()
+                )
+                .record(selected.decoded_bytes as f64);
+                let mut claimed: Vec<PathBuf> = Vec::with_capacity(selected.paths.len());
                 let mut claim_err: Option<anyhow::Error> = None;
-                for s in &selected {
+                for s in &selected.paths {
                     match claim_segment(s) {
                         Ok(p) => claimed.push(p),
                         Err(e) => {
@@ -3422,7 +3446,9 @@ impl Compactor {
                 let ice = ice.clone();
                 let wal_dir = dir.to_path_buf();
                 let transient_failures = self.transient_fs_commit_failures_for_test.clone();
-                inflight_bytes = inflight_bytes.saturating_add(selected_bytes);
+                inflight_decoded_bytes =
+                    inflight_decoded_bytes.saturating_add(selected.decoded_bytes);
+                let selected_decoded_bytes = selected.decoded_bytes;
                 inflight.push(async move {
                     let inject_failure = transient_failures.is_some_and(|remaining| {
                         remaining
@@ -3440,7 +3466,7 @@ impl Compactor {
                     } else {
                         commit_claimed(&ice, &wal_dir, &claimed, target).await
                     };
-                    (claimed, selected_bytes, res)
+                    (claimed, selected_decoded_bytes, res)
                 });
             }
             metrics::gauge!(
@@ -3448,10 +3474,10 @@ impl Compactor {
                 "tenant" => tenant_label.to_string()
             )
             .set(inflight.len() as f64);
-            let Some((claimed, batch_bytes, res)) = inflight.next().await else {
+            let Some((claimed, batch_decoded_bytes, res)) = inflight.next().await else {
                 break;
             };
-            inflight_bytes = inflight_bytes.saturating_sub(batch_bytes);
+            inflight_decoded_bytes = inflight_decoded_bytes.saturating_sub(batch_decoded_bytes);
             match res {
                 Ok(outcome) => {
                     let mut finish_failures = 0u64;
@@ -4203,24 +4229,40 @@ impl Compactor {
         )
     }
 
-    fn select_sealed_for_cycle(&self, sealed: &[PathBuf]) -> Result<Vec<PathBuf>> {
-        let mut selected = Vec::new();
-        let mut total_bytes = 0u64;
+    fn select_sealed_for_cycle(
+        &self,
+        sealed: &[PathBuf],
+        decoded_budget: u64,
+    ) -> Result<SelectedFsBatch> {
+        let mut paths = Vec::new();
+        let mut physical_bytes = 0u64;
+        let mut decoded_bytes = 0u64;
+        let mut max_segment_decoded_bytes = 0u64;
         for path in sealed {
-            let bytes = std::fs::metadata(path)
+            let physical = std::fs::metadata(path)
                 .with_context(|| format!("stat {}", path.display()))?
                 .len();
+            let decoded = segment_uncompressed_bytes(path)
+                .with_context(|| format!("size decoded WAL segment {}", path.display()))?;
             let hit_segment_limit =
-                self.fs_batch.max_segments > 0 && selected.len() >= self.fs_batch.max_segments;
+                self.fs_batch.max_segments > 0 && paths.len() >= self.fs_batch.max_segments;
             let hit_byte_limit = self.fs_batch.max_bytes > 0
-                && total_bytes.saturating_add(bytes) > self.fs_batch.max_bytes;
-            if !selected.is_empty() && (hit_segment_limit || hit_byte_limit) {
+                && physical_bytes.saturating_add(physical) > self.fs_batch.max_bytes;
+            let hit_decoded_limit = decoded_bytes.saturating_add(decoded) > decoded_budget;
+            if !paths.is_empty() && (hit_segment_limit || hit_byte_limit || hit_decoded_limit) {
                 break;
             }
-            total_bytes = total_bytes.saturating_add(bytes);
-            selected.push(path.clone());
+            physical_bytes = physical_bytes.saturating_add(physical);
+            decoded_bytes = decoded_bytes.saturating_add(decoded);
+            max_segment_decoded_bytes = max_segment_decoded_bytes.max(decoded);
+            paths.push(path.clone());
         }
-        Ok(selected)
+        Ok(SelectedFsBatch {
+            paths,
+            physical_bytes,
+            decoded_bytes,
+            max_segment_decoded_bytes,
+        })
     }
 }
 
@@ -5088,13 +5130,12 @@ fn drain_cycle_budget() -> Duration {
     )
 }
 
-/// On-disk bytes of claimed batches admitted into flight simultaneously
-/// (default 1 GiB). The batch bytes multiply ~4–6× through the
-/// read → concat → sort → partition-split → encode pipeline, so a raw
-/// concurrency knob alone has an OOM corner: 12 × 256 MiB batches killed a
-/// 64 GB node. Admission requires BOTH this byte budget and the concurrency
-/// cap; a single batch larger than the budget still admits alone (no
-/// deadlock), it just flies solo.
+/// Operator ceiling for WAL bytes admitted into flight simultaneously
+/// (default 1 GiB). Since #6744 this ceiling is applied to uncompressed Arrow
+/// IPC bytes, not the zstd-compressed file length: the allocations downstream
+/// of the claim are decoded buffers, and field data compressed enough for a
+/// 64 MiB physical claim to decode past the packaged 1 GiB container limit.
+/// The container-derived ceiling below can tighten this further.
 fn drain_inflight_budget_bytes() -> u64 {
     std::env::var("SIGLAKE_DRAIN_INFLIGHT_BUDGET_MB")
         .ok()
@@ -5103,8 +5144,30 @@ fn drain_inflight_budget_bytes() -> u64 {
         .unwrap_or(1024 * 1024 * 1024)
 }
 
+/// Total decoded Arrow IPC admitted across every live filesystem-drain batch.
+///
+/// The downstream pipeline can retain several representations while it maps,
+/// concatenates, sorts and encodes. Keep decoded input to one eighth of the
+/// process limit, never above the operator's in-flight ceiling. A 1 GiB
+/// packaged compactor therefore admits 128 MiB of decoded WAL at once even
+/// when the shipped setting remains 1024 MiB. The 64 MiB floor matches the
+/// smallest accepted operator ceiling and keeps small/unlimited test processes
+/// productive; one segment larger than the result is admitted alone by both
+/// selection and [`admit_batch`] so the drain cannot deadlock.
+fn drain_decoded_budget_bytes(memory_limit: Option<u64>, configured_ceiling: u64) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const FALLBACK: u64 = 128 * MIB;
+    const MIN: u64 = 64 * MIB;
+    const MAX: u64 = 1024 * MIB;
+
+    let derived = memory_limit
+        .map(|limit| (limit / 8).clamp(MIN, MAX))
+        .unwrap_or(FALLBACK);
+    derived.min(configured_ceiling.max(MIN))
+}
+
 /// Pure admission rule for the continuous-dispatch top-up loop: admit the next
-/// batch while under the pipeline-count cap AND the in-flight byte budget —
+/// batch while under the pipeline-count cap AND the in-flight decoded-byte budget —
 /// except that an empty pipeline always admits (a batch bigger than the whole
 /// budget must not deadlock the drain; it just runs alone).
 fn admit_batch(
@@ -7525,6 +7588,184 @@ mod poison_ledger_tests {
     }
 }
 
+/// #6763: the drain, end to end, over a `sealed/` directory whose FIRST entry
+/// is a file no WAL writer could have produced. Since #6744 the cycle sizes
+/// every candidate ([`segment_uncompressed_bytes`]) before it claims anything,
+/// so an unparsable header is reached one step earlier than the read that used
+/// to be the first thing to see it. An error at that step fails the cycle
+/// before a single batch is admitted, and the valid segment behind the
+/// malformed one never commits. Sizing instead charges a corrupt estimate and
+/// leaves the verdict to [`read_segment`] and #3143's poison ledger. The
+/// ledger tests above inject the read error; these drive the real bytes.
+#[cfg(test)]
+mod malformed_first_sealed_segment_tests {
+    use super::*;
+    use datafusion::prelude::SessionContext;
+    use siglake_core::Event;
+    use siglake_wal::{read_poison_note, SEALED_DIR, WAL_FRAME_MAGIC};
+
+    /// Consecutive failed cycles before the set-aside. Two, so a shape is
+    /// charged, released and re-claimed at least once before `poison/` takes
+    /// it — the one-failure case would never exercise the retry.
+    const POISON_ATTEMPTS: u32 = 2;
+    /// Rows in the one valid segment.
+    const VALID_ROWS: usize = 4;
+    /// Sorts before any `ing-1-<uuidv7>.arrow`, so the drain meets it first.
+    const MALFORMED_NAME: &str = "0000-malformed.arrow";
+
+    /// The framed-segment header `siglake-wal` keeps private: magic(4)
+    /// version(1) flags(1) reserved(2) min_ts(8) max_ts(8) body_len(8)
+    /// body_crc(4), and for v2 a 16-byte owner uuid. Spelled out here rather
+    /// than exported: nothing in the tree writes these shapes, and the WAL's
+    /// public surface should not grow a way to.
+    const V1_HEADER_LEN: usize = 36;
+    const V2_HEADER_LEN: usize = 52;
+    /// FLAGS bit0: the body is zstd-compressed.
+    const FLAG_ZSTD: u8 = 0b0000_0001;
+    const CURRENT_VERSION: u8 = 2;
+
+    /// A v2-sized header with `version`/`flags`/`body_len` as given, followed
+    /// by `body` verbatim. Timestamps and CRC stay zero: every shape built
+    /// here is rejected before either is consulted.
+    fn framed(version: u8, flags: u8, declared_body_len: u64, body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; V2_HEADER_LEN];
+        bytes[0..4].copy_from_slice(WAL_FRAME_MAGIC);
+        bytes[4] = version;
+        bytes[5] = flags;
+        bytes[24..32].copy_from_slice(&declared_body_len.to_le_bytes());
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    async fn committed_rows(ice: &IcebergContext) -> i64 {
+        let ctx = SessionContext::new();
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        let batches = ctx
+            .sql("SELECT count(*) AS n FROM events")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    /// Seal one valid segment, drop `malformed` ahead of it in `sealed/`, and
+    /// run enough cycles for the attempt budget to be spent. Every cycle must
+    /// return `Ok`, the valid segment's rows must land, and the malformed file
+    /// must end up in `poison/` alone.
+    async fn drain_past(shape: &str, malformed: Vec<u8>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let warehouse = tmp.path().join("warehouse");
+
+        let mut writer = siglake_wal::WalWriter::with_thresholds(
+            &wal,
+            "ing-1",
+            VALID_ROWS,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let events: Vec<Event> = (0..VALID_ROWS)
+            .map(|i| Event::now(format!("{shape}-{i}")))
+            .collect();
+        let valid = writer
+            .append_events(&events)
+            .unwrap()
+            .expect("VALID_ROWS events reach the seal threshold")
+            .path;
+
+        let bad = wal.join(SEALED_DIR).join(MALFORMED_NAME);
+        std::fs::write(&bad, &malformed).unwrap();
+
+        // Preconditions: the drain meets the malformed file first, sizing it
+        // does NOT error (that is the #6744 property under test), and reading
+        // it does.
+        assert_eq!(
+            list_sealed(&wal).unwrap(),
+            vec![bad.clone(), valid.clone()],
+            "{shape}: the malformed file must sort ahead of the valid segment"
+        );
+        segment_uncompressed_bytes(&bad)
+            .unwrap_or_else(|e| panic!("{shape}: sizing must not fail the cycle: {e:#}"));
+        let read_err = read_segment(&bad).unwrap_err();
+        assert!(
+            read_err.to_string().contains("WAL frame"),
+            "{shape}: the fixture must be rejected by the frame walk, got: {read_err:#}"
+        );
+
+        let ice = Arc::new(IcebergContext::open(&warehouse).await.unwrap());
+        let compactor = Compactor::new(&wal, ice.clone())
+            .with_poison_attempts(POISON_ATTEMPTS)
+            .with_drain_concurrency(1)
+            .with_drain_cycle_budget(Duration::from_secs(10));
+
+        let mut committed = 0usize;
+        for cycle in 0..POISON_ATTEMPTS + 2 {
+            committed += compactor
+                .run_once()
+                .await
+                .unwrap_or_else(|e| panic!("{shape}: cycle {cycle} returned an error: {e:#}"));
+        }
+
+        assert_eq!(
+            committed, 1,
+            "{shape}: the valid segment commits, exactly once"
+        );
+        assert_eq!(
+            committed_rows(&ice).await,
+            VALID_ROWS as i64,
+            "{shape}: the valid segment's rows must be in the table"
+        );
+        assert!(
+            list_sealed(&wal).unwrap().is_empty(),
+            "{shape}: nothing may be left in sealed/ once the attempts are spent"
+        );
+        let poisoned = list_poisoned(&wal).unwrap();
+        assert_eq!(
+            poisoned
+                .iter()
+                .map(|p| p.file_name().unwrap().to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![MALFORMED_NAME],
+            "{shape}: only the malformed file is set aside"
+        );
+        let note = read_poison_note(&poisoned[0]).unwrap();
+        assert_eq!(note.segment, MALFORMED_NAME);
+        assert_eq!(note.attempts, POISON_ATTEMPTS);
+    }
+
+    /// Magic, then a version this build has no header length for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_first_sealed_segment_with_an_unknown_version() {
+        drain_past("unknown_version", framed(0x7f, 0, 0, b"body")).await;
+    }
+
+    /// Magic, then fewer bytes than the shortest header the reader knows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_first_sealed_segment_truncated_below_the_v1_header() {
+        let mut bytes = WAL_FRAME_MAGIC.to_vec();
+        bytes.resize(V1_HEADER_LEN - 8, 0);
+        drain_past("truncated_header", bytes).await;
+    }
+
+    /// A current-version zstd frame whose declared body length is not the one
+    /// the file actually carries.
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_first_sealed_segment_with_a_disagreeing_zstd_body_length() {
+        drain_past(
+            "zstd_body_length_mismatch",
+            framed(CURRENT_VERSION, FLAG_ZSTD, 4096, b"eight..."),
+        )
+        .await;
+    }
+}
+
 #[cfg(test)]
 mod agg_fold_tests {
     use super::*;
@@ -7809,6 +8050,105 @@ mod backpressure_gate_tests {
         assert!(admit_batch(0, 4, 0, 10_000 * MB, 1024 * MB));
         // Overflow-safe.
         assert!(!admit_batch(1, 4, u64::MAX, u64::MAX, 1024 * MB));
+    }
+
+    #[test]
+    fn shipped_one_gib_profile_caps_decoded_wal_at_one_eighth() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(
+            drain_decoded_budget_bytes(Some(1024 * MIB), 1024 * MIB),
+            128 * MIB
+        );
+        assert_eq!(
+            drain_decoded_budget_bytes(Some(1024 * MIB), 64 * MIB),
+            64 * MIB,
+            "an operator may tighten the decoded ceiling"
+        );
+        assert_eq!(
+            drain_decoded_budget_bytes(Some(64 * 1024 * MIB), 1024 * MIB),
+            1024 * MIB,
+            "the existing in-flight ceiling still binds large compactors"
+        );
+    }
+
+    /// Native Arrow allocation regression for #6744. Four field-shaped WAL
+    /// segments compress beneath the old physical claim cap together, while
+    /// their decoded arrays exceed the test budget. Selection must retain only
+    /// the prefix whose real IPC/native footprint fits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn compressed_wal_claim_is_bounded_by_decoded_native_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let mut writer = siglake_wal::WalWriter::with_thresholds(
+            &wal,
+            "native-memory",
+            1,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let mut sealed = Vec::new();
+        for n in 0..4 {
+            let event = siglake_core::Event::now(format!(
+                "field={n} {}",
+                "compressible-payload-".repeat(32_768)
+            ));
+            sealed.push(
+                writer
+                    .append_events(&[event])
+                    .unwrap()
+                    .expect("max_events=1 seals every fixture")
+                    .path,
+            );
+        }
+        let decoded: Vec<u64> = sealed
+            .iter()
+            .map(|path| segment_uncompressed_bytes(path).unwrap())
+            .collect();
+        let physical_total: u64 = sealed
+            .iter()
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .sum();
+        let decoded_budget = decoded[0] + decoded[1];
+        assert!(physical_total < DEFAULT_FS_MAX_BYTES);
+        assert!(decoded.iter().sum::<u64>() > decoded_budget);
+
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        let compactor = Compactor::new(&wal, ice);
+        let selected = compactor
+            .select_sealed_for_cycle(&sealed, decoded_budget)
+            .unwrap();
+        assert_eq!(selected.paths.len(), 2);
+        assert_eq!(selected.decoded_bytes, decoded_budget);
+        assert_eq!(
+            selected.max_segment_decoded_bytes,
+            decoded[0].max(decoded[1])
+        );
+
+        let selected_native_bytes: u64 = selected
+            .paths
+            .iter()
+            .flat_map(|path| read_segment(path).unwrap())
+            .map(|batch| batch.get_array_memory_size() as u64)
+            .sum();
+        let old_physical_only_native_bytes: u64 = sealed
+            .iter()
+            .flat_map(|path| read_segment(path).unwrap())
+            .map(|batch| batch.get_array_memory_size() as u64)
+            .sum();
+        assert!(
+            selected_native_bytes < old_physical_only_native_bytes,
+            "decoded admission must reduce retained native Arrow memory: selected \
+             {selected_native_bytes}, physical-only {old_physical_only_native_bytes}"
+        );
+        assert_eq!(
+            selected_native_bytes * 2,
+            old_physical_only_native_bytes,
+            "two of four equal field segments must retain half the old native allocation"
+        );
     }
 }
 

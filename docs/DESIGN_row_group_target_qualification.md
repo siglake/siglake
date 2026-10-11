@@ -303,6 +303,16 @@ establishes that 256 MiB is unsafe at 1Gi — only that it is measurably closer 
 the limit than it needs to be, on a bin far smaller than the ones the fleet
 merges.
 
+The matched field attempt on 2026-10-11 subsequently OOM-killed both the
+256 MiB and 64 MiB arms before canonical ingest completed. That result did not
+distinguish the row-group targets. #6744 identified a shared admission weakness:
+a claim could count only 64 MiB of zstd-compressed WAL while readers allocated
+much larger uncompressed Arrow IPC bodies. Decoded admission now targets a
+budget independently of the row-group target, but admits one oversized segment
+alone for progress. A fresh matched field qualification must retain maximum
+decoded segment and claimed batch sizes, verify no OOM, and complete ingestion
+before this candidate can establish a fix or qualify the target comparison.
+
 The follow-up this left open is #5132, the chart change if a round supports it.
 #5133 settled the 32 MiB arm's selective read against the page accounting above.
 #5805 added requested-versus-fetched scan attribution, and #5806 renamed the
