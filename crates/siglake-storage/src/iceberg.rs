@@ -10849,6 +10849,9 @@ pub struct ReclusterMergeOptions {
     /// Rows materialized at once by the page-bounded merge. Floored at 1024.
     /// Env: `SIGLAKE_MERGE_CHUNK_ROWS`.
     pub merge_chunk_rows: Option<usize>,
+    /// Page-bounded merge chunks whose fetched input may be resident at once.
+    /// Floored at 1. Env: `SIGLAKE_MERGE_CHUNK_PREFETCH`.
+    pub merge_chunk_prefetch: Option<usize>,
 }
 
 /// Per-context value overrides for storage knobs that otherwise come from the
@@ -19840,16 +19843,45 @@ impl IcebergContext {
     /// encodes, which is the point; 1 restores the strictly serial
     /// fetch-then-encode loop.
     ///
-    /// Peak decoded input memory for a merge is `merge_chunk_rows() x this`, so
-    /// raising it trades memory for hidden read latency. The 2026-08-05 200G
-    /// round measured input at ~30% of merge time against S3 (9.6% on a local
-    /// filesystem), which is what this exists to hide.
-    fn merge_chunk_prefetch() -> usize {
-        std::env::var("SIGLAKE_MERGE_CHUNK_PREFETCH")
-            .ok()
+    /// The packaged 1 GiB compactor stays serial. On the retained 2026-10-11
+    /// field input, the mean decoded row width estimates about 259 MB per
+    /// default 524,288-row chunk. The old loop could retain three such chunks,
+    /// alongside WAL admission and writer/decoder allocations. This estimates
+    /// a possible allocation window, not the observed peak at the field OOM.
+    /// Larger or unlimited processes
+    /// keep the measured depth of 2. An explicit setting remains an operator
+    /// choice.
+    /// Resolve the environment and cgroup-derived page-bounded prefetch depth.
+    /// A valid explicit value is honored; otherwise the shipped 1 GiB process
+    /// gives up read/encode overlap to retain one decoded chunk at a time.
+    fn merge_chunk_prefetch_from(
+        configured: Option<&str>,
+        memory_limit_bytes: Option<u64>,
+    ) -> usize {
+        if let Some(depth) = configured
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or(2)
+        {
+            return depth;
+        }
+        const SHIPPED_COMPACTOR_LIMIT: u64 = 1024 * 1024 * 1024;
+        if memory_limit_bytes.is_some_and(|limit| limit <= SHIPPED_COMPACTOR_LIMIT) {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Pure resolver for the per-call override. A call-specific value wins over
+    /// both the environment and cgroup policy, including a zero floored to one.
+    fn merge_chunk_prefetch_for_call(
+        per_call: Option<usize>,
+        configured: Option<&str>,
+        memory_limit_bytes: Option<u64>,
+    ) -> usize {
+        per_call
+            .map(|depth| depth.max(1))
+            .unwrap_or_else(|| Self::merge_chunk_prefetch_from(configured, memory_limit_bytes))
     }
 
     /// Re-cluster `files` into time-disjoint output via a bounded-fan-in streaming
@@ -19910,6 +19942,7 @@ impl IcebergContext {
                         .merge_chunk_rows
                         .map(|rows| rows.max(1024))
                         .unwrap_or_else(Self::merge_chunk_rows),
+                    merge.merge_chunk_prefetch,
                     segmented_sink,
                 ),
             )
@@ -20343,6 +20376,7 @@ impl IcebergContext {
     ///    rolling writer as the streaming merge. Between chunks every reader
     ///    is CLOSED: no per-input decoder state persists, so 600 inputs cost
     ///    the same resident memory as 6.
+    #[allow(clippy::too_many_arguments)]
     async fn merge_files_page_bounded(
         &self,
         table: &Table,
@@ -20350,6 +20384,7 @@ impl IcebergContext {
         bloom_columns: &[&str],
         rewrite_gen: u32,
         chunk_rows: usize,
+        merge_chunk_prefetch: Option<usize>,
         segmented_sink: Option<Arc<SegmentedIndexSink>>,
     ) -> Result<(Vec<DataFile>, usize)> {
         use arrow::compute::interleave_record_batch;
@@ -20439,11 +20474,17 @@ impl IcebergContext {
         // declared sort. Reordering here would emit mis-sorted rows beneath a
         // truthful-looking footer, which the ordered-scan early-stop trusts.
         //
-        // Cost: peak decoded input becomes `chunk_rows x prefetch` instead of
-        // `chunk_rows`. Halve `SIGLAKE_MERGE_CHUNK_ROWS` to hold the product
-        // constant on a memory-tight compactor.
+        // Cost: peak fetched input becomes `chunk_rows x prefetch` instead of
+        // `chunk_rows`, plus whatever slices the output writer's open row group
+        // still retains. The derived 1 GiB default is therefore one; larger
+        // processes keep two for overlap.
         let plans: Vec<ChunkFetchPlan> = chunks.iter().map(|c| plan_chunk_fetches(c)).collect();
-        let prefetch = Self::merge_chunk_prefetch();
+        let configured_prefetch = std::env::var("SIGLAKE_MERGE_CHUNK_PREFETCH").ok();
+        let prefetch = Self::merge_chunk_prefetch_for_call(
+            merge_chunk_prefetch,
+            configured_prefetch.as_deref(),
+            cgroup_memory_limit_bytes(),
+        );
         // Stream items must be fully OWNED. A closure borrowing `&ChunkFetchPlan`
         // out of `plans` trips rustc's higher-ranked-lifetime limitation for
         // every spawn up the compactor call chain (the same one the phase-1
@@ -20501,13 +20542,18 @@ impl IcebergContext {
         };
         let mut pending_args: std::collections::VecDeque<(usize, Vec<FetchArgs>)> =
             fetch_args.into_iter().enumerate().collect();
-        // Depth-bounded so decoded input memory stays `chunk_rows x prefetch`.
+        // A slot remains occupied after its handle is popped: the decoded
+        // result is current until assembly/write releases it. This separate
+        // window makes that lifetime explicit instead of equating queue length
+        // with resident chunk count.
+        let mut prefetch_window = PageBoundedPrefetchWindow::new(prefetch);
         let mut inflight: std::collections::VecDeque<_> = std::collections::VecDeque::new();
-        while inflight.len() < prefetch.max(1) {
+        while prefetch_window.available() > 0 {
             let Some((ci, args)) = pending_args.pop_front() else {
                 break;
             };
             inflight.push_back(spawn_fetch(ci, args));
+            prefetch_window.started();
         }
 
         let mut writer = self.lazy_merge_output_writer(
@@ -20537,11 +20583,6 @@ impl IcebergContext {
             };
             let joined = handle.await.context("page-bounded fetch task")?;
             stages.input += t_wait.elapsed().as_nanos() as u64;
-            // Refill immediately, so the next chunk's fetch runs on the runtime
-            // during THIS chunk's encode — the whole point of the pipeline.
-            if let Some((nci, nargs)) = pending_args.pop_front() {
-                inflight.push_back(spawn_fetch(nci, nargs));
-            }
             let (ci, raw, input_nanos) = joined?;
             fetch_total_nanos += input_nanos;
             let chunk = &chunks[ci];
@@ -20677,6 +20718,27 @@ impl IcebergContext {
             stages.write += chunk_write_nanos;
             stages.assemble +=
                 (t_assemble.elapsed().as_nanos() as u64).saturating_sub(chunk_write_nanos);
+
+            // The depth includes the chunk just consumed. Refill only after
+            // its decoded input is released. Refilling immediately after
+            // `pop_front` made the default depth of 2 mean CURRENT + 2 queued
+            // chunks. At the retained field input's mean decoded row width,
+            // that window estimates about 777 MB before writer/WAL overhead;
+            // actual simultaneous residency at the field OOM was not measured.
+            // Dropping these views first makes the
+            // configured depth an actual upper bound on fetched input owned by
+            // this loop. (The writer may retain slices for its open row group,
+            // which is why the 1 GiB derived default above is depth 1.)
+            drop(batch_refs);
+            drop(parts_flat);
+            prefetch_window.released();
+            while prefetch_window.available() > 0 {
+                let Some((nci, nargs)) = pending_args.pop_front() else {
+                    break;
+                };
+                inflight.push_back(spawn_fetch(nci, nargs));
+                prefetch_window.started();
+            }
         }
 
         anyhow::ensure!(
@@ -31046,6 +31108,65 @@ mod group_count_summary_tests {
         }
     }
 
+    #[test]
+    fn page_bounded_prefetch_reserves_the_shipped_compactor_for_one_chunk() {
+        let gib = 1024 * 1024 * 1024;
+
+        assert_eq!(
+            super::IcebergContext::merge_chunk_prefetch_from(None, Some(gib)),
+            1,
+            "the packaged 1 GiB compactor must not overlap decoded chunks"
+        );
+        assert_eq!(
+            super::IcebergContext::merge_chunk_prefetch_from(None, Some(gib + 1)),
+            2,
+            "larger processes retain the measured overlap default"
+        );
+        assert_eq!(
+            super::IcebergContext::merge_chunk_prefetch_from(None, None),
+            2,
+            "an unlimited process retains the historical default"
+        );
+        assert_eq!(
+            super::IcebergContext::merge_chunk_prefetch_from(Some("3"), Some(gib)),
+            3,
+            "a valid explicit operator setting remains authoritative"
+        );
+        assert_eq!(
+            super::IcebergContext::merge_chunk_prefetch_from(Some("0"), Some(gib)),
+            1,
+            "an invalid setting falls back to the cgroup-derived default"
+        );
+        assert_eq!(
+            super::IcebergContext::merge_chunk_prefetch_for_call(Some(3), Some("7"), Some(gib),),
+            3,
+            "the per-call depth must win over both environment and cgroup policy"
+        );
+        assert_eq!(
+            super::IcebergContext::merge_chunk_prefetch_for_call(Some(0), Some("7"), Some(gib + 1),),
+            1,
+            "a zero per-call depth must floor to one"
+        );
+    }
+
+    #[test]
+    fn page_bounded_prefetch_depth_includes_the_current_decoded_chunk() {
+        let mut window = super::PageBoundedPrefetchWindow::new(2);
+        window.started();
+        window.started();
+        assert_eq!(window.available(), 0);
+
+        // Popping and awaiting the first handle does not release its decoded
+        // output. Before #6789 the queue length fell to one here and the loop
+        // launched a third fetch, giving CURRENT + 2 pending chunks. The slot
+        // is released only after assembly/write drops the current input.
+        assert_eq!(window.available(), 0);
+        window.released();
+        assert_eq!(window.available(), 1);
+        window.started();
+        assert_eq!(window.available(), 0);
+    }
+
     /// F-3 census: a run that exactly spans an input's row groups makes all of
     /// them copyable; a run that starts or ends mid-group excludes the straddled
     /// ones. Both directions asserted — a census that always returned "all
@@ -31562,6 +31683,41 @@ struct ChunkFetchPlan {
     fetches: Vec<(usize, usize, usize)>,
 }
 
+/// Slots occupied by page-bounded chunk fetches, including the decoded chunk
+/// currently being assembled and written.
+///
+/// `VecDeque::len()` cannot express this lifetime: awaiting `pop_front()`
+/// removes the handle before its output is consumed. Treating that removal as
+/// free capacity admitted one extra decoded chunk (#6789).
+#[derive(Debug)]
+struct PageBoundedPrefetchWindow {
+    depth: usize,
+    occupied: usize,
+}
+
+impl PageBoundedPrefetchWindow {
+    fn new(depth: usize) -> Self {
+        Self {
+            depth: depth.max(1),
+            occupied: 0,
+        }
+    }
+
+    fn available(&self) -> usize {
+        self.depth - self.occupied
+    }
+
+    fn started(&mut self) {
+        debug_assert!(self.occupied < self.depth);
+        self.occupied += 1;
+    }
+
+    fn released(&mut self) {
+        debug_assert!(self.occupied > 0);
+        self.occupied -= 1;
+    }
+}
+
 /// Build a chunk's fetch plan. Within a chunk an input's rows form ONE
 /// contiguous range (the split-chunks invariant — inputs are consumed strictly
 /// forward), so `(lo, len)` fully describes its read.
@@ -31933,7 +32089,7 @@ mod streaming_recluster_tests {
             .await
             .unwrap();
         let (paged, paged_rows) = ice
-            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 1, 4, None)
+            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 1, 4, None, None)
             .await
             .unwrap();
         assert_eq!(streamed_rows, 25);
@@ -31980,7 +32136,7 @@ mod streaming_recluster_tests {
         let table = ice.catalog().load_table(&ident).await.unwrap();
 
         let (added, rows) = ice
-            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 2, 1 << 20, None)
+            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 2, 1 << 20, None, None)
             .await
             .unwrap();
         assert_eq!(rows, 6);
