@@ -21011,8 +21011,15 @@ impl IcebergContext {
         if promoted.is_empty() {
             return Ok(batch);
         }
-        siglake_core::repromote_attributes(&batch, &promoted)
-            .map_err(|e| anyhow::anyhow!("repromote batch: {e}"))
+        let batch = siglake_core::repromote_attributes(&batch, &promoted)
+            .map_err(|e| anyhow::anyhow!("repromote batch: {e}"))?;
+        // Extraction stamps the canonical events-table ids (9..), while a
+        // managed index assigns promoted fields after its own mapping. The
+        // streaming merge writes this batch directly, unlike the in-RAM path
+        // which passes through `write_batch_to_data_files` and its alignment.
+        // Restamp the extracted fields to this table's ids before handing the
+        // batch to the shared merge writer.
+        align_batch_to_table_schema(table, batch)
     }
 
     /// Re-cluster one bin of data files into time-sorted replacement output and

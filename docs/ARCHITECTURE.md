@@ -953,6 +953,11 @@ read, byte and duration attribution, and committed promotion-backfill bins
 publish rewritten files, input/output bytes and duration. The structured INFO
 line names a bounded set of keys refused for the cap, a schema-name collision
 or mixed sampled types and reports how many names were truncated.
+Streaming backfill re-clusters align each decoded batch to the table schema,
+re-extract every promoted value from `attributes`, and align once more before
+the writer. The second alignment is required for managed indexes: extraction
+uses the canonical events-table field IDs while the index owns IDs assigned
+after its declared mapping.
 `SiglakeAutoPromotionNearCeiling` reads
 the per-table configured cap at 80%; it does not infer a universal schema
 column ceiling.
