@@ -1374,12 +1374,16 @@ file, and a residual `FilterExec` above the scan that DataFusion cannot push a
 limit through. Every partition therefore believes it owes its whole file, and on
 a fully compacted table they all open at once and decode their first megabytes
 before the global limit can cancel them. The scan instead admits partitions in
-widening waves: one to start, doubling each time the admitted partitions have
-produced their own number of batches or ends. Scheduling only — a partition that
-waits still reads every row it would have read, and the limit still lives above
-the residual filter, so no qualifying row can be lost. Scoped to the shape whose
-rows the limit clips one for one (the same test that gates the index decline
-above), so ordered drains and aggregates are untouched. Observable via
+widening waves: one to start, doubling when cumulative credits reach the
+admitted width. An exhausted partition pays immediately; raw source batches pay
+one credit per eight batches because the residual predicate above the scan may
+need several batches to make the final result row. This keeps a common clipped
+predicate on its first partition while a sparse 15-partition scan still reaches
+full fan-out after 64 batches. Scheduling only — a partition that waits still
+reads every row it would have read, and the limit still lives above the residual
+filter, so no qualifying row can be lost. Scoped to the shape whose rows the
+limit clips one for one (the same test that gates the index decline above), so
+ordered drains and aggregates are untouched. Observable via
 `siglake_query_scan_clipped_admission_total{outcome}` and
 `siglake_query_scan_clipped_admission_wait_seconds`; `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE=0`
 turns it off. Measured in

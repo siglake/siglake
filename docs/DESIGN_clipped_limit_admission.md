@@ -42,19 +42,20 @@ wrong; what is wrong is that they all start.
 `ScanAdmission` stages the start. A partition takes a ticket when it is
 executed and runs once the ramp passes its ticket. The ramp starts at one
 partition and multiplies by `wave` (default 2) each time the cumulative credits
-reach the admitted width — one credit per batch the scan emits, one per
-partition that ends.
+reach the admitted width. A partition end pays one credit immediately. Raw
+source batches pay one credit per eight batches: the residual predicate lives
+above the scan, so a raw batch does not mean the query needs another partition.
 
-* A limit answered out of the first batch leaves the ramp at `wave`: one
-  partition decoded, one admitted behind it.
+* A limit answered within eight source batches stays on the first partition.
 * A sparse term, or a term with too few matches, reaches full fan-out after
-  `partitions / wave` credits — eight batches on the 15-file layout, against the
-  430 batches one of its files holds.
+  64 batches on the 15-file layout, still far short of one 7M-row file.
 
-Charging the ramp the admitted width rather than one credit per batch is what
-keeps the first wave narrow. Widening on every batch was measured on the local
-fixture below and reached four files where the width rule reaches two, because
-the ramp outruns the root stream closing.
+The eight-batch pace repairs #6721's retained 50G failure. The earlier ramp
+reached all 15 partitions after eight raw batches. The warm scans fetched zero
+object-store bytes, yet decoded 11.8--31.4 MB and 154,624--445,440 rows for 100
+results; collect alone took 6.2--20.4 ms. The batch credit was therefore the
+bottleneck, not index I/O. Eight batches per credit keeps the common predicate
+on its first partition and bounds the sparse case above.
 
 The credit count is cumulative and is never reset. A per-wave counter deadlocks
 the shape that pays nothing but its ends: with the ramp at 2 and its first
@@ -126,25 +127,29 @@ store and is reported for the pair comparison only — it is not S3 traffic.
 
 Both arms return 20 rows and every row satisfies the predicate.
 
+With #6721's paced credit, the same seven-pair test measured a gated median of
+138,364 decoded bytes (one row group) against 553,456 ungated (four row groups).
+Before the change, the matched run measured 276,728 against 415,092. Drain wall
+times overlapped in both runs because this small fixture is planning-bound; the
+assertion grades decoded work and exact results, not local latency.
+
 The seven fixtures in this test binary run serially. Six own four-worker Tokio
 runtimes; before serialization they created 24 runtime workers plus the
 mechanism test on a four-core hosted runner. A process-wide fixture lock removed
 that in-binary contention. The full workspace gate can still schedule other test
-binaries beside this one. Gate attempt #2911 then measured three gated row
-groups against four ungated groups, while the isolated rerun measured two
-against three. Both ratios describe the same scheduler race, but only the
-isolated run met the asserted one-third reduction.
-
-The A/B test is therefore an ignored measurement. Run it alone:
+binaries beside this one. The old per-batch ramp could widen to full fan-out
+under that contention. The eight-batch pace bounds this fixture at one decoded
+group plus, at most, the successor admitted by the first partition's terminal
+credit. The matched A/B is therefore a required test:
 
 ```shell
 cargo test -p siglake-storage --test clipped_limit_admission \
   the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit \
-  -- --ignored --nocapture
+  -- --nocapture
 ```
 
-The regular test gate retains the exact query-result controls below and the
-scheduler-free mechanism assertion.
+The regular test gate also retains the exact query-result controls below and
+the scheduler-free mechanism assertion.
 
 The mechanism is asserted separately and without a scheduler in
 `a_partition_behind_the_ramp_reads_nothing`: the partition streams are executed

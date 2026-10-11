@@ -243,13 +243,13 @@ fn assert_all_qualify(rows: &[String], sql: &str) {
 /// alternates within them, because the arm that runs second in a pair finds the
 /// footers cached and is handed the shorter window.
 ///
-/// Starving the box further than the gate does erases the effect rather than
-/// the measurement of it: at six concurrent copies the ramp widens to the full
-/// fan-out before the limit can cancel anything, and the medians converge. The
-/// mechanism itself is therefore asserted separately and without a scheduler,
-/// in `a_partition_behind_the_ramp_reads_nothing`.
+/// #6721's eight-batch credit pace also bounds the gated arm under contention:
+/// this fixture's first partition is one source batch, so its terminal credit
+/// can admit one successor but batch credits cannot race the ramp to full
+/// fan-out. The matched A/B is therefore a regular regression test now; the
+/// mechanism remains asserted separately without a scheduler in
+/// `a_partition_behind_the_ramp_reads_nothing`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "scheduler-dependent measurement; run alone with --ignored --nocapture"]
 async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit() {
     let _fixture_guard = FIXTURE_SERIAL.lock().await;
 
@@ -272,8 +272,8 @@ async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit()
     // scheduling race with the root stream closing (10/5/6 and 7/4/5 across three
     // otherwise identical ungated pairs on this box). Decoded bytes count the
     // batches that were actually built, which is the cost the card is about and
-    // which the ramp bounds directly — the gated arm decoded exactly two
-    // batches in every pair measured on an idle lane.
+    // which the ramp bounds directly. With #6721's paced credit the gated arm
+    // decodes one batch on this fixture; the old per-batch credit decoded two.
     let mut decoded: Vec<(usize, usize)> = Vec::new();
     let mut ungated_groups: Vec<usize> = Vec::new();
     let (mut gated_files, mut ungated_files) = (0usize, 0usize);
