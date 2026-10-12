@@ -29,6 +29,11 @@ confidence-threshold = 0.8
 # If no replacement exists, add { crate = "name@version", reason = "..." } to ignore below.
 yanked = "deny"
 ignore = [
+    # Maintenance-only advisory; no patched unsafe-libyaml release exists.
+    # serde_yaml is used by operator/kube-client1.1 and OpenAPI tooling, not
+    # query/ingest binaries. This does not suppress other vulnerability IDs.
+    # Owned removal (including kube-client transitive copy): task #6847.
+    "RUSTSEC-2024-0449",
     "RUSTSEC-2024-0436", # paste is transitive through DataFusion/Parquet/utoipa; no safe upgrade exists.
     "RUSTSEC-2026-0194", # quick-xml <0.41 is pinned by reqsign/object_store; upgrade with those dependencies.
     "RUSTSEC-2026-0195", # quick-xml <0.41 is pinned by reqsign/object_store; upgrade with those dependencies.
