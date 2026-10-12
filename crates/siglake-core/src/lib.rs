@@ -21,7 +21,8 @@ pub use build_info::{build_info, BuildInfo, BUILD_VERSION};
 pub use mapping::{map_carrier_batch, map_carrier_batch_with_stats, CarrierBatchMapping};
 pub use promote::{
     promote_attributes, promoted_columns_from_property, promoted_property_json,
-    repromote_attributes, PromotedColumn, PromotedType, PROMOTED_PROPERTY_KEY,
+    repromote_attributes, PromotedColumn, PromotedType, ATTR_EXTRACTOR_VERSION,
+    PROMOTED_PROPERTY_KEY,
 };
 
 use std::sync::{Arc, OnceLock};

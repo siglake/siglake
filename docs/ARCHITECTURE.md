@@ -919,6 +919,32 @@ column, queryable via the `attr_get(attributes, key)` UDF (values come back as
 text so they `CAST` cleanly) and `LIKE`. Existing tables gain the column via
 the additive `siglake migrate-schema` — see **Upgrades** below.
 
+**One extraction rule, versioned.** A promoted column is a materialized
+`attr_get`: the query layer substitutes the column for the UDF once backfill
+completes, and prunes row groups from its statistics before that. Both are
+wrong the moment the two extractors disagree, so the rule is defined once —
+a literal (possibly dotted) key wins at every level of the walk, then a dotted
+key descends one segment at a time — and carries a version,
+`siglake_core::ATTR_EXTRACTOR_VERSION`. Every new data-file name carries an
+`x<version>` component beside its rewrite generation. The manifest path is
+therefore per-file writer provenance: an unmarked file, including one a
+still-running old compactor commits after adoption, never feeds the rewrite or
+the promoted-column prune. `siglake.promotion_extraction.v1` records the table
+adoption, but its sequence is not treated as writer provenance. The
+backfill-completion property
+(`siglake.promotion_backfill_complete.v1`) carries the version too, so a table
+qualified under an older rule is no longer qualified: the rewrite and the
+prune hints stay off and queries answer from the residual JSON — correct, and
+as slow as they were before the promotion — until every unqualified file has
+been rewritten. Compaction gets there on a table that keeps being written to,
+and not at all on one whose files have settled at the terminal level or the
+merge-generation cap; the WS-7 backfill selector does not help, because it
+picks files by a missing promoted column and these carry theirs. Nothing
+migrates data automatically and no command forces it. Version 1
+(0.2.1 and earlier) retried the literal key only at the top level, so a key
+`a.b.c` whose object under `a` held a literal `"b.c"` key promoted to NULL
+while `attr_get` returned the value (#6769).
+
 **A non-scalar value reads differently per mechanism, on purpose.** `attr_get`
 and a `Utf8` promotion of the same key both return an object's or array's
 compact JSON, and they return the same text: each parses the value and

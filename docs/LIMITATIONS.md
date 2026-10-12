@@ -1600,6 +1600,30 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   per table, a sample bounded in files × rows, and a 4096-key census cap.
   Leaving it off is still the shipped answer — qualifying the bounds is not a
   decision to turn it on.
+- **Promoted columns written before 0.3.0 lose their speedup until the files
+  are rewritten.** Through 0.2.1 the promotion extractor retried a literal
+  dotted key only at the top level while `attr_get` retried it at every level,
+  so a key `a.b.c` whose object under `a` carried a literal `"b.c"` key
+  promoted to NULL and the UDF returned the value (#6769). 0.3.0 makes the two
+  extractors identical and versions the rule, which costs the older data its
+  qualification. New file names carry the extraction-rule version, and the
+  `attr_get`→column rewrite and promoted-column prune stay off until every live
+  file carries the current version. This also rejects a file that a
+  still-running old compactor commits after the table is adopted. Those
+  queries are correct — they read the residual JSON, which is what they did
+  before the promotion — but they scan. A rewrite re-extracts the values through
+  the current rule, and nothing schedules one for this reason: the WS-7
+  backfill selector picks files by a MISSING promoted column
+  (`iceberg.rs`'s `ScoredBinKind::Backfill`), not by which rule wrote the
+  values it finds, and an old-rule file carries the column already. Level
+  and depth triggers rewrite what keeps being written to, so a table under
+  continuing ingest converges by itself; a file that has reached the terminal
+  level or the merge-generation cap in a disjoint partition is never selected
+  again and keeps its old values indefinitely. No operator command rewrites a
+  table's live files on demand — `siglake migrate-schema` widens the catalog
+  schema and rewrites nothing — so for a cold table the practical answer is to
+  leave it unqualified: the queries stay correct. There is no repair that fixes
+  the values in place, and no automatic migration.
 - **Tier-1 group counts serve only columns present since the table's first
   commit.** The serving guard is `column_total(column) == record_count`, so a
   column that starts accumulating mid-life — a typed column on a table created

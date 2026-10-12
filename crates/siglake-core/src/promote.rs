@@ -106,9 +106,33 @@ impl PromotedColumn {
     }
 }
 
-/// Look `key` up in a parsed attributes map: a literal (possibly dotted)
-/// top-level key wins; otherwise a dotted key walks into nested objects one
+/// Version of the dotted-key extraction rule shared by [`attr_lookup`] here and
+/// `find_value_path` in the query server's `attr_get` UDF. The two must agree
+/// on every input: the query layer substitutes a promoted column for
+/// `attr_get(attributes, key)` and prunes row groups from its statistics, and
+/// both are wrong the moment the column holds a value the UDF would not have
+/// produced.
+///
+/// Bump it when the rule changes. Values materialized by an older rule are not
+/// interchangeable with the current `attr_get`, so the storage layer stamps
+/// this version on the table (`siglake.promotion_extraction.v1`) and withholds
+/// the rewrite and the prune hints from data written under an older one.
+///
+/// - v1 (≤ 0.2.1): literal key at the top level, then a strict segment walk.
+///   A key `a.b.c` whose object under `a` holds a literal `"b.c"` key extracted
+///   to NULL while `attr_get` returned the value.
+/// - v2: literal key retried at EVERY level, matching the UDF (#6769).
+pub const ATTR_EXTRACTOR_VERSION: u32 = 2;
+
+/// Look `key` up in a parsed attributes map: a literal (possibly dotted) key
+/// wins at every level; otherwise a dotted key walks into nested objects one
 /// segment at a time (OTLP residuals hold nested objects).
+///
+/// Byte-for-byte the rule of the query server's `find_value_path`, including
+/// its absence of backtracking: `a.b.c` against `{"a":{"x":1},"a.b":{"c":9}}`
+/// resolves `a`, fails inside it, and does NOT retry `a.b` at the top level.
+/// Both extractors must answer identically for every input — see
+/// [`ATTR_EXTRACTOR_VERSION`].
 fn attr_lookup<'a>(
     map: &'a serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -117,11 +141,7 @@ fn attr_lookup<'a>(
         return Some(v);
     }
     let (head, tail) = key.split_once('.')?;
-    let mut cur = map.get(head)?;
-    for seg in tail.split('.') {
-        cur = cur.as_object()?.get(seg)?;
-    }
-    Some(cur)
+    attr_lookup(map.get(head)?.as_object()?, tail)
 }
 
 /// Field id of the `index`-th promoted column. The 8 core columns own ids 1..=8.
@@ -428,6 +448,104 @@ mod tests {
             .unwrap();
         assert!(sampled.value(0));
         assert!(sampled.is_null(1));
+    }
+
+    /// #6769: the inner literal dotted key. `attr_get`'s walk retries the
+    /// literal key at every level, so `a.b.c` resolves against
+    /// `{"a":{"b.c":1}}`; promotion's strict segment walk used to miss it and
+    /// write NULL, and the rewrite then substituted that NULL for the UDF.
+    #[test]
+    fn inner_literal_dotted_key_matches_attr_get() {
+        let json = serde_json::from_str::<serde_json::Map<_, _>>(r#"{"a":{"b.c":1}}"#).unwrap();
+        assert_eq!(attr_lookup(&json, "a.b.c"), Some(&serde_json::json!(1)));
+    }
+
+    #[test]
+    fn literal_key_wins_at_every_level() {
+        // Top level: the literal dotted key beats the nested object (the Big5
+        // `log.file.path` shape depends on this precedence).
+        let top =
+            serde_json::from_str::<serde_json::Map<_, _>>(r#"{"a.b":1,"a":{"b":2}}"#).unwrap();
+        assert_eq!(attr_lookup(&top, "a.b"), Some(&serde_json::json!(1)));
+        // Inner level: same precedence one step down.
+        let inner = serde_json::from_str::<serde_json::Map<_, _>>(r#"{"a":{"b.c":1,"b":{"c":2}}}"#)
+            .unwrap();
+        assert_eq!(attr_lookup(&inner, "a.b.c"), Some(&serde_json::json!(1)));
+    }
+
+    #[test]
+    fn nested_walk_and_misses() {
+        let m = |s: &str| serde_json::from_str::<serde_json::Map<_, _>>(s).unwrap();
+        // Plain nested walk, unchanged.
+        assert_eq!(
+            attr_lookup(&m(r#"{"a":{"b":{"c":3}}}"#), "a.b.c"),
+            Some(&serde_json::json!(3))
+        );
+        // A JSON null resolves — and promotes to a NULL cell, see below.
+        assert_eq!(
+            attr_lookup(&m(r#"{"a":{"b.c":null}}"#), "a.b.c"),
+            Some(&serde_json::Value::Null)
+        );
+        // No backtracking: `a` resolves, the rest fails inside it, and the
+        // top-level `a.b` is NOT retried. The UDF answers None here too.
+        assert_eq!(
+            attr_lookup(&m(r#"{"a":{"x":1},"a.b":{"c":9}}"#), "a.b.c"),
+            None
+        );
+        // A scalar in the middle of a path is a miss, not a panic.
+        assert_eq!(attr_lookup(&m(r#"{"a":"scalar"}"#), "a.b"), None);
+        assert_eq!(attr_lookup(&m(r#"{"a":{"b":1}}"#), "a.b.c"), None);
+    }
+
+    #[test]
+    fn promotes_inner_literal_dotted_key_and_keeps_null_precedence() {
+        let cols = vec![
+            PromotedColumn {
+                attr_key: "a.b.c".into(),
+                name: "abc".into(),
+                ty: PromotedType::Int64,
+            },
+            PromotedColumn {
+                attr_key: "log.file.path".into(),
+                name: "log_file_path".into(),
+                ty: PromotedType::Utf8,
+            },
+        ];
+        let events = vec![
+            ev(Some(r#"{"a":{"b.c":7},"log.file.path":"/var/log/a"}"#)),
+            ev(Some(
+                r#"{"a":{"b":{"c":8}},"log":{"file":{"path":"/var/log/b"}}}"#,
+            )),
+            // Literal dotted key wins over the nested object at both levels.
+            ev(Some(
+                r#"{"a":{"b.c":9,"b":{"c":1}},"log.file.path":"/lit","log":{"file":{"path":"/nested"}}}"#,
+            )),
+            // An explicit JSON null promotes to NULL, as an absent key does.
+            ev(Some(r#"{"a":{"b.c":null},"log.file.path":null}"#)),
+        ];
+        let batch = events_to_record_batch(&events).unwrap();
+        let out = promote_attributes(&batch, &cols).unwrap();
+        let abc = out
+            .column_by_name("abc")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(abc.value(0), 7, "inner literal dotted key");
+        assert_eq!(abc.value(1), 8, "nested walk still resolves");
+        assert_eq!(abc.value(2), 9, "literal beats nested at the inner level");
+        assert!(abc.is_null(3), "JSON null promotes to NULL");
+
+        let path = out
+            .column_by_name("log_file_path")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(path.value(0), "/var/log/a");
+        assert_eq!(path.value(1), "/var/log/b");
+        assert_eq!(path.value(2), "/lit", "top-level literal precedence held");
+        assert!(path.is_null(3));
     }
 
     #[test]
