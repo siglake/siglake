@@ -51,7 +51,7 @@ struct Cli {
 }
 
 fn render(spec: &Spec) -> Result<String> {
-    serde_yaml::to_string(&(spec.build)()).context("serialize OpenAPI document to YAML")
+    serde_saphyr::to_string(&(spec.build)()).context("serialize OpenAPI document to YAML")
 }
 
 fn main() -> Result<()> {

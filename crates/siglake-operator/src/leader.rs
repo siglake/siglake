@@ -35,7 +35,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use kube::{
@@ -276,7 +275,7 @@ impl Election {
             .as_ref()
             .and_then(|s| s.lease_duration_seconds)
             .unwrap_or(self.lease_duration.as_secs() as i32);
-        if is_lease_alive(renew, Utc::now(), lease_seconds) {
+        if is_lease_alive(renew, jiff::Timestamp::now(), lease_seconds) {
             return Ok(false);
         }
         // Holder is dead. PATCH to take over.
@@ -314,7 +313,7 @@ impl Election {
             spec: Some(LeaseSpec {
                 holder_identity: holder,
                 lease_duration_seconds: Some(self.lease_duration.as_secs() as i32),
-                renew_time: Some(MicroTime(Utc::now())),
+                renew_time: Some(MicroTime(jiff::Timestamp::now())),
                 ..Default::default()
             }),
         }
@@ -328,15 +327,12 @@ impl Election {
 /// Extracted from `try_steal_expired` so the time arithmetic can be
 /// unit-tested without spinning up a kube API.
 fn is_lease_alive(
-    renew_time: Option<chrono::DateTime<Utc>>,
-    now: chrono::DateTime<Utc>,
+    renew_time: Option<jiff::Timestamp>,
+    now: jiff::Timestamp,
     lease_seconds: i32,
 ) -> bool {
     match renew_time {
-        Some(r) => {
-            let age = now.signed_duration_since(r);
-            age.num_seconds() < lease_seconds as i64
-        }
+        Some(r) => now.as_second() - r.as_second() < i64::from(lease_seconds),
         None => false,
     }
 }
@@ -344,10 +340,8 @@ fn is_lease_alive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
-
-    fn t(secs: i64) -> chrono::DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).single().unwrap()
+    fn t(secs: i64) -> jiff::Timestamp {
+        jiff::Timestamp::new(secs, 0).unwrap()
     }
 
     #[test]

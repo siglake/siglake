@@ -143,7 +143,8 @@ async fn run() -> Result<()> {
     if let Some(values_path) = cli.adopt_values.as_ref() {
         let raw = std::fs::read_to_string(values_path)
             .with_context(|| format!("read {}", values_path.display()))?;
-        let values: serde_yaml::Value = serde_yaml::from_str(&raw).context("parse values yaml")?;
+        let values: serde_json::Value =
+            serde_saphyr::from_str(&raw).context("parse values yaml")?;
         let namespace = siglake_operator::adopt::adoption_namespace_from(
             cli.adopt_namespace.as_deref(),
             &cli.adopt_cluster_name,
@@ -265,7 +266,7 @@ async fn run() -> Result<()> {
 fn print_crd_yaml() -> Result<()> {
     use kube::CustomResourceExt;
     let crd_doc = SiglakeCluster::crd();
-    let y = serde_yaml::to_string(&crd_doc).context("serialize CRD to YAML")?;
+    let y = serde_saphyr::to_string(&crd_doc).context("serialize CRD to YAML")?;
     println!("{y}");
     Ok(())
 }
