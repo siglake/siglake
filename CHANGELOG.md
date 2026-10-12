@@ -20,6 +20,20 @@
   forces a rewrite. No data is migrated automatically and no property needs
   hand repair. (#6769)
 
+- **Auto-promotion backfill (fix, target 0.3.0)**: the write path now decides
+  whether a batch already matches the table by comparing whole Arrow fields
+  rather than column names alone, and restamps the catalog's field ids when
+  they differ. A promoted column on a managed index takes its id from that
+  index's own schema while promotion extraction stamps the canonical
+  events-table id, so on a narrow index every persisted backfill rewrite failed
+  with `Field id N not found in struct array`. Streaming re-clusters now repeat
+  that alignment after re-extracting promoted values; without the second
+  alignment, a multi-column page-bounded backfill restored the canonical ids
+  and failed at its output writer. The steady-state path, where the ids already
+  agree, passes the batch through as before. The delete-rewrite table provider
+  declares its stream's schema through the same comparison, so it cannot
+  declare a file schema for batches that were rebuilt. (#6745, #6779, #6820)
+
 - **Compactor drain memory (bug fix, target 0.3.0)**: filesystem-drain claim
   admission now counts uncompressed Arrow IPC bytes across in-flight commits,
   beside the existing compressed-byte and segment caps. The packaged 1Gi

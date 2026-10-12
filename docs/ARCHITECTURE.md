@@ -979,6 +979,11 @@ read, byte and duration attribution, and committed promotion-backfill bins
 publish rewritten files, input/output bytes and duration. The structured INFO
 line names a bounded set of keys refused for the cap, a schema-name collision
 or mixed sampled types and reports how many names were truncated.
+Streaming backfill re-clusters align each decoded batch to the table schema,
+re-extract every promoted value from `attributes`, and align once more before
+the writer. The second alignment is required for managed indexes: extraction
+uses the canonical events-table field IDs while the index owns IDs assigned
+after its declared mapping.
 `SiglakeAutoPromotionNearCeiling` reads
 the per-table configured cap at 80%; it does not infer a universal schema
 column ceiling.
@@ -2085,7 +2090,7 @@ handler returns. Two fields make the join exact anyway.
 
 | Field | Minted | Meaning |
 | --- | --- | --- |
-| `query_execution_id` | Once per execution, by the handler that starts it (`QueryExecutionId::next`), and injected through `SessionConfig` | The request. `0` (`UNATTRIBUTED_QUERY_EXECUTION_ID`) means the session carried none — an internal scan. |
+| `query_execution_id` | Once per execution, by the handler that starts it (`QueryExecutionId::next`), and injected through `SessionConfig` | One execution within the request. `0` (`UNATTRIBUTED_QUERY_EXECUTION_ID`) means the session carried none — an internal scan. |
 | `scan_id` | Once per scan node, in `SiglakeIcebergTableScan::try_new` | The node. Separates two scan nodes of one execution (the residual twin plan) and the same query planned again later. |
 
 Each execution also logs one `query execution start` line carrying its id, its
@@ -2107,7 +2112,11 @@ refused executions keep their existing event set.
 
 Ids are process-local. A distributed query's coordinator and worker halves
 each mint their own and are joined by the W3C trace context the fan-out
-already propagates, not by a shared id. `crates/siglake-storage/tests/scan_event_attribution.rs`
+already propagates, not by a shared id. The coordinator's pre-dispatch work
+and a subsequent `scan_local` serve also mint separate ids, even though they
+run on one pod for one request; each id has its own `query execution start`
+line.
+`crates/siglake-storage/tests/scan_event_attribution.rs`
 and `crates/siglake-query-server/tests/query_execution_attribution.rs` pin
 the concurrent, early-`LIMIT` and streaming cases.
 

@@ -50,7 +50,21 @@ pub fn set_object_cache_max_bytes(max_bytes: u64) {
 }
 
 fn object_cache_cacheable(path: &str) -> bool {
-    !path.contains("/wal-mirror/") && !path.contains("/_active/")
+    !path.contains("/wal-mirror/")
+        && !path.contains("/_active/")
+        && !is_mutable_side_aggregate(path)
+}
+
+fn is_mutable_side_aggregate(path: &str) -> bool {
+    // The commit path overwrites this cumulative object in place. Its sibling
+    // delta objects are immutable because their identity includes a sequence.
+    let Some((_, aggregate_path)) = path.rsplit_once("/metadata/siglake-agg/") else {
+        return false;
+    };
+    let Some((incarnation, object)) = aggregate_path.split_once('/') else {
+        return false;
+    };
+    !incarnation.is_empty() && object == "siglake-aggregates.json"
 }
 
 #[derive(Default)]
@@ -610,6 +624,15 @@ mod tests {
         FileIO::new_with_fs()
     }
 
+    async fn write_object(file_io: &FileIO, path: &str, value: &'static [u8]) {
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(value))
+            .await
+            .unwrap();
+    }
+
     #[derive(Debug)]
     struct CountedRead {
         bytes: Bytes,
@@ -669,6 +692,90 @@ mod tests {
         cache.insert("oversized".into(), Bytes::from_static(b"1234567"), 6);
         assert!(cache.get("oversized").is_none());
         assert!(cache.bytes <= 6);
+    }
+
+    #[test]
+    fn object_cache_admission_keeps_immutable_objects_and_mutable_exclusions() {
+        for path in [
+            "s3://bucket/table/data/part-00000.parquet",
+            "s3://bucket/table/metadata/v7.metadata.json",
+            "s3://bucket/table/metadata/siglake-agg/1111/siglake-agg-deltas/0001.json",
+            "s3://bucket/other/siglake-aggregates.json",
+            "s3://bucket/table/metadata/siglake-agg/1111/nested/siglake-aggregates.json",
+            "s3://bucket/table/metadata/siglake-agg/1111/siglake-aggregates.json.backup",
+        ] {
+            assert!(super::object_cache_cacheable(path), "{path}");
+        }
+
+        for path in [
+            "s3://bucket/wal-mirror/tenant/segment.arrow",
+            "s3://bucket/table/_active/segment.arrow.partial",
+            "s3://bucket/table/metadata/siglake-agg/1111/siglake-aggregates.json",
+        ] {
+            assert!(!super::object_cache_cacheable(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mutable_side_aggregate_whole_object_overwrites_are_visible_without_restart() {
+        super::set_object_cache_max_bytes(64 * 1024 * 1024);
+        let tmp_dir = TempDir::new().unwrap();
+        let path = format!(
+            "memory://{}/metadata/siglake-agg/11111111-1111-1111-1111-111111111111/siglake-aggregates.json",
+            tmp_dir.path().display()
+        );
+        let file_io = FileIO::new_with_memory();
+        let input = file_io.new_input(&path).unwrap();
+
+        write_object(&file_io, &path, b"A").await;
+        assert_eq!(input.read().await.unwrap(), Bytes::from_static(b"A"));
+
+        write_object(&file_io, &path, b"B").await;
+        assert_eq!(input.read().await.unwrap(), Bytes::from_static(b"B"));
+    }
+
+    #[tokio::test]
+    async fn mutable_side_aggregate_range_overwrites_are_visible_without_restart() {
+        super::set_object_cache_max_bytes(64 * 1024 * 1024);
+        let tmp_dir = TempDir::new().unwrap();
+        let path = format!(
+            "memory://{}/metadata/siglake-agg/11111111-1111-1111-1111-111111111111/siglake-aggregates.json",
+            tmp_dir.path().display()
+        );
+        let file_io = FileIO::new_with_memory();
+        let input = file_io.new_input(&path).unwrap();
+
+        write_object(&file_io, &path, b"A").await;
+        let reader = input.reader().await.unwrap();
+        assert_eq!(reader.read(0..1).await.unwrap(), Bytes::from_static(b"A"));
+
+        write_object(&file_io, &path, b"B").await;
+        let reader = input.reader().await.unwrap();
+        assert_eq!(reader.read(0..1).await.unwrap(), Bytes::from_static(b"B"));
+    }
+
+    #[tokio::test]
+    async fn immutable_whole_object_reads_still_hit_the_cache() {
+        super::set_object_cache_max_bytes(64 * 1024 * 1024);
+        let tmp_dir = TempDir::new().unwrap();
+        let path = format!(
+            "memory://{}/data/part-00000.parquet",
+            tmp_dir.path().display()
+        );
+        let file_io = FileIO::new_with_memory();
+        let input = file_io.new_input(&path).unwrap();
+
+        write_object(&file_io, &path, b"immutable A").await;
+        assert_eq!(
+            input.read().await.unwrap(),
+            Bytes::from_static(b"immutable A")
+        );
+
+        write_object(&file_io, &path, b"changed underneath").await;
+        assert_eq!(
+            input.read().await.unwrap(),
+            Bytes::from_static(b"immutable A")
+        );
     }
 
     fn write_to_file<P: AsRef<Path>>(s: &str, path: P) {
