@@ -6848,6 +6848,7 @@ mod aggregate_coverage_chain_tests {
             HashMap::new(),
             None,
             MergeConsumedProofAction::new(Vec::new(), None),
+            None,
         )
         .await
         .unwrap();
@@ -6980,6 +6981,7 @@ mod aggregate_coverage_chain_tests {
                     HashMap::new(),
                     Some(&default_events_inverted_index_spec()),
                     MergeConsumedProofAction::new(Vec::new(), None),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -11051,6 +11053,56 @@ pub struct IcebergTuning {
     /// several data files — one sidecar per output file (#4377) — without
     /// writing half a gigabyte to get there.
     pub merge_target_file_bytes: Option<usize>,
+}
+
+/// Ownership retained by blocking work detached from an append future.
+///
+/// Tokio cannot cancel a `spawn_blocking` closure after it starts. A caller
+/// whose memory admission is tied to the append future can therefore pass its
+/// ownership token here; every blocking child that retains the append's
+/// decoded input keeps a clone until that input and the child's allocations
+/// have been dropped.
+#[derive(Clone)]
+pub struct AppendWorkGuard {
+    owner: Arc<dyn Send + Sync>,
+    blocking_child_start: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl AppendWorkGuard {
+    pub fn new<T>(owner: Arc<T>) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        Self {
+            owner,
+            blocking_child_start: None,
+        }
+    }
+
+    /// Install a deterministic blocking-child entry hook for cancellation
+    /// tests. Production callers use [`Self::new`].
+    #[doc(hidden)]
+    pub fn with_blocking_child_start_for_test<T>(
+        owner: Arc<T>,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        Self {
+            owner,
+            blocking_child_start: Some(hook),
+        }
+    }
+
+    fn blocking_child_started(&self) {
+        if let Some(hook) = &self.blocking_child_start {
+            hook();
+        }
+        // Read the owner after the hook so its lifetime visibly spans a test
+        // hook that blocks until the cancelling parent has gone away.
+        let _ = &self.owner;
+    }
 }
 
 /// Decide whether a re-cluster bin is merged via the memory-bounded streaming
@@ -16463,6 +16515,49 @@ impl IcebergContext {
         terminal_segment_ids: &[String],
         expect_table_uuid: Option<&str>,
     ) -> Result<usize> {
+        self.append_batch_with_consumed_proof_pruning_inner(
+            batch,
+            consumed,
+            acknowledged_through_ms,
+            terminal_segment_ids,
+            expect_table_uuid,
+            None,
+        )
+        .await
+    }
+
+    /// Variant used by a memory-admitted caller whose ownership must outlive
+    /// cancellation while blocking append work is still live.
+    pub async fn append_batch_with_consumed_proof_pruning_with_work_guard(
+        &self,
+        batch: RecordBatch,
+        consumed: &[ConsumedProofEntry],
+        acknowledged_through_ms: Option<i64>,
+        terminal_segment_ids: &[String],
+        expect_table_uuid: Option<&str>,
+        work_guard: AppendWorkGuard,
+    ) -> Result<usize> {
+        self.append_batch_with_consumed_proof_pruning_inner(
+            batch,
+            consumed,
+            acknowledged_through_ms,
+            terminal_segment_ids,
+            expect_table_uuid,
+            Some(work_guard),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_batch_with_consumed_proof_pruning_inner(
+        &self,
+        batch: RecordBatch,
+        consumed: &[ConsumedProofEntry],
+        acknowledged_through_ms: Option<i64>,
+        terminal_segment_ids: &[String],
+        expect_table_uuid: Option<&str>,
+        work_guard: Option<AppendWorkGuard>,
+    ) -> Result<usize> {
         // WS-7: promotion + promoted blooms happen in the generic append core
         // (one property-driven site for every table); this wrapper only
         // supplies the events base bloom set.
@@ -16489,6 +16584,7 @@ impl IcebergContext {
             MergeConsumedProofAction::new(consumed.to_vec(), acknowledged_through_ms)
                 .with_terminal_segment_ids(terminal_segment_ids.iter().cloned()),
             expect_table_uuid,
+            work_guard,
         )
         .await
     }
@@ -16672,6 +16768,7 @@ impl IcebergContext {
             None,
             MergeConsumedProofAction::new(proof_additions, None),
             None,
+            None,
         )
         .await
     }
@@ -16717,6 +16814,58 @@ impl IcebergContext {
         terminal_segment_ids: &[String],
         expect_table_uuid: Option<&str>,
     ) -> Result<usize> {
+        self.append_to_table_with_consumed_proof_pruning_inner(
+            table_ident,
+            batch,
+            bloom_columns,
+            consumed,
+            acknowledged_through_ms,
+            terminal_segment_ids,
+            expect_table_uuid,
+            None,
+        )
+        .await
+    }
+
+    /// User-index counterpart of
+    /// [`Self::append_batch_with_consumed_proof_pruning_with_work_guard`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_to_table_with_consumed_proof_pruning_with_work_guard(
+        &self,
+        table_ident: &TableIdent,
+        batch: RecordBatch,
+        bloom_columns: &[&str],
+        consumed: &[ConsumedProofEntry],
+        acknowledged_through_ms: Option<i64>,
+        terminal_segment_ids: &[String],
+        expect_table_uuid: Option<&str>,
+        work_guard: AppendWorkGuard,
+    ) -> Result<usize> {
+        self.append_to_table_with_consumed_proof_pruning_inner(
+            table_ident,
+            batch,
+            bloom_columns,
+            consumed,
+            acknowledged_through_ms,
+            terminal_segment_ids,
+            expect_table_uuid,
+            Some(work_guard),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_to_table_with_consumed_proof_pruning_inner(
+        &self,
+        table_ident: &TableIdent,
+        batch: RecordBatch,
+        bloom_columns: &[&str],
+        consumed: &[ConsumedProofEntry],
+        acknowledged_through_ms: Option<i64>,
+        terminal_segment_ids: &[String],
+        expect_table_uuid: Option<&str>,
+        work_guard: Option<AppendWorkGuard>,
+    ) -> Result<usize> {
         let mut snapshot_props = HashMap::new();
         if !consumed.is_empty() {
             snapshot_props.insert(
@@ -16737,6 +16886,7 @@ impl IcebergContext {
             MergeConsumedProofAction::new(consumed.to_vec(), acknowledged_through_ms)
                 .with_terminal_segment_ids(terminal_segment_ids.iter().cloned()),
             expect_table_uuid,
+            work_guard,
         )
         .await
     }
@@ -16751,6 +16901,7 @@ impl IcebergContext {
         index_spec: Option<&[InvertedIndexSpec]>,
         proof_action: MergeConsumedProofAction,
         expect_table_uuid: Option<&str>,
+        work_guard: Option<AppendWorkGuard>,
     ) -> Result<usize> {
         let table = self
             .load_append_target(table_ident, expect_table_uuid)
@@ -16762,6 +16913,7 @@ impl IcebergContext {
             snapshot_props,
             index_spec,
             proof_action,
+            work_guard,
         )
         .await
     }
@@ -16974,6 +17126,7 @@ impl IcebergContext {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn append_to_loaded_table(
         &self,
         table: Table,
@@ -16982,6 +17135,7 @@ impl IcebergContext {
         snapshot_props: HashMap<String, String>,
         index_spec: Option<&[InvertedIndexSpec]>,
         proof_action: MergeConsumedProofAction,
+        work_guard: Option<AppendWorkGuard>,
     ) -> Result<usize> {
         let rows = batch.num_rows();
         let table_ident = table.identifier().clone();
@@ -17101,6 +17255,9 @@ impl IcebergContext {
         let gc_base_cap = self.base_group_count_cardinality();
         let gc_sketch_m = self.group_count_sketch_counters();
         let aggregates_task = tokio::task::spawn_blocking(move || {
+            if let Some(work_guard) = &work_guard {
+                work_guard.blocking_child_started();
+            }
             let cols: Vec<&str> = gc_columns.iter().map(String::as_str).collect();
             // The delta covers EVERY column, not just the ones the inline object
             // turns down: classifying per batch would put `host` inline while it
@@ -17129,7 +17286,9 @@ impl IcebergContext {
             };
             let delta_tb = file_time_buckets(&gc_batch, "timestamp", SNAPSHOT_TIME_BUCKET_BASE_NS);
             let delta_tg = file_time_group_counts(&gc_batch, &cols, SNAPSHOT_TIME_BUCKET_BASE_NS);
-            (delta_gc, wide_gc, delta_tb, delta_tg, sketches)
+            let result = (delta_gc, wide_gc, delta_tb, delta_tg, sketches);
+            drop(work_guard);
+            result
         });
 
         let write_start = std::time::Instant::now();
@@ -35221,6 +35380,7 @@ mod append_incarnation_tests {
                 )]),
                 None,
                 MergeConsumedProofAction::new(vec![proof_entry("seg-dropped.arrow")], None),
+                None,
             )
             .await
             .expect_err("the commit must refuse a table that changed under it");
