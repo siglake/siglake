@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Promoted-column extraction (bug fix, target 0.3.0)**: a promoted column and
+  `attr_get(attributes, key)` now resolve every key to the same value. Through
+  0.2.1 promotion retried a literal dotted key only at the top level while the
+  UDF retried it at every level, so a key `a.b.c` whose object under `a` held a
+  literal `"b.c"` key promoted to NULL and the UDF returned the value; once
+  backfill completed, the column was substituted for the UDF and the answer
+  changed silently. The extraction rule now carries a version in every new
+  data file's name; unmarked files and files from another rule are ineligible
+  even when an old writer commits them after the table is adopted. Queries keep
+  answering from the residual JSON — correct, and as slow as before the
+  promotion — and neither the `attr_get`→column rewrite nor the
+  promoted-column prune applies until every unqualified file has been
+  rewritten. Compaction gets there on a table that keeps being written
+  to; files that have settled at the terminal level or the merge-generation cap
+  are not rewritten for this reason and keep their old values, and no command
+  forces a rewrite. No data is migrated automatically and no property needs
+  hand repair. (#6769)
+
 - **Auto-promotion backfill (fix, target 0.3.0)**: the write path now decides
   whether a batch already matches the table by comparing whole Arrow fields
   rather than column names alone, and restamps the catalog's field ids when

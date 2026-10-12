@@ -208,8 +208,11 @@ async fn managed_index_backfill_restamps_promoted_field_id_and_commits_exact_val
     );
     assert_eq!(
         after.metadata().properties().get(PROMOTION_BACKFILL_PROP),
-        Some(&promotion_json),
-        "the completion property records the exact promoted set"
+        Some(&format!(
+            "extractor{}:{promotion_json}",
+            siglake_core::ATTR_EXTRACTOR_VERSION
+        )),
+        "the completion property records the current extractor and exact promoted set"
     );
     let files = ice.live_data_files(&ident).await.unwrap();
     assert_eq!(files.len(), 1);

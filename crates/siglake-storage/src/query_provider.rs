@@ -2783,7 +2783,7 @@ impl SiglakeIcebergTableScan {
             )
             .increment(1);
         }
-        let promoted_prune = extract_promoted_prune(filters, &promoted_utf8_columns(&table));
+        let mut promoted_prune = extract_promoted_prune(filters, &promoted_utf8_columns(&table));
         let tuning = crate::current_query_scan_tuning();
         // Per-request distributed-query shard, injected as a SessionConfig
         // extension by the query-server (absent for ordinary single-pod scans).
@@ -2802,6 +2802,20 @@ impl SiglakeIcebergTableScan {
             shard,
         )
         .await?;
+        // A promoted-column statistic is sound only for a file written by the
+        // current extraction rule. A pre-upgrade writer can commit after the
+        // table was adopted, so table properties and sequence numbers are not
+        // provenance. Disable the hint for the whole scan when any planned
+        // file lacks the per-file marker; the residual `attr_get` predicate
+        // remains and answers from JSON.
+        if !promoted_prune.is_empty()
+            && task_partitions.iter().flatten().any(|task| {
+                crate::iceberg::file_extractor_version(task.data_file_path())
+                    != Some(siglake_core::ATTR_EXTRACTOR_VERSION)
+            })
+        {
+            promoted_prune.clear();
+        }
         // `partition_count` is computed after the #4 unordered-limit re-split below,
         // since that can change the partition count. `planned_files`/`planned_bytes`
         // are invariant under re-partitioning (same file set), so compute them here.
@@ -6882,18 +6896,23 @@ fn extract_match_udf_prune(
 /// `siglake.promoted.v1` property (written by `ensure_promoted_columns`).
 /// Empty for tables without declared promotions. Utf8 only: `attr_get`
 /// yields strings, so only Utf8 promotions substitute value-for-value.
+///
+/// Per-file extraction provenance is checked after file planning, before this
+/// hint reaches a reader. A row group whose promoted column is all-NULL can be
+/// skipped only when every planned file names the current rule (#6769).
 fn promoted_utf8_columns(table: &Table) -> HashMap<String, String> {
-    siglake_core::promoted_columns_from_property(
+    let promoted = siglake_core::promoted_columns_from_property(
         table
             .metadata()
             .properties()
             .get(siglake_core::PROMOTED_PROPERTY_KEY)
             .map(String::as_str),
-    )
-    .into_iter()
-    .filter(|c| c.ty == siglake_core::PromotedType::Utf8)
-    .map(|c| (c.attr_key, c.name))
-    .collect()
+    );
+    promoted
+        .into_iter()
+        .filter(|c| c.ty == siglake_core::PromotedType::Utf8)
+        .map(|c| (c.attr_key, c.name))
+        .collect()
 }
 
 /// WS-7: extract `attr_get(attributes, 'key') = 'value'` (and non-negated

@@ -2028,7 +2028,7 @@ struct LazyMergeOutputWriter<'a> {
     files: &'a [DataFile],
     bloom_columns: &'a [&'a str],
     with_footers: bool,
-    rewrite_gen: u32,
+    stamp: MergeOutputStamp,
     /// Where this merge's segmented sidecars land (#4377), or `None` when the
     /// writer builds none. One sink per rewrite, shared by every output file
     /// the rolling writer opens, so a partition-split rewrite leaves one
@@ -2047,7 +2047,8 @@ impl LazyMergeOutputWriter<'_> {
                         self.files,
                         self.bloom_columns,
                         self.with_footers,
-                        self.rewrite_gen,
+                        self.stamp.rewrite_gen,
+                        self.stamp.extractor_version,
                         Some(&batch),
                         self.segmented_sink.clone(),
                     )
@@ -2068,6 +2069,16 @@ impl LazyMergeOutputWriter<'_> {
             None => Ok(Vec::new()),
         }
     }
+}
+
+/// Filename metadata for one merge-style output writer. Normal merge paths
+/// re-extract promoted values and use the current rule; delete-survivor paths
+/// copy values and preserve the input marker (including `None` for an old
+/// unprovenanced file).
+#[derive(Clone, Copy)]
+struct MergeOutputStamp {
+    rewrite_gen: u32,
+    extractor_version: Option<u32>,
 }
 
 /// Outcome of a tier-2 re-clustering rewrite. See [`IcebergContext::recluster_files`].
@@ -2641,15 +2652,38 @@ fn file_rewrite_generation(path: &str) -> u32 {
     digits.parse::<u32>().unwrap_or(0)
 }
 
-/// Unique per-writer file-name prefix; rewrites (gen ≥ 1) embed their generation
-/// so [`file_rewrite_generation`] can recover it from the manifest path. UUIDs are
-/// hex, so a plain `siglake-<uuid>` prefix can never false-parse as `siglake-g…`.
-fn rewrite_prefix(rewrite_gen: u32) -> String {
-    if rewrite_gen == 0 {
-        format!("siglake-{}", Uuid::now_v7())
-    } else {
-        format!("siglake-g{rewrite_gen}-{}", Uuid::now_v7())
+/// Extraction-rule provenance carried by every data file this binary writes.
+///
+/// The marker lives in the file name because the manifest already carries the
+/// path. Qualification can therefore prove every live file without opening a
+/// Parquet footer. A pre-marker writer uses `siglake-<uuid>` or
+/// `siglake-g<N>-<uuid>`; UUIDs are hexadecimal, so neither can accidentally
+/// produce the `x<version>` component.
+pub(crate) fn file_extractor_version(path: &str) -> Option<u32> {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let mut rest = base.strip_prefix("siglake-")?;
+    if let Some(after_g) = rest.strip_prefix('g') {
+        let (_, after_generation) = after_g.split_once('-')?;
+        rest = after_generation;
     }
+    let after_x = rest.strip_prefix('x')?;
+    let (version, _) = after_x.split_once('-')?;
+    version.parse().ok()
+}
+
+/// Unique per-writer file-name prefix. Rewrites (gen ≥ 1) embed their
+/// generation and every current writer embeds the extraction-rule version.
+/// `extractor_version = None` exists only for the mixed-writer regression,
+/// which persists the exact unprovenanced shape a pre-#6769 writer produces.
+fn rewrite_prefix(rewrite_gen: u32, extractor_version: Option<u32>) -> String {
+    let generation = (rewrite_gen > 0).then(|| format!("g{rewrite_gen}-"));
+    let extractor = extractor_version.map(|version| format!("x{version}-"));
+    format!(
+        "siglake-{}{}{}",
+        generation.as_deref().unwrap_or_default(),
+        extractor.as_deref().unwrap_or_default(),
+        Uuid::now_v7()
+    )
 }
 
 impl LevelPolicy {
@@ -3346,15 +3380,75 @@ pub const REWRITE_COMMIT_PROP: &str = "siglake.rewrite";
 /// stamping existed) to this order's direction during the convergence.
 pub const LEGACY_SORT_ORDER_PROP: &str = "siglake.legacy_sort_order_id";
 
-/// Table property set (to the promoted-columns JSON) once EVERY live data
-/// file carries every promoted column — the gate for the query server's
-/// `attr_get(attributes, key)` → column rewrite, which is only sound when no
-/// pre-promotion file (column absent, key still in the residual JSON) can be
-/// scanned. The value is the full promotion list, so declaring a NEW
-/// promotion automatically invalidates the gate until backfill converges
-/// again. Flipped by the compactor after backfill passes; never unset by
-/// hand.
+/// Table property set once EVERY live data file carries every promoted column
+/// AND was written by the current extraction rule — the gate for the query
+/// server's `attr_get(attributes, key)` → column rewrite, which is only sound
+/// when no pre-promotion file (column absent, key still in the residual JSON)
+/// and no stale-rule file (column present, value not what `attr_get` returns)
+/// can be scanned. The value is the extractor version plus the full promotion
+/// list, so declaring a NEW promotion — or upgrading to a new extraction rule
+/// (#6769) — automatically invalidates the gate until the data converges
+/// again. Flipped by the compactor after backfill passes; never unset by hand.
 pub const PROMOTION_BACKFILL_PROP: &str = "siglake.promotion_backfill_complete.v1";
+
+/// Table property recording WHICH extraction rule materialized this table's
+/// promoted columns: `"<version>:declared"` when the promotions were first
+/// declared by a binary at that [`siglake_core::ATTR_EXTRACTOR_VERSION`], or
+/// `"<version>:after:<sequence>"` when a table whose promotions predate the
+/// stamp was adopted at that rule. This is an upgrade record, not file-writer
+/// provenance; qualification uses each file name.
+pub const PROMOTION_EXTRACTION_PROP: &str = "siglake.promotion_extraction.v1";
+
+/// What [`PROMOTION_EXTRACTION_PROP`] says about a table's promoted values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromotionExtraction {
+    /// Promotions declared under the current rule.
+    Declared,
+    /// Adopted at the current rule after `sequence`.
+    AdoptedAfter(i64),
+}
+
+/// Parse [`PROMOTION_EXTRACTION_PROP`]. `None` when it is absent, unparseable,
+/// or stamped at an extractor version other than the current one — all of
+/// which mean "this table's promoted values are not known to match `attr_get`".
+pub(crate) fn promotion_extraction_from(value: Option<&str>) -> Option<PromotionExtraction> {
+    let (version, rest) = value?.split_once(':')?;
+    if version.parse::<u32>().ok()? != siglake_core::ATTR_EXTRACTOR_VERSION {
+        return None;
+    }
+    match rest {
+        "declared" => Some(PromotionExtraction::Declared),
+        _ => rest
+            .strip_prefix("after:")
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(PromotionExtraction::AdoptedAfter),
+    }
+}
+
+/// [`PROMOTION_EXTRACTION_PROP`]'s value for a freshly declared promotion.
+pub(crate) fn promotion_declared_stamp() -> String {
+    format!("{}:declared", siglake_core::ATTR_EXTRACTOR_VERSION)
+}
+
+/// [`PROMOTION_EXTRACTION_PROP`]'s value for a table adopted at the current
+/// rule with `sequence` live at the time.
+pub(crate) fn promotion_adopted_stamp(sequence: i64) -> String {
+    format!("{}:after:{sequence}", siglake_core::ATTR_EXTRACTOR_VERSION)
+}
+
+/// [`PROMOTION_BACKFILL_PROP`]'s value for `promoted` under the current
+/// extraction rule. A table qualified under an older rule carries a different
+/// value, so the rewrite stays off until its data converges (#6769).
+pub(crate) fn promotion_backfill_value(
+    promoted: &[siglake_core::PromotedColumn],
+) -> Result<String> {
+    let json = siglake_core::promoted_property_json(promoted)
+        .map_err(|e| anyhow::anyhow!("promoted property json: {e}"))?;
+    Ok(format!(
+        "extractor{}:{json}",
+        siglake_core::ATTR_EXTRACTOR_VERSION
+    ))
+}
 
 /// Create one table's auto-promotion cost series at zero, before the sampling
 /// pass or the committed Backfill bin that would otherwise be their first
@@ -4180,6 +4274,44 @@ async fn live_data_files_within(
         }
     }
     Ok(Some(files))
+}
+
+/// Does every live data file carry a manifest column entry for each of `ids`
+/// AND name the current extraction rule as its writer? The promotion-backfill
+/// verdict short-circuits on the first disqualifying entry.
+///
+/// Sequence numbers cannot prove this: a pre-upgrade compactor can commit a
+/// stale promoted value after a new binary adopts the table. Per-file writer
+/// provenance makes that later file unqualified too (#6769). An absent or
+/// unparseable marker is unknown provenance and never qualifies.
+async fn live_files_carry_current_promotions(table: &Table, ids: &[i32]) -> Result<bool> {
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return Ok(true);
+    };
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), &table.metadata_ref())
+        .await
+        .context("load_manifest_list")?;
+    for mf in manifest_list.entries() {
+        tokio::task::yield_now().await;
+        let manifest = mf
+            .load_manifest(table.file_io())
+            .await
+            .context("load_manifest")?;
+        for entry in manifest.entries() {
+            if !entry.is_alive() {
+                continue;
+            }
+            let file = entry.data_file();
+            if file_extractor_version(file.file_path())
+                != Some(siglake_core::ATTR_EXTRACTOR_VERSION)
+                || !ids.iter().all(|id| file.column_sizes().contains_key(id))
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn data_file_timestamp_lower_ns(file: &DataFile, field: TimeBoundField) -> Option<i64> {
@@ -6848,6 +6980,8 @@ mod aggregate_coverage_chain_tests {
             HashMap::new(),
             None,
             MergeConsumedProofAction::new(Vec::new(), None),
+            Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+            None,
         )
         .await
         .unwrap();
@@ -6980,6 +7114,8 @@ mod aggregate_coverage_chain_tests {
                     HashMap::new(),
                     Some(&default_events_inverted_index_spec()),
                     MergeConsumedProofAction::new(Vec::new(), None),
+                    Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -8377,6 +8513,68 @@ fn newest_sample_files(mut files: Vec<SampleCandidate>, limit: usize) -> Vec<Sam
     });
     files.truncate(limit.max(1));
     files
+}
+
+/// #6769: the pure half of the extraction-rule gate — which stamps count as
+/// "these promoted values match the current `attr_get`". The end-to-end
+/// behaviour (no rewrite, no prune, re-qualification after a rewrite) lives in
+/// `siglake-query-server`'s `promoted_prune.rs`.
+#[cfg(test)]
+mod promotion_extraction_tests {
+    use super::*;
+
+    #[test]
+    fn stamps_round_trip_at_the_current_version() {
+        assert_eq!(
+            promotion_extraction_from(Some(&promotion_declared_stamp())),
+            Some(PromotionExtraction::Declared)
+        );
+        assert_eq!(
+            promotion_extraction_from(Some(&promotion_adopted_stamp(41))),
+            Some(PromotionExtraction::AdoptedAfter(41))
+        );
+    }
+
+    #[test]
+    fn absent_unparseable_or_older_rule_is_not_current() {
+        // A table written before the stamp existed (every 0.2.1 table).
+        assert_eq!(promotion_extraction_from(None), None);
+        // Another rule's stamp says nothing about this one's values.
+        assert_eq!(promotion_extraction_from(Some("1:declared")), None);
+        assert_eq!(promotion_extraction_from(Some("1:after:7")), None);
+        for junk in [
+            "",
+            "declared",
+            "2",
+            "2:",
+            "2:after:",
+            "2:after:x",
+            "x:declared",
+        ] {
+            assert_eq!(promotion_extraction_from(Some(junk)), None, "{junk}");
+        }
+    }
+
+    #[test]
+    fn backfill_value_carries_the_extractor_version() {
+        let promoted = vec![siglake_core::PromotedColumn {
+            attr_key: "a.b.c".into(),
+            name: "a_b_c".into(),
+            ty: siglake_core::PromotedType::Utf8,
+        }];
+        let value = promotion_backfill_value(&promoted).unwrap();
+        let json = siglake_core::promoted_property_json(&promoted).unwrap();
+        assert!(value.ends_with(&json), "{value}");
+        assert_ne!(
+            value, json,
+            "a table qualified under the old rule must not match the new value"
+        );
+        assert_eq!(
+            value,
+            promotion_backfill_value(&promoted).unwrap(),
+            "stable for an unchanged promotion list"
+        );
+    }
 }
 
 /// #3052 qualification: the bounded sampling and column-cap rules of WS-7
@@ -11051,6 +11249,142 @@ pub struct IcebergTuning {
     /// several data files — one sidecar per output file (#4377) — without
     /// writing half a gigabyte to get there.
     pub merge_target_file_bytes: Option<usize>,
+}
+
+/// Ownership retained by blocking work detached from an append future.
+///
+/// Tokio cannot cancel a `spawn_blocking` closure after it starts. A caller
+/// whose memory admission is tied to the append future can therefore pass its
+/// ownership token here; every blocking child that retains the append's
+/// decoded input keeps a clone until that input and the child's allocations
+/// have been dropped.
+#[derive(Clone)]
+pub struct AppendWorkGuard {
+    owner: Arc<dyn Send + Sync>,
+    blocking_child_start: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl AppendWorkGuard {
+    pub fn new<T>(owner: Arc<T>) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        Self {
+            owner,
+            blocking_child_start: None,
+        }
+    }
+
+    /// Install a deterministic blocking-child entry hook for cancellation
+    /// tests. Production callers use [`Self::new`].
+    #[doc(hidden)]
+    pub fn with_blocking_child_start_for_test<T>(
+        owner: Arc<T>,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        Self {
+            owner,
+            blocking_child_start: Some(hook),
+        }
+    }
+
+    fn blocking_child_started(&self) {
+        if let Some(hook) = &self.blocking_child_start {
+            hook();
+        }
+        // Read the owner after the hook so its lifetime visibly spans a test
+        // hook that blocks until the cancelling parent has gone away.
+        let _ = &self.owner;
+    }
+}
+
+// Field order is intentional: decoded input or completed aggregate output must
+// be destroyed before its admission owner, including Tokio's detached output.
+struct OwnedAppendWork<T> {
+    value: T,
+    guard: Option<AppendWorkGuard>,
+}
+
+impl<T> OwnedAppendWork<T> {
+    fn replace<U>(self, value: U) -> OwnedAppendWork<U> {
+        let Self {
+            value: input,
+            guard,
+        } = self;
+        drop(input);
+        OwnedAppendWork { value, guard }
+    }
+}
+
+#[cfg(test)]
+mod append_work_output_tests {
+    use super::{AppendWorkGuard, OwnedAppendWork};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tokio::sync::{Notify, Semaphore};
+
+    struct Payload {
+        admission: Arc<Semaphore>,
+        dropped_under_lease: Arc<AtomicBool>,
+    }
+
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.dropped_under_lease
+                .store(self.admission.available_permits() == 0, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_parent_keeps_completed_blocking_output_owned_until_destruction() {
+        let admission = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(admission.clone().acquire_owned().await.unwrap());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(Notify::new());
+        let finished_in_parent = finished.clone();
+        let payload = Payload {
+            admission: admission.clone(),
+            dropped_under_lease: dropped.clone(),
+        };
+        let parent = tokio::spawn(async move {
+            let guard = AppendWorkGuard::new(permit.clone());
+            let child = tokio::task::spawn_blocking(move || OwnedAppendWork {
+                value: payload,
+                guard: Some(guard),
+            });
+            // The child/output must be the sole owner: retaining a parent
+            // clone would mask an output that released its guard too early.
+            drop(permit);
+            while !child.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            finished_in_parent.notify_one();
+            // Keep a completed, allocation-bearing JoinHandle unjoined until
+            // cancellation, matching an append still waiting for its IO path.
+            std::future::pending::<()>().await;
+            drop(child);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), finished.notified())
+            .await
+            .unwrap();
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(admission.clone().try_acquire_owned().is_err());
+        parent.abort();
+        assert!(parent.await.unwrap_err().is_cancelled());
+        let _next = tokio::time::timeout(std::time::Duration::from_secs(5), admission.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "output was freed after its owner"
+        );
+    }
 }
 
 /// Decide whether a re-cluster bin is merged via the memory-bounded streaming
@@ -14875,18 +15209,10 @@ impl IcebergContext {
         if promoted.is_empty() {
             return Ok(false);
         }
-        let desired = siglake_core::promoted_property_json(&promoted)
-            .map_err(|e| anyhow::anyhow!("promoted property json: {e}"))?;
-        if entry
-            .table
-            .metadata()
-            .properties()
-            .get(PROMOTION_BACKFILL_PROP)
-            .map(String::as_str)
-            == Some(desired.as_str())
-        {
-            return Ok(false);
-        }
+        let desired = promotion_backfill_value(&promoted)?;
+        let props = entry.table.metadata().properties();
+        let already_recorded =
+            props.get(PROMOTION_BACKFILL_PROP).map(String::as_str) == Some(desired.as_str());
         let schema = entry.table.metadata().current_schema();
         let mut ids = Vec::with_capacity(promoted.len());
         for col in &promoted {
@@ -14896,18 +15222,25 @@ impl IcebergContext {
                 None => return Ok(false),
             }
         }
-        let files = self.live_data_files(table_ident).await?;
-        let all_covered = files
-            .iter()
-            .all(|f| ids.iter().all(|id| f.column_sizes().contains_key(id)));
-        if !all_covered {
-            return Ok(false);
+        // Keep the table-level stamp as an upgrade record, but do not use its
+        // sequence as writer provenance: an old compactor can commit after it.
+        // The live-file walk below is the qualification proof.
+        if promotion_extraction_from(props.get(PROMOTION_EXTRACTION_PROP).map(String::as_str))
+            .is_none()
+        {
+            return self
+                .adopt_promotion_extraction(table_ident)
+                .await
+                .map(|_| false);
         }
         let table = self
             .catalog()
             .load_table(table_ident)
             .await
             .with_context(|| format!("load {table_ident} for backfill property"))?;
+        if !live_files_carry_current_promotions(&table, &ids).await? || already_recorded {
+            return Ok(false);
+        }
         let tx = Transaction::new(&table);
         let tx = tx
             .update_table_properties()
@@ -14923,13 +15256,72 @@ impl IcebergContext {
         Ok(true)
     }
 
+    /// Stamp a table whose promoted columns were materialized by an unknown
+    /// (older, or unrecorded) extraction rule as adopted at the CURRENT rule,
+    /// recording the sequence number its stale values can hide behind. Only
+    /// files written after it can qualify the table for the `attr_get`
+    /// rewrite and the promoted-column prune hints.
+    ///
+    /// This writes a property; it never rewrites data, and nothing schedules a
+    /// rewrite for this reason: the WS-7 backfill selector picks files by a
+    /// MISSING promoted column, and these carry theirs. A table under
+    /// continuing ingest converges through the ordinary level and depth
+    /// triggers; one whose files have settled at the terminal level or the
+    /// merge-generation cap keeps its old values, and no operator command
+    /// rewrites them on demand — see `docs/LIMITATIONS.md`.
+    /// Returns `true` when this call wrote the stamp.
+    pub async fn adopt_promotion_extraction(&self, table_ident: &TableIdent) -> Result<bool> {
+        let table = self
+            .catalog()
+            .load_table(table_ident)
+            .await
+            .with_context(|| format!("load {table_ident} for extraction stamp"))?;
+        if promotion_extraction_from(
+            table
+                .metadata()
+                .properties()
+                .get(PROMOTION_EXTRACTION_PROP)
+                .map(String::as_str),
+        )
+        .is_some()
+        {
+            return Ok(false);
+        }
+        let sequence = table.metadata().last_sequence_number();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set(
+                PROMOTION_EXTRACTION_PROP.to_string(),
+                promotion_adopted_stamp(sequence),
+            )
+            .apply(tx)
+            .context("set promotion extraction stamp")?;
+        tx.commit(self.catalog().as_ref())
+            .await
+            .context("commit promotion extraction stamp")?;
+        self.invalidate_cached_table(table_ident).await;
+        tracing::warn!(
+            table = %table_ident, sequence,
+            version = siglake_core::ATTR_EXTRACTOR_VERSION,
+            "promoted columns predate the current attribute-extraction rule; \
+             attr_get rewrite and promoted-column pruning stay off for this table \
+             until every live file carries current extraction provenance"
+        );
+        Ok(true)
+    }
+
     /// WS-7: the `attr_get(attributes, key)` → promoted-column rewrite map for
     /// the events table — `Some` ONLY when the backfill-complete property
-    /// matches the recorded promotion list (the substitution is unsound while
-    /// any pre-promotion file is live: its column reads NULL, its JSON still
-    /// holds the key). Typed columns rewrite comparisons to typed
-    /// literals; other uses go through CAST back to VARCHAR (see the server).
-    /// Reads the cached entry — no IO on the warm path.
+    /// matches the recorded promotion list AND the current extraction rule
+    /// (the substitution is unsound while any pre-promotion file is live — its
+    /// column reads NULL, its JSON still holds the key — and equally while any
+    /// file holds values an older rule extracted, #6769). Typed columns
+    /// rewrite comparisons to typed literals; other uses go through CAST back
+    /// to VARCHAR (see the server).
+    /// Reads the cached table entry, then walks that snapshot's manifests to
+    /// verify per-file provenance. The rewrite and the scan therefore make the
+    /// same decision about the exact snapshot they serve.
     pub async fn events_attr_rewrite_map(
         &self,
     ) -> Result<Option<std::collections::HashMap<String, (String, siglake_core::PromotedType)>>>
@@ -14944,6 +15336,20 @@ impl IcebergContext {
         table_ident: &TableIdent,
     ) -> Result<Option<std::collections::HashMap<String, (String, siglake_core::PromotedType)>>>
     {
+        Ok(self
+            .qualified_attr_rewrite_for(table_ident)
+            .await?
+            .map(|qualified| qualified.mapping))
+    }
+
+    /// The qualified rewrite map and the exact provider generation whose live
+    /// files established that qualification. A caller that substitutes the map
+    /// must register this provider (and use its WAL-consumption/config capture)
+    /// rather than reading the mutable table cache again later in the request.
+    pub async fn qualified_attr_rewrite_for(
+        &self,
+        table_ident: &TableIdent,
+    ) -> Result<Option<QualifiedAttrRewrite>> {
         let entry = self.cached_table_entry(table_ident).await?;
         let props = entry.table.metadata().properties();
         let promoted = siglake_core::promoted_columns_from_property(
@@ -14954,16 +15360,36 @@ impl IcebergContext {
         if promoted.is_empty() {
             return Ok(None);
         }
-        let recorded = siglake_core::promoted_property_json(&promoted)
-            .map_err(|e| anyhow::anyhow!("promoted property json: {e}"))?;
+        let recorded = promotion_backfill_value(&promoted)?;
         if props.get(PROMOTION_BACKFILL_PROP).map(String::as_str) != Some(recorded.as_str()) {
+            return Ok(None);
+        }
+        let schema = entry.table.metadata().current_schema();
+        let ids: Option<Vec<i32>> = promoted
+            .iter()
+            .map(|column| schema.field_id_by_name(&column.name))
+            .collect();
+        let Some(ids) = ids else {
+            return Ok(None);
+        };
+        if !live_files_carry_current_promotions(&entry.table, &ids).await? {
             return Ok(None);
         }
         let map: std::collections::HashMap<String, (String, siglake_core::PromotedType)> = promoted
             .into_iter()
             .map(|c| (c.attr_key, (c.name, c.ty)))
             .collect();
-        Ok(if map.is_empty() { None } else { Some(map) })
+        if map.is_empty() {
+            return Ok(None);
+        }
+        let index_config =
+            crate::index_manager::index_config_from_table(table_ident.name(), &entry.table)?;
+        Ok(Some(QualifiedAttrRewrite {
+            mapping: map,
+            snapshot: BufferedTableSnapshot::from_cached(entry.clone()),
+            index_config,
+            aggregate_entry: entry,
+        }))
     }
 
     /// Fold each table's outstanding group-count deltas into its wide base and
@@ -16248,22 +16674,39 @@ impl IcebergContext {
             .load_table(table_ident)
             .await
             .with_context(|| format!("load {table_ident} for promoted property"))?;
-        if table
-            .metadata()
-            .properties()
+        let props = table.metadata().properties();
+        if props
             .get(siglake_core::PROMOTED_PROPERTY_KEY)
             .map(String::as_str)
             != Some(desired_json.as_str())
         {
+            // Record WHICH extraction rule will have written this table's
+            // promoted values (#6769), in the same transaction as the
+            // declaration itself. A table that holds no promotion yet gets
+            // `declared`: the columns did not exist before this rule. A table
+            // that already holds one, declared by a binary that left no stamp,
+            // is adopted at the current sequence instead. Neither form proves
+            // a file's writer; qualification reads the file-name marker.
+            let stamp = match promotion_extraction_from(
+                props.get(PROMOTION_EXTRACTION_PROP).map(String::as_str),
+            ) {
+                Some(_) => None,
+                None if !props.contains_key(siglake_core::PROMOTED_PROPERTY_KEY) => {
+                    Some(promotion_declared_stamp())
+                }
+                None => Some(promotion_adopted_stamp(
+                    table.metadata().last_sequence_number(),
+                )),
+            };
             let tx = Transaction::new(&table);
-            let tx = tx
-                .update_table_properties()
-                .set(
-                    siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
-                    desired_json.clone(),
-                )
-                .apply(tx)
-                .context("set promoted property")?;
+            let mut update = tx.update_table_properties().set(
+                siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
+                desired_json.clone(),
+            );
+            if let Some(stamp) = stamp {
+                update = update.set(PROMOTION_EXTRACTION_PROP.to_string(), stamp);
+            }
+            let tx = update.apply(tx).context("set promoted property")?;
             // Every query replica declares the SAME promotions on a tenant's
             // first request (`for_namespace`), so N of them CAS the same
             // catalog row at once and N−1 lose. `Transaction::commit` retries
@@ -16463,6 +16906,49 @@ impl IcebergContext {
         terminal_segment_ids: &[String],
         expect_table_uuid: Option<&str>,
     ) -> Result<usize> {
+        self.append_batch_with_consumed_proof_pruning_inner(
+            batch,
+            consumed,
+            acknowledged_through_ms,
+            terminal_segment_ids,
+            expect_table_uuid,
+            None,
+        )
+        .await
+    }
+
+    /// Variant used by a memory-admitted caller whose ownership must outlive
+    /// cancellation while blocking append work is still live.
+    pub async fn append_batch_with_consumed_proof_pruning_with_work_guard(
+        &self,
+        batch: RecordBatch,
+        consumed: &[ConsumedProofEntry],
+        acknowledged_through_ms: Option<i64>,
+        terminal_segment_ids: &[String],
+        expect_table_uuid: Option<&str>,
+        work_guard: AppendWorkGuard,
+    ) -> Result<usize> {
+        self.append_batch_with_consumed_proof_pruning_inner(
+            batch,
+            consumed,
+            acknowledged_through_ms,
+            terminal_segment_ids,
+            expect_table_uuid,
+            Some(work_guard),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_batch_with_consumed_proof_pruning_inner(
+        &self,
+        batch: RecordBatch,
+        consumed: &[ConsumedProofEntry],
+        acknowledged_through_ms: Option<i64>,
+        terminal_segment_ids: &[String],
+        expect_table_uuid: Option<&str>,
+        work_guard: Option<AppendWorkGuard>,
+    ) -> Result<usize> {
         // WS-7: promotion + promoted blooms happen in the generic append core
         // (one property-driven site for every table); this wrapper only
         // supplies the events base bloom set.
@@ -16489,6 +16975,7 @@ impl IcebergContext {
             MergeConsumedProofAction::new(consumed.to_vec(), acknowledged_through_ms)
                 .with_terminal_segment_ids(terminal_segment_ids.iter().cloned()),
             expect_table_uuid,
+            work_guard,
         )
         .await
     }
@@ -16641,6 +17128,32 @@ impl IcebergContext {
             .await
     }
 
+    /// Persist a batch exactly as a pre-#6769 writer could: do not recompute
+    /// promoted columns and do not stamp extraction provenance on its files.
+    /// Regression support only; production builds do not expose this helper and
+    /// production writes always use
+    /// [`Self::append_to_table`].
+    #[doc(hidden)]
+    #[cfg(feature = "test-utils")]
+    pub async fn append_unprovenanced_promoted_batch_for_test(
+        &self,
+        table_ident: &TableIdent,
+        batch: RecordBatch,
+    ) -> Result<usize> {
+        let table = self.load_append_target(table_ident, None).await?;
+        self.append_to_loaded_table(
+            table,
+            batch,
+            &[],
+            HashMap::new(),
+            None,
+            MergeConsumedProofAction::new(Vec::new(), None),
+            None,
+            None,
+        )
+        .await
+    }
+
     /// Like [`append_to_table`](Self::append_to_table) but attaches
     /// `snapshot_props` to the committed snapshot's summary (Iceberg
     /// `additional_properties`). WS-6 uses this to record which WAL segments a
@@ -16671,6 +17184,7 @@ impl IcebergContext {
             snapshot_props,
             None,
             MergeConsumedProofAction::new(proof_additions, None),
+            None,
             None,
         )
         .await
@@ -16717,6 +17231,58 @@ impl IcebergContext {
         terminal_segment_ids: &[String],
         expect_table_uuid: Option<&str>,
     ) -> Result<usize> {
+        self.append_to_table_with_consumed_proof_pruning_inner(
+            table_ident,
+            batch,
+            bloom_columns,
+            consumed,
+            acknowledged_through_ms,
+            terminal_segment_ids,
+            expect_table_uuid,
+            None,
+        )
+        .await
+    }
+
+    /// User-index counterpart of
+    /// [`Self::append_batch_with_consumed_proof_pruning_with_work_guard`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_to_table_with_consumed_proof_pruning_with_work_guard(
+        &self,
+        table_ident: &TableIdent,
+        batch: RecordBatch,
+        bloom_columns: &[&str],
+        consumed: &[ConsumedProofEntry],
+        acknowledged_through_ms: Option<i64>,
+        terminal_segment_ids: &[String],
+        expect_table_uuid: Option<&str>,
+        work_guard: AppendWorkGuard,
+    ) -> Result<usize> {
+        self.append_to_table_with_consumed_proof_pruning_inner(
+            table_ident,
+            batch,
+            bloom_columns,
+            consumed,
+            acknowledged_through_ms,
+            terminal_segment_ids,
+            expect_table_uuid,
+            Some(work_guard),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_to_table_with_consumed_proof_pruning_inner(
+        &self,
+        table_ident: &TableIdent,
+        batch: RecordBatch,
+        bloom_columns: &[&str],
+        consumed: &[ConsumedProofEntry],
+        acknowledged_through_ms: Option<i64>,
+        terminal_segment_ids: &[String],
+        expect_table_uuid: Option<&str>,
+        work_guard: Option<AppendWorkGuard>,
+    ) -> Result<usize> {
         let mut snapshot_props = HashMap::new();
         if !consumed.is_empty() {
             snapshot_props.insert(
@@ -16737,6 +17303,7 @@ impl IcebergContext {
             MergeConsumedProofAction::new(consumed.to_vec(), acknowledged_through_ms)
                 .with_terminal_segment_ids(terminal_segment_ids.iter().cloned()),
             expect_table_uuid,
+            work_guard,
         )
         .await
     }
@@ -16751,6 +17318,7 @@ impl IcebergContext {
         index_spec: Option<&[InvertedIndexSpec]>,
         proof_action: MergeConsumedProofAction,
         expect_table_uuid: Option<&str>,
+        work_guard: Option<AppendWorkGuard>,
     ) -> Result<usize> {
         let table = self
             .load_append_target(table_ident, expect_table_uuid)
@@ -16762,6 +17330,8 @@ impl IcebergContext {
             snapshot_props,
             index_spec,
             proof_action,
+            Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+            work_guard,
         )
         .await
     }
@@ -16974,6 +17544,7 @@ impl IcebergContext {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn append_to_loaded_table(
         &self,
         table: Table,
@@ -16982,6 +17553,8 @@ impl IcebergContext {
         snapshot_props: HashMap<String, String>,
         index_spec: Option<&[InvertedIndexSpec]>,
         proof_action: MergeConsumedProofAction,
+        file_extractor_version: Option<u32>,
+        work_guard: Option<AppendWorkGuard>,
     ) -> Result<usize> {
         let rows = batch.num_rows();
         let table_ident = table.identifier().clone();
@@ -16995,6 +17568,10 @@ impl IcebergContext {
         // Promoted Utf8 columns join the bloom set.
         let promoted = self.promoted_for_table(&table);
         let (batch, bloom_owned): (RecordBatch, Vec<String>) = if promoted.is_empty() {
+            (batch, bloom_columns.iter().map(|s| s.to_string()).collect())
+        } else if file_extractor_version.is_none() {
+            // The mixed-writer regression supplies a physically stale promoted
+            // column. Recomputing it here would erase the state under test.
             (batch, bloom_columns.iter().map(|s| s.to_string()).collect())
         } else {
             let batch = siglake_core::repromote_attributes(&batch, &promoted)
@@ -17100,7 +17677,15 @@ impl IcebergContext {
         let gc_table_cap = self.table_group_count_cardinality();
         let gc_base_cap = self.base_group_count_cardinality();
         let gc_sketch_m = self.group_count_sketch_counters();
+        let aggregate_input = OwnedAppendWork {
+            value: gc_batch,
+            guard: work_guard,
+        };
         let aggregates_task = tokio::task::spawn_blocking(move || {
+            if let Some(work_guard) = &aggregate_input.guard {
+                work_guard.blocking_child_started();
+            }
+            let gc_batch = &aggregate_input.value;
             let cols: Vec<&str> = gc_columns.iter().map(String::as_str).collect();
             // The delta covers EVERY column, not just the ones the inline object
             // turns down: classifying per batch would put `host` inline while it
@@ -17112,7 +17697,7 @@ impl IcebergContext {
             let (delta_gc, wide_gc, sketches) = if gc_deltas_enabled {
                 let declared: Vec<&str> = gc_declared.iter().map(String::as_str).collect();
                 let (wide, sketches) = file_group_counts_and_sketches(
-                    &gc_batch,
+                    gc_batch,
                     &cols,
                     &declared,
                     gc_table_cap,
@@ -17125,16 +17710,24 @@ impl IcebergContext {
                     sketches,
                 )
             } else {
-                (file_group_counts(&gc_batch, &cols, gc_base_cap), None, None)
+                (file_group_counts(gc_batch, &cols, gc_base_cap), None, None)
             };
-            let delta_tb = file_time_buckets(&gc_batch, "timestamp", SNAPSHOT_TIME_BUCKET_BASE_NS);
-            let delta_tg = file_time_group_counts(&gc_batch, &cols, SNAPSHOT_TIME_BUCKET_BASE_NS);
-            (delta_gc, wide_gc, delta_tb, delta_tg, sketches)
+            let delta_tb = file_time_buckets(gc_batch, "timestamp", SNAPSHOT_TIME_BUCKET_BASE_NS);
+            let delta_tg = file_time_group_counts(gc_batch, &cols, SNAPSHOT_TIME_BUCKET_BASE_NS);
+            let result = (delta_gc, wide_gc, delta_tb, delta_tg, sketches);
+            aggregate_input.replace(result)
         });
 
         let write_start = std::time::Instant::now();
         let write_output = self
-            .write_batch_to_data_files(&table, batch, bloom_columns, index_spec, 0)
+            .write_batch_to_data_files_with_extractor_version(
+                &table,
+                batch,
+                bloom_columns,
+                index_spec,
+                0,
+                file_extractor_version,
+            )
             .await?;
         let data_file_count = write_output.data_files.len();
         metrics::histogram!(
@@ -17152,7 +17745,7 @@ impl IcebergContext {
         // the part that did NOT overlap; the histogram is what tells us whether
         // the overlap is actually working at scale rather than in theory.
         let join_start = std::time::Instant::now();
-        let (delta_gc, wide_gc, delta_tb, delta_tg, delta_sketches) = match aggregates_task.await {
+        let aggregate_output = match aggregates_task.await {
             Ok(v) => v,
             // A panic in the counting pass must not lose the rows. The commit
             // proceeds; the aggregate simply misses this batch, the read-time
@@ -17164,9 +17757,16 @@ impl IcebergContext {
                     table = %table_ident,
                     "group-count pass failed; aggregates skip this commit"
                 );
-                (None, None, None, None, None)
+                OwnedAppendWork {
+                    value: (None, None, None, None, None),
+                    guard: None,
+                }
             }
         };
+        // Declare the owner before the destructured values so cancellation of
+        // the remaining async append also destroys those values first.
+        let _append_output_guard = aggregate_output.guard;
+        let (delta_gc, wide_gc, delta_tb, delta_tg, delta_sketches) = aggregate_output.value;
         metrics::histogram!(
             "siglake_iceberg_aggregate_join_duration_seconds",
             "table" => table_label.to_string()
@@ -17876,6 +18476,26 @@ impl IcebergContext {
         index_spec: Option<&[InvertedIndexSpec]>,
         rewrite_gen: u32,
     ) -> Result<WriteBatchOutput> {
+        self.write_batch_to_data_files_with_extractor_version(
+            table,
+            batch,
+            bloom_columns,
+            index_spec,
+            rewrite_gen,
+            Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+        )
+        .await
+    }
+
+    async fn write_batch_to_data_files_with_extractor_version(
+        &self,
+        table: &Table,
+        batch: RecordBatch,
+        bloom_columns: &[&str],
+        index_spec: Option<&[InvertedIndexSpec]>,
+        rewrite_gen: u32,
+        file_extractor_version: Option<u32>,
+    ) -> Result<WriteBatchOutput> {
         // Physically order rows by the table's declared Iceberg sort order
         // (time-first) before writing, so every write path — compactor append,
         // direct append, detection-table writes, tier-2 re-clustering — produces
@@ -17932,7 +18552,7 @@ impl IcebergContext {
         // unique to avoid filename collisions across commits. Rewrites (gen ≥ 1)
         // carry their generation in the name — see `file_rewrite_generation`.
         let name_gen = DefaultFileNameGenerator::new(
-            rewrite_prefix(rewrite_gen),
+            rewrite_prefix(rewrite_gen, file_extractor_version),
             None,
             DataFileFormat::Parquet,
         );
@@ -18132,7 +18752,7 @@ impl IcebergContext {
                         file_io,
                         location_gen,
                         DefaultFileNameGenerator::new(
-                            rewrite_prefix(rewrite_gen),
+                            rewrite_prefix(rewrite_gen, file_extractor_version),
                             None,
                             DataFileFormat::Parquet,
                         ),
@@ -19402,7 +20022,14 @@ impl IcebergContext {
         let survivor_batch = arrow::compute::concat_batches(&target_schema, &survivor_batches)
             .context("concat delete-task survivor batches")?;
         let write_output = self
-            .write_batch_to_data_files(table, survivor_batch, bloom_columns, index_spec, 0)
+            .write_batch_to_data_files_with_extractor_version(
+                table,
+                survivor_batch,
+                bloom_columns,
+                index_spec,
+                0,
+                file_extractor_version(file.file_path()),
+            )
             .await?;
         Ok(Some(DeleteTaskCandidateRewrite {
             rows_deleted: matches,
@@ -19501,7 +20128,10 @@ impl IcebergContext {
                 std::slice::from_ref(file),
                 bloom_columns,
                 true,
-                0,
+                MergeOutputStamp {
+                    rewrite_gen: 0,
+                    extractor_version: file_extractor_version(file.file_path()),
+                },
                 None,
             )
         });
@@ -20319,7 +20949,7 @@ impl IcebergContext {
         files: &'a [DataFile],
         bloom_columns: &'a [&'a str],
         with_footers: bool,
-        rewrite_gen: u32,
+        stamp: MergeOutputStamp,
         segmented_sink: Option<Arc<SegmentedIndexSink>>,
     ) -> LazyMergeOutputWriter<'a> {
         LazyMergeOutputWriter {
@@ -20328,7 +20958,7 @@ impl IcebergContext {
             files,
             bloom_columns,
             with_footers,
-            rewrite_gen,
+            stamp,
             segmented_sink,
             inner: None,
         }
@@ -20351,6 +20981,7 @@ impl IcebergContext {
         bloom_columns: &[&str],
         with_footers: bool,
         rewrite_gen: u32,
+        output_extractor_version: Option<u32>,
         // The first batch the caller is about to write, as the row-size sample
         // the byte target is divided by. `None` — no output batch exists yet —
         // is what every merge path used to pass, and it reaches the
@@ -20432,7 +21063,10 @@ impl IcebergContext {
         let location_gen = DefaultLocationGenerator::new(table.metadata())
             .context("default location generator")?;
         let name_gen = DefaultFileNameGenerator::new(
-            rewrite_prefix(if with_footers { rewrite_gen } else { 0 }),
+            rewrite_prefix(
+                if with_footers { rewrite_gen } else { 0 },
+                output_extractor_version,
+            ),
             None,
             DataFileFormat::Parquet,
         );
@@ -20532,7 +21166,10 @@ impl IcebergContext {
             files,
             bloom_columns,
             with_footers,
-            rewrite_gen,
+            MergeOutputStamp {
+                rewrite_gen,
+                extractor_version: Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+            },
             segmented_sink,
         );
 
@@ -20795,7 +21432,10 @@ impl IcebergContext {
             files,
             bloom_columns,
             true,
-            rewrite_gen,
+            MergeOutputStamp {
+                rewrite_gen,
+                extractor_version: Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+            },
             segmented_sink,
         );
         let mut rows_written = 0usize;
@@ -23817,6 +24457,7 @@ pub enum PinnedEmptySchema {
 /// `schema_id` and `table_uuid` ride along for the same reason (#2554/#2921):
 /// the coordinator ships its whole serving generation to workers, and reading
 /// either from a later cache entry could pair it with a different snapshot.
+#[derive(Clone)]
 pub struct BufferedTableSnapshot {
     pub provider: Arc<dyn datafusion::datasource::TableProvider>,
     pub consumed: Arc<std::collections::HashSet<String>>,
@@ -23828,6 +24469,23 @@ pub struct BufferedTableSnapshot {
     /// a dropped index's replacement starts at no snapshot and schema id 0,
     /// which is exactly what a never-written table looks like.
     pub table_uuid: String,
+}
+
+/// A promoted-attribute substitution qualified against one immutable table
+/// generation. Query registration and WAL wrapping consume this same capture,
+/// closing the interval in which cache refresh could otherwise swap in files
+/// whose promoted values were never qualified.
+#[derive(Clone)]
+pub struct QualifiedAttrRewrite {
+    pub mapping: HashMap<String, (String, siglake_core::PromotedType)>,
+    pub snapshot: BufferedTableSnapshot,
+    /// The carrier mapping from the same table generation. `None` for tables
+    /// that are not managed indexes; such tables have no index WAL override.
+    pub index_config: Option<IndexConfig>,
+    /// The same immutable table generation, retaining the metadata and lazy
+    /// aggregate pins needed by the query server's zero-scan paths. Kept
+    /// private so callers can only consume it through snapshot-bound methods.
+    aggregate_entry: CachedTableEntry,
 }
 
 impl BufferedTableSnapshot {
@@ -25571,12 +26229,41 @@ impl IcebergContext {
         group_column: &str,
         value_column: &str,
     ) -> Result<Option<Vec<GroupedNumericAvgRow>>> {
-        use siglake_bloom::{GroupedNumericKind, GroupedNumericSum, GroupedNumericValue};
-
         let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
         let cached = self.cached_table_entry(&table_ident).await?;
+        self.grouped_numeric_avg_for_cached(&table_ident, &cached, group_column, value_column)
+            .await
+    }
+
+    /// Snapshot-bound counterpart used after an `attr_get` substitution.
+    /// The footer summaries and provider then describe the same generation.
+    pub async fn qualified_grouped_numeric_avg(
+        &self,
+        qualified: &QualifiedAttrRewrite,
+        group_column: &str,
+        value_column: &str,
+    ) -> Result<Option<Vec<GroupedNumericAvgRow>>> {
+        let table_ident = qualified.aggregate_entry.table.identifier().clone();
+        self.grouped_numeric_avg_for_cached(
+            &table_ident,
+            &qualified.aggregate_entry,
+            group_column,
+            value_column,
+        )
+        .await
+    }
+
+    async fn grouped_numeric_avg_for_cached(
+        &self,
+        table_ident: &TableIdent,
+        cached: &CachedTableEntry,
+        group_column: &str,
+        value_column: &str,
+    ) -> Result<Option<Vec<GroupedNumericAvgRow>>> {
+        use siglake_bloom::{GroupedNumericKind, GroupedNumericSum, GroupedNumericValue};
+
         let tasks = self
-            .live_file_scan_tasks_cached(&table_ident, &cached)
+            .live_file_scan_tasks_cached(table_ident, cached)
             .await?;
         if tasks.iter().any(|task| {
             !grouped_numeric_file_supported(task.data_file_format, !task.deletes.is_empty())
@@ -25724,7 +26411,37 @@ impl IcebergContext {
 
         let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
         let cached = self.cached_table_entry(&table_ident).await?;
+        self.grouped_counts_unwindowed_for_cached(&table_ident, &cached, column, shard)
+            .await
+    }
 
+    /// Snapshot-bound unwindowed group counts for a qualified promoted-column
+    /// rewrite. Windowed aggregate helpers have their own table-name cache
+    /// lookups, so the query layer conservatively declines those shapes while
+    /// a rewrite binding is active.
+    pub async fn qualified_grouped_counts_with_summary(
+        &self,
+        qualified: &QualifiedAttrRewrite,
+        column: &str,
+        shard: Option<crate::ScanShard>,
+    ) -> Result<Option<GroupCounts>> {
+        let table_ident = qualified.aggregate_entry.table.identifier().clone();
+        self.grouped_counts_unwindowed_for_cached(
+            &table_ident,
+            &qualified.aggregate_entry,
+            column,
+            shard,
+        )
+        .await
+    }
+
+    async fn grouped_counts_unwindowed_for_cached(
+        &self,
+        table_ident: &TableIdent,
+        cached: &CachedTableEntry,
+        column: &str,
+        shard: Option<crate::ScanShard>,
+    ) -> Result<Option<GroupCounts>> {
         // Phase 2 — snapshot-keyed unwindowed-aggregate cache. The whole-table
         // (non-sharded) result is a pure function of `(table, snapshot, column)`;
         // snapshots are immutable between commits, so a warm hit skips the
@@ -25767,7 +26484,7 @@ impl IcebergContext {
                     .and_then(|v| v.parse::<u64>().ok());
                 if let Some(record_count) = record_count {
                     if let Some(rows) = self
-                        .tier1_group_count_rows(&cached, column, record_count)
+                        .tier1_group_count_rows(cached, column, record_count)
                         .await?
                     {
                         if let Some(key) = agg_key {
@@ -25785,7 +26502,7 @@ impl IcebergContext {
         // Tier 2 — sum the per-file footer summaries (with raw-page RLE
         // fallback), through the one implementation the rebuild path also uses.
         let Some(totals) = self
-            .grouped_counts_from_files(&cached, &table_ident, column, shard)
+            .grouped_counts_from_files(cached, table_ident, column, shard)
             .await?
         else {
             return Ok(None);
@@ -30686,7 +31403,7 @@ mod recluster_binpack_tests {
 
     #[test]
     fn rewrite_generation_parses_from_file_names() {
-        use super::{file_rewrite_generation, rewrite_prefix};
+        use super::{file_extractor_version, file_rewrite_generation, rewrite_prefix};
         // Ingest-written files carry no marker → generation 0.
         assert_eq!(
             file_rewrite_generation(
@@ -30704,13 +31421,29 @@ mod recluster_binpack_tests {
         assert_eq!(file_rewrite_generation("siglake-g-uuid.parquet"), 0);
         assert_eq!(file_rewrite_generation("other-file.parquet"), 0);
         assert_eq!(file_rewrite_generation(""), 0);
+        // Old writers, including rewrites, carry no extraction provenance.
+        assert_eq!(file_extractor_version("siglake-019f-0.parquet"), None);
+        assert_eq!(file_extractor_version("siglake-g7-019f-0.parquet"), None);
+        assert_eq!(file_extractor_version("siglake-x1-019f-0.parquet"), Some(1));
+        assert_eq!(
+            file_extractor_version("siglake-g7-x2-019f-0.parquet"),
+            Some(2)
+        );
+        assert_eq!(file_extractor_version("siglake-g7-x-019f.parquet"), None);
+        assert_eq!(file_extractor_version("other-x2-file.parquet"), None);
         // Round-trip: prefix(g) parses back to g (uuid hex can't fake a marker).
         assert_eq!(
-            file_rewrite_generation(&format!("{}-0.parquet", rewrite_prefix(0))),
+            file_rewrite_generation(&format!(
+                "{}-0.parquet",
+                rewrite_prefix(0, Some(siglake_core::ATTR_EXTRACTOR_VERSION))
+            )),
             0
         );
         assert_eq!(
-            file_rewrite_generation(&format!("{}-0.parquet", rewrite_prefix(3))),
+            file_rewrite_generation(&format!(
+                "{}-0.parquet",
+                rewrite_prefix(3, Some(siglake_core::ATTR_EXTRACTOR_VERSION))
+            )),
             3
         );
     }
@@ -35221,6 +35954,8 @@ mod append_incarnation_tests {
                 )]),
                 None,
                 MergeConsumedProofAction::new(vec![proof_entry("seg-dropped.arrow")], None),
+                Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+                None,
             )
             .await
             .expect_err("the commit must refuse a table that changed under it");

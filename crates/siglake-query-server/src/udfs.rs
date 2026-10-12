@@ -775,6 +775,78 @@ mod tests {
         }
     }
 
+    /// Promote `key` out of `attributes` into a Utf8 column and read the cell
+    /// back — the value a query sees once the `attr_get`→column rewrite fires.
+    fn promoted_cell(attributes: &str, key: &str) -> Option<String> {
+        use arrow_array::Array;
+        let batch = siglake_core::events_to_record_batch(&[
+            siglake_core::Event::now("raw").with_attributes(Some(attributes.to_string()))
+        ])
+        .unwrap();
+        let col = siglake_core::PromotedColumn {
+            attr_key: key.to_string(),
+            name: "promoted".into(),
+            ty: siglake_core::PromotedType::Utf8,
+        };
+        let out = siglake_core::promote_attributes(&batch, std::slice::from_ref(&col)).unwrap();
+        let values = out
+            .column_by_name("promoted")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        (!values.is_null(0)).then(|| values.value(0).to_string())
+    }
+
+    /// #6769: `attr_get` and WS-7 promotion must resolve a key to the same
+    /// value for every input — the query layer substitutes the promoted column
+    /// for the UDF and prunes row groups from its statistics, so a shape where
+    /// they disagree silently changes answers. Promotion's strict segment walk
+    /// used to miss an inner literal dotted key (`{"a":{"b.c":1}}`) that the
+    /// UDF's per-level literal retry resolves.
+    #[test]
+    fn attr_get_matches_promoted_extraction() {
+        let cases: &[(&str, &[&str])] = &[
+            // The divergent shape, and the nested shape it must not break.
+            (r#"{"a":{"b.c":1}}"#, &["a.b.c", "a", "a.b"]),
+            (r#"{"a":{"b":{"c":1}}}"#, &["a.b.c", "a.b", "a"]),
+            // Literal-dotted precedence at both levels (the Big5
+            // `log.file.path` key depends on the top-level half).
+            (
+                r#"{"log.file.path":"/lit","log":{"file":{"path":"/nested"}}}"#,
+                &["log.file.path", "log.file", "log"],
+            ),
+            (
+                r#"{"a":{"b.c":"inner-lit","b":{"c":"inner-nested"}}}"#,
+                &["a.b.c", "a.b"],
+            ),
+            // No backtracking in either extractor: `a` resolves and the rest
+            // fails inside it; top-level `a.b` is not retried.
+            (r#"{"a":{"x":1},"a.b":{"c":9}}"#, &["a.b.c", "a.b", "a.b.x"]),
+            // Nulls, scalars mid-path, absent keys, non-scalar leaves.
+            (
+                r#"{"a":{"b.c":null,"s":"str"},"n":5}"#,
+                &["a.b.c", "a.s.x", "n.x", "absent.key", "a"],
+            ),
+            (
+                r#"{"k8s":{"pod":"p-1","labels":{"app.kubernetes.io/name":"siglake"}}}"#,
+                &["k8s.pod", "k8s.labels.app.kubernetes.io/name", "k8s.labels"],
+            ),
+            // Unparseable / non-object attributes.
+            ("not json", &["a.b"]),
+            ("[1,2]", &["a.b"]),
+        ];
+        for (json, keys) in cases {
+            for key in *keys {
+                assert_eq!(
+                    json_attr_lookup(json, key),
+                    promoted_cell(json, key),
+                    "attr_get and promotion disagree: json={json} key={key}"
+                );
+            }
+        }
+    }
+
     /// Manual perf check (ignored by default): the scanner vs the full parse on
     /// a wide blob where the queried key is late. Prints the speedup.
     #[test]

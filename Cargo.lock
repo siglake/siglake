@@ -6529,6 +6529,7 @@ dependencies = [
  "datafusion",
  "futures",
  "hickory-resolver",
+ "iceberg",
  "jsonwebtoken",
  "metrics",
  "metrics-util",
