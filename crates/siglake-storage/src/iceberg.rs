@@ -11105,6 +11105,90 @@ impl AppendWorkGuard {
     }
 }
 
+// Field order is intentional: decoded input or completed aggregate output must
+// be destroyed before its admission owner, including Tokio's detached output.
+struct OwnedAppendWork<T> {
+    value: T,
+    guard: Option<AppendWorkGuard>,
+}
+
+impl<T> OwnedAppendWork<T> {
+    fn replace<U>(self, value: U) -> OwnedAppendWork<U> {
+        let Self {
+            value: input,
+            guard,
+        } = self;
+        drop(input);
+        OwnedAppendWork { value, guard }
+    }
+}
+
+#[cfg(test)]
+mod append_work_output_tests {
+    use super::{AppendWorkGuard, OwnedAppendWork};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tokio::sync::{Notify, Semaphore};
+
+    struct Payload {
+        admission: Arc<Semaphore>,
+        dropped_under_lease: Arc<AtomicBool>,
+    }
+
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.dropped_under_lease
+                .store(self.admission.available_permits() == 0, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_parent_keeps_completed_blocking_output_owned_until_destruction() {
+        let admission = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(admission.clone().acquire_owned().await.unwrap());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(Notify::new());
+        let finished_in_parent = finished.clone();
+        let payload = Payload {
+            admission: admission.clone(),
+            dropped_under_lease: dropped.clone(),
+        };
+        let parent = tokio::spawn(async move {
+            let guard = AppendWorkGuard::new(permit.clone());
+            let child = tokio::task::spawn_blocking(move || OwnedAppendWork {
+                value: payload,
+                guard: Some(guard),
+            });
+            while !child.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            finished_in_parent.notify_one();
+            // Keep a completed, allocation-bearing JoinHandle unjoined until
+            // cancellation, matching an append still waiting for its IO path.
+            std::future::pending::<()>().await;
+            drop(child);
+            drop(permit);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), finished.notified())
+            .await
+            .unwrap();
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(admission.clone().try_acquire_owned().is_err());
+        parent.abort();
+        assert!(parent.await.unwrap_err().is_cancelled());
+        let _next = tokio::time::timeout(std::time::Duration::from_secs(5), admission.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "output was freed after its owner"
+        );
+    }
+}
+
 /// Decide whether a re-cluster bin is merged via the memory-bounded streaming
 /// path. `true` when streaming is force-enabled, or when the bin's compressed
 /// bytes / row count exceed the in-RAM safety thresholds (so an oversized bin
@@ -17254,10 +17338,15 @@ impl IcebergContext {
         let gc_table_cap = self.table_group_count_cardinality();
         let gc_base_cap = self.base_group_count_cardinality();
         let gc_sketch_m = self.group_count_sketch_counters();
+        let aggregate_input = OwnedAppendWork {
+            value: gc_batch,
+            guard: work_guard,
+        };
         let aggregates_task = tokio::task::spawn_blocking(move || {
-            if let Some(work_guard) = &work_guard {
+            if let Some(work_guard) = &aggregate_input.guard {
                 work_guard.blocking_child_started();
             }
+            let gc_batch = &aggregate_input.value;
             let cols: Vec<&str> = gc_columns.iter().map(String::as_str).collect();
             // The delta covers EVERY column, not just the ones the inline object
             // turns down: classifying per batch would put `host` inline while it
@@ -17269,7 +17358,7 @@ impl IcebergContext {
             let (delta_gc, wide_gc, sketches) = if gc_deltas_enabled {
                 let declared: Vec<&str> = gc_declared.iter().map(String::as_str).collect();
                 let (wide, sketches) = file_group_counts_and_sketches(
-                    &gc_batch,
+                    gc_batch,
                     &cols,
                     &declared,
                     gc_table_cap,
@@ -17282,13 +17371,12 @@ impl IcebergContext {
                     sketches,
                 )
             } else {
-                (file_group_counts(&gc_batch, &cols, gc_base_cap), None, None)
+                (file_group_counts(gc_batch, &cols, gc_base_cap), None, None)
             };
-            let delta_tb = file_time_buckets(&gc_batch, "timestamp", SNAPSHOT_TIME_BUCKET_BASE_NS);
-            let delta_tg = file_time_group_counts(&gc_batch, &cols, SNAPSHOT_TIME_BUCKET_BASE_NS);
+            let delta_tb = file_time_buckets(gc_batch, "timestamp", SNAPSHOT_TIME_BUCKET_BASE_NS);
+            let delta_tg = file_time_group_counts(gc_batch, &cols, SNAPSHOT_TIME_BUCKET_BASE_NS);
             let result = (delta_gc, wide_gc, delta_tb, delta_tg, sketches);
-            drop(work_guard);
-            result
+            aggregate_input.replace(result)
         });
 
         let write_start = std::time::Instant::now();
@@ -17311,7 +17399,7 @@ impl IcebergContext {
         // the part that did NOT overlap; the histogram is what tells us whether
         // the overlap is actually working at scale rather than in theory.
         let join_start = std::time::Instant::now();
-        let (delta_gc, wide_gc, delta_tb, delta_tg, delta_sketches) = match aggregates_task.await {
+        let aggregate_output = match aggregates_task.await {
             Ok(v) => v,
             // A panic in the counting pass must not lose the rows. The commit
             // proceeds; the aggregate simply misses this batch, the read-time
@@ -17323,9 +17411,16 @@ impl IcebergContext {
                     table = %table_ident,
                     "group-count pass failed; aggregates skip this commit"
                 );
-                (None, None, None, None, None)
+                OwnedAppendWork {
+                    value: (None, None, None, None, None),
+                    guard: None,
+                }
             }
         };
+        // Declare the owner before the destructured values so cancellation of
+        // the remaining async append also destroys those values first.
+        let _append_output_guard = aggregate_output.guard;
+        let (delta_gc, wide_gc, delta_tb, delta_tg, delta_sketches) = aggregate_output.value;
         metrics::histogram!(
             "siglake_iceberg_aggregate_join_duration_seconds",
             "table" => table_label.to_string()
