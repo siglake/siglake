@@ -11357,6 +11357,9 @@ mod append_work_output_tests {
                 value: payload,
                 guard: Some(guard),
             });
+            // The child/output must be the sole owner: retaining a parent
+            // clone would mask an output that released its guard too early.
+            drop(permit);
             while !child.is_finished() {
                 tokio::task::yield_now().await;
             }
@@ -11365,7 +11368,6 @@ mod append_work_output_tests {
             // cancellation, matching an append still waiting for its IO path.
             std::future::pending::<()>().await;
             drop(child);
-            drop(permit);
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), finished.notified())
             .await
