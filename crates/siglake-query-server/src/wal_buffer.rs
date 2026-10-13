@@ -597,7 +597,7 @@ fn attach_reservation_to_buffer(
     buffer: &Buffer,
     reservation: &Arc<BufferMemoryReservation>,
 ) -> Buffer {
-    if buffer.is_empty() {
+    if buffer.is_empty() && buffer.capacity() == 0 {
         return buffer.clone();
     }
     let owner = Arc::new(LeasedBufferOwner {
@@ -605,7 +605,7 @@ fn attach_reservation_to_buffer(
         _reservation: Arc::clone(reservation),
     });
     let ptr = std::ptr::NonNull::new(buffer.as_ptr() as *mut u8)
-        .expect("a nonempty Arrow buffer has a non-null pointer");
+        .expect("an allocated Arrow buffer has a non-null pointer");
     // SAFETY: `owner` retains the original Buffer allocation, and therefore
     // keeps `ptr..ptr+len` valid until the custom Buffer's final clone drops.
     unsafe { Buffer::from_custom_allocation(ptr, buffer.len(), owner) }
@@ -2873,6 +2873,29 @@ mod tests {
             let schema = Arc::new(Schema::new(vec![Field::new("value", data_type, true)]));
             assert!(bounded_output_payload(&schema, 3, 3276).is_none());
         }
+    }
+
+    #[test]
+    fn empty_values_backing_retains_output_reservation_after_parent_drop() {
+        use arrow_array::builder::StringBuilder;
+        let mut strings = StringBuilder::with_capacity(1, 8192);
+        strings.append_value("");
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, false)])),
+            vec![Arc::new(strings.finish())],
+        )
+        .unwrap();
+        assert!(batch.column(0).to_data().buffers()[1].is_empty());
+        assert!(batch.column(0).to_data().buffers()[1].capacity() >= 8192);
+        let charge = decoded_payload_bytes(std::slice::from_ref(&batch));
+        let budget = BufferMemoryBudget::new(charge);
+        let reservation = budget.try_reserve(charge).unwrap();
+        let leased = BufferOutputLease { reservation }.attach(vec![batch]).unwrap();
+        let values = leased[0].column(0).to_data().buffers()[1].clone();
+        drop(leased);
+        assert_eq!(budget.used(), charge, "empty values still retain their allocation");
+        drop(values);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
