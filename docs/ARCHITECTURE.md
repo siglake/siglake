@@ -542,6 +542,20 @@ the carrier-shaped WAL batches mapped through the index's doc-mapping before
 the union); `query_audit` is served committed-only. All of it requires the
 query pod to see the ingester's WAL — a shared RWX volume (EFS) in the
 distributed deployment — and is off unless `--query-wal-buffer-dir` is set.
+Each decode uses one owner-, consumed-set- and time-filtered segment listing
+for both admission and the read. `SIGLAKE_BUFFER_DELTA_MAX_BYTES` remains the
+compressed-file ceiling (2 GiB by default). A separate process-wide ownership
+budget, `SIGLAKE_BUFFER_DELTA_MEMORY_BYTES`, covers compressed input,
+decompressed IPC, decoded Arrow, mapping/alignment output, cache generations
+and active readers. It defaults to one eighth of the container limit, bounded
+to 64 MiB..1 GiB (512 MiB when no limit is readable); zero disables WAL-buffer
+reads. Admission never waits. Capacity, corrupt sizing, a selected member that
+changes or disappears, or a decode error refuses that complete generation and
+serves the exact committed snapshot until a later request can admit the WAL or
+the drain commits it. The
+IPC body size is a pre-decode charge, not an Arrow-heap or RSS estimate;
+retained Arrow ownership is measured after decode, and its reservation stays
+with cache readers and execution streams after replacement or cancellation.
 The measured figure is **~5.8 s ingest→queryable** for a lone marker on a
 bench node (seal-age dominated; sustained streams seal by size); that
 measurement is on `events`, and the index path has not been measured
@@ -1866,13 +1880,13 @@ result cache by outcome** panel of `deploy/grafana/siglake-overview.json` is
 where the three are read against the working `hit`/`miss`/`insert` arms.
 It also serves and stores only while the WAL buffer is *proven* to contribute
 nothing to the query's tables: buffered rows change results without changing
-the snapshot, so rows in flight — or a buffer read that failed, or one refused
-for being past the decode budget, and therefore proved nothing — take the
-request off the cache entirely, both lookup and insert. A refusal in
-particular is not emptiness: the fast paths price the whole buffer while a
-scan prices only the segments the query's window keeps, so during backlog
-recovery a windowed query is served a union the refusing gate never saw. Those
-requests recompute; the fast paths keep serving their committed-only answers.
+the snapshot, so rows in flight — or a generation refused by compressed-byte,
+decoded-memory, corruption or concurrency admission — take the request off the
+cache entirely, both lookup and insert. A refusal is not emptiness: the fast
+paths consult the whole referenced buffer while a scan selects only segments
+its query window keeps. Refused fast paths serve committed-only answers;
+admitted scans union the selected WAL generation. Neither refusal may populate
+the result cache.
 The proof is also *re-taken at insert time*, over the segment set it was
 originally established on: the scan lists the WAL directory afresh (that is how
 a `timestamp` predicate prunes segments by header), so a segment sealing between

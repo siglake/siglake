@@ -55,6 +55,17 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   therefore receive another `412` and must repeat the merge. The validator is
   deliberately mapping-specific: data appends and maintenance commits do not
   change it, while deleting and recreating the index does.
+- **WAL freshness can fall back to the committed snapshot under memory
+  pressure or segment damage.** The query server does not wait for WAL decode
+  ownership. If the exact selected generation exceeds either its compressed
+  file ceiling or the process-wide decoded-memory budget, overlaps a retained
+  cache generation that leaves insufficient room, or contains a selected
+  member that changes or becomes unreadable, the request omits that whole WAL
+  generation.
+  Fast paths and union scans keep exact committed rows; fresh rows appear after
+  a later admission or the drain commit. `SIGLAKE_BUFFER_DELTA_MEMORY_BYTES`
+  controls the ownership budget (one eighth of the container limit by default,
+  64 MiB..1 GiB; 512 MiB without a readable limit; zero disables WAL reads).
 - **A pod at the 4Gi floor caches no text indexes by default.** Both caches now
   derive from the pod's memory limit and are subtracted from the query pool, so
   they are inside the budget rather than beside it — and what they get is what

@@ -39,7 +39,9 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskPollContext, Poll};
 
 use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
@@ -47,9 +49,12 @@ use arrow_schema::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_plan::display::DisplayFormatType;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{DisplayAs, ExecutionPlan, RecordBatchStream};
+use futures::Stream;
 
 use siglake_wal::{COMMITTED_DIR, PROCESSING_DIR, SEALED_DIR};
 
@@ -195,9 +200,24 @@ fn list_uncommitted_segments(
     exclude: &HashSet<String>,
     time_bound: Option<(i64, i64)>,
 ) -> Result<(Vec<PathBuf>, usize, usize)> {
+    list_uncommitted_segments_bounded(wal_dir, exclude, time_bound, None, 0)
+}
+
+/// Exact selected-set listing with owner filtering and bounded work. The
+/// examination cap applies after consumed/recency exclusion; the kept-entry
+/// cap is checked again after time and owner filtering. Crossing either is an
+/// explicit committed-only refusal, never a partial generation.
+fn list_uncommitted_segments_bounded(
+    wal_dir: &Path,
+    exclude: &HashSet<String>,
+    time_bound: Option<(i64, i64)>,
+    owner: Option<&str>,
+    kept_cap: usize,
+) -> Result<(Vec<PathBuf>, usize, usize)> {
     let mut out = Vec::new();
     let mut excluded = 0usize;
     let mut pruned = 0usize;
+    let mut examined = 0usize;
     for sub in [SEALED_DIR, PROCESSING_DIR, COMMITTED_DIR] {
         let dir = wal_dir.join(sub);
         if !dir.is_dir() {
@@ -238,6 +258,12 @@ fn list_uncommitted_segments(
                     continue;
                 }
             }
+            examined += 1;
+            if kept_cap > 0 && examined > kept_cap {
+                metrics::counter!("siglake_query_wal_buffer_refused_segment_cap_total")
+                    .increment(1);
+                anyhow::bail!("WAL segment examination exceeds request ceiling");
+            }
             // WS-8 time-range prune: skip a framed segment whose header min/max
             // can't intersect the query window. Conservative — only prune when
             // the segment is *entirely* outside, so a kept-but-non-matching
@@ -250,7 +276,19 @@ fn list_uncommitted_segments(
                     }
                 }
             }
-            out.push(p);
+            if owner.is_some() {
+                let mut candidate = vec![p];
+                retain_owned_segments(&mut candidate, owner);
+                let Some(p) = candidate.pop() else {
+                    continue;
+                };
+                out.push(p);
+            } else {
+                out.push(p);
+            }
+            if kept_cap > 0 && out.len() > kept_cap {
+                anyhow::bail!("selected WAL segment count exceeds request ceiling");
+            }
         }
     }
     out.sort();
@@ -368,9 +406,10 @@ fn size_until_decided_capped(
     (true, total)
 }
 
-/// Ceiling on the ON-DISK bytes of buffered segments a single request may
-/// decode (`SIGLAKE_BUFFER_DELTA_MAX_BYTES`, default 2 GiB; 0 disables the
-/// guard). The buffer normally holds seconds of data, but after an outage it
+/// Compatibility ceiling on the ON-DISK bytes of buffered segments a single
+/// request may decode (`SIGLAKE_BUFFER_DELTA_MAX_BYTES`, default 2 GiB; 0
+/// disables this compressed-file guard, not the ownership budget). The buffer
+/// normally holds seconds of data, but after an outage it
 /// can hold the entire backlog — the Phase-4 validation round had the whole
 /// 200G corpus sealed-uncommitted after a node wedge, and both buffer paths
 /// (the fast-path delta and the union MemTable) MATERIALIZE the decoded rows
@@ -387,8 +426,8 @@ fn buffer_delta_max_bytes() -> u64 {
     })
 }
 
-/// Whether the surviving uncommitted segments under `wal_dir` fit the decode
-/// budget. Returns `(within_budget, total_bytes)`; an unreadable listing
+/// Whether the surviving uncommitted segments under `wal_dir` fit the legacy
+/// compressed-file budget. Returns `(within_budget, total_bytes)`; an unreadable listing
 /// counts as over budget (don't decode what you can't size).
 pub fn buffer_within_budget(
     wal_dir: &Path,
@@ -426,6 +465,194 @@ pub(crate) fn buffer_within_budget_with_max(
     size_until_decided(wal_dir, exclude, time_bound, max)
 }
 
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+
+/// Process-wide bytes reserved for WAL decode scratch and retained Arrow
+/// ownership. The default is one eighth of the container limit, bounded to
+/// 64 MiB..1 GiB; a host without a readable limit uses 512 MiB. Setting
+/// `SIGLAKE_BUFFER_DELTA_MEMORY_BYTES=0` disables WAL-buffer reads rather than
+/// disabling the guard.
+///
+/// This is separate from [`buffer_delta_max_bytes`]. That existing setting is
+/// a compatibility ceiling on compressed files. This one accounts for the
+/// allocations those files can create and is shared by simultaneous requests,
+/// cache generations, and readers of replaced generations.
+fn buffer_delta_memory_bytes_from(configured: Option<&str>, memory_limit: Option<u64>) -> u64 {
+    if let Some(bytes) = configured.and_then(|value| value.trim().parse::<u64>().ok()) {
+        return bytes;
+    }
+    memory_limit
+        .map(|limit| (limit / 8).max(1).clamp(64 * MIB, GIB).min(limit))
+        .unwrap_or(512 * MIB)
+}
+
+fn buffer_delta_memory_bytes() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        buffer_delta_memory_bytes_from(
+            std::env::var("SIGLAKE_BUFFER_DELTA_MEMORY_BYTES")
+                .ok()
+                .as_deref(),
+            siglake_storage::iceberg::cgroup_memory_limit_bytes(),
+        )
+    })
+}
+
+#[derive(Debug)]
+struct BufferMemoryState {
+    used: u64,
+}
+
+#[derive(Debug)]
+struct BufferMemoryBudget {
+    limit: u64,
+    state: std::sync::Mutex<BufferMemoryState>,
+}
+
+impl BufferMemoryBudget {
+    fn new(limit: u64) -> Arc<Self> {
+        let budget = Arc::new(Self {
+            limit,
+            state: std::sync::Mutex::new(BufferMemoryState { used: 0 }),
+        });
+        metrics::gauge!("siglake_query_wal_buffer_memory_limit_bytes").set(limit as f64);
+        metrics::gauge!("siglake_query_wal_buffer_memory_reserved_bytes").set(0.0);
+        budget
+    }
+
+    /// Non-waiting admission. A WAL buffer is a freshness aid, so contention
+    /// declines to the exact committed snapshot instead of building a queue
+    /// that can starve maintenance and request watchdogs.
+    fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<BufferMemoryReservation> {
+        if bytes == 0 {
+            return Some(BufferMemoryReservation {
+                budget: Arc::clone(self),
+                bytes: 0,
+            });
+        }
+        let mut state = self.state.lock().expect("WAL memory budget poisoned");
+        if bytes > self.limit.saturating_sub(state.used) {
+            metrics::counter!("siglake_query_wal_buffer_refused_memory_total").increment(1);
+            return None;
+        }
+        state.used = state.used.saturating_add(bytes);
+        metrics::gauge!("siglake_query_wal_buffer_memory_reserved_bytes").set(state.used as f64);
+        Some(BufferMemoryReservation {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn used(&self) -> u64 {
+        self.state.lock().expect("WAL memory budget poisoned").used
+    }
+}
+
+#[derive(Debug)]
+struct BufferMemoryReservation {
+    budget: Arc<BufferMemoryBudget>,
+    bytes: u64,
+}
+
+impl BufferMemoryReservation {
+    /// Verify measured retained Arrow ownership fits the conservative charge.
+    /// The full charge remains until the last reader drops: its spare component
+    /// covers filter/sort copies made from the retained decoded generation.
+    fn contains_actual(&self, actual: u64) -> bool {
+        if actual > self.bytes {
+            metrics::counter!("siglake_query_wal_buffer_refused_actual_bytes_total").increment(1);
+            return false;
+        }
+        true
+    }
+}
+
+impl Drop for BufferMemoryReservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .budget
+            .state
+            .lock()
+            .expect("WAL memory budget poisoned");
+        state.used = state.used.saturating_sub(self.bytes);
+        metrics::gauge!("siglake_query_wal_buffer_memory_reserved_bytes").set(state.used as f64);
+    }
+}
+
+#[derive(Debug)]
+struct SelectedBufferSegments {
+    paths: Vec<PathBuf>,
+    names: Vec<String>,
+    compressed_bytes: u64,
+    decode_charge_bytes: u64,
+    admitted: bool,
+}
+
+/// Take the one listing that defines both admission and decode. Each selected
+/// segment is charged for its compressed file buffer plus three uncompressed
+/// IPC extents: the decompressed body, decoded Arrow ownership, and a possible
+/// carrier-map/alignment output. IPC size is an admission input, not a claim
+/// about Arrow heap or process RSS; retained output is measured after decode.
+fn select_buffer_segments(
+    wal_dir: &Path,
+    exclude: &HashSet<String>,
+    time_bound: Option<(i64, i64)>,
+    owner: Option<&str>,
+    compressed_max: u64,
+) -> Result<SelectedBufferSegments> {
+    let (paths, excluded, pruned) = list_uncommitted_segments_bounded(
+        wal_dir,
+        exclude,
+        time_bound,
+        owner,
+        buffer_delta_max_segments(),
+    )?;
+    metrics::counter!("siglake_query_wal_buffer_segments_excluded_total")
+        .increment(excluded as u64);
+    metrics::counter!("siglake_query_wal_buffer_segments_time_pruned_total")
+        .increment(pruned as u64);
+    metrics::counter!("siglake_query_wal_buffer_segments_kept_total").increment(paths.len() as u64);
+
+    let mut names = Vec::with_capacity(paths.len());
+    let mut compressed_bytes = 0u64;
+    let mut decode_charge_bytes = 0u64;
+    for path in &paths {
+        let physical = std::fs::metadata(path)
+            .with_context(|| format!("stat selected WAL segment {}", path.display()))?
+            .len();
+        compressed_bytes = compressed_bytes.saturating_add(physical);
+        if compressed_max > 0 && compressed_bytes > compressed_max {
+            return Ok(SelectedBufferSegments {
+                paths: Vec::new(),
+                names: Vec::new(),
+                compressed_bytes,
+                decode_charge_bytes: 0,
+                admitted: false,
+            });
+        }
+        let ipc = siglake_wal::segment_uncompressed_bytes(path)
+            .with_context(|| format!("size selected WAL segment {}", path.display()))?;
+        decode_charge_bytes = decode_charge_bytes
+            .saturating_add(physical)
+            .saturating_add(ipc.saturating_mul(3));
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("selected WAL segment has no UTF-8 basename")?;
+        names.push(name.to_string());
+    }
+    names.sort_unstable();
+    Ok(SelectedBufferSegments {
+        paths,
+        names,
+        compressed_bytes,
+        decode_charge_bytes,
+        admitted: true,
+    })
+}
+
 /// #78: sorted basenames of the segments a buffer read over `wal_dir` would
 /// decode right now (post consumed-set exclusion, no time pruning). This is
 /// the cache key for [`BufferDeltaCache`]: sealed segments are immutable and
@@ -461,8 +688,13 @@ fn uncommitted_segment_names_with_bound(
     time_bound: Option<(i64, i64)>,
     owner: Option<&str>,
 ) -> Result<Vec<String>> {
-    let (mut segments, _, _) = list_uncommitted_segments(wal_dir, exclude, time_bound)?;
-    retain_owned_segments(&mut segments, owner);
+    let (segments, _, _) = list_uncommitted_segments_bounded(
+        wal_dir,
+        exclude,
+        time_bound,
+        owner,
+        buffer_delta_max_segments(),
+    )?;
     let mut names: Vec<String> = segments
         .iter()
         .filter_map(|p| p.file_name().and_then(|f| f.to_str()).map(String::from))
@@ -485,14 +717,14 @@ fn uncommitted_segment_names_with_bound(
 /// result cache (standing invariant): nothing here expires by time; entries
 /// are replaced on key change and evicted when the buffer drains.
 ///
-/// Memory: at most one decoded buffer per actively-queried table, bounded by
-/// the seal window — the same rows `load_buffer_delta` previously decoded
-/// per request.
-#[derive(Default)]
+/// Every cached generation owns a process-wide memory reservation. Replacing
+/// the cache slot does not release that reservation while a query, execution
+/// stream, or blocking child still holds the old generation.
 pub struct BufferDeltaCache {
     entries: std::sync::Mutex<HashMap<PathBuf, BufferDeltaCacheEntry>>,
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
+    memory: Arc<BufferMemoryBudget>,
 }
 
 struct BufferDeltaCacheEntry {
@@ -504,10 +736,61 @@ struct BufferDeltaCacheEntry {
     /// to a different table after a `DELETE`+`POST`, and the per-segment owner
     /// gate that produced these batches was run against the previous one.
     owner: Option<String>,
+    decoded: Arc<DecodedBuffer>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DecodedBuffer {
     batches: Vec<RecordBatch>,
+    names: Vec<String>,
+    compressed_bytes: u64,
+    _reservation: BufferMemoryReservation,
+}
+
+impl DecodedBuffer {
+    pub(crate) fn batches(&self) -> &[RecordBatch] {
+        &self.batches
+    }
+
+    pub(crate) fn cloned_batches(&self) -> Vec<RecordBatch> {
+        self.batches.clone()
+    }
+
+    pub(crate) fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    pub(crate) fn compressed_bytes(&self) -> u64 {
+        self.compressed_bytes
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum BufferReadOutcome {
+    Loaded(Arc<DecodedBuffer>),
+    /// Exact committed-only fallback. The selected WAL generation was not
+    /// partially served, cached, or treated as proof of an empty buffer.
+    Refused {
+        compressed_bytes: u64,
+    },
+}
+
+impl Default for BufferDeltaCache {
+    fn default() -> Self {
+        Self::with_memory_limit(buffer_delta_memory_bytes())
+    }
 }
 
 impl BufferDeltaCache {
+    fn with_memory_limit(limit: u64) -> Self {
+        Self {
+            entries: std::sync::Mutex::new(HashMap::new()),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+            memory: BufferMemoryBudget::new(limit),
+        }
+    }
+
     /// Return decoded batches for the current `(wal_dir, exclude, time_bound)`
     /// state, decoding and installing them only when the exact segment set is
     /// not cached.
@@ -525,16 +808,16 @@ impl BufferDeltaCache {
         time_bound: Option<(i64, i64)>,
         carrier: Option<&siglake_core::index_config::IndexConfig>,
         owner: Option<&str>,
-    ) -> Result<Vec<RecordBatch>> {
-        self.get_or_load_for_query_keyed(
+    ) -> Result<BufferReadOutcome> {
+        self.get_or_load_inner(
             wal_dir,
             target_schema,
             exclude,
             time_bound,
             carrier,
             owner,
+            None,
         )
-        .map(|(batches, _)| batches)
     }
 
     /// [`Self::get_or_load_for_query`] that also hands back the sorted segment
@@ -555,41 +838,176 @@ impl BufferDeltaCache {
         time_bound: Option<(i64, i64)>,
         carrier: Option<&siglake_core::index_config::IndexConfig>,
         owner: Option<&str>,
-    ) -> Result<(Vec<RecordBatch>, Vec<String>)> {
-        let names = uncommitted_segment_names_with_bound(wal_dir, exclude, time_bound, owner)?;
+    ) -> Result<BufferReadOutcome> {
+        self.get_or_load_inner(
+            wal_dir,
+            target_schema,
+            exclude,
+            time_bound,
+            carrier,
+            owner,
+            None,
+        )
+    }
+
+    pub(crate) fn get_or_load_for_query_keyed_with_max(
+        &self,
+        wal_dir: &Path,
+        target_schema: &SchemaRef,
+        exclude: &HashSet<String>,
+        time_bound: Option<(i64, i64)>,
+        carrier: Option<&siglake_core::index_config::IndexConfig>,
+        owner: Option<&str>,
+        compressed_max: Option<u64>,
+    ) -> Result<BufferReadOutcome> {
+        self.get_or_load_inner(
+            wal_dir,
+            target_schema,
+            exclude,
+            time_bound,
+            carrier,
+            owner,
+            compressed_max,
+        )
+    }
+
+    fn get_or_load_inner(
+        &self,
+        wal_dir: &Path,
+        target_schema: &SchemaRef,
+        exclude: &HashSet<String>,
+        time_bound: Option<(i64, i64)>,
+        carrier: Option<&siglake_core::index_config::IndexConfig>,
+        owner: Option<&str>,
+        compressed_max: Option<u64>,
+    ) -> Result<BufferReadOutcome> {
+        let names = match uncommitted_segment_names_with_bound(wal_dir, exclude, time_bound, owner)
+        {
+            Ok(names) => names,
+            Err(error) => {
+                metrics::counter!("siglake_query_wal_buffer_refused_listing_total").increment(1);
+                tracing::warn!(error = %error, dir = %wal_dir.display(),
+                    "refusing WAL buffer generation whose listing is unavailable");
+                self.evict(wal_dir);
+                return Ok(BufferReadOutcome::Refused {
+                    compressed_bytes: 0,
+                });
+            }
+        };
         if names.is_empty() {
             if time_bound.is_none() {
                 self.evict(wal_dir);
             }
-            return Ok((Vec::new(), names));
+            let reservation = self
+                .memory
+                .try_reserve(0)
+                .expect("a zero-byte reservation cannot fail");
+            return Ok(BufferReadOutcome::Loaded(Arc::new(DecodedBuffer {
+                batches: Vec::new(),
+                names,
+                compressed_bytes: 0,
+                _reservation: reservation,
+            })));
         }
         if let Some(cached) = self.get(wal_dir, &names, target_schema, carrier, owner) {
-            return Ok((cached, names));
+            if compressed_max.is_some_and(|max| max > 0 && cached.compressed_bytes() > max) {
+                return Ok(BufferReadOutcome::Refused {
+                    compressed_bytes: cached.compressed_bytes(),
+                });
+            }
+            return Ok(BufferReadOutcome::Loaded(cached));
         }
 
         // `load_buffer_delta` has already populated this entry on the normal
         // distributed path. A time bound only prunes segment decoding; the
         // query executed over these batches still carries the exact predicate.
         if time_bound.is_some() {
-            let all_names = uncommitted_segment_names(wal_dir, exclude, owner)?;
+            let all_names = match uncommitted_segment_names(wal_dir, exclude, owner) {
+                Ok(names) => names,
+                Err(error) => {
+                    metrics::counter!("siglake_query_wal_buffer_refused_listing_total")
+                        .increment(1);
+                    tracing::warn!(error = %error, dir = %wal_dir.display(),
+                        "refusing WAL buffer generation whose full listing is unavailable");
+                    self.evict(wal_dir);
+                    return Ok(BufferReadOutcome::Refused {
+                        compressed_bytes: 0,
+                    });
+                }
+            };
             if all_names != names {
                 if let Some(cached) = self.get(wal_dir, &all_names, target_schema, carrier, owner) {
-                    return Ok((cached, all_names));
+                    if compressed_max.is_some_and(|max| max > 0 && cached.compressed_bytes() > max)
+                    {
+                        return Ok(BufferReadOutcome::Refused {
+                            compressed_bytes: cached.compressed_bytes(),
+                        });
+                    }
+                    return Ok(BufferReadOutcome::Loaded(cached));
                 }
             }
         }
 
-        let (batches, read_names) =
-            read_buffer_batches_keyed(wal_dir, target_schema, exclude, time_bound, carrier, owner)?;
+        // A mismatched slot cannot answer this generation. Remove the cache's
+        // ownership before admitting its replacement; active readers keep
+        // their Arc and reservation, so overlap is still charged exactly while
+        // an idle stale entry cannot cause permanent self-refusal.
+        self.evict(wal_dir);
+
+        let selected = match select_buffer_segments(
+            wal_dir,
+            exclude,
+            time_bound,
+            owner,
+            compressed_max.unwrap_or_else(buffer_delta_max_bytes),
+        ) {
+            Ok(selected) => selected,
+            Err(error) => {
+                metrics::counter!("siglake_query_wal_buffer_refused_sizing_total").increment(1);
+                tracing::warn!(error = %error, dir = %wal_dir.display(),
+                    "refusing WAL buffer generation that cannot be sized exactly");
+                return Ok(BufferReadOutcome::Refused {
+                    compressed_bytes: 0,
+                });
+            }
+        };
+        let compressed_bytes = selected.compressed_bytes;
+        if !selected.admitted {
+            metrics::counter!("siglake_query_wal_buffer_refused_bytes_total").increment(1);
+            return Ok(BufferReadOutcome::Refused { compressed_bytes });
+        }
+        let Some(reservation) = self.memory.try_reserve(selected.decode_charge_bytes) else {
+            return Ok(BufferReadOutcome::Refused { compressed_bytes });
+        };
+        let batches = match read_selected_buffer_batches(&selected, target_schema, carrier) {
+            Ok(batches) => batches,
+            Err(error) => {
+                metrics::counter!("siglake_query_wal_buffer_refused_decode_total").increment(1);
+                tracing::warn!(error = %error, dir = %wal_dir.display(),
+                    "refusing incomplete WAL buffer generation");
+                return Ok(BufferReadOutcome::Refused { compressed_bytes });
+            }
+        };
+        let actual_bytes = batches.iter().fold(0u64, |bytes, batch| {
+            bytes.saturating_add(batch.get_array_memory_size() as u64)
+        });
+        if !reservation.contains_actual(actual_bytes) {
+            return Ok(BufferReadOutcome::Refused { compressed_bytes });
+        }
+        let decoded = Arc::new(DecodedBuffer {
+            batches,
+            names: selected.names,
+            compressed_bytes,
+            _reservation: reservation,
+        });
         self.insert(
             wal_dir.to_path_buf(),
-            read_names.clone(),
             target_schema.clone(),
             carrier.cloned(),
             owner.map(str::to_string),
-            batches.clone(),
+            Arc::clone(&decoded),
         );
-        Ok((batches, read_names))
+        Ok(BufferReadOutcome::Loaded(decoded))
     }
 
     /// Cached batches for `wal_dir` iff the key (surviving basenames + schema
@@ -601,7 +1019,7 @@ impl BufferDeltaCache {
         schema: &SchemaRef,
         carrier: Option<&siglake_core::index_config::IndexConfig>,
         owner: Option<&str>,
-    ) -> Option<Vec<RecordBatch>> {
+    ) -> Option<Arc<DecodedBuffer>> {
         let entries = self.entries.lock().expect("buffer delta cache poisoned");
         let e = entries.get(wal_dir)?;
         if e.names == names
@@ -612,7 +1030,7 @@ impl BufferDeltaCache {
             self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             metrics::counter!("siglake_query_buffer_delta_cache_total", "result" => "hit")
                 .increment(1);
-            Some(e.batches.clone())
+            Some(Arc::clone(&e.decoded))
         } else {
             None
         }
@@ -623,11 +1041,10 @@ impl BufferDeltaCache {
     pub fn insert(
         &self,
         wal_dir: PathBuf,
-        names: Vec<String>,
         schema: SchemaRef,
         carrier: Option<siglake_core::index_config::IndexConfig>,
         owner: Option<String>,
-        batches: Vec<RecordBatch>,
+        decoded: Arc<DecodedBuffer>,
     ) {
         self.misses
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -639,11 +1056,11 @@ impl BufferDeltaCache {
             .insert(
                 wal_dir,
                 BufferDeltaCacheEntry {
-                    names,
+                    names: decoded.names.clone(),
                     schema,
                     carrier,
                     owner,
-                    batches,
+                    decoded,
                 },
             );
     }
@@ -700,12 +1117,40 @@ fn align_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> Result<Reco
     RecordBatch::try_new(target.clone(), columns).context("align WAL buffer batch to events schema")
 }
 
+/// Decode exactly the generation admitted by [`select_buffer_segments`]. A
+/// missing, replaced, corrupt, or unmappable member refuses the whole
+/// generation; serving a subset would turn corruption or a listing race into
+/// a silently inexact answer.
+fn read_selected_buffer_batches(
+    selected: &SelectedBufferSegments,
+    target_schema: &SchemaRef,
+    carrier: Option<&siglake_core::index_config::IndexConfig>,
+) -> Result<Vec<RecordBatch>> {
+    let mut batches = Vec::new();
+    for segment in &selected.paths {
+        let segment_batches = siglake_wal::read_segment(segment)
+            .with_context(|| format!("decode selected WAL segment {}", segment.display()))?;
+        for batch in segment_batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let batch = match carrier {
+                Some(config) => siglake_core::mapping::map_carrier_batch(&batch, config)
+                    .context("map carrier batch for index buffer")?,
+                None => batch,
+            };
+            batches.push(align_batch_to_schema(&batch, target_schema)?);
+        }
+    }
+    Ok(batches)
+}
+
 /// Read the un-committed WAL segments under `wal_dir` into batches aligned to
 /// `target_schema`. `exclude` drops already-committed segments and `time_bound`
 /// (`Some((lo, hi))` ns, half-open) prunes framed segments outside the query's
 /// `timestamp` window (WS-8). Returns an empty vec when nothing survives. A
-/// single unreadable/corrupt segment is skipped (logged) rather than failing the
-/// whole query — real-time visibility is best-effort.
+/// unreadable/corrupt member fails the generation; callers must fall back to
+/// committed-only rather than serve a silently incomplete WAL slice.
 pub fn read_buffer_batches(
     wal_dir: &Path,
     target_schema: &SchemaRef,
@@ -730,10 +1175,13 @@ pub fn read_buffer_batches_keyed(
     carrier: Option<&siglake_core::index_config::IndexConfig>,
     owner: Option<&str>,
 ) -> Result<(Vec<RecordBatch>, Vec<String>)> {
-    let (mut segments, excluded, pruned) = list_uncommitted_segments(wal_dir, exclude, time_bound)?;
-    // #2693: refuse per SEGMENT, after the listing gates. The names this read
-    // reports (and keys its cache on) are the ones it decoded.
-    retain_owned_segments(&mut segments, owner);
+    let (segments, excluded, pruned) = list_uncommitted_segments_bounded(
+        wal_dir,
+        exclude,
+        time_bound,
+        owner,
+        buffer_delta_max_segments(),
+    )?;
     metrics::counter!("siglake_query_wal_buffer_segments_excluded_total")
         .increment(excluded as u64);
     // Both arms always emitted, including zero. The 2026-08-10 round could not
@@ -748,32 +1196,25 @@ pub fn read_buffer_batches_keyed(
     let mut names = Vec::with_capacity(segments.len());
     let mut batches = Vec::new();
     for seg in segments {
-        match siglake_wal::read_segment(&seg) {
-            Ok(segment_batches) => {
-                if let Some(name) = seg.file_name().and_then(|f| f.to_str()) {
-                    names.push(name.to_string());
-                }
-                for b in segment_batches {
-                    if b.num_rows() == 0 {
-                        continue;
-                    }
-                    // #61: a user index's WAL segments carry the CARRIER
-                    // (events-shaped) schema; apply the same doc-mapping the
-                    // compactor applies at commit so the buffered rows match
-                    // what the committed rows will become.
-                    let b = match carrier {
-                        Some(config) => siglake_core::mapping::map_carrier_batch(&b, config)
-                            .context("map carrier batch for index buffer")?,
-                        None => b,
-                    };
-                    batches.push(align_batch_to_schema(&b, target_schema)?);
-                }
+        let segment_batches = siglake_wal::read_segment(&seg)
+            .with_context(|| format!("decode WAL buffer segment {}", seg.display()))?;
+        if let Some(name) = seg.file_name().and_then(|f| f.to_str()) {
+            names.push(name.to_string());
+        }
+        for b in segment_batches {
+            if b.num_rows() == 0 {
+                continue;
             }
-            Err(e) => {
-                metrics::counter!("siglake_query_wal_buffer_segment_errors_total").increment(1);
-                tracing::warn!(error = %e, segment = %seg.display(),
-                    "skipping unreadable WAL buffer segment");
-            }
+            // #61: a user index's WAL segments carry the CARRIER
+            // (events-shaped) schema; apply the same doc-mapping the
+            // compactor applies at commit so the buffered rows match
+            // what the committed rows will become.
+            let b = match carrier {
+                Some(config) => siglake_core::mapping::map_carrier_batch(&b, config)
+                    .context("map carrier batch for index buffer")?,
+                None => b,
+            };
+            batches.push(align_batch_to_schema(&b, target_schema)?);
         }
     }
     names.sort_unstable();
@@ -828,6 +1269,7 @@ fn filter_batches(
 /// overhead once data has been committed.
 pub struct UnionEventsProvider {
     base: Arc<dyn TableProvider>,
+    cache: Arc<BufferDeltaCache>,
     wal_dir: PathBuf,
     /// Segment basenames already in the serving Iceberg snapshot (excluded).
     exclude: HashSet<String>,
@@ -837,7 +1279,7 @@ pub struct UnionEventsProvider {
     /// `None` for the events table, whose WAL batches are already
     /// events-shaped.
     carrier: Option<siglake_core::index_config::IndexConfig>,
-    /// Injected decode ceiling; `None` reads the configured one. The sibling of
+    /// Injected compressed-file ceiling; `None` reads the configured one. The sibling of
     /// `load_buffer_delta_with_max`: the two gates must be compared at ONE
     /// ceiling for a backlog regression to mean anything, and the configured
     /// value is a 2 GiB `OnceLock` no test can move.
@@ -865,10 +1307,27 @@ impl UnionEventsProvider {
         wal_dir: &Path,
         exclude: &HashSet<String>,
     ) -> Result<Self> {
-        Self::try_new_inner(base, wal_dir, exclude, None, None, None)
+        Self::try_new_inner(
+            base,
+            Arc::new(BufferDeltaCache::default()),
+            wal_dir,
+            exclude,
+            None,
+            None,
+            None,
+        )
     }
 
-    /// [`Self::try_new`] with the decode ceiling injected, so a backlog
+    pub fn try_new_with_cache(
+        base: Arc<dyn TableProvider>,
+        cache: Arc<BufferDeltaCache>,
+        wal_dir: &Path,
+        exclude: &HashSet<String>,
+    ) -> Result<Self> {
+        Self::try_new_inner(base, cache, wal_dir, exclude, None, None, None)
+    }
+
+    /// [`Self::try_new`] with the compressed-file ceiling injected, so a backlog
     /// regression can price the scan gate and the fast-path delta gate against
     /// the SAME ceiling without a 2 GiB fixture.
     #[cfg(test)]
@@ -878,7 +1337,15 @@ impl UnionEventsProvider {
         exclude: &HashSet<String>,
         max_bytes: u64,
     ) -> Result<Self> {
-        Self::try_new_inner(base, wal_dir, exclude, None, Some(max_bytes), None)
+        Self::try_new_inner(
+            base,
+            Arc::new(BufferDeltaCache::default()),
+            wal_dir,
+            exclude,
+            None,
+            Some(max_bytes),
+            None,
+        )
     }
 
     /// #61: buffer provider for a USER INDEX — WAL batches are carrier-shaped
@@ -890,11 +1357,31 @@ impl UnionEventsProvider {
         config: siglake_core::index_config::IndexConfig,
         owner: Option<&str>,
     ) -> Result<Self> {
-        Self::try_new_inner(base, wal_dir, exclude, Some(config), None, owner)
+        Self::try_new_inner(
+            base,
+            Arc::new(BufferDeltaCache::default()),
+            wal_dir,
+            exclude,
+            Some(config),
+            None,
+            owner,
+        )
+    }
+
+    pub fn try_new_for_index_with_cache(
+        base: Arc<dyn TableProvider>,
+        cache: Arc<BufferDeltaCache>,
+        wal_dir: &Path,
+        exclude: &HashSet<String>,
+        config: siglake_core::index_config::IndexConfig,
+        owner: Option<&str>,
+    ) -> Result<Self> {
+        Self::try_new_inner(base, cache, wal_dir, exclude, Some(config), None, owner)
     }
 
     fn try_new_inner(
         base: Arc<dyn TableProvider>,
+        cache: Arc<BufferDeltaCache>,
         wal_dir: &Path,
         exclude: &HashSet<String>,
         carrier: Option<siglake_core::index_config::IndexConfig>,
@@ -904,6 +1391,7 @@ impl UnionEventsProvider {
         let schema = base.schema();
         Ok(Self {
             base,
+            cache,
             wal_dir: wal_dir.to_path_buf(),
             exclude: exclude.clone(),
             schema,
@@ -992,6 +1480,109 @@ fn projected_event_time_ordering(
     )])
 }
 
+/// Keep a decoded generation's ownership reservation alive for as long as the
+/// physical plan or any stream produced from it can retain shallow Arrow
+/// buffers. Optimizer child replacement preserves the same lease.
+struct WalBufferLeaseExec {
+    inner: Arc<dyn ExecutionPlan>,
+    decoded: Arc<DecodedBuffer>,
+}
+
+impl WalBufferLeaseExec {
+    fn new(inner: Arc<dyn ExecutionPlan>, decoded: Arc<DecodedBuffer>) -> Self {
+        Self { inner, decoded }
+    }
+}
+
+impl std::fmt::Debug for WalBufferLeaseExec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WalBufferLeaseExec")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for WalBufferLeaseExec {
+    fn fmt_as(
+        &self,
+        display: DisplayFormatType,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        self.inner.fmt_as(display, formatter)
+    }
+}
+
+impl ExecutionPlan for WalBufferLeaseExec {
+    fn name(&self) -> &str {
+        "WalBufferLeaseExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
+        self.inner.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.inner]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "WalBufferLeaseExec expected one child, got {}",
+                children.len()
+            )));
+        }
+        Ok(Arc::new(Self::new(
+            children.remove(0),
+            Arc::clone(&self.decoded),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let inner = self.inner.execute(partition, context)?;
+        Ok(Box::pin(WalBufferLeaseStream {
+            schema: inner.schema(),
+            inner,
+            _decoded: Arc::clone(&self.decoded),
+        }))
+    }
+}
+
+struct WalBufferLeaseStream {
+    schema: SchemaRef,
+    inner: SendableRecordBatchStream,
+    _decoded: Arc<DecodedBuffer>,
+}
+
+impl Stream for WalBufferLeaseStream {
+    type Item = DFResult<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskPollContext<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(context)
+    }
+}
+
+impl RecordBatchStream for WalBufferLeaseStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
 #[async_trait::async_trait]
 impl TableProvider for UnionEventsProvider {
     fn as_any(&self) -> &dyn Any {
@@ -1025,25 +1616,38 @@ impl TableProvider for UnionEventsProvider {
         // NOTHING about what this scan unions — see `BufferDeltaState`.
         let df_schema = datafusion::common::DFSchema::try_from(self.schema.as_ref().clone())?;
         let bound = time_bound_from_filters(filters, &df_schema);
-        let within_budget = match self.max_bytes {
-            Some(max) => buffer_within_budget_with_max(&self.wal_dir, &self.exclude, bound, max).0,
-            None => buffer_within_budget(&self.wal_dir, &self.exclude, bound).0,
+        // The cache takes one listing, prices that exact owner/consumed/window
+        // generation, and holds its reservation through every shallow reader.
+        // Capacity and corrupt/listing failures are explicit committed-only
+        // fallbacks; no partial generation enters the union.
+        let outcome = tokio::task::spawn_blocking({
+            let cache = Arc::clone(&self.cache);
+            let wal_dir = self.wal_dir.clone();
+            let schema = self.schema.clone();
+            let exclude = self.exclude.clone();
+            let carrier = self.carrier.clone();
+            let owner = self.owner.clone();
+            let compressed_max = self.max_bytes;
+            move || {
+                cache.get_or_load_inner(
+                    &wal_dir,
+                    &schema,
+                    &exclude,
+                    bound,
+                    carrier.as_ref(),
+                    owner.as_deref(),
+                    compressed_max,
+                )
+            }
+        })
+        .await
+        .map_err(|error| DataFusionError::External(error.into()))?
+        .map_err(|error| DataFusionError::External(error.into()))?;
+        let decoded = match outcome {
+            BufferReadOutcome::Loaded(decoded) => decoded,
+            BufferReadOutcome::Refused { .. } => return Ok(base_plan),
         };
-        if !within_budget {
-            return Ok(base_plan);
-        }
-        // Read the un-committed WAL afresh, pruning segments outside the query's
-        // timestamp window (WS-8) and excluding already-committed ones (WS-6).
-        let batches = read_buffer_batches(
-            &self.wal_dir,
-            &self.schema,
-            &self.exclude,
-            bound,
-            self.carrier.as_ref(),
-            self.owner.as_deref(),
-        )
-        .map_err(|e| DataFusionError::External(e.into()))?;
-        if batches.is_empty() {
+        if decoded.batches().is_empty() {
             return Ok(base_plan);
         }
         // Apply this query's predicates to the buffer BEFORE deciding to union.
@@ -1061,13 +1665,13 @@ impl TableProvider for UnionEventsProvider {
         // hundred KB, in memory) lets those queries take the base plan unchanged
         // and pay nothing. Rows that DO match are still unioned, so the answer is
         // unchanged either way.
-        let batches = match filter_batches(&batches, filters, &self.schema, state) {
+        let batches = match filter_batches(decoded.batches(), filters, &self.schema, state) {
             Ok(filtered) => filtered,
             // Never let a filter we cannot evaluate change the ANSWER: fall back
             // to unioning everything, which is correct but slow.
             Err(e) => {
                 tracing::debug!(error = %e, "wal-buffer: filter pre-pass failed; unioning unfiltered");
-                batches
+                decoded.cloned_batches()
             }
         };
         if batches.iter().all(|b| b.num_rows() == 0) {
@@ -1142,15 +1746,16 @@ impl TableProvider for UnionEventsProvider {
             // when the sort column was projected out.
             if let Some(ordering) = projected_event_time_ordering(&union, &base_ordering) {
                 tracing::debug!("wal-buffer union: SPM applied");
-                return Ok(Arc::new(
+                let plan: Arc<dyn ExecutionPlan> = Arc::new(
                     datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec::new(
                         ordering, union,
                     ),
-                ));
+                );
+                return Ok(Arc::new(WalBufferLeaseExec::new(plan, decoded)));
             }
         }
         tracing::debug!(sorted, "wal-buffer union: plain union (no SPM)");
-        Ok(union)
+        Ok(Arc::new(WalBufferLeaseExec::new(union, decoded)))
     }
 
     fn supports_filters_pushdown(
@@ -1181,6 +1786,15 @@ mod tests {
             .collect();
         w.append_events(&evs).unwrap();
         w.seal().unwrap().expect("sealed segment");
+    }
+
+    fn loaded(outcome: BufferReadOutcome) -> Arc<DecodedBuffer> {
+        match outcome {
+            BufferReadOutcome::Loaded(decoded) => decoded,
+            BufferReadOutcome::Refused { compressed_bytes } => {
+                panic!("tiny fixture was refused after {compressed_bytes} compressed bytes")
+            }
+        }
     }
 
     /// `count(*) FROM events` against a provider, optionally with a WHERE clause.
@@ -1303,25 +1917,20 @@ mod tests {
             "cold cache misses"
         );
 
-        let (batches, read_names) =
-            read_buffer_batches_keyed(tmp.path(), &schema, &exclude, None, None, None).unwrap();
-        assert_eq!(read_names, names);
-        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(rows, 5);
-        cache.insert(
-            tmp.path().to_path_buf(),
-            read_names,
-            schema.clone(),
-            None,
-            None,
-            batches,
+        let decoded = loaded(
+            cache
+                .get_or_load_for_query_keyed(tmp.path(), &schema, &exclude, None, None, None)
+                .unwrap(),
         );
+        assert_eq!(decoded.names(), names);
+        let rows: usize = decoded.batches().iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 5);
 
         // Unchanged buffer state ⇒ hit with the same rows.
         let hit = cache
             .get(tmp.path(), &names, &schema, None, None)
             .expect("hit");
-        assert_eq!(hit.iter().map(|b| b.num_rows()).sum::<usize>(), 5);
+        assert_eq!(hit.batches().iter().map(|b| b.num_rows()).sum::<usize>(), 5);
         assert_eq!(cache.stats(), (1, 1));
 
         // A new sealed segment changes the basename set ⇒ miss.
@@ -1369,29 +1978,34 @@ mod tests {
         let original = std::fs::read(segment).unwrap();
         std::fs::write(segment, b"not a WAL segment").unwrap();
 
-        let (first, failed_read_names) = cache
+        let first = cache
             .get_or_load_for_query_keyed(tmp.path(), &schema, &exclude, None, None, None)
             .unwrap();
         assert!(
-            first.is_empty(),
-            "the unreadable segment is best-effort skipped"
-        );
-        assert!(
-            failed_read_names.is_empty(),
-            "an unreadable segment must not vouch for a complete cache entry"
+            matches!(first, BufferReadOutcome::Refused { .. }),
+            "an unreadable segment must refuse the complete generation"
         );
 
         std::fs::write(segment, original).unwrap();
         let restored_names = uncommitted_segment_names(tmp.path(), &exclude, None).unwrap();
-        let (second, read_names) = cache
-            .get_or_load_for_query_keyed(tmp.path(), &schema, &exclude, None, None, None)
-            .unwrap();
+        let second = loaded(
+            cache
+                .get_or_load_for_query_keyed(tmp.path(), &schema, &exclude, None, None, None)
+                .unwrap(),
+        );
 
-        assert_eq!(read_names, restored_names);
-        assert_eq!(second.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+        assert_eq!(second.names(), restored_names);
+        assert_eq!(
+            second
+                .batches()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            5
+        );
         assert_eq!(
             cache.stats(),
-            (0, 2),
+            (0, 1),
             "the unchanged full basename set must retry after a failed decode"
         );
     }
@@ -1405,15 +2019,33 @@ mod tests {
         let cache = BufferDeltaCache::default();
         let time_bound = Some((i64::MIN, i64::MAX));
 
-        let first = cache
-            .get_or_load_for_query(tmp.path(), &schema, &exclude, time_bound, None, None)
-            .unwrap();
-        let second = cache
-            .get_or_load_for_query(tmp.path(), &schema, &exclude, time_bound, None, None)
-            .unwrap();
+        let first = loaded(
+            cache
+                .get_or_load_for_query(tmp.path(), &schema, &exclude, time_bound, None, None)
+                .unwrap(),
+        );
+        let second = loaded(
+            cache
+                .get_or_load_for_query(tmp.path(), &schema, &exclude, time_bound, None, None)
+                .unwrap(),
+        );
 
-        assert_eq!(first.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
-        assert_eq!(second.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+        assert_eq!(
+            first
+                .batches()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            5
+        );
+        assert_eq!(
+            second
+                .batches()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            5
+        );
         assert_eq!(cache.stats(), (1, 1), "second call must hit the cache");
     }
 
@@ -1440,22 +2072,176 @@ mod tests {
         let schema = siglake_core::events_schema();
         let exclude = HashSet::new();
         let cache = BufferDeltaCache::default();
-        let all = cache
-            .get_or_load_for_query(tmp.path(), &schema, &exclude, None, None, None)
-            .unwrap();
-        assert_eq!(all.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+        let all = loaded(
+            cache
+                .get_or_load_for_query(tmp.path(), &schema, &exclude, None, None, None)
+                .unwrap(),
+        );
+        assert_eq!(
+            all.batches()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            5
+        );
 
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap();
         let recent_only = Some((now - 60_000_000_000, i64::MAX));
-        let bounded = cache
-            .get_or_load_for_query(tmp.path(), &schema, &exclude, recent_only, None, None)
-            .unwrap();
+        let bounded = loaded(
+            cache
+                .get_or_load_for_query(tmp.path(), &schema, &exclude, recent_only, None, None)
+                .unwrap(),
+        );
 
         // The full cached batches are a safe superset: the distributed SQL
         // still applies this timestamp predicate, and no segment is decoded a
         // second time after the Tier-1 delta load.
-        assert_eq!(bounded.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+        assert_eq!(
+            bounded
+                .batches()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            5
+        );
         assert_eq!(cache.stats(), (1, 1), "bounded call must reuse full decode");
+    }
+
+    #[test]
+    fn wal_memory_default_tracks_the_container_without_relabeling_disk_bytes() {
+        assert_eq!(
+            buffer_delta_memory_bytes_from(None, Some(4 * GIB)),
+            512 * MIB
+        );
+        assert_eq!(buffer_delta_memory_bytes_from(None, Some(64 * GIB)), GIB);
+        assert_eq!(buffer_delta_memory_bytes_from(None, None), 512 * MIB);
+        assert_eq!(
+            buffer_delta_memory_bytes_from(Some("12345"), Some(4 * GIB)),
+            12345
+        );
+        assert_eq!(buffer_delta_memory_bytes_from(Some("0"), Some(4 * GIB)), 0);
+    }
+
+    #[test]
+    fn compressible_segment_is_refused_by_decoded_admission_before_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer =
+            WalWriter::with_thresholds(tmp.path(), "ing", 10_000, Duration::from_secs(60)).unwrap();
+        writer
+            .append_events(&[Event::now("compressible".repeat(128 * 1024))])
+            .unwrap();
+        writer.seal().unwrap().expect("sealed segment");
+
+        let cache = BufferDeltaCache::with_memory_limit(64 * 1024);
+        let outcome = cache
+            .get_or_load_for_query(
+                tmp.path(),
+                &siglake_core::events_schema(),
+                &HashSet::new(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(outcome, BufferReadOutcome::Refused { .. }));
+        assert_eq!(cache.stats(), (0, 0), "a refused generation is not cached");
+        assert_eq!(cache.memory.used(), 0, "failed admission leaves no lease");
+    }
+
+    #[test]
+    fn admitted_listing_is_the_only_generation_decoded() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sealed_segment(tmp.path(), 2);
+        let selected =
+            select_buffer_segments(tmp.path(), &HashSet::new(), None, None, u64::MAX).unwrap();
+        write_sealed_segment(tmp.path(), 3);
+
+        let batches =
+            read_selected_buffer_batches(&selected, &siglake_core::events_schema(), None).unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        assert_eq!(
+            selected.names.len(),
+            1,
+            "the later seal is a later generation"
+        );
+    }
+
+    #[test]
+    fn corrupt_or_disappeared_selected_member_refuses_the_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sealed_segment(tmp.path(), 2);
+        let selected =
+            select_buffer_segments(tmp.path(), &HashSet::new(), None, None, u64::MAX).unwrap();
+        std::fs::remove_file(&selected.paths[0]).unwrap();
+        assert!(
+            read_selected_buffer_batches(&selected, &siglake_core::events_schema(), None).is_err()
+        );
+    }
+
+    #[test]
+    fn replaced_generation_and_reader_are_both_charged_until_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sealed_segment(tmp.path(), 2);
+        let cache = BufferDeltaCache::with_memory_limit(64 * MIB);
+        let schema = siglake_core::events_schema();
+        let first = loaded(
+            cache
+                .get_or_load_for_query(tmp.path(), &schema, &HashSet::new(), None, None, None)
+                .unwrap(),
+        );
+        let first_charge = cache.memory.used();
+        assert!(first_charge > 0);
+
+        write_sealed_segment(tmp.path(), 3);
+        let second = loaded(
+            cache
+                .get_or_load_for_query(tmp.path(), &schema, &HashSet::new(), None, None, None)
+                .unwrap(),
+        );
+        assert!(
+            cache.memory.used() > first_charge,
+            "old reader and replacement generation overlap in the budget"
+        );
+        cache.evict(tmp.path());
+        assert!(
+            cache.memory.used() > first_charge,
+            "reader Arcs retain both leases"
+        );
+        drop(second);
+        assert_eq!(cache.memory.used(), first_charge);
+        drop(first);
+        assert_eq!(cache.memory.used(), 0);
+    }
+
+    #[test]
+    fn simultaneous_reservations_refuse_without_waiting() {
+        let budget = BufferMemoryBudget::new(100);
+        let first = budget.try_reserve(60).expect("first reservation");
+        assert!(
+            budget.try_reserve(50).is_none(),
+            "no wait queue or overcommit"
+        );
+        drop(first);
+        assert!(budget.try_reserve(50).is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_join_handle_does_not_release_blocking_child_reservation() {
+        let budget = BufferMemoryBudget::new(100);
+        let child_budget = Arc::clone(&budget);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let child = tokio::task::spawn_blocking(move || {
+            let _reservation = child_budget.try_reserve(80).expect("child reservation");
+            started_tx.send(()).unwrap();
+            release_rx.blocking_recv().unwrap();
+        });
+        started_rx.await.unwrap();
+        child.abort();
+        assert_eq!(budget.used(), 80, "abort cannot stop spawn_blocking work");
+        release_tx.send(()).unwrap();
+        let _ = child.await;
+        assert_eq!(budget.used(), 0);
     }
 
     #[tokio::test]
