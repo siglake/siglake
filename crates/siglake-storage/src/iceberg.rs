@@ -8286,6 +8286,8 @@ const MAX_SAMPLED_KEYS: usize = 4096;
 struct SampledKeys {
     rows: usize,
     keys: std::collections::HashMap<String, (usize, Option<SampledKind>)>,
+    declined: std::collections::HashMap<String, (usize, AutoPromotionDeclineReason)>,
+    tracked_keys: usize,
     dropped_keys: usize,
     cap: usize,
 }
@@ -8295,15 +8297,18 @@ impl SampledKeys {
         Self {
             rows: 0,
             keys: std::collections::HashMap::new(),
+            declined: std::collections::HashMap::new(),
+            tracked_keys: 0,
             dropped_keys: 0,
             cap: cap.max(1),
         }
     }
 
     /// Record one sampled row. `attributes` is its residual JSON, or `None`
-    /// for a null cell. OTLP residuals hold nested objects; their scalar
-    /// LEAVES are the promotable units, addressed by dotted key (one level —
-    /// deeper nesting stays residual).
+    /// for a null cell. OTLP residuals hold nested objects; scalar leaves under
+    /// an undotted parent are addressed by dotted key (one level — deeper
+    /// nesting stays residual). Leaves under a literal dotted parent are
+    /// counted as declines because the synthesized path cannot address them.
     fn observe_row(&mut self, attributes: Option<&str>) {
         self.rows += 1;
         let Some(json) = attributes else {
@@ -8317,7 +8322,12 @@ impl SampledKeys {
             match value {
                 serde_json::Value::Object(inner) => {
                     for (sub, sub_value) in inner {
-                        self.hit(format!("{key}.{sub}"), sub_value);
+                        let leaf = format!("{key}.{sub}");
+                        if key.contains('.') {
+                            self.decline(leaf, AutoPromotionDeclineReason::DottedParent);
+                        } else {
+                            self.hit(leaf, sub_value);
+                        }
                     }
                 }
                 _ => self.hit(key.clone(), value),
@@ -8332,10 +8342,31 @@ impl SampledKeys {
         if let Some(slot) = self.keys.get_mut(&key) {
             slot.0 += 1;
             slot.1 = merge_sampled_kind(slot.1, value);
-        } else if self.keys.len() >= self.cap {
+        } else if !self.declined.contains_key(&key) && self.tracked_keys >= self.cap {
             self.dropped_keys += 1;
         } else {
+            if !self.declined.contains_key(&key) {
+                self.tracked_keys += 1;
+            }
             self.keys.insert(key, (1, merge_sampled_kind(None, value)));
+        }
+    }
+
+    /// Retain a leaf which cleared the JSON walk but cannot be addressed by
+    /// the extraction rule. It is kept apart from ordinary nested leaves so a
+    /// literal dotted parent never manufactures a promotable path.
+    fn decline(&mut self, key: String, reason: AutoPromotionDeclineReason) {
+        if let Some(slot) = self.declined.get_mut(&key) {
+            slot.0 += 1;
+            return;
+        }
+        if !self.keys.contains_key(&key) && self.tracked_keys >= self.cap {
+            self.dropped_keys += 1;
+        } else {
+            if !self.keys.contains_key(&key) {
+                self.tracked_keys += 1;
+            }
+            self.declined.insert(key, (1, reason));
         }
     }
 }
@@ -8364,6 +8395,7 @@ fn threshold_is_off(min_fraction: f64) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoPromotionDeclineReason {
     ColumnCeiling,
+    DottedParent,
     NameCollision,
     MixedType,
 }
@@ -8372,6 +8404,7 @@ impl AutoPromotionDeclineReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ColumnCeiling => "ceiling",
+            Self::DottedParent => "dotted_parent",
             Self::NameCollision => "name_collision",
             Self::MixedType => "mixed_type",
         }
@@ -8387,7 +8420,8 @@ pub struct AutoPromotionDecline {
 #[derive(Debug, Clone)]
 struct PromotionSelection {
     /// Unpromoted keys whose sampled frequency cleared the configured bar.
-    /// This includes keys later refused for type, name, or capacity.
+    /// This includes keys later refused for a dotted parent, type, name, or
+    /// capacity.
     candidates: usize,
     promoted: Vec<siglake_core::PromotedColumn>,
     declined: Vec<AutoPromotionDecline>,
@@ -8426,6 +8460,13 @@ fn select_promotions(
     }
     let already: std::collections::HashSet<&str> =
         existing.iter().map(|c| c.attr_key.as_str()).collect();
+    let dotted_parent_declines = census.declined.iter().filter_map(|(key, (rows, reason))| {
+        (!already.contains(key.as_str()) && (*rows as f64) / (census.rows as f64) >= min_fraction)
+            .then_some(AutoPromotionDecline {
+                attr_key: key.clone(),
+                reason: *reason,
+            })
+    });
     let mut candidates: Vec<(&str, usize, Option<siglake_core::PromotedType>)> = census
         .keys
         .iter()
@@ -8445,8 +8486,17 @@ fn select_promotions(
     let mut taken: std::collections::HashSet<String> =
         existing.iter().map(|c| c.name.clone()).collect();
     let mut promoted_now = Vec::new();
-    let candidate_count = candidates.len();
-    let mut declined = Vec::new();
+    let mut declined = dotted_parent_declines.collect::<Vec<_>>();
+    declined.sort_by(|a, b| a.attr_key.cmp(&b.attr_key));
+    let eligible_keys = candidates
+        .iter()
+        .map(|(key, _, _)| *key)
+        .collect::<std::collections::HashSet<_>>();
+    let candidate_count = candidates.len()
+        + declined
+            .iter()
+            .filter(|item| !eligible_keys.contains(item.attr_key.as_str()))
+            .count();
     for (key, _, ty) in candidates {
         let Some(ty) = ty else {
             declined.push(AutoPromotionDecline {
@@ -8673,6 +8723,70 @@ mod auto_promotion_sampling_tests {
             "a nested object leaf is not a scalar"
         );
         assert!(!deep.keys.contains_key("a.b.c"));
+    }
+
+    #[test]
+    fn dotted_parent_leaves_are_declined_without_hiding_safe_nested_leaves() {
+        let c = census(&[
+            Some(r#"{"aws.cloudwatch":{"log_stream":"s","log_group":"g"}}"#),
+            Some(r#"{"http":{"status":500}}"#),
+        ]);
+        let selection = select_promotions(&c, &[], 0.5, 16, &no_schema_collision);
+        assert_eq!(
+            selection
+                .promoted
+                .iter()
+                .map(|column| column.attr_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["http.status"]
+        );
+        assert_eq!(
+            selection
+                .declined
+                .iter()
+                .map(|item| (item.attr_key.as_str(), item.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "aws.cloudwatch.log_group",
+                    AutoPromotionDeclineReason::DottedParent,
+                ),
+                (
+                    "aws.cloudwatch.log_stream",
+                    AutoPromotionDeclineReason::DottedParent,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_selected_promotion_extracts_a_non_null_sampled_cell() {
+        let attributes = [
+            r#"{"http":{"status":500},"a":{"b.c":1},"service":"api","ratio":1.5,"ok":true,"aws.cloudwatch":{"log_stream":"s"}}"#,
+            r#"{"http":{"status":200},"a":{"b.c":2},"service":"worker","ratio":2,"ok":false}"#,
+        ];
+        let rows = attributes.iter().copied().map(Some).collect::<Vec<_>>();
+        let selection = select_promotions(&census(&rows), &[], 0.5, 16, &no_schema_collision);
+        assert!(!selection.promoted.is_empty());
+
+        let events = attributes
+            .iter()
+            .enumerate()
+            .map(|(row, attributes)| {
+                siglake_core::Event::now(format!("row-{row}"))
+                    .with_attributes(Some((*attributes).to_string()))
+            })
+            .collect::<Vec<_>>();
+        let batch = siglake_core::events_to_record_batch(&events).unwrap();
+        let promoted = siglake_core::promote_attributes(&batch, &selection.promoted).unwrap();
+        for column in &selection.promoted {
+            let values = promoted.column_by_name(&column.name).unwrap();
+            assert!(
+                values.null_count() < values.len(),
+                "selected promotion {} extracted only NULL cells",
+                column.attr_key
+            );
+        }
     }
 
     #[test]
@@ -16510,7 +16624,7 @@ impl IcebergContext {
         if census.dropped_keys > 0 {
             tracing::warn!(
                 table = %table_ident,
-                tracked = census.keys.len(),
+                tracked = census.tracked_keys,
                 dropped = census.dropped_keys,
                 "auto-promotion: attribute key census truncated; a dropped key was seen too rarely to promote"
             );
@@ -23930,11 +24044,48 @@ impl IcebergContext {
         else {
             return Ok(None);
         };
-        self.tier1_group_count_rows(&cached, column, record_count)
+        self.tier1_group_count_rows(&table_ident, &cached, column, record_count)
             .await
     }
 
-    /// An approximate top-`k` for `column`, when no exact aggregate covers it.    /// An approximate top-`k` for `column`, when no exact aggregate covers it.
+    /// Fold an uncached Tier-1 wide column during validation.
+    ///
+    /// A result-cache-enabled query keeps the established snapshot-cache path.
+    /// With result caches disabled, this lets an exact bounded collector avoid
+    /// reconstructing every front-coded key once for validation and again for
+    /// selection. The named outcome distinguishes an uninspected miss from a
+    /// decoded refusal, allowing the caller to continue below Tier-1 without
+    /// repeating the same decode.
+    pub async fn tier1_group_counts_fold<T: siglake_bloom::group_counts::StreamingColumnFold>(
+        &self,
+        table_name: &str,
+        column: &str,
+        state: T,
+    ) -> Result<Tier1GroupCountsFold<T>> {
+        if self.result_caches_enabled() {
+            return Ok(Tier1GroupCountsFold::NotInspected);
+        }
+        let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
+        let cached = self.cached_table_entry(&table_ident).await?;
+        let Some(record_count) = cached
+            .table
+            .metadata()
+            .current_snapshot()
+            .and_then(|snapshot| {
+                snapshot
+                    .summary()
+                    .additional_properties
+                    .get("total-records")
+            })
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return Ok(Tier1GroupCountsFold::NotInspected);
+        };
+        self.tier1_group_count_rows_fold(&table_ident, &cached, column, record_count, state)
+            .await
+    }
+
+    /// An approximate top-`k` for `column`, when no exact aggregate covers it.
     ///
     /// **Only top-K by count.** A sketch holds at most `m` counters and has no
     /// idea what it evicted, so it cannot answer `count(DISTINCT)`, a negation
@@ -23950,11 +24101,42 @@ impl IcebergContext {
         k: usize,
         buffered: Option<&HashMap<Option<String>, u64>>,
     ) -> Result<Option<ApproximateGroupCounts>> {
+        let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
+        self.approximate_top_group_counts_inner(&table_ident, column, k, buffered, None)
+            .await
+    }
+
+    /// Approximate fallback after the same request already decoded and refused
+    /// the exact Tier-1 column. Skips only that generation's duplicate probe;
+    /// a refreshed generation checks exact Tier-1 again before its sketch.
+    pub async fn approximate_top_group_counts_after_tier1_refusal(
+        &self,
+        refusal: &Tier1GroupCountsRefusal,
+        k: usize,
+        buffered: Option<&HashMap<Option<String>, u64>>,
+    ) -> Result<Option<ApproximateGroupCounts>> {
+        self.approximate_top_group_counts_inner(
+            &refusal.table_ident,
+            &refusal.column,
+            k,
+            buffered,
+            Some(refusal),
+        )
+        .await
+    }
+
+    async fn approximate_top_group_counts_inner(
+        &self,
+        table_ident: &TableIdent,
+        column: &str,
+        k: usize,
+        buffered: Option<&HashMap<Option<String>, u64>>,
+        refusal: Option<&Tier1GroupCountsRefusal>,
+    ) -> Result<Option<ApproximateGroupCounts>> {
         if !self.group_count_deltas_enabled() {
             return Ok(None);
         }
-        let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
-        let cached = self.cached_table_entry(&table_ident).await?;
+        let cached = self.cached_table_entry(table_ident).await?;
 
         // Never shadow an exact answer: if the exact path can serve this
         // column, it must. The sketch exists for the case that would otherwise
@@ -23965,13 +24147,15 @@ impl IcebergContext {
             .current_snapshot()
             .and_then(|s| s.summary().additional_properties.get("total-records"))
             .and_then(|v| v.parse::<u64>().ok());
-        if let Some(rc) = record_count {
-            if self
-                .tier1_group_count_rows(&cached, column, rc)
-                .await?
-                .is_some()
-            {
-                return Ok(None);
+        if refusal.is_none_or(|refusal| !refusal.matches(&cached)) {
+            if let Some(rc) = record_count {
+                if self
+                    .tier1_group_count_rows(table_ident, &cached, column, rc)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(None);
+                }
             }
         }
 
@@ -24045,10 +24229,33 @@ impl IcebergContext {
     /// down. Completeness is the only safe discriminator.
     async fn tier1_group_count_rows(
         &self,
+        table_ident: &TableIdent,
         cached: &CachedTableEntry,
         column: &str,
         record_count: u64,
     ) -> Result<Option<GroupCounts>> {
+        Ok(
+            match self
+                .tier1_group_count_rows_fold(table_ident, cached, column, record_count, ())
+                .await?
+            {
+                Tier1GroupCountsFold::Hit { rows, .. } => Some(rows),
+                Tier1GroupCountsFold::NotInspected | Tier1GroupCountsFold::Refused(_) => None,
+            },
+        )
+    }
+
+    /// Tier-1 lookup that can fold a wide column during its mandatory
+    /// validation pass. The outcome says whether `fold` consumed the rows; an
+    /// inline hit leaves `state` untouched so its map-backed view stays cheap.
+    async fn tier1_group_count_rows_fold<T: siglake_bloom::group_counts::StreamingColumnFold>(
+        &self,
+        table_ident: &TableIdent,
+        cached: &CachedTableEntry,
+        column: &str,
+        record_count: u64,
+        state: T,
+    ) -> Result<Tier1GroupCountsFold<T>> {
         // Both arms hand back a BORROWED view of the aggregate they matched.
         // Nothing downstream needs owned keys, and materializing them here is
         // what put 1.1M string allocations on every query — see [`GroupCounts`].
@@ -24062,30 +24269,55 @@ impl IcebergContext {
                 .and_then(|g| g.column_total(column))
                 == Some(record_count)
             {
-                return Ok(Some(GroupCounts::Inline {
-                    aggs,
-                    column: column.to_string(),
-                }));
+                return Ok(Tier1GroupCountsFold::Hit {
+                    rows: GroupCounts::Inline {
+                        aggs,
+                        column: column.to_string(),
+                    },
+                    state,
+                    folded: false,
+                });
             }
         }
         let Some(wide) = self.cached_wide_group_counts(cached).await? else {
-            return Ok(None);
+            return Ok(Tier1GroupCountsFold::NotInspected);
         };
         if !aggregate_covers_current_snapshot(&cached.table, wide.coverage) {
-            return Ok(None);
+            return Ok(Tier1GroupCountsFold::NotInspected);
         }
         // Decode ONLY this column out of the blob. Rebuilding all of them to
         // check one total is what made this seconds-per-generation at 1TB.
-        let Some(counts) = wide.streaming_column(column) else {
-            return Ok(None);
+        let Some(blob) = wide.group_counts.as_deref() else {
+            return Ok(Tier1GroupCountsFold::Refused(Tier1GroupCountsRefusal::new(
+                table_ident,
+                column,
+                cached,
+            )));
+        };
+        let Some((counts, state)) =
+            siglake_bloom::group_counts::streaming_column_fold(blob, column, state)
+        else {
+            return Ok(Tier1GroupCountsFold::Refused(Tier1GroupCountsRefusal::new(
+                table_ident,
+                column,
+                cached,
+            )));
         };
         if counts.total() != record_count {
-            return Ok(None);
+            return Ok(Tier1GroupCountsFold::Refused(Tier1GroupCountsRefusal::new(
+                table_ident,
+                column,
+                cached,
+            )));
         }
-        Ok(Some(GroupCounts::Streaming {
-            column: Arc::new(counts),
-            materialized: Arc::new(std::sync::OnceLock::new()),
-        }))
+        Ok(Tier1GroupCountsFold::Hit {
+            rows: GroupCounts::Streaming {
+                column: Arc::new(counts),
+                materialized: Arc::new(std::sync::OnceLock::new()),
+            },
+            state,
+            folded: true,
+        })
     }
 
     /// #89: a table provider PINNED to `snapshot_id` (time-travel), `schema_id`
@@ -26513,6 +26745,30 @@ impl IcebergContext {
             .await
     }
 
+    /// Continue after a decoded Tier-1 refusal. The per-file tier is used
+    /// directly only while the refusal's table generation still matches;
+    /// otherwise the new generation re-enters the exact-first lookup.
+    pub async fn grouped_counts_after_tier1_refusal(
+        &self,
+        refusal: &Tier1GroupCountsRefusal,
+    ) -> Result<Option<GroupCounts>> {
+        let cached = self.cached_table_entry(&refusal.table_ident).await?;
+        if !refusal.matches(&cached) {
+            return self
+                .grouped_counts_unwindowed_for_cached(
+                    &refusal.table_ident,
+                    &cached,
+                    &refusal.column,
+                    None,
+                )
+                .await;
+        }
+        Ok(self
+            .grouped_counts_from_files(&cached, &refusal.table_ident, &refusal.column, None)
+            .await?
+            .map(|totals| GroupCounts::owned(totals.into_iter().collect(), OwnedCounts::FooterSum)))
+    }
+
     /// Snapshot-bound unwindowed group counts for a qualified promoted-column
     /// rewrite. Windowed aggregate helpers have their own table-name cache
     /// lookups, so the query layer conservatively declines those shapes while
@@ -26582,7 +26838,7 @@ impl IcebergContext {
                     .and_then(|v| v.parse::<u64>().ok());
                 if let Some(record_count) = record_count {
                     if let Some(rows) = self
-                        .tier1_group_count_rows(cached, column, record_count)
+                        .tier1_group_count_rows(table_ident, cached, column, record_count)
                         .await?
                     {
                         if let Some(key) = agg_key {
@@ -26927,6 +27183,58 @@ pub enum GroupCounts {
         rows: Arc<GroupCountRows>,
         source: OwnedCounts,
     },
+}
+
+/// Outcome of trying to fold a bounded collector into a Tier-1 lookup.
+#[derive(Debug)]
+pub enum Tier1GroupCountsFold<T> {
+    /// No current wide blob was decoded, so the ordinary lookup remains valid.
+    NotInspected,
+    /// A current wide blob was decoded but could not answer exactly. The caller
+    /// should continue below Tier-1 without decoding the blob again.
+    Refused(Tier1GroupCountsRefusal),
+    /// An exact Tier-1 answer. `folded` distinguishes a wide streaming hit from
+    /// an inline hit, which returns the untouched state.
+    Hit {
+        rows: GroupCounts,
+        state: T,
+        folded: bool,
+    },
+}
+
+/// Provenance for a decoded Tier-1 refusal.
+///
+/// Fields stay private so callers can only return the token to the fallback
+/// APIs. A refusal permits skipping the repeated Tier-1 decode only while the
+/// table, column and originating cache-entry generation still match.
+#[derive(Debug, Clone)]
+pub struct Tier1GroupCountsRefusal {
+    table_ident: TableIdent,
+    column: String,
+    snapshot_id: Option<i64>,
+    schema_id: i32,
+    table_uuid: uuid::Uuid,
+    entry_wide_group_counts: Arc<tokio::sync::Mutex<Option<CachedWide>>>,
+}
+
+impl Tier1GroupCountsRefusal {
+    fn new(table_ident: &TableIdent, column: &str, cached: &CachedTableEntry) -> Self {
+        Self {
+            table_ident: table_ident.clone(),
+            column: column.to_string(),
+            snapshot_id: cached.snapshot_id,
+            schema_id: cached.schema_id,
+            table_uuid: cached.table.metadata().uuid(),
+            entry_wide_group_counts: cached.wide_group_counts.clone(),
+        }
+    }
+
+    fn matches(&self, cached: &CachedTableEntry) -> bool {
+        self.snapshot_id == cached.snapshot_id
+            && self.schema_id == cached.schema_id
+            && self.table_uuid == cached.table.metadata().uuid()
+            && Arc::ptr_eq(&self.entry_wide_group_counts, &cached.wide_group_counts)
+    }
 }
 
 /// Which materialized path produced an [`GroupCounts::Owned`].
@@ -35265,6 +35573,109 @@ mod table_cache_fence_tests {
 
     fn ev(raw: &str) -> Event {
         Event::now(raw.to_string())
+    }
+
+    #[tokio::test]
+    async fn tier1_refusal_rechecks_exact_after_generation_switch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap()
+            .with_tuning(IcebergTuning {
+                table_group_count_cardinality: Some(10_000),
+                result_caches: Some(false),
+                ..Default::default()
+            });
+        let mut first = ev("first");
+        first.host = "first-host".to_string();
+        ice.append_events(&[first]).await.unwrap();
+
+        let ident = ice.table_ident.clone();
+        let old = ice.cached_table_entry(&ident).await.unwrap();
+        // Model the provenance returned by an old-generation wide refusal.
+        // Constructing it directly keeps the generation switch deterministic;
+        // malformed-wide behavior is covered by the codec refusal tests.
+        let refusal = Tier1GroupCountsRefusal::new(&ident, "host", &old);
+        assert!(refusal.matches(&old), "the original generation may skip");
+
+        let mut second = ev("second");
+        second.host = "second-host".to_string();
+        ice.append_events(&[second]).await.unwrap();
+        let current = ice.cached_table_entry(&ident).await.unwrap();
+        assert_ne!(old.snapshot_id, current.snapshot_id);
+        assert!(
+            !refusal.matches(&current),
+            "a changed generation must restore the exact probe"
+        );
+
+        let approximate = ice
+            .approximate_top_group_counts_after_tier1_refusal(&refusal, 10, None)
+            .await
+            .unwrap();
+        assert!(
+            approximate.is_none(),
+            "the new generation's exact Tier-1 answer must preempt its sketch"
+        );
+
+        let exact = ice
+            .grouped_counts_after_tier1_refusal(&refusal)
+            .await
+            .unwrap()
+            .expect("new generation has exact host counts");
+        assert_eq!(exact.source_label(), "tier1_inline");
+        let mut rows = Vec::new();
+        exact.for_each(|key, count| rows.push((key.map(str::to_string), count)));
+        assert_eq!(
+            rows,
+            vec![
+                (Some("first-host".to_string()), 1),
+                (Some("second-host".to_string()), 1),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn current_generation_refusal_keeps_sketch_and_footer_fallbacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap()
+            .with_tuning(IcebergTuning {
+                table_group_count_cardinality: Some(4_097),
+                result_caches: Some(false),
+                ..Default::default()
+            });
+        let events: Vec<_> = (0..4_100)
+            .map(|n| {
+                let mut event = ev(&format!("event-{n}"));
+                event.host = format!("host-{n:03}");
+                event
+            })
+            .collect();
+        ice.append_events(&events).await.unwrap();
+
+        let refusal = match ice
+            .tier1_group_counts_fold("events", "host", ())
+            .await
+            .unwrap()
+        {
+            Tier1GroupCountsFold::Refused(refusal) => refusal,
+            other => panic!("over-cap host must refuse exact Tier-1, got {other:?}"),
+        };
+        let approximate = ice
+            .approximate_top_group_counts_after_tier1_refusal(&refusal, 5, None)
+            .await
+            .unwrap()
+            .expect("same-generation sketch remains eligible");
+        assert_eq!(approximate.rows_accounted, 4_100);
+
+        let exact = ice
+            .grouped_counts_after_tier1_refusal(&refusal)
+            .await
+            .unwrap()
+            .expect("same-generation footer fallback remains eligible");
+        assert_eq!(exact.source_label(), "materialized");
+        assert_eq!(exact.len(), 4_100);
     }
 
     /// #1625 — `siglake_core::metrics::TABLE_CACHE_FENCED` creates this

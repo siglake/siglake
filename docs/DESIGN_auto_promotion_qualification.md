@@ -19,10 +19,11 @@ already does:
 1. **Sample.** `IcebergContext::auto_promote_hot_keys_for` lists the table's
    live data files, takes the newest `sample_files` of them, and reads the
    `attributes` column of the first `sample_rows` rows of each.
-2. **Census.** Each row's residual JSON contributes one hit per scalar key,
-   with nested objects addressed one level down by dotted key. A key's sampled
-   values merge through a type lattice: one kind promotes, `Int` widens to
-   `Float`, every other mix is `Mixed` and stays residual.
+2. **Census.** Each row's residual JSON contributes one hit per scalar key.
+   An object under an undotted parent is addressed one level down by dotted
+   key; leaves under a literal dotted parent are counted as declines. A key's
+   sampled values merge through a type lattice: one kind promotes, `Int`
+   widens to `Float`, every other mix is `Mixed` and stays residual.
 3. **Select.** `select_promotions` — pure, no IO — keeps keys above the
    threshold that are not already promoted and whose sanitized name collides
    with nothing in the schema, ranks them hottest-first with a name tie-break,
@@ -212,6 +213,10 @@ publishes usage against the effective configured cap per Iceberg namespace and
 table. The packaged dashboard reads all of these and
 `SiglakeAutoPromotionNearCeiling` warns at 80%. One INFO line per sampled pass
 retains bounded key names by refusal reason and an exact truncation count.
+`siglake_auto_promotion_declined_total{reason}` counts the same refusals. A
+literal dotted parent has its one-level leaves counted as `dotted_parent`
+declines instead of emitting synthesized paths which the v2 extractor resolves
+to NULL.
 `siglake_auto_promotion_sample_reads_total` and
 `siglake_auto_promotion_sample_bytes_total{phase="footer|index|data"}` attribute
 the sampling reads per Iceberg namespace and table, while

@@ -252,6 +252,15 @@ impl StreamingColumnCounts {
     }
 }
 
+/// Caller-owned state folded transactionally while a column validates.
+pub trait StreamingColumnFold {
+    fn fold(&mut self, value: Option<&str>, count: u64);
+}
+
+impl StreamingColumnFold for () {
+    fn fold(&mut self, _value: Option<&str>, _count: u64) {}
+}
+
 /// Validate a compact blob and prepare one column for a streaming read.
 ///
 /// Unlike [`decode_column`], this walks the complete body before returning.
@@ -259,6 +268,20 @@ impl StreamingColumnCounts {
 /// may retain only top-K candidates, so discovering corruption after emitting
 /// candidates must still fall back rather than return the partial selection.
 pub fn streaming_column(s: &str, column: &str) -> Option<StreamingColumnCounts> {
+    streaming_column_fold(s, column, ()).map(|(counts, ())| counts)
+}
+
+/// Validate one column while folding its values into caller-owned state.
+///
+/// The state is returned only after the complete compact body, including
+/// columns after the target, has validated. A caller can therefore combine
+/// validation with selection without making a partial answer observable when
+/// later damage makes the aggregate unusable.
+pub fn streaming_column_fold<T: StreamingColumnFold>(
+    s: &str,
+    column: &str,
+    mut state: T,
+) -> Option<(StreamingColumnCounts, T)> {
     let body = blob_body(s)?;
     let mut cur = Cursor { buf: &body, pos: 0 };
     let n_columns = cur.uvarint()?;
@@ -284,9 +307,13 @@ pub fn streaming_column(s: &str, column: &str) -> Option<StreamingColumnCounts> 
             let suffix = cur.bytes()?;
             prev.truncate(shared);
             prev.extend_from_slice(suffix);
-            std::str::from_utf8(&prev).ok()?;
+            let value = std::str::from_utf8(&prev).ok()?;
             let count = cur.uvarint()?;
             total = total.saturating_add(count);
+            state.fold(Some(value), count);
+        }
+        if nulls > 0 {
+            state.fold(None, nulls);
         }
         found = Some((values_start, n_values, nulls, total));
     }
@@ -294,13 +321,16 @@ pub fn streaming_column(s: &str, column: &str) -> Option<StreamingColumnCounts> 
         return None;
     }
     let (values_start, n_values, nulls, total) = found?;
-    Some(StreamingColumnCounts {
-        body,
-        values_start,
-        n_values,
-        nulls,
-        total,
-    })
+    Some((
+        StreamingColumnCounts {
+            body,
+            values_start,
+            n_values,
+            nulls,
+            total,
+        },
+        state,
+    ))
 }
 
 /// Validate front-coded entry framing without reconstructing key bytes.
@@ -554,6 +584,12 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
 
+    impl StreamingColumnFold for Vec<(Option<String>, u64)> {
+        fn fold(&mut self, value: Option<&str>, count: u64) {
+            self.push((value.map(str::to_string), count));
+        }
+    }
+
     fn col(values: &[(&str, u64)], nulls: u64) -> ColumnCounts {
         ColumnCounts {
             values: values.iter().map(|(v, n)| ((*v).to_string(), *n)).collect(),
@@ -658,6 +694,26 @@ mod tests {
     }
 
     #[test]
+    fn streaming_fold_matches_owned_decode() {
+        let gc = sample();
+        let blob = gc.encode().unwrap();
+        for (name, col) in &gc.columns {
+            let (streamed, values) =
+                streaming_column_fold(&blob, name, Vec::new()).expect("covered column folds");
+            let mut want: Vec<(Option<String>, u64)> = col
+                .values
+                .iter()
+                .map(|(value, count)| (Some(value.clone()), *count))
+                .collect();
+            if col.nulls > 0 {
+                want.push((None, col.nulls));
+            }
+            assert_eq!(values, want, "column {name}");
+            assert_eq!(streamed.len(), want.len());
+        }
+    }
+
+    #[test]
     fn streaming_decode_rejects_damage_after_the_target() {
         let columns = sample().columns;
         let mut body = encode_body(&columns);
@@ -672,6 +728,7 @@ mod tests {
         // Streaming selection must validate the whole aggregate first so a
         // caller never mistakes a partial visit for an exact answer.
         assert!(streaming_column(&malformed, "level").is_none());
+        assert!(streaming_column_fold(&malformed, "level", Vec::new()).is_none());
     }
 
     #[test]

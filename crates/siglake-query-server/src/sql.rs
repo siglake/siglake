@@ -8185,6 +8185,58 @@ fn push_bounded_owned(
     }
 }
 
+struct OwnedGroupCollector<'d> {
+    view: Vec<(Option<String>, u64)>,
+    cutoff: Option<(Option<String>, u64)>,
+    matched: std::collections::HashSet<&'d str>,
+    saw_null: bool,
+    delta_by_key: &'d std::collections::HashMap<&'d str, u64>,
+    delta_nulls: u64,
+    bound: Option<(usize, GroupEntryCmp)>,
+}
+
+impl<'d> OwnedGroupCollector<'d> {
+    fn new(
+        capacity: usize,
+        delta_by_key: &'d std::collections::HashMap<&'d str, u64>,
+        delta_nulls: u64,
+        bound: Option<(usize, GroupEntryCmp)>,
+    ) -> Self {
+        Self {
+            view: Vec::with_capacity(capacity),
+            cutoff: None,
+            matched: std::collections::HashSet::with_capacity(delta_by_key.len()),
+            saw_null: false,
+            delta_by_key,
+            delta_nulls,
+            bound,
+        }
+    }
+
+    fn push_committed(&mut self, key: Option<&str>, count: u64) {
+        let entry = match key {
+            Some(key) => match self.delta_by_key.get_key_value(key) {
+                Some((delta_key, delta_count)) => {
+                    self.matched.insert(*delta_key);
+                    (Some(key), count + *delta_count)
+                }
+                None => (Some(key), count),
+            },
+            None => {
+                self.saw_null = true;
+                (None, count + self.delta_nulls)
+            }
+        };
+        push_bounded_owned(&mut self.view, entry, self.bound, &mut self.cutoff);
+    }
+}
+
+impl siglake_bloom::group_counts::StreamingColumnFold for OwnedGroupCollector<'_> {
+    fn fold(&mut self, value: Option<&str>, count: u64) {
+        self.push_committed(value, count);
+    }
+}
+
 #[cfg(test)]
 async fn try_group_count_fast_path_records(
     df: &DataFrame,
@@ -8253,10 +8305,93 @@ async fn try_group_count_fast_path_records_with_bindings(
         && allow_approximate.get()
         && matches!(fp.sort, Some(GroupCountSort::Count { ascending: false }))
         && fp.limit.is_some();
-    let mut exact = if let Some(qualified) = qualified {
+
+    // #61 hybrid: fold the buffered rows' per-value counts before selection.
+    let delta_owned: std::collections::HashMap<Option<String>, u64> = delta
+        .map(|delta| delta.group_counts(&fp.table_name, &fp.group_column, fp.time_bounds.as_ref()))
+        .unwrap_or_default();
+    let mut delta_nulls = 0u64;
+    let mut delta_by_key: std::collections::HashMap<&str, u64> =
+        std::collections::HashMap::with_capacity(delta_owned.len());
+    for (key, count) in &delta_owned {
+        match key {
+            Some(key) => {
+                delta_by_key.insert(key.as_str(), *count);
+            }
+            None => delta_nulls += *count,
+        }
+    }
+    // Clone-free comparators over borrowed keys; NULL order is the SQL
+    // default (ASC ⇒ NULLS LAST, DESC ⇒ NULLS FIRST).
+    let cmp: Option<GroupEntryCmp> = fp.sort.map(|sort| GroupEntryCmp {
+        sort,
+        kind: fp.group_kind,
+    });
+
+    // A result-cache-off, whole-table bounded query can select during the
+    // wide blob's mandatory validation pass. The accumulator is returned only
+    // after all later columns and trailing bytes validate; a refusal takes the
+    // established exact footer/page fallback below.
+    let fold_bound = match (cmp, fp.limit) {
+        // Keep the eager capacity bounded before the streamed column reveals
+        // its cardinality. Larger LIMITs retain the established post-validate
+        // path, which can compare K with `rows.len()` first.
+        (Some(cmp), Some(limit)) if (1..=4096).contains(&limit) => Some((limit, cmp)),
+        _ => None,
+    };
+    let mut precollected = None;
+    let mut tier1_fold_refusal = None;
+    let folded_exact = if let (true, true, Some((limit, _))) =
+        (qualified.is_none(), fp.time_bounds.is_none(), fold_bound)
+    {
+        let initial = OwnedGroupCollector::new(
+            limit.saturating_mul(2),
+            &delta_by_key,
+            delta_nulls,
+            fold_bound,
+        );
+        match ice
+            .tier1_group_counts_fold(&fp.table_name, &fp.group_column, initial)
+            .await
+            .map_err(ApiError::internal)?
+        {
+            siglake_storage::iceberg::Tier1GroupCountsFold::Hit {
+                rows,
+                state,
+                folded: true,
+            } => {
+                precollected = Some(state);
+                Some(rows)
+            }
+            siglake_storage::iceberg::Tier1GroupCountsFold::Hit {
+                rows,
+                folded: false,
+                ..
+            } => Some(rows),
+            siglake_storage::iceberg::Tier1GroupCountsFold::Refused(refusal) => {
+                tier1_fold_refusal = Some(refusal);
+                None
+            }
+            siglake_storage::iceberg::Tier1GroupCountsFold::NotInspected => None,
+        }
+    } else {
+        None
+    };
+
+    let mut exact = if let Some(rows) = folded_exact {
+        Some(rows)
+    } else if let Some(qualified) = qualified {
         ice.qualified_grouped_counts_with_summary(qualified, &fp.group_column, shard)
             .await
             .map_err(ApiError::internal)?
+    } else if let Some(refusal) = tier1_fold_refusal.as_ref() {
+        if tier1_only {
+            None
+        } else {
+            ice.grouped_counts_after_tier1_refusal(refusal)
+                .await
+                .map_err(ApiError::internal)?
+        }
     } else if tier1_only {
         ice.tier1_group_counts(&fp.table_name, &fp.group_column)
             .await
@@ -8272,69 +8407,34 @@ async fn try_group_count_fast_path_records_with_bindings(
         // is whole-table), an ascending order (the tail is exactly what it
         // discards), or an unbounded one.
         let limit = fp.limit.unwrap_or_default();
-        let buffered = delta
-            .map(|d| d.group_counts(&fp.table_name, &fp.group_column, fp.time_bounds.as_ref()));
-        if let Some(approx) = ice
-            .approximate_top_group_counts(
-                &fp.table_name,
-                &fp.group_column,
-                limit,
-                buffered.as_ref(),
-            )
-            .await
-            .map_err(ApiError::internal)?
-        {
+        let buffered = (!delta_owned.is_empty()).then_some(&delta_owned);
+        let approx = if let Some(refusal) = tier1_fold_refusal.as_ref() {
+            ice.approximate_top_group_counts_after_tier1_refusal(refusal, limit, buffered)
+                .await
+        } else {
+            ice.approximate_top_group_counts(&fp.table_name, &fp.group_column, limit, buffered)
+                .await
+        }
+        .map_err(ApiError::internal)?;
+        if let Some(approx) = approx {
             return Ok(Some(approximate_group_count_response(fp, approx, cost)));
         }
         // No summary either — take the full path after all, so an over-cap
         // column without a sketch is no worse off than before any of this
         // existed.
-        exact = ice
-            .grouped_counts_with_summary(&fp.table_name, &fp.group_column, shard, fp.time_bounds)
-            .await
-            .map_err(ApiError::internal)?;
+        exact = if let Some(refusal) = tier1_fold_refusal.as_ref() {
+            ice.grouped_counts_after_tier1_refusal(refusal).await
+        } else {
+            ice.grouped_counts_with_summary(&fp.table_name, &fp.group_column, shard, fp.time_bounds)
+                .await
+        }
+        .map_err(ApiError::internal)?;
     }
     let Some(rows) = exact else {
         return Ok(None);
     };
     let served_by = rows.source_label();
 
-    // #61 hybrid: fold the buffered rows' per-value counts before sort/limit.
-    // The delta is TINY (seal-age segments) while the committed rows can be
-    // millions of keys, so the fold adds delta counts into the BORROWED view
-    // — no re-materialization. (The first version rebuilt an owned map of
-    // every committed key per query: with 20 buffered markers on a 1.1M-key
-    // column, top_hosts paid ~700ms of clones+sort per request, live-found
-    // in the http_logs validation round. Real deployments always have rows
-    // in flight, so the delta path must be as cheap as the drained one.)
-    let delta_owned: std::collections::HashMap<Option<String>, u64> = delta
-        .map(|delta| delta.group_counts(&fp.table_name, &fp.group_column, fp.time_bounds.as_ref()))
-        .unwrap_or_default();
-    // Split NULL out so the rest keys on `&str`: the committed side now yields
-    // `Option<&str>`, and `HashMap<Option<String>, _>` cannot be probed with one
-    // without allocating a `String` per key — which is the cost this whole path
-    // exists to avoid.
-    let mut delta_nulls = 0u64;
-    let mut delta_by_key: std::collections::HashMap<&str, u64> =
-        std::collections::HashMap::with_capacity(delta_owned.len());
-    for (k, v) in &delta_owned {
-        match k {
-            Some(key) => {
-                delta_by_key.insert(key.as_str(), *v);
-            }
-            None => delta_nulls += *v,
-        }
-    }
-    let mut matched: std::collections::HashSet<&str> =
-        std::collections::HashSet::with_capacity(delta_by_key.len());
-    let mut saw_null = false;
-    // Clone-free comparators over borrowed keys; NULL order is the SQL
-    // default (ASC ⇒ NULLS LAST, DESC ⇒ NULLS FIRST — detection rejects
-    // explicit non-defaults).
-    let cmp: Option<GroupEntryCmp> = fp.sort.map(|sort| GroupEntryCmp {
-        sort,
-        kind: fp.group_kind,
-    });
     // Bounded top-K: with a sort and a small LIMIT the answer only ever needs
     // K entries in hand, so the full view never has to exist. Entries stream
     // into a buffer of 2K that collapses back to K by the SAME comparator the
@@ -8344,42 +8444,49 @@ async fn try_group_count_fast_path_records_with_bindings(
     // the same order as sorting everything; there is no tie for the unstable
     // partition to break differently. At 1.15M hosts a LIMIT-100 leaderboard
     // stops allocating and writing a ~28MB Vec per request.
-    let bound = match (cmp, fp.limit) {
-        (Some(cmp), Some(limit))
-            if limit > 0 && limit.saturating_mul(4) < rows.len() + delta_by_key.len() =>
-        {
-            Some((limit, cmp))
-        }
-        _ => None,
-    };
-    let mut view: Vec<(Option<String>, u64)> = Vec::with_capacity(match bound {
-        Some((k, _)) => k.saturating_mul(2),
-        None => rows.len() + delta_by_key.len() + 1,
-    });
-    let mut cutoff = None;
-    rows.for_each(|k, c| {
-        let entry = match k {
-            Some(key) => match delta_by_key.get_key_value(key) {
-                Some((delta_key, dv)) => {
-                    matched.insert(*delta_key);
-                    (Some(key), c + *dv)
-                }
-                None => (Some(key), c),
-            },
-            None => {
-                saw_null = true;
-                (None, c + delta_nulls)
+    let bound = precollected.as_ref().map_or_else(
+        || match (cmp, fp.limit) {
+            (Some(cmp), Some(limit))
+                if limit > 0 && limit.saturating_mul(4) < rows.len() + delta_by_key.len() =>
+            {
+                Some((limit, cmp))
             }
+            _ => None,
+        },
+        |_| fold_bound,
+    );
+    let was_precollected = precollected.is_some();
+    let mut collected = precollected.unwrap_or_else(|| {
+        let capacity = match bound {
+            Some((limit, _)) => limit.saturating_mul(2),
+            None => rows.len() + delta_by_key.len() + 1,
         };
-        push_bounded_owned(&mut view, entry, bound, &mut cutoff);
+        OwnedGroupCollector::new(capacity, &delta_by_key, delta_nulls, bound)
     });
+    if !was_precollected {
+        rows.for_each(|key, count| collected.push_committed(key, count));
+    }
     // Buffered-only groups (not yet committed at all) join the view.
-    for (k, v) in delta_by_key.iter().filter(|(k, _)| !matched.contains(*k)) {
-        push_bounded_owned(&mut view, (Some(*k), *v), bound, &mut cutoff);
+    for (key, count) in delta_by_key
+        .iter()
+        .filter(|(key, _)| !collected.matched.contains(*key))
+    {
+        push_bounded_owned(
+            &mut collected.view,
+            (Some(*key), *count),
+            bound,
+            &mut collected.cutoff,
+        );
     }
-    if !saw_null && delta_nulls > 0 {
-        push_bounded_owned(&mut view, (None, delta_nulls), bound, &mut cutoff);
+    if !collected.saw_null && delta_nulls > 0 {
+        push_bounded_owned(
+            &mut collected.view,
+            (None, delta_nulls),
+            bound,
+            &mut collected.cutoff,
+        );
     }
+    let mut view = collected.view;
     if let Some(cmp) = cmp {
         match fp.limit {
             // Top-K: O(n) partition to the K boundary, then sort only the
@@ -11600,6 +11707,44 @@ mod tests {
         }
         assert_eq!(unbounded.len(), keys.len());
         assert!(cutoff.is_none());
+    }
+
+    #[test]
+    fn folded_collector_applies_deltas_before_typed_top_k() {
+        let cmp = GroupEntryCmp {
+            sort: GroupCountSort::Count { ascending: false },
+            kind: GroupKeyKind::Int,
+        };
+        let bound = Some((2, cmp));
+        let delta_by_key = std::collections::HashMap::from([("10", 11), ("4", 20)]);
+        let mut collected = OwnedGroupCollector::new(4, &delta_by_key, 5, bound);
+        for (key, count) in [(Some("2"), 10), (Some("10"), 9), (Some("3"), 8), (None, 3)] {
+            collected.push_committed(key, count);
+        }
+        for (key, count) in delta_by_key
+            .iter()
+            .filter(|(key, _)| !collected.matched.contains(*key))
+        {
+            push_bounded_owned(
+                &mut collected.view,
+                (Some(*key), *count),
+                bound,
+                &mut collected.cutoff,
+            );
+        }
+        collected.view.sort_unstable_by(|left, right| {
+            cmp.compare(&(left.0.as_deref(), left.1), &(right.0.as_deref(), right.1))
+        });
+        collected.view.truncate(2);
+
+        assert_eq!(
+            collected.view,
+            vec![(Some("4".to_string()), 20), (Some("10".to_string()), 20)]
+        );
+        assert!(
+            collected.saw_null,
+            "the committed NULL was merged with its delta"
+        );
     }
 
     use datafusion::execution::context::SessionContext;
@@ -15567,6 +15712,68 @@ mod tests {
         let expected = crate::format::batches_to_records(&batches, None).unwrap();
         assert_eq!(fast.rows, expected.rows);
         assert!(fast.approximation.is_none());
+    }
+
+    #[tokio::test]
+    async fn wide_group_count_validation_folds_exact_top_k() {
+        const GROUPS: usize = 5_000;
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap()
+            .with_tuning(siglake_storage::iceberg::IcebergTuning {
+                table_group_count_cardinality: Some(10_000),
+                result_caches: Some(false),
+                ..Default::default()
+            });
+        let mut committed: Vec<Event> = (0..GROUPS).map(smoke_event).collect();
+        ice.append_events(&committed).await.unwrap();
+        let ctx = SessionContext::new();
+        let ice = Arc::new(ice);
+        register_all_tables(&ice, &ctx).await.unwrap();
+
+        let query = "SELECT host, count(*) AS n FROM events GROUP BY host ORDER BY n DESC LIMIT 2";
+        let df = ctx.sql(query).await.unwrap();
+        let cost = estimate(&df, &ice).await.unwrap();
+        let mut buffered = vec![smoke_event(0); 3];
+        buffered.extend(std::iter::repeat_n(smoke_event(GROUPS), 5));
+        let delta = BufferDelta {
+            batches: std::collections::HashMap::from([(
+                "events".to_string(),
+                vec![siglake_core::events_to_record_batch(&buffered).unwrap()],
+            )]),
+        };
+        let fast = try_group_count_fast_path_records(
+            &df,
+            &ice,
+            None,
+            cost,
+            Some(&delta),
+            AllowApproximate::always(),
+        )
+        .await
+        .unwrap()
+        .expect("wide exact group count fast path");
+
+        committed.extend(buffered);
+        let reference = SessionContext::new();
+        reference
+            .register_batch(
+                "events",
+                siglake_core::events_to_record_batch(&committed).unwrap(),
+            )
+            .unwrap();
+        let expected = crate::format::batches_to_records(
+            &reference.sql(query).await.unwrap().collect().await.unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(fast.rows, expected.rows);
+        assert!(fast.approximation.is_none(), "exact wide counts must win");
+        assert_eq!(
+            fast.stats.and_then(|stats| stats.served_by),
+            Some("tier1_wide".to_string())
+        );
     }
 
     #[tokio::test]
