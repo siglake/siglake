@@ -848,7 +848,7 @@ impl BufferOutputLease {
     pub(crate) fn attach(self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
         if !self
             .reservation
-            .contains_actual(batches_payload_bytes(&batches))
+            .contains_actual(decoded_payload_bytes(&batches))
         {
             anyhow::bail!("WAL query output exceeded its admitted payload bound");
         }
@@ -894,22 +894,57 @@ impl DecodedBuffer {
     }
 }
 
+/// Payload bound for simple mergeable partials (COUNT/SUM/MIN/MAX and direct
+/// group keys). The output can be split into at most one nonempty batch per
+/// input row. Price builder startup for every possible batch, not just logical
+/// output length: pinned DataFusion 53.1 ArrowBytesMap starts with 8192 value
+/// bytes, while Arrow 58.4 default primitive/Boolean/bytes builders start with
+/// 1024 slots (DataFusion primitive group values use only 128).
+///
+/// MutableBuffer rounds growth to 64 bytes and doubles previous capacity;
+/// Vec-backed offsets/values also double. Summing twice the maximum logical
+/// payload plus startup/rounding per possible batch covers those capacities.
+/// Variable output keys/extrema cannot exceed the source variable payload.
+/// This deliberately conservative bound can refuse large deltas. It accounts
+/// physical Arrow buffers, consistently with BufferOutputLease::attach; it is
+/// not an allocator-metadata/RSS bound. View/nested layouts remain unsupported.
 pub(crate) fn bounded_output_payload(
     schema: &SchemaRef,
     max_rows: usize,
     source_variable_payload: u64,
 ) -> Option<u64> {
+    let rows = u64::try_from(max_rows).ok()?;
+    let batches = rows.max(1);
+    let grow = |logical: u64, startup: u64| {
+        logical
+            .checked_mul(2)?
+            .checked_add(batches.checked_mul(startup.checked_add(64)?)?)
+    };
+    let validity = grow(rows.div_ceil(8), 128)?;
     let mut total = 0u64;
     for field in schema.fields() {
-        let mut field_bytes = null_array_payload_bound(field.data_type(), max_rows)?;
-        if matches!(
-            field.data_type(),
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
-        ) {
-            // A simple group key is copied from one input column. Its values
-            // cannot exceed all variable-width payload in the source batch.
-            field_bytes = field_bytes.checked_add(source_variable_payload)?;
-        }
+        let data_type = field.data_type();
+        let field_bytes = if matches!(data_type, DataType::Null) {
+            0
+        } else if matches!(data_type, DataType::Boolean) {
+            grow(rows.div_ceil(8), 128)?.checked_add(validity)?
+        } else if let Some(width) = data_type.primitive_width() {
+            let width = u64::try_from(width).ok()?;
+            grow(rows.checked_mul(width)?, 1024u64.checked_mul(width)?)?.checked_add(validity)?
+        } else {
+            let offset_width = match data_type {
+                DataType::Utf8 | DataType::Binary => 4u64,
+                DataType::LargeUtf8 | DataType::LargeBinary => 8u64,
+                _ => return None,
+            };
+            let offsets = grow(
+                rows.checked_add(batches)?.checked_mul(offset_width)?,
+                1025u64.checked_mul(offset_width)?,
+            )?;
+            offsets
+                .checked_add(grow(source_variable_payload, 8192)?)?
+                .checked_add(validity)?
+        };
         total = total.checked_add(field_bytes)?;
     }
     Some(total)
@@ -2776,6 +2811,44 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn partial_output_bound_covers_split_builder_capacity_and_refuses_views() {
+        use arrow_array::builder::StringBuilder;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("host", DataType::Utf8, false),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let mut partials = Vec::new();
+        for host in ["host-0", "host-1", "host-2"] {
+            let mut strings = StringBuilder::with_capacity(1, 8192);
+            strings.append_value(host);
+            partials.push(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(strings.finish()),
+                        Arc::new(arrow_array::Int64Array::from(vec![3])),
+                    ],
+                )
+                .unwrap(),
+            );
+        }
+        let old_logical_bound = 3276 + 9 * 8 + 10 * 4 + 4;
+        assert!(decoded_payload_bytes(&partials) > old_logical_bound);
+        let bound = bounded_output_payload(&schema, 9, 3276).unwrap();
+        let budget = BufferMemoryBudget::new(bound);
+        let reservation = budget.try_reserve(bound).unwrap();
+        let leased = BufferOutputLease { reservation }.attach(partials).unwrap();
+        assert_eq!(leased.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        assert_eq!(budget.used(), bound);
+        drop(leased);
+        assert_eq!(budget.used(), 0);
+        for data_type in [DataType::Utf8View, DataType::BinaryView] {
+            let schema = Arc::new(Schema::new(vec![Field::new("value", data_type, true)]));
+            assert!(bounded_output_payload(&schema, 3, 3276).is_none());
+        }
     }
 
     #[test]
