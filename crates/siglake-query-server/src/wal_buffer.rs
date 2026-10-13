@@ -2850,8 +2850,8 @@ mod tests {
         assert_eq!(budget.used(), 0);
         let large = "x".repeat(32 * 1024);
         let mut suffixes = Vec::new();
-        for start in 0..3 {
-            let strings = StringArray::from(vec![large.as_str(); 3 - start]);
+        for start in 0..8 {
+            let strings = StringArray::from(vec![large.as_str(); 8 - start]);
             let one = strings.slice(0, 1);
             suffixes.push(
                 RecordBatch::try_new(
@@ -2864,9 +2864,11 @@ mod tests {
                 .unwrap(),
             );
         }
-        let bound = bounded_output_payload(&schema, 3, (large.len() * 3) as u64).unwrap();
+        let bound = bounded_output_payload(&schema, 8, (large.len() * 8) as u64).unwrap();
         assert!(decoded_payload_bytes(&suffixes) <= bound);
-        assert!(decoded_payload_bytes(&suffixes) > (large.len() * 3) as u64);
+        // The previous twice-total-input bound plus all its builder floors
+        // is below this threshold; retained suffixes exceed it.
+        assert!(decoded_payload_bytes(&suffixes) > (large.len() * 8 * 2 + 256 * 1024) as u64);
         for data_type in [DataType::Utf8View, DataType::BinaryView] {
             let schema = Arc::new(Schema::new(vec![Field::new("value", data_type, true)]));
             assert!(bounded_output_payload(&schema, 3, 3276).is_none());
