@@ -130,6 +130,25 @@ Coexistence without starving the commit path:
   batches drop. Waiting for the permit is outside the drain watchdog, leaving
   the loop free to service the re-clustering watchdog. Larger and unlimited
   processes keep the concurrent plan.
+  **Update (2026-10-13):** the unchanged packaged profile still OOM-killed both
+  A8 arms after the permit and one-chunk prefetch fixes. The row64 failure
+  planned 18 inputs / 3,837,995 rows at 524,288 rows per chunk, then sized its
+  output row group at 135,847 rows from a measured 494 B/row. Across the
+  recovered row64 Parquet files, footer-uncompressed width is 408.8 B/row and
+  one decoded 3,575,459-row file is 494.2 B/row (1.209x). A 1Gi process now
+  gives implicit page-bounded fetched input the same 128 MiB share as decoded
+  WAL admission: footer width is multiplied by 5/4, then the share is divided
+  by that estimate to resolve `chunk_rows`. This changes the retained A8 shape
+  from 524,288 to 262,144 rows per chunk. Explicit
+  `SIGLAKE_MERGE_CHUNK_ROWS` values remain authoritative, and processes above
+  1Gi keep 524,288 rows. The evidence prices a retained allocation; it does not
+  identify which allocation caused either kernel kill. The production-path
+  constrained regression now writes 18 wide input files / 540,000 rows, races
+  that page-bounded merge with a real 30,000-row WAL drain behind the packaged
+  decoded-work permit, and reads every committed value back. It observed
+  271,777,792 bytes RSS before the raced operations and 862,609,408 bytes at
+  peak, below the 1Gi limit, with exact timestamp, field, NULL, duplicate and
+  omission checks passing.
 - **Backpressure-aware sharing.** A shared signal from the WAL queue depth
   (`siglake_ingest_backpressure_*`, already exported): if drain falls behind (WAL
   growing), compaction throttles (fewer concurrent merges) to yield IO; if L0 piles

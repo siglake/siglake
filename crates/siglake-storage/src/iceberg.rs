@@ -11209,6 +11209,11 @@ pub struct ReclusterMergeOptions {
     /// Page-bounded merge chunks whose fetched input may be resident at once.
     /// Floored at 1. Env: `SIGLAKE_MERGE_CHUNK_PREFETCH`.
     pub merge_chunk_prefetch: Option<usize>,
+    /// Process memory limit used to resolve the implicit page-bounded chunk
+    /// size and prefetch depth. Production leaves this `None` and reads the
+    /// cgroup; constrained-memory regressions set it so they exercise the same
+    /// policy on a development host without mutating process-global state.
+    pub merge_memory_limit_bytes: Option<u64>,
 }
 
 /// Per-context value overrides for storage knobs that otherwise come from the
@@ -20689,17 +20694,65 @@ impl IcebergContext {
         std::env::var("SIGLAKE_RECLUSTER_TIERED_MERGE").is_ok_and(|v| v == "1")
     }
 
-    /// Output-chunk size for the page-bounded merge: the number of merged rows
-    /// materialized (decoded) at once. This — not fan-in, not bin bytes — is
-    /// the merge's decoded-memory bound, because per chunk each input
-    /// contributes only its `RowSelection`-selected slice and the slices sum to
-    /// one chunk. Tunable via `SIGLAKE_MERGE_CHUNK_ROWS`.
-    fn merge_chunk_rows() -> usize {
-        std::env::var("SIGLAKE_MERGE_CHUNK_ROWS")
-            .ok()
+    /// Explicit output-chunk rows, if the operator supplied a valid override.
+    /// An explicit row count remains authoritative; only the implicit default
+    /// is narrowed from the input files' measured width on constrained pods.
+    fn configured_merge_chunk_rows() -> Option<usize> {
+        Self::configured_merge_chunk_rows_from(
+            std::env::var("SIGLAKE_MERGE_CHUNK_ROWS").ok().as_deref(),
+        )
+    }
+
+    fn configured_merge_chunk_rows_from(configured: Option<&str>) -> Option<usize> {
+        configured
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1024)
-            .unwrap_or(524_288)
+    }
+
+    /// Resolve the implicit row bound from the source files' Parquet
+    /// uncompressed width. A page-bounded chunk coexists with the writer's open
+    /// row group (256 MiB by default) and the Parquet encoder's allocations.
+    /// The packaged 1 GiB profile therefore gives fetched input the same 1/8
+    /// decoded-memory share as WAL admission: 128 MiB. This is a byte ceiling,
+    /// translated to rows from the actual input footers, so narrow inputs keep
+    /// the historical 524,288 rows while the retained A8-width input does not.
+    fn merge_chunk_rows_for_input(
+        explicit_rows: Option<usize>,
+        memory_limit_bytes: Option<u64>,
+        estimated_row_bytes: usize,
+    ) -> usize {
+        const DEFAULT_ROWS: usize = 524_288;
+        const PACKAGED_COMPACTOR_LIMIT: u64 = 1024 * 1024 * 1024;
+        const MIN_ROWS: usize = 1024;
+
+        if let Some(rows) = explicit_rows {
+            return rows.max(MIN_ROWS);
+        }
+        let Some(limit) = memory_limit_bytes.filter(|limit| *limit <= PACKAGED_COMPACTOR_LIMIT)
+        else {
+            return DEFAULT_ROWS;
+        };
+        let input_budget = limit / 8;
+        let rows = usize::try_from(input_budget)
+            .unwrap_or(usize::MAX)
+            .checked_div(estimated_row_bytes.max(1))
+            .unwrap_or(DEFAULT_ROWS);
+        rows.clamp(MIN_ROWS, DEFAULT_ROWS)
+    }
+
+    /// Translate Parquet's footer-reported uncompressed bytes into the Arrow
+    /// bytes the chunk reader retains. The recovered A8 row64 files report
+    /// 408.8 B/row across 21.67M rows; decoding the largest retained file is
+    /// 494.2 B/row (1.209x). A 5/4 allowance covers that measured format
+    /// expansion without decoding a full source row group during planning.
+    fn estimated_arrow_row_bytes(uncompressed_bytes: u64, rows: usize) -> usize {
+        if rows == 0 {
+            return 1;
+        }
+        let parquet_row_bytes = usize::try_from(uncompressed_bytes.div_ceil(rows as u64))
+            .unwrap_or(usize::MAX)
+            .max(1);
+        parquet_row_bytes.saturating_add(parquet_row_bytes.div_ceil(4))
     }
 
     /// How many page-bounded merge chunks may have their object-store reads in
@@ -20805,8 +20858,11 @@ impl IcebergContext {
                     merge
                         .merge_chunk_rows
                         .map(|rows| rows.max(1024))
-                        .unwrap_or_else(Self::merge_chunk_rows),
+                        .or_else(Self::configured_merge_chunk_rows),
                     merge.merge_chunk_prefetch,
+                    merge
+                        .merge_memory_limit_bytes
+                        .or_else(cgroup_memory_limit_bytes),
                     segmented_sink,
                 ),
             )
@@ -21254,8 +21310,9 @@ impl IcebergContext {
         files: &[DataFile],
         bloom_columns: &[&str],
         rewrite_gen: u32,
-        chunk_rows: usize,
+        configured_chunk_rows: Option<usize>,
         merge_chunk_prefetch: Option<usize>,
+        memory_limit_bytes: Option<u64>,
         segmented_sink: Option<Arc<SegmentedIndexSink>>,
     ) -> Result<(Vec<DataFile>, usize)> {
         use arrow::compute::interleave_record_batch;
@@ -21299,6 +21356,17 @@ impl IcebergContext {
         let row_counts: Vec<usize> = plan_inputs.iter().map(|(_, ts)| ts.len()).collect();
         let total_rows: usize = row_counts.iter().sum();
         let metas: Vec<ArrowReaderMetadata> = plan_inputs.into_iter().map(|(m, _)| m).collect();
+        let uncompressed_bytes: u64 = metas
+            .iter()
+            .flat_map(|meta| meta.metadata().row_groups())
+            .map(|row_group| u64::try_from(row_group.total_byte_size()).unwrap_or(0))
+            .sum();
+        let estimated_row_bytes = Self::estimated_arrow_row_bytes(uncompressed_bytes, total_rows);
+        let chunk_rows = Self::merge_chunk_rows_for_input(
+            configured_chunk_rows,
+            memory_limit_bytes,
+            estimated_row_bytes,
+        );
         let chunks = crate::merge::split_plan_chunks(&plan, chunk_rows);
         stages.assemble += t_plan.elapsed().as_nanos() as u64;
         metrics::counter!("siglake_compactor_merge_page_bounded_total").increment(1);
@@ -21324,6 +21392,8 @@ impl IcebergContext {
             runs = plan.len(),
             chunks = chunks.len(),
             chunk_rows,
+            estimated_row_bytes,
+            chunk_input_budget_bytes = chunk_rows.saturating_mul(estimated_row_bytes),
             row_groups = census.total_row_groups,
             copyable_row_groups = census.copyable_row_groups,
             copyable_rows = census.copyable_rows,
@@ -21354,7 +21424,7 @@ impl IcebergContext {
         let prefetch = Self::merge_chunk_prefetch_for_call(
             merge_chunk_prefetch,
             configured_prefetch.as_deref(),
-            cgroup_memory_limit_bytes(),
+            memory_limit_bytes,
         );
         // Stream items must be fully OWNED. A closure borrowing `&ChunkFetchPlan`
         // out of `plans` trips rustc's higher-ranked-lifetime limitation for
@@ -32157,6 +32227,50 @@ mod group_count_summary_tests {
     }
 
     #[test]
+    fn packaged_page_merge_caps_implicit_rows_from_actual_input_width() {
+        let gib = 1024 * 1024 * 1024;
+        let retained_a8_row_bytes = super::IcebergContext::estimated_arrow_row_bytes(4089, 10);
+
+        assert_eq!(
+            retained_a8_row_bytes, 512,
+            "the footer estimate must include the measured Parquet-to-Arrow expansion"
+        );
+
+        assert_eq!(
+            super::IcebergContext::merge_chunk_rows_for_input(
+                None,
+                Some(gib),
+                retained_a8_row_bytes,
+            ),
+            256 * 1024,
+            "512-byte rows must keep fetched input at the 128 MiB packaged share"
+        );
+        assert_eq!(
+            super::IcebergContext::merge_chunk_rows_for_input(None, Some(gib), 64),
+            512 * 1024,
+            "narrow rows keep the historical row cap"
+        );
+        assert_eq!(
+            super::IcebergContext::merge_chunk_rows_for_input(None, Some(gib + 1), 512),
+            512 * 1024,
+            "larger processes keep the measured historical default"
+        );
+        assert_eq!(
+            super::IcebergContext::merge_chunk_rows_for_input(Some(700_000), Some(gib), 512),
+            700_000,
+            "an explicit operator row bound remains authoritative"
+        );
+        assert_eq!(
+            super::IcebergContext::configured_merge_chunk_rows_from(Some("1024")),
+            Some(1024)
+        );
+        assert_eq!(
+            super::IcebergContext::configured_merge_chunk_rows_from(Some("1000")),
+            None
+        );
+    }
+
+    #[test]
     fn page_bounded_prefetch_depth_includes_the_current_decoded_chunk() {
         let mut window = super::PageBoundedPrefetchWindow::new(2);
         window.started();
@@ -33096,7 +33210,16 @@ mod streaming_recluster_tests {
             .await
             .unwrap();
         let (paged, paged_rows) = ice
-            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 1, 4, None, None)
+            .merge_files_page_bounded(
+                &table,
+                &files,
+                BLOOM_FILTER_COLUMNS,
+                1,
+                Some(4),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(streamed_rows, 25);
@@ -33143,7 +33266,16 @@ mod streaming_recluster_tests {
         let table = ice.catalog().load_table(&ident).await.unwrap();
 
         let (added, rows) = ice
-            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 2, 1 << 20, None, None)
+            .merge_files_page_bounded(
+                &table,
+                &files,
+                BLOOM_FILTER_COLUMNS,
+                2,
+                Some(1 << 20),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(rows, 6);

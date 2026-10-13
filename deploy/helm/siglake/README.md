@@ -338,8 +338,11 @@ default is 100); no data-file rewrite is required.
 
 Bins in a leveled compaction pass are file-disjoint and independent, so they can
 merge concurrently. **Memory, not CPU, is the binding constraint**: each in-flight
-bin holds its own decoded working set (roughly `SIGLAKE_MERGE_CHUNK_ROWS` x
-`SIGLAKE_MERGE_CHUNK_PREFETCH` rows, plus its open row-group decoders).
+bin holds its own decoded working set (explicitly,
+`SIGLAKE_MERGE_CHUNK_ROWS` x `SIGLAKE_MERGE_CHUNK_PREFETCH` rows, plus its open
+row-group decoders). At the packaged 1Gi limit with no explicit row setting,
+the merge instead derives a row count that keeps estimated fetched input at or
+below 128 MiB; larger limits keep the 524,288-row default.
 
 **Measured: `binConcurrency: 4` peaked at 12.03 GiB (200G) and 14.44 GiB (1TB)
 of compaction-only RSS — roughly 3-3.4 GiB per bin, GROWING with corpus size.** An earlier ~650Mi/bin figure came

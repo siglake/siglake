@@ -8554,11 +8554,6 @@ mod combined_memory_regression_tests {
     use siglake_wal::WalWriter;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    const INPUT_FILES: usize = 8;
-    const ROWS_PER_FILE: usize = 2_000;
-    const WAL_FILE: usize = INPUT_FILES;
-    const TOTAL_ROWS: usize = (INPUT_FILES + 1) * ROWS_PER_FILE;
-
     fn resident_bytes() -> u64 {
         let status = std::fs::read_to_string("/proc/self/status").expect("read process status");
         let kib = status
@@ -9037,6 +9032,15 @@ mod combined_memory_regression_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "process-wide RSS ceiling must run alone; use the exact test filter"]
     async fn packaged_memory_serializes_real_page_merge_and_wal_with_exact_parity() {
+        // The A8 failures planned 18 and 22 inputs at the shipped 524,288-row
+        // default. Keep the smaller failed fan-in and cross the old chunk
+        // boundary with field-width rows so this exercises the production
+        // byte-derived default rather than a test-only 4K-row waiver.
+        const FIELD_INPUT_FILES: usize = 18;
+        const FIELD_ROWS_PER_FILE: usize = 30_000;
+        const FIELD_WAL_FILE: usize = FIELD_INPUT_FILES;
+        const FIELD_TOTAL_ROWS: usize = (FIELD_INPUT_FILES + 1) * FIELD_ROWS_PER_FILE;
+
         let tmp = tempfile::tempdir().unwrap();
         let wal = tmp.path().join("wal");
         let ice = Arc::new(
@@ -9045,21 +9049,25 @@ mod combined_memory_regression_tests {
                 .unwrap(),
         );
 
-        for file in 0..INPUT_FILES {
-            let events: Vec<_> = (0..ROWS_PER_FILE).map(|row| event(file, row)).collect();
+        for file in 0..FIELD_INPUT_FILES {
+            let events: Vec<_> = (0..FIELD_ROWS_PER_FILE)
+                .map(|row| event(file, row))
+                .collect();
             ice.append_events(&events).await.unwrap();
         }
         let merge_inputs = ice.live_data_files(ice.events_table_ident()).await.unwrap();
-        assert_eq!(merge_inputs.len(), INPUT_FILES);
+        assert_eq!(merge_inputs.len(), FIELD_INPUT_FILES);
 
         let mut writer = WalWriter::with_thresholds(
             &wal,
             "combined-memory",
-            ROWS_PER_FILE,
+            FIELD_ROWS_PER_FILE,
             Duration::from_secs(60),
         )
         .unwrap();
-        let wal_events: Vec<_> = (0..ROWS_PER_FILE).map(|row| event(WAL_FILE, row)).collect();
+        let wal_events: Vec<_> = (0..FIELD_ROWS_PER_FILE)
+            .map(|row| event(FIELD_WAL_FILE, row))
+            .collect();
         assert!(writer.append_events(&wal_events).unwrap().is_some());
         drop(wal_events);
         drop(writer);
@@ -9098,8 +9106,7 @@ mod combined_memory_regression_tests {
                         force_streaming: Some(true),
                         merge_fanin: Some(2),
                         force_tiered: Some(false),
-                        merge_chunk_rows: Some(4_096),
-                        merge_chunk_prefetch: Some(1),
+                        merge_memory_limit_bytes: Some(1024 * 1024 * 1024),
                         ..Default::default()
                     },
                 )
@@ -9118,7 +9125,7 @@ mod combined_memory_regression_tests {
         let (merge_stats, drained) = tokio::join!(merge, drain);
         let merge_stats = merge_stats.unwrap().unwrap();
         assert_eq!(merge_stats.merge_path, Some(MergePathKind::PageBounded));
-        assert_eq!(merge_stats.rows, INPUT_FILES * ROWS_PER_FILE);
+        assert_eq!(merge_stats.rows, FIELD_INPUT_FILES * FIELD_ROWS_PER_FILE);
         assert_eq!(drained.unwrap().unwrap(), 1);
 
         stop.store(true, Ordering::Relaxed);
@@ -9148,7 +9155,7 @@ mod combined_memory_regression_tests {
             .await
             .unwrap();
         let mut stream = execute_stream(plan, ctx.task_ctx()).unwrap();
-        let mut seen = vec![false; TOTAL_ROWS];
+        let mut seen = vec![false; FIELD_TOTAL_ROWS];
         let base_ns = Utc
             .with_ymd_and_hms(2026, 10, 11, 0, 0, 0)
             .unwrap()
@@ -9193,8 +9200,8 @@ mod combined_memory_regression_tests {
                 .unwrap();
             for row_index in 0..batch.num_rows() {
                 let (file, row) = parse_id(raws.value(row_index));
-                assert!(file <= WAL_FILE && row < ROWS_PER_FILE);
-                let slot = file * ROWS_PER_FILE + row;
+                assert!(file <= FIELD_WAL_FILE && row < FIELD_ROWS_PER_FILE);
+                let slot = file * FIELD_ROWS_PER_FILE + row;
                 assert!(!seen[slot], "duplicate source row f{file}-r{row}");
                 seen[slot] = true;
                 assert_eq!(
