@@ -2503,7 +2503,10 @@ mod tests {
         let error = cache
             .get_or_load_for_query_keyed(tmp.path(), &schema, &exclude, None, None, None)
             .unwrap_err();
-        assert!(format!("{error:#}").contains("open selected WAL segment"));
+        assert!(
+            format!("{error:#}").contains("decode selected WAL segment"),
+            "{error:#}"
+        );
         assert_eq!(cache.memory.used(), 0, "failed load retains no reservation");
 
         std::fs::write(segment, original).unwrap();
