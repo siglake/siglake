@@ -2425,8 +2425,11 @@ impl Compactor {
                         "promoted"
                     };
                     note_auto_promotion_pass(&iceberg_namespace, &table, outcome);
+                    note_auto_promotion_declines(&iceberg_namespace, &table, &report.declined);
                     let (ceiling, ceiling_truncated) =
                         declined_keys(&report.declined, AutoPromotionDeclineReason::ColumnCeiling);
+                    let (dotted_parent, dotted_parent_truncated) =
+                        declined_keys(&report.declined, AutoPromotionDeclineReason::DottedParent);
                     let (collisions, collisions_truncated) =
                         declined_keys(&report.declined, AutoPromotionDeclineReason::NameCollision);
                     let (mixed, mixed_truncated) =
@@ -2452,6 +2455,8 @@ impl Compactor {
                         promoted_truncated,
                         declined_ceiling = ?ceiling,
                         declined_ceiling_truncated = ceiling_truncated,
+                        declined_dotted_parent = ?dotted_parent,
+                        declined_dotted_parent_truncated = dotted_parent_truncated,
                         declined_name_collision = ?collisions,
                         declined_name_collision_truncated = collisions_truncated,
                         declined_mixed_type = ?mixed,
@@ -6694,6 +6699,12 @@ const DEFAULT_AUTO_PROMOTE_MAX_COLUMNS: usize = 16;
 const AUTO_PROMOTE_SAMPLE_FILES: usize = 4;
 const AUTO_PROMOTE_SAMPLE_ROWS: usize = 4096;
 const AUTO_PROMOTION_OUTCOMES: &[&str] = &["promoted", "nothing_cleared", "at_ceiling", "failed"];
+const AUTO_PROMOTION_DECLINE_REASONS: &[AutoPromotionDeclineReason] = &[
+    AutoPromotionDeclineReason::ColumnCeiling,
+    AutoPromotionDeclineReason::DottedParent,
+    AutoPromotionDeclineReason::NameCollision,
+    AutoPromotionDeclineReason::MixedType,
+];
 /// Attribute names retained in one structured pass log, per disposition.
 /// Counts remain exact; only the diagnostic names are truncated.
 const AUTO_PROMOTION_LOGGED_KEYS: usize = 32;
@@ -6711,6 +6722,15 @@ fn preregister_auto_promotion_passes(iceberg_namespace: &str, table: &str) {
             "iceberg_namespace" => iceberg_namespace.to_string(),
             "table" => table.to_string(),
             "outcome" => *outcome
+        )
+        .increment(0);
+    }
+    for reason in AUTO_PROMOTION_DECLINE_REASONS {
+        metrics::counter!(
+            "siglake_auto_promotion_declined_total",
+            "iceberg_namespace" => iceberg_namespace.to_string(),
+            "table" => table.to_string(),
+            "reason" => reason.as_str()
         )
         .increment(0);
     }
@@ -6772,6 +6792,26 @@ fn note_auto_promotion_pass(iceberg_namespace: &str, table: &str, outcome: &'sta
         "outcome" => outcome
     )
     .increment(1);
+}
+
+fn note_auto_promotion_declines(
+    iceberg_namespace: &str,
+    table: &str,
+    declined: &[AutoPromotionDecline],
+) {
+    for reason in AUTO_PROMOTION_DECLINE_REASONS {
+        let count = declined
+            .iter()
+            .filter(|item| item.reason == *reason)
+            .count();
+        metrics::counter!(
+            "siglake_auto_promotion_declined_total",
+            "iceberg_namespace" => iceberg_namespace.to_string(),
+            "table" => table.to_string(),
+            "reason" => reason.as_str()
+        )
+        .increment(count as u64);
+    }
 }
 
 fn bounded_key_names<'a>(keys: impl IntoIterator<Item = &'a str>) -> (Vec<&'a str>, usize) {
@@ -7870,6 +7910,46 @@ mod auto_promotion_telemetry_tests {
         let (keys, truncated) = declined_keys(&declined, AutoPromotionDeclineReason::ColumnCeiling);
         assert_eq!(keys.len(), AUTO_PROMOTION_LOGGED_KEYS);
         assert_eq!(truncated, 8);
+    }
+
+    #[test]
+    fn decline_series_are_registered_and_count_each_reason() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let declined = AUTO_PROMOTION_DECLINE_REASONS
+            .iter()
+            .map(|reason| AutoPromotionDecline {
+                attr_key: reason.as_str().into(),
+                reason: *reason,
+            })
+            .collect::<Vec<_>>();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            preregister_auto_promotion_passes("siglake", "events");
+            note_auto_promotion_declines("siglake", "events", &declined);
+        }
+        let counts = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| {
+                (key.key().name() == "siglake_auto_promotion_declined_total").then(|| {
+                    let reason = key
+                        .key()
+                        .labels()
+                        .find(|label| label.key() == "reason")
+                        .unwrap()
+                        .value()
+                        .to_string();
+                    let DebugValue::Counter(count) = value else {
+                        panic!("decline series must be counters")
+                    };
+                    (reason, count)
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(counts.len(), AUTO_PROMOTION_DECLINE_REASONS.len());
+        assert!(counts.values().all(|count| *count == 1), "{counts:?}");
     }
 }
 

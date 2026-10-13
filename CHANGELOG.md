@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Auto-promotion census (bug fix, target 0.3.0)**: nested leaves under a
+  literal dotted parent no longer become promoted columns whose backfilled
+  values are all NULL. The census flattens one object level only for an
+  undotted parent; leaves under a parent such as `"aws.cloudwatch"` remain
+  residual and appear in the pass log and
+  `siglake_auto_promotion_declined_total{reason="dotted_parent"}`. This does
+  not change the v2 extraction rule or promote the parent object. (#6875)
+
 - **Promoted-column extraction (bug fix, target 0.3.0)**: a promoted column and
   `attr_get(attributes, key)` now resolve every key to the same value. Through
   0.2.1 promotion retried a literal dotted key only at the top level while the
