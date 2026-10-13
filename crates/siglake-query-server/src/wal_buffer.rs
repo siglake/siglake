@@ -2500,13 +2500,11 @@ mod tests {
         let original = std::fs::read(segment).unwrap();
         std::fs::write(segment, b"not a WAL segment").unwrap();
 
-        let first = cache
+        let error = cache
             .get_or_load_for_query_keyed(tmp.path(), &schema, &exclude, None, None, None)
-            .unwrap();
-        assert!(
-            matches!(first, BufferReadOutcome::Refused { .. }),
-            "an unreadable segment must refuse the complete generation"
-        );
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("open selected WAL segment"));
+        assert_eq!(cache.memory.used(), 0, "failed load retains no reservation");
 
         std::fs::write(segment, original).unwrap();
         let restored_names = uncommitted_segment_names(tmp.path(), &exclude, None).unwrap();
@@ -2718,10 +2716,10 @@ mod tests {
             "fixture budget must be tiny relative to decoded numeric payload"
         );
         let cache = BufferDeltaCache::with_memory_limit(memory_limit);
-        let outcome = cache
+        let error = cache
             .get_or_load_for_query(tmp.path(), &schema, &HashSet::new(), None, None, None)
-            .unwrap();
-        assert!(matches!(outcome, BufferReadOutcome::Refused { .. }));
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("IPC body compression"));
         assert_eq!(cache.memory.used(), 0, "refusal releases predecode charge");
     }
 
