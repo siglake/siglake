@@ -463,9 +463,7 @@ async fn composed_attr_get_rewrite_refuses_flat_materialization_then_converges()
         .with_promoted_columns(vec![conflicting_promotion]);
     let error = conflicting.ensure_promoted_columns().await.unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("cannot change extraction identity"),
+        format!("{error:#}").contains("cannot change extraction identity"),
         "{error:#}"
     );
 
@@ -552,9 +550,7 @@ async fn composed_attr_get_rewrite_refuses_flat_materialization_then_converges()
         .with_promoted_columns(changed);
     let error = stale_writer.ensure_promoted_columns().await.unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("cannot change extraction identity"),
+        format!("{error:#}").contains("cannot change extraction identity"),
         "{error:#}"
     );
     assert_eq!(nested_object_answer(&app, SQL).await, expected);
