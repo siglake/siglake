@@ -2851,7 +2851,7 @@ fn segment_uncompressed_bytes_strict_file(
         .read(&mut zstd_header)
         .with_context(|| format!("reading zstd header from {}", path.display()))?;
     match zstd::zstd_safe::get_frame_content_size(&zstd_header[..prefix_len]) {
-        Ok(Some(content_size)) => return Ok(content_size),
+        Ok(Some(content_size)) => Ok(content_size),
         Ok(None) => {
             bail!(
                 "zstd WAL body in {} has no declared content size",
