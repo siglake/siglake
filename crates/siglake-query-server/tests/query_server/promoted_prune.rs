@@ -286,7 +286,7 @@ fn composed_cloudwatch_promotion() -> Vec<PromotedColumn> {
     vec![PromotedColumn {
         attr_key: "aws.cloudwatch".into(),
         attr_get_path: vec!["log_stream".into()],
-        name: "aws_cloudwatch_log_stream".into(),
+        name: "aws_cloudwatch_composed_log_stream".into(),
         ty: PromotedType::Utf8,
     }]
 }
@@ -425,6 +425,9 @@ async fn composed_attr_get_rewrite_refuses_flat_materialization_then_converges()
         Event::now("nested").with_attributes(Some(
             r#"{"aws":{"cloudwatch":{"log_stream":9007199254740993}}}"#.into(),
         )),
+        Event::now("prefix-only").with_attributes(Some(
+            r#"{"aws.cloudwatch":{"log_stream":"prefix-only"}}"#.into(),
+        )),
         Event::now("null-prefix").with_attributes(Some(
             r#"{"aws.cloudwatch":null,"aws":{"cloudwatch":{"log_stream":"nested"}}}"#.into(),
         )),
@@ -436,6 +439,7 @@ async fn composed_attr_get_rewrite_refuses_flat_materialization_then_converges()
         {"raw":"collision", "stream":"prefix-child"},
         {"raw":"nested", "stream":"9007199254740993"},
         {"raw":"null-prefix"},
+        {"raw":"prefix-only", "stream":"prefix-only"},
         {"raw":"serialized", "stream":"json-string-child"}
     ]);
 
@@ -449,13 +453,31 @@ async fn composed_attr_get_rewrite_refuses_flat_materialization_then_converges()
     flat.append_events(&events).await.unwrap();
     assert!(flat.ensure_promotion_backfill_property().await.unwrap());
 
-    // Re-declare the same physical column with the composed source. The old
-    // file is x2 and contains flat semantics; the expression-aware set needs
-    // x3, so neither the rewrite nor promoted pruning may trust it.
+    // Reusing the flat physical column for a composed source is refused: x3
+    // alone cannot prove which expression populated an existing field id.
+    let mut conflicting_promotion = composed_cloudwatch_promotion().remove(0);
+    conflicting_promotion.name = "aws_cloudwatch_log_stream".into();
+    let conflicting = IcebergContext::open(&warehouse)
+        .await
+        .unwrap()
+        .with_promoted_columns(vec![conflicting_promotion]);
+    let error = conflicting.ensure_promoted_columns().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot change extraction identity"),
+        "{error:#}"
+    );
+
+    // A distinct physical column gives the composed source its own field id.
+    // The old x2 file lacks it, so neither rewrite nor pruning can trust that
+    // snapshot until a rewrite materializes the new field under x3.
+    let mut promotions = flat_cloudwatch_promotion();
+    promotions.extend(composed_cloudwatch_promotion());
     let composed = IcebergContext::open(&warehouse)
         .await
         .unwrap()
-        .with_promoted_columns(composed_cloudwatch_promotion());
+        .with_promoted_columns(promotions.clone());
     composed.ensure_promoted_columns().await.unwrap();
     let declared = composed
         .catalog()
@@ -463,19 +485,20 @@ async fn composed_attr_get_rewrite_refuses_flat_materialization_then_converges()
         .await
         .unwrap();
     let props = declared.metadata().properties();
+    let legacy_json = siglake_core::promoted_property_json(&flat_cloudwatch_promotion()).unwrap();
     assert_eq!(
         props
             .get(siglake_core::PROMOTED_PROPERTY_KEY)
             .map(String::as_str),
-        Some("[]"),
-        "old writers receive no false flat identity"
+        Some(legacy_json.as_str()),
+        "old writers receive the direct identity only"
     );
     let recorded = siglake_core::promoted_columns_from_property(
         props
             .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
             .map(String::as_str),
     );
-    assert_eq!(recorded, composed_cloudwatch_promotion());
+    assert_eq!(recorded, promotions);
     assert!(!composed.ensure_promotion_backfill_property().await.unwrap());
     assert!(composed.events_attr_rewrite_map().await.unwrap().is_none());
     let app = router(AppState::new(
@@ -494,7 +517,11 @@ async fn composed_attr_get_rewrite_refuses_flat_materialization_then_converges()
     let ident = composed.events_table_ident().clone();
     let files = composed.live_data_files(&ident).await.unwrap();
     composed
-        .recluster_files(&ident, files, &["host", "aws_cloudwatch_log_stream"])
+        .recluster_files(
+            &ident,
+            files,
+            &["host", "aws_cloudwatch_composed_log_stream"],
+        )
         .await
         .unwrap();
     assert!(composed.ensure_promotion_backfill_property().await.unwrap());
@@ -505,10 +532,32 @@ async fn composed_attr_get_rewrite_refuses_flat_materialization_then_converges()
     assert_eq!(nested_object_answer(&app, SQL).await, expected);
     let rewritten_plan = nested_object_plan(&app, SQL).await;
     assert!(
-        rewritten_plan.contains("aws_cloudwatch_log_stream"),
+        rewritten_plan.contains("aws_cloudwatch_composed_log_stream"),
         "{rewritten_plan}"
     );
     assert!(!rewritten_plan.contains("attr_get"), "{rewritten_plan}");
+
+    // A later composed writer cannot silently reuse that field id for another
+    // outer key. The original property and handler answer remain unchanged.
+    let mut changed = flat_cloudwatch_promotion();
+    changed.push(PromotedColumn {
+        attr_key: "aws.cloudwatch".into(),
+        attr_get_path: vec!["log_group".into()],
+        name: "aws_cloudwatch_composed_log_stream".into(),
+        ty: PromotedType::Utf8,
+    });
+    let stale_writer = IcebergContext::open(&warehouse)
+        .await
+        .unwrap()
+        .with_promoted_columns(changed);
+    let error = stale_writer.ensure_promoted_columns().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot change extraction identity"),
+        "{error:#}"
+    );
+    assert_eq!(nested_object_answer(&app, SQL).await, expected);
 }
 
 /// The full autonomous loop, zero configuration: hot attribute keys promote
