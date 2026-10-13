@@ -1778,13 +1778,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   wide files / 540,000 merge rows, races it with a real 30,000-row WAL drain
   behind the packaged permit, and observed 271,777,792 bytes RSS before the
   operations and 862,609,408 bytes at peak in a system-allocator test binary.
-  A8 then established that the shipped allocator can retain a completed drain's
-  dirty pages across the 1.9–2.3-second gap before merge planning: jemalloc's
-  default decay is 10 seconds, while drain-only cgroup samples reached 445–672
-  MB. A constrained compactor now purges all jemalloc arenas after acquiring the
-  re-cluster permit and before allocating merge buffers. The shipped-allocator
-  test proves that this command lowers resident memory after drain-shaped
-  medium-buffer churn, but it does not qualify full merge-plan residency.
+  A9's pre-merge resident/active difference suggests allocator retention, but
+  does not establish dirty-page attribution or the cause of its 1GiB kill.
+  The constrained compactor now requests an all-arena purge before merge work,
+  with fallible before/after observations. The shipped-allocator unit test only
+  exercises reclamation of freed medium buffers; it does not bound live input,
+  writer or encoder residency. A fresh canonical field remains required.
   It then proved every exact
   timestamp, field, NULL, duplicate and omission result. It is not the full
   shipped field workload: fresh 1Gi qualification on the retained canonical

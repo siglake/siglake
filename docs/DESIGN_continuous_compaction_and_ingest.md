@@ -151,17 +151,20 @@ Coexistence without starving the commit path:
   omission checks passing. Shipped jemalloc retention and full-field merge-plan
   residency remain unqualified by this test; the mean-width estimate and
   1,024-row floor do not establish a hard byte ceiling.
-  **Allocator continuation (2026-10-13):** A8 timing rules out simultaneous WAL
-  and merge ownership: commits completed 1.9–2.3 seconds before their merge
-  plans, while the shipped jemalloc keeps unused dirty pages for up to 10
-  seconds by default. Retained 15-second cgroup samples put drain-only anonymous
-  memory at 445–672 MB, but the system-allocator regression returned its large
-  buffers immediately. When a <=1Gi process acquires the re-cluster side of the
-  decoded-work permit it now purges all jemalloc arenas, logs allocator and
-  cgroup bytes before and after, then starts the pass. A shipped-allocator unit
-  test frees 256 touched 256-KiB allocations and verifies that the purge lowers
-  resident bytes. Purging may add admission latency; it runs once per constrained
-  re-cluster pass, not once per chunk, and leaves larger processes unchanged.
+  **Allocator continuation (2026-10-13):** The A9 row256 field failed at
+  1GiB after planning 261,632-row input chunks and 543,391-row output groups.
+  Before the merge, sampled allocator resident memory was about 511 MB while
+  active memory was about 17 MB. This suggests allocator retention may consume
+  useful headroom; it does not identify those bytes as dirty pages or establish
+  the cause of the later kill. Input and writer memory grew during the merge.
+  When a <=1Gi process acquires the re-cluster permit it now requests an all-arena
+  dirty-page purge and records before/after allocator and cgroup bytes. Readout
+  or purge errors are reported without panicking. A shipped-allocator unit test
+  exercises reclamation after medium-buffer churn, not the full field workload.
+  The purge leaves decay settings unchanged; the configured decay interval is
+  not a guaranteed upper bound on resident-page lifetime. Admission latency,
+  live input/writer residency and fresh canonical 1GiB acceptance remain open.
+
 - **Backpressure-aware sharing.** A shared signal from the WAL queue depth
   (`siglake_ingest_backpressure_*`, already exported): if drain falls behind (WAL
   growing), compaction throttles (fewer concurrent merges) to yield IO; if L0 piles

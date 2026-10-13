@@ -90,26 +90,99 @@ pub fn purge_allocator_dirty_pages(
     if !jemalloc_is_global_allocator() {
         return Ok(None);
     }
-    let before = allocator_memory_readout().expect("positive jemalloc probe remains positive");
+    purge_allocator_with(allocator_memory_readout, || {
+        // jemalloc's argument-free all-arena purge takes null old/new pointers.
+        let status = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                c"arena.4096.purge".as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(status))
+        }
+    })
+    .map(Some)
+}
 
-    // jemalloc documents 4096 as MALLCTL_ARENAS_ALL. arena.<i>.purge is a
-    // void command: every old/new pointer must be null, a shape the ctl
-    // crate's typed read/write helpers cannot express.
-    let status = unsafe {
-        tikv_jemalloc_sys::mallctl(
-            c"arena.4096.purge".as_ptr(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if status != 0 {
-        return Err(std::io::Error::from_raw_os_error(status));
+// Keep both fallible observations in the same nonfatal result path as mallctl.
+// A cached positive global-allocator probe does not guarantee stats reads work.
+fn purge_allocator_with(
+    mut read: impl FnMut() -> Option<AllocatorMemoryReadout>,
+    purge: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<AllocatorPurgeReadout> {
+    let before =
+        read().ok_or_else(|| std::io::Error::other("allocator stats unavailable before purge"))?;
+    purge()?;
+    let after =
+        read().ok_or_else(|| std::io::Error::other("allocator stats unavailable after purge"))?;
+    Ok(AllocatorPurgeReadout { before, after })
+}
+
+#[cfg(test)]
+mod purge_failure_tests {
+    use super::*;
+
+    fn sample() -> AllocatorMemoryReadout {
+        AllocatorMemoryReadout {
+            allocated_bytes: 1,
+            active_bytes: 2,
+            resident_bytes: 3,
+            cgroup_memory_current_bytes: None,
+        }
     }
 
-    let after = allocator_memory_readout().expect("positive jemalloc probe remains positive");
-    Ok(Some(AllocatorPurgeReadout { before, after }))
+    #[test]
+    fn missing_before_stats_refuses_purge_without_panicking() {
+        let called = std::cell::Cell::new(false);
+        let error = purge_allocator_with(
+            || None,
+            || {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("before purge"));
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn missing_after_stats_is_nonfatal_error_after_one_purge() {
+        let mut reads = [Some(sample()), None].into_iter();
+        let calls = std::cell::Cell::new(0);
+        let error = purge_allocator_with(
+            || reads.next().unwrap(),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("after purge"));
+        assert_eq!(calls.get(), 1);
+        assert!(reads.next().is_none());
+    }
+
+    #[test]
+    fn purge_failure_preserves_error_and_skips_after_read() {
+        let mut reads = 0;
+        let error = purge_allocator_with(
+            || {
+                reads += 1;
+                Some(sample())
+            },
+            || Err(std::io::Error::from_raw_os_error(5)),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(reads, 1);
+    }
 }
 
 fn jemalloc_is_global_allocator() -> bool {
