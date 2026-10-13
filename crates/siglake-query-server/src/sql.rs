@@ -8341,8 +8341,9 @@ async fn try_group_count_fast_path_records_with_bindings(
     };
     let mut precollected = None;
     let mut tier1_fold_refusal = None;
-    let folded_exact = if qualified.is_none() && fp.time_bounds.is_none() && fold_bound.is_some() {
-        let (limit, _) = fold_bound.expect("checked bounded fold");
+    let folded_exact = if let (true, true, Some((limit, _))) =
+        (qualified.is_none(), fp.time_bounds.is_none(), fold_bound)
+    {
         let initial = OwnedGroupCollector::new(
             limit.saturating_mul(2),
             &delta_by_key,
