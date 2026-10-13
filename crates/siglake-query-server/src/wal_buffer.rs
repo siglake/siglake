@@ -997,6 +997,7 @@ impl BufferDeltaCache {
     /// directory. An empty batch vec still reports its listing — an empty name
     /// list proves a drained buffer, while a non-empty one that decoded to no
     /// rows does not.
+    #[cfg(test)]
     pub(crate) fn get_or_load_for_query_keyed(
         &self,
         wal_dir: &Path,
