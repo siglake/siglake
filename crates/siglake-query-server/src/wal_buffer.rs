@@ -1056,6 +1056,8 @@ impl BufferDeltaCache {
         )
     }
 
+    // Keep snapshot selection and its independent compressed-byte limit explicit.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn get_or_load_for_query_keyed_with_max(
         &self,
         wal_dir: &Path,
@@ -1077,6 +1079,8 @@ impl BufferDeltaCache {
         )
     }
 
+    // Match the explicit selection/admission boundary used by the query caller.
+    #[allow(clippy::too_many_arguments)]
     fn get_or_load_inner(
         &self,
         wal_dir: &Path,
