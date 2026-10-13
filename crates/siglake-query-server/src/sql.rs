@@ -10596,6 +10596,24 @@ fn partial_scalar_leaf(expr: &Expr) -> bool {
     }
 }
 
+// Output bytes must come from admitted inputs. Variable-width literals can
+// synthesize an arbitrarily large MIN/MAX/group value absent from those inputs;
+// keep them out while allowing COUNT's numeric literal and scalar comparisons.
+fn partial_output_leaf(expr: &Expr) -> bool {
+    match expr {
+        Expr::Alias(alias) => partial_output_leaf(&alias.expr),
+        Expr::Column(_) => true,
+        Expr::Literal(value, _) => {
+            let data_type = value.data_type();
+            matches!(
+                data_type,
+                arrow_schema::DataType::Null | arrow_schema::DataType::Boolean
+            ) || data_type.primitive_width().is_some()
+        }
+        _ => false,
+    }
+}
+
 fn partial_filter_expr_has_bounded_workspace(expr: &Expr) -> bool {
     match expr {
         Expr::Alias(alias) => partial_filter_expr_has_bounded_workspace(&alias.expr),
@@ -10640,19 +10658,19 @@ fn partial_filter_expr_has_bounded_workspace(expr: &Expr) -> bool {
 fn partial_plan_nodes_have_bounded_workspace(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Aggregate(aggregate) => {
-            aggregate.group_expr.iter().all(partial_scalar_leaf)
+            aggregate.group_expr.iter().all(partial_output_leaf)
                 && aggregate.aggr_expr.iter().all(|expr| {
                     let Expr::AggregateFunction(function) = expr else {
                         return false;
                     };
-                    function.params.args.iter().all(partial_scalar_leaf)
+                    function.params.args.iter().all(partial_output_leaf)
                         && function.params.filter.is_none()
                         && function.params.order_by.is_empty()
                 })
                 && partial_plan_nodes_have_bounded_workspace(&aggregate.input)
         }
         LogicalPlan::Projection(projection) => {
-            projection.expr.iter().all(partial_scalar_leaf)
+            projection.expr.iter().all(partial_output_leaf)
                 && partial_plan_nodes_have_bounded_workspace(&projection.input)
         }
         LogicalPlan::Filter(filter) => {
@@ -11723,6 +11741,17 @@ mod tests {
 
     #[tokio::test]
     async fn buffer_partial_workspace_guard_checks_all_executed_expressions() {
+        assert!(!partial_output_leaf(&datafusion::logical_expr::lit(
+            "absent source bytes"
+        )));
+        assert!(partial_output_leaf(&datafusion::logical_expr::lit(1i64)));
+        assert!(
+            !buffer_partial_workspace_decision(
+                "SELECT host, min('absent source bytes') FROM events GROUP BY host",
+            )
+            .await
+        );
+
         assert!(
             buffer_partial_workspace_decision("SELECT count(*) FROM events WHERE timestamp > 0",)
                 .await,

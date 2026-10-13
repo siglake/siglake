@@ -902,10 +902,12 @@ impl DecodedBuffer {
 /// 1024 slots (DataFusion primitive group values use only 128).
 ///
 /// MutableBuffer rounds growth to 64 bytes and doubles previous capacity;
-/// Vec-backed offsets/values also double. Summing twice the maximum logical
-/// payload plus startup/rounding per possible batch covers those capacities.
-/// Variable output keys/extrema cannot exceed the source variable payload.
-/// This deliberately conservative bound can refuse large deltas. It accounts
+/// Vec-backed offsets/values also double. EmitTo::First can retain an entire
+/// backing array while rebuilding its suffix, so EACH possible output batch
+/// is charged for the full source/row extent plus startup/rounding, rather than
+/// summing only emitted logical lengths. Output literal guards exclude values
+/// absent from the source. This deliberately conservative (potentially
+/// quadratic) bound can refuse large deltas; it is not an efficiency claim. It accounts
 /// physical Arrow buffers, consistently with BufferOutputLease::attach; it is
 /// not an allocator-metadata/RSS bound. View/nested layouts remain unsupported.
 pub(crate) fn bounded_output_payload(
@@ -918,7 +920,8 @@ pub(crate) fn bounded_output_payload(
     let grow = |logical: u64, startup: u64| {
         logical
             .checked_mul(2)?
-            .checked_add(batches.checked_mul(startup.checked_add(64)?)?)
+            .checked_add(startup.checked_add(64)?)?
+            .checked_mul(batches)
     };
     let validity = grow(rows.div_ceil(8), 128)?;
     let mut total = 0u64;
@@ -2845,6 +2848,25 @@ mod tests {
         assert_eq!(budget.used(), bound);
         drop(leased);
         assert_eq!(budget.used(), 0);
+        let large = "x".repeat(32 * 1024);
+        let mut suffixes = Vec::new();
+        for start in 0..3 {
+            let strings = StringArray::from(vec![large.as_str(); 3 - start]);
+            let one = strings.slice(0, 1);
+            suffixes.push(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(one),
+                        Arc::new(arrow_array::Int64Array::from(vec![1])),
+                    ],
+                )
+                .unwrap(),
+            );
+        }
+        let bound = bounded_output_payload(&schema, 3, (large.len() * 3) as u64).unwrap();
+        assert!(decoded_payload_bytes(&suffixes) <= bound);
+        assert!(decoded_payload_bytes(&suffixes) > (large.len() * 3) as u64);
         for data_type in [DataType::Utf8View, DataType::BinaryView] {
             let schema = Arc::new(Schema::new(vec![Field::new("value", data_type, true)]));
             assert!(bounded_output_payload(&schema, 3, 3276).is_none());
