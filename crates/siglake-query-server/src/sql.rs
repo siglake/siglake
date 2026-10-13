@@ -10539,6 +10539,25 @@ async fn compute_buffer_partials(
     if decoded.batches().is_empty() {
         return Ok((Vec::new(), Some(decoded)));
     }
+    let Some(masks) = partial_filter_mask_count(plan) else {
+        return Ok((Vec::new(), None));
+    };
+    let partial_input = if masks == 0 {
+        decoded.cloned_batches()
+    } else {
+        let workspace = decoded
+            .payload_bytes()
+            .saturating_add((decoded.row_count() as u64).div_ceil(8))
+            .saturating_mul(masks.saturating_add(1));
+        let Some(lease) = decoded.try_reserve_output(workspace) else {
+            return Ok((Vec::new(), None));
+        };
+        // Put the workspace lease on input allocations so detached execution
+        // children retain it even when the requesting future is cancelled.
+        lease
+            .attach(decoded.cloned_batches())
+            .map_err(ApiError::internal)?
+    };
     let output_schema = Arc::new(plan.schema().as_arrow().clone());
     let Some(output_bound) = crate::wal_buffer::bounded_output_payload(
         &output_schema,
@@ -10555,7 +10574,7 @@ async fn compute_buffer_partials(
     // here is the same capacity answer as one in the coordinator's own scan
     // (503 + Retry-After, counted), not a fault.
     let ctx = buffer_partial_context();
-    let partials = run_buffer_partial(&ctx, &table, base_schema, decoded.cloned_batches(), query)
+    let partials = run_buffer_partial(&ctx, &table, base_schema, partial_input, query)
         .await
         .map_err(|e| ApiError::from_execution(anyhow::anyhow!(e), priority))?;
     let partials = match output_lease.attach(partials) {
@@ -10599,6 +10618,7 @@ fn partial_filter_expr_has_bounded_workspace(expr: &Expr) -> bool {
         {
             partial_scalar_leaf(&binary.left) && partial_scalar_leaf(&binary.right)
         }
+        Expr::Like(_) => crate::wal_buffer::bounded_literal_like(expr),
         Expr::Not(inner) => partial_filter_expr_has_bounded_workspace(inner),
         Expr::IsNull(inner)
         | Expr::IsNotNull(inner)
@@ -10663,6 +10683,23 @@ fn partial_plan_nodes_have_bounded_workspace(plan: &LogicalPlan) -> bool {
         }
         _ => false,
     }
+}
+
+// Count every filter, including filters already pushed into scans. The caller
+// reserves each mask plus one full source-sized filter output before evaluation.
+fn partial_filter_mask_count(plan: &LogicalPlan) -> Option<u64> {
+    let own = match plan {
+        LogicalPlan::Filter(filter) => {
+            crate::wal_buffer::bounded_filter_mask_count(&filter.predicate)?
+        }
+        LogicalPlan::TableScan(scan) => scan.filters.iter().try_fold(0u64, |sum, filter| {
+            sum.checked_add(crate::wal_buffer::bounded_filter_mask_count(filter)?)
+        })?,
+        _ => 0,
+    };
+    plan.inputs().iter().try_fold(own, |sum, input| {
+        sum.checked_add(partial_filter_mask_count(input)?)
+    })
 }
 
 fn buffer_partial_plan_has_bounded_workspace(
@@ -11690,6 +11727,24 @@ mod tests {
             buffer_partial_workspace_decision("SELECT count(*) FROM events WHERE timestamp > 0",)
                 .await,
             "simple comparison COUNT must remain eligible"
+        );
+        assert!(
+            buffer_partial_workspace_decision(
+                "SELECT count(*) FROM events WHERE host LIKE '%host%'",
+            )
+            .await
+        );
+        assert!(
+            !buffer_partial_workspace_decision(
+                "SELECT count(*) FROM events WHERE host LIKE '%h%t%'",
+            )
+            .await
+        );
+        assert!(
+            !buffer_partial_workspace_decision(
+                "SELECT count(*) FROM events WHERE repeat(host, 1000000) LIKE '%x%'",
+            )
+            .await
         );
         assert!(
             !buffer_partial_workspace_decision(

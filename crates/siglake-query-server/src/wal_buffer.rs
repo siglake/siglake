@@ -1057,9 +1057,7 @@ impl BufferDeltaCache {
                 tracing::warn!(error = %error, dir = %wal_dir.display(),
                     "refusing WAL buffer generation whose listing is unavailable");
                 self.evict(wal_dir);
-                return Ok(BufferReadOutcome::Refused {
-                    compressed_bytes: 0,
-                });
+                return Err(error);
             }
         };
         if names.is_empty() {
@@ -1098,9 +1096,7 @@ impl BufferDeltaCache {
                     tracing::warn!(error = %error, dir = %wal_dir.display(),
                         "refusing WAL buffer generation whose full listing is unavailable");
                     self.evict(wal_dir);
-                    return Ok(BufferReadOutcome::Refused {
-                        compressed_bytes: 0,
-                    });
+                    return Err(error);
                 }
             };
             if all_names != names {
@@ -1134,9 +1130,7 @@ impl BufferDeltaCache {
                 metrics::counter!("siglake_query_wal_buffer_refused_sizing_total").increment(1);
                 tracing::warn!(error = %error, dir = %wal_dir.display(),
                     "refusing WAL buffer generation that cannot be sized exactly");
-                return Ok(BufferReadOutcome::Refused {
-                    compressed_bytes: 0,
-                });
+                return Err(error);
             }
         };
         let compressed_bytes = selected.compressed_bytes;
@@ -1153,7 +1147,7 @@ impl BufferDeltaCache {
                 metrics::counter!("siglake_query_wal_buffer_refused_decode_total").increment(1);
                 tracing::warn!(error = %error, dir = %wal_dir.display(),
                     "refusing incomplete WAL buffer generation");
-                return Ok(BufferReadOutcome::Refused { compressed_bytes });
+                return Err(error);
             }
         };
         let raw_payload = decoded_payload_bytes(&raw_batches);
@@ -1175,7 +1169,7 @@ impl BufferDeltaCache {
                 metrics::counter!("siglake_query_wal_buffer_refused_decode_total").increment(1);
                 tracing::warn!(error = %error, dir = %wal_dir.display(),
                     "refusing incomplete WAL buffer generation");
-                return Ok(BufferReadOutcome::Refused { compressed_bytes });
+                return Err(error);
             }
         };
         let transformed_payload = decoded_payload_bytes(&batches);
@@ -1190,7 +1184,7 @@ impl BufferDeltaCache {
                 metrics::counter!("siglake_query_wal_buffer_refused_decode_total").increment(1);
                 tracing::warn!(error = %error, dir = %wal_dir.display(),
                     "refusing WAL buffer generation whose ownership cannot be charged");
-                return Ok(BufferReadOutcome::Refused { compressed_bytes });
+                return Err(error);
             }
         };
         let decoded = Arc::new(DecodedBuffer {
@@ -1614,12 +1608,39 @@ fn scalar_filter_leaf(expr: &Expr) -> bool {
     }
 }
 
+/// Arrow 58.4 evaluates these scalar patterns with borrowed equality/contains
+/// predicates, without a regex, string copy, or StringView prefix/suffix Vec.
+/// Restrict the input to a direct column and the pattern to a scalar literal;
+/// a function or coercive expression may allocate before producing its value.
+pub(crate) fn bounded_literal_like(expr: &Expr) -> bool {
+    let Expr::Like(like) = expr else {
+        return false;
+    };
+    if like.case_insensitive
+        || like.escape_char.is_some()
+        || !matches!(like.expr.as_ref(), Expr::Column(_))
+    {
+        return false;
+    }
+    let Expr::Literal(datafusion::common::ScalarValue::Utf8(Some(pattern)), _) =
+        like.pattern.as_ref()
+    else {
+        return false;
+    };
+    let plain = |s: &str| !s.bytes().any(|b| matches!(b, b'%' | b'_' | b'\\'));
+    plain(pattern)
+        || (pattern.len() >= 2
+            && pattern.starts_with('%')
+            && pattern.ends_with('%')
+            && plain(&pattern[1..pattern.len() - 1]))
+}
+
 /// Only admit predicates whose physical evaluation is limited to scalar
 /// comparisons and Boolean masks. String functions, casts, regular
 /// expressions, user-defined functions, and arithmetic are declined before
 /// evaluation because they can allocate an intermediate larger than both the
 /// input and final Boolean result.
-fn bounded_filter_mask_count(expr: &Expr) -> Option<u64> {
+pub(crate) fn bounded_filter_mask_count(expr: &Expr) -> Option<u64> {
     match expr {
         Expr::Alias(alias) => bounded_filter_mask_count(&alias.expr),
         Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
@@ -1642,6 +1663,7 @@ fn bounded_filter_mask_count(expr: &Expr) -> Option<u64> {
         {
             (scalar_filter_leaf(&binary.left) && scalar_filter_leaf(&binary.right)).then_some(1)
         }
+        Expr::Like(_) if bounded_literal_like(expr) => Some(2),
         Expr::Not(inner) => bounded_filter_mask_count(inner)?.checked_add(1),
         Expr::IsNull(inner)
         | Expr::IsNotNull(inner)
@@ -2753,6 +2775,29 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn bounded_like_accepts_borrowed_patterns_and_refuses_allocating_shapes() {
+        use datafusion::logical_expr::{col, lit};
+        for pattern in ["plain", "%row%", "%%", "%é%"] {
+            assert_eq!(
+                bounded_filter_mask_count(&col("raw").like(lit(pattern))),
+                Some(2)
+            );
+            assert_eq!(
+                bounded_filter_mask_count(&col("raw").not_like(lit(pattern))),
+                Some(2)
+            );
+        }
+        for pattern in ["prefix%", "%suffix", "%a%b%", "%_%", "%\\_%"] {
+            assert!(bounded_filter_mask_count(&col("raw").like(lit(pattern))).is_none());
+        }
+        assert!(bounded_filter_mask_count(&col("raw").ilike(lit("%row%"))).is_none());
+        assert!(bounded_filter_mask_count(&col("raw").like(col("pattern"))).is_none());
+        let allocating =
+            datafusion::functions::string::repeat().call(vec![col("raw"), lit(1_000_000i64)]);
+        assert!(bounded_filter_mask_count(&allocating.like(lit("%row%"))).is_none());
     }
 
     #[test]
