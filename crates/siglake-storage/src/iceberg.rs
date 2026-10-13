@@ -3411,9 +3411,12 @@ pub(crate) enum PromotionExtraction {
 /// Parse [`PROMOTION_EXTRACTION_PROP`]. `None` when it is absent, unparseable,
 /// or stamped at an extractor version other than the current one — all of
 /// which mean "this table's promoted values are not known to match `attr_get`".
-pub(crate) fn promotion_extraction_from(value: Option<&str>) -> Option<PromotionExtraction> {
+pub(crate) fn promotion_extraction_from(
+    value: Option<&str>,
+    expected_version: u32,
+) -> Option<PromotionExtraction> {
     let (version, rest) = value?.split_once(':')?;
-    if version.parse::<u32>().ok()? != siglake_core::ATTR_EXTRACTOR_VERSION {
+    if version.parse::<u32>().ok()? != expected_version {
         return None;
     }
     match rest {
@@ -3426,14 +3429,14 @@ pub(crate) fn promotion_extraction_from(value: Option<&str>) -> Option<Promotion
 }
 
 /// [`PROMOTION_EXTRACTION_PROP`]'s value for a freshly declared promotion.
-pub(crate) fn promotion_declared_stamp() -> String {
-    format!("{}:declared", siglake_core::ATTR_EXTRACTOR_VERSION)
+pub(crate) fn promotion_declared_stamp(version: u32) -> String {
+    format!("{version}:declared")
 }
 
 /// [`PROMOTION_EXTRACTION_PROP`]'s value for a table adopted at the current
 /// rule with `sequence` live at the time.
-pub(crate) fn promotion_adopted_stamp(sequence: i64) -> String {
-    format!("{}:after:{sequence}", siglake_core::ATTR_EXTRACTOR_VERSION)
+pub(crate) fn promotion_adopted_stamp(version: u32, sequence: i64) -> String {
+    format!("{version}:after:{sequence}")
 }
 
 /// [`PROMOTION_BACKFILL_PROP`]'s value for `promoted` under the current
@@ -3446,7 +3449,7 @@ pub(crate) fn promotion_backfill_value(
         .map_err(|e| anyhow::anyhow!("promoted property json: {e}"))?;
     Ok(format!(
         "extractor{}:{json}",
-        siglake_core::ATTR_EXTRACTOR_VERSION
+        siglake_core::promotion_extractor_version(promoted)
     ))
 }
 
@@ -4284,7 +4287,11 @@ async fn live_data_files_within(
 /// stale promoted value after a new binary adopts the table. Per-file writer
 /// provenance makes that later file unqualified too (#6769). An absent or
 /// unparseable marker is unknown provenance and never qualifies.
-async fn live_files_carry_current_promotions(table: &Table, ids: &[i32]) -> Result<bool> {
+async fn live_files_carry_current_promotions(
+    table: &Table,
+    ids: &[i32],
+    expected_version: u32,
+) -> Result<bool> {
     let Some(snapshot) = table.metadata().current_snapshot() else {
         return Ok(true);
     };
@@ -4303,8 +4310,7 @@ async fn live_files_carry_current_promotions(table: &Table, ids: &[i32]) -> Resu
                 continue;
             }
             let file = entry.data_file();
-            if file_extractor_version(file.file_path())
-                != Some(siglake_core::ATTR_EXTRACTOR_VERSION)
+            if file_extractor_version(file.file_path()) != Some(expected_version)
                 || !ids.iter().all(|id| file.column_sizes().contains_key(id))
             {
                 return Ok(false);
@@ -8473,6 +8479,7 @@ fn select_promotions(
         taken.insert(name.clone());
         promoted_now.push(siglake_core::PromotedColumn {
             attr_key: key.to_string(),
+            attr_get_path: Vec::new(),
             name,
             ty,
         });
@@ -8526,11 +8533,22 @@ mod promotion_extraction_tests {
     #[test]
     fn stamps_round_trip_at_the_current_version() {
         assert_eq!(
-            promotion_extraction_from(Some(&promotion_declared_stamp())),
+            promotion_extraction_from(
+                Some(&promotion_declared_stamp(
+                    siglake_core::ATTR_EXTRACTOR_VERSION
+                )),
+                siglake_core::ATTR_EXTRACTOR_VERSION,
+            ),
             Some(PromotionExtraction::Declared)
         );
         assert_eq!(
-            promotion_extraction_from(Some(&promotion_adopted_stamp(41))),
+            promotion_extraction_from(
+                Some(&promotion_adopted_stamp(
+                    siglake_core::ATTR_EXTRACTOR_VERSION,
+                    41
+                )),
+                siglake_core::ATTR_EXTRACTOR_VERSION,
+            ),
             Some(PromotionExtraction::AdoptedAfter(41))
         );
     }
@@ -8538,10 +8556,19 @@ mod promotion_extraction_tests {
     #[test]
     fn absent_unparseable_or_older_rule_is_not_current() {
         // A table written before the stamp existed (every 0.2.1 table).
-        assert_eq!(promotion_extraction_from(None), None);
+        assert_eq!(
+            promotion_extraction_from(None, siglake_core::ATTR_EXTRACTOR_VERSION),
+            None
+        );
         // Another rule's stamp says nothing about this one's values.
-        assert_eq!(promotion_extraction_from(Some("1:declared")), None);
-        assert_eq!(promotion_extraction_from(Some("1:after:7")), None);
+        assert_eq!(
+            promotion_extraction_from(Some("1:declared"), siglake_core::ATTR_EXTRACTOR_VERSION),
+            None
+        );
+        assert_eq!(
+            promotion_extraction_from(Some("1:after:7"), siglake_core::ATTR_EXTRACTOR_VERSION),
+            None
+        );
         for junk in [
             "",
             "declared",
@@ -8551,7 +8578,11 @@ mod promotion_extraction_tests {
             "2:after:x",
             "x:declared",
         ] {
-            assert_eq!(promotion_extraction_from(Some(junk)), None, "{junk}");
+            assert_eq!(
+                promotion_extraction_from(Some(junk), siglake_core::ATTR_EXTRACTOR_VERSION),
+                None,
+                "{junk}"
+            );
         }
     }
 
@@ -8559,6 +8590,7 @@ mod promotion_extraction_tests {
     fn backfill_value_carries_the_extractor_version() {
         let promoted = vec![siglake_core::PromotedColumn {
             attr_key: "a.b.c".into(),
+            attr_get_path: Vec::new(),
             name: "a_b_c".into(),
             ty: siglake_core::PromotedType::Utf8,
         }];
@@ -8707,6 +8739,7 @@ mod auto_promotion_sampling_tests {
         let c = census(&[Some(r#"{"a":"1","b":"2","c":"3"}"#)]);
         let existing = vec![PromotedColumn {
             attr_key: "z".into(),
+            attr_get_path: Vec::new(),
             name: "z".into(),
             ty: PromotedType::Utf8,
         }];
@@ -8762,6 +8795,7 @@ mod auto_promotion_sampling_tests {
         let c = census(&[Some(r#"{"a":"1","host":"h","b-1":"2"}"#)]);
         let existing = vec![PromotedColumn {
             attr_key: "a".into(),
+            attr_get_path: Vec::new(),
             name: "a".into(),
             ty: PromotedType::Utf8,
         }];
@@ -15215,6 +15249,7 @@ impl IcebergContext {
             return Ok(false);
         }
         let desired = promotion_backfill_value(&promoted)?;
+        let expected_version = siglake_core::promotion_extractor_version(&promoted);
         let props = entry.table.metadata().properties();
         let already_recorded =
             props.get(PROMOTION_BACKFILL_PROP).map(String::as_str) == Some(desired.as_str());
@@ -15230,8 +15265,11 @@ impl IcebergContext {
         // Keep the table-level stamp as an upgrade record, but do not use its
         // sequence as writer provenance: an old compactor can commit after it.
         // The live-file walk below is the qualification proof.
-        if promotion_extraction_from(props.get(PROMOTION_EXTRACTION_PROP).map(String::as_str))
-            .is_none()
+        if promotion_extraction_from(
+            props.get(PROMOTION_EXTRACTION_PROP).map(String::as_str),
+            expected_version,
+        )
+        .is_none()
         {
             return self
                 .adopt_promotion_extraction(table_ident)
@@ -15243,7 +15281,9 @@ impl IcebergContext {
             .load_table(table_ident)
             .await
             .with_context(|| format!("load {table_ident} for backfill property"))?;
-        if !live_files_carry_current_promotions(&table, &ids).await? || already_recorded {
+        if !live_files_carry_current_promotions(&table, &ids, expected_version).await?
+            || already_recorded
+        {
             return Ok(false);
         }
         let tx = Transaction::new(&table);
@@ -15281,12 +15321,15 @@ impl IcebergContext {
             .load_table(table_ident)
             .await
             .with_context(|| format!("load {table_ident} for extraction stamp"))?;
+        let promoted = self.promoted_for_table(&table);
+        let expected_version = siglake_core::promotion_extractor_version(&promoted);
         if promotion_extraction_from(
             table
                 .metadata()
                 .properties()
                 .get(PROMOTION_EXTRACTION_PROP)
                 .map(String::as_str),
+            expected_version,
         )
         .is_some()
         {
@@ -15298,7 +15341,7 @@ impl IcebergContext {
             .update_table_properties()
             .set(
                 PROMOTION_EXTRACTION_PROP.to_string(),
-                promotion_adopted_stamp(sequence),
+                promotion_adopted_stamp(expected_version, sequence),
             )
             .apply(tx)
             .context("set promotion extraction stamp")?;
@@ -15308,7 +15351,7 @@ impl IcebergContext {
         self.invalidate_cached_table(table_ident).await;
         tracing::warn!(
             table = %table_ident, sequence,
-            version = siglake_core::ATTR_EXTRACTOR_VERSION,
+            version = expected_version,
             "promoted columns predate the current attribute-extraction rule; \
              attr_get rewrite and promoted-column pruning stay off for this table \
              until every live file carries current extraction provenance"
@@ -15329,8 +15372,11 @@ impl IcebergContext {
     /// same decision about the exact snapshot they serve.
     pub async fn events_attr_rewrite_map(
         &self,
-    ) -> Result<Option<std::collections::HashMap<String, (String, siglake_core::PromotedType)>>>
-    {
+    ) -> Result<
+        Option<
+            std::collections::HashMap<(String, Vec<String>), (String, siglake_core::PromotedType)>,
+        >,
+    > {
         self.attr_rewrite_map_for(&self.table_ident.clone()).await
     }
 
@@ -15339,8 +15385,11 @@ impl IcebergContext {
     pub async fn attr_rewrite_map_for(
         &self,
         table_ident: &TableIdent,
-    ) -> Result<Option<std::collections::HashMap<String, (String, siglake_core::PromotedType)>>>
-    {
+    ) -> Result<
+        Option<
+            std::collections::HashMap<(String, Vec<String>), (String, siglake_core::PromotedType)>,
+        >,
+    > {
         Ok(self
             .qualified_attr_rewrite_for(table_ident)
             .await?
@@ -15357,7 +15406,10 @@ impl IcebergContext {
     ) -> Result<Option<QualifiedAttrRewrite>> {
         let entry = self.cached_table_entry(table_ident).await?;
         let props = entry.table.metadata().properties();
-        let promoted = siglake_core::promoted_columns_from_property(
+        let promoted = siglake_core::promoted_columns_from_properties(
+            props
+                .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+                .map(String::as_str),
             props
                 .get(siglake_core::PROMOTED_PROPERTY_KEY)
                 .map(String::as_str),
@@ -15377,13 +15429,14 @@ impl IcebergContext {
         let Some(ids) = ids else {
             return Ok(None);
         };
-        if !live_files_carry_current_promotions(&entry.table, &ids).await? {
+        let expected_version = siglake_core::promotion_extractor_version(&promoted);
+        if !live_files_carry_current_promotions(&entry.table, &ids, expected_version).await? {
             return Ok(None);
         }
-        let map: std::collections::HashMap<String, (String, siglake_core::PromotedType)> = promoted
+        let map = promoted
             .into_iter()
-            .map(|c| (c.attr_key, (c.name, c.ty)))
-            .collect();
+            .map(|c| ((c.attr_key, c.attr_get_path), (c.name, c.ty)))
+            .collect::<std::collections::HashMap<_, _>>();
         if map.is_empty() {
             return Ok(None);
         }
@@ -16674,17 +16727,38 @@ impl IcebergContext {
         // it is selected for backfill and repaired.
         let desired_json = siglake_core::promoted_property_json(promoted)
             .map_err(|e| anyhow::anyhow!("promoted property json: {e}"))?;
+        let expression_aware = promoted
+            .iter()
+            .any(siglake_core::PromotedColumn::is_composed);
+        let legacy_json = expression_aware
+            .then(|| {
+                siglake_core::promoted_property_json(&siglake_core::direct_promotions(promoted))
+            })
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("legacy promoted property json: {e}"))?;
+        let expected_version = siglake_core::promotion_extractor_version(promoted);
         let table = self
             .catalog()
             .load_table(table_ident)
             .await
             .with_context(|| format!("load {table_ident} for promoted property"))?;
         let props = table.metadata().properties();
-        if props
-            .get(siglake_core::PROMOTED_PROPERTY_KEY)
-            .map(String::as_str)
-            != Some(desired_json.as_str())
-        {
+        let property_matches = if expression_aware {
+            props
+                .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+                .map(String::as_str)
+                == Some(desired_json.as_str())
+                && props
+                    .get(siglake_core::PROMOTED_PROPERTY_KEY)
+                    .map(String::as_str)
+                    == legacy_json.as_deref()
+        } else {
+            props
+                .get(siglake_core::PROMOTED_PROPERTY_KEY)
+                .map(String::as_str)
+                == Some(desired_json.as_str())
+        };
+        if !property_matches {
             // Record WHICH extraction rule will have written this table's
             // promoted values (#6769), in the same transaction as the
             // declaration itself. A table that holds no promotion yet gets
@@ -16694,20 +16768,37 @@ impl IcebergContext {
             // a file's writer; qualification reads the file-name marker.
             let stamp = match promotion_extraction_from(
                 props.get(PROMOTION_EXTRACTION_PROP).map(String::as_str),
+                expected_version,
             ) {
                 Some(_) => None,
-                None if !props.contains_key(siglake_core::PROMOTED_PROPERTY_KEY) => {
-                    Some(promotion_declared_stamp())
+                None if !props.contains_key(siglake_core::PROMOTED_PROPERTY_KEY)
+                    && !props.contains_key(siglake_core::PROMOTED_PROPERTY_V2_KEY) =>
+                {
+                    Some(promotion_declared_stamp(expected_version))
                 }
                 None => Some(promotion_adopted_stamp(
+                    expected_version,
                     table.metadata().last_sequence_number(),
                 )),
             };
             let tx = Transaction::new(&table);
-            let mut update = tx.update_table_properties().set(
-                siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
-                desired_json.clone(),
-            );
+            let mut update = tx.update_table_properties();
+            if let Some(legacy_json) = &legacy_json {
+                update = update
+                    .set(
+                        siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
+                        legacy_json.clone(),
+                    )
+                    .set(
+                        siglake_core::PROMOTED_PROPERTY_V2_KEY.to_string(),
+                        desired_json.clone(),
+                    );
+            } else {
+                update = update.set(
+                    siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
+                    desired_json.clone(),
+                );
+            }
             if let Some(stamp) = stamp {
                 update = update.set(PROMOTION_EXTRACTION_PROP.to_string(), stamp);
             }
@@ -16730,11 +16821,22 @@ impl IcebergContext {
                     .await
                     .ok()
                     .filter(|t| {
-                        t.metadata()
-                            .properties()
-                            .get(siglake_core::PROMOTED_PROPERTY_KEY)
-                            .map(String::as_str)
-                            == Some(desired_json.as_str())
+                        let settled = t.metadata().properties();
+                        if expression_aware {
+                            settled
+                                .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+                                .map(String::as_str)
+                                == Some(desired_json.as_str())
+                                && settled
+                                    .get(siglake_core::PROMOTED_PROPERTY_KEY)
+                                    .map(String::as_str)
+                                    == legacy_json.as_deref()
+                        } else {
+                            settled
+                                .get(siglake_core::PROMOTED_PROPERTY_KEY)
+                                .map(String::as_str)
+                                == Some(desired_json.as_str())
+                        }
                     })
                     .is_some();
                 if !settled {
@@ -17010,21 +17112,26 @@ impl IcebergContext {
     }
 
     /// The EFFECTIVE promotion list for a loaded events-table handle: the
-    /// `siglake.promoted.v1` property when present (the single source of
+    /// expression-aware v2 property when present, otherwise the direct-only
+    /// `siglake.promoted.v1` property (the single source of
     /// truth — auto-promotion appends there at runtime), else the process's
     /// CLI-declared list (the bootstrap seed `ensure_promoted_columns`
     /// records into the property).
     pub fn promoted_for_table(&self, table: &Table) -> Vec<siglake_core::PromotedColumn> {
-        let from_prop = siglake_core::promoted_columns_from_property(
-            table
-                .metadata()
-                .properties()
+        let props = table.metadata().properties();
+        let from_prop = siglake_core::promoted_columns_from_properties(
+            props
+                .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+                .map(String::as_str),
+            props
                 .get(siglake_core::PROMOTED_PROPERTY_KEY)
                 .map(String::as_str),
         );
         // The CLI list is the EVENTS-table bootstrap seed only; user indexes
         // are property-only (declared via auto-promotion or the index API).
-        if from_prop.is_empty() && table.identifier() == &self.table_ident {
+        let has_property = props.contains_key(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+            || props.contains_key(siglake_core::PROMOTED_PROPERTY_KEY);
+        if !has_property && table.identifier() == &self.table_ident {
             self.promoted.clone()
         } else {
             from_prop
@@ -17572,6 +17679,8 @@ impl IcebergContext {
         // idempotent, so a caller that already widened the batch is fine.
         // Promoted Utf8 columns join the bloom set.
         let promoted = self.promoted_for_table(&table);
+        let file_extractor_version =
+            file_extractor_version.map(|_| siglake_core::promotion_extractor_version(&promoted));
         let (batch, bloom_owned): (RecordBatch, Vec<String>) = if promoted.is_empty() {
             (batch, bloom_columns.iter().map(|s| s.to_string()).collect())
         } else if file_extractor_version.is_none() {
@@ -18481,13 +18590,14 @@ impl IcebergContext {
         index_spec: Option<&[InvertedIndexSpec]>,
         rewrite_gen: u32,
     ) -> Result<WriteBatchOutput> {
+        let promoted = self.promoted_for_table(table);
         self.write_batch_to_data_files_with_extractor_version(
             table,
             batch,
             bloom_columns,
             index_spec,
             rewrite_gen,
-            Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+            Some(siglake_core::promotion_extractor_version(&promoted)),
         )
         .await
     }
@@ -21225,7 +21335,9 @@ impl IcebergContext {
             with_footers,
             MergeOutputStamp {
                 rewrite_gen,
-                extractor_version: Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+                extractor_version: Some(siglake_core::promotion_extractor_version(
+                    &self.promoted_for_table(table),
+                )),
             },
             segmented_sink,
         );
@@ -21515,7 +21627,9 @@ impl IcebergContext {
             true,
             MergeOutputStamp {
                 rewrite_gen,
-                extractor_version: Some(siglake_core::ATTR_EXTRACTOR_VERSION),
+                extractor_version: Some(siglake_core::promotion_extractor_version(
+                    &self.promoted_for_table(table),
+                )),
             },
             segmented_sink,
         );
@@ -24575,7 +24689,7 @@ pub struct BufferedTableSnapshot {
 /// whose promoted values were never qualified.
 #[derive(Clone)]
 pub struct QualifiedAttrRewrite {
-    pub mapping: HashMap<String, (String, siglake_core::PromotedType)>,
+    pub mapping: HashMap<(String, Vec<String>), (String, siglake_core::PromotedType)>,
     pub snapshot: BufferedTableSnapshot,
     /// The carrier mapping from the same table generation. `None` for tables
     /// that are not managed indexes; such tables have no index WAL override.
@@ -28901,11 +29015,13 @@ mod namespace_bootstrap_tests {
         let promoted = vec![
             siglake_core::PromotedColumn {
                 attr_key: "http.status_code".to_string(),
+                attr_get_path: Vec::new(),
                 name: "http_status_code".to_string(),
                 ty: siglake_core::PromotedType::Int64,
             },
             siglake_core::PromotedColumn {
                 attr_key: "service.name".to_string(),
+                attr_get_path: Vec::new(),
                 name: "service_name".to_string(),
                 ty: siglake_core::PromotedType::Utf8,
             },

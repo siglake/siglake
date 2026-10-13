@@ -1624,6 +1624,18 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   schema and rewrites nothing — so for a cold table the practical answer is to
   leave it unqualified: the queries stay correct. There is no repair that fixes
   the values in place, and no automatic migration.
+- **A composed attribute promotion does not automatically rewrite an existing
+  flat promotion with the same physical column name.** The composed source is
+  expression-specific: `attr_get(attr_get(attributes,'aws.cloudwatch'),
+  'log_stream')` can differ from the flat dotted-key lookup when literal dotted
+  keys, nulls or a serialized JSON string are present. Files written by the old
+  flat declaration carry extraction marker `x2`; a composed declaration needs
+  `x3`, so queries keep the original JSON expression and scan until every live
+  file is rewritten. The backfill selector only finds a missing physical
+  column. A stale flat file already carries that column and is therefore subject
+  to the same convergence limit described above: ordinary level/depth rewrites
+  may replace it, while a settled file can remain residual indefinitely. There
+  is no automatic migration or default composed promotion (#6752).
 - **Tier-1 group counts serve only columns present since the table's first
   commit.** The serving guard is `column_total(column) == record_count`, so a
   column that starts accumulating mid-life — a typed column on a table created
