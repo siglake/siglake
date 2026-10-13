@@ -967,7 +967,7 @@ impl BufferDeltaCache {
     /// superset of the time window; this is safe for the query path because the
     /// SQL timestamp predicate still filters rows, while avoiding a second
     /// decode after `load_buffer_delta` populated the unbounded entry.
-    pub fn get_or_load_for_query(
+    pub(crate) fn get_or_load_for_query(
         &self,
         wal_dir: &Path,
         target_schema: &SchemaRef,
@@ -997,7 +997,7 @@ impl BufferDeltaCache {
     /// directory. An empty batch vec still reports its listing — an empty name
     /// list proves a drained buffer, while a non-empty one that decoded to no
     /// rows does not.
-    pub fn get_or_load_for_query_keyed(
+    pub(crate) fn get_or_load_for_query_keyed(
         &self,
         wal_dir: &Path,
         target_schema: &SchemaRef,
@@ -1210,7 +1210,7 @@ impl BufferDeltaCache {
 
     /// Cached batches for `wal_dir` iff the key (surviving basenames + schema
     /// + carrier) matches exactly. Batch clones are shallow (Arc'd columns).
-    pub fn get(
+    pub(crate) fn get(
         &self,
         wal_dir: &Path,
         names: &[String],
@@ -2720,7 +2720,9 @@ mod tests {
 
         let batch = siglake_core::events_to_record_batch(&[Event::now("x")]).unwrap();
         let schema = batch.schema();
-        let filter = repeat(vec![col("raw"), lit(1_000_000i64)]).eq(lit("never"));
+        let filter = repeat()
+            .call(vec![col("raw"), lit(1_000_000i64)])
+            .eq(lit("never"));
         let state = SessionContext::new().state();
         let memory = BufferMemoryBudget::new(MIB);
         for _ in 0..2 {
