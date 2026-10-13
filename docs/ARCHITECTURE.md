@@ -576,7 +576,11 @@ reclustering completes (`docs/DESIGN_time_ordered_storage.md`).
   can read one column out of without touching the rest. Wide Tier-1 reads keep
   the decoded body and reconstruct that column's keys in one reusable buffer;
   a top-K query owns only competitive keys, while count and predicate consumers
-  own none. The full decoder remains for folds and diagnostics. Inferred typed group
+  own none. With result caches off, a whole-table LIMIT up to 4,096 folds exact
+  delta-adjusted candidates into that collector during the validation pass.
+  The fold state remains private until the target and the rest of the immutable
+  blob validate; a refusal takes the existing footer/page fallback. The full
+  decoder remains for folds and diagnostics. Inferred typed group
   dimensions omit the canonical `timestamp_ns` event-time twin; explicitly
   declared dimensions and unrelated user fields with that name remain eligible
   (`docs/DESIGN_group_count_footer_encoding.md`). The 0.3.0 grouped-numeric

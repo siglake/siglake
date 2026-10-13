@@ -23836,7 +23836,44 @@ impl IcebergContext {
             .await
     }
 
-    /// An approximate top-`k` for `column`, when no exact aggregate covers it.    /// An approximate top-`k` for `column`, when no exact aggregate covers it.
+    /// Fold an uncached Tier-1 wide column during validation.
+    ///
+    /// A result-cache-enabled query keeps the established snapshot-cache path.
+    /// With result caches disabled, this lets an exact bounded collector avoid
+    /// reconstructing every front-coded key once for validation and again for
+    /// selection. The named outcome distinguishes an uninspected miss from a
+    /// decoded refusal, allowing the caller to continue below Tier-1 without
+    /// repeating the same decode.
+    pub async fn tier1_group_counts_fold<T: siglake_bloom::group_counts::StreamingColumnFold>(
+        &self,
+        table_name: &str,
+        column: &str,
+        state: T,
+    ) -> Result<Tier1GroupCountsFold<T>> {
+        if self.result_caches_enabled() {
+            return Ok(Tier1GroupCountsFold::NotInspected);
+        }
+        let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
+        let cached = self.cached_table_entry(&table_ident).await?;
+        let Some(record_count) = cached
+            .table
+            .metadata()
+            .current_snapshot()
+            .and_then(|snapshot| {
+                snapshot
+                    .summary()
+                    .additional_properties
+                    .get("total-records")
+            })
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return Ok(Tier1GroupCountsFold::NotInspected);
+        };
+        self.tier1_group_count_rows_fold(&cached, column, record_count, state)
+            .await
+    }
+
+    /// An approximate top-`k` for `column`, when no exact aggregate covers it.
     ///
     /// **Only top-K by count.** A sketch holds at most `m` counters and has no
     /// idea what it evicted, so it cannot answer `count(DISTINCT)`, a negation
@@ -23851,6 +23888,31 @@ impl IcebergContext {
         column: &str,
         k: usize,
         buffered: Option<&HashMap<Option<String>, u64>>,
+    ) -> Result<Option<ApproximateGroupCounts>> {
+        self.approximate_top_group_counts_inner(table_name, column, k, buffered, true)
+            .await
+    }
+
+    /// Approximate fallback after the same request already decoded and refused
+    /// the exact Tier-1 column. Skips only that duplicate exact probe.
+    pub async fn approximate_top_group_counts_after_tier1_refusal(
+        &self,
+        table_name: &str,
+        column: &str,
+        k: usize,
+        buffered: Option<&HashMap<Option<String>, u64>>,
+    ) -> Result<Option<ApproximateGroupCounts>> {
+        self.approximate_top_group_counts_inner(table_name, column, k, buffered, false)
+            .await
+    }
+
+    async fn approximate_top_group_counts_inner(
+        &self,
+        table_name: &str,
+        column: &str,
+        k: usize,
+        buffered: Option<&HashMap<Option<String>, u64>>,
+        check_exact: bool,
     ) -> Result<Option<ApproximateGroupCounts>> {
         if !self.group_count_deltas_enabled() {
             return Ok(None);
@@ -23867,13 +23929,15 @@ impl IcebergContext {
             .current_snapshot()
             .and_then(|s| s.summary().additional_properties.get("total-records"))
             .and_then(|v| v.parse::<u64>().ok());
-        if let Some(rc) = record_count {
-            if self
-                .tier1_group_count_rows(&cached, column, rc)
-                .await?
-                .is_some()
-            {
-                return Ok(None);
+        if check_exact {
+            if let Some(rc) = record_count {
+                if self
+                    .tier1_group_count_rows(&cached, column, rc)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(None);
+                }
             }
         }
 
@@ -23951,6 +24015,27 @@ impl IcebergContext {
         column: &str,
         record_count: u64,
     ) -> Result<Option<GroupCounts>> {
+        Ok(
+            match self
+                .tier1_group_count_rows_fold(cached, column, record_count, ())
+                .await?
+            {
+                Tier1GroupCountsFold::Hit { rows, .. } => Some(rows),
+                Tier1GroupCountsFold::NotInspected | Tier1GroupCountsFold::Refused => None,
+            },
+        )
+    }
+
+    /// Tier-1 lookup that can fold a wide column during its mandatory
+    /// validation pass. The outcome says whether `fold` consumed the rows; an
+    /// inline hit leaves `state` untouched so its map-backed view stays cheap.
+    async fn tier1_group_count_rows_fold<T: siglake_bloom::group_counts::StreamingColumnFold>(
+        &self,
+        cached: &CachedTableEntry,
+        column: &str,
+        record_count: u64,
+        state: T,
+    ) -> Result<Tier1GroupCountsFold<T>> {
         // Both arms hand back a BORROWED view of the aggregate they matched.
         // Nothing downstream needs owned keys, and materializing them here is
         // what put 1.1M string allocations on every query — see [`GroupCounts`].
@@ -23964,30 +24049,43 @@ impl IcebergContext {
                 .and_then(|g| g.column_total(column))
                 == Some(record_count)
             {
-                return Ok(Some(GroupCounts::Inline {
-                    aggs,
-                    column: column.to_string(),
-                }));
+                return Ok(Tier1GroupCountsFold::Hit {
+                    rows: GroupCounts::Inline {
+                        aggs,
+                        column: column.to_string(),
+                    },
+                    state,
+                    folded: false,
+                });
             }
         }
         let Some(wide) = self.cached_wide_group_counts(cached).await? else {
-            return Ok(None);
+            return Ok(Tier1GroupCountsFold::NotInspected);
         };
         if !aggregate_covers_current_snapshot(&cached.table, wide.coverage) {
-            return Ok(None);
+            return Ok(Tier1GroupCountsFold::NotInspected);
         }
         // Decode ONLY this column out of the blob. Rebuilding all of them to
         // check one total is what made this seconds-per-generation at 1TB.
-        let Some(counts) = wide.streaming_column(column) else {
-            return Ok(None);
+        let Some(blob) = wide.group_counts.as_deref() else {
+            return Ok(Tier1GroupCountsFold::Refused);
+        };
+        let Some((counts, state)) =
+            siglake_bloom::group_counts::streaming_column_fold(blob, column, state)
+        else {
+            return Ok(Tier1GroupCountsFold::Refused);
         };
         if counts.total() != record_count {
-            return Ok(None);
+            return Ok(Tier1GroupCountsFold::Refused);
         }
-        Ok(Some(GroupCounts::Streaming {
-            column: Arc::new(counts),
-            materialized: Arc::new(std::sync::OnceLock::new()),
-        }))
+        Ok(Tier1GroupCountsFold::Hit {
+            rows: GroupCounts::Streaming {
+                column: Arc::new(counts),
+                materialized: Arc::new(std::sync::OnceLock::new()),
+            },
+            state,
+            folded: true,
+        })
     }
 
     /// #89: a table provider PINNED to `snapshot_id` (time-travel), `schema_id`
@@ -26415,6 +26513,21 @@ impl IcebergContext {
             .await
     }
 
+    /// Continue at the exact per-file tier after this request already decoded
+    /// and refused Tier-1. Used only to avoid repeating that same refusal.
+    pub async fn grouped_counts_after_tier1_refusal(
+        &self,
+        table_name: &str,
+        column: &str,
+    ) -> Result<Option<GroupCounts>> {
+        let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
+        let cached = self.cached_table_entry(&table_ident).await?;
+        Ok(self
+            .grouped_counts_from_files(&cached, &table_ident, column, None)
+            .await?
+            .map(|totals| GroupCounts::owned(totals.into_iter().collect(), OwnedCounts::FooterSum)))
+    }
+
     /// Snapshot-bound unwindowed group counts for a qualified promoted-column
     /// rewrite. Windowed aggregate helpers have their own table-name cache
     /// lookups, so the query layer conservatively declines those shapes while
@@ -26828,6 +26941,23 @@ pub enum GroupCounts {
     Owned {
         rows: Arc<GroupCountRows>,
         source: OwnedCounts,
+    },
+}
+
+/// Outcome of trying to fold a bounded collector into a Tier-1 lookup.
+#[derive(Debug)]
+pub enum Tier1GroupCountsFold<T> {
+    /// No current wide blob was decoded, so the ordinary lookup remains valid.
+    NotInspected,
+    /// A current wide blob was decoded but could not answer exactly. The caller
+    /// should continue below Tier-1 without decoding the blob again.
+    Refused,
+    /// An exact Tier-1 answer. `folded` distinguishes a wide streaming hit from
+    /// an inline hit, which returns the untouched state.
+    Hit {
+        rows: GroupCounts,
+        state: T,
+        folded: bool,
     },
 }
 

@@ -12,12 +12,13 @@
 //!   report_22_column_prepare_cost -- --ignored --nocapture
 //! ```
 //!
-//! The two arms consume the same encoded bytes in one process. `owned_decode`
-//! is the preserved full decoder; `stream_prepare` validates the whole payload
+//! The arms consume the same encoded bytes in one process. `owned_decode` is
+//! the preserved full decoder; `stream_prepare` validates the whole payload
 //! and retains its decoded body; `stream_select` reconstructs every key in one
-//! scratch buffer and owns only competitive top-100 keys. CPU is process CPU,
-//! not an inference from wall time. Heap readings cover allocations made while
-//! each result remains live.
+//! scratch buffer and owns only competitive top-100 keys. `validate_select`
+//! folds that selection into the validation pass. CPU is process CPU, not an
+//! inference from wall time. Heap readings cover allocations made while each
+//! result remains live.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
@@ -260,35 +261,80 @@ fn better_borrowed(key: &str, count: u64, right: &(String, u64)) -> bool {
     count > right.1 || (count == right.1 && key < right.0.as_str())
 }
 
-fn select_top(
-    streamed: &siglake_bloom::group_counts::StreamingColumnCounts,
+struct TopSelection {
+    selected: Vec<(String, u64)>,
+    cutoff: Option<(String, u64)>,
+    total: u64,
     k: usize,
-) -> (Vec<(String, u64)>, u64) {
-    let mut selected: Vec<(String, u64)> = Vec::with_capacity(k * 2);
-    let mut cutoff: Option<(String, u64)> = None;
-    let mut total = 0u64;
-    streamed.for_each(|key, count| {
-        total = total.saturating_add(count);
+}
+
+impl TopSelection {
+    fn new(k: usize) -> Self {
+        Self {
+            selected: Vec::with_capacity(k * 2),
+            cutoff: None,
+            total: 0,
+            k,
+        }
+    }
+
+    fn push(&mut self, key: Option<&str>, count: u64) {
+        self.total = self.total.saturating_add(count);
         let Some(key) = key else {
             return;
         };
-        if cutoff
+        if self
+            .cutoff
             .as_ref()
             .is_some_and(|worst| !better_borrowed(key, count, worst))
         {
             return;
         }
-        selected.push((key.to_string(), count));
-        if selected.len() == k * 2 {
-            selected
-                .select_nth_unstable_by(k - 1, |a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            selected.truncate(k);
-            cutoff = Some(selected[k - 1].clone());
+        self.selected.push((key.to_string(), count));
+        if self.selected.len() == self.k * 2 {
+            self.selected.select_nth_unstable_by(self.k - 1, |a, b| {
+                b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+            });
+            self.selected.truncate(self.k);
+            self.cutoff = Some(self.selected[self.k - 1].clone());
         }
-    });
-    selected.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    selected.truncate(k);
-    (selected, total)
+    }
+
+    fn finish(mut self) -> (Vec<(String, u64)>, u64) {
+        self.selected
+            .sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        self.selected.truncate(self.k);
+        (self.selected, self.total)
+    }
+}
+
+impl siglake_bloom::group_counts::StreamingColumnFold for TopSelection {
+    fn fold(&mut self, value: Option<&str>, count: u64) {
+        self.push(value, count);
+    }
+}
+
+fn select_top(
+    streamed: &siglake_bloom::group_counts::StreamingColumnCounts,
+    k: usize,
+) -> (Vec<(String, u64)>, u64) {
+    let mut state = TopSelection::new(k);
+    streamed.for_each(|key, count| state.push(key, count));
+    state.finish()
+}
+
+fn select_top_while_validating(
+    wide: &WideGroupCounts,
+    column: &str,
+    k: usize,
+) -> (Vec<(String, u64)>, u64) {
+    let (_, state) = siglake_bloom::group_counts::streaming_column_fold(
+        wide.group_counts.as_deref().expect("encoded group counts"),
+        column,
+        TopSelection::new(k),
+    )
+    .expect("valid streaming column");
+    state.finish()
 }
 
 fn report_profile(label: &str, wide: &WideGroupCounts, column: &str) {
@@ -310,6 +356,11 @@ fn report_profile(label: &str, wide: &WideGroupCounts, column: &str) {
     let ((selected, streamed_total), select_time) = run(false, || select_top(&streamed, K));
     let (_, select_allocations) = run(true, || select_top(&streamed, K));
     let select_reading = combine(select_time, select_allocations);
+
+    let ((folded_selected, folded_total), folded_time) =
+        run(false, || select_top_while_validating(wide, column, K));
+    let (_, folded_allocations) = run(true, || select_top_while_validating(wide, column, K));
+    let folded_reading = combine(folded_time, folded_allocations);
 
     // Differential validation is deliberately outside every measurement
     // window. Compare the complete streamed column, then compare its bounded
@@ -335,11 +386,14 @@ fn report_profile(label: &str, wide: &WideGroupCounts, column: &str) {
         .sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     assert_eq!(streamed_total, owned_total);
     assert_eq!(selected, owned.values[..K]);
+    assert_eq!(folded_total, owned_total);
+    assert_eq!(folded_selected, owned.values[..K]);
 
     println!("fixture={label} groups={groups} encoded_kib={encoded_kib} top_k={K}");
     print_reading("owned_decode", owned_reading);
     print_reading("stream_prepare", prepare_reading);
     print_reading("stream_select", select_reading);
+    print_reading("validate_select", folded_reading);
     println!(
         "stream_total      wall_ms={:>8.2} cpu_ms={:>8.2} allocations={:>9} \
          allocated_mib={:>8.2} peak_heap_mib={:>8.2}",
