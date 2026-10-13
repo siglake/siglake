@@ -13,9 +13,11 @@ design as written.*
 
 *2026-10-13 (#6752): exact composed `attr_get` sources ship as an explicit JSON
 key-chain declaration. Materialization reparses each intermediate string as the
-UDF does; promotion metadata and per-file provenance distinguish the composed
-tree from a flat dotted key. Old, incomplete and mixed-writer files retain the
-residual expression until an ordinary rewrite rematerializes them. No automatic
+UDF does. A physical promoted column has an immutable source expression and
+type, so a composed tree cannot reuse a flat dotted key's field id. Promotion
+metadata and per-file provenance then distinguish the expressions. Old,
+incomplete and mixed-writer files retain the residual expression until an
+ordinary rewrite rematerializes the distinct composed column. No automatic
 migration or default promotion was added; the column cap is unchanged.*
 
 ## What already shipped (don't re-implement)

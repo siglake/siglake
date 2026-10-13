@@ -3453,6 +3453,164 @@ pub(crate) fn promotion_backfill_value(
     ))
 }
 
+/// A physical promoted field has one immutable extraction identity. Reusing
+/// its Iceberg field id for another direct key, composed key chain, or type
+/// would let already-written files satisfy the field-presence proof while
+/// carrying values from the old expression.
+fn validate_promotion_redefinition(
+    existing: &[siglake_core::PromotedColumn],
+    desired: &[siglake_core::PromotedColumn],
+) -> Result<()> {
+    let existing_by_name = existing
+        .iter()
+        .map(|column| (column.name.as_str(), column))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut desired_names = std::collections::HashSet::new();
+    for column in desired {
+        anyhow::ensure!(
+            desired_names.insert(column.name.as_str()),
+            "promoted column `{}` is declared more than once",
+            column.name
+        );
+        if let Some(previous) = existing_by_name.get(column.name.as_str()) {
+            anyhow::ensure!(
+                *previous == column,
+                "promoted column `{}` cannot change extraction identity from {:?} to {:?}; \
+                 declare the new expression under a distinct column name",
+                column.name,
+                previous,
+                column
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Retry-aware property declaration. `Transaction` re-applies this action to
+/// freshly loaded metadata after a catalog conflict, so expression identity is
+/// checked again on every attempt instead of only against the caller's stale
+/// base table.
+struct DeclarePromotionsAction {
+    promoted: Vec<siglake_core::PromotedColumn>,
+    desired_json: String,
+    legacy_json: Option<String>,
+    expected_version: u32,
+}
+
+impl DeclarePromotionsAction {
+    fn properties_match(&self, properties: &HashMap<String, String>) -> bool {
+        if let Some(legacy_json) = &self.legacy_json {
+            properties
+                .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+                .map(String::as_str)
+                == Some(self.desired_json.as_str())
+                && properties
+                    .get(siglake_core::PROMOTED_PROPERTY_KEY)
+                    .map(String::as_str)
+                    == Some(legacy_json.as_str())
+        } else {
+            properties
+                .get(siglake_core::PROMOTED_PROPERTY_KEY)
+                .map(String::as_str)
+                == Some(self.desired_json.as_str())
+        }
+    }
+
+    fn invalid(message: impl Into<String>) -> IcebergError {
+        IcebergError::new(IcebergErrorKind::PreconditionFailed, message.into())
+            .with_retryable(false)
+    }
+}
+
+#[async_trait::async_trait]
+impl TransactionAction for DeclarePromotionsAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        let properties = table.metadata().properties();
+        let existing = match properties.get(siglake_core::PROMOTED_PROPERTY_V2_KEY) {
+            Some(json) => serde_json::from_str::<Vec<siglake_core::PromotedColumn>>(json).map_err(
+                |error| {
+                    Self::invalid(format!(
+                        "parse {} for promotion identity validation: {error}",
+                        siglake_core::PROMOTED_PROPERTY_V2_KEY
+                    ))
+                },
+            )?,
+            None => match properties.get(siglake_core::PROMOTED_PROPERTY_KEY) {
+                Some(json) => serde_json::from_str::<Vec<siglake_core::PromotedColumn>>(json)
+                    .map_err(|error| {
+                        Self::invalid(format!(
+                            "parse {} for promotion identity validation: {error}",
+                            siglake_core::PROMOTED_PROPERTY_KEY
+                        ))
+                    })?,
+                None => Vec::new(),
+            },
+        };
+        validate_promotion_redefinition(&existing, &self.promoted)
+            .map_err(|error| Self::invalid(error.to_string()))?;
+        let existing_names = existing
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<HashSet<_>>();
+        let schema = table.metadata().current_schema();
+        for column in &self.promoted {
+            if !existing_names.contains(column.name.as_str())
+                && schema.field_id_by_name(&column.name).is_some()
+            {
+                return Err(Self::invalid(format!(
+                    "column `{}` already exists without the requested promotion identity; \
+                     declare the expression under a distinct column name",
+                    column.name
+                )));
+            }
+        }
+        if self.properties_match(properties) {
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+
+        let mut updates = HashMap::new();
+        if let Some(legacy_json) = &self.legacy_json {
+            updates.insert(
+                siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
+                legacy_json.clone(),
+            );
+            updates.insert(
+                siglake_core::PROMOTED_PROPERTY_V2_KEY.to_string(),
+                self.desired_json.clone(),
+            );
+        } else {
+            updates.insert(
+                siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
+                self.desired_json.clone(),
+            );
+        }
+        if promotion_extraction_from(
+            properties
+                .get(PROMOTION_EXTRACTION_PROP)
+                .map(String::as_str),
+            self.expected_version,
+        )
+        .is_none()
+        {
+            let stamp = if !properties.contains_key(siglake_core::PROMOTED_PROPERTY_KEY)
+                && !properties.contains_key(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+            {
+                promotion_declared_stamp(self.expected_version)
+            } else {
+                promotion_adopted_stamp(
+                    self.expected_version,
+                    table.metadata().last_sequence_number(),
+                )
+            };
+            updates.insert(PROMOTION_EXTRACTION_PROP.to_string(), stamp);
+        }
+        Ok(ActionCommit::new(
+            vec![TableUpdate::SetProperties { updates }],
+            vec![],
+        ))
+    }
+}
+
 /// Create one table's auto-promotion cost series at zero, before the sampling
 /// pass or the committed Backfill bin that would otherwise be their first
 /// sample.
@@ -8606,6 +8764,52 @@ mod promotion_extraction_tests {
             promotion_backfill_value(&promoted).unwrap(),
             "stable for an unchanged promotion list"
         );
+    }
+
+    #[test]
+    fn a_physical_promotion_column_cannot_change_expression_identity() {
+        let direct = siglake_core::PromotedColumn {
+            attr_key: "aws.cloudwatch.log_stream".into(),
+            attr_get_path: Vec::new(),
+            name: "cloudwatch_stream".into(),
+            ty: siglake_core::PromotedType::Utf8,
+        };
+        let composed = siglake_core::PromotedColumn {
+            attr_key: "aws.cloudwatch".into(),
+            attr_get_path: vec!["log_stream".into()],
+            name: "cloudwatch_stream".into(),
+            ty: siglake_core::PromotedType::Utf8,
+        };
+        let error = validate_promotion_redefinition(
+            std::slice::from_ref(&direct),
+            std::slice::from_ref(&composed),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("distinct column name"),
+            "{error:#}"
+        );
+        validate_promotion_redefinition(
+            std::slice::from_ref(&direct),
+            std::slice::from_ref(&direct),
+        )
+        .unwrap();
+
+        let changed_type = siglake_core::PromotedColumn {
+            ty: siglake_core::PromotedType::Boolean,
+            ..direct.clone()
+        };
+        assert!(
+            validate_promotion_redefinition(std::slice::from_ref(&direct), &[changed_type])
+                .is_err(),
+            "the physical field type is part of its immutable identity"
+        );
+
+        let distinct = siglake_core::PromotedColumn {
+            name: "cloudwatch_composed_stream".into(),
+            ..composed
+        };
+        validate_promotion_redefinition(&[direct], &[distinct]).unwrap();
     }
 }
 
@@ -16742,78 +16946,31 @@ impl IcebergContext {
             .load_table(table_ident)
             .await
             .with_context(|| format!("load {table_ident} for promoted property"))?;
-        let props = table.metadata().properties();
-        let property_matches = if expression_aware {
-            props
-                .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
-                .map(String::as_str)
-                == Some(desired_json.as_str())
-                && props
-                    .get(siglake_core::PROMOTED_PROPERTY_KEY)
-                    .map(String::as_str)
-                    == legacy_json.as_deref()
-        } else {
-            props
-                .get(siglake_core::PROMOTED_PROPERTY_KEY)
-                .map(String::as_str)
-                == Some(desired_json.as_str())
+        let action = DeclarePromotionsAction {
+            promoted: promoted.to_vec(),
+            desired_json: desired_json.clone(),
+            legacy_json: legacy_json.clone(),
+            expected_version,
         };
-        if !property_matches {
+        if !action.properties_match(table.metadata().properties()) {
             // Record WHICH extraction rule will have written this table's
             // promoted values (#6769), in the same transaction as the
-            // declaration itself. A table that holds no promotion yet gets
-            // `declared`: the columns did not exist before this rule. A table
-            // that already holds one, declared by a binary that left no stamp,
-            // is adopted at the current sequence instead. Neither form proves
-            // a file's writer; qualification reads the file-name marker.
-            let stamp = match promotion_extraction_from(
-                props.get(PROMOTION_EXTRACTION_PROP).map(String::as_str),
-                expected_version,
-            ) {
-                Some(_) => None,
-                None if !props.contains_key(siglake_core::PROMOTED_PROPERTY_KEY)
-                    && !props.contains_key(siglake_core::PROMOTED_PROPERTY_V2_KEY) =>
-                {
-                    Some(promotion_declared_stamp(expected_version))
-                }
-                None => Some(promotion_adopted_stamp(
-                    expected_version,
-                    table.metadata().last_sequence_number(),
-                )),
-            };
+            // declaration itself. The retry-aware action revalidates immutable
+            // expression identity against every refreshed transaction base.
             let tx = Transaction::new(&table);
-            let mut update = tx.update_table_properties();
-            if let Some(legacy_json) = &legacy_json {
-                update = update
-                    .set(
-                        siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
-                        legacy_json.clone(),
-                    )
-                    .set(
-                        siglake_core::PROMOTED_PROPERTY_V2_KEY.to_string(),
-                        desired_json.clone(),
-                    );
-            } else {
-                update = update.set(
-                    siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
-                    desired_json.clone(),
-                );
-            }
-            if let Some(stamp) = stamp {
-                update = update.set(PROMOTION_EXTRACTION_PROP.to_string(), stamp);
-            }
-            let tx = update.apply(tx).context("set promoted property")?;
-            // Every query replica declares the SAME promotions on a tenant's
-            // first request (`for_namespace`), so N of them CAS the same
-            // catalog row at once and N−1 lose. `Transaction::commit` retries
-            // a lost CAS, but the budget is 4 retries: measured on the sqlite
-            // catalog, 8 replicas converge, 12 already exhaust it and the
-            // loser fails the tenant's first query with
+            let tx = action.apply(tx).context("set promoted property")?;
+            // Query replicas normally declare the SAME promotions on a
+            // tenant's first request (`for_namespace`), so N of them CAS the
+            // same catalog row at once and N−1 lose. `Transaction::commit`
+            // retries a lost CAS, but the budget is 4 retries: measured on the
+            // sqlite catalog, 8 replicas converge, 12 already exhaust it and
+            // the loser fails the tenant's first query with
             // `CatalogCommitConflicts`. Same doctrine as
             // `create_namespace_tolerating_existing`: the goal is the
-            // declaration's EXISTENCE, not our authorship of it, and every
-            // racer writes the identical value — so re-read and continue if
-            // the declaration is there.
+            // declaration's EXISTENCE, not our authorship of it, so re-read
+            // and continue if the identical declaration is there. A rollout
+            // racing a different expression is rejected by the action when it
+            // re-runs on the refreshed base.
             if let Err(err) = tx.commit(self.catalog().as_ref()).await {
                 let settled = self
                     .catalog()

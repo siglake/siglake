@@ -961,17 +961,20 @@ while `attr_get` returned the value (#6769).
 
 A composed lookup has a separate identity from a flat dotted key. Operators
 declare one with a JSON key chain, for example
-`--promote-attr '["aws.cloudwatch","log_stream"]:string:aws_cloudwatch_log_stream'`.
+`--promote-attr '["aws.cloudwatch","log_stream"]:string:aws_cloudwatch_composed_log_stream'`.
 That source materializes
 `attr_get(attr_get(attributes,'aws.cloudwatch'),'log_stream')`; it does not
 materialize `attr_get(attributes,'aws.cloudwatch.log_stream')`. Each outer step
 consumes and reparses the inner call's text, so an object-valued prefix and a
 string containing a JSON object both retain the UDF's behavior. The full source
 is stored in `siglake.promoted.v2`; `siglake.promoted.v1` remains a direct-only
-view for old writers. Files containing any composed promotion use extraction
-marker `x3`. A v2 writer can null-pad or mis-materialize the physical column,
-but its `x2` file cannot open the composed rewrite. Qualification still binds
-the rewrite map and provider to one snapshot (#6752).
+view for old writers. A promoted physical column's source expression and type
+are immutable: changing a direct key to a composed chain, changing a chain
+component, or changing the type under the same column name is refused. The new
+expression must use a distinct column name and field id. Files containing any
+composed promotion use extraction marker `x3`. An old writer can null-pad the
+new physical column, but its `x2` file cannot open the composed rewrite.
+Qualification still binds the rewrite map and provider to one snapshot (#6752).
 
 **A non-scalar value reads differently per mechanism, on purpose.** `attr_get`
 and a `Utf8` promotion of the same key both return an object's or array's

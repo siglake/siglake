@@ -867,7 +867,8 @@ enum Command {
         /// `attributes` JSON into its own typed column on write. Repeatable.
         /// Format `attr_key:type[:column]`, or exact composed lookup
         /// `["inner key","outer key"]:type[:column]`; type ∈
-        /// string|int|float|bool. E.g.
+        /// string|int|float|bool. A composed lookup cannot reuse an existing
+        /// flat promotion's column name. E.g.
         /// `--promote-attr http.status_code:int --promote-attr k8s.namespace:string`.
         /// The events table is widened additively at startup.
         #[arg(long = "promote-attr")]
