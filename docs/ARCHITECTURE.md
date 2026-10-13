@@ -357,6 +357,20 @@ consume its drain-watchdog interval, so the loop can still cancel a stalled
 merge. Each deferred admission waits the adaptive idle backoff before the next
 iteration and is not counted as a maintenance backpressure skip. Larger and
 unlimited processes retain drain/re-cluster overlap.
+The packaged compactor samples its own memory at the boundaries that distinguish
+the two kinds of work: every `compactor commit complete` event, every
+`page-bounded merge planned` event, and every
+`page-bounded merge chunk written` event carries
+`allocator_allocated_bytes`, `allocator_active_bytes`,
+`allocator_resident_bytes`, and `cgroup_memory_current_bytes`. The allocator
+values are jemalloc's epoch-refreshed `stats.allocated`, `stats.active`, and
+`stats.resident`; the cgroup value is the process's v2 `memory.current` or v1
+`memory.usage_in_bytes`. The same samples update
+`siglake_compactor_allocator_allocated_bytes`,
+`siglake_compactor_allocator_active_bytes`,
+`siglake_compactor_allocator_resident_bytes`, and
+`siglake_compactor_cgroup_memory_current_bytes`. This is observation only: the
+sampler does not purge jemalloc or change its decay settings.
 The drain keeps
 `SIGLAKE_DRAIN_CONCURRENCY` commits in flight
 *continuously* — topping up the moment one lands, re-listing `sealed/` as new
