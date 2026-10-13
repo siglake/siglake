@@ -341,8 +341,9 @@ merge concurrently. **Memory, not CPU, is the binding constraint**: each in-flig
 bin holds its own decoded working set (explicitly,
 `SIGLAKE_MERGE_CHUNK_ROWS` x `SIGLAKE_MERGE_CHUNK_PREFETCH` rows, plus its open
 row-group decoders). At the packaged 1Gi limit with no explicit row setting,
-the merge instead derives a row count that keeps estimated fetched input at or
-below 128 MiB; larger limits keep the 524,288-row default.
+the merge derives a row count targeting 128 MiB of estimated fetched input.
+The estimate uses mean footer width; skewed chunks and the 1,024-row minimum
+can exceed the target. Larger limits keep the 524,288-row default.
 
 **Measured: `binConcurrency: 4` peaked at 12.03 GiB (200G) and 14.44 GiB (1TB)
 of compaction-only RSS — roughly 3-3.4 GiB per bin, GROWING with corpus size.** An earlier ~650Mi/bin figure came

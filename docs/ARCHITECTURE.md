@@ -1148,10 +1148,11 @@ through 200 GB and 1 TB sustained-ingest rounds
   independent of fan-in — with zero intermediate write amplification, and
   near-disjoint inputs collapse to zero-copy slices (merges get cheaper as
   data ages). On a process capped at 1Gi, the implicit 524,288-row chunk is
-  also capped to 128 MiB of estimated decoded input. The estimate comes from
+  also reduced toward a 128 MiB estimated decoded-input target. The estimate comes from
   each bin's Parquet uncompressed footer bytes plus the measured 5/4
   Parquet-to-Arrow expansion; explicit `SIGLAKE_MERGE_CHUNK_ROWS` settings stay
-  row-based and authoritative. Larger processes keep the 524,288-row default.
+  row-based and authoritative. Mean-width estimates do not bound skewed chunks,
+  and the 1,024-row minimum can exceed the target. Larger processes keep the 524,288-row default.
   A re-cluster call writes ONE output partition — a streamed
   merge's writer stamps the bin's first partition value on everything it writes
   — so a bin spanning two partitions is refused, on every dispatch, rather than

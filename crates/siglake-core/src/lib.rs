@@ -43,8 +43,9 @@ pub struct AllocatorMemoryReadout {
 ///
 /// Crate test binaries use Rust's system allocator even though they link this
 /// crate and therefore jemalloc's control symbols. The first call compares a
-/// small allocation through Rust's global allocator with jemalloc's allocated
-/// byte count and caches whether they are the same allocator. Return `None`
+/// 4 MiB allocation through Rust's global allocator with jemalloc's allocated
+/// byte count. Only a positive result is cached; concurrent frees can mask
+/// the probe's growth, so a negative result is retried on the next call. Return `None`
 /// when they are not, so those binaries do not publish a plausible-looking
 /// sample from jemalloc's otherwise idle internal arena.
 pub fn allocator_memory_readout() -> Option<AllocatorMemoryReadout> {
@@ -71,30 +72,65 @@ pub fn allocator_memory_readout() -> Option<AllocatorMemoryReadout> {
 }
 
 fn jemalloc_is_global_allocator() -> bool {
-    const PROBE_BYTES: usize = 64 * 1024;
-    const MIN_REPORTED_GROWTH: usize = PROBE_BYTES / 2;
-    static IS_GLOBAL: OnceLock<bool> = OnceLock::new();
+    static IS_GLOBAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    positive_allocator_probe(&IS_GLOBAL, probe_jemalloc_global)
+}
 
-    *IS_GLOBAL.get_or_init(|| {
-        if tikv_jemalloc_ctl::epoch::advance().is_err() {
-            return false;
+fn positive_allocator_probe(
+    known_global: &std::sync::atomic::AtomicBool,
+    probe: impl FnOnce() -> bool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if known_global.load(Ordering::Relaxed) {
+        return true;
+    }
+    if !probe() {
+        return false;
+    }
+    known_global.store(true, Ordering::Relaxed);
+    true
+}
+
+fn probe_jemalloc_global() -> bool {
+    const PROBE_BYTES: usize = 4 * 1024 * 1024;
+    const MIN_REPORTED_GROWTH: usize = PROBE_BYTES / 2;
+    if tikv_jemalloc_ctl::epoch::advance().is_err() {
+        return false;
+    }
+    let Ok(before) = tikv_jemalloc_ctl::stats::allocated::read() else {
+        return false;
+    };
+    // allocated counts malloc's allocation, not touched resident pages. Avoid
+    // faulting pages merely to identify the allocator. Concurrent frees can
+    // still mask growth; the caller never caches a negative observation.
+    let probe = vec![0_u8; PROBE_BYTES];
+    std::hint::black_box(&probe);
+    if tikv_jemalloc_ctl::epoch::advance().is_err() {
+        return false;
+    }
+    let Ok(during) = tikv_jemalloc_ctl::stats::allocated::read() else {
+        return false;
+    };
+    during.saturating_sub(before) >= MIN_REPORTED_GROWTH
+}
+
+#[cfg(test)]
+mod allocator_probe_tests {
+    #[test]
+    fn negative_probe_is_retried_and_positive_is_cached() {
+        let known = std::sync::atomic::AtomicBool::new(false);
+        let mut probes = 0;
+        for (answer, expected) in [(false, false), (false, false), (true, true), (true, true)] {
+            assert_eq!(
+                super::positive_allocator_probe(&known, || {
+                    probes += 1;
+                    answer
+                }),
+                expected
+            );
         }
-        let Ok(before) = tikv_jemalloc_ctl::stats::allocated::read() else {
-            return false;
-        };
-        let mut probe = vec![0_u8; PROBE_BYTES];
-        for (page, bytes) in probe.chunks_mut(4096).enumerate() {
-            bytes[0] = (page as u8).wrapping_add(1);
-        }
-        std::hint::black_box(&probe);
-        if tikv_jemalloc_ctl::epoch::advance().is_err() {
-            return false;
-        }
-        let Ok(during) = tikv_jemalloc_ctl::stats::allocated::read() else {
-            return false;
-        };
-        during.saturating_sub(before) >= MIN_REPORTED_GROWTH
-    })
+        assert_eq!(probes, 3);
+    }
 }
 
 fn cgroup_memory_current_bytes() -> Option<u64> {

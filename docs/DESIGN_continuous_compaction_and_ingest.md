@@ -147,8 +147,10 @@ Coexistence without starving the commit path:
   that page-bounded merge with a real 30,000-row WAL drain behind the packaged
   decoded-work permit, and reads every committed value back. It observed
   271,777,792 bytes RSS before the raced operations and 862,609,408 bytes at
-  peak, below the 1Gi limit, with exact timestamp, field, NULL, duplicate and
-  omission checks passing.
+  peak in a system-allocator test binary, below 1Gi, with exact timestamp, field, NULL, duplicate and
+  omission checks passing. Shipped jemalloc retention and full-field merge-plan
+  residency remain unqualified by this test; the mean-width estimate and
+  1,024-row floor do not establish a hard byte ceiling.
 - **Backpressure-aware sharing.** A shared signal from the WAL queue depth
   (`siglake_ingest_backpressure_*`, already exported): if drain falls behind (WAL
   growing), compaction throttles (fewer concurrent merges) to yield IO; if L0 piles

@@ -1770,12 +1770,16 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   invalidated that small regression as sufficient: both arms OOM-killed again,
   with 18 / 22 inputs and 3.84M / 4.27M rows planned at 524,288 rows per fetched
   chunk. The recovered row64 files measure 408.8 footer-uncompressed B/row and
-  494.2 decoded Arrow B/row. At 1Gi, the implicit chunk is now capped to 128 MiB
+  494.2 decoded Arrow B/row. At 1Gi, the implicit chunk now targets 128 MiB
   using the actual footer width plus a measured 5/4 format-expansion allowance;
-  the A8 width resolves to 262,144 rows. A production-path regression writes 18
+  the A8 width resolves to 262,144 rows. This mean-width estimate is not a hard
+  memory ceiling: skewed chunks and the 1,024-row minimum can exceed the target.
+  A production-path regression writes 18
   wide files / 540,000 merge rows, races it with a real 30,000-row WAL drain
   behind the packaged permit, and observed 271,777,792 bytes RSS before the
-  operations and 862,609,408 bytes at peak. It then proved every exact
+  operations and 862,609,408 bytes at peak in a system-allocator test binary.
+  This does not qualify shipped jemalloc retention or full merge-plan residency.
+  It then proved every exact
   timestamp, field, NULL, duplicate and omission result. It is not the full
   shipped field workload: fresh 1Gi qualification on the retained canonical
   field remains required before claiming the OOM is resolved. One oversized

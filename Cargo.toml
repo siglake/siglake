@@ -171,6 +171,8 @@ metrics-exporter-prometheus = { version = "0.17", default-features = false }
 pprof = { version = "0.15", default-features = false, features = ["protobuf-codec", "frame-pointer"] }
 # Version-locked to the `tikv-jemallocator` the two binaries already declare a
 # global allocator with; the ctl crate talks to that same embedded jemalloc.
+# Enabling stats changes both shipped binaries from --disable-stats to
+# --enable-stats, adding allocator accounting and making stats.* readable.
 tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }
 # `default = ["rt"]`, which is the RuntimeMonitor we want.
 tokio-metrics = "0.5"

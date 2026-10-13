@@ -1142,6 +1142,24 @@ mod allocator_memory_readout_tests {
     const MIB: usize = 1024 * 1024;
 
     #[test]
+    #[ignore = "allocator churn probe must run alone"]
+    fn jemalloc_readout_survives_concurrent_allocator_churn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                let allocation = vec![0_u8; MIB];
+                std::hint::black_box(&allocation);
+            }
+        });
+        let present = (0..1_000).all(|_| siglake_core::allocator_memory_readout().is_some());
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        assert!(present, "readout disappeared during allocator churn");
+    }
+
+    #[test]
     fn jemalloc_readout_tracks_a_touched_large_allocation() {
         let before = siglake_core::allocator_memory_readout()
             .expect("siglake-cli tests use jemalloc as the global allocator");

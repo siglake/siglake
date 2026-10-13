@@ -20713,8 +20713,9 @@ impl IcebergContext {
     /// uncompressed width. A page-bounded chunk coexists with the writer's open
     /// row group (256 MiB by default) and the Parquet encoder's allocations.
     /// The packaged 1 GiB profile therefore gives fetched input the same 1/8
-    /// decoded-memory share as WAL admission: 128 MiB. This is a byte ceiling,
-    /// translated to rows from the actual input footers, so narrow inputs keep
+    /// decoded-memory share as WAL admission: 128 MiB. This is an estimated byte target,
+    /// translated from the mean input footer width; skewed chunks or the 1024-row
+    /// minimum can exceed it. Narrow inputs keep
     /// the historical 524,288 rows while the retained A8-width input does not.
     fn merge_chunk_rows_for_input(
         explicit_rows: Option<usize>,
@@ -33268,10 +33269,19 @@ mod streaming_recluster_tests {
         );
         let (paged, paged_rows) = {
             use tracing::instrument::WithSubscriber;
-            ice.merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 1, Some(4), None, None, None)
-                .with_subscriber(subscriber)
-                .await
-                .unwrap()
+            ice.merge_files_page_bounded(
+                &table,
+                &files,
+                BLOOM_FILTER_COLUMNS,
+                1,
+                Some(4),
+                None,
+                None,
+                None,
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap()
         };
 
         assert_eq!(streamed_rows, 25);
