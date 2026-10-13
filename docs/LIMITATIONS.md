@@ -1598,6 +1598,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   [`DESIGN_auto_promotion_qualification.md`](DESIGN_auto_promotion_qualification.md):
   a threshold floor of 1% of the sample, a hard ceiling of 64 promoted columns
   per table, a sample bounded in files × rows, and a 4096-key census cap.
+  The census flattens one object level only when the parent key contains no
+  dot. A literal dotted parent such as `"aws.cloudwatch"` stays residual: its
+  child leaves are reported as `dotted_parent` declines because the v2
+  extractor cannot address the synthesized `aws.cloudwatch.log_stream` path.
+  Auto-promotion does not promote the parent object as a `Utf8` column.
   Leaving it off is still the shipped answer — qualifying the bounds is not a
   decision to turn it on.
 - **Promoted columns written before 0.3.0 lose their speedup until the files

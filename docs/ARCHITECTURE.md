@@ -986,10 +986,13 @@ that cleared the frequency bar in `siglake_auto_promotion_candidates`; the
 availability sibling is zero when the feature is disabled or the table is
 already at its cap, because those paths preserve the no-sampling boundary and
 have no candidate verdict. Successful sampling passes also publish per-table
-read, byte and duration attribution, and committed promotion-backfill bins
-publish rewritten files, input/output bytes and duration. The structured INFO
-line names a bounded set of keys refused for the cap, a schema-name collision
-or mixed sampled types and reports how many names were truncated.
+read, byte and duration attribution. Declines are counted by reason in
+`siglake_auto_promotion_declined_total`, including leaves under a literal
+dotted parent that the extractor cannot address by their synthesized path.
+Committed promotion-backfill bins publish rewritten files, input/output bytes
+and duration. The structured INFO line names a bounded set of keys refused for
+the cap, a dotted parent, a schema-name collision or mixed sampled types and
+reports how many names were truncated.
 Streaming backfill re-clusters align each decoded batch to the table schema,
 re-extract every promoted value from `attributes`, and align once more before
 the writer. The second alignment is required for managed indexes: extraction

@@ -8286,6 +8286,8 @@ const MAX_SAMPLED_KEYS: usize = 4096;
 struct SampledKeys {
     rows: usize,
     keys: std::collections::HashMap<String, (usize, Option<SampledKind>)>,
+    declined: std::collections::HashMap<String, (usize, AutoPromotionDeclineReason)>,
+    tracked_keys: usize,
     dropped_keys: usize,
     cap: usize,
 }
@@ -8295,15 +8297,18 @@ impl SampledKeys {
         Self {
             rows: 0,
             keys: std::collections::HashMap::new(),
+            declined: std::collections::HashMap::new(),
+            tracked_keys: 0,
             dropped_keys: 0,
             cap: cap.max(1),
         }
     }
 
     /// Record one sampled row. `attributes` is its residual JSON, or `None`
-    /// for a null cell. OTLP residuals hold nested objects; their scalar
-    /// LEAVES are the promotable units, addressed by dotted key (one level —
-    /// deeper nesting stays residual).
+    /// for a null cell. OTLP residuals hold nested objects; scalar leaves under
+    /// an undotted parent are addressed by dotted key (one level — deeper
+    /// nesting stays residual). Leaves under a literal dotted parent are
+    /// counted as declines because the synthesized path cannot address them.
     fn observe_row(&mut self, attributes: Option<&str>) {
         self.rows += 1;
         let Some(json) = attributes else {
@@ -8317,7 +8322,12 @@ impl SampledKeys {
             match value {
                 serde_json::Value::Object(inner) => {
                     for (sub, sub_value) in inner {
-                        self.hit(format!("{key}.{sub}"), sub_value);
+                        let leaf = format!("{key}.{sub}");
+                        if key.contains('.') {
+                            self.decline(leaf, AutoPromotionDeclineReason::DottedParent);
+                        } else {
+                            self.hit(leaf, sub_value);
+                        }
                     }
                 }
                 _ => self.hit(key.clone(), value),
@@ -8332,10 +8342,31 @@ impl SampledKeys {
         if let Some(slot) = self.keys.get_mut(&key) {
             slot.0 += 1;
             slot.1 = merge_sampled_kind(slot.1, value);
-        } else if self.keys.len() >= self.cap {
+        } else if !self.declined.contains_key(&key) && self.tracked_keys >= self.cap {
             self.dropped_keys += 1;
         } else {
+            if !self.declined.contains_key(&key) {
+                self.tracked_keys += 1;
+            }
             self.keys.insert(key, (1, merge_sampled_kind(None, value)));
+        }
+    }
+
+    /// Retain a leaf which cleared the JSON walk but cannot be addressed by
+    /// the extraction rule. It is kept apart from ordinary nested leaves so a
+    /// literal dotted parent never manufactures a promotable path.
+    fn decline(&mut self, key: String, reason: AutoPromotionDeclineReason) {
+        if let Some(slot) = self.declined.get_mut(&key) {
+            slot.0 += 1;
+            return;
+        }
+        if !self.keys.contains_key(&key) && self.tracked_keys >= self.cap {
+            self.dropped_keys += 1;
+        } else {
+            if !self.keys.contains_key(&key) {
+                self.tracked_keys += 1;
+            }
+            self.declined.insert(key, (1, reason));
         }
     }
 }
@@ -8364,6 +8395,7 @@ fn threshold_is_off(min_fraction: f64) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoPromotionDeclineReason {
     ColumnCeiling,
+    DottedParent,
     NameCollision,
     MixedType,
 }
@@ -8372,6 +8404,7 @@ impl AutoPromotionDeclineReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ColumnCeiling => "ceiling",
+            Self::DottedParent => "dotted_parent",
             Self::NameCollision => "name_collision",
             Self::MixedType => "mixed_type",
         }
@@ -8387,7 +8420,8 @@ pub struct AutoPromotionDecline {
 #[derive(Debug, Clone)]
 struct PromotionSelection {
     /// Unpromoted keys whose sampled frequency cleared the configured bar.
-    /// This includes keys later refused for type, name, or capacity.
+    /// This includes keys later refused for a dotted parent, type, name, or
+    /// capacity.
     candidates: usize,
     promoted: Vec<siglake_core::PromotedColumn>,
     declined: Vec<AutoPromotionDecline>,
@@ -8426,6 +8460,13 @@ fn select_promotions(
     }
     let already: std::collections::HashSet<&str> =
         existing.iter().map(|c| c.attr_key.as_str()).collect();
+    let dotted_parent_declines = census.declined.iter().filter_map(|(key, (rows, reason))| {
+        (!already.contains(key.as_str()) && (*rows as f64) / (census.rows as f64) >= min_fraction)
+            .then_some(AutoPromotionDecline {
+                attr_key: key.clone(),
+                reason: *reason,
+            })
+    });
     let mut candidates: Vec<(&str, usize, Option<siglake_core::PromotedType>)> = census
         .keys
         .iter()
@@ -8445,8 +8486,17 @@ fn select_promotions(
     let mut taken: std::collections::HashSet<String> =
         existing.iter().map(|c| c.name.clone()).collect();
     let mut promoted_now = Vec::new();
-    let candidate_count = candidates.len();
-    let mut declined = Vec::new();
+    let mut declined = dotted_parent_declines.collect::<Vec<_>>();
+    declined.sort_by(|a, b| a.attr_key.cmp(&b.attr_key));
+    let eligible_keys = candidates
+        .iter()
+        .map(|(key, _, _)| *key)
+        .collect::<std::collections::HashSet<_>>();
+    let candidate_count = candidates.len()
+        + declined
+            .iter()
+            .filter(|item| !eligible_keys.contains(item.attr_key.as_str()))
+            .count();
     for (key, _, ty) in candidates {
         let Some(ty) = ty else {
             declined.push(AutoPromotionDecline {
@@ -8673,6 +8723,70 @@ mod auto_promotion_sampling_tests {
             "a nested object leaf is not a scalar"
         );
         assert!(!deep.keys.contains_key("a.b.c"));
+    }
+
+    #[test]
+    fn dotted_parent_leaves_are_declined_without_hiding_safe_nested_leaves() {
+        let c = census(&[
+            Some(r#"{"aws.cloudwatch":{"log_stream":"s","log_group":"g"}}"#),
+            Some(r#"{"http":{"status":500}}"#),
+        ]);
+        let selection = select_promotions(&c, &[], 0.5, 16, &no_schema_collision);
+        assert_eq!(
+            selection
+                .promoted
+                .iter()
+                .map(|column| column.attr_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["http.status"]
+        );
+        assert_eq!(
+            selection
+                .declined
+                .iter()
+                .map(|item| (item.attr_key.as_str(), item.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "aws.cloudwatch.log_group",
+                    AutoPromotionDeclineReason::DottedParent,
+                ),
+                (
+                    "aws.cloudwatch.log_stream",
+                    AutoPromotionDeclineReason::DottedParent,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_selected_promotion_extracts_a_non_null_sampled_cell() {
+        let attributes = [
+            r#"{"http":{"status":500},"a":{"b.c":1},"service":"api","ratio":1.5,"ok":true,"aws.cloudwatch":{"log_stream":"s"}}"#,
+            r#"{"http":{"status":200},"a":{"b.c":2},"service":"worker","ratio":2,"ok":false}"#,
+        ];
+        let rows = attributes.iter().copied().map(Some).collect::<Vec<_>>();
+        let selection = select_promotions(&census(&rows), &[], 0.5, 16, &no_schema_collision);
+        assert!(!selection.promoted.is_empty());
+
+        let events = attributes
+            .iter()
+            .enumerate()
+            .map(|(row, attributes)| {
+                siglake_core::Event::now(format!("row-{row}"))
+                    .with_attributes(Some((*attributes).to_string()))
+            })
+            .collect::<Vec<_>>();
+        let batch = siglake_core::events_to_record_batch(&events).unwrap();
+        let promoted = siglake_core::promote_attributes(&batch, &selection.promoted).unwrap();
+        for column in &selection.promoted {
+            let values = promoted.column_by_name(&column.name).unwrap();
+            assert!(
+                values.null_count() < values.len(),
+                "selected promotion {} extracted only NULL cells",
+                column.attr_key
+            );
+        }
     }
 
     #[test]
@@ -16505,7 +16619,7 @@ impl IcebergContext {
         if census.dropped_keys > 0 {
             tracing::warn!(
                 table = %table_ident,
-                tracked = census.keys.len(),
+                tracked = census.tracked_keys,
                 dropped = census.dropped_keys,
                 "auto-promotion: attribute key census truncated; a dropped key was seen too rarely to promote"
             );
