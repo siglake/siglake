@@ -267,8 +267,20 @@ fn print_crd_yaml() -> Result<()> {
     use kube::CustomResourceExt;
     let crd_doc = SiglakeCluster::crd();
     let y = serde_saphyr::to_string(&crd_doc).context("serialize CRD to YAML")?;
-    println!("{y}");
+    print!("{}", without_trailing_whitespace(&y));
     Ok(())
+}
+
+fn without_trailing_whitespace(yaml: &str) -> String {
+    let mut clean = yaml
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if yaml.ends_with('\n') {
+        clean.push('\n');
+    }
+    clean
 }
 
 #[cfg(test)]

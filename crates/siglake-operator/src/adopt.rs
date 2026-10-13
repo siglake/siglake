@@ -44,7 +44,8 @@ impl AdoptionReport {
         out.push_str("# --- synthesized SiglakeCluster: this whole output is one manifest ---\n");
         out.push_str("# Save it (cluster.yaml) and apply it at step 5; every line below the\n");
         out.push_str("# resource is a comment, so `kubectl apply -f` reads only the resource.\n");
-        out.push_str(&serde_saphyr::to_string(&self.cluster).context("serialize SiglakeCluster")?);
+        let cluster = serde_saphyr::to_string(&self.cluster).context("serialize SiglakeCluster")?;
+        out.push_str(&without_trailing_whitespace(&cluster));
         if self.findings.is_empty() {
             out.push_str("# preflight: no findings — proceed to the runbook\n");
         } else {
@@ -58,6 +59,18 @@ impl AdoptionReport {
         out.push('\n');
         Ok(out)
     }
+}
+
+fn without_trailing_whitespace(yaml: &str) -> String {
+    let mut clean = yaml
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if yaml.ends_with('\n') {
+        clean.push('\n');
+    }
+    clean
 }
 
 /// The namespace the handover targets: `--adopt-namespace` when it carries

@@ -332,7 +332,7 @@ fn is_lease_alive(
     lease_seconds: i32,
 ) -> bool {
     match renew_time {
-        Some(r) => now.as_second() - r.as_second() < i64::from(lease_seconds),
+        Some(r) => now.duration_since(r).as_secs() < i64::from(lease_seconds),
         None => false,
     }
 }
