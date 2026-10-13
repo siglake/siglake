@@ -630,6 +630,35 @@ async fn wait_after_deferred_drain(
     true
 }
 
+fn log_compactor_commit_complete(segments: usize) {
+    let memory = siglake_core::allocator_memory_readout();
+    let allocator_allocated_bytes = memory.map(|value| value.allocated_bytes);
+    let allocator_active_bytes = memory.map(|value| value.active_bytes);
+    let allocator_resident_bytes = memory.map(|value| value.resident_bytes);
+    let cgroup_memory_current_bytes = memory.and_then(|value| value.cgroup_memory_current_bytes);
+    tracing::info!(
+        segments,
+        allocator_allocated_bytes = ?allocator_allocated_bytes,
+        allocator_active_bytes = ?allocator_active_bytes,
+        allocator_resident_bytes = ?allocator_resident_bytes,
+        cgroup_memory_current_bytes = ?cgroup_memory_current_bytes,
+        "compactor commit complete"
+    );
+}
+
+#[cfg(test)]
+mod allocator_readout_tests {
+    #[test]
+    fn commit_log_accepts_a_non_jemalloc_process() {
+        let readout = siglake_core::allocator_memory_readout();
+        assert!(
+            readout.is_none(),
+            "the compactor crate test binary uses the system allocator: {readout:?}"
+        );
+        super::log_compactor_commit_complete(1);
+    }
+}
+
 /// Records elapsed time into `name` on drop.
 ///
 /// Needed because the blocks being timed exit through `continue` and match arms,
@@ -4096,7 +4125,7 @@ impl Compactor {
             }
             if n > 0 {
                 idle_backoff = idle_backoff_base;
-                tracing::info!(segments = n, "compactor commit complete");
+                log_compactor_commit_complete(n);
                 // Ingest active — abandon any in-progress idle drain burst.
                 draining = false;
                 drain_passes = 0;

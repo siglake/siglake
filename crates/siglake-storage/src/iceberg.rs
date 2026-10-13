@@ -21318,6 +21318,12 @@ impl IcebergContext {
             .increment(census.copyable_row_groups as u64);
         metrics::counter!("siglake_compactor_merge_rows_copyable_total")
             .increment(census.copyable_rows as u64);
+        let memory = siglake_core::allocator_memory_readout();
+        let allocator_allocated_bytes = memory.map(|value| value.allocated_bytes);
+        let allocator_active_bytes = memory.map(|value| value.active_bytes);
+        let allocator_resident_bytes = memory.map(|value| value.resident_bytes);
+        let cgroup_memory_current_bytes =
+            memory.and_then(|value| value.cgroup_memory_current_bytes);
         tracing::debug!(
             inputs = files.len(),
             rows = total_rows,
@@ -21327,6 +21333,10 @@ impl IcebergContext {
             row_groups = census.total_row_groups,
             copyable_row_groups = census.copyable_row_groups,
             copyable_rows = census.copyable_rows,
+            allocator_allocated_bytes = ?allocator_allocated_bytes,
+            allocator_active_bytes = ?allocator_active_bytes,
+            allocator_resident_bytes = ?allocator_resident_bytes,
+            cgroup_memory_current_bytes = ?cgroup_memory_current_bytes,
             "page-bounded merge planned"
         );
 
@@ -21592,6 +21602,23 @@ impl IcebergContext {
             stages.write += chunk_write_nanos;
             stages.assemble +=
                 (t_assemble.elapsed().as_nanos() as u64).saturating_sub(chunk_write_nanos);
+
+            let memory = siglake_core::allocator_memory_readout();
+            let allocator_allocated_bytes = memory.map(|value| value.allocated_bytes);
+            let allocator_active_bytes = memory.map(|value| value.active_bytes);
+            let allocator_resident_bytes = memory.map(|value| value.resident_bytes);
+            let cgroup_memory_current_bytes =
+                memory.and_then(|value| value.cgroup_memory_current_bytes);
+            tracing::debug!(
+                chunk = ci + 1,
+                chunks = chunks.len(),
+                rows = chunk.iter().map(|run| run.row_count).sum::<usize>(),
+                allocator_allocated_bytes = ?allocator_allocated_bytes,
+                allocator_active_bytes = ?allocator_active_bytes,
+                allocator_resident_bytes = ?allocator_resident_bytes,
+                cgroup_memory_current_bytes = ?cgroup_memory_current_bytes,
+                "page-bounded merge chunk written"
+            );
 
             // The depth includes the chunk just consumed. Refill only after
             // its decoded input is released. Refilling immediately after
@@ -32936,6 +32963,28 @@ mod streaming_recluster_tests {
     use chrono::TimeZone;
     use siglake_core::Event;
 
+    #[derive(Clone)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     fn ev(secs: i64) -> Event {
         Event {
             timestamp: chrono::Utc.timestamp_opt(secs, 0).single().unwrap(),
@@ -33095,12 +33144,40 @@ mod streaming_recluster_tests {
             .merge_file_slice_streaming(&table, &files, BLOOM_FILTER_COLUMNS, true, 1, None)
             .await
             .unwrap();
-        let (paged, paged_rows) = ice
-            .merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 1, 4, None, None)
-            .await
-            .unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new("siglake_storage=debug"))
+                .with_ansi(false)
+                .with_writer(CapturedLog(captured.clone()))
+                .finish(),
+        );
+        let (paged, paged_rows) = {
+            use tracing::instrument::WithSubscriber;
+            ice.merge_files_page_bounded(&table, &files, BLOOM_FILTER_COLUMNS, 1, 4, None, None)
+                .with_subscriber(subscriber)
+                .await
+                .unwrap()
+        };
         assert_eq!(streamed_rows, 25);
         assert_eq!(paged_rows, 25);
+
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        let planned = log
+            .lines()
+            .find(|line| line.contains("page-bounded merge planned"))
+            .unwrap_or_else(|| panic!("page-bounded plan event missing from {log:?}"));
+        for field in [
+            "allocator_allocated_bytes",
+            "allocator_active_bytes",
+            "allocator_resident_bytes",
+            "cgroup_memory_current_bytes",
+        ] {
+            assert!(
+                planned.contains(field),
+                "{field} missing from page-bounded plan event {planned:?}"
+            );
+        }
 
         let expected = read_back_rows(&table, &streamed).await;
         let got = read_back_rows(&table, &paged).await;
