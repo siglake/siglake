@@ -357,6 +357,20 @@ consume its drain-watchdog interval, so the loop can still cancel a stalled
 merge. Each deferred admission waits the adaptive idle backoff before the next
 iteration and is not counted as a maintenance backpressure skip. Larger and
 unlimited processes retain drain/re-cluster overlap.
+The packaged compactor samples its own memory at the boundaries that distinguish
+the two kinds of work: every `compactor commit complete` event, every
+`page-bounded merge planned` event, and every
+`page-bounded merge chunk written` event carries
+`allocator_allocated_bytes`, `allocator_active_bytes`,
+`allocator_resident_bytes`, and `cgroup_memory_current_bytes`. The allocator
+values are jemalloc's epoch-refreshed `stats.allocated`, `stats.active`, and
+`stats.resident`; the cgroup value is the process's v2 `memory.current` or v1
+`memory.usage_in_bytes`. The same samples update
+`siglake_compactor_allocator_allocated_bytes`,
+`siglake_compactor_allocator_active_bytes`,
+`siglake_compactor_allocator_resident_bytes`, and
+`siglake_compactor_cgroup_memory_current_bytes`. This is observation only: the
+sampler does not purge jemalloc or change its decay settings.
 The drain keeps
 `SIGLAKE_DRAIN_CONCURRENCY` commits in flight
 *continuously* — topping up the moment one lands, re-listing `sealed/` as new
@@ -1140,7 +1154,13 @@ through 200 GB and 1 TB sustained-ingest rounds
   reads against cached metadata), so decoded memory is bounded by the chunk —
   independent of fan-in — with zero intermediate write amplification, and
   near-disjoint inputs collapse to zero-copy slices (merges get cheaper as
-  data ages). A re-cluster call writes ONE output partition — a streamed
+  data ages). On a process capped at 1Gi, the implicit 524,288-row chunk is
+  also reduced toward a 128 MiB estimated decoded-input target. The estimate comes from
+  each bin's Parquet uncompressed footer bytes plus the measured 5/4
+  Parquet-to-Arrow expansion; explicit `SIGLAKE_MERGE_CHUNK_ROWS` settings stay
+  row-based and authoritative. Mean-width estimates do not bound skewed chunks,
+  and the 1,024-row minimum can exceed the target. Larger processes keep the 524,288-row default.
+  A re-cluster call writes ONE output partition — a streamed
   merge's writer stamps the bin's first partition value on everything it writes
   — so a bin spanning two partitions is refused, on every dispatch, rather than
   committed under a partition value that hides its rows from a predicated
@@ -1451,12 +1471,16 @@ file, and a residual `FilterExec` above the scan that DataFusion cannot push a
 limit through. Every partition therefore believes it owes its whole file, and on
 a fully compacted table they all open at once and decode their first megabytes
 before the global limit can cancel them. The scan instead admits partitions in
-widening waves: one to start, doubling each time the admitted partitions have
-produced their own number of batches or ends. Scheduling only — a partition that
-waits still reads every row it would have read, and the limit still lives above
-the residual filter, so no qualifying row can be lost. Scoped to the shape whose
-rows the limit clips one for one (the same test that gates the index decline
-above), so ordered drains and aggregates are untouched. Observable via
+widening waves: one to start, doubling when cumulative credits reach the
+admitted width. An exhausted partition pays immediately; raw source batches pay
+one credit per eight batches because the residual predicate above the scan may
+need several batches to make the final result row. This keeps a common clipped
+predicate on its first partition while a sparse 15-partition scan still reaches
+full fan-out after 64 batches. Scheduling only — a partition that waits still
+reads every row it would have read, and the limit still lives above the residual
+filter, so no qualifying row can be lost. Scoped to the shape whose rows the
+limit clips one for one (the same test that gates the index decline above), so
+ordered drains and aggregates are untouched. Observable via
 `siglake_query_scan_clipped_admission_total{outcome}` and
 `siglake_query_scan_clipped_admission_wait_seconds`; `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE=0`
 turns it off. Measured in

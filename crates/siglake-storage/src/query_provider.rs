@@ -52,11 +52,18 @@ const DEFAULT_ORDERED_DRAIN_BUFFER_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_ORDERED_MERGE_GLOBAL_FANIN: usize = 32;
 const MIN_AGGREGATE_READER_BUDGET: usize = 2;
 /// #4865: how fast the clipped-limit admission ramp opens. See
-/// [`ScanAdmission`]; `2` doubles the admitted partition count on every batch
-/// the scan emits and on every partition that ends, so a scan reaches full
-/// fan-out in `log2(partitions)` steps and a `LIMIT` answered by the first
-/// batch never opens more than two partitions.
+/// [`ScanAdmission`]; `2` doubles the admitted partition count whenever the
+/// paced batch/terminal credits reach the current width.
 const DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE: usize = 2;
+/// Raw source batches required to pay one clipped-admission credit.
+///
+/// The original ramp paid on every batch and therefore reached all 15
+/// partitions after eight batches. The retained 50G text scans still needed
+/// only four batches' worth of source rows to fill `LIMIT 100`, but by then
+/// the pumps had decoded 154k--445k rows. Holding each credit for eight batches
+/// keeps that common case on the first partition while a sparse scan still
+/// reaches full fan-out after 64 batches, far short of one 7M-row file.
+const SCAN_CLIPPED_ADMISSION_BATCHES_PER_CREDIT: usize = 8;
 
 fn ordered_drain_buffer_bytes() -> u64 {
     ordered_drain_buffer_bytes_from(
@@ -4950,19 +4957,16 @@ impl ScanPartitionTracker {
 /// Admission: a partition takes a ticket when it is executed and runs once
 /// `admitted` passes its ticket. `admitted` starts at 1 and multiplies by
 /// `wave` (default 2) each time the cumulative CREDITS reach the admitted width
-/// — one credit per batch the scan emits and one per partition that ends.
-/// Charging the width rather than every batch is what keeps the first wave
-/// narrow: a limit answered out of the first batch leaves the ramp at `wave`,
-/// where widening per batch would already have reached `wave^3` by the time the
-/// root stream closed (measured on the local fixture: 4 files opened against
-/// 2).
+/// — one credit per eight source batches and one per partition that ends.
+/// The eight-batch pace is the bound the retained 50G failure exposed: paying
+/// every batch opened all 15 partitions after eight batches, before a common
+/// text predicate filled `LIMIT 100`, and the pumps decoded up to 445,440 rows.
 ///
-///   * A limit answered out of the first batch therefore opens `wave`
-///     partitions, which is the case this exists for.
+///   * A limit answered before the eighth source batch therefore opens only the
+///     first partition, which is the case this exists for.
 ///   * A sparse term, or a term with too few matches, reaches full fan-out
-///     after `partitions / wave` credits — 8 batches on the 15-file layout,
-///     against the 430 batches one of its files holds — which is the case this
-///     must not slow down.
+///     after 64 batches on the 15-file layout, still far short of one 7M-row
+///     file — which is the case this must not stall.
 ///
 /// Liveness, since a gated partition returns `Pending` to a pump that may be
 /// the only one running: every terminal event pays a credit. If tickets are
@@ -4981,6 +4985,10 @@ struct ScanAdmission {
     admitted: std::sync::atomic::AtomicUsize,
     /// Credits paid by the current wave; widens and resets at `admitted`.
     credits: std::sync::atomic::AtomicUsize,
+    /// Source batches seen across admitted partitions. Only every
+    /// [`SCAN_CLIPPED_ADMISSION_BATCHES_PER_CREDIT`]th batch pays a credit;
+    /// terminal events still pay immediately for liveness.
+    batches: std::sync::atomic::AtomicUsize,
     partitions: usize,
     wave: usize,
     notify: tokio::sync::Notify,
@@ -4992,6 +5000,7 @@ impl ScanAdmission {
             next_ticket: std::sync::atomic::AtomicUsize::new(0),
             admitted: std::sync::atomic::AtomicUsize::new(1),
             credits: std::sync::atomic::AtomicUsize::new(0),
+            batches: std::sync::atomic::AtomicUsize::new(0),
             partitions: partitions.max(1),
             wave: wave.max(2),
             notify: tokio::sync::Notify::new(),
@@ -5035,6 +5044,26 @@ impl ScanAdmission {
             AcqRel,
         );
         self.notify.notify_waiters();
+    }
+
+    /// Account one raw source batch, paying a ramp credit only at the bounded
+    /// batch quantum. The residual predicate lives above this stream, so one
+    /// source batch is not evidence that the clipped limit still needs another
+    /// partition: common predicates need several batches to produce the final
+    /// `LIMIT` row. Terminal events bypass this pacing through [`Self::advance`]
+    /// so an empty or exhausted partition cannot stall the scan.
+    fn advance_after_batch(&self) {
+        if self.admitted.load(std::sync::atomic::Ordering::Acquire) >= self.partitions {
+            return;
+        }
+        if (self
+            .batches
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1)
+        .is_multiple_of(SCAN_CLIPPED_ADMISSION_BATCHES_PER_CREDIT)
+        {
+            self.advance();
+        }
     }
 
     /// Resolves once `ticket` may run.
@@ -5419,11 +5448,12 @@ impl Stream for SourceMetricsStream {
         let poll = self.inner.as_mut().poll_next(cx);
         match &poll {
             Poll::Ready(Some(Ok(batch))) => {
-                // A batch means the consumer is still asking for rows, so the
-                // limit above the residual filter is not yet met: widen the
-                // ramp by one wave.
+                // The consumer still wants rows, but the residual filter above
+                // this stream may need several source batches to make the last
+                // LIMIT row. Pace the ramp instead of treating every raw batch
+                // as a reason to open another wave.
                 if let AdmissionGate::Admitted(admission) = &self.gate {
-                    admission.advance();
+                    admission.advance_after_batch();
                 }
                 let now = Instant::now();
                 if self.first_batch_at.is_none() {
@@ -9669,10 +9699,9 @@ mod tests {
         }
     }
 
-    /// The ramp itself: ticket 0 runs at once, the rest wait, and the admitted
-    /// count doubles each time the cumulative credits reach it — at 1, 2, 4 and
-    /// 8. Eight credits open all fifteen partitions; one credit opens two,
-    /// which is the whole point.
+    /// Terminal credits keep the ramp live: ticket 0 runs at once, the rest
+    /// wait, and the admitted count doubles when cumulative credits reach 1,
+    /// 2, 4 and 8. Eight exhausted partitions open all fifteen.
     #[test]
     fn the_admission_ramp_widens_one_wave_at_a_time() {
         let admission = ScanAdmission::new(15, 2);
@@ -9697,6 +9726,40 @@ mod tests {
             let open = (0..15).filter(|t| admission.is_admitted(*t)).count();
             assert_eq!(open, expected, "after {credits} credits");
         }
+    }
+
+    /// #6721: raw source batches are not residual matches. The retained 15-file
+    /// failure reached full fan-out after eight raw batches and then decoded up
+    /// to 445,440 rows for `LIMIT 100`. The paced path must hold the second
+    /// ticket until the eighth batch and require 64 batches to open all 15;
+    /// terminal credits above remain immediate for empty/exhausted partitions.
+    #[test]
+    fn clipped_batches_are_paced_before_the_ramp_widens() {
+        let admission = ScanAdmission::new(15, 2);
+        for batches in 1..SCAN_CLIPPED_ADMISSION_BATCHES_PER_CREDIT {
+            admission.advance_after_batch();
+            assert!(
+                !admission.is_admitted(1),
+                "batch {batches} must leave the scan on its first partition"
+            );
+        }
+        admission.advance_after_batch();
+        assert!(admission.is_admitted(1), "batch 8 admits the second ticket");
+        assert!(!admission.is_admitted(2));
+
+        for _ in SCAN_CLIPPED_ADMISSION_BATCHES_PER_CREDIT..64 {
+            admission.advance_after_batch();
+        }
+        assert!(
+            (0..15).all(|ticket| admission.is_admitted(ticket)),
+            "64 source batches must reach full fan-out"
+        );
+        admission.advance_after_batch();
+        assert_eq!(
+            admission.batches.load(std::sync::atomic::Ordering::Acquire),
+            64,
+            "a full-fan-out scan keeps the one-load steady-state path"
+        );
     }
 
     /// Tickets are handed out modulo the partition count, so a caller that
