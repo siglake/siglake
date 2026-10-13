@@ -579,8 +579,11 @@ reclustering completes (`docs/DESIGN_time_ordered_storage.md`).
   own none. With result caches off, a whole-table LIMIT up to 4,096 folds exact
   delta-adjusted candidates into that collector during the validation pass.
   The fold state remains private until the target and the rest of the immutable
-  blob validate; a refusal takes the existing footer/page fallback. The full
-  decoder remains for folds and diagnostics. Inferred typed group
+  blob validate; a refusal takes the existing footer/page fallback. A refusal
+  can skip the duplicate Tier-1 probe only for the same table generation;
+  snapshot, schema or table-incarnation changes restore the exact-first probe
+  before a sketch or footer fallback. The full decoder remains for folds and
+  diagnostics. Inferred typed group
   dimensions omit the canonical `timestamp_ns` event-time twin; explicitly
   declared dimensions and unrelated user fields with that name remain eligible
   (`docs/DESIGN_group_count_footer_encoding.md`). The 0.3.0 grouped-numeric

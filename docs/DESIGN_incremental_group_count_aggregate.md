@@ -610,7 +610,10 @@ Callers that need materialized values retain the full decoder. The on-disk
 format, SQL shapes, coverage and row-total guards, cardinality budgets,
 result-cache switch and aggregate-object cache are unchanged. A malformed,
 truncated or foreign payload returns no aggregate and takes the existing exact
-fallback.
+fallback. That refusal carries its table, column, snapshot, schema, table
+incarnation and cache-entry identity into the fallback. The decoder probe is
+skipped only while those still match; a new generation checks exact Tier 1
+again before consulting its sketch or file footers.
 
 Differential tests compare the streaming rows with the full decoder and the
 owned bounded collector with a full sort. The latter covers string, integer and

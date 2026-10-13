@@ -23832,7 +23832,7 @@ impl IcebergContext {
         else {
             return Ok(None);
         };
-        self.tier1_group_count_rows(&cached, column, record_count)
+        self.tier1_group_count_rows(&table_ident, &cached, column, record_count)
             .await
     }
 
@@ -23869,7 +23869,7 @@ impl IcebergContext {
         else {
             return Ok(Tier1GroupCountsFold::NotInspected);
         };
-        self.tier1_group_count_rows_fold(&cached, column, record_count, state)
+        self.tier1_group_count_rows_fold(&table_ident, &cached, column, record_count, state)
             .await
     }
 
@@ -23889,36 +23889,42 @@ impl IcebergContext {
         k: usize,
         buffered: Option<&HashMap<Option<String>, u64>>,
     ) -> Result<Option<ApproximateGroupCounts>> {
-        self.approximate_top_group_counts_inner(table_name, column, k, buffered, true)
+        let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
+        self.approximate_top_group_counts_inner(&table_ident, column, k, buffered, None)
             .await
     }
 
     /// Approximate fallback after the same request already decoded and refused
-    /// the exact Tier-1 column. Skips only that duplicate exact probe.
+    /// the exact Tier-1 column. Skips only that generation's duplicate probe;
+    /// a refreshed generation checks exact Tier-1 again before its sketch.
     pub async fn approximate_top_group_counts_after_tier1_refusal(
         &self,
-        table_name: &str,
-        column: &str,
+        refusal: &Tier1GroupCountsRefusal,
         k: usize,
         buffered: Option<&HashMap<Option<String>, u64>>,
     ) -> Result<Option<ApproximateGroupCounts>> {
-        self.approximate_top_group_counts_inner(table_name, column, k, buffered, false)
-            .await
+        self.approximate_top_group_counts_inner(
+            &refusal.table_ident,
+            &refusal.column,
+            k,
+            buffered,
+            Some(refusal),
+        )
+        .await
     }
 
     async fn approximate_top_group_counts_inner(
         &self,
-        table_name: &str,
+        table_ident: &TableIdent,
         column: &str,
         k: usize,
         buffered: Option<&HashMap<Option<String>, u64>>,
-        check_exact: bool,
+        refusal: Option<&Tier1GroupCountsRefusal>,
     ) -> Result<Option<ApproximateGroupCounts>> {
         if !self.group_count_deltas_enabled() {
             return Ok(None);
         }
-        let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
-        let cached = self.cached_table_entry(&table_ident).await?;
+        let cached = self.cached_table_entry(table_ident).await?;
 
         // Never shadow an exact answer: if the exact path can serve this
         // column, it must. The sketch exists for the case that would otherwise
@@ -23929,10 +23935,10 @@ impl IcebergContext {
             .current_snapshot()
             .and_then(|s| s.summary().additional_properties.get("total-records"))
             .and_then(|v| v.parse::<u64>().ok());
-        if check_exact {
+        if refusal.is_none_or(|refusal| !refusal.matches(&cached)) {
             if let Some(rc) = record_count {
                 if self
-                    .tier1_group_count_rows(&cached, column, rc)
+                    .tier1_group_count_rows(table_ident, &cached, column, rc)
                     .await?
                     .is_some()
                 {
@@ -24011,17 +24017,18 @@ impl IcebergContext {
     /// down. Completeness is the only safe discriminator.
     async fn tier1_group_count_rows(
         &self,
+        table_ident: &TableIdent,
         cached: &CachedTableEntry,
         column: &str,
         record_count: u64,
     ) -> Result<Option<GroupCounts>> {
         Ok(
             match self
-                .tier1_group_count_rows_fold(cached, column, record_count, ())
+                .tier1_group_count_rows_fold(table_ident, cached, column, record_count, ())
                 .await?
             {
                 Tier1GroupCountsFold::Hit { rows, .. } => Some(rows),
-                Tier1GroupCountsFold::NotInspected | Tier1GroupCountsFold::Refused => None,
+                Tier1GroupCountsFold::NotInspected | Tier1GroupCountsFold::Refused(_) => None,
             },
         )
     }
@@ -24031,6 +24038,7 @@ impl IcebergContext {
     /// inline hit leaves `state` untouched so its map-backed view stays cheap.
     async fn tier1_group_count_rows_fold<T: siglake_bloom::group_counts::StreamingColumnFold>(
         &self,
+        table_ident: &TableIdent,
         cached: &CachedTableEntry,
         column: &str,
         record_count: u64,
@@ -24068,15 +24076,27 @@ impl IcebergContext {
         // Decode ONLY this column out of the blob. Rebuilding all of them to
         // check one total is what made this seconds-per-generation at 1TB.
         let Some(blob) = wide.group_counts.as_deref() else {
-            return Ok(Tier1GroupCountsFold::Refused);
+            return Ok(Tier1GroupCountsFold::Refused(Tier1GroupCountsRefusal::new(
+                table_ident,
+                column,
+                cached,
+            )));
         };
         let Some((counts, state)) =
             siglake_bloom::group_counts::streaming_column_fold(blob, column, state)
         else {
-            return Ok(Tier1GroupCountsFold::Refused);
+            return Ok(Tier1GroupCountsFold::Refused(Tier1GroupCountsRefusal::new(
+                table_ident,
+                column,
+                cached,
+            )));
         };
         if counts.total() != record_count {
-            return Ok(Tier1GroupCountsFold::Refused);
+            return Ok(Tier1GroupCountsFold::Refused(Tier1GroupCountsRefusal::new(
+                table_ident,
+                column,
+                cached,
+            )));
         }
         Ok(Tier1GroupCountsFold::Hit {
             rows: GroupCounts::Streaming {
@@ -26513,17 +26533,26 @@ impl IcebergContext {
             .await
     }
 
-    /// Continue at the exact per-file tier after this request already decoded
-    /// and refused Tier-1. Used only to avoid repeating that same refusal.
+    /// Continue after a decoded Tier-1 refusal. The per-file tier is used
+    /// directly only while the refusal's table generation still matches;
+    /// otherwise the new generation re-enters the exact-first lookup.
     pub async fn grouped_counts_after_tier1_refusal(
         &self,
-        table_name: &str,
-        column: &str,
+        refusal: &Tier1GroupCountsRefusal,
     ) -> Result<Option<GroupCounts>> {
-        let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
-        let cached = self.cached_table_entry(&table_ident).await?;
+        let cached = self.cached_table_entry(&refusal.table_ident).await?;
+        if !refusal.matches(&cached) {
+            return self
+                .grouped_counts_unwindowed_for_cached(
+                    &refusal.table_ident,
+                    &cached,
+                    &refusal.column,
+                    None,
+                )
+                .await;
+        }
         Ok(self
-            .grouped_counts_from_files(&cached, &table_ident, column, None)
+            .grouped_counts_from_files(&cached, &refusal.table_ident, &refusal.column, None)
             .await?
             .map(|totals| GroupCounts::owned(totals.into_iter().collect(), OwnedCounts::FooterSum)))
     }
@@ -26597,7 +26626,7 @@ impl IcebergContext {
                     .and_then(|v| v.parse::<u64>().ok());
                 if let Some(record_count) = record_count {
                     if let Some(rows) = self
-                        .tier1_group_count_rows(cached, column, record_count)
+                        .tier1_group_count_rows(table_ident, cached, column, record_count)
                         .await?
                     {
                         if let Some(key) = agg_key {
@@ -26951,7 +26980,7 @@ pub enum Tier1GroupCountsFold<T> {
     NotInspected,
     /// A current wide blob was decoded but could not answer exactly. The caller
     /// should continue below Tier-1 without decoding the blob again.
-    Refused,
+    Refused(Tier1GroupCountsRefusal),
     /// An exact Tier-1 answer. `folded` distinguishes a wide streaming hit from
     /// an inline hit, which returns the untouched state.
     Hit {
@@ -26959,6 +26988,41 @@ pub enum Tier1GroupCountsFold<T> {
         state: T,
         folded: bool,
     },
+}
+
+/// Provenance for a decoded Tier-1 refusal.
+///
+/// Fields stay private so callers can only return the token to the fallback
+/// APIs. A refusal permits skipping the repeated Tier-1 decode only while the
+/// table, column and originating cache-entry generation still match.
+#[derive(Debug, Clone)]
+pub struct Tier1GroupCountsRefusal {
+    table_ident: TableIdent,
+    column: String,
+    snapshot_id: Option<i64>,
+    schema_id: i32,
+    table_uuid: uuid::Uuid,
+    entry_wide_group_counts: Arc<tokio::sync::Mutex<Option<CachedWide>>>,
+}
+
+impl Tier1GroupCountsRefusal {
+    fn new(table_ident: &TableIdent, column: &str, cached: &CachedTableEntry) -> Self {
+        Self {
+            table_ident: table_ident.clone(),
+            column: column.to_string(),
+            snapshot_id: cached.snapshot_id,
+            schema_id: cached.schema_id,
+            table_uuid: cached.table.metadata().uuid(),
+            entry_wide_group_counts: cached.wide_group_counts.clone(),
+        }
+    }
+
+    fn matches(&self, cached: &CachedTableEntry) -> bool {
+        self.snapshot_id == cached.snapshot_id
+            && self.schema_id == cached.schema_id
+            && self.table_uuid == cached.table.metadata().uuid()
+            && Arc::ptr_eq(&self.entry_wide_group_counts, &cached.wide_group_counts)
+    }
 }
 
 /// Which materialized path produced an [`GroupCounts::Owned`].
@@ -35184,6 +35248,109 @@ mod table_cache_fence_tests {
 
     fn ev(raw: &str) -> Event {
         Event::now(raw.to_string())
+    }
+
+    #[tokio::test]
+    async fn tier1_refusal_rechecks_exact_after_generation_switch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap()
+            .with_tuning(IcebergTuning {
+                table_group_count_cardinality: Some(10_000),
+                result_caches: Some(false),
+                ..Default::default()
+            });
+        let mut first = ev("first");
+        first.host = "first-host".to_string();
+        ice.append_events(&[first]).await.unwrap();
+
+        let ident = ice.table_ident.clone();
+        let old = ice.cached_table_entry(&ident).await.unwrap();
+        // Model the provenance returned by an old-generation wide refusal.
+        // Constructing it directly keeps the generation switch deterministic;
+        // malformed-wide behavior is covered by the codec refusal tests.
+        let refusal = Tier1GroupCountsRefusal::new(&ident, "host", &old);
+        assert!(refusal.matches(&old), "the original generation may skip");
+
+        let mut second = ev("second");
+        second.host = "second-host".to_string();
+        ice.append_events(&[second]).await.unwrap();
+        let current = ice.cached_table_entry(&ident).await.unwrap();
+        assert_ne!(old.snapshot_id, current.snapshot_id);
+        assert!(
+            !refusal.matches(&current),
+            "a changed generation must restore the exact probe"
+        );
+
+        let approximate = ice
+            .approximate_top_group_counts_after_tier1_refusal(&refusal, 10, None)
+            .await
+            .unwrap();
+        assert!(
+            approximate.is_none(),
+            "the new generation's exact Tier-1 answer must preempt its sketch"
+        );
+
+        let exact = ice
+            .grouped_counts_after_tier1_refusal(&refusal)
+            .await
+            .unwrap()
+            .expect("new generation has exact host counts");
+        assert_eq!(exact.source_label(), "tier1_inline");
+        let mut rows = Vec::new();
+        exact.for_each(|key, count| rows.push((key.map(str::to_string), count)));
+        assert_eq!(
+            rows,
+            vec![
+                (Some("first-host".to_string()), 1),
+                (Some("second-host".to_string()), 1),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn current_generation_refusal_keeps_sketch_and_footer_fallbacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap()
+            .with_tuning(IcebergTuning {
+                table_group_count_cardinality: Some(4_097),
+                result_caches: Some(false),
+                ..Default::default()
+            });
+        let events: Vec<_> = (0..4_100)
+            .map(|n| {
+                let mut event = ev(&format!("event-{n}"));
+                event.host = format!("host-{n:03}");
+                event
+            })
+            .collect();
+        ice.append_events(&events).await.unwrap();
+
+        let refusal = match ice
+            .tier1_group_counts_fold("events", "host", ())
+            .await
+            .unwrap()
+        {
+            Tier1GroupCountsFold::Refused(refusal) => refusal,
+            other => panic!("over-cap host must refuse exact Tier-1, got {other:?}"),
+        };
+        let approximate = ice
+            .approximate_top_group_counts_after_tier1_refusal(&refusal, 5, None)
+            .await
+            .unwrap()
+            .expect("same-generation sketch remains eligible");
+        assert_eq!(approximate.rows_accounted, 4_100);
+
+        let exact = ice
+            .grouped_counts_after_tier1_refusal(&refusal)
+            .await
+            .unwrap()
+            .expect("same-generation footer fallback remains eligible");
+        assert_eq!(exact.source_label(), "materialized");
+        assert_eq!(exact.len(), 4_100);
     }
 
     /// #1625 — `siglake_core::metrics::TABLE_CACHE_FENCED` creates this

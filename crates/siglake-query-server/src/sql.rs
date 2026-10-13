@@ -8340,7 +8340,7 @@ async fn try_group_count_fast_path_records_with_bindings(
         _ => None,
     };
     let mut precollected = None;
-    let mut tier1_fold_refused = false;
+    let mut tier1_fold_refusal = None;
     let folded_exact = if qualified.is_none() && fp.time_bounds.is_none() && fold_bound.is_some() {
         let (limit, _) = fold_bound.expect("checked bounded fold");
         let initial = OwnedGroupCollector::new(
@@ -8367,8 +8367,8 @@ async fn try_group_count_fast_path_records_with_bindings(
                 folded: false,
                 ..
             } => Some(rows),
-            siglake_storage::iceberg::Tier1GroupCountsFold::Refused => {
-                tier1_fold_refused = true;
+            siglake_storage::iceberg::Tier1GroupCountsFold::Refused(refusal) => {
+                tier1_fold_refusal = Some(refusal);
                 None
             }
             siglake_storage::iceberg::Tier1GroupCountsFold::NotInspected => None,
@@ -8383,16 +8383,18 @@ async fn try_group_count_fast_path_records_with_bindings(
         ice.qualified_grouped_counts_with_summary(qualified, &fp.group_column, shard)
             .await
             .map_err(ApiError::internal)?
-    } else if tier1_fold_refused && !tier1_only {
-        ice.grouped_counts_after_tier1_refusal(&fp.table_name, &fp.group_column)
-            .await
-            .map_err(ApiError::internal)?
-    } else if tier1_only && !tier1_fold_refused {
+    } else if let Some(refusal) = tier1_fold_refusal.as_ref() {
+        if tier1_only {
+            None
+        } else {
+            ice.grouped_counts_after_tier1_refusal(refusal)
+                .await
+                .map_err(ApiError::internal)?
+        }
+    } else if tier1_only {
         ice.tier1_group_counts(&fp.table_name, &fp.group_column)
             .await
             .map_err(ApiError::internal)?
-    } else if tier1_only {
-        None
     } else {
         ice.grouped_counts_with_summary(&fp.table_name, &fp.group_column, shard, fp.time_bounds)
             .await
@@ -8405,14 +8407,9 @@ async fn try_group_count_fast_path_records_with_bindings(
         // discards), or an unbounded one.
         let limit = fp.limit.unwrap_or_default();
         let buffered = (!delta_owned.is_empty()).then_some(&delta_owned);
-        let approx = if tier1_fold_refused {
-            ice.approximate_top_group_counts_after_tier1_refusal(
-                &fp.table_name,
-                &fp.group_column,
-                limit,
-                buffered,
-            )
-            .await
+        let approx = if let Some(refusal) = tier1_fold_refusal.as_ref() {
+            ice.approximate_top_group_counts_after_tier1_refusal(refusal, limit, buffered)
+                .await
         } else {
             ice.approximate_top_group_counts(&fp.table_name, &fp.group_column, limit, buffered)
                 .await
@@ -8424,9 +8421,8 @@ async fn try_group_count_fast_path_records_with_bindings(
         // No summary either — take the full path after all, so an over-cap
         // column without a sketch is no worse off than before any of this
         // existed.
-        exact = if tier1_fold_refused {
-            ice.grouped_counts_after_tier1_refusal(&fp.table_name, &fp.group_column)
-                .await
+        exact = if let Some(refusal) = tier1_fold_refusal.as_ref() {
+            ice.grouped_counts_after_tier1_refusal(refusal).await
         } else {
             ice.grouped_counts_with_summary(&fp.table_name, &fp.group_column, shard, fp.time_bounds)
                 .await
