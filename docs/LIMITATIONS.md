@@ -1783,7 +1783,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   wide files / 540,000 merge rows, races it with a real 30,000-row WAL drain
   behind the packaged permit, and observed 271,777,792 bytes RSS before the
   operations and 862,609,408 bytes at peak in a system-allocator test binary.
-  This does not qualify shipped jemalloc retention or full merge-plan residency.
+  A9's pre-merge resident/active difference suggests allocator retention, but
+  does not establish dirty-page attribution or the cause of its 1GiB kill.
+  The constrained compactor now requests an all-arena purge before merge work,
+  with fallible before/after observations. The shipped-allocator unit test only
+  exercises reclamation of freed medium buffers; it does not bound live input,
+  writer or encoder residency. A fresh canonical field remains required.
   It then proved every exact
   timestamp, field, NULL, duplicate and omission result. It is not the full
   shipped field workload: fresh 1Gi qualification on the retained canonical

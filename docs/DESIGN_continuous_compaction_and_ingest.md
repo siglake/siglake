@@ -151,6 +151,20 @@ Coexistence without starving the commit path:
   omission checks passing. Shipped jemalloc retention and full-field merge-plan
   residency remain unqualified by this test; the mean-width estimate and
   1,024-row floor do not establish a hard byte ceiling.
+  **Allocator continuation (2026-10-13):** The A9 row256 field failed at
+  1GiB after planning 261,632-row input chunks and 543,391-row output groups.
+  Before the merge, sampled allocator resident memory was about 511 MB while
+  active memory was about 17 MB. This suggests allocator retention may consume
+  useful headroom; it does not identify those bytes as dirty pages or establish
+  the cause of the later kill. Input and writer memory grew during the merge.
+  When a <=1Gi process acquires the re-cluster permit it now requests an all-arena
+  dirty-page purge and records before/after allocator and cgroup bytes. Readout
+  or purge errors are reported without panicking. A shipped-allocator unit test
+  exercises reclamation after medium-buffer churn, not the full field workload.
+  The purge leaves decay settings unchanged; the configured decay interval is
+  not a guaranteed upper bound on resident-page lifetime. Admission latency,
+  live input/writer residency and fresh canonical 1GiB acceptance remain open.
+
 - **Backpressure-aware sharing.** A shared signal from the WAL queue depth
   (`siglake_ingest_backpressure_*`, already exported): if drain falls behind (WAL
   growing), compaction throttles (fewer concurrent merges) to yield IO; if L0 piles

@@ -1183,6 +1183,37 @@ mod allocator_memory_readout_tests {
             after.resident_bytes.saturating_sub(before.resident_bytes)
         );
     }
+
+    #[test]
+    fn jemalloc_purge_returns_freed_dirty_pages() {
+        // One huge extent can be unmapped as soon as it is freed. The drain
+        // leaves many medium Arrow buffers, which occupy ordinary dirty
+        // extents and exercise the retention this handoff purge addresses.
+        let mut allocations = vec![vec![0_u8; MIB / 4]; 256];
+        for (allocation_index, allocation) in allocations.iter_mut().enumerate() {
+            for (page, byte) in allocation.chunks_mut(4096).enumerate() {
+                byte[0] = (allocation_index as u8).wrapping_add(page as u8);
+            }
+        }
+        std::hint::black_box(&allocations);
+        drop(allocations);
+
+        let purge = siglake_core::purge_allocator_dirty_pages()
+            .expect("jemalloc arena purge")
+            .expect("siglake-cli tests use jemalloc as the global allocator");
+        assert!(
+            purge.after.resident_bytes < purge.before.resident_bytes,
+            "purge did not lower resident bytes: {purge:?}"
+        );
+        assert!(
+            purge
+                .before
+                .resident_bytes
+                .saturating_sub(purge.after.resident_bytes)
+                >= 48 * MIB as u64,
+            "purge returned fewer than 48 MiB from freed 64 MiB buffers: {purge:?}"
+        );
+    }
 }
 
 #[tokio::main]
