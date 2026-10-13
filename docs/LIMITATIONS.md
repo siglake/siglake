@@ -1629,6 +1629,20 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   schema and rewrites nothing — so for a cold table the practical answer is to
   leave it unqualified: the queries stay correct. There is no repair that fixes
   the values in place, and no automatic migration.
+- **A composed attribute promotion cannot reuse an existing flat promotion's
+  physical column name.** The composed source is expression-specific:
+  `attr_get(attr_get(attributes,'aws.cloudwatch'),'log_stream')` can differ
+  from the flat dotted-key lookup when literal dotted keys, nulls or a
+  serialized JSON string are present. Siglake refuses any source-chain or type
+  change under an existing promoted column name; declare the composed source
+  under a distinct name and field id with `siglake declare-promotions --table
+  <events-or-managed-index> --promote-attr <spec>`. The command retains older
+  declarations and rewrites no data. Old files lack the new field and keep the
+  original JSON expression until an ordinary rewrite materializes it with the
+  `x3` extraction marker. The backfill selector finds the missing physical
+  column, but a settled file remains residual until some other compaction
+  trigger rewrites it. There is no automatic migration or default composed
+  promotion (#6752).
 - **Tier-1 group counts serve only columns present since the table's first
   commit.** The serving guard is `column_total(column) == record_count`, so a
   column that starts accumulating mid-life — a typed column on a table created
@@ -1783,7 +1797,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   wide files / 540,000 merge rows, races it with a real 30,000-row WAL drain
   behind the packaged permit, and observed 271,777,792 bytes RSS before the
   operations and 862,609,408 bytes at peak in a system-allocator test binary.
-  This does not qualify shipped jemalloc retention or full merge-plan residency.
+  A9's pre-merge resident/active difference suggests allocator retention, but
+  does not establish dirty-page attribution or the cause of its 1GiB kill.
+  The constrained compactor now requests an all-arena purge before merge work,
+  with fallible before/after observations. The shipped-allocator unit test only
+  exercises reclamation of freed medium buffers; it does not bound live input,
+  writer or encoder residency. A fresh canonical field remains required.
   It then proved every exact
   timestamp, field, NULL, duplicate and omission result. It is not the full
   shipped field workload: fresh 1Gi qualification on the retained canonical

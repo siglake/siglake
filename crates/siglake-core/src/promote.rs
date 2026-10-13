@@ -30,6 +30,12 @@ use crate::{with_field_id, Result};
 /// stats-based pruning — the provider only holds a `Table`, not CLI state.
 pub const PROMOTED_PROPERTY_KEY: &str = "siglake.promoted.v1";
 
+/// Promotion property carrying expression-aware sources. Version 1 remains a
+/// direct-attribute-only compatibility view for older writers: they may safely
+/// null-pad a composed column, but must never mistake its first key for the
+/// whole expression and materialize the wrong value.
+pub const PROMOTED_PROPERTY_V2_KEY: &str = "siglake.promoted.v2";
+
 /// Arrow/Parquet type a promoted attribute lands in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -67,6 +73,14 @@ impl PromotedType {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PromotedColumn {
     pub attr_key: String,
+    /// Keys applied by outer `attr_get` calls after `attr_key`. Empty is the
+    /// original `attr_get(attributes, attr_key)` source. For example,
+    /// `attr_key = "aws.cloudwatch"`, `attr_get_path = ["log_stream"]`
+    /// identifies `attr_get(attr_get(attributes, 'aws.cloudwatch'),
+    /// 'log_stream')` without conflating it with the literal flat key
+    /// `aws.cloudwatch.log_stream`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attr_get_path: Vec<String>,
     pub name: String,
     pub ty: PromotedType,
 }
@@ -84,10 +98,49 @@ pub fn promoted_columns_from_property(json: Option<&str>) -> Vec<PromotedColumn>
         .unwrap_or_default()
 }
 
+/// Read the expression-aware property when present, otherwise the legacy
+/// direct-only property. An invalid v2 value is not allowed to fall back to v1:
+/// doing so could silently discard a composed source and qualify the wrong map.
+pub fn promoted_columns_from_properties(
+    expression_aware: Option<&str>,
+    legacy: Option<&str>,
+) -> Vec<PromotedColumn> {
+    match expression_aware {
+        Some(json) => promoted_columns_from_property(Some(json)),
+        None => promoted_columns_from_property(legacy),
+    }
+}
+
 impl PromotedColumn {
-    /// Parse a CLI spec `attr_key:type[:column]`. The column name defaults to
-    /// the attr key with `.`/`-` replaced by `_` (a SQL-friendly identifier).
+    /// Parse a CLI spec `attr_key:type[:column]`, or an exact composed lookup
+    /// as `["inner key","outer key",...]:type[:column]`. The column name
+    /// defaults to all source keys with `.`/`-` replaced by `_`.
     pub fn parse_spec(spec: &str) -> Option<Self> {
+        if spec.starts_with('[') {
+            let mut values = serde_json::Deserializer::from_str(spec).into_iter::<Vec<String>>();
+            let path = values.next()?.ok()?;
+            let offset = values.byte_offset();
+            let suffix = spec.get(offset..)?.strip_prefix(':')?;
+            if path.is_empty() || path.iter().any(|key| key.is_empty()) {
+                return None;
+            }
+            let mut parts = suffix.splitn(2, ':');
+            let ty = PromotedType::parse(parts.next()?.trim())?;
+            let name = match parts.next() {
+                Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+                _ => path
+                    .iter()
+                    .map(|key| key.replace(['.', '-'], "_"))
+                    .collect::<Vec<_>>()
+                    .join("_"),
+            };
+            return Some(PromotedColumn {
+                attr_key: path[0].clone(),
+                attr_get_path: path[1..].to_vec(),
+                name,
+                ty,
+            });
+        }
         let mut parts = spec.splitn(3, ':');
         let attr_key = parts.next()?.trim();
         if attr_key.is_empty() {
@@ -100,10 +153,41 @@ impl PromotedColumn {
         };
         Some(PromotedColumn {
             attr_key: attr_key.to_string(),
+            attr_get_path: Vec::new(),
             name,
             ty,
         })
     }
+
+    pub fn is_composed(&self) -> bool {
+        !self.attr_get_path.is_empty()
+    }
+
+    /// Exact sequence of literal keys in the represented `attr_get` tree.
+    pub fn expression_keys(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.attr_key.as_str()).chain(self.attr_get_path.iter().map(String::as_str))
+    }
+}
+
+/// File/table provenance version required by this promotion set. Direct
+/// lookups retain v2. A composed lookup requires v3 so a concurrent or rolled
+/// back v2 writer cannot qualify its null-padded or wrongly materialized file.
+pub fn promotion_extractor_version(promoted: &[PromotedColumn]) -> u32 {
+    if promoted.iter().any(PromotedColumn::is_composed) {
+        COMPOSED_ATTR_EXTRACTOR_VERSION
+    } else {
+        ATTR_EXTRACTOR_VERSION
+    }
+}
+
+/// Direct-only compatibility view stored under [`PROMOTED_PROPERTY_KEY`].
+/// Older binaries cannot represent composed expression identity.
+pub fn direct_promotions(promoted: &[PromotedColumn]) -> Vec<PromotedColumn> {
+    promoted
+        .iter()
+        .filter(|column| !column.is_composed())
+        .cloned()
+        .collect()
 }
 
 /// Version of the dotted-key extraction rule shared by [`attr_lookup`] here and
@@ -124,6 +208,10 @@ impl PromotedColumn {
 /// - v2: literal key retried at EVERY level, matching the UDF (#6769).
 pub const ATTR_EXTRACTOR_VERSION: u32 = 2;
 
+/// Provenance version for promotion sets containing a composed `attr_get`.
+/// Direct-only writers stamp v2; expression-aware writers stamp v3.
+pub const COMPOSED_ATTR_EXTRACTOR_VERSION: u32 = 3;
+
 /// Look `key` up in a parsed attributes map: a literal (possibly dotted) key
 /// wins at every level; otherwise a dotted key walks into nested objects one
 /// segment at a time (OTLP residuals hold nested objects).
@@ -142,6 +230,26 @@ fn attr_lookup<'a>(
     }
     let (head, tail) = key.split_once('.')?;
     attr_lookup(map.get(head)?.as_object()?, tail)
+}
+
+/// Evaluate the exact nested `attr_get` source represented by `column`.
+/// Every outer step consumes the previous call's STRING result and reparses
+/// it, including the case where the inner value was itself a JSON string.
+fn promoted_value(
+    map: &serde_json::Map<String, serde_json::Value>,
+    column: &PromotedColumn,
+) -> Option<serde_json::Value> {
+    let mut value = attr_lookup(map, &column.attr_key)?.clone();
+    for key in &column.attr_get_path {
+        let text = match value {
+            serde_json::Value::Null => return None,
+            serde_json::Value::String(text) => text,
+            other => other.to_string(),
+        };
+        let inner: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).ok()?;
+        value = attr_lookup(&inner, key)?.clone();
+    }
+    Some(value)
 }
 
 /// Field id of the `index`-th promoted column. The 8 core columns own ids 1..=8.
@@ -216,16 +324,16 @@ pub fn promote_attributes(batch: &RecordBatch, promoted: &[PromotedColumn]) -> R
             .filter(|a| !a.is_null(row))
             .and_then(|a| serde_json::from_str(a.value(row)).ok());
         for (col, b) in promoted.iter().zip(builders.iter_mut()) {
-            let v = parsed.as_ref().and_then(|m| attr_lookup(m, &col.attr_key));
+            let v = parsed.as_ref().and_then(|m| promoted_value(m, col));
             match b {
-                B::Utf8(bld) => match v {
+                B::Utf8(bld) => match v.as_ref() {
                     Some(serde_json::Value::String(s)) => bld.append_value(s),
                     Some(serde_json::Value::Null) | None => bld.append_null(),
                     Some(other) => bld.append_value(other.to_string()),
                 },
-                B::Int64(bld) => bld.append_option(v.and_then(json_as_i64)),
-                B::Float64(bld) => bld.append_option(v.and_then(json_as_f64)),
-                B::Boolean(bld) => bld.append_option(v.and_then(json_as_bool)),
+                B::Int64(bld) => bld.append_option(v.as_ref().and_then(json_as_i64)),
+                B::Float64(bld) => bld.append_option(v.as_ref().and_then(json_as_f64)),
+                B::Boolean(bld) => bld.append_option(v.as_ref().and_then(json_as_bool)),
             }
         }
     }
@@ -339,21 +447,25 @@ mod tests {
         vec![
             PromotedColumn {
                 attr_key: "http.status_code".into(),
+                attr_get_path: Vec::new(),
                 name: "status".into(),
                 ty: PromotedType::Int64,
             },
             PromotedColumn {
                 attr_key: "k8s.namespace".into(),
+                attr_get_path: Vec::new(),
                 name: "ns".into(),
                 ty: PromotedType::Utf8,
             },
             PromotedColumn {
                 attr_key: "ratio".into(),
+                attr_get_path: Vec::new(),
                 name: "ratio".into(),
                 ty: PromotedType::Float64,
             },
             PromotedColumn {
                 attr_key: "sampled".into(),
+                attr_get_path: Vec::new(),
                 name: "sampled".into(),
                 ty: PromotedType::Boolean,
             },
@@ -366,6 +478,7 @@ mod tests {
             PromotedColumn::parse_spec("http.status_code:int"),
             Some(PromotedColumn {
                 attr_key: "http.status_code".into(),
+                attr_get_path: Vec::new(),
                 name: "http_status_code".into(),
                 ty: PromotedType::Int64
             })
@@ -374,12 +487,100 @@ mod tests {
             PromotedColumn::parse_spec("k8s.namespace:string:ns"),
             Some(PromotedColumn {
                 attr_key: "k8s.namespace".into(),
+                attr_get_path: Vec::new(),
                 name: "ns".into(),
                 ty: PromotedType::Utf8
             })
         );
         assert_eq!(PromotedColumn::parse_spec("bad"), None);
         assert_eq!(PromotedColumn::parse_spec("k:nosuchtype"), None);
+        assert_eq!(
+            PromotedColumn::parse_spec(
+                r#"["aws.cloudwatch","log_stream"]:string:cloudwatch_stream"#
+            ),
+            Some(PromotedColumn {
+                attr_key: "aws.cloudwatch".into(),
+                attr_get_path: vec!["log_stream".into()],
+                name: "cloudwatch_stream".into(),
+                ty: PromotedType::Utf8,
+            })
+        );
+        assert_eq!(
+            PromotedColumn::parse_spec(r#"["aws.cloudwatch","log-stream"]:string"#)
+                .unwrap()
+                .name,
+            "aws_cloudwatch_log_stream"
+        );
+        assert!(PromotedColumn::parse_spec("[]:string").is_none());
+        assert!(PromotedColumn::parse_spec(r#"["only"]:nosuchtype"#).is_none());
+    }
+
+    #[test]
+    fn composed_lookup_materialization_preserves_expression_identity() {
+        let cases = [
+            (
+                r#"{"aws.cloudwatch":{"log_stream":"prefix-child"},"aws.cloudwatch.log_stream":"full-literal"}"#,
+                Some("prefix-child"),
+            ),
+            (
+                r#"{"aws.cloudwatch":{"log_stream":"prefix-child"}}"#,
+                Some("prefix-child"),
+            ),
+            (
+                r#"{"aws":{"cloudwatch":{"log_stream":"nested"}}}"#,
+                Some("nested"),
+            ),
+            (
+                r#"{"aws.cloudwatch":{"log_stream":"prefix-child"},"aws":{"cloudwatch":{"log_stream":"nested"}}}"#,
+                Some("prefix-child"),
+            ),
+            (
+                r#"{"aws.cloudwatch":null,"aws":{"cloudwatch":{"log_stream":"nested"}}}"#,
+                None,
+            ),
+            (
+                r#"{"aws.cloudwatch":{"log_stream":"prefix-child"},"aws.cloudwatch.log_stream":null}"#,
+                Some("prefix-child"),
+            ),
+            (
+                r#"{"aws.cloudwatch":"{\"log_stream\":\"json-string-child\"}"}"#,
+                Some("json-string-child"),
+            ),
+            (r#"{"aws.cloudwatch":7}"#, None),
+            (r#"{}"#, None),
+            (
+                r#"{"aws":{"cloudwatch":{"log_stream":9007199254740993}}}"#,
+                Some("9007199254740993"),
+            ),
+            (
+                r#"{"aws":{"cloudwatch":{"log_stream":false}}}"#,
+                Some("false"),
+            ),
+        ];
+        let promoted = [PromotedColumn {
+            attr_key: "aws.cloudwatch".into(),
+            attr_get_path: vec!["log_stream".into()],
+            name: "cloudwatch_stream".into(),
+            ty: PromotedType::Utf8,
+        }];
+        let events = cases
+            .iter()
+            .map(|(attributes, _)| ev(Some(attributes)))
+            .collect::<Vec<_>>();
+        let batch = events_to_record_batch(&events).unwrap();
+        let out = promote_attributes(&batch, &promoted).unwrap();
+        let values = out
+            .column_by_name("cloudwatch_stream")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for (row, (_, expected)) in cases.iter().enumerate() {
+            let actual = (!values.is_null(row)).then(|| values.value(row));
+            assert_eq!(actual, *expected, "row {row}");
+        }
+        assert_eq!(promotion_extractor_version(&promoted), 3);
+        assert!(direct_promotions(&promoted).is_empty());
     }
 
     #[test]
@@ -502,11 +703,13 @@ mod tests {
         let cols = vec![
             PromotedColumn {
                 attr_key: "a.b.c".into(),
+                attr_get_path: Vec::new(),
                 name: "abc".into(),
                 ty: PromotedType::Int64,
             },
             PromotedColumn {
                 attr_key: "log.file.path".into(),
+                attr_get_path: Vec::new(),
                 name: "log_file_path".into(),
                 ty: PromotedType::Utf8,
             },
