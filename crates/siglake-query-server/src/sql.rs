@@ -10430,6 +10430,10 @@ async fn compute_buffer_partials(
     if matches!(dist, crate::coordinator::DistPlan::Local) {
         return Ok((Vec::new(), None));
     }
+    if !buffer_partial_plan_has_bounded_workspace(plan, &dist) {
+        metrics::counter!("siglake_query_wal_buffer_refused_partial_workspace_total").increment(1);
+        return Ok((Vec::new(), None));
+    }
     // #82: an ordered aggregate's partials must be the sort/limit-stripped
     // aggregate (same rewrite the workers run) — sorting/limiting the buffer
     // slice would drop groups from the merge.
@@ -10503,7 +10507,15 @@ async fn compute_buffer_partials(
     if decoded.batches().is_empty() {
         return Ok((Vec::new(), Some(decoded)));
     }
-    let Some(output_lease) = decoded.try_reserve_output(plan.schema().fields().len()) else {
+    let output_schema = Arc::new(plan.schema().as_arrow().clone());
+    let Some(output_bound) = crate::wal_buffer::bounded_output_payload(
+        &output_schema,
+        decoded.row_count(),
+        decoded.payload_bytes(),
+    ) else {
+        return Ok((Vec::new(), None));
+    };
+    let Some(output_lease) = decoded.try_reserve_output(output_bound) else {
         return Ok((Vec::new(), None));
     };
     // Run the shard query over a buffer-only table to produce a partial in the
@@ -10523,6 +10535,41 @@ async fn compute_buffer_partials(
     };
     metrics::counter!("siglake_query_wal_buffer_distributed_used_total").increment(1);
     Ok((partials, Some(decoded)))
+}
+
+fn partial_scalar_leaf(expr: &Expr) -> bool {
+    match expr {
+        Expr::Alias(alias) => partial_scalar_leaf(&alias.expr),
+        Expr::Column(_) | Expr::Literal(_, _) => true,
+        _ => false,
+    }
+}
+
+fn buffer_partial_plan_has_bounded_workspace(
+    plan: &LogicalPlan,
+    dist: &crate::coordinator::DistPlan,
+) -> bool {
+    if !matches!(
+        dist,
+        crate::coordinator::DistPlan::Aggregate { .. }
+            | crate::coordinator::DistPlan::OrderedAggregate { .. }
+    ) {
+        return false;
+    }
+    if let LogicalPlan::Aggregate(aggregate) = plan {
+        return aggregate.group_expr.iter().all(partial_scalar_leaf)
+            && aggregate.aggr_expr.iter().all(|expr| {
+                let Expr::AggregateFunction(function) = expr else {
+                    return false;
+                };
+                function.params.args.iter().all(partial_scalar_leaf)
+                    && function.params.filter.is_none()
+                    && function.params.order_by.is_empty()
+            });
+    }
+    plan.inputs()
+        .into_iter()
+        .any(|input| buffer_partial_plan_has_bounded_workspace(input, dist))
 }
 
 /// The `SessionContext` the buffer partial executes on: a clone of the
@@ -15725,7 +15772,9 @@ mod tests {
         let delta = BufferDelta {
             batches: std::collections::HashMap::from([(
                 "events".to_string(),
-                vec![siglake_core::events_to_record_batch(&buffered).unwrap()],
+                crate::wal_buffer::decoded_buffer_for_test(vec![
+                    siglake_core::events_to_record_batch(&buffered).unwrap(),
+                ]),
             )]),
         };
         let fast = try_group_count_fast_path_records(
@@ -15779,7 +15828,9 @@ mod tests {
         let delta = BufferDelta {
             batches: std::collections::HashMap::from([(
                 "events".to_string(),
-                vec![siglake_core::events_to_record_batch(&buffered).unwrap()],
+                crate::wal_buffer::decoded_buffer_for_test(vec![
+                    siglake_core::events_to_record_batch(&buffered).unwrap(),
+                ]),
             )]),
         };
         let fast = try_group_count_fast_path_records(

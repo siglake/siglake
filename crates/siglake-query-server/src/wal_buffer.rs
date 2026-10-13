@@ -46,13 +46,13 @@ use std::task::{Context as TaskPollContext, Poll};
 use anyhow::{Context, Result};
 use arrow::array::ArrayData;
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
-use arrow_array::{make_array, Array, ArrayRef, RecordBatch};
-use arrow_schema::SchemaRef;
+use arrow_array::{make_array, Array, ArrayRef, RecordBatch, StringArray};
+use arrow_schema::{DataType, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::display::DisplayFormatType;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, RecordBatchStream};
@@ -671,10 +671,9 @@ fn attach_reservation_to_batches(
 #[derive(Debug)]
 struct SelectedBufferSegments {
     paths: Vec<PathBuf>,
-    uncompressed_bytes: Vec<u64>,
+    readers: Vec<siglake_wal::BoundedSegmentReader>,
     names: Vec<String>,
     compressed_bytes: u64,
-    uncompressed_total_bytes: u64,
     decode_charge_bytes: u64,
     admitted: bool,
 }
@@ -706,33 +705,29 @@ fn select_buffer_segments(
     metrics::counter!("siglake_query_wal_buffer_segments_kept_total").increment(paths.len() as u64);
 
     let mut names = Vec::with_capacity(paths.len());
-    let mut uncompressed_bytes = Vec::with_capacity(paths.len());
+    let mut readers = Vec::with_capacity(paths.len());
     let mut compressed_bytes = 0u64;
-    let mut uncompressed_total_bytes = 0u64;
     let mut decode_charge_bytes = 0u64;
     for path in &paths {
-        let physical = std::fs::metadata(path)
-            .with_context(|| format!("stat selected WAL segment {}", path.display()))?
-            .len();
+        let reader = siglake_wal::BoundedSegmentReader::open(path)
+            .with_context(|| format!("open selected WAL segment {}", path.display()))?;
+        let physical = reader.physical_bytes();
         compressed_bytes = compressed_bytes.saturating_add(physical);
         if compressed_max > 0 && compressed_bytes > compressed_max {
             return Ok(SelectedBufferSegments {
                 paths: Vec::new(),
-                uncompressed_bytes: Vec::new(),
+                readers: Vec::new(),
                 names: Vec::new(),
                 compressed_bytes,
-                uncompressed_total_bytes: 0,
                 decode_charge_bytes: 0,
                 admitted: false,
             });
         }
-        let ipc = siglake_wal::segment_uncompressed_bytes_strict(path)
-            .with_context(|| format!("size selected WAL segment {}", path.display()))?;
+        let ipc = reader.uncompressed_bytes();
         decode_charge_bytes = decode_charge_bytes
             .saturating_add(physical)
             .saturating_add(ipc.saturating_mul(2));
-        uncompressed_total_bytes = uncompressed_total_bytes.saturating_add(ipc);
-        uncompressed_bytes.push(ipc);
+        readers.push(reader);
         let name = path
             .file_name()
             .and_then(|value| value.to_str())
@@ -742,10 +737,9 @@ fn select_buffer_segments(
     names.sort_unstable();
     Ok(SelectedBufferSegments {
         paths,
-        uncompressed_bytes,
+        readers,
         names,
         compressed_bytes,
-        uncompressed_total_bytes,
         decode_charge_bytes,
         admitted: true,
     })
@@ -842,7 +836,7 @@ pub(crate) struct DecodedBuffer {
     batches: Vec<RecordBatch>,
     names: Vec<String>,
     compressed_bytes: u64,
-    _reservation: Arc<BufferMemoryReservation>,
+    reservations: Vec<Arc<BufferMemoryReservation>>,
 }
 
 #[derive(Debug)]
@@ -879,20 +873,63 @@ impl DecodedBuffer {
         self.compressed_bytes
     }
 
-    /// Reserve construction plus retained payload for a query result derived
-    /// from this generation. Each output column can retain at most one
-    /// source-sized derived payload; the second extent covers its construction
-    /// while the source remains live. DataFusion separately accounts operator
-    /// state in the shared query pool.
-    pub(crate) fn try_reserve_output(&self, output_columns: usize) -> Option<BufferOutputLease> {
-        let bound = batches_payload_bytes(&self.batches)
-            .saturating_mul(output_columns.max(1) as u64)
-            .saturating_mul(2);
-        self._reservation
+    pub(crate) fn row_count(&self) -> usize {
+        self.batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    pub(crate) fn payload_bytes(&self) -> u64 {
+        batches_payload_bytes(&self.batches)
+    }
+
+    /// Reserve a caller-proved retained-output payload bound before executing
+    /// the operator that creates it. DataFusion accounts aggregate state; this
+    /// lease covers Arrow output overlapping the decoded generation and other
+    /// cache readers.
+    pub(crate) fn try_reserve_output(&self, bound: u64) -> Option<BufferOutputLease> {
+        self.reservations
+            .first()?
             .budget
             .try_reserve(bound)
             .map(|reservation| BufferOutputLease { reservation })
     }
+}
+
+pub(crate) fn bounded_output_payload(
+    schema: &SchemaRef,
+    max_rows: usize,
+    source_variable_payload: u64,
+) -> Option<u64> {
+    let mut total = 0u64;
+    for field in schema.fields() {
+        let mut field_bytes = null_array_payload_bound(field.data_type(), max_rows)?;
+        if matches!(
+            field.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+        ) {
+            // A simple group key is copied from one input column. Its values
+            // cannot exceed all variable-width payload in the source batch.
+            field_bytes = field_bytes.checked_add(source_variable_payload)?;
+        }
+        total = total.checked_add(field_bytes)?;
+    }
+    Some(total)
+}
+
+#[cfg(test)]
+pub(crate) fn decoded_buffer_for_test(batches: Vec<RecordBatch>) -> Arc<DecodedBuffer> {
+    let payload = batches_payload_bytes(&batches);
+    let budget = BufferMemoryBudget::new(payload.max(1));
+    let reservation = budget
+        .try_reserve(payload)
+        .expect("test decoded buffer reservation");
+    let batches = attach_reservation_to_batches(batches, &reservation)
+        .expect("attach test decoded buffer reservation");
+    Arc::new(DecodedBuffer {
+        batches,
+        names: Vec::new(),
+        compressed_bytes: 0,
+        reservations: vec![reservation],
+    })
 }
 
 #[derive(Debug)]
@@ -1036,7 +1073,7 @@ impl BufferDeltaCache {
                 batches: Vec::new(),
                 names,
                 compressed_bytes: 0,
-                _reservation: reservation,
+                reservations: vec![reservation],
             })));
         }
         if let Some(cached) = self.get(wal_dir, &names, target_schema, carrier, owner) {
@@ -1106,24 +1143,10 @@ impl BufferDeltaCache {
             metrics::counter!("siglake_query_wal_buffer_refused_bytes_total").increment(1);
             return Ok(BufferReadOutcome::Refused { compressed_bytes });
         }
-        // Mapping/alignment can create one value/offset/validity payload per
-        // target column while its source value and parser/builder workspace
-        // are still live. Each such payload is derived from the admitted IPC
-        // bytes: one IPC extent bounds retained column data and one bounds its
-        // construction workspace. This schema-scaled term deliberately
-        // refuses very wide generations rather than treating a fixed IPC
-        // multiplier as an Arrow-heap ceiling.
-        let output_and_workspace_bound = selected
-            .uncompressed_total_bytes
-            .saturating_mul(target_schema.fields().len().max(1) as u64)
-            .saturating_mul(2);
-        let total_charge = selected
-            .decode_charge_bytes
-            .saturating_add(output_and_workspace_bound);
-        let Some(reservation) = self.memory.try_reserve(total_charge) else {
+        let Some(decode_reservation) = self.memory.try_reserve(selected.decode_charge_bytes) else {
             return Ok(BufferReadOutcome::Refused { compressed_bytes });
         };
-        let batches = match read_selected_buffer_batches(&selected, target_schema, carrier) {
+        let raw_batches = match read_selected_buffer_batches(&selected) {
             Ok(batches) => batches,
             Err(error) => {
                 metrics::counter!("siglake_query_wal_buffer_refused_decode_total").increment(1);
@@ -1132,13 +1155,35 @@ impl BufferDeltaCache {
                 return Ok(BufferReadOutcome::Refused { compressed_bytes });
             }
         };
-        let actual_bytes = batches.iter().fold(0u64, |bytes, batch| {
-            bytes.saturating_add(batch.get_array_memory_size() as u64)
-        });
-        if !reservation.contains_actual(actual_bytes) {
+        let raw_payload = batches_payload_bytes(&raw_batches);
+        if !decode_reservation.contains_actual(raw_payload) {
             return Ok(BufferReadOutcome::Refused { compressed_bytes });
         }
-        let batches = match attach_reservation_to_batches(batches, &reservation) {
+        let Some(expansion_bound) =
+            transformation_expansion_bound(&raw_batches, target_schema, carrier)
+        else {
+            metrics::counter!("siglake_query_wal_buffer_refused_layout_total").increment(1);
+            return Ok(BufferReadOutcome::Refused { compressed_bytes });
+        };
+        let Some(expansion_reservation) = self.memory.try_reserve(expansion_bound) else {
+            return Ok(BufferReadOutcome::Refused { compressed_bytes });
+        };
+        let batches = match transform_selected_buffer_batches(raw_batches, target_schema, carrier) {
+            Ok(batches) => batches,
+            Err(error) => {
+                metrics::counter!("siglake_query_wal_buffer_refused_decode_total").increment(1);
+                tracing::warn!(error = %error, dir = %wal_dir.display(),
+                    "refusing incomplete WAL buffer generation");
+                return Ok(BufferReadOutcome::Refused { compressed_bytes });
+            }
+        };
+        let transformed_payload = batches_payload_bytes(&batches);
+        if transformed_payload > raw_payload.saturating_add(expansion_bound) {
+            return Ok(BufferReadOutcome::Refused { compressed_bytes });
+        }
+        let batches = match attach_reservation_to_batches(batches, &decode_reservation)
+            .and_then(|batches| attach_reservation_to_batches(batches, &expansion_reservation))
+        {
             Ok(batches) => batches,
             Err(error) => {
                 metrics::counter!("siglake_query_wal_buffer_refused_decode_total").increment(1);
@@ -1151,7 +1196,7 @@ impl BufferDeltaCache {
             batches,
             names: selected.names,
             compressed_bytes,
-            _reservation: reservation,
+            reservations: vec![decode_reservation, expansion_reservation],
         });
         self.insert(
             wal_dir.to_path_buf(),
@@ -1191,7 +1236,7 @@ impl BufferDeltaCache {
 
     /// Install the freshly-decoded batches under the names that were actually
     /// read (single slot per dir — replaces any stale entry).
-    pub fn insert(
+    fn insert(
         &self,
         wal_dir: PathBuf,
         schema: SchemaRef,
@@ -1270,32 +1315,133 @@ fn align_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> Result<Reco
     RecordBatch::try_new(target.clone(), columns).context("align WAL buffer batch to events schema")
 }
 
+fn bitmap_bytes(rows: usize) -> Option<u64> {
+    Some(u64::try_from(rows).ok()?.div_ceil(8))
+}
+
+/// Upper bound for the buffers allocated by Arrow's all-null constructor.
+/// Nested, dictionary, union, and run-end layouts are declined because their
+/// recursive allocation has no local preallocation proof here.
+fn null_array_payload_bound(data_type: &DataType, rows: usize) -> Option<u64> {
+    let rows = u64::try_from(rows).ok()?;
+    let validity = bitmap_bytes(usize::try_from(rows).ok()?)?;
+    if matches!(data_type, DataType::Null) {
+        return Some(0);
+    }
+    if matches!(data_type, DataType::Boolean) {
+        return validity.checked_mul(2);
+    }
+    if let Some(width) = data_type.primitive_width() {
+        return rows
+            .checked_mul(u64::try_from(width).ok()?)?
+            .checked_add(validity);
+    }
+    let offsets = match data_type {
+        DataType::Binary | DataType::Utf8 => rows.checked_add(1)?.checked_mul(4)?,
+        DataType::LargeBinary | DataType::LargeUtf8 => rows.checked_add(1)?.checked_mul(8)?,
+        DataType::BinaryView | DataType::Utf8View => rows.checked_mul(16)?,
+        DataType::FixedSizeBinary(width) if *width >= 0 => {
+            rows.checked_mul(u64::try_from(*width).ok()?)?
+        }
+        _ => return None,
+    };
+    offsets.checked_add(validity)
+}
+
+fn attributes_are_all_empty(batch: &RecordBatch) -> bool {
+    let Some(column) = batch.column_by_name("attributes") else {
+        return true;
+    };
+    let Some(attributes) = column.as_any().downcast_ref::<StringArray>() else {
+        return false;
+    };
+    (0..attributes.len()).all(|row| attributes.is_null(row) || attributes.value(row).is_empty())
+}
+
+/// Bound allocations performed before schema alignment or carrier mapping.
+///
+/// Empty carrier attributes are the only mapped layout admitted here. They do
+/// not invoke serde's object allocator. The per-Utf8 64-byte value capacity is
+/// the largest explicit builder capacity in `mapping::new_builder` (the
+/// residual attributes builder); fixed-width and offset/validity buffers use
+/// Arrow's layout widths. Non-empty attributes and recursive Arrow layouts
+/// fail closed to the committed snapshot.
+fn transformation_expansion_bound(
+    batches: &[RecordBatch],
+    target: &SchemaRef,
+    carrier: Option<&siglake_core::index_config::IndexConfig>,
+) -> Option<u64> {
+    let mut total = 0u64;
+    for batch in batches {
+        if carrier.is_some() {
+            if !attributes_are_all_empty(batch) {
+                return None;
+            }
+            for field in target.fields() {
+                if matches!(field.data_type(), DataType::Binary | DataType::LargeBinary) {
+                    // BinaryBuilder grows dynamically and does not expose an
+                    // exact construction-capacity bound.
+                    return None;
+                }
+                let mut bytes = null_array_payload_bound(field.data_type(), batch.num_rows())?;
+                if matches!(field.data_type(), DataType::Utf8) {
+                    batch.num_rows().checked_mul(64)?;
+                    bytes = bytes
+                        .checked_add(u64::try_from(batch.num_rows()).ok()?.checked_mul(64)?)?;
+                }
+                total = total.checked_add(bytes)?;
+            }
+            continue;
+        }
+        let schema = batch.schema();
+        for field in target.fields() {
+            if schema.field_with_name(field.name()).is_err() {
+                total = total.checked_add(null_array_payload_bound(
+                    field.data_type(),
+                    batch.num_rows(),
+                )?)?;
+            }
+        }
+    }
+    Some(total)
+}
+
 /// Decode exactly the generation admitted by [`select_buffer_segments`]. A
 /// missing, replaced, corrupt, or unmappable member refuses the whole
 /// generation; serving a subset would turn corruption or a listing race into
 /// a silently inexact answer.
-fn read_selected_buffer_batches(
-    selected: &SelectedBufferSegments,
-    target_schema: &SchemaRef,
-    carrier: Option<&siglake_core::index_config::IndexConfig>,
-) -> Result<Vec<RecordBatch>> {
+fn read_selected_buffer_batches(selected: &SelectedBufferSegments) -> Result<Vec<RecordBatch>> {
     let mut batches = Vec::new();
-    for (segment, uncompressed_bytes) in selected.paths.iter().zip(&selected.uncompressed_bytes) {
-        let segment_batches = siglake_wal::read_segment_bounded(segment, *uncompressed_bytes)
+    for (segment, reader) in selected.paths.iter().zip(&selected.readers) {
+        let segment_batches = reader
+            .read(reader.uncompressed_bytes())
             .with_context(|| format!("decode selected WAL segment {}", segment.display()))?;
         for batch in segment_batches {
             if batch.num_rows() == 0 {
                 continue;
             }
+            batches.push(batch);
+        }
+    }
+    Ok(batches)
+}
+
+fn transform_selected_buffer_batches(
+    batches: Vec<RecordBatch>,
+    target_schema: &SchemaRef,
+    carrier: Option<&siglake_core::index_config::IndexConfig>,
+) -> Result<Vec<RecordBatch>> {
+    batches
+        .into_iter()
+        .map(|batch| {
             let batch = match carrier {
                 Some(config) => siglake_core::mapping::map_carrier_batch(&batch, config)
                     .context("map carrier batch for index buffer")?,
                 None => batch,
             };
-            batches.push(align_batch_to_schema(&batch, target_schema)?);
-        }
-    }
-    Ok(batches)
+            align_batch_to_schema(&batch, target_schema)
+        })
+        .collect()
 }
 
 /// Read the un-committed WAL segments under `wal_dir` into batches aligned to
@@ -1418,6 +1564,59 @@ fn batches_payload_bytes(batches: &[RecordBatch]) -> u64 {
     })
 }
 
+fn scalar_filter_leaf(expr: &Expr) -> bool {
+    match expr {
+        Expr::Alias(alias) => scalar_filter_leaf(&alias.expr),
+        Expr::Column(_) | Expr::Literal(_, _) => true,
+        _ => false,
+    }
+}
+
+/// Only admit predicates whose physical evaluation is limited to scalar
+/// comparisons and Boolean masks. String functions, casts, regular
+/// expressions, user-defined functions, and arithmetic are declined before
+/// evaluation because they can allocate an intermediate larger than both the
+/// input and final Boolean result.
+fn bounded_filter_mask_count(expr: &Expr) -> Option<u64> {
+    match expr {
+        Expr::Alias(alias) => bounded_filter_mask_count(&alias.expr),
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
+            bounded_filter_mask_count(&binary.left)?
+                .checked_add(bounded_filter_mask_count(&binary.right)?)?
+                .checked_add(1)
+        }
+        Expr::BinaryExpr(binary)
+            if matches!(
+                binary.op,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq
+                    | Operator::IsDistinctFrom
+                    | Operator::IsNotDistinctFrom
+            ) =>
+        {
+            (scalar_filter_leaf(&binary.left) && scalar_filter_leaf(&binary.right)).then_some(1)
+        }
+        Expr::Not(inner) => bounded_filter_mask_count(inner)?.checked_add(1),
+        Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsUnknown(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsNotFalse(inner)
+        | Expr::IsNotUnknown(inner) => scalar_filter_leaf(inner).then_some(1),
+        Expr::Between(between) => (scalar_filter_leaf(&between.expr)
+            && scalar_filter_leaf(&between.low)
+            && scalar_filter_leaf(&between.high))
+        .then_some(3),
+        _ => None,
+    }
+}
+
 /// Run the query-local filter under its own reservation. Filtered value
 /// buffers cannot contain more values or variable-width payload than their
 /// inputs; the extra term covers one value bitmap per predicate plus the
@@ -1433,13 +1632,18 @@ fn filter_batches_charged(
     if filters.is_empty() || batches.is_empty() {
         return Some(Ok(batches.to_vec()));
     }
+    let Some(expression_masks) = filters.iter().try_fold(0u64, |count, filter| {
+        count.checked_add(bounded_filter_mask_count(filter)?)
+    }) else {
+        metrics::counter!("siglake_query_wal_buffer_refused_filter_workspace_total").increment(1);
+        return None;
+    };
     let rows = batches.iter().fold(0u64, |rows, batch| {
         rows.saturating_add(batch.num_rows() as u64)
     });
     let mask_bytes = rows
-        .saturating_add(7)
-        .saturating_div(8)
-        .saturating_mul((filters.len() as u64).saturating_add(1));
+        .div_ceil(8)
+        .saturating_mul(expression_masks.saturating_add(filters.len() as u64));
     let bound = batches_payload_bytes(batches).saturating_add(mask_bytes);
     let reservation = memory.try_reserve(bound)?;
     let filtered = match filter_batches(batches, filters, schema, state) {
@@ -2403,6 +2607,81 @@ mod tests {
     }
 
     #[test]
+    fn null_ipc_alignment_is_sized_from_rows_and_target_layout() {
+        let rows = 10_000_000;
+        let source = Arc::new(Schema::new(vec![Field::new(
+            "compact",
+            DataType::Null,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            source,
+            vec![arrow_array::new_null_array(&DataType::Null, rows)],
+        )
+        .unwrap();
+        let target = Arc::new(Schema::new(vec![
+            Field::new("compact", DataType::Null, true),
+            Field::new("expanded", DataType::Int64, true),
+        ]));
+        let bound = transformation_expansion_bound(&[batch], &target, None).unwrap();
+        assert!(bound >= 80_000_000, "fixed-width target is row-sized");
+    }
+
+    #[test]
+    fn nonempty_carrier_attributes_are_refused_before_mapping() {
+        let batch = siglake_core::events_to_record_batch(&[
+            Event::now("mapped").with_attributes(Some(r#"{"nested":{"value":1}}"#.into()))
+        ])
+        .unwrap();
+        let config = siglake_core::index_config::IndexConfig::builtin_events();
+        assert!(
+            transformation_expansion_bound(&[batch], &config.to_arrow_schema(), Some(&config),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn empty_carrier_mapping_keeps_parity_under_its_layout_bound() {
+        let batch = siglake_core::events_to_record_batch(&[Event::now("mapped")]).unwrap();
+        let config = siglake_core::index_config::IndexConfig::builtin_events();
+        let target = config.to_arrow_schema();
+        assert!(transformation_expansion_bound(
+            std::slice::from_ref(&batch),
+            &target,
+            Some(&config),
+        )
+        .is_some());
+        let expected = siglake_core::mapping::map_carrier_batch(&batch, &config).unwrap();
+        let actual = transform_selected_buffer_batches(vec![batch], &target, Some(&config))
+            .unwrap()
+            .remove(0);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn allocating_filter_is_refused_for_two_cache_hits_without_a_charge() {
+        use datafusion::functions::string::repeat;
+        use datafusion::prelude::{col, lit};
+
+        let batch = siglake_core::events_to_record_batch(&[Event::now("x")]).unwrap();
+        let schema = batch.schema();
+        let filter = repeat(vec![col("raw"), lit(1_000_000i64)]).eq(lit("never"));
+        let state = SessionContext::new().state();
+        let memory = BufferMemoryBudget::new(MIB);
+        for _ in 0..2 {
+            assert!(filter_batches_charged(
+                &memory,
+                std::slice::from_ref(&batch),
+                std::slice::from_ref(&filter),
+                &schema,
+                &state,
+            )
+            .is_none());
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[test]
     fn admitted_listing_is_the_only_generation_decoded() {
         let tmp = tempfile::tempdir().unwrap();
         write_sealed_segment(tmp.path(), 2);
@@ -2410,8 +2689,7 @@ mod tests {
             select_buffer_segments(tmp.path(), &HashSet::new(), None, None, u64::MAX).unwrap();
         write_sealed_segment(tmp.path(), 3);
 
-        let batches =
-            read_selected_buffer_batches(&selected, &siglake_core::events_schema(), None).unwrap();
+        let batches = read_selected_buffer_batches(&selected).unwrap();
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
         assert_eq!(
             selected.names.len(),
@@ -2427,9 +2705,7 @@ mod tests {
         let selected =
             select_buffer_segments(tmp.path(), &HashSet::new(), None, None, u64::MAX).unwrap();
         std::fs::remove_file(&selected.paths[0]).unwrap();
-        assert!(
-            read_selected_buffer_batches(&selected, &siglake_core::events_schema(), None).is_err()
-        );
+        assert!(read_selected_buffer_batches(&selected).is_err());
     }
 
     #[test]

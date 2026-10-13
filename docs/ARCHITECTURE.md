@@ -547,15 +547,22 @@ for both admission and the read. `SIGLAKE_BUFFER_DELTA_MAX_BYTES` remains the
 compressed-file ceiling (2 GiB by default). A separate process-wide ownership
 budget, `SIGLAKE_BUFFER_DELTA_MEMORY_BYTES`, covers compressed input,
 decompressed IPC, decoded Arrow, mapping/alignment output, cache generations
-and active readers. The query reader validates each selected member's exact IPC
-extent before allocation and decompresses into that exact extent. Mapping and
-alignment admission scales with the target schema rather than treating a fixed
-IPC multiplier as an Arrow-heap ceiling. Filter and ordered-union copies take
-per-query reservations, so simultaneous cache hits are additive. Reservations
-are attached to the Arrow buffers they cover and remain charged when a caller
-retains a batch after the plan, stream, or cache generation is gone. This is a
-payload-ownership bound, not an RSS estimate. It defaults to one eighth of the
-container limit, bounded to 64 MiB..1 GiB (512 MiB when no limit is readable);
+and active readers. The query reader opens each selected member once, sizes and
+reads through that descriptor, and refuses replacement, resizing, trailing
+growth, or an unknown IPC extent. It decompresses into the admitted IPC
+extent. Before alignment, row counts and supported Arrow layouts price every
+missing-column allocation. Managed-index mapping is admitted only when the
+carrier attributes are empty and its builder layouts have a local bound;
+other mappings use the committed snapshot. The WAL filter pre-pass accepts
+only scalar comparisons and Boolean masks. String functions, casts, regular
+expressions, user-defined functions, and arithmetic use the committed snapshot
+instead of allocating an unpriced intermediate. Filter and ordered-union
+copies take per-query reservations, so simultaneous cache hits are additive.
+Reservations are attached to the Arrow buffers they cover and remain charged
+when a caller retains a batch after the plan, stream, or cache generation is
+gone. This is a payload-ownership bound, not an RSS estimate. It defaults to
+one eighth of the container limit, bounded to 64 MiB..1 GiB (512 MiB when no
+limit is readable);
 zero disables WAL-buffer reads. Admission never waits. Capacity, corrupt
 sizing, a selected member that changes or disappears, or a decode error refuses
 that complete generation and serves the exact committed snapshot until a later

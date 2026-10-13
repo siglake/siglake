@@ -24,6 +24,7 @@ pub mod mirror;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -2574,6 +2575,140 @@ pub fn read_segment(path: &Path) -> Result<Vec<RecordBatch>> {
     }
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    created: Option<std::time::SystemTime>,
+}
+
+#[cfg(not(unix))]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        created: metadata.created().ok(),
+    }
+}
+
+/// A sealed WAL member pinned to the descriptor used for query admission.
+///
+/// The descriptor stays open from header sizing through body materialization.
+/// Reads reject path replacement, descriptor length changes, short reads, and
+/// trailing growth before decoding, so no path race can allocate more physical
+/// input than the admitted extent.
+#[derive(Debug)]
+pub struct BoundedSegmentReader {
+    path: PathBuf,
+    file: Mutex<File>,
+    identity: FileIdentity,
+    physical_bytes: u64,
+    uncompressed_bytes: u64,
+}
+
+impl BoundedSegmentReader {
+    pub fn open(path: &Path) -> Result<Self> {
+        let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("stat {}", path.display()))?;
+        let physical_bytes = metadata.len();
+        let uncompressed_bytes =
+            segment_uncompressed_bytes_strict_file(&mut file, path, physical_bytes)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Mutex::new(file),
+            identity: file_identity(&metadata),
+            physical_bytes,
+            uncompressed_bytes,
+        })
+    }
+
+    pub fn physical_bytes(&self) -> u64 {
+        self.physical_bytes
+    }
+
+    pub fn uncompressed_bytes(&self) -> u64 {
+        self.uncompressed_bytes
+    }
+
+    pub fn read(&self, max_uncompressed_bytes: u64) -> Result<Vec<RecordBatch>> {
+        if self.uncompressed_bytes > max_uncompressed_bytes {
+            bail!(
+                "WAL segment {} has {} uncompressed bytes, above limit {max_uncompressed_bytes}",
+                self.path.display(),
+                self.uncompressed_bytes
+            );
+        }
+        let path_metadata = fs::metadata(&self.path)
+            .with_context(|| format!("restat selected WAL segment {}", self.path.display()))?;
+        if file_identity(&path_metadata) != self.identity
+            || path_metadata.len() != self.physical_bytes
+        {
+            bail!(
+                "selected WAL segment {} was replaced or resized after admission",
+                self.path.display()
+            );
+        }
+
+        let mut file = self.file.lock().expect("bounded WAL reader poisoned");
+        let descriptor_metadata = file
+            .metadata()
+            .with_context(|| format!("restat WAL descriptor {}", self.path.display()))?;
+        if file_identity(&descriptor_metadata) != self.identity
+            || descriptor_metadata.len() != self.physical_bytes
+        {
+            bail!(
+                "selected WAL descriptor {} changed after admission",
+                self.path.display()
+            );
+        }
+        let physical_len = usize::try_from(self.physical_bytes)
+            .with_context(|| format!("WAL segment {} is too large", self.path.display()))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(physical_len)
+            .with_context(|| format!("reserve WAL input for {}", self.path.display()))?;
+        bytes.resize(physical_len, 0);
+        file.seek(std::io::SeekFrom::Start(0))
+            .with_context(|| format!("rewind WAL input {}", self.path.display()))?;
+        file.read_exact(&mut bytes)
+            .with_context(|| format!("read exact WAL input from {}", self.path.display()))?;
+        let mut trailing = [0u8; 1];
+        if file
+            .read(&mut trailing)
+            .with_context(|| format!("finish WAL input from {}", self.path.display()))?
+            != 0
+        {
+            bail!("WAL segment {} grew after admission", self.path.display());
+        }
+        let final_path_metadata = fs::metadata(&self.path)
+            .with_context(|| format!("finish selected WAL segment {}", self.path.display()))?;
+        if file_identity(&final_path_metadata) != self.identity
+            || final_path_metadata.len() != self.physical_bytes
+        {
+            bail!(
+                "selected WAL segment {} changed while being read",
+                self.path.display()
+            );
+        }
+        decode_segment_bounded_bytes(&self.path, &bytes, self.uncompressed_bytes)
+    }
+}
+
 /// Read a sealed segment after proving its uncompressed IPC extent is at most
 /// `max_uncompressed_bytes`.
 ///
@@ -2583,16 +2718,15 @@ pub fn read_segment(path: &Path) -> Result<Vec<RecordBatch>> {
 /// are errors. Query-side WAL admission uses this path so a compressed member
 /// cannot cross its admitted IPC-payload bound while being decoded.
 pub fn read_segment_bounded(path: &Path, max_uncompressed_bytes: u64) -> Result<Vec<RecordBatch>> {
-    let uncompressed = segment_uncompressed_bytes_strict(path)?;
-    if uncompressed > max_uncompressed_bytes {
-        bail!(
-            "WAL segment {} has {uncompressed} uncompressed bytes, above limit {max_uncompressed_bytes}",
-            path.display()
-        );
-    }
+    BoundedSegmentReader::open(path)?.read(max_uncompressed_bytes)
+}
 
-    let bytes = fs::read(path).with_context(|| format!("opening {}", path.display()))?;
-    if !is_framed(&bytes) {
+fn decode_segment_bounded_bytes(
+    path: &Path,
+    bytes: &[u8],
+    uncompressed: u64,
+) -> Result<Vec<RecordBatch>> {
+    if !is_framed(bytes) {
         if bytes.len() as u64 != uncompressed {
             bail!(
                 "WAL segment {} changed size after preflight: {} != {uncompressed}",
@@ -2600,11 +2734,11 @@ pub fn read_segment_bounded(path: &Path, max_uncompressed_bytes: u64) -> Result<
                 bytes.len()
             );
         }
-        validate_segment_crc(path, &bytes)?;
-        return read_segment_bytes(&bytes);
+        validate_segment_crc(path, bytes)?;
+        return read_segment_bytes(bytes);
     }
 
-    let (zstd, body) = verify_wal_frame(path, &bytes)?;
+    let (zstd, body) = verify_wal_frame(path, bytes)?;
     if !zstd {
         if body.len() as u64 != uncompressed {
             bail!(
@@ -2657,13 +2791,23 @@ pub fn read_segment_bounded(path: &Path, max_uncompressed_bytes: u64) -> Result<
 /// bad segment. Query serving must fail closed instead: it has no safe amount
 /// to reserve when framing or compressed size cannot be established.
 pub fn segment_uncompressed_bytes_strict(path: &Path) -> Result<u64> {
-    const ZSTD_FRAME_HEADER_MAX: usize = 18;
-
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let file_len = file
         .metadata()
         .with_context(|| format!("stat {}", path.display()))?
         .len();
+    segment_uncompressed_bytes_strict_file(&mut file, path, file_len)
+}
+
+fn segment_uncompressed_bytes_strict_file(
+    file: &mut File,
+    path: &Path,
+    file_len: u64,
+) -> Result<u64> {
+    const ZSTD_FRAME_HEADER_MAX: usize = 18;
+
+    file.seek(std::io::SeekFrom::Start(0))
+        .with_context(|| format!("rewind WAL header in {}", path.display()))?;
     let mut fixed = [0u8; WAL_FRAME_HEADER_LEN];
     let fixed_len = file_len.min(WAL_FRAME_HEADER_LEN as u64) as usize;
     file.read_exact(&mut fixed[..fixed_len])
@@ -4025,6 +4169,33 @@ mod crc_integrity_tests {
             }
             assert_eq!(read_segment(&path).unwrap()[0].num_rows(), 2);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_refuses_growth_and_same_size_replacement_after_admission() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_one_segment(tmp.path());
+        let reader = BoundedSegmentReader::open(&path).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"growth")
+            .unwrap();
+        assert!(reader.read(u64::MAX).is_err());
+
+        let path = write_one_segment(tmp.path());
+        let reader = BoundedSegmentReader::open(&path).unwrap();
+        let replacement = path.with_extension("replacement");
+        fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert!(
+            reader.read(u64::MAX).is_err(),
+            "same-size path replacement must not pass descriptor admission"
+        );
     }
 
     /// A byte flipped in the framed body trips the in-band integrity check.
