@@ -329,8 +329,10 @@ compactor:
   # commits its own rewrite, so they are independent work.
   #
   # MEMORY IS THE BINDING CONSTRAINT, NOT CPU. Each in-flight bin holds its
-  # own decoded working set — roughly SIGLAKE_MERGE_CHUNK_ROWS rows times
-  # SIGLAKE_MERGE_CHUNK_PREFETCH, plus its open row-group decoders.
+  # own decoded working set. An explicit SIGLAKE_MERGE_CHUNK_ROWS is multiplied
+  # by SIGLAKE_MERGE_CHUNK_PREFETCH; at the packaged 1Gi limit with no explicit
+  # row setting, fetched input is instead derived to an estimated 128MiB per
+  # resident chunk. Open writer row groups and encoder allocations are separate.
   #
   # MEASURED, not extrapolated: a 200G AWS round with binConcurrency: 4 peaked
   # at 12.03 GB of compaction-only RSS — about 3 GB PER BIN. An earlier estimate

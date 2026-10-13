@@ -1137,6 +1137,54 @@ mod warehouse_role_tests {
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(test)]
+mod allocator_memory_readout_tests {
+    const MIB: usize = 1024 * 1024;
+
+    #[test]
+    #[ignore = "allocator churn probe must run alone"]
+    fn jemalloc_readout_survives_concurrent_allocator_churn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                let allocation = vec![0_u8; MIB];
+                std::hint::black_box(&allocation);
+            }
+        });
+        let present = (0..1_000).all(|_| siglake_core::allocator_memory_readout().is_some());
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        assert!(present, "readout disappeared during allocator churn");
+    }
+
+    #[test]
+    fn jemalloc_readout_tracks_a_touched_large_allocation() {
+        let before = siglake_core::allocator_memory_readout()
+            .expect("siglake-cli tests use jemalloc as the global allocator");
+        assert!(before.resident_bytes > 0);
+
+        let mut allocation = vec![0_u8; 64 * MIB];
+        for (page, byte) in allocation.chunks_mut(4096).enumerate() {
+            byte[0] = (page as u8).wrapping_add(1);
+        }
+        std::hint::black_box(&allocation);
+
+        let after = siglake_core::allocator_memory_readout().expect("jemalloc readout after grow");
+        assert!(
+            after.allocated_bytes.saturating_sub(before.allocated_bytes) >= 48 * MIB as u64,
+            "allocated grew by only {} bytes: before={before:?}, after={after:?}",
+            after.allocated_bytes.saturating_sub(before.allocated_bytes)
+        );
+        assert!(
+            after.resident_bytes.saturating_sub(before.resident_bytes) >= 48 * MIB as u64,
+            "resident grew by only {} bytes: before={before:?}, after={after:?}",
+            after.resident_bytes.saturating_sub(before.resident_bytes)
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();

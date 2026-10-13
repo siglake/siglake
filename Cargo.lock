@@ -6331,6 +6331,7 @@ dependencies = [
  "siglake-storage",
  "siglake-wal",
  "tempfile",
+ "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
  "tower",

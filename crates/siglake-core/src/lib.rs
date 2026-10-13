@@ -25,6 +25,128 @@ pub use promote::{
     PROMOTED_PROPERTY_KEY,
 };
 
+/// Point-in-time process memory reported by jemalloc and the process cgroup.
+///
+/// jemalloc statistics are refreshed by advancing its epoch before every
+/// read. `cgroup_memory_current_bytes` is absent outside a cgroup with either
+/// the v2 or v1 memory controller mounted at the paths used by Siglake's
+/// memory-limit resolver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllocatorMemoryReadout {
+    pub allocated_bytes: u64,
+    pub active_bytes: u64,
+    pub resident_bytes: u64,
+    pub cgroup_memory_current_bytes: Option<u64>,
+}
+
+/// Read and export the compactor's current allocator and cgroup memory.
+///
+/// Crate test binaries use Rust's system allocator even though they link this
+/// crate and therefore jemalloc's control symbols. The first call compares a
+/// 4 MiB allocation through Rust's global allocator with jemalloc's allocated
+/// byte count. Only a positive result is cached; concurrent frees can mask
+/// the probe's growth, so a negative result is retried on the next call. Return `None`
+/// when they are not, so those binaries do not publish a plausible-looking
+/// sample from jemalloc's otherwise idle internal arena.
+pub fn allocator_memory_readout() -> Option<AllocatorMemoryReadout> {
+    if !jemalloc_is_global_allocator() {
+        return None;
+    }
+    tikv_jemalloc_ctl::epoch::advance().ok()?;
+    let allocated_bytes = tikv_jemalloc_ctl::stats::allocated::read().ok()? as u64;
+    let readout = AllocatorMemoryReadout {
+        allocated_bytes,
+        active_bytes: tikv_jemalloc_ctl::stats::active::read().ok()? as u64,
+        resident_bytes: tikv_jemalloc_ctl::stats::resident::read().ok()? as u64,
+        cgroup_memory_current_bytes: cgroup_memory_current_bytes(),
+    };
+    ::metrics::gauge!("siglake_compactor_allocator_allocated_bytes")
+        .set(readout.allocated_bytes as f64);
+    ::metrics::gauge!("siglake_compactor_allocator_active_bytes").set(readout.active_bytes as f64);
+    ::metrics::gauge!("siglake_compactor_allocator_resident_bytes")
+        .set(readout.resident_bytes as f64);
+    if let Some(bytes) = readout.cgroup_memory_current_bytes {
+        ::metrics::gauge!("siglake_compactor_cgroup_memory_current_bytes").set(bytes as f64);
+    }
+    Some(readout)
+}
+
+fn jemalloc_is_global_allocator() -> bool {
+    static IS_GLOBAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    positive_allocator_probe(&IS_GLOBAL, probe_jemalloc_global)
+}
+
+fn positive_allocator_probe(
+    known_global: &std::sync::atomic::AtomicBool,
+    probe: impl FnOnce() -> bool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if known_global.load(Ordering::Relaxed) {
+        return true;
+    }
+    if !probe() {
+        return false;
+    }
+    known_global.store(true, Ordering::Relaxed);
+    true
+}
+
+fn probe_jemalloc_global() -> bool {
+    const PROBE_BYTES: usize = 4 * 1024 * 1024;
+    const MIN_REPORTED_GROWTH: usize = PROBE_BYTES / 2;
+    if tikv_jemalloc_ctl::epoch::advance().is_err() {
+        return false;
+    }
+    let Ok(before) = tikv_jemalloc_ctl::stats::allocated::read() else {
+        return false;
+    };
+    // allocated counts malloc's allocation, not touched resident pages. Avoid
+    // faulting pages merely to identify the allocator. Concurrent frees can
+    // still mask growth; the caller never caches a negative observation.
+    let probe = vec![0_u8; PROBE_BYTES];
+    std::hint::black_box(&probe);
+    if tikv_jemalloc_ctl::epoch::advance().is_err() {
+        return false;
+    }
+    let Ok(during) = tikv_jemalloc_ctl::stats::allocated::read() else {
+        return false;
+    };
+    during.saturating_sub(before) >= MIN_REPORTED_GROWTH
+}
+
+#[cfg(test)]
+mod allocator_probe_tests {
+    #[test]
+    fn negative_probe_is_retried_and_positive_is_cached() {
+        let known = std::sync::atomic::AtomicBool::new(false);
+        let mut probes = 0;
+        for (answer, expected) in [(false, false), (false, false), (true, true), (true, true)] {
+            assert_eq!(
+                super::positive_allocator_probe(&known, || {
+                    probes += 1;
+                    answer
+                }),
+                expected
+            );
+        }
+        assert_eq!(probes, 3);
+    }
+}
+
+fn cgroup_memory_current_bytes() -> Option<u64> {
+    for path in [
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            if let Ok(bytes) = raw.trim().parse() {
+                return Some(bytes);
+            }
+        }
+    }
+    None
+}
+
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::builder::{Int64Builder, StringBuilder, TimestampMicrosecondBuilder};
