@@ -272,6 +272,123 @@ async fn attr_get_rewrite_activates_after_backfill() {
     }
 }
 
+fn object_promotion() -> Vec<PromotedColumn> {
+    vec![PromotedColumn {
+        attr_key: "aws.cloudwatch".into(),
+        name: "aws_cloudwatch".into(),
+        ty: PromotedType::Utf8,
+    }]
+}
+
+fn object_events() -> Vec<Event> {
+    [
+        (
+            "object",
+            r#"{"aws.cloudwatch":{"log_group":"group-a","log_stream":"stream-a"}}"#,
+        ),
+        (
+            "array",
+            r#"{"aws.cloudwatch":[{"log_stream":"array-stream"},2]}"#,
+        ),
+    ]
+    .into_iter()
+    .map(|(raw, attributes)| Event::now(raw).with_attributes(Some(attributes.to_string())))
+    .collect()
+}
+
+async fn nested_object_answer(app: &Router, sql: &str) -> Value {
+    let (status, body) = request_json(
+        app,
+        "/api/v1/sql",
+        serde_json::json!({ "query": sql, "default_order": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["rows"].clone()
+}
+
+async fn nested_object_plan(app: &Router, sql: &str) -> String {
+    nested_object_answer(app, &format!("EXPLAIN {sql}"))
+        .await
+        .to_string()
+}
+
+/// #6782: production SQL rewriting substitutes a qualified, object-valued
+/// promotion only for the inner call of a nested `attr_get`. The unchanged
+/// query must retain the outer call and the same answers as an unpromoted
+/// table. Keeping the pre-backfill plan in the fixture proves the result is
+/// not merely the JSON fallback succeeding on both sides.
+#[tokio::test]
+async fn nested_attr_get_rewrites_its_object_valued_inner_call() {
+    const SQL: &str = "SELECT raw, \
+        attr_get(attr_get(attributes, 'aws.cloudwatch'), 'log_stream') AS log_stream \
+        FROM events ORDER BY raw";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let promoted_warehouse = tmp.path().join("promoted");
+    let promoted = IcebergContext::open(&promoted_warehouse)
+        .await
+        .unwrap()
+        .with_promoted_columns(object_promotion());
+    promoted.ensure_promoted_columns().await.unwrap();
+    promoted.append_events(&object_events()).await.unwrap();
+
+    let control_warehouse = tmp.path().join("control");
+    let control = IcebergContext::open(&control_warehouse).await.unwrap();
+    control.append_events(&object_events()).await.unwrap();
+
+    let promoted_app = router(AppState::new(
+        Arc::new(IcebergContext::open(&promoted_warehouse).await.unwrap()),
+        AuthConfig::open(),
+    ));
+    let control_app = router(AppState::new(
+        Arc::new(IcebergContext::open(&control_warehouse).await.unwrap()),
+        AuthConfig::open(),
+    ));
+
+    // The promoted property exists, but the backfill/extraction-version gate
+    // is still closed. The original nested expression must remain in the plan.
+    assert!(promoted.events_attr_rewrite_map().await.unwrap().is_none());
+    let closed_plan = nested_object_plan(&promoted_app, SQL).await;
+    assert!(
+        closed_plan.contains("attr_get(attr_get(attributes"),
+        "gate-closed plan must retain the nested JSON walk:\n{closed_plan}"
+    );
+    let control_rows = nested_object_answer(&control_app, SQL).await;
+    assert_eq!(
+        nested_object_answer(&promoted_app, SQL).await,
+        control_rows,
+        "the gate-closed promoted table must use the JSON fallback"
+    );
+
+    assert!(promoted.ensure_promotion_backfill_property().await.unwrap());
+    assert!(promoted.events_attr_rewrite_map().await.unwrap().is_some());
+    let promoted_app = router(AppState::new(
+        Arc::new(IcebergContext::open(&promoted_warehouse).await.unwrap()),
+        AuthConfig::open(),
+    ));
+
+    let open_plan = nested_object_plan(&promoted_app, SQL).await;
+    assert!(
+        open_plan.contains("attr_get(aws_cloudwatch"),
+        "outer attr_get must remain over the promoted column:\n{open_plan}"
+    );
+    assert!(
+        !open_plan.contains("attr_get(attributes"),
+        "inner attr_get must be absent after substitution:\n{open_plan}"
+    );
+    let promoted_rows = nested_object_answer(&promoted_app, SQL).await;
+    assert_eq!(promoted_rows, control_rows);
+    assert_eq!(
+        promoted_rows,
+        serde_json::json!([
+            { "raw": "array" },
+            { "raw": "object", "log_stream": "stream-a" }
+        ]),
+        "the fixture must exercise both array and object promoted values"
+    );
+}
+
 /// The full autonomous loop, zero configuration: hot attribute keys promote
 /// themselves (sampled from live files), the property-driven write path
 /// materializes them on subsequent commits, backfill rewrites the old files,
