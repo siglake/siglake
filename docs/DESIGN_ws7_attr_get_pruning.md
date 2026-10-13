@@ -20,7 +20,9 @@ incomplete and mixed-writer files retain the residual expression until an
 ordinary rewrite rematerializes the distinct composed column. No automatic
 migration or default promotion was added; the column cap is unchanged. The
 explicit `declare-promotions --table <events-or-managed-index>` command records
-the additive identity and schema without rewriting data.*
+the additive identity and schema without rewriting data. Each catalog retry
+recomputes the union from its refreshed base so concurrent declarations are
+retained.*
 
 ## What already shipped (don't re-implement)
 

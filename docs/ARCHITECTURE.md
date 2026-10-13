@@ -976,8 +976,10 @@ siglake declare-promotions --table big5 \
 ```
 
 The command retains every promotion already recorded on the table and performs
-no data rewrite. The compactor's flag uses the same `--promote-attr` syntax as
-an events-table bootstrap seed.
+no data rewrite. Catalog retries rebuild the additive union from refreshed
+metadata, so concurrent declarations of distinct expressions cannot remove
+each other. The compactor's flag uses the same `--promote-attr` syntax as an
+events-table bootstrap seed.
 That source materializes
 `attr_get(attr_get(attributes,'aws.cloudwatch'),'log_stream')`; it does not
 materialize `attr_get(attributes,'aws.cloudwatch.log_stream')`. Each outer step

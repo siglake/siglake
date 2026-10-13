@@ -3902,36 +3902,10 @@ async fn declare_promotions_on_table(
             ice.namespace()
         );
     };
-    let loaded = ice
-        .catalog()
-        .load_table(&ident)
-        .await
-        .with_context(|| format!("load promotion target {ident}"))?;
-    let properties = loaded.metadata().properties();
-    let mut desired = siglake_core::promoted_columns_from_properties(
-        properties
-            .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
-            .map(String::as_str),
-        properties
-            .get(siglake_core::PROMOTED_PROPERTY_KEY)
-            .map(String::as_str),
-    );
-    for addition in additions {
-        if let Some(position) = desired
-            .iter()
-            .position(|current| current.name == addition.name)
-        {
-            // Leave an identical declaration alone. Put a changed identity in
-            // the desired set so storage's retry-aware validator reports the
-            // immutable-field refusal against the catalog base it commits on.
-            if desired[position] != *addition {
-                desired[position] = addition.clone();
-            }
-        } else {
-            desired.push(addition.clone());
-        }
-    }
-    let added = ice.declare_promotions_for(&ident, &desired).await?;
+    // Storage forms the complete additive union from fresh catalog metadata
+    // on every transaction retry. Passing only this request's additions keeps
+    // a stale CLI read from replacing a concurrent declaration.
+    let added = ice.declare_promotions_for(&ident, additions).await?;
     Ok((ident, added))
 }
 
