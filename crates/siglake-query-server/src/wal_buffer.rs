@@ -2607,6 +2607,61 @@ mod tests {
     }
 
     #[test]
+    fn internally_compressed_ipc_is_refused_before_arrow_decode() {
+        let rows = 1_000_000;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from_iter_values(
+                std::iter::repeat_n(0, rows),
+            ))],
+        )
+        .unwrap();
+        let options = arrow::ipc::writer::IpcWriteOptions::default()
+            .try_with_compression(Some(arrow::ipc::CompressionType::LZ4_FRAME))
+            .unwrap();
+        let mut encoded = Vec::new();
+        {
+            let mut writer = arrow::ipc::writer::StreamWriter::try_new_with_options(
+                &mut encoded,
+                &schema,
+                options,
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(
+            encoded.len() * 16 < rows * std::mem::size_of::<i64>(),
+            "fixture must have a much smaller outer IPC extent than decoded values"
+        );
+        let error = siglake_wal::read_segment_bytes(&encoded).unwrap_err();
+        assert!(
+            error.to_string().contains("IPC body compression"),
+            "compressed IPC must be refused from metadata: {error:#}"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let sealed = tmp.path().join(SEALED_DIR);
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::write(sealed.join("compressed.arrow"), &encoded).unwrap();
+        let memory_limit = (encoded.len() as u64) * 4;
+        assert!(
+            memory_limit * 16 < (rows * std::mem::size_of::<i64>()) as u64,
+            "fixture budget must be tiny relative to decoded numeric payload"
+        );
+        let cache = BufferDeltaCache::with_memory_limit(memory_limit);
+        let outcome = cache
+            .get_or_load_for_query(tmp.path(), &schema, &HashSet::new(), None, None, None)
+            .unwrap();
+        assert!(matches!(outcome, BufferReadOutcome::Refused { .. }));
+        assert_eq!(cache.memory.used(), 0, "refusal releases predecode charge");
+    }
+
+    #[test]
     fn null_ipc_alignment_is_sized_from_rows_and_target_layout() {
         let rows = 10_000_000;
         let source = Arc::new(Schema::new(vec![Field::new(

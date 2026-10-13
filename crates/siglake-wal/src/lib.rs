@@ -3081,7 +3081,8 @@ fn read_partial_segment_bytes(path: &Path, bytes: &[u8]) -> Result<Vec<RecordBat
         IpcStreamExtent::Complete => return decode_ipc_stream(bytes),
         IpcStreamExtent::Truncated { offset, detail } => (offset, detail),
         // Bytes all present and still not a message: corruption, not a tear.
-        IpcStreamExtent::Malformed { offset, detail } => {
+        IpcStreamExtent::Malformed { offset, detail }
+        | IpcStreamExtent::Unsupported { offset, detail } => {
             metrics::counter!("siglake_wal_ipc_framing_refused_total").increment(1);
             bail!(
                 "WAL partial-segment IPC framing check for {}: the message at byte {offset} {detail}",
@@ -3491,7 +3492,8 @@ pub fn read_segment_bytes(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     match ipc_stream_extent(bytes) {
         IpcStreamExtent::Complete => {}
         IpcStreamExtent::Truncated { offset, detail }
-        | IpcStreamExtent::Malformed { offset, detail } => {
+        | IpcStreamExtent::Malformed { offset, detail }
+        | IpcStreamExtent::Unsupported { offset, detail } => {
             metrics::counter!("siglake_wal_ipc_framing_refused_total").increment(1);
             bail!("WAL segment IPC framing check: the message at byte {offset} {detail}")
         }
@@ -3524,11 +3526,15 @@ enum IpcStreamExtent {
     /// torn tail — the bytes are all present and still do not describe a
     /// message.
     Malformed { offset: usize, detail: String },
+    /// The message is structurally valid but uses an allocation-bearing IPC
+    /// feature the WAL reader cannot bound before Arrow decodes it.
+    Unsupported { offset: usize, detail: String },
 }
 
 /// Walk `bytes` as an Arrow IPC stream, checking each message's declared
-/// metadata and body length against what is left of the segment. Mirrors
-/// `StreamReader`'s own framing rules: an optional continuation marker, a
+/// metadata and body length against what is left of the segment and rejecting
+/// body compression before Arrow can allocate its embedded decoded lengths.
+/// Mirrors `StreamReader`'s framing rules: an optional continuation marker, a
 /// little-endian `i32` metadata length, the flatbuffer metadata, then the body
 /// `bodyLength` names. A zero length is the end-of-stream marker.
 fn ipc_stream_extent(bytes: &[u8]) -> IpcStreamExtent {
@@ -3577,6 +3583,22 @@ fn ipc_stream_extent(bytes: &[u8]) -> IpcStreamExtent {
                 detail: format!("has {meta_len} metadata bytes the flatbuffer verifier rejects"),
             };
         };
+        let internally_compressed = match message.header_type() {
+            arrow::ipc::MessageHeader::RecordBatch => message
+                .header_as_record_batch()
+                .is_some_and(|batch| batch.compression().is_some()),
+            arrow::ipc::MessageHeader::DictionaryBatch => message
+                .header_as_dictionary_batch()
+                .and_then(|dictionary| dictionary.data())
+                .is_some_and(|batch| batch.compression().is_some()),
+            _ => false,
+        };
+        if internally_compressed {
+            return IpcStreamExtent::Unsupported {
+                offset: start,
+                detail: "uses unsupported Arrow IPC body compression".to_string(),
+            };
+        }
         let declared_body = message.bodyLength();
         let Ok(body_len) = usize::try_from(declared_body) else {
             return IpcStreamExtent::Malformed {
@@ -4198,6 +4220,44 @@ mod crc_integrity_tests {
         );
     }
 
+    #[test]
+    fn internally_compressed_dictionary_message_is_refused_before_decode() {
+        use arrow_array::types::Int32Type;
+        use arrow_array::{DictionaryArray, Int32Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let dictionary = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0, 1, 0, 1]),
+            std::sync::Arc::new(StringArray::from(vec!["alpha", "beta"])),
+        )
+        .unwrap();
+        let schema = Schema::new(vec![Field::new(
+            "tag",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )]);
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(schema.clone()),
+            vec![std::sync::Arc::new(dictionary)],
+        )
+        .unwrap();
+        let options = arrow::ipc::writer::IpcWriteOptions::default()
+            .try_with_compression(Some(arrow::ipc::CompressionType::LZ4_FRAME))
+            .unwrap();
+        let mut encoded = Vec::new();
+        {
+            let mut writer =
+                StreamWriter::try_new_with_options(&mut encoded, &schema, options).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        let error = read_segment_bytes(&encoded).unwrap_err();
+        assert!(
+            error.to_string().contains("IPC body compression"),
+            "compressed dictionary message must be refused from metadata: {error:#}"
+        );
+    }
+
     /// A byte flipped in the framed body trips the in-band integrity check.
     #[test]
     fn corrupted_framed_segment_is_rejected() {
@@ -4665,7 +4725,8 @@ mod ipc_framing_tests {
             let detail = match &verdict {
                 IpcStreamExtent::Complete => panic!("{label}: accepted as a complete stream"),
                 IpcStreamExtent::Truncated { detail, .. }
-                | IpcStreamExtent::Malformed { detail, .. } => detail.clone(),
+                | IpcStreamExtent::Malformed { detail, .. }
+                | IpcStreamExtent::Unsupported { detail, .. } => detail.clone(),
             };
             if declared != 0 {
                 assert!(

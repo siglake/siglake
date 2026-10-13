@@ -10545,6 +10545,94 @@ fn partial_scalar_leaf(expr: &Expr) -> bool {
     }
 }
 
+fn partial_filter_expr_has_bounded_workspace(expr: &Expr) -> bool {
+    match expr {
+        Expr::Alias(alias) => partial_filter_expr_has_bounded_workspace(&alias.expr),
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
+            partial_filter_expr_has_bounded_workspace(&binary.left)
+                && partial_filter_expr_has_bounded_workspace(&binary.right)
+        }
+        Expr::BinaryExpr(binary)
+            if matches!(
+                binary.op,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq
+                    | Operator::IsDistinctFrom
+                    | Operator::IsNotDistinctFrom
+            ) =>
+        {
+            partial_scalar_leaf(&binary.left) && partial_scalar_leaf(&binary.right)
+        }
+        Expr::Not(inner) => partial_filter_expr_has_bounded_workspace(inner),
+        Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsUnknown(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsNotFalse(inner)
+        | Expr::IsNotUnknown(inner) => partial_scalar_leaf(inner),
+        Expr::Between(between) => {
+            partial_scalar_leaf(&between.expr)
+                && partial_scalar_leaf(&between.low)
+                && partial_scalar_leaf(&between.high)
+        }
+        _ => false,
+    }
+}
+
+fn partial_plan_nodes_have_bounded_workspace(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => {
+            aggregate.group_expr.iter().all(partial_scalar_leaf)
+                && aggregate.aggr_expr.iter().all(|expr| {
+                    let Expr::AggregateFunction(function) = expr else {
+                        return false;
+                    };
+                    function.params.args.iter().all(partial_scalar_leaf)
+                        && function.params.filter.is_none()
+                        && function.params.order_by.is_empty()
+                })
+                && partial_plan_nodes_have_bounded_workspace(&aggregate.input)
+        }
+        LogicalPlan::Projection(projection) => {
+            projection.expr.iter().all(partial_scalar_leaf)
+                && partial_plan_nodes_have_bounded_workspace(&projection.input)
+        }
+        LogicalPlan::Filter(filter) => {
+            partial_filter_expr_has_bounded_workspace(&filter.predicate)
+                && partial_plan_nodes_have_bounded_workspace(&filter.input)
+        }
+        LogicalPlan::TableScan(scan) => scan
+            .filters
+            .iter()
+            .all(partial_filter_expr_has_bounded_workspace),
+        LogicalPlan::SubqueryAlias(alias) => {
+            partial_plan_nodes_have_bounded_workspace(&alias.input)
+        }
+        LogicalPlan::Sort(sort) => {
+            sort.expr.iter().all(|expr| partial_scalar_leaf(&expr.expr))
+                && partial_plan_nodes_have_bounded_workspace(&sort.input)
+        }
+        LogicalPlan::Limit(limit) => {
+            limit
+                .skip
+                .as_deref()
+                .is_none_or(|expr| matches!(expr, Expr::Literal(_, _)))
+                && limit
+                    .fetch
+                    .as_deref()
+                    .is_none_or(|expr| matches!(expr, Expr::Literal(_, _)))
+                && partial_plan_nodes_have_bounded_workspace(&limit.input)
+        }
+        _ => false,
+    }
+}
+
 fn buffer_partial_plan_has_bounded_workspace(
     plan: &LogicalPlan,
     dist: &crate::coordinator::DistPlan,
@@ -10556,20 +10644,7 @@ fn buffer_partial_plan_has_bounded_workspace(
     ) {
         return false;
     }
-    if let LogicalPlan::Aggregate(aggregate) = plan {
-        return aggregate.group_expr.iter().all(partial_scalar_leaf)
-            && aggregate.aggr_expr.iter().all(|expr| {
-                let Expr::AggregateFunction(function) = expr else {
-                    return false;
-                };
-                function.params.args.iter().all(partial_scalar_leaf)
-                    && function.params.filter.is_none()
-                    && function.params.order_by.is_empty()
-            });
-    }
-    plan.inputs()
-        .into_iter()
-        .any(|input| buffer_partial_plan_has_bounded_workspace(input, dist))
+    partial_plan_nodes_have_bounded_workspace(plan)
 }
 
 /// The `SessionContext` the buffer partial executes on: a clone of the
@@ -11561,6 +11636,43 @@ mod tests {
             })
             .collect();
         (schema, batches)
+    }
+
+    async fn buffer_partial_workspace_decision(query: &str) -> bool {
+        let ctx = buffer_partial_context();
+        let (schema, batches) = buffer_partial_fixture();
+        let table = datafusion::datasource::MemTable::try_new(schema, vec![batches]).unwrap();
+        ctx.register_table("events", Arc::new(table)).unwrap();
+        let df = ctx.sql(query).await.unwrap();
+        let dist = crate::coordinator::classify(df.logical_plan());
+        assert!(
+            !matches!(dist, crate::coordinator::DistPlan::Local),
+            "fixture must reach the distributed partial path: {query}"
+        );
+        buffer_partial_plan_has_bounded_workspace(df.logical_plan(), &dist)
+    }
+
+    #[tokio::test]
+    async fn buffer_partial_workspace_guard_checks_all_executed_expressions() {
+        assert!(
+            buffer_partial_workspace_decision("SELECT count(*) FROM events WHERE timestamp > 0",)
+                .await,
+            "simple comparison COUNT must remain eligible"
+        );
+        assert!(
+            !buffer_partial_workspace_decision(
+                "SELECT count(*) FROM events WHERE repeat(host, 1000000) = 'x'",
+            )
+            .await,
+            "allocating input filter must be refused"
+        );
+        assert!(
+            !buffer_partial_workspace_decision(
+                "SELECT count(expanded) FROM (SELECT repeat(host, 1000000) AS expanded FROM events) projected",
+            )
+            .await,
+            "allocating input projection must be refused"
+        );
     }
 
     /// #549: the buffer partial executes inside whatever pool its context

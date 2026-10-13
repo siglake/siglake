@@ -68,12 +68,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   limit by default, 64 MiB..1 GiB; 512 MiB without a readable limit; zero
   disables WAL reads). Descriptor-pinned decode preflight and row/layout-based
   alignment admission can refuse a compressed generation well below the
-  compressed-file ceiling. Managed-index WAL rows with non-empty carrier
-  attributes and queries whose WAL filter or distributed partial contains an
-  allocating expression currently use the exact committed snapshot. This
-  keeps those allocations outside the untracked WAL path; freshness resumes
-  after the drain commits the rows. The budget covers admitted Arrow payload,
-  not allocator metadata or total process RSS.
+  compressed-file ceiling. Arrow IPC body compression inside a WAL stream is
+  unsupported and refused from message metadata before Arrow decoding; Siglake
+  WAL writers emit uncompressed IPC inside the separately compressed WAL frame.
+  Managed-index WAL rows with non-empty carrier attributes and queries whose
+  WAL filter or distributed partial contains an allocating expression currently
+  use the exact committed snapshot. This keeps those allocations outside the
+  untracked WAL path; freshness resumes after the drain commits the rows. The
+  budget covers admitted Arrow payload, not allocator metadata or total process
+  RSS.
 - **A pod at the 4Gi floor caches no text indexes by default.** Both caches now
   derive from the pod's memory limit and are subtracted from the query pool, so
   they are inside the budget rather than beside it — and what they get is what
