@@ -974,8 +974,19 @@ migrates data automatically and no command forces it. Version 1
 while `attr_get` returned the value (#6769).
 
 A composed lookup has a separate identity from a flat dotted key. Operators
-declare one with a JSON key chain, for example
-`--promote-attr '["aws.cloudwatch","log_stream"]:string:aws_cloudwatch_composed_log_stream'`.
+declare one on an existing events or managed-index table with a JSON key chain,
+for example:
+
+```sh
+siglake declare-promotions --table big5 \
+  --promote-attr '["aws.cloudwatch","log_stream"]:string:aws_cloudwatch_composed_log_stream'
+```
+
+The command retains every promotion already recorded on the table and performs
+no data rewrite. Catalog retries rebuild the additive union from refreshed
+metadata, so concurrent declarations of distinct expressions cannot remove
+each other. The compactor's flag uses the same `--promote-attr` syntax as an
+events-table bootstrap seed.
 That source materializes
 `attr_get(attr_get(attributes,'aws.cloudwatch'),'log_stream')`; it does not
 materialize `attr_get(attributes,'aws.cloudwatch.log_stream')`. Each outer step

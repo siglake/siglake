@@ -3490,14 +3490,19 @@ fn validate_promotion_redefinition(
 /// freshly loaded metadata after a catalog conflict, so expression identity is
 /// checked again on every attempt instead of only against the caller's stale
 /// base table.
+#[derive(Clone)]
 struct DeclarePromotionsAction {
+    requested: Vec<siglake_core::PromotedColumn>,
+}
+
+struct PromotionDeclarationPlan {
     promoted: Vec<siglake_core::PromotedColumn>,
     desired_json: String,
     legacy_json: Option<String>,
     expected_version: u32,
 }
 
-impl DeclarePromotionsAction {
+impl PromotionDeclarationPlan {
     fn properties_match(&self, properties: &HashMap<String, String>) -> bool {
         if let Some(legacy_json) = &self.legacy_json {
             properties
@@ -3515,16 +3520,24 @@ impl DeclarePromotionsAction {
                 == Some(self.desired_json.as_str())
         }
     }
+}
+
+impl DeclarePromotionsAction {
+    fn new(requested: &[siglake_core::PromotedColumn]) -> Self {
+        Self {
+            requested: requested.to_vec(),
+        }
+    }
 
     fn invalid(message: impl Into<String>) -> IcebergError {
         IcebergError::new(IcebergErrorKind::PreconditionFailed, message.into())
             .with_retryable(false)
     }
-}
 
-#[async_trait::async_trait]
-impl TransactionAction for DeclarePromotionsAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+    /// Merge this caller's requested identities into the current catalog
+    /// base. `Transaction` invokes this again after every stale-base retry, so
+    /// a disjoint declaration which won the preceding attempt is retained.
+    fn plan(&self, table: &Table) -> iceberg::Result<PromotionDeclarationPlan> {
         let properties = table.metadata().properties();
         let existing = match properties.get(siglake_core::PROMOTED_PROPERTY_V2_KEY) {
             Some(json) => serde_json::from_str::<Vec<siglake_core::PromotedColumn>>(json).map_err(
@@ -3546,14 +3559,15 @@ impl TransactionAction for DeclarePromotionsAction {
                 None => Vec::new(),
             },
         };
-        validate_promotion_redefinition(&existing, &self.promoted)
+        validate_promotion_redefinition(&existing, &existing)
+            .and_then(|()| validate_promotion_redefinition(&existing, &self.requested))
             .map_err(|error| Self::invalid(error.to_string()))?;
         let existing_names = existing
             .iter()
             .map(|column| column.name.as_str())
             .collect::<HashSet<_>>();
         let schema = table.metadata().current_schema();
-        for column in &self.promoted {
+        for column in &self.requested {
             if !existing_names.contains(column.name.as_str())
                 && schema.field_id_by_name(&column.name).is_some()
             {
@@ -3564,41 +3578,74 @@ impl TransactionAction for DeclarePromotionsAction {
                 )));
             }
         }
-        if self.properties_match(properties) {
+
+        let mut promoted = existing;
+        for requested in &self.requested {
+            if !promoted.iter().any(|column| column == requested) {
+                promoted.push(requested.clone());
+            }
+        }
+        let desired_json = siglake_core::promoted_property_json(&promoted)
+            .map_err(|error| Self::invalid(format!("promoted property json: {error}")))?;
+        let expression_aware = promoted
+            .iter()
+            .any(siglake_core::PromotedColumn::is_composed);
+        let legacy_json = expression_aware
+            .then(|| {
+                siglake_core::promoted_property_json(&siglake_core::direct_promotions(&promoted))
+            })
+            .transpose()
+            .map_err(|error| Self::invalid(format!("legacy promoted property json: {error}")))?;
+        let expected_version = siglake_core::promotion_extractor_version(&promoted);
+        Ok(PromotionDeclarationPlan {
+            promoted,
+            desired_json,
+            legacy_json,
+            expected_version,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl TransactionAction for DeclarePromotionsAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        let properties = table.metadata().properties();
+        let plan = self.plan(table)?;
+        if plan.properties_match(properties) {
             return Ok(ActionCommit::new(vec![], vec![]));
         }
 
         let mut updates = HashMap::new();
-        if let Some(legacy_json) = &self.legacy_json {
+        if let Some(legacy_json) = &plan.legacy_json {
             updates.insert(
                 siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
                 legacy_json.clone(),
             );
             updates.insert(
                 siglake_core::PROMOTED_PROPERTY_V2_KEY.to_string(),
-                self.desired_json.clone(),
+                plan.desired_json.clone(),
             );
         } else {
             updates.insert(
                 siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
-                self.desired_json.clone(),
+                plan.desired_json.clone(),
             );
         }
         if promotion_extraction_from(
             properties
                 .get(PROMOTION_EXTRACTION_PROP)
                 .map(String::as_str),
-            self.expected_version,
+            plan.expected_version,
         )
         .is_none()
         {
             let stamp = if !properties.contains_key(siglake_core::PROMOTED_PROPERTY_KEY)
                 && !properties.contains_key(siglake_core::PROMOTED_PROPERTY_V2_KEY)
             {
-                promotion_declared_stamp(self.expected_version)
+                promotion_declared_stamp(plan.expected_version)
             } else {
                 promotion_adopted_stamp(
-                    self.expected_version,
+                    plan.expected_version,
                     table.metadata().last_sequence_number(),
                 )
             };
@@ -8860,6 +8907,89 @@ mod promotion_extraction_tests {
             ..composed
         };
         validate_promotion_redefinition(&[direct], &[distinct]).unwrap();
+    }
+
+    /// Two managed-index declaration requests observed the same base. The
+    /// second transaction commits after the first and must merge against the
+    /// refreshed property rather than replaying JSON from its stale base.
+    #[tokio::test]
+    async fn stale_managed_index_declarations_merge_the_additive_union() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let config = siglake_core::index_config::IndexConfig {
+            index_id: "big5".into(),
+            ..siglake_core::index_config::IndexConfig::builtin_events()
+        };
+        let ident = ice.create_index(&config).await.unwrap();
+        let stale_base = ice.catalog().load_table(&ident).await.unwrap();
+        let stream = siglake_core::PromotedColumn {
+            attr_key: "aws.cloudwatch".into(),
+            attr_get_path: vec!["log_stream".into()],
+            name: "aws_cloudwatch_composed_log_stream".into(),
+            ty: siglake_core::PromotedType::Utf8,
+        };
+        let group = siglake_core::PromotedColumn {
+            attr_key: "aws.cloudwatch".into(),
+            attr_get_path: vec!["log_group".into()],
+            name: "aws_cloudwatch_composed_log_group".into(),
+            ty: siglake_core::PromotedType::Utf8,
+        };
+        let conflicting = siglake_core::PromotedColumn {
+            attr_get_path: vec!["ingestion_time".into()],
+            ..stream.clone()
+        };
+
+        let first = DeclarePromotionsAction::new(std::slice::from_ref(&stream))
+            .apply(Transaction::new(&stale_base))
+            .unwrap();
+        let second = DeclarePromotionsAction::new(std::slice::from_ref(&group))
+            .apply(Transaction::new(&stale_base))
+            .unwrap();
+        let rejected = DeclarePromotionsAction::new(&[conflicting])
+            .apply(Transaction::new(&stale_base))
+            .unwrap();
+        first.commit(ice.catalog().as_ref()).await.unwrap();
+        second.commit(ice.catalog().as_ref()).await.unwrap();
+        let error = rejected.commit(ice.catalog().as_ref()).await.unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("cannot change extraction identity"),
+            "{error}"
+        );
+
+        let table = ice.catalog().load_table(&ident).await.unwrap();
+        let properties = table.metadata().properties();
+        assert_eq!(
+            siglake_core::promoted_columns_from_properties(
+                properties
+                    .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+                    .map(String::as_str),
+                properties
+                    .get(siglake_core::PROMOTED_PROPERTY_KEY)
+                    .map(String::as_str),
+            ),
+            vec![stream.clone(), group.clone()],
+            "the stale second transaction must retain the first identity"
+        );
+
+        // The retry winner could stop after its property transaction. A later
+        // declaration pass widens every identity in the settled union, not
+        // only the identities its own caller requested.
+        assert_eq!(ice.declare_promotions_for(&ident, &[]).await.unwrap(), 2);
+        let table = ice.catalog().load_table(&ident).await.unwrap();
+        for column in [stream, group] {
+            assert!(
+                table
+                    .metadata()
+                    .current_schema()
+                    .field_id_by_name(&column.name)
+                    .is_some(),
+                "settled union field {} was not widened",
+                column.name
+            );
+        }
     }
 }
 
@@ -16999,30 +17129,6 @@ impl IcebergContext {
         table_ident: &TableIdent,
         promoted: &[siglake_core::PromotedColumn],
     ) -> Result<usize> {
-        // Desired schema: the events table keeps its canonical
-        // `events_schema_with` shape (which also heals a v1 table missing
-        // core columns); an index keeps its OWN current schema + any missing
-        // promoted fields (additive; migrate matches by NAME, ids are
-        // catalog-assigned).
-        let desired = if table_ident == &self.table_ident {
-            siglake_core::events_schema_with(promoted)
-        } else {
-            let current = self.cached_table_entry(table_ident).await?;
-            let current_arrow =
-                iceberg::arrow::schema_to_arrow_schema(current.table.metadata().current_schema())
-                    .context("current schema to arrow")?;
-            let mut fields: Vec<arrow_schema::Field> = current_arrow
-                .fields()
-                .iter()
-                .map(|f| f.as_ref().clone())
-                .collect();
-            for col in promoted {
-                if !fields.iter().any(|f| f.name() == &col.name) {
-                    fields.push(arrow_schema::Field::new(&col.name, col.ty.arrow(), true));
-                }
-            }
-            std::sync::Arc::new(arrow_schema::Schema::new(fields))
-        };
         // ORDER MATTERS, and it is property-then-widen.
         //
         // These are two catalog transactions; a writer can load the table
@@ -17043,36 +17149,24 @@ impl IcebergContext {
         // so alignment drops it (all-null, nothing lost) and the file visibly
         // LACKS the column — which is exactly what both predicates detect, so
         // it is selected for backfill and repaired.
-        let desired_json = siglake_core::promoted_property_json(promoted)
-            .map_err(|e| anyhow::anyhow!("promoted property json: {e}"))?;
-        let expression_aware = promoted
-            .iter()
-            .any(siglake_core::PromotedColumn::is_composed);
-        let legacy_json = expression_aware
-            .then(|| {
-                siglake_core::promoted_property_json(&siglake_core::direct_promotions(promoted))
-            })
-            .transpose()
-            .map_err(|e| anyhow::anyhow!("legacy promoted property json: {e}"))?;
-        let expected_version = siglake_core::promotion_extractor_version(promoted);
         let table = self
             .catalog()
             .load_table(table_ident)
             .await
             .with_context(|| format!("load {table_ident} for promoted property"))?;
-        let action = DeclarePromotionsAction {
-            promoted: promoted.to_vec(),
-            desired_json: desired_json.clone(),
-            legacy_json: legacy_json.clone(),
-            expected_version,
-        };
-        if !action.properties_match(table.metadata().properties()) {
+        let action = DeclarePromotionsAction::new(promoted);
+        let initial_plan = action
+            .plan(&table)
+            .map_err(anyhow::Error::new)
+            .context("plan promoted property")?;
+        if !initial_plan.properties_match(table.metadata().properties()) {
             // Record WHICH extraction rule will have written this table's
             // promoted values (#6769), in the same transaction as the
             // declaration itself. The retry-aware action revalidates immutable
-            // expression identity against every refreshed transaction base.
+            // expression identity and recomputes the additive union against
+            // every refreshed transaction base.
             let tx = Transaction::new(&table);
-            let tx = action.apply(tx).context("set promoted property")?;
+            let tx = action.clone().apply(tx).context("set promoted property")?;
             // Query replicas normally declare the SAME promotions on a
             // tenant's first request (`for_namespace`), so N of them CAS the
             // same catalog row at once and N−1 lose. `Transaction::commit`
@@ -17082,9 +17176,10 @@ impl IcebergContext {
             // `CatalogCommitConflicts`. Same doctrine as
             // `create_namespace_tolerating_existing`: the goal is the
             // declaration's EXISTENCE, not our authorship of it, so re-read
-            // and continue if the identical declaration is there. A rollout
-            // racing a different expression is rejected by the action when it
-            // re-runs on the refreshed base.
+            // and continue if our requested identities are in the additive
+            // union. A rollout racing a different expression under the same
+            // physical name is rejected when the action re-runs on the
+            // refreshed base.
             if let Err(err) = tx.commit(self.catalog().as_ref()).await {
                 let settled = self
                     .catalog()
@@ -17092,22 +17187,9 @@ impl IcebergContext {
                     .await
                     .ok()
                     .filter(|t| {
-                        let settled = t.metadata().properties();
-                        if expression_aware {
-                            settled
-                                .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
-                                .map(String::as_str)
-                                == Some(desired_json.as_str())
-                                && settled
-                                    .get(siglake_core::PROMOTED_PROPERTY_KEY)
-                                    .map(String::as_str)
-                                    == legacy_json.as_deref()
-                        } else {
-                            settled
-                                .get(siglake_core::PROMOTED_PROPERTY_KEY)
-                                .map(String::as_str)
-                                == Some(desired_json.as_str())
-                        }
+                        action
+                            .plan(t)
+                            .is_ok_and(|plan| plan.properties_match(t.metadata().properties()))
                     })
                     .is_some();
                 if !settled {
@@ -17120,6 +17202,48 @@ impl IcebergContext {
             }
             self.invalidate_cached_table(table_ident).await;
         }
+        // Re-read the union the retry-aware property action actually settled.
+        // A disjoint declaration can join it after our first observation; this
+        // caller widens every field in the union so a winner which crashes
+        // between its property and schema transactions cannot strand a
+        // property whose physical column is absent.
+        let table = self
+            .catalog()
+            .load_table(table_ident)
+            .await
+            .with_context(|| format!("reload {table_ident} after promoted property"))?;
+        let final_plan = action
+            .plan(&table)
+            .map_err(anyhow::Error::new)
+            .context("verify settled promoted property")?;
+        anyhow::ensure!(
+            final_plan.properties_match(table.metadata().properties()),
+            "promotion declaration for {table_ident} did not settle"
+        );
+        let promoted = &final_plan.promoted;
+        // Desired schema: the events table keeps its canonical
+        // `events_schema_with` shape (which also heals a v1 table missing
+        // core columns); an index keeps its OWN current schema + every field
+        // in the settled additive union (migrate matches by NAME, ids are
+        // catalog-assigned).
+        let desired = if table_ident == &self.table_ident {
+            siglake_core::events_schema_with(promoted)
+        } else {
+            let current_arrow =
+                iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
+                    .context("current schema to arrow")?;
+            let mut fields: Vec<arrow_schema::Field> = current_arrow
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect();
+            for col in promoted {
+                if !fields.iter().any(|f| f.name() == &col.name) {
+                    fields.push(arrow_schema::Field::new(&col.name, col.ty.arrow(), true));
+                }
+            }
+            std::sync::Arc::new(arrow_schema::Schema::new(fields))
+        };
         // The widen half of the same race. `migrate_table_schema_additive` is
         // a no-op once the columns are present, so a loser that re-reads a
         // fully widened schema has nothing left to do.
