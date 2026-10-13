@@ -1156,7 +1156,7 @@ impl BufferDeltaCache {
                 return Ok(BufferReadOutcome::Refused { compressed_bytes });
             }
         };
-        let raw_payload = batches_payload_bytes(&raw_batches);
+        let raw_payload = decoded_payload_bytes(&raw_batches);
         if !decode_reservation.contains_actual(raw_payload) {
             return Ok(BufferReadOutcome::Refused { compressed_bytes });
         }
@@ -1178,7 +1178,7 @@ impl BufferDeltaCache {
                 return Ok(BufferReadOutcome::Refused { compressed_bytes });
             }
         };
-        let transformed_payload = batches_payload_bytes(&batches);
+        let transformed_payload = decoded_payload_bytes(&batches);
         if transformed_payload > raw_payload.saturating_add(expansion_bound) {
             return Ok(BufferReadOutcome::Refused { compressed_bytes });
         }
@@ -1557,6 +1557,47 @@ fn filter_batches(
         }
     }
     Ok(out)
+}
+
+/// Count unique backing allocations for decoded IPC payload, excluding Arrow
+/// object metadata. IPC columns can be slices of the same allocation: summing
+/// `get_array_memory_size` would count that allocation once per slice and also
+/// add metadata to a payload-only admission bound. Keep full backing capacity,
+/// not just the visible slice length. Query-local filter/sort estimates below
+/// deliberately retain their existing conservative array-memory accounting.
+fn decoded_payload_bytes(batches: &[RecordBatch]) -> u64 {
+    fn visit_buffer(buffer: &Buffer, allocations: &mut HashMap<usize, u64>) {
+        let extent = buffer
+            .capacity()
+            .max(buffer.ptr_offset().saturating_add(buffer.len())) as u64;
+        if extent == 0 {
+            return;
+        }
+        let entry = allocations
+            .entry(buffer.data_ptr().as_ptr() as usize)
+            .or_default();
+        *entry = (*entry).max(extent);
+    }
+    fn visit_array(data: &ArrayData, allocations: &mut HashMap<usize, u64>) {
+        for buffer in data.buffers() {
+            visit_buffer(buffer, allocations);
+        }
+        if let Some(nulls) = data.nulls() {
+            visit_buffer(nulls.buffer(), allocations);
+        }
+        for child in data.child_data() {
+            visit_array(child, allocations);
+        }
+    }
+    let mut allocations = HashMap::new();
+    for batch in batches {
+        for column in batch.columns() {
+            visit_array(&column.to_data(), &mut allocations);
+        }
+    }
+    allocations
+        .values()
+        .fold(0u64, |total, bytes| total.saturating_add(*bytes))
 }
 
 fn batches_payload_bytes(batches: &[RecordBatch]) -> u64 {
@@ -2712,6 +2753,64 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn decoded_payload_counts_shared_backing_once_and_retains_hidden_capacity() {
+        let backing = Buffer::from(vec![7u8; 128]);
+        let column = |offset| {
+            make_array(
+                ArrayData::builder(DataType::UInt8)
+                    .len(4)
+                    .add_buffer(backing.slice_with_length(offset, 4))
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::UInt8, false),
+                Field::new("b", DataType::UInt8, false),
+            ])),
+            vec![column(8), column(96)],
+        )
+        .unwrap();
+        assert_eq!(decoded_payload_bytes(&[batch.clone(), batch]), 128);
+    }
+
+    #[test]
+    fn decoded_ipc_payload_fits_admission_despite_shared_column_views() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sealed_segment(tmp.path(), 2);
+        let selected =
+            select_buffer_segments(tmp.path(), &HashSet::new(), None, None, u64::MAX).unwrap();
+        let raw = read_selected_buffer_batches(&selected).unwrap();
+        assert!(
+            batches_payload_bytes(&raw) > selected.decode_charge_bytes,
+            "fixture must falsify the old repeated-allocation/metadata accounting"
+        );
+        assert!(decoded_payload_bytes(&raw) <= selected.decode_charge_bytes);
+        let cache = BufferDeltaCache::with_memory_limit(64 * MIB);
+        let decoded = loaded(
+            cache
+                .get_or_load_for_query(
+                    tmp.path(),
+                    &siglake_core::events_schema(),
+                    &HashSet::new(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            decoded
+                .batches()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2
+        );
     }
 
     #[test]
