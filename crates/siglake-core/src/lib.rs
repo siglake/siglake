@@ -39,6 +39,13 @@ pub struct AllocatorMemoryReadout {
     pub cgroup_memory_current_bytes: Option<u64>,
 }
 
+/// Allocator and cgroup memory on either side of an explicit dirty-page purge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllocatorPurgeReadout {
+    pub before: AllocatorMemoryReadout,
+    pub after: AllocatorMemoryReadout,
+}
+
 /// Read and export the compactor's current allocator and cgroup memory.
 ///
 /// Crate test binaries use Rust's system allocator even though they link this
@@ -69,6 +76,40 @@ pub fn allocator_memory_readout() -> Option<AllocatorMemoryReadout> {
         ::metrics::gauge!("siglake_compactor_cgroup_memory_current_bytes").set(bytes as f64);
     }
     Some(readout)
+}
+
+/// Return all unused dirty jemalloc pages to the operating system.
+///
+/// The shipped binaries use jemalloc, whose default 10-second dirty decay can
+/// keep a completed compactor drain charged to a constrained cgroup while the
+/// next re-cluster pass starts. Crate test binaries use the system allocator;
+/// they return `Ok(None)` rather than controlling the otherwise idle jemalloc
+/// instance linked through this crate.
+pub fn purge_allocator_dirty_pages(
+) -> std::result::Result<Option<AllocatorPurgeReadout>, std::io::Error> {
+    if !jemalloc_is_global_allocator() {
+        return Ok(None);
+    }
+    let before = allocator_memory_readout().expect("positive jemalloc probe remains positive");
+
+    // jemalloc documents 4096 as MALLCTL_ARENAS_ALL. arena.<i>.purge is a
+    // void command: every old/new pointer must be null, a shape the ctl
+    // crate's typed read/write helpers cannot express.
+    let status = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            c"arena.4096.purge".as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status));
+    }
+
+    let after = allocator_memory_readout().expect("positive jemalloc probe remains positive");
+    Ok(Some(AllocatorPurgeReadout { before, after }))
 }
 
 fn jemalloc_is_global_allocator() -> bool {

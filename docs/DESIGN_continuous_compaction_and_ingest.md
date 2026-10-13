@@ -151,6 +151,17 @@ Coexistence without starving the commit path:
   omission checks passing. Shipped jemalloc retention and full-field merge-plan
   residency remain unqualified by this test; the mean-width estimate and
   1,024-row floor do not establish a hard byte ceiling.
+  **Allocator continuation (2026-10-13):** A8 timing rules out simultaneous WAL
+  and merge ownership: commits completed 1.9–2.3 seconds before their merge
+  plans, while the shipped jemalloc keeps unused dirty pages for up to 10
+  seconds by default. Retained 15-second cgroup samples put drain-only anonymous
+  memory at 445–672 MB, but the system-allocator regression returned its large
+  buffers immediately. When a <=1Gi process acquires the re-cluster side of the
+  decoded-work permit it now purges all jemalloc arenas, logs allocator and
+  cgroup bytes before and after, then starts the pass. A shipped-allocator unit
+  test frees 256 touched 256-KiB allocations and verifies that the purge lowers
+  resident bytes. Purging may add admission latency; it runs once per constrained
+  re-cluster pass, not once per chunk, and leaves larger processes unchanged.
 - **Backpressure-aware sharing.** A shared signal from the WAL queue depth
   (`siglake_ingest_backpressure_*`, already exported): if drain falls behind (WAL
   growing), compaction throttles (fewer concurrent merges) to yield IO; if L0 piles

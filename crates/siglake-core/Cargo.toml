@@ -61,6 +61,7 @@ uuid = { workspace = true }
 # Basic allocator statistics are available in shipped compactor builds. The
 # `profiling` feature above separately owns the jemalloc `prof.*` controls.
 tikv-jemalloc-ctl = { workspace = true }
+tikv-jemalloc-sys = { workspace = true }
 
 # Optional, and reached only under the `profiling` feature above.
 pprof = { workspace = true, optional = true }

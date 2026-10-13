@@ -646,6 +646,56 @@ fn log_compactor_commit_complete(segments: usize) {
     );
 }
 
+/// Reclaim the previous drain's dirty jemalloc pages before a constrained
+/// process starts allocating merge input and writer buffers. The caller owns
+/// the packaged decoded-work semaphore, so no drain allocation can race the
+/// handoff. Failure is observable but does not make maintenance unavailable.
+fn purge_allocator_at_recluster_handoff() {
+    let started = std::time::Instant::now();
+    match siglake_core::purge_allocator_dirty_pages() {
+        Ok(Some(readout)) => {
+            let elapsed = started.elapsed();
+            let allocator_resident_reclaimed_bytes = readout
+                .before
+                .resident_bytes
+                .saturating_sub(readout.after.resident_bytes);
+            let cgroup_reclaimed_bytes = readout
+                .before
+                .cgroup_memory_current_bytes
+                .zip(readout.after.cgroup_memory_current_bytes)
+                .map(|(before, after)| before.saturating_sub(after));
+            metrics::counter!("siglake_compactor_allocator_purges_total", "result" => "success")
+                .increment(1);
+            metrics::histogram!("siglake_compactor_allocator_purge_duration_seconds")
+                .record(elapsed.as_secs_f64());
+            tracing::info!(
+                allocator_allocated_before_bytes = readout.before.allocated_bytes,
+                allocator_allocated_after_bytes = readout.after.allocated_bytes,
+                allocator_active_before_bytes = readout.before.active_bytes,
+                allocator_active_after_bytes = readout.after.active_bytes,
+                allocator_resident_before_bytes = readout.before.resident_bytes,
+                allocator_resident_after_bytes = readout.after.resident_bytes,
+                allocator_resident_reclaimed_bytes,
+                cgroup_memory_before_bytes = ?readout.before.cgroup_memory_current_bytes,
+                cgroup_memory_after_bytes = ?readout.after.cgroup_memory_current_bytes,
+                cgroup_reclaimed_bytes = ?cgroup_reclaimed_bytes,
+                elapsed_seconds = elapsed.as_secs_f64(),
+                "purged allocator dirty pages at drain-to-recluster handoff"
+            );
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "allocator purge skipped because jemalloc is not the process-global allocator"
+            );
+        }
+        Err(error) => {
+            metrics::counter!("siglake_compactor_allocator_purges_total", "result" => "error")
+                .increment(1);
+            tracing::warn!(%error, "could not purge allocator dirty pages before re-clustering");
+        }
+    }
+}
+
 #[cfg(test)]
 mod allocator_readout_tests {
     #[test]
@@ -656,6 +706,7 @@ mod allocator_readout_tests {
             "the compactor crate test binary uses the system allocator: {readout:?}"
         );
         super::log_compactor_commit_complete(1);
+        super::purge_allocator_at_recluster_handoff();
     }
 }
 
@@ -1031,6 +1082,9 @@ impl Compactor {
             "owner" => owner
         )
         .record(started.elapsed().as_secs_f64());
+        if owner == "recluster" {
+            purge_allocator_at_recluster_handoff();
+        }
         Arc::new(DecodedWorkLease {
             _permit: Some(permit),
         })

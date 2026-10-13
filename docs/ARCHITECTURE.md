@@ -369,8 +369,15 @@ values are jemalloc's epoch-refreshed `stats.allocated`, `stats.active`, and
 `siglake_compactor_allocator_allocated_bytes`,
 `siglake_compactor_allocator_active_bytes`,
 `siglake_compactor_allocator_resident_bytes`, and
-`siglake_compactor_cgroup_memory_current_bytes`. This is observation only: the
-sampler does not purge jemalloc or change its decay settings.
+`siglake_compactor_cgroup_memory_current_bytes`. At or below the packaged 1Gi
+limit, acquiring the re-cluster side of the decoded-work permit also runs
+jemalloc's all-arena dirty-page purge before the merge allocates input or
+writer buffers. Its INFO event records allocator and cgroup memory before and
+after the purge; `siglake_compactor_allocator_purges_total{result}` and
+`siglake_compactor_allocator_purge_duration_seconds` expose success, failure,
+and admission latency. The purge leaves jemalloc's process-wide decay settings
+unchanged. Larger processes do not take the shared permit and do not purge at
+this boundary.
 The drain keeps
 `SIGLAKE_DRAIN_CONCURRENCY` commits in flight
 *continuously* — topping up the moment one lands, re-listing `sealed/` as new
