@@ -4848,6 +4848,7 @@ async fn handle_local_inner(
             override_events_with_wal_buffer(
                 &ice,
                 &ctx,
+                &state.buffer_delta_cache,
                 buffer_root,
                 identity.tenant.as_deref(),
                 effective_query.attr_rewrite_bindings.get("events"),
@@ -4857,6 +4858,7 @@ async fn handle_local_inner(
             override_indexes_with_wal_buffer(
                 &ice,
                 &ctx,
+                &state.buffer_delta_cache,
                 buffer_root,
                 identity.tenant.as_deref(),
                 &effective_query.sql,
@@ -9606,6 +9608,7 @@ async fn register_selected_tables(
 async fn override_events_with_wal_buffer(
     ice: &siglake_storage::iceberg::IcebergContext,
     ctx: &SessionContext,
+    cache: &Arc<crate::wal_buffer::BufferDeltaCache>,
     buffer_root: &std::path::Path,
     tenant: Option<&str>,
     binding: Option<&siglake_storage::iceberg::QualifiedAttrRewrite>,
@@ -9625,7 +9628,12 @@ async fn override_events_with_wal_buffer(
     };
     let wal_dir =
         crate::wal_buffer::resolve_tenant_wal_dir(buffer_root, tenant.unwrap_or("default"));
-    match crate::wal_buffer::UnionEventsProvider::try_new(base, &wal_dir, &consumed) {
+    match crate::wal_buffer::UnionEventsProvider::try_new_with_cache(
+        base,
+        Arc::clone(cache),
+        &wal_dir,
+        &consumed,
+    ) {
         Ok(provider) => {
             // Replace the plain Iceberg `events` registration with the union; the
             // provider reads the WAL lazily in `scan` (filter-aware time pruning),
@@ -9656,7 +9664,7 @@ async fn override_events_with_wal_buffer(
 struct BufferDelta {
     /// table → buffered batches, aligned to the table schema (carrier-mapped
     /// for user indexes) with already-committed segments excluded.
-    batches: std::collections::HashMap<String, Vec<arrow_array::RecordBatch>>,
+    batches: std::collections::HashMap<String, Arc<crate::wal_buffer::DecodedBuffer>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9879,7 +9887,7 @@ async fn resolve_buffer_delta(
     .await
 }
 
-/// [`resolve_buffer_delta`] with the decode ceiling injected, so the backlog
+/// [`resolve_buffer_delta`] with the compressed-file ceiling injected, so the backlog
 /// classification is testable without a 2 GiB fixture.
 #[cfg(test)]
 async fn resolve_buffer_delta_with_max(
@@ -9942,7 +9950,10 @@ async fn resolve_buffer_delta_with_bindings(
 
 impl BufferDelta {
     fn table(&self, table: &str) -> &[arrow_array::RecordBatch] {
-        self.batches.get(table).map(Vec::as_slice).unwrap_or(&[])
+        self.batches
+            .get(table)
+            .map(|decoded| decoded.batches())
+            .unwrap_or(&[])
     }
 
     fn bounds_ns(
@@ -10137,7 +10148,7 @@ async fn load_buffer_delta_with_max_and_bindings(
         });
     };
     let tenant = identity.tenant.as_deref().unwrap_or("default");
-    let mut batches: std::collections::HashMap<String, Vec<arrow_array::RecordBatch>> =
+    let mut batches: std::collections::HashMap<String, Arc<crate::wal_buffer::DecodedBuffer>> =
         std::collections::HashMap::new();
     let mut counts = std::collections::HashMap::new();
     let mut proof = BufferProof::default();
@@ -10209,39 +10220,10 @@ async fn load_buffer_delta_with_max_and_bindings(
             continue;
         }
         let schema = snapshot.provider.schema();
-        // Backlog guard: past the decode budget (outage recovery) the fast
-        // paths serve the committed-only view — same degradation as the union
-        // provider, and the only bounded-memory answer with a corpus-sized
-        // buffer. Rows appear as the drain commits.
-        // `None`: this site has only the raw SQL string, not a parsed window, so
-        // it cannot price per-query the way the scan provider now does. The
-        // windowed fast paths would benefit from the same time-aware gate —
-        // it needs the bound plumbed down here, which is a larger change.
-        let (within_budget, buffer_bytes) = match max_bytes {
-            Some(max) => crate::wal_buffer::buffer_within_budget_with_max(
-                &dir,
-                &snapshot.consumed,
-                None,
-                max,
-            ),
-            None => crate::wal_buffer::buffer_within_budget(&dir, &snapshot.consumed, None),
-        };
-        let mut observation = CountBufferObservation {
-            snapshot_id: snapshot.snapshot_id,
-            manifest_rows: snapshot.manifest_rows,
-            buffer_within_budget: within_budget,
-            buffer_bytes,
-            included_buffer_rows: 0,
-        };
-        if !within_budget {
-            cache.evict(&dir);
-            counts.insert(name, observation);
-            continue;
-        }
-        // #78/#652: cache the decoded delta by its immutable segment set. The
-        // distributed buffer partial consults the same cache later in this
-        // request instead of decoding the WAL again.
-        let (loaded, read_names) = tokio::task::spawn_blocking({
+        // Take, price, and decode one immutable generation in the blocking
+        // child. Its reservation is moved into that child, so request timeout
+        // cannot release capacity while the non-cancellable decode continues.
+        let outcome = tokio::task::spawn_blocking({
             let cache = Arc::clone(cache);
             let dir = dir.clone();
             let schema = schema.clone();
@@ -10249,31 +10231,59 @@ async fn load_buffer_delta_with_max_and_bindings(
             let consumed = snapshot.consumed.clone();
             let owner = owner.clone();
             move || {
-                cache.get_or_load_for_query_keyed(
+                cache.get_or_load_for_query_keyed_with_max(
                     &dir,
                     &schema,
                     &consumed,
                     None,
                     carrier.as_ref(),
                     owner.as_deref(),
+                    max_bytes,
                 )
             }
         })
         .await
         .map_err(|e| ApiError::internal(anyhow::anyhow!(e)))?
         .map_err(ApiError::internal)?;
+        let loaded = match outcome {
+            crate::wal_buffer::BufferReadOutcome::Loaded(loaded) => loaded,
+            crate::wal_buffer::BufferReadOutcome::Refused { compressed_bytes } => {
+                counts.insert(
+                    name,
+                    CountBufferObservation {
+                        snapshot_id: snapshot.snapshot_id,
+                        manifest_rows: snapshot.manifest_rows,
+                        buffer_within_budget: false,
+                        buffer_bytes: compressed_bytes,
+                        included_buffer_rows: 0,
+                    },
+                );
+                continue;
+            }
+        };
+        let mut observation = CountBufferObservation {
+            snapshot_id: snapshot.snapshot_id,
+            manifest_rows: snapshot.manifest_rows,
+            buffer_within_budget: true,
+            buffer_bytes: loaded.compressed_bytes(),
+            included_buffer_rows: 0,
+        };
         // #1562: the listing this classification was drawn from, so an insert
         // keyed on "the WAL contributes nothing" can re-prove it. Taken from the
         // read itself — a second listing here could already disagree.
         proof.tables.push(WitnessedBuffer {
             dir: dir.clone(),
             exclude: snapshot.consumed.clone(),
-            names: read_names,
+            names: loaded.names().to_vec(),
             owner,
         });
-        observation.included_buffer_rows = loaded.iter().map(|batch| batch.num_rows() as u64).sum();
+        observation.included_buffer_rows = loaded
+            .batches()
+            .iter()
+            .map(|batch| batch.num_rows() as u64)
+            .sum();
         counts.insert(name.clone(), observation);
-        if !loaded.is_empty() {
+        if !loaded.batches().is_empty() {
             batches.insert(name, loaded);
         }
     }
@@ -10298,6 +10308,7 @@ async fn load_buffer_delta_with_max_and_bindings(
 async fn override_indexes_with_wal_buffer(
     ice: &siglake_storage::iceberg::IcebergContext,
     ctx: &SessionContext,
+    cache: &Arc<crate::wal_buffer::BufferDeltaCache>,
     buffer_root: &std::path::Path,
     tenant: Option<&str>,
     query: &str,
@@ -10342,8 +10353,9 @@ async fn override_indexes_with_wal_buffer(
         ) else {
             continue;
         };
-        match crate::wal_buffer::UnionEventsProvider::try_new_for_index(
+        match crate::wal_buffer::UnionEventsProvider::try_new_for_index_with_cache(
             snapshot.provider,
+            Arc::clone(cache),
             &wal_dir,
             &snapshot.consumed,
             config,
@@ -10424,15 +10436,21 @@ async fn capture_buffered_shard_read(
 async fn compute_buffer_partials(
     read: &BufferedShardRead,
     buffer_root: &std::path::Path,
-    cache: &crate::wal_buffer::BufferDeltaCache,
+    cache: &Arc<crate::wal_buffer::BufferDeltaCache>,
     tenant: Option<&str>,
     query: &str,
     plan: &datafusion::logical_expr::LogicalPlan,
     priority: Priority,
-) -> Result<Vec<arrow_array::RecordBatch>, ApiError> {
+) -> Result<
+    (
+        Vec<arrow_array::RecordBatch>,
+        Option<Arc<crate::wal_buffer::DecodedBuffer>>,
+    ),
+    ApiError,
+> {
     let table = match referenced_tables(query).as_deref() {
         Some([t]) => t.clone(),
-        _ => return Ok(Vec::new()),
+        _ => return Ok((Vec::new(), None)),
     };
     if table != read.table {
         return Err(ApiError::internal(anyhow::anyhow!(
@@ -10442,7 +10460,11 @@ async fn compute_buffer_partials(
     }
     let dist = crate::coordinator::classify(plan);
     if matches!(dist, crate::coordinator::DistPlan::Local) {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
+    }
+    if !buffer_partial_plan_has_bounded_workspace(plan, &dist) {
+        metrics::counter!("siglake_query_wal_buffer_refused_partial_workspace_total").increment(1);
+        return Ok((Vec::new(), None));
     }
     // #82: an ordered aggregate's partials must be the sort/limit-stripped
     // aggregate (same rewrite the workers run) — sorting/limiting the buffer
@@ -10466,7 +10488,7 @@ async fn compute_buffer_partials(
             &table,
             &read.snapshot.table_uuid,
         ) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         };
         (dir, read.carrier.as_ref())
     };
@@ -10487,35 +10509,174 @@ async fn compute_buffer_partials(
             .unwrap_or(i64::MAX);
         (lo < hi).then_some((lo, hi))
     });
-    // Backlog guard: a corpus-sized buffer (outage recovery) can't be
-    // materialized into a partial — serve committed-only until the drain
-    // catches up.
-    if !crate::wal_buffer::buffer_within_budget(&wal_dir, consumed, time_bound).0 {
-        return Ok(Vec::new());
+    let outcome = tokio::task::spawn_blocking({
+        let cache = Arc::clone(cache);
+        let wal_dir = wal_dir.clone();
+        let base_schema = base_schema.clone();
+        let consumed = Arc::clone(consumed);
+        let carrier = carrier.cloned();
+        let owner = (table != "events").then(|| read.snapshot.table_uuid.clone());
+        move || {
+            cache.get_or_load_for_query(
+                &wal_dir,
+                &base_schema,
+                &consumed,
+                time_bound,
+                carrier.as_ref(),
+                owner.as_deref(),
+            )
+        }
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow::anyhow!(error)))?
+    .map_err(ApiError::internal)?;
+    let decoded = match outcome {
+        crate::wal_buffer::BufferReadOutcome::Loaded(decoded) => decoded,
+        crate::wal_buffer::BufferReadOutcome::Refused { .. } => {
+            return Ok((Vec::new(), None));
+        }
+    };
+    if decoded.batches().is_empty() {
+        return Ok((Vec::new(), Some(decoded)));
     }
-    let batches = cache
-        .get_or_load_for_query(
-            &wal_dir,
-            &base_schema,
-            consumed,
-            time_bound,
-            carrier,
-            (table != "events").then_some(read.snapshot.table_uuid.as_str()),
-        )
-        .map_err(ApiError::internal)?;
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
+    let output_schema = Arc::new(plan.schema().as_arrow().clone());
+    let Some(output_bound) = crate::wal_buffer::bounded_output_payload(
+        &output_schema,
+        decoded.row_count(),
+        decoded.payload_bytes(),
+    ) else {
+        return Ok((Vec::new(), None));
+    };
+    let Some(output_lease) = decoded.try_reserve_output(output_bound) else {
+        return Ok((Vec::new(), None));
+    };
     // Run the shard query over a buffer-only table to produce a partial in the
     // same shape the workers return for their Iceberg shards. A pool refusal
     // here is the same capacity answer as one in the coordinator's own scan
     // (503 + Retry-After, counted), not a fault.
     let ctx = buffer_partial_context();
-    let partials = run_buffer_partial(&ctx, &table, base_schema, batches, query)
+    let partials = run_buffer_partial(&ctx, &table, base_schema, decoded.cloned_batches(), query)
         .await
         .map_err(|e| ApiError::from_execution(anyhow::anyhow!(e), priority))?;
+    let partials = match output_lease.attach(partials) {
+        Ok(partials) => partials,
+        Err(error) => {
+            tracing::warn!(error = %error, table, "refusing WAL partial output whose ownership cannot be charged");
+            return Ok((Vec::new(), None));
+        }
+    };
     metrics::counter!("siglake_query_wal_buffer_distributed_used_total").increment(1);
-    Ok(partials)
+    Ok((partials, Some(decoded)))
+}
+
+fn partial_scalar_leaf(expr: &Expr) -> bool {
+    match expr {
+        Expr::Alias(alias) => partial_scalar_leaf(&alias.expr),
+        Expr::Column(_) | Expr::Literal(_, _) => true,
+        _ => false,
+    }
+}
+
+fn partial_filter_expr_has_bounded_workspace(expr: &Expr) -> bool {
+    match expr {
+        Expr::Alias(alias) => partial_filter_expr_has_bounded_workspace(&alias.expr),
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
+            partial_filter_expr_has_bounded_workspace(&binary.left)
+                && partial_filter_expr_has_bounded_workspace(&binary.right)
+        }
+        Expr::BinaryExpr(binary)
+            if matches!(
+                binary.op,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq
+                    | Operator::IsDistinctFrom
+                    | Operator::IsNotDistinctFrom
+            ) =>
+        {
+            partial_scalar_leaf(&binary.left) && partial_scalar_leaf(&binary.right)
+        }
+        Expr::Not(inner) => partial_filter_expr_has_bounded_workspace(inner),
+        Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsUnknown(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsNotFalse(inner)
+        | Expr::IsNotUnknown(inner) => partial_scalar_leaf(inner),
+        Expr::Between(between) => {
+            partial_scalar_leaf(&between.expr)
+                && partial_scalar_leaf(&between.low)
+                && partial_scalar_leaf(&between.high)
+        }
+        _ => false,
+    }
+}
+
+fn partial_plan_nodes_have_bounded_workspace(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => {
+            aggregate.group_expr.iter().all(partial_scalar_leaf)
+                && aggregate.aggr_expr.iter().all(|expr| {
+                    let Expr::AggregateFunction(function) = expr else {
+                        return false;
+                    };
+                    function.params.args.iter().all(partial_scalar_leaf)
+                        && function.params.filter.is_none()
+                        && function.params.order_by.is_empty()
+                })
+                && partial_plan_nodes_have_bounded_workspace(&aggregate.input)
+        }
+        LogicalPlan::Projection(projection) => {
+            projection.expr.iter().all(partial_scalar_leaf)
+                && partial_plan_nodes_have_bounded_workspace(&projection.input)
+        }
+        LogicalPlan::Filter(filter) => {
+            partial_filter_expr_has_bounded_workspace(&filter.predicate)
+                && partial_plan_nodes_have_bounded_workspace(&filter.input)
+        }
+        LogicalPlan::TableScan(scan) => scan
+            .filters
+            .iter()
+            .all(partial_filter_expr_has_bounded_workspace),
+        LogicalPlan::SubqueryAlias(alias) => {
+            partial_plan_nodes_have_bounded_workspace(&alias.input)
+        }
+        LogicalPlan::Sort(sort) => {
+            sort.expr.iter().all(|expr| partial_scalar_leaf(&expr.expr))
+                && partial_plan_nodes_have_bounded_workspace(&sort.input)
+        }
+        LogicalPlan::Limit(limit) => {
+            limit
+                .skip
+                .as_deref()
+                .is_none_or(|expr| matches!(expr, Expr::Literal(_, _)))
+                && limit
+                    .fetch
+                    .as_deref()
+                    .is_none_or(|expr| matches!(expr, Expr::Literal(_, _)))
+                && partial_plan_nodes_have_bounded_workspace(&limit.input)
+        }
+        _ => false,
+    }
+}
+
+fn buffer_partial_plan_has_bounded_workspace(
+    plan: &LogicalPlan,
+    dist: &crate::coordinator::DistPlan,
+) -> bool {
+    if !matches!(
+        dist,
+        crate::coordinator::DistPlan::Aggregate { .. }
+            | crate::coordinator::DistPlan::OrderedAggregate { .. }
+    ) {
+        return false;
+    }
+    partial_plan_nodes_have_bounded_workspace(plan)
 }
 
 /// The `SessionContext` the buffer partial executes on: a clone of the
@@ -11507,6 +11668,43 @@ mod tests {
             })
             .collect();
         (schema, batches)
+    }
+
+    async fn buffer_partial_workspace_decision(query: &str) -> bool {
+        let ctx = buffer_partial_context();
+        let (schema, batches) = buffer_partial_fixture();
+        let table = datafusion::datasource::MemTable::try_new(schema, vec![batches]).unwrap();
+        ctx.register_table("events", Arc::new(table)).unwrap();
+        let df = ctx.sql(query).await.unwrap();
+        let dist = crate::coordinator::classify(df.logical_plan());
+        assert!(
+            !matches!(dist, crate::coordinator::DistPlan::Local),
+            "fixture must reach the distributed partial path: {query}"
+        );
+        buffer_partial_plan_has_bounded_workspace(df.logical_plan(), &dist)
+    }
+
+    #[tokio::test]
+    async fn buffer_partial_workspace_guard_checks_all_executed_expressions() {
+        assert!(
+            buffer_partial_workspace_decision("SELECT count(*) FROM events WHERE timestamp > 0",)
+                .await,
+            "simple comparison COUNT must remain eligible"
+        );
+        assert!(
+            !buffer_partial_workspace_decision(
+                "SELECT count(*) FROM events WHERE repeat(host, 1000000) = 'x'",
+            )
+            .await,
+            "allocating input filter must be refused"
+        );
+        assert!(
+            !buffer_partial_workspace_decision(
+                "SELECT count(expanded) FROM (SELECT repeat(host, 1000000) AS expanded FROM events) projected",
+            )
+            .await,
+            "allocating input projection must be refused"
+        );
     }
 
     /// #549: the buffer partial executes inside whatever pool its context
@@ -14064,7 +14262,7 @@ mod tests {
 
     /// A committed table plus a WAL buffer holding an out-of-window BACKLOG
     /// segment and a small in-window one, sized so the WHOLE buffer busts the
-    /// decode ceiling while the window's share fits under it.
+    /// compressed-file ceiling while the window's share fits under it.
     ///
     /// That is the outage-recovery shape, and it is where the two buffer gates
     /// part company: `load_buffer_delta` prices the whole buffer
@@ -14076,7 +14274,7 @@ mod tests {
         wal_root: std::path::PathBuf,
         wal_dir: std::path::PathBuf,
         writer: siglake_wal::WalWriter,
-        /// The injected decode ceiling: between the whole buffer and the
+        /// The injected compressed-file ceiling: between the whole buffer and the
         /// window's share for `new`, and `0` (guard off) for `drained`.
         max_bytes: u64,
         committed_in_window: usize,
@@ -14142,7 +14340,7 @@ mod tests {
                 );
                 max_bytes
             } else {
-                // Nothing sealed, and `0` disables the decode ceiling
+                // Nothing sealed, and `0` disables the compressed-file ceiling
                 // (`buffer_delta_max_bytes`): the drained-buffer fixture must
                 // not have a budget refusal standing in for a proof.
                 0
@@ -15787,7 +15985,9 @@ mod tests {
         let delta = BufferDelta {
             batches: std::collections::HashMap::from([(
                 "events".to_string(),
-                vec![siglake_core::events_to_record_batch(&buffered).unwrap()],
+                crate::wal_buffer::decoded_buffer_for_test(vec![
+                    siglake_core::events_to_record_batch(&buffered).unwrap(),
+                ]),
             )]),
         };
         let fast = try_group_count_fast_path_records(
@@ -15841,7 +16041,9 @@ mod tests {
         let delta = BufferDelta {
             batches: std::collections::HashMap::from([(
                 "events".to_string(),
-                vec![siglake_core::events_to_record_batch(&buffered).unwrap()],
+                crate::wal_buffer::decoded_buffer_for_test(vec![
+                    siglake_core::events_to_record_batch(&buffered).unwrap(),
+                ]),
             )]),
         };
         let fast = try_group_count_fast_path_records(
@@ -16598,9 +16800,16 @@ mod tests {
         assert_eq!(n_before, 4);
 
         // With override: union ⇒ 7.
-        override_events_with_wal_buffer(&ice, &ctx, &wal_root, None, None)
-            .await
-            .unwrap();
+        override_events_with_wal_buffer(
+            &ice,
+            &ctx,
+            &Arc::new(crate::wal_buffer::BufferDeltaCache::default()),
+            &wal_root,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let n_after = count_events(&ctx).await;
         assert_eq!(n_after, 7, "4 committed + 3 un-committed WAL rows");
     }
@@ -18037,8 +18246,8 @@ async fn distributed_inner(
     // configured, the plan is distributable, and the query reads exactly one
     // bufferable table (events or a managed index).
     let buffer_started = Instant::now();
-    let extra_partials = if peers.len() <= 1 {
-        Vec::new()
+    let (extra_partials, _extra_partials_wal_lease) = if peers.len() <= 1 {
+        (Vec::new(), None)
     } else if let Some(buffer_root) = state.wal_buffer_dir.as_deref() {
         compute_buffer_partials(
             &buffered_read,
@@ -18051,7 +18260,7 @@ async fn distributed_inner(
         )
         .await?
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
     let buffer_delta_micros = buffer_started.elapsed().as_micros() as u64;
 
