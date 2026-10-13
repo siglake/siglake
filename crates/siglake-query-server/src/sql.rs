@@ -1854,9 +1854,9 @@ fn attr_get_rewrite_target(
     mappings: &HashMap<String, AttrRewriteMap>,
     scopes: &[AttrRewriteScope],
 ) -> Option<(SqlAstExpr, siglake_core::PromotedType)> {
-    fn expression<'a>(
-        func: &'a datafusion::sql::sqlparser::ast::Function,
-    ) -> Option<(&'a SqlAstExpr, Vec<String>)> {
+    fn expression(
+        func: &datafusion::sql::sqlparser::ast::Function,
+    ) -> Option<(&SqlAstExpr, Vec<String>)> {
         let FunctionArguments::List(args) = &func.args else {
             return None;
         };
