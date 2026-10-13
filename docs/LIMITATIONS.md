@@ -64,8 +64,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   generation.
   Fast paths and union scans keep exact committed rows; fresh rows appear after
   a later admission or the drain commit. `SIGLAKE_BUFFER_DELTA_MEMORY_BYTES`
-  controls the ownership budget (one eighth of the container limit by default,
-  64 MiB..1 GiB; 512 MiB without a readable limit; zero disables WAL reads).
+  controls the Arrow-payload ownership budget (one eighth of the container
+  limit by default, 64 MiB..1 GiB; 512 MiB without a readable limit; zero
+  disables WAL reads). Exact-size decode preflight and schema-scaled mapping
+  admission can refuse a compressed generation well below the compressed-file
+  ceiling. The budget does not claim to predict allocator metadata or total
+  process RSS.
 - **A pod at the 4Gi floor caches no text indexes by default.** Both caches now
   derive from the pod's memory limit and are subtracted from the query pool, so
   they are inside the budget rather than beside it — and what they get is what

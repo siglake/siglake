@@ -2542,7 +2542,28 @@ pub fn sweep_committed(dir: &Path, retention: Duration) -> Result<usize> {
 
 /// Read all `RecordBatch`es from a sealed segment file.
 pub fn read_segment(path: &Path) -> Result<Vec<RecordBatch>> {
-    let bytes = fs::read(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let physical_len_u64 = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    let physical_len = usize::try_from(physical_len_u64)
+        .with_context(|| format!("WAL segment {} is too large", path.display()))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(physical_len)
+        .with_context(|| format!("reserve WAL input for {}", path.display()))?;
+    bytes.resize(physical_len, 0);
+    file.read_exact(&mut bytes)
+        .with_context(|| format!("read exact WAL input from {}", path.display()))?;
+    let mut file_trailing = [0u8; 1];
+    if file
+        .read(&mut file_trailing)
+        .with_context(|| format!("finish WAL input from {}", path.display()))?
+        != 0
+    {
+        bail!("WAL segment {} grew after preflight", path.display());
+    }
     if is_framed(&bytes) {
         // WS-8 framed segment: verify the in-band header + body CRC, then decode.
         decode_wal_frame(path, &bytes)
@@ -2550,6 +2571,152 @@ pub fn read_segment(path: &Path) -> Result<Vec<RecordBatch>> {
         // Legacy raw-IPC segment: validate against the `.crc` sidecar if present.
         validate_segment_crc(path, &bytes)?;
         read_segment_bytes(&bytes)
+    }
+}
+
+/// Read a sealed segment after proving its uncompressed IPC extent is at most
+/// `max_uncompressed_bytes`.
+///
+/// Unlike [`read_segment`], compressed input is expanded into an exactly sized
+/// allocation. The size is established before the file body is materialized;
+/// corrupt headers, unknown lengths, short decodes, and trailing decoded bytes
+/// are errors. Query-side WAL admission uses this path so a compressed member
+/// cannot cross its admitted IPC-payload bound while being decoded.
+pub fn read_segment_bounded(path: &Path, max_uncompressed_bytes: u64) -> Result<Vec<RecordBatch>> {
+    let uncompressed = segment_uncompressed_bytes_strict(path)?;
+    if uncompressed > max_uncompressed_bytes {
+        bail!(
+            "WAL segment {} has {uncompressed} uncompressed bytes, above limit {max_uncompressed_bytes}",
+            path.display()
+        );
+    }
+
+    let bytes = fs::read(path).with_context(|| format!("opening {}", path.display()))?;
+    if !is_framed(&bytes) {
+        if bytes.len() as u64 != uncompressed {
+            bail!(
+                "WAL segment {} changed size after preflight: {} != {uncompressed}",
+                path.display(),
+                bytes.len()
+            );
+        }
+        validate_segment_crc(path, &bytes)?;
+        return read_segment_bytes(&bytes);
+    }
+
+    let (zstd, body) = verify_wal_frame(path, &bytes)?;
+    if !zstd {
+        if body.len() as u64 != uncompressed {
+            bail!(
+                "WAL segment {} changed IPC size after preflight: {} != {uncompressed}",
+                path.display(),
+                body.len()
+            );
+        }
+        return if bytes[5] & WAL_FRAME_FLAG_PARTIAL != 0 {
+            read_partial_segment_bytes(path, body)
+        } else {
+            read_segment_bytes(body)
+        };
+    }
+
+    let decoded_len = usize::try_from(uncompressed)
+        .with_context(|| format!("uncompressed WAL segment {} is too large", path.display()))?;
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(decoded_len)
+        .with_context(|| format!("reserve decoded WAL body for {}", path.display()))?;
+    raw.resize(decoded_len, 0);
+    let mut decoder = zstd::stream::read::Decoder::new(body)
+        .with_context(|| format!("open zstd WAL body in {}", path.display()))?;
+    let window_log =
+        (u64::BITS - uncompressed.max(1).saturating_sub(1).leading_zeros()).clamp(10, 31);
+    decoder
+        .window_log_max(window_log)
+        .with_context(|| format!("bound zstd WAL window in {}", path.display()))?;
+    decoder
+        .read_exact(&mut raw)
+        .with_context(|| format!("decode exact zstd WAL body in {}", path.display()))?;
+    let mut trailing = [0u8; 1];
+    if decoder
+        .read(&mut trailing)
+        .with_context(|| format!("finish zstd WAL body in {}", path.display()))?
+        != 0
+    {
+        bail!(
+            "WAL segment {} decoded beyond its preflight size {uncompressed}",
+            path.display()
+        );
+    }
+    read_segment_bytes(&raw)
+}
+
+/// Exact uncompressed Arrow IPC bytes for query admission.
+///
+/// This differs from [`segment_uncompressed_bytes`], whose corrupt-input
+/// fallback is intentionally lenient so the compactor can claim and poison a
+/// bad segment. Query serving must fail closed instead: it has no safe amount
+/// to reserve when framing or compressed size cannot be established.
+pub fn segment_uncompressed_bytes_strict(path: &Path) -> Result<u64> {
+    const ZSTD_FRAME_HEADER_MAX: usize = 18;
+
+    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    let mut fixed = [0u8; WAL_FRAME_HEADER_LEN];
+    let fixed_len = file_len.min(WAL_FRAME_HEADER_LEN as u64) as usize;
+    file.read_exact(&mut fixed[..fixed_len])
+        .with_context(|| format!("reading WAL header from {}", path.display()))?;
+    if fixed_len < WAL_FRAME_MAGIC.len() || &fixed[..4] != WAL_FRAME_MAGIC {
+        return Ok(file_len);
+    }
+    if fixed_len < WAL_FRAME_HEADER_LEN_V1 {
+        bail!("WAL frame {} is shorter than its header", path.display());
+    }
+    let version = fixed[4];
+    let header_len = frame_header_len(version).with_context(|| {
+        format!(
+            "unsupported WAL frame version {version} in {}",
+            path.display()
+        )
+    })?;
+    if file_len < header_len as u64 {
+        bail!(
+            "WAL frame {} is shorter than its v{version} header",
+            path.display()
+        );
+    }
+    let physical_body_len = file_len - header_len as u64;
+    let partial = fixed[5] & WAL_FRAME_FLAG_PARTIAL != 0;
+    if partial || fixed[5] & WAL_FRAME_FLAG_ZSTD == 0 {
+        return Ok(physical_body_len);
+    }
+
+    let declared_body_len = u64::from_le_bytes(fixed[24..32].try_into().unwrap());
+    if physical_body_len != declared_body_len {
+        bail!(
+            "WAL frame {} body length {physical_body_len} != header {declared_body_len}",
+            path.display()
+        );
+    }
+    file.seek(std::io::SeekFrom::Start(header_len as u64))
+        .with_context(|| format!("seeking to WAL body in {}", path.display()))?;
+    let mut zstd_header = [0u8; ZSTD_FRAME_HEADER_MAX];
+    let prefix_len = file
+        .read(&mut zstd_header)
+        .with_context(|| format!("reading zstd header from {}", path.display()))?;
+    match zstd::zstd_safe::get_frame_content_size(&zstd_header[..prefix_len]) {
+        Ok(Some(content_size)) => return Ok(content_size),
+        Ok(None) => {
+            bail!(
+                "zstd WAL body in {} has no declared content size",
+                path.display()
+            )
+        }
+        Err(error) => {
+            bail!("invalid zstd frame header in {}: {error:?}", path.display())
+        }
     }
 }
 
@@ -3812,13 +3979,15 @@ mod crc_integrity_tests {
             (
                 "content-size",
                 zstd::bulk::compress(&raw, WAL_ZSTD_LEVEL).unwrap(),
+                true,
             ),
             (
                 "legacy-stream",
                 zstd::encode_all(raw.as_slice(), WAL_ZSTD_LEVEL).unwrap(),
+                false,
             ),
         ];
-        for (name, compressed) in cases {
+        for (name, compressed, query_sizable) in cases {
             let path = tmp.path().join(format!("{name}.arrow"));
             let frame = build_wal_frame(
                 WAL_FRAME_FLAG_ZSTD,
@@ -3834,6 +4003,26 @@ mod crc_integrity_tests {
                 raw.len() > frame.len() * 10,
                 "fixture must reproduce a compressed-byte admission bypass"
             );
+            if query_sizable {
+                assert_eq!(
+                    segment_uncompressed_bytes_strict(&path).unwrap(),
+                    raw.len() as u64
+                );
+                assert!(
+                    read_segment_bounded(&path, raw.len() as u64 - 1).is_err(),
+                    "{name}: oversized member must be refused before decode"
+                );
+                assert_eq!(
+                    read_segment_bounded(&path, raw.len() as u64).unwrap()[0].num_rows(),
+                    2
+                );
+            } else {
+                assert!(
+                    segment_uncompressed_bytes_strict(&path).is_err(),
+                    "query admission must fail closed without a declared content size"
+                );
+                assert!(read_segment_bounded(&path, u64::MAX).is_err());
+            }
             assert_eq!(read_segment(&path).unwrap()[0].num_rows(), 2);
         }
     }
@@ -4346,6 +4535,13 @@ mod ipc_framing_tests {
             assert!(
                 format!("{err:#}").contains("IPC framing check"),
                 "{label}: read_segment refused by the framing check: {err:#}"
+            );
+            let err = read_segment_bounded(&path, bytes.len() as u64)
+                .map(|b| b.len())
+                .expect_err(&format!("{label}: bounded reader must refuse"));
+            assert!(
+                format!("{err:#}").contains("IPC framing check"),
+                "{label}: bounded reader refused before decoder allocation: {err:#}"
             );
 
             // And over the object-store path the catalog-claim drain uses.

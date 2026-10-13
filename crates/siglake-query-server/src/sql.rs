@@ -10116,7 +10116,7 @@ async fn load_buffer_delta_with_max_and_bindings(
         });
     };
     let tenant = identity.tenant.as_deref().unwrap_or("default");
-    let mut batches: std::collections::HashMap<String, Vec<arrow_array::RecordBatch>> =
+    let mut batches: std::collections::HashMap<String, Arc<crate::wal_buffer::DecodedBuffer>> =
         std::collections::HashMap::new();
     let mut counts = std::collections::HashMap::new();
     let mut proof = BufferProof::default();
@@ -10503,6 +10503,9 @@ async fn compute_buffer_partials(
     if decoded.batches().is_empty() {
         return Ok((Vec::new(), Some(decoded)));
     }
+    let Some(output_lease) = decoded.try_reserve_output(plan.schema().fields().len()) else {
+        return Ok((Vec::new(), None));
+    };
     // Run the shard query over a buffer-only table to produce a partial in the
     // same shape the workers return for their Iceberg shards. A pool refusal
     // here is the same capacity answer as one in the coordinator's own scan
@@ -10511,6 +10514,13 @@ async fn compute_buffer_partials(
     let partials = run_buffer_partial(&ctx, &table, base_schema, decoded.cloned_batches(), query)
         .await
         .map_err(|e| ApiError::from_execution(anyhow::anyhow!(e), priority))?;
+    let partials = match output_lease.attach(partials) {
+        Ok(partials) => partials,
+        Err(error) => {
+            tracing::warn!(error = %error, table, "refusing WAL partial output whose ownership cannot be charged");
+            return Ok((Vec::new(), None));
+        }
+    };
     metrics::counter!("siglake_query_wal_buffer_distributed_used_total").increment(1);
     Ok((partials, Some(decoded)))
 }

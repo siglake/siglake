@@ -44,7 +44,9 @@ use std::sync::Arc;
 use std::task::{Context as TaskPollContext, Poll};
 
 use anyhow::{Context, Result};
-use arrow_array::RecordBatch;
+use arrow::array::ArrayData;
+use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
+use arrow_array::{make_array, Array, ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::datasource::{MemTable, TableProvider, TableType};
@@ -524,12 +526,12 @@ impl BufferMemoryBudget {
     /// Non-waiting admission. A WAL buffer is a freshness aid, so contention
     /// declines to the exact committed snapshot instead of building a queue
     /// that can starve maintenance and request watchdogs.
-    fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<BufferMemoryReservation> {
+    fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<Arc<BufferMemoryReservation>> {
         if bytes == 0 {
-            return Some(BufferMemoryReservation {
+            return Some(Arc::new(BufferMemoryReservation {
                 budget: Arc::clone(self),
                 bytes: 0,
-            });
+            }));
         }
         let mut state = self.state.lock().expect("WAL memory budget poisoned");
         if bytes > self.limit.saturating_sub(state.used) {
@@ -538,10 +540,10 @@ impl BufferMemoryBudget {
         }
         state.used = state.used.saturating_add(bytes);
         metrics::gauge!("siglake_query_wal_buffer_memory_reserved_bytes").set(state.used as f64);
-        Some(BufferMemoryReservation {
+        Some(Arc::new(BufferMemoryReservation {
             budget: Arc::clone(self),
             bytes,
-        })
+        }))
     }
 
     #[cfg(test)]
@@ -581,20 +583,108 @@ impl Drop for BufferMemoryReservation {
     }
 }
 
+/// Owns an Arrow buffer together with the reservation charged for that
+/// allocation. Rebuilding an array around these owners is zero-copy: the
+/// original buffer remains the storage, while its last shallow descendant now
+/// controls when the charge is released.
+#[derive(Debug)]
+struct LeasedBufferOwner {
+    _buffer: Buffer,
+    _reservation: Arc<BufferMemoryReservation>,
+}
+
+fn attach_reservation_to_buffer(
+    buffer: &Buffer,
+    reservation: &Arc<BufferMemoryReservation>,
+) -> Buffer {
+    if buffer.is_empty() {
+        return buffer.clone();
+    }
+    let owner = Arc::new(LeasedBufferOwner {
+        _buffer: buffer.clone(),
+        _reservation: Arc::clone(reservation),
+    });
+    let ptr = std::ptr::NonNull::new(buffer.as_ptr() as *mut u8)
+        .expect("a nonempty Arrow buffer has a non-null pointer");
+    // SAFETY: `owner` retains the original Buffer allocation, and therefore
+    // keeps `ptr..ptr+len` valid until the custom Buffer's final clone drops.
+    unsafe { Buffer::from_custom_allocation(ptr, buffer.len(), owner) }
+}
+
+fn attach_reservation_to_array_data(
+    data: &ArrayData,
+    reservation: &Arc<BufferMemoryReservation>,
+) -> Result<ArrayData> {
+    let buffers = data
+        .buffers()
+        .iter()
+        .map(|buffer| attach_reservation_to_buffer(buffer, reservation))
+        .collect();
+    let children = data
+        .child_data()
+        .iter()
+        .map(|child| attach_reservation_to_array_data(child, reservation))
+        .collect::<Result<Vec<_>>>()?;
+    let nulls = data.nulls().map(|nulls| {
+        let bits = nulls.inner();
+        NullBuffer::new(BooleanBuffer::new(
+            attach_reservation_to_buffer(bits.inner(), reservation),
+            bits.offset(),
+            bits.len(),
+        ))
+    });
+    ArrayData::builder(data.data_type().clone())
+        .len(data.len())
+        .offset(data.offset())
+        .buffers(buffers)
+        .child_data(children)
+        .nulls(nulls)
+        .build()
+        .context("attach WAL memory reservation to Arrow array")
+}
+
+fn attach_reservation_to_batch(
+    batch: &RecordBatch,
+    reservation: &Arc<BufferMemoryReservation>,
+) -> Result<RecordBatch> {
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| {
+            attach_reservation_to_array_data(&column.to_data(), reservation).map(make_array)
+        })
+        .collect::<Result<Vec<ArrayRef>>>()?;
+    RecordBatch::try_new(batch.schema(), columns)
+        .context("attach WAL memory reservation to record batch")
+}
+
+fn attach_reservation_to_batches(
+    batches: Vec<RecordBatch>,
+    reservation: &Arc<BufferMemoryReservation>,
+) -> Result<Vec<RecordBatch>> {
+    batches
+        .iter()
+        .map(|batch| attach_reservation_to_batch(batch, reservation))
+        .collect()
+}
+
 #[derive(Debug)]
 struct SelectedBufferSegments {
     paths: Vec<PathBuf>,
+    uncompressed_bytes: Vec<u64>,
     names: Vec<String>,
     compressed_bytes: u64,
+    uncompressed_total_bytes: u64,
     decode_charge_bytes: u64,
     admitted: bool,
 }
 
 /// Take the one listing that defines both admission and decode. Each selected
-/// segment is charged for its compressed file buffer plus three uncompressed
-/// IPC extents: the decompressed body, decoded Arrow ownership, and a possible
-/// carrier-map/alignment output. IPC size is an admission input, not a claim
-/// about Arrow heap or process RSS; retained output is measured after decode.
+/// segment is charged for the compressed file buffer, its exactly sized
+/// decompressed IPC body, and the IPC message buffers retained by Arrow. The
+/// bounded reader proves these payload extents before allocating. This is a
+/// payload-ownership budget, not a claim about allocator metadata or process
+/// RSS; query transformations take separate reservations below.
 fn select_buffer_segments(
     wal_dir: &Path,
     exclude: &HashSet<String>,
@@ -616,7 +706,9 @@ fn select_buffer_segments(
     metrics::counter!("siglake_query_wal_buffer_segments_kept_total").increment(paths.len() as u64);
 
     let mut names = Vec::with_capacity(paths.len());
+    let mut uncompressed_bytes = Vec::with_capacity(paths.len());
     let mut compressed_bytes = 0u64;
+    let mut uncompressed_total_bytes = 0u64;
     let mut decode_charge_bytes = 0u64;
     for path in &paths {
         let physical = std::fs::metadata(path)
@@ -626,17 +718,21 @@ fn select_buffer_segments(
         if compressed_max > 0 && compressed_bytes > compressed_max {
             return Ok(SelectedBufferSegments {
                 paths: Vec::new(),
+                uncompressed_bytes: Vec::new(),
                 names: Vec::new(),
                 compressed_bytes,
+                uncompressed_total_bytes: 0,
                 decode_charge_bytes: 0,
                 admitted: false,
             });
         }
-        let ipc = siglake_wal::segment_uncompressed_bytes(path)
+        let ipc = siglake_wal::segment_uncompressed_bytes_strict(path)
             .with_context(|| format!("size selected WAL segment {}", path.display()))?;
         decode_charge_bytes = decode_charge_bytes
             .saturating_add(physical)
-            .saturating_add(ipc.saturating_mul(3));
+            .saturating_add(ipc.saturating_mul(2));
+        uncompressed_total_bytes = uncompressed_total_bytes.saturating_add(ipc);
+        uncompressed_bytes.push(ipc);
         let name = path
             .file_name()
             .and_then(|value| value.to_str())
@@ -646,8 +742,10 @@ fn select_buffer_segments(
     names.sort_unstable();
     Ok(SelectedBufferSegments {
         paths,
+        uncompressed_bytes,
         names,
         compressed_bytes,
+        uncompressed_total_bytes,
         decode_charge_bytes,
         admitted: true,
     })
@@ -744,7 +842,24 @@ pub(crate) struct DecodedBuffer {
     batches: Vec<RecordBatch>,
     names: Vec<String>,
     compressed_bytes: u64,
-    _reservation: BufferMemoryReservation,
+    _reservation: Arc<BufferMemoryReservation>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BufferOutputLease {
+    reservation: Arc<BufferMemoryReservation>,
+}
+
+impl BufferOutputLease {
+    pub(crate) fn attach(self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+        if !self
+            .reservation
+            .contains_actual(batches_payload_bytes(&batches))
+        {
+            anyhow::bail!("WAL query output exceeded its admitted payload bound");
+        }
+        attach_reservation_to_batches(batches, &self.reservation)
+    }
 }
 
 impl DecodedBuffer {
@@ -762,6 +877,21 @@ impl DecodedBuffer {
 
     pub(crate) fn compressed_bytes(&self) -> u64 {
         self.compressed_bytes
+    }
+
+    /// Reserve construction plus retained payload for a query result derived
+    /// from this generation. Each output column can retain at most one
+    /// source-sized derived payload; the second extent covers its construction
+    /// while the source remains live. DataFusion separately accounts operator
+    /// state in the shared query pool.
+    pub(crate) fn try_reserve_output(&self, output_columns: usize) -> Option<BufferOutputLease> {
+        let bound = batches_payload_bytes(&self.batches)
+            .saturating_mul(output_columns.max(1) as u64)
+            .saturating_mul(2);
+        self._reservation
+            .budget
+            .try_reserve(bound)
+            .map(|reservation| BufferOutputLease { reservation })
     }
 }
 
@@ -976,7 +1106,21 @@ impl BufferDeltaCache {
             metrics::counter!("siglake_query_wal_buffer_refused_bytes_total").increment(1);
             return Ok(BufferReadOutcome::Refused { compressed_bytes });
         }
-        let Some(reservation) = self.memory.try_reserve(selected.decode_charge_bytes) else {
+        // Mapping/alignment can create one value/offset/validity payload per
+        // target column while its source value and parser/builder workspace
+        // are still live. Each such payload is derived from the admitted IPC
+        // bytes: one IPC extent bounds retained column data and one bounds its
+        // construction workspace. This schema-scaled term deliberately
+        // refuses very wide generations rather than treating a fixed IPC
+        // multiplier as an Arrow-heap ceiling.
+        let output_and_workspace_bound = selected
+            .uncompressed_total_bytes
+            .saturating_mul(target_schema.fields().len().max(1) as u64)
+            .saturating_mul(2);
+        let total_charge = selected
+            .decode_charge_bytes
+            .saturating_add(output_and_workspace_bound);
+        let Some(reservation) = self.memory.try_reserve(total_charge) else {
             return Ok(BufferReadOutcome::Refused { compressed_bytes });
         };
         let batches = match read_selected_buffer_batches(&selected, target_schema, carrier) {
@@ -994,6 +1138,15 @@ impl BufferDeltaCache {
         if !reservation.contains_actual(actual_bytes) {
             return Ok(BufferReadOutcome::Refused { compressed_bytes });
         }
+        let batches = match attach_reservation_to_batches(batches, &reservation) {
+            Ok(batches) => batches,
+            Err(error) => {
+                metrics::counter!("siglake_query_wal_buffer_refused_decode_total").increment(1);
+                tracing::warn!(error = %error, dir = %wal_dir.display(),
+                    "refusing WAL buffer generation whose ownership cannot be charged");
+                return Ok(BufferReadOutcome::Refused { compressed_bytes });
+            }
+        };
         let decoded = Arc::new(DecodedBuffer {
             batches,
             names: selected.names,
@@ -1127,8 +1280,8 @@ fn read_selected_buffer_batches(
     carrier: Option<&siglake_core::index_config::IndexConfig>,
 ) -> Result<Vec<RecordBatch>> {
     let mut batches = Vec::new();
-    for segment in &selected.paths {
-        let segment_batches = siglake_wal::read_segment(segment)
+    for (segment, uncompressed_bytes) in selected.paths.iter().zip(&selected.uncompressed_bytes) {
+        let segment_batches = siglake_wal::read_segment_bounded(segment, *uncompressed_bytes)
             .with_context(|| format!("decode selected WAL segment {}", segment.display()))?;
         for batch in segment_batches {
             if batch.num_rows() == 0 {
@@ -1257,6 +1410,51 @@ fn filter_batches(
         }
     }
     Ok(out)
+}
+
+fn batches_payload_bytes(batches: &[RecordBatch]) -> u64 {
+    batches.iter().fold(0u64, |bytes, batch| {
+        bytes.saturating_add(batch.get_array_memory_size() as u64)
+    })
+}
+
+/// Run the query-local filter under its own reservation. Filtered value
+/// buffers cannot contain more values or variable-width payload than their
+/// inputs; the extra term covers one value bitmap per predicate plus the
+/// combined mask. The returned arrays own the reservation through their final
+/// shallow clone.
+fn filter_batches_charged(
+    memory: &Arc<BufferMemoryBudget>,
+    batches: &[RecordBatch],
+    filters: &[Expr],
+    schema: &SchemaRef,
+    state: &dyn Session,
+) -> Option<DFResult<Vec<RecordBatch>>> {
+    if filters.is_empty() || batches.is_empty() {
+        return Some(Ok(batches.to_vec()));
+    }
+    let rows = batches.iter().fold(0u64, |rows, batch| {
+        rows.saturating_add(batch.num_rows() as u64)
+    });
+    let mask_bytes = rows
+        .saturating_add(7)
+        .saturating_div(8)
+        .saturating_mul((filters.len() as u64).saturating_add(1));
+    let bound = batches_payload_bytes(batches).saturating_add(mask_bytes);
+    let reservation = memory.try_reserve(bound)?;
+    let filtered = match filter_batches(batches, filters, schema, state) {
+        Ok(filtered) => filtered,
+        Err(error) => return Some(Err(error)),
+    };
+    if !reservation.contains_actual(batches_payload_bytes(&filtered)) {
+        return Some(Err(DataFusionError::ResourcesExhausted(
+            "WAL filter output exceeded its admitted payload bound".to_string(),
+        )));
+    }
+    Some(
+        attach_reservation_to_batches(filtered, &reservation)
+            .map_err(|error| DataFusionError::External(error.into())),
+    )
 }
 
 /// A [`TableProvider`] that unions a base provider (the Iceberg `events`
@@ -1454,6 +1652,46 @@ fn sort_batches_like(
     take_record_batch(&combined, &indices)
         .ok()
         .map(|b| (vec![b], first.options, col.name().to_string()))
+}
+
+enum ChargedSort {
+    Sorted((Vec<RecordBatch>, arrow_schema::SortOptions, String)),
+    Unsupported,
+    Refused,
+}
+
+/// Sort under a per-query reservation. `concat_batches` can duplicate the
+/// input payload once, `take_record_batch` once more, and the sort indices use
+/// one 64-bit slot per row. Keeping the full workspace charge on the returned
+/// batch is conservative and makes concurrent cache-hit sorts additive.
+fn sort_batches_like_charged(
+    memory: &Arc<BufferMemoryBudget>,
+    batches: &[RecordBatch],
+    ordering: &datafusion::physical_expr::LexOrdering,
+    schema: &SchemaRef,
+) -> ChargedSort {
+    let rows = batches.iter().fold(0u64, |rows, batch| {
+        rows.saturating_add(batch.num_rows() as u64)
+    });
+    let bound = batches_payload_bytes(batches)
+        .saturating_mul(2)
+        .saturating_add(rows.saturating_mul(8));
+    let Some(reservation) = memory.try_reserve(bound) else {
+        return ChargedSort::Refused;
+    };
+    let Some((sorted, options, field)) = sort_batches_like(batches, ordering, schema) else {
+        return ChargedSort::Unsupported;
+    };
+    if !reservation.contains_actual(batches_payload_bytes(&sorted)) {
+        return ChargedSort::Refused;
+    }
+    match attach_reservation_to_batches(sorted, &reservation) {
+        Ok(sorted) => ChargedSort::Sorted((sorted, options, field)),
+        Err(error) => {
+            tracing::warn!(error = %error, "refusing WAL sort output whose ownership cannot be charged");
+            ChargedSort::Refused
+        }
+    }
 }
 
 /// Rebuild the base scan's event-time ordering against `plan`'s (possibly
@@ -1665,14 +1903,21 @@ impl TableProvider for UnionEventsProvider {
         // hundred KB, in memory) lets those queries take the base plan unchanged
         // and pay nothing. Rows that DO match are still unioned, so the answer is
         // unchanged either way.
-        let batches = match filter_batches(decoded.batches(), filters, &self.schema, state) {
-            Ok(filtered) => filtered,
+        let batches = match filter_batches_charged(
+            &self.cache.memory,
+            decoded.batches(),
+            filters,
+            &self.schema,
+            state,
+        ) {
+            Some(Ok(filtered)) => filtered,
             // Never let a filter we cannot evaluate change the ANSWER: fall back
             // to unioning everything, which is correct but slow.
-            Err(e) => {
+            Some(Err(e)) => {
                 tracing::debug!(error = %e, "wal-buffer: filter pre-pass failed; unioning unfiltered");
                 decoded.cloned_batches()
             }
+            None => return Ok(base_plan),
         };
         if batches.iter().all(|b| b.num_rows() == 0) {
             metrics::counter!("siglake_query_wal_buffer_skipped_no_match_total").increment(1);
@@ -1695,8 +1940,13 @@ impl TableProvider for UnionEventsProvider {
             "wal-buffer union: base ordering state"
         );
         let (buffer, sorted) = match &base_ordering {
-            Some(ordering) => match sort_batches_like(&batches, ordering, &self.schema) {
-                Some((sorted_batches, options, field)) => {
+            Some(ordering) => match sort_batches_like_charged(
+                &self.cache.memory,
+                &batches,
+                ordering,
+                &self.schema,
+            ) {
+                ChargedSort::Sorted((sorted_batches, options, field)) => {
                     // Physically sorted AND declared: the physical optimizer
                     // re-plans around whatever we return (it replaced an
                     // undeclared-but-sorted memtable with a full-scan TopK on
@@ -1719,17 +1969,21 @@ impl TableProvider for UnionEventsProvider {
                         true,
                     )
                 }
-                None => (
+                ChargedSort::Unsupported => (
                     MemTable::try_new(self.schema.clone(), vec![batches])?,
                     false,
                 ),
+                ChargedSort::Refused => return Ok(base_plan),
             },
             None => (
                 MemTable::try_new(self.schema.clone(), vec![batches])?,
                 false,
             ),
         };
-        let buffer_plan = buffer.scan(state, projection, filters, limit).await?;
+        // The pre-pass above has already applied every pushed predicate. Do
+        // not ask MemTable to allocate a second filtered copy. DataFusion's
+        // parent filter remains because this provider advertises `Inexact`.
+        let buffer_plan = buffer.scan(state, projection, &[], limit).await?;
         // Both children share the (projected) events schema, so a plain union is
         // valid. UnionExec requires ≥1 inputs and identical output schemas.
         if base_plan.schema() != buffer_plan.schema() {
@@ -2211,6 +2465,108 @@ mod tests {
         assert_eq!(cache.memory.used(), first_charge);
         drop(first);
         assert_eq!(cache.memory.used(), 0);
+    }
+
+    #[test]
+    fn retained_plain_batch_keeps_charge_after_generation_and_cache_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sealed_segment(tmp.path(), 2);
+        let cache = BufferDeltaCache::with_memory_limit(64 * MIB);
+        let decoded = loaded(
+            cache
+                .get_or_load_for_query(
+                    tmp.path(),
+                    &siglake_core::events_schema(),
+                    &HashSet::new(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        let retained = decoded.batches()[0].clone();
+        let charged = cache.memory.used();
+        assert!(charged > 0);
+
+        cache.evict(tmp.path());
+        drop(decoded);
+        assert_eq!(
+            cache.memory.used(),
+            charged,
+            "plain Arrow buffers, not the cache entry, must own the charge"
+        );
+        drop(retained);
+        assert_eq!(cache.memory.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn completed_union_output_keeps_charge_after_plan_stream_and_cache_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sealed_segment(tmp.path(), 2);
+        let schema = siglake_core::events_schema();
+        let base = Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap());
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(64 * MIB));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            base,
+            Arc::clone(&cache),
+            tmp.path(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let plan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let output = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        let charged = cache.memory.used();
+        assert!(charged > 0);
+
+        cache.evict(tmp.path());
+        drop(provider);
+        assert_eq!(
+            cache.memory.used(),
+            charged,
+            "completed output must retain the charge after EOF and plan drop"
+        );
+        drop(output);
+        assert_eq!(cache.memory.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn simultaneous_cache_hit_filters_have_additive_output_charges() {
+        use datafusion::prelude::{col, lit};
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_sealed_segment(tmp.path(), 4);
+        let schema = siglake_core::events_schema();
+        let cache = BufferDeltaCache::with_memory_limit(64 * MIB);
+        let decoded = loaded(
+            cache
+                .get_or_load_for_query(tmp.path(), &schema, &HashSet::new(), None, None, None)
+                .unwrap(),
+        );
+        let state = SessionContext::new().state();
+        let filters = [col("raw").eq(lit("buffered 1"))];
+        let generation_charge = cache.memory.used();
+        let first =
+            filter_batches_charged(&cache.memory, decoded.batches(), &filters, &schema, &state)
+                .expect("first query admitted")
+                .unwrap();
+        let one_output_charge = cache.memory.used();
+        assert!(one_output_charge > generation_charge);
+        let second =
+            filter_batches_charged(&cache.memory, decoded.batches(), &filters, &schema, &state)
+                .expect("second query admitted")
+                .unwrap();
+        assert!(
+            cache.memory.used() > one_output_charge,
+            "concurrent cache hits must not share one transformation charge"
+        );
+
+        drop(first);
+        assert_eq!(cache.memory.used(), one_output_charge);
+        drop(second);
+        assert_eq!(cache.memory.used(), generation_charge);
     }
 
     #[test]
