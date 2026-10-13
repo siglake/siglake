@@ -2881,7 +2881,11 @@ mod tests {
         let mut strings = StringBuilder::with_capacity(1, 8192);
         strings.append_value("");
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, false)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Utf8,
+                false,
+            )])),
             vec![Arc::new(strings.finish())],
         )
         .unwrap();
@@ -2890,10 +2894,16 @@ mod tests {
         let charge = decoded_payload_bytes(std::slice::from_ref(&batch));
         let budget = BufferMemoryBudget::new(charge);
         let reservation = budget.try_reserve(charge).unwrap();
-        let leased = BufferOutputLease { reservation }.attach(vec![batch]).unwrap();
+        let leased = BufferOutputLease { reservation }
+            .attach(vec![batch])
+            .unwrap();
         let values = leased[0].column(0).to_data().buffers()[1].clone();
         drop(leased);
-        assert_eq!(budget.used(), charge, "empty values still retain their allocation");
+        assert_eq!(
+            budget.used(),
+            charge,
+            "empty values still retain their allocation"
+        );
         drop(values);
         assert_eq!(budget.used(), 0);
     }
