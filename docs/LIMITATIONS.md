@@ -1635,7 +1635,9 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   from the flat dotted-key lookup when literal dotted keys, nulls or a
   serialized JSON string are present. Siglake refuses any source-chain or type
   change under an existing promoted column name; declare the composed source
-  under a distinct name and field id. Old files lack that field and keep the
+  under a distinct name and field id with `siglake declare-promotions --table
+  <events-or-managed-index> --promote-attr <spec>`. The command retains older
+  declarations and rewrites no data. Old files lack the new field and keep the
   original JSON expression until an ordinary rewrite materializes it with the
   `x3` extraction marker. The backfill selector finds the missing physical
   column, but a settled file remains residual until some other compaction

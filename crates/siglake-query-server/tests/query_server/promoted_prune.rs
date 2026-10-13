@@ -462,11 +462,10 @@ async fn composed_attr_get_rewrite_refuses_flat_materialization_then_converges()
         .unwrap()
         .with_promoted_columns(vec![conflicting_promotion]);
     let error = conflicting.ensure_promoted_columns().await.unwrap_err();
+    let error = format!("{error:#}");
     assert!(
-        error
-            .to_string()
-            .contains("cannot change extraction identity"),
-        "{error:#}"
+        error.contains("cannot change extraction identity"),
+        "{error}"
     );
 
     // A distinct physical column gives the composed source its own field id.
@@ -551,11 +550,10 @@ async fn composed_attr_get_rewrite_refuses_flat_materialization_then_converges()
         .unwrap()
         .with_promoted_columns(changed);
     let error = stale_writer.ensure_promoted_columns().await.unwrap_err();
+    let error = format!("{error:#}");
     assert!(
-        error
-            .to_string()
-            .contains("cannot change extraction identity"),
-        "{error:#}"
+        error.contains("cannot change extraction identity"),
+        "{error}"
     );
     assert_eq!(nested_object_answer(&app, SQL).await, expected);
 }

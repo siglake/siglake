@@ -730,6 +730,33 @@ enum Command {
         promote_attr: Vec<String>,
     },
 
+    /// Declare additive attribute promotions for one existing events or
+    /// managed-index table.
+    ///
+    /// Records the exact source expression and widens the table with its typed
+    /// physical column. Existing promotions are retained. Existing files are
+    /// not rewritten: queries keep the residual `attr_get` expression until
+    /// ordinary compaction has materialized every declared column.
+    DeclarePromotions {
+        /// Iceberg warehouse URL. Reads `SIGLAKE_WAREHOUSE_URL` if not given.
+        #[arg(long, env = "SIGLAKE_WAREHOUSE_URL")]
+        warehouse_url: Option<String>,
+        /// Iceberg catalog URI. Reads `SIGLAKE_CATALOG_URI` if not given.
+        #[arg(long, env = "SIGLAKE_CATALOG_URI")]
+        catalog_uri: Option<String>,
+        /// Per-deployment Iceberg namespace.
+        #[arg(long, env = "SIGLAKE_TENANT_NAMESPACE", default_value = "siglake")]
+        namespace: String,
+        /// Existing table: `events` or a managed index id.
+        #[arg(long)]
+        table: String,
+        /// Attribute promotion to add. Repeatable. Uses
+        /// `attr_key:type[:column]` or the exact JSON key-chain form
+        /// `["inner key","outer key"]:type[:column]`.
+        #[arg(long = "promote-attr", required = true)]
+        promote_attr: Vec<String>,
+    },
+
     /// Run a SQL query DIRECTLY against a warehouse via DataFusion — no
     /// query server involved (offline/ops tool; `siglake sql` is the
     /// client for a running server).
@@ -899,6 +926,7 @@ fn component_name(cmd: &Command) -> &'static str {
         | Command::RebuildGroupCounts { .. }
         | Command::RebuildTimeAggregates { .. }
         | Command::MigrateSchema { .. }
+        | Command::DeclarePromotions { .. }
         | Command::Subscribe { .. } => "cli",
     }
 }
@@ -941,7 +969,8 @@ fn warehouse_role(command: &Command) -> WarehouseRole {
         | Command::DeleteSweep { .. }
         | Command::RebuildGroupCounts { .. }
         | Command::RebuildTimeAggregates { .. }
-        | Command::MigrateSchema { .. } => WarehouseRole::Maintenance,
+        | Command::MigrateSchema { .. }
+        | Command::DeclarePromotions { .. } => WarehouseRole::Maintenance,
     }
 }
 
@@ -1012,6 +1041,14 @@ mod component_name_tests {
             vec!["siglake", "wal-requeue", "--wal", "/var/lib/siglake/wal"],
             vec!["siglake", "rebuild-time-aggregates"],
             vec!["siglake", "migrate-schema"],
+            vec![
+                "siglake",
+                "declare-promotions",
+                "--table",
+                "big5",
+                "--promote-attr",
+                "[\"aws.cloudwatch\",\"log_stream\"]:string:aws_cloudwatch_composed_log_stream",
+            ],
         ] {
             assert_eq!(component_of(&argv), "cli", "{argv:?}");
         }
@@ -1447,6 +1484,23 @@ async fn run(cli: Cli) -> Result<()> {
                 catalog_uri.as_deref(),
                 &namespace,
                 &table,
+            )
+            .await
+        }
+        Command::DeclarePromotions {
+            warehouse_url,
+            catalog_uri,
+            namespace,
+            table,
+            promote_attr,
+        } => {
+            run_declare_promotions(
+                &cli.data_dir,
+                warehouse_url.as_deref(),
+                catalog_uri.as_deref(),
+                &namespace,
+                &table,
+                parse_promoted(&promote_attr)?,
             )
             .await
         }
@@ -3815,6 +3869,206 @@ async fn run_delete_sweep(
         );
     }
     Ok(())
+}
+
+/// Add the requested promotion identities to one existing events or managed
+/// index table. The caller supplies additions; the table property remains the
+/// complete set so an explicit declaration cannot drop an older promotion.
+async fn declare_promotions_on_table(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    table: &str,
+    additions: &[siglake_core::PromotedColumn],
+) -> Result<(iceberg::TableIdent, usize)> {
+    anyhow::ensure!(
+        !additions.is_empty(),
+        "at least one --promote-attr is required"
+    );
+    let mut requested_names = std::collections::HashSet::new();
+    for column in additions {
+        anyhow::ensure!(
+            requested_names.insert(column.name.as_str()),
+            "promoted column `{}` is requested more than once",
+            column.name
+        );
+    }
+
+    let ident = if table == siglake_storage::iceberg::TABLE_NAME {
+        ice.events_table_ident().clone()
+    } else if ice.get_index(table).await?.is_some() {
+        ice.index_table_ident(table)
+    } else {
+        anyhow::bail!(
+            "table `{table}` is not `events` or an existing managed index in namespace `{}`",
+            ice.namespace()
+        );
+    };
+    let loaded = ice
+        .catalog()
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load promotion target {ident}"))?;
+    let properties = loaded.metadata().properties();
+    let mut desired = siglake_core::promoted_columns_from_properties(
+        properties
+            .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+            .map(String::as_str),
+        properties
+            .get(siglake_core::PROMOTED_PROPERTY_KEY)
+            .map(String::as_str),
+    );
+    for addition in additions {
+        if let Some(position) = desired
+            .iter()
+            .position(|current| current.name == addition.name)
+        {
+            // Leave an identical declaration alone. Put a changed identity in
+            // the desired set so storage's retry-aware validator reports the
+            // immutable-field refusal against the catalog base it commits on.
+            if desired[position] != *addition {
+                desired[position] = addition.clone();
+            }
+        } else {
+            desired.push(addition.clone());
+        }
+    }
+    let added = ice.declare_promotions_for(&ident, &desired).await?;
+    Ok((ident, added))
+}
+
+async fn run_declare_promotions(
+    data_dir: &std::path::Path,
+    warehouse_url: Option<&str>,
+    catalog_uri: Option<&str>,
+    namespace: &str,
+    table: &str,
+    additions: Vec<siglake_core::PromotedColumn>,
+) -> Result<()> {
+    let ice = open_iceberg(
+        data_dir,
+        "warehouse",
+        warehouse_url,
+        catalog_uri,
+        Some(namespace),
+    )
+    .await?;
+    let declared = additions.len();
+    let (ident, added) = declare_promotions_on_table(&ice, table, &additions).await?;
+    println!(
+        "{ident}: declared {declared} promotion(s), added {added} physical column(s); existing files remain residual until rewritten"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod declare_promotions_tests {
+    use super::*;
+    use siglake_core::index_config::IndexConfig;
+
+    fn flat_cloudwatch() -> siglake_core::PromotedColumn {
+        siglake_core::PromotedColumn {
+            attr_key: "aws.cloudwatch.log_stream".into(),
+            attr_get_path: Vec::new(),
+            name: "aws_cloudwatch_log_stream".into(),
+            ty: siglake_core::PromotedType::Utf8,
+        }
+    }
+
+    fn composed_cloudwatch() -> siglake_core::PromotedColumn {
+        siglake_core::PromotedColumn {
+            attr_key: "aws.cloudwatch".into(),
+            attr_get_path: vec!["log_stream".into()],
+            name: "aws_cloudwatch_composed_log_stream".into(),
+            ty: siglake_core::PromotedType::Utf8,
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_managed_index_declaration_retains_existing_promotions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let config = IndexConfig {
+            index_id: "big5".into(),
+            ..IndexConfig::builtin_events()
+        };
+        let ident = ice.create_index(&config).await.unwrap();
+        let flat = flat_cloudwatch();
+        ice.declare_promotions_for(&ident, std::slice::from_ref(&flat))
+            .await
+            .unwrap();
+
+        let composed = composed_cloudwatch();
+        let (target, added) =
+            declare_promotions_on_table(&ice, "big5", std::slice::from_ref(&composed))
+                .await
+                .unwrap();
+        assert_eq!(target, ident);
+        assert_eq!(added, 1);
+
+        let table = ice.catalog().load_table(&ident).await.unwrap();
+        let properties = table.metadata().properties();
+        assert_eq!(
+            siglake_core::promoted_columns_from_properties(
+                properties
+                    .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+                    .map(String::as_str),
+                properties
+                    .get(siglake_core::PROMOTED_PROPERTY_KEY)
+                    .map(String::as_str),
+            ),
+            vec![flat, composed.clone()]
+        );
+        assert!(table
+            .metadata()
+            .current_schema()
+            .field_id_by_name(&composed.name)
+            .is_some());
+        assert!(ice
+            .catalog()
+            .load_table(ice.events_table_ident())
+            .await
+            .unwrap()
+            .metadata()
+            .properties()
+            .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_declaration_refuses_unmanaged_tables_and_identity_reuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let error = declare_promotions_on_table(
+            &ice,
+            siglake_storage::iceberg::QUERY_AUDIT_TABLE,
+            &[composed_cloudwatch()],
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("not `events` or an existing managed index"));
+
+        let config = IndexConfig {
+            index_id: "big5".into(),
+            ..IndexConfig::builtin_events()
+        };
+        let ident = ice.create_index(&config).await.unwrap();
+        let flat = flat_cloudwatch();
+        ice.declare_promotions_for(&ident, std::slice::from_ref(&flat))
+            .await
+            .unwrap();
+        let mut conflicting = composed_cloudwatch();
+        conflicting.name = flat.name;
+        let error = declare_promotions_on_table(&ice, "big5", &[conflicting])
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("cannot change extraction identity"),
+            "{error:#}"
+        );
+    }
 }
 
 /// The schema the running build declares for `table`, or `None` for an
