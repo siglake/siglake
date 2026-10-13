@@ -306,6 +306,7 @@ async fn dropping_the_promote_attr_flag_does_not_null_the_promoted_column() {
         .unwrap()
         .with_promoted_columns(vec![PromotedColumn {
             attr_key: "http.status_code".into(),
+            attr_get_path: Vec::new(),
             name: "status".into(),
             ty: PromotedType::Int64,
         }]);

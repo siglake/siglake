@@ -785,6 +785,7 @@ mod tests {
         .unwrap();
         let col = siglake_core::PromotedColumn {
             attr_key: key.to_string(),
+            attr_get_path: Vec::new(),
             name: "promoted".into(),
             ty: siglake_core::PromotedType::Utf8,
         };

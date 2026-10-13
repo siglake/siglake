@@ -498,8 +498,9 @@ compactor:
   # Dense extraction: promote declared OTLP attributes out of the
   # `attributes` JSON into their own typed columns (Parquet stats/bloom pruning
   # + clean typed SQL, vs `attr_get()` over the JSON). Each entry is
-  # `attr_key:type[:column]`, type ∈ string|int|float|bool; the column name
-  # defaults to the attr key with `.`/`-` → `_`. The compactor widens the events
+  # `attr_key:type[:column]`, or an exact composed lookup as
+  # `["inner key","outer key"]:type[:column]`; type ∈
+  # string|int|float|bool. The compactor widens the events
   # table additively at startup. Run `siglake migrate-schema --table events
   # --promote-attr ...` with the same set to widen an existing warehouse first.
   # Empty = no promotion (the long tail stays queryable via `attr_get`).

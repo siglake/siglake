@@ -11,6 +11,13 @@ promotion, which is opt-in and qualified in
 `DESIGN_auto_promotion_qualification.md`. The rest of this document is the
 design as written.*
 
+*2026-10-13 (#6752): exact composed `attr_get` sources ship as an explicit JSON
+key-chain declaration. Materialization reparses each intermediate string as the
+UDF does; promotion metadata and per-file provenance distinguish the composed
+tree from a flat dotted key. Old, incomplete and mixed-writer files retain the
+residual expression until an ordinary rewrite rematerializes them. No automatic
+migration or default promotion was added; the column cap is unchanged.*
+
 ## What already shipped (don't re-implement)
 
 The BIG_TRACKS Track-4 description lagged reality. Landed and

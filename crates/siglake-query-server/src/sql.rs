@@ -1505,7 +1505,7 @@ fn query_order_field<'a>(query: &SqlQuery, ordered_index: Option<(&'a str, &'a s
 /// every table whose mapping does not name another one.
 const CANONICAL_EVENT_TIME: &str = siglake_storage::CANONICAL_EVENT_TIME_FIELD;
 
-type AttrRewriteMap = HashMap<String, (String, siglake_core::PromotedType)>;
+type AttrRewriteMap = HashMap<(String, Vec<String>), (String, siglake_core::PromotedType)>;
 
 /// WS-7 rewrite mechanics: replace every `attr_get(attributes, 'key')` whose
 /// column owner is proven and whose owning table's `mapping` contains the key.
@@ -1553,14 +1553,23 @@ fn rewrite_attr_get_to_columns(
             core::ops::ControlFlow::Continue(())
         }
 
+        fn pre_visit_expr(&mut self, expr: &mut SqlAstExpr) -> core::ops::ControlFlow<()> {
+            if matches!(self.pass, AttrRewritePass::Remaining) {
+                // Match the whole nested attr_get tree before its inner call
+                // can be rewritten. This preserves the expression identity of
+                // a composed promotion even when the inner object also has a
+                // direct promotion.
+                rewrite_remaining_attr_get(expr, self.mappings, &self.scopes, self.changed);
+            }
+            core::ops::ControlFlow::Continue(())
+        }
+
         fn post_visit_expr(&mut self, expr: &mut SqlAstExpr) -> core::ops::ControlFlow<()> {
             match self.pass {
                 AttrRewritePass::TypedComparisons => {
                     rewrite_typed_attr_comparison(expr, self.mappings, &self.scopes, self.changed)
                 }
-                AttrRewritePass::Remaining => {
-                    rewrite_remaining_attr_get(expr, self.mappings, &self.scopes, self.changed)
-                }
+                AttrRewritePass::Remaining => {}
             }
             core::ops::ControlFlow::Continue(())
         }
@@ -1837,22 +1846,51 @@ fn rewrite_remaining_attr_get(
     }
 }
 
-/// The promoted column for one `attr_get` call — `Some` only for the exact
-/// shape `attr_get(attributes, '<literal key>')` with a mapped key.
+/// The promoted column for one exact `attr_get` expression. The base must be
+/// `attributes` owned by the mapped table; every key must be a literal. A
+/// composed map therefore cannot match a flat dotted key or another nesting.
 fn attr_get_rewrite_target(
     func: &datafusion::sql::sqlparser::ast::Function,
     mappings: &HashMap<String, AttrRewriteMap>,
     scopes: &[AttrRewriteScope],
 ) -> Option<(SqlAstExpr, siglake_core::PromotedType)> {
-    let FunctionArguments::List(args) = &func.args else {
-        return None;
-    };
-    if args.duplicate_treatment.is_some() || !args.clauses.is_empty() || args.args.len() != 2 {
-        return None;
+    fn expression<'a>(
+        func: &'a datafusion::sql::sqlparser::ast::Function,
+    ) -> Option<(&'a SqlAstExpr, Vec<String>)> {
+        let FunctionArguments::List(args) = &func.args else {
+            return None;
+        };
+        if args.duplicate_treatment.is_some() || !args.clauses.is_empty() || args.args.len() != 2 {
+            return None;
+        }
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(first)) = &args.args[0] else {
+            return None;
+        };
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlAstExpr::Value(value))) = &args.args[1]
+        else {
+            return None;
+        };
+        let key = match &value.value {
+            SqlValue::SingleQuotedString(key) | SqlValue::DoubleQuotedString(key) => key.clone(),
+            _ => return None,
+        };
+        let (base, mut keys) = match first {
+            SqlAstExpr::Function(inner)
+                if inner
+                    .name
+                    .0
+                    .last()
+                    .is_some_and(|part| part.to_string().eq_ignore_ascii_case("attr_get")) =>
+            {
+                expression(inner)?
+            }
+            base => (base, Vec::new()),
+        };
+        keys.push(key);
+        Some((base, keys))
     }
-    let FunctionArg::Unnamed(FunctionArgExpr::Expr(first)) = &args.args[0] else {
-        return None;
-    };
+
+    let (first, keys) = expression(func)?;
     let (owner, qualifier) = match first {
         SqlAstExpr::Identifier(id) if id.value.eq_ignore_ascii_case("attributes") => {
             (scopes.last()?.unqualified_owner.as_deref()?, None)
@@ -1881,16 +1919,10 @@ fn attr_get_rewrite_target(
         }
         _ => return None,
     };
-    let FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlAstExpr::Value(value))) = &args.args[1]
-    else {
-        return None;
-    };
-    let key = match &value.value {
-        SqlValue::SingleQuotedString(k) | SqlValue::DoubleQuotedString(k) => k,
-        _ => return None,
-    };
     let mapping = mappings.get(owner)?;
-    let (column, ty) = mapping.get(key)?.clone();
+    let (first_key, outer_keys) = keys.split_first()?;
+    let source = (first_key.clone(), outer_keys.to_vec());
+    let (column, ty) = mapping.get(&source)?.clone();
     let column = match qualifier {
         None => SqlAstExpr::Identifier(column.as_str().into()),
         Some(mut parts) => {
@@ -12932,11 +12964,76 @@ mod tests {
         let mut maps = HashMap::<String, AttrRewriteMap>::new();
         for (table, key, column) in entries {
             maps.entry((*table).into()).or_default().insert(
-                (*key).into(),
+                ((*key).into(), Vec::new()),
                 ((*column).into(), siglake_core::PromotedType::Utf8),
             );
         }
         maps
+    }
+
+    #[test]
+    fn composed_attr_rewrite_matches_only_the_exact_expression_tree() {
+        let mut event_map = AttrRewriteMap::new();
+        event_map.insert(
+            ("aws.cloudwatch".into(), Vec::new()),
+            ("aws_cloudwatch".into(), siglake_core::PromotedType::Utf8),
+        );
+        event_map.insert(
+            ("aws.cloudwatch".into(), vec!["log_stream".into()]),
+            (
+                "aws_cloudwatch_log_stream".into(),
+                siglake_core::PromotedType::Utf8,
+            ),
+        );
+        let maps = HashMap::from([("events".into(), event_map)]);
+        let nested = rewrite_attr_get_to_columns(
+            "SELECT attr_get(attr_get(attributes, 'aws.cloudwatch'), 'log_stream') FROM events",
+            &maps,
+        )
+        .unwrap();
+        assert!(nested.contains("aws_cloudwatch_log_stream"), "{nested}");
+        assert!(!nested.contains("attr_get"), "{nested}");
+
+        let flat = rewrite_attr_get_to_columns(
+            "SELECT attr_get(attributes, 'aws.cloudwatch.log_stream') FROM events",
+            &maps,
+        );
+        assert!(
+            flat.is_none(),
+            "a flat dotted key is a different expression"
+        );
+    }
+
+    #[test]
+    fn composed_numeric_comparison_keeps_typed_bounds() {
+        let maps = HashMap::from([(
+            "events".into(),
+            HashMap::from([(
+                ("metrics".into(), vec!["size".into()]),
+                ("metrics_size".into(), siglake_core::PromotedType::Int64),
+            )]),
+        )]);
+        let rewritten = rewrite_attr_get_to_columns(
+            "SELECT raw FROM events WHERE \
+             attr_get(attr_get(attributes, 'metrics'), 'size') >= '9007199254740993'",
+            &maps,
+        )
+        .unwrap();
+        assert!(
+            rewritten.contains("metrics_size >= 9007199254740993"),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("CAST"), "{rewritten}");
+
+        let projected = rewrite_attr_get_to_columns(
+            "SELECT attr_get(attr_get(attributes, 'metrics'), 'size') FROM events",
+            &maps,
+        )
+        .unwrap();
+        assert!(
+            projected.contains("CAST(metrics_size AS VARCHAR)"),
+            "{projected}"
+        );
     }
 
     /// THE DEFECT THIS GUARDS: a predicate-only second table used to make the
@@ -12961,6 +13058,7 @@ mod tests {
             .unwrap()
             .with_promoted_columns(vec![siglake_core::PromotedColumn {
                 attr_key: "k".into(),
+                attr_get_path: Vec::new(),
                 name: "event_k".into(),
                 ty: siglake_core::PromotedType::Utf8,
             }]);
@@ -12999,6 +13097,7 @@ mod tests {
         let warehouse = tmp.path().join("warehouse");
         let promotion = vec![siglake_core::PromotedColumn {
             attr_key: "a.b.c".into(),
+            attr_get_path: Vec::new(),
             name: "a_b_c".into(),
             ty: siglake_core::PromotedType::Utf8,
         }];
@@ -13126,11 +13225,13 @@ mod tests {
         let promotions = vec![
             siglake_core::PromotedColumn {
                 attr_key: "a.b.c".into(),
+                attr_get_path: Vec::new(),
                 name: "status".into(),
                 ty: siglake_core::PromotedType::Utf8,
             },
             siglake_core::PromotedColumn {
                 attr_key: "measure".into(),
+                attr_get_path: Vec::new(),
                 name: "size".into(),
                 ty: siglake_core::PromotedType::Int64,
             },
