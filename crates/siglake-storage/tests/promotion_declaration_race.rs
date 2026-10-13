@@ -68,11 +68,13 @@ fn promotions() -> Vec<PromotedColumn> {
     vec![
         PromotedColumn {
             attr_key: "http.status_code".to_string(),
+            attr_get_path: Vec::new(),
             name: "http_status_code".to_string(),
             ty: PromotedType::Int64,
         },
         PromotedColumn {
             attr_key: "service.name".to_string(),
+            attr_get_path: Vec::new(),
             name: "service_name".to_string(),
             ty: PromotedType::Utf8,
         },

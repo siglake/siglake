@@ -792,6 +792,7 @@ mod tests {
 
         let promoted = [crate::PromotedColumn {
             attr_key: "cw_text".into(),
+            attr_get_path: Vec::new(),
             name: "cw_promoted".into(),
             ty: crate::PromotedType::Utf8,
         }];

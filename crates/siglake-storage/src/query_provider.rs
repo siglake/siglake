@@ -2790,7 +2790,10 @@ impl SiglakeIcebergTableScan {
             )
             .increment(1);
         }
-        let mut promoted_prune = extract_promoted_prune(filters, &promoted_utf8_columns(&table));
+        let promoted = promoted_columns(&table);
+        let expected_promotion_version = siglake_core::promotion_extractor_version(&promoted);
+        let mut promoted_prune =
+            extract_promoted_prune(filters, &promoted_utf8_columns_from(promoted));
         let tuning = crate::current_query_scan_tuning();
         // Per-request distributed-query shard, injected as a SessionConfig
         // extension by the query-server (absent for ordinary single-pod scans).
@@ -2818,7 +2821,7 @@ impl SiglakeIcebergTableScan {
         if !promoted_prune.is_empty()
             && task_partitions.iter().flatten().any(|task| {
                 crate::iceberg::file_extractor_version(task.data_file_path())
-                    != Some(siglake_core::ATTR_EXTRACTOR_VERSION)
+                    != Some(expected_promotion_version)
             })
         {
             promoted_prune.clear();
@@ -6930,19 +6933,30 @@ fn extract_match_udf_prune(
 /// Per-file extraction provenance is checked after file planning, before this
 /// hint reaches a reader. A row group whose promoted column is all-NULL can be
 /// skipped only when every planned file names the current rule (#6769).
-fn promoted_utf8_columns(table: &Table) -> HashMap<String, String> {
-    let promoted = siglake_core::promoted_columns_from_property(
-        table
-            .metadata()
-            .properties()
+fn promoted_columns(table: &Table) -> Vec<siglake_core::PromotedColumn> {
+    let props = table.metadata().properties();
+    siglake_core::promoted_columns_from_properties(
+        props
+            .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+            .map(String::as_str),
+        props
             .get(siglake_core::PROMOTED_PROPERTY_KEY)
             .map(String::as_str),
-    );
+    )
+}
+
+fn promoted_utf8_columns_from(
+    promoted: Vec<siglake_core::PromotedColumn>,
+) -> HashMap<String, String> {
     promoted
         .into_iter()
-        .filter(|c| c.ty == siglake_core::PromotedType::Utf8)
+        .filter(|c| c.ty == siglake_core::PromotedType::Utf8 && !c.is_composed())
         .map(|c| (c.attr_key, c.name))
         .collect()
+}
+
+fn promoted_utf8_columns(table: &Table) -> HashMap<String, String> {
+    promoted_utf8_columns_from(promoted_columns(table))
 }
 
 /// WS-7: extract `attr_get(attributes, 'key') = 'value'` (and non-negated
@@ -8434,11 +8448,13 @@ mod tests {
         events_schema_with(&[
             PromotedColumn {
                 attr_key: "region".into(),
+                attr_get_path: Vec::new(),
                 name: "region".into(),
                 ty: PromotedType::Utf8,
             },
             PromotedColumn {
                 attr_key: "http.status_code".into(),
+                attr_get_path: Vec::new(),
                 name: "status".into(),
                 ty: PromotedType::Int64,
             },

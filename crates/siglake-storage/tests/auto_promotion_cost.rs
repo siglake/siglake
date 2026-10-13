@@ -107,6 +107,7 @@ fn promotions(n: usize) -> Vec<PromotedColumn> {
             let (key, ty) = real[i % real.len()];
             PromotedColumn {
                 attr_key: key.to_string(),
+                attr_get_path: Vec::new(),
                 name: if i < real.len() {
                     key.replace('.', "_")
                 } else {

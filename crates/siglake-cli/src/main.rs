@@ -723,7 +723,8 @@ enum Command {
         dry_run: bool,
         /// Include these promoted typed columns in the
         /// `events` declared schema so the migration adds them. Repeatable;
-        /// same `attr_key:type[:column]` format as `compactor --promote-attr`.
+        /// same `attr_key:type[:column]` or JSON key-chain format as
+        /// `compactor --promote-attr`.
         /// Pass the same set the compactor runs with.
         #[arg(long = "promote-attr")]
         promote_attr: Vec<String>,
@@ -864,8 +865,10 @@ enum Command {
         fs_claim_max_bytes: u64,
         /// Promote a declared OTLP attribute out of the
         /// `attributes` JSON into its own typed column on write. Repeatable.
-        /// Format `attr_key:type[:column]`, type ∈ string|int|float|bool, column
-        /// defaults to the attr key with `.`/`-`→`_`. E.g.
+        /// Format `attr_key:type[:column]`, or exact composed lookup
+        /// `["inner key","outer key"]:type[:column]`; type ∈
+        /// string|int|float|bool. A composed lookup cannot reuse an existing
+        /// flat promotion's column name. E.g.
         /// `--promote-attr http.status_code:int --promote-attr k8s.namespace:string`.
         /// The events table is widened additively at startup.
         #[arg(long = "promote-attr")]
@@ -1554,7 +1557,7 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-/// Parse `--promote-attr attr_key:type[:column]` specs (WS-7 dense extraction)
+/// Parse direct or exact composed `--promote-attr` specs (WS-7 dense extraction)
 /// into [`PromotedColumn`]s. Errors on a malformed spec.
 /// Register one mirrored segment, retrying with exponential backoff and jitter.
 ///
@@ -2345,8 +2348,9 @@ fn parse_promoted(specs: &[String]) -> Result<Vec<siglake_core::PromotedColumn>>
         .map(|s| {
             siglake_core::PromotedColumn::parse_spec(s).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "invalid --promote-attr {s:?}; expected `attr_key:type[:column]` \
-                     where type is string|int|float|bool"
+                    "invalid --promote-attr {s:?}; expected `attr_key:type[:column]` or \
+                     `[\"inner key\",\"outer key\"]:type[:column]`, where type is \
+                     string|int|float|bool"
                 )
             })
         })
@@ -4199,6 +4203,7 @@ mod migrate_schema_tests {
             .unwrap();
         let promoted = [siglake_core::PromotedColumn {
             attr_key: "service.name".to_string(),
+            attr_get_path: Vec::new(),
             name: "service_name".to_string(),
             ty: siglake_core::PromotedType::Utf8,
         }];
@@ -4235,6 +4240,7 @@ mod migrate_schema_tests {
             .unwrap();
         let promoted = [siglake_core::PromotedColumn {
             attr_key: "service.name".to_string(),
+            attr_get_path: Vec::new(),
             name: "service_name".to_string(),
             ty: siglake_core::PromotedType::Utf8,
         }];
@@ -4333,6 +4339,7 @@ mod migrate_schema_tests {
 
         let promoted = [siglake_core::PromotedColumn {
             attr_key: "service.name".to_string(),
+            attr_get_path: Vec::new(),
             name: "service_name".to_string(),
             ty: siglake_core::PromotedType::Utf8,
         }];

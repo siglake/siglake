@@ -20,9 +20,10 @@ pub mod tenant;
 pub use build_info::{build_info, BuildInfo, BUILD_VERSION};
 pub use mapping::{map_carrier_batch, map_carrier_batch_with_stats, CarrierBatchMapping};
 pub use promote::{
-    promote_attributes, promoted_columns_from_property, promoted_property_json,
+    direct_promotions, promote_attributes, promoted_columns_from_properties,
+    promoted_columns_from_property, promoted_property_json, promotion_extractor_version,
     repromote_attributes, PromotedColumn, PromotedType, ATTR_EXTRACTOR_VERSION,
-    PROMOTED_PROPERTY_KEY,
+    COMPOSED_ATTR_EXTRACTOR_VERSION, PROMOTED_PROPERTY_KEY, PROMOTED_PROPERTY_V2_KEY,
 };
 
 /// Point-in-time process memory reported by jemalloc and the process cgroup.
@@ -694,6 +695,7 @@ mod tests {
 
         let promoted = [PromotedColumn {
             attr_key: "service.name".to_string(),
+            attr_get_path: Vec::new(),
             name: "service_name".to_string(),
             ty: PromotedType::Utf8,
         }];
