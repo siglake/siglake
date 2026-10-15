@@ -24,6 +24,8 @@ an operator and Terraform/EKS deployment — at 200 GB (394 M rows) and 1 TB
   [`docs/DESIGN_*.md`](docs/) files.
 - **What it leaves out, on purpose:** [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md).
 - **Changes:** [`CHANGELOG.md`](CHANGELOG.md).
+- **Claude and Codex:** the [read-only MCP server](integrations/mcp/README.md)
+  provides table discovery, schema mappings, SQL queries and cost estimates.
 
 ## Quickstart
 

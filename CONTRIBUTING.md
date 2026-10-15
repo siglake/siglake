@@ -69,6 +69,11 @@ storage spin up their infrastructure via `deploy/docker-compose.yml` or use
 in-memory/`file://` backends — a plain `cargo test --workspace` needs no
 external services.
 
+The standalone Python MCP adapter has its own test environment and CI workflow.
+For changes under `integrations/mcp`, install `./integrations/mcp[test]` into a
+Python virtual environment and run `python -m pytest integrations/mcp/tests`.
+Its protocol tests use local fake HTTP services and require no cloud credentials.
+
 ## Local stack
 
 A full local deployment (Postgres catalog + MinIO warehouse + Siglake) is one

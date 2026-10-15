@@ -17,6 +17,16 @@ Sections: [API surface](#api-surface) · [Roles](#roles) ·
 
 ## API surface
 
+The standalone [MCP adapter](../integrations/mcp/README.md) connects Claude and
+Codex over stdio to the query server's existing HTTP API. It lists and describes
+managed indexes through GET `/api/v1/indexes`, and sends validated read-only SQL
+to POST `/api/v1/sql`, including its dry-run cost mode. The adapter forwards
+operator-configured credentials and tenant context; query-server authorization
+remains authoritative. It bounds request duration, decoded response size and
+returned rows, exposes truncation and execution metadata, and provides no
+ingestion or administrative tools. It has an independent Python package and
+test workflow and does not run inside a query or compactor process.
+
 | Endpoint | What |
 |---|---|
 | `POST /v1/logs`, `POST /v1/traces` | OTLP/HTTP ingest (protobuf or JSON). Single-tenant unless a tenant claim or `ingester.trustScopeHeader` routes `X-Scope-OrgID`. |

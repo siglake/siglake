@@ -310,6 +310,17 @@ impl FileWriterBuilder for ParquetWriterBuilder {
     type R = ParquetWriter;
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
+        // Row-group sidecars use row-count boundaries. A parquet byte limit
+        // can split those groups internally, making their pruning metadata
+        // unsafe. Refuse this combination rather than publish misaligned data.
+        if self.props.max_row_group_bytes().is_some()
+            && (self.raw_rowgroup_bloom_column.is_some() || self.segmented_index.is_some())
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Row-group indexes require row-count boundaries; max_row_group_bytes is unsupported",
+            ));
+        }
         let grouped_numeric = self.grouped_numeric_pair.as_ref().and_then(|(group, value)| {
             let field = self.schema.field_by_name(value)?;
             let kind = match field.field_type.as_ref() {
@@ -1319,6 +1330,19 @@ impl ParquetWriter {
             self.pending_rows += take;
             offset += take;
             if self.pending_rows == group_rows {
+                // An explicit row limit normally auto-flushes in parquet. If
+                // it is None, we still form groups at the fallback row count,
+                // exactly as the buffered path does. Flush is a no-op after
+                // an automatic flush and never creates an empty row group.
+                self.inner_writer
+                    .as_mut()
+                    .expect("writer initialized above")
+                    .flush()
+                    .await
+                    .map_err(|err| {
+                        Error::new(ErrorKind::Unexpected, "Failed to flush parquet row group.")
+                            .with_source(err)
+                    })?;
                 self.finish_streamed_rowgroup_bloom();
                 self.pending_rows = 0;
             }
@@ -1592,7 +1616,13 @@ impl CurrentFileStatus for ParquetWriter {
             // changes row-group/footer identity. Flushed bytes advance only at
             // the exact group boundary and preserve the old rolling contract.
             if self.forms_row_groups() {
-                inner.bytes_written()
+                // The buffered path exposed zero bytes before its first full
+                // group. Exclude the header here as well, even for tiny rolls.
+                if inner.flushed_row_groups().is_empty() {
+                    0
+                } else {
+                    inner.bytes_written()
+                }
             } else {
                 // Without explicit row-group ownership, retain the upstream
                 // estimate so a large in-progress group can still trigger a
@@ -3398,6 +3428,251 @@ mod tests {
         assert_eq!(cdc.min_chunk_size, 4096);
         assert_eq!(cdc.max_chunk_size, 8192);
         assert_eq!(cdc.norm_level, 2);
+    }
+
+    fn bloom_boundary_fixture(values: Vec<Option<&str>>) -> (SchemaRef, RecordBatch) {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![NestedField::optional(
+                    1,
+                    "raw",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into()])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(schema_to_arrow_schema(schema.as_ref()).unwrap());
+        let batch =
+            RecordBatch::try_new(arrow_schema, vec![Arc::new(StringArray::from(values))]).unwrap();
+        (schema, batch)
+    }
+
+    #[tokio::test]
+    async fn streamed_blooms_match_physical_groups_across_writes() -> Result<()> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let values = vec![
+            Some("alpha"),
+            None,
+            Some("bravo"),
+            Some("charlie"),
+            Some("delta"),
+        ];
+        let (schema, batch) = bloom_boundary_fixture(values.clone());
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("cross-write.parquet");
+        let output = FileIO::new_with_fs().new_output(path.to_string_lossy())?;
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut writer = ParquetWriterBuilder::new(props, schema)
+            .with_raw_rowgroup_bloom_column("raw")
+            .build(output)
+            .await?;
+        for (offset, len) in [(0, 1), (1, 2), (3, 2)] {
+            writer.write(&batch.slice(offset, len)).await?;
+            assert!(writer.pending.is_empty());
+        }
+        writer.close().await?;
+        let reader = SerializedFileReader::new(std::fs::File::open(&path)?)?;
+        let metadata = reader.metadata();
+        let encoded = metadata
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .find(|kv| kv.key == siglake_bloom::RAW_TRIGRAM_ROWGROUP_BLOOM_KV_KEY)
+            .and_then(|kv| kv.value.as_deref())
+            .unwrap();
+        let blooms = siglake_bloom::rowgroup_blooms_from_hex(encoded).unwrap();
+        assert_eq!(metadata.num_row_groups(), 3);
+        assert_eq!(blooms.len(), 3);
+        for (group, expected_values) in values.chunks(2).enumerate() {
+            assert_eq!(
+                metadata.row_group(group).num_rows(),
+                expected_values.len() as i64
+            );
+            let mut grams = siglake_bloom::TrigramSet::new();
+            for value in expected_values.iter().flatten() {
+                grams.add(value);
+            }
+            let expected = siglake_bloom::TokenBloom::build(grams.len(), 0.01, grams.iter());
+            assert_eq!(
+                blooms[group].to_hex(),
+                expected.to_hex(),
+                "row group {group}"
+            );
+        }
+        let decoded = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?
+            .build()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(concat_batches(&batch.schema(), &decoded)?, batch);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_blooms_disable_file_for_unindexable_group() -> Result<()> {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        for unindexable in [[None, None], [Some("x"), Some("!")]] {
+            let (schema, batch) = bloom_boundary_fixture(vec![
+                Some("alpha"),
+                Some("bravo"),
+                unindexable[0],
+                unindexable[1],
+                Some("charlie"),
+                Some("delta"),
+            ]);
+            let tmp = TempDir::new()?;
+            let path = tmp.path().join("unindexable.parquet");
+            let output = FileIO::new_with_fs().new_output(path.to_string_lossy())?;
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(2))
+                .build();
+            let mut writer = ParquetWriterBuilder::new(props, schema)
+                .with_raw_rowgroup_bloom_column("raw")
+                .build(output)
+                .await?;
+            for offset in 0..batch.num_rows() {
+                writer.write(&batch.slice(offset, 1)).await?;
+            }
+            writer.close().await?;
+            let reader = SerializedFileReader::new(std::fs::File::open(path)?)?;
+            assert_eq!(reader.metadata().num_row_groups(), 3);
+            assert_eq!(reader.metadata().file_metadata().num_rows(), 6);
+            assert!(!reader
+                .metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .into_iter()
+                .flatten()
+                .any(|kv| kv.key == siglake_bloom::RAW_TRIGRAM_ROWGROUP_BLOOM_KV_KEY));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_blooms_flush_fallback_when_row_limit_is_none() -> Result<()> {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let group_rows = parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT;
+        let (schema, batch) = bloom_boundary_fixture(vec![Some("alpha"); group_rows + 1]);
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("no-row-limit.parquet");
+        let output = FileIO::new_with_fs().new_output(path.to_string_lossy())?;
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(None)
+            .build();
+        let mut writer = ParquetWriterBuilder::new(props, schema)
+            .with_raw_rowgroup_bloom_column("raw")
+            .build(output)
+            .await?;
+        writer.write(&batch.slice(0, group_rows - 1)).await?;
+        writer.write(&batch.slice(group_rows - 1, 2)).await?;
+        assert!(writer.pending.is_empty());
+        assert_eq!(writer.pending_rows, 1);
+        writer.close().await?;
+        let reader = SerializedFileReader::new(std::fs::File::open(path)?)?;
+        let metadata = reader.metadata();
+        assert_eq!(metadata.num_row_groups(), 2);
+        assert_eq!(metadata.row_group(0).num_rows(), group_rows as i64);
+        assert_eq!(metadata.row_group(1).num_rows(), 1);
+        let encoded = metadata
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .find(|kv| kv.key == siglake_bloom::RAW_TRIGRAM_ROWGROUP_BLOOM_KV_KEY)
+            .and_then(|kv| kv.value.as_deref())
+            .unwrap();
+        let blooms = siglake_bloom::rowgroup_blooms_from_hex(encoded).unwrap();
+        let mut grams = siglake_bloom::TrigramSet::new();
+        grams.add("alpha");
+        let expected = siglake_bloom::TokenBloom::build(grams.len(), 0.01, grams.iter()).to_hex();
+        assert_eq!(blooms.len(), 2);
+        assert!(blooms.iter().all(|bloom| bloom.to_hex() == expected));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rowgroup_indexes_refuse_independent_parquet_byte_boundaries() -> Result<()> {
+        let (schema, _) = bloom_boundary_fixture(vec![Some("alpha")]);
+        let tmp = TempDir::new()?;
+        let io = FileIO::new_with_fs();
+        let props = WriterProperties::builder()
+            .set_max_row_group_bytes(Some(1024))
+            .build();
+        // Unindexed writers continue to support parquet's byte limit.
+        ParquetWriterBuilder::new(props.clone(), schema.clone())
+            .build(io.new_output(tmp.path().join("plain.parquet").to_string_lossy())?)
+            .await?;
+        let result = ParquetWriterBuilder::new(props, schema)
+            .with_raw_rowgroup_bloom_column("raw")
+            .build(io.new_output(tmp.path().join("indexed.parquet").to_string_lossy())?)
+            .await;
+        let Err(error) = result else {
+            panic!("unsafe row-group combination was accepted")
+        };
+        assert!(error
+            .to_string()
+            .contains("max_row_group_bytes is unsupported"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_bloom_rollover_waits_for_complete_row_group() -> Result<()> {
+        use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let (schema, batch) = bloom_boundary_fixture(vec![
+            Some("alpha"),
+            Some("bravo"),
+            Some("charlie"),
+            Some("delta"),
+            Some("echo"),
+            Some("foxtrot"),
+        ]);
+        let tmp = TempDir::new()?;
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4))
+            .build();
+        let builder =
+            ParquetWriterBuilder::new(props, schema).with_raw_rowgroup_bloom_column("raw");
+        // A one-byte rolling target makes any premature exposure of the
+        // parquet header or partial group observable as an extra output file.
+        let mut writer = RollingFileWriterBuilder::new(
+            builder,
+            1,
+            FileIO::new_with_fs(),
+            DefaultLocationGenerator::with_data_location(tmp.path().to_string_lossy().into_owned()),
+            DefaultFileNameGenerator::new("boundary".into(), None, DataFileFormat::Parquet),
+        )
+        .build();
+        for (offset, len) in [(0, 1), (1, 3), (4, 1), (5, 1)] {
+            writer.write(&None, &batch.slice(offset, len)).await?;
+        }
+        let files = writer.close().await?;
+        assert_eq!(
+            files.len(),
+            2,
+            "partial groups must not cause extra file rolls"
+        );
+        let mut decoded = Vec::new();
+        for (builder, expected_rows) in files.into_iter().zip([4, 2]) {
+            let file = builder.build()?;
+            assert_eq!(file.record_count(), expected_rows);
+            let reader = SerializedFileReader::new(std::fs::File::open(file.file_path())?)?;
+            assert_eq!(reader.metadata().num_row_groups(), 1);
+            decoded.extend(
+                ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(file.file_path())?)?
+                    .build()?
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            );
+        }
+        assert_eq!(concat_batches(&batch.schema(), &decoded)?, batch);
+        Ok(())
     }
 
     fn footer_extension_schema() -> SchemaRef {

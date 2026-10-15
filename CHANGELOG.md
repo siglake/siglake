@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Compactor bloom-only Parquet writers encode input batches incrementally instead
+  of retaining decoded batches until a row group fills. Row-group and rolling
+  file boundaries remain unchanged; packaged memory qualification is separate.
+
+- **MCP integration**: a standalone read-only adapter connects Claude Code,
+  Claude Desktop and Codex to the existing query API. It exposes managed-table
+  discovery, declared schemas, bounded SQL results and dry-run cost estimates.
+  See `integrations/mcp/README.md` for installation and client configuration.
+
 - Local Docker CI selects free query and ingest ports so a running demo tunnel
   does not block release validation. Other listeners are left running.
 
