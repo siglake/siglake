@@ -164,6 +164,21 @@ Coexistence without starving the commit path:
   The purge leaves decay settings unchanged; the configured decay interval is
   not a guaranteed upper bound on resident-page lifetime. Admission latency,
   live input/writer residency and fresh canonical 1GiB acceptance remain open.
+  **Dispatch continuation (2026-10-15):** a successful 64-input rewrite can
+  leave a later bin below both the in-RAM byte/row caps and the 64-input fan-in.
+  On the retained reconstruction, eight original files totalled about 1.88M
+  rows / 155 MB compressed. Both old choices were allocation risks at 1Gi:
+  whole-bin decode plus concat and sort, or one open Parquet decoder per input.
+  Timestamp-led bins at or below the packaged memory limit now take the
+  page-bounded executor before either allocation begins, including bins at or
+  below fan-in. Generic sort orders keep the prior path; the plan merge cannot
+  honor them. The explicit >fan-in tiered escape hatch still wins. A structured
+  INFO event records selected files, rows, bytes, path, cgroup limit and
+  effective limit before input decode. The constrained regression runs a
+  64-input / 58-chunk page merge, then separate small-bin continuations that
+  would otherwise select whole-bin and slice-streaming paths, samples RSS below
+  1Gi and checks every raw value, exact timestamp, NULL and duplicate once.
+  This regression is scaled source evidence, not canonical field acceptance.
 
 - **Backpressure-aware sharing.** A shared signal from the WAL queue depth
   (`siglake_ingest_backpressure_*`, already exported): if drain falls behind (WAL
@@ -317,6 +332,13 @@ unbounded un-compacted layout's *read* amplification at query time.
     now share one absolute request deadline. `CancelOnDrop` remains armed while
     the battery runs, so a timed-out footer sweep cannot continue unobserved.
 - **A.4.4 (optional)** — dedicated compaction service (own deployment + scaling).
+- **A.4.5 — Constrained continuation dispatch** ✅ *(source; packaged
+  qualification pending).* Timestamp-led bins at or below the packaged 1Gi
+  limit use page-bounded execution before whole-bin or per-input-decoder
+  allocation. Generic sort orders and explicit >fan-in tiering retain their
+  prior dispatch. The pre-decode event records the selected geometry and path;
+  the scaled 64-input then two-small-bin regression retains RSS and exact row
+  parity evidence.
 
 ### A.5 Validation
 

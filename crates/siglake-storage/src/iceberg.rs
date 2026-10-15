@@ -1985,7 +1985,7 @@ pub enum MergePathKind {
     /// row (`files ≤ SIGLAKE_RECLUSTER_MERGE_FANIN`).
     SliceStreaming,
     /// RLE run plan executed in row-bounded chunks, no open decoders between
-    /// chunks (`files > fan-in`, the default above the cap).
+    /// chunks (the default above fan-in and for timestamp-led 1 GiB bins).
     PageBounded,
     /// Tiered merge through intermediate files (`SIGLAKE_RECLUSTER_TIERED_MERGE=1`).
     Tiered,
@@ -1999,6 +1999,47 @@ impl MergePathKind {
             Self::PageBounded => "page_bounded",
             Self::Tiered => "tiered",
         }
+    }
+}
+
+const PACKAGED_COMPACTOR_MEMORY_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Select the executor before any input file is decoded.
+///
+/// The packaged 1 GiB compactor cannot safely treat either "small compressed
+/// bin" or "at most fan-in inputs" as a decoded-memory bound. The retained
+/// reconstruction had both shapes after its first large rewrite: eight old
+/// files fit the in-RAM caps, while a forced streaming continuation could open
+/// one decoder per file. A timestamp-led table can use the page-bounded plan
+/// for both without changing its declared sort order. Other sort orders retain
+/// the established dispatch because the page-bounded executor merges only the
+/// exact timestamp key.
+fn recluster_merge_path(
+    should_stream: bool,
+    files: usize,
+    fanin: usize,
+    force_tiered: bool,
+    memory_limit_bytes: Option<u64>,
+    timestamp_merge_supported: bool,
+) -> MergePathKind {
+    let constrained_page_bounded = timestamp_merge_supported
+        && memory_limit_bytes
+            .is_some_and(|limit| limit <= PACKAGED_COMPACTOR_MEMORY_LIMIT_BYTES);
+    // Preserve the explicit >fan-in tiered escape hatch whenever either the
+    // old thresholds or the constrained policy select a streaming executor.
+    if files > fanin && force_tiered && (should_stream || constrained_page_bounded) {
+        return MergePathKind::Tiered;
+    }
+    if constrained_page_bounded {
+        return MergePathKind::PageBounded;
+    }
+    if !should_stream {
+        return MergePathKind::InRamSort;
+    }
+    if files <= fanin {
+        MergePathKind::SliceStreaming
+    } else {
+        MergePathKind::PageBounded
     }
 }
 
@@ -11668,7 +11709,7 @@ fn recluster_inram_max_rows_from(configured: Option<&str>) -> u64 {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReclusterMergeOptions {
     /// `Some(true)` forces the streaming merge for any bin size;
-    /// `Some(false)` never forces (the in-RAM caps alone decide).
+    /// `Some(false)` does not force streaming; memory safety policy still may.
     /// Env: `SIGLAKE_RECLUSTER_STREAMING`.
     pub force_streaming: Option<bool>,
     /// Streaming fan-in cap: bins at or under it take the slice-streaming
@@ -11691,10 +11732,11 @@ pub struct ReclusterMergeOptions {
     /// Page-bounded merge chunks whose fetched input may be resident at once.
     /// Floored at 1. Env: `SIGLAKE_MERGE_CHUNK_PREFETCH`.
     pub merge_chunk_prefetch: Option<usize>,
-    /// Process memory limit used to resolve the implicit page-bounded chunk
-    /// size and prefetch depth. Production leaves this `None` and reads the
-    /// cgroup; constrained-memory regressions set it so they exercise the same
-    /// policy on a development host without mutating process-global state.
+    /// Process memory limit used to select constrained page-bounded dispatch
+    /// and resolve its implicit chunk size and prefetch depth. Production
+    /// leaves this `None` and reads the cgroup; constrained-memory regressions
+    /// set it so they exercise the same policy on a development host without
+    /// mutating process-global state.
     pub merge_memory_limit_bytes: Option<u64>,
 }
 
@@ -11874,12 +11916,12 @@ mod append_work_output_tests {
     }
 }
 
-/// Decide whether a re-cluster bin is merged via the memory-bounded streaming
-/// path. `true` when streaming is force-enabled, or when the bin's compressed
-/// bytes / row count exceed the in-RAM safety thresholds (so an oversized bin
-/// never OOMs the whole-bin concat). Small bins stay on the in-RAM path, which
-/// also emits the whole-file raw-bloom + layout-meta KV. Each threshold comes
-/// from `merge` when set there, else from the environment.
+/// Baseline decision between whole-bin and streaming re-cluster. `true` when
+/// streaming is force-enabled, or when the bin's compressed bytes / row count
+/// exceed the in-RAM thresholds. [`recluster_merge_path`] applies the process
+/// memory policy afterward: on a timestamp-led 1 GiB table even a small bin
+/// takes the page-bounded path. Each threshold comes from `merge` when set
+/// there, else from the environment.
 fn recluster_should_stream(files: &[DataFile], merge: &ReclusterMergeOptions) -> bool {
     if merge
         .force_streaming
@@ -22381,6 +22423,36 @@ impl IcebergContext {
             .unwrap_or(0)
             .saturating_add(1);
 
+        let input_rows: u64 = files.iter().map(|f| f.record_count()).sum();
+        let input_bytes: u64 = files.iter().map(|f| f.file_size_in_bytes()).sum();
+        let cgroup_limit_bytes = cgroup_memory_limit_bytes();
+        let merge_memory_limit_bytes = merge.merge_memory_limit_bytes.or(cgroup_limit_bytes);
+        let should_stream = recluster_should_stream(&files, merge);
+        let fanin = merge
+            .merge_fanin
+            .map(|n| n.max(2))
+            .unwrap_or_else(Self::recluster_merge_fanin);
+        let force_tiered = merge.force_tiered.unwrap_or_else(Self::tiered_merge_forced);
+        let timestamp_merge_supported = Self::declared_timestamp_merge_direction(&table).is_ok();
+        let merge_path = recluster_merge_path(
+            should_stream,
+            files.len(),
+            fanin,
+            force_tiered,
+            merge_memory_limit_bytes,
+            timestamp_merge_supported,
+        );
+        tracing::info!(
+            selected_inputs = files.len(),
+            selected_rows = input_rows,
+            selected_bytes = input_bytes,
+            path = merge_path.label(),
+            cgroup_memory_limit_bytes = ?cgroup_limit_bytes,
+            dispatch_memory_limit_bytes = ?merge_memory_limit_bytes,
+            timestamp_merge_supported,
+            "recluster merge dispatch"
+        );
+
         // #4377: the segmented sidecars this rewrite's streaming output builds
         // as it emits row groups, collected here and registered in the same
         // transaction as the rewrite below. `None` unless the writer is opted
@@ -22392,35 +22464,48 @@ impl IcebergContext {
             .then(|| Arc::new(SegmentedIndexSink::new()));
 
         // Produce the re-clustered output files + the row count carried through.
-        // Two paths: the bounded streaming k-way merge (for bins too large for an
-        // in-RAM concat, or when forced), or the whole-bin in-RAM concat + sort.
-        // Both re-sort into the table's declared (time-ascending) order; the
-        // streaming path bounds decoded memory so an oversized bin can't OOM.
-        let (added, rows, merge_path) = if recluster_should_stream(&files, merge) {
-            let fanin = merge
-                .merge_fanin
-                .map(|n| n.max(2))
-                .unwrap_or_else(Self::recluster_merge_fanin);
-            self.merge_files_streaming(
-                &table,
-                &files,
-                bloom_columns,
-                out_gen,
-                fanin,
-                merge,
-                segmented_sink.clone(),
-            )
-            .await?
-        } else {
-            // The set is bounded by the caller, so an in-memory concat is OK.
-            let combined = self.read_files_concatenated(&table, &files).await?;
-            let combined = self.maybe_repromote(&table, combined)?;
-            let rows = combined.num_rows();
-            let write_output = self
-                .write_batch_to_data_files(&table, combined, bloom_columns, None, out_gen)
-                .await?;
-            let added = write_output.data_files;
-            (added, rows, MergePathKind::InRamSort)
+        // The decision above is logged before a decoder or whole-bin concat is
+        // opened, so an OOM artifact identifies the selected allocation shape.
+        let (added, rows) = match merge_path {
+            MergePathKind::PageBounded => self
+                .merge_files_page_bounded(
+                    &table,
+                    &files,
+                    bloom_columns,
+                    out_gen,
+                    merge
+                        .merge_chunk_rows
+                        .map(|rows| rows.max(1024))
+                        .or_else(Self::configured_merge_chunk_rows),
+                    merge.merge_chunk_prefetch,
+                    merge_memory_limit_bytes,
+                    segmented_sink.clone(),
+                )
+                .await?,
+            MergePathKind::SliceStreaming | MergePathKind::Tiered => {
+                let (added, rows, actual_path) = self
+                    .merge_files_streaming(
+                        &table,
+                        &files,
+                        bloom_columns,
+                        out_gen,
+                        fanin,
+                        merge,
+                        segmented_sink.clone(),
+                    )
+                    .await?;
+                debug_assert_eq!(actual_path, merge_path);
+                (added, rows)
+            }
+            MergePathKind::InRamSort => {
+                let combined = self.read_files_concatenated(&table, &files).await?;
+                let combined = self.maybe_repromote(&table, combined)?;
+                let rows = combined.num_rows();
+                let write_output = self
+                    .write_batch_to_data_files(&table, combined, bloom_columns, None, out_gen)
+                    .await?;
+                (write_output.data_files, rows)
+            }
         };
         metrics::counter!(
             "siglake_compactor_merge_path_total",
@@ -22434,7 +22519,6 @@ impl IcebergContext {
         // duplicate rows while still swapping the same file set. Re-clustering
         // only re-sorts, so the rows we wrote must equal the records the input
         // manifests declared. Refuse to commit a lossy/duplicating rewrite.
-        let input_rows: u64 = files.iter().map(|f| f.record_count()).sum();
         if input_rows != rows as u64 {
             anyhow::bail!(
                 "re-cluster row-count mismatch on {table_ident}: wrote {rows} rows from \
@@ -32956,6 +33040,42 @@ mod group_count_summary_tests {
             super::IcebergContext::merge_chunk_prefetch_for_call(Some(0), Some("7"), Some(gib + 1),),
             1,
             "a zero per-call depth must floor to one"
+        );
+    }
+
+    #[test]
+    fn packaged_dispatch_uses_page_bounded_before_small_bin_allocations() {
+        let gib = 1024 * 1024 * 1024;
+
+        assert_eq!(
+            super::recluster_merge_path(false, 8, 16, false, Some(gib), true),
+            super::MergePathKind::PageBounded,
+            "a bin below the in-RAM caps must not decode and concatenate whole on 1 GiB"
+        );
+        assert_eq!(
+            super::recluster_merge_path(true, 8, 16, false, Some(gib), true),
+            super::MergePathKind::PageBounded,
+            "a streaming bin below fan-in must not retain one decoder per input on 1 GiB"
+        );
+        assert_eq!(
+            super::recluster_merge_path(false, 8, 16, false, Some(gib), false),
+            super::MergePathKind::InRamSort,
+            "a generic sort order cannot be sent through the timestamp-only plan"
+        );
+        assert_eq!(
+            super::recluster_merge_path(true, 32, 16, true, Some(gib), true),
+            super::MergePathKind::Tiered,
+            "the explicit >fan-in tiered escape hatch remains authoritative"
+        );
+        assert_eq!(
+            super::recluster_merge_path(false, 32, 16, true, Some(gib), true),
+            super::MergePathKind::Tiered,
+            "constrained dispatch must not bypass explicit >fan-in tiering"
+        );
+        assert_eq!(
+            super::recluster_merge_path(true, 8, 16, false, Some(gib + 1), true),
+            super::MergePathKind::SliceStreaming,
+            "larger profiles retain the established small-fan-in executor"
         );
     }
 
