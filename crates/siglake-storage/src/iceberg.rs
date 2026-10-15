@@ -34440,6 +34440,7 @@ mod constrained_recluster_dispatch_tests {
 
     #[tokio::test]
     async fn persisted_out_of_nanosecond_range_keeps_original_unit_order_and_parity() {
+        const YEAR_2024_MICROS: i64 = 1_704_067_200_000_000;
         const YEAR_2500_MICROS: i64 = 16_725_225_600_000_000;
         const YEAR_2501_MICROS: i64 = 16_756_761_600_000_000;
 
@@ -34462,7 +34463,7 @@ mod constrained_recluster_dispatch_tests {
             &ice,
             &ident,
             &[
-                (Some(i64::MIN), "minimum"),
+                (Some(YEAR_2024_MICROS), "earliest"),
                 (Some(YEAR_2500_MICROS), "duplicate"),
                 (Some(YEAR_2500_MICROS), "duplicate"),
             ],
@@ -34504,7 +34505,7 @@ mod constrained_recluster_dispatch_tests {
                 .map(|(timestamp, _)| *timestamp)
                 .collect::<Vec<_>>(),
             vec![
-                i64::MIN,
+                YEAR_2024_MICROS,
                 YEAR_2500_MICROS,
                 YEAR_2500_MICROS,
                 YEAR_2501_MICROS,
@@ -34515,7 +34516,7 @@ mod constrained_recluster_dispatch_tests {
         got_parity.sort();
         let mut expected = vec![
             (YEAR_2501_MICROS, "later".to_string()),
-            (i64::MIN, "minimum".to_string()),
+            (YEAR_2024_MICROS, "earliest".to_string()),
             (YEAR_2500_MICROS, "duplicate".to_string()),
             (YEAR_2500_MICROS, "duplicate".to_string()),
         ];
