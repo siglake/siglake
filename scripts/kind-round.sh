@@ -17,10 +17,12 @@ KEDA_NAMESPACE=keda
 PROM_RELEASE=kube-prometheus-stack
 PROM_CHART_VERSION=77.11.1
 KEDA_CHART_VERSION=2.17.2
-PROM_LOCAL_PORT=19090
-PROM_URL="http://127.0.0.1:${PROM_LOCAL_PORT}"
-QUERY_LOCAL_PORT=18089
-QUERY_METRICS_LOCAL_PORT=19105
+# Each forward binds an OS-selected IPv4 port; probes must use that exact listener.
+PROM_LOCAL_PORT=
+PROM_URL=
+QUERY_LOCAL_PORT=
+QUERY_METRICS_LOCAL_PORT=
+FORWARD_LOCAL_PORT=
 LOAD_EVENTS="${KIND_ROUND_EVENTS:-6000}"
 [[ "$LOAD_EVENTS" =~ ^[1-9][0-9]*$ ]] || {
   printf 'ERROR: KIND_ROUND_EVENTS must be a positive integer\n' >&2
@@ -549,19 +551,24 @@ done
 
 wait_for_forward() {
   local pid=$1 log_file=$2
+  FORWARD_LOCAL_PORT=
   for _ in $(seq 1 60); do
     kill -0 "$pid" 2>/dev/null || {
       sed 's/^/  /' "$log_file" >&2
       die "kubectl port-forward exited before becoming ready"
     }
-    grep -q 'Forwarding from' "$log_file" && return 0
+    FORWARD_LOCAL_PORT="$(sed -nE 's/^Forwarding from 127\.0\.0\.1:([0-9]+) -> [0-9]+$/\1/p' "$log_file" | head -1)"
+    if [[ "$FORWARD_LOCAL_PORT" =~ ^[0-9]+$ ]] &&
+      ((FORWARD_LOCAL_PORT > 0 && FORWARD_LOCAL_PORT <= 65535)); then
+      return 0
+    fi
     sleep 1
   done
   die "kubectl port-forward did not become ready"
 }
 
 scrape_preregistered_zeros() {
-  local role=$1 remote_port=$2 local_port=$3 pod pf_pid metrics_file pf_log
+  local role=$1 remote_port=$2 local_port pod pf_pid metrics_file pf_log
   pod="$(kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get pod \
     -l "app.kubernetes.io/instance=siglake,app.kubernetes.io/component=${role}" \
     --sort-by=.metadata.creationTimestamp \
@@ -569,11 +576,12 @@ scrape_preregistered_zeros() {
   [[ -n "$pod" ]] || die "no ${role} pod found for pre-load metrics scrape"
   metrics_file="$TMP_DIR/${role}.metrics"
   pf_log="$TMP_DIR/${role}.port-forward.log"
-  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" port-forward \
-    "pod/$pod" "${local_port}:${remote_port}" >"$pf_log" 2>&1 &
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" port-forward --address 127.0.0.1 \
+    "pod/$pod" ":${remote_port}" >"$pf_log" 2>&1 &
   pf_pid=$!
   ACTIVE_PF_PID=$pf_pid
   wait_for_forward "$pf_pid" "$pf_log"
+  local_port=$FORWARD_LOCAL_PORT
 
   # This is deliberately the pod's first and only evidence scrape in the
   # round, before any load can increment an alerted counter.
@@ -723,12 +731,13 @@ run_sql_at() {
 }
 
 start_query_pod_forward() {
-  local pod=$1 local_port=$2 remote_port=$3 purpose=$4
+  local pod=$1 port_variable=$2 remote_port=$3 purpose=$4
   local pf_log="$TMP_DIR/${pod}.${purpose}.port-forward.log"
-  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" port-forward \
-    "pod/$pod" "${local_port}:${remote_port}" >"$pf_log" 2>&1 &
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" port-forward --address 127.0.0.1 \
+    "pod/$pod" ":${remote_port}" >"$pf_log" 2>&1 &
   ACTIVE_PF_PID=$!
   wait_for_forward "$ACTIVE_PF_PID" "$pf_log"
+  printf -v "$port_variable" '%s' "$FORWARD_LOCAL_PORT"
 }
 
 stop_active_forward() {
@@ -741,7 +750,7 @@ stop_active_forward() {
 LAST_QUERY_COUNT=0
 wait_for_query_pod_count() {
   local pod=$1 expected=$2 response count=0
-  start_query_pod_forward "$pod" "$QUERY_LOCAL_PORT" 8089 query
+  start_query_pod_forward "$pod" QUERY_LOCAL_PORT 8089 query
   for attempt in $(seq 1 90); do
     response="$(run_sql_at \
       "http://127.0.0.1:${QUERY_LOCAL_PORT}/api/v1/sql/local" \
@@ -766,7 +775,7 @@ query_pinned_total() {
   # The Service can pick either coordinator, so the peer is not knowable in
   # advance. Sum the worker-side pinned counter across every query pod.
   for pod in "${QUERY_PODS[@]}"; do
-    start_query_pod_forward "$pod" "$QUERY_METRICS_LOCAL_PORT" 9105 metrics
+    start_query_pod_forward "$pod" QUERY_METRICS_LOCAL_PORT 9105 metrics
     value="$(curl -fsS "http://127.0.0.1:${QUERY_METRICS_LOCAL_PORT}/metrics" |
       awk 'BEGIN { value=0 }
         /^siglake_query_shard_pin_total\{/ && /outcome="pinned"/ { value += $2 }
@@ -883,7 +892,7 @@ POD_ROW_COUNT=
 read_pod_row_count() {
   local pod=$1 response
   POD_ROW_COUNT=
-  start_query_pod_forward "$pod" "$QUERY_LOCAL_PORT" 8089 scale
+  start_query_pod_forward "$pod" QUERY_LOCAL_PORT 8089 scale
   response="$(run_sql_at \
     "http://127.0.0.1:${QUERY_LOCAL_PORT}/api/v1/sql/local" \
     'SELECT count(*) AS n FROM events')" || {
@@ -935,7 +944,7 @@ read_query_pod_metrics() {
   local pod out= metrics_file
   for pod in "$@"; do
     metrics_file="$TMP_DIR/${pod}.scale.metrics"
-    start_query_pod_forward "$pod" "$QUERY_METRICS_LOCAL_PORT" 9105 scale-metrics
+    start_query_pod_forward "$pod" QUERY_METRICS_LOCAL_PORT 9105 scale-metrics
     if ! curl -fsS "http://127.0.0.1:${QUERY_METRICS_LOCAL_PORT}/metrics" \
       >"$metrics_file"; then
       stop_active_forward
@@ -2961,8 +2970,8 @@ capture_mirror_reclaim_effective_config
 start_mirror_reclaim_observer
 
 log "scrape pre-registered alerted counters before load"
-scrape_preregistered_zeros ingester 9100 19100
-scrape_preregistered_zeros compactor 9101 19101
+scrape_preregistered_zeros ingester 9100
+scrape_preregistered_zeros compactor 9101
 capture_mirror_reclaim_sample
 
 log "$(initial_load_description)"
@@ -3117,12 +3126,14 @@ write_scale_evidence ||
 finish_mirror_reclaim_evidence "$next_event" "$rounds"
 
 log "port-forward Prometheus and wait for its API"
-kubectl --context "$KUBE_CONTEXT" -n "$PROM_NAMESPACE" port-forward \
-  "service/${PROM_RELEASE}-prometheus" "${PROM_LOCAL_PORT}:9090" \
+kubectl --context "$KUBE_CONTEXT" -n "$PROM_NAMESPACE" port-forward --address 127.0.0.1 \
+  "service/${PROM_RELEASE}-prometheus" ":9090" \
   >"$TMP_DIR/prometheus.port-forward.log" 2>&1 &
 PROM_PF_PID=$!
 ACTIVE_PF_PID=$PROM_PF_PID
 wait_for_forward "$PROM_PF_PID" "$TMP_DIR/prometheus.port-forward.log"
+PROM_LOCAL_PORT=$FORWARD_LOCAL_PORT
+PROM_URL="http://127.0.0.1:${PROM_LOCAL_PORT}"
 for _ in $(seq 1 30); do
   curl -fsS "$PROM_URL/-/ready" >/dev/null 2>&1 && break
   sleep 1

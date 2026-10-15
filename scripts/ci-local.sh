@@ -260,6 +260,7 @@ else
   scripts/check-ci-approve-run.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-external-readers-report.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-image-sizes-report.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  python3 scripts/check-kind-forward.py >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-round-scale.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-round-events.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-object-store.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1

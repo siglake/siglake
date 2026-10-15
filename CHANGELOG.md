@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Local kind qualification binds each pod probe to its own dynamically allocated
+  IPv4 port, preventing a running demo tunnel from supplying unrelated results.
+
 - Compactor bloom-only Parquet writers encode input batches incrementally instead
   of retaining decoded batches until a row group fills. Row-group and rolling
   file boundaries remain unchanged; packaged memory qualification is separate.
