@@ -8713,7 +8713,9 @@ mod combined_memory_regression_tests {
     use datafusion::prelude::SessionContext;
     use futures::StreamExt;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-    use siglake_storage::iceberg::{MergePathKind, ReclusterMergeOptions, BLOOM_FILTER_COLUMNS};
+    use siglake_storage::iceberg::{
+        IcebergTuning, MergePathKind, ReclusterMergeOptions, BLOOM_FILTER_COLUMNS,
+    };
     use siglake_wal::WalWriter;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -9195,21 +9197,35 @@ mod combined_memory_regression_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "process-wide RSS ceiling must run alone; use the exact test filter"]
     async fn packaged_memory_serializes_real_page_merge_and_wal_with_exact_parity() {
-        // The A8 failures planned 18 and 22 inputs at the shipped 524,288-row
-        // default. Keep the smaller failed fan-in and cross the old chunk
-        // boundary with field-width rows so this exercises the production
-        // byte-derived default rather than a test-only 4K-row waiver.
-        const FIELD_INPUT_FILES: usize = 18;
-        const FIELD_ROWS_PER_FILE: usize = 30_000;
+        // Scale A14's 64-input, 58-chunk geometry down by row count while
+        // preserving its lifetime: one output row group spans just over two
+        // decoded input chunks, and the merge must finish all 58 chunks under
+        // the packaged ceiling. The values remain field-width and the same
+        // timestamps repeat in every input, exercising stable duplicate order.
+        const FIELD_INPUT_FILES: usize = 64;
+        const FIELD_ROWS_PER_FILE: usize = 4_096;
+        const FIELD_MERGE_CHUNK_ROWS: usize = 4_520;
         const FIELD_WAL_FILE: usize = FIELD_INPUT_FILES;
         const FIELD_TOTAL_ROWS: usize = (FIELD_INPUT_FILES + 1) * FIELD_ROWS_PER_FILE;
+        assert_eq!(
+            (FIELD_INPUT_FILES * FIELD_ROWS_PER_FILE).div_ceil(FIELD_MERGE_CHUNK_ROWS),
+            58,
+            "scaled A14 merge geometry"
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let wal = tmp.path().join("wal");
         let ice = Arc::new(
             IcebergContext::open(&tmp.path().join("warehouse"))
                 .await
-                .unwrap(),
+                .unwrap()
+                .with_tuning(IcebergTuning {
+                    // `event` is roughly 1 KiB/row, making an 8 MiB group a
+                    // little over two 4,520-row input chunks, as A14's
+                    // 543,391-row group was over two 261,632-row chunks.
+                    target_row_group_bytes: Some(8 * 1024 * 1024),
+                    ..Default::default()
+                }),
         );
 
         for file in 0..FIELD_INPUT_FILES {
@@ -9269,6 +9285,8 @@ mod combined_memory_regression_tests {
                         force_streaming: Some(true),
                         merge_fanin: Some(2),
                         force_tiered: Some(false),
+                        merge_chunk_rows: Some(FIELD_MERGE_CHUNK_ROWS),
+                        merge_chunk_prefetch: Some(1),
                         merge_memory_limit_bytes: Some(1024 * 1024 * 1024),
                         ..Default::default()
                     },

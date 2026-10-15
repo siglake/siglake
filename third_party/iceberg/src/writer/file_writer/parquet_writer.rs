@@ -339,6 +339,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             rowgroup_bloom_column: self.raw_rowgroup_bloom_column.clone(),
             rowgroup_blooms: Vec::new(),
             rowgroup_bloom_disabled: false,
+            rowgroup_trigrams: siglake_bloom::TrigramSet::new(),
             pending: Vec::new(),
             pending_rows: 0,
             group_count_columns: self.group_count_columns.clone(),
@@ -506,6 +507,10 @@ pub struct ParquetWriter {
     rowgroup_bloom_column: Option<String>,
     rowgroup_blooms: Vec<siglake_bloom::TokenBloom>,
     rowgroup_bloom_disabled: bool,
+    /// The current output row group's bloom input. Bloom-only writers feed
+    /// their Arrow batches to parquet immediately and retain this compact set
+    /// instead of retaining the decoded batches until the group is full.
+    rowgroup_trigrams: siglake_bloom::TrigramSet,
     pending: Vec<arrow_array::RecordBatch>,
     pending_rows: usize,
     group_count_columns: Vec<String>,
@@ -1094,6 +1099,58 @@ impl ParquetWriter {
             grams.iter(),
         ))
     }
+
+    /// Add one slice to the bloom for the row group currently being encoded.
+    ///
+    /// This is the bloom-only streaming path. The old grouped path remains for
+    /// segmented sidecars because their index builders still consume the full
+    /// row group together. Both paths use `TrigramSet` and produce the same
+    /// token set at the same physical row-group boundary.
+    fn accumulate_streamed_rowgroup_bloom(&mut self, batch: &arrow_array::RecordBatch) {
+        if self.rowgroup_bloom_disabled {
+            return;
+        }
+        let Some(col_name) = self.rowgroup_bloom_column.as_ref() else {
+            return;
+        };
+        let Some(col) = batch
+            .schema()
+            .index_of(col_name)
+            .ok()
+            .and_then(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+            })
+        else {
+            self.rowgroup_bloom_disabled = true;
+            self.rowgroup_blooms.clear();
+            self.rowgroup_trigrams = siglake_bloom::TrigramSet::new();
+            return;
+        };
+        for value in col.iter().flatten() {
+            self.rowgroup_trigrams.add(value);
+        }
+    }
+
+    /// Seal the bloom that belongs to the parquet row group just completed.
+    fn finish_streamed_rowgroup_bloom(&mut self) {
+        if self.rowgroup_bloom_disabled || self.rowgroup_bloom_column.is_none() {
+            return;
+        }
+        let grams = std::mem::take(&mut self.rowgroup_trigrams);
+        if grams.is_empty() {
+            self.rowgroup_bloom_disabled = true;
+            self.rowgroup_blooms.clear();
+            return;
+        }
+        self.rowgroup_blooms.push(siglake_bloom::TokenBloom::build(
+            grams.len(),
+            0.01,
+            grams.iter(),
+        ));
+    }
     /// siglake (#4377): push these batches — exactly one row group's rows — as
     /// one group of each configured column's segmented sidecar.
     ///
@@ -1220,6 +1277,55 @@ impl ParquetWriter {
         self.rowgroup_bloom_column.is_some() || self.segmented.is_some()
     }
 
+    /// Segmented indexes still need all row-group batches together. A writer
+    /// with only the row-group bloom can stream each slice directly into the
+    /// parquet encoder and retain only its distinct trigrams.
+    fn buffers_row_groups(&self) -> bool {
+        self.segmented.is_some()
+    }
+
+    /// Stream a bloom-only batch into the parquet encoder, splitting it at the
+    /// exact configured row-group boundary. `pending_rows` is the current
+    /// encoder group's row count on this path; `pending` remains empty.
+    async fn write_streamed_row_groups(
+        &mut self,
+        batch: &arrow_array::RecordBatch,
+    ) -> Result<()> {
+        let group_rows = self
+            .writer_properties
+            .max_row_group_row_count()
+            .unwrap_or(parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT);
+        if group_rows == 0 {
+            return Ok(());
+        }
+        let mut offset = 0usize;
+        while offset < batch.num_rows() {
+            let take = (group_rows - self.pending_rows).min(batch.num_rows() - offset);
+            let slice = batch.slice(offset, take);
+            self.accumulate_streamed_rowgroup_bloom(&slice);
+            self.inner_or_init().await?;
+            self.inner_writer
+                .as_mut()
+                .expect("writer initialized above")
+                .write(&slice)
+                .await
+                .map_err(|err| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Failed to write using parquet writer.",
+                    )
+                    .with_source(err)
+                })?;
+            self.pending_rows += take;
+            offset += take;
+            if self.pending_rows == group_rows {
+                self.finish_streamed_rowgroup_bloom();
+                self.pending_rows = 0;
+            }
+        }
+        Ok(())
+    }
+
     /// Write `batch` as exactly one row group, recording its token bloom. When
     /// `flush` is true the row group is sealed immediately (`AsyncArrowWriter::flush`);
     /// the final row group at close is sealed by `finish()` instead.
@@ -1337,6 +1443,10 @@ impl FileWriter for ParquetWriter {
         self.nan_value_count_visitor
             .compute(self.schema.clone(), batch_c)?;
 
+        if self.forms_row_groups() && !self.buffers_row_groups() {
+            return self.write_streamed_row_groups(batch).await;
+        }
+
         if self.forms_row_groups() {
             self.pending.push(batch.clone());
             self.pending_rows += batch.num_rows();
@@ -1362,7 +1472,10 @@ impl FileWriter for ParquetWriter {
     }
 
     async fn close(mut self) -> Result<Vec<DataFileBuilder>> {
-        if self.forms_row_groups() && self.pending_rows > 0 {
+        if self.forms_row_groups() && !self.buffers_row_groups() && self.pending_rows > 0 {
+            self.finish_streamed_rowgroup_bloom();
+            self.pending_rows = 0;
+        } else if self.forms_row_groups() && self.pending_rows > 0 {
             let last = std::mem::take(&mut self.pending);
             self.pending_rows = 0;
             self.emit_row_group(&last, false).await?;
@@ -1471,9 +1584,21 @@ impl CurrentFileStatus for ParquetWriter {
 
     fn current_written_size(&self) -> usize {
         if let Some(inner) = self.inner_writer.as_ref() {
-            // inner/AsyncArrowWriter contains sync and async writers
-            // written size = bytes flushed to inner's async writer + bytes buffered in the inner's sync writer
-            inner.bytes_written() + inner.in_progress_size()
+            // A writer that owns row-group formation may roll only between
+            // completed groups. The bloom-only path now feeds the parquet
+            // encoder incrementally; counting that encoder's in-progress size
+            // would make RollingFileWriter close the file mid-group before the
+            // next input batch. Besides producing many undersized files, that
+            // changes row-group/footer identity. Flushed bytes advance only at
+            // the exact group boundary and preserve the old rolling contract.
+            if self.forms_row_groups() {
+                inner.bytes_written()
+            } else {
+                // Without explicit row-group ownership, retain the upstream
+                // estimate so a large in-progress group can still trigger a
+                // roll before the following batch.
+                inner.bytes_written() + inner.in_progress_size()
+            }
         } else {
             // inner writer is not initialized yet
             0
@@ -3351,6 +3476,14 @@ mod tests {
             .build(output)
             .await?;
         writer.write(&batch).await?;
+        assert!(
+            writer.pending.is_empty(),
+            "bloom-only writes must not retain decoded Arrow batches between row groups"
+        );
+        assert_eq!(
+            writer.pending_rows, 1,
+            "five rows at a two-row target leave one row in the parquet encoder"
+        );
         let mut builders = writer.close().await?;
         let data_file = builders.pop().unwrap().build()?;
         assert_eq!(data_file.record_count(), 5);

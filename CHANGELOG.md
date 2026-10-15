@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Local Docker CI selects free query and ingest ports so a running demo tunnel
+  does not block release validation. Other listeners are left running.
+
 - **Auto-promotion census (bug fix, target 0.3.0)**: nested leaves under a
   literal dotted parent no longer become promoted columns whose backfilled
   values are all NULL. The census flattens one object level only for an

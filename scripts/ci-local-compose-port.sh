@@ -6,10 +6,11 @@
 # port returned by a bind-to-zero probe before compose starts, so candidates
 # come from below ip_local_port_range instead.
 
-ci_local_choose_compose_ingest_port() { # <log>
-  local log=$1 port
+ci_local_choose_compose_port() { # <log> <variable>
+  local log=$1 port_variable=$2 port
 
   port=$(python3 - \
+    "${SIGLAKE_INGEST_HOST_PORT:-}" \
     "${SIGLAKE_PG_HOST_PORT:-}" \
     "${SIGLAKE_MINIO_HOST_PORT:-}" \
     "${SIGLAKE_MINIO_CONSOLE_HOST_PORT:-}" \
@@ -50,10 +51,19 @@ else:
     raise SystemExit("no free host port below the ephemeral range")
 PY
   ) || {
-    echo "docker compose port selection failed: no free ingest host port below ip_local_port_range" >>"$log"
+    echo "docker compose port selection failed: no free $port_variable below ip_local_port_range" >>"$log"
     return 1
   }
 
-  export SIGLAKE_INGEST_HOST_PORT=$port
-  echo "==> docker compose selected SIGLAKE_INGEST_HOST_PORT=$port" >>"$log"
+  printf -v "$port_variable" '%s' "$port"
+  export "$port_variable"
+  echo "==> docker compose selected $port_variable=$port" >>"$log"
+}
+
+ci_local_choose_compose_ingest_port() { # <log>
+  ci_local_choose_compose_port "$1" SIGLAKE_INGEST_HOST_PORT
+}
+
+ci_local_choose_compose_query_port() { # <log>
+  ci_local_choose_compose_port "$1" SIGLAKE_QUERY_HOST_PORT
 }
