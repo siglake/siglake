@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "siglake-mcp"
+version = "0.1.0"
+description = "Read-only Siglake discovery and SQL tools for MCP clients"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = ["mcp==2.3.0", "httpx==0.28.1", "sqlglot==30.23.0"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=1,<2"]
+
+[project.scripts]
+siglake-mcp = "siglake_mcp.server:main"
+
+[project.urls]
+Repository = "https://github.com/siglake/siglake"
+Documentation = "https://github.com/siglake/siglake/tree/main/integrations/mcp"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

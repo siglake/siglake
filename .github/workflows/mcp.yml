@@ -1,0 +1,26 @@
+name: mcp
+
+on:
+  push:
+    branches: [main]
+    paths: ["integrations/mcp/**", ".github/workflows/mcp.yml"]
+  pull_request:
+    paths: ["integrations/mcp/**", ".github/workflows/mcp.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install './integrations/mcp[test]'
+      - run: python -m pytest integrations/mcp/tests
+      - run: siglake-mcp --help

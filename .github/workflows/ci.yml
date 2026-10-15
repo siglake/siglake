@@ -272,6 +272,8 @@ jobs:
       # round script's constants, its `--set` lines and the name it derives for
       # the scale evidence file, and requires the documents that point a reader
       # at that file to name the same one. No cluster, no kubectl, no helm.
+      - name: kind probes use their own dynamic IPv4 forwards
+        run: python3 scripts/check-kind-forward.py
       - name: the kind round keeps KEDA headroom on the query tier
         run: scripts/check-kind-round-scale.sh
       - name: the kind round validates and applies its initial event count

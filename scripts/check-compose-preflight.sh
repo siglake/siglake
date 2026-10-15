@@ -195,6 +195,8 @@ export SIGLAKE_OTLP_GRPC_HOST_PORT SIGLAKE_INGEST_METRICS_HOST_PORT
 export SIGLAKE_COMPACTOR_METRICS_HOST_PORT SIGLAKE_QUERY_HOST_PORT
 export SIGLAKE_QUERY_METRICS_HOST_PORT SIGLAKE_PROMETHEUS_HOST_PORT
 export SIGLAKE_GARAGE_HOST_PORT SIGLAKE_GARAGE_ADMIN_HOST_PORT
+ci_local_choose_compose_query_port "$selection_log"
+selected_query_port=$SIGLAKE_QUERY_HOST_PORT
 ci_local_choose_compose_ingest_port "$selection_log"
 selected_port=$SIGLAKE_INGEST_HOST_PORT
 
@@ -219,13 +221,26 @@ if ! grep -Fxq "==> docker compose selected SIGLAKE_INGEST_HOST_PORT=$selected_p
   echo "FAIL ci-local did not log its selected ingest port" >&2
   exit 1
 fi
+if [ "$selected_query_port" = 18089 ] || [ "$selected_query_port" = "$selected_port" ] ||
+  [ "$selected_query_port" -ge "$ephemeral_low" ]; then
+  echo "FAIL ci-local selected a conflicting query port $selected_query_port" >&2
+  exit 1
+fi
+if ! grep -Fxq "==> docker compose selected SIGLAKE_QUERY_HOST_PORT=$selected_query_port" "$selection_log"; then
+  echo "FAIL ci-local did not log its selected query port" >&2
+  exit 1
+fi
+if ! grep -Fq 'ci_local_choose_compose_query_port "$dlog"' scripts/ci-local.sh; then
+  echo "FAIL ci-local Docker job does not select a query port" >&2
+  exit 1
+fi
 if siglake_compose_port_is_listening "$selected_port"; then
   echo "FAIL ci-local selected listening host port $selected_port" >&2
   exit 1
 fi
 
 siglake_compose_port_is_listening() {
-  [ "$1" = 18088 ]
+  [ "$1" = 18088 ] || [ "$1" = 18089 ]
 }
 if ! output=$(siglake_compose_preflight 2>&1); then
   echo "FAIL compose preflight rejected selected port $selected_port while 18088 was occupied" >&2
@@ -238,7 +253,7 @@ if ! grep -Fq 'ci_local_choose_compose_ingest_port "$dlog"' scripts/ci-local.sh;
   exit 1
 fi
 
-echo "ok (ci-local selected and logged free ingest host port $selected_port; occupied 18088 ignored)"
+echo "ok (ci-local selected and logged free ingest host port $selected_port; occupied 18088/18089 ignored; query $selected_query_port)"
 
 # A compose startup error used to leave before the health-timeout logger could
 # run. Drive the whole up script with fake Docker and curl commands so startup

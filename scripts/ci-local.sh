@@ -260,6 +260,7 @@ else
   scripts/check-ci-approve-run.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-external-readers-report.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-image-sizes-report.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  python3 scripts/check-kind-forward.py >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-round-scale.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-round-events.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   scripts/check-kind-object-store.sh >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
@@ -824,7 +825,6 @@ if [ "$WITH_HEAVY" = 1 ]; then
     export SIGLAKE_OTLP_GRPC_HOST_PORT=14317
     export SIGLAKE_INGEST_METRICS_HOST_PORT=19100
     export SIGLAKE_COMPACTOR_METRICS_HOST_PORT=19101
-    export SIGLAKE_QUERY_HOST_PORT=18089
     export SIGLAKE_QUERY_METRICS_HOST_PORT=19105
     export SIGLAKE_PROMETHEUS_HOST_PORT=19090
     export SIGLAKE_GARAGE_HOST_PORT=13900
@@ -836,7 +836,10 @@ if [ "$WITH_HEAVY" = 1 ]; then
     ci_local_phases_reset "$dlog"
     ci_local_phase_begin preflight
     preflight_rc=0
-    if ci_local_choose_compose_ingest_port "$dlog"; then
+    # The demo tunnel may own 18089; choose independent query and ingest
+    # ports instead of stopping another process (nightly failure 2026-10-14).
+    if ci_local_choose_compose_query_port "$dlog" &&
+      ci_local_choose_compose_ingest_port "$dlog"; then
       # Resolve the store the stack will run on, so the S3 test below points at
       # whatever scripts/up.sh brought up. SIGLAKE_OBJECT_STORE=minio unless the
       # caller selected garage (task #2958); CI always takes the default.
