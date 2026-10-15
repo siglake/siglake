@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Update rustls to 0.23.46 for upstream TLS session redaction, ECH,
+  certificate decompression, and key-exchange corrections.
+
 - Local kind qualification binds each pod probe to its own dynamically allocated
   IPv4 port, preventing a running demo tunnel from supplying unrelated results.
 
