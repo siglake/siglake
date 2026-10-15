@@ -21554,9 +21554,11 @@ impl IcebergContext {
     /// inputs. Dispatch therefore needs stronger evidence than a lead field
     /// named `timestamp`: the selected `timestamp_ns` sibling (when present)
     /// must have a supported Arrow type, and every input manifest must
-    /// explicitly report zero nulls for that field. Missing statistics are
-    /// unknown, never equivalent to zero. The reason is a stable telemetry
-    /// value identifying why the prior executor was retained.
+    /// explicitly report zero nulls plus typed lower/upper bounds for that
+    /// field. The bounds must prove conversion to nanoseconds is exact and
+    /// exclude `i64::MIN`, which the ascending merge planner cannot negate.
+    /// Missing statistics are unknown, never equivalent to safe. The reason is
+    /// a stable telemetry value identifying why the prior executor was retained.
     fn constrained_page_bounded_proof(table: &Table, files: &[DataFile]) -> (bool, &'static str) {
         let Ok((arrow_schema, _ts_col, merge_col, _descending)) =
             Self::declared_timestamp_merge_direction(table)
@@ -21564,15 +21566,18 @@ impl IcebergContext {
             return (false, "unsupported_sort_order");
         };
         let merge_field = arrow_schema.field(merge_col);
-        if siglake_core::nanos_per_value(merge_field.data_type()).is_none() {
+        let Some(nanos_per_value) = siglake_core::nanos_per_value(merge_field.data_type()) else {
             return (false, "unsupported_merge_key_type");
-        }
-        let Some(merge_field_id) = table
-            .metadata()
-            .current_schema()
-            .field_id_by_name(merge_field.name())
-        else {
+        };
+        let iceberg_schema = table.metadata().current_schema();
+        let Some(merge_field_id) = iceberg_schema.field_id_by_name(merge_field.name()) else {
             return (false, "merge_key_missing_from_iceberg_schema");
+        };
+        let Some(merge_iceberg_field) = iceberg_schema.field_by_id(merge_field_id) else {
+            return (false, "merge_key_missing_from_iceberg_schema");
+        };
+        let Type::Primitive(merge_primitive_type) = merge_iceberg_field.field_type.as_ref() else {
+            return (false, "unsupported_merge_key_type");
         };
         for file in files {
             match file.null_value_counts().get(&merge_field_id) {
@@ -21580,8 +21585,38 @@ impl IcebergContext {
                 Some(_) => return (false, "merge_key_contains_nulls"),
                 None => return (false, "merge_key_null_count_unknown"),
             }
+            let (Some(lower), Some(upper)) = (
+                file.lower_bounds().get(&merge_field_id),
+                file.upper_bounds().get(&merge_field_id),
+            ) else {
+                return (false, "merge_key_bounds_unknown");
+            };
+            if lower.data_type() != merge_primitive_type
+                || upper.data_type() != merge_primitive_type
+            {
+                return (false, "merge_key_bound_type_mismatch");
+            }
+            let (
+                iceberg::spec::PrimitiveLiteral::Long(lower),
+                iceberg::spec::PrimitiveLiteral::Long(upper),
+            ) = (lower.literal(), upper.literal())
+            else {
+                return (false, "merge_key_bound_type_mismatch");
+            };
+            let (Some(lower), Some(upper)) = (
+                lower.checked_mul(nanos_per_value),
+                upper.checked_mul(nanos_per_value),
+            ) else {
+                return (false, "merge_key_bounds_out_of_range");
+            };
+            if lower > upper {
+                return (false, "merge_key_bounds_out_of_order");
+            }
+            if lower == i64::MIN {
+                return (false, "merge_key_bounds_include_i64_min");
+            }
         }
-        (true, "supported_null_free_merge_key")
+        (true, "supported_null_free_in_range_merge_key")
     }
 
     /// The merge output writer every merge path writes through, held unbuilt
@@ -33944,7 +33979,7 @@ mod constrained_recluster_dispatch_tests {
     use super::*;
     use arrow_array::{Array, StringArray, TimestampMicrosecondArray};
     use iceberg::spec::{
-        DataContentType, DataFileBuilder, NestedField, Schema as IcebergSchema, Struct,
+        DataContentType, DataFileBuilder, Datum, NestedField, Schema as IcebergSchema, Struct,
     };
 
     fn schema(timestamp_type: PrimitiveType, timestamp_required: bool) -> IcebergSchema {
@@ -34016,7 +34051,11 @@ mod constrained_recluster_dispatch_tests {
         in_memory_table_with_sort(schema, sort_order)
     }
 
-    fn manifest_file(null_counts: HashMap<i32, u64>) -> DataFile {
+    fn manifest_file_with_bounds(
+        null_counts: HashMap<i32, u64>,
+        lower_bounds: HashMap<i32, Datum>,
+        upper_bounds: HashMap<i32, Datum>,
+    ) -> DataFile {
         DataFileBuilder::default()
             .content(DataContentType::Data)
             .file_path("memory:///dispatch_fixture.parquet".to_string())
@@ -34026,8 +34065,18 @@ mod constrained_recluster_dispatch_tests {
             .record_count(2)
             .file_size_in_bytes(100)
             .null_value_counts(null_counts)
+            .lower_bounds(lower_bounds)
+            .upper_bounds(upper_bounds)
             .build()
             .unwrap()
+    }
+
+    fn timestamp_manifest_file(null_counts: HashMap<i32, u64>) -> DataFile {
+        manifest_file_with_bounds(
+            null_counts,
+            HashMap::from([(1, Datum::timestamptz_micros(1))]),
+            HashMap::from([(1, Datum::timestamptz_micros(2))]),
+        )
     }
 
     async fn create_table(
@@ -34109,13 +34158,57 @@ mod constrained_recluster_dispatch_tests {
         rows
     }
 
+    /// Read the persisted timestamp buffer without `column_nanos`: this is the
+    /// compatibility oracle for values whose nanosecond conversion would
+    /// saturate and hide the ordering defect under test.
+    async fn read_timestamp_micros_rows(
+        ice: &IcebergContext,
+        ident: &TableIdent,
+    ) -> Vec<(i64, String)> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let table = ice.catalog().load_table(ident).await.unwrap();
+        let files = ice.live_data_files(ident).await.unwrap();
+        let mut rows = Vec::new();
+        for file in files {
+            let bytes = table
+                .file_io()
+                .new_input(file.file_path())
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+                .unwrap()
+                .build()
+                .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let timestamp = batch
+                    .column(batch.schema().index_of("timestamp").unwrap())
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                let raw = batch
+                    .column(batch.schema().index_of("raw").unwrap())
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    rows.push((timestamp.value(row), raw.value(row).to_string()));
+                }
+            }
+        }
+        rows
+    }
+
     #[tokio::test]
     async fn proof_rejects_unsupported_type_and_unknown_or_nonzero_null_counts() {
         let unsupported = in_memory_table(schema(PrimitiveType::String, true), "timestamp");
         assert_eq!(
             IcebergContext::constrained_page_bounded_proof(
                 &unsupported,
-                &[manifest_file(HashMap::from([(1, 0)]))],
+                &[timestamp_manifest_file(HashMap::from([(1, 0)]))],
             ),
             (false, "unsupported_merge_key_type")
         );
@@ -34124,30 +34217,30 @@ mod constrained_recluster_dispatch_tests {
         assert_eq!(
             IcebergContext::constrained_page_bounded_proof(
                 &timestamp,
-                &[manifest_file(HashMap::new())],
+                &[timestamp_manifest_file(HashMap::new())],
             ),
             (false, "merge_key_null_count_unknown")
         );
         assert_eq!(
             IcebergContext::constrained_page_bounded_proof(
                 &timestamp,
-                &[manifest_file(HashMap::from([(1, 1)]))],
+                &[timestamp_manifest_file(HashMap::from([(1, 1)]))],
             ),
             (false, "merge_key_contains_nulls")
         );
         assert_eq!(
             IcebergContext::constrained_page_bounded_proof(
                 &timestamp,
-                &[manifest_file(HashMap::from([(1, 0)]))],
+                &[timestamp_manifest_file(HashMap::from([(1, 0)]))],
             ),
-            (true, "supported_null_free_merge_key")
+            (true, "supported_null_free_in_range_merge_key")
         );
 
         let exact_sibling = in_memory_table_with_exact_sibling();
         assert_eq!(
             IcebergContext::constrained_page_bounded_proof(
                 &exact_sibling,
-                &[manifest_file(HashMap::from([(1, 0)]))],
+                &[timestamp_manifest_file(HashMap::from([(1, 0)]))],
             ),
             (false, "merge_key_null_count_unknown"),
             "the effective timestamp_ns key needs its own explicit statistics"
@@ -34155,9 +34248,73 @@ mod constrained_recluster_dispatch_tests {
         assert_eq!(
             IcebergContext::constrained_page_bounded_proof(
                 &exact_sibling,
-                &[manifest_file(HashMap::from([(1, 0), (2, 0)]))],
+                &[manifest_file_with_bounds(
+                    HashMap::from([(1, 0), (2, 0)]),
+                    HashMap::from([(2, Datum::long(1))]),
+                    HashMap::from([(2, Datum::long(2))]),
+                )],
             ),
-            (true, "supported_null_free_merge_key")
+            (true, "supported_null_free_in_range_merge_key")
+        );
+    }
+
+    #[tokio::test]
+    async fn proof_requires_ordered_lossless_typed_bounds_away_from_i64_min() {
+        let timestamp = in_memory_table(schema(PrimitiveType::Timestamptz, true), "timestamp");
+        let prove = |file| IcebergContext::constrained_page_bounded_proof(&timestamp, &[file]);
+
+        assert_eq!(
+            prove(manifest_file_with_bounds(
+                HashMap::from([(1, 0)]),
+                HashMap::new(),
+                HashMap::new(),
+            )),
+            (false, "merge_key_bounds_unknown")
+        );
+        assert_eq!(
+            prove(manifest_file_with_bounds(
+                HashMap::from([(1, 0)]),
+                HashMap::from([(1, Datum::long(1))]),
+                HashMap::from([(1, Datum::long(2))]),
+            )),
+            (false, "merge_key_bound_type_mismatch")
+        );
+        let first_overflowing_microsecond = i64::MAX / 1_000 + 1;
+        assert_eq!(
+            prove(manifest_file_with_bounds(
+                HashMap::from([(1, 0)]),
+                HashMap::from([(1, Datum::timestamptz_micros(first_overflowing_microsecond),)]),
+                HashMap::from([(
+                    1,
+                    Datum::timestamptz_micros(first_overflowing_microsecond + 1),
+                )]),
+            )),
+            (false, "merge_key_bounds_out_of_range")
+        );
+        assert_eq!(
+            prove(manifest_file_with_bounds(
+                HashMap::from([(1, 0)]),
+                HashMap::from([(1, Datum::timestamptz_micros(2))]),
+                HashMap::from([(1, Datum::timestamptz_micros(1))]),
+            )),
+            (false, "merge_key_bounds_out_of_order")
+        );
+
+        let exact_sibling = in_memory_table_with_exact_sibling();
+        assert_eq!(
+            IcebergContext::constrained_page_bounded_proof(
+                &exact_sibling,
+                &[manifest_file_with_bounds(
+                    HashMap::from([(2, 0)]),
+                    HashMap::from([(2, Datum::long(i64::MIN))]),
+                    HashMap::from([(2, Datum::long(i64::MIN + 1))]),
+                )],
+            ),
+            (false, "merge_key_bounds_include_i64_min")
+        );
+        assert_eq!(
+            prove(timestamp_manifest_file(HashMap::from([(1, 0)]))),
+            (true, "supported_null_free_in_range_merge_key")
         );
     }
 
@@ -34279,6 +34436,91 @@ mod constrained_recluster_dispatch_tests {
             ],
             "generic sort order, duplicate rows, and timestamps must survive"
         );
+    }
+
+    #[tokio::test]
+    async fn persisted_out_of_nanosecond_range_keeps_original_unit_order_and_parity() {
+        const YEAR_2500_MICROS: i64 = 16_725_225_600_000_000;
+        const YEAR_2501_MICROS: i64 = 16_756_761_600_000_000;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let ident = create_table(
+            &ice,
+            "coarse_timestamp_dispatch",
+            schema(PrimitiveType::Timestamptz, true),
+            "timestamp",
+        )
+        .await;
+        // File order is intentionally opposite timestamp order. Saturating
+        // both year-2500 values to i64::MAX would make the page planner break
+        // the tie by input index and put year 2501 first.
+        append_rows(&ice, &ident, &[(Some(YEAR_2501_MICROS), "later")]).await;
+        append_rows(
+            &ice,
+            &ident,
+            &[
+                (Some(i64::MIN), "minimum"),
+                (Some(YEAR_2500_MICROS), "duplicate"),
+                (Some(YEAR_2500_MICROS), "duplicate"),
+            ],
+        )
+        .await;
+
+        let files = ice.live_data_files(&ident).await.unwrap();
+        assert_eq!(
+            files.len(),
+            2,
+            "fixture must span multiple persisted inputs"
+        );
+        assert_eq!(
+            IcebergContext::constrained_page_bounded_proof(
+                &ice.catalog().load_table(&ident).await.unwrap(),
+                &files,
+            ),
+            (false, "merge_key_bounds_out_of_range")
+        );
+        let stats = ice
+            .recluster_files_with(
+                &ident,
+                files,
+                &[],
+                &ReclusterMergeOptions {
+                    merge_memory_limit_bytes: Some(PACKAGED_COMPACTOR_MEMORY_LIMIT_BYTES),
+                    inram_max_bytes: Some(u64::MAX),
+                    inram_max_rows: Some(u64::MAX),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.merge_path, Some(MergePathKind::InRamSort));
+
+        let got = read_timestamp_micros_rows(&ice, &ident).await;
+        assert_eq!(
+            got.iter()
+                .map(|(timestamp, _)| *timestamp)
+                .collect::<Vec<_>>(),
+            vec![
+                i64::MIN,
+                YEAR_2500_MICROS,
+                YEAR_2500_MICROS,
+                YEAR_2501_MICROS,
+            ],
+            "the established path must retain ascending original-unit order"
+        );
+        let mut got_parity = got;
+        got_parity.sort();
+        let mut expected = vec![
+            (YEAR_2501_MICROS, "later".to_string()),
+            (i64::MIN, "minimum".to_string()),
+            (YEAR_2500_MICROS, "duplicate".to_string()),
+            (YEAR_2500_MICROS, "duplicate".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(got_parity, expected, "values and duplicates must survive");
     }
 }
 

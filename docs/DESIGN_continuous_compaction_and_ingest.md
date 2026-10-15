@@ -172,10 +172,11 @@ Coexistence without starving the commit path:
   Bins at or below the packaged memory limit now take the page-bounded executor
   before either allocation begins, including bins at or below fan-in, when the
   effective timestamp key has a supported Arrow type and every selected file
-  explicitly reports zero nulls for it. Nullable keys, unknown null statistics
-  and generic sort orders keep the prior path; the plan merge cannot honor
-  them. The explicit >fan-in tiered escape hatch still wins. A structured INFO
-  event records selected files, rows, bytes, path, cgroup limit, effective
+  explicitly reports zero nulls and typed, ordered lower/upper bounds for it.
+  Bound conversion to nanoseconds must be exact and exclude `i64::MIN`.
+  Nullable, unknown-statistics, out-of-range and generic sort inputs keep the
+  prior path. The explicit >fan-in tiered escape hatch still wins. A structured
+  INFO event records selected files, rows, bytes, path, cgroup limit, effective
   limit and eligibility reason before input decode. The constrained regression
   runs a 64-input / 58-chunk page merge, then separate small-bin continuations
   that would otherwise select whole-bin and slice-streaming paths. It samples
@@ -338,11 +339,13 @@ unbounded un-compacted layout's *read* amplification at query time.
 - **A.4.5 — Constrained continuation dispatch** ✅ *(source; packaged
   qualification pending).* Bins at or below the packaged 1Gi limit use
   page-bounded execution before whole-bin or per-input-decoder allocation only
-  with a supported, manifest-proven null-free effective timestamp key. Nullable
-  or unknown-statistics keys, generic sort orders and explicit >fan-in tiering
-  retain their prior dispatch. The pre-decode event records the selected
-  geometry, path and eligibility reason; the scaled 64-input then two-small-bin
-  regression retains RSS and exact row parity evidence.
+  with a supported effective timestamp key whose manifest bounds prove
+  null-free, ordered, lossless nanosecond conversion away from `i64::MIN`.
+  Nullable, unknown-statistics or out-of-range keys, generic sort orders and
+  explicit >fan-in tiering retain their prior dispatch. The pre-decode event
+  records the selected geometry, path and eligibility reason; the scaled
+  64-input then two-small-bin regression retains RSS and exact row parity
+  evidence.
 
 ### A.5 Validation
 

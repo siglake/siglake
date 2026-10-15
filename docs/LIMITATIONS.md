@@ -1873,9 +1873,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - **Streamed rewrite output carries no inline inverted index.** Every rewrite
   past the in-RAM caps — plus every re-cluster on a process at or below the
   packaged 1Gi limit whose effective timestamp key has a supported type and
-  explicit zero-null statistics in every input — is written by the streaming
-  writer. This includes leveled compaction merges, re-clustering passes and a
-  delete task's large candidates (16 MiB compressed / 128 Ki rows). The writer
+  per-file statistics proving zero nulls and lossless nanosecond bounds away
+  from `i64::MIN` — is written by the streaming writer. Nullable, out-of-range
+  or unknown-statistics small bins retain their established executor. This
+  includes leveled compaction merges, re-clustering passes and a delete task's
+  large candidates (16 MiB compressed / 128 Ki rows). The writer
   builds the group-count, time-bucket and raw row-group-bloom footers but not
   the footer inverted indexes or the whole-file raw trigram bloom. Both are
   computed from the whole decoded batch, which is what the streaming arm

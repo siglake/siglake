@@ -1243,13 +1243,14 @@ through 200 GB and 1 TB sustained-ingest rounds
   A timestamp-led bin in a process capped at 1Gi takes the page-bounded path
   regardless of compressed bin size or input count only when the effective
   merge key (`timestamp_ns` when present) has a type supported by the planner
-  and every selected file explicitly reports zero nulls for that field.
-  Missing null statistics are unknown. Nullable inputs and generic sort orders
-  retain their prior dispatch because the page-bounded executor can merge only
-  a non-null exact timestamp column. Before opening a decoder, each call records
-  selected inputs, manifest rows and bytes, selected path, the cgroup and
-  effective memory limits, and the constrained-dispatch eligibility reason in
-  `recluster merge dispatch`.
+  and every selected file explicitly reports zero nulls plus typed, ordered
+  lower/upper bounds for that field. Both bounds must convert to nanoseconds
+  without overflow and must exclude `i64::MIN`, which the ascending plan cannot
+  negate. Missing statistics are unknown. Nullable, out-of-range and generic
+  sort inputs retain their prior dispatch. Before opening a decoder, each call
+  records selected inputs, manifest rows and bytes, selected path, the cgroup
+  and effective memory limits, and the constrained-dispatch eligibility reason
+  in `recluster merge dispatch`.
   A re-cluster call writes ONE output partition — a streamed
   merge's writer stamps the bin's first partition value on everything it writes
   — so a bin spanning two partitions is refused, on every dispatch, rather than
