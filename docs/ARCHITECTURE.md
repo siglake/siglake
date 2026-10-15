@@ -1241,13 +1241,15 @@ through 200 GB and 1 TB sustained-ingest rounds
   row-based and authoritative. Mean-width estimates do not bound skewed chunks,
   and the 1,024-row minimum can exceed the target. Larger processes keep the 524,288-row default.
   A timestamp-led bin in a process capped at 1Gi takes the page-bounded path
-  regardless of compressed bin size or input count. This prevents a later
-  maintenance cycle from decoding a small bin whole or retaining one Parquet
-  decoder per input after an earlier large rewrite. Generic sort orders retain
-  their prior dispatch because the page-bounded executor can merge only the
-  exact timestamp column. Before opening a decoder, each call records selected
-  inputs, manifest rows and bytes, selected path, and the cgroup and effective
-  memory limits in `recluster merge dispatch`.
+  regardless of compressed bin size or input count only when the effective
+  merge key (`timestamp_ns` when present) has a type supported by the planner
+  and every selected file explicitly reports zero nulls for that field.
+  Missing null statistics are unknown. Nullable inputs and generic sort orders
+  retain their prior dispatch because the page-bounded executor can merge only
+  a non-null exact timestamp column. Before opening a decoder, each call records
+  selected inputs, manifest rows and bytes, selected path, the cgroup and
+  effective memory limits, and the constrained-dispatch eligibility reason in
+  `recluster merge dispatch`.
   A re-cluster call writes ONE output partition — a streamed
   merge's writer stamps the bin's first partition value on everything it writes
   — so a bin spanning two partitions is refused, on every dispatch, rather than

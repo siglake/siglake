@@ -2,13 +2,14 @@
 
 ## Unreleased
 
-- A timestamp-led re-cluster in the packaged 1Gi compactor now uses the
-  page-bounded executor for small continuation bins as well as bins above the
-  merge fan-in. Dispatch is logged before input decode with selected files,
-  rows, bytes, path and memory limits. This avoids whole-bin concat and
-  per-input decoder retention after a large rewrite; generic sort orders and
-  the explicit tiered escape hatch keep their prior behavior. Fresh packaged
-  1Gi qualification remains required.
+- A re-cluster in the packaged 1Gi compactor now uses the page-bounded executor
+  for small continuation bins when its effective timestamp merge key has a
+  supported type and every input manifest explicitly reports zero nulls.
+  Dispatch is logged before input decode with selected files, rows, bytes,
+  path, memory limits and the eligibility reason. This avoids whole-bin concat
+  and per-input decoder retention after a large rewrite. Generic sort orders,
+  nullable keys, missing null statistics and the explicit tiered escape hatch
+  keep their prior behavior. Fresh packaged 1Gi qualification remains required.
 
 - Update rustls to 0.23.46 for upstream TLS session redaction, ECH,
   certificate decompression, and key-exchange corrections.

@@ -1871,14 +1871,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   measurement of that side exists. `docs/DESIGN_row_group_target_qualification.md`
   measures the merge side only.
 - **Streamed rewrite output carries no inline inverted index.** Every rewrite
-  past the in-RAM caps — plus every timestamp-led re-cluster on a process at or
-  below the packaged 1Gi limit — is written by the streaming writer. This
-  includes leveled compaction merges, re-clustering passes and a delete task's
-  large candidates (16 MiB compressed / 128 Ki rows). The writer builds the
-  group-count, time-bucket and raw row-group-bloom footers but not the footer
-  inverted indexes and not the whole-file raw trigram bloom. Both are computed
-  from the whole decoded batch, which is what the streaming arm declines to
-  hold. The post-commit rebuild pass covers part of that and is **off by
+  past the in-RAM caps — plus every re-cluster on a process at or below the
+  packaged 1Gi limit whose effective timestamp key has a supported type and
+  explicit zero-null statistics in every input — is written by the streaming
+  writer. This includes leveled compaction merges, re-clustering passes and a
+  delete task's large candidates (16 MiB compressed / 128 Ki rows). The writer
+  builds the group-count, time-bucket and raw row-group-bloom footers but not
+  the footer inverted indexes or the whole-file raw trigram bloom. Both are
+  computed from the whole decoded batch, which is what the streaming arm
+  declines to hold. The post-commit rebuild pass covers part of that and is **off by
   default**, so a
   default-shaped install queries a streamed merge's output by scan. Turned on
   (`SIGLAKE_INDEX_REBUILD=1`), it registers Puffin inverted-index sidecars for

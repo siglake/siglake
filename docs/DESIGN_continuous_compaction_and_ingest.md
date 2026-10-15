@@ -169,15 +169,18 @@ Coexistence without starving the commit path:
   On the retained reconstruction, eight original files totalled about 1.88M
   rows / 155 MB compressed. Both old choices were allocation risks at 1Gi:
   whole-bin decode plus concat and sort, or one open Parquet decoder per input.
-  Timestamp-led bins at or below the packaged memory limit now take the
-  page-bounded executor before either allocation begins, including bins at or
-  below fan-in. Generic sort orders keep the prior path; the plan merge cannot
-  honor them. The explicit >fan-in tiered escape hatch still wins. A structured
-  INFO event records selected files, rows, bytes, path, cgroup limit and
-  effective limit before input decode. The constrained regression runs a
-  64-input / 58-chunk page merge, then separate small-bin continuations that
-  would otherwise select whole-bin and slice-streaming paths, samples RSS below
-  1Gi and checks every raw value, exact timestamp, NULL and duplicate once.
+  Bins at or below the packaged memory limit now take the page-bounded executor
+  before either allocation begins, including bins at or below fan-in, when the
+  effective timestamp key has a supported Arrow type and every selected file
+  explicitly reports zero nulls for it. Nullable keys, unknown null statistics
+  and generic sort orders keep the prior path; the plan merge cannot honor
+  them. The explicit >fan-in tiered escape hatch still wins. A structured INFO
+  event records selected files, rows, bytes, path, cgroup limit, effective
+  limit and eligibility reason before input decode. The constrained regression
+  runs a 64-input / 58-chunk page merge, then separate small-bin continuations
+  that would otherwise select whole-bin and slice-streaming paths. It samples
+  RSS below 1Gi and checks every raw value, exact timestamp, NULL and duplicate
+  once.
   This regression is scaled source evidence, not canonical field acceptance.
 
 - **Backpressure-aware sharing.** A shared signal from the WAL queue depth
@@ -333,12 +336,13 @@ unbounded un-compacted layout's *read* amplification at query time.
     the battery runs, so a timed-out footer sweep cannot continue unobserved.
 - **A.4.4 (optional)** — dedicated compaction service (own deployment + scaling).
 - **A.4.5 — Constrained continuation dispatch** ✅ *(source; packaged
-  qualification pending).* Timestamp-led bins at or below the packaged 1Gi
-  limit use page-bounded execution before whole-bin or per-input-decoder
-  allocation. Generic sort orders and explicit >fan-in tiering retain their
-  prior dispatch. The pre-decode event records the selected geometry and path;
-  the scaled 64-input then two-small-bin regression retains RSS and exact row
-  parity evidence.
+  qualification pending).* Bins at or below the packaged 1Gi limit use
+  page-bounded execution before whole-bin or per-input-decoder allocation only
+  with a supported, manifest-proven null-free effective timestamp key. Nullable
+  or unknown-statistics keys, generic sort orders and explicit >fan-in tiering
+  retain their prior dispatch. The pre-decode event records the selected
+  geometry, path and eligibility reason; the scaled 64-input then two-small-bin
+  regression retains RSS and exact row parity evidence.
 
 ### A.5 Validation
 
