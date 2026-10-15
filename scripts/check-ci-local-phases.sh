@@ -361,6 +361,10 @@ docker_job_status() {
   elif [ "\${2:-1}" = 0 ]; then printf 'FAIL (port preflight%s)\n' "\${sizes:+; \$sizes}"
   else printf 'FAIL%s\n' "\${sizes:+ (\$sizes)}"; fi
 }
+ci_local_choose_compose_query_port() {
+  echo 'stub query port selection' >>"\$1"
+  return \${STUB_QUERY_PORT_RC:-0}
+}
 ci_local_choose_compose_ingest_port() {
   echo 'stub port selection' >>"\$1"
   return \${STUB_PORT_RC:-0}
@@ -432,6 +436,14 @@ expect 'port-preflight verdict' 'docker             FAIL (port preflight)' "$job
 expect 'port-preflight counters' 'VERDICT fail=1 red=1 dk_ok=0 preflight_ok=0' "$job_verdict"
 expect 'port-preflight phases' 'phase preflight Ns rc=1' "$(shapes "$job_log")"
 expect_not_log 'a rejected port never ran preflight-only' "$job_log" 'stub preflight'
+
+run_docker_block query_port STUB_QUERY_PORT_RC=1
+expect 'query-port-preflight verdict' 'docker             FAIL (port preflight)' "$job_line"
+expect 'query-port-preflight counters' 'VERDICT fail=1 red=1 dk_ok=0 preflight_ok=0' "$job_verdict"
+expect 'query-port-preflight phases' 'phase preflight Ns rc=1' "$(shapes "$job_log")"
+expect_log 'query port selection ran' "$job_log" 'stub query port selection'
+expect_not_log 'a rejected query port never selected ingest' "$job_log" 'stub port selection'
+expect_not_log 'a rejected query port never ran preflight-only' "$job_log" 'stub preflight'
 
 # up.sh's own preflight refused: same verdict, and the record says the phase
 # reached it.
@@ -586,5 +598,5 @@ if [ "$failures" -gt 0 ]; then
 fi
 echo "ok (green and failing records, status preservation, nesting excluded from"
 echo "    the sum, residual, unbalanced blocks, stale block, derived cargo"
-echo "    subdurations; the lifted docker job over stand-ins on eight paths;"
+echo "    subdurations; the lifted docker job over stand-ins on nine paths;"
 echo "    its wiring, and up.sh's elapsed lines and loadgen labelling)"
