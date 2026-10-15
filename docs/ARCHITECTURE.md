@@ -1240,6 +1240,17 @@ through 200 GB and 1 TB sustained-ingest rounds
   Parquet-to-Arrow expansion; explicit `SIGLAKE_MERGE_CHUNK_ROWS` settings stay
   row-based and authoritative. Mean-width estimates do not bound skewed chunks,
   and the 1,024-row minimum can exceed the target. Larger processes keep the 524,288-row default.
+  A timestamp-led bin in a process capped at 1Gi takes the page-bounded path
+  regardless of compressed bin size or input count only when the effective
+  merge key (`timestamp_ns` when present) has a type supported by the planner
+  and every selected file explicitly reports zero nulls plus typed, ordered
+  lower/upper bounds for that field. Both bounds must convert to nanoseconds
+  without overflow and must exclude `i64::MIN`, which the ascending plan cannot
+  negate. Missing statistics are unknown. Nullable, out-of-range and generic
+  sort inputs retain their prior dispatch. Before opening a decoder, each call
+  records selected inputs, manifest rows and bytes, selected path, the cgroup
+  and effective memory limits, and the constrained-dispatch eligibility reason
+  in `recluster merge dispatch`.
   A re-cluster call writes ONE output partition — a streamed
   merge's writer stamps the bin's first partition value on everything it writes
   — so a bin spanning two partitions is refused, on every dispatch, rather than

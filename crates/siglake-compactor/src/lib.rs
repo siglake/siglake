@@ -9208,6 +9208,157 @@ mod combined_memory_regression_tests {
         run_combined_memory_fixture(64, 4_096, Some(4_520), Some(8 * 1024 * 1024)).await;
     }
 
+    /// Reproduce the retained reconstruction's allocation sequence: a large
+    /// page-bounded rewrite leaves a smaller bin, then the next maintenance
+    /// cycle reaches it. The two continuation passes separately prove that the
+    /// 1 GiB dispatch bypasses whole-bin concat and the <=fan-in decoder path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "process-wide RSS ceiling must run alone; use the exact test filter"]
+    async fn packaged_memory_large_merge_then_small_continuations_preserve_exact_parity() {
+        const INITIAL_FILES: usize = 64;
+        const CONTINUATION_FILES: usize = 7;
+        const ROWS_PER_FILE: usize = 4_096;
+        const CHUNK_ROWS: usize = 4_520;
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        assert_eq!(
+            (INITIAL_FILES * ROWS_PER_FILE).div_ceil(CHUNK_ROWS),
+            58,
+            "scaled retained first-merge geometry"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap()
+            .with_tuning(IcebergTuning {
+                target_row_group_bytes: Some(8 * 1024 * 1024),
+                ..Default::default()
+            });
+
+        for file in 0..INITIAL_FILES {
+            let events: Vec<_> = (0..ROWS_PER_FILE).map(|row| event(file, row)).collect();
+            ice.append_events(&events).await.unwrap();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let baseline = resident_bytes();
+        let peak = Arc::new(AtomicU64::new(baseline));
+        let sampler = {
+            let stop = stop.clone();
+            let peak = peak.clone();
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    peak.fetch_max(resident_bytes(), Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                peak.fetch_max(resident_bytes(), Ordering::Relaxed);
+            })
+        };
+
+        let initial = ice.live_data_files(ice.events_table_ident()).await.unwrap();
+        assert_eq!(initial.len(), INITIAL_FILES);
+        let first = ice
+            .recluster_files_with(
+                ice.events_table_ident(),
+                initial,
+                BLOOM_FILTER_COLUMNS,
+                &ReclusterMergeOptions {
+                    force_streaming: Some(true),
+                    merge_fanin: Some(16),
+                    merge_chunk_rows: Some(CHUNK_ROWS),
+                    merge_chunk_prefetch: Some(1),
+                    merge_memory_limit_bytes: Some(GIB),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.merge_path, Some(MergePathKind::PageBounded));
+        assert_eq!(first.rows, INITIAL_FILES * ROWS_PER_FILE);
+
+        for file in INITIAL_FILES..INITIAL_FILES + CONTINUATION_FILES {
+            let events: Vec<_> = (0..ROWS_PER_FILE).map(|row| event(file, row)).collect();
+            ice.append_events(&events).await.unwrap();
+        }
+        let inram_candidate = ice.live_data_files(ice.events_table_ident()).await.unwrap();
+        assert!(
+            inram_candidate.len() <= 16,
+            "continuation must stay at or below fan-in, got {} files",
+            inram_candidate.len()
+        );
+        let inram_continuation = ice
+            .recluster_files_with(
+                ice.events_table_ident(),
+                inram_candidate,
+                BLOOM_FILTER_COLUMNS,
+                &ReclusterMergeOptions {
+                    force_streaming: Some(false),
+                    merge_fanin: Some(16),
+                    inram_max_bytes: Some(u64::MAX),
+                    inram_max_rows: Some(u64::MAX),
+                    merge_chunk_rows: Some(CHUNK_ROWS),
+                    merge_chunk_prefetch: Some(1),
+                    merge_memory_limit_bytes: Some(GIB),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            inram_continuation.merge_path,
+            Some(MergePathKind::PageBounded),
+            "the constrained continuation must bypass whole-bin concat"
+        );
+
+        let last_file = INITIAL_FILES + CONTINUATION_FILES * 2;
+        for file in INITIAL_FILES + CONTINUATION_FILES..last_file {
+            let events: Vec<_> = (0..ROWS_PER_FILE).map(|row| event(file, row)).collect();
+            ice.append_events(&events).await.unwrap();
+        }
+        let slice_candidate = ice.live_data_files(ice.events_table_ident()).await.unwrap();
+        assert!(
+            slice_candidate.len() <= 16,
+            "forced-streaming continuation must stay at or below fan-in, got {} files",
+            slice_candidate.len()
+        );
+        let slice_continuation = ice
+            .recluster_files_with(
+                ice.events_table_ident(),
+                slice_candidate,
+                BLOOM_FILTER_COLUMNS,
+                &ReclusterMergeOptions {
+                    force_streaming: Some(true),
+                    merge_fanin: Some(16),
+                    merge_chunk_rows: Some(CHUNK_ROWS),
+                    merge_chunk_prefetch: Some(1),
+                    merge_memory_limit_bytes: Some(GIB),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            slice_continuation.merge_path,
+            Some(MergePathKind::PageBounded),
+            "the constrained continuation must bypass open per-file decoders"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        sampler.await.unwrap();
+        let peak = peak.load(Ordering::Relaxed);
+        eprintln!(
+            "large + constrained continuations RSS baseline={} peak={} growth={}",
+            baseline,
+            peak,
+            peak.saturating_sub(baseline)
+        );
+        assert!(
+            peak < GIB,
+            "large merge plus continuations exceeded the packaged 1 GiB limit: baseline={baseline}, peak={peak}"
+        );
+        assert_exact_event_parity(&ice, last_file, ROWS_PER_FILE).await;
+    }
+
     async fn run_combined_memory_fixture(
         input_files: usize,
         rows_per_file: usize,
@@ -9215,7 +9366,6 @@ mod combined_memory_regression_tests {
         target_row_group_bytes: Option<usize>,
     ) {
         let wal_file = input_files;
-        let total_rows = (input_files + 1) * rows_per_file;
         let tmp = tempfile::tempdir().unwrap();
         let wal = tmp.path().join("wal");
         let mut ice = IcebergContext::open(&tmp.path().join("warehouse"))
@@ -9320,6 +9470,15 @@ mod combined_memory_regression_tests {
             "real merge/WAL fixture exceeded the packaged 1 GiB limit: baseline={baseline}, peak={peak}"
         );
 
+        assert_exact_event_parity(&ice, input_files + 1, rows_per_file).await;
+    }
+
+    async fn assert_exact_event_parity(
+        ice: &IcebergContext,
+        file_count: usize,
+        rows_per_file: usize,
+    ) {
+        let total_rows = file_count * rows_per_file;
         let ctx = SessionContext::new();
         ice.register_with_datafusion(&ctx).await.unwrap();
         let plan = ctx
@@ -9378,7 +9537,7 @@ mod combined_memory_regression_tests {
                 .unwrap();
             for row_index in 0..batch.num_rows() {
                 let (file, row) = parse_id(raws.value(row_index));
-                assert!(file <= wal_file && row < rows_per_file);
+                assert!(file < file_count && row < rows_per_file);
                 assert_eq!(raws.value(row_index), event(file, row).raw);
                 let slot = file * rows_per_file + row;
                 assert!(!seen[slot], "duplicate source row f{file}-r{row}");

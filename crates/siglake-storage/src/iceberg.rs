@@ -1985,7 +1985,8 @@ pub enum MergePathKind {
     /// row (`files ≤ SIGLAKE_RECLUSTER_MERGE_FANIN`).
     SliceStreaming,
     /// RLE run plan executed in row-bounded chunks, no open decoders between
-    /// chunks (`files > fan-in`, the default above the cap).
+    /// chunks (the default above fan-in and for proven null-free timestamp-led
+    /// 1 GiB bins).
     PageBounded,
     /// Tiered merge through intermediate files (`SIGLAKE_RECLUSTER_TIERED_MERGE=1`).
     Tiered,
@@ -1999,6 +2000,47 @@ impl MergePathKind {
             Self::PageBounded => "page_bounded",
             Self::Tiered => "tiered",
         }
+    }
+}
+
+const PACKAGED_COMPACTOR_MEMORY_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Select the executor before any input file is decoded.
+///
+/// The packaged 1 GiB compactor cannot safely treat either "small compressed
+/// bin" or "at most fan-in inputs" as a decoded-memory bound. The retained
+/// reconstruction had both shapes after its first large rewrite: eight old
+/// files fit the in-RAM caps, while a forced streaming continuation could open
+/// one decoder per file. A table can use the page-bounded plan for both only
+/// after [`IcebergContext::constrained_page_bounded_proof`] establishes that
+/// its effective merge key has a supported type and every selected file has
+/// explicit zero-null statistics. Other inputs retain the established dispatch
+/// because the page-bounded executor merges only a non-null exact timestamp key.
+fn recluster_merge_path(
+    should_stream: bool,
+    files: usize,
+    fanin: usize,
+    force_tiered: bool,
+    memory_limit_bytes: Option<u64>,
+    constrained_page_bounded_proven: bool,
+) -> MergePathKind {
+    let constrained_page_bounded = constrained_page_bounded_proven
+        && memory_limit_bytes.is_some_and(|limit| limit <= PACKAGED_COMPACTOR_MEMORY_LIMIT_BYTES);
+    // Preserve the explicit >fan-in tiered escape hatch whenever either the
+    // old thresholds or the constrained policy select a streaming executor.
+    if files > fanin && force_tiered && (should_stream || constrained_page_bounded) {
+        return MergePathKind::Tiered;
+    }
+    if constrained_page_bounded {
+        return MergePathKind::PageBounded;
+    }
+    if !should_stream {
+        return MergePathKind::InRamSort;
+    }
+    if files <= fanin {
+        MergePathKind::SliceStreaming
+    } else {
+        MergePathKind::PageBounded
     }
 }
 
@@ -11668,7 +11710,7 @@ fn recluster_inram_max_rows_from(configured: Option<&str>) -> u64 {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReclusterMergeOptions {
     /// `Some(true)` forces the streaming merge for any bin size;
-    /// `Some(false)` never forces (the in-RAM caps alone decide).
+    /// `Some(false)` does not force streaming; memory safety policy still may.
     /// Env: `SIGLAKE_RECLUSTER_STREAMING`.
     pub force_streaming: Option<bool>,
     /// Streaming fan-in cap: bins at or under it take the slice-streaming
@@ -11691,10 +11733,11 @@ pub struct ReclusterMergeOptions {
     /// Page-bounded merge chunks whose fetched input may be resident at once.
     /// Floored at 1. Env: `SIGLAKE_MERGE_CHUNK_PREFETCH`.
     pub merge_chunk_prefetch: Option<usize>,
-    /// Process memory limit used to resolve the implicit page-bounded chunk
-    /// size and prefetch depth. Production leaves this `None` and reads the
-    /// cgroup; constrained-memory regressions set it so they exercise the same
-    /// policy on a development host without mutating process-global state.
+    /// Process memory limit used to select constrained page-bounded dispatch
+    /// and resolve its implicit chunk size and prefetch depth. Production
+    /// leaves this `None` and reads the cgroup; constrained-memory regressions
+    /// set it so they exercise the same policy on a development host without
+    /// mutating process-global state.
     pub merge_memory_limit_bytes: Option<u64>,
 }
 
@@ -11874,12 +11917,13 @@ mod append_work_output_tests {
     }
 }
 
-/// Decide whether a re-cluster bin is merged via the memory-bounded streaming
-/// path. `true` when streaming is force-enabled, or when the bin's compressed
-/// bytes / row count exceed the in-RAM safety thresholds (so an oversized bin
-/// never OOMs the whole-bin concat). Small bins stay on the in-RAM path, which
-/// also emits the whole-file raw-bloom + layout-meta KV. Each threshold comes
-/// from `merge` when set there, else from the environment.
+/// Baseline decision between whole-bin and streaming re-cluster. `true` when
+/// streaming is force-enabled, or when the bin's compressed bytes / row count
+/// exceed the in-RAM thresholds. [`recluster_merge_path`] applies the process
+/// memory policy afterward: on a 1 GiB table a small bin takes the page-bounded
+/// path only when its effective timestamp key is supported and every input has
+/// explicit zero-null statistics. Each threshold comes from `merge` when set
+/// there, else from the environment.
 fn recluster_should_stream(files: &[DataFile], merge: &ReclusterMergeOptions) -> bool {
     if merge
         .force_streaming
@@ -21502,6 +21546,79 @@ impl IcebergContext {
         Ok((arrow_schema, ts_col, merge_col, descending))
     }
 
+    /// Prove that constrained dispatch may select the timestamp-only
+    /// page-bounded executor for `files`.
+    ///
+    /// The executor decodes the effective merge key through
+    /// [`siglake_core::column_nanos`] and refuses a null after opening the
+    /// inputs. Dispatch therefore needs stronger evidence than a lead field
+    /// named `timestamp`: the selected `timestamp_ns` sibling (when present)
+    /// must have a supported Arrow type, and every input manifest must
+    /// explicitly report zero nulls plus typed lower/upper bounds for that
+    /// field. The bounds must prove conversion to nanoseconds is exact and
+    /// exclude `i64::MIN`, which the ascending merge planner cannot negate.
+    /// Missing statistics are unknown, never equivalent to safe. The reason is
+    /// a stable telemetry value identifying why the prior executor was retained.
+    fn constrained_page_bounded_proof(table: &Table, files: &[DataFile]) -> (bool, &'static str) {
+        let Ok((arrow_schema, _ts_col, merge_col, _descending)) =
+            Self::declared_timestamp_merge_direction(table)
+        else {
+            return (false, "unsupported_sort_order");
+        };
+        let merge_field = arrow_schema.field(merge_col);
+        let Some(nanos_per_value) = siglake_core::nanos_per_value(merge_field.data_type()) else {
+            return (false, "unsupported_merge_key_type");
+        };
+        let iceberg_schema = table.metadata().current_schema();
+        let Some(merge_field_id) = iceberg_schema.field_id_by_name(merge_field.name()) else {
+            return (false, "merge_key_missing_from_iceberg_schema");
+        };
+        let Some(merge_iceberg_field) = iceberg_schema.field_by_id(merge_field_id) else {
+            return (false, "merge_key_missing_from_iceberg_schema");
+        };
+        let Type::Primitive(merge_primitive_type) = merge_iceberg_field.field_type.as_ref() else {
+            return (false, "unsupported_merge_key_type");
+        };
+        for file in files {
+            match file.null_value_counts().get(&merge_field_id) {
+                Some(0) => {}
+                Some(_) => return (false, "merge_key_contains_nulls"),
+                None => return (false, "merge_key_null_count_unknown"),
+            }
+            let (Some(lower), Some(upper)) = (
+                file.lower_bounds().get(&merge_field_id),
+                file.upper_bounds().get(&merge_field_id),
+            ) else {
+                return (false, "merge_key_bounds_unknown");
+            };
+            if lower.data_type() != merge_primitive_type
+                || upper.data_type() != merge_primitive_type
+            {
+                return (false, "merge_key_bound_type_mismatch");
+            }
+            let (
+                iceberg::spec::PrimitiveLiteral::Long(lower),
+                iceberg::spec::PrimitiveLiteral::Long(upper),
+            ) = (lower.literal(), upper.literal())
+            else {
+                return (false, "merge_key_bound_type_mismatch");
+            };
+            let (Some(lower), Some(upper)) = (
+                lower.checked_mul(nanos_per_value),
+                upper.checked_mul(nanos_per_value),
+            ) else {
+                return (false, "merge_key_bounds_out_of_range");
+            };
+            if lower > upper {
+                return (false, "merge_key_bounds_out_of_order");
+            }
+            if lower == i64::MIN {
+                return (false, "merge_key_bounds_include_i64_min");
+            }
+        }
+        (true, "supported_null_free_in_range_merge_key")
+    }
+
     /// The merge output writer every merge path writes through, held unbuilt
     /// until its first batch so the row group is sized from a real row size
     /// against the configured byte target. See [`LazyMergeOutputWriter`].
@@ -22381,6 +22498,38 @@ impl IcebergContext {
             .unwrap_or(0)
             .saturating_add(1);
 
+        let input_rows: u64 = files.iter().map(|f| f.record_count()).sum();
+        let input_bytes: u64 = files.iter().map(|f| f.file_size_in_bytes()).sum();
+        let cgroup_limit_bytes = cgroup_memory_limit_bytes();
+        let merge_memory_limit_bytes = merge.merge_memory_limit_bytes.or(cgroup_limit_bytes);
+        let should_stream = recluster_should_stream(&files, merge);
+        let fanin = merge
+            .merge_fanin
+            .map(|n| n.max(2))
+            .unwrap_or_else(Self::recluster_merge_fanin);
+        let force_tiered = merge.force_tiered.unwrap_or_else(Self::tiered_merge_forced);
+        let (constrained_page_bounded_proven, constrained_page_bounded_reason) =
+            Self::constrained_page_bounded_proof(&table, &files);
+        let merge_path = recluster_merge_path(
+            should_stream,
+            files.len(),
+            fanin,
+            force_tiered,
+            merge_memory_limit_bytes,
+            constrained_page_bounded_proven,
+        );
+        tracing::info!(
+            selected_inputs = files.len(),
+            selected_rows = input_rows,
+            selected_bytes = input_bytes,
+            path = merge_path.label(),
+            cgroup_memory_limit_bytes = ?cgroup_limit_bytes,
+            dispatch_memory_limit_bytes = ?merge_memory_limit_bytes,
+            constrained_page_bounded_proven,
+            constrained_page_bounded_reason,
+            "recluster merge dispatch"
+        );
+
         // #4377: the segmented sidecars this rewrite's streaming output builds
         // as it emits row groups, collected here and registered in the same
         // transaction as the rewrite below. `None` unless the writer is opted
@@ -22392,35 +22541,49 @@ impl IcebergContext {
             .then(|| Arc::new(SegmentedIndexSink::new()));
 
         // Produce the re-clustered output files + the row count carried through.
-        // Two paths: the bounded streaming k-way merge (for bins too large for an
-        // in-RAM concat, or when forced), or the whole-bin in-RAM concat + sort.
-        // Both re-sort into the table's declared (time-ascending) order; the
-        // streaming path bounds decoded memory so an oversized bin can't OOM.
-        let (added, rows, merge_path) = if recluster_should_stream(&files, merge) {
-            let fanin = merge
-                .merge_fanin
-                .map(|n| n.max(2))
-                .unwrap_or_else(Self::recluster_merge_fanin);
-            self.merge_files_streaming(
-                &table,
-                &files,
-                bloom_columns,
-                out_gen,
-                fanin,
-                merge,
-                segmented_sink.clone(),
-            )
-            .await?
-        } else {
-            // The set is bounded by the caller, so an in-memory concat is OK.
-            let combined = self.read_files_concatenated(&table, &files).await?;
-            let combined = self.maybe_repromote(&table, combined)?;
-            let rows = combined.num_rows();
-            let write_output = self
-                .write_batch_to_data_files(&table, combined, bloom_columns, None, out_gen)
-                .await?;
-            let added = write_output.data_files;
-            (added, rows, MergePathKind::InRamSort)
+        // The decision above is logged before a decoder or whole-bin concat is
+        // opened, so an OOM artifact identifies the selected allocation shape.
+        let (added, rows) = match merge_path {
+            MergePathKind::PageBounded => {
+                self.merge_files_page_bounded(
+                    &table,
+                    &files,
+                    bloom_columns,
+                    out_gen,
+                    merge
+                        .merge_chunk_rows
+                        .map(|rows| rows.max(1024))
+                        .or_else(Self::configured_merge_chunk_rows),
+                    merge.merge_chunk_prefetch,
+                    merge_memory_limit_bytes,
+                    segmented_sink.clone(),
+                )
+                .await?
+            }
+            MergePathKind::SliceStreaming | MergePathKind::Tiered => {
+                let (added, rows, actual_path) = self
+                    .merge_files_streaming(
+                        &table,
+                        &files,
+                        bloom_columns,
+                        out_gen,
+                        fanin,
+                        merge,
+                        segmented_sink.clone(),
+                    )
+                    .await?;
+                debug_assert_eq!(actual_path, merge_path);
+                (added, rows)
+            }
+            MergePathKind::InRamSort => {
+                let combined = self.read_files_concatenated(&table, &files).await?;
+                let combined = self.maybe_repromote(&table, combined)?;
+                let rows = combined.num_rows();
+                let write_output = self
+                    .write_batch_to_data_files(&table, combined, bloom_columns, None, out_gen)
+                    .await?;
+                (write_output.data_files, rows)
+            }
         };
         metrics::counter!(
             "siglake_compactor_merge_path_total",
@@ -22434,7 +22597,6 @@ impl IcebergContext {
         // duplicate rows while still swapping the same file set. Re-clustering
         // only re-sorts, so the rows we wrote must equal the records the input
         // manifests declared. Refuse to commit a lossy/duplicating rewrite.
-        let input_rows: u64 = files.iter().map(|f| f.record_count()).sum();
         if input_rows != rows as u64 {
             anyhow::bail!(
                 "re-cluster row-count mismatch on {table_ident}: wrote {rows} rows from \
@@ -32960,6 +33122,42 @@ mod group_count_summary_tests {
     }
 
     #[test]
+    fn packaged_dispatch_uses_page_bounded_before_small_bin_allocations() {
+        let gib = 1024 * 1024 * 1024;
+
+        assert_eq!(
+            super::recluster_merge_path(false, 8, 16, false, Some(gib), true),
+            super::MergePathKind::PageBounded,
+            "a bin below the in-RAM caps must not decode and concatenate whole on 1 GiB"
+        );
+        assert_eq!(
+            super::recluster_merge_path(true, 8, 16, false, Some(gib), true),
+            super::MergePathKind::PageBounded,
+            "a streaming bin below fan-in must not retain one decoder per input on 1 GiB"
+        );
+        assert_eq!(
+            super::recluster_merge_path(false, 8, 16, false, Some(gib), false),
+            super::MergePathKind::InRamSort,
+            "a generic sort order cannot be sent through the timestamp-only plan"
+        );
+        assert_eq!(
+            super::recluster_merge_path(true, 32, 16, true, Some(gib), true),
+            super::MergePathKind::Tiered,
+            "the explicit >fan-in tiered escape hatch remains authoritative"
+        );
+        assert_eq!(
+            super::recluster_merge_path(false, 32, 16, true, Some(gib), true),
+            super::MergePathKind::Tiered,
+            "constrained dispatch must not bypass explicit >fan-in tiering"
+        );
+        assert_eq!(
+            super::recluster_merge_path(true, 8, 16, false, Some(gib + 1), true),
+            super::MergePathKind::SliceStreaming,
+            "larger profiles retain the established small-fan-in executor"
+        );
+    }
+
+    #[test]
     fn packaged_page_merge_caps_implicit_rows_from_actual_input_width() {
         let gib = 1024 * 1024 * 1024;
         let retained_a8_row_bytes = super::IcebergContext::estimated_arrow_row_bytes(4089, 10);
@@ -33771,6 +33969,560 @@ async fn page_bounded_fetch_slice(
         .try_collect()
         .await
         .context("decode chunk input batches")
+}
+
+#[cfg(test)]
+mod constrained_recluster_dispatch_tests {
+    //! Constrained dispatch is an optimization over the established generic
+    //! and null-aware in-RAM path. Its proof must reject any input the
+    //! timestamp-only page planner cannot decode without changing semantics.
+    use super::*;
+    use arrow_array::{Array, StringArray, TimestampMicrosecondArray};
+    use iceberg::spec::{
+        DataContentType, DataFileBuilder, Datum, NestedField, Schema as IcebergSchema, Struct,
+    };
+
+    fn schema(timestamp_type: PrimitiveType, timestamp_required: bool) -> IcebergSchema {
+        let timestamp = if timestamp_required {
+            NestedField::required(1, "timestamp", Type::Primitive(timestamp_type))
+        } else {
+            NestedField::optional(1, "timestamp", Type::Primitive(timestamp_type))
+        };
+        IcebergSchema::builder()
+            .with_fields(vec![
+                timestamp.into(),
+                NestedField::required(2, "raw", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn in_memory_table_with_sort(schema: IcebergSchema, sort_order: SortOrder) -> Table {
+        let metadata = iceberg::spec::TableMetadataBuilder::from_table_creation(
+            TableCreation::builder()
+                .name("dispatch_fixture".to_string())
+                .location("memory:///dispatch_fixture".to_string())
+                .schema(schema)
+                .format_version(FormatVersion::V2)
+                .sort_order(sort_order)
+                .build(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        Table::builder()
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["ns", "dispatch_fixture"]).unwrap())
+            .file_io(FileIOBuilder::new(Arc::new(iceberg::io::MemoryStorageFactory)).build())
+            .runtime(iceberg::Runtime::try_current().unwrap())
+            .build()
+            .unwrap()
+    }
+
+    fn in_memory_table(schema: IcebergSchema, lead: &str) -> Table {
+        let sort_order =
+            ascending_identity_sort_order(&schema, lead, "constrained dispatch fixture").unwrap();
+        in_memory_table_with_sort(schema, sort_order)
+    }
+
+    fn in_memory_table_with_exact_sibling() -> Table {
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "timestamp", Type::Primitive(PrimitiveType::Timestamptz))
+                    .into(),
+                NestedField::required(
+                    2,
+                    siglake_core::TIMESTAMP_NS_COLUMN,
+                    Type::Primitive(PrimitiveType::Long),
+                )
+                .into(),
+                NestedField::required(3, "raw", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+        let sort_order = ascending_identity_sort_order_with_tiebreak(
+            &schema,
+            "timestamp",
+            Some(siglake_core::TIMESTAMP_NS_COLUMN),
+            "constrained dispatch exact-sibling fixture",
+        )
+        .unwrap();
+        in_memory_table_with_sort(schema, sort_order)
+    }
+
+    fn manifest_file_with_bounds(
+        null_counts: HashMap<i32, u64>,
+        lower_bounds: HashMap<i32, Datum>,
+        upper_bounds: HashMap<i32, Datum>,
+    ) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("memory:///dispatch_fixture.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(2)
+            .file_size_in_bytes(100)
+            .null_value_counts(null_counts)
+            .lower_bounds(lower_bounds)
+            .upper_bounds(upper_bounds)
+            .build()
+            .unwrap()
+    }
+
+    fn timestamp_manifest_file(null_counts: HashMap<i32, u64>) -> DataFile {
+        manifest_file_with_bounds(
+            null_counts,
+            HashMap::from([(1, Datum::timestamptz_micros(1))]),
+            HashMap::from([(1, Datum::timestamptz_micros(2))]),
+        )
+    }
+
+    async fn create_table(
+        ice: &IcebergContext,
+        name: &str,
+        schema: IcebergSchema,
+        lead: &str,
+    ) -> TableIdent {
+        let sort_order =
+            ascending_identity_sort_order(&schema, lead, "constrained dispatch fixture").unwrap();
+        ice.create_table_tolerating_existing(
+            TableCreation::builder()
+                .name(name.to_string())
+                .schema(schema)
+                .format_version(FormatVersion::V2)
+                .sort_order(sort_order)
+                .build(),
+            format!("create constrained dispatch fixture {name}"),
+        )
+        .await
+        .unwrap();
+        ice.index_table_ident(name)
+    }
+
+    async fn append_rows(ice: &IcebergContext, ident: &TableIdent, rows: &[(Option<i64>, &str)]) {
+        let table = ice.catalog().load_table(ident).await.unwrap();
+        let arrow_schema = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).unwrap(),
+        );
+        let timestamps = TimestampMicrosecondArray::from(
+            rows.iter()
+                .map(|(timestamp, _)| *timestamp)
+                .collect::<Vec<_>>(),
+        )
+        .with_timezone(siglake_core::TIMESTAMP_TZ);
+        let raw = StringArray::from(rows.iter().map(|(_, raw)| Some(*raw)).collect::<Vec<_>>());
+        let batch =
+            RecordBatch::try_new(arrow_schema, vec![Arc::new(timestamps), Arc::new(raw)]).unwrap();
+        ice.append_to_table(ident, batch, &[]).await.unwrap();
+    }
+
+    async fn read_rows(ice: &IcebergContext, ident: &TableIdent) -> Vec<(Option<i64>, String)> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let table = ice.catalog().load_table(ident).await.unwrap();
+        let files = ice.live_data_files(ident).await.unwrap();
+        let mut rows = Vec::new();
+        for file in files {
+            let bytes = table
+                .file_io()
+                .new_input(file.file_path())
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+                .unwrap()
+                .build()
+                .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let timestamp = siglake_core::column_nanos(
+                    batch.column(batch.schema().index_of("timestamp").unwrap()),
+                )
+                .unwrap();
+                let raw = batch
+                    .column(batch.schema().index_of("raw").unwrap())
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    rows.push((
+                        (!timestamp.is_null(row)).then(|| timestamp.value(row)),
+                        raw.value(row).to_string(),
+                    ));
+                }
+            }
+        }
+        rows
+    }
+
+    /// Read the persisted timestamp buffer without `column_nanos`: this is the
+    /// compatibility oracle for values whose nanosecond conversion would
+    /// saturate and hide the ordering defect under test.
+    async fn read_timestamp_micros_rows(
+        ice: &IcebergContext,
+        ident: &TableIdent,
+    ) -> Vec<(i64, String)> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let table = ice.catalog().load_table(ident).await.unwrap();
+        let files = ice.live_data_files(ident).await.unwrap();
+        let mut rows = Vec::new();
+        for file in files {
+            let bytes = table
+                .file_io()
+                .new_input(file.file_path())
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+                .unwrap()
+                .build()
+                .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let timestamp = batch
+                    .column(batch.schema().index_of("timestamp").unwrap())
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                let raw = batch
+                    .column(batch.schema().index_of("raw").unwrap())
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    rows.push((timestamp.value(row), raw.value(row).to_string()));
+                }
+            }
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn proof_rejects_unsupported_type_and_unknown_or_nonzero_null_counts() {
+        let unsupported = in_memory_table(schema(PrimitiveType::String, true), "timestamp");
+        assert_eq!(
+            IcebergContext::constrained_page_bounded_proof(
+                &unsupported,
+                &[timestamp_manifest_file(HashMap::from([(1, 0)]))],
+            ),
+            (false, "unsupported_merge_key_type")
+        );
+
+        let timestamp = in_memory_table(schema(PrimitiveType::Timestamptz, false), "timestamp");
+        assert_eq!(
+            IcebergContext::constrained_page_bounded_proof(
+                &timestamp,
+                &[timestamp_manifest_file(HashMap::new())],
+            ),
+            (false, "merge_key_null_count_unknown")
+        );
+        assert_eq!(
+            IcebergContext::constrained_page_bounded_proof(
+                &timestamp,
+                &[timestamp_manifest_file(HashMap::from([(1, 1)]))],
+            ),
+            (false, "merge_key_contains_nulls")
+        );
+        assert_eq!(
+            IcebergContext::constrained_page_bounded_proof(
+                &timestamp,
+                &[timestamp_manifest_file(HashMap::from([(1, 0)]))],
+            ),
+            (true, "supported_null_free_in_range_merge_key")
+        );
+
+        let exact_sibling = in_memory_table_with_exact_sibling();
+        assert_eq!(
+            IcebergContext::constrained_page_bounded_proof(
+                &exact_sibling,
+                &[timestamp_manifest_file(HashMap::from([(1, 0)]))],
+            ),
+            (false, "merge_key_null_count_unknown"),
+            "the effective timestamp_ns key needs its own explicit statistics"
+        );
+        assert_eq!(
+            IcebergContext::constrained_page_bounded_proof(
+                &exact_sibling,
+                &[manifest_file_with_bounds(
+                    HashMap::from([(1, 0), (2, 0)]),
+                    HashMap::from([(2, Datum::long(1))]),
+                    HashMap::from([(2, Datum::long(2))]),
+                )],
+            ),
+            (true, "supported_null_free_in_range_merge_key")
+        );
+    }
+
+    #[tokio::test]
+    async fn proof_requires_ordered_lossless_typed_bounds_away_from_i64_min() {
+        let timestamp = in_memory_table(schema(PrimitiveType::Timestamptz, true), "timestamp");
+        let prove = |file| IcebergContext::constrained_page_bounded_proof(&timestamp, &[file]);
+
+        assert_eq!(
+            prove(manifest_file_with_bounds(
+                HashMap::from([(1, 0)]),
+                HashMap::new(),
+                HashMap::new(),
+            )),
+            (false, "merge_key_bounds_unknown")
+        );
+        assert_eq!(
+            prove(manifest_file_with_bounds(
+                HashMap::from([(1, 0)]),
+                HashMap::from([(1, Datum::long(1))]),
+                HashMap::from([(1, Datum::long(2))]),
+            )),
+            (false, "merge_key_bound_type_mismatch")
+        );
+        let first_overflowing_microsecond = i64::MAX / 1_000 + 1;
+        assert_eq!(
+            prove(manifest_file_with_bounds(
+                HashMap::from([(1, 0)]),
+                HashMap::from([(1, Datum::timestamptz_micros(first_overflowing_microsecond),)]),
+                HashMap::from([(
+                    1,
+                    Datum::timestamptz_micros(first_overflowing_microsecond + 1),
+                )]),
+            )),
+            (false, "merge_key_bounds_out_of_range")
+        );
+        assert_eq!(
+            prove(manifest_file_with_bounds(
+                HashMap::from([(1, 0)]),
+                HashMap::from([(1, Datum::timestamptz_micros(2))]),
+                HashMap::from([(1, Datum::timestamptz_micros(1))]),
+            )),
+            (false, "merge_key_bounds_out_of_order")
+        );
+
+        let exact_sibling = in_memory_table_with_exact_sibling();
+        assert_eq!(
+            IcebergContext::constrained_page_bounded_proof(
+                &exact_sibling,
+                &[manifest_file_with_bounds(
+                    HashMap::from([(2, 0)]),
+                    HashMap::from([(2, Datum::long(i64::MIN))]),
+                    HashMap::from([(2, Datum::long(i64::MIN + 1))]),
+                )],
+            ),
+            (false, "merge_key_bounds_include_i64_min")
+        );
+        assert_eq!(
+            prove(timestamp_manifest_file(HashMap::from([(1, 0)]))),
+            (true, "supported_null_free_in_range_merge_key")
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_nullable_timestamp_small_bin_keeps_inram_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let ident = create_table(
+            &ice,
+            "nullable_dispatch",
+            schema(PrimitiveType::Timestamptz, false),
+            "timestamp",
+        )
+        .await;
+        append_rows(&ice, &ident, &[(Some(3), "dup"), (None, "null-a")]).await;
+        append_rows(
+            &ice,
+            &ident,
+            &[(Some(1), "first"), (Some(3), "dup"), (None, "null-b")],
+        )
+        .await;
+
+        let files = ice.live_data_files(&ident).await.unwrap();
+        assert_eq!(
+            files.len(),
+            2,
+            "fixture must persist a small continuation bin"
+        );
+        assert_eq!(
+            IcebergContext::constrained_page_bounded_proof(
+                &ice.catalog().load_table(&ident).await.unwrap(),
+                &files,
+            ),
+            (false, "merge_key_contains_nulls")
+        );
+        let stats = ice
+            .recluster_files_with(
+                &ident,
+                files,
+                &[],
+                &ReclusterMergeOptions {
+                    merge_memory_limit_bytes: Some(PACKAGED_COMPACTOR_MEMORY_LIMIT_BYTES),
+                    inram_max_bytes: Some(u64::MAX),
+                    inram_max_rows: Some(u64::MAX),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.merge_path, Some(MergePathKind::InRamSort));
+
+        let mut got = read_rows(&ice, &ident).await;
+        got.sort();
+        let mut expected = vec![
+            (Some(3_000), "dup".to_string()),
+            (None, "null-a".to_string()),
+            (Some(1_000), "first".to_string()),
+            (Some(3_000), "dup".to_string()),
+            (None, "null-b".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(got, expected, "values, nulls, and duplicates must survive");
+    }
+
+    #[tokio::test]
+    async fn persisted_non_timestamp_led_small_bin_keeps_generic_sort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let ident = create_table(
+            &ice,
+            "generic_dispatch",
+            schema(PrimitiveType::Timestamptz, true),
+            "raw",
+        )
+        .await;
+        append_rows(&ice, &ident, &[(Some(3), "c"), (Some(1), "a")]).await;
+        append_rows(&ice, &ident, &[(Some(2), "b"), (Some(1), "a")]).await;
+
+        let files = ice.live_data_files(&ident).await.unwrap();
+        assert_eq!(
+            files.len(),
+            2,
+            "fixture must persist a small continuation bin"
+        );
+        assert_eq!(
+            IcebergContext::constrained_page_bounded_proof(
+                &ice.catalog().load_table(&ident).await.unwrap(),
+                &files,
+            ),
+            (false, "unsupported_sort_order")
+        );
+        let stats = ice
+            .recluster_files_with(
+                &ident,
+                files,
+                &[],
+                &ReclusterMergeOptions {
+                    merge_memory_limit_bytes: Some(PACKAGED_COMPACTOR_MEMORY_LIMIT_BYTES),
+                    inram_max_bytes: Some(u64::MAX),
+                    inram_max_rows: Some(u64::MAX),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.merge_path, Some(MergePathKind::InRamSort));
+
+        assert_eq!(
+            read_rows(&ice, &ident).await,
+            vec![
+                (Some(1_000), "a".to_string()),
+                (Some(1_000), "a".to_string()),
+                (Some(2_000), "b".to_string()),
+                (Some(3_000), "c".to_string()),
+            ],
+            "generic sort order, duplicate rows, and timestamps must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_out_of_nanosecond_range_keeps_original_unit_order_and_parity() {
+        const YEAR_2024_MICROS: i64 = 1_704_067_200_000_000;
+        const YEAR_2500_MICROS: i64 = 16_725_225_600_000_000;
+        const YEAR_2501_MICROS: i64 = 16_756_761_600_000_000;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let ident = create_table(
+            &ice,
+            "coarse_timestamp_dispatch",
+            schema(PrimitiveType::Timestamptz, true),
+            "timestamp",
+        )
+        .await;
+        // File order is intentionally opposite timestamp order. Saturating
+        // both year-2500 values to i64::MAX would make the page planner break
+        // the tie by input index and put year 2501 first.
+        append_rows(&ice, &ident, &[(Some(YEAR_2501_MICROS), "later")]).await;
+        append_rows(
+            &ice,
+            &ident,
+            &[
+                (Some(YEAR_2024_MICROS), "earliest"),
+                (Some(YEAR_2500_MICROS), "duplicate"),
+                (Some(YEAR_2500_MICROS), "duplicate"),
+            ],
+        )
+        .await;
+
+        let files = ice.live_data_files(&ident).await.unwrap();
+        assert_eq!(
+            files.len(),
+            2,
+            "fixture must span multiple persisted inputs"
+        );
+        assert_eq!(
+            IcebergContext::constrained_page_bounded_proof(
+                &ice.catalog().load_table(&ident).await.unwrap(),
+                &files,
+            ),
+            (false, "merge_key_bounds_out_of_range")
+        );
+        let stats = ice
+            .recluster_files_with(
+                &ident,
+                files,
+                &[],
+                &ReclusterMergeOptions {
+                    merge_memory_limit_bytes: Some(PACKAGED_COMPACTOR_MEMORY_LIMIT_BYTES),
+                    inram_max_bytes: Some(u64::MAX),
+                    inram_max_rows: Some(u64::MAX),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.merge_path, Some(MergePathKind::InRamSort));
+
+        let got = read_timestamp_micros_rows(&ice, &ident).await;
+        assert_eq!(
+            got.iter()
+                .map(|(timestamp, _)| *timestamp)
+                .collect::<Vec<_>>(),
+            vec![
+                YEAR_2024_MICROS,
+                YEAR_2500_MICROS,
+                YEAR_2500_MICROS,
+                YEAR_2501_MICROS,
+            ],
+            "the established path must retain ascending original-unit order"
+        );
+        let mut got_parity = got;
+        got_parity.sort();
+        let mut expected = vec![
+            (YEAR_2501_MICROS, "later".to_string()),
+            (YEAR_2024_MICROS, "earliest".to_string()),
+            (YEAR_2500_MICROS, "duplicate".to_string()),
+            (YEAR_2500_MICROS, "duplicate".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(got_parity, expected, "values and duplicates must survive");
+    }
 }
 
 #[cfg(test)]
