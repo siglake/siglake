@@ -1,0 +1,57 @@
+{
+  "arms": [
+    {
+      "external_run_id": 193,
+      "task_id": 6900,
+      "source_sha": "be8e173975879fd962dafba29570c57af96db96e",
+      "params": {
+        "local": true,
+        "pinned_sha": "be8e173975879fd962dafba29570c57af96db96e",
+        "object_store": "minio"
+      },
+      "exit_code": 0,
+      "started_at": "2026-10-16T16:49:43.640Z",
+      "ended_at": "2026-10-16T16:58:22.754Z",
+      "log_sha256": "6934948f0f205640f749d27daebc785b455fa430c15d1662b3fbb0565388144e",
+      "results": {
+        "membership.log": "f16cfc33608e4e87ff5d8594845f4e4fddd0a76ab55cef469ebdad5db82bc718",
+        "scale-2-4-2.json": "25d81ceb3ce7e32e946aff024ca763be68ab5ef723b47ab82e5f130aca1ed464"
+      },
+      "cross_shard_lines": [
+        "CROSS_SHARD_GROUP_BY groups=6000 sum=6000 row_count=6000 mode=aggregate pinned_before=0 pinned_after=2 status=ok",
+        "SCALE_SAMPLE phase=before at=2026-10-16T16:52:45Z ready_pods=2 row_count=6000 groups=6000 group_by_sum=6000 exact=ok mode=aggregate peers=2 peer_generation=1",
+        "SCALE_SAMPLE phase=during at=2026-10-16T16:52:59Z ready_pods=4 row_count=6000 groups=6000 group_by_sum=6000 exact=ok mode=aggregate peers=4 peer_generation=2",
+        "SCALE_SAMPLE phase=after at=2026-10-16T16:53:14Z ready_pods=2 row_count=6320 groups=6320 group_by_sum=6320 exact=ok mode=aggregate peers=2 peer_generation=4",
+        "WORKLOADS shapes=12 rounds=208 duration_seconds=330 elapsed_seconds=330 status=ok",
+        "SCALE_2_4_2 status=ok samples=3 transitions=2 exact=True"
+      ]
+    },
+    {
+      "external_run_id": 194,
+      "task_id": 6910,
+      "source_sha": "be8e173975879fd962dafba29570c57af96db96e",
+      "params": {
+        "local": true,
+        "pinned_sha": "be8e173975879fd962dafba29570c57af96db96e",
+        "object_store": "garage"
+      },
+      "exit_code": 0,
+      "started_at": "2026-10-16T17:02:57.540Z",
+      "ended_at": "2026-10-16T17:11:26.245Z",
+      "log_sha256": "caf1039c9e879e85dd204f17211e46161d2c9ffc46e2e4308ade6c527398c635",
+      "results": {
+        "membership.log": "76329ecc40ec16b8d21fe92fee65b3ed0a1f42aad7b1c209e2d77d7c8db62d74",
+        "scale-2-4-2.json": "2b6fadddb76ecc3bf33ba83306b2ffbc9d6149c5c01afc9246c27e38fa5504e9"
+      },
+      "cross_shard_lines": [
+        "CROSS_SHARD_GROUP_BY groups=6000 sum=6000 row_count=6000 mode=aggregate pinned_before=0 pinned_after=2 status=ok",
+        "SCALE_SAMPLE phase=before at=2026-10-16T17:05:51Z ready_pods=2 row_count=6000 groups=6000 group_by_sum=6000 exact=ok mode=aggregate peers=2 peer_generation=2",
+        "SCALE_SAMPLE phase=during at=2026-10-16T17:06:05Z ready_pods=4 row_count=6000 groups=6000 group_by_sum=6000 exact=ok mode=aggregate peers=4 peer_generation=1",
+        "SCALE_SAMPLE phase=after at=2026-10-16T17:06:19Z ready_pods=2 row_count=6320 groups=6320 group_by_sum=6320 exact=ok mode=aggregate peers=2 peer_generation=3",
+        "WORKLOADS shapes=12 rounds=206 duration_seconds=330 elapsed_seconds=331 status=ok",
+        "SCALE_2_4_2 status=ok samples=3 transitions=2 exact=True"
+      ]
+    }
+  ],
+  "scope": "Local matched round outcomes; Garage remains unsupported; required refusal evidence absent from collected artifacts."
+}

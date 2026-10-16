@@ -272,6 +272,7 @@ async fn query_cache_refreshes_on_schema_only_migration() {
         .unwrap()
         .with_promoted_columns(vec![PromotedColumn {
             attr_key: "http.status_code".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "status".into(),
             ty: PromotedType::Int64,
@@ -313,12 +314,14 @@ async fn ws7_promoted_attributes_become_typed_columns() {
     let promoted = vec![
         PromotedColumn {
             attr_key: "http.status_code".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "status".into(),
             ty: PromotedType::Int64,
         },
         PromotedColumn {
             attr_key: "k8s.namespace".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "ns".into(),
             ty: PromotedType::Utf8,
@@ -424,6 +427,7 @@ async fn exact_filter_pushdown_limit_removes_residual_filter_and_keeps_results_c
         .unwrap()
         .with_promoted_columns(vec![PromotedColumn {
             attr_key: "http.status_code".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "status".into(),
             ty: PromotedType::Int64,
@@ -556,6 +560,7 @@ async fn exact_filter_pushdown_matches_bruteforce_for_exact_safe_shapes() {
         .unwrap()
         .with_promoted_columns(vec![PromotedColumn {
             attr_key: "http.status_code".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "status".into(),
             ty: PromotedType::Int64,
@@ -696,12 +701,14 @@ async fn filtered_count_star_stays_correct_for_exact_and_inexact_shapes() {
         .with_promoted_columns(vec![
             PromotedColumn {
                 attr_key: "region".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "region".into(),
                 ty: PromotedType::Utf8,
             },
             PromotedColumn {
                 attr_key: "http.status_code".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "status".into(),
                 ty: PromotedType::Int64,
@@ -4128,6 +4135,7 @@ async fn promotion_backfill_rewrites_old_files_and_flips_property() {
         .unwrap()
         .with_promoted_columns(vec![PromotedColumn {
             attr_key: "k8s.pod".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "k8s_pod".into(),
             ty: PromotedType::Utf8,

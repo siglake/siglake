@@ -60,7 +60,11 @@ the other's endpoint.
 Garage is a comparison arm, not a supported warehouse. It is refused for
 conditional warehouse mutations, so an arm running on it comes up with inline
 side aggregates unpublished and the other guarded operations failing closed
-(`docs/LIMITATIONS.md`), and no matched MinIO/Garage round has been retained.
+(`docs/LIMITATIONS.md`). Matched local runs 193/194 on one frozen source now
+retain successful query, scale, panel and cleanup results; their collection
+did not retain the required Garage conditional-write refusal logs. See the
+[comparison report](../../results/release-validation/20261016-object-store-kind-comparison.md)
+for that remaining acceptance gap. Passing these rounds does not establish Garage support.
 `scripts/check-kind-object-store.sh` (in CI's `shell` job and the local gate)
 drives the resolver, runs `kind-up.sh` end to end against recording stand-ins
 for `kind`, `kubectl`, `helm` and `docker`, drives both refusals, and compares

@@ -51,7 +51,21 @@ struct Cli {
 }
 
 fn render(spec: &Spec) -> Result<String> {
-    serde_yaml::to_string(&(spec.build)()).context("serialize OpenAPI document to YAML")
+    let yaml =
+        serde_saphyr::to_string(&(spec.build)()).context("serialize OpenAPI document to YAML")?;
+    Ok(without_trailing_whitespace(&yaml))
+}
+
+fn without_trailing_whitespace(yaml: &str) -> String {
+    let mut clean = yaml
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if yaml.ends_with('\n') {
+        clean.push('\n');
+    }
+    clean
 }
 
 fn main() -> Result<()> {

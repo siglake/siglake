@@ -26,32 +26,37 @@ paths:
         schema:
           type: string
       responses:
-        '200':
+        "200":
           description: Matching delete tasks.
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/DeleteTask'
-        '401':
+                  $ref: "#/components/schemas/DeleteTask"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
     post:
       tags:
       - delete-tasks
@@ -104,46 +109,53 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/CreateDeleteTaskRequest'
+              $ref: "#/components/schemas/CreateDeleteTaskRequest"
         required: true
       responses:
-        '201':
-          description: Task recorded in `pending`, bound to the index incarnation named in `table_uuid`.
+        "201":
+          description: >-
+            Task recorded in `pending`, bound to the index incarnation named in
+            `table_uuid`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DeleteTask'
-        '400':
+                $ref: "#/components/schemas/DeleteTask"
+        "400":
           description: Empty or unparseable `predicate_sql`, or `start_ts >= end_ts`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '401':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '404':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "404":
           description: No such index.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-  /api/v1/delete-tasks/{id}:
+                $ref: "#/components/schemas/ApiErrorBody"
+  "/api/v1/delete-tasks/{id}":
     get:
       tags:
       - delete-tasks
@@ -158,36 +170,41 @@ paths:
           type: string
           format: uuid
       responses:
-        '200':
+        "200":
           description: The delete task. Pending tasks include a read-only claim observation.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DeleteTaskGetResponse'
-        '401':
+                $ref: "#/components/schemas/DeleteTaskGetResponse"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '404':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "404":
           description: No such task.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
   /api/v1/index-templates:
     get:
       tags:
@@ -199,33 +216,38 @@ paths:
         never shared across tenant namespaces.
       operationId: list_templates
       responses:
-        '200':
+        "200":
           description: All index templates.
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/IndexTemplate'
-        '401':
+                  $ref: "#/components/schemas/IndexTemplate"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-  /api/v1/index-templates/{id}:
+                $ref: "#/components/schemas/ApiErrorBody"
+  "/api/v1/index-templates/{id}":
     put:
       tags:
       - index-templates
@@ -247,39 +269,44 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/IndexTemplate'
+              $ref: "#/components/schemas/IndexTemplate"
         required: true
       responses:
-        '200':
+        "200":
           description: Stored. Body echoes the template.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/IndexTemplate'
-        '400':
+                $ref: "#/components/schemas/IndexTemplate"
+        "400":
           description: Invalid template, or the path id does not match the body's `template_id`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '401':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
     delete:
       tags:
       - index-templates
@@ -293,32 +320,37 @@ paths:
         schema:
           type: string
       responses:
-        '204':
+        "204":
           description: Deleted. Empty body.
-        '401':
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '404':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "404":
           description: No such template.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
   /api/v1/indexes:
     get:
       tags:
@@ -326,32 +358,37 @@ paths:
       summary: List every index in the caller's tenant.
       operationId: list
       responses:
-        '200':
+        "200":
           description: All index configurations.
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/IndexConfig'
-        '401':
+                  $ref: "#/components/schemas/IndexConfig"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
     post:
       tags:
       - indexes
@@ -365,46 +402,51 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/IndexConfig'
+              $ref: "#/components/schemas/IndexConfig"
         required: true
       responses:
-        '201':
+        "201":
           description: Created. Body is the stored configuration as the catalog normalized it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/IndexConfig'
-        '400':
+                $ref: "#/components/schemas/IndexConfig"
+        "400":
           description: Invalid configuration.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '401':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '409':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "409":
           description: An index with this id already exists.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-  /api/v1/indexes/{id}:
+                $ref: "#/components/schemas/ApiErrorBody"
+  "/api/v1/indexes/{id}":
     get:
       tags:
       - indexes
@@ -418,7 +460,7 @@ paths:
         schema:
           type: string
       responses:
-        '200':
+        "200":
           description: The index configuration.
           headers:
             ETag:
@@ -428,31 +470,36 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/IndexConfig'
-        '401':
+                $ref: "#/components/schemas/IndexConfig"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '404':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "404":
           description: No such index.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
     put:
       tags:
       - indexes
@@ -476,15 +523,15 @@ paths:
         schema:
           type:
           - string
-          - 'null'
+          - "null"
       requestBody:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/IndexConfig'
+              $ref: "#/components/schemas/IndexConfig"
         required: true
       responses:
-        '200':
+        "200":
           description: Updated. Body is the stored configuration.
           headers:
             ETag:
@@ -494,33 +541,41 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/IndexConfig'
-        '400':
+                $ref: "#/components/schemas/IndexConfig"
+        "400":
           description: Invalid configuration, or the path id does not match the body's `index_id`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '401':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '404':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "404":
           description: No such index.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '412':
-          description: The supplied If-Match condition is false. `current` and ETag come from the exact rejecting commit base; another writer may replace them before this response arrives.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "412":
+          description: >-
+            The supplied If-Match condition is false. `current` and ETag come from the
+            exact rejecting commit base; another writer may replace them before this response
+            arrives.
           headers:
             ETag:
               schema:
@@ -529,13 +584,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ManagedIndexPreconditionErrorBody'
-        '500':
+                $ref: "#/components/schemas/ManagedIndexPreconditionErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
     delete:
       tags:
       - indexes
@@ -553,33 +608,38 @@ paths:
         schema:
           type: string
       responses:
-        '204':
+        "204":
           description: Deleted. Empty body.
-        '401':
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '404':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "404":
           description: No such index.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-  /api/v1/jaeger/{index}/api/services:
+                $ref: "#/components/schemas/ApiErrorBody"
+  "/api/v1/jaeger/{index}/api/services":
     get:
       tags:
       - jaeger
@@ -596,38 +656,43 @@ paths:
         schema:
           type: string
       responses:
-        '200':
+        "200":
           description: Distinct service names.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/JaegerNamesResponse'
-        '401':
+                $ref: "#/components/schemas/JaegerNamesResponse"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '404':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "404":
           description: No such index.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '413':
-          description: 'The render exceeded one of this request''s ceilings. Two units apply: distinct names and accumulated Arrow bytes (a span can carry megabytes of attributes, so no row count bounds the render). Both are DERIVED from the admission reservation this request already holds — `min(16 MiB, budget / share)` — so they move with `SIGLAKE_QUERY_ADMISSION_BUDGET_BYTES` and the pod''s memory and there is no Jaeger-specific knob; the resolved interactive `max_rows_returned` still applies where it is tighter. Counted across the WHOLE request: for a trace search, the spans of every selected trace rather than each trace separately, and trace selection and span retrieval spend ONE budget. Read MID-FLIGHT, at a batch boundary — and the PRODUCER is bounded too, so the refusal no longer costs a whole materialized result: the plan carries a fetch of one row past the row bound, which turns the span query''s blocking sort into a bounded `TopK`. The figure in the message is what was held when the bound was crossed — one row past the row bound, and for the byte bound whatever those rows weigh, since one span can carry megabytes — not the size of the whole result. NOTHING is returned: `/api/v1/sql` answers 413 with a truncated body and says so in its envelope (`truncated`, `max_rows`), but the Jaeger response carries only `data` and `total`, and a trace silently missing spans is worse than no trace. No `Retry-After` — the refusal is deterministic, not load-dependent. Narrow the request: service, operation, time window, tags, or a smaller `limit`. Counted as `siglake_query_breaker_trips_total{breaker="jaeger_name_rows"}` or `{breaker="jaeger_render_bytes"}`.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "413":
+          description: "The render exceeded one of this request's ceilings. Two units apply: distinct names and accumulated Arrow bytes (a span can carry megabytes of attributes, so no row count bounds the render). Both are DERIVED from the admission reservation this request already holds — `min(16 MiB, budget / share)` — so they move with `SIGLAKE_QUERY_ADMISSION_BUDGET_BYTES` and the pod's memory and there is no Jaeger-specific knob; the resolved interactive `max_rows_returned` still applies where it is tighter. Counted across the WHOLE request: for a trace search, the spans of every selected trace rather than each trace separately, and trace selection and span retrieval spend ONE budget. Read MID-FLIGHT, at a batch boundary — and the PRODUCER is bounded too, so the refusal no longer costs a whole materialized result: the plan carries a fetch of one row past the row bound, which turns the span query's blocking sort into a bounded `TopK`. The figure in the message is what was held when the bound was crossed — one row past the row bound, and for the byte bound whatever those rows weigh, since one span can carry megabytes — not the size of the whole result. NOTHING is returned: `/api/v1/sql` answers 413 with a truncated body and says so in its envelope (`truncated`, `max_rows`), but the Jaeger response carries only `data` and `total`, and a trace silently missing spans is worse than no trace. No `Retry-After` — the refusal is deterministic, not load-dependent. Narrow the request: service, operation, time window, tags, or a smaller `limit`. Counted as `siglake_query_breaker_trips_total{breaker=\"jaeger_name_rows\"}` or `{breaker=\"jaeger_render_bytes\"}`."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '429':
-          description: 'The shared interactive admission budget stayed full through the admission wait. A trace read reserves from the SAME per-pod budget as `/api/v1/sql` — one reservation per request, held across both query phases — so it sheds the same way. Nothing is wrong with the request: wait `Retry-After` seconds and retry.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "429":
+          description: "The shared interactive admission budget stayed full through the admission wait. A trace read reserves from the SAME per-pod budget as `/api/v1/sql` — one reservation per request, held across both query phases — so it sheds the same way. Nothing is wrong with the request: wait `Retry-After` seconds and retry."
           headers:
             retry-after:
               schema:
@@ -638,15 +703,15 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '503':
-          description: 'The query memory pool (or the spill directory''s byte cap) refused an allocation for this trace query — the same pool the SQL routes run on, and the same answer they give. Nothing is wrong with the request: wait `Retry-After` seconds and retry.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "503":
+          description: "The query memory pool (or the spill directory's byte cap) refused an allocation for this trace query — the same pool the SQL routes run on, and the same answer they give. Nothing is wrong with the request: wait `Retry-After` seconds and retry."
           headers:
             retry-after:
               schema:
@@ -657,14 +722,20 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '504':
-          description: The request exceeded the server's interactive wall-clock budget. ONE budget starts before tenant resolution and covers the index lookup, table registration and every query phase (for a trace search, trace-id selection AND span retrieval), so a request that spends it all preparing is refused rather than handed a fresh budget to scan with. The refusal releases the admission reservation and cancels any scan already running for the request.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "504":
+          description: >-
+            The request exceeded the server's interactive wall-clock budget. ONE budget
+            starts before tenant resolution and covers the index lookup, table registration and
+            every query phase (for a trace search, trace-id selection AND span retrieval), so
+            a request that spends it all preparing is refused rather than handed a fresh
+            budget to scan with. The refusal releases the admission reservation and cancels any
+            scan already running for the request.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-  /api/v1/jaeger/{index}/api/services/{service}/operations:
+                $ref: "#/components/schemas/ApiErrorBody"
+  "/api/v1/jaeger/{index}/api/services/{service}/operations":
     get:
       tags:
       - jaeger
@@ -684,38 +755,43 @@ paths:
         schema:
           type: string
       responses:
-        '200':
+        "200":
           description: Distinct operation names.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/JaegerNamesResponse'
-        '401':
+                $ref: "#/components/schemas/JaegerNamesResponse"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '404':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "404":
           description: No such index.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '413':
-          description: 'The render exceeded one of this request''s ceilings. Two units apply: distinct names and accumulated Arrow bytes (a span can carry megabytes of attributes, so no row count bounds the render). Both are DERIVED from the admission reservation this request already holds — `min(16 MiB, budget / share)` — so they move with `SIGLAKE_QUERY_ADMISSION_BUDGET_BYTES` and the pod''s memory and there is no Jaeger-specific knob; the resolved interactive `max_rows_returned` still applies where it is tighter. Counted across the WHOLE request: for a trace search, the spans of every selected trace rather than each trace separately, and trace selection and span retrieval spend ONE budget. Read MID-FLIGHT, at a batch boundary — and the PRODUCER is bounded too, so the refusal no longer costs a whole materialized result: the plan carries a fetch of one row past the row bound, which turns the span query''s blocking sort into a bounded `TopK`. The figure in the message is what was held when the bound was crossed — one row past the row bound, and for the byte bound whatever those rows weigh, since one span can carry megabytes — not the size of the whole result. NOTHING is returned: `/api/v1/sql` answers 413 with a truncated body and says so in its envelope (`truncated`, `max_rows`), but the Jaeger response carries only `data` and `total`, and a trace silently missing spans is worse than no trace. No `Retry-After` — the refusal is deterministic, not load-dependent. Narrow the request: service, operation, time window, tags, or a smaller `limit`. Counted as `siglake_query_breaker_trips_total{breaker="jaeger_name_rows"}` or `{breaker="jaeger_render_bytes"}`.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "413":
+          description: "The render exceeded one of this request's ceilings. Two units apply: distinct names and accumulated Arrow bytes (a span can carry megabytes of attributes, so no row count bounds the render). Both are DERIVED from the admission reservation this request already holds — `min(16 MiB, budget / share)` — so they move with `SIGLAKE_QUERY_ADMISSION_BUDGET_BYTES` and the pod's memory and there is no Jaeger-specific knob; the resolved interactive `max_rows_returned` still applies where it is tighter. Counted across the WHOLE request: for a trace search, the spans of every selected trace rather than each trace separately, and trace selection and span retrieval spend ONE budget. Read MID-FLIGHT, at a batch boundary — and the PRODUCER is bounded too, so the refusal no longer costs a whole materialized result: the plan carries a fetch of one row past the row bound, which turns the span query's blocking sort into a bounded `TopK`. The figure in the message is what was held when the bound was crossed — one row past the row bound, and for the byte bound whatever those rows weigh, since one span can carry megabytes — not the size of the whole result. NOTHING is returned: `/api/v1/sql` answers 413 with a truncated body and says so in its envelope (`truncated`, `max_rows`), but the Jaeger response carries only `data` and `total`, and a trace silently missing spans is worse than no trace. No `Retry-After` — the refusal is deterministic, not load-dependent. Narrow the request: service, operation, time window, tags, or a smaller `limit`. Counted as `siglake_query_breaker_trips_total{breaker=\"jaeger_name_rows\"}` or `{breaker=\"jaeger_render_bytes\"}`."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '429':
-          description: 'The shared interactive admission budget stayed full through the admission wait. A trace read reserves from the SAME per-pod budget as `/api/v1/sql` — one reservation per request, held across both query phases — so it sheds the same way. Nothing is wrong with the request: wait `Retry-After` seconds and retry.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "429":
+          description: "The shared interactive admission budget stayed full through the admission wait. A trace read reserves from the SAME per-pod budget as `/api/v1/sql` — one reservation per request, held across both query phases — so it sheds the same way. Nothing is wrong with the request: wait `Retry-After` seconds and retry."
           headers:
             retry-after:
               schema:
@@ -726,15 +802,15 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '503':
-          description: 'The query memory pool (or the spill directory''s byte cap) refused an allocation for this trace query — the same pool the SQL routes run on, and the same answer they give. Nothing is wrong with the request: wait `Retry-After` seconds and retry.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "503":
+          description: "The query memory pool (or the spill directory's byte cap) refused an allocation for this trace query — the same pool the SQL routes run on, and the same answer they give. Nothing is wrong with the request: wait `Retry-After` seconds and retry."
           headers:
             retry-after:
               schema:
@@ -745,14 +821,20 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '504':
-          description: The request exceeded the server's interactive wall-clock budget. ONE budget starts before tenant resolution and covers the index lookup, table registration and every query phase (for a trace search, trace-id selection AND span retrieval), so a request that spends it all preparing is refused rather than handed a fresh budget to scan with. The refusal releases the admission reservation and cancels any scan already running for the request.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "504":
+          description: >-
+            The request exceeded the server's interactive wall-clock budget. ONE budget
+            starts before tenant resolution and covers the index lookup, table registration and
+            every query phase (for a trace search, trace-id selection AND span retrieval), so
+            a request that spends it all preparing is refused rather than handed a fresh
+            budget to scan with. The refusal releases the admission reservation and cancels any
+            scan already running for the request.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-  /api/v1/jaeger/{index}/api/traces:
+                $ref: "#/components/schemas/ApiErrorBody"
+  "/api/v1/jaeger/{index}/api/traces":
     get:
       tags:
       - jaeger
@@ -820,44 +902,49 @@ paths:
         schema:
           type: string
       responses:
-        '200':
+        "200":
           description: Matching traces. `data` is empty rather than absent when nothing matched.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/JaegerTracesResponse'
-        '400':
-          description: 'Unparseable duration or tag filter, or a `limit` above this server''s derived Jaeger trace ceiling. The ceiling comes out of the same admission reservation as the render ceilings below (no Jaeger-specific knob), and `limit` is checked BEFORE the reservation is taken, before the index lookup and before the planner — so a flood of hostile `?limit=` cannot occupy the pod''s admission budget on its way to being refused. The message names both the ceiling and the value sent. 400 rather than 413 because the request is refused on its face: the answer does not depend on what is stored or on load, so it carries no retry semantics, and 413 here already means "your result was too big" (narrow the search) when the fix is to lower `limit`. Counted as `siglake_query_breaker_trips_total{breaker="jaeger_trace_limit"}`.'
+                $ref: "#/components/schemas/JaegerTracesResponse"
+        "400":
+          description: "Unparseable duration or tag filter, or a `limit` above this server's derived Jaeger trace ceiling. The ceiling comes out of the same admission reservation as the render ceilings below (no Jaeger-specific knob), and `limit` is checked BEFORE the reservation is taken, before the index lookup and before the planner — so a flood of hostile `?limit=` cannot occupy the pod's admission budget on its way to being refused. The message names both the ceiling and the value sent. 400 rather than 413 because the request is refused on its face: the answer does not depend on what is stored or on load, so it carries no retry semantics, and 413 here already means \"your result was too big\" (narrow the search) when the fix is to lower `limit`. Counted as `siglake_query_breaker_trips_total{breaker=\"jaeger_trace_limit\"}`."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '401':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '404':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "404":
           description: No such index.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '413':
-          description: 'The render exceeded one of this request''s ceilings. Two units apply: span rows and accumulated Arrow bytes (a span can carry megabytes of attributes, so no row count bounds the render). Both are DERIVED from the admission reservation this request already holds — `min(16 MiB, budget / share)` — so they move with `SIGLAKE_QUERY_ADMISSION_BUDGET_BYTES` and the pod''s memory and there is no Jaeger-specific knob; the resolved interactive `max_rows_returned` still applies where it is tighter. Counted across the WHOLE request: for a trace search, the spans of every selected trace rather than each trace separately, and trace selection and span retrieval spend ONE budget. Read MID-FLIGHT, at a batch boundary — and the PRODUCER is bounded too, so the refusal no longer costs a whole materialized result: the plan carries a fetch of one row past the row bound, which turns the span query''s blocking sort into a bounded `TopK`. The figure in the message is what was held when the bound was crossed — one row past the row bound, and for the byte bound whatever those rows weigh, since one span can carry megabytes — not the size of the whole result. NOTHING is returned: `/api/v1/sql` answers 413 with a truncated body and says so in its envelope (`truncated`, `max_rows`), but the Jaeger response carries only `data` and `total`, and a trace silently missing spans is worse than no trace. No `Retry-After` — the refusal is deterministic, not load-dependent. Narrow the request: service, operation, time window, tags, or a smaller `limit`. Counted as `siglake_query_breaker_trips_total{breaker="jaeger_span_rows"}` or `{breaker="jaeger_render_bytes"}`.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "413":
+          description: "The render exceeded one of this request's ceilings. Two units apply: span rows and accumulated Arrow bytes (a span can carry megabytes of attributes, so no row count bounds the render). Both are DERIVED from the admission reservation this request already holds — `min(16 MiB, budget / share)` — so they move with `SIGLAKE_QUERY_ADMISSION_BUDGET_BYTES` and the pod's memory and there is no Jaeger-specific knob; the resolved interactive `max_rows_returned` still applies where it is tighter. Counted across the WHOLE request: for a trace search, the spans of every selected trace rather than each trace separately, and trace selection and span retrieval spend ONE budget. Read MID-FLIGHT, at a batch boundary — and the PRODUCER is bounded too, so the refusal no longer costs a whole materialized result: the plan carries a fetch of one row past the row bound, which turns the span query's blocking sort into a bounded `TopK`. The figure in the message is what was held when the bound was crossed — one row past the row bound, and for the byte bound whatever those rows weigh, since one span can carry megabytes — not the size of the whole result. NOTHING is returned: `/api/v1/sql` answers 413 with a truncated body and says so in its envelope (`truncated`, `max_rows`), but the Jaeger response carries only `data` and `total`, and a trace silently missing spans is worse than no trace. No `Retry-After` — the refusal is deterministic, not load-dependent. Narrow the request: service, operation, time window, tags, or a smaller `limit`. Counted as `siglake_query_breaker_trips_total{breaker=\"jaeger_span_rows\"}` or `{breaker=\"jaeger_render_bytes\"}`."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '429':
-          description: 'The shared interactive admission budget stayed full through the admission wait. A trace read reserves from the SAME per-pod budget as `/api/v1/sql` — one reservation per request, held across both query phases — so it sheds the same way. Nothing is wrong with the request: wait `Retry-After` seconds and retry.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "429":
+          description: "The shared interactive admission budget stayed full through the admission wait. A trace read reserves from the SAME per-pod budget as `/api/v1/sql` — one reservation per request, held across both query phases — so it sheds the same way. Nothing is wrong with the request: wait `Retry-After` seconds and retry."
           headers:
             retry-after:
               schema:
@@ -868,15 +955,15 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '503':
-          description: 'The query memory pool (or the spill directory''s byte cap) refused an allocation for this trace query — the same pool the SQL routes run on, and the same answer they give. Nothing is wrong with the request: wait `Retry-After` seconds and retry.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "503":
+          description: "The query memory pool (or the spill directory's byte cap) refused an allocation for this trace query — the same pool the SQL routes run on, and the same answer they give. Nothing is wrong with the request: wait `Retry-After` seconds and retry."
           headers:
             retry-after:
               schema:
@@ -887,14 +974,20 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '504':
-          description: The request exceeded the server's interactive wall-clock budget. ONE budget starts before tenant resolution and covers the index lookup, table registration and every query phase (for a trace search, trace-id selection AND span retrieval), so a request that spends it all preparing is refused rather than handed a fresh budget to scan with. The refusal releases the admission reservation and cancels any scan already running for the request.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "504":
+          description: >-
+            The request exceeded the server's interactive wall-clock budget. ONE budget
+            starts before tenant resolution and covers the index lookup, table registration and
+            every query phase (for a trace search, trace-id selection AND span retrieval), so
+            a request that spends it all preparing is refused rather than handed a fresh
+            budget to scan with. The refusal releases the admission reservation and cancels any
+            scan already running for the request.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-  /api/v1/jaeger/{index}/api/traces/{trace_id}:
+                $ref: "#/components/schemas/ApiErrorBody"
+  "/api/v1/jaeger/{index}/api/traces/{trace_id}":
     get:
       tags:
       - jaeger
@@ -914,38 +1007,43 @@ paths:
         schema:
           type: string
       responses:
-        '200':
+        "200":
           description: The trace, as a single-element `data` array.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/JaegerTracesResponse'
-        '401':
+                $ref: "#/components/schemas/JaegerTracesResponse"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '404':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "404":
           description: No such index.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '413':
-          description: 'The render exceeded one of this request''s ceilings. Two units apply: span rows and accumulated Arrow bytes (a span can carry megabytes of attributes, so no row count bounds the render). Both are DERIVED from the admission reservation this request already holds — `min(16 MiB, budget / share)` — so they move with `SIGLAKE_QUERY_ADMISSION_BUDGET_BYTES` and the pod''s memory and there is no Jaeger-specific knob; the resolved interactive `max_rows_returned` still applies where it is tighter. Counted across the WHOLE request: for a trace search, the spans of every selected trace rather than each trace separately, and trace selection and span retrieval spend ONE budget. Read MID-FLIGHT, at a batch boundary — and the PRODUCER is bounded too, so the refusal no longer costs a whole materialized result: the plan carries a fetch of one row past the row bound, which turns the span query''s blocking sort into a bounded `TopK`. The figure in the message is what was held when the bound was crossed — one row past the row bound, and for the byte bound whatever those rows weigh, since one span can carry megabytes — not the size of the whole result. NOTHING is returned: `/api/v1/sql` answers 413 with a truncated body and says so in its envelope (`truncated`, `max_rows`), but the Jaeger response carries only `data` and `total`, and a trace silently missing spans is worse than no trace. No `Retry-After` — the refusal is deterministic, not load-dependent. Narrow the request: service, operation, time window, tags, or a smaller `limit`. Counted as `siglake_query_breaker_trips_total{breaker="jaeger_span_rows"}` or `{breaker="jaeger_render_bytes"}`.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "413":
+          description: "The render exceeded one of this request's ceilings. Two units apply: span rows and accumulated Arrow bytes (a span can carry megabytes of attributes, so no row count bounds the render). Both are DERIVED from the admission reservation this request already holds — `min(16 MiB, budget / share)` — so they move with `SIGLAKE_QUERY_ADMISSION_BUDGET_BYTES` and the pod's memory and there is no Jaeger-specific knob; the resolved interactive `max_rows_returned` still applies where it is tighter. Counted across the WHOLE request: for a trace search, the spans of every selected trace rather than each trace separately, and trace selection and span retrieval spend ONE budget. Read MID-FLIGHT, at a batch boundary — and the PRODUCER is bounded too, so the refusal no longer costs a whole materialized result: the plan carries a fetch of one row past the row bound, which turns the span query's blocking sort into a bounded `TopK`. The figure in the message is what was held when the bound was crossed — one row past the row bound, and for the byte bound whatever those rows weigh, since one span can carry megabytes — not the size of the whole result. NOTHING is returned: `/api/v1/sql` answers 413 with a truncated body and says so in its envelope (`truncated`, `max_rows`), but the Jaeger response carries only `data` and `total`, and a trace silently missing spans is worse than no trace. No `Retry-After` — the refusal is deterministic, not load-dependent. Narrow the request: service, operation, time window, tags, or a smaller `limit`. Counted as `siglake_query_breaker_trips_total{breaker=\"jaeger_span_rows\"}` or `{breaker=\"jaeger_render_bytes\"}`."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '429':
-          description: 'The shared interactive admission budget stayed full through the admission wait. A trace read reserves from the SAME per-pod budget as `/api/v1/sql` — one reservation per request, held across both query phases — so it sheds the same way. Nothing is wrong with the request: wait `Retry-After` seconds and retry.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "429":
+          description: "The shared interactive admission budget stayed full through the admission wait. A trace read reserves from the SAME per-pod budget as `/api/v1/sql` — one reservation per request, held across both query phases — so it sheds the same way. Nothing is wrong with the request: wait `Retry-After` seconds and retry."
           headers:
             retry-after:
               schema:
@@ -956,15 +1054,15 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '503':
-          description: 'The query memory pool (or the spill directory''s byte cap) refused an allocation for this trace query — the same pool the SQL routes run on, and the same answer they give. Nothing is wrong with the request: wait `Retry-After` seconds and retry.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "503":
+          description: "The query memory pool (or the spill directory's byte cap) refused an allocation for this trace query — the same pool the SQL routes run on, and the same answer they give. Nothing is wrong with the request: wait `Retry-After` seconds and retry."
           headers:
             retry-after:
               schema:
@@ -975,14 +1073,20 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '504':
-          description: The request exceeded the server's interactive wall-clock budget. ONE budget starts before tenant resolution and covers the index lookup, table registration and every query phase (for a trace search, trace-id selection AND span retrieval), so a request that spends it all preparing is refused rather than handed a fresh budget to scan with. The refusal releases the admission reservation and cancels any scan already running for the request.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "504":
+          description: >-
+            The request exceeded the server's interactive wall-clock budget. ONE budget
+            starts before tenant resolution and covers the index lookup, table registration and
+            every query phase (for a trace search, trace-id selection AND span retrieval), so
+            a request that spends it all preparing is refused rather than handed a fresh
+            budget to scan with. The refusal releases the admission reservation and cancels any
+            scan already running for the request.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-  /api/v1/jobs/{id}:
+                $ref: "#/components/schemas/ApiErrorBody"
+  "/api/v1/jobs/{id}":
     get:
       tags:
       - jobs
@@ -1002,43 +1106,48 @@ paths:
         schema:
           type: string
       responses:
-        '200':
+        "200":
           description: Job state. `cost` is populated once planning has run.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/JobInfo'
-        '400':
+                $ref: "#/components/schemas/JobInfo"
+        "400":
           description: Malformed job id.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '401':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '404':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "404":
           description: No such job.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '503':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "503":
           description: The job store is temporarily unavailable; retry the request.
           headers:
             retry-after:
@@ -1050,7 +1159,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
     delete:
       tags:
       - jobs
@@ -1077,49 +1186,57 @@ paths:
         schema:
           type: string
       responses:
-        '202':
-          description: Cancellation persisted. The row is `cancelled` for every replica and a later completion is refused; the executing replica aborts the work within `--jobs-cancel-poll-secs` (default 2 s) when it is not the replica that served this request.
+        "202":
+          description: >-
+            Cancellation persisted. The row is `cancelled` for every replica and a later
+            completion is refused; the executing replica aborts the work within
+            `--jobs-cancel-poll-secs` (default 2 s) when it is not the replica that served this request.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/JobCancelResponse'
-        '400':
+                $ref: "#/components/schemas/JobCancelResponse"
+        "400":
           description: Malformed job id.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '401':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '404':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "404":
           description: No such job.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '409':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "409":
           description: The job already reached a terminal state.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '503':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "503":
           description: The job store is temporarily unavailable; retry the request.
           headers:
             retry-after:
@@ -1131,8 +1248,8 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-  /api/v1/jobs/{id}/result:
+                $ref: "#/components/schemas/ApiErrorBody"
+  "/api/v1/jobs/{id}/result":
     get:
       tags:
       - jobs
@@ -1150,49 +1267,54 @@ paths:
         schema:
           type: string
       responses:
-        '200':
+        "200":
           description: Result rows.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RecordsResponse'
-        '400':
+                $ref: "#/components/schemas/RecordsResponse"
+        "400":
           description: Malformed job id.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '401':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '404':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "404":
           description: No such job, or it is still pending or running.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '409':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "409":
           description: The job ended in a non-success state (failed, cancelled or timed out).
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '503':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "503":
           description: The job store is temporarily unavailable; retry the request.
           headers:
             retry-after:
@@ -1204,7 +1326,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
   /api/v1/sql:
     post:
       tags:
@@ -1220,52 +1342,63 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/SqlRequest'
+              $ref: "#/components/schemas/SqlRequest"
         required: true
       responses:
-        '200':
-          description: 'Success. Normally result rows (`RecordsResponse`); a `dry_run` request returns only the `CostReport` instead. When the request asks for `format: "ndjson"` the body is `application/x-ndjson` — one JSON object per line, streamed, with a trailing `{"_meta": ...}` line if the result was cut short or execution failed after the 200 response started. An error trailer carries `code` and `error`; a pool-refusal trailer also carries `retry_after_secs`.'
+        "200":
+          description: "Success. Normally result rows (`RecordsResponse`); a `dry_run` request returns only the `CostReport` instead. When the request asks for `format: \"ndjson\"` the body is `application/x-ndjson` — one JSON object per line, streamed, with a trailing `{\"_meta\": ...}` line if the result was cut short or execution failed after the 200 response started. An error trailer carries `code` and `error`; a pool-refusal trailer also carries `retry_after_secs`."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SqlSuccess'
+                $ref: "#/components/schemas/SqlSuccess"
             application/x-ndjson:
               schema:
                 type: string
-        '202':
-          description: 'Admitted and queued on the dedicated runtime when the request set `priority: "batch"`. Poll the returned URLs. Batch submissions share the query admission budget and return 429 instead when it remains full through the admission wait.'
+        "202":
+          description: "Admitted and queued on the dedicated runtime when the request set `priority: \"batch\"`. Poll the returned URLs. Batch submissions share the query admission budget and return 429 instead when it remains full through the admission wait."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/BatchSubmitResponse'
-        '400':
-          description: Empty or unparseable SQL, a statement that is not a read (DDL, DML and session statements — `CREATE`, `COPY … TO`, `INSERT`, `SET` — are refused before they can take effect), or a rejected cost estimate. `cost` carries the estimate that was refused.
+                $ref: "#/components/schemas/BatchSubmitResponse"
+        "400":
+          description: >-
+            Empty or unparseable SQL, a statement that is not a read (DDL, DML and session
+            statements — `CREATE`, `COPY … TO`, `INSERT`, `SET` — are refused before they can
+            take effect), or a rejected cost estimate. `cost` carries the estimate that was
+            refused.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '401':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '413':
-          description: 'Two distinct cases. Either the row cap was hit while rendering — the body is then a `RecordsResponse` with `truncated: true` and the rows that did fit — or the mid-flight rows-scanned breaker tripped, in which case the body is an error carrying `cost` and `stats`. Distinguish by whether `rows` is present.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "413":
+          description: "Two distinct cases. Either the row cap was hit while rendering — the body is then a `RecordsResponse` with `truncated: true` and the rows that did fit — or the mid-flight rows-scanned breaker tripped, in which case the body is an error carrying `cost` and `stats`. Distinguish by whether `rows` is present."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '422':
-          description: 'Unprocessable request body: a key inside `limits` is not a known per-request limit. The commonest case is `max_rows`, which is the RESPONSE envelope''s name for the applied cap; the request field is `max_rows_returned`. Refused by the JSON extractor before planning, execution or batch enqueue, so no work is done and no job is created — a dropped cap is never applied silently. The body is the extractor''s plain-text message naming the unknown field, not an `ApiErrorBody`. Unknown keys at the TOP level of the request are still ignored.'
-        '429':
-          description: Admission control rejected the interactive query or batch submission; the server is at its in-flight ceiling.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "422":
+          description: "Unprocessable request body: a key inside `limits` is not a known per-request limit. The commonest case is `max_rows`, which is the RESPONSE envelope's name for the applied cap; the request field is `max_rows_returned`. Refused by the JSON extractor before planning, execution or batch enqueue, so no work is done and no job is created — a dropped cap is never applied silently. The body is the extractor's plain-text message naming the unknown field, not an `ApiErrorBody`. Unknown keys at the TOP level of the request are still ignored."
+        "429":
+          description: >-
+            Admission control rejected the interactive query or batch submission; the
+            server is at its in-flight ceiling.
           headers:
             retry-after:
               schema:
@@ -1276,15 +1409,15 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '503':
-          description: 'Retryable refusal, from this server or from a worker whose answer is forwarded: the query memory pool (or the spill directory''s byte cap) refused an allocation, or a fanned-out shard could not resolve the generation — table incarnation, snapshot or schema — the coordinator pinned it to (`reason: "shard_pin_unresolved"`), which is refused rather than answered from a mix of generations. Nothing is wrong with the query: wait `Retry-After` seconds and retry.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "503":
+          description: "Retryable refusal, from this server or from a worker whose answer is forwarded: the query memory pool (or the spill directory's byte cap) refused an allocation, or a fanned-out shard could not resolve the generation — table incarnation, snapshot or schema — the coordinator pinned it to (`reason: \"shard_pin_unresolved\"`), which is refused rather than answered from a mix of generations. Nothing is wrong with the query: wait `Retry-After` seconds and retry."
           headers:
             retry-after:
               schema:
@@ -1295,13 +1428,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '504':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "504":
           description: The query exceeded its wall-clock budget.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
   /api/v1/sql/distributed:
     post:
       tags:
@@ -1315,45 +1448,53 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/SqlRequest'
+              $ref: "#/components/schemas/SqlRequest"
         required: true
       responses:
-        '200':
-          description: 'Merged result rows, or NDJSON when the request asked for `format: "ndjson"`.'
+        "200":
+          description: "Merged result rows, or NDJSON when the request asked for `format: \"ndjson\"`."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RecordsResponse'
+                $ref: "#/components/schemas/RecordsResponse"
             application/x-ndjson:
               schema:
                 type: string
-        '400':
-          description: Empty or unparseable SQL, a statement that is not a read (DDL, DML and session statements — `CREATE`, `COPY … TO`, `INSERT`, `SET` — are refused before they can take effect), or no worker peers are configured on this server.
+        "400":
+          description: >-
+            Empty or unparseable SQL, a statement that is not a read (DDL, DML and session
+            statements — `CREATE`, `COPY … TO`, `INSERT`, `SET` — are refused before they can
+            take effect), or no worker peers are configured on this server.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '401':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '413':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "413":
           description: Row cap hit, or the mid-flight rows-scanned breaker tripped.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '422':
-          description: 'Unprocessable request body: a key inside `limits` is not a known per-request limit. The commonest case is `max_rows`, which is the RESPONSE envelope''s name for the applied cap; the request field is `max_rows_returned`. Refused by the JSON extractor before planning, execution or batch enqueue, so no work is done and no job is created — a dropped cap is never applied silently. The body is the extractor''s plain-text message naming the unknown field, not an `ApiErrorBody`. Unknown keys at the TOP level of the request are still ignored.'
-        '429':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "422":
+          description: "Unprocessable request body: a key inside `limits` is not a known per-request limit. The commonest case is `max_rows`, which is the RESPONSE envelope's name for the applied cap; the request field is `max_rows_returned`. Refused by the JSON extractor before planning, execution or batch enqueue, so no work is done and no job is created — a dropped cap is never applied silently. The body is the extractor's plain-text message naming the unknown field, not an `ApiErrorBody`. Unknown keys at the TOP level of the request are still ignored."
+        "429":
           description: Admission control rejected the query.
           headers:
             retry-after:
@@ -1365,15 +1506,15 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error, including a failed shard with no surviving replica.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '503':
-          description: 'Retryable refusal, from this coordinator or from a worker whose answer is forwarded: the query memory pool refused an allocation, or a shard could not resolve the generation — table incarnation, snapshot or schema — this coordinator pinned the fan-out to (`reason: "shard_pin_unresolved"`). A pinned shard is never answered from a different generation, so the whole query is refused rather than merged across them. Wait `Retry-After` seconds and retry.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "503":
+          description: "Retryable refusal, from this coordinator or from a worker whose answer is forwarded: the query memory pool refused an allocation, or a shard could not resolve the generation — table incarnation, snapshot or schema — this coordinator pinned the fan-out to (`reason: \"shard_pin_unresolved\"`). A pinned shard is never answered from a different generation, so the whole query is refused rather than merged across them. Wait `Retry-After` seconds and retry."
           headers:
             retry-after:
               schema:
@@ -1384,13 +1525,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '504':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "504":
           description: The query exceeded its wall-clock budget.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
   /api/v1/sql/explain:
     post:
       tags:
@@ -1404,41 +1545,49 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/SqlRequest'
+              $ref: "#/components/schemas/SqlRequest"
         required: true
       responses:
-        '200':
+        "200":
           description: Cost estimate. `exact` is false when the estimate fell back to a heuristic.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CostReport'
-        '400':
-          description: Empty or unparseable SQL, or a statement that is not a read (DDL, DML and session statements — `CREATE`, `COPY … TO`, `INSERT`, `SET` — are refused before they can take effect).
+                $ref: "#/components/schemas/CostReport"
+        "400":
+          description: >-
+            Empty or unparseable SQL, or a statement that is not a read (DDL, DML and
+            session statements — `CREATE`, `COPY … TO`, `INSERT`, `SET` — are refused before they
+            can take effect).
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '401':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '422':
-          description: 'Unprocessable request body: a key inside `limits` is not a known per-request limit. The commonest case is `max_rows`, which is the RESPONSE envelope''s name for the applied cap; the request field is `max_rows_returned`. Refused by the JSON extractor before planning, execution or batch enqueue, so no work is done and no job is created — a dropped cap is never applied silently. The body is the extractor''s plain-text message naming the unknown field, not an `ApiErrorBody`. Unknown keys at the TOP level of the request are still ignored.'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "422":
+          description: "Unprocessable request body: a key inside `limits` is not a known per-request limit. The commonest case is `max_rows`, which is the RESPONSE envelope's name for the applied cap; the request field is `max_rows_returned`. Refused by the JSON extractor before planning, execution or batch enqueue, so no work is done and no job is created — a dropped cap is never applied silently. The body is the extractor's plain-text message naming the unknown field, not an `ApiErrorBody`. Unknown keys at the TOP level of the request are still ignored."
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
   /api/v1/sql/local:
     post:
       tags:
@@ -1453,51 +1602,61 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/SqlRequest'
+              $ref: "#/components/schemas/SqlRequest"
         required: true
       responses:
-        '200':
-          description: 'Success. Result rows, the `CostReport` for a `dry_run`, or an `application/x-ndjson` stream for `format: "ndjson"`. If execution fails after that stream''s 200 response starts, its final line is an `_meta: "error"` trailer with `code` and `error`; a pool refusal also carries `retry_after_secs`.'
+        "200":
+          description: "Success. Result rows, the `CostReport` for a `dry_run`, or an `application/x-ndjson` stream for `format: \"ndjson\"`. If execution fails after that stream's 200 response starts, its final line is an `_meta: \"error\"` trailer with `code` and `error`; a pool refusal also carries `retry_after_secs`."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SqlSuccess'
+                $ref: "#/components/schemas/SqlSuccess"
             application/x-ndjson:
               schema:
                 type: string
-        '202':
-          description: 'Admitted and queued on the dedicated runtime when `priority: "batch"`; returns 429 instead if the shared admission budget remains full through the admission wait.'
+        "202":
+          description: "Admitted and queued on the dedicated runtime when `priority: \"batch\"`; returns 429 instead if the shared admission budget remains full through the admission wait."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/BatchSubmitResponse'
-        '400':
-          description: Empty or unparseable SQL, a statement that is not a read (DDL, DML and session statements — `CREATE`, `COPY … TO`, `INSERT`, `SET` — are refused before they can take effect), or a rejected cost estimate.
+                $ref: "#/components/schemas/BatchSubmitResponse"
+        "400":
+          description: >-
+            Empty or unparseable SQL, a statement that is not a read (DDL, DML and session
+            statements — `CREATE`, `COPY … TO`, `INSERT`, `SET` — are refused before they can
+            take effect), or a rejected cost estimate.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '401':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '413':
-          description: Row cap hit (body is a truncated `RecordsResponse`) or the mid-flight breaker tripped (body is an error).
+                $ref: "#/components/schemas/ApiErrorBody"
+        "413":
+          description: >-
+            Row cap hit (body is a truncated `RecordsResponse`) or the mid-flight breaker
+            tripped (body is an error).
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '422':
-          description: 'Unprocessable request body: a key inside `limits` is not a known per-request limit. The commonest case is `max_rows`, which is the RESPONSE envelope''s name for the applied cap; the request field is `max_rows_returned`. Refused by the JSON extractor before planning, execution or batch enqueue, so no work is done and no job is created — a dropped cap is never applied silently. The body is the extractor''s plain-text message naming the unknown field, not an `ApiErrorBody`. Unknown keys at the TOP level of the request are still ignored.'
-        '429':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "422":
+          description: "Unprocessable request body: a key inside `limits` is not a known per-request limit. The commonest case is `max_rows`, which is the RESPONSE envelope's name for the applied cap; the request field is `max_rows_returned`. Refused by the JSON extractor before planning, execution or batch enqueue, so no work is done and no job is created — a dropped cap is never applied silently. The body is the extractor's plain-text message naming the unknown field, not an `ApiErrorBody`. Unknown keys at the TOP level of the request are still ignored."
+        "429":
           description: Admission control rejected the interactive query or batch submission.
           headers:
             retry-after:
@@ -1509,15 +1668,15 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '503':
-          description: 'The query memory pool (or the spill directory''s byte cap) refused an allocation. Nothing is wrong with the query: wait `Retry-After` seconds and retry.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "503":
+          description: "The query memory pool (or the spill directory's byte cap) refused an allocation. Nothing is wrong with the query: wait `Retry-After` seconds and retry."
           headers:
             retry-after:
               schema:
@@ -1528,13 +1687,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '504':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "504":
           description: The query exceeded its wall-clock budget.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
   /api/v1/sql/shard:
     post:
       tags:
@@ -1547,11 +1706,13 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ShardQueryRequest'
+              $ref: "#/components/schemas/ShardQueryRequest"
         required: true
       responses:
-        '200':
-          description: Partial result for this shard, as an Arrow IPC **stream** (lossless — the coordinator merges typed batches, not JSON).
+        "200":
+          description: >-
+            Partial result for this shard, as an Arrow IPC **stream** (lossless — the
+            coordinator merges typed batches, not JSON).
           content:
             application/vnd.apache.arrow.stream:
               schema:
@@ -1560,38 +1721,46 @@ paths:
                   type: integer
                   format: int32
                   minimum: 0
-        '400':
-          description: Empty or unparseable SQL, an invalid generation pin, a statement that is not a read (DDL, DML and session statements — `CREATE`, `COPY … TO`, `INSERT`, `SET` — are refused before they can take effect), or an invalid shard selector.
+        "400":
+          description: >-
+            Empty or unparseable SQL, an invalid generation pin, a statement that is not a
+            read (DDL, DML and session statements — `CREATE`, `COPY … TO`, `INSERT`, `SET` —
+            are refused before they can take effect), or an invalid shard selector.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '401':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '413':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "413":
           description: The mid-flight rows-scanned breaker tripped.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '500':
+                $ref: "#/components/schemas/ApiErrorBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '503':
-          description: 'Retryable refusal. Either this worker''s query memory pool (or spill directory byte cap) refused an allocation, or the request carried a `pin` whose generation this worker cannot resolve even after a metadata refresh (`reason: "shard_pin_unresolved"` in the body, with the pin) — a pinned shard is never answered from a different table incarnation or snapshot, because file shards only partition the table when every worker reads the same file generation, nor from a different schema, because a fan-out plans once on the coordinator. The coordinator forwards either to the caller rather than re-running the shard on itself.'
+                $ref: "#/components/schemas/ApiErrorBody"
+        "503":
+          description: "Retryable refusal. Either this worker's query memory pool (or spill directory byte cap) refused an allocation, or the request carried a `pin` whose generation this worker cannot resolve even after a metadata refresh (`reason: \"shard_pin_unresolved\"` in the body, with the pin) — a pinned shard is never answered from a different table incarnation or snapshot, because file shards only partition the table when every worker reads the same file generation, nor from a different schema, because a fan-out plans once on the coordinator. The coordinator forwards either to the caller rather than re-running the shard on itself."
           headers:
             retry-after:
               schema:
@@ -1602,13 +1771,17 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '504':
-          description: The shard exceeded its wall-clock budget. The budget starts when the request arrives and covers preparation (tenant resolution, table registration, pin resolution, planning) as well as execution, so a shard that spends it all preparing is refused without starting its scan.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "504":
+          description: >-
+            The shard exceeded its wall-clock budget. The budget starts when the request
+            arrives and covers preparation (tenant resolution, table registration, pin
+            resolution, planning) as well as execution, so a shard that spends it all preparing is
+            refused without starting its scan.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
   /debug/memory-pool:
     get:
       tags:
@@ -1621,24 +1794,30 @@ paths:
         unbounded.
       operationId: memory_pool
       responses:
-        '200':
+        "200":
           description: Current query memory-pool occupancy and its ten largest tracked consumers.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/MemoryPoolDebugResponse'
-        '401':
+                $ref: "#/components/schemas/MemoryPoolDebugResponse"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
-        '403':
-          description: Tenant refused before the handler runs. This server derives the tenant from a verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`, 1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered by the auth middleware, so it can reach every operation behind it — including this one, which reads no tenant data.
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: >-
+            Tenant refused before the handler runs. This server derives the tenant from a
+            verified JWT claim when one is configured (`--oidc-tenant-claim`), and this token
+            carries none, or carries one that is not a usable tenant id (`[A-Za-z0-9_-]`,
+            1..=128 chars), or is absent from the configured `--allowed-tenants` set. Answered
+            by the auth middleware, so it can reach every operation behind it — including this
+            one, which reads no tenant data.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiErrorBody'
+                $ref: "#/components/schemas/ApiErrorBody"
   /healthz:
     get:
       tags:
@@ -1650,34 +1829,34 @@ paths:
         use `/readyz` for that.
       operationId: healthz
       responses:
-        '200':
+        "200":
           description: The process is serving.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HealthResponse'
+                $ref: "#/components/schemas/HealthResponse"
       security:
       - {}
   /readyz:
     get:
       tags:
       - health
-      summary: 'Readiness probe: verifies the Iceberg catalog is reachable.'
+      summary: "Readiness probe: verifies the Iceberg catalog is reachable."
       description: Mounted outside the auth layer, so it needs no credentials.
       operationId: readyz
       responses:
-        '200':
+        "200":
           description: Catalog reachable; ready to serve queries.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ReadyResponse'
-        '503':
+                $ref: "#/components/schemas/ReadyResponse"
+        "503":
           description: Catalog unreachable. `error` carries the cause.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ReadyResponse'
+                $ref: "#/components/schemas/ReadyResponse"
       security:
       - {}
 components:
@@ -1702,8 +1881,8 @@ components:
           minimum: 0
         cost:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/CostReport'
+          - type: "null"
+          - $ref: "#/components/schemas/CostReport"
             description: Present when the failure was cost- or time-related.
         error:
           type: string
@@ -1787,7 +1966,7 @@ components:
       - exact
       properties:
         complexity_class:
-          $ref: '#/components/schemas/ComplexityClass'
+          $ref: "#/components/schemas/ComplexityClass"
         estimated_bytes_scanned:
           type: integer
           format: int64
@@ -1807,7 +1986,7 @@ components:
         files_considered:
           type:
           - integer
-          - 'null'
+          - "null"
           description: |-
             Live files considered BEFORE the manifest time-bounds prune —
             `files_considered - files_to_scan` is planning-time pruning's win.
@@ -1815,7 +1994,7 @@ components:
         files_to_scan:
           type:
           - integer
-          - 'null'
+          - "null"
           minimum: 0
         warnings:
           type: array
@@ -1830,7 +2009,7 @@ components:
         end_ts:
           type:
           - string
-          - 'null'
+          - "null"
           format: date-time
           description: Optional exclusive upper time bound.
         index_id:
@@ -1845,7 +2024,7 @@ components:
         start_ts:
           type:
           - string
-          - 'null'
+          - "null"
           format: date-time
           description: |-
             Optional inclusive lower time bound, narrowing the files the executor
@@ -1871,12 +2050,12 @@ components:
         end_ts:
           type:
           - string
-          - 'null'
+          - "null"
           format: date-time
         error:
           type:
           - string
-          - 'null'
+          - "null"
         files_rewritten:
           type: integer
           minimum: 0
@@ -1891,14 +2070,14 @@ components:
         start_ts:
           type:
           - string
-          - 'null'
+          - "null"
           format: date-time
         state:
-          $ref: '#/components/schemas/DeleteTaskState'
+          $ref: "#/components/schemas/DeleteTaskState"
         table_uuid:
           type:
           - string
-          - 'null'
+          - "null"
           description: |-
             The Iceberg table this deletion was accepted against — the index
             incarnation it is authorised for. An index id can be deleted and
@@ -1928,7 +2107,7 @@ components:
         age_seconds:
           type:
           - integer
-          - 'null'
+          - "null"
           format: int64
           description: |-
             Whole seconds from claim creation to `observed_at`, floored at zero for
@@ -1937,12 +2116,12 @@ components:
         claimant:
           type:
           - string
-          - 'null'
+          - "null"
           format: uuid
         claimed_at:
           type:
           - string
-          - 'null'
+          - "null"
           format: date-time
         observed_at:
           type: string
@@ -1951,13 +2130,13 @@ components:
           type: boolean
     DeleteTaskGetResponse:
       allOf:
-      - $ref: '#/components/schemas/DeleteTask'
+      - $ref: "#/components/schemas/DeleteTask"
       - type: object
         properties:
           claim:
             oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/DeleteTaskClaimObservation'
+            - type: "null"
+            - $ref: "#/components/schemas/DeleteTaskClaimObservation"
               description: Present only while the persisted task state is `pending`.
       description: |-
         GET-only representation of a delete task. POST and collection-list
@@ -2032,10 +2211,10 @@ components:
         field_mappings:
           type: array
           items:
-            $ref: '#/components/schemas/FieldMappingSchema'
+            $ref: "#/components/schemas/FieldMappingSchema"
           description: Declared typed fields in stable order.
         mode:
-          $ref: '#/components/schemas/MappingMode'
+          $ref: "#/components/schemas/MappingMode"
           description: Handling mode for unmapped attributes.
         tag_fields:
           type: array
@@ -2063,7 +2242,7 @@ components:
           tokenizer:
             type:
             - string
-            - 'null'
+            - "null"
             description: |-
               Named tokenizer/analyzer to use for this field. Serialized even when
               absent (as `null`) to match the index mapping wire format.
@@ -2171,7 +2350,7 @@ components:
         files:
           type: array
           items:
-            $ref: '#/components/schemas/FileAttributionEntry'
+            $ref: "#/components/schemas/FileAttributionEntry"
         files_omitted:
           type: integer
           format: int64
@@ -2210,7 +2389,7 @@ components:
           type: string
     HealthResponse:
       type: object
-      description: '`GET /healthz` response body.'
+      description: "`GET /healthz` response body."
       required:
       - status
       properties:
@@ -2225,12 +2404,12 @@ components:
       - doc_mapping
       properties:
         doc_mapping:
-          $ref: '#/components/schemas/DocMapping'
+          $ref: "#/components/schemas/DocMapping"
           description: Declared document mapping.
         index_at_flush:
           type:
           - boolean
-          - 'null'
+          - "null"
           description: |-
             Whether the ingest drain builds the raw-text search indexes (inverted
             index, trigram + row-group token blooms, Puffin sidecar) inline with
@@ -2245,8 +2424,8 @@ components:
           description: Human-facing index identifier.
         retention:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/RetentionPolicy'
+          - type: "null"
+          - $ref: "#/components/schemas/RetentionPolicy"
             description: Optional retention policy.
       additionalProperties: false
     IndexTemplate:
@@ -2259,7 +2438,7 @@ components:
       - doc_mapping
       properties:
         doc_mapping:
-          $ref: '#/components/schemas/DocMapping'
+          $ref: "#/components/schemas/DocMapping"
           description: Document mapping to materialize onto the created index.
         index_id_patterns:
           type: array
@@ -2272,8 +2451,8 @@ components:
           description: Higher values win when multiple templates match.
         retention:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/RetentionPolicy'
+          - type: "null"
+          - $ref: "#/components/schemas/RetentionPolicy"
             description: Optional retention policy copied into the created index.
         template_id:
           type: string
@@ -2359,7 +2538,7 @@ components:
         spans:
           type: array
           items:
-            $ref: '#/components/schemas/JaegerSpan'
+            $ref: "#/components/schemas/JaegerSpan"
         traceID:
           type: string
     JaegerTracesResponse:
@@ -2372,14 +2551,14 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/JaegerTrace'
+            $ref: "#/components/schemas/JaegerTrace"
         total:
           type: integer
           description: Number of traces in `data`.
           minimum: 0
     JobCancelResponse:
       type: object
-      description: '`202 Accepted` body of `DELETE /api/v1/jobs/{id}`.'
+      description: "`202 Accepted` body of `DELETE /api/v1/jobs/{id}`."
       required:
       - cancelled
       properties:
@@ -2400,30 +2579,30 @@ components:
       properties:
         cost:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/CostReport'
+          - type: "null"
+          - $ref: "#/components/schemas/CostReport"
         ended_at:
           type:
           - string
-          - 'null'
+          - "null"
           format: date-time
         error:
           type:
           - string
-          - 'null'
+          - "null"
         job_id:
           type: string
         priority:
-          $ref: '#/components/schemas/Priority'
+          $ref: "#/components/schemas/Priority"
         query:
           type: string
         started_at:
           type:
           - string
-          - 'null'
+          - "null"
           format: date-time
         status:
-          $ref: '#/components/schemas/JobStatus'
+          $ref: "#/components/schemas/JobStatus"
         submitted_at:
           type: string
           format: date-time
@@ -2450,7 +2629,7 @@ components:
           description: Always 412.
           minimum: 0
         current:
-          $ref: '#/components/schemas/IndexConfig'
+          $ref: "#/components/schemas/IndexConfig"
           description: Configuration from the exact commit base that rejected the condition.
         error:
           type: string
@@ -2464,12 +2643,12 @@ components:
       - strict
     MemoryPoolDebugResponse:
       type: object
-      description: '`GET /debug/memory-pool` response body.'
+      description: "`GET /debug/memory-pool` response body."
       properties:
         limit_bytes:
           type:
           - integer
-          - 'null'
+          - "null"
           format: int64
           description: |-
             Process-wide DataFusion pool limit in bytes. `null` when the pool is
@@ -2478,7 +2657,7 @@ components:
         reserved_bytes:
           type:
           - integer
-          - 'null'
+          - "null"
           format: int64
           description: |-
             Bytes currently reserved by DataFusion operators. `null` when the pool
@@ -2487,7 +2666,7 @@ components:
         top_consumers:
           type:
           - string
-          - 'null'
+          - "null"
           description: |-
             DataFusion's report for the ten consumers with the largest current
             reservations. `null` when tracking is disabled or the pool is
@@ -2516,8 +2695,8 @@ components:
           minimum: 0
         distributed:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/DistPhaseStats'
+          - type: "null"
+          - $ref: "#/components/schemas/DistPhaseStats"
         plan_micros:
           type: integer
           format: int64
@@ -2553,7 +2732,7 @@ components:
         error:
           type:
           - string
-          - 'null'
+          - "null"
         status:
           type: string
           example: ready
@@ -2567,8 +2746,8 @@ components:
       properties:
         approximation:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/Approximation'
+          - type: "null"
+          - $ref: "#/components/schemas/Approximation"
             description: |-
               Present ONLY when the answer is approximate, and then always — with the
               bound and the residual, never a bare flag.
@@ -2582,15 +2761,15 @@ components:
             type: string
         cost:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/CostReport'
+          - type: "null"
+          - $ref: "#/components/schemas/CostReport"
             description: |-
               Cost report attached to every successful response so callers
               can track effort without a separate `/explain` round trip.
         max_rows:
           type:
           - integer
-          - 'null'
+          - "null"
           description: |-
             Effective row cap that produced the truncation. Only present
             when `truncated == true`.
@@ -2605,8 +2784,8 @@ components:
           description: One JSON object per row, keyed by `columns`.
         stats:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/ScanStats'
+          - type: "null"
+          - $ref: "#/components/schemas/ScanStats"
             description: |-
               Per-query leaf scan accounting (rows/bytes read, spill). Set by the
               execution path; `Some(ScanStats::default())` on fast-path responses.
@@ -2638,30 +2817,30 @@ components:
         circuit_breakers:
           type:
           - boolean
-          - 'null'
+          - "null"
           description: |-
             `false` bypasses the wall-clock timeout but **does not** lift
             the bytes-scanned or row-returned ceilings. Default `true`.
         max_bytes_scanned:
           type:
           - integer
-          - 'null'
+          - "null"
           format: int64
           minimum: 0
         max_rows_returned:
           type:
           - integer
-          - 'null'
+          - "null"
           minimum: 0
         max_rows_scanned:
           type:
           - integer
-          - 'null'
+          - "null"
           minimum: 0
         timeout_seconds:
           type:
           - integer
-          - 'null'
+          - "null"
           format: int64
           minimum: 0
       additionalProperties: false
@@ -2679,7 +2858,7 @@ components:
         schedule:
           type:
           - string
-          - 'null'
+          - "null"
           description: Optional evaluator schedule string.
       additionalProperties: false
     ScanDetail:
@@ -2735,8 +2914,8 @@ components:
           minimum: 0
         file_attribution:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/FileAttribution'
+          - type: "null"
+          - $ref: "#/components/schemas/FileAttribution"
             description: |-
               Bounded file-task membership for geometry joins. Keys are relative to
               the Iceberg table location; omissions are explicit and make
@@ -2801,7 +2980,7 @@ components:
         ordering:
           type:
           - string
-          - 'null'
+          - "null"
           description: |-
             Scan-ordering gate decision: `"advertised"` (the scan streams sorted,
             ordered LIMITs early-stop) or the refusal reason (`"filtered"`,
@@ -2866,8 +3045,8 @@ components:
           minimum: 0
         phases:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/PhaseStats'
+          - type: "null"
+          - $ref: "#/components/schemas/PhaseStats"
             description: |-
               #85: per-phase wall breakdown for shape-level attribution (which stage
               a slow query spent its time in). `None` on paths that don't measure
@@ -2879,8 +3058,8 @@ components:
           minimum: 0
         scan:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/ScanDetail'
+          - type: "null"
+          - $ref: "#/components/schemas/ScanDetail"
             description: |-
               Per-request scan attribution: what the plan assigned, what each pruning
               mechanism dropped, what the read actually cost. `None` when the plan
@@ -2888,7 +3067,7 @@ components:
         served_by:
           type:
           - string
-          - 'null'
+          - "null"
           description: |-
             WHICH path produced the answer.
 
@@ -2929,7 +3108,7 @@ components:
           minimum: 0
     ShardPin:
       type: object
-      description: '#89/#1655: one table generation a shard read is pinned to.'
+      description: "#89/#1655: one table generation a shard read is pinned to."
       required:
       - table
       properties:
@@ -2942,7 +3121,7 @@ components:
         schema_id:
           type:
           - integer
-          - 'null'
+          - "null"
           format: int32
           description: |-
             #2554: the Iceberg schema id the coordinator PLANNED against, from the
@@ -2970,7 +3149,7 @@ components:
         snapshot_id:
           type:
           - integer
-          - 'null'
+          - "null"
           format: int64
           description: The exact committed snapshot to read. Mutually exclusive with `empty`.
         table:
@@ -2978,7 +3157,7 @@ components:
         table_uuid:
           type:
           - string
-          - 'null'
+          - "null"
           description: |-
             #2921: the Iceberg table incarnation the coordinator captured.
             Snapshot and schema identifiers can both repeat when a snapshotless
@@ -3000,8 +3179,8 @@ components:
       properties:
         pin:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/ShardPin'
+          - type: "null"
+          - $ref: "#/components/schemas/ShardPin"
             description: |-
               #89/#1655: the exact table generation used to construct the
               coordinator's WAL partial — a snapshot by id (or the initial empty
@@ -3019,7 +3198,7 @@ components:
               partial carries the schema the coordinator planned. Omit `pin` to read
               the worker's current generation deliberately.
         priority:
-          $ref: '#/components/schemas/Priority'
+          $ref: "#/components/schemas/Priority"
           description: |-
             Original query priority, forwarded by the coordinator so the worker
             applies the matching tier's mid-flight breaker. Defaults to interactive
@@ -3028,12 +3207,12 @@ components:
           type: string
         shard:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/ShardParam'
+          - type: "null"
+          - $ref: "#/components/schemas/ShardParam"
         tenant:
           type:
           - string
-          - 'null'
+          - "null"
           description: |-
             The tenant the ORIGINAL caller resolved to, forwarded by the coordinator.
 
@@ -3092,18 +3271,18 @@ components:
             billing, reconciliation, anything where the number is the deliverable.
         format:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/QueryFormat'
+          - type: "null"
+          - $ref: "#/components/schemas/QueryFormat"
         limits:
-          $ref: '#/components/schemas/RequestLimits'
+          $ref: "#/components/schemas/RequestLimits"
         priority:
-          $ref: '#/components/schemas/Priority'
+          $ref: "#/components/schemas/Priority"
         query:
           type: string
         shard:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/ShardParam'
+          - type: "null"
+          - $ref: "#/components/schemas/ShardParam"
             description: |-
               Distributed-query shard (#7): when set, this worker scans only its
               `index`-of-`count` slice of the table's files. A coordinator fans the
@@ -3111,10 +3290,10 @@ components:
               results. Absent ⇒ a normal whole-table scan.
     SqlSuccess:
       oneOf:
-      - $ref: '#/components/schemas/RecordsResponse'
+      - $ref: "#/components/schemas/RecordsResponse"
         description: Result rows. The normal case.
-      - $ref: '#/components/schemas/CostReport'
-        description: 'Cost estimate only, returned when the request set `dry_run: true`.'
+      - $ref: "#/components/schemas/CostReport"
+        description: "Cost estimate only, returned when the request set `dry_run: true`."
       description: |-
         The two success bodies `POST /api/v1/sql` can return at `200`: a dry run
         answers with only a cost report, while a real query answers with result rows.
@@ -3122,7 +3301,7 @@ components:
     query_token:
       type: http
       scheme: bearer
-      description: '`Authorization: Bearer <token>`. With OIDC configured the token is a JWT and its claims select the tenant; otherwise it is matched against the cluster''s static token list. A server started with neither accepts unauthenticated requests.'
+      description: "`Authorization: Bearer <token>`. With OIDC configured the token is a JWT and its claims select the tenant; otherwise it is matched against the cluster's static token list. A server started with neither accepts unauthenticated requests."
 security:
 - query_token: []
 tags:
