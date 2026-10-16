@@ -374,8 +374,11 @@ drain is ~28–90 K/s and degrades. Order: exhaust single-node levers, then scal
 - **B.1.3 — Parallel drain.** Multiple concurrent WAL→Iceberg drain workers (the
   WAL is already per-tenant/segment-sharded). Iceberg optimistic concurrency +
   `update_table_with_base` handle parallel commits; UUID filenames avoid dup-check.
-  The decoded-memory correction in #6744 admits uncompressed Arrow IPC bytes,
-  not compressed WAL file lengths, across those workers. At the packaged 1Gi
+  The decoded-memory corrections in #6744 and #6750 admit uncompressed Arrow
+  IPC bytes, not compressed WAL file lengths. The filesystem path applies the
+  sum across its workers. The catalog-claim path fetches physical windows with
+  concurrent GETs, preflights every fetched frame, and commits decoded-byte
+  subgroups with their own exact consumed-proof entries. At the packaged 1Gi
   limit the decoded input target is 128 MiB; the 1024 MiB shipped in-flight
   setting caps that target for larger compactors. One oversized segment is
   admitted alone for progress, so neither value is a hard memory guarantee.

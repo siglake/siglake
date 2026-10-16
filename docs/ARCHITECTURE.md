@@ -354,9 +354,15 @@ Arrow IPC bodies. The decoded target is one eighth of the process memory limit,
 never above `SIGLAKE_DRAIN_INFLIGHT_BUDGET_MB`: 128 MiB in the packaged 1Gi
 compactor under the shipped 1024 MiB setting. New WAL zstd frames expose their
 uncompressed size without decoding; segments written by older builds are sized
-through a streaming decoder before claim. An oversized segment is admitted
-alone to preserve progress, so the target does not guarantee peak memory or
-prevent every OOM. In a combined-role process whose cgroup limit is at or below
+through a streaming decoder before claim. The catalog-claim path uses the same
+decoded target. It fetches registered-physical-byte windows with concurrent
+object GETs, sizes each body before Arrow decode, and commits each tenant/index
+claim in decoded-byte-bounded subgroups. Each subgroup carries only its own
+segment identities into the consumed proof; ownership refusals remain terminal
+quarantines, and a later subgroup failure releases every claim not already
+committed. An oversized segment is admitted alone to preserve progress, so the
+target does not guarantee peak memory or prevent every OOM. In a combined-role
+process whose cgroup limit is at or below
 the packaged 1Gi setting, a drain cycle and a re-clustering pass take one shared
 decoded-work permit. The permit spans the complete drain claim through append
 and the complete re-clustering pass. Blocking WAL readers retain the permit

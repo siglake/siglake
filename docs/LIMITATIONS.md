@@ -1777,6 +1777,19 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   and the gauge is a last observation, so the alert carries
   `increase(siglake_inline_coverage_census_total[1h]) > 0` as a liveness arm to
   keep a compactor that stopped censusing from paging off a stale reading.
+- **Catalog-claim WAL admission is a decoded-input target, not a process-memory
+  cap.** The claim path derives the same one-eighth-of-container target as the
+  filesystem drain, fetches a window bounded by the catalog's immutable
+  physical-byte ledger with concurrent object GETs, and sizes every fetched WAL
+  frame before Arrow decode. It then commits subgroups whose summed uncompressed
+  IPC bodies fit the target. Compressed bodies for one fetch window remain live
+  beside the decoded subgroup, and the append can retain mapped, sorted and
+  encoded representations downstream; none of those are included in the IPC
+  sum. A segment larger than the target runs alone so it cannot be stranded.
+  Legacy zstd frames without a declared content size pay a streaming sizing
+  pass, and malformed frames receive a conservative charge before the existing
+  decode error releases them for retry. These exceptions preserve progress and
+  corrupt-segment disposition, but they prevent a hard memory-cap claim.
 - **A streamed delete rewrite never holds its input, but it does hold its
   survivors.** The streaming arm decodes the candidate a batch at a time, and
   the writer it streams into buffers the open row group as decoded Arrow
