@@ -385,6 +385,72 @@ array_contains() {
   return 1
 }
 
+# Retain healthy compactor evidence too: a green round can still exercise the
+# unsupported-store refusal boundary. Collection is best-effort and records
+# failures explicitly; it never substitutes for a runtime acceptance reader.
+compactor_evidence_command() {
+  local directory=$1 name=$2 rc=0
+  shift 2
+  "$@" >"$directory/$name.stdout" 2>"$directory/$name.stderr" || rc=$?
+  printf '%s\t%s\n' "$name" "$rc" >>"$directory/commands.tsv"
+}
+
+capture_compactor_evidence() {
+  local directory="$RESULTS_DIR/compactor-evidence" pod restarts
+  local -a kc=(kubectl --context "$KUBE_CONTEXT" --request-timeout=30s -n "$NAMESPACE")
+  mkdir -p "$RESULTS_DIR" || return 0
+  if ! mkdir "$directory"; then
+    printf 'COMPACTOR_EVIDENCE_INCOMPLETE existing_or_unwritable=%s\n' "$directory"
+    return 0
+  fi
+  compactor_evidence_command "$directory" deployment "${kc[@]}" get deployment siglake-compactor -o json
+  compactor_evidence_command "$directory" pods "${kc[@]}" get pods \
+    -l 'app.kubernetes.io/instance=siglake,app.kubernetes.io/component=compactor' -o json
+  python3 - "$directory/pods.stdout" >"$directory/targets.tsv" 2>"$directory/targets.stderr" <<'PYPODS' || true
+import json, re, sys
+items = json.load(open(sys.argv[1]))["items"]
+assert items, "no compactor pods"
+for pod in items:
+    meta = pod["metadata"]
+    assert meta["labels"]["app.kubernetes.io/instance"] == "siglake"
+    assert meta["labels"]["app.kubernetes.io/component"] == "compactor"
+    name = meta["name"]
+    assert re.fullmatch(r"[a-z0-9][a-z0-9.-]*", name)
+    statuses = [s for s in pod.get("status", {}).get("containerStatuses", []) if s["name"] == "compactor"]
+    assert len(statuses) == 1, "missing compactor status"
+    print(name, statuses[0]["restartCount"], sep="\t")
+PYPODS
+  while IFS=$'\t' read -r pod restarts; do
+    [[ -n "$pod" ]] || continue
+    compactor_evidence_command "$directory" "$pod-current" "${kc[@]}" logs "$pod" -c compactor --timestamps --tail=-1
+    if [[ "$restarts" =~ ^[0-9]+$ ]] && ((restarts > 0)); then
+      compactor_evidence_command "$directory" "$pod-previous" "${kc[@]}" logs "$pod" -c compactor --previous --timestamps --tail=-1
+    fi
+    compactor_evidence_command "$directory" "$pod-metrics" "${kc[@]}" get --raw \
+      "/api/v1/namespaces/$NAMESPACE/pods/$pod:9101/proxy/metrics"
+    printf 'COMPACTOR_CURRENT_LOG_BEGIN pod=%s\n' "$pod"
+    cat "$directory/$pod-current.stdout" || true
+    printf 'COMPACTOR_CURRENT_LOG_END pod=%s\n' "$pod"
+    if [[ -f "$directory/$pod-previous.stdout" ]]; then
+      printf 'COMPACTOR_PREVIOUS_LOG_BEGIN pod=%s\n' "$pod"
+      cat "$directory/$pod-previous.stdout" || true
+      printf 'COMPACTOR_PREVIOUS_LOG_END pod=%s\n' "$pod"
+    fi
+  done <"$directory/targets.tsv"
+  python3 - "$directory" <<'PYMANIFEST' || true
+import hashlib, json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+commands = [dict(name=n, exit_code=int(rc)) for n, rc in (line.split("\t") for line in (p/"commands.tsv").read_text().splitlines())]
+targets = (p/"targets.tsv").read_text().splitlines()
+complete = bool(targets) and not (p/"targets.stderr").stat().st_size and all(c["exit_code"] == 0 for c in commands)
+receipt = {"status": "capture_complete" if complete else "capture_incomplete", "commands": commands,
+           "targets": targets, "scope": "One pre-teardown capture; absence of refusal text is not proof of support or conditional-write acceptance.",
+           "files": {f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in p.iterdir() if f.is_file()}}
+(p/"capture.json").write_text(json.dumps(receipt, indent=2)+"\n")
+print("COMPACTOR_EVIDENCE", receipt["status"], str(p/"capture.json"))
+PYMANIFEST
+}
+
 # Cluster state for the round log, printed before the cluster is deleted so a
 # round is readable from its log alone. Kind round #2 lost the failed
 # migrate-schema hook's stderr to the immediate teardown and its root cause had
@@ -392,7 +458,8 @@ array_contains() {
 # dump must never change the status cleanup exits with.
 #
 # On every exit: pods with restart counts and BackOff events, which is what the
-# playbook's restart check reads. On a failed exit, additionally: nodes and
+# playbook's restart check reads, plus healthy compactor logs/config/metrics.
+# On a failed exit, additionally: nodes and
 # their complete taint lists, the release namespace's Jobs and events, describe
 # + logs of every migrate-schema or failed Job, and describe + logs of every
 # pod that is not Ready.
@@ -449,6 +516,8 @@ for item in items:
     "${kc[@]}" -n "$ns" logs "$pod" --previous -c "$container" --tail=60 || true
     printf 'PREVIOUS_LOGS_END\n'
   done
+
+  capture_compactor_evidence || true
 
   [[ "$status" -ne 0 ]] || return 0
 

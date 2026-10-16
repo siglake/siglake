@@ -337,6 +337,8 @@ jobs:
       # the whole dump to leave the round's exit status alone. No cluster.
       - name: a failed kind round dumps each pod's logs once
         run: scripts/check-kind-round-diagnostics.sh
+      - name: Check kind compactor evidence capture
+        run: scripts/check-kind-round-compactor-evidence.sh
       # The 2026-09-16 sweep rule: the published tree does not discuss non-OSS
       # competitors. Task #4569 cleared one vendor's name and its
       # event-collector protocol out of sixteen files by hand -- one of them a
