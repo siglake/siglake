@@ -2092,3 +2092,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   still needs either a project-published build with an AGPL-3.0 redistribution
   policy or a qualified replacement S3 implementation. Tracked as #6118 and
   #6252.
+
+Raw-carrier rolling-writer limitation: old writers may append, but concurrent
+promotion declarations from binaries that only know v1/v2 are unsupported once
+v3 is present. If those compatibility views diverge, current readers decline
+promotion qualification and current declarations refuse without overwriting
+the older writer's addition. Upgrade declarers and reconcile source identities
+explicitly before declaring again; this does not trigger automatic migration.

@@ -3593,6 +3593,19 @@ impl DeclarePromotionsAction {
     /// a disjoint declaration which won the preceding attempt is retained.
     fn plan(&self, table: &Table) -> iceberg::Result<PromotionDeclarationPlan> {
         let properties = table.metadata().properties();
+        if !siglake_core::promoted_compatibility_matches(
+            properties
+                .get(siglake_core::PROMOTED_PROPERTY_V3_KEY)
+                .map(String::as_str),
+            properties
+                .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+                .map(String::as_str),
+            properties
+                .get(siglake_core::PROMOTED_PROPERTY_KEY)
+                .map(String::as_str),
+        ) {
+            return Err(Self::invalid("promotion compatibility views diverged; stop mixed-version declarations and reconcile identities before declaring more columns"));
+        }
         let existing = match properties
             .get(siglake_core::PROMOTED_PROPERTY_V3_KEY)
             .or_else(|| properties.get(siglake_core::PROMOTED_PROPERTY_V2_KEY))

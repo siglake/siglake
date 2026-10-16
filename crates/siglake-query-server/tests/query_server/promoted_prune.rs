@@ -684,6 +684,49 @@ async fn raw_carrier_managed_index_keeps_answers_across_backfill_and_old_writer(
     ));
     assert_eq!(nested_object_answer(&app, SQL).await, doubled);
     assert!(!nested_object_plan(&app, SQL).await.contains("attr_get"));
+    // A genuinely old declarer changes its v1/v2 views without knowing v3.
+    // Never silently drop that addition or qualify a divergent metadata set.
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let table = ice.catalog().load_table(&ident).await.unwrap();
+    let old_view = table.metadata().properties()[siglake_core::PROMOTED_PROPERTY_V2_KEY].clone();
+    let mut old_columns = siglake_core::promoted_columns_from_property(Some(&old_view));
+    old_columns.push(PromotedColumn::parse_spec("added:string:old_added").unwrap());
+    let changed = siglake_core::promoted_property_json(&old_columns).unwrap();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_table_properties()
+        .set(
+            siglake_core::PROMOTED_PROPERTY_V2_KEY.into(),
+            changed.clone(),
+        )
+        .set(siglake_core::PROMOTED_PROPERTY_KEY.into(), changed.clone())
+        .apply(tx)
+        .unwrap();
+    tx.commit(ice.catalog().as_ref()).await.unwrap();
+    let reopened = IcebergContext::open(&warehouse).await.unwrap();
+    assert!(reopened
+        .attr_rewrite_map_for(&ident)
+        .await
+        .unwrap()
+        .is_none());
+    let extra = PromotedColumn::parse_spec("later:string:later_value").unwrap();
+    let error = reopened
+        .declare_promotions_for(&ident, &[extra])
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("compatibility views diverged"));
+    let after = reopened.catalog().load_table(&ident).await.unwrap();
+    assert_eq!(
+        after.metadata().properties()[siglake_core::PROMOTED_PROPERTY_V2_KEY],
+        changed
+    );
+    assert_eq!(
+        after.metadata().properties()[siglake_core::PROMOTED_PROPERTY_V3_KEY],
+        table.metadata().properties()[siglake_core::PROMOTED_PROPERTY_V3_KEY]
+    );
+    let app = router(AppState::new(Arc::new(reopened), AuthConfig::open()));
+    assert_eq!(nested_object_answer(&app, SQL).await, doubled);
+    assert!(nested_object_plan(&app, SQL).await.contains("attr_get"));
 }
 
 /// The full autonomous loop, zero configuration: hot attribute keys promote

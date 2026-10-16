@@ -132,6 +132,35 @@ pub fn promoted_columns_from_property(json: Option<&str>) -> Vec<PromotedColumn>
         .unwrap_or_default()
 }
 
+/// v3 is authoritative only while older compatibility properties are its exact
+/// supported projections. An old writer may append safely, but its declaration
+/// must not be silently overwritten or inferred to be a v3 identity.
+pub fn promoted_compatibility_matches(
+    carrier_aware: Option<&str>,
+    expression_aware: Option<&str>,
+    legacy: Option<&str>,
+) -> bool {
+    let Some(json) = carrier_aware else {
+        return true;
+    };
+    let Ok(columns) = serde_json::from_str::<Vec<PromotedColumn>>(json) else {
+        return false;
+    };
+    if columns.iter().any(|c| !c.supported_carrier_type()) {
+        return false;
+    }
+    let attributes: Vec<_> = columns
+        .iter()
+        .filter(|c| c.carrier.is_attributes())
+        .cloned()
+        .collect();
+    let parse = |value: Option<&str>| {
+        value.and_then(|s| serde_json::from_str::<Vec<PromotedColumn>>(s).ok())
+    };
+    parse(expression_aware) == Some(attributes)
+        && parse(legacy) == Some(direct_promotions(&columns))
+}
+
 /// Read the newest present property without falling back past malformed
 /// metadata. v3 includes the carrier, v2 the attributes expression, and v1
 /// the legacy direct attributes identity.
@@ -140,6 +169,9 @@ pub fn promoted_columns_from_properties(
     expression_aware: Option<&str>,
     legacy: Option<&str>,
 ) -> Vec<PromotedColumn> {
+    if !promoted_compatibility_matches(carrier_aware, expression_aware, legacy) {
+        return Vec::new();
+    }
     match carrier_aware.or(expression_aware) {
         Some(json) => promoted_columns_from_property(Some(json)),
         None => promoted_columns_from_property(legacy),
@@ -585,7 +617,7 @@ mod tests {
         );
         let current = promoted_property_json(&[raw.clone()]).unwrap();
         assert_eq!(
-            promoted_columns_from_properties(Some(&current), None, Some(&legacy)),
+            promoted_columns_from_properties(Some(&current), Some("[]"), Some("[]")),
             vec![raw]
         );
         assert!(promoted_columns_from_properties(Some("invalid"), None, Some(&legacy)).is_empty());
@@ -595,6 +627,46 @@ mod tests {
             Some(&legacy)
         )
         .is_empty());
+    }
+
+    #[test]
+    fn raw_carrier_compatibility_divergence_is_not_a_qualified_identity() {
+        let attr = PromotedColumn::parse_spec("value:string:attr_value").unwrap();
+        let mut raw = PromotedColumn::parse_spec("value:string:raw_value").unwrap();
+        raw.carrier = PromotionCarrier::Raw;
+        let current = promoted_property_json(&[attr.clone(), raw]).unwrap();
+        let compatible = promoted_property_json(&[attr.clone()]).unwrap();
+        assert!(promoted_compatibility_matches(
+            Some(&current),
+            Some(&compatible),
+            Some(&compatible)
+        ));
+        let extra = PromotedColumn::parse_spec("extra:string:extra_value").unwrap();
+        let changed = promoted_property_json(&[attr, extra]).unwrap();
+        assert!(!promoted_compatibility_matches(
+            Some(&current),
+            Some(&changed),
+            Some(&changed)
+        ));
+        assert!(
+            promoted_columns_from_properties(Some(&current), Some(&changed), Some(&changed))
+                .is_empty()
+        );
+        assert!(!promoted_compatibility_matches(
+            Some(&current),
+            None,
+            Some(&compatible)
+        ));
+        assert!(!promoted_compatibility_matches(
+            Some(&current),
+            Some("bad"),
+            Some(&compatible)
+        ));
+        assert!(!promoted_compatibility_matches(
+            Some(&current),
+            Some(&compatible),
+            Some("[]")
+        ));
     }
 
     fn ev(attributes: Option<&str>) -> Event {

@@ -23,10 +23,11 @@ pub use build_info::{build_info, BuildInfo, BUILD_VERSION};
 pub use mapping::{map_carrier_batch, map_carrier_batch_with_stats, CarrierBatchMapping};
 pub use promote::{
     direct_promotions, promote_attributes, promoted_columns_from_properties,
-    promoted_columns_from_property, promoted_property_json, promotion_extractor_version,
-    repromote_attributes, PromotedColumn, PromotedType, PromotionCarrier, ATTR_EXTRACTOR_VERSION,
-    COMPOSED_ATTR_EXTRACTOR_VERSION, PROMOTED_PROPERTY_KEY, PROMOTED_PROPERTY_V2_KEY,
-    PROMOTED_PROPERTY_V3_KEY, RAW_EXTRACTOR_VERSION,
+    promoted_columns_from_property, promoted_compatibility_matches, promoted_property_json,
+    promotion_extractor_version, repromote_attributes, PromotedColumn, PromotedType,
+    PromotionCarrier, ATTR_EXTRACTOR_VERSION, COMPOSED_ATTR_EXTRACTOR_VERSION,
+    PROMOTED_PROPERTY_KEY, PROMOTED_PROPERTY_V2_KEY, PROMOTED_PROPERTY_V3_KEY,
+    RAW_EXTRACTOR_VERSION,
 };
 
 /// Point-in-time process memory reported by jemalloc and the process cgroup.
