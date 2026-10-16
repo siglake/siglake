@@ -131,8 +131,8 @@ clap = { version = "4", features = ["derive", "env"] }
 # its documentation in the same call, so an endpoint cannot ship undocumented
 # (see `docs/api/README.md`). NOTE: do NOT enable utoipa's `yaml` feature — it
 # pulls `serde_norway` + `unsafe-libyaml-norway`, and cargo feature unification
-# would land both in the shipped binaries. `siglake-openapi` uses the
-# workspace's existing `serde_yaml` for serialization instead.
+# would land a second YAML stack in the shipped binaries. `siglake-openapi`
+# serializes with the same `serde-saphyr` stack as kube-client instead.
 # `chrono` here is a codegen flag only (teaches the derive to map
 # `DateTime<Utc>` -> string/date-time); it adds no dependency.
 utoipa = { version = "5.5", default-features = false, features = ["macros", "axum_extras", "chrono", "uuid"] }

@@ -44,7 +44,8 @@ impl AdoptionReport {
         out.push_str("# --- synthesized SiglakeCluster: this whole output is one manifest ---\n");
         out.push_str("# Save it (cluster.yaml) and apply it at step 5; every line below the\n");
         out.push_str("# resource is a comment, so `kubectl apply -f` reads only the resource.\n");
-        out.push_str(&serde_yaml::to_string(&self.cluster).context("serialize SiglakeCluster")?);
+        let cluster = serde_saphyr::to_string(&self.cluster).context("serialize SiglakeCluster")?;
+        out.push_str(&without_trailing_whitespace(&cluster));
         if self.findings.is_empty() {
             out.push_str("# preflight: no findings — proceed to the runbook\n");
         } else {
@@ -60,6 +61,18 @@ impl AdoptionReport {
     }
 }
 
+fn without_trailing_whitespace(yaml: &str) -> String {
+    let mut clean = yaml
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if yaml.ends_with('\n') {
+        clean.push('\n');
+    }
+    clean
+}
+
 /// The namespace the handover targets: `--adopt-namespace` when it carries
 /// one, otherwise the release name. The fallback is what every runbook step
 /// assumed before the flag existed (`-n {name}`), so a release whose
@@ -71,19 +84,19 @@ pub fn adoption_namespace_from<'a>(flag: Option<&'a str>, cluster_name: &'a str)
     }
 }
 
-fn yaml_str(v: &serde_yaml::Value, path: &[&str]) -> Option<String> {
+fn yaml_str(v: &serde_json::Value, path: &[&str]) -> Option<String> {
     let mut cur = v;
     for key in path {
         cur = cur.get(key)?;
     }
     match cur {
-        serde_yaml::Value::String(s) if !s.is_empty() => Some(s.clone()),
-        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
 }
 
-fn yaml_i64(v: &serde_yaml::Value, path: &[&str]) -> Option<i64> {
+fn yaml_i64(v: &serde_json::Value, path: &[&str]) -> Option<i64> {
     let mut cur = v;
     for key in path {
         cur = cur.get(key)?;
@@ -91,7 +104,7 @@ fn yaml_i64(v: &serde_yaml::Value, path: &[&str]) -> Option<i64> {
     cur.as_i64()
 }
 
-fn yaml_bool(v: &serde_yaml::Value, path: &[&str]) -> Option<bool> {
+fn yaml_bool(v: &serde_json::Value, path: &[&str]) -> Option<bool> {
     let mut cur = v;
     for key in path {
         cur = cur.get(key)?;
@@ -101,7 +114,7 @@ fn yaml_bool(v: &serde_yaml::Value, path: &[&str]) -> Option<bool> {
 
 /// A chart list of non-empty strings (`ingester.allowedTenants`,
 /// `<tier>.tokens.list`). Absent and empty are the same answer.
-fn yaml_strings(v: &serde_yaml::Value, path: &[&str]) -> Vec<String> {
+fn yaml_strings(v: &serde_json::Value, path: &[&str]) -> Vec<String> {
     let mut cur = v;
     for key in path {
         let Some(next) = cur.get(key) else {
@@ -109,7 +122,7 @@ fn yaml_strings(v: &serde_yaml::Value, path: &[&str]) -> Vec<String> {
         };
         cur = next;
     }
-    cur.as_sequence()
+    cur.as_array()
         .map(|items| {
             items
                 .iter()
@@ -125,7 +138,7 @@ fn yaml_strings(v: &serde_yaml::Value, path: &[&str]) -> Vec<String> {
 /// Helm values write CPU counts as numbers (`cpu: 2`); the CR carries the
 /// same value as the string Kubernetes parses it to (`"2"`).
 fn quantity_map(
-    values: &serde_yaml::Value,
+    values: &serde_json::Value,
     path: &[&str],
 ) -> std::collections::BTreeMap<String, String> {
     let mut cur = values;
@@ -135,14 +148,14 @@ fn quantity_map(
         };
         cur = next;
     }
-    cur.as_mapping()
+    cur.as_object()
         .map(|m| {
             m.iter()
                 .filter_map(|(k, v)| {
-                    let k = k.as_str()?.to_string();
+                    let k = k.to_string();
                     let v = match v {
-                        serde_yaml::Value::String(s) if !s.is_empty() => s.clone(),
-                        serde_yaml::Value::Number(n) => n.to_string(),
+                        serde_json::Value::String(s) if !s.is_empty() => s.clone(),
+                        serde_json::Value::Number(n) => n.to_string(),
                         _ => return None,
                     };
                     Some((k, v))
@@ -157,7 +170,7 @@ fn quantity_map(
 /// block adopts to the same pod; a present block is carried key for key
 /// (`spec.resources.<tier>` merges over the defaults the way helm's values
 /// merge does), so a release that raised the query memory limit keeps it.
-fn tier_resources(values: &serde_yaml::Value, tier: &str) -> Option<TierResources> {
+fn tier_resources(values: &serde_json::Value, tier: &str) -> Option<TierResources> {
     let requests = quantity_map(values, &[tier, "resources", "requests"]);
     let limits = quantity_map(values, &[tier, "resources", "limits"]);
     if requests.is_empty() && limits.is_empty() {
@@ -166,11 +179,11 @@ fn tier_resources(values: &serde_yaml::Value, tier: &str) -> Option<TierResource
     Some(TierResources { requests, limits })
 }
 
-fn tier_extra_env(values: &serde_yaml::Value, tier: &str, out: &mut Vec<ExtraEnvVar>) {
+fn tier_extra_env(values: &serde_json::Value, tier: &str, out: &mut Vec<ExtraEnvVar>) {
     let Some(list) = values
         .get(tier)
         .and_then(|t| t.get("extraEnv"))
-        .and_then(|e| e.as_sequence())
+        .and_then(|e| e.as_array())
     else {
         return;
     };
@@ -199,7 +212,7 @@ struct TierOidc {
     tenant_claim: Option<String>,
 }
 
-fn tier_oidc(values: &serde_yaml::Value, tier: &str) -> Option<TierOidc> {
+fn tier_oidc(values: &serde_json::Value, tier: &str) -> Option<TierOidc> {
     Some(TierOidc {
         issuer: yaml_str(values, &[tier, "oidc", "issuer"])?,
         audience: yaml_str(values, &[tier, "oidc", "audience"])?,
@@ -223,7 +236,7 @@ fn tier_oidc(values: &serde_yaml::Value, tier: &str) -> Option<TierOidc> {
 /// stored in plaintext, so it carries issuers, claims and caps but never a
 /// credential.
 fn auth_and_tenancy_findings(
-    values: &serde_yaml::Value,
+    values: &serde_json::Value,
     cluster_name: &str,
     findings: &mut Vec<String>,
 ) {
@@ -388,7 +401,7 @@ fn auth_and_tenancy_findings(
 /// namespaced, so a resource without it is applied wherever the current
 /// kubecontext points, which is not necessarily where the release runs.
 pub fn synthesize_from_values(
-    values: &serde_yaml::Value,
+    values: &serde_json::Value,
     cluster_name: &str,
     namespace: &str,
     catalog_uri: Option<&str>,
@@ -745,7 +758,6 @@ fn runbook_for(name: &str, namespace: &str) -> String {
 mod tests {
     use super::*;
     use crate::render::name_of;
-    use serde::Deserialize;
 
     /// A release that CUSTOMIZED the keys the converter has to read.
     ///
@@ -754,8 +766,8 @@ mod tests {
     /// `s3.warehousePrefix`: both default to "warehouse", so the wrong key
     /// produced the right answer. A fixture that agrees with the code under test
     /// by coincidence is worse than no fixture — it reads as coverage.
-    fn customized_values() -> serde_yaml::Value {
-        serde_yaml::from_str(
+    fn customized_values() -> serde_json::Value {
+        serde_saphyr::from_str(
             r#"
 image:
   repository: registry.example.com/siglake
@@ -878,8 +890,8 @@ query:
         );
     }
 
-    fn standing_values() -> serde_yaml::Value {
-        serde_yaml::from_str(
+    fn standing_values() -> serde_json::Value {
+        serde_saphyr::from_str(
             r#"
 image:
   repository: registry.example.com/siglake
@@ -953,7 +965,7 @@ dispatcher:
     #[test]
     fn fixed_one_pod_catalog_claim_adoption_requires_a_policy_choice() {
         let mut values = standing_values();
-        values["compactor"]["catalogClaim"]["enabled"] = serde_yaml::Value::Bool(true);
+        values["compactor"]["catalogClaim"]["enabled"] = serde_json::Value::Bool(true);
         let report = synthesize_from_values(
             &values,
             "siglake",
@@ -970,7 +982,7 @@ dispatcher:
     #[test]
     fn empty_chart_image_tag_cannot_become_latest_during_adoption() {
         let mut values = standing_values();
-        values["image"]["tag"] = serde_yaml::Value::String(String::new());
+        values["image"]["tag"] = serde_json::Value::String(String::new());
         let report = synthesize_from_values(
             &values,
             "siglake",
@@ -1014,7 +1026,7 @@ dispatcher:
     #[test]
     fn a_chart_delete_task_opt_out_is_reported_at_adoption() {
         let mut values = standing_values();
-        values["compactor"]["deleteTasks"] = serde_yaml::Value::Bool(false);
+        values["compactor"]["deleteTasks"] = serde_json::Value::Bool(false);
         let report = synthesize_from_values(
             &values,
             "siglake",
@@ -1033,7 +1045,7 @@ dispatcher:
 
         // The default, and an explicit `true`, are what the adopted compactor
         // already does — no finding to make.
-        values["compactor"]["deleteTasks"] = serde_yaml::Value::Bool(true);
+        values["compactor"]["deleteTasks"] = serde_json::Value::Bool(true);
         let report = synthesize_from_values(
             &values,
             "siglake",
@@ -1054,7 +1066,7 @@ dispatcher:
     #[test]
     fn a_chart_inverted_index_opt_out_is_reported_at_adoption() {
         let mut values = standing_values();
-        values["compactor"]["invertedIndex"]["enabled"] = serde_yaml::Value::Bool(false);
+        values["compactor"]["invertedIndex"]["enabled"] = serde_json::Value::Bool(false);
         let report = synthesize_from_values(
             &values,
             "siglake",
@@ -1070,7 +1082,7 @@ dispatcher:
             report.findings
         );
 
-        values["compactor"]["invertedIndex"]["enabled"] = serde_yaml::Value::Bool(true);
+        values["compactor"]["invertedIndex"]["enabled"] = serde_json::Value::Bool(true);
         let report = synthesize_from_values(
             &values,
             "siglake",
@@ -1094,7 +1106,7 @@ dispatcher:
     #[test]
     fn a_chart_index_rebuild_opt_in_is_reported_at_adoption() {
         let mut values = standing_values();
-        values["compactor"]["indexRebuild"] = serde_yaml::Value::Bool(true);
+        values["compactor"]["indexRebuild"] = serde_json::Value::Bool(true);
         let report = synthesize_from_values(
             &values,
             "siglake",
@@ -1112,7 +1124,7 @@ dispatcher:
             report.findings
         );
 
-        values["compactor"]["indexRebuild"] = serde_yaml::Value::Bool(false);
+        values["compactor"]["indexRebuild"] = serde_json::Value::Bool(false);
         let report = synthesize_from_values(
             &values,
             "siglake",
@@ -1136,7 +1148,7 @@ dispatcher:
     #[test]
     fn a_chart_in_memory_job_store_is_reported_at_adoption() {
         let mut values = standing_values();
-        values["query"]["jobs"]["persistent"] = serde_yaml::Value::Bool(false);
+        values["query"]["jobs"]["persistent"] = serde_json::Value::Bool(false);
         let report = synthesize_from_values(
             &values,
             "siglake",
@@ -1156,7 +1168,7 @@ dispatcher:
 
         // The chart default, and an explicit `true`, are what the adopted
         // query tier already does — no finding to make.
-        values["query"]["jobs"]["persistent"] = serde_yaml::Value::Bool(true);
+        values["query"]["jobs"]["persistent"] = serde_json::Value::Bool(true);
         let report = synthesize_from_values(
             &values,
             "siglake",
@@ -1181,7 +1193,7 @@ dispatcher:
     #[test]
     fn a_chart_wal_mirror_opt_out_is_reported_at_adoption() {
         let mut values = standing_values();
-        values["wal"]["mirror"]["enabled"] = serde_yaml::Value::Bool(false);
+        values["wal"]["mirror"]["enabled"] = serde_json::Value::Bool(false);
         let report = synthesize_from_values(
             &values,
             "siglake",
@@ -1198,7 +1210,7 @@ dispatcher:
         );
 
         // The chart default is what the adopted ingester already does.
-        values["wal"]["mirror"]["enabled"] = serde_yaml::Value::Bool(true);
+        values["wal"]["mirror"]["enabled"] = serde_json::Value::Bool(true);
         let report = synthesize_from_values(
             &values,
             "siglake",
@@ -1223,7 +1235,7 @@ dispatcher:
     #[test]
     fn a_chart_wal_existing_claim_is_reported_at_adoption() {
         let uri = Some("postgres://siglake:pw@host:5432/db");
-        let finding_of = |values: &serde_yaml::Value| {
+        let finding_of = |values: &serde_json::Value| {
             synthesize_from_values(values, "siglake", "siglake", uri)
                 .unwrap()
                 .findings
@@ -1236,16 +1248,16 @@ dispatcher:
         // operator renders. Nothing moves, nothing to report.
         let mut values = standing_values();
         assert_eq!(finding_of(&values), None, "no wal key at all");
-        values["wal"]["existingClaim"] = serde_yaml::Value::String(String::new());
+        values["wal"]["existingClaim"] = serde_json::Value::String(String::new());
         assert_eq!(finding_of(&values), None, "chart default is empty");
 
         // A release whose pre-created claim happens to carry the name the
         // operator renders adopts onto the SAME volume.
-        values["wal"]["existingClaim"] = serde_yaml::Value::String("siglake-wal".into());
+        values["wal"]["existingClaim"] = serde_json::Value::String("siglake-wal".into());
         assert_eq!(finding_of(&values), None, "same claim, same WAL");
 
         // Any other name is a WAL switch at cutover.
-        values["wal"]["existingClaim"] = serde_yaml::Value::String("acme-wal-efs".into());
+        values["wal"]["existingClaim"] = serde_json::Value::String("acme-wal-efs".into());
         let finding = finding_of(&values).expect("a repointed WAL claim must be reported");
         assert!(
             finding.contains("\"acme-wal-efs\"") && finding.contains("\"siglake-wal\""),
@@ -1268,7 +1280,7 @@ dispatcher:
         );
 
         // Carrying the geometry across is unchanged by any of it.
-        values["wal"]["size"] = serde_yaml::Value::String("50Gi".into());
+        values["wal"]["size"] = serde_json::Value::String("50Gi".into());
         let report = synthesize_from_values(&values, "siglake", "siglake", uri).unwrap();
         assert_eq!(report.cluster.spec.storage.wal_size, "50Gi");
     }
@@ -1302,9 +1314,9 @@ query:
     tenantClaim: ""
 "#;
 
-    fn merge(base: &mut serde_yaml::Value, patch: &serde_yaml::Value) {
+    fn merge(base: &mut serde_json::Value, patch: &serde_json::Value) {
         match (base, patch) {
-            (serde_yaml::Value::Mapping(b), serde_yaml::Value::Mapping(p)) => {
+            (serde_json::Value::Object(b), serde_json::Value::Object(p)) => {
                 for (key, value) in p {
                     match b.get_mut(key) {
                         Some(slot) => merge(slot, value),
@@ -1319,17 +1331,17 @@ query:
     }
 
     /// `standing_values` + the chart's auth/tenancy defaults + `patch`.
-    fn values_with(patch: &str) -> serde_yaml::Value {
+    fn values_with(patch: &str) -> serde_json::Value {
         let mut values = standing_values();
         merge(
             &mut values,
-            &serde_yaml::from_str(CHART_AUTH_DEFAULTS).unwrap(),
+            &serde_saphyr::from_str(CHART_AUTH_DEFAULTS).unwrap(),
         );
-        merge(&mut values, &serde_yaml::from_str(patch).unwrap());
+        merge(&mut values, &serde_saphyr::from_str(patch).unwrap());
         values
     }
 
-    fn adopt(values: &serde_yaml::Value) -> AdoptionReport {
+    fn adopt(values: &serde_json::Value) -> AdoptionReport {
         synthesize_from_values(
             values,
             "siglake",
@@ -1687,9 +1699,8 @@ query:
         let printed = report.to_yaml().unwrap();
 
         // What kubectl parses: one document, and it is the CR.
-        let docs: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(&printed)
-            .map(|d| serde_yaml::Value::deserialize(d).expect("the report must parse as YAML"))
-            .collect();
+        let docs: Vec<serde_json::Value> =
+            serde_saphyr::from_multiple(&printed).expect("the report must parse as YAML");
         assert_eq!(docs.len(), 1, "one resource per report:\n{printed}");
         assert_eq!(docs[0]["kind"].as_str(), Some("SiglakeCluster"));
         assert_eq!(
@@ -1699,7 +1710,7 @@ query:
         assert_eq!(docs[0]["metadata"]["name"].as_str(), Some("siglake"));
         assert_eq!(docs[0]["metadata"]["namespace"].as_str(), Some("siglake"));
         let parsed: SiglakeCluster =
-            serde_yaml::from_str(&printed).expect("the report must deserialize into the CR");
+            serde_saphyr::from_str(&printed).expect("the report must deserialize into the CR");
         assert_eq!(parsed.spec, report.cluster.spec);
 
         // And the reason it parses: nothing below the resource is anything but
@@ -1725,7 +1736,7 @@ query:
             report.findings.len(),
             "one comment line per finding:\n{printed}"
         );
-        serde_yaml::from_str::<SiglakeCluster>(&printed)
+        serde_saphyr::from_str::<SiglakeCluster>(&printed)
             .expect("findings must not break the manifest");
     }
 
@@ -1748,7 +1759,7 @@ query:
         );
         assert_eq!(report.cluster.metadata.name.as_deref(), Some("acme"));
         assert_eq!(
-            serde_yaml::from_str::<serde_yaml::Value>(&report.to_yaml().unwrap()).unwrap()
+            serde_saphyr::from_str::<serde_json::Value>(&report.to_yaml().unwrap()).unwrap()
                 ["metadata"]["namespace"]
                 .as_str(),
             Some("obs-prod")

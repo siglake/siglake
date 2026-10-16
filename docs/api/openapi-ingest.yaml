@@ -22,31 +22,41 @@ paths:
         refuse to send anywhere that does not identify as Elasticsearch.
       operationId: get_es_root
       responses:
-        '200':
+        "200":
           description: Version fingerprint.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EsRootInfo'
-        '400':
-          description: Invalid `X-Scope-OrgID` value. The ingest middleware validates the header on every route before the handler runs, so this route refuses a malformed tenant id even though it ignores which tenant is named. Body is the siglake `{text, code}` envelope, not an ES-shaped body.
+                $ref: "#/components/schemas/EsRootInfo"
+        "400":
+          description: >-
+            Invalid `X-Scope-OrgID` value. The ingest middleware validates the header on
+            every route before the handler runs, so this route refuses a malformed tenant id
+            even though it ignores which tenant is named. Body is the siglake `{text, code}`
+            envelope, not an ES-shaped body.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '401':
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '403':
-          description: Tenant refused by the ingest middleware before the handler runs — a tenant header this single-tenant ingester will not route, a header that disagrees with (or a token that lacks) the JWT tenant claim, a resolved tenant outside `--allowed-tenants`, or a novel tenant past `--max-tenants` — even though this route ignores which tenant is named. Body is the siglake `{text, code}` envelope, not an ES-shaped body.
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "403":
+          description: >-
+            Tenant refused by the ingest middleware before the handler runs — a tenant
+            header this single-tenant ingester will not route, a header that disagrees with (or a
+            token that lacks) the JWT tenant claim, a resolved tenant outside
+            `--allowed-tenants`, or a novel tenant past `--max-tenants` — even though this route ignores
+            which tenant is named. Body is the siglake `{text, code}` envelope, not an
+            ES-shaped body.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '429':
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "429":
           description: Rate limited.
           headers:
             retry-after:
@@ -58,7 +68,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RateLimitBody'
+                $ref: "#/components/schemas/RateLimitBody"
     head:
       tags:
       - elasticsearch-compat
@@ -75,16 +85,25 @@ paths:
         still receives and must obey.
       operationId: head_es_root
       responses:
-        '200':
+        "200":
           description: Reachable. Empty body.
-        '400':
-          description: 'Invalid `X-Scope-OrgID` value. The ingest middleware validates the header on every route before the handler runs, so this route refuses a malformed tenant id even though it ignores which tenant is named. No body: see `GET /` for the envelope the same refusal carries there.'
-        '401':
+        "400":
+          description: "Invalid `X-Scope-OrgID` value. The ingest middleware validates the header on every route before the handler runs, so this route refuses a malformed tenant id even though it ignores which tenant is named. No body: see `GET /` for the envelope the same refusal carries there."
+        "401":
           description: Missing or invalid credentials. No body.
-        '403':
-          description: Tenant refused by the ingest middleware before the handler runs — a tenant header this single-tenant ingester will not route, a header that disagrees with (or a token that lacks) the JWT tenant claim, a resolved tenant outside `--allowed-tenants`, or a novel tenant past `--max-tenants` — even though this route ignores which tenant is named. No body.
-        '429':
-          description: Rate limited. `ingest_rate_limit_middleware` wraps every ingest route and runs ahead of even the auth check, so this probe is throttled like any other request. No body — `retry-after` carries the only part a `HEAD` caller could have read anyway.
+        "403":
+          description: >-
+            Tenant refused by the ingest middleware before the handler runs — a tenant
+            header this single-tenant ingester will not route, a header that disagrees with (or a
+            token that lacks) the JWT tenant claim, a resolved tenant outside
+            `--allowed-tenants`, or a novel tenant past `--max-tenants` — even though this route ignores
+            which tenant is named. No body.
+        "429":
+          description: >-
+            Rate limited. `ingest_rate_limit_middleware` wraps every ingest route and runs
+            ahead of even the auth check, so this probe is throttled like any other request.
+            No body — `retry-after` carries the only part a `HEAD` caller could have read
+            anyway.
           headers:
             retry-after:
               schema:
@@ -102,32 +121,45 @@ paths:
         purely as a readiness gate before starting to send.
       operationId: get_es_cluster_health
       responses:
-        '200':
+        "200":
           description: Always `green`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EsClusterHealth'
-        '400':
-          description: Invalid `X-Scope-OrgID` value. The ingest middleware validates the header on every route before the handler runs, so this readiness gate refuses a malformed tenant id even though it ignores which tenant is named. Body is the siglake `{text, code}` envelope, not an ES-shaped body.
+                $ref: "#/components/schemas/EsClusterHealth"
+        "400":
+          description: >-
+            Invalid `X-Scope-OrgID` value. The ingest middleware validates the header on
+            every route before the handler runs, so this readiness gate refuses a malformed
+            tenant id even though it ignores which tenant is named. Body is the siglake `{text,
+            code}` envelope, not an ES-shaped body.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '401':
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '403':
-          description: Tenant refused by the ingest middleware before the handler runs — a tenant header this single-tenant ingester will not route, a header that disagrees with (or a token that lacks) the JWT tenant claim, a resolved tenant outside `--allowed-tenants`, or a novel tenant past `--max-tenants` — even though this route ignores which tenant is named. Body is the siglake `{text, code}` envelope, not an ES-shaped body.
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "403":
+          description: >-
+            Tenant refused by the ingest middleware before the handler runs — a tenant
+            header this single-tenant ingester will not route, a header that disagrees with (or a
+            token that lacks) the JWT tenant claim, a resolved tenant outside
+            `--allowed-tenants`, or a novel tenant past `--max-tenants` — even though this route ignores
+            which tenant is named. Body is the siglake `{text, code}` envelope, not an
+            ES-shaped body.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '429':
-          description: Rate limited. `ingest_rate_limit_middleware` wraps every ingest route, this readiness gate included, and runs ahead of even the auth check — so a shipper that polls health hard enough is throttled here, before it has sent a single event.
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "429":
+          description: >-
+            Rate limited. `ingest_rate_limit_middleware` wraps every ingest route, this
+            readiness gate included, and runs ahead of even the auth check — so a shipper that
+            polls health hard enough is throttled here, before it has sent a single event.
           headers:
             retry-after:
               schema:
@@ -138,7 +170,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RateLimitBody'
+                $ref: "#/components/schemas/RateLimitBody"
   /api/v1/_elastic/_bulk:
     post:
       tags:
@@ -176,55 +208,61 @@ paths:
           - force
       - name: x-siglake-commit
         in: header
-        description: 'Durability mode: `auto` | `wait_for` | `force`. Defaults to `wait_for`; overridden by the `commit` query parameter.'
+        description: "Durability mode: `auto` | `wait_for` | `force`. Defaults to `wait_for`; overridden by the `commit` query parameter."
         required: false
         schema:
           type:
           - string
-          - 'null'
+          - "null"
       - name: x-scope-orgid
         in: header
-        description: 'Tenant id, `[A-Za-z0-9_-]{1,128}`. Absent ⇒ `default`: the request is accepted and written into the `default` tenant rather than rejected. WHETHER IT ROUTES ANYWHERE IS A DEPLOYMENT SETTING. A single-tenant ingester — the default — accepts this header only when it names `default`, and answers `403` otherwise; it does not silently write elsewhere. `--trust-scope-header` makes the header select the tenant. When the ingester derives the tenant from a verified JWT claim (`--oidc-tenant-claim`) the claim is the authority and this header may only AGREE with it; disagreeing is `403`.'
+        description: "Tenant id, `[A-Za-z0-9_-]{1,128}`. Absent ⇒ `default`: the request is accepted and written into the `default` tenant rather than rejected. WHETHER IT ROUTES ANYWHERE IS A DEPLOYMENT SETTING. A single-tenant ingester — the default — accepts this header only when it names `default`, and answers `403` otherwise; it does not silently write elsewhere. `--trust-scope-header` makes the header select the tenant. When the ingester derives the tenant from a verified JWT claim (`--oidc-tenant-claim`) the claim is the authority and this header may only AGREE with it; disagreeing is `403`."
         required: false
         schema:
           type:
           - string
-          - 'null'
+          - "null"
       requestBody:
-        description: 'ES bulk NDJSON: action line, optional source line, repeated.'
+        description: "ES bulk NDJSON: action line, optional source line, repeated."
         content:
           application/x-ndjson:
             schema:
               type: string
         required: true
       responses:
-        '200':
-          description: Request parsed. Individual items may still have failed — check `errors` and `items`.
+        "200":
+          description: >-
+            Request parsed. Individual items may still have failed — check `errors` and
+            `items`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EsBulkResponse'
-        '400':
-          description: Malformed NDJSON, or an unsupported action, which fails the whole request. An invalid `X-Scope-OrgID` value is also a `400`, but comes from the ingest middleware ahead of the handler and carries the siglake `{text, code}` envelope instead of this one.
+                $ref: "#/components/schemas/EsBulkResponse"
+        "400":
+          description: >-
+            Malformed NDJSON, or an unsupported action, which fails the whole request. An
+            invalid `X-Scope-OrgID` value is also a `400`, but comes from the ingest
+            middleware ahead of the handler and carries the siglake `{text, code}` envelope instead of
+            this one.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EsErrorBody'
-        '401':
+                $ref: "#/components/schemas/EsErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '403':
-          description: 'Tenant refused: this ingester is single-tenant and the header named another tenant, or the header disagrees with (or the token lacks) the JWT tenant claim, or the resolved tenant is outside `--allowed-tenants`, or this ingester is at `--max-tenants` and the resolved tenant is one it has not admitted before.'
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "403":
+          description: "Tenant refused: this ingester is single-tenant and the header named another tenant, or the header disagrees with (or the token lacks) the JWT tenant claim, or the resolved tenant is outside `--allowed-tenants`, or this ingester is at `--max-tenants` and the resolved tenant is one it has not admitted before."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '413':
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "413":
           description: Body exceeds the ingest body cap (env-tunable, 16 MiB by default).
-        '429':
+        "429":
           description: Rate limited.
           headers:
             retry-after:
@@ -236,15 +274,18 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RateLimitBody'
-        '500':
+                $ref: "#/components/schemas/RateLimitBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '503':
-          description: Transient load shedding, or a novel tenant/index key past the persistent lane cap. The lane-cap response has no Retry-After header because recovery requires routing or operator action.
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "503":
+          description: >-
+            Transient load shedding, or a novel tenant/index key past the persistent lane
+            cap. The lane-cap response has no Retry-After header because recovery requires
+            routing or operator action.
           headers:
             retry-after:
               schema:
@@ -255,46 +296,59 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '504':
-          description: '`commit=force` did not complete in time.'
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "504":
+          description: "`commit=force` did not complete in time."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
+                $ref: "#/components/schemas/SiglakeErrorBody"
   /api/v1/_elastic/_cluster/health:
     get:
       tags:
       - elasticsearch-compat
-      summary: '`/api/v1/_elastic`-prefixed alias of `GET /_cluster/health`.'
+      summary: "`/api/v1/_elastic`-prefixed alias of `GET /_cluster/health`."
       operationId: get_es_cluster_health_compat
       responses:
-        '200':
+        "200":
           description: Always `green`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EsClusterHealth'
-        '400':
-          description: Invalid `X-Scope-OrgID` value. The ingest middleware validates the header on every route before the handler runs, so this readiness gate refuses a malformed tenant id even though it ignores which tenant is named. Body is the siglake `{text, code}` envelope, not an ES-shaped body.
+                $ref: "#/components/schemas/EsClusterHealth"
+        "400":
+          description: >-
+            Invalid `X-Scope-OrgID` value. The ingest middleware validates the header on
+            every route before the handler runs, so this readiness gate refuses a malformed
+            tenant id even though it ignores which tenant is named. Body is the siglake `{text,
+            code}` envelope, not an ES-shaped body.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '401':
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '403':
-          description: Tenant refused by the ingest middleware before the handler runs — a tenant header this single-tenant ingester will not route, a header that disagrees with (or a token that lacks) the JWT tenant claim, a resolved tenant outside `--allowed-tenants`, or a novel tenant past `--max-tenants` — even though this route ignores which tenant is named. Body is the siglake `{text, code}` envelope, not an ES-shaped body.
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "403":
+          description: >-
+            Tenant refused by the ingest middleware before the handler runs — a tenant
+            header this single-tenant ingester will not route, a header that disagrees with (or a
+            token that lacks) the JWT tenant claim, a resolved tenant outside
+            `--allowed-tenants`, or a novel tenant past `--max-tenants` — even though this route ignores
+            which tenant is named. Body is the siglake `{text, code}` envelope, not an
+            ES-shaped body.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '429':
-          description: Rate limited. `ingest_rate_limit_middleware` wraps every ingest route, this readiness gate included, and runs ahead of even the auth check — so a shipper that polls health hard enough is throttled here, before it has sent a single event.
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "429":
+          description: >-
+            Rate limited. `ingest_rate_limit_middleware` wraps every ingest route, this
+            readiness gate included, and runs ahead of even the auth check — so a shipper that
+            polls health hard enough is throttled here, before it has sent a single event.
           headers:
             retry-after:
               schema:
@@ -305,8 +359,8 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RateLimitBody'
-  /api/v1/_elastic/{index}/_bulk:
+                $ref: "#/components/schemas/RateLimitBody"
+  "/api/v1/_elastic/{index}/_bulk":
     post:
       tags:
       - elasticsearch-compat
@@ -339,55 +393,60 @@ paths:
           type: string
       - name: x-siglake-commit
         in: header
-        description: 'Durability mode: `auto` | `wait_for` | `force`. Defaults to `wait_for`; overridden by the `commit` query parameter.'
+        description: "Durability mode: `auto` | `wait_for` | `force`. Defaults to `wait_for`; overridden by the `commit` query parameter."
         required: false
         schema:
           type:
           - string
-          - 'null'
+          - "null"
       - name: x-scope-orgid
         in: header
-        description: 'Tenant id, `[A-Za-z0-9_-]{1,128}`. Absent ⇒ `default`: the request is accepted and written into the `default` tenant rather than rejected. WHETHER IT ROUTES ANYWHERE IS A DEPLOYMENT SETTING. A single-tenant ingester — the default — accepts this header only when it names `default`, and answers `403` otherwise; it does not silently write elsewhere. `--trust-scope-header` makes the header select the tenant. When the ingester derives the tenant from a verified JWT claim (`--oidc-tenant-claim`) the claim is the authority and this header may only AGREE with it; disagreeing is `403`.'
+        description: "Tenant id, `[A-Za-z0-9_-]{1,128}`. Absent ⇒ `default`: the request is accepted and written into the `default` tenant rather than rejected. WHETHER IT ROUTES ANYWHERE IS A DEPLOYMENT SETTING. A single-tenant ingester — the default — accepts this header only when it names `default`, and answers `403` otherwise; it does not silently write elsewhere. `--trust-scope-header` makes the header select the tenant. When the ingester derives the tenant from a verified JWT claim (`--oidc-tenant-claim`) the claim is the authority and this header may only AGREE with it; disagreeing is `403`."
         required: false
         schema:
           type:
           - string
-          - 'null'
+          - "null"
       requestBody:
-        description: 'ES bulk NDJSON: action line, optional source line, repeated.'
+        description: "ES bulk NDJSON: action line, optional source line, repeated."
         content:
           application/x-ndjson:
             schema:
               type: string
         required: true
       responses:
-        '200':
-          description: Request parsed. Individual items may still have failed — check `errors` and `items`.
+        "200":
+          description: >-
+            Request parsed. Individual items may still have failed — check `errors` and
+            `items`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EsBulkResponse'
-        '400':
-          description: Malformed NDJSON, or an unsupported action. An invalid `X-Scope-OrgID` value is also a `400`, but comes from the ingest middleware ahead of the handler and carries the siglake `{text, code}` envelope instead of this one.
+                $ref: "#/components/schemas/EsBulkResponse"
+        "400":
+          description: >-
+            Malformed NDJSON, or an unsupported action. An invalid `X-Scope-OrgID` value is
+            also a `400`, but comes from the ingest middleware ahead of the handler and
+            carries the siglake `{text, code}` envelope instead of this one.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EsErrorBody'
-        '401':
+                $ref: "#/components/schemas/EsErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '403':
-          description: 'Tenant refused: this ingester is single-tenant and the header named another tenant, or the header disagrees with (or the token lacks) the JWT tenant claim, or the resolved tenant is outside `--allowed-tenants`, or this ingester is at `--max-tenants` and the resolved tenant is one it has not admitted before.'
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "403":
+          description: "Tenant refused: this ingester is single-tenant and the header named another tenant, or the header disagrees with (or the token lacks) the JWT tenant claim, or the resolved tenant is outside `--allowed-tenants`, or this ingester is at `--max-tenants` and the resolved tenant is one it has not admitted before."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '413':
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "413":
           description: Body exceeds the ingest body cap.
-        '429':
+        "429":
           description: Rate limited.
           headers:
             retry-after:
@@ -399,15 +458,18 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RateLimitBody'
-        '500':
+                $ref: "#/components/schemas/RateLimitBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '503':
-          description: Transient load shedding, or a novel tenant/index key past the persistent lane cap. The lane-cap response has no Retry-After header because recovery requires routing or operator action.
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "503":
+          description: >-
+            Transient load shedding, or a novel tenant/index key past the persistent lane
+            cap. The lane-cap response has no Retry-After header because recovery requires
+            routing or operator action.
           headers:
             retry-after:
               schema:
@@ -418,18 +480,18 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '504':
-          description: '`commit=force` did not complete in time.'
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "504":
+          description: "`commit=force` did not complete in time."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
+                $ref: "#/components/schemas/SiglakeErrorBody"
   /api/v1/stream:
     get:
       tags:
       - stream
-      summary: '`GET /api/v1/stream` — Server-Sent Events tail of the ingest path.'
+      summary: "`GET /api/v1/stream` — Server-Sent Events tail of the ingest path."
       description: |-
         Published from the ingest path BEFORE the WAL append, not after
         acknowledgement: the ingester tees each batch to subscribers ahead of the
@@ -452,38 +514,43 @@ paths:
       parameters:
       - name: x-scope-orgid
         in: header
-        description: 'Tenant whose events this subscription delivers, `[A-Za-z0-9_-]{1,128}`. Absent ⇒ `default`: the subscription succeeds and delivers the `default` tenant''s events, so a missing header is silent — it selects a different tenant''s stream rather than failing. When the ingester derives the tenant from a verified JWT claim (`--oidc-tenant-claim`) this header may only AGREE with the claim; disagreeing is `403`.'
+        description: "Tenant whose events this subscription delivers, `[A-Za-z0-9_-]{1,128}`. Absent ⇒ `default`: the subscription succeeds and delivers the `default` tenant's events, so a missing header is silent — it selects a different tenant's stream rather than failing. When the ingester derives the tenant from a verified JWT claim (`--oidc-tenant-claim`) this header may only AGREE with the claim; disagreeing is `403`."
         required: false
         schema:
           type:
           - string
-          - 'null'
+          - "null"
       responses:
-        '200':
-          description: SSE stream. Each `data:` line is one JSON `Event`. A subscriber that falls behind receives an event named `lagged` whose data is the number of dropped events. A keep-alive comment is sent every 15 seconds. The stream never completes.
+        "200":
+          description: >-
+            SSE stream. Each `data:` line is one JSON `Event`. A subscriber that falls
+            behind receives an event named `lagged` whose data is the number of dropped events. A
+            keep-alive comment is sent every 15 seconds. The stream never completes.
           content:
             text/event-stream:
               schema:
                 type: string
-        '400':
-          description: Invalid `X-Scope-OrgID` value (`[A-Za-z0-9_-]{1,128}`), refused by the ingest middleware before the subscription is created.
+        "400":
+          description: >-
+            Invalid `X-Scope-OrgID` value (`[A-Za-z0-9_-]{1,128}`), refused by the ingest
+            middleware before the subscription is created.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '401':
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '403':
-          description: 'Tenant refused: this ingester is single-tenant and the header named another tenant, or the header disagrees with (or the token lacks) the JWT tenant claim, or the resolved tenant is outside `--allowed-tenants`, or this ingester is at `--max-tenants` and the resolved tenant is one it has not admitted before.'
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "403":
+          description: "Tenant refused: this ingester is single-tenant and the header named another tenant, or the header disagrees with (or the token lacks) the JWT tenant claim, or the resolved tenant is outside `--allowed-tenants`, or this ingester is at `--max-tenants` and the resolved tenant is one it has not admitted before."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '429':
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "429":
           description: Rate limited.
           headers:
             retry-after:
@@ -495,13 +562,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RateLimitBody'
-        '500':
+                $ref: "#/components/schemas/RateLimitBody"
+        "500":
           description: Streaming is not enabled on this ingester.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
+                $ref: "#/components/schemas/SiglakeErrorBody"
   /healthz:
     get:
       tags:
@@ -512,19 +579,19 @@ paths:
         and is never rate-limited.
       operationId: get_health
       responses:
-        '200':
+        "200":
           description: The process is serving.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HealthBody'
+                $ref: "#/components/schemas/HealthBody"
       security:
       - {}
   /readyz:
     get:
       tags:
       - health
-      summary: 'Readiness probe: can this ingester still durably accept writes?'
+      summary: "Readiness probe: can this ingester still durably accept writes?"
       description: |-
         The ingester used to wire the constant-200 `/healthz` as BOTH liveness and
         readiness, so it had no readiness gate at all — an ingester whose WAL volume
@@ -540,18 +607,18 @@ paths:
         through those.
       operationId: get_ready
       responses:
-        '200':
+        "200":
           description: The WAL is writable; this pod can accept.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HealthBody'
-        '503':
+                $ref: "#/components/schemas/HealthBody"
+        "503":
           description: The WAL is not writable; take this pod out of rotation.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HealthBody'
+                $ref: "#/components/schemas/HealthBody"
       security:
       - {}
   /v1/logs:
@@ -592,23 +659,23 @@ paths:
         schema:
           type:
           - string
-          - 'null'
+          - "null"
       - name: x-siglake-commit
         in: header
-        description: 'Durability mode: `auto` | `wait_for` | `force`. Defaults to `wait_for`; overridden by the `commit` query parameter.'
+        description: "Durability mode: `auto` | `wait_for` | `force`. Defaults to `wait_for`; overridden by the `commit` query parameter."
         required: false
         schema:
           type:
           - string
-          - 'null'
+          - "null"
       - name: x-scope-orgid
         in: header
-        description: 'Tenant id, `[A-Za-z0-9_-]{1,128}`. Absent ⇒ `default`: the request is accepted and written into the `default` tenant rather than rejected. WHETHER IT ROUTES ANYWHERE IS A DEPLOYMENT SETTING. A single-tenant ingester — the default — accepts this header only when it names `default`, and answers `403` otherwise; it does not silently write elsewhere. `--trust-scope-header` makes the header select the tenant. When the ingester derives the tenant from a verified JWT claim (`--oidc-tenant-claim`) the claim is the authority and this header may only AGREE with it; disagreeing is `403`.'
+        description: "Tenant id, `[A-Za-z0-9_-]{1,128}`. Absent ⇒ `default`: the request is accepted and written into the `default` tenant rather than rejected. WHETHER IT ROUTES ANYWHERE IS A DEPLOYMENT SETTING. A single-tenant ingester — the default — accepts this header only when it names `default`, and answers `403` otherwise; it does not silently write elsewhere. `--trust-scope-header` makes the header select the tenant. When the ingester derives the tenant from a verified JWT claim (`--oidc-tenant-claim`) the claim is the authority and this header may only AGREE with it; disagreeing is `403`."
         required: false
         schema:
           type:
           - string
-          - 'null'
+          - "null"
       requestBody:
         description: OTLP `ExportLogsServiceRequest`.
         content:
@@ -628,12 +695,14 @@ paths:
                 minimum: 0
         required: true
       responses:
-        '200':
-          description: Accepted. Body is an OTLP `ExportLogsServiceResponse` in the request's format; `partialSuccess` is set only when the request carried no log records.
+        "200":
+          description: >-
+            Accepted. Body is an OTLP `ExportLogsServiceResponse` in the request's format;
+            `partialSuccess` is set only when the request carried no log records.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/OtlpExportResponse'
+                $ref: "#/components/schemas/OtlpExportResponse"
             application/x-protobuf:
               schema:
                 type: array
@@ -641,27 +710,32 @@ paths:
                   type: integer
                   format: int32
                   minimum: 0
-        '400':
-          description: Undecodable body, or an invalid index, commit-mode or `X-Scope-OrgID` header value. Also `commit=force` when a remote drain consumes the mirrored WAL.
+        "400":
+          description: >-
+            Undecodable body, or an invalid index, commit-mode or `X-Scope-OrgID` header
+            value. Also `commit=force` when a remote drain consumes the mirrored WAL.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '401':
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '403':
-          description: 'Tenant refused: this ingester is single-tenant and the header named another tenant, or the header disagrees with (or the token lacks) the JWT tenant claim, or the resolved tenant is outside `--allowed-tenants`, or this ingester is at `--max-tenants` and the resolved tenant is one it has not admitted before.'
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "403":
+          description: "Tenant refused: this ingester is single-tenant and the header named another tenant, or the header disagrees with (or the token lacks) the JWT tenant claim, or the resolved tenant is outside `--allowed-tenants`, or this ingester is at `--max-tenants` and the resolved tenant is one it has not admitted before."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '413':
-          description: Body exceeds the ingest body cap (env-tunable via `SIGLAKE_INGEST_MAX_BODY_BYTES`, 16 MiB by default). Rejected by the framework, so the body is not the usual error envelope.
-        '429':
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "413":
+          description: >-
+            Body exceeds the ingest body cap (env-tunable via
+            `SIGLAKE_INGEST_MAX_BODY_BYTES`, 16 MiB by default). Rejected by the framework, so the body is not the usual
+            error envelope.
+        "429":
           description: Rate limited.
           headers:
             retry-after:
@@ -673,32 +747,34 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RateLimitBody'
-        '500':
+                $ref: "#/components/schemas/RateLimitBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '503':
-          description: 'Shedding load: the memory circuit breaker tripped, the backpressure queue is full, or a novel tenant/index key reached the persistent lane cap. Retry-After is omitted for the lane cap because recovery requires routing or operator action.'
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "503":
+          description: "Shedding load: the memory circuit breaker tripped, the backpressure queue is full, or a novel tenant/index key reached the persistent lane cap. Retry-After is omitted for the lane cap because recovery requires routing or operator action."
           headers:
             retry-after:
               schema:
                 type: integer
                 format: int64
                 minimum: 0
-              description: Seconds to wait before retrying; present for transient shedding and absent for a lane-cap refusal.
+              description: >-
+                Seconds to wait before retrying; present for transient shedding and absent for
+                a lane-cap refusal.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '504':
-          description: '`commit=force` did not complete in time. The rows may still land; re-sending risks duplicates.'
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "504":
+          description: "`commit=force` did not complete in time. The rows may still land; re-sending risks duplicates."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
+                $ref: "#/components/schemas/SiglakeErrorBody"
   /v1/traces:
     post:
       tags:
@@ -733,23 +809,23 @@ paths:
         schema:
           type:
           - string
-          - 'null'
+          - "null"
       - name: x-siglake-commit
         in: header
-        description: 'Durability mode: `auto` | `wait_for` | `force`. Defaults to `wait_for`; overridden by the `commit` query parameter.'
+        description: "Durability mode: `auto` | `wait_for` | `force`. Defaults to `wait_for`; overridden by the `commit` query parameter."
         required: false
         schema:
           type:
           - string
-          - 'null'
+          - "null"
       - name: x-scope-orgid
         in: header
-        description: 'Tenant id, `[A-Za-z0-9_-]{1,128}`. Absent ⇒ `default`: the request is accepted and written into the `default` tenant rather than rejected. WHETHER IT ROUTES ANYWHERE IS A DEPLOYMENT SETTING. A single-tenant ingester — the default — accepts this header only when it names `default`, and answers `403` otherwise; it does not silently write elsewhere. `--trust-scope-header` makes the header select the tenant. When the ingester derives the tenant from a verified JWT claim (`--oidc-tenant-claim`) the claim is the authority and this header may only AGREE with it; disagreeing is `403`.'
+        description: "Tenant id, `[A-Za-z0-9_-]{1,128}`. Absent ⇒ `default`: the request is accepted and written into the `default` tenant rather than rejected. WHETHER IT ROUTES ANYWHERE IS A DEPLOYMENT SETTING. A single-tenant ingester — the default — accepts this header only when it names `default`, and answers `403` otherwise; it does not silently write elsewhere. `--trust-scope-header` makes the header select the tenant. When the ingester derives the tenant from a verified JWT claim (`--oidc-tenant-claim`) the claim is the authority and this header may only AGREE with it; disagreeing is `403`."
         required: false
         schema:
           type:
           - string
-          - 'null'
+          - "null"
       requestBody:
         description: OTLP `ExportTraceServiceRequest`.
         content:
@@ -769,12 +845,14 @@ paths:
                 minimum: 0
         required: true
       responses:
-        '200':
-          description: Accepted. Body is an OTLP `ExportTraceServiceResponse` in the request's format; `partialSuccess` is set only when the request carried no spans.
+        "200":
+          description: >-
+            Accepted. Body is an OTLP `ExportTraceServiceResponse` in the request's format;
+            `partialSuccess` is set only when the request carried no spans.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/OtlpExportResponse'
+                $ref: "#/components/schemas/OtlpExportResponse"
             application/x-protobuf:
               schema:
                 type: array
@@ -782,27 +860,29 @@ paths:
                   type: integer
                   format: int32
                   minimum: 0
-        '400':
-          description: Undecodable body, or an invalid index, commit-mode or `X-Scope-OrgID` header value. Also `commit=force` when a remote drain consumes the mirrored WAL.
+        "400":
+          description: >-
+            Undecodable body, or an invalid index, commit-mode or `X-Scope-OrgID` header
+            value. Also `commit=force` when a remote drain consumes the mirrored WAL.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '401':
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "401":
           description: Missing or invalid credentials.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '403':
-          description: 'Tenant refused: this ingester is single-tenant and the header named another tenant, or the header disagrees with (or the token lacks) the JWT tenant claim, or the resolved tenant is outside `--allowed-tenants`, or this ingester is at `--max-tenants` and the resolved tenant is one it has not admitted before.'
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "403":
+          description: "Tenant refused: this ingester is single-tenant and the header named another tenant, or the header disagrees with (or the token lacks) the JWT tenant claim, or the resolved tenant is outside `--allowed-tenants`, or this ingester is at `--max-tenants` and the resolved tenant is one it has not admitted before."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '413':
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "413":
           description: Body exceeds the ingest body cap (env-tunable, 16 MiB by default).
-        '429':
+        "429":
           description: Rate limited.
           headers:
             retry-after:
@@ -814,15 +894,18 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RateLimitBody'
-        '500':
+                $ref: "#/components/schemas/RateLimitBody"
+        "500":
           description: Internal error.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '503':
-          description: Transient load shedding, or a novel tenant/index key past the persistent lane cap. The lane-cap response has no Retry-After header because recovery requires routing or operator action.
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "503":
+          description: >-
+            Transient load shedding, or a novel tenant/index key past the persistent lane
+            cap. The lane-cap response has no Retry-After header because recovery requires
+            routing or operator action.
           headers:
             retry-after:
               schema:
@@ -833,13 +916,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
-        '504':
-          description: '`commit=force` did not complete in time.'
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "504":
+          description: "`commit=force` did not complete in time."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SiglakeErrorBody'
+                $ref: "#/components/schemas/SiglakeErrorBody"
 components:
   schemas:
     EsBulkItem:
@@ -853,20 +936,20 @@ components:
       properties:
         create:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/EsBulkItemResult'
+          - type: "null"
+          - $ref: "#/components/schemas/EsBulkItemResult"
         delete:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/EsBulkItemResult'
+          - type: "null"
+          - $ref: "#/components/schemas/EsBulkItemResult"
         index:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/EsBulkItemResult'
+          - type: "null"
+          - $ref: "#/components/schemas/EsBulkItemResult"
         update:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/EsBulkItemResult'
+          - type: "null"
+          - $ref: "#/components/schemas/EsBulkItemResult"
     EsBulkItemResult:
       type: object
       description: Per-item outcome in an Elasticsearch bulk response.
@@ -876,17 +959,17 @@ components:
         _index:
           type:
           - string
-          - 'null'
+          - "null"
           description: Resolved target index, absent when the action line failed to parse.
         error:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/EsErrorDetail'
+          - type: "null"
+          - $ref: "#/components/schemas/EsErrorDetail"
             description: Present only on rejection.
         status:
           type: integer
           format: int32
-          description: '`201` when the document was accepted, `400` when it was rejected.'
+          description: "`201` when the document was accepted, `400` when it was rejected."
           example: 201
           minimum: 0
     EsBulkResponse:
@@ -908,7 +991,7 @@ components:
         items:
           type: array
           items:
-            $ref: '#/components/schemas/EsBulkItem'
+            $ref: "#/components/schemas/EsBulkItem"
           description: One entry per action line in the request, in request order.
         took:
           type: integer
@@ -940,7 +1023,7 @@ components:
       - status
       properties:
         error:
-          $ref: '#/components/schemas/EsErrorDetail'
+          $ref: "#/components/schemas/EsErrorDetail"
         status:
           type: integer
           format: int32
@@ -984,7 +1067,7 @@ components:
           type: string
           example: You Know, for Search
         version:
-          $ref: '#/components/schemas/EsVersion'
+          $ref: "#/components/schemas/EsVersion"
     EsVersion:
       type: object
       description: The `version` object in the Elasticsearch-compatible `GET /` response.
@@ -1018,7 +1101,7 @@ components:
         attributes:
           type:
           - string
-          - 'null'
+          - "null"
           description: Residual structured attributes as a JSON object string, or `None`.
         host:
           type: string
@@ -1035,7 +1118,7 @@ components:
           format: date-time
     HealthBody:
       type: object
-      description: '`GET /healthz` response body.'
+      description: "`GET /healthz` response body."
       required:
       - text
       - code
@@ -1062,8 +1145,8 @@ components:
       properties:
         partialSuccess:
           oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/OtlpPartialSuccess'
+          - type: "null"
+          - $ref: "#/components/schemas/OtlpPartialSuccess"
     OtlpPartialSuccess:
       type: object
       description: The `partialSuccess` object in a successful OTLP export response.
@@ -1076,13 +1159,13 @@ components:
         rejectedLogRecords:
           type:
           - integer
-          - 'null'
+          - "null"
           format: int64
           description: Present on the logs endpoint only.
         rejectedSpans:
           type:
           - integer
-          - 'null'
+          - "null"
           format: int64
           description: Present on the traces endpoint only.
     RateLimitBody:
@@ -1129,7 +1212,7 @@ components:
     ingest_token:
       type: http
       scheme: bearer
-      description: 'Cluster-wide ingest token, sent as `Authorization: Bearer <tok>`. When OIDC is configured the same header carries the JWT instead. An ingester started with neither `--auth-tokens` nor OIDC accepts unauthenticated requests.'
+      description: "Cluster-wide ingest token, sent as `Authorization: Bearer <tok>`. When OIDC is configured the same header carries the JWT instead. An ingester started with neither `--auth-tokens` nor OIDC accepts unauthenticated requests."
 security:
 - ingest_token: []
 tags:
@@ -1138,6 +1221,8 @@ tags:
 - name: otlp
   description: OTLP/HTTP logs and traces — the native ingest path.
 - name: elasticsearch-compat
-  description: 'Elasticsearch 7.10-shaped surface: bulk ingest, the root and cluster-health fingerprints. Elasticsearch read APIs (`_search`, `_msearch`, scroll, `_field_caps`, `_cat`) are not implemented and return 501 with a pointer to `POST /api/v1/sql`. They are routed but undocumented — no ES query API is planned, and the operations are not in this document so nothing here reads as a surface to build on.'
+  description: "Elasticsearch 7.10-shaped surface: bulk ingest, the root and cluster-health fingerprints. Elasticsearch read APIs (`_search`, `_msearch`, scroll, `_field_caps`, `_cat`) are not implemented and return 501 with a pointer to `POST /api/v1/sql`. They are routed but undocumented — no ES query API is planned, and the operations are not in this document so nothing here reads as a surface to build on."
 - name: stream
-  description: Server-Sent Events tail of the ingest path, teed before the WAL append — a tailed event is not yet acknowledged.
+  description: >-
+    Server-Sent Events tail of the ingest path, teed before the WAL append — a
+    tailed event is not yet acknowledged.

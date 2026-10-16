@@ -15,9 +15,9 @@ siglake-query-server = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 utoipa = { workspace = true }
-# `serde_yaml` (not utoipa's `yaml` feature) so the YAML dependency stays out of
-# the shipped server binaries — see the workspace `utoipa` comment.
-serde_yaml = "0.9"
+# Keep the generator on kube-client's maintained YAML stack without enabling
+# utoipa's separate `serde_norway`-based `yaml` feature.
+serde-saphyr = "0.0.29"
 
 [dev-dependencies]
 serde_json = { workspace = true }
