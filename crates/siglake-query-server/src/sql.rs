@@ -1893,21 +1893,32 @@ fn attr_get_rewrite_target(
         Some((base, keys))
     }
 
+    fn carrier_for_identifier(
+        id: &datafusion::sql::sqlparser::ast::Ident,
+    ) -> Option<siglake_core::PromotionCarrier> {
+        let carrier = siglake_core::PromotionCarrier::from_column(&id.value)?;
+        // Quoted identifiers are exact: "RAW" must not be turned into the
+        // distinct stored raw column. Leave unresolved spellings to SQL.
+        if carrier == siglake_core::PromotionCarrier::Raw
+            && id.quote_style.is_some()
+            && id.value != "raw"
+        {
+            return None;
+        }
+        Some(carrier)
+    }
+
     let (first, keys) = expression(func)?;
     let (owner, qualifier, carrier) = match first {
-        SqlAstExpr::Identifier(id)
-            if siglake_core::PromotionCarrier::from_column(&id.value).is_some() =>
-        {
-            (
-                scopes.last()?.unqualified_owner.as_deref()?,
-                None,
-                siglake_core::PromotionCarrier::from_column(&id.value)?,
-            )
-        }
+        SqlAstExpr::Identifier(id) if carrier_for_identifier(id).is_some() => (
+            scopes.last()?.unqualified_owner.as_deref()?,
+            None,
+            carrier_for_identifier(id)?,
+        ),
         SqlAstExpr::CompoundIdentifier(parts)
-            if parts.last().is_some_and(|id| {
-                siglake_core::PromotionCarrier::from_column(&id.value).is_some()
-            }) =>
+            if parts
+                .last()
+                .is_some_and(|id| carrier_for_identifier(id).is_some()) =>
         {
             let qualifier = parts[..parts.len() - 1]
                 .iter()
@@ -1927,7 +1938,7 @@ fn attr_get_rewrite_target(
             (
                 owner?,
                 Some(parts[..parts.len() - 1].to_vec()),
-                siglake_core::PromotionCarrier::from_column(&parts.last()?.value)?,
+                carrier_for_identifier(parts.last()?)?,
             )
         }
         _ => return None,
@@ -13303,6 +13314,8 @@ mod tests {
             "SELECT attr_get(attr_get(attributes, 'obj'), 'leaf') FROM events",
             "SELECT attr_get(CONCAT(' ', raw), 'value') FROM events",
             "SELECT attr_get(raw, 'value') FROM unrelated",
+            r#"SELECT attr_get("RAW", 'value') FROM events"#,
+            r#"SELECT attr_get(e."Raw", 'value') FROM events e"#,
         ] {
             assert!(rewrite_attr_get_to_columns(sql, &maps).is_none(), "{sql}");
         }
