@@ -606,7 +606,7 @@ mod tests {
         let mut unsupported = raw.clone();
         unsupported.ty = PromotedType::Int64;
         assert!(promote_attributes(&batch, &[unsupported]).is_err());
-        let legacy = promoted_property_json(&[attrs.clone()]).unwrap();
+        let legacy = promoted_property_json(std::slice::from_ref(&attrs)).unwrap();
         assert!(
             !legacy.contains("carrier"),
             "old metadata remains byte compatible"
@@ -615,7 +615,7 @@ mod tests {
             promoted_columns_from_properties(None, None, Some(&legacy)),
             vec![attrs]
         );
-        let current = promoted_property_json(&[raw.clone()]).unwrap();
+        let current = promoted_property_json(std::slice::from_ref(&raw)).unwrap();
         assert_eq!(
             promoted_columns_from_properties(Some(&current), Some("[]"), Some("[]")),
             vec![raw]
@@ -635,7 +635,7 @@ mod tests {
         let mut raw = PromotedColumn::parse_spec("value:string:raw_value").unwrap();
         raw.carrier = PromotionCarrier::Raw;
         let current = promoted_property_json(&[attr.clone(), raw]).unwrap();
-        let compatible = promoted_property_json(&[attr.clone()]).unwrap();
+        let compatible = promoted_property_json(std::slice::from_ref(&attr)).unwrap();
         assert!(promoted_compatibility_matches(
             Some(&current),
             Some(&compatible),

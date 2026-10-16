@@ -4057,14 +4057,15 @@ mod declare_promotions_tests {
         tenant.create_index(&config).await.unwrap();
         let mut raw = siglake_core::PromotedColumn::parse_spec("value:string:raw_value").unwrap();
         raw.carrier = siglake_core::PromotionCarrier::Raw;
-        let (ident, added) = declare_promotions_on_table(&tenant, "eventdata", &[raw.clone()])
-            .await
-            .unwrap();
+        let (ident, added) =
+            declare_promotions_on_table(&tenant, "eventdata", std::slice::from_ref(&raw))
+                .await
+                .unwrap();
         assert_eq!(added, 1);
         let table = tenant.catalog().load_table(&ident).await.unwrap();
         assert_eq!(tenant.promoted_for_table(&table), vec![raw.clone()]);
         assert!(
-            declare_promotions_on_table(&base, "eventdata", &[raw.clone()])
+            declare_promotions_on_table(&base, "eventdata", std::slice::from_ref(&raw))
                 .await
                 .is_err()
         );
