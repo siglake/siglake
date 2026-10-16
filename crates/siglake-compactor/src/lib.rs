@@ -49,7 +49,7 @@ use opendal::Operator;
 use siglake_core::index_config::{FieldType, IndexConfig};
 use siglake_core::mapping::map_carrier_batch_with_stats;
 use siglake_storage::catalog_claim::{
-    ConsumedProofWatermark, LocalCommittedSegment, ProofProvenance, SqlSegmentClaim,
+    ClaimedSegment, ConsumedProofWatermark, LocalCommittedSegment, ProofProvenance, SqlSegmentClaim,
 };
 use siglake_storage::consumed_proof::{ConsumedProofEntry, ConsumedProofRead, ReclaimProofSources};
 use siglake_storage::iceberg::{
@@ -63,7 +63,7 @@ use siglake_wal::{
     claim_segment, finish_segment, list_committed, list_index_dirs, list_orphaned, list_poisoned,
     list_sealed, list_tenant_dirs, list_visible, quarantine_poison_segment, read_segment,
     read_segment_from_bytes, recover_orphaned_processing, release_segment,
-    segment_uncompressed_bytes, sweep_committed_gated,
+    segment_uncompressed_bytes, segment_uncompressed_bytes_from_bytes, sweep_committed_gated,
 };
 
 /// How long to retain `committed/` segments before sweep deletes them.
@@ -979,6 +979,9 @@ pub struct Compactor {
     /// after its async drain parent is cancelled.
     #[cfg(test)]
     append_aggregate_hold_for_test: Option<Arc<AppendAggregateHold>>,
+    /// Pin the catalog fetch/decode budget without changing process state.
+    #[cfg(test)]
+    catalog_decoded_budget_for_test: Option<u64>,
 }
 
 impl Compactor {
@@ -1022,6 +1025,8 @@ impl Compactor {
             segment_read_hold_for_test: None,
             #[cfg(test)]
             append_aggregate_hold_for_test: None,
+            #[cfg(test)]
+            catalog_decoded_budget_for_test: None,
         };
         s.quarantine_processing_orphans();
         s
@@ -1162,6 +1167,12 @@ impl Compactor {
     #[cfg(test)]
     fn with_append_aggregate_hold_for_test(mut self, hold: Arc<AppendAggregateHold>) -> Self {
         self.append_aggregate_hold_for_test = Some(hold);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_catalog_decoded_budget_for_test(mut self, bytes: u64) -> Self {
+        self.catalog_decoded_budget_for_test = Some(bytes.max(1));
         self
     }
 
@@ -4688,7 +4699,10 @@ enum WalDirClaim {
 /// What a mirrored segment's fetch produced: rows to commit, or a refusal that
 /// no retry can change.
 enum SegmentFetch {
-    Ready(Vec<RecordBatch>),
+    Ready {
+        body: bytes::Bytes,
+        decoded_bytes: u64,
+    },
     /// Quarantine the claim on this cycle, with this reason (#2746). Terminal
     /// because a table uuid is never reused, so re-fetching the bytes can only
     /// reach the same verdict.
@@ -4697,6 +4711,27 @@ enum SegmentFetch {
 
 /// One segment's fetch-and-classify step on the catalog-claim drain.
 type SegmentFetchFut = futures::future::BoxFuture<'static, anyhow::Result<SegmentFetch>>;
+
+/// Longest non-empty prefix whose byte sum fits `budget_bytes`.
+///
+/// A first member larger than the whole budget is returned alone so neither a
+/// physical fetch window nor a decoded commit group can strand it forever.
+fn budgeted_prefix_len(sizes: impl IntoIterator<Item = u64>, budget_bytes: u64) -> usize {
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for size in sizes {
+        if count > 0 && bytes.saturating_add(size) > budget_bytes {
+            break;
+        }
+        count += 1;
+        bytes = bytes.saturating_add(size);
+    }
+    count
+}
+
+fn claimed_physical_bytes(claim: &ClaimedSegment) -> u64 {
+    u64::try_from(claim.bytes).unwrap_or(u64::MAX).max(1)
+}
 
 /// #2693: the object's own frame header names a table this index no longer
 /// resolves to.
@@ -6305,6 +6340,16 @@ impl Compactor {
             n = claimed.len(),
             "catalog-claim: draining WAL segments into per-(tenant, index) commits"
         );
+        let derived_decoded_byte_budget = drain_decoded_budget_bytes(
+            siglake_storage::memory_limit_for_sizing(),
+            drain_inflight_budget_bytes(),
+        );
+        #[cfg(test)]
+        let decoded_byte_budget = self
+            .catalog_decoded_budget_for_test
+            .unwrap_or(derived_decoded_byte_budget);
+        #[cfg(not(test))]
+        let decoded_byte_budget = derived_decoded_byte_budget;
 
         // 3. Group claimed segments by (tenant, index) and commit each group to
         // its own table in its own Iceberg namespace (fleet prereq 2: user-index
@@ -6447,223 +6492,277 @@ impl Compactor {
             // accounting identity caught it.
             drop(_resolve_guard);
             use futures::StreamExt as _;
-            // Fetch + decode the group's segments CONCURRENTLY: the serial
-            // per-segment GET was the drain's dominant wall cost (a 256-claim
-            // batch paid 256 round-trip latencies per cycle — the ~50K rows/s
-            // per-drain ceiling in fleet round 3). Segment order within a
+            // Fetch each physical window concurrently, preflight its decoded
+            // sizes, then append decoded-byte-bounded subgroups. The registered
+            // physical byte count bounds compressed bodies retained while an
+            // append is live; the frame preflight prevents compression from
+            // bypassing the decoded allocation budget. Segment order within a
             // commit is irrelevant: storage re-sorts every batch into the
             // table's declared order at write.
             let fetch_concurrency = drain_fetch_concurrency();
-            // Materialized BoxFutures rather than a lazy borrowing iterator:
-            // the borrow-through-stream chain leaked a higher-ranked lifetime
-            // obligation into the embedded-drain future and broke downstream
-            // crates' spawns with "FnOnce is not general enough".
-            // `SegmentFetch::Refused` = the segment cannot be placed in the
-            // table this group is for (#2693, #2729); it is quarantined, not
-            // committed.
-            let fetch_futs: Vec<SegmentFetchFut> = group
-                .iter()
-                .map(|c| {
-                    // Root-relative mirror key — layout-agnostic (flat,
-                    // per-tenant, or per-tenant/per-index).
-                    let key = c.segment_url.clone();
-                    let store = cfg.store.clone();
-                    let owner = group_owner.clone();
-                    let strict = strict_owner;
-                    // #2745: the group knows both, and the refusal counter is
-                    // the only numeric signal that a recreated index is holding
-                    // objects back. Labelled `tenant="mirror"` it could not be
-                    // broken down at all, so an operator reading a non-zero
-                    // rate could not tell which index to look at.
-                    let refused_tenant = tenant.clone();
-                    let refused_index = index_id.clone();
-                    let fut: futures::future::BoxFuture<'static, _> = Box::pin(async move {
-                        let bs = store
-                            .read(&key)
-                            .await
-                            .map_err(|e| anyhow::Error::from(e).context(format!("GET {key}")))?;
-                        let body = bs.to_bytes();
-                        // #2693: the mirror-side owner marker is per key PREFIX,
-                        // so it says nothing about a segment a stale writer
-                        // uploaded after the prefix was re-stamped. The frame
-                        // header does. Refusing here quarantines this segment's
-                        // claim rather than committing a dropped incarnation's
-                        // rows into the replacement (#2746: terminal on the
-                        // first cycle, since a table uuid is never reused).
-                        //
-                        // #2729: under `strict` the prefix has itself named a
-                        // dropped table, so an UNSTAMPED object under it is
-                        // refused on the same grounds — it may be a segment of
-                        // that dropped incarnation, written before headers
-                        // carried an identity, and nothing here can tell.
-                        if let Some(uuid) = owner.as_deref() {
-                            let refusal =
-                                match siglake_wal::classify_segment_owner_bytes(&body, uuid) {
-                                    siglake_wal::WalOwner::Stale(dropped) => {
-                                        Some((dropped, STALE_HEADER_REFUSAL))
-                                    }
-                                    siglake_wal::WalOwner::Unmarked if strict => {
-                                        Some(("unstamped".to_string(), UNSTAMPED_REFUSAL))
-                                    }
-                                    _ => None,
-                                };
-                            if let Some((dropped, reason)) = refusal {
-                                metrics::counter!(
-                                    "siglake_compactor_wal_stale_segments_total",
-                                    "tenant" => refused_tenant,
-                                    "index" => refused_index
-                                )
-                                .increment(1);
-                                tracing::warn!(
-                                    key = %key,
-                                    dropped_table = %dropped,
-                                    live_table = %uuid,
-                                    "mirrored segment cannot be placed in the table this index \
-                                     resolves to now; quarantining the claim instead of \
-                                     committing it"
-                                );
-                                return Ok(SegmentFetch::Refused(reason));
+            let mut fetch_offset = 0usize;
+            while fetch_offset < group.len() {
+                let fetch_count = budgeted_prefix_len(
+                    group[fetch_offset..]
+                        .iter()
+                        .map(|claim| claimed_physical_bytes(claim)),
+                    decoded_byte_budget,
+                );
+                let fetch_group = &group[fetch_offset..fetch_offset + fetch_count];
+                let registered_physical_bytes = fetch_group.iter().fold(0u64, |sum, claim| {
+                    sum.saturating_add(claimed_physical_bytes(claim))
+                });
+                // Materialized BoxFutures rather than a lazy borrowing iterator:
+                // the borrow-through-stream chain leaked a higher-ranked lifetime
+                // obligation into the embedded-drain future and broke downstream
+                // crates' spawns with "FnOnce is not general enough".
+                // `SegmentFetch::Refused` = the segment cannot be placed in the
+                // table this group is for (#2693, #2729); it is quarantined, not
+                // committed.
+                let fetch_futs: Vec<SegmentFetchFut> = fetch_group
+                    .iter()
+                    .map(|c| {
+                        // Root-relative mirror key — layout-agnostic (flat,
+                        // per-tenant, or per-tenant/per-index).
+                        let key = c.segment_url.clone();
+                        let store = cfg.store.clone();
+                        let owner = group_owner.clone();
+                        let strict = strict_owner;
+                        // #2745: the group knows both, and the refusal counter is
+                        // the only numeric signal that a recreated index is holding
+                        // objects back. Labelled `tenant="mirror"` it could not be
+                        // broken down at all, so an operator reading a non-zero
+                        // rate could not tell which index to look at.
+                        let refused_tenant = tenant.clone();
+                        let refused_index = index_id.clone();
+                        let fut: futures::future::BoxFuture<'static, _> = Box::pin(async move {
+                            let bs = store.read(&key).await.map_err(|e| {
+                                anyhow::Error::from(e).context(format!("GET {key}"))
+                            })?;
+                            let body = bs.to_bytes();
+                            // #2693: the mirror-side owner marker is per key PREFIX,
+                            // so it says nothing about a segment a stale writer
+                            // uploaded after the prefix was re-stamped. The frame
+                            // header does. Refusing here quarantines this segment's
+                            // claim rather than committing a dropped incarnation's
+                            // rows into the replacement (#2746: terminal on the
+                            // first cycle, since a table uuid is never reused).
+                            //
+                            // #2729: under `strict` the prefix has itself named a
+                            // dropped table, so an UNSTAMPED object under it is
+                            // refused on the same grounds — it may be a segment of
+                            // that dropped incarnation, written before headers
+                            // carried an identity, and nothing here can tell.
+                            if let Some(uuid) = owner.as_deref() {
+                                let refusal =
+                                    match siglake_wal::classify_segment_owner_bytes(&body, uuid) {
+                                        siglake_wal::WalOwner::Stale(dropped) => {
+                                            Some((dropped, STALE_HEADER_REFUSAL))
+                                        }
+                                        siglake_wal::WalOwner::Unmarked if strict => {
+                                            Some(("unstamped".to_string(), UNSTAMPED_REFUSAL))
+                                        }
+                                        _ => None,
+                                    };
+                                if let Some((dropped, reason)) = refusal {
+                                    metrics::counter!(
+                                        "siglake_compactor_wal_stale_segments_total",
+                                        "tenant" => refused_tenant,
+                                        "index" => refused_index
+                                    )
+                                    .increment(1);
+                                    tracing::warn!(
+                                        key = %key,
+                                        dropped_table = %dropped,
+                                        live_table = %uuid,
+                                        "mirrored segment cannot be placed in the table this index \
+                                         resolves to now; quarantining the claim instead of \
+                                         committing it"
+                                    );
+                                    return Ok(SegmentFetch::Refused(reason));
+                                }
+                            }
+                            let decoded_bytes = segment_uncompressed_bytes_from_bytes(&body);
+                            Ok(SegmentFetch::Ready {
+                                body,
+                                decoded_bytes,
+                            })
+                        });
+                        fut
+                    })
+                    .collect();
+                // Timed as stage WALL (not summed per-segment latency) so it is
+                // directly comparable to concat/data_write, which are also
+                // per-call wall times.
+                let _fetch_t = std::time::Instant::now();
+                let fetched: Vec<anyhow::Result<SegmentFetch>> = futures::stream::iter(fetch_futs)
+                    .buffered(fetch_concurrency)
+                    .collect()
+                    .await;
+                metrics::histogram!("siglake_compactor_segment_fetch_duration_seconds")
+                    .record(_fetch_t.elapsed().as_secs_f64());
+                metrics::counter!("siglake_compactor_segments_fetched_total")
+                    .increment(fetch_group.len() as u64);
+
+                let mut ready: Vec<(&ClaimedSegment, bytes::Bytes, u64)> = Vec::new();
+                let mut fetch_err: Option<anyhow::Error> = None;
+                let mut refused: Vec<(String, &'static str)> = Vec::new();
+                for (c, result) in fetch_group.iter().zip(fetched) {
+                    match result {
+                        Ok(SegmentFetch::Ready {
+                            body,
+                            decoded_bytes,
+                        }) => ready.push((c, body, decoded_bytes)),
+                        Ok(SegmentFetch::Refused(reason)) => {
+                            refused.push((c.id.clone(), reason));
+                        }
+                        Err(e) => {
+                            if fetch_err.is_none() {
+                                fetch_err = Some(e);
                             }
                         }
-                        // Object-store segments may be WS-8 framed (header +
-                        // CRC + body) or legacy raw IPC — decode either.
-                        read_segment_from_bytes(&body)
-                            .context("read_segment_from_bytes")
-                            .map(SegmentFetch::Ready)
-                    });
-                    fut
-                })
-                .collect();
-            // The fetch stage had NO timer, and it is the largest block on the
-            // drain path: a 512-segment claim issues 512 GETs at
-            // `fetch_concurrency`. The 2026-08-14 attribution measured a
-            // work-saturated 4-drain fleet at 64.6% "duty" with a GROWING
-            // backlog -- the missing 35% could not be idleness, and this was
-            // the only unmeasured stage it could be hiding in.
-            //
-            // Timed as stage WALL (not summed per-segment latency) so it is
-            // directly comparable to concat/data_write, which are also per-call
-            // wall times. Summing them across calls gives node-seconds.
-            let _fetch_t = std::time::Instant::now();
-            let fetched: Vec<anyhow::Result<SegmentFetch>> = futures::stream::iter(fetch_futs)
-                .buffered(fetch_concurrency)
-                .collect()
-                .await;
-            metrics::histogram!("siglake_compactor_segment_fetch_duration_seconds")
-                .record(_fetch_t.elapsed().as_secs_f64());
-            metrics::counter!("siglake_compactor_segments_fetched_total")
-                .increment(group.len() as u64);
-            let mut batches: Vec<RecordBatch> = Vec::new();
-            let mut consumed: Vec<ConsumedProofEntry> = Vec::with_capacity(group.len());
-            let mut fetch_err: Option<anyhow::Error> = None;
-            let mut refused: Vec<(String, &'static str)> = Vec::new();
-            for (c, result) in group.iter().zip(fetched) {
-                match result {
-                    Ok(SegmentFetch::Ready(mut bs)) => {
-                        batches.append(&mut bs);
-                        consumed.push(ConsumedProofEntry {
-                            segment_id: format!("{}.arrow", c.id),
-                            claimed_at_ms: c.claimed_at.timestamp_millis(),
-                        });
-                    }
-                    Ok(SegmentFetch::Refused(reason)) => refused.push((c.id.clone(), reason)),
-                    Err(e) => {
-                        fetch_err = Some(e);
-                        break;
                     }
                 }
-            }
-            // Quarantined on this cycle, not committed and not deleted: the same
-            // disposition `stale/` gives the FS path, and `requeue_quarantined`
-            // is the way back. #2746: this used to `release`, which is
-            // retry-shaped — twelve cycles, each paying a GET of the object's
-            // bytes, to reach an answer a table uuid's never being reused made
-            // terminal on the first one.
-            for (id, reason) in &refused {
-                let _ = cfg.claim.quarantine_terminal(id, reason).await;
-                released_ids.insert(id.clone());
-            }
-            let group: Vec<_> = group
-                .iter()
-                .filter(|c| !refused.iter().any(|(id, _)| id == &c.id))
-                .collect();
-            if group.is_empty() {
-                continue;
-            }
-            if let Some(e) = fetch_err {
-                commit_err = Some(e);
-                break 'outer;
-            }
-            Self::preregister_proof_watermark_skips(index_id);
-            let stored = cfg
-                .claim
-                .consumed_proof_watermark(tenant, index_id)
-                .await
-                .with_context(|| {
-                    format!("read consumed-proof watermark for {tenant}/{index_id}")
-                })?;
-            // #2889: the append writes this boundary onto the table the group's
-            // ownership check named. A boundary established by a different
-            // incarnation describes segments that table never held, so it is
-            // dropped rather than carried — the rows still commit.
-            let watermark =
-                Self::watermark_for_incarnation(stored.as_ref(), group_owner.as_deref());
-            if watermark.is_none() && stored.is_some() {
-                metrics::counter!(
-                    "siglake_compactor_proof_watermark_skipped_total",
-                    "reason" => PROOF_WATERMARK_UNVERIFIED_APPEND,
-                    "index" => index_id.clone()
-                )
-                .increment(1);
-            }
-            let terminal_proof_entries = Self::terminal_consumed_proof_entries(
-                &ice,
-                &cfg.claim,
-                tenant,
-                index_id,
-                target.index_label(),
-            )
-            .await
-            .with_context(|| {
-                format!("read terminal consumed-proof entries for {tenant}/{index_id}")
-            })?;
-            let outcome = match commit_batches(
-                &ice,
-                batches,
-                consumed,
-                watermark,
-                &terminal_proof_entries,
-                group.len(),
-                &target,
-                None,
-            )
-            .await
-            {
-                Ok(o) => o,
-                Err(e) => {
+                // Quarantined on this cycle, not committed and not deleted: the
+                // same disposition `stale/` gives the FS path, and
+                // `requeue_quarantined` is the way back.
+                for (id, reason) in &refused {
+                    let _ = cfg.claim.quarantine_terminal(id, reason).await;
+                    released_ids.insert(id.clone());
+                }
+                if let Some(e) = fetch_err {
                     commit_err = Some(e);
                     break 'outer;
                 }
-            };
-            metrics::counter!(
-                "siglake_compactor_rows_committed_total",
-                "tenant" => tenant.clone()
-            )
-            .increment(outcome.rows);
-            if outcome.strict_residual_rows > 0 {
-                metrics::counter!(
-                    "siglake_compactor_strict_residual_rows_total",
-                    "tenant" => tenant.clone(),
-                    "index" => target.index_label().to_string()
-                )
-                .increment(outcome.strict_residual_rows);
-            }
-            committed_total += group.len();
-            committed_ids.extend(group.iter().map(|c| c.id.clone()));
-            if let Some(owner) = group_owner.as_deref() {
-                // The append above was fenced against this uuid, so it is the
-                // table these rows and their proof entries are in (#2889).
-                provenance.record(tenant, index_id, owner);
+                fetch_offset += fetch_count;
+
+                while !ready.is_empty() {
+                    let decoded_count = budgeted_prefix_len(
+                        ready.iter().map(|(_, _, decoded_bytes)| *decoded_bytes),
+                        decoded_byte_budget,
+                    );
+                    let chunk: Vec<_> = ready.drain(..decoded_count).collect();
+                    let chunk_decoded_bytes = chunk
+                        .iter()
+                        .fold(0u64, |sum, (_, _, bytes)| sum.saturating_add(*bytes));
+                    tracing::info!(
+                        tenant,
+                        index = index_id,
+                        segments = chunk.len(),
+                        registered_physical_bytes,
+                        decoded_bytes = chunk_decoded_bytes,
+                        decoded_budget_bytes = decoded_byte_budget,
+                        oversized_segment = chunk_decoded_bytes > decoded_byte_budget,
+                        "catalog WAL subgroup admitted"
+                    );
+
+                    let mut batches: Vec<RecordBatch> = Vec::new();
+                    let mut consumed: Vec<ConsumedProofEntry> = Vec::with_capacity(chunk.len());
+                    let mut chunk_ids: Vec<String> = Vec::with_capacity(chunk.len());
+                    for (claim, body, _) in &chunk {
+                        match read_segment_from_bytes(body).context("read_segment_from_bytes") {
+                            Ok(mut segment_batches) => {
+                                batches.append(&mut segment_batches);
+                                consumed.push(ConsumedProofEntry {
+                                    segment_id: format!("{}.arrow", claim.id),
+                                    claimed_at_ms: claim.claimed_at.timestamp_millis(),
+                                });
+                                chunk_ids.push(claim.id.clone());
+                            }
+                            Err(e) => {
+                                commit_err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    if commit_err.is_some() {
+                        break 'outer;
+                    }
+
+                    Self::preregister_proof_watermark_skips(index_id);
+                    let stored = match cfg
+                        .claim
+                        .consumed_proof_watermark(tenant, index_id)
+                        .await
+                        .with_context(|| {
+                            format!("read consumed-proof watermark for {tenant}/{index_id}")
+                        }) {
+                        Ok(stored) => stored,
+                        Err(e) => {
+                            commit_err = Some(e);
+                            break 'outer;
+                        }
+                    };
+                    // #2889: the append writes this boundary onto the table the
+                    // group's ownership check named. A boundary established by
+                    // another incarnation describes segments that table never
+                    // held, so it is dropped rather than carried.
+                    let watermark =
+                        Self::watermark_for_incarnation(stored.as_ref(), group_owner.as_deref());
+                    if watermark.is_none() && stored.is_some() {
+                        metrics::counter!(
+                            "siglake_compactor_proof_watermark_skipped_total",
+                            "reason" => PROOF_WATERMARK_UNVERIFIED_APPEND,
+                            "index" => index_id.clone()
+                        )
+                        .increment(1);
+                    }
+                    let terminal_proof_entries = match Self::terminal_consumed_proof_entries(
+                        &ice,
+                        &cfg.claim,
+                        tenant,
+                        index_id,
+                        target.index_label(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("read terminal consumed-proof entries for {tenant}/{index_id}")
+                    }) {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            commit_err = Some(e);
+                            break 'outer;
+                        }
+                    };
+                    let outcome = match commit_batches(
+                        &ice,
+                        batches,
+                        consumed,
+                        watermark,
+                        &terminal_proof_entries,
+                        chunk.len(),
+                        &target,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            commit_err = Some(e);
+                            break 'outer;
+                        }
+                    };
+                    metrics::counter!(
+                        "siglake_compactor_rows_committed_total",
+                        "tenant" => tenant.clone()
+                    )
+                    .increment(outcome.rows);
+                    if outcome.strict_residual_rows > 0 {
+                        metrics::counter!(
+                            "siglake_compactor_strict_residual_rows_total",
+                            "tenant" => tenant.clone(),
+                            "index" => target.index_label().to_string()
+                        )
+                        .increment(outcome.strict_residual_rows);
+                    }
+                    committed_total += chunk.len();
+                    committed_ids.extend(chunk_ids);
+                    if let Some(owner) = group_owner.as_deref() {
+                        // The append above was fenced against this uuid, so it is
+                        // the table these rows and their proof entries are in.
+                        provenance.record(tenant, index_id, owner);
+                    }
+                }
             }
         }
 
@@ -9763,6 +9862,122 @@ mod watermark_incarnation_tests {
             Compactor::preregister_proof_watermark_skips("");
         }
         assert!(snapshotter.snapshot().into_vec().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod catalog_decoded_budget_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use opendal::services::Memory;
+
+    use super::*;
+
+    #[test]
+    fn aggregate_prefix_budget_allows_one_oversized_segment_to_progress() {
+        assert_eq!(budgeted_prefix_len([40, 50, 20], 100), 2);
+        assert_eq!(
+            budgeted_prefix_len([101, 1], 100),
+            1,
+            "an oversized first segment must run alone instead of deadlocking"
+        );
+        assert_eq!(budgeted_prefix_len([u64::MAX, 1], 100), 1);
+    }
+
+    /// The catalog drain must apply the decoded budget to the aggregate native
+    /// WAL payload, while retaining concurrent GETs and one consumed-proof entry
+    /// per segment across the resulting commits.
+    #[tokio::test]
+    async fn compressed_catalog_group_commits_in_decoded_byte_subgroups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source-wal");
+        let mut writer = siglake_wal::WalWriter::with_thresholds(
+            &source,
+            "catalog-budget",
+            1,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let store = Operator::new(Memory::default()).unwrap().finish();
+        let claim_uri = format!(
+            "sqlite://{}?mode=rwc",
+            tmp.path().join("claim.db").display()
+        );
+        let claim = SqlSegmentClaim::connect(&claim_uri, "catalog-budget-test")
+            .await
+            .unwrap();
+
+        let mut ids = Vec::new();
+        let mut decoded = Vec::new();
+        let mut physical_total = 0u64;
+        for n in 0..4 {
+            let segment = writer
+                .append_events(&[siglake_core::Event::now(format!(
+                    "field={n} {}",
+                    "compressible-payload-".repeat(32_768)
+                ))])
+                .unwrap()
+                .expect("max_events=1 seals every fixture");
+            let filename = segment.path.file_name().unwrap().to_str().unwrap();
+            let id = filename.strip_suffix(".arrow").unwrap().to_string();
+            let key = format!("wal-mirror/{filename}");
+            let body = std::fs::read(&segment.path).unwrap();
+            physical_total = physical_total.saturating_add(body.len() as u64);
+            decoded.push(segment_uncompressed_bytes_from_bytes(&body));
+            store.write(&key, Bytes::from(body)).await.unwrap();
+            claim
+                .register(&id, "default", "", &key, segment.bytes as i64, 1)
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let decoded_budget = decoded[0].saturating_add(decoded[1]);
+        assert!(
+            physical_total < decoded_budget,
+            "the whole compressed claim must fit the old physical-byte admission"
+        );
+        assert!(decoded.iter().sum::<u64>() > decoded_budget);
+        assert_eq!(
+            budgeted_prefix_len(decoded.iter().copied(), decoded_budget),
+            2,
+            "aggregate admission must stop before the third decoded segment"
+        );
+
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        let compactor = Compactor::new(tmp.path().join("drain-wal"), ice.clone())
+            .with_catalog_claim(CatalogClaimConfig {
+                claim: claim.clone(),
+                store,
+                prefix: "wal-mirror".to_string(),
+                batch_size: ids.len(),
+                last_mirror_sync: Default::default(),
+                last_reclaim: Default::default(),
+            })
+            .with_catalog_decoded_budget_for_test(decoded_budget);
+
+        assert_eq!(compactor.run_once().await.unwrap(), ids.len());
+        assert_eq!(compactor.run_once().await.unwrap(), 0);
+        let ConsumedProofRead::Valid(proof) = ice.durable_consumed_proof("events").await.unwrap()
+        else {
+            panic!("catalog drain must persist a consumed proof")
+        };
+        for id in &ids {
+            assert!(proof.contains(&format!("{id}.arrow")));
+        }
+        let rows: u64 = ice
+            .live_data_files(ice.events_table_ident())
+            .await
+            .unwrap()
+            .iter()
+            .map(|file| file.record_count())
+            .sum();
+        assert_eq!(rows, ids.len() as u64);
     }
 }
 

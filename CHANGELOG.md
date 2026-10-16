@@ -71,15 +71,16 @@
   declares its stream's schema through the same comparison, so it cannot
   declare a file schema for batches that were rebuilt. (#6745, #6779, #6820)
 
-- **Compactor drain memory (bug fix, target 0.3.0)**: filesystem-drain claim
-  admission now counts uncompressed Arrow IPC bytes across in-flight commits,
-  beside the existing compressed-byte and segment caps. The packaged 1Gi
-  compactor targets 128 MiB of decoded WAL input under the shipped
-  1024 MiB setting. New zstd WAL frames expose their uncompressed size without
-  decoding; segments from older builds use a bounded streaming sizing pass.
-  One oversized segment is still admitted alone to preserve progress; this is
-  not a hard memory bound. Fresh 1Gi field qualification remains required.
-  (#6744)
+- **Compactor drain memory (bug fix, target 0.3.0)**: filesystem and
+  catalog-claim admission now count uncompressed Arrow IPC bytes instead of
+  letting compressed WAL lengths price decoded input. The packaged 1Gi
+  compactor targets 128 MiB of decoded WAL input under the shipped 1024 MiB
+  setting. The catalog path keeps concurrent object GETs, then commits each
+  tenant/index claim as decoded-byte-bounded subgroups with exact consumed
+  proofs. New zstd WAL frames expose their uncompressed size without decoding;
+  segments from older builds use a bounded streaming sizing pass. One oversized
+  segment is still admitted alone to preserve progress, so this is not a hard
+  memory bound. Fresh 1Gi field qualification remains required. (#6744, #6750)
 
 - **Exact grouped AVG (feature, target 0.3.0)**: new Parquet files carry a
   bounded `status`/`size` grouped numeric footer. The published

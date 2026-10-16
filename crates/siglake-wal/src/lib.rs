@@ -2799,6 +2799,50 @@ pub fn segment_uncompressed_bytes_strict(path: &Path) -> Result<u64> {
     segment_uncompressed_bytes_strict_file(&mut file, path, file_len)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentSizePreflight {
+    Known(u64),
+    Zstd { body_offset: usize, body_len: u64 },
+}
+
+fn corrupt_segment_charge(bytes: u64) -> u64 {
+    bytes.max(1).saturating_mul(16)
+}
+
+/// Classify enough of a segment header to choose its decoded-size path.
+///
+/// Both filesystem and object-store admission use this parser, so malformed
+/// framing receives the same conservative charge before either path decodes.
+fn segment_size_preflight(prefix: &[u8], file_len: u64) -> SegmentSizePreflight {
+    if prefix.len() < WAL_FRAME_MAGIC.len() || &prefix[..4] != WAL_FRAME_MAGIC {
+        return SegmentSizePreflight::Known(file_len);
+    }
+    if prefix.len() < WAL_FRAME_HEADER_LEN_V1 {
+        return SegmentSizePreflight::Known(corrupt_segment_charge(file_len));
+    }
+    let version = prefix[4];
+    let Some(header_len) = frame_header_len(version) else {
+        return SegmentSizePreflight::Known(corrupt_segment_charge(file_len));
+    };
+    if file_len < header_len as u64 || prefix.len() < header_len {
+        return SegmentSizePreflight::Known(corrupt_segment_charge(file_len));
+    }
+    let physical_body_len = file_len - header_len as u64;
+    let partial = prefix[5] & WAL_FRAME_FLAG_PARTIAL != 0;
+    if partial || prefix[5] & WAL_FRAME_FLAG_ZSTD == 0 {
+        return SegmentSizePreflight::Known(physical_body_len);
+    }
+
+    let declared_body_len = u64::from_le_bytes(prefix[24..32].try_into().unwrap());
+    if physical_body_len != declared_body_len {
+        return SegmentSizePreflight::Known(corrupt_segment_charge(physical_body_len));
+    }
+    SegmentSizePreflight::Zstd {
+        body_offset: header_len,
+        body_len: declared_body_len,
+    }
+}
+
 fn segment_uncompressed_bytes_strict_file(
     file: &mut File,
     path: &Path,
@@ -2874,7 +2918,6 @@ fn segment_uncompressed_bytes_strict_file(
 /// cannot bypass its decoded-memory admission bound.
 pub fn segment_uncompressed_bytes(path: &Path) -> Result<u64> {
     const ZSTD_FRAME_HEADER_MAX: usize = 18;
-    let corrupt_charge = |bytes: u64| bytes.max(1).saturating_mul(16);
 
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let file_len = file
@@ -2885,30 +2928,14 @@ pub fn segment_uncompressed_bytes(path: &Path) -> Result<u64> {
     let fixed_len = file_len.min(WAL_FRAME_HEADER_LEN as u64) as usize;
     file.read_exact(&mut fixed[..fixed_len])
         .with_context(|| format!("reading WAL header from {}", path.display()))?;
-    if fixed_len < WAL_FRAME_MAGIC.len() || &fixed[..4] != WAL_FRAME_MAGIC {
-        return Ok(file_len);
-    }
-    if fixed_len < WAL_FRAME_HEADER_LEN_V1 {
-        return Ok(corrupt_charge(file_len));
-    }
-    let version = fixed[4];
-    let Some(header_len) = frame_header_len(version) else {
-        return Ok(corrupt_charge(file_len));
+    let (body_offset, body_len) = match segment_size_preflight(&fixed[..fixed_len], file_len) {
+        SegmentSizePreflight::Known(bytes) => return Ok(bytes),
+        SegmentSizePreflight::Zstd {
+            body_offset,
+            body_len,
+        } => (body_offset, body_len),
     };
-    if file_len < header_len as u64 {
-        return Ok(corrupt_charge(file_len));
-    }
-    let physical_body_len = file_len - header_len as u64;
-    let partial = fixed[5] & WAL_FRAME_FLAG_PARTIAL != 0;
-    if partial || fixed[5] & WAL_FRAME_FLAG_ZSTD == 0 {
-        return Ok(physical_body_len);
-    }
-
-    let declared_body_len = u64::from_le_bytes(fixed[24..32].try_into().unwrap());
-    if physical_body_len != declared_body_len {
-        return Ok(corrupt_charge(physical_body_len));
-    }
-    file.seek(std::io::SeekFrom::Start(header_len as u64))
+    file.seek(std::io::SeekFrom::Start(body_offset as u64))
         .with_context(|| format!("seeking to WAL body in {}", path.display()))?;
     let mut zstd_header = [0u8; ZSTD_FRAME_HEADER_MAX];
     let prefix_len = file
@@ -2923,10 +2950,10 @@ pub fn segment_uncompressed_bytes(path: &Path) -> Result<u64> {
     // Segments written before the one-shot encoder did not stamp a content
     // size. Count the decoded stream without retaining it, then decode it for
     // real only if the compactor admits this segment.
-    file.seek(std::io::SeekFrom::Start(header_len as u64))
+    file.seek(std::io::SeekFrom::Start(body_offset as u64))
         .with_context(|| format!("seeking to legacy zstd body in {}", path.display()))?;
-    let Ok(mut decoder) = zstd::stream::read::Decoder::new(file.take(declared_body_len)) else {
-        return Ok(corrupt_charge(declared_body_len));
+    let Ok(mut decoder) = zstd::stream::read::Decoder::new(file.take(body_len)) else {
+        return Ok(corrupt_segment_charge(body_len));
     };
     match std::io::copy(&mut decoder, &mut std::io::sink()) {
         Ok(bytes) => Ok(bytes),
@@ -2934,7 +2961,38 @@ pub fn segment_uncompressed_bytes(path: &Path) -> Result<u64> {
         // Charge a conservative estimate so this object is eventually claimed;
         // read_segment then verifies its CRC/decoder and the existing poison
         // ledger names and contains it.
-        Err(_) => Ok(corrupt_charge(declared_body_len)),
+        Err(_) => Ok(corrupt_segment_charge(body_len)),
+    }
+}
+
+/// Bytes in the uncompressed Arrow IPC body of an in-memory WAL segment.
+///
+/// This is the object-store twin of [`segment_uncompressed_bytes`]. It shares
+/// the frame-header parser and the corrupt-input charge with the filesystem
+/// path, and streams legacy zstd frames into a sink when they do not declare a
+/// content size. Callers can therefore size a fetched object before retaining
+/// any decoded Arrow arrays.
+pub fn segment_uncompressed_bytes_from_bytes(bytes: &[u8]) -> u64 {
+    const ZSTD_FRAME_HEADER_MAX: usize = 18;
+
+    let prefix_len = bytes.len().min(WAL_FRAME_HEADER_LEN);
+    match segment_size_preflight(&bytes[..prefix_len], bytes.len() as u64) {
+        SegmentSizePreflight::Known(size) => size,
+        SegmentSizePreflight::Zstd {
+            body_offset,
+            body_len,
+        } => {
+            let body = &bytes[body_offset..];
+            let zstd_prefix = &body[..body.len().min(ZSTD_FRAME_HEADER_MAX)];
+            if let Ok(Some(content_size)) = zstd::zstd_safe::get_frame_content_size(zstd_prefix) {
+                return content_size;
+            }
+            let Ok(mut decoder) = zstd::stream::read::Decoder::new(body) else {
+                return corrupt_segment_charge(body_len);
+            };
+            std::io::copy(&mut decoder, &mut std::io::sink())
+                .unwrap_or_else(|_| corrupt_segment_charge(body_len))
+        }
     }
 }
 
@@ -4165,6 +4223,11 @@ mod crc_integrity_tests {
             );
             fs::write(&path, &frame).unwrap();
             assert_eq!(segment_uncompressed_bytes(&path).unwrap(), raw.len() as u64);
+            assert_eq!(
+                segment_uncompressed_bytes_from_bytes(&frame),
+                raw.len() as u64,
+                "object-store sizing must match filesystem sizing for {name}"
+            );
             assert!(
                 raw.len() > frame.len() * 10,
                 "fixture must reproduce a compressed-byte admission bypass"
@@ -4190,6 +4253,43 @@ mod crc_integrity_tests {
                 assert!(read_segment_bounded(&path, u64::MAX).is_err());
             }
             assert_eq!(read_segment(&path).unwrap()[0].num_rows(), 2);
+        }
+    }
+
+    #[test]
+    fn object_store_sizing_matches_legacy_and_corrupt_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let batch = events_to_record_batch(&[Event::now("legacy")]).unwrap();
+        let mut legacy = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut legacy, &batch.schema()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut short_frame = WAL_FRAME_MAGIC.to_vec();
+        short_frame.extend_from_slice(&[WAL_FRAME_VERSION, WAL_FRAME_FLAG_ZSTD]);
+        let mut wrong_body_len = build_wal_frame(
+            WAL_FRAME_FLAG_ZSTD,
+            0,
+            0,
+            None,
+            b"not-zstd",
+            crc32(b"not-zstd"),
+        );
+        wrong_body_len[24..32].copy_from_slice(&999u64.to_le_bytes());
+
+        for (name, bytes) in [
+            ("legacy", legacy),
+            ("short-frame", short_frame),
+            ("wrong-body-len", wrong_body_len),
+        ] {
+            let path = tmp.path().join(format!("{name}.arrow"));
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                segment_uncompressed_bytes_from_bytes(&bytes),
+                segment_uncompressed_bytes(&path).unwrap(),
+                "{name}: object and filesystem corrupt-input charges must match"
+            );
         }
     }
 

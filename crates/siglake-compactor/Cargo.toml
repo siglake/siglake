@@ -13,6 +13,7 @@ siglake-wal = { workspace = true }
 anyhow = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 metrics = { workspace = true }
@@ -25,7 +26,6 @@ uuid = { workspace = true }
 metrics-util = "0.20"
 metrics = { workspace = true }
 arrow-array = { workspace = true }
-bytes = { workspace = true }
 datafusion = { workspace = true }
 iceberg = { workspace = true }
 opendal = { workspace = true }
