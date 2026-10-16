@@ -677,7 +677,11 @@ async fn raw_carrier_managed_index_keeps_answers_across_backfill_and_old_writer(
     ice.recluster_files(&ident, files, &["host", "raw_value"])
         .await
         .unwrap();
-    assert!(ice.ensure_promotion_backfill_property().await.unwrap());
+    // The original completion stamp remains recorded. Rewriting the later
+    // unprovenanced file restores live-file qualification without flipping it
+    // again; the return value reports a property mutation, not eligibility.
+    assert!(!ice.ensure_promotion_backfill_property().await.unwrap());
+    assert!(ice.attr_rewrite_map_for(&ident).await.unwrap().is_some());
     let app = router(AppState::new(
         Arc::new(IcebergContext::open(&warehouse).await.unwrap()),
         AuthConfig::open(),
