@@ -1247,8 +1247,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   A deployment that comes up says nothing about correctness there. Garage is
   refused for conditional warehouse mutations (above), so an arm running on it
   leaves inline side aggregates unpublished and fails the other guarded
-  operations closed, and no matched MinIO/Garage kind round has been retained:
-  the repository preparation is checked offline by
+  operations closed. Matched local MinIO/Garage runs 193/194 on the same frozen
+  source both exited zero, with exact distributed counts and 2→4→2 scaling.
+  The required Garage conditional-write refusal logs were not retained, so
+  that acceptance evidence remains incomplete; see the
+  [comparison report](../results/release-validation/20261016-object-store-kind-comparison.md).
+  The repository preparation is checked offline by
   `scripts/check-kind-object-store.sh`, which drives the selector, the
   bootstrap and the manifest/values/`garage.toml` agreement without a cluster.
   Two opt-ins address MinIO by name rather than through the selector — the
