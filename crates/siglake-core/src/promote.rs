@@ -36,6 +36,36 @@ pub const PROMOTED_PROPERTY_KEY: &str = "siglake.promoted.v1";
 /// whole expression and materialize the wrong value.
 pub const PROMOTED_PROPERTY_V2_KEY: &str = "siglake.promoted.v2";
 
+/// Carrier-aware identities. Older writers see only attributes declarations in
+/// v1/v2 and therefore cannot materialize raw columns from the wrong JSON.
+pub const PROMOTED_PROPERTY_V3_KEY: &str = "siglake.promoted.v3";
+
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PromotionCarrier {
+    #[default]
+    Attributes,
+    Raw,
+}
+
+impl PromotionCarrier {
+    pub fn is_attributes(&self) -> bool {
+        *self == Self::Attributes
+    }
+
+    pub fn from_column(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("attributes") {
+            Some(Self::Attributes)
+        } else if name.eq_ignore_ascii_case("raw") {
+            Some(Self::Raw)
+        } else {
+            None
+        }
+    }
+}
+
 /// Arrow/Parquet type a promoted attribute lands in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -72,6 +102,9 @@ impl PromotedType {
 /// `name` column of `ty`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PromotedColumn {
+    /// Actual stored JSON carrier; absent in historical metadata means attributes.
+    #[serde(default, skip_serializing_if = "PromotionCarrier::is_attributes")]
+    pub carrier: PromotionCarrier,
     pub attr_key: String,
     /// Keys applied by outer `attr_get` calls after `attr_key`. Empty is the
     /// original `attr_get(attributes, attr_key)` source. For example,
@@ -94,18 +127,52 @@ pub fn promoted_property_json(promoted: &[PromotedColumn]) -> Result<String> {
 /// Parse [`PROMOTED_PROPERTY_KEY`] from table properties. Absent or
 /// unparseable ⇒ empty (no pruning; conservative).
 pub fn promoted_columns_from_property(json: Option<&str>) -> Vec<PromotedColumn> {
-    json.and_then(|j| serde_json::from_str(j).ok())
+    json.and_then(|j| serde_json::from_str::<Vec<PromotedColumn>>(j).ok())
+        .filter(|columns| columns.iter().all(PromotedColumn::supported_carrier_type))
         .unwrap_or_default()
 }
 
-/// Read the expression-aware property when present, otherwise the legacy
-/// direct-only property. An invalid v2 value is not allowed to fall back to v1:
-/// doing so could silently discard a composed source and qualify the wrong map.
+/// v3 is authoritative only while older compatibility properties are its exact
+/// supported projections. An old writer may append safely, but its declaration
+/// must not be silently overwritten or inferred to be a v3 identity.
+pub fn promoted_compatibility_matches(
+    carrier_aware: Option<&str>,
+    expression_aware: Option<&str>,
+    legacy: Option<&str>,
+) -> bool {
+    let Some(json) = carrier_aware else {
+        return true;
+    };
+    let Ok(columns) = serde_json::from_str::<Vec<PromotedColumn>>(json) else {
+        return false;
+    };
+    if columns.iter().any(|c| !c.supported_carrier_type()) {
+        return false;
+    }
+    let attributes: Vec<_> = columns
+        .iter()
+        .filter(|c| c.carrier.is_attributes())
+        .cloned()
+        .collect();
+    let parse = |value: Option<&str>| {
+        value.and_then(|s| serde_json::from_str::<Vec<PromotedColumn>>(s).ok())
+    };
+    parse(expression_aware) == Some(attributes)
+        && parse(legacy) == Some(direct_promotions(&columns))
+}
+
+/// Read the newest present property without falling back past malformed
+/// metadata. v3 includes the carrier, v2 the attributes expression, and v1
+/// the legacy direct attributes identity.
 pub fn promoted_columns_from_properties(
+    carrier_aware: Option<&str>,
     expression_aware: Option<&str>,
     legacy: Option<&str>,
 ) -> Vec<PromotedColumn> {
-    match expression_aware {
+    if !promoted_compatibility_matches(carrier_aware, expression_aware, legacy) {
+        return Vec::new();
+    }
+    match carrier_aware.or(expression_aware) {
         Some(json) => promoted_columns_from_property(Some(json)),
         None => promoted_columns_from_property(legacy),
     }
@@ -136,6 +203,7 @@ impl PromotedColumn {
             };
             return Some(PromotedColumn {
                 attr_key: path[0].clone(),
+                carrier: Default::default(),
                 attr_get_path: path[1..].to_vec(),
                 name,
                 ty,
@@ -153,10 +221,17 @@ impl PromotedColumn {
         };
         Some(PromotedColumn {
             attr_key: attr_key.to_string(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name,
             ty,
         })
+    }
+
+    /// Raw promotions store the UDF's exact text. Numeric casts remain in SQL
+    /// until their failure/rounding semantics have separately qualified types.
+    pub fn supported_carrier_type(&self) -> bool {
+        self.carrier.is_attributes() || self.ty == PromotedType::Utf8
     }
 
     pub fn is_composed(&self) -> bool {
@@ -173,7 +248,9 @@ impl PromotedColumn {
 /// lookups retain v2. A composed lookup requires v3 so a concurrent or rolled
 /// back v2 writer cannot qualify its null-padded or wrongly materialized file.
 pub fn promotion_extractor_version(promoted: &[PromotedColumn]) -> u32 {
-    if promoted.iter().any(PromotedColumn::is_composed) {
+    if promoted.iter().any(|c| c.carrier == PromotionCarrier::Raw) {
+        RAW_EXTRACTOR_VERSION
+    } else if promoted.iter().any(PromotedColumn::is_composed) {
         COMPOSED_ATTR_EXTRACTOR_VERSION
     } else {
         ATTR_EXTRACTOR_VERSION
@@ -185,7 +262,7 @@ pub fn promotion_extractor_version(promoted: &[PromotedColumn]) -> u32 {
 pub fn direct_promotions(promoted: &[PromotedColumn]) -> Vec<PromotedColumn> {
     promoted
         .iter()
-        .filter(|column| !column.is_composed())
+        .filter(|column| column.carrier.is_attributes() && !column.is_composed())
         .cloned()
         .collect()
 }
@@ -211,6 +288,8 @@ pub const ATTR_EXTRACTOR_VERSION: u32 = 2;
 /// Provenance version for promotion sets containing a composed `attr_get`.
 /// Direct-only writers stamp v2; expression-aware writers stamp v3.
 pub const COMPOSED_ATTR_EXTRACTOR_VERSION: u32 = 3;
+/// Raw-carrier identities must never qualify files written by attributes-only writers.
+pub const RAW_EXTRACTOR_VERSION: u32 = 4;
 
 /// Look `key` up in a parsed attributes map: a literal (possibly dotted) key
 /// wins at every level; otherwise a dotted key walks into nested objects one
@@ -296,10 +375,20 @@ pub fn promote_attributes(batch: &RecordBatch, promoted: &[PromotedColumn]) -> R
     if promoted.is_empty() {
         return Ok(batch.clone());
     }
+    if promoted.iter().any(|c| !c.supported_carrier_type()) {
+        return Err(crate::CoreError::InvalidEvent(
+            "raw promotions require string type; retain numeric casts in SQL".into(),
+        ));
+    }
     let n = batch.num_rows();
     let attrs: Option<&StringArray> = batch
         .column_by_name("attributes")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+    let raw: Option<&StringArray> = batch
+        .column_by_name("raw")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let needs_attributes = promoted.iter().any(|c| c.carrier.is_attributes());
 
     // One typed builder per promoted column.
     enum B {
@@ -321,10 +410,22 @@ pub fn promote_attributes(batch: &RecordBatch, promoted: &[PromotedColumn]) -> R
     for row in 0..n {
         // Parse this row's attributes JSON once; extract every promoted key from it.
         let parsed: Option<serde_json::Map<String, serde_json::Value>> = attrs
+            .filter(|_| needs_attributes)
             .filter(|a| !a.is_null(row))
             .and_then(|a| serde_json::from_str(a.value(row)).ok());
         for (col, b) in promoted.iter().zip(builders.iter_mut()) {
-            let v = parsed.as_ref().and_then(|m| promoted_value(m, col));
+            let v = match col.carrier {
+                PromotionCarrier::Attributes => {
+                    parsed.as_ref().and_then(|m| promoted_value(m, col))
+                }
+                PromotionCarrier::Raw => raw.filter(|a| !a.is_null(row)).and_then(|a| {
+                    let mut value = crate::json_attr_lookup(a.value(row), &col.attr_key)?;
+                    for key in &col.attr_get_path {
+                        value = crate::json_attr_lookup(&value, key)?;
+                    }
+                    Some(serde_json::Value::String(value))
+                }),
+            };
             match b {
                 B::Utf8(bld) => match v.as_ref() {
                     Some(serde_json::Value::String(s)) => bld.append_value(s),
@@ -439,6 +540,135 @@ mod tests {
     use crate::{events_schema, events_to_record_batch, Event};
     use arrow_array::{BooleanArray, Float64Array, Int64Array};
 
+    #[test]
+    fn raw_carrier_materializes_actual_raw_and_preserves_attribute_identity() {
+        let attrs = PromotedColumn::parse_spec("value:string:attr_value").unwrap();
+        let mut raw = attrs.clone();
+        raw.name = "raw_value".into();
+        raw.carrier = PromotionCarrier::Raw;
+        let mut chained = PromotedColumn::parse_spec(r#"["obj","leaf"]:string:raw_leaf"#).unwrap();
+        chained.carrier = PromotionCarrier::Raw;
+        let events = [
+            Event::now(r#"{"value":7,"obj":"{\"leaf\":\"serialized\"}"}"#)
+                .with_attributes(Some(r#"{"value":9,"obj":{"leaf":"wrong"}}"#.into())),
+            Event::now("not-json").with_attributes(Some(r#"{"value":8}"#.into())),
+            Event::now(r#"{"value":null,"obj":null}"#)
+                .with_attributes(Some(r#"{"value":6}"#.into())),
+            Event::now(r#"{"value":"raw-only","obj":{"leaf":9007199254740993}}"#),
+        ];
+        let batch = events_to_record_batch(&events).unwrap();
+        let promoted = vec![attrs.clone(), raw.clone(), chained];
+        let widened = promote_attributes(&batch, &promoted).unwrap();
+        let values = |name: &str| {
+            widened
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            values("attr_value"),
+            vec![Some("9"), Some("8"), Some("6"), None]
+        );
+        assert_eq!(
+            values("raw_value"),
+            vec![Some("7"), None, None, Some("raw-only")]
+        );
+        assert_eq!(
+            values("raw_leaf"),
+            vec![Some("serialized"), None, None, Some("9007199254740993")]
+        );
+        assert_eq!(
+            promotion_extractor_version(&promoted),
+            RAW_EXTRACTOR_VERSION
+        );
+        assert_eq!(direct_promotions(&promoted), vec![attrs.clone()]);
+        assert_eq!(repromote_attributes(&widened, &promoted).unwrap(), widened);
+        let odd = events_to_record_batch(&[
+            Event::now(r#"{"value":1,"value":2}"#),
+            Event::now(r#"{"value":3,"bad": ???}"#),
+        ])
+        .unwrap();
+        let odd = promote_attributes(&odd, std::slice::from_ref(&raw)).unwrap();
+        assert_eq!(
+            odd.column_by_name("raw_value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some("1"), Some("3")]
+        );
+        let mut unsupported = raw.clone();
+        unsupported.ty = PromotedType::Int64;
+        assert!(promote_attributes(&batch, &[unsupported]).is_err());
+        let legacy = promoted_property_json(std::slice::from_ref(&attrs)).unwrap();
+        assert!(
+            !legacy.contains("carrier"),
+            "old metadata remains byte compatible"
+        );
+        assert_eq!(
+            promoted_columns_from_properties(None, None, Some(&legacy)),
+            vec![attrs]
+        );
+        let current = promoted_property_json(std::slice::from_ref(&raw)).unwrap();
+        assert_eq!(
+            promoted_columns_from_properties(Some(&current), Some("[]"), Some("[]")),
+            vec![raw]
+        );
+        assert!(promoted_columns_from_properties(Some("invalid"), None, Some(&legacy)).is_empty());
+        assert!(promoted_columns_from_properties(
+            Some(&current.replace("raw", "unknown")),
+            None,
+            Some(&legacy)
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn raw_carrier_compatibility_divergence_is_not_a_qualified_identity() {
+        let attr = PromotedColumn::parse_spec("value:string:attr_value").unwrap();
+        let mut raw = PromotedColumn::parse_spec("value:string:raw_value").unwrap();
+        raw.carrier = PromotionCarrier::Raw;
+        let current = promoted_property_json(&[attr.clone(), raw]).unwrap();
+        let compatible = promoted_property_json(std::slice::from_ref(&attr)).unwrap();
+        assert!(promoted_compatibility_matches(
+            Some(&current),
+            Some(&compatible),
+            Some(&compatible)
+        ));
+        let extra = PromotedColumn::parse_spec("extra:string:extra_value").unwrap();
+        let changed = promoted_property_json(&[attr, extra]).unwrap();
+        assert!(!promoted_compatibility_matches(
+            Some(&current),
+            Some(&changed),
+            Some(&changed)
+        ));
+        assert!(
+            promoted_columns_from_properties(Some(&current), Some(&changed), Some(&changed))
+                .is_empty()
+        );
+        assert!(!promoted_compatibility_matches(
+            Some(&current),
+            None,
+            Some(&compatible)
+        ));
+        assert!(!promoted_compatibility_matches(
+            Some(&current),
+            Some("bad"),
+            Some(&compatible)
+        ));
+        assert!(!promoted_compatibility_matches(
+            Some(&current),
+            Some(&compatible),
+            Some("[]")
+        ));
+    }
+
     fn ev(attributes: Option<&str>) -> Event {
         Event::now("raw").with_attributes(attributes.map(str::to_string))
     }
@@ -447,24 +677,28 @@ mod tests {
         vec![
             PromotedColumn {
                 attr_key: "http.status_code".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "status".into(),
                 ty: PromotedType::Int64,
             },
             PromotedColumn {
                 attr_key: "k8s.namespace".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "ns".into(),
                 ty: PromotedType::Utf8,
             },
             PromotedColumn {
                 attr_key: "ratio".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "ratio".into(),
                 ty: PromotedType::Float64,
             },
             PromotedColumn {
                 attr_key: "sampled".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "sampled".into(),
                 ty: PromotedType::Boolean,
@@ -478,6 +712,7 @@ mod tests {
             PromotedColumn::parse_spec("http.status_code:int"),
             Some(PromotedColumn {
                 attr_key: "http.status_code".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "http_status_code".into(),
                 ty: PromotedType::Int64
@@ -487,6 +722,7 @@ mod tests {
             PromotedColumn::parse_spec("k8s.namespace:string:ns"),
             Some(PromotedColumn {
                 attr_key: "k8s.namespace".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "ns".into(),
                 ty: PromotedType::Utf8
@@ -500,6 +736,7 @@ mod tests {
             ),
             Some(PromotedColumn {
                 attr_key: "aws.cloudwatch".into(),
+                carrier: Default::default(),
                 attr_get_path: vec!["log_stream".into()],
                 name: "cloudwatch_stream".into(),
                 ty: PromotedType::Utf8,
@@ -559,6 +796,7 @@ mod tests {
         ];
         let promoted = [PromotedColumn {
             attr_key: "aws.cloudwatch".into(),
+            carrier: Default::default(),
             attr_get_path: vec!["log_stream".into()],
             name: "cloudwatch_stream".into(),
             ty: PromotedType::Utf8,
@@ -703,12 +941,14 @@ mod tests {
         let cols = vec![
             PromotedColumn {
                 attr_key: "a.b.c".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "abc".into(),
                 ty: PromotedType::Int64,
             },
             PromotedColumn {
                 attr_key: "log.file.path".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "log_file_path".into(),
                 ty: PromotedType::Utf8,

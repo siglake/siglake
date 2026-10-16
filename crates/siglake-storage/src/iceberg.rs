@@ -3510,6 +3510,10 @@ fn validate_promotion_redefinition(
     let mut desired_names = std::collections::HashSet::new();
     for column in desired {
         anyhow::ensure!(
+            column.supported_carrier_type(),
+            "raw promotions require string type; retain numeric casts in SQL"
+        );
+        anyhow::ensure!(
             desired_names.insert(column.name.as_str()),
             "promoted column `{}` is declared more than once",
             column.name
@@ -3541,11 +3545,19 @@ struct PromotionDeclarationPlan {
     promoted: Vec<siglake_core::PromotedColumn>,
     desired_json: String,
     legacy_json: Option<String>,
+    carrier_json: Option<String>,
     expected_version: u32,
 }
 
 impl PromotionDeclarationPlan {
     fn properties_match(&self, properties: &HashMap<String, String>) -> bool {
+        if self.carrier_json.as_deref()
+            != properties
+                .get(siglake_core::PROMOTED_PROPERTY_V3_KEY)
+                .map(String::as_str)
+        {
+            return false;
+        }
         if let Some(legacy_json) = &self.legacy_json {
             properties
                 .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
@@ -3581,7 +3593,23 @@ impl DeclarePromotionsAction {
     /// a disjoint declaration which won the preceding attempt is retained.
     fn plan(&self, table: &Table) -> iceberg::Result<PromotionDeclarationPlan> {
         let properties = table.metadata().properties();
-        let existing = match properties.get(siglake_core::PROMOTED_PROPERTY_V2_KEY) {
+        if !siglake_core::promoted_compatibility_matches(
+            properties
+                .get(siglake_core::PROMOTED_PROPERTY_V3_KEY)
+                .map(String::as_str),
+            properties
+                .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+                .map(String::as_str),
+            properties
+                .get(siglake_core::PROMOTED_PROPERTY_KEY)
+                .map(String::as_str),
+        ) {
+            return Err(Self::invalid("promotion compatibility views diverged; stop mixed-version declarations and reconcile identities before declaring more columns"));
+        }
+        let existing = match properties
+            .get(siglake_core::PROMOTED_PROPERTY_V3_KEY)
+            .or_else(|| properties.get(siglake_core::PROMOTED_PROPERTY_V2_KEY))
+        {
             Some(json) => serde_json::from_str::<Vec<siglake_core::PromotedColumn>>(json).map_err(
                 |error| {
                     Self::invalid(format!(
@@ -3627,11 +3655,25 @@ impl DeclarePromotionsAction {
                 promoted.push(requested.clone());
             }
         }
-        let desired_json = siglake_core::promoted_property_json(&promoted)
-            .map_err(|error| Self::invalid(format!("promoted property json: {error}")))?;
-        let expression_aware = promoted
+        let carrier_aware = promoted.iter().any(|c| !c.carrier.is_attributes());
+        let carrier_json = carrier_aware
+            .then(|| siglake_core::promoted_property_json(&promoted))
+            .transpose()
+            .map_err(|error| Self::invalid(format!("carrier promoted property json: {error}")))?;
+        // v2 is the exact attributes-only compatibility view. v1 is its
+        // direct subset. Old writers null-pad raw columns, never populate them
+        // from attributes; their old file provenance cannot satisfy v4.
+        let attributes: Vec<_> = promoted
             .iter()
-            .any(siglake_core::PromotedColumn::is_composed);
+            .filter(|c| c.carrier.is_attributes())
+            .cloned()
+            .collect();
+        let desired_json = siglake_core::promoted_property_json(&attributes)
+            .map_err(|error| Self::invalid(format!("promoted property json: {error}")))?;
+        let expression_aware = carrier_aware
+            || promoted
+                .iter()
+                .any(siglake_core::PromotedColumn::is_composed);
         let legacy_json = expression_aware
             .then(|| {
                 siglake_core::promoted_property_json(&siglake_core::direct_promotions(&promoted))
@@ -3643,6 +3685,7 @@ impl DeclarePromotionsAction {
             promoted,
             desired_json,
             legacy_json,
+            carrier_json,
             expected_version,
         })
     }
@@ -3658,6 +3701,12 @@ impl TransactionAction for DeclarePromotionsAction {
         }
 
         let mut updates = HashMap::new();
+        if let Some(carrier_json) = &plan.carrier_json {
+            updates.insert(
+                siglake_core::PROMOTED_PROPERTY_V3_KEY.to_string(),
+                carrier_json.clone(),
+            );
+        }
         if let Some(legacy_json) = &plan.legacy_json {
             updates.insert(
                 siglake_core::PROMOTED_PROPERTY_KEY.to_string(),
@@ -3683,6 +3732,7 @@ impl TransactionAction for DeclarePromotionsAction {
         {
             let stamp = if !properties.contains_key(siglake_core::PROMOTED_PROPERTY_KEY)
                 && !properties.contains_key(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+                && !properties.contains_key(siglake_core::PROMOTED_PROPERTY_V3_KEY)
             {
                 promotion_declared_stamp(plan.expected_version)
             } else {
@@ -8711,8 +8761,11 @@ fn select_promotions(
             declined: Vec::new(),
         };
     }
-    let already: std::collections::HashSet<&str> =
-        existing.iter().map(|c| c.attr_key.as_str()).collect();
+    let already: std::collections::HashSet<&str> = existing
+        .iter()
+        .filter(|c| c.carrier.is_attributes() && !c.is_composed())
+        .map(|c| c.attr_key.as_str())
+        .collect();
     let dotted_parent_declines = census.declined.iter().filter_map(|(key, (rows, reason))| {
         (!already.contains(key.as_str()) && (*rows as f64) / (census.rows as f64) >= min_fraction)
             .then_some(AutoPromotionDecline {
@@ -8776,6 +8829,7 @@ fn select_promotions(
         taken.insert(name.clone());
         promoted_now.push(siglake_core::PromotedColumn {
             attr_key: key.to_string(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name,
             ty,
@@ -8826,6 +8880,60 @@ fn newest_sample_files(mut files: Vec<SampleCandidate>, limit: usize) -> Vec<Sam
 #[cfg(test)]
 mod promotion_extraction_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn raw_carrier_metadata_preserves_old_views_and_rejects_reassignment() {
+        use siglake_core::{
+            PromotedColumn, PromotionCarrier, PROMOTED_PROPERTY_KEY, PROMOTED_PROPERTY_V2_KEY,
+            PROMOTED_PROPERTY_V3_KEY,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let attr = PromotedColumn::parse_spec("value:string:attr_value").unwrap();
+        let mut raw = PromotedColumn::parse_spec("value:string:raw_value").unwrap();
+        raw.carrier = PromotionCarrier::Raw;
+        ice.declare_promotions_for(ice.events_table_ident(), std::slice::from_ref(&attr))
+            .await
+            .unwrap();
+        ice.declare_promotions_for(ice.events_table_ident(), std::slice::from_ref(&raw))
+            .await
+            .unwrap();
+        let table = ice
+            .catalog()
+            .load_table(ice.events_table_ident())
+            .await
+            .unwrap();
+        let props = table.metadata().properties();
+        for key in [PROMOTED_PROPERTY_KEY, PROMOTED_PROPERTY_V2_KEY] {
+            assert_eq!(
+                siglake_core::promoted_columns_from_property(props.get(key).map(String::as_str)),
+                vec![attr.clone()]
+            );
+        }
+        assert_eq!(
+            siglake_core::promoted_columns_from_property(
+                props.get(PROMOTED_PROPERTY_V3_KEY).map(String::as_str)
+            ),
+            vec![attr.clone(), raw.clone()]
+        );
+        assert!(props[PROMOTION_EXTRACTION_PROP].starts_with("4:"));
+        let mut changed = raw.clone();
+        changed.carrier = PromotionCarrier::Attributes;
+        let error = ice
+            .declare_promotions_for(ice.events_table_ident(), &[changed])
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("cannot change extraction identity"));
+        // A fresh retry must preserve an independently added attribute and raw identity.
+        let extra = PromotedColumn::parse_spec("extra:string:extra_value").unwrap();
+        let stale = DeclarePromotionsAction::new(std::slice::from_ref(&extra));
+        let plan = stale.plan(&table).unwrap();
+        assert_eq!(plan.promoted, vec![attr, raw, extra]);
+        assert!(plan.carrier_json.is_some());
+        assert_eq!(plan.expected_version, siglake_core::RAW_EXTRACTOR_VERSION);
+    }
 
     #[test]
     fn stamps_round_trip_at_the_current_version() {
@@ -8887,6 +8995,7 @@ mod promotion_extraction_tests {
     fn backfill_value_carries_the_extractor_version() {
         let promoted = vec![siglake_core::PromotedColumn {
             attr_key: "a.b.c".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "a_b_c".into(),
             ty: siglake_core::PromotedType::Utf8,
@@ -8909,12 +9018,14 @@ mod promotion_extraction_tests {
     fn a_physical_promotion_column_cannot_change_expression_identity() {
         let direct = siglake_core::PromotedColumn {
             attr_key: "aws.cloudwatch.log_stream".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "cloudwatch_stream".into(),
             ty: siglake_core::PromotedType::Utf8,
         };
         let composed = siglake_core::PromotedColumn {
             attr_key: "aws.cloudwatch".into(),
+            carrier: Default::default(),
             attr_get_path: vec!["log_stream".into()],
             name: "cloudwatch_stream".into(),
             ty: siglake_core::PromotedType::Utf8,
@@ -8968,17 +9079,20 @@ mod promotion_extraction_tests {
         let stale_base = ice.catalog().load_table(&ident).await.unwrap();
         let stream = siglake_core::PromotedColumn {
             attr_key: "aws.cloudwatch".into(),
+            carrier: Default::default(),
             attr_get_path: vec!["log_stream".into()],
             name: "aws_cloudwatch_composed_log_stream".into(),
             ty: siglake_core::PromotedType::Utf8,
         };
         let group = siglake_core::PromotedColumn {
             attr_key: "aws.cloudwatch".into(),
+            carrier: Default::default(),
             attr_get_path: vec!["log_group".into()],
             name: "aws_cloudwatch_composed_log_group".into(),
             ty: siglake_core::PromotedType::Utf8,
         };
         let conflicting = siglake_core::PromotedColumn {
+            carrier: Default::default(),
             attr_get_path: vec!["ingestion_time".into()],
             ..stream.clone()
         };
@@ -9005,6 +9119,9 @@ mod promotion_extraction_tests {
         let properties = table.metadata().properties();
         assert_eq!(
             siglake_core::promoted_columns_from_properties(
+                properties
+                    .get(siglake_core::PROMOTED_PROPERTY_V3_KEY)
+                    .map(String::as_str),
                 properties
                     .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
                     .map(String::as_str),
@@ -9229,6 +9346,7 @@ mod auto_promotion_sampling_tests {
         let c = census(&[Some(r#"{"a":"1","b":"2","c":"3"}"#)]);
         let existing = vec![PromotedColumn {
             attr_key: "z".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "z".into(),
             ty: PromotedType::Utf8,
@@ -9285,6 +9403,7 @@ mod auto_promotion_sampling_tests {
         let c = census(&[Some(r#"{"a":"1","host":"h","b-1":"2"}"#)]);
         let existing = vec![PromotedColumn {
             attr_key: "a".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "a".into(),
             ty: PromotedType::Utf8,
@@ -15866,7 +15985,10 @@ impl IcebergContext {
         &self,
     ) -> Result<
         Option<
-            std::collections::HashMap<(String, Vec<String>), (String, siglake_core::PromotedType)>,
+            std::collections::HashMap<
+                (siglake_core::PromotionCarrier, String, Vec<String>),
+                (String, siglake_core::PromotedType),
+            >,
         >,
     > {
         self.attr_rewrite_map_for(&self.table_ident.clone()).await
@@ -15879,7 +16001,10 @@ impl IcebergContext {
         table_ident: &TableIdent,
     ) -> Result<
         Option<
-            std::collections::HashMap<(String, Vec<String>), (String, siglake_core::PromotedType)>,
+            std::collections::HashMap<
+                (siglake_core::PromotionCarrier, String, Vec<String>),
+                (String, siglake_core::PromotedType),
+            >,
         >,
     > {
         Ok(self
@@ -15899,6 +16024,9 @@ impl IcebergContext {
         let entry = self.cached_table_entry(table_ident).await?;
         let props = entry.table.metadata().properties();
         let promoted = siglake_core::promoted_columns_from_properties(
+            props
+                .get(siglake_core::PROMOTED_PROPERTY_V3_KEY)
+                .map(String::as_str),
             props
                 .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
                 .map(String::as_str),
@@ -15927,7 +16055,7 @@ impl IcebergContext {
         }
         let map = promoted
             .into_iter()
-            .map(|c| ((c.attr_key, c.attr_get_path), (c.name, c.ty)))
+            .map(|c| ((c.carrier, c.attr_key, c.attr_get_path), (c.name, c.ty)))
             .collect::<std::collections::HashMap<_, _>>();
         if map.is_empty() {
             return Ok(None);
@@ -17560,6 +17688,9 @@ impl IcebergContext {
         let props = table.metadata().properties();
         let from_prop = siglake_core::promoted_columns_from_properties(
             props
+                .get(siglake_core::PROMOTED_PROPERTY_V3_KEY)
+                .map(String::as_str),
+            props
                 .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
                 .map(String::as_str),
             props
@@ -17568,7 +17699,8 @@ impl IcebergContext {
         );
         // The CLI list is the EVENTS-table bootstrap seed only; user indexes
         // are property-only (declared via auto-promotion or the index API).
-        let has_property = props.contains_key(siglake_core::PROMOTED_PROPERTY_V2_KEY)
+        let has_property = props.contains_key(siglake_core::PROMOTED_PROPERTY_V3_KEY)
+            || props.contains_key(siglake_core::PROMOTED_PROPERTY_V2_KEY)
             || props.contains_key(siglake_core::PROMOTED_PROPERTY_KEY);
         if !has_property && table.identifier() == &self.table_ident {
             self.promoted.clone()
@@ -25364,7 +25496,10 @@ pub struct BufferedTableSnapshot {
 /// whose promoted values were never qualified.
 #[derive(Clone)]
 pub struct QualifiedAttrRewrite {
-    pub mapping: HashMap<(String, Vec<String>), (String, siglake_core::PromotedType)>,
+    pub mapping: HashMap<
+        (siglake_core::PromotionCarrier, String, Vec<String>),
+        (String, siglake_core::PromotedType),
+    >,
     pub snapshot: BufferedTableSnapshot,
     /// The carrier mapping from the same table generation. `None` for tables
     /// that are not managed indexes; such tables have no index WAL override.
@@ -29766,12 +29901,14 @@ mod namespace_bootstrap_tests {
         let promoted = vec![
             siglake_core::PromotedColumn {
                 attr_key: "http.status_code".to_string(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "http_status_code".to_string(),
                 ty: siglake_core::PromotedType::Int64,
             },
             siglake_core::PromotedColumn {
                 attr_key: "service.name".to_string(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "service_name".to_string(),
                 ty: siglake_core::PromotedType::Utf8,

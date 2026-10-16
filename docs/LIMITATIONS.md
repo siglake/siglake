@@ -1669,6 +1669,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   column, but a settled file remains residual until some other compaction
   trigger rewrites it. There is no automatic migration or default composed
   promotion (#6752).
+- **Raw JSON promotion is explicit and text-only.** `--promote-raw` on
+  `declare-promotions` records a distinct carrier identity and requires a
+  `string` type; numeric casts remain in SQL. Existing attribute columns
+  cannot be reused, even when sample values happen to agree. The materializer
+  uses the actual raw carrier and the UDF scanner, not the attributes map.
+  Raw metadata is v3 and file provenance is x4. Old or mixed files keep the
+  original raw expression until normal backfill qualifies the complete
+  snapshot. No automatic raw candidate selection or migration is provided.
 - **Tier-1 group counts serve only columns present since the table's first
   commit.** The serving guard is `column_total(column) == record_count`, so a
   column that starts accumulating mid-life — a typed column on a table created
@@ -2088,3 +2096,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   still needs either a project-published build with an AGPL-3.0 redistribution
   policy or a qualified replacement S3 implementation. Tracked as #6118 and
   #6252.
+
+Raw-carrier rolling-writer limitation: old writers may append, but concurrent
+promotion declarations from binaries that only know v1/v2 are unsupported once
+v3 is present. If those compatibility views diverge, current readers decline
+promotion qualification and current declarations refuse without overwriting
+the older writer's addition. Upgrade declarers and reconcile source identities
+explicitly before declaring again; this does not trigger automatic migration.
