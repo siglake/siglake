@@ -6937,6 +6937,9 @@ fn promoted_columns(table: &Table) -> Vec<siglake_core::PromotedColumn> {
     let props = table.metadata().properties();
     siglake_core::promoted_columns_from_properties(
         props
+            .get(siglake_core::PROMOTED_PROPERTY_V3_KEY)
+            .map(String::as_str),
+        props
             .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
             .map(String::as_str),
         props
@@ -6950,7 +6953,11 @@ fn promoted_utf8_columns_from(
 ) -> HashMap<String, String> {
     promoted
         .into_iter()
-        .filter(|c| c.ty == siglake_core::PromotedType::Utf8 && !c.is_composed())
+        .filter(|c| {
+            c.carrier.is_attributes()
+                && c.ty == siglake_core::PromotedType::Utf8
+                && !c.is_composed()
+        })
         .map(|c| (c.attr_key, c.name))
         .collect()
 }
@@ -8448,12 +8455,14 @@ mod tests {
         events_schema_with(&[
             PromotedColumn {
                 attr_key: "region".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "region".into(),
                 ty: PromotedType::Utf8,
             },
             PromotedColumn {
                 attr_key: "http.status_code".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "status".into(),
                 ty: PromotedType::Int64,

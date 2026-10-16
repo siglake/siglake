@@ -79,6 +79,7 @@ async fn promotion_backfill_check_visits_each_table_once() {
         .unwrap()
         .with_promoted_columns(vec![PromotedColumn {
             attr_key: "k8s.pod".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "k8s_pod".into(),
             ty: PromotedType::Utf8,

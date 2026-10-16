@@ -753,8 +753,12 @@ enum Command {
         /// Attribute promotion to add. Repeatable. Uses
         /// `attr_key:type[:column]` or the exact JSON key-chain form
         /// `["inner key","outer key"]:type[:column]`.
-        #[arg(long = "promote-attr", required = true)]
+        #[arg(long = "promote-attr", required_unless_present = "promote_raw")]
         promote_attr: Vec<String>,
+        /// Promotion extracted from the actual stored raw JSON, independently of attributes.
+        /// Same key/type syntax as --promote-attr; use a distinct physical column.
+        #[arg(long = "promote-raw", required_unless_present = "promote_attr")]
+        promote_raw: Vec<String>,
     },
 
     /// Run a SQL query DIRECTLY against a warehouse via DataFusion — no
@@ -1524,14 +1528,21 @@ async fn run(cli: Cli) -> Result<()> {
             namespace,
             table,
             promote_attr,
+            promote_raw,
         } => {
+            let mut additions = parse_promoted(&promote_attr)?;
+            let mut raw = parse_promoted(&promote_raw)?;
+            for column in &mut raw {
+                column.carrier = siglake_core::PromotionCarrier::Raw;
+            }
+            additions.extend(raw);
             run_declare_promotions(
                 &cli.data_dir,
                 warehouse_url.as_deref(),
                 catalog_uri.as_deref(),
                 &namespace,
                 &table,
-                parse_promoted(&promote_attr)?,
+                additions,
             )
             .await
         }
@@ -3912,7 +3923,7 @@ async fn declare_promotions_on_table(
 ) -> Result<(iceberg::TableIdent, usize)> {
     anyhow::ensure!(
         !additions.is_empty(),
-        "at least one --promote-attr is required"
+        "at least one --promote-attr or --promote-raw is required"
     );
     let mut requested_names = std::collections::HashSet::new();
     for column in additions {
@@ -3972,6 +3983,7 @@ mod declare_promotions_tests {
     fn flat_cloudwatch() -> siglake_core::PromotedColumn {
         siglake_core::PromotedColumn {
             attr_key: "aws.cloudwatch.log_stream".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "aws_cloudwatch_log_stream".into(),
             ty: siglake_core::PromotedType::Utf8,
@@ -3981,10 +3993,87 @@ mod declare_promotions_tests {
     fn composed_cloudwatch() -> siglake_core::PromotedColumn {
         siglake_core::PromotedColumn {
             attr_key: "aws.cloudwatch".into(),
+            carrier: Default::default(),
             attr_get_path: vec!["log_stream".into()],
             name: "aws_cloudwatch_composed_log_stream".into(),
             ty: siglake_core::PromotedType::Utf8,
         }
+    }
+
+    #[test]
+    fn raw_carrier_cli_is_explicit_and_preserves_attribute_specs() {
+        let parsed = Cli::try_parse_from([
+            "siglake",
+            "declare-promotions",
+            "--table",
+            "eventdata",
+            "--promote-raw",
+            "nginx.access.body_sent.bytes:string:raw_body_bytes",
+            "--promote-attr",
+            "value:string:attr_value",
+        ])
+        .unwrap();
+        let Command::DeclarePromotions {
+            promote_attr,
+            promote_raw,
+            ..
+        } = parsed.command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(
+            parse_promoted(&promote_attr).unwrap()[0].carrier,
+            siglake_core::PromotionCarrier::Attributes
+        );
+        assert_eq!(
+            parse_promoted(&promote_raw).unwrap()[0].name,
+            "raw_body_bytes"
+        );
+        assert!(Cli::try_parse_from([
+            "siglake",
+            "declare-promotions",
+            "--table",
+            "eventdata",
+            "--promote-raw",
+            "value:string:raw_value"
+        ])
+        .is_ok());
+        assert!(
+            Cli::try_parse_from(["siglake", "declare-promotions", "--table", "eventdata"]).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_raw_declaration_is_namespaced_and_type_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        let tenant = base.for_namespace("raw_tenant").await.unwrap();
+        let config = IndexConfig {
+            index_id: "eventdata".into(),
+            ..IndexConfig::builtin_events()
+        };
+        tenant.create_index(&config).await.unwrap();
+        let mut raw = siglake_core::PromotedColumn::parse_spec("value:string:raw_value").unwrap();
+        raw.carrier = siglake_core::PromotionCarrier::Raw;
+        let (ident, added) = declare_promotions_on_table(&tenant, "eventdata", &[raw.clone()])
+            .await
+            .unwrap();
+        assert_eq!(added, 1);
+        let table = tenant.catalog().load_table(&ident).await.unwrap();
+        assert_eq!(tenant.promoted_for_table(&table), vec![raw.clone()]);
+        assert!(
+            declare_promotions_on_table(&base, "eventdata", &[raw.clone()])
+                .await
+                .is_err()
+        );
+        raw.ty = siglake_core::PromotedType::Int64;
+        raw.name = "raw_numeric".into();
+        let error = declare_promotions_on_table(&tenant, "eventdata", &[raw])
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("raw promotions require string type"));
     }
 
     #[tokio::test]
@@ -4015,6 +4104,9 @@ mod declare_promotions_tests {
         let properties = table.metadata().properties();
         assert_eq!(
             siglake_core::promoted_columns_from_properties(
+                properties
+                    .get(siglake_core::PROMOTED_PROPERTY_V3_KEY)
+                    .map(String::as_str),
                 properties
                     .get(siglake_core::PROMOTED_PROPERTY_V2_KEY)
                     .map(String::as_str),
@@ -4431,6 +4523,7 @@ mod migrate_schema_tests {
             .unwrap();
         let promoted = [siglake_core::PromotedColumn {
             attr_key: "service.name".to_string(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "service_name".to_string(),
             ty: siglake_core::PromotedType::Utf8,
@@ -4468,6 +4561,7 @@ mod migrate_schema_tests {
             .unwrap();
         let promoted = [siglake_core::PromotedColumn {
             attr_key: "service.name".to_string(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "service_name".to_string(),
             ty: siglake_core::PromotedType::Utf8,
@@ -4567,6 +4661,7 @@ mod migrate_schema_tests {
 
         let promoted = [siglake_core::PromotedColumn {
             attr_key: "service.name".to_string(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "service_name".to_string(),
             ty: siglake_core::PromotedType::Utf8,

@@ -1043,6 +1043,30 @@ composed promotion use extraction marker `x3`. An old writer can null-pad the
 new physical column, but its `x2` file cannot open the composed rewrite.
 Qualification still binds the rewrite map and provider to one snapshot (#6752).
 
+Raw JSON uses an explicit carrier identity; it is never inferred from an
+attributes promotion. For example, the original expression
+`CAST(attr_get(raw, 'nginx.access.body_sent.bytes') AS BIGINT)` can use a
+separately declared text column while retaining the SQL cast:
+
+```sh
+siglake declare-promotions --namespace siglake --table eventdata \
+  --promote-raw 'nginx.access.body_sent.bytes:string:raw_body_bytes' \
+  --promote-raw 'nginx.access.response_code:string:raw_response_code'
+```
+
+`--promote-raw` accepts the same direct or JSON key-chain syntax, currently with
+`string` type only. It materializes the actual stored `raw` text through the
+same scanner as `attr_get`, including first duplicate-key selection, literal
+key precedence, NULL, and serialized intermediate objects. It does not copy
+attributes: ingest may store a message in raw while attributes holds different
+values. Numeric casts and their errors remain in the original SQL. The raw
+carrier is part of immutable physical source identity. Carrier-aware metadata
+is stored in `siglake.promoted.v3`; older v2 and v1 properties contain only their
+supported attributes identities. Raw-containing files use `x4`; old writers'
+files keep the query residual until normal backfill establishes complete
+snapshot-qualified provenance. Declaration does not rewrite files or enable
+automatic raw promotion.
+
 **A non-scalar value reads differently per mechanism, on purpose.** `attr_get`
 and a `Utf8` promotion of the same key both return an object's or array's
 compact JSON, and they return the same text: each parses the value and

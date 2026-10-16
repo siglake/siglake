@@ -67,6 +67,7 @@ const ROWS: &[Option<&str>] = &[
 fn promoted() -> Vec<PromotedColumn> {
     vec![PromotedColumn {
         attr_key: "aws.cloudwatch".into(),
+        carrier: Default::default(),
         attr_get_path: Vec::new(),
         name: "aws_cloudwatch".into(),
         ty: PromotedType::Utf8,
@@ -265,18 +266,21 @@ fn non_utf8_promoted_types_reject_object_values() {
     let cols = vec![
         PromotedColumn {
             attr_key: "aws.cloudwatch".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "as_int".into(),
             ty: PromotedType::Int64,
         },
         PromotedColumn {
             attr_key: "aws.cloudwatch".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "as_float".into(),
             ty: PromotedType::Float64,
         },
         PromotedColumn {
             attr_key: "aws.cloudwatch".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "as_bool".into(),
             ty: PromotedType::Boolean,

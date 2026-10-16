@@ -47,6 +47,7 @@ fn pod_events(pod: &str, n: usize) -> Vec<Event> {
 fn promotion() -> Vec<PromotedColumn> {
     vec![PromotedColumn {
         attr_key: "k8s.pod".into(),
+        carrier: Default::default(),
         attr_get_path: Vec::new(),
         name: "k8s_pod".into(),
         ty: PromotedType::Utf8,
@@ -276,6 +277,7 @@ async fn attr_get_rewrite_activates_after_backfill() {
 fn object_promotion() -> Vec<PromotedColumn> {
     vec![PromotedColumn {
         attr_key: "aws.cloudwatch".into(),
+        carrier: Default::default(),
         attr_get_path: Vec::new(),
         name: "aws_cloudwatch".into(),
         ty: PromotedType::Utf8,
@@ -285,6 +287,7 @@ fn object_promotion() -> Vec<PromotedColumn> {
 fn composed_cloudwatch_promotion() -> Vec<PromotedColumn> {
     vec![PromotedColumn {
         attr_key: "aws.cloudwatch".into(),
+        carrier: Default::default(),
         attr_get_path: vec!["log_stream".into()],
         name: "aws_cloudwatch_composed_log_stream".into(),
         ty: PromotedType::Utf8,
@@ -294,6 +297,7 @@ fn composed_cloudwatch_promotion() -> Vec<PromotedColumn> {
 fn flat_cloudwatch_promotion() -> Vec<PromotedColumn> {
     vec![PromotedColumn {
         attr_key: "aws.cloudwatch.log_stream".into(),
+        carrier: Default::default(),
         attr_get_path: Vec::new(),
         name: "aws_cloudwatch_log_stream".into(),
         ty: PromotedType::Utf8,
@@ -540,6 +544,7 @@ async fn composed_attr_get_rewrite_refuses_flat_materialization_then_converges()
     let mut changed = flat_cloudwatch_promotion();
     changed.push(PromotedColumn {
         attr_key: "aws.cloudwatch".into(),
+        carrier: Default::default(),
         attr_get_path: vec!["log_group".into()],
         name: "aws_cloudwatch_composed_log_stream".into(),
         ty: PromotedType::Utf8,
@@ -554,6 +559,131 @@ async fn composed_attr_get_rewrite_refuses_flat_materialization_then_converges()
         "{error:#}"
     );
     assert_eq!(nested_object_answer(&app, SQL).await, expected);
+}
+
+/// The original raw expression must keep its own answer even when attributes
+/// disagree. Exercise actual managed-index handler substitution, old-file
+/// fallback, normal backfill, and a later unprovenanced writer.
+#[tokio::test]
+async fn raw_carrier_managed_index_keeps_answers_across_backfill_and_old_writer() {
+    use siglake_core::{index_config::IndexConfig, PromotionCarrier};
+    const SQL: &str = "SELECT timestamp, attr_get(e.raw, 'value') AS v, \
+        attr_get(e.attributes, 'value') AS a, \
+        attr_get(attr_get(e.raw, 'obj'), 'leaf') AS leaf \
+        FROM raw_events e ORDER BY timestamp";
+    const SUM: &str = "SELECT SUM(CAST(attr_get(raw, 'value') AS BIGINT)) AS bytes_sum FROM raw_events WHERE attr_get(raw, 'value') = '7'";
+    let mut events = vec![
+        Event::now(r#"{"value":7,"obj":{"leaf":"raw-child"}}"#)
+            .with_attributes(Some(r#"{"value":9,"obj":{"leaf":"wrong"}}"#.into())),
+        Event::now("not-json").with_attributes(Some(r#"{"value":8}"#.into())),
+        Event::now(r#"{"value":null,"obj":null,"obj.leaf":"not-the-chain"}"#)
+            .with_attributes(Some(r#"{"value":6}"#.into())),
+        Event::now(r#"{"value":"raw-only","obj":"{\"leaf\":\"serialized\"}"}"#),
+    ];
+    for (index, event) in events.iter_mut().enumerate() {
+        event.timestamp = chrono::DateTime::from_timestamp(1700000000 + index as i64, 0).unwrap();
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = tmp.path().join("warehouse");
+    let ice = IcebergContext::open(&warehouse).await.unwrap();
+    let config = IndexConfig {
+        index_id: "raw_events".into(),
+        ..IndexConfig::builtin_events()
+    };
+    let ident = ice.create_index(&config).await.unwrap();
+    let batch = siglake_core::events_to_record_batch(&events).unwrap();
+    let mapped = siglake_core::mapping::map_carrier_batch(&batch, &config).unwrap();
+    ice.append_to_table(&ident, mapped.clone(), &[])
+        .await
+        .unwrap();
+    let app = router(AppState::new(
+        Arc::new(IcebergContext::open(&warehouse).await.unwrap()),
+        AuthConfig::open(),
+    ));
+    let before = nested_object_answer(&app, SQL).await;
+    let sum_before = nested_object_answer(&app, SUM).await;
+    assert_eq!(sum_before, serde_json::json!([{"bytes_sum":7}]));
+    assert_eq!(before[0]["v"], "7");
+    assert_eq!(before[0]["a"], "9");
+    assert_eq!(before[0]["leaf"], "raw-child");
+    assert!(before[1].get("v").is_none());
+    assert_eq!(before[1]["a"], "8");
+    assert!(before[2].get("leaf").is_none());
+    assert_eq!(before[3]["leaf"], "serialized");
+    let attr = PromotedColumn::parse_spec("value:string:attr_value").unwrap();
+    let mut raw = PromotedColumn::parse_spec("value:string:raw_value").unwrap();
+    raw.carrier = PromotionCarrier::Raw;
+    let mut leaf = PromotedColumn::parse_spec(r#"["obj","leaf"]:string:raw_leaf"#).unwrap();
+    leaf.carrier = PromotionCarrier::Raw;
+    ice.declare_promotions_for(&ident, &[attr, raw.clone(), leaf])
+        .await
+        .unwrap();
+    assert!(!ice.ensure_promotion_backfill_property().await.unwrap());
+    assert!(ice.attr_rewrite_map_for(&ident).await.unwrap().is_none());
+    let app = router(AppState::new(
+        Arc::new(IcebergContext::open(&warehouse).await.unwrap()),
+        AuthConfig::open(),
+    ));
+    assert_eq!(nested_object_answer(&app, SQL).await, before);
+    assert_eq!(nested_object_answer(&app, SUM).await, sum_before);
+    assert!(nested_object_plan(&app, SQL).await.contains("attr_get"));
+    let files = ice.live_data_files(&ident).await.unwrap();
+    ice.recluster_files(&ident, files, &["host", "raw_value"])
+        .await
+        .unwrap();
+    assert!(ice.ensure_promotion_backfill_property().await.unwrap());
+    assert!(ice.attr_rewrite_map_for(&ident).await.unwrap().is_some());
+    let app = router(AppState::new(
+        Arc::new(IcebergContext::open(&warehouse).await.unwrap()),
+        AuthConfig::open(),
+    ));
+    assert_eq!(nested_object_answer(&app, SQL).await, before);
+    assert_eq!(nested_object_answer(&app, SUM).await, sum_before);
+    let plan = nested_object_plan(&app, SQL).await;
+    assert!(
+        plan.contains("raw_value") && plan.contains("raw_leaf") && plan.contains("attr_value"),
+        "{plan}"
+    );
+    assert!(!plan.contains("attr_get"), "{plan}");
+    // Neither physical name reuse nor a later legacy write can qualify raw
+    // values from attributes or null-padding.
+    raw.carrier = PromotionCarrier::Attributes;
+    let error = ice
+        .declare_promotions_for(&ident, &[raw])
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("cannot change extraction identity"));
+    ice.append_unprovenanced_promoted_batch_for_test(&ident, mapped)
+        .await
+        .unwrap();
+    assert!(!ice.ensure_promotion_backfill_property().await.unwrap());
+    assert!(ice.attr_rewrite_map_for(&ident).await.unwrap().is_none());
+    let app = router(AppState::new(
+        Arc::new(IcebergContext::open(&warehouse).await.unwrap()),
+        AuthConfig::open(),
+    ));
+    let doubled = nested_object_answer(&app, SQL).await;
+    assert_eq!(
+        nested_object_answer(&app, SUM).await,
+        serde_json::json!([{"bytes_sum":14}])
+    );
+    assert_eq!(doubled.as_array().unwrap().len(), 8);
+    for (index, expected) in before.as_array().unwrap().iter().enumerate() {
+        assert_eq!(&doubled[index * 2], expected);
+        assert_eq!(&doubled[index * 2 + 1], expected);
+    }
+    assert!(nested_object_plan(&app, SQL).await.contains("attr_get"));
+    let files = ice.live_data_files(&ident).await.unwrap();
+    ice.recluster_files(&ident, files, &["host", "raw_value"])
+        .await
+        .unwrap();
+    assert!(ice.ensure_promotion_backfill_property().await.unwrap());
+    let app = router(AppState::new(
+        Arc::new(IcebergContext::open(&warehouse).await.unwrap()),
+        AuthConfig::open(),
+    ));
+    assert_eq!(nested_object_answer(&app, SQL).await, doubled);
+    assert!(!nested_object_plan(&app, SQL).await.contains("attr_get"));
 }
 
 /// The full autonomous loop, zero configuration: hot attribute keys promote
@@ -874,6 +1004,7 @@ async fn equality_count_on_attribute_serves_from_footers() {
 fn dotted_promotion() -> Vec<PromotedColumn> {
     vec![PromotedColumn {
         attr_key: "a.b.c".into(),
+        carrier: Default::default(),
         attr_get_path: Vec::new(),
         name: "a_b_c".into(),
         ty: PromotedType::Utf8,

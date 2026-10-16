@@ -1505,7 +1505,10 @@ fn query_order_field<'a>(query: &SqlQuery, ordered_index: Option<(&'a str, &'a s
 /// every table whose mapping does not name another one.
 const CANONICAL_EVENT_TIME: &str = siglake_storage::CANONICAL_EVENT_TIME_FIELD;
 
-type AttrRewriteMap = HashMap<(String, Vec<String>), (String, siglake_core::PromotedType)>;
+type AttrRewriteMap = HashMap<
+    (siglake_core::PromotionCarrier, String, Vec<String>),
+    (String, siglake_core::PromotedType),
+>;
 
 /// WS-7 rewrite mechanics: replace every `attr_get(attributes, 'key')` whose
 /// column owner is proven and whose owning table's `mapping` contains the key.
@@ -1891,14 +1894,20 @@ fn attr_get_rewrite_target(
     }
 
     let (first, keys) = expression(func)?;
-    let (owner, qualifier) = match first {
-        SqlAstExpr::Identifier(id) if id.value.eq_ignore_ascii_case("attributes") => {
-            (scopes.last()?.unqualified_owner.as_deref()?, None)
+    let (owner, qualifier, carrier) = match first {
+        SqlAstExpr::Identifier(id)
+            if siglake_core::PromotionCarrier::from_column(&id.value).is_some() =>
+        {
+            (
+                scopes.last()?.unqualified_owner.as_deref()?,
+                None,
+                siglake_core::PromotionCarrier::from_column(&id.value)?,
+            )
         }
         SqlAstExpr::CompoundIdentifier(parts)
-            if parts
-                .last()
-                .is_some_and(|id| id.value.eq_ignore_ascii_case("attributes")) =>
+            if parts.last().is_some_and(|id| {
+                siglake_core::PromotionCarrier::from_column(&id.value).is_some()
+            }) =>
         {
             let qualifier = parts[..parts.len() - 1]
                 .iter()
@@ -1915,13 +1924,17 @@ fn attr_get_rewrite_target(
                     break;
                 }
             }
-            (owner?, Some(parts[..parts.len() - 1].to_vec()))
+            (
+                owner?,
+                Some(parts[..parts.len() - 1].to_vec()),
+                siglake_core::PromotionCarrier::from_column(&parts.last()?.value)?,
+            )
         }
         _ => return None,
     };
     let mapping = mappings.get(owner)?;
     let (first_key, outer_keys) = keys.split_first()?;
-    let source = (first_key.clone(), outer_keys.to_vec());
+    let source = (carrier, first_key.clone(), outer_keys.to_vec());
     let (column, ty) = mapping.get(&source)?.clone();
     let column = match qualifier {
         None => SqlAstExpr::Identifier(column.as_str().into()),
@@ -13246,7 +13259,11 @@ mod tests {
         let mut maps = HashMap::<String, AttrRewriteMap>::new();
         for (table, key, column) in entries {
             maps.entry((*table).into()).or_default().insert(
-                ((*key).into(), Vec::new()),
+                (
+                    siglake_core::PromotionCarrier::Attributes,
+                    (*key).into(),
+                    Vec::new(),
+                ),
                 ((*column).into(), siglake_core::PromotedType::Utf8),
             );
         }
@@ -13254,14 +13271,60 @@ mod tests {
     }
 
     #[test]
+    fn raw_carrier_rewrite_requires_exact_carrier_and_preserves_scope() {
+        use siglake_core::{PromotedType, PromotionCarrier};
+        let maps = HashMap::from([(
+            "events".into(),
+            HashMap::from([
+                (
+                    (PromotionCarrier::Raw, "value".into(), Vec::new()),
+                    ("raw_value".into(), PromotedType::Utf8),
+                ),
+                (
+                    (PromotionCarrier::Attributes, "value".into(), Vec::new()),
+                    ("attr_value".into(), PromotedType::Utf8),
+                ),
+                (
+                    (PromotionCarrier::Raw, "obj".into(), vec!["leaf".into()]),
+                    ("raw_leaf".into(), PromotedType::Utf8),
+                ),
+            ]),
+        )]);
+        let result = rewrite_attr_get_to_columns("SELECT attr_get(e.raw, 'value'), attr_get(e.attributes, 'value'), attr_get(attr_get(e.raw, 'obj'), 'leaf') FROM events e", &maps).unwrap();
+        assert!(
+            result.contains("e.raw_value")
+                && result.contains("e.attr_value")
+                && result.contains("e.raw_leaf"),
+            "{result}"
+        );
+        assert!(!result.contains("attr_get"), "{result}");
+        for sql in [
+            "SELECT attr_get(raw, 'obj.leaf') FROM events",
+            "SELECT attr_get(attr_get(attributes, 'obj'), 'leaf') FROM events",
+            "SELECT attr_get(CONCAT(' ', raw), 'value') FROM events",
+            "SELECT attr_get(raw, 'value') FROM unrelated",
+        ] {
+            assert!(rewrite_attr_get_to_columns(sql, &maps).is_none(), "{sql}");
+        }
+    }
+
+    #[test]
     fn composed_attr_rewrite_matches_only_the_exact_expression_tree() {
         let mut event_map = AttrRewriteMap::new();
         event_map.insert(
-            ("aws.cloudwatch".into(), Vec::new()),
+            (
+                siglake_core::PromotionCarrier::Attributes,
+                "aws.cloudwatch".into(),
+                Vec::new(),
+            ),
             ("aws_cloudwatch".into(), siglake_core::PromotedType::Utf8),
         );
         event_map.insert(
-            ("aws.cloudwatch".into(), vec!["log_stream".into()]),
+            (
+                siglake_core::PromotionCarrier::Attributes,
+                "aws.cloudwatch".into(),
+                vec!["log_stream".into()],
+            ),
             (
                 "aws_cloudwatch_log_stream".into(),
                 siglake_core::PromotedType::Utf8,
@@ -13291,7 +13354,11 @@ mod tests {
         let maps = HashMap::from([(
             "events".into(),
             HashMap::from([(
-                ("metrics".into(), vec!["size".into()]),
+                (
+                    siglake_core::PromotionCarrier::Attributes,
+                    "metrics".into(),
+                    vec!["size".into()],
+                ),
                 ("metrics_size".into(), siglake_core::PromotedType::Int64),
             )]),
         )]);
@@ -13340,6 +13407,7 @@ mod tests {
             .unwrap()
             .with_promoted_columns(vec![siglake_core::PromotedColumn {
                 attr_key: "k".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "event_k".into(),
                 ty: siglake_core::PromotedType::Utf8,
@@ -13379,6 +13447,7 @@ mod tests {
         let warehouse = tmp.path().join("warehouse");
         let promotion = vec![siglake_core::PromotedColumn {
             attr_key: "a.b.c".into(),
+            carrier: Default::default(),
             attr_get_path: Vec::new(),
             name: "a_b_c".into(),
             ty: siglake_core::PromotedType::Utf8,
@@ -13507,12 +13576,14 @@ mod tests {
         let promotions = vec![
             siglake_core::PromotedColumn {
                 attr_key: "a.b.c".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "status".into(),
                 ty: siglake_core::PromotedType::Utf8,
             },
             siglake_core::PromotedColumn {
                 attr_key: "measure".into(),
+                carrier: Default::default(),
                 attr_get_path: Vec::new(),
                 name: "size".into(),
                 ty: siglake_core::PromotedType::Int64,
