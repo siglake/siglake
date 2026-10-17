@@ -10493,10 +10493,7 @@ async fn compute_buffer_partials(
     // #82: an ordered aggregate's partials must be the sort/limit-stripped
     // aggregate (same rewrite the workers run) — sorting/limiting the buffer
     // slice would drop groups from the merge.
-    let query: &str = match &dist {
-        crate::coordinator::DistPlan::OrderedAggregate { worker_sql, .. } => worker_sql,
-        _ => query,
-    };
+    let query = dist.worker_sql(query);
     let tenant_label = tenant.unwrap_or("default");
     let (wal_dir, carrier) = if table == "events" {
         (
@@ -10566,13 +10563,16 @@ async fn compute_buffer_partials(
     let Some(masks) = partial_filter_mask_count(plan) else {
         return Ok((Vec::new(), None));
     };
-    let partial_input = if masks == 0 {
+    let cast_workspace = dist.partial_cast_bytes_per_row().saturating_mul(decoded.row_count() as u64);
+    let partial_input = if masks == 0 && cast_workspace == 0 {
         decoded.cloned_batches()
     } else {
-        let workspace = decoded
-            .payload_bytes()
-            .saturating_add((decoded.row_count() as u64).div_ceil(8))
-            .saturating_mul(masks.saturating_add(1));
+        let filter_workspace = if masks == 0 { 0 } else {
+            decoded.payload_bytes()
+                .saturating_add((decoded.row_count() as u64).div_ceil(8))
+                .saturating_mul(masks.saturating_add(1))
+        };
+        let workspace = filter_workspace.saturating_add(cast_workspace);
         let Some(lease) = decoded.try_reserve_output(workspace) else {
             return Ok((Vec::new(), None));
         };
@@ -10582,7 +10582,7 @@ async fn compute_buffer_partials(
             .attach(decoded.cloned_batches())
             .map_err(ApiError::internal)?
     };
-    let output_schema = Arc::new(plan.schema().as_arrow().clone());
+    let output_schema = Arc::new(dist.partial_schema(plan.schema().as_arrow()).clone());
     let Some(output_bound) = crate::wal_buffer::bounded_output_payload(
         &output_schema,
         decoded.row_count(),
@@ -10752,6 +10752,7 @@ fn buffer_partial_plan_has_bounded_workspace(
         dist,
         crate::coordinator::DistPlan::Aggregate { .. }
             | crate::coordinator::DistPlan::OrderedAggregate { .. }
+            | crate::coordinator::DistPlan::AverageAggregate(_)
     ) {
         return false;
     }
