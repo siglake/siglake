@@ -12576,8 +12576,8 @@ async fn build_puffin_index_blobs_for_file(
 ) -> Result<Vec<PuffinSidecarBlobSpec>> {
     use futures::StreamExt;
     use iceberg::arrow::ArrowFileReader;
-    use parquet::arrow::ProjectionMask;
     use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+    use parquet::arrow::ProjectionMask;
 
     if specs.is_empty() {
         return Ok(Vec::new());

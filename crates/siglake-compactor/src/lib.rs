@@ -8872,8 +8872,8 @@ mod combined_memory_regression_tests {
             total.saturating_add(column.to_data().get_slice_memory_size().unwrap())
         });
         let sample_row_bytes = (bytes / batch.num_rows()).max(1);
-        let row_group_rows = (256 * 1024 * 1024 / sample_row_bytes)
-            .clamp(128 * 1024, 4 * 1024 * 1024);
+        let row_group_rows =
+            (256 * 1024 * 1024 / sample_row_bytes).clamp(128 * 1024, 4 * 1024 * 1024);
         assert!(
             (2 * CHUNK_ROWS..3 * CHUNK_ROWS).contains(&row_group_rows),
             "fixture row group must retain the Oct 17 two-chunk lifetime: \
