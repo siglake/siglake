@@ -22070,20 +22070,20 @@ impl IcebergContext {
     /// 1. **Plan pass** — per input, cache the Parquet metadata (footer + page
     ///    index) and decode ONLY the `timestamp` column (a projected read: the
     ///    fetch touches just that column's chunks). Cost: 8 bytes/row.
-    /// 2. **RLE plan** — [`crate::merge::compute_merge_plan`] turns the
-    ///    timestamp columns into `MergeRun`s: the exact output order as runs,
-    ///    not rows. Sorted, near-disjoint inputs collapse to ~one run per
-    ///    input, and re-merges of already-merged files produce ever-longer
-    ///    runs — merges get cheaper as data ages.
-    /// 3. **Chunked execution** — walk the plan in `chunk_rows`-row chunks. Per
+    /// 2. **RLE cursor** — [`crate::merge::MergeRuns`] yields the exact output
+    ///    order without collecting a whole-bin plan. A first streaming pass
+    ///    measures uncut-run copy opportunities; execution restarts the cursor.
+    ///    Timestamp columns remain resident (8 bytes per row), while run and
+    ///    fetch metadata are bounded by admitted chunks even for interleaving.
+    /// 3. **Chunked execution** — advance in `chunk_rows`-row chunks. Per
     ///    chunk, each contributing input's rows form ONE contiguous range
     ///    (inputs are consumed strictly forward), fetched with a single
     ///    `RowSelection` read that prunes non-covered pages via the offset
     ///    index. The chunk assembles into output batches — zero-copy slices
     ///    for whole runs, `interleave` for run fragments — through the same
     ///    rolling writer as the streaming merge. Between chunks every reader
-    ///    is CLOSED: no per-input decoder state persists, so 600 inputs cost
-    ///    the same resident memory as 6.
+    ///    is CLOSED: no per-input decoder state persists. Projected timestamps,
+    ///    cached footers and per-input cursors remain separate memory costs.
     #[allow(clippy::too_many_arguments)]
     async fn merge_files_page_bounded(
         &self,
@@ -22128,15 +22128,15 @@ impl IcebergContext {
             .await?;
         stages.input += t_plan_input.elapsed().as_nanos() as u64;
 
-        // Phase 2 — the RLE plan, then the timestamps are no longer needed.
+        // Phase 2 — retain projected timestamps and only O(fan-in) planner
+        // cursors. A bin with identical timestamp sequences can have one run
+        // per row; materializing that plan and all chunk copies is unbounded.
         let t_plan = std::time::Instant::now();
-        let plan = {
-            let ts_slices: Vec<&[i64]> = plan_inputs.iter().map(|(_, ts)| ts.as_slice()).collect();
-            crate::merge::compute_merge_plan(&ts_slices, descending)
-        };
-        let row_counts: Vec<usize> = plan_inputs.iter().map(|(_, ts)| ts.len()).collect();
+        let (metas, timestamps): (Vec<ArrowReaderMetadata>, Vec<Vec<i64>>) =
+            plan_inputs.into_iter().unzip();
+        let ts_slices: Vec<&[i64]> = timestamps.iter().map(Vec::as_slice).collect();
+        let row_counts: Vec<usize> = timestamps.iter().map(Vec::len).collect();
         let total_rows: usize = row_counts.iter().sum();
-        let metas: Vec<ArrowReaderMetadata> = plan_inputs.into_iter().map(|(m, _)| m).collect();
         let uncompressed_bytes: u64 = metas
             .iter()
             .flat_map(|meta| meta.metadata().row_groups())
@@ -22148,10 +22148,8 @@ impl IcebergContext {
             memory_limit_bytes,
             estimated_row_bytes,
         );
-        let chunks = crate::merge::split_plan_chunks(&plan, chunk_rows);
-        stages.assemble += t_plan.elapsed().as_nanos() as u64;
+        let chunk_count = total_rows.div_ceil(chunk_rows.max(1));
         metrics::counter!("siglake_compactor_merge_page_bounded_total").increment(1);
-        metrics::counter!("siglake_compactor_merge_plan_runs_total").increment(plan.len() as u64);
 
         // Cross-review F-3 pricing. A verbatim row-group copy (parquet's
         // `SerializedRowGroupWriter::append_column`) can only serve a source row
@@ -22160,7 +22158,13 @@ impl IcebergContext {
         // the cached footers we already hold, so the lever is priced before it
         // is built rather than after. Deliberately independent of `chunk_rows`:
         // chunking is tunable, run structure is what the data decides.
-        let census = page_bounded_copy_census(&plan, &metas);
+        let mut run_count = 0usize;
+        let census = page_bounded_copy_census(
+            crate::merge::MergeRuns::new(&ts_slices, descending).inspect(|_| run_count += 1),
+            &metas,
+        );
+        stages.assemble += t_plan.elapsed().as_nanos() as u64;
+        metrics::counter!("siglake_compactor_merge_plan_runs_total").increment(run_count as u64);
         metrics::counter!("siglake_compactor_merge_rowgroups_total")
             .increment(census.total_row_groups as u64);
         metrics::counter!("siglake_compactor_merge_rowgroups_copyable_total")
@@ -22176,8 +22180,8 @@ impl IcebergContext {
         tracing::debug!(
             inputs = files.len(),
             rows = total_rows,
-            runs = plan.len(),
-            chunks = chunks.len(),
+            runs = run_count,
+            chunks = chunk_count,
             chunk_rows,
             estimated_row_bytes,
             chunk_input_budget_bytes = chunk_rows.saturating_mul(estimated_row_bytes),
@@ -22210,37 +22214,39 @@ impl IcebergContext {
         // `chunk_rows`, plus whatever slices the output writer's open row group
         // still retains. The derived 1 GiB default is therefore one; larger
         // processes keep two for overlap.
-        let plans: Vec<ChunkFetchPlan> = chunks.iter().map(|c| plan_chunk_fetches(c)).collect();
         let configured_prefetch = std::env::var("SIGLAKE_MERGE_CHUNK_PREFETCH").ok();
         let prefetch = Self::merge_chunk_prefetch_for_call(
             merge_chunk_prefetch,
             configured_prefetch.as_deref(),
             memory_limit_bytes,
         );
-        // Stream items must be fully OWNED. A closure borrowing `&ChunkFetchPlan`
-        // out of `plans` trips rustc's higher-ranked-lifetime limitation for
-        // every spawn up the compactor call chain (the same one the phase-1
-        // fetch futures are written around). `ArrowReaderMetadata` is
-        // Arc-backed, so cloning it per chunk is a refcount bump, not a copy of
-        // the footer.
+        // Generate a chunk only when its resident prefetch slot is available.
+        // Fetch tasks take owned arguments; the cursor borrows only projected
+        // timestamps, never any task's decoded batches. No whole-bin chunks,
+        // fetch plans, or fetch-argument vectors are retained.
         type FetchArgs = (String, ArrowReaderMetadata, usize, usize, usize);
-        let fetch_args: Vec<Vec<FetchArgs>> = plans
-            .iter()
-            .map(|plan| {
-                plan.fetches
-                    .iter()
-                    .map(|&(i, lo, len)| {
-                        (
-                            files[i].file_path().to_string(),
-                            metas[i].clone(),
-                            lo,
-                            len,
-                            row_counts[i],
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
+        let mut pending_chunks = crate::merge::MergeChunks::new(
+            crate::merge::MergeRuns::new(&ts_slices, descending),
+            chunk_rows,
+        )
+        .enumerate()
+        .map(|(ci, chunk)| {
+            let plan = plan_chunk_fetches(&chunk);
+            let args: Vec<FetchArgs> = plan
+                .fetches
+                .iter()
+                .map(|&(i, lo, len)| {
+                    (
+                        files[i].file_path().to_string(),
+                        metas[i].clone(),
+                        lo,
+                        len,
+                        row_counts[i],
+                    )
+                })
+                .collect();
+            (ci, chunk, plan, args)
+        });
         let file_io = table.file_io().clone();
         // SPAWNED, not `stream::buffered`. A `buffered` stream only advances its
         // futures while something polls the stream — and the encode below is
@@ -22272,8 +22278,6 @@ impl IcebergContext {
                 })
             }
         };
-        let mut pending_args: std::collections::VecDeque<(usize, Vec<FetchArgs>)> =
-            fetch_args.into_iter().enumerate().collect();
         // A slot remains occupied after its handle is popped: the decoded
         // result is current until assembly/write releases it. This separate
         // window makes that lifetime explicit instead of equating queue length
@@ -22281,10 +22285,12 @@ impl IcebergContext {
         let mut prefetch_window = PageBoundedPrefetchWindow::new(prefetch);
         let mut inflight: std::collections::VecDeque<_> = std::collections::VecDeque::new();
         while prefetch_window.available() > 0 {
-            let Some((ci, args)) = pending_args.pop_front() else {
+            let t_chunk_plan = std::time::Instant::now();
+            let Some((ci, chunk, plan, args)) = pending_chunks.next() else {
                 break;
             };
-            inflight.push_back(spawn_fetch(ci, args));
+            stages.assemble += t_chunk_plan.elapsed().as_nanos() as u64;
+            inflight.push_back((chunk, plan, spawn_fetch(ci, args)));
             prefetch_window.started();
         }
 
@@ -22315,18 +22321,17 @@ impl IcebergContext {
             // `fetch_total_nanos` keeps the gross figure so the two can be
             // differenced into "how much did pipelining hide".
             let t_wait = std::time::Instant::now();
-            let Some(handle) = inflight.pop_front() else {
+            let Some((chunk, plan, handle)) = inflight.pop_front() else {
                 break;
             };
             let joined = handle.await.context("page-bounded fetch task")?;
             stages.input += t_wait.elapsed().as_nanos() as u64;
             let (ci, raw, input_nanos) = joined?;
             fetch_total_nanos += input_nanos;
-            let chunk = &chunks[ci];
             let ChunkFetchPlan {
                 ordinal_of,
                 fetches,
-            } = &plans[ci];
+            } = &plan;
             let t_assemble = std::time::Instant::now();
             // Keep the fetched PARTS; do not flatten them.
             //
@@ -22382,7 +22387,7 @@ impl IcebergContext {
             // accumulate it and subtract at the end of the chunk rather than
             // trying to bracket each stage separately.
             let mut chunk_write_nanos = 0u64;
-            for run in chunk {
+            for run in &chunk {
                 let ord = ordinal_of[&run.input_index];
                 let local_start = run.start_row - fetches[ord].1;
                 if run.row_count >= MERGE_BATCH_ROWS {
@@ -22464,7 +22469,7 @@ impl IcebergContext {
                 memory.and_then(|value| value.cgroup_memory_current_bytes);
             tracing::debug!(
                 chunk = ci + 1,
-                chunks = chunks.len(),
+                chunks = chunk_count,
                 rows = chunk.iter().map(|run| run.row_count).sum::<usize>(),
                 allocator_allocated_bytes = ?allocator_allocated_bytes,
                 allocator_active_bytes = ?allocator_active_bytes,
@@ -22485,12 +22490,16 @@ impl IcebergContext {
             // which is why the 1 GiB derived default above is depth 1.)
             drop(batch_refs);
             drop(parts_flat);
+            drop(chunk);
+            drop(plan);
             prefetch_window.released();
             while prefetch_window.available() > 0 {
-                let Some((nci, nargs)) = pending_args.pop_front() else {
+                let t_chunk_plan = std::time::Instant::now();
+                let Some((nci, chunk, plan, nargs)) = pending_chunks.next() else {
                     break;
                 };
-                inflight.push_back(spawn_fetch(nci, nargs));
+                stages.assemble += t_chunk_plan.elapsed().as_nanos() as u64;
+                inflight.push_back((chunk, plan, spawn_fetch(nci, nargs)));
                 prefetch_window.started();
             }
         }
@@ -33990,7 +33999,7 @@ struct CopyCensus {
 /// upper bound on the opportunity, and reporting it as such is the point —
 /// otherwise F-3 gets built against an assumption.
 fn page_bounded_copy_census(
-    plan: &[crate::merge::MergeRun],
+    plan: impl Iterator<Item = crate::merge::MergeRun>,
     metas: &[parquet::arrow::arrow_reader::ArrowReaderMetadata],
 ) -> CopyCensus {
     // Per input: each row group as `(start_row, rows)`.
@@ -34010,13 +34019,21 @@ fn page_bounded_copy_census(
                 .collect()
         })
         .collect();
-    copy_census_from_boundaries(plan, &boundaries)
+    copy_census_from_runs(plan, &boundaries)
 }
 
 /// The census proper, over pre-extracted row-group boundaries so it is a pure
 /// function that can be tested without building Parquet files.
+#[cfg(test)]
 fn copy_census_from_boundaries(
     plan: &[crate::merge::MergeRun],
+    boundaries: &[Vec<(usize, usize)>],
+) -> CopyCensus {
+    copy_census_from_runs(plan.iter().copied(), boundaries)
+}
+
+fn copy_census_from_runs(
+    plan: impl Iterator<Item = crate::merge::MergeRun>,
     boundaries: &[Vec<(usize, usize)>],
 ) -> CopyCensus {
     let mut census = CopyCensus {

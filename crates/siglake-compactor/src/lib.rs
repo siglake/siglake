@@ -9549,6 +9549,7 @@ mod combined_memory_regression_tests {
         index_rebuild: bool,
         payload_repeats: usize,
     ) {
+        eprintln!("combined fixture phase=setup inputs={input_files} rows_per_file={rows_per_file} segmented={segmented_index_writes}");
         let wal_file = input_files;
         let tmp = tempfile::tempdir().unwrap();
         let wal = tmp.path().join("wal");
@@ -9568,6 +9569,11 @@ mod combined_memory_regression_tests {
                 .map(|row| event_with_payload(file, row, payload_repeats))
                 .collect();
             ice.append_events(&events).await.unwrap();
+            eprintln!(
+                "combined fixture phase=input_committed input={} rss={}",
+                file + 1,
+                resident_bytes()
+            );
         }
         let merge_inputs = ice.live_data_files(ice.events_table_ident()).await.unwrap();
         assert_eq!(merge_inputs.len(), input_files);
@@ -9582,7 +9588,15 @@ mod combined_memory_regression_tests {
         let wal_events: Vec<_> = (0..rows_per_file)
             .map(|row| event_with_payload(wal_file, row, payload_repeats))
             .collect();
+        eprintln!(
+            "combined fixture phase=wal_append_enter rss={}",
+            resident_bytes()
+        );
         assert!(writer.append_events(&wal_events).unwrap().is_some());
+        eprintln!(
+            "combined fixture phase=wal_append_returned rss={}",
+            resident_bytes()
+        );
         drop(wal_events);
         drop(writer);
 
@@ -9612,21 +9626,32 @@ mod combined_memory_regression_tests {
             tokio::spawn(async move {
                 barrier.wait().await;
                 let _permit = compactor.decoded_work_permit("recluster").await;
-                ice.recluster_files_with(
-                    ice.events_table_ident(),
-                    merge_inputs,
-                    BLOOM_FILTER_COLUMNS,
-                    &ReclusterMergeOptions {
-                        force_streaming: Some(true),
-                        merge_fanin: Some(2),
-                        force_tiered: Some(false),
-                        merge_chunk_rows,
-                        merge_chunk_prefetch: merge_chunk_rows.map(|_| 1),
-                        merge_memory_limit_bytes: Some(1024 * 1024 * 1024),
-                        ..Default::default()
-                    },
-                )
-                .await
+                eprintln!(
+                    "combined fixture phase=merge_permit_acquired rss={}",
+                    resident_bytes()
+                );
+                let result = ice
+                    .recluster_files_with(
+                        ice.events_table_ident(),
+                        merge_inputs,
+                        BLOOM_FILTER_COLUMNS,
+                        &ReclusterMergeOptions {
+                            force_streaming: Some(true),
+                            merge_fanin: Some(2),
+                            force_tiered: Some(false),
+                            merge_chunk_rows,
+                            merge_chunk_prefetch: merge_chunk_rows.map(|_| 1),
+                            merge_memory_limit_bytes: Some(1024 * 1024 * 1024),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                eprintln!(
+                    "combined fixture phase=merge_returned ok={} rss={}",
+                    result.is_ok(),
+                    resident_bytes()
+                );
+                result
             })
         };
         let drain = {
@@ -9634,7 +9659,17 @@ mod combined_memory_regression_tests {
             let barrier = barrier.clone();
             tokio::spawn(async move {
                 barrier.wait().await;
-                compactor.run_once().await
+                eprintln!(
+                    "combined fixture phase=drain_enter rss={}",
+                    resident_bytes()
+                );
+                let result = compactor.run_once().await;
+                eprintln!(
+                    "combined fixture phase=drain_returned ok={} rss={}",
+                    result.is_ok(),
+                    resident_bytes()
+                );
+                result
             })
         };
         barrier.wait().await;

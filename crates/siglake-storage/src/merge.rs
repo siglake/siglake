@@ -63,29 +63,52 @@ pub struct MergeRun {
 /// near-disjoint inputs compaction feeds it, runs ≈ k and this is effectively
 /// free, no matter how many rows the bin holds.
 pub fn compute_merge_plan(inputs: &[&[i64]], descending: bool) -> Vec<MergeRun> {
-    // Direction normalized into one key (negated for ASC) so a single max-heap
-    // serves both directions; `Reverse(i)` makes the lowest input index win
-    // ties — both exactly as in `TimestampKwayMerge`.
-    let key = |ts: i64| if descending { ts } else { ts.wrapping_neg() };
-    let mut heap: BinaryHeap<(i64, Reverse<usize>)> = inputs
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| !a.is_empty())
-        .map(|(i, a)| (key(a[0]), Reverse(i)))
-        .collect();
-    let mut plan: Vec<MergeRun> = Vec::new();
-    let mut pos = vec![0usize; inputs.len()];
-    while let Some((_, Reverse(i))) = heap.pop() {
-        let a = inputs[i];
-        let start = pos[i];
-        let end = match heap.peek() {
-            // No rival left: the winner takes everything it has.
+    MergeRuns::new(inputs, descending).collect()
+}
+
+/// Stateful RLE planner. Only input cursors and one heap entry per live input
+/// are retained; an adversarially interleaved bin never builds a whole-bin plan.
+/// Timestamp columns are borrowed and remain a separate 8-bytes-per-row cost.
+pub struct MergeRuns<'a> {
+    inputs: Vec<&'a [i64]>,
+    heap: BinaryHeap<(i64, Reverse<usize>)>,
+    pos: Vec<usize>,
+    descending: bool,
+}
+
+impl<'a> MergeRuns<'a> {
+    pub fn new(inputs: &[&'a [i64]], descending: bool) -> Self {
+        let key = |ts: i64| if descending { ts } else { ts.wrapping_neg() };
+        Self {
+            inputs: inputs.to_vec(),
+            heap: inputs
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| !a.is_empty())
+                .map(|(i, a)| (key(a[0]), Reverse(i)))
+                .collect(),
+            pos: vec![0; inputs.len()],
+            descending,
+        }
+    }
+}
+
+impl Iterator for MergeRuns<'_> {
+    type Item = MergeRun;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let key = |ts: i64| {
+            if self.descending {
+                ts
+            } else {
+                ts.wrapping_neg()
+            }
+        };
+        let (_, Reverse(i)) = self.heap.pop()?;
+        let a = self.inputs[i];
+        let start = self.pos[i];
+        let end = match self.heap.peek() {
             None => a.len(),
-            // The peek is the strongest rival (best key, then lowest index).
-            // Input `i` keeps winning while its key beats the rival's — or
-            // ties it with a lower input index. `key(a[..])` is non-increasing
-            // (inputs are sorted in the merge direction), so the win predicate
-            // is monotone and `partition_point` finds the handover row.
             Some(&(rival_key, Reverse(rival))) => {
                 start
                     + a[start..].partition_point(|&ts| {
@@ -95,53 +118,70 @@ pub fn compute_merge_plan(inputs: &[&[i64]], descending: bool) -> Vec<MergeRun> 
             }
         };
         debug_assert!(end > start, "heap winner must contribute at least one row");
-        plan.push(MergeRun {
+        self.pos[i] = end;
+        if end < a.len() {
+            self.heap.push((key(a[end]), Reverse(i)));
+        }
+        Some(MergeRun {
             input_index: i,
             start_row: start,
             row_count: end - start,
-        });
-        pos[i] = end;
-        if end < a.len() {
-            heap.push((key(a[end]), Reverse(i)));
-        }
+        })
     }
-    plan
 }
 
-/// Split a merge plan into chunks of at most `chunk_rows` output rows, cutting
-/// runs at chunk boundaries. Each chunk is what the page-bounded executor
-/// materializes at once, so `chunk_rows` — not fan-in, not bin bytes — bounds
-/// the merge's decoded working set. Within a chunk every input's rows form one
-/// contiguous range (inputs are consumed strictly forward), which is what lets
-/// the executor fetch each input's contribution with a single `RowSelection`.
-pub fn split_plan_chunks(plan: &[MergeRun], chunk_rows: usize) -> Vec<Vec<MergeRun>> {
-    let chunk_rows = chunk_rows.max(1);
-    let mut chunks: Vec<Vec<MergeRun>> = Vec::new();
-    let mut cur: Vec<MergeRun> = Vec::new();
-    let mut cur_rows = 0usize;
-    for run in plan {
-        let mut start = run.start_row;
-        let mut remaining = run.row_count;
-        while remaining > 0 {
-            let take = remaining.min(chunk_rows - cur_rows);
-            cur.push(MergeRun {
-                input_index: run.input_index,
-                start_row: start,
-                row_count: take,
-            });
-            cur_rows += take;
-            start += take;
-            remaining -= take;
-            if cur_rows == chunk_rows {
-                chunks.push(std::mem::take(&mut cur));
-                cur_rows = 0;
-            }
+/// Lazily cut runs at output-row boundaries. Each call owns at most
+/// `chunk_rows` runs, with at most one residual run retained between calls.
+/// The caller must bound the number of returned chunks it retains.
+pub struct MergeChunks<I> {
+    runs: I,
+    remaining: Option<MergeRun>,
+    chunk_rows: usize,
+}
+
+impl<I: Iterator<Item = MergeRun>> MergeChunks<I> {
+    pub fn new(runs: I, chunk_rows: usize) -> Self {
+        Self {
+            runs,
+            remaining: None,
+            chunk_rows: chunk_rows.max(1),
         }
     }
-    if !cur.is_empty() {
-        chunks.push(cur);
+}
+
+impl<I: Iterator<Item = MergeRun>> Iterator for MergeChunks<I> {
+    type Item = Vec<MergeRun>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut chunk = Vec::new();
+        let mut rows = 0;
+        while rows < self.chunk_rows {
+            let Some(mut run) = self.remaining.take().or_else(|| self.runs.next()) else {
+                break;
+            };
+            if run.row_count == 0 {
+                continue;
+            }
+            let take = run.row_count.min(self.chunk_rows - rows);
+            chunk.push(MergeRun {
+                row_count: take,
+                ..run
+            });
+            rows += take;
+            run.start_row += take;
+            run.row_count -= take;
+            if run.row_count > 0 {
+                self.remaining = Some(run);
+            }
+        }
+        (!chunk.is_empty()).then_some(chunk)
     }
-    chunks
+}
+
+/// Materializing compatibility helper for callers/tests that need the entire
+/// plan. The page-bounded executor uses `MergeChunks` directly instead.
+pub fn split_plan_chunks(plan: &[MergeRun], chunk_rows: usize) -> Vec<Vec<MergeRun>> {
+    MergeChunks::new(plan.iter().copied(), chunk_rows).collect()
 }
 
 /// Wall-clock attribution of a merge, split by what the time was spent *on*
@@ -663,6 +703,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chunk_cursor_does_not_read_ahead_or_split_census_runs() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let input = [
+            MergeRun {
+                input_index: 0,
+                start_row: 0,
+                row_count: 10,
+            },
+            MergeRun {
+                input_index: 1,
+                start_row: 0,
+                row_count: 2,
+            },
+        ];
+        let runs = input.into_iter().inspect(|_| calls.set(calls.get() + 1));
+        let mut chunks = MergeChunks::new(runs, 3);
+        assert_eq!(calls.get(), 0);
+        for start in [0, 3, 6] {
+            assert_eq!(
+                chunks.next().unwrap(),
+                vec![MergeRun {
+                    input_index: 0,
+                    start_row: start,
+                    row_count: 3
+                }]
+            );
+            assert_eq!(calls.get(), 1);
+        }
+        assert_eq!(
+            chunks.next().unwrap(),
+            vec![
+                MergeRun {
+                    input_index: 0,
+                    start_row: 9,
+                    row_count: 1
+                },
+                MergeRun {
+                    input_index: 1,
+                    start_row: 0,
+                    row_count: 2
+                }
+            ]
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(chunks.next().is_none());
+        // The census consumes uncut runs, independent of chunk boundaries.
+        assert_eq!(input[0].row_count, 10);
+    }
+
+    #[test]
+    fn interleaved_plan_metadata_stays_within_one_chunk() {
+        for descending in [false, true] {
+            let mut timestamps: Vec<i64> = (0..4096).collect();
+            if descending {
+                timestamps.reverse();
+            }
+            let inputs: Vec<&[i64]> = vec![timestamps.as_slice(); 64];
+            let mut ordinal = 0;
+            for chunk in MergeChunks::new(MergeRuns::new(&inputs, descending), 257) {
+                assert!(chunk.len() <= 257);
+                assert!(chunk.capacity() <= 514);
+                for run in chunk {
+                    assert_eq!(run.input_index, ordinal % 64);
+                    assert_eq!(run.start_row, ordinal / 64);
+                    assert_eq!(run.row_count, 1);
+                    ordinal += 1;
+                }
+            }
+            assert_eq!(ordinal, 64 * 4096);
+        }
+    }
+
     proptest! {
         /// Differential: the gallop-based RLE planner must reproduce the exact
         /// per-row pick order of the per-row heap merge (the semantics
@@ -690,7 +804,11 @@ mod tests {
             let chunks = split_plan_chunks(&plan, chunk_rows);
             let rejoined: Vec<(usize, usize)> =
                 chunks.iter().flat_map(|c| expand_plan(c)).collect();
-            prop_assert_eq!(rejoined, expected);
+            prop_assert_eq!(rejoined, expected.clone());
+            let lazy_rejoined: Vec<_> = MergeChunks::new(
+                MergeRuns::new(&inputs, descending), chunk_rows,
+            ).flat_map(|c| expand_plan(&c)).collect();
+            prop_assert_eq!(lazy_rejoined, expected);
             for c in &chunks {
                 let rows: usize = c.iter().map(|r| r.row_count).sum();
                 prop_assert!(rows <= chunk_rows);
