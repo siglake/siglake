@@ -881,6 +881,12 @@ impl DecodedBuffer {
         batches_payload_bytes(&self.batches)
     }
 
+    #[cfg(test)]
+    pub(crate) fn memory_usage_for_test(&self) -> Box<dyn Fn() -> u64> {
+        let budget = Arc::clone(&self.reservations[0].budget);
+        Box::new(move || budget.used())
+    }
+
     /// Reserve a caller-proved retained-output payload bound before executing
     /// the operator that creates it. DataFusion accounts aggregate state; this
     /// lease covers Arrow output overlapping the decoded generation and other
@@ -955,8 +961,14 @@ pub(crate) fn bounded_output_payload(
 
 #[cfg(test)]
 pub(crate) fn decoded_buffer_for_test(batches: Vec<RecordBatch>) -> Arc<DecodedBuffer> {
+    let limit = batches_payload_bytes(&batches).max(1);
+    decoded_buffer_with_limit_for_test(batches, limit)
+}
+
+#[cfg(test)]
+pub(crate) fn decoded_buffer_with_limit_for_test(batches: Vec<RecordBatch>, limit: u64) -> Arc<DecodedBuffer> {
     let payload = batches_payload_bytes(&batches);
-    let budget = BufferMemoryBudget::new(payload.max(1));
+    let budget = BufferMemoryBudget::new(limit);
     let reservation = budget
         .try_reserve(payload)
         .expect("test decoded buffer reservation");

@@ -10457,6 +10457,55 @@ async fn capture_buffered_shard_read(
     })
 }
 
+// Newly admitted distributed AVG requires the complete selected WAL tail.
+// Preserve other variants' historical committed-snapshot refusal policy.
+fn refused_buffer_partials(
+    dist: &crate::coordinator::DistPlan,
+    reason: &str,
+) -> Result<(Vec<arrow_array::RecordBatch>, Option<Arc<crate::wal_buffer::DecodedBuffer>>), ApiError> {
+    if matches!(dist, crate::coordinator::DistPlan::AverageAggregate(_)) {
+        return Err(ApiError::pool_exhausted(format!(
+            "distributed AVG requires complete WAL admission: {reason}"
+        )));
+    }
+    Ok((Vec::new(), None))
+}
+
+fn prepare_buffer_partial_input(
+    decoded: &Arc<crate::wal_buffer::DecodedBuffer>,
+    dist: &crate::coordinator::DistPlan,
+    masks: u64,
+) -> Result<Option<Vec<arrow_array::RecordBatch>>, ApiError> {
+    let workspace = (|| {
+        let cast = dist.partial_cast_workspace(decoded.row_count())?;
+        if masks == 0 && cast == 0 {
+            return Some(0);
+        }
+        let filter = if masks == 0 { 0 } else {
+            decoded.payload_bytes()
+                .checked_add((decoded.row_count() as u64).div_ceil(8))?
+                .checked_mul(masks.checked_add(1)?)?
+        };
+        // attach() validates the entire input, not only incremental scratch.
+        // For filtered inputs the existing bound already includes that payload.
+        filter.max(decoded.payload_bytes()).checked_add(cast)
+    })();
+    let Some(workspace) = workspace else {
+        refused_buffer_partials(dist, "input workspace overflow")?;
+        return Ok(None);
+    };
+    if workspace == 0 {
+        return Ok(Some(decoded.cloned_batches()));
+    }
+    let Some(lease) = decoded.try_reserve_output(workspace) else {
+        refused_buffer_partials(dist, "input workspace capacity")?;
+        return Ok(None);
+    };
+    // Arrow allocations carry both decoded and workspace leases, including
+    // children detached from a cancelled requester.
+    lease.attach(decoded.cloned_batches()).map(Some).map_err(ApiError::internal)
+}
+
 async fn compute_buffer_partials(
     read: &BufferedShardRead,
     buffer_root: &std::path::Path,
@@ -10472,9 +10521,10 @@ async fn compute_buffer_partials(
     ),
     ApiError,
 > {
+    let dist = crate::coordinator::classify(plan);
     let table = match referenced_tables(query).as_deref() {
         Some([t]) => t.clone(),
-        _ => return Ok((Vec::new(), None)),
+        _ => return refused_buffer_partials(&dist, "table identity"),
     };
     if table != read.table {
         return Err(ApiError::internal(anyhow::anyhow!(
@@ -10482,13 +10532,12 @@ async fn compute_buffer_partials(
             read.table
         )));
     }
-    let dist = crate::coordinator::classify(plan);
     if matches!(dist, crate::coordinator::DistPlan::Local) {
-        return Ok((Vec::new(), None));
+        return refused_buffer_partials(&dist, "WAL admission or workspace");
     }
     if !buffer_partial_plan_has_bounded_workspace(plan, &dist) {
         metrics::counter!("siglake_query_wal_buffer_refused_partial_workspace_total").increment(1);
-        return Ok((Vec::new(), None));
+        return refused_buffer_partials(&dist, "WAL admission or workspace");
     }
     // #82: an ordered aggregate's partials must be the sort/limit-stripped
     // aggregate (same rewrite the workers run) — sorting/limiting the buffer
@@ -10509,7 +10558,7 @@ async fn compute_buffer_partials(
             &table,
             &read.snapshot.table_uuid,
         ) else {
-            return Ok((Vec::new(), None));
+            return refused_buffer_partials(&dist, "WAL admission or workspace");
         };
         (dir, read.carrier.as_ref())
     };
@@ -10554,33 +10603,17 @@ async fn compute_buffer_partials(
     let decoded = match outcome {
         crate::wal_buffer::BufferReadOutcome::Loaded(decoded) => decoded,
         crate::wal_buffer::BufferReadOutcome::Refused { .. } => {
-            return Ok((Vec::new(), None));
+            return refused_buffer_partials(&dist, "WAL admission or workspace");
         }
     };
     if decoded.batches().is_empty() {
         return Ok((Vec::new(), Some(decoded)));
     }
     let Some(masks) = partial_filter_mask_count(plan) else {
-        return Ok((Vec::new(), None));
+        return refused_buffer_partials(&dist, "WAL admission or workspace");
     };
-    let cast_workspace = dist.partial_cast_bytes_per_row().saturating_mul(decoded.row_count() as u64);
-    let partial_input = if masks == 0 && cast_workspace == 0 {
-        decoded.cloned_batches()
-    } else {
-        let filter_workspace = if masks == 0 { 0 } else {
-            decoded.payload_bytes()
-                .saturating_add((decoded.row_count() as u64).div_ceil(8))
-                .saturating_mul(masks.saturating_add(1))
-        };
-        let workspace = filter_workspace.saturating_add(cast_workspace);
-        let Some(lease) = decoded.try_reserve_output(workspace) else {
-            return Ok((Vec::new(), None));
-        };
-        // Put the workspace lease on input allocations so detached execution
-        // children retain it even when the requesting future is cancelled.
-        lease
-            .attach(decoded.cloned_batches())
-            .map_err(ApiError::internal)?
+    let Some(partial_input) = prepare_buffer_partial_input(&decoded, &dist, masks)? else {
+        return refused_buffer_partials(&dist, "input workspace");
     };
     let output_schema = Arc::new(dist.partial_schema(plan.schema().as_arrow()).clone());
     let Some(output_bound) = crate::wal_buffer::bounded_output_payload(
@@ -10588,10 +10621,10 @@ async fn compute_buffer_partials(
         decoded.row_count(),
         decoded.payload_bytes(),
     ) else {
-        return Ok((Vec::new(), None));
+        return refused_buffer_partials(&dist, "WAL admission or workspace");
     };
     let Some(output_lease) = decoded.try_reserve_output(output_bound) else {
-        return Ok((Vec::new(), None));
+        return refused_buffer_partials(&dist, "WAL admission or workspace");
     };
     // Run the shard query over a buffer-only table to produce a partial in the
     // same shape the workers return for their Iceberg shards. A pool refusal
@@ -10605,7 +10638,7 @@ async fn compute_buffer_partials(
         Ok(partials) => partials,
         Err(error) => {
             tracing::warn!(error = %error, table, "refusing WAL partial output whose ownership cannot be charged");
-            return Ok((Vec::new(), None));
+            return refused_buffer_partials(&dist, "WAL admission or workspace");
         }
     };
     metrics::counter!("siglake_query_wal_buffer_distributed_used_total").increment(1);
@@ -11465,6 +11498,61 @@ mod tests {
 
     use chrono::{TimeZone, Utc};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+
+    #[tokio::test]
+    async fn distributed_average_wal_workspace_refuses_tail_omission_and_retains_children() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("size", DataType::Int64, true),
+            Field::new("raw", DataType::Utf8, false),
+        ]));
+        let raw = "x".repeat(8192);
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(Int64Array::from(vec![Some(0), Some(100), None])),
+            Arc::new(StringArray::from(vec![raw.as_str(); 3])),
+        ]).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_batch("events", batch.clone()).unwrap();
+        let logical = ctx.state().create_logical_plan(
+            "SELECT avg(size) AS a, count(*) AS n FROM events"
+        ).await.unwrap();
+        let dist = crate::coordinator::classify(&logical);
+        assert!(matches!(&dist, crate::coordinator::DistPlan::AverageAggregate(_)));
+        assert!(buffer_partial_plan_has_bounded_workspace(&logical, &dist));
+        // An actual nonempty decoded tail with no spare workspace MUST refuse;
+        // returning empty partials here would turn a complete AVG into a
+        // successful committed-only result in distributed_inner.
+        let low = crate::wal_buffer::decoded_buffer_for_test(vec![batch.clone()]);
+        assert!(low.payload_bytes() > 27 * low.row_count() as u64);
+        assert!(prepare_buffer_partial_input(&low, &dist, 0).is_err());
+        for stage in ["decode admission", "bounded plan", "filter masks",
+            "output bound", "output reservation", "output attachment"] {
+            assert!(refused_buffer_partials(&dist, stage).is_err());
+            assert!(refused_buffer_partials(&crate::coordinator::DistPlan::Local, stage).is_ok());
+        }
+        drop(low);
+
+        // Startup and rounding matter even for one row; the old 27-byte
+        // incremental charge was not a full Arrow allocation bound.
+        assert!(dist.partial_cast_workspace(1).unwrap() > 27);
+        assert!(dist.partial_cast_workspace(usize::MAX).is_none());
+        let decoded = crate::wal_buffer::decoded_buffer_with_limit_for_test(
+            vec![batch], 64 * 1024 * 1024,
+        );
+        let used = decoded.memory_usage_for_test();
+        let base = used();
+        let inputs = prepare_buffer_partial_input(&decoded, &dist, 0).unwrap().unwrap();
+        assert!(used() >= base + decoded.payload_bytes() + dist.partial_cast_workspace(3).unwrap());
+        let detached_child = inputs[0].column(1).clone();
+        let retained = used();
+        drop(inputs);
+        drop(decoded);
+        assert_eq!(used(), retained, "detached Arrow child must retain both leases");
+        drop(detached_child);
+        assert_eq!(used(), 0);
+    }
 
     #[test]
     fn grouped_numeric_fast_path_switch_defaults_on_and_parses_off_values() {

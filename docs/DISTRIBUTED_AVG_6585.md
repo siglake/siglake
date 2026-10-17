@@ -45,3 +45,12 @@ answer/order against an independently built MemTable, and requires one actual
 shard request per worker plus distributed phases. These tests still require
 execution in a coordinated build slot, followed by independent source review,
 full exact-source gates and qualification; source presence is not acceptance.
+
+WAL admission is mandatory for this new AVG path. A selected tail that cannot
+be decoded, bounded, reserved or attached returns an explicit error before
+worker fan-out; it must not be replaced by empty partials. Cast workspace uses
+the conservative Arrow startup/rounding/fragmentation bound, and the attached
+input's full physical payload is charged separately. Detached Arrow children
+retain both decoded and workspace reservations. Other distribution variants
+keep their existing refusal policy. These source regressions still require
+execution under the separately owned compiler lease.

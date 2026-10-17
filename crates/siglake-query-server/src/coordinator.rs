@@ -428,16 +428,26 @@ impl DistPlan {
         }
     }
 
-    /// Conservative room for the Float64 SUM cast and aggregate scratch:
-    /// three fixed-width arrays including a one-byte-per-row validity allowance.
-    /// Integer range witnesses retain their original type. Charge this on the
-    /// decoded input lease even if the optimizer shares or streams the cast.
-    pub(crate) fn partial_cast_bytes_per_row(&self) -> u64 {
+    /// Price cast/scratch arrays with the same startup, rounding and batch
+    /// fragmentation bound used for retained partial output. This is separate
+    /// from the full input payload needed to attach the workspace lease.
+    pub(crate) fn partial_cast_workspace(&self, rows: usize) -> Option<u64> {
         match self {
-            Self::AverageAggregate(plan) => (plan.averages.len() as u64).saturating_mul(27),
-            _ => 0,
+            Self::AverageAggregate(plan) => {
+                let count = plan.averages.len().checked_mul(3)?;
+                let fields = (0..count)
+                    .map(|i| arrow::datatypes::Field::new(
+                        format!("cast_scratch_{i}"), arrow::datatypes::DataType::Float64, true,
+                    ))
+                    .collect::<Vec<_>>();
+                crate::wal_buffer::bounded_output_payload(
+                    &Arc::new(arrow::datatypes::Schema::new(fields)), rows, 0,
+                )
+            }
+            _ => Some(0),
         }
     }
+
 }
 
 /// Classify a (already-planned) query into a [`DistPlan`].
