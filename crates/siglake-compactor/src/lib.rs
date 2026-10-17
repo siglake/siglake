@@ -9658,6 +9658,16 @@ mod combined_memory_regression_tests {
             "real merge/WAL fixture exceeded the packaged 1 GiB limit: baseline={baseline}, peak={peak}"
         );
 
+        if index_rebuild {
+            assert_committed_rewrite_index_coverage(
+                &ice,
+                segmented_index_writes,
+                merge_stats.files_added,
+                input_files * rows_per_file,
+            )
+            .await;
+        }
+
         assert_exact_event_parity_with_payload(
             &ice,
             input_files + 1,
@@ -9665,6 +9675,163 @@ mod combined_memory_regression_tests {
             payload_repeats,
         )
         .await;
+    }
+
+    /// A successful rewrite is insufficient: rebuild errors are deliberately
+    /// non-fatal. Prove the intended index mode was committed for every rewrite
+    /// output, then open its physical blob and validate the row domain.
+    async fn assert_committed_rewrite_index_coverage(
+        ice: &IcebergContext,
+        segmented: bool,
+        expected_files: usize,
+        expected_rows: usize,
+    ) {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use siglake_index::segmented::{RangeSource, SegmentedReader, SEGMENTED_V2_BLOB_TYPE};
+
+        struct BorrowedBytes<'a>(&'a [u8]);
+        impl RangeSource for BorrowedBytes<'_> {
+            fn len(&self) -> u64 {
+                self.0.len() as u64
+            }
+            fn read(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
+                let start = usize::try_from(offset).ok()?;
+                Some(self.0.get(start..start.checked_add(len)?)?.to_vec())
+            }
+        }
+
+        let table = ice
+            .catalog()
+            .load_table(ice.events_table_ident())
+            .await
+            .unwrap();
+        let live = ice.live_data_files(ice.events_table_ident()).await.unwrap();
+        // This fixture creates generation-zero append/WAL inputs and exactly
+        // one rewrite. Its generation-one files are the rewrite's outputs.
+        let outputs: Vec<_> = live
+            .iter()
+            .filter(|file| {
+                file.file_path()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .starts_with("siglake-g1-")
+            })
+            .collect();
+        assert_eq!(
+            outputs.len(),
+            expected_files,
+            "all committed rewrite outputs"
+        );
+        assert_eq!(
+            outputs.iter().map(|f| f.record_count()).sum::<u64>(),
+            expected_rows as u64
+        );
+        assert!(expected_files > 0);
+        let expected_type = if segmented {
+            SEGMENTED_V2_BLOB_TYPE
+        } else {
+            "siglake-inverted-v1"
+        };
+        let raw_id = table
+            .metadata()
+            .current_schema()
+            .field_id_by_name("raw")
+            .unwrap();
+        for file in outputs {
+            let path = file.file_path();
+            let footer = ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(path.trim_start_matches("file://")).unwrap(),
+            )
+            .unwrap();
+            let groups: Vec<u64> = footer
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|g| g.num_rows() as u64)
+                .collect();
+            assert_eq!(groups.iter().sum::<u64>(), file.record_count());
+            let registered: Vec<_> = table
+                .metadata()
+                .statistics_iter()
+                .flat_map(|stats| {
+                    stats
+                        .blob_metadata
+                        .iter()
+                        .filter(move |blob| {
+                            blob.properties.get("data_file").is_some_and(|p| p == path)
+                                && blob.properties.get("column").is_some_and(|c| c == "raw")
+                        })
+                        .map(move |blob| (stats, blob))
+                })
+                .collect();
+            assert_eq!(
+                registered.len(),
+                1,
+                "exactly one intended raw sidecar for {path}"
+            );
+            let (stats, registered) = registered[0];
+            assert_eq!(
+                registered.r#type, expected_type,
+                "wrong fallback index mode"
+            );
+            assert_eq!(registered.fields, vec![raw_id]);
+            assert_eq!(registered.snapshot_id, stats.snapshot_id);
+            let reader = iceberg::puffin::PuffinReader::new(
+                table.file_io().new_input(&stats.statistics_path).unwrap(),
+            );
+            let physical = reader.file_metadata().await.unwrap();
+            let matching: Vec<_> = physical
+                .blobs()
+                .iter()
+                .filter(|blob| {
+                    blob.properties()
+                        .get("data_file")
+                        .is_some_and(|p| p == path)
+                        && blob.properties().get("column").is_some_and(|c| c == "raw")
+                })
+                .collect();
+            assert_eq!(matching.len(), 1, "registered blob must physically exist");
+            let blob = matching[0];
+            assert_eq!(blob.blob_type(), expected_type);
+            assert_eq!(blob.fields(), &[raw_id]);
+            assert_eq!(blob.snapshot_id(), registered.snapshot_id);
+            assert_eq!(blob.sequence_number(), registered.sequence_number);
+            assert_eq!(blob.properties(), &registered.properties);
+            let data = reader.blob(blob).await.unwrap();
+            let rows = if segmented {
+                assert_eq!(
+                    blob.compression_codec(),
+                    iceberg::puffin::CompressionCodec::None
+                );
+                let index = SegmentedReader::open(BorrowedBytes(data.data())).unwrap();
+                assert!(
+                    index.matches_row_groups(&groups),
+                    "exact physical group domain"
+                );
+                assert_eq!(u64::from(index.n_rows()), file.record_count());
+                index
+                    .postings("field")
+                    .rows()
+                    .expect("known token must be answerable")
+            } else {
+                assert_eq!(
+                    registered.properties.get("format").map(String::as_str),
+                    Some("v1")
+                );
+                let stamped: u64 = registered.properties["row_group_size"].parse().unwrap();
+                assert_eq!(stamped, *groups.iter().max().unwrap());
+                let index = siglake_index::InvertedIndex::from_bytes(data.data()).unwrap();
+                assert_eq!(u64::from(index.n_rows()), file.record_count());
+                index.matching_rows_all(&["field"])
+            };
+            assert_eq!(
+                rows.len() as u64,
+                file.record_count(),
+                "every fixture raw contains field"
+            );
+            assert!(rows.iter().enumerate().all(|(i, row)| *row as usize == i));
+        }
     }
 
     async fn assert_exact_event_parity(

@@ -6379,6 +6379,7 @@ dependencies = [
  "opendal",
  "parquet",
  "siglake-core",
+ "siglake-index",
  "siglake-storage",
  "siglake-wal",
  "tempfile",
