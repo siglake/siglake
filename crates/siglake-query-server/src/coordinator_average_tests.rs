@@ -118,7 +118,7 @@ async fn wal_extra_partial_uses_identical_states_and_non_null_denominator() {
     let got = coordinate_with_extra(&ctx, &workers, ORIGINAL, 3, extra).await.unwrap();
     let wanted = context(vec![committed, buffer]).sql(ORIGINAL).await.unwrap().collect().await.unwrap();
     assert_eq!(rows(&got), rows(&wanted));
-    assert!(dist.partial_cast_bytes_per_row() >= 9);
+    assert!(dist.partial_cast_workspace(3).unwrap() > 3 * 27);
     assert!(dist.partial_schema(ctx.state().create_logical_plan(ORIGINAL).await.unwrap().schema().as_arrow()).fields().len() > 3);
 }
 
