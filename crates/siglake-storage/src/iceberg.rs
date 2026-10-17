@@ -12541,19 +12541,24 @@ mod rebuild_coverage_tests {
 }
 
 async fn parquet_footer_has_index(path: &str, file_io: &FileIO, column: &str) -> bool {
+    use iceberg::arrow::ArrowFileReader;
+    use parquet::arrow::async_reader::AsyncFileReader;
+
     let Ok(input) = file_io.new_input(path) else {
         return false;
     };
-    let Ok(bytes) = input.read().await else {
+    let Ok(meta) = input.metadata().await else {
         return false;
     };
-    let Ok(reader) = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
-    else {
+    let Ok(read) = input.reader().await else {
+        return false;
+    };
+    let mut reader = ArrowFileReader::new(meta, read);
+    let Ok(metadata) = reader.get_metadata(None).await else {
         return false;
     };
     let key = siglake_index::inverted_index_kv_key(column);
-    reader
-        .metadata()
+    metadata
         .file_metadata()
         .key_value_metadata()
         .and_then(|kv| {
@@ -12569,7 +12574,10 @@ async fn build_puffin_index_blobs_for_file(
     data_file: &DataFile,
     specs: &[InvertedIndexSpec],
 ) -> Result<Vec<PuffinSidecarBlobSpec>> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use futures::StreamExt;
+    use iceberg::arrow::ArrowFileReader;
+    use parquet::arrow::ProjectionMask;
+    use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 
     if specs.is_empty() {
         return Ok(Vec::new());
@@ -12578,13 +12586,15 @@ async fn build_puffin_index_blobs_for_file(
         .file_io()
         .new_input(data_file.file_path())
         .context("FileIO::new_input")?;
-    let bytes = input
-        .read()
+    let meta = input
+        .metadata()
         .await
-        .context("read data file for index rebuild")?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
-        .context("ParquetRecordBatchReaderBuilder for index rebuild")?;
-    let metadata = reader.metadata().clone();
+        .context("index rebuild input metadata")?;
+    let read = input.reader().await.context("index rebuild input reader")?;
+    let builder = ParquetRecordBatchStreamBuilder::new(ArrowFileReader::new(meta, read))
+        .await
+        .context("ParquetRecordBatchStreamBuilder for index rebuild")?;
+    let metadata = builder.metadata().clone();
     let row_group_size = metadata
         .row_groups()
         .iter()
@@ -12600,11 +12610,16 @@ async fn build_puffin_index_blobs_for_file(
             )
         })
         .collect();
-    let mut reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
-        .context("ParquetRecordBatchReaderBuilder for rebuild stream")?
+    let projection = ProjectionMask::columns(
+        metadata.file_metadata().schema_descr(),
+        specs.iter().map(|spec| spec.column.as_str()),
+    );
+    let mut reader = builder
+        .with_projection(projection)
+        .with_batch_size(MERGE_BATCH_ROWS)
         .build()
         .context("build parquet reader for index rebuild")?;
-    for batch in &mut reader {
+    while let Some(batch) = reader.next().await {
         let batch = batch.context("decode parquet batch for index rebuild")?;
         for (spec, builder) in &mut builders {
             let Ok(idx) = batch.schema().index_of(spec.column.as_str()) else {
@@ -18785,6 +18800,15 @@ impl IcebergContext {
             if missing.is_empty() {
                 continue;
             }
+            tracing::info!(
+                selected_inputs = 1,
+                selected_rows = data_file.record_count(),
+                selected_bytes = data_file.file_size_in_bytes(),
+                selected_columns = missing.len(),
+                path = "range_streamed",
+                cgroup_memory_limit_bytes = ?cgroup_memory_limit_bytes(),
+                "inverted-index rebuild dispatch"
+            );
             let file_blobs = build_puffin_index_blobs_for_file(&table, data_file, &missing).await?;
             if !file_blobs.is_empty() {
                 rebuilt_files += 1;

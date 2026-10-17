@@ -8830,6 +8830,10 @@ mod combined_memory_regression_tests {
     }
 
     fn event(file: usize, row: usize) -> siglake_core::Event {
+        event_with_payload(file, row, 64)
+    }
+
+    fn event_with_payload(file: usize, row: usize, payload_repeats: usize) -> siglake_core::Event {
         let base = Utc.with_ymd_and_hms(2026, 10, 11, 0, 0, 0).unwrap();
         let mut event = siglake_core::Event {
             timestamp: base + chrono::Duration::milliseconds(row as i64),
@@ -8837,7 +8841,10 @@ mod combined_memory_regression_tests {
             source: format!("source-{}", file % 3),
             sourcetype: if row.is_multiple_of(2) { "even" } else { "odd" }.into(),
             index: "main".into(),
-            raw: format!("f{file:02}-r{row:05}:{}", "field-payload-".repeat(64)),
+            raw: format!(
+                "f{file:02}-r{row:05}:{}",
+                "field-payload-".repeat(payload_repeats)
+            ),
             attributes: None,
         };
         if !(file + row).is_multiple_of(3) {
@@ -8853,6 +8860,25 @@ mod combined_memory_regression_tests {
             file.trim_start_matches('f').parse().unwrap(),
             row.parse().unwrap(),
         )
+    }
+
+    fn assert_oct17_output_group_geometry(payload_repeats: usize) {
+        const CHUNK_ROWS: usize = 261_632;
+        let events: Vec<_> = (0..4_096)
+            .map(|row| event_with_payload(0, row, payload_repeats))
+            .collect();
+        let batch = siglake_core::events_to_record_batch(&events).unwrap();
+        let bytes = batch.columns().iter().fold(0usize, |total, column| {
+            total.saturating_add(column.to_data().get_slice_memory_size().unwrap())
+        });
+        let sample_row_bytes = (bytes / batch.num_rows()).max(1);
+        let row_group_rows = (256 * 1024 * 1024 / sample_row_bytes)
+            .clamp(128 * 1024, 4 * 1024 * 1024);
+        assert!(
+            (2 * CHUNK_ROWS..3 * CHUNK_ROWS).contains(&row_group_rows),
+            "fixture row group must retain the Oct 17 two-chunk lifetime: \
+             sample_row_bytes={sample_row_bytes}, row_group_rows={row_group_rows}"
+        );
     }
 
     #[tokio::test]
@@ -9295,7 +9321,7 @@ mod combined_memory_regression_tests {
     #[ignore = "process-wide RSS ceiling must run alone; use the exact test filter"]
     async fn packaged_memory_serializes_real_page_merge_and_wal_with_exact_parity() {
         // A8's smaller failed fan-in, crossing the old 524,288-row default.
-        run_combined_memory_fixture(18, 30_000, None, None).await;
+        run_combined_memory_fixture(18, 30_000, None, None, false, false, 64).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9304,7 +9330,63 @@ mod combined_memory_regression_tests {
         // Scale A14's 64 inputs and 58 chunks to exercise repeated group
         // lifetimes. The smaller row groups are not production-size evidence.
         assert_eq!((64usize * 4_096).div_ceil(4_520), 58);
-        run_combined_memory_fixture(64, 4_096, Some(4_520), Some(8 * 1024 * 1024)).await;
+        run_combined_memory_fixture(
+            64,
+            4_096,
+            Some(4_520),
+            Some(8 * 1024 * 1024),
+            false,
+            false,
+            64,
+        )
+        .await;
+    }
+
+    /// Oct 17 seg2-on geometry: 64 inputs, about 15.06M rows, 58 input
+    /// chunks, and a 256 MiB output row group. This is intentionally separate
+    /// from the scaled lifetime test: it exercises the physical row-group
+    /// boundary that used to retain decoded Arrow batches in the seg2 writer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "production-geometry RSS ceiling must run alone on the packaged 1 GiB profile"]
+    async fn packaged_memory_seg2_production_geometry_preserves_exact_parity() {
+        const ROWS_PER_FILE: usize = 235_349;
+        const CHUNK_ROWS: usize = 261_632;
+        const PAYLOAD_REPEATS: usize = 28;
+        assert_eq!((64usize * ROWS_PER_FILE).div_ceil(CHUNK_ROWS), 58);
+        assert_oct17_output_group_geometry(PAYLOAD_REPEATS);
+        run_combined_memory_fixture(
+            64,
+            ROWS_PER_FILE,
+            Some(CHUNK_ROWS),
+            Some(256 * 1024 * 1024),
+            true,
+            true,
+            PAYLOAD_REPEATS,
+        )
+        .await;
+    }
+
+    /// The matched seg2-off arm reaches the post-rewrite v1 rebuild. Keep it
+    /// distinct from the seg2 writer regression so a memory result identifies
+    /// which allocation sequence ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "production-geometry RSS ceiling must run alone on the packaged 1 GiB profile"]
+    async fn packaged_memory_v1_rebuild_production_geometry_preserves_exact_parity() {
+        const ROWS_PER_FILE: usize = 235_349;
+        const CHUNK_ROWS: usize = 261_632;
+        const PAYLOAD_REPEATS: usize = 28;
+        assert_eq!((64usize * ROWS_PER_FILE).div_ceil(CHUNK_ROWS), 58);
+        assert_oct17_output_group_geometry(PAYLOAD_REPEATS);
+        run_combined_memory_fixture(
+            64,
+            ROWS_PER_FILE,
+            Some(CHUNK_ROWS),
+            Some(256 * 1024 * 1024),
+            false,
+            true,
+            PAYLOAD_REPEATS,
+        )
+        .await;
     }
 
     /// Reproduce the retained reconstruction's allocation sequence: a large
@@ -9463,6 +9545,9 @@ mod combined_memory_regression_tests {
         rows_per_file: usize,
         merge_chunk_rows: Option<usize>,
         target_row_group_bytes: Option<usize>,
+        segmented_index_writes: bool,
+        index_rebuild: bool,
+        payload_repeats: usize,
     ) {
         let wal_file = input_files;
         let tmp = tempfile::tempdir().unwrap();
@@ -9470,16 +9555,18 @@ mod combined_memory_regression_tests {
         let mut ice = IcebergContext::open(&tmp.path().join("warehouse"))
             .await
             .unwrap();
-        if target_row_group_bytes.is_some() {
-            ice = ice.with_tuning(IcebergTuning {
-                target_row_group_bytes,
-                ..Default::default()
-            });
-        }
+        ice = ice.with_tuning(IcebergTuning {
+            target_row_group_bytes,
+            segmented_index_writes: Some(segmented_index_writes),
+            index_rebuild: Some(index_rebuild),
+            ..Default::default()
+        });
         let ice = Arc::new(ice);
 
         for file in 0..input_files {
-            let events: Vec<_> = (0..rows_per_file).map(|row| event(file, row)).collect();
+            let events: Vec<_> = (0..rows_per_file)
+                .map(|row| event_with_payload(file, row, payload_repeats))
+                .collect();
             ice.append_events(&events).await.unwrap();
         }
         let merge_inputs = ice.live_data_files(ice.events_table_ident()).await.unwrap();
@@ -9492,7 +9579,9 @@ mod combined_memory_regression_tests {
             Duration::from_secs(60),
         )
         .unwrap();
-        let wal_events: Vec<_> = (0..rows_per_file).map(|row| event(wal_file, row)).collect();
+        let wal_events: Vec<_> = (0..rows_per_file)
+            .map(|row| event_with_payload(wal_file, row, payload_repeats))
+            .collect();
         assert!(writer.append_events(&wal_events).unwrap().is_some());
         drop(wal_events);
         drop(writer);
@@ -9569,13 +9658,28 @@ mod combined_memory_regression_tests {
             "real merge/WAL fixture exceeded the packaged 1 GiB limit: baseline={baseline}, peak={peak}"
         );
 
-        assert_exact_event_parity(&ice, input_files + 1, rows_per_file).await;
+        assert_exact_event_parity_with_payload(
+            &ice,
+            input_files + 1,
+            rows_per_file,
+            payload_repeats,
+        )
+        .await;
     }
 
     async fn assert_exact_event_parity(
         ice: &IcebergContext,
         file_count: usize,
         rows_per_file: usize,
+    ) {
+        assert_exact_event_parity_with_payload(ice, file_count, rows_per_file, 64).await;
+    }
+
+    async fn assert_exact_event_parity_with_payload(
+        ice: &IcebergContext,
+        file_count: usize,
+        rows_per_file: usize,
+        payload_repeats: usize,
     ) {
         let total_rows = file_count * rows_per_file;
         let ctx = SessionContext::new();
@@ -9637,7 +9741,10 @@ mod combined_memory_regression_tests {
             for row_index in 0..batch.num_rows() {
                 let (file, row) = parse_id(raws.value(row_index));
                 assert!(file < file_count && row < rows_per_file);
-                assert_eq!(raws.value(row_index), event(file, row).raw);
+                assert_eq!(
+                    raws.value(row_index),
+                    event_with_payload(file, row, payload_repeats).raw
+                );
                 let slot = file * rows_per_file + row;
                 assert!(!seen[slot], "duplicate source row f{file}-r{row}");
                 seen[slot] = true;
