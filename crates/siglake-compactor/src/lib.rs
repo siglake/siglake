@@ -979,6 +979,10 @@ pub struct Compactor {
     /// after its async drain parent is cancelled.
     #[cfg(test)]
     append_aggregate_hold_for_test: Option<Arc<AppendAggregateHold>>,
+    /// Stop this filesystem cycle after a deterministic number of dispatched
+    /// batches while allowing every admitted commit to finish normally.
+    #[cfg(test)]
+    fs_dispatch_batch_cap_for_test: Option<usize>,
     /// Pin the catalog fetch/decode budget without changing process state.
     #[cfg(test)]
     catalog_decoded_budget_for_test: Option<u64>,
@@ -1025,6 +1029,8 @@ impl Compactor {
             segment_read_hold_for_test: None,
             #[cfg(test)]
             append_aggregate_hold_for_test: None,
+            #[cfg(test)]
+            fs_dispatch_batch_cap_for_test: None,
             #[cfg(test)]
             catalog_decoded_budget_for_test: None,
         };
@@ -1167,6 +1173,13 @@ impl Compactor {
     #[cfg(test)]
     fn with_append_aggregate_hold_for_test(mut self, hold: Arc<AppendAggregateHold>) -> Self {
         self.append_aggregate_hold_for_test = Some(hold);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_fs_dispatch_batch_cap_for_test(mut self, batches: usize) -> Self {
+        assert!(batches > 0);
+        self.fs_dispatch_batch_cap_for_test = Some(batches);
         self
     }
 
@@ -3675,10 +3688,19 @@ impl Compactor {
         let mut committed_segments = 0usize;
         let mut first_err: Option<anyhow::Error> = None;
         let mut stop_top_up = false;
+        #[cfg(test)]
+        let mut dispatched_batches_for_test = 0usize;
 
         loop {
             // Top up to the concurrency target while budget remains.
             while !stop_top_up && inflight.len() < workers && std::time::Instant::now() < deadline {
+                #[cfg(test)]
+                if self
+                    .fs_dispatch_batch_cap_for_test
+                    .is_some_and(|cap| dispatched_batches_for_test >= cap)
+                {
+                    break;
+                }
                 if offset >= queue.len() {
                     // Snapshot exhausted: re-list once per exhaustion to pick up
                     // segments sealed while this pass ran. processing/ renames make
@@ -3832,6 +3854,10 @@ impl Compactor {
                     };
                     (claimed, selected_decoded_bytes, res)
                 });
+                #[cfg(test)]
+                {
+                    dispatched_batches_for_test = dispatched_batches_for_test.saturating_add(1);
+                }
             }
             metrics::gauge!(
                 "siglake_compactor_drain_inflight",
@@ -10941,7 +10967,7 @@ mod durable_reclaim_proof_tests {
             let compactor = Compactor::new(&wal_root, ice.clone())
                 .with_fs_batch_limits(4, 0)
                 .with_drain_concurrency(1)
-                .with_drain_cycle_budget(Duration::from_millis(100));
+                .with_fs_dispatch_batch_cap_for_test(1);
             std::fs::create_dir_all(wal_dir.join(siglake_wal::PROCESSING_DIR)).unwrap();
             std::fs::write(
                 wal_dir
@@ -10950,9 +10976,9 @@ mod durable_reclaim_proof_tests {
                 [],
             )
             .unwrap();
-            // This sorts after UUID segment names. Scanning the thousands of
-            // committed proof entries makes the first append outlive the
-            // cycle's 100 ms dispatch budget, so the tail remains sealed.
+            // This sorts after UUID segment names. The per-instance test cap
+            // admits exactly the first four-segment batch, then drains it without
+            // topping up. The tail stays sealed regardless of append speed.
             std::fs::write(
                 wal_dir.join(siglake_wal::SEALED_DIR).join(sealed_survivor),
                 [],
