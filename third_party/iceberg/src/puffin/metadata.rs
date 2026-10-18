@@ -579,7 +579,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string(),
-            "DataInvalid => Bad magic value: [49, 80, 70, 65] should be [80, 70, 65, 49]",
+            "DataInvalid => Puffin footer payload exceeds the file extent",
         )
     }
 
