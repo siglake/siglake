@@ -37,49 +37,65 @@ fn isolated(mode: &str) {
             .unwrap(),
     );
     let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
+    let mut timed_out = false;
+    let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
-            let mut output = String::new();
-            child
-                .0
-                .stdout
-                .take()
-                .unwrap()
-                .take(65_537)
-                .read_to_string(&mut output)
-                .unwrap();
-            let mut errors = String::new();
-            child
-                .0
-                .stderr
-                .take()
-                .unwrap()
-                .take(65_537)
-                .read_to_string(&mut errors)
-                .unwrap();
-            assert!(
-                output.len() <= 65_536 && errors.len() <= 65_536,
-                "child output bound"
-            );
-            // Prefix libtest summaries so whole-workspace parsers do not count
-            // the isolated child again as an additional top-level test suite.
-            for line in output.lines().chain(errors.lines()) {
-                eprintln!("isolated_reclaim_child[{mode}] {line}");
-            }
-            assert!(status.success(), "isolated {mode} exited {status}");
-            assert!(
-                output.contains("test result: ok. 1 passed; 0 failed;"),
-                "exact child test did not pass"
-            );
-            assert!(
-                output.contains(&format!("reclaim_child_completed mode={mode}")),
-                "child body did not complete"
-            );
-            break;
+            break status;
         }
-        assert!(Instant::now() < deadline, "isolated {mode} timed out");
+        if Instant::now() >= deadline {
+            timed_out = true;
+            child.0.kill().expect("kill timed-out owned child");
+            break child.0.wait().expect("drain killed child");
+        }
         std::thread::sleep(Duration::from_millis(10));
+    };
+    // The child is now reaped. Its known-small output is bounded by pipe
+    // capacity while running; excess output cannot defeat the deadline.
+    // Drain a bounded diagnostic prefix on failure/timeout as well as success.
+    let mut output = String::new();
+    child
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .take(65_537)
+        .read_to_string(&mut output)
+        .unwrap();
+    let mut errors = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .take(65_537)
+        .read_to_string(&mut errors)
+        .unwrap();
+    // Prefix libtest summaries so whole-workspace parsers do not count
+    // the isolated child again as an additional top-level test suite.
+    for line in output.lines().chain(errors.lines()) {
+        eprintln!("isolated_reclaim_child[{mode}] {line}");
     }
+    assert!(
+        output.len() <= 65_536 && errors.len() <= 65_536,
+        "child output bound"
+    );
+    assert!(!timed_out, "isolated {mode} timed out");
+    assert!(status.success(), "isolated {mode} exited {status}");
+    let summaries: Vec<_> = output
+        .lines()
+        .filter(|line| line.starts_with("test result:"))
+        .collect();
+    assert_eq!(summaries.len(), 1, "exactly one child summary required");
+    assert!(
+        summaries[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+        "exact child test did not pass"
+    );
+    let marker = format!("reclaim_child_completed mode={mode}");
+    assert_eq!(
+        output.lines().filter(|line| *line == marker).count(),
+        1,
+        "exactly one child body completion required"
+    );
 }
 
 fn resident_bytes() -> u64 {
