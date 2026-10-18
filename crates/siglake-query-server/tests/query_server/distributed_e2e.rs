@@ -2693,16 +2693,22 @@ fn strip_table_metadata(warehouse: &std::path::Path, index_id: &str) -> usize {
 #[tokio::test]
 async fn integer_avg_original_sql_uses_three_workers_and_exact_wal_states() {
     require_loopback!();
-    integer_avg_wal_admission_fixture(false).await;
+    integer_avg_wal_admission_fixture(false, false).await;
 }
 
 #[tokio::test]
 async fn integer_avg_declined_json_wal_refuses_before_footer() {
     require_loopback!();
-    integer_avg_wal_admission_fixture(true).await;
+    integer_avg_wal_admission_fixture(true, false).await;
 }
 
-async fn integer_avg_wal_admission_fixture(unsupported_json_tail: bool) {
+#[tokio::test]
+async fn integer_avg_shared_count_declined_json_wal_refuses_before_footer() {
+    require_loopback!();
+    integer_avg_wal_admission_fixture(true, true).await;
+}
+
+async fn integer_avg_wal_admission_fixture(unsupported_json_tail: bool, count_only: bool) {
     use siglake_core::index_config::{FieldMapping, FieldType, IndexConfig};
     use std::sync::atomic::{AtomicUsize, Ordering};
     let tmp = tempfile::tempdir().unwrap();
@@ -2816,7 +2822,11 @@ async fn integer_avg_wal_admission_fixture(unsupported_json_tail: bool) {
     )
     .await;
     handles.push(coordinator);
-    let sql = "SELECT status, avg(size) AS avg_size, count(*) AS n FROM \"httplogs\" GROUP BY status ORDER BY n DESC LIMIT 20";
+    let sql = if count_only {
+        "SELECT status, count(*) AS n FROM \"httplogs\" GROUP BY status ORDER BY n DESC LIMIT 20"
+    } else {
+        "SELECT status, avg(size) AS avg_size, count(*) AS n FROM \"httplogs\" GROUP BY status ORDER BY n DESC LIMIT 20"
+    };
     let expected = batches_to_records(
         &oracle.sql(sql).await.unwrap().collect().await.unwrap(),
         None,
@@ -2839,8 +2849,7 @@ async fn integer_avg_wal_admission_fixture(unsupported_json_tail: bool) {
     if unsupported_json_tail {
         assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert!(
-            body.to_string()
-                .contains("distributed AVG requires complete WAL admission"),
+            body.to_string().contains("requires complete WAL admission"),
             "{body}"
         );
         assert!(counters

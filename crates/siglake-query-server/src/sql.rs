@@ -10457,8 +10457,8 @@ async fn capture_buffered_shard_read(
     })
 }
 
-// Newly admitted distributed AVG requires the complete selected WAL tail.
-// Preserve other variants' historical committed-snapshot refusal policy.
+// A distributed answer must include the complete selected WAL tail. A declined
+// load or workspace reservation is never an empty committed-snapshot delta.
 fn refused_buffer_partials(
     dist: &crate::coordinator::DistPlan,
     reason: &str,
@@ -10469,12 +10469,17 @@ fn refused_buffer_partials(
     ),
     ApiError,
 > {
-    if matches!(dist, crate::coordinator::DistPlan::AverageAggregate(_)) {
-        return Err(ApiError::pool_exhausted(format!(
-            "distributed AVG requires complete WAL admission: {reason}"
-        )));
+    if matches!(dist, crate::coordinator::DistPlan::Local) {
+        return Ok((Vec::new(), None));
     }
-    Ok((Vec::new(), None))
+    let kind = if matches!(dist, crate::coordinator::DistPlan::AverageAggregate(_)) {
+        "AVG"
+    } else {
+        "query"
+    };
+    Err(ApiError::pool_exhausted(format!(
+        "distributed {kind} requires complete WAL admission: {reason}"
+    )))
 }
 
 fn prepare_buffer_partial_input(
@@ -10547,10 +10552,6 @@ async fn compute_buffer_partials(
     if matches!(dist, crate::coordinator::DistPlan::Local) {
         return refused_buffer_partials(&dist, "WAL admission or workspace");
     }
-    if !buffer_partial_plan_has_bounded_workspace(plan, &dist) {
-        metrics::counter!("siglake_query_wal_buffer_refused_partial_workspace_total").increment(1);
-        return refused_buffer_partials(&dist, "WAL admission or workspace");
-    }
     // #82: an ordered aggregate's partials must be the sort/limit-stripped
     // aggregate (same rewrite the workers run) — sorting/limiting the buffer
     // slice would drop groups from the merge.
@@ -10570,7 +10571,9 @@ async fn compute_buffer_partials(
             &table,
             &read.snapshot.table_uuid,
         ) else {
-            return refused_buffer_partials(&dist, "WAL admission or workspace");
+            // An absent/foreign-incarnation directory contains no owned tail;
+            // unlike admission refusal it is legitimately empty for this read.
+            return Ok((Vec::new(), None));
         };
         (dir, read.carrier.as_ref())
     };
@@ -10620,6 +10623,10 @@ async fn compute_buffer_partials(
     };
     if decoded.batches().is_empty() {
         return Ok((Vec::new(), Some(decoded)));
+    }
+    if !buffer_partial_plan_has_bounded_workspace(plan, &dist) {
+        metrics::counter!("siglake_query_wal_buffer_refused_partial_workspace_total").increment(1);
+        return refused_buffer_partials(&dist, "WAL admission or workspace");
     }
     let Some(masks) = partial_filter_mask_count(plan) else {
         return refused_buffer_partials(&dist, "WAL admission or workspace");
@@ -11548,6 +11555,18 @@ mod tests {
         let low = crate::wal_buffer::decoded_buffer_for_test(vec![batch.clone()]);
         assert!(low.payload_bytes() > 27 * low.row_count() as u64);
         assert!(prepare_buffer_partial_input(&low, &dist, 0).is_err());
+        let count_logical = ctx
+            .state()
+            .create_logical_plan(
+                "SELECT size, count(*) AS n FROM events GROUP BY size ORDER BY n DESC LIMIT 20",
+            )
+            .await
+            .unwrap();
+        let count_dist = crate::coordinator::classify(&count_logical);
+        assert!(matches!(
+            &count_dist,
+            crate::coordinator::DistPlan::OrderedAggregate(_)
+        ));
         for stage in [
             "decode admission",
             "bounded plan",
@@ -11557,6 +11576,7 @@ mod tests {
             "output attachment",
         ] {
             assert!(refused_buffer_partials(&dist, stage).is_err());
+            assert!(refused_buffer_partials(&count_dist, stage).is_err());
             assert!(refused_buffer_partials(&crate::coordinator::DistPlan::Local, stage).is_ok());
         }
         drop(low);
@@ -18348,7 +18368,7 @@ async fn distributed_inner(
             }
         };
     // A declined WAL load is not an empty tail. Never authorize a committed-only
-    // Tier-1 answer from it. AVG additionally requires complete admission before
+    // Tier-1 answer from it. Distributed plans require complete admission before
     // worker fanout; a successful merge must include every buffered row.
     if tier1_load
         .as_ref()
