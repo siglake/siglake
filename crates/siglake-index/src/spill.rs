@@ -13,10 +13,10 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::{Arc, Mutex};
 
-use siglake_bloom::{MAX_TOKENS_PER_ROW, Tokenizer};
+use siglake_bloom::{Tokenizer, MAX_TOKENS_PER_ROW};
 use tempfile::NamedTempFile;
 
-use crate::{INDEX_MAGIC, INDEX_VERSION, IndexBuilder};
+use crate::{IndexBuilder, INDEX_MAGIC, INDEX_VERSION};
 
 const FAN_IN: usize = 16;
 const MIN_MEMORY: usize = 64 * 1024;
@@ -732,11 +732,9 @@ mod tests {
         let mut builder =
             SpillingIndexBuilder::new(Tokenizer::Raw, MIN_MEMORY, 1024 * 1024).unwrap();
         builder.push_row("before").unwrap();
-        assert!(
-            builder
-                .push_row(&"x".repeat(MIN_MEMORY / (FAN_IN * 4) + 1))
-                .is_err()
-        );
+        assert!(builder
+            .push_row(&"x".repeat(MIN_MEMORY / (FAN_IN * 4) + 1))
+            .is_err());
         assert!(builder.push_row("after").is_err());
         assert!(builder.finish().is_err());
     }
