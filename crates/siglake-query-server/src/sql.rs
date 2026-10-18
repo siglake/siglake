@@ -11565,7 +11565,7 @@ mod tests {
         let count_dist = crate::coordinator::classify(&count_logical);
         assert!(matches!(
             &count_dist,
-            crate::coordinator::DistPlan::OrderedAggregate(_)
+            crate::coordinator::DistPlan::OrderedAggregate { .. }
         ));
         for stage in [
             "decode admission",
