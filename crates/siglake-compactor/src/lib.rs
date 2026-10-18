@@ -11471,6 +11471,7 @@ mod mirror_ledger_reclaim_tests {
         wal: PathBuf,
         id: String,
         key: String,
+        ledger: sqlx::SqlitePool,
     }
 
     /// A drain with ledger reclamation attached, a mirrored segment in
@@ -11523,6 +11524,7 @@ mod mirror_ledger_reclaim_tests {
                 last_reclaim: Default::default(),
             },
         );
+        let ledger = sqlx::SqlitePool::connect(&uri).await.unwrap();
         Seeded {
             compactor,
             claim,
@@ -11530,17 +11532,76 @@ mod mirror_ledger_reclaim_tests {
             wal,
             id,
             key,
+            ledger,
         }
     }
 
-    async fn purgeable(claim: &SqlSegmentClaim) -> Vec<String> {
-        claim
-            .purgeable_committed(Duration::ZERO, 10)
+    async fn ledger_row(s: &Seeded) -> Option<(String, Option<i64>, String)> {
+        sqlx::query_as("SELECT status, committed_at_ms, segment_url FROM wal_segments WHERE id = ?")
+            .bind(&s.id)
+            .fetch_optional(&s.ledger)
             .await
             .unwrap()
-            .into_iter()
-            .map(|(_, key)| key)
-            .collect()
+    }
+
+    /// Durability is independent of whether the wall clock has advanced past
+    /// the mark's millisecond. Read the exact stored row, not age eligibility.
+    async fn committed_keys(s: &Seeded) -> Vec<String> {
+        let ids = s
+            .claim
+            .committed_segment_ids("default", "", std::slice::from_ref(&s.id))
+            .await
+            .unwrap();
+        match ledger_row(s).await {
+            Some((status, stamp, key)) if status == "committed" => {
+                assert!(
+                    stamp.is_some(),
+                    "the durable mark must retain its timestamp"
+                );
+                assert_eq!(ids, vec![s.id.clone()]);
+                vec![key]
+            }
+            _ => {
+                assert!(ids.is_empty());
+                Vec::new()
+            }
+        }
+    }
+
+    /// Set only this test's already-proved committed row behind a captured
+    /// cutoff. Retention still uses the real production query and object/row
+    /// deletion path; no sleeps, retry-until-green or production clock changes.
+    async fn make_retention_due(s: &Seeded) {
+        let (status, original_stamp, key) = ledger_row(s).await.unwrap();
+        assert_eq!(status, "committed");
+        assert_eq!(key, s.key);
+        let original_stamp = original_stamp.expect("mark timestamp");
+        let cutoff = chrono::Utc::now().timestamp_millis();
+        let due = cutoff.checked_sub(60_000).unwrap();
+        assert!(due < cutoff);
+        let updated = sqlx::query(
+            "UPDATE wal_segments SET committed_at_ms = ? \
+             WHERE id = ? AND status = 'committed' AND committed_at_ms = ?",
+        )
+        .bind(due)
+        .bind(&s.id)
+        .bind(original_stamp)
+        .execute(&s.ledger)
+        .await
+        .unwrap();
+        assert_eq!(updated.rows_affected(), 1);
+        assert_eq!(
+            ledger_row(s).await,
+            Some(("committed".to_string(), Some(due), s.key.clone()))
+        );
+        assert_eq!(
+            s.claim
+                .purgeable_committed(Duration::ZERO, 10)
+                .await
+                .unwrap(),
+            vec![(s.id.clone(), s.key.clone())],
+            "the unchanged strict age predicate must select the explicitly aged row"
+        );
     }
 
     fn committed_files(wal: &std::path::Path) -> Vec<String> {
@@ -11560,18 +11621,17 @@ mod mirror_ledger_reclaim_tests {
 
         assert_eq!(s.compactor.run_once().await.unwrap(), 1);
         assert_eq!(
-            purgeable(&s.claim).await,
+            committed_keys(&s).await,
             vec![s.key.clone()],
             "the drain's commit must transition the ingester's row"
         );
-        // The age predicate is strict at millisecond precision.
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        make_retention_due(&s).await;
         assert_eq!(
             s.compactor.run_retention_with(Some(Duration::ZERO)).await,
             1
         );
         assert!(!s.store.exists(&s.key).await.unwrap());
-        assert!(purgeable(&s.claim).await.is_empty());
+        assert!(committed_keys(&s).await.is_empty());
     }
 
     /// The negative control, driven through the resolver rather than the
@@ -11583,7 +11643,7 @@ mod mirror_ledger_reclaim_tests {
         let s = seed(tmp.path(), DEFAULT_RETENTION, true).await;
 
         assert_eq!(s.compactor.run_once().await.unwrap(), 1);
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        make_retention_due(&s).await;
         assert_eq!(
             s.compactor
                 .run_retention_with(committed_retention_from(Some("0")))
@@ -11591,7 +11651,7 @@ mod mirror_ledger_reclaim_tests {
             0
         );
         assert!(s.store.exists(&s.key).await.unwrap());
-        assert_eq!(purgeable(&s.claim).await, vec![s.key]);
+        assert_eq!(committed_keys(&s).await, vec![s.key]);
     }
 
     /// A segment with a live `mirror-pending/` pin still owes an upload.
@@ -11609,7 +11669,7 @@ mod mirror_ledger_reclaim_tests {
 
         assert_eq!(s.compactor.run_once().await.unwrap(), 1);
         assert!(
-            purgeable(&s.claim).await.is_empty(),
+            committed_keys(&s).await.is_empty(),
             "a pinned segment must not be marked committed"
         );
         assert_eq!(
@@ -11621,12 +11681,12 @@ mod mirror_ledger_reclaim_tests {
         // The upload lands and the pin clears: the next cycle marks it.
         std::fs::remove_file(&pin).unwrap();
         s.compactor.run_once().await.unwrap();
-        assert_eq!(purgeable(&s.claim).await, vec![s.key.clone()]);
+        assert_eq!(committed_keys(&s).await, vec![s.key.clone()]);
         assert!(
             committed_files(&s.wal).is_empty(),
             "once the mark is durable the local copy is releasable"
         );
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        make_retention_due(&s).await;
         assert_eq!(
             s.compactor.run_retention_with(Some(Duration::ZERO)).await,
             1
@@ -11649,8 +11709,8 @@ mod mirror_ledger_reclaim_tests {
 
         // An idle cycle: nothing to commit, everything to repair.
         assert_eq!(s.compactor.run_once().await.unwrap(), 0);
-        assert_eq!(purgeable(&s.claim).await, vec![s.key.clone()]);
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(committed_keys(&s).await, vec![s.key.clone()]);
+        make_retention_due(&s).await;
         assert_eq!(
             s.compactor.run_retention_with(Some(Duration::ZERO)).await,
             1
@@ -11669,23 +11729,29 @@ mod mirror_ledger_reclaim_tests {
 
         assert_eq!(s.compactor.run_once().await.unwrap(), 1);
         assert_eq!(
-            purgeable(&s.claim).await,
+            committed_keys(&s).await,
             vec![s.key.clone()],
             "the mark must insert the row the upload has not registered yet"
         );
+        let before_registration = ledger_row(&s).await;
         // The uploader's registrar catches up afterwards.
         assert!(!s
             .claim
             .register(&s.id, "default", "", &s.key, 1, 2)
             .await
             .unwrap());
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            ledger_row(&s).await,
+            before_registration,
+            "late insert-ignore must preserve status, exact timestamp and mirror key"
+        );
+        make_retention_due(&s).await;
         assert_eq!(
             s.compactor.run_retention_with(Some(Duration::ZERO)).await,
             1
         );
         assert!(!s.store.exists(&s.key).await.unwrap());
-        assert!(purgeable(&s.claim).await.is_empty());
+        assert!(committed_keys(&s).await.is_empty());
     }
 
     /// Segments of a dropped incarnation are quarantined into `stale/` by the
@@ -11705,7 +11771,7 @@ mod mirror_ledger_reclaim_tests {
 
         assert_eq!(s.compactor.run_once().await.unwrap(), 0);
         assert!(
-            purgeable(&s.claim).await.is_empty(),
+            committed_keys(&s).await.is_empty(),
             "a quarantined segment must never be marked committed"
         );
         assert_eq!(
@@ -11731,7 +11797,7 @@ mod mirror_ledger_reclaim_tests {
 
         assert_eq!(plain.run_once().await.unwrap(), 1);
         assert!(
-            purgeable(&s.claim).await.is_empty(),
+            committed_keys(&s).await.is_empty(),
             "the row stays sealed forever, which is the limitation this closes"
         );
         assert!(

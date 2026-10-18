@@ -6382,6 +6382,7 @@ dependencies = [
  "siglake-index",
  "siglake-storage",
  "siglake-wal",
+ "sqlx",
  "tempfile",
  "tokio",
  "tracing",
