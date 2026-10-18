@@ -131,6 +131,7 @@ impl PuffinWriter {
         self.write_header_once().await?;
         let offset = self.num_bytes_written;
         let mut length = 0u64;
+        let stream = stream.into_stream();
         futures::pin_mut!(stream);
         while let Some(chunk) = stream.try_next().await? {
             length = length.checked_add(chunk.len() as u64).ok_or_else(|| {
