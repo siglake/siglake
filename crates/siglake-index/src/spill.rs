@@ -518,15 +518,12 @@ fn merge(
     let mut terms = 0u64;
     {
         let mut out = BufWriter::with_capacity(buffer, &mut body);
-        loop {
-            let Some(term) = readers
-                .iter()
-                .filter_map(|reader| reader.term.as_ref())
-                .min()
-                .cloned()
-            else {
-                break;
-            };
+        while let Some(term) = readers
+            .iter()
+            .filter_map(|reader| reader.term.as_ref())
+            .min()
+            .cloned()
+        {
             let mut count = 0u64;
             for reader in &readers {
                 if reader.term.as_ref() == Some(&term) {
