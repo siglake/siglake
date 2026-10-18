@@ -16,8 +16,10 @@ pub mod iceberg;
 pub mod index_manager;
 pub mod merge;
 mod query_provider;
+mod rebuild_spool;
 pub mod schema_version;
 pub mod subscribe;
+mod timestamp_spool;
 pub mod wal_ledger;
 
 pub use query_provider::{

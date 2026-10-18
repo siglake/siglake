@@ -33,16 +33,18 @@ class IsolationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             v.isolated_config(config, 'release')
 
-    def test_version_selection_adds_0_2_1_without_changing_historical_versions(self):
-        self.assertEqual(v.SUPPORTED_VERSIONS, ('v0.1.0', 'v0.2.0', 'v0.2.1'))
-        self.assertEqual(v.PROVENANCE_VERSIONS, {'v0.2.1'})
-        args = v.argument_parser().parse_args([
-            '--version', 'v0.2.1', '--profile', 'smoke', '--out', '/unused'
-        ])
-        self.assertEqual(args.version, 'v0.2.1')
+    def test_version_selection_keeps_historical_checks_and_adds_0_3_0(self):
+        self.assertEqual(v.SUPPORTED_VERSIONS, ('v0.1.0', 'v0.2.0', 'v0.2.1', 'v0.3.0'))
+        self.assertEqual(v.PROVENANCE_VERSIONS, {'v0.2.1', 'v0.3.0'})
+        self.assertEqual(v.QUERY_AUDIT_AGGREGATE_VERSIONS, {'v0.2.1', 'v0.3.0'})
+        for version in ('v0.2.1', 'v0.3.0'):
+            args = v.argument_parser().parse_args([
+                '--version', version, '--profile', 'smoke', '--out', '/unused'
+            ])
+            self.assertEqual(args.version, version)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             v.argument_parser().parse_args([
-                '--version', 'v0.3.0', '--profile', 'smoke', '--out', '/unused'
+                '--version', 'v0.4.0', '--profile', 'smoke', '--out', '/unused'
             ])
 
     def test_product_provenance_accepts_the_release_commit(self):

@@ -30,6 +30,11 @@
 //!   complete per-shard groups, and the coordinator re-aggregates, then
 //!   applies the `ORDER BY`/`LIMIT` once, over global totals.
 //!
+//! * **Integer-column AVG** (#6585) — workers emit SUM/non-null COUNT plus
+//!   original integer MIN/MAX witnesses; the coordinator validates an exact
+//!   binary64 accumulation bound, finalizes once, then orders/limits globally.
+//!   Unsupported types/expressions stay local; an out-of-range state refuses.
+//!
 //! Everything else falls back to a single whole-table run ([`DistPlan::Local`])
 //! — always correct, just not distributed. The exhaustive differential tests
 //! assert the coordinated result equals the unsharded result for every
@@ -43,7 +48,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::datasource::MemTable;
 use datafusion::logical_expr::expr::AggregateFunction;
-use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 use siglake_storage::iceberg::TableGeneration;
 use siglake_storage::ScanShard;
@@ -378,8 +383,76 @@ pub enum DistPlan {
         limit: Option<usize>,
         worker_sql: String,
     },
+    /// Exact-integer AVG state, with an optional final global order/limit.
+    AverageAggregate(AveragePlan),
     /// Not safely mergeable — run the whole table on one worker.
     Local,
+}
+
+/// A separate wire schema is necessary for AVG: final output names/order are
+/// not the SUM/non-null COUNT state names. MIN/MAX are range witnesses, not
+/// alternative averages. This first implementation accepts integer columns
+/// only, and refuses a distributed result unless the sum of absolute-value
+/// bounds is <= 2^53. Every intermediate integer sum is then exactly binary64
+/// representable, so regrouping cannot change the original AVG bits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AveragePlan {
+    worker_sql: String,
+    partial_schema: arrow::datatypes::SchemaRef,
+    output_schema: arrow::datatypes::SchemaRef,
+    keys: Vec<String>,
+    outputs: Vec<String>,
+    averages: Vec<[usize; 4]>, // sum, non-null count, min, max
+    counts: Vec<usize>,
+    order: Option<(String, Option<usize>)>,
+}
+
+impl DistPlan {
+    /// Remote shards, local shard failover and the WAL partial must all run
+    /// this exact query, including AVG states and removal of global top-N.
+    pub fn worker_sql<'a>(&'a self, original: &'a str) -> &'a str {
+        match self {
+            Self::OrderedAggregate { worker_sql, .. } => worker_sql,
+            Self::AverageAggregate(plan) => &plan.worker_sql,
+            _ => original,
+        }
+    }
+
+    pub(crate) fn partial_schema<'a>(
+        &'a self,
+        original: &'a arrow::datatypes::Schema,
+    ) -> &'a arrow::datatypes::Schema {
+        match self {
+            Self::AverageAggregate(plan) => &plan.partial_schema,
+            _ => original,
+        }
+    }
+
+    /// Price cast/scratch arrays with the same startup, rounding and batch
+    /// fragmentation bound used for retained partial output. This is separate
+    /// from the full input payload needed to attach the workspace lease.
+    pub(crate) fn partial_cast_workspace(&self, rows: usize) -> Option<u64> {
+        match self {
+            Self::AverageAggregate(plan) => {
+                let count = plan.averages.len().checked_mul(3)?;
+                let fields = (0..count)
+                    .map(|i| {
+                        arrow::datatypes::Field::new(
+                            format!("cast_scratch_{i}"),
+                            arrow::datatypes::DataType::Float64,
+                            true,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                crate::wal_buffer::bounded_output_payload(
+                    &Arc::new(arrow::datatypes::Schema::new(fields)),
+                    rows,
+                    0,
+                )
+            }
+            _ => Some(0),
+        }
+    }
 }
 
 /// Classify a (already-planned) query into a [`DistPlan`].
@@ -542,6 +615,10 @@ fn ordered_aggregate(plan: &LogicalPlan) -> Option<DistPlan> {
                 worker_sql,
             })
         }
+        DistPlan::AverageAggregate(mut average) => {
+            average.order = Some((order_by, limit));
+            Some(DistPlan::AverageAggregate(average))
+        }
         other => Some(other), // Local: aggregate but not mergeable
     }
 }
@@ -555,7 +632,7 @@ enum AggRole {
 /// Classify an aggregate-rooted plan. Returns `None` if `plan` is not an
 /// aggregate (or aggregate-under-a-pass-through-projection) — the caller then
 /// tries the scan path. Returns `Some(DistPlan::Local)` when it *is* an
-/// aggregate but is not shard-mergeable (e.g. `DISTINCT` / `avg`), and
+/// aggregate but is not shard-mergeable (e.g. `DISTINCT` / floating AVG), and
 /// `Some(DistPlan::Aggregate{..})` when it is.
 ///
 /// DataFusion always wraps an aggregate in a projection that aliases the
@@ -595,6 +672,13 @@ fn classify_aggregate(plan: &LogicalPlan) -> Option<DistPlan> {
     // `is_pure_scan`; this one was the exception.
     if !is_pure_scan(&agg.input) {
         return Some(DistPlan::Local);
+    }
+
+    if agg.aggr_expr.iter().any(|expr| {
+        matches!(expr,
+        Expr::AggregateFunction(function) if function.func.name() == "avg")
+    }) {
+        return Some(classify_average(plan, agg, proj).unwrap_or(DistPlan::Local));
     }
 
     // Role of each aggregate-internal output column (group keys come first in
@@ -665,6 +749,359 @@ fn classify_aggregate(plan: &LogicalPlan) -> Option<DistPlan> {
         }
     }
     Some(DistPlan::Aggregate { key_names, agg_fns })
+}
+
+/// Preserve a deliberately small, auditable shape: integer-column AVG plus
+/// COUNT, keys and a pass-through output projection. Other numeric types,
+/// computed operands, DISTINCT/FILTER/ordered aggregates remain local.
+fn classify_average(
+    plan: &LogicalPlan,
+    agg: &datafusion::logical_expr::Aggregate,
+    proj: Option<&datafusion::logical_expr::Projection>,
+) -> Option<DistPlan> {
+    use arrow::datatypes::DataType;
+    use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
+    if !agg
+        .group_expr
+        .iter()
+        .all(|expr| matches!(expr, Expr::Column(_)))
+    {
+        return None;
+    }
+    let mut names: HashSet<String> = agg
+        .schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    if names.len() != agg.schema.fields().len() {
+        return None;
+    }
+    let mut next_name = || {
+        let mut n = names.len();
+        loop {
+            let name = format!("__siglake_avg_state_{n}");
+            if names.insert(name.clone()) {
+                break name;
+            }
+            n += 1;
+        }
+    };
+    let n_keys = agg.group_expr.len();
+    let keys: Vec<String> = agg.schema.fields()[..n_keys]
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let mut merge_exprs: Vec<String> = keys.iter().map(|s| quote_ident(s)).collect();
+    let mut states = Vec::new();
+    let mut averages = Vec::new();
+    let mut counts = Vec::new();
+    for expr in &agg.aggr_expr {
+        let Expr::AggregateFunction(function) = expr else {
+            return None;
+        };
+        let params = &function.params;
+        if params.distinct
+            || params.filter.is_some()
+            || !params.order_by.is_empty()
+            || params.args.len() != 1
+        {
+            return None;
+        }
+        match function.func.name() {
+            "avg" => {
+                let argument = &params.args[0];
+                if !matches!(argument, Expr::Column(_))
+                    || !matches!(
+                        argument.get_type(agg.input.schema()).ok()?,
+                        DataType::Int8
+                            | DataType::Int16
+                            | DataType::Int32
+                            | DataType::Int64
+                            | DataType::UInt8
+                            | DataType::UInt16
+                            | DataType::UInt32
+                    )
+                {
+                    return None;
+                }
+                let cast = argument
+                    .clone()
+                    .cast_to(&DataType::Float64, agg.input.schema())
+                    .ok()?;
+                let start = n_keys + states.len();
+                let sum_name = next_name();
+                let count_name = next_name();
+                let min_name = next_name();
+                let max_name = next_name();
+                states.extend([
+                    sum(cast.clone()).alias(&sum_name),
+                    count(argument.clone()).alias(&count_name),
+                    min(argument.clone()).alias(&min_name),
+                    max(argument.clone()).alias(&max_name),
+                ]);
+                averages.push([start, start + 1, start + 2, start + 3]);
+                counts.push(start + 1);
+                let s = quote_ident(&sum_name);
+                let c = quote_ident(&count_name);
+                merge_exprs.push(format!(
+                    "CASE WHEN SUM({c}) = 0 THEN CAST(NULL AS DOUBLE) ELSE SUM({s}) / CAST(SUM({c}) AS DOUBLE) END"
+                ));
+            }
+            "count" => {
+                // Preserve count(column) vs count(*) exactly. Reject computed
+                // count operands to keep WAL expression workspace bounded.
+                if !matches!(&params.args[0], Expr::Column(_) | Expr::Literal(_, _)) {
+                    return None;
+                }
+                let name = next_name();
+                counts.push(n_keys + states.len());
+                states.push(expr.clone().alias(&name));
+                merge_exprs.push(format!("SUM({})", quote_ident(&name)));
+            }
+            _ => return None,
+        }
+    }
+    let worker = LogicalPlanBuilder::from(agg.input.as_ref().clone())
+        .aggregate(agg.group_expr.clone(), states)
+        .ok()?
+        .build()
+        .ok()?;
+    // The bare Aggregate unparser emits aggregate expressions before group
+    // keys, unlike its logical schema (keys first). Make the transport order
+    // explicit so remote, local-failover and WAL workers share these indexes.
+    let columns = worker
+        .schema()
+        .columns()
+        .into_iter()
+        .map(Expr::Column)
+        .collect::<Vec<_>>();
+    let worker = LogicalPlanBuilder::from(worker)
+        .project(columns)
+        .ok()?
+        .build()
+        .ok()?;
+    let worker_sql = datafusion::sql::unparser::plan_to_sql(&worker)
+        .ok()?
+        .to_string();
+    let output_schema = Arc::new(plan.schema().as_arrow().clone());
+    let mut seen_output_names = HashSet::new();
+    let mut outputs = Vec::new();
+    for (index, field) in output_schema.fields().iter().enumerate() {
+        if !seen_output_names.insert(field.name()) {
+            return None;
+        }
+        let internal = if let Some(proj) = proj {
+            let mut inner = &proj.expr[index];
+            while let Expr::Alias(alias) = inner {
+                inner = &alias.expr;
+            }
+            let Expr::Column(column) = inner else {
+                return None;
+            };
+            agg.schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == &column.name)?
+        } else {
+            index
+        };
+        outputs.push(format!(
+            "{} AS {}",
+            merge_exprs.get(internal)?,
+            quote_ident(field.name())
+        ));
+    }
+    Some(DistPlan::AverageAggregate(AveragePlan {
+        worker_sql,
+        partial_schema: Arc::new(worker.schema().as_arrow().clone()),
+        output_schema,
+        keys,
+        outputs,
+        averages,
+        counts,
+        order: None,
+    }))
+}
+
+impl AveragePlan {
+    fn validate_schema(&self, batches: &[RecordBatch]) -> Result<()> {
+        for batch in batches {
+            let schema = batch.schema();
+            anyhow::ensure!(
+                schema.fields().len() == self.partial_schema.fields().len(),
+                "AVG partial column count mismatch"
+            );
+            for (got, expected) in schema.fields().iter().zip(self.partial_schema.fields()) {
+                anyhow::ensure!(
+                    got.name() == expected.name() && got.data_type() == expected.data_type(),
+                    "AVG partial schema mismatch for {}",
+                    expected.name()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_states(&self, batches: &[RecordBatch]) -> Result<()> {
+        use arrow::array::{Array, Float64Array, Int64Array};
+        self.validate_schema(batches)?;
+        for &index in &self.counts {
+            let mut total = 0i64;
+            for batch in batches {
+                let counts = batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .context("AVG partial count must be Int64")?;
+                for row in 0..batch.num_rows() {
+                    anyhow::ensure!(
+                        !counts.is_null(row) && counts.value(row) >= 0,
+                        "AVG partial count is null or negative"
+                    );
+                    total = total
+                        .checked_add(counts.value(row))
+                        .context("AVG partial count overflow")?;
+                }
+            }
+        }
+        for &[sum_index, count_index, min_index, max_index] in &self.averages {
+            let mut absolute_bound = 0u128;
+            let mut nonnull_count = 0u128;
+            for batch in batches {
+                let doubles = |i: usize| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .context("AVG partial sum/range must be Float64")
+                };
+                let sums = doubles(sum_index)?;
+                let lo = batch.column(min_index);
+                let hi = batch.column(max_index);
+                let counts = batch
+                    .column(count_index)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .context("AVG partial count must be Int64")?;
+                for row in 0..batch.num_rows() {
+                    let count = counts.value(row) as u128;
+                    if count == 0 {
+                        anyhow::ensure!(
+                            sums.is_null(row) && lo.is_null(row) && hi.is_null(row),
+                            "empty AVG partial has a non-null sum/range"
+                        );
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        !sums.is_null(row) && !lo.is_null(row) && !hi.is_null(row),
+                        "nonempty AVG partial has a null sum/range"
+                    );
+                    // Inspect ORIGINAL integer extrema: casting 2^53+1 to
+                    // Float64 first would round it into the accepted boundary.
+                    let integer = |array: &dyn Array| -> Result<i128> {
+                        use datafusion::scalar::ScalarValue;
+                        Ok(match ScalarValue::try_from_array(array, row)? {
+                            ScalarValue::Int8(Some(v)) => i128::from(v),
+                            ScalarValue::Int16(Some(v)) => i128::from(v),
+                            ScalarValue::Int32(Some(v)) => i128::from(v),
+                            ScalarValue::Int64(Some(v)) => i128::from(v),
+                            ScalarValue::UInt8(Some(v)) => i128::from(v),
+                            ScalarValue::UInt16(Some(v)) => i128::from(v),
+                            ScalarValue::UInt32(Some(v)) => i128::from(v),
+                            _ => anyhow::bail!("AVG range witness must retain integer type"),
+                        })
+                    };
+                    let (s, l, h) = (
+                        sums.value(row),
+                        integer(lo.as_ref())?,
+                        integer(hi.as_ref())?,
+                    );
+                    let magnitude = l.unsigned_abs().max(h.unsigned_abs());
+                    anyhow::ensure!(
+                        s.is_finite() && s.fract() == 0.0 && l <= h && magnitude <= (1u128 << 53),
+                        "distributed AVG requires exact finite integer range"
+                    );
+                    let bound = magnitude
+                        .checked_mul(count)
+                        .context("AVG absolute range overflow")?;
+                    anyhow::ensure!(s.abs() <= bound as f64, "AVG sum exceeds declared range");
+                    absolute_bound = absolute_bound
+                        .checked_add(bound)
+                        .context("AVG range overflow")?;
+                    nonnull_count = nonnull_count
+                        .checked_add(count)
+                        .context("AVG count overflow")?;
+                }
+            }
+            anyhow::ensure!(
+                absolute_bound <= (1u128 << 53) && nonnull_count <= (1u128 << 53),
+                "distributed AVG exact integer accumulation bound exceeded"
+            );
+        }
+        Ok(())
+    }
+}
+
+async fn merge_average(partials: Vec<RecordBatch>, plan: &AveragePlan) -> Result<Vec<RecordBatch>> {
+    plan.validate_states(&partials)?;
+    if partials.iter().all(|batch| batch.num_rows() == 0) {
+        anyhow::ensure!(!plan.keys.is_empty(), "scalar AVG missing worker state");
+        return Ok(vec![RecordBatch::new_empty(plan.output_schema.clone())]);
+    }
+    let (schema, partials) = normalize_partials(partials)?.context("AVG missing partials")?;
+    let mut sql = format!(
+        "SELECT {} FROM \"__shard_partials\"",
+        plan.outputs.join(", ")
+    );
+    if !plan.keys.is_empty() {
+        sql.push_str(" GROUP BY ");
+        sql.push_str(
+            &plan
+                .keys
+                .iter()
+                .map(|s| quote_ident(s))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    if let Some((order, limit)) = &plan.order {
+        sql.push_str(" ORDER BY ");
+        sql.push_str(order);
+        if let Some(limit) = limit {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
+    }
+    let ctx = siglake_storage::session_context_with(None, None);
+    ctx.register_table(
+        "__shard_partials",
+        Arc::new(MemTable::try_new(schema, vec![partials])?),
+    )?;
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    batches
+        .into_iter()
+        .map(|batch| {
+            anyhow::ensure!(
+                batch.num_columns() == plan.output_schema.fields().len(),
+                "AVG final width mismatch"
+            );
+            for (got, expected) in batch
+                .schema()
+                .fields()
+                .iter()
+                .zip(plan.output_schema.fields())
+            {
+                anyhow::ensure!(
+                    got.name() == expected.name() && got.data_type() == expected.data_type(),
+                    "AVG final schema mismatch"
+                );
+            }
+            Ok(RecordBatch::try_new(
+                plan.output_schema.clone(),
+                batch.columns().to_vec(),
+            )?)
+        })
+        .collect()
 }
 
 /// `Some(limit)` if `plan` is a pure scan (projection/filter/table-scan, with
@@ -821,10 +1258,7 @@ pub async fn coordinate_with_failover(
     // `DistPlan::OrderedAggregate`). Concurrency matters: the sequential loop
     // this replaces made every multi-shard query pay the SUM of worker walls
     // instead of the max.
-    let shard_sql: &str = match &dist {
-        DistPlan::OrderedAggregate { worker_sql, .. } => worker_sql,
-        _ => sql,
-    };
+    let shard_sql = dist.worker_sql(sql);
     let shard_runs = futures::future::join_all((0..shards).map(|index| async move {
         let started = std::time::Instant::now();
         let shard = ScanShard::new(index, shards);
@@ -855,6 +1289,15 @@ pub async fn coordinate_with_failover(
     let mut shard_missing_file_attribution = false;
     for (run, wall) in shard_runs {
         let mut run = run?;
+        if let DistPlan::AverageAggregate(average) = &dist {
+            average.validate_schema(&run.batches)?;
+            if average.keys.is_empty() {
+                anyhow::ensure!(
+                    run.batches.iter().map(|b| b.num_rows()).sum::<usize>() == 1,
+                    "scalar AVG worker must return exactly one state row"
+                );
+            }
+        }
         partials.append(&mut run.batches);
         shard_wall_micros.push(wall);
         if let Some(s) = run.scan {
@@ -907,6 +1350,14 @@ pub async fn coordinate_with_failover(
             (
                 "ordered_aggregate",
                 merge_aggregate(partials, &key_names, &agg_fns, Some((&order_by, limit))).await?,
+            )
+        }
+        DistPlan::AverageAggregate(average) => {
+            metrics::counter!("siglake_query_coordinator_total", "mode" => "average_aggregate")
+                .increment(1);
+            (
+                "average_aggregate",
+                merge_average(partials, &average).await?,
             )
         }
         DistPlan::Local => unreachable!("handled above"),
@@ -1298,9 +1749,10 @@ mod tests {
     #[tokio::test]
     async fn classify_falls_back_for_non_mergeable_shapes() {
         let ctx = events_ctx().await;
-        // avg has no single-column merge function → Local.
+        // Arbitrary floating-point AVG cannot promise partition-independent
+        // original bits. This initial path requires an integer-column operand.
         assert!(matches!(
-            classify_sql(&ctx, "SELECT avg(bytes) FROM events").await,
+            classify_sql(&ctx, "SELECT avg(CAST(bytes AS DOUBLE)) FROM events").await,
             DistPlan::Local
         ));
         // DISTINCT aggregate can't be merged from per-shard partials → Local.
@@ -1376,14 +1828,14 @@ mod tests {
             }
             other => panic!("ordered aggregate -> {other:?}"),
         }
-        // Ordered but UNMERGEABLE aggregate (avg) → still Local.
+        // Integer AVG has its own multi-column partial state and final order.
         assert!(matches!(
             classify_sql(
                 &ctx,
                 "SELECT host, avg(bytes) AS a FROM events GROUP BY host ORDER BY a"
             )
             .await,
-            DistPlan::Local
+            DistPlan::AverageAggregate(_)
         ));
         // Sort key not in the aggregate output → Local.
         assert!(matches!(
@@ -1769,3 +2221,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "coordinator_average_tests.rs"]
+mod average_tests;

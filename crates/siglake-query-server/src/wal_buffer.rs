@@ -881,6 +881,12 @@ impl DecodedBuffer {
         batches_payload_bytes(&self.batches)
     }
 
+    #[cfg(test)]
+    pub(crate) fn memory_usage_for_test(&self) -> Box<dyn Fn() -> u64> {
+        let budget = Arc::clone(&self.reservations[0].budget);
+        Box::new(move || budget.used())
+    }
+
     /// Reserve a caller-proved retained-output payload bound before executing
     /// the operator that creates it. DataFusion accounts aggregate state; this
     /// lease covers Arrow output overlapping the decoded generation and other
@@ -955,8 +961,17 @@ pub(crate) fn bounded_output_payload(
 
 #[cfg(test)]
 pub(crate) fn decoded_buffer_for_test(batches: Vec<RecordBatch>) -> Arc<DecodedBuffer> {
+    let limit = batches_payload_bytes(&batches).max(1);
+    decoded_buffer_with_limit_for_test(batches, limit)
+}
+
+#[cfg(test)]
+pub(crate) fn decoded_buffer_with_limit_for_test(
+    batches: Vec<RecordBatch>,
+    limit: u64,
+) -> Arc<DecodedBuffer> {
     let payload = batches_payload_bytes(&batches);
-    let budget = BufferMemoryBudget::new(payload.max(1));
+    let budget = BufferMemoryBudget::new(limit);
     let reservation = budget
         .try_reserve(payload)
         .expect("test decoded buffer reservation");
@@ -1642,12 +1657,43 @@ fn batches_payload_bytes(batches: &[RecordBatch]) -> u64 {
     })
 }
 
-fn scalar_filter_leaf(expr: &Expr) -> bool {
+pub(crate) fn bounded_scalar_filter_leaf(expr: &Expr) -> bool {
     match expr {
-        Expr::Alias(alias) => scalar_filter_leaf(&alias.expr),
+        Expr::Alias(alias) => bounded_scalar_filter_leaf(&alias.expr),
         Expr::Column(_) | Expr::Literal(_, _) => true,
+        // SQL TIMESTAMP '...' is an explicit cast of one Utf8 literal in
+        // DataFusion's unoptimized plan. Its input and timezone metadata are
+        // capped; the result is one fixed-width scalar, never a column cast.
+        Expr::Cast(cast) => {
+            matches!((cast.expr.as_ref(), &cast.data_type),
+                (Expr::Literal(datafusion::common::ScalarValue::Utf8(Some(value)), _),
+                 DataType::Timestamp(_, zone))
+                if value.len() <= 64 && zone.as_ref().is_none_or(|zone| zone.len() <= 64))
+        }
         _ => false,
     }
+}
+
+/// Reserve scalar conversion scratch independently of the row-sized masks.
+/// The only admitted cast has at most 64 input bytes, 64 timezone bytes and
+/// an eight-byte scalar output. Charge a conservative 64 KiB per expression
+/// per input batch, including small/empty masks and detached execution.
+pub(crate) fn bounded_filter_scalar_workspace(expr: &Expr) -> Option<u64> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut bytes = 0u64;
+    expr.apply(|node| {
+        if matches!(node, Expr::Cast(_)) {
+            if !bounded_scalar_filter_leaf(node) {
+                return Err(DataFusionError::Plan("unbounded scalar cast".into()));
+            }
+            bytes = bytes
+                .checked_add(64 * 1024)
+                .ok_or_else(|| DataFusionError::Plan("scalar workspace overflow".into()))?;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .ok()?;
+    Some(bytes)
 }
 
 /// Arrow 58.4 evaluates these scalar patterns with borrowed equality/contains
@@ -1678,8 +1724,9 @@ pub(crate) fn bounded_literal_like(expr: &Expr) -> bool {
 }
 
 /// Only admit predicates whose physical evaluation is limited to scalar
-/// comparisons and Boolean masks. String functions, casts, regular
-/// expressions, user-defined functions, and arithmetic are declined before
+/// comparisons and Boolean masks, plus capped scalar timestamp literals. String
+/// functions, column casts, regular expressions, user-defined functions, and
+/// arithmetic are declined before
 /// evaluation because they can allocate an intermediate larger than both the
 /// input and final Boolean result.
 pub(crate) fn bounded_filter_mask_count(expr: &Expr) -> Option<u64> {
@@ -1703,7 +1750,8 @@ pub(crate) fn bounded_filter_mask_count(expr: &Expr) -> Option<u64> {
                     | Operator::IsNotDistinctFrom
             ) =>
         {
-            (scalar_filter_leaf(&binary.left) && scalar_filter_leaf(&binary.right)).then_some(1)
+            (bounded_scalar_filter_leaf(&binary.left) && bounded_scalar_filter_leaf(&binary.right))
+                .then_some(1)
         }
         Expr::Like(_) if bounded_literal_like(expr) => Some(2),
         Expr::Not(inner) => bounded_filter_mask_count(inner)?.checked_add(1),
@@ -1714,10 +1762,10 @@ pub(crate) fn bounded_filter_mask_count(expr: &Expr) -> Option<u64> {
         | Expr::IsUnknown(inner)
         | Expr::IsNotTrue(inner)
         | Expr::IsNotFalse(inner)
-        | Expr::IsNotUnknown(inner) => scalar_filter_leaf(inner).then_some(1),
-        Expr::Between(between) => (scalar_filter_leaf(&between.expr)
-            && scalar_filter_leaf(&between.low)
-            && scalar_filter_leaf(&between.high))
+        | Expr::IsNotUnknown(inner) => bounded_scalar_filter_leaf(inner).then_some(1),
+        Expr::Between(between) => (bounded_scalar_filter_leaf(&between.expr)
+            && bounded_scalar_filter_leaf(&between.low)
+            && bounded_scalar_filter_leaf(&between.high))
         .then_some(3),
         _ => None,
     }
@@ -1750,7 +1798,15 @@ fn filter_batches_charged(
     let mask_bytes = rows
         .div_ceil(8)
         .saturating_mul(expression_masks.saturating_add(filters.len() as u64));
-    let bound = batches_payload_bytes(batches).saturating_add(mask_bytes);
+    let scalar_bytes = filters
+        .iter()
+        .try_fold(0u64, |sum, expr| {
+            sum.checked_add(bounded_filter_scalar_workspace(expr)?)
+        })?
+        .checked_mul(batches.len() as u64)?;
+    let bound = batches_payload_bytes(batches)
+        .checked_add(mask_bytes)?
+        .checked_add(scalar_bytes)?;
     let reservation = memory.try_reserve(bound)?;
     let filtered = match filter_batches(batches, filters, schema, state) {
         Ok(filtered) => filtered,
@@ -2910,6 +2966,78 @@ mod tests {
         );
         drop(values);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn bounded_timestamp_literal_accepts_only_capped_scalar_casts() {
+        use arrow_schema::TimeUnit;
+        use datafusion::logical_expr::{cast, col, lit};
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ] {
+            for zone in [None, Some("UTC".into())] {
+                let literal = cast(lit("2026-06-01T00:00:00Z"), DataType::Timestamp(unit, zone));
+                let filter = col("timestamp").gt_eq(literal);
+                assert_eq!(bounded_filter_mask_count(&filter), Some(1));
+                assert_eq!(bounded_filter_scalar_workspace(&filter), Some(65536));
+            }
+        }
+        let timestamp = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        for invalid in [
+            cast(lit("x".repeat(65)), timestamp.clone()),
+            cast(
+                lit("2026-06-01"),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("x".repeat(65).into())),
+            ),
+            cast(col("raw"), timestamp.clone()),
+            cast(cast(lit("2026-06-01"), DataType::Utf8), timestamp.clone()),
+            cast(lit("2026-06-01"), DataType::Utf8),
+            cast(lit(1i64) + lit(2i64), timestamp),
+        ] {
+            let filter = col("timestamp").gt_eq(invalid);
+            assert!(bounded_filter_mask_count(&filter).is_none());
+            assert!(bounded_filter_scalar_workspace(&filter).is_none());
+        }
+    }
+
+    #[test]
+    fn bounded_timestamp_filter_reserves_scalar_scratch_and_retains_output() {
+        use datafusion::logical_expr::{cast, col, lit};
+        let mut event = Event::now("timestamp scratch");
+        event.timestamp = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:01Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let batch = siglake_core::events_to_record_batch(&[event]).unwrap();
+        let schema = batch.schema();
+        let state = SessionContext::new().state();
+        let filters = [col("timestamp").gt_eq(cast(
+            lit("2026-06-01T00:00:00Z"),
+            siglake_core::timestamp_data_type(),
+        ))];
+        let low = BufferMemoryBudget::new(65535);
+        assert!(filter_batches_charged(
+            &low,
+            std::slice::from_ref(&batch),
+            &filters,
+            &schema,
+            &state
+        )
+        .is_none());
+        assert_eq!(low.used(), 0);
+        let memory = BufferMemoryBudget::new(MIB);
+        let output = filter_batches_charged(&memory, &[batch], &filters, &schema, &state)
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert!(memory.used() >= 65536);
+        let child = output[0].column(0).clone();
+        drop(output);
+        assert!(memory.used() >= 65536);
+        drop(child);
+        assert_eq!(memory.used(), 0);
     }
 
     #[test]

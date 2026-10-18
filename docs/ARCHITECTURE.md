@@ -483,7 +483,10 @@ streaming outputs come out unindexed and are queried by scan. Reads of indexes
 that already exist are unaffected, and so is the writer's footer index on the
 flush path: only new sidecars stop being produced. Enabled, the rebuild checks
 every `(file, column)` and skips both footer indexes and Puffin registrations,
-including registrations whose data snapshot has expired.
+including registrations whose data snapshot has expired. The check reads only
+Parquet metadata and a missing v1 sidecar is rebuilt from projected byte-range
+batches; it does not retain the compacted Parquet object while the whole-file
+index is accumulated.
 Missing indexes affect pruning only: queries still scan and return exact rows.
 
 The default is off because a compacted file's inverted index costs about 40
@@ -508,7 +511,10 @@ so a store wait never holds a thread of the blocking pool and a shape's rounds
 of waits are its stages — four, or two on a held directory — rather than its
 reads, which run from 4 to 2,938 per file (#5007).
 A streaming re-cluster can build the compressed seg2 generation one
-Parquet row group at a time when `SIGLAKE_SEGMENTED_INDEX_WRITES=1`: each
+Parquet row group at a time when `SIGLAKE_SEGMENTED_INDEX_WRITES=1`. Input
+batches feed both Parquet and the current group's index builder incrementally,
+so the sidecar path retains parsed postings but no decoded Arrow copy of the
+whole row group. Each
 finished output file contributes one uncompressed Puffin blob whose interior
 contains independently compressed dictionary and posting blocks, and the
 statistics registration is committed in the same transaction as the data-file

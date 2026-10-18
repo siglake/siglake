@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use siglake_bloom::{normalize_query_term, Tokenizer};
 
 pub mod segmented;
+pub mod spill;
 
 /// Magic prefixing a serialized index blob.
 const INDEX_MAGIC: &[u8; 4] = b"KIDX";

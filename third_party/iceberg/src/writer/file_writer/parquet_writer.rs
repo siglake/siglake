@@ -146,12 +146,13 @@ struct SegmentedIndexRequest {
 
 /// One output file's in-progress segmented sidecars.
 struct SegmentedIndexState {
-    /// Per column: the request, the encoder, and the row count of every group
-    /// pushed into it.
+    /// Per column: the request, the encoder, the row count of every completed
+    /// group, and the current group's incremental index builder.
     writers: Vec<(
         SegmentedIndexColumn,
         siglake_index::segmented::SegmentedWriter,
         Vec<u32>,
+        siglake_index::IndexBuilder,
     )>,
     sink: Arc<SegmentedIndexSink>,
     /// A column that could not be indexed for one row group makes the whole
@@ -351,7 +352,6 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             rowgroup_blooms: Vec::new(),
             rowgroup_bloom_disabled: false,
             rowgroup_trigrams: siglake_bloom::TrigramSet::new(),
-            pending: Vec::new(),
             pending_rows: 0,
             group_count_columns: self.group_count_columns.clone(),
             group_count_cap: self.group_count_cap,
@@ -377,6 +377,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
                                 )
                                 .with_tokenizer(column.tokenizer),
                                 Vec::new(),
+                                siglake_index::IndexBuilder::with_tokenizer(column.tokenizer),
                             )
                         })
                         .collect(),
@@ -522,7 +523,8 @@ pub struct ParquetWriter {
     /// their Arrow batches to parquet immediately and retain this compact set
     /// instead of retaining the decoded batches until the group is full.
     rowgroup_trigrams: siglake_bloom::TrigramSet,
-    pending: Vec<arrow_array::RecordBatch>,
+    /// Rows already fed to the Parquet encoder and row-group index builders
+    /// for the current physical row group.
     pending_rows: usize,
     group_count_columns: Vec<String>,
     group_count_cap: usize,
@@ -1068,55 +1070,7 @@ impl ParquetWriter {
         Ok(())
     }
 
-    /// Compute a token bloom over `batch`'s configured bloom column. Returns
-    /// `None` when no bloom can be built (column missing, not Utf8, or no
-    /// indexable tokens) — the caller then disables row-group blooms for the whole
-    /// file so the reader never sees a misaligned or over-pruning list.
-    fn compute_rowgroup_bloom(
-        &self,
-        batches: &[arrow_array::RecordBatch],
-    ) -> Option<siglake_bloom::TokenBloom> {
-        let col_name = self.rowgroup_bloom_column.as_ref()?;
-        // Character trigrams (not whole tokens) so the reader can prune on
-        // arbitrary substrings, not just whole words. See siglake-bloom + #8.
-        //
-        // Distinct trigrams only, via the shared accumulator that reuses its
-        // buffers and allocates only for grams not seen before.
-        //
-        // THIS SITE IS WHY `TrigramSet` EXISTS. The per-row `trigrams()` form
-        // was found and fixed on the drain path on 2026-08-14 (11.9% of cycle
-        // time) and the fix never reached here -- a different crate, ~4,300
-        // lines away -- while this copy runs inside compaction's write stage,
-        // which is 83-92% of merge time. Measured 2026-08-27 on the local
-        // compaction bench: merge wall 6.48s -> 4.34s (slice) and 5.68s -> 4.20s
-        // (page-bounded) on the 1.2M-row arm, 1.35-1.49x, against 2-3% spread.
-        let mut grams = siglake_bloom::TrigramSet::new();
-        for batch in batches {
-            let idx = batch.schema().index_of(col_name).ok()?;
-            let col = batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()?;
-            for value in col.iter().flatten() {
-                grams.add(value);
-            }
-        }
-        if grams.is_empty() {
-            return None;
-        }
-        Some(siglake_bloom::TokenBloom::build(
-            grams.len(),
-            0.01,
-            grams.iter(),
-        ))
-    }
-
     /// Add one slice to the bloom for the row group currently being encoded.
-    ///
-    /// This is the bloom-only streaming path. The old grouped path remains for
-    /// segmented sidecars because their index builders still consume the full
-    /// row group together. Both paths use `TrigramSet` and produce the same
-    /// token set at the same physical row-group boundary.
     fn accumulate_streamed_rowgroup_bloom(&mut self, batch: &arrow_array::RecordBatch) {
         if self.rowgroup_bloom_disabled {
             return;
@@ -1162,8 +1116,9 @@ impl ParquetWriter {
             grams.iter(),
         ));
     }
-    /// siglake (#4377): push these batches — exactly one row group's rows — as
-    /// one group of each configured column's segmented sidecar.
+
+    /// Add one slice to the segmented index for the row group currently being
+    /// encoded.
     ///
     /// The index is built over the group's rows and handed to the encoder,
     /// which serializes it and drops it, so the live index state is one row
@@ -1176,7 +1131,7 @@ impl ParquetWriter {
     /// and a skipped group cannot be expressed. That is the same "publish
     /// nothing rather than something misaligned" rule the row-group bloom list
     /// follows.
-    fn push_segmented_groups(&mut self, batches: &[arrow_array::RecordBatch]) {
+    fn accumulate_streamed_segmented_group(&mut self, batch: &arrow_array::RecordBatch) {
         use arrow_array::Array;
 
         let Some(segmented) = self.segmented.as_mut() else {
@@ -1185,32 +1140,70 @@ impl ParquetWriter {
         if segmented.disabled {
             return;
         }
-        let group_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-        for (column, writer, rows) in &mut segmented.writers {
-            let mut builder = siglake_index::IndexBuilder::with_tokenizer(column.tokenizer);
-            let mut pushed = 0usize;
-            for batch in batches {
-                let Some(idx) = batch.schema().index_of(column.column.as_str()).ok() else {
-                    break;
-                };
-                let Some(values) = batch
-                    .column(idx)
-                    .as_any()
-                    .downcast_ref::<arrow_array::StringArray>()
-                else {
-                    break;
-                };
-                for i in 0..values.len() {
-                    builder.push_row(if values.is_null(i) { "" } else { values.value(i) });
-                }
-                pushed += values.len();
+        let supported = segmented.writers.iter().all(|(column, ..)| {
+            batch
+                .schema()
+                .index_of(column.column.as_str())
+                .ok()
+                .is_some_and(|idx| {
+                    batch
+                        .column(idx)
+                        .as_any()
+                        .is::<arrow_array::StringArray>()
+                })
+        });
+        if !supported {
+            segmented.disabled = true;
+            segmented.writers.clear();
+            return;
+        }
+        for (column, _writer, _rows, builder) in &mut segmented.writers {
+            let values = batch
+                .schema()
+                .index_of(column.column.as_str())
+                .ok()
+                .and_then(|idx| {
+                    batch
+                        .column(idx)
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                })
+                .expect("column type checked above");
+            for i in 0..values.len() {
+                builder.push_row(if values.is_null(i) { "" } else { values.value(i) });
             }
-            if pushed != group_rows {
-                segmented.disabled = true;
-                segmented.writers.clear();
-                return;
-            }
-            let index = builder.build();
+        }
+    }
+
+    /// Finish exactly one physical row group's segmented-index state. The
+    /// Arrow slices have already been handed to the Parquet encoder, so only
+    /// this group's parsed postings remain live here.
+    fn finish_streamed_segmented_group(&mut self, group_rows: usize) {
+        let Some(segmented) = self.segmented.as_mut() else {
+            return;
+        };
+        if segmented.disabled {
+            return;
+        }
+        let mut indexes = Vec::with_capacity(segmented.writers.len());
+        for (column, _writer, _rows, builder) in &mut segmented.writers {
+            let finished = std::mem::replace(
+                builder,
+                siglake_index::IndexBuilder::with_tokenizer(column.tokenizer),
+            );
+            indexes.push(finished.build());
+        }
+        if indexes
+            .iter()
+            .any(|index| index.n_rows() as usize != group_rows)
+        {
+            segmented.disabled = true;
+            segmented.writers.clear();
+            return;
+        }
+        for ((_column, writer, rows, _builder), index) in
+            segmented.writers.iter_mut().zip(indexes)
+        {
             metrics::histogram!("siglake_iceberg_segmented_index_group_index_bytes")
                 .record(index.heap_size_bytes() as f64);
             writer.push_group_index(&index);
@@ -1248,7 +1241,7 @@ impl ParquetWriter {
         }
         let sink = segmented.sink;
         let mut finished = Vec::with_capacity(segmented.writers.len());
-        for (column, writer, group_rows) in segmented.writers {
+        for (column, writer, group_rows, _builder) in segmented.writers {
             if group_rows != row_counts {
                 Self::record_segmented_write("refused", "row_domain");
                 return;
@@ -1288,16 +1281,8 @@ impl ParquetWriter {
         self.rowgroup_bloom_column.is_some() || self.segmented.is_some()
     }
 
-    /// Segmented indexes still need all row-group batches together. A writer
-    /// with only the row-group bloom can stream each slice directly into the
-    /// parquet encoder and retain only its distinct trigrams.
-    fn buffers_row_groups(&self) -> bool {
-        self.segmented.is_some()
-    }
-
-    /// Stream a bloom-only batch into the parquet encoder, splitting it at the
-    /// exact configured row-group boundary. `pending_rows` is the current
-    /// encoder group's row count on this path; `pending` remains empty.
+    /// Stream a batch into the Parquet encoder and row-group index builders,
+    /// splitting it at the exact configured physical row-group boundary.
     async fn write_streamed_row_groups(
         &mut self,
         batch: &arrow_array::RecordBatch,
@@ -1314,6 +1299,7 @@ impl ParquetWriter {
             let take = (group_rows - self.pending_rows).min(batch.num_rows() - offset);
             let slice = batch.slice(offset, take);
             self.accumulate_streamed_rowgroup_bloom(&slice);
+            self.accumulate_streamed_segmented_group(&slice);
             self.inner_or_init().await?;
             self.inner_writer
                 .as_mut()
@@ -1344,104 +1330,13 @@ impl ParquetWriter {
                             .with_source(err)
                     })?;
                 self.finish_streamed_rowgroup_bloom();
+                self.finish_streamed_segmented_group(group_rows);
                 self.pending_rows = 0;
             }
         }
         Ok(())
     }
 
-    /// Write `batch` as exactly one row group, recording its token bloom. When
-    /// `flush` is true the row group is sealed immediately (`AsyncArrowWriter::flush`);
-    /// the final row group at close is sealed by `finish()` instead.
-    async fn emit_row_group(
-        &mut self,
-        batches: &[arrow_array::RecordBatch],
-        flush: bool,
-    ) -> Result<()> {
-        self.push_segmented_groups(batches);
-        if !self.rowgroup_bloom_disabled {
-            match self.compute_rowgroup_bloom(batches) {
-                Some(bloom) => self.rowgroup_blooms.push(bloom),
-                None => {
-                    // Can't index this row group — drop the whole list so the
-                    // reader falls back to no row-group pruning (always safe).
-                    self.rowgroup_bloom_disabled = true;
-                    self.rowgroup_blooms.clear();
-                }
-            }
-        }
-        self.inner_or_init().await?;
-        let writer = self.inner_writer.as_mut().unwrap();
-        // The batches total exactly one row group's worth, so the inner
-        // writer forms one row group from them and the bloom above covers
-        // exactly it.
-        for batch in batches {
-            writer.write(batch).await.map_err(|err| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Failed to write using parquet writer.",
-                )
-                .with_source(err)
-            })?;
-        }
-        if flush {
-            writer.flush().await.map_err(|err| {
-                Error::new(ErrorKind::Unexpected, "Failed to flush parquet row group.")
-                    .with_source(err)
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Detach exactly `n` rows from the front of the carry buffer, as zero-copy
-    /// slices of the batches already there.
-    ///
-    /// This used to `concat_batches` the whole carry buffer into one batch so
-    /// `emit_row_group` could take a single `RecordBatch` — a full copy of every
-    /// byte written, once per row group, inside the write stage. It also left
-    /// the remainder as a SLICE OF THE CONCATENATED BUFFER, so a few thousand
-    /// leftover rows pinned the entire ~1M-row allocation until the next drain.
-    ///
-    /// Nothing needed the single batch: the bloom folds over any number of them
-    /// and the inner writer forms one row group from a run of writes totalling
-    /// `max_row_group_size`. Row-group boundaries are unchanged — the straddling
-    /// batch is split at the exact row, as before.
-    fn take_rows(&mut self, n: usize) -> Vec<arrow_array::RecordBatch> {
-        let mut out = Vec::new();
-        let mut taken = 0;
-        while taken < n {
-            let head = self.pending.remove(0);
-            let need = n - taken;
-            if head.num_rows() <= need {
-                taken += head.num_rows();
-                out.push(head);
-            } else {
-                out.push(head.slice(0, need));
-                self.pending
-                    .insert(0, head.slice(need, head.num_rows() - need));
-                taken = n;
-            }
-        }
-        self.pending_rows -= n;
-        out
-    }
-
-    /// Emit every full (`max_row_group_size`-row) row group buffered so far,
-    /// leaving any partial remainder in `pending`.
-    async fn drain_full_row_groups(&mut self) -> Result<()> {
-        let chunk = self
-            .writer_properties
-            .max_row_group_row_count()
-            .unwrap_or(parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT);
-        if chunk == 0 {
-            return Ok(());
-        }
-        while self.pending_rows >= chunk {
-            let group = self.take_rows(chunk);
-            self.emit_row_group(&group, true).await?;
-        }
-        Ok(())
-    }
 }
 
 impl FileWriter for ParquetWriter {
@@ -1467,15 +1362,8 @@ impl FileWriter for ParquetWriter {
         self.nan_value_count_visitor
             .compute(self.schema.clone(), batch_c)?;
 
-        if self.forms_row_groups() && !self.buffers_row_groups() {
-            return self.write_streamed_row_groups(batch).await;
-        }
-
         if self.forms_row_groups() {
-            self.pending.push(batch.clone());
-            self.pending_rows += batch.num_rows();
-            self.drain_full_row_groups().await?;
-            return Ok(());
+            return self.write_streamed_row_groups(batch).await;
         }
 
         self.inner_or_init().await?;
@@ -1496,13 +1384,11 @@ impl FileWriter for ParquetWriter {
     }
 
     async fn close(mut self) -> Result<Vec<DataFileBuilder>> {
-        if self.forms_row_groups() && !self.buffers_row_groups() && self.pending_rows > 0 {
+        if self.forms_row_groups() && self.pending_rows > 0 {
+            let pending_rows = self.pending_rows;
             self.finish_streamed_rowgroup_bloom();
+            self.finish_streamed_segmented_group(pending_rows);
             self.pending_rows = 0;
-        } else if self.forms_row_groups() && self.pending_rows > 0 {
-            let last = std::mem::take(&mut self.pending);
-            self.pending_rows = 0;
-            self.emit_row_group(&last, false).await?;
         }
 
         let mut writer = match self.inner_writer.take() {
@@ -3474,7 +3360,6 @@ mod tests {
             .await?;
         for (offset, len) in [(0, 1), (1, 2), (3, 2)] {
             writer.write(&batch.slice(offset, len)).await?;
-            assert!(writer.pending.is_empty());
         }
         writer.close().await?;
         let reader = SerializedFileReader::new(std::fs::File::open(&path)?)?;
@@ -3510,6 +3395,70 @@ mod tests {
             .build()?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(concat_batches(&batch.schema(), &decoded)?, batch);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_segmented_index_keeps_group_identity_without_arrow_carry() -> Result<()> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use siglake_index::segmented::{SegmentedReader, SliceSource};
+
+        let values = vec![
+            Some("alpha"),
+            None,
+            Some("bravo alpha"),
+            Some("charlie"),
+            Some("alpha"),
+        ];
+        let (schema, _) = bloom_boundary_fixture(values.clone());
+        let arrow_schema = Arc::new(schema_to_arrow_schema(schema.as_ref())?);
+        let held: arrow_array::ArrayRef = Arc::new(StringArray::from(values));
+        let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), vec![Arc::clone(&held)])?;
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("streamed-seg2.parquet");
+        let output = FileIO::new_with_fs().new_output(path.to_string_lossy())?;
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let sink = Arc::new(SegmentedIndexSink::new());
+        let mut writer = ParquetWriterBuilder::new(props, schema)
+            .with_raw_rowgroup_bloom_column("raw")
+            .with_segmented_index(
+                vec![SegmentedIndexColumn {
+                    column: "raw".to_string(),
+                    tokenizer: siglake_bloom::Tokenizer::Default,
+                }],
+                siglake_index::segmented::DEFAULT_TARGET_BLOCK_BYTES,
+                Arc::clone(&sink),
+            )
+            .build(output)
+            .await?;
+        for (offset, len) in [(0, 1), (1, 2), (3, 2)] {
+            writer.write(&batch.slice(offset, len)).await?;
+        }
+        drop(batch);
+        assert_eq!(
+            Arc::strong_count(&held),
+            1,
+            "the sidecar builder must not retain an Arrow slice of a partial row group"
+        );
+        writer.close().await?;
+
+        let decoded = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?
+            .build()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let expected = RecordBatch::try_new(arrow_schema, vec![Arc::clone(&held)])?;
+        assert_eq!(concat_batches(&expected.schema(), &decoded)?, expected);
+
+        let mut blobs = sink.take();
+        assert_eq!(blobs.len(), 1);
+        let blob = blobs.pop().unwrap();
+        assert_eq!(blob.group_rows, vec![2, 2, 1]);
+        let reader = SegmentedReader::open(SliceSource::new(blob.bytes)).unwrap();
+        assert_eq!(reader.group_rows(), vec![2, 2, 1]);
+        assert_eq!(reader.postings("alpha").rows(), Some(vec![0, 2, 4]));
+        assert_eq!(reader.postings("bravo").rows(), Some(vec![2]));
+        assert_eq!(reader.postings("charlie").rows(), Some(vec![3]));
         Ok(())
     }
 
@@ -3570,7 +3519,6 @@ mod tests {
             .await?;
         writer.write(&batch.slice(0, group_rows - 1)).await?;
         writer.write(&batch.slice(group_rows - 1, 2)).await?;
-        assert!(writer.pending.is_empty());
         assert_eq!(writer.pending_rows, 1);
         writer.close().await?;
         let reader = SerializedFileReader::new(std::fs::File::open(path)?)?;
@@ -3751,10 +3699,6 @@ mod tests {
             .build(output)
             .await?;
         writer.write(&batch).await?;
-        assert!(
-            writer.pending.is_empty(),
-            "bloom-only writes must not retain decoded Arrow batches between row groups"
-        );
         assert_eq!(
             writer.pending_rows, 1,
             "five rows at a two-row target leave one row in the parquet encoder"

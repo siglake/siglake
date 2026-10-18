@@ -671,27 +671,47 @@ async fn user_index_on_coordinator_with_buffer_keeps_fast_paths() {
         "small-LIMIT browse must run local, not fan out: {body}"
     );
 
-    // Tier-1 battery on the distributed path: windowed count and negation
-    // are metadata answers (+ buffered delta) — they must serve zero-scan on
-    // the coordinator, never reach a worker's fast-path-less /shard (the six
-    // 500s of the first round-2 board).
-    for sql in [
-        "SELECT count(*) AS n FROM \"dist-idx\" WHERE timestamp >= TIMESTAMP '2026-06-01T00:00:00Z'",
-        "SELECT count(*) AS n FROM \"dist-idx\" WHERE host <> 'h9'",
+    // An open-ended window cannot use the finite-window metadata shortcut.
+    // Preserve the original SQL and require the complete committed + WAL answer
+    // through its distributed fallback, rather than accepting omitted tail rows.
+    let sql = "SELECT count(*) AS n FROM \"dist-idx\" WHERE timestamp >= TIMESTAMP '2026-06-01T00:00:00Z'";
+    let resp = client
+        .post(format!("{url_a}/api/v1/sql"))
+        .json(&serde_json::json!({ "query": sql }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rows"][0]["n"].as_i64(), Some(33), "{body}");
+    assert_eq!(
+        body["stats"]["phases"]["distributed"]["mode"].as_str(),
+        Some("aggregate"),
+        "{body}"
+    );
+    assert_eq!(
+        body["stats"]["phases"]["distributed"]["shard_wall_micros"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "{body}"
+    );
+
+    // A finite window and host negation retain their exact zero-scan metadata
+    // answers, including the admitted WAL delta.
+    for (sql, expected) in [
+        ("SELECT count(*) AS n FROM \"dist-idx\" WHERE timestamp >= TIMESTAMP '2026-06-01T00:00:00Z' AND timestamp < TIMESTAMP '2026-06-02T00:00:00Z'", 33),
+        ("SELECT count(*) AS n FROM \"dist-idx\" WHERE host <> 'h9'", 30),
     ] {
-        let resp = client
-            .post(format!("{url_a}/api/v1/sql"))
-            .json(&serde_json::json!({ "query": sql }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "`{sql}`");
+        let resp = client.post(format!("{url_a}/api/v1/sql"))
+            .json(&serde_json::json!({ "query": sql })).send().await.unwrap();
+        let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(
-            body["stats"]["rows_scanned"].as_u64(),
-            Some(0),
-            "Tier-1 must serve `{sql}` zero-scan on the coordinator: {body}"
-        );
+        assert_eq!(status, 200, "`{sql}`: {body}");
+        assert_eq!(body["rows"][0]["n"].as_i64(), Some(expected), "{body}");
+        assert_eq!(body["stats"]["rows_scanned"].as_u64(), Some(0),
+            "Tier-1 must serve `{sql}` zero-scan on the coordinator: {body}");
     }
 
     // A FILTERED aggregate Tier-1 can't serve (predicate on raw) must
@@ -2681,4 +2701,206 @@ fn strip_table_metadata(warehouse: &std::path::Path, index_id: &str) -> usize {
         }
     }
     removed
+}
+
+/// #6585: the ORIGINAL AVG SQL must really visit three HTTP workers. A live
+/// empty-attribute WAL tail contributes NULL keys/values and COUNT(*) exactly
+/// once. Nonempty JSON carrier mapping is deliberately not admitted by the
+/// bounded WAL loader; the separate refusal regression preserves that layout.
+/// Unequal committed numeric populations exercise SUM/non-null COUNT merging. All rows are independently evaluated
+/// in a plain MemTable for the oracle; neither worker states nor footer data
+/// generate the expected answers.
+#[tokio::test]
+async fn integer_avg_original_sql_uses_three_workers_and_exact_wal_states() {
+    require_loopback!();
+    integer_avg_wal_admission_fixture(false, false).await;
+}
+
+#[tokio::test]
+async fn integer_avg_declined_json_wal_refuses_before_footer() {
+    require_loopback!();
+    integer_avg_wal_admission_fixture(true, false).await;
+}
+
+#[tokio::test]
+async fn integer_avg_shared_count_declined_json_wal_refuses_before_footer() {
+    require_loopback!();
+    integer_avg_wal_admission_fixture(true, true).await;
+}
+
+async fn integer_avg_wal_admission_fixture(unsupported_json_tail: bool, count_only: bool) {
+    use siglake_core::index_config::{FieldMapping, FieldType, IndexConfig};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = Arc::new(
+        IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap(),
+    );
+    let wal_root = tmp.path().join("wal");
+    let mut config = IndexConfig::builtin_events();
+    config.index_id = "httplogs".into();
+    for name in ["status", "size"] {
+        config.doc_mapping.field_mappings.push(FieldMapping {
+            name: name.into(),
+            field_type: FieldType::Long,
+            required: false,
+        });
+    }
+    ice.create_index(&config).await.unwrap();
+    let make = |status: Option<i64>, size: Option<i64>| {
+        Event::now("avg fixture").with_attributes(Some(
+            serde_json::json!({"status":status,"size":size}).to_string(),
+        ))
+    };
+    let mut files = vec![
+        vec![
+            make(Some(200), Some(0)),
+            make(Some(200), None),
+            make(Some(200), None),
+        ],
+        vec![make(Some(200), Some(100)); 3],
+        vec![make(Some(404), None)],
+        vec![make(Some(404), None)],
+        vec![make(Some(500), Some(-5))],
+        vec![make(Some(500), Some(5))],
+    ];
+    if !unsupported_json_tail {
+        // Distinct group counts make the original ORDER BY deterministic.
+        files[2].push(make(Some(404), None));
+    }
+    let mut all = Vec::new();
+    for events in &files {
+        let carrier = siglake_core::events_to_record_batch(events).unwrap();
+        let mapped = siglake_core::map_carrier_batch(&carrier, &config).unwrap();
+        ice.append_to_table(&ice.index_table_ident("httplogs"), mapped, &[])
+            .await
+            .unwrap();
+        all.extend(events.clone());
+    }
+    let tail = if unsupported_json_tail {
+        // Preserve the exact formerly successful-but-incomplete answer fixture.
+        vec![
+            make(Some(200), Some(100)),
+            make(Some(404), None),
+            make(None, Some(8)),
+        ]
+    } else {
+        // This is an actually supported ingester carrier layout, not a fabricated
+        // typed WAL schema. All four rows must reach the NULL-key group.
+        (0..4).map(|_| Event::now("avg NULL tail")).collect()
+    };
+    seal_index_buffer_segment(&wal_root, "httplogs", "avg-tail", &tail);
+    all.extend(tail);
+    let oracle_batch = siglake_core::map_carrier_batch(
+        &siglake_core::events_to_record_batch(&all).unwrap(),
+        &config,
+    )
+    .unwrap();
+    let oracle = session_context_with(None, None);
+    oracle
+        .register_table(
+            "httplogs",
+            Arc::new(
+                datafusion::datasource::MemTable::try_new(
+                    oracle_batch.schema(),
+                    vec![vec![oracle_batch]],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    let mut peers = Vec::new();
+    let mut handles = Vec::new();
+    let mut counters = Vec::new();
+    for _ in 0..3 {
+        let counter = Arc::new(AtomicUsize::new(0));
+        counters.push(counter.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        peers.push(format!("http://{}", listener.local_addr().unwrap()));
+        let app = router(AppState::new(ice.clone(), AuthConfig::open())).layer(
+            axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let counter = counter.clone();
+                    async move {
+                        if request.uri().path() == "/api/v1/sql/shard" {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                        }
+                        next.run(request).await
+                    }
+                },
+            ),
+        );
+        handles.push(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+    }
+    let (url, coordinator) = serve(
+        AppState::new(ice, AuthConfig::open())
+            .with_coordinator(peers, None)
+            .with_wal_buffer_dir(Some(wal_root)),
+    )
+    .await;
+    handles.push(coordinator);
+    let sql = if count_only {
+        "SELECT status, count(*) AS n FROM \"httplogs\" GROUP BY status ORDER BY n DESC LIMIT 20"
+    } else {
+        "SELECT status, avg(size) AS avg_size, count(*) AS n FROM \"httplogs\" GROUP BY status ORDER BY n DESC LIMIT 20"
+    };
+    let expected = batches_to_records(
+        &oracle.sql(sql).await.unwrap().collect().await.unwrap(),
+        None,
+    )
+    .unwrap()
+    .rows;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/api/v1/sql/distributed"))
+        .json(&serde_json::json!({"query":sql, "default_order":false}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    // Stop owned listeners even if an assertion below fails.
+    for handle in handles {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if unsupported_json_tail {
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body.to_string().contains("requires complete WAL admission"),
+            "{body}"
+        );
+        assert!(counters
+            .iter()
+            .all(|counter| counter.load(Ordering::SeqCst) == 0));
+        return;
+    }
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rows"], expected,
+        "original order and all NULL-aware values: {body}"
+    );
+    assert_eq!(body["rows"][0]["avg_size"], serde_json::json!(75.0));
+    assert_eq!(body["rows"][0]["n"], serde_json::json!(6));
+    assert_eq!(body["rows"].as_array().unwrap().len(), 4);
+    assert_eq!(body["rows"][1]["n"], serde_json::json!(4));
+    assert!(body["rows"][1]["status"].is_null());
+    assert!(body["rows"][1]["avg_size"].is_null());
+    assert_eq!(
+        body["stats"]["phases"]["distributed"]["mode"],
+        "average_aggregate"
+    );
+    assert_eq!(
+        shard_walls(&body),
+        Some(3),
+        "not a Local/tier1 answer: {body}"
+    );
+    assert!(
+        counters
+            .iter()
+            .all(|counter| counter.load(Ordering::SeqCst) == 1),
+        "each actual worker must receive exactly one shard request"
+    );
 }

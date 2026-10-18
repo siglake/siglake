@@ -12541,19 +12541,24 @@ mod rebuild_coverage_tests {
 }
 
 async fn parquet_footer_has_index(path: &str, file_io: &FileIO, column: &str) -> bool {
+    use iceberg::arrow::ArrowFileReader;
+    use parquet::arrow::async_reader::AsyncFileReader;
+
     let Ok(input) = file_io.new_input(path) else {
         return false;
     };
-    let Ok(bytes) = input.read().await else {
+    let Ok(meta) = input.metadata().await else {
         return false;
     };
-    let Ok(reader) = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
-    else {
+    let Ok(read) = input.reader().await else {
+        return false;
+    };
+    let mut reader = ArrowFileReader::new(meta, read);
+    let Ok(metadata) = reader.get_metadata(None).await else {
         return false;
     };
     let key = siglake_index::inverted_index_kv_key(column);
-    reader
-        .metadata()
+    metadata
         .file_metadata()
         .key_value_metadata()
         .and_then(|kv| {
@@ -12564,77 +12569,83 @@ async fn parquet_footer_has_index(path: &str, file_io: &FileIO, column: &str) ->
         .is_some()
 }
 
-async fn build_puffin_index_blobs_for_file(
+async fn build_spilled_puffin_index_for_column(
     table: &Table,
     data_file: &DataFile,
-    specs: &[InvertedIndexSpec],
-) -> Result<Vec<PuffinSidecarBlobSpec>> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    spec: &InvertedIndexSpec,
+) -> Result<(siglake_index::spill::SpilledIndex, usize)> {
+    use crate::rebuild_spool::{INDEX_MEMORY_BYTES, INDEX_SCRATCH_BYTES};
+    use futures::StreamExt;
+    use iceberg::arrow::ArrowFileReader;
+    use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+    use parquet::arrow::ProjectionMask;
 
-    if specs.is_empty() {
-        return Ok(Vec::new());
-    }
     let input = table
         .file_io()
         .new_input(data_file.file_path())
         .context("FileIO::new_input")?;
-    let bytes = input
-        .read()
+    let meta = input
+        .metadata()
         .await
-        .context("read data file for index rebuild")?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
-        .context("ParquetRecordBatchReaderBuilder for index rebuild")?;
-    let metadata = reader.metadata().clone();
+        .context("index rebuild input metadata")?;
+    let read = input.reader().await.context("index rebuild input reader")?;
+    let builder = ParquetRecordBatchStreamBuilder::new(ArrowFileReader::new(meta, read))
+        .await
+        .context("ParquetRecordBatchStreamBuilder for index rebuild")?;
+    let metadata = builder.metadata().clone();
     let row_group_size = metadata
         .row_groups()
         .iter()
         .map(|rg| rg.num_rows() as usize)
         .max()
         .unwrap_or(0);
-    let mut builders: Vec<(InvertedIndexSpec, siglake_index::IndexBuilder)> = specs
-        .iter()
-        .map(|spec| {
-            (
-                spec.clone(),
-                siglake_index::IndexBuilder::with_tokenizer(spec.tokenizer),
-            )
-        })
-        .collect();
-    let mut reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
-        .context("ParquetRecordBatchReaderBuilder for rebuild stream")?
+    let projection = ProjectionMask::columns(
+        metadata.file_metadata().schema_descr(),
+        [spec.column.as_str()],
+    );
+    // One column at a time bounds both the number of builders and decoder
+    // projections. Batch/row-group geometry and physical row order are unchanged.
+    let mut index = siglake_index::spill::SpillingIndexBuilder::new(
+        spec.tokenizer,
+        INDEX_MEMORY_BYTES,
+        INDEX_SCRATCH_BYTES,
+    )
+    .context("create bounded v1 index builder")?;
+    let mut reader = builder
+        .with_projection(projection)
+        .with_batch_size(MERGE_BATCH_ROWS)
         .build()
         .context("build parquet reader for index rebuild")?;
-    for batch in &mut reader {
+    while let Some(batch) = reader.next().await {
         let batch = batch.context("decode parquet batch for index rebuild")?;
-        for (spec, builder) in &mut builders {
-            let Ok(idx) = batch.schema().index_of(spec.column.as_str()) else {
-                continue;
-            };
-            let Some(col) = batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-            else {
-                continue;
-            };
-            for value in col.iter() {
-                builder.push_row(value.unwrap_or(""));
-            }
+        let Ok(column) = batch.schema().index_of(spec.column.as_str()) else {
+            continue;
+        };
+        let Some(column) = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+        else {
+            continue;
+        };
+        for value in column.iter() {
+            index
+                .push_row(value.unwrap_or(""))
+                .context("spill v1 index row")?;
         }
     }
-    Ok(builders
-        .into_iter()
-        .filter_map(|(spec, builder)| {
-            let index = builder.build();
-            (index.n_terms() > 0).then_some(PuffinSidecarBlobSpec {
-                data_file_path: data_file.file_path().to_string(),
-                column: spec.column,
-                tokenizer: spec.tokenizer,
-                row_group_size,
-                bytes: index.to_bytes(),
-            })
-        })
-        .collect())
+    // Do not overlap the Parquet decoder's retained pages with the final merge
+    // and serialization. Spilling remains synchronous bounded disk I/O; this
+    // is not a promise of preemption or a bound on Parquet/allocator residency.
+    drop(reader);
+    let index = index.finish().context("finish spilled v1 index")?;
+    if index.n_terms() > 0 {
+        anyhow::ensure!(
+            u64::from(index.n_rows()) == data_file.record_count(),
+            "rebuilt v1 index row domain differs from Parquet"
+        );
+    }
+    Ok((index, row_group_size))
 }
 
 /// Write one Puffin statistics file holding the segmented (`seg2`) sidecars a
@@ -18718,6 +18729,17 @@ impl IcebergContext {
                 anyhow::anyhow!("snapshot {snapshot_id} not present on committed table")
             })?;
         let statistics = write_puffin_sidecar(table, snapshot, blobs).await?;
+        self.commit_puffin_statistics(table, statistics, snapshot_id, covered_files)
+            .await
+    }
+
+    async fn commit_puffin_statistics(
+        &self,
+        table: &Table,
+        statistics: StatisticsFile,
+        snapshot_id: i64,
+        covered_files: BTreeSet<String>,
+    ) -> Result<bool> {
         let statistics_path = statistics.statistics_path.clone();
         let observation = Arc::new(FirstStatisticsRegistrationObservation::default());
         let tx = Transaction::new(table);
@@ -18765,7 +18787,31 @@ impl IcebergContext {
             return Ok(0);
         }
         let existing = existing_puffin_index_columns(table.metadata());
-        let mut blobs = Vec::new();
+        use crate::rebuild_spool::{compress_v1, file_chunks, PUFFIN_SCRATCH_BYTES};
+        use futures::TryStreamExt;
+        let snapshot = table
+            .metadata()
+            .current_snapshot()
+            .filter(|snapshot| snapshot.snapshot_id() == snapshot_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("snapshot {snapshot_id} not present on committed table")
+            })?;
+        // Stage the whole container locally so the original pre-upload
+        // first-statistics guard remains in force. Only small blob metadata is
+        // retained across columns/files, never their serialized payloads.
+        let stage = tempfile::NamedTempFile::new().context("create rebuilt Puffin spool")?;
+        let local_io = FileIO::new_with_fs();
+        let local_output = local_io.new_output(
+            stage
+                .path()
+                .to_str()
+                .context("Puffin spool path is not UTF-8")?,
+        )?;
+        let mut writer = PuffinWriter::new(&local_output, HashMap::new(), false)
+            .await?
+            .with_max_size(PUFFIN_SCRATCH_BYTES);
+        let mut blob_metadata = Vec::new();
+        let mut covered_files = BTreeSet::new();
         let mut rebuilt_files = 0usize;
         let mut rebuilt_bytes = 0u64;
         let started = Instant::now();
@@ -18785,18 +18831,128 @@ impl IcebergContext {
             if missing.is_empty() {
                 continue;
             }
-            let file_blobs = build_puffin_index_blobs_for_file(&table, data_file, &missing).await?;
-            if !file_blobs.is_empty() {
+            tracing::info!(
+                selected_inputs = 1, selected_rows = data_file.record_count(),
+                selected_bytes = data_file.file_size_in_bytes(), selected_columns = missing.len(),
+                path = "range_streamed", postings = "disk_spilled_v1",
+                cgroup_memory_limit_bytes = ?cgroup_memory_limit_bytes(),
+                "inverted-index rebuild dispatch"
+            );
+            let mut rebuilt_file = false;
+            for spec in missing {
+                let (index, row_group_size) =
+                    build_spilled_puffin_index_for_column(&table, data_file, &spec).await?;
+                if index.n_terms() == 0 {
+                    continue;
+                }
+                let level = match SIGLAKE_PUFFIN_INVERTED_CODEC {
+                    PuffinCompressionCodec::Zstd(level) => level,
+                    _ => anyhow::bail!("spilled v1 rebuild requires the registered Zstd codec"),
+                };
+                tracing::debug!(
+                    column = %spec.column,
+                    rows = index.n_rows(), terms = index.n_terms(), raw_bytes = index.raw_len(),
+                    "spilled v1 rebuild encoding complete"
+                );
+                let compressed = compress_v1(index.reopen_reader()?, index.raw_len(), level)?;
+                drop(index);
+                let properties = HashMap::from([
+                    ("data_file".to_string(), data_file.file_path().to_string()),
+                    ("column".to_string(), spec.column.clone()),
+                    (
+                        "tokenizer".to_string(),
+                        tokenizer_name(spec.tokenizer).to_string(),
+                    ),
+                    ("row_group_size".to_string(), row_group_size.to_string()),
+                    ("format".to_string(), "v1".to_string()),
+                ]);
+                let field_id = table
+                    .metadata()
+                    .current_schema()
+                    .field_id_by_name(spec.column.as_str())
+                    .unwrap_or_default();
+                writer
+                    .add_compressed_stream(
+                        PuffinBlob::builder()
+                            .r#type(SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE.to_string())
+                            .fields(vec![field_id])
+                            .snapshot_id(snapshot_id)
+                            .sequence_number(snapshot.sequence_number())
+                            .data(Vec::new())
+                            .properties(properties.clone())
+                            .build(),
+                        SIGLAKE_PUFFIN_INVERTED_CODEC,
+                        compressed.as_file().metadata()?.len(),
+                        file_chunks(compressed.reopen()?),
+                    )
+                    .await
+                    .context("stream rebuilt v1 blob into Puffin spool")?;
+                blob_metadata.push(StatisticsBlobMetadata {
+                    r#type: SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE.to_string(),
+                    snapshot_id,
+                    sequence_number: snapshot.sequence_number(),
+                    fields: vec![field_id],
+                    properties,
+                });
+                rebuilt_file = true;
+            }
+            if rebuilt_file {
+                covered_files.insert(data_file.file_path().to_string());
                 rebuilt_files += 1;
                 rebuilt_bytes += data_file.file_size_in_bytes();
-                blobs.extend(file_blobs);
             }
         }
-        if blobs.is_empty() {
+        if blob_metadata.is_empty() {
             return Ok(0);
         }
+        writer
+            .close()
+            .await
+            .context("finish rebuilt Puffin spool")?;
+        if table
+            .metadata()
+            .statistics_for_snapshot(snapshot_id)
+            .is_some()
+        {
+            record_registration_deferral(table.identifier(), snapshot_id, &covered_files, None);
+            return Ok(0);
+        }
+        let statistics_path = next_puffin_sidecar_path(&table)?;
+        let output = table.file_io().new_output(&statistics_path)?;
+        let staged_length = stage.as_file().metadata()?.len();
+        let mut upload = output.writer().await?;
+        let chunks = file_chunks(stage.reopen()?);
+        futures::pin_mut!(chunks);
+        let mut uploaded = 0u64;
+        while let Some(chunk) = chunks.try_next().await? {
+            uploaded = uploaded
+                .checked_add(chunk.len() as u64)
+                .context("Puffin upload length overflow")?;
+            anyhow::ensure!(uploaded <= staged_length, "Puffin spool grew during upload");
+            upload.write(chunk).await?;
+        }
+        anyhow::ensure!(
+            uploaded == staged_length,
+            "Puffin spool truncated during upload"
+        );
+        upload.close().await?;
+        let input = output.to_input_file();
+        let actual_size = input.metadata().await?.size;
+        anyhow::ensure!(
+            actual_size == staged_length,
+            "rebuilt Puffin object size differs from spool"
+        );
+        let footer_size = PuffinReader::new(input).footer_size_in_bytes().await?;
+        let statistics = StatisticsFile {
+            snapshot_id,
+            statistics_path,
+            file_size_in_bytes: i64::try_from(actual_size)?,
+            file_footer_size_in_bytes: i64::try_from(footer_size)?,
+            key_metadata: None,
+            blob_metadata,
+        };
         if !self
-            .register_puffin_sidecar_for_snapshot(&table, blobs, snapshot_id)
+            .commit_puffin_statistics(&table, statistics, snapshot_id, covered_files)
             .await?
         {
             return Ok(0);
@@ -22046,20 +22202,20 @@ impl IcebergContext {
     /// 1. **Plan pass** — per input, cache the Parquet metadata (footer + page
     ///    index) and decode ONLY the `timestamp` column (a projected read: the
     ///    fetch touches just that column's chunks). Cost: 8 bytes/row.
-    /// 2. **RLE plan** — [`crate::merge::compute_merge_plan`] turns the
-    ///    timestamp columns into `MergeRun`s: the exact output order as runs,
-    ///    not rows. Sorted, near-disjoint inputs collapse to ~one run per
-    ///    input, and re-merges of already-merged files produce ever-longer
-    ///    runs — merges get cheaper as data ages.
-    /// 3. **Chunked execution** — walk the plan in `chunk_rows`-row chunks. Per
+    /// 2. **RLE cursor** — [`crate::merge::MergeRuns`] yields the exact output
+    ///    order without collecting a whole-bin plan. A first streaming pass
+    ///    measures uncut-run copy opportunities; execution restarts the cursor.
+    ///    Timestamp columns remain resident (8 bytes per row), while run and
+    ///    fetch metadata are bounded by admitted chunks even for interleaving.
+    /// 3. **Chunked execution** — advance in `chunk_rows`-row chunks. Per
     ///    chunk, each contributing input's rows form ONE contiguous range
     ///    (inputs are consumed strictly forward), fetched with a single
     ///    `RowSelection` read that prunes non-covered pages via the offset
     ///    index. The chunk assembles into output batches — zero-copy slices
     ///    for whole runs, `interleave` for run fragments — through the same
     ///    rolling writer as the streaming merge. Between chunks every reader
-    ///    is CLOSED: no per-input decoder state persists, so 600 inputs cost
-    ///    the same resident memory as 6.
+    ///    is CLOSED: no per-input decoder state persists. Projected timestamps,
+    ///    cached footers and per-input cursors remain separate memory costs.
     #[allow(clippy::too_many_arguments)]
     async fn merge_files_page_bounded(
         &self,
@@ -22086,6 +22242,13 @@ impl IcebergContext {
         // (FileIO clone + path) — capturing `&Table`/`&DataFile` in a
         // `buffered` stream trips rustc's higher-ranked-lifetime `Send`
         // limitation for every spawn up the compactor call chain.
+        let declared_rows = files.iter().try_fold(0usize, |total, file| {
+            total
+                .checked_add(usize::try_from(file.record_count())?)
+                .context("timestamp spool total row count overflow")
+        })?;
+        let timestamp_spool_bytes = crate::timestamp_spool::spool_budget_bytes(declared_rows)?;
+        tracing::info!(timestamp_spool_bytes, inputs = files.len(), cursor_bytes_per_input = crate::timestamp_spool::CURSOR_BYTES, "page-bounded timestamp scratch budget; TMPDIR must be disk-backed for memory isolation");
         let plan_futs: Vec<_> = files
             .iter()
             .map(|f| {
@@ -22093,26 +22256,37 @@ impl IcebergContext {
                     table.file_io().clone(),
                     f.file_path().to_string(),
                     ts_name.clone(),
+                    descending,
+                    f.record_count(),
                 )
             })
             .collect();
         let mut stages = crate::merge::MergeStageNanos::default();
         let t_plan_input = std::time::Instant::now();
-        let plan_inputs: Vec<(ArrowReaderMetadata, Vec<i64>)> = futures::stream::iter(plan_futs)
-            .buffered(merge_fetch_concurrency())
-            .try_collect()
-            .await?;
+        let plan_inputs: Vec<(ArrowReaderMetadata, crate::timestamp_spool::TimestampSpool)> =
+            futures::stream::iter(plan_futs)
+                .buffered(merge_fetch_concurrency())
+                .try_collect()
+                .await?;
         stages.input += t_plan_input.elapsed().as_nanos() as u64;
 
-        // Phase 2 — the RLE plan, then the timestamps are no longer needed.
+        // Phase 2 — private fixed-width timestamp spools and bounded forward
+        // cursors. Neither full timestamp columns nor a whole-bin plan stay
+        // resident. Census and execution reopen independent cursor offsets.
         let t_plan = std::time::Instant::now();
-        let plan = {
-            let ts_slices: Vec<&[i64]> = plan_inputs.iter().map(|(_, ts)| ts.as_slice()).collect();
-            crate::merge::compute_merge_plan(&ts_slices, descending)
-        };
-        let row_counts: Vec<usize> = plan_inputs.iter().map(|(_, ts)| ts.len()).collect();
+        let (metas, timestamps): (
+            Vec<ArrowReaderMetadata>,
+            Vec<crate::timestamp_spool::TimestampSpool>,
+        ) = plan_inputs.into_iter().unzip();
+        let row_counts: Vec<usize> = timestamps
+            .iter()
+            .map(crate::timestamp_spool::TimestampSpool::rows)
+            .collect();
         let total_rows: usize = row_counts.iter().sum();
-        let metas: Vec<ArrowReaderMetadata> = plan_inputs.into_iter().map(|(m, _)| m).collect();
+        anyhow::ensure!(
+            total_rows == declared_rows,
+            "timestamp spool rows differ from input file records"
+        );
         let uncompressed_bytes: u64 = metas
             .iter()
             .flat_map(|meta| meta.metadata().row_groups())
@@ -22124,10 +22298,8 @@ impl IcebergContext {
             memory_limit_bytes,
             estimated_row_bytes,
         );
-        let chunks = crate::merge::split_plan_chunks(&plan, chunk_rows);
-        stages.assemble += t_plan.elapsed().as_nanos() as u64;
+        let chunk_count = total_rows.div_ceil(chunk_rows.max(1));
         metrics::counter!("siglake_compactor_merge_page_bounded_total").increment(1);
-        metrics::counter!("siglake_compactor_merge_plan_runs_total").increment(plan.len() as u64);
 
         // Cross-review F-3 pricing. A verbatim row-group copy (parquet's
         // `SerializedRowGroupWriter::append_column`) can only serve a source row
@@ -22136,7 +22308,17 @@ impl IcebergContext {
         // the cached footers we already hold, so the lever is priced before it
         // is built rather than after. Deliberately independent of `chunk_rows`:
         // chunking is tunable, run structure is what the data decides.
-        let census = page_bounded_copy_census(&plan, &metas);
+        let mut run_count = 0usize;
+        let census = page_bounded_copy_census(
+            crate::timestamp_spool::SpoolMergeRuns::new(&timestamps, descending)?.inspect(|run| {
+                if run.is_ok() {
+                    run_count += 1;
+                }
+            }),
+            &metas,
+        )?;
+        stages.assemble += t_plan.elapsed().as_nanos() as u64;
+        metrics::counter!("siglake_compactor_merge_plan_runs_total").increment(run_count as u64);
         metrics::counter!("siglake_compactor_merge_rowgroups_total")
             .increment(census.total_row_groups as u64);
         metrics::counter!("siglake_compactor_merge_rowgroups_copyable_total")
@@ -22152,8 +22334,8 @@ impl IcebergContext {
         tracing::debug!(
             inputs = files.len(),
             rows = total_rows,
-            runs = plan.len(),
-            chunks = chunks.len(),
+            runs = run_count,
+            chunks = chunk_count,
             chunk_rows,
             estimated_row_bytes,
             chunk_input_budget_bytes = chunk_rows.saturating_mul(estimated_row_bytes),
@@ -22186,37 +22368,40 @@ impl IcebergContext {
         // `chunk_rows`, plus whatever slices the output writer's open row group
         // still retains. The derived 1 GiB default is therefore one; larger
         // processes keep two for overlap.
-        let plans: Vec<ChunkFetchPlan> = chunks.iter().map(|c| plan_chunk_fetches(c)).collect();
         let configured_prefetch = std::env::var("SIGLAKE_MERGE_CHUNK_PREFETCH").ok();
         let prefetch = Self::merge_chunk_prefetch_for_call(
             merge_chunk_prefetch,
             configured_prefetch.as_deref(),
             memory_limit_bytes,
         );
-        // Stream items must be fully OWNED. A closure borrowing `&ChunkFetchPlan`
-        // out of `plans` trips rustc's higher-ranked-lifetime limitation for
-        // every spawn up the compactor call chain (the same one the phase-1
-        // fetch futures are written around). `ArrowReaderMetadata` is
-        // Arc-backed, so cloning it per chunk is a refcount bump, not a copy of
-        // the footer.
+        // Generate a chunk only when its resident prefetch slot is available.
+        // Fetch tasks take owned arguments; scratch cursors own independent
+        // files, never any task's decoded batches. No whole-bin chunks,
+        // fetch plans, or fetch-argument vectors are retained.
         type FetchArgs = (String, ArrowReaderMetadata, usize, usize, usize);
-        let fetch_args: Vec<Vec<FetchArgs>> = plans
-            .iter()
-            .map(|plan| {
-                plan.fetches
-                    .iter()
-                    .map(|&(i, lo, len)| {
-                        (
-                            files[i].file_path().to_string(),
-                            metas[i].clone(),
-                            lo,
-                            len,
-                            row_counts[i],
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
+        let mut pending_chunks = crate::timestamp_spool::SpoolMergeChunks::new(
+            crate::timestamp_spool::SpoolMergeRuns::new(&timestamps, descending)?,
+            chunk_rows,
+        )
+        .enumerate()
+        .map(|(ci, chunk)| -> Result<_> {
+            let chunk = chunk?;
+            let plan = plan_chunk_fetches(&chunk);
+            let args: Vec<FetchArgs> = plan
+                .fetches
+                .iter()
+                .map(|&(i, lo, len)| {
+                    (
+                        files[i].file_path().to_string(),
+                        metas[i].clone(),
+                        lo,
+                        len,
+                        row_counts[i],
+                    )
+                })
+                .collect();
+            Ok((ci, chunk, plan, args))
+        });
         let file_io = table.file_io().clone();
         // SPAWNED, not `stream::buffered`. A `buffered` stream only advances its
         // futures while something polls the stream — and the encode below is
@@ -22232,7 +22417,7 @@ impl IcebergContext {
             let file_io = file_io.clone();
             move |ci: usize, args: Vec<FetchArgs>| {
                 let file_io = file_io.clone();
-                tokio::spawn(async move {
+                MergeFetchGuard(tokio::spawn(async move {
                     let t_input = std::time::Instant::now();
                     let futs: Vec<_> = args
                         .into_iter()
@@ -22245,11 +22430,9 @@ impl IcebergContext {
                         .try_collect()
                         .await?;
                     Ok::<_, anyhow::Error>((ci, raw, t_input.elapsed().as_nanos() as u64))
-                })
+                }))
             }
         };
-        let mut pending_args: std::collections::VecDeque<(usize, Vec<FetchArgs>)> =
-            fetch_args.into_iter().enumerate().collect();
         // A slot remains occupied after its handle is popped: the decoded
         // result is current until assembly/write releases it. This separate
         // window makes that lifetime explicit instead of equating queue length
@@ -22257,10 +22440,12 @@ impl IcebergContext {
         let mut prefetch_window = PageBoundedPrefetchWindow::new(prefetch);
         let mut inflight: std::collections::VecDeque<_> = std::collections::VecDeque::new();
         while prefetch_window.available() > 0 {
-            let Some((ci, args)) = pending_args.pop_front() else {
+            let t_chunk_plan = std::time::Instant::now();
+            let Some((ci, chunk, plan, args)) = pending_chunks.next().transpose()? else {
                 break;
             };
-            inflight.push_back(spawn_fetch(ci, args));
+            stages.assemble += t_chunk_plan.elapsed().as_nanos() as u64;
+            inflight.push_back((chunk, plan, spawn_fetch(ci, args)));
             prefetch_window.started();
         }
 
@@ -22291,18 +22476,17 @@ impl IcebergContext {
             // `fetch_total_nanos` keeps the gross figure so the two can be
             // differenced into "how much did pipelining hide".
             let t_wait = std::time::Instant::now();
-            let Some(handle) = inflight.pop_front() else {
+            let Some((chunk, plan, handle)) = inflight.pop_front() else {
                 break;
             };
             let joined = handle.await.context("page-bounded fetch task")?;
             stages.input += t_wait.elapsed().as_nanos() as u64;
             let (ci, raw, input_nanos) = joined?;
             fetch_total_nanos += input_nanos;
-            let chunk = &chunks[ci];
             let ChunkFetchPlan {
                 ordinal_of,
                 fetches,
-            } = &plans[ci];
+            } = &plan;
             let t_assemble = std::time::Instant::now();
             // Keep the fetched PARTS; do not flatten them.
             //
@@ -22358,7 +22542,7 @@ impl IcebergContext {
             // accumulate it and subtract at the end of the chunk rather than
             // trying to bracket each stage separately.
             let mut chunk_write_nanos = 0u64;
-            for run in chunk {
+            for run in &chunk {
                 let ord = ordinal_of[&run.input_index];
                 let local_start = run.start_row - fetches[ord].1;
                 if run.row_count >= MERGE_BATCH_ROWS {
@@ -22440,7 +22624,7 @@ impl IcebergContext {
                 memory.and_then(|value| value.cgroup_memory_current_bytes);
             tracing::debug!(
                 chunk = ci + 1,
-                chunks = chunks.len(),
+                chunks = chunk_count,
                 rows = chunk.iter().map(|run| run.row_count).sum::<usize>(),
                 allocator_allocated_bytes = ?allocator_allocated_bytes,
                 allocator_active_bytes = ?allocator_active_bytes,
@@ -22461,15 +22645,27 @@ impl IcebergContext {
             // which is why the 1 GiB derived default above is depth 1.)
             drop(batch_refs);
             drop(parts_flat);
+            drop(chunk);
+            drop(plan);
             prefetch_window.released();
             while prefetch_window.available() > 0 {
-                let Some((nci, nargs)) = pending_args.pop_front() else {
+                let t_chunk_plan = std::time::Instant::now();
+                let Some((nci, chunk, plan, nargs)) = pending_chunks.next().transpose()? else {
                     break;
                 };
-                inflight.push_back(spawn_fetch(nci, nargs));
+                stages.assemble += t_chunk_plan.elapsed().as_nanos() as u64;
+                inflight.push_back((chunk, plan, spawn_fetch(nci, nargs)));
                 prefetch_window.started();
             }
         }
+
+        // All fetch slots have completed and no output row needs the planner
+        // again. Close cursor file descriptions and remove private timestamp
+        // spools before final row-group/index encoding in close.
+        drop(pending_chunks);
+        drop(timestamps);
+        drop(metas);
+        drop(row_counts);
 
         anyhow::ensure!(
             rows_written == total_rows,
@@ -33872,6 +34068,25 @@ struct ChunkFetchPlan {
     fetches: Vec<(usize, usize, usize)>,
 }
 
+// New fallible scratch reads must not detach prefetched decoders when a
+// census/execution error unwinds the merge. Abort requests cancellation; it
+// does not synchronously await termination. Completed handles abort harmlessly.
+struct MergeFetchGuard<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for MergeFetchGuard<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+impl<T> std::future::Future for MergeFetchGuard<T> {
+    type Output = std::result::Result<T, tokio::task::JoinError>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::future::Future::poll(std::pin::Pin::new(&mut self.0), cx)
+    }
+}
+
 /// Slots occupied by page-bounded chunk fetches, including the decoded chunk
 /// currently being assembled and written.
 ///
@@ -33966,9 +34181,9 @@ struct CopyCensus {
 /// upper bound on the opportunity, and reporting it as such is the point —
 /// otherwise F-3 gets built against an assumption.
 fn page_bounded_copy_census(
-    plan: &[crate::merge::MergeRun],
+    plan: impl Iterator<Item = Result<crate::merge::MergeRun>>,
     metas: &[parquet::arrow::arrow_reader::ArrowReaderMetadata],
-) -> CopyCensus {
+) -> Result<CopyCensus> {
     // Per input: each row group as `(start_row, rows)`.
     let boundaries: Vec<Vec<(usize, usize)>> = metas
         .iter()
@@ -33986,20 +34201,30 @@ fn page_bounded_copy_census(
                 .collect()
         })
         .collect();
-    copy_census_from_boundaries(plan, &boundaries)
+    copy_census_from_runs(plan, &boundaries)
 }
 
 /// The census proper, over pre-extracted row-group boundaries so it is a pure
 /// function that can be tested without building Parquet files.
+#[cfg(test)]
 fn copy_census_from_boundaries(
     plan: &[crate::merge::MergeRun],
     boundaries: &[Vec<(usize, usize)>],
 ) -> CopyCensus {
+    copy_census_from_runs(plan.iter().copied().map(Ok), boundaries)
+        .expect("in-memory runs cannot fail")
+}
+
+fn copy_census_from_runs(
+    plan: impl Iterator<Item = Result<crate::merge::MergeRun>>,
+    boundaries: &[Vec<(usize, usize)>],
+) -> Result<CopyCensus> {
     let mut census = CopyCensus {
         total_row_groups: boundaries.iter().map(|b| b.len()).sum(),
         ..CopyCensus::default()
     };
     for run in plan {
+        let run = run?;
         let Some(groups) = boundaries.get(run.input_index) else {
             continue;
         };
@@ -34011,7 +34236,7 @@ fn copy_census_from_boundaries(
             }
         }
     }
-    census
+    Ok(census)
 }
 
 /// Page-bounded merge, phase 1, one input: load the Parquet metadata with the
@@ -34022,7 +34247,12 @@ async fn page_bounded_plan_input(
     file_io: iceberg::io::FileIO,
     path: String,
     ts_name: String,
-) -> Result<(parquet::arrow::arrow_reader::ArrowReaderMetadata, Vec<i64>)> {
+    descending: bool,
+    declared_rows: u64,
+) -> Result<(
+    parquet::arrow::arrow_reader::ArrowReaderMetadata,
+    crate::timestamp_spool::TimestampSpool,
+)> {
     use futures::StreamExt;
     use iceberg::arrow::ArrowFileReader;
     use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -34053,7 +34283,13 @@ async fn page_bounded_plan_input(
         .with_batch_size(65_536)
         .build()
         .context("build timestamp plan stream")?;
-    let mut ts: Vec<i64> = Vec::new();
+    let expected_rows = usize::try_from(meta.metadata().file_metadata().num_rows())
+        .context("negative or oversized timestamp metadata row count")?;
+    anyhow::ensure!(
+        u64::try_from(expected_rows)? == declared_rows,
+        "timestamp Parquet row count differs from declared input file"
+    );
+    let mut ts = crate::timestamp_spool::TimestampSpool::new(expected_rows, descending)?;
     while let Some(rb) = stream.next().await {
         let rb = rb.context("decode timestamp plan batch")?;
         let arr = siglake_core::column_nanos(rb.column(0))
@@ -34062,9 +34298,9 @@ async fn page_bounded_plan_input(
             arrow_array::Array::null_count(&arr) == 0,
             "page-bounded merge requires non-null timestamps"
         );
-        ts.extend_from_slice(arr.values());
+        ts.push(arr.values())?;
     }
-    Ok((meta, ts))
+    Ok((meta, ts.finish()?))
 }
 
 /// Page-bounded merge, phase 3, one input's chunk slice: re-open the input
@@ -38754,5 +38990,103 @@ mod side_publication_retry_tests {
         )
         .await;
         assert!(!op.exists(&group_count_rebuild_rel_path(7)).await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod timestamp_spool_integration_tests {
+    use super::*;
+    use crate::timestamp_spool::{SpoolMergeChunks, SpoolMergeRuns, TimestampSpool};
+
+    fn spool(values: &[i64]) -> TimestampSpool {
+        let mut spool = TimestampSpool::new(values.len(), false).unwrap();
+        spool.push(values).unwrap();
+        spool.finish().unwrap()
+    }
+
+    #[test]
+    fn timestamp_spool_census_preserves_uncut_cross_page_runs() {
+        let inputs = [vec![1; 20_000], vec![2; 17_000]];
+        let spools: Vec<_> = inputs.iter().map(|v| spool(v)).collect();
+        let boundaries = [vec![(0, 10_000), (10_000, 10_000)], vec![(0, 17_000)]];
+        let actual =
+            copy_census_from_runs(SpoolMergeRuns::new(&spools, false).unwrap(), &boundaries)
+                .unwrap();
+        let expected = CopyCensus {
+            total_row_groups: 3,
+            copyable_row_groups: 3,
+            copyable_rows: 37_000,
+        };
+        assert_eq!(actual, expected);
+        let chunks = SpoolMergeChunks::new(SpoolMergeRuns::new(&spools, false).unwrap(), 257)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.iter().map(|r| r.row_count).sum::<usize>() <= 257));
+        assert_eq!(
+            chunks.iter().flatten().map(|r| r.row_count).sum::<usize>(),
+            37_000
+        );
+    }
+
+    #[test]
+    fn timestamp_spool_census_propagates_error_without_partial_success() {
+        let plan = vec![
+            Ok(crate::merge::MergeRun {
+                input_index: 0,
+                start_row: 0,
+                row_count: 3,
+            }),
+            Err(anyhow::anyhow!("scratch read refused")),
+        ];
+        assert!(copy_census_from_runs(plan.into_iter(), &[vec![(0, 3)]]).is_err());
+    }
+
+    #[test]
+    fn timestamp_spool_chunk_fetch_ranges_match_slice_planner() {
+        let inputs = [vec![1, 2, 2, 7, 9], vec![1, 2, 5, 7, 10], vec![0, 3, 6, 8]];
+        let spools: Vec<_> = inputs.iter().map(|v| spool(v)).collect();
+        let slices: Vec<_> = inputs.iter().map(Vec::as_slice).collect();
+        let expected: Vec<_> =
+            crate::merge::MergeChunks::new(crate::merge::MergeRuns::new(&slices, false), 4)
+                .collect();
+        let actual = SpoolMergeChunks::new(SpoolMergeRuns::new(&spools, false).unwrap(), 4)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        for (actual, expected) in actual.iter().zip(&expected) {
+            let a = plan_chunk_fetches(actual);
+            let e = plan_chunk_fetches(expected);
+            assert_eq!(a.fetches, e.fetches);
+            assert_eq!(a.ordinal_of, e.ordinal_of);
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn timestamp_spool_error_cleanup_aborts_prefetched_decoder() {
+        struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = dropped.clone();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let fetch = MergeFetchGuard(tokio::spawn(async move {
+            let _dropped = Dropped(signal);
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        started.await.unwrap();
+        drop(fetch);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

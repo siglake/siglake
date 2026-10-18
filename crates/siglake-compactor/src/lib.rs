@@ -131,6 +131,22 @@ struct DecodedWorkLease {
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+// Reclaim only after exclusive decoded-work ownership has transferred, before
+// the new owner can allocate input buffers. The callback is also used by the
+// ownership tests; it must not release or replace the acquired permit.
+fn decoded_work_lease_after_reclaim(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    owner: &'static str,
+    reclaim: impl FnOnce(&'static str),
+) -> Arc<DecodedWorkLease> {
+    if matches!(owner, "drain" | "recluster") {
+        reclaim(owner);
+    }
+    Arc::new(DecodedWorkLease {
+        _permit: Some(permit),
+    })
+}
+
 #[cfg(test)]
 struct SegmentReadHold {
     remaining: std::sync::atomic::AtomicUsize,
@@ -646,14 +662,14 @@ fn log_compactor_commit_complete(segments: usize) {
     );
 }
 
-/// Reclaim the previous drain's dirty jemalloc pages before a constrained
-/// process starts allocating merge input and writer buffers. The caller owns
-/// the packaged decoded-work semaphore, so no drain allocation can race the
-/// handoff. Failure is observable but does not make maintenance unavailable.
-fn purge_allocator_at_recluster_handoff() {
+/// Request unused pages back before the next constrained decoded operation.
+/// The caller owns the packaged decoded-work semaphore during reclamation.
+/// This cannot release live buffers or establish an overall memory bound;
+/// failure is observable but does not make drain or maintenance unavailable.
+fn reclaim_allocator_at_decoded_handoff(owner: &'static str) {
     let started = std::time::Instant::now();
-    match siglake_core::purge_allocator_dirty_pages() {
-        Ok(Some(readout)) => {
+    match siglake_core::reclaim_allocator_free_pages() {
+        Ok(siglake_core::AllocatorFreePageReclaim::Jemalloc(readout)) => {
             let elapsed = started.elapsed();
             let allocator_resident_reclaimed_bytes = readout
                 .before
@@ -669,6 +685,8 @@ fn purge_allocator_at_recluster_handoff() {
             metrics::histogram!("siglake_compactor_allocator_purge_duration_seconds")
                 .record(elapsed.as_secs_f64());
             tracing::info!(
+                owner,
+                allocator_backend = "jemalloc",
                 allocator_allocated_before_bytes = readout.before.allocated_bytes,
                 allocator_allocated_after_bytes = readout.after.allocated_bytes,
                 allocator_active_before_bytes = readout.before.active_bytes,
@@ -680,18 +698,32 @@ fn purge_allocator_at_recluster_handoff() {
                 cgroup_memory_after_bytes = ?readout.after.cgroup_memory_current_bytes,
                 cgroup_reclaimed_bytes = ?cgroup_reclaimed_bytes,
                 elapsed_seconds = elapsed.as_secs_f64(),
-                "purged allocator dirty pages at drain-to-recluster handoff"
+                "purged allocator dirty pages at decoded-work handoff"
             );
         }
-        Ok(None) => {
+        Ok(siglake_core::AllocatorFreePageReclaim::GlibcHeap { released_pages }) => {
+            metrics::counter!("siglake_compactor_allocator_purges_total", "result" => "success")
+                .increment(1);
+            metrics::histogram!("siglake_compactor_allocator_purge_duration_seconds")
+                .record(started.elapsed().as_secs_f64());
+            tracing::info!(
+                owner,
+                allocator_backend = "glibc_heap",
+                released_pages,
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                "requested glibc free-page trim at decoded-work handoff; global allocator unidentified"
+            );
+        }
+        Ok(siglake_core::AllocatorFreePageReclaim::Unsupported) => {
             tracing::debug!(
-                "allocator purge skipped because jemalloc is not the process-global allocator"
+                owner,
+                "allocator reclamation unsupported at decoded-work handoff"
             );
         }
         Err(error) => {
             metrics::counter!("siglake_compactor_allocator_purges_total", "result" => "error")
                 .increment(1);
-            tracing::warn!(%error, "could not purge allocator dirty pages before re-clustering");
+            tracing::warn!(owner, %error, "could not reclaim allocator free pages at decoded-work handoff");
         }
     }
 }
@@ -706,7 +738,7 @@ mod allocator_readout_tests {
             "the compactor crate test binary uses the system allocator: {readout:?}"
         );
         super::log_compactor_commit_complete(1);
-        super::purge_allocator_at_recluster_handoff();
+        super::reclaim_allocator_at_decoded_handoff("recluster");
     }
 }
 
@@ -979,6 +1011,10 @@ pub struct Compactor {
     /// after its async drain parent is cancelled.
     #[cfg(test)]
     append_aggregate_hold_for_test: Option<Arc<AppendAggregateHold>>,
+    /// Stop this filesystem cycle after a deterministic number of dispatched
+    /// batches while allowing every admitted commit to finish normally.
+    #[cfg(test)]
+    fs_dispatch_batch_cap_for_test: Option<usize>,
     /// Pin the catalog fetch/decode budget without changing process state.
     #[cfg(test)]
     catalog_decoded_budget_for_test: Option<u64>,
@@ -1025,6 +1061,8 @@ impl Compactor {
             segment_read_hold_for_test: None,
             #[cfg(test)]
             append_aggregate_hold_for_test: None,
+            #[cfg(test)]
+            fs_dispatch_batch_cap_for_test: None,
             #[cfg(test)]
             catalog_decoded_budget_for_test: None,
         };
@@ -1087,12 +1125,7 @@ impl Compactor {
             "owner" => owner
         )
         .record(started.elapsed().as_secs_f64());
-        if owner == "recluster" {
-            purge_allocator_at_recluster_handoff();
-        }
-        Arc::new(DecodedWorkLease {
-            _permit: Some(permit),
-        })
+        decoded_work_lease_after_reclaim(permit, owner, reclaim_allocator_at_decoded_handoff)
     }
 
     /// Take the decoded-work slot without parking the maintenance loop.
@@ -1110,9 +1143,11 @@ impl Compactor {
             "owner" => owner
         )
         .record(0.0);
-        Some(Arc::new(DecodedWorkLease {
-            _permit: Some(permit),
-        }))
+        Some(decoded_work_lease_after_reclaim(
+            permit,
+            owner,
+            reclaim_allocator_at_decoded_handoff,
+        ))
     }
 
     /// Pin how many consecutive failed reads a local segment gets before the
@@ -1167,6 +1202,13 @@ impl Compactor {
     #[cfg(test)]
     fn with_append_aggregate_hold_for_test(mut self, hold: Arc<AppendAggregateHold>) -> Self {
         self.append_aggregate_hold_for_test = Some(hold);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_fs_dispatch_batch_cap_for_test(mut self, batches: usize) -> Self {
+        assert!(batches > 0);
+        self.fs_dispatch_batch_cap_for_test = Some(batches);
         self
     }
 
@@ -3675,10 +3717,19 @@ impl Compactor {
         let mut committed_segments = 0usize;
         let mut first_err: Option<anyhow::Error> = None;
         let mut stop_top_up = false;
+        #[cfg(test)]
+        let mut dispatched_batches_for_test = 0usize;
 
         loop {
             // Top up to the concurrency target while budget remains.
             while !stop_top_up && inflight.len() < workers && std::time::Instant::now() < deadline {
+                #[cfg(test)]
+                if self
+                    .fs_dispatch_batch_cap_for_test
+                    .is_some_and(|cap| dispatched_batches_for_test >= cap)
+                {
+                    break;
+                }
                 if offset >= queue.len() {
                     // Snapshot exhausted: re-list once per exhaustion to pick up
                     // segments sealed while this pass ran. processing/ renames make
@@ -3832,6 +3883,10 @@ impl Compactor {
                     };
                     (claimed, selected_decoded_bytes, res)
                 });
+                #[cfg(test)]
+                {
+                    dispatched_batches_for_test = dispatched_batches_for_test.saturating_add(1);
+                }
             }
             metrics::gauge!(
                 "siglake_compactor_drain_inflight",
@@ -5755,6 +5810,18 @@ fn concat_batches_unified(batches: &[RecordBatch]) -> Result<RecordBatch> {
     arrow::compute::concat_batches(&target, aligned.iter()).context("concat_batches (aligned)")
 }
 
+/// Consume the decoded WAL inputs before the append starts allocating its
+/// sorted output and Parquet/index state. Retaining the input Vec across the
+/// append kept both the original buffers and their concatenated copy alive.
+/// A single input is already the required batch and needs no concatenation.
+fn concat_owned_wal_batches(mut batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    match batches.len() {
+        0 => anyhow::bail!("cannot concatenate an empty WAL batch collection"),
+        1 => Ok(batches.pop().expect("one WAL batch")),
+        _ => concat_batches_unified(&batches),
+    }
+}
+
 /// Project `batch` onto `target`, null-filling columns it lacks.
 fn align_batch_to(
     batch: &RecordBatch,
@@ -6033,7 +6100,7 @@ async fn commit_batches(
     metrics::histogram!("siglake_compactor_carrier_map_duration_seconds")
         .record(map_start.elapsed().as_secs_f64());
     let concat_start = std::time::Instant::now();
-    let combined = concat_batches_unified(&batches).context("concat_batches")?;
+    let combined = concat_owned_wal_batches(batches).context("concat_batches")?;
     metrics::histogram!("siglake_compactor_concat_duration_seconds")
         .record(concat_start.elapsed().as_secs_f64());
     let row_count = combined.num_rows() as u64;
@@ -8829,7 +8896,28 @@ mod combined_memory_regression_tests {
         kib * 1024
     }
 
+    fn init_memory_fixture_trace() {
+        if std::env::var("SIGLAKE_MEMORY_FIXTURE_TRACE").as_deref() != Ok("1") {
+            return;
+        }
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            // These ignored process-wide fixtures run alone. Retain the real
+            // merge/chunk/commit logs when requested, without reading ambient
+            // OTLP endpoints or enabling an external exporter. RUST_LOG still
+            // controls the console filter through the normal telemetry path.
+            let mut config =
+                siglake_core::telemetry::TelemetryConfig::resolve("memory-fixture", &|_| None);
+            config.default_log_filter = "siglake_storage=debug,siglake_compactor=debug".to_string();
+            siglake_core::telemetry::init(config).expect("memory fixture console tracing");
+        });
+    }
+
     fn event(file: usize, row: usize) -> siglake_core::Event {
+        event_with_payload(file, row, 64)
+    }
+
+    fn event_with_payload(file: usize, row: usize, payload_repeats: usize) -> siglake_core::Event {
         let base = Utc.with_ymd_and_hms(2026, 10, 11, 0, 0, 0).unwrap();
         let mut event = siglake_core::Event {
             timestamp: base + chrono::Duration::milliseconds(row as i64),
@@ -8837,7 +8925,10 @@ mod combined_memory_regression_tests {
             source: format!("source-{}", file % 3),
             sourcetype: if row.is_multiple_of(2) { "even" } else { "odd" }.into(),
             index: "main".into(),
-            raw: format!("f{file:02}-r{row:05}:{}", "field-payload-".repeat(64)),
+            raw: format!(
+                "f{file:02}-r{row:05}:{}",
+                "field-payload-".repeat(payload_repeats)
+            ),
             attributes: None,
         };
         if !(file + row).is_multiple_of(3) {
@@ -8853,6 +8944,25 @@ mod combined_memory_regression_tests {
             file.trim_start_matches('f').parse().unwrap(),
             row.parse().unwrap(),
         )
+    }
+
+    fn assert_oct17_output_group_geometry(payload_repeats: usize) {
+        const CHUNK_ROWS: usize = 261_632;
+        let events: Vec<_> = (0..4_096)
+            .map(|row| event_with_payload(0, row, payload_repeats))
+            .collect();
+        let batch = siglake_core::events_to_record_batch(&events).unwrap();
+        let bytes = batch.columns().iter().fold(0usize, |total, column| {
+            total.saturating_add(column.to_data().get_slice_memory_size().unwrap())
+        });
+        let sample_row_bytes = (bytes / batch.num_rows()).max(1);
+        let row_group_rows =
+            (256 * 1024 * 1024 / sample_row_bytes).clamp(128 * 1024, 4 * 1024 * 1024);
+        assert!(
+            (2 * CHUNK_ROWS..3 * CHUNK_ROWS).contains(&row_group_rows),
+            "fixture row group must retain the Oct 17 two-chunk lifetime: \
+             sample_row_bytes={sample_row_bytes}, row_group_rows={row_group_rows}"
+        );
     }
 
     #[tokio::test]
@@ -9295,7 +9405,7 @@ mod combined_memory_regression_tests {
     #[ignore = "process-wide RSS ceiling must run alone; use the exact test filter"]
     async fn packaged_memory_serializes_real_page_merge_and_wal_with_exact_parity() {
         // A8's smaller failed fan-in, crossing the old 524,288-row default.
-        run_combined_memory_fixture(18, 30_000, None, None).await;
+        run_combined_memory_fixture(18, 30_000, None, None, false, false, 64).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9304,7 +9414,63 @@ mod combined_memory_regression_tests {
         // Scale A14's 64 inputs and 58 chunks to exercise repeated group
         // lifetimes. The smaller row groups are not production-size evidence.
         assert_eq!((64usize * 4_096).div_ceil(4_520), 58);
-        run_combined_memory_fixture(64, 4_096, Some(4_520), Some(8 * 1024 * 1024)).await;
+        run_combined_memory_fixture(
+            64,
+            4_096,
+            Some(4_520),
+            Some(8 * 1024 * 1024),
+            false,
+            false,
+            64,
+        )
+        .await;
+    }
+
+    /// Oct 17 seg2-on geometry: 64 inputs, about 15.06M rows, 58 input
+    /// chunks, and a 256 MiB output row group. This is intentionally separate
+    /// from the scaled lifetime test: it exercises the physical row-group
+    /// boundary that used to retain decoded Arrow batches in the seg2 writer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "production-geometry RSS ceiling must run alone on the packaged 1 GiB profile"]
+    async fn packaged_memory_seg2_production_geometry_preserves_exact_parity() {
+        const ROWS_PER_FILE: usize = 235_349;
+        const CHUNK_ROWS: usize = 261_632;
+        const PAYLOAD_REPEATS: usize = 28;
+        assert_eq!((64usize * ROWS_PER_FILE).div_ceil(CHUNK_ROWS), 58);
+        assert_oct17_output_group_geometry(PAYLOAD_REPEATS);
+        run_combined_memory_fixture(
+            64,
+            ROWS_PER_FILE,
+            Some(CHUNK_ROWS),
+            Some(256 * 1024 * 1024),
+            true,
+            true,
+            PAYLOAD_REPEATS,
+        )
+        .await;
+    }
+
+    /// The matched seg2-off arm reaches the post-rewrite v1 rebuild. Keep it
+    /// distinct from the seg2 writer regression so a memory result identifies
+    /// which allocation sequence ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "production-geometry RSS ceiling must run alone on the packaged 1 GiB profile"]
+    async fn packaged_memory_v1_rebuild_production_geometry_preserves_exact_parity() {
+        const ROWS_PER_FILE: usize = 235_349;
+        const CHUNK_ROWS: usize = 261_632;
+        const PAYLOAD_REPEATS: usize = 28;
+        assert_eq!((64usize * ROWS_PER_FILE).div_ceil(CHUNK_ROWS), 58);
+        assert_oct17_output_group_geometry(PAYLOAD_REPEATS);
+        run_combined_memory_fixture(
+            64,
+            ROWS_PER_FILE,
+            Some(CHUNK_ROWS),
+            Some(256 * 1024 * 1024),
+            false,
+            true,
+            PAYLOAD_REPEATS,
+        )
+        .await;
     }
 
     /// Reproduce the retained reconstruction's allocation sequence: a large
@@ -9463,24 +9629,38 @@ mod combined_memory_regression_tests {
         rows_per_file: usize,
         merge_chunk_rows: Option<usize>,
         target_row_group_bytes: Option<usize>,
+        segmented_index_writes: bool,
+        index_rebuild: bool,
+        payload_repeats: usize,
     ) {
+        init_memory_fixture_trace();
+        eprintln!(
+            "combined fixture phase=setup inputs={input_files} rows_per_file={rows_per_file} segmented={segmented_index_writes}"
+        );
         let wal_file = input_files;
         let tmp = tempfile::tempdir().unwrap();
         let wal = tmp.path().join("wal");
         let mut ice = IcebergContext::open(&tmp.path().join("warehouse"))
             .await
             .unwrap();
-        if target_row_group_bytes.is_some() {
-            ice = ice.with_tuning(IcebergTuning {
-                target_row_group_bytes,
-                ..Default::default()
-            });
-        }
+        ice = ice.with_tuning(IcebergTuning {
+            target_row_group_bytes,
+            segmented_index_writes: Some(segmented_index_writes),
+            index_rebuild: Some(index_rebuild),
+            ..Default::default()
+        });
         let ice = Arc::new(ice);
 
         for file in 0..input_files {
-            let events: Vec<_> = (0..rows_per_file).map(|row| event(file, row)).collect();
+            let events: Vec<_> = (0..rows_per_file)
+                .map(|row| event_with_payload(file, row, payload_repeats))
+                .collect();
             ice.append_events(&events).await.unwrap();
+            eprintln!(
+                "combined fixture phase=input_committed input={} rss={}",
+                file + 1,
+                resident_bytes()
+            );
         }
         let merge_inputs = ice.live_data_files(ice.events_table_ident()).await.unwrap();
         assert_eq!(merge_inputs.len(), input_files);
@@ -9492,8 +9672,18 @@ mod combined_memory_regression_tests {
             Duration::from_secs(60),
         )
         .unwrap();
-        let wal_events: Vec<_> = (0..rows_per_file).map(|row| event(wal_file, row)).collect();
+        let wal_events: Vec<_> = (0..rows_per_file)
+            .map(|row| event_with_payload(wal_file, row, payload_repeats))
+            .collect();
+        eprintln!(
+            "combined fixture phase=wal_append_enter rss={}",
+            resident_bytes()
+        );
         assert!(writer.append_events(&wal_events).unwrap().is_some());
+        eprintln!(
+            "combined fixture phase=wal_append_returned rss={}",
+            resident_bytes()
+        );
         drop(wal_events);
         drop(writer);
 
@@ -9523,21 +9713,36 @@ mod combined_memory_regression_tests {
             tokio::spawn(async move {
                 barrier.wait().await;
                 let _permit = compactor.decoded_work_permit("recluster").await;
-                ice.recluster_files_with(
-                    ice.events_table_ident(),
-                    merge_inputs,
-                    BLOOM_FILTER_COLUMNS,
-                    &ReclusterMergeOptions {
-                        force_streaming: Some(true),
-                        merge_fanin: Some(2),
-                        force_tiered: Some(false),
-                        merge_chunk_rows,
-                        merge_chunk_prefetch: merge_chunk_rows.map(|_| 1),
-                        merge_memory_limit_bytes: Some(1024 * 1024 * 1024),
-                        ..Default::default()
-                    },
-                )
-                .await
+                eprintln!(
+                    "combined fixture phase=merge_permit_acquired rss={}",
+                    resident_bytes()
+                );
+                let result = ice
+                    .recluster_files_with(
+                        ice.events_table_ident(),
+                        merge_inputs,
+                        BLOOM_FILTER_COLUMNS,
+                        &ReclusterMergeOptions {
+                            force_streaming: Some(true),
+                            merge_fanin: Some(2),
+                            force_tiered: Some(false),
+                            merge_chunk_rows,
+                            merge_chunk_prefetch: merge_chunk_rows.map(|_| 1),
+                            merge_memory_limit_bytes: Some(1024 * 1024 * 1024),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                eprintln!(
+                    "combined fixture phase=merge_returned ok={} rss={} unix_ms={}",
+                    result.is_ok(),
+                    resident_bytes(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis()
+                );
+                result
             })
         };
         let drain = {
@@ -9545,7 +9750,21 @@ mod combined_memory_regression_tests {
             let barrier = barrier.clone();
             tokio::spawn(async move {
                 barrier.wait().await;
-                compactor.run_once().await
+                eprintln!(
+                    "combined fixture phase=drain_enter rss={}",
+                    resident_bytes()
+                );
+                let result = compactor.run_once().await;
+                eprintln!(
+                    "combined fixture phase=drain_returned ok={} rss={} unix_ms={}",
+                    result.is_ok(),
+                    resident_bytes(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis()
+                );
+                result
             })
         };
         barrier.wait().await;
@@ -9569,13 +9788,300 @@ mod combined_memory_regression_tests {
             "real merge/WAL fixture exceeded the packaged 1 GiB limit: baseline={baseline}, peak={peak}"
         );
 
-        assert_exact_event_parity(&ice, input_files + 1, rows_per_file).await;
+        if index_rebuild {
+            eprintln!(
+                "combined fixture phase=coverage_enter rss={}",
+                resident_bytes()
+            );
+            assert_committed_rewrite_index_coverage(
+                &ice,
+                segmented_index_writes,
+                merge_stats.files_added,
+                input_files * rows_per_file,
+            )
+            .await;
+            eprintln!(
+                "combined fixture phase=coverage_returned rss={}",
+                resident_bytes()
+            );
+        }
+
+        eprintln!(
+            "combined fixture phase=parity_enter rss={}",
+            resident_bytes()
+        );
+        assert_exact_event_parity_with_payload(
+            &ice,
+            input_files + 1,
+            rows_per_file,
+            payload_repeats,
+        )
+        .await;
+        eprintln!(
+            "combined fixture phase=parity_returned rss={}",
+            resident_bytes()
+        );
+    }
+
+    /// Test-only forward cursor. Borrows the already decoded Puffin bytes;
+    /// never allocates a dictionary, posting list or selected-row vector.
+    struct V1CoverageCursor<'a> {
+        bytes: &'a [u8],
+        position: usize,
+    }
+
+    impl<'a> V1CoverageCursor<'a> {
+        fn take(&mut self, count: usize) -> Option<&'a [u8]> {
+            let end = self.position.checked_add(count)?;
+            let value = self.bytes.get(self.position..end)?;
+            self.position = end;
+            Some(value)
+        }
+
+        fn remaining(&self) -> usize {
+            self.bytes.len().saturating_sub(self.position)
+        }
+
+        fn varint(&mut self) -> Option<u64> {
+            let mut value = 0u64;
+            let mut shift = 0u32;
+            loop {
+                let byte = *self.take(1)?.first()?;
+                if shift >= 64 {
+                    return None;
+                }
+                let payload = u64::from(byte & 0x7f);
+                if payload << shift >> shift != payload {
+                    return None;
+                }
+                value |= payload << shift;
+                if byte & 0x80 == 0 {
+                    return Some(value);
+                }
+                shift += 7;
+            }
+        }
+    }
+
+    /// Equivalent to decoding v1 plus requiring `field` postings == 0..n_rows,
+    /// with constant additional state over the borrowed blob. Every term and
+    /// posting is validated, including those following `field`. This changes
+    /// only the fixture oracle's memory, not the production query reader.
+    fn streaming_v1_field_coverage(bytes: &[u8]) -> Option<u32> {
+        let mut cursor = V1CoverageCursor { bytes, position: 0 };
+        if cursor.take(4)? != b"KIDX" || cursor.take(1)? != [1] {
+            return None;
+        }
+        let n_rows: u32 = cursor.varint()?.try_into().ok()?;
+        let n_terms: usize = cursor.varint()?.try_into().ok()?;
+        if n_terms > cursor.remaining() / 3 {
+            return None;
+        }
+        let mut previous_term: Option<&str> = None;
+        let mut field_dense = n_rows == 0;
+        for _ in 0..n_terms {
+            let length: usize = cursor.varint()?.try_into().ok()?;
+            let term = std::str::from_utf8(cursor.take(length)?).ok()?;
+            if previous_term.is_some_and(|previous| term <= previous) {
+                return None;
+            }
+            previous_term = Some(term);
+            let postings: usize = cursor.varint()?.try_into().ok()?;
+            if postings == 0 || postings > cursor.remaining() {
+                return None;
+            }
+            let is_field = term == "field";
+            if is_field {
+                field_dense = postings as u64 == u64::from(n_rows);
+            }
+            let mut previous_row = 0u32;
+            for ordinal in 0..postings {
+                let delta: u32 = cursor.varint()?.try_into().ok()?;
+                if ordinal > 0 && delta == 0 {
+                    return None;
+                }
+                previous_row = previous_row.checked_add(delta)?;
+                if previous_row >= n_rows {
+                    return None;
+                }
+                if is_field && u64::from(previous_row) != ordinal as u64 {
+                    field_dense = false;
+                }
+            }
+        }
+        (cursor.remaining() == 0 && field_dense).then_some(n_rows)
+    }
+
+    /// A successful rewrite is insufficient: rebuild errors are deliberately
+    /// non-fatal. Prove the intended index mode was committed for every rewrite
+    /// output, then open its physical blob and validate the row domain.
+    async fn assert_committed_rewrite_index_coverage(
+        ice: &IcebergContext,
+        segmented: bool,
+        expected_files: usize,
+        expected_rows: usize,
+    ) {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use siglake_index::segmented::{RangeSource, SegmentedReader, SEGMENTED_V2_BLOB_TYPE};
+
+        struct BorrowedBytes<'a>(&'a [u8]);
+        impl RangeSource for BorrowedBytes<'_> {
+            fn len(&self) -> u64 {
+                self.0.len() as u64
+            }
+            fn read(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
+                let start = usize::try_from(offset).ok()?;
+                Some(self.0.get(start..start.checked_add(len)?)?.to_vec())
+            }
+        }
+
+        let table = ice
+            .catalog()
+            .load_table(ice.events_table_ident())
+            .await
+            .unwrap();
+        let live = ice.live_data_files(ice.events_table_ident()).await.unwrap();
+        // This fixture creates generation-zero append/WAL inputs and exactly
+        // one rewrite. Its generation-one files are the rewrite's outputs.
+        let outputs: Vec<_> = live
+            .iter()
+            .filter(|file| {
+                file.file_path()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .starts_with("siglake-g1-")
+            })
+            .collect();
+        assert_eq!(
+            outputs.len(),
+            expected_files,
+            "all committed rewrite outputs"
+        );
+        assert_eq!(
+            outputs.iter().map(|f| f.record_count()).sum::<u64>(),
+            expected_rows as u64
+        );
+        assert!(expected_files > 0);
+        let expected_type = if segmented {
+            SEGMENTED_V2_BLOB_TYPE
+        } else {
+            "siglake-inverted-v1"
+        };
+        let raw_id = table
+            .metadata()
+            .current_schema()
+            .field_id_by_name("raw")
+            .unwrap();
+        for file in outputs {
+            let path = file.file_path();
+            let footer = ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(path.trim_start_matches("file://")).unwrap(),
+            )
+            .unwrap();
+            let groups: Vec<u64> = footer
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|g| g.num_rows() as u64)
+                .collect();
+            assert_eq!(groups.iter().sum::<u64>(), file.record_count());
+            let registered: Vec<_> = table
+                .metadata()
+                .statistics_iter()
+                .flat_map(|stats| {
+                    stats
+                        .blob_metadata
+                        .iter()
+                        .filter(move |blob| {
+                            blob.properties.get("data_file").is_some_and(|p| p == path)
+                                && blob.properties.get("column").is_some_and(|c| c == "raw")
+                        })
+                        .map(move |blob| (stats, blob))
+                })
+                .collect();
+            assert_eq!(
+                registered.len(),
+                1,
+                "exactly one intended raw sidecar for {path}"
+            );
+            let (stats, registered) = registered[0];
+            assert_eq!(
+                registered.r#type, expected_type,
+                "wrong fallback index mode"
+            );
+            assert_eq!(registered.fields, vec![raw_id]);
+            assert_eq!(registered.snapshot_id, stats.snapshot_id);
+            let reader = iceberg::puffin::PuffinReader::new(
+                table.file_io().new_input(&stats.statistics_path).unwrap(),
+            );
+            let physical = reader.file_metadata().await.unwrap();
+            let matching: Vec<_> = physical
+                .blobs()
+                .iter()
+                .filter(|blob| {
+                    blob.properties()
+                        .get("data_file")
+                        .is_some_and(|p| p == path)
+                        && blob.properties().get("column").is_some_and(|c| c == "raw")
+                })
+                .collect();
+            assert_eq!(matching.len(), 1, "registered blob must physically exist");
+            let blob = matching[0];
+            assert_eq!(blob.blob_type(), expected_type);
+            assert_eq!(blob.fields(), &[raw_id]);
+            assert_eq!(blob.snapshot_id(), registered.snapshot_id);
+            assert_eq!(blob.sequence_number(), registered.sequence_number);
+            assert_eq!(blob.properties(), &registered.properties);
+            let data = reader.blob(blob).await.unwrap();
+            if segmented {
+                assert_eq!(
+                    blob.compression_codec(),
+                    iceberg::puffin::CompressionCodec::None
+                );
+                let index = SegmentedReader::open(BorrowedBytes(data.data())).unwrap();
+                assert!(
+                    index.matches_row_groups(&groups),
+                    "exact physical group domain"
+                );
+                assert_eq!(u64::from(index.n_rows()), file.record_count());
+                let rows = index
+                    .postings("field")
+                    .rows()
+                    .expect("known token must be answerable");
+                assert_eq!(
+                    rows.len() as u64,
+                    file.record_count(),
+                    "every fixture raw contains field"
+                );
+                assert!(rows.iter().enumerate().all(|(i, row)| *row as usize == i));
+            } else {
+                assert_eq!(
+                    registered.properties.get("format").map(String::as_str),
+                    Some("v1")
+                );
+                let stamped: u64 = registered.properties["row_group_size"].parse().unwrap();
+                assert_eq!(stamped, *groups.iter().max().unwrap());
+                let rows = streaming_v1_field_coverage(data.data())
+                    .expect("valid complete v1 structure and dense field postings");
+                assert_eq!(u64::from(rows), file.record_count());
+            }
+        }
     }
 
     async fn assert_exact_event_parity(
         ice: &IcebergContext,
         file_count: usize,
         rows_per_file: usize,
+    ) {
+        assert_exact_event_parity_with_payload(ice, file_count, rows_per_file, 64).await;
+    }
+
+    async fn assert_exact_event_parity_with_payload(
+        ice: &IcebergContext,
+        file_count: usize,
+        rows_per_file: usize,
+        payload_repeats: usize,
     ) {
         let total_rows = file_count * rows_per_file;
         let ctx = SessionContext::new();
@@ -9637,7 +10143,10 @@ mod combined_memory_regression_tests {
             for row_index in 0..batch.num_rows() {
                 let (file, row) = parse_id(raws.value(row_index));
                 assert!(file < file_count && row < rows_per_file);
-                assert_eq!(raws.value(row_index), event(file, row).raw);
+                assert_eq!(
+                    raws.value(row_index),
+                    event_with_payload(file, row, payload_repeats).raw
+                );
                 let slot = file * rows_per_file + row;
                 assert!(!seen[slot], "duplicate source row f{file}-r{row}");
                 seen[slot] = true;
@@ -9663,6 +10172,176 @@ mod combined_memory_regression_tests {
             }
         }
         assert!(seen.into_iter().all(|present| present));
+    }
+
+    #[cfg(test)]
+    mod streaming_v1_coverage_tests {
+        use super::streaming_v1_field_coverage;
+
+        fn production_oracle(bytes: &[u8]) -> Option<u32> {
+            let index = siglake_index::InvertedIndex::from_bytes(bytes)?;
+            let rows = index.matching_rows_all(&["field"]);
+            (rows.len() as u64 == u64::from(index.n_rows())
+                && rows.iter().enumerate().all(|(i, row)| *row as usize == i))
+            .then_some(index.n_rows())
+        }
+
+        fn varint(bytes: &mut Vec<u8>, mut value: u64) {
+            loop {
+                let low = (value & 0x7f) as u8;
+                value >>= 7;
+                bytes.push(low | if value == 0 { 0 } else { 0x80 });
+                if value == 0 {
+                    break;
+                }
+            }
+        }
+
+        fn blob(rows: u64, terms: &[(&[u8], &[u64])]) -> Vec<u8> {
+            let mut bytes = b"KIDX\x01".to_vec();
+            varint(&mut bytes, rows);
+            varint(&mut bytes, terms.len() as u64);
+            for (term, deltas) in terms {
+                varint(&mut bytes, term.len() as u64);
+                bytes.extend_from_slice(term);
+                varint(&mut bytes, deltas.len() as u64);
+                for delta in *deltas {
+                    varint(&mut bytes, *delta);
+                }
+            }
+            bytes
+        }
+
+        #[test]
+        fn streaming_v1_coverage_matches_small_production_indexes() {
+            for count in 0..=6 {
+                for mask in 0..(1 << count) {
+                    let rows: Vec<_> = (0..count)
+                        .map(|i| {
+                            if mask & (1 << i) == 0 {
+                                "field alpha zulu"
+                            } else {
+                                "other"
+                            }
+                        })
+                        .collect();
+                    let bytes = siglake_index::InvertedIndex::from_rows(rows).to_bytes();
+                    assert_eq!(
+                        streaming_v1_field_coverage(&bytes),
+                        production_oracle(&bytes)
+                    );
+                }
+            }
+            let empty_term = blob(1, &[(b"", &[0]), (b"field", &[0])]);
+            assert_eq!(streaming_v1_field_coverage(&empty_term), Some(1));
+            assert_eq!(
+                streaming_v1_field_coverage(&empty_term),
+                production_oracle(&empty_term)
+            );
+        }
+
+        #[test]
+        fn streaming_v1_coverage_matches_all_small_truncations_and_mutations() {
+            let good =
+                siglake_index::InvertedIndex::from_rows(["field alpha", "field zulu"]).to_bytes();
+            for cut in 0..good.len() {
+                assert_eq!(streaming_v1_field_coverage(&good[..cut]), None);
+                assert_eq!(
+                    streaming_v1_field_coverage(&good[..cut]),
+                    production_oracle(&good[..cut])
+                );
+            }
+            for offset in 0..good.len() {
+                for byte in [0, 1, 0x7f, 0x80, 0xff] {
+                    let mut changed = good.clone();
+                    changed[offset] = byte;
+                    assert_eq!(
+                        streaming_v1_field_coverage(&changed),
+                        production_oracle(&changed),
+                        "offset={offset} byte={byte}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn streaming_v1_coverage_rejects_corrupt_nonfield_and_field_structures() {
+            let bad = [
+                blob(1u64 << 32, &[]),
+                blob(3, &[(b"field", &[0, 1, 1]), (b"zulu", &[0, 0])]),
+                blob(3, &[(b"field", &[0, 1, 1]), (b"\xff", &[0])]),
+                blob(3, &[(b"field", &[0, 1, 1]), (b"zulu", &[3])]),
+                blob(3, &[(b"field", &[0, 1, 1]), (b"zulu", &[])]),
+                blob(3, &[(b"field", &[0, 1, 1]), (b"alpha", &[0])]),
+                blob(3, &[(b"field", &[0, 1, 1]), (b"field", &[0])]),
+                blob(3, &[(b"field", &[1, 1])]),
+                blob(3, &[(b"field", &[0, 1u64 << 32])]),
+                blob(
+                    u64::from(u32::MAX),
+                    &[(b"field", &[1, u64::from(u32::MAX)])],
+                ),
+                blob(0, &[(b"field", &[0])]),
+            ];
+            for bytes in bad {
+                assert_eq!(streaming_v1_field_coverage(&bytes), None);
+                assert_eq!(
+                    streaming_v1_field_coverage(&bytes),
+                    production_oracle(&bytes)
+                );
+            }
+            let mut trailing = blob(1, &[(b"field", &[0])]);
+            trailing.push(0);
+            assert_eq!(streaming_v1_field_coverage(&trailing), None);
+            assert_eq!(
+                streaming_v1_field_coverage(&trailing),
+                production_oracle(&trailing)
+            );
+        }
+
+        #[test]
+        fn streaming_v1_coverage_preserves_varint_and_count_refusals() {
+            for suffix in [
+                vec![0xff; 11],
+                vec![0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2],
+            ] {
+                let mut bytes = b"KIDX\x01".to_vec();
+                bytes.extend(suffix);
+                assert_eq!(
+                    streaming_v1_field_coverage(&bytes),
+                    production_oracle(&bytes)
+                );
+                assert_eq!(streaming_v1_field_coverage(&bytes), None);
+            }
+            let mut impossible_terms = b"KIDX\x01\x03".to_vec();
+            varint(&mut impossible_terms, u64::from(u32::MAX));
+            assert_eq!(streaming_v1_field_coverage(&impossible_terms), None);
+            assert_eq!(
+                streaming_v1_field_coverage(&impossible_terms),
+                production_oracle(&impossible_terms)
+            );
+        }
+
+        #[test]
+        fn streaming_v1_coverage_large_dense_domain_uses_only_borrowed_cursor() {
+            // Input bytes are the existing Puffin allocation. The verifier's
+            // cursor and previous term borrow that input; no n_rows-sized output.
+            let rows = 1_000_000u64;
+            let mut bytes = b"KIDX\x01".to_vec();
+            varint(&mut bytes, rows);
+            varint(&mut bytes, 2);
+            for term in [b"field".as_slice(), b"zulu".as_slice()] {
+                varint(&mut bytes, term.len() as u64);
+                bytes.extend_from_slice(term);
+                varint(&mut bytes, rows);
+                bytes.push(0);
+                bytes.resize(bytes.len() + rows as usize - 1, 1);
+            }
+            assert_eq!(streaming_v1_field_coverage(&bytes), Some(rows as u32));
+            assert!(
+                std::mem::size_of::<super::V1CoverageCursor<'_>>()
+                    <= 4 * std::mem::size_of::<usize>()
+            );
+        }
     }
 }
 
@@ -9700,6 +10379,71 @@ mod drain_schema_drift_tests {
             })
             .collect();
         RecordBatch::try_new(schema, arrays).unwrap()
+    }
+
+    #[test]
+    fn owned_wal_concat_moves_single_batch_without_copying() {
+        let input = batch(&["ts", "raw"], 3);
+        let schema = input.schema();
+        let columns = input.columns().to_vec();
+        let output = concat_owned_wal_batches(vec![input]).unwrap();
+        assert!(Arc::ptr_eq(&schema, &output.schema()));
+        assert_eq!(output.num_rows(), 3);
+        for (before, after) in columns.iter().zip(output.columns()) {
+            assert!(Arc::ptr_eq(before, after));
+        }
+    }
+
+    #[test]
+    fn owned_wal_concat_releases_inputs_before_uniform_or_union_append() {
+        for extra in [false, true] {
+            let first = batch(&["ts", "raw"], 2);
+            let second = batch(
+                if extra {
+                    &["ts", "raw", "attributes"]
+                } else {
+                    &["ts", "raw"]
+                },
+                3,
+            );
+            let weak: Vec<_> = first
+                .columns()
+                .iter()
+                .chain(second.columns())
+                .map(Arc::downgrade)
+                .collect();
+            let output = concat_owned_wal_batches(vec![first, second]).unwrap();
+            assert!(weak.iter().all(|input| input.upgrade().is_none()));
+            assert_eq!(output.num_rows(), 5);
+            let raw = output
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(raw.iter().collect::<Vec<_>>(), vec![Some("raw"); 5]);
+            if extra {
+                let attrs = output
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(
+                    attrs.iter().collect::<Vec<_>>(),
+                    vec![
+                        None,
+                        None,
+                        Some("attributes"),
+                        Some("attributes"),
+                        Some("attributes")
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_wal_concat_refuses_empty_input() {
+        assert!(concat_owned_wal_batches(Vec::new()).is_err());
     }
 
     /// The 2026-08-10 wedge: a drain claim spanning two document shapes. The old
@@ -10252,7 +10996,7 @@ mod durable_reclaim_proof_tests {
             let compactor = Compactor::new(&wal_root, ice.clone())
                 .with_fs_batch_limits(4, 0)
                 .with_drain_concurrency(1)
-                .with_drain_cycle_budget(Duration::from_millis(100));
+                .with_fs_dispatch_batch_cap_for_test(1);
             std::fs::create_dir_all(wal_dir.join(siglake_wal::PROCESSING_DIR)).unwrap();
             std::fs::write(
                 wal_dir
@@ -10261,9 +11005,9 @@ mod durable_reclaim_proof_tests {
                 [],
             )
             .unwrap();
-            // This sorts after UUID segment names. Scanning the thousands of
-            // committed proof entries makes the first append outlive the
-            // cycle's 100 ms dispatch budget, so the tail remains sealed.
+            // This sorts after UUID segment names. The per-instance test cap
+            // admits exactly the first four-segment batch, then drains it without
+            // topping up. The tail stays sealed regardless of append speed.
             std::fs::write(
                 wal_dir.join(siglake_wal::SEALED_DIR).join(sealed_survivor),
                 [],
@@ -10756,6 +11500,7 @@ mod mirror_ledger_reclaim_tests {
         wal: PathBuf,
         id: String,
         key: String,
+        ledger: sqlx::SqlitePool,
     }
 
     /// A drain with ledger reclamation attached, a mirrored segment in
@@ -10808,6 +11553,7 @@ mod mirror_ledger_reclaim_tests {
                 last_reclaim: Default::default(),
             },
         );
+        let ledger = sqlx::SqlitePool::connect(&uri).await.unwrap();
         Seeded {
             compactor,
             claim,
@@ -10815,17 +11561,76 @@ mod mirror_ledger_reclaim_tests {
             wal,
             id,
             key,
+            ledger,
         }
     }
 
-    async fn purgeable(claim: &SqlSegmentClaim) -> Vec<String> {
-        claim
-            .purgeable_committed(Duration::ZERO, 10)
+    async fn ledger_row(s: &Seeded) -> Option<(String, Option<i64>, String)> {
+        sqlx::query_as("SELECT status, committed_at_ms, segment_url FROM wal_segments WHERE id = ?")
+            .bind(&s.id)
+            .fetch_optional(&s.ledger)
             .await
             .unwrap()
-            .into_iter()
-            .map(|(_, key)| key)
-            .collect()
+    }
+
+    /// Durability is independent of whether the wall clock has advanced past
+    /// the mark's millisecond. Read the exact stored row, not age eligibility.
+    async fn committed_keys(s: &Seeded) -> Vec<String> {
+        let ids = s
+            .claim
+            .committed_segment_ids("default", "", std::slice::from_ref(&s.id))
+            .await
+            .unwrap();
+        match ledger_row(s).await {
+            Some((status, stamp, key)) if status == "committed" => {
+                assert!(
+                    stamp.is_some(),
+                    "the durable mark must retain its timestamp"
+                );
+                assert_eq!(ids, vec![s.id.clone()]);
+                vec![key]
+            }
+            _ => {
+                assert!(ids.is_empty());
+                Vec::new()
+            }
+        }
+    }
+
+    /// Set only this test's already-proved committed row behind a captured
+    /// cutoff. Retention still uses the real production query and object/row
+    /// deletion path; no sleeps, retry-until-green or production clock changes.
+    async fn make_retention_due(s: &Seeded) {
+        let (status, original_stamp, key) = ledger_row(s).await.unwrap();
+        assert_eq!(status, "committed");
+        assert_eq!(key, s.key);
+        let original_stamp = original_stamp.expect("mark timestamp");
+        let cutoff = chrono::Utc::now().timestamp_millis();
+        let due = cutoff.checked_sub(60_000).unwrap();
+        assert!(due < cutoff);
+        let updated = sqlx::query(
+            "UPDATE wal_segments SET committed_at_ms = ? \
+             WHERE id = ? AND status = 'committed' AND committed_at_ms = ?",
+        )
+        .bind(due)
+        .bind(&s.id)
+        .bind(original_stamp)
+        .execute(&s.ledger)
+        .await
+        .unwrap();
+        assert_eq!(updated.rows_affected(), 1);
+        assert_eq!(
+            ledger_row(s).await,
+            Some(("committed".to_string(), Some(due), s.key.clone()))
+        );
+        assert_eq!(
+            s.claim
+                .purgeable_committed(Duration::ZERO, 10)
+                .await
+                .unwrap(),
+            vec![(s.id.clone(), s.key.clone())],
+            "the unchanged strict age predicate must select the explicitly aged row"
+        );
     }
 
     fn committed_files(wal: &std::path::Path) -> Vec<String> {
@@ -10845,18 +11650,17 @@ mod mirror_ledger_reclaim_tests {
 
         assert_eq!(s.compactor.run_once().await.unwrap(), 1);
         assert_eq!(
-            purgeable(&s.claim).await,
+            committed_keys(&s).await,
             vec![s.key.clone()],
             "the drain's commit must transition the ingester's row"
         );
-        // The age predicate is strict at millisecond precision.
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        make_retention_due(&s).await;
         assert_eq!(
             s.compactor.run_retention_with(Some(Duration::ZERO)).await,
             1
         );
         assert!(!s.store.exists(&s.key).await.unwrap());
-        assert!(purgeable(&s.claim).await.is_empty());
+        assert!(committed_keys(&s).await.is_empty());
     }
 
     /// The negative control, driven through the resolver rather than the
@@ -10868,7 +11672,7 @@ mod mirror_ledger_reclaim_tests {
         let s = seed(tmp.path(), DEFAULT_RETENTION, true).await;
 
         assert_eq!(s.compactor.run_once().await.unwrap(), 1);
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        make_retention_due(&s).await;
         assert_eq!(
             s.compactor
                 .run_retention_with(committed_retention_from(Some("0")))
@@ -10876,7 +11680,7 @@ mod mirror_ledger_reclaim_tests {
             0
         );
         assert!(s.store.exists(&s.key).await.unwrap());
-        assert_eq!(purgeable(&s.claim).await, vec![s.key]);
+        assert_eq!(committed_keys(&s).await, vec![s.key]);
     }
 
     /// A segment with a live `mirror-pending/` pin still owes an upload.
@@ -10894,7 +11698,7 @@ mod mirror_ledger_reclaim_tests {
 
         assert_eq!(s.compactor.run_once().await.unwrap(), 1);
         assert!(
-            purgeable(&s.claim).await.is_empty(),
+            committed_keys(&s).await.is_empty(),
             "a pinned segment must not be marked committed"
         );
         assert_eq!(
@@ -10906,12 +11710,12 @@ mod mirror_ledger_reclaim_tests {
         // The upload lands and the pin clears: the next cycle marks it.
         std::fs::remove_file(&pin).unwrap();
         s.compactor.run_once().await.unwrap();
-        assert_eq!(purgeable(&s.claim).await, vec![s.key.clone()]);
+        assert_eq!(committed_keys(&s).await, vec![s.key.clone()]);
         assert!(
             committed_files(&s.wal).is_empty(),
             "once the mark is durable the local copy is releasable"
         );
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        make_retention_due(&s).await;
         assert_eq!(
             s.compactor.run_retention_with(Some(Duration::ZERO)).await,
             1
@@ -10934,8 +11738,8 @@ mod mirror_ledger_reclaim_tests {
 
         // An idle cycle: nothing to commit, everything to repair.
         assert_eq!(s.compactor.run_once().await.unwrap(), 0);
-        assert_eq!(purgeable(&s.claim).await, vec![s.key.clone()]);
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(committed_keys(&s).await, vec![s.key.clone()]);
+        make_retention_due(&s).await;
         assert_eq!(
             s.compactor.run_retention_with(Some(Duration::ZERO)).await,
             1
@@ -10954,23 +11758,29 @@ mod mirror_ledger_reclaim_tests {
 
         assert_eq!(s.compactor.run_once().await.unwrap(), 1);
         assert_eq!(
-            purgeable(&s.claim).await,
+            committed_keys(&s).await,
             vec![s.key.clone()],
             "the mark must insert the row the upload has not registered yet"
         );
+        let before_registration = ledger_row(&s).await;
         // The uploader's registrar catches up afterwards.
         assert!(!s
             .claim
             .register(&s.id, "default", "", &s.key, 1, 2)
             .await
             .unwrap());
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            ledger_row(&s).await,
+            before_registration,
+            "late insert-ignore must preserve status, exact timestamp and mirror key"
+        );
+        make_retention_due(&s).await;
         assert_eq!(
             s.compactor.run_retention_with(Some(Duration::ZERO)).await,
             1
         );
         assert!(!s.store.exists(&s.key).await.unwrap());
-        assert!(purgeable(&s.claim).await.is_empty());
+        assert!(committed_keys(&s).await.is_empty());
     }
 
     /// Segments of a dropped incarnation are quarantined into `stale/` by the
@@ -10990,7 +11800,7 @@ mod mirror_ledger_reclaim_tests {
 
         assert_eq!(s.compactor.run_once().await.unwrap(), 0);
         assert!(
-            purgeable(&s.claim).await.is_empty(),
+            committed_keys(&s).await.is_empty(),
             "a quarantined segment must never be marked committed"
         );
         assert_eq!(
@@ -11016,7 +11826,7 @@ mod mirror_ledger_reclaim_tests {
 
         assert_eq!(plain.run_once().await.unwrap(), 1);
         assert!(
-            purgeable(&s.claim).await.is_empty(),
+            committed_keys(&s).await.is_empty(),
             "the row stays sealed forever, which is the limitation this closes"
         );
         assert!(
@@ -12656,5 +13466,42 @@ mod delete_task_stall_tests {
             claim_before,
             "a create-only claim write that loses must not refresh the claim's age"
         );
+    }
+}
+
+#[cfg(test)]
+mod decoded_work_reclaim_tests {
+    use super::*;
+
+    #[test]
+    fn both_handoffs_reclaim_with_exclusive_ownership_and_keep_live_clones() {
+        for owner in ["drain", "recluster"] {
+            let gate = Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = gate.clone().try_acquire_owned().unwrap();
+            let called = std::cell::Cell::new(false);
+            let lease = decoded_work_lease_after_reclaim(permit, owner, |observed| {
+                assert_eq!(observed, owner);
+                assert!(gate.clone().try_acquire_owned().is_err());
+                called.set(true);
+            });
+            assert!(called.get());
+            let blocking_reader = lease.clone();
+            drop(lease);
+            assert!(gate.clone().try_acquire_owned().is_err());
+            drop(blocking_reader);
+            assert!(gate.clone().try_acquire_owned().is_ok());
+        }
+    }
+
+    #[test]
+    fn non_work_owner_keeps_lease_without_reclaiming() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().try_acquire_owned().unwrap();
+        let lease = decoded_work_lease_after_reclaim(permit, "test", |_| {
+            panic!("non-work owner must not trigger allocator reclamation");
+        });
+        assert!(gate.clone().try_acquire_owned().is_err());
+        drop(lease);
+        assert!(gate.clone().try_acquire_owned().is_ok());
     }
 }

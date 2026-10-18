@@ -2,6 +2,8 @@
 //! [`Schema`] for the `events` table, and helpers to convert events into
 //! Arrow [`RecordBatch`]es ready for Parquet write.
 
+mod free_page_reclaim;
+pub use free_page_reclaim::{reclaim_allocator_free_pages, AllocatorFreePageReclaim};
 mod json_attr;
 pub use json_attr::json_attr_lookup;
 pub mod audit_schema;

@@ -13,7 +13,8 @@
 
 use std::sync::Arc;
 
-use datafusion::prelude::SessionContext;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 
 use siglake_core::Event;
@@ -42,13 +43,35 @@ async fn fixture() -> (tempfile::TempDir, IcebergContext) {
 }
 
 fn ctx_with(cancel: Option<QueryCancel>) -> SessionContext {
-    let ctx = SessionContext::new();
+    // This tests cancellation at the actual source, not how many batches the
+    // host-dependent partition pumps happened to prefetch before the consumer
+    // received its first item. On a 32-CPU host all 40 tiny file batches can
+    // already be above the source before cancel(), making that assertion
+    // unobservable. One source partition leaves unread work after the first
+    // batch, while retaining the same provider/token wiring and full baseline.
+    let ctx = SessionContext::new_with_config(
+        SessionConfig::new()
+            .with_target_partitions(1)
+            .with_batch_size(ROWS_PER_FILE),
+    );
     let Some(cancel) = cancel else {
         return ctx;
     };
     let mut state = ctx.state();
     state.config_mut().set_extension(Arc::new(cancel));
     SessionContext::new_with_state(state)
+}
+
+fn assert_single_source_partition(plan: &dyn ExecutionPlan) -> usize {
+    let mut sources = 0;
+    if plan.name() == "SiglakeIcebergTableScan" {
+        assert_eq!(plan.output_partitioning().partition_count(), 1);
+        sources += 1;
+    }
+    for child in plan.children() {
+        sources += assert_single_source_partition(child.as_ref());
+    }
+    sources
 }
 
 /// Baseline: with a token present but NOT cancelled, the query is unaffected.
@@ -101,13 +124,10 @@ async fn cancelling_mid_stream_ends_the_scan() {
     let ctx = ctx_with(Some(cancel.clone()));
     ice.register_with_datafusion(&ctx).await.unwrap();
 
-    let mut stream = ctx
-        .sql("SELECT raw FROM events")
-        .await
-        .unwrap()
-        .execute_stream()
-        .await
-        .unwrap();
+    let df = ctx.sql("SELECT raw FROM events").await.unwrap();
+    let physical = df.clone().create_physical_plan().await.unwrap();
+    assert_eq!(assert_single_source_partition(physical.as_ref()), 1);
+    let mut stream = df.execute_stream().await.unwrap();
 
     let first = stream.next().await;
     assert!(
@@ -142,13 +162,10 @@ async fn dropping_the_request_guard_stops_the_scan() {
     let ctx = ctx_with(Some(cancel.clone()));
     ice.register_with_datafusion(&ctx).await.unwrap();
 
-    let mut stream = ctx
-        .sql("SELECT raw FROM events")
-        .await
-        .unwrap()
-        .execute_stream()
-        .await
-        .unwrap();
+    let df = ctx.sql("SELECT raw FROM events").await.unwrap();
+    let physical = df.clone().create_physical_plan().await.unwrap();
+    assert_eq!(assert_single_source_partition(physical.as_ref()), 1);
+    let mut stream = df.execute_stream().await.unwrap();
     let before: usize = stream.next().await.unwrap().unwrap().num_rows();
 
     {
