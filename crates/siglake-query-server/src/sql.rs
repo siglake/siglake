@@ -18338,7 +18338,7 @@ async fn distributed_inner(
                 )
                 .await
                 {
-                    Ok(load) => (true, Some(load)),
+                    Ok(load) => (!load.declined_a_buffer(), Some(load)),
                     Err(err) => {
                         tracing::warn!(error = ?err,
                             "coordinator buffer delta load failed; skipping Tier-1");
@@ -18347,6 +18347,18 @@ async fn distributed_inner(
                 }
             }
         };
+    // A declined WAL load is not an empty tail. Never authorize a committed-only
+    // Tier-1 answer from it. AVG additionally requires complete admission before
+    // worker fanout; a successful merge must include every buffered row.
+    if tier1_load
+        .as_ref()
+        .is_some_and(BufferDeltaLoad::declined_a_buffer)
+    {
+        refused_buffer_partials(
+            &crate::coordinator::classify(df.logical_plan()),
+            "Tier-1 WAL admission",
+        )?;
+    }
     let tier1_delta_micros = tier1_delta_started.elapsed().as_micros() as u64;
     if tier1_safe && format == QueryFormat::Records {
         // #86 follow-through: the FULL local fast-path battery, not just

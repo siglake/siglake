@@ -2684,13 +2684,25 @@ fn strip_table_metadata(warehouse: &std::path::Path, index_id: &str) -> usize {
 }
 
 /// #6585: the ORIGINAL AVG SQL must really visit three HTTP workers. A live
-/// WAL tail disables the local footer answer and must contribute matching
-/// SUM/non-null COUNT states exactly once. All rows are independently evaluated
+/// empty-attribute WAL tail contributes NULL keys/values and COUNT(*) exactly
+/// once. Nonempty JSON carrier mapping is deliberately not admitted by the
+/// bounded WAL loader; the separate refusal regression preserves that layout.
+/// Unequal committed numeric populations exercise SUM/non-null COUNT merging. All rows are independently evaluated
 /// in a plain MemTable for the oracle; neither worker states nor footer data
 /// generate the expected answers.
 #[tokio::test]
 async fn integer_avg_original_sql_uses_three_workers_and_exact_wal_states() {
     require_loopback!();
+    integer_avg_wal_admission_fixture(false).await;
+}
+
+#[tokio::test]
+async fn integer_avg_declined_json_wal_refuses_before_footer() {
+    require_loopback!();
+    integer_avg_wal_admission_fixture(true).await;
+}
+
+async fn integer_avg_wal_admission_fixture(unsupported_json_tail: bool) {
     use siglake_core::index_config::{FieldMapping, FieldType, IndexConfig};
     use std::sync::atomic::{AtomicUsize, Ordering};
     let tmp = tempfile::tempdir().unwrap();
@@ -2715,7 +2727,7 @@ async fn integer_avg_original_sql_uses_three_workers_and_exact_wal_states() {
             serde_json::json!({"status":status,"size":size}).to_string(),
         ))
     };
-    let files = vec![
+    let mut files = vec![
         vec![
             make(Some(200), Some(0)),
             make(Some(200), None),
@@ -2727,6 +2739,10 @@ async fn integer_avg_original_sql_uses_three_workers_and_exact_wal_states() {
         vec![make(Some(500), Some(-5))],
         vec![make(Some(500), Some(5))],
     ];
+    if !unsupported_json_tail {
+        // Distinct group counts make the original ORDER BY deterministic.
+        files[2].push(make(Some(404), None));
+    }
     let mut all = Vec::new();
     for events in &files {
         let carrier = siglake_core::events_to_record_batch(events).unwrap();
@@ -2736,11 +2752,18 @@ async fn integer_avg_original_sql_uses_three_workers_and_exact_wal_states() {
             .unwrap();
         all.extend(events.clone());
     }
-    let tail = vec![
-        make(Some(200), Some(100)),
-        make(Some(404), None),
-        make(None, Some(8)),
-    ];
+    let tail = if unsupported_json_tail {
+        // Preserve the exact formerly successful-but-incomplete answer fixture.
+        vec![
+            make(Some(200), Some(100)),
+            make(Some(404), None),
+            make(None, Some(8)),
+        ]
+    } else {
+        // This is an actually supported ingester carrier layout, not a fabricated
+        // typed WAL schema. All four rows must reach the NULL-key group.
+        (0..4).map(|_| Event::now("avg NULL tail")).collect()
+    };
     seal_index_buffer_segment(&wal_root, "httplogs", "avg-tail", &tail);
     all.extend(tail);
     let oracle_batch = siglake_core::map_carrier_batch(
@@ -2813,13 +2836,29 @@ async fn integer_avg_original_sql_uses_three_workers_and_exact_wal_states() {
         handle.abort();
         let _ = handle.await;
     }
+    if unsupported_json_tail {
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body.to_string()
+                .contains("distributed AVG requires complete WAL admission"),
+            "{body}"
+        );
+        assert!(counters
+            .iter()
+            .all(|counter| counter.load(Ordering::SeqCst) == 0));
+        return;
+    }
     assert_eq!(status, reqwest::StatusCode::OK, "{body}");
     assert_eq!(
         body["rows"], expected,
         "original order and all NULL-aware values: {body}"
     );
-    assert_eq!(body["rows"][0]["avg_size"], serde_json::json!(80.0));
-    assert_eq!(body["rows"][0]["n"], serde_json::json!(7));
+    assert_eq!(body["rows"][0]["avg_size"], serde_json::json!(75.0));
+    assert_eq!(body["rows"][0]["n"], serde_json::json!(6));
+    assert_eq!(body["rows"].as_array().unwrap().len(), 4);
+    assert_eq!(body["rows"][1]["n"], serde_json::json!(4));
+    assert!(body["rows"][1]["status"].is_null());
+    assert!(body["rows"][1]["avg_size"].is_null());
     assert_eq!(
         body["stats"]["phases"]["distributed"]["mode"],
         "average_aggregate"
