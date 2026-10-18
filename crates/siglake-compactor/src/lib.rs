@@ -8841,6 +8841,23 @@ mod combined_memory_regression_tests {
         kib * 1024
     }
 
+    fn init_memory_fixture_trace() {
+        if std::env::var("SIGLAKE_MEMORY_FIXTURE_TRACE").as_deref() != Ok("1") {
+            return;
+        }
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            // These ignored process-wide fixtures run alone. Retain the real
+            // merge/chunk/commit logs when requested, without reading ambient
+            // OTLP endpoints or enabling an external exporter. RUST_LOG still
+            // controls the console filter through the normal telemetry path.
+            let mut config =
+                siglake_core::telemetry::TelemetryConfig::resolve("memory-fixture", &|_| None);
+            config.default_log_filter = "siglake_storage=debug,siglake_compactor=debug".to_string();
+            siglake_core::telemetry::init(config).expect("memory fixture console tracing");
+        });
+    }
+
     fn event(file: usize, row: usize) -> siglake_core::Event {
         event_with_payload(file, row, 64)
     }
@@ -9561,7 +9578,10 @@ mod combined_memory_regression_tests {
         index_rebuild: bool,
         payload_repeats: usize,
     ) {
-        eprintln!("combined fixture phase=setup inputs={input_files} rows_per_file={rows_per_file} segmented={segmented_index_writes}");
+        init_memory_fixture_trace();
+        eprintln!(
+            "combined fixture phase=setup inputs={input_files} rows_per_file={rows_per_file} segmented={segmented_index_writes}"
+        );
         let wal_file = input_files;
         let tmp = tempfile::tempdir().unwrap();
         let wal = tmp.path().join("wal");
