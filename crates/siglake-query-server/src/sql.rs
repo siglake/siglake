@@ -10486,10 +10486,11 @@ fn prepare_buffer_partial_input(
     decoded: &Arc<crate::wal_buffer::DecodedBuffer>,
     dist: &crate::coordinator::DistPlan,
     masks: u64,
+    scalar_workspace: u64,
 ) -> Result<Option<Vec<arrow_array::RecordBatch>>, ApiError> {
     let workspace = (|| {
         let cast = dist.partial_cast_workspace(decoded.row_count())?;
-        if masks == 0 && cast == 0 {
+        if masks == 0 && cast == 0 && scalar_workspace == 0 {
             return Some(0);
         }
         let filter = if masks == 0 {
@@ -10502,7 +10503,10 @@ fn prepare_buffer_partial_input(
         };
         // attach() validates the entire input, not only incremental scratch.
         // For filtered inputs the existing bound already includes that payload.
-        filter.max(decoded.payload_bytes()).checked_add(cast)
+        filter
+            .max(decoded.payload_bytes())
+            .checked_add(cast)?
+            .checked_add(scalar_workspace)
     })();
     let Some(workspace) = workspace else {
         refused_buffer_partials(dist, "input workspace overflow")?;
@@ -10631,7 +10635,14 @@ async fn compute_buffer_partials(
     let Some(masks) = partial_filter_mask_count(plan) else {
         return refused_buffer_partials(&dist, "WAL admission or workspace");
     };
-    let Some(partial_input) = prepare_buffer_partial_input(&decoded, &dist, masks)? else {
+    let Some(scalar_workspace) = partial_filter_scalar_workspace(plan)
+        .and_then(|bytes| bytes.checked_mul(decoded.batches().len() as u64))
+    else {
+        return refused_buffer_partials(&dist, "scalar filter workspace");
+    };
+    let Some(partial_input) =
+        prepare_buffer_partial_input(&decoded, &dist, masks, scalar_workspace)?
+    else {
         return refused_buffer_partials(&dist, "input workspace");
     };
     let output_schema = Arc::new(dist.partial_schema(plan.schema().as_arrow()).clone());
@@ -10691,44 +10702,7 @@ fn partial_output_leaf(expr: &Expr) -> bool {
 }
 
 fn partial_filter_expr_has_bounded_workspace(expr: &Expr) -> bool {
-    match expr {
-        Expr::Alias(alias) => partial_filter_expr_has_bounded_workspace(&alias.expr),
-        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
-            partial_filter_expr_has_bounded_workspace(&binary.left)
-                && partial_filter_expr_has_bounded_workspace(&binary.right)
-        }
-        Expr::BinaryExpr(binary)
-            if matches!(
-                binary.op,
-                Operator::Eq
-                    | Operator::NotEq
-                    | Operator::Lt
-                    | Operator::LtEq
-                    | Operator::Gt
-                    | Operator::GtEq
-                    | Operator::IsDistinctFrom
-                    | Operator::IsNotDistinctFrom
-            ) =>
-        {
-            partial_scalar_leaf(&binary.left) && partial_scalar_leaf(&binary.right)
-        }
-        Expr::Like(_) => crate::wal_buffer::bounded_literal_like(expr),
-        Expr::Not(inner) => partial_filter_expr_has_bounded_workspace(inner),
-        Expr::IsNull(inner)
-        | Expr::IsNotNull(inner)
-        | Expr::IsTrue(inner)
-        | Expr::IsFalse(inner)
-        | Expr::IsUnknown(inner)
-        | Expr::IsNotTrue(inner)
-        | Expr::IsNotFalse(inner)
-        | Expr::IsNotUnknown(inner) => partial_scalar_leaf(inner),
-        Expr::Between(between) => {
-            partial_scalar_leaf(&between.expr)
-                && partial_scalar_leaf(&between.low)
-                && partial_scalar_leaf(&between.high)
-        }
-        _ => false,
-    }
+    crate::wal_buffer::bounded_filter_mask_count(expr).is_some()
 }
 
 fn partial_plan_nodes_have_bounded_workspace(plan: &LogicalPlan) -> bool {
@@ -10793,6 +10767,21 @@ fn partial_filter_mask_count(plan: &LogicalPlan) -> Option<u64> {
     };
     plan.inputs().iter().try_fold(own, |sum, input| {
         sum.checked_add(partial_filter_mask_count(input)?)
+    })
+}
+
+fn partial_filter_scalar_workspace(plan: &LogicalPlan) -> Option<u64> {
+    let own = match plan {
+        LogicalPlan::Filter(filter) => {
+            crate::wal_buffer::bounded_filter_scalar_workspace(&filter.predicate)?
+        }
+        LogicalPlan::TableScan(scan) => scan.filters.iter().try_fold(0u64, |sum, expr| {
+            sum.checked_add(crate::wal_buffer::bounded_filter_scalar_workspace(expr)?)
+        })?,
+        _ => 0,
+    };
+    plan.inputs().iter().try_fold(own, |sum, input| {
+        sum.checked_add(partial_filter_scalar_workspace(input)?)
     })
 }
 
@@ -11554,7 +11543,7 @@ mod tests {
         // successful committed-only result in distributed_inner.
         let low = crate::wal_buffer::decoded_buffer_for_test(vec![batch.clone()]);
         assert!(low.payload_bytes() > 27 * low.row_count() as u64);
-        assert!(prepare_buffer_partial_input(&low, &dist, 0).is_err());
+        assert!(prepare_buffer_partial_input(&low, &dist, 0, 0).is_err());
         let count_logical = ctx
             .state()
             .create_logical_plan(
@@ -11589,7 +11578,7 @@ mod tests {
             crate::wal_buffer::decoded_buffer_with_limit_for_test(vec![batch], 64 * 1024 * 1024);
         let used = decoded.memory_usage_for_test();
         let base = used();
-        let inputs = prepare_buffer_partial_input(&decoded, &dist, 0)
+        let inputs = prepare_buffer_partial_input(&decoded, &dist, 0, 0)
             .unwrap()
             .unwrap();
         assert!(used() >= base + decoded.payload_bytes() + dist.partial_cast_workspace(3).unwrap());
@@ -13966,6 +13955,28 @@ mod tests {
         let events: Vec<Event> = (0..4).map(smoke_event).collect();
         let (_tmp, _ice, _ctx, df) = dataframe_for(query, events).await;
         df
+    }
+
+    #[tokio::test]
+    async fn distributed_timestamp_sql_has_bounded_literal_workspace() {
+        for query in [
+            "SELECT count(*) FROM events WHERE timestamp >= TIMESTAMP '2026-06-01T00:00:00Z'",
+            "SELECT count(*) FROM events WHERE timestamp >= TIMESTAMP '2026-06-01T00:00:00Z' AND timestamp < TIMESTAMP '2026-06-02T00:00:00Z'",
+        ] {
+            let df = plan_for(query).await;
+            let plan = df.logical_plan();
+            let dist = crate::coordinator::classify(plan);
+            assert!(buffer_partial_plan_has_bounded_workspace(plan, &dist), "{plan:?}");
+            assert!(partial_filter_mask_count(plan).unwrap() >= 1);
+            assert!(partial_filter_scalar_workspace(plan).unwrap() >= 65536);
+        }
+        let df = plan_for("SELECT count(*) FROM events WHERE CAST(raw AS TIMESTAMP) >= TIMESTAMP '2026-06-01T00:00:00Z'").await;
+        let plan = df.logical_plan();
+        assert!(!buffer_partial_plan_has_bounded_workspace(
+            plan,
+            &crate::coordinator::classify(plan)
+        ));
+        assert!(partial_filter_scalar_workspace(plan).is_none());
     }
 
     async fn collect_records(query: &str) -> crate::format::RecordsResponse {

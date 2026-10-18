@@ -671,27 +671,47 @@ async fn user_index_on_coordinator_with_buffer_keeps_fast_paths() {
         "small-LIMIT browse must run local, not fan out: {body}"
     );
 
-    // Tier-1 battery on the distributed path: windowed count and negation
-    // are metadata answers (+ buffered delta) — they must serve zero-scan on
-    // the coordinator, never reach a worker's fast-path-less /shard (the six
-    // 500s of the first round-2 board).
-    for sql in [
-        "SELECT count(*) AS n FROM \"dist-idx\" WHERE timestamp >= TIMESTAMP '2026-06-01T00:00:00Z'",
-        "SELECT count(*) AS n FROM \"dist-idx\" WHERE host <> 'h9'",
+    // An open-ended window cannot use the finite-window metadata shortcut.
+    // Preserve the original SQL and require the complete committed + WAL answer
+    // through its distributed fallback, rather than accepting omitted tail rows.
+    let sql = "SELECT count(*) AS n FROM \"dist-idx\" WHERE timestamp >= TIMESTAMP '2026-06-01T00:00:00Z'";
+    let resp = client
+        .post(format!("{url_a}/api/v1/sql"))
+        .json(&serde_json::json!({ "query": sql }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rows"][0]["n"].as_i64(), Some(33), "{body}");
+    assert_eq!(
+        body["stats"]["phases"]["distributed"]["mode"].as_str(),
+        Some("aggregate"),
+        "{body}"
+    );
+    assert_eq!(
+        body["stats"]["phases"]["distributed"]["shard_wall_micros"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "{body}"
+    );
+
+    // A finite window and host negation retain their exact zero-scan metadata
+    // answers, including the admitted WAL delta.
+    for (sql, expected) in [
+        ("SELECT count(*) AS n FROM \"dist-idx\" WHERE timestamp >= TIMESTAMP '2026-06-01T00:00:00Z' AND timestamp < TIMESTAMP '2026-06-02T00:00:00Z'", 33),
+        ("SELECT count(*) AS n FROM \"dist-idx\" WHERE host <> 'h9'", 30),
     ] {
-        let resp = client
-            .post(format!("{url_a}/api/v1/sql"))
-            .json(&serde_json::json!({ "query": sql }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "`{sql}`");
+        let resp = client.post(format!("{url_a}/api/v1/sql"))
+            .json(&serde_json::json!({ "query": sql })).send().await.unwrap();
+        let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(
-            body["stats"]["rows_scanned"].as_u64(),
-            Some(0),
-            "Tier-1 must serve `{sql}` zero-scan on the coordinator: {body}"
-        );
+        assert_eq!(status, 200, "`{sql}`: {body}");
+        assert_eq!(body["rows"][0]["n"].as_i64(), Some(expected), "{body}");
+        assert_eq!(body["stats"]["rows_scanned"].as_u64(), Some(0),
+            "Tier-1 must serve `{sql}` zero-scan on the coordinator: {body}");
     }
 
     // A FILTERED aggregate Tier-1 can't serve (predicate on raw) must
