@@ -22504,6 +22504,16 @@ impl IcebergContext {
             }
         }
 
+        // All fetch slots have completed and no output row needs the planner
+        // again. Release its borrowed cursor first, then the projected keys
+        // and cached metadata before final row-group/index encoding in close.
+        // Otherwise roughly eight bytes per input row overlap finalization.
+        drop(pending_chunks);
+        drop(ts_slices);
+        drop(timestamps);
+        drop(metas);
+        drop(row_counts);
+
         anyhow::ensure!(
             rows_written == total_rows,
             "page-bounded merge wrote {rows_written} rows, planned {total_rows}"

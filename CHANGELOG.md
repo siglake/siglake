@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- WAL drains release decoded input batches before sorting and encoding their
+  combined append, and move single batches without a concatenation copy.
+  Page-bounded merges release exhausted timestamp planning state before final
+  writer close. Packaged memory qualification remains separate.
+
 - Page-bounded compaction now generates merge runs and fetch plans only for
   admitted chunks, avoiding whole-bin plan copies on heavily interleaved inputs.
   Timestamp columns remain resident; packaged memory qualification is separate.

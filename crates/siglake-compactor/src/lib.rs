@@ -5755,6 +5755,18 @@ fn concat_batches_unified(batches: &[RecordBatch]) -> Result<RecordBatch> {
     arrow::compute::concat_batches(&target, aligned.iter()).context("concat_batches (aligned)")
 }
 
+/// Consume the decoded WAL inputs before the append starts allocating its
+/// sorted output and Parquet/index state. Retaining the input Vec across the
+/// append kept both the original buffers and their concatenated copy alive.
+/// A single input is already the required batch and needs no concatenation.
+fn concat_owned_wal_batches(mut batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    match batches.len() {
+        0 => anyhow::bail!("cannot concatenate an empty WAL batch collection"),
+        1 => Ok(batches.pop().expect("one WAL batch")),
+        _ => concat_batches_unified(&batches),
+    }
+}
+
 /// Project `batch` onto `target`, null-filling columns it lacks.
 fn align_batch_to(
     batch: &RecordBatch,
@@ -6033,7 +6045,7 @@ async fn commit_batches(
     metrics::histogram!("siglake_compactor_carrier_map_duration_seconds")
         .record(map_start.elapsed().as_secs_f64());
     let concat_start = std::time::Instant::now();
-    let combined = concat_batches_unified(&batches).context("concat_batches")?;
+    let combined = concat_owned_wal_batches(batches).context("concat_batches")?;
     metrics::histogram!("siglake_compactor_concat_duration_seconds")
         .record(concat_start.elapsed().as_secs_f64());
     let row_count = combined.num_rows() as u64;
@@ -9647,9 +9659,13 @@ mod combined_memory_regression_tests {
                     )
                     .await;
                 eprintln!(
-                    "combined fixture phase=merge_returned ok={} rss={}",
+                    "combined fixture phase=merge_returned ok={} rss={} unix_ms={}",
                     result.is_ok(),
-                    resident_bytes()
+                    resident_bytes(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis()
                 );
                 result
             })
@@ -9665,9 +9681,13 @@ mod combined_memory_regression_tests {
                 );
                 let result = compactor.run_once().await;
                 eprintln!(
-                    "combined fixture phase=drain_returned ok={} rss={}",
+                    "combined fixture phase=drain_returned ok={} rss={} unix_ms={}",
                     result.is_ok(),
-                    resident_bytes()
+                    resident_bytes(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis()
                 );
                 result
             })
@@ -10009,6 +10029,71 @@ mod drain_schema_drift_tests {
             })
             .collect();
         RecordBatch::try_new(schema, arrays).unwrap()
+    }
+
+    #[test]
+    fn owned_wal_concat_moves_single_batch_without_copying() {
+        let input = batch(&["ts", "raw"], 3);
+        let schema = input.schema();
+        let columns = input.columns().to_vec();
+        let output = concat_owned_wal_batches(vec![input]).unwrap();
+        assert!(Arc::ptr_eq(&schema, &output.schema()));
+        assert_eq!(output.num_rows(), 3);
+        for (before, after) in columns.iter().zip(output.columns()) {
+            assert!(Arc::ptr_eq(before, after));
+        }
+    }
+
+    #[test]
+    fn owned_wal_concat_releases_inputs_before_uniform_or_union_append() {
+        for extra in [false, true] {
+            let first = batch(&["ts", "raw"], 2);
+            let second = batch(
+                if extra {
+                    &["ts", "raw", "attributes"]
+                } else {
+                    &["ts", "raw"]
+                },
+                3,
+            );
+            let weak: Vec<_> = first
+                .columns()
+                .iter()
+                .chain(second.columns())
+                .map(Arc::downgrade)
+                .collect();
+            let output = concat_owned_wal_batches(vec![first, second]).unwrap();
+            assert!(weak.iter().all(|input| input.upgrade().is_none()));
+            assert_eq!(output.num_rows(), 5);
+            let raw = output
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(raw.iter().collect::<Vec<_>>(), vec![Some("raw"); 5]);
+            if extra {
+                let attrs = output
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(
+                    attrs.iter().collect::<Vec<_>>(),
+                    vec![
+                        None,
+                        None,
+                        Some("attributes"),
+                        Some("attributes"),
+                        Some("attributes")
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_wal_concat_refuses_empty_input() {
+        assert!(concat_owned_wal_batches(Vec::new()).is_err());
     }
 
     /// The 2026-08-10 wedge: a drain claim spanning two document shapes. The old
