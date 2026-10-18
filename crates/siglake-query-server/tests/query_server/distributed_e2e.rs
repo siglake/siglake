@@ -2691,24 +2691,36 @@ fn strip_table_metadata(warehouse: &std::path::Path, index_id: &str) -> usize {
 #[tokio::test]
 async fn integer_avg_original_sql_uses_three_workers_and_exact_wal_states() {
     require_loopback!();
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use siglake_core::index_config::{FieldMapping, FieldType, IndexConfig};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let tmp = tempfile::tempdir().unwrap();
-    let ice = Arc::new(IcebergContext::open(&tmp.path().join("warehouse")).await.unwrap());
+    let ice = Arc::new(
+        IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap(),
+    );
     let wal_root = tmp.path().join("wal");
     let mut config = IndexConfig::builtin_events();
     config.index_id = "httplogs".into();
     for name in ["status", "size"] {
         config.doc_mapping.field_mappings.push(FieldMapping {
-            name: name.into(), field_type: FieldType::Long, required: false,
+            name: name.into(),
+            field_type: FieldType::Long,
+            required: false,
         });
     }
     ice.create_index(&config).await.unwrap();
     let make = |status: Option<i64>, size: Option<i64>| {
-        Event::now("avg fixture").with_attributes(Some(serde_json::json!({"status":status,"size":size}).to_string()))
+        Event::now("avg fixture").with_attributes(Some(
+            serde_json::json!({"status":status,"size":size}).to_string(),
+        ))
     };
     let files = vec![
-        vec![make(Some(200), Some(0)), make(Some(200), None), make(Some(200), None)],
+        vec![
+            make(Some(200), Some(0)),
+            make(Some(200), None),
+            make(Some(200), None),
+        ],
         vec![make(Some(200), Some(100)); 3],
         vec![make(Some(404), None)],
         vec![make(Some(404), None)],
@@ -2719,19 +2731,36 @@ async fn integer_avg_original_sql_uses_three_workers_and_exact_wal_states() {
     for events in &files {
         let carrier = siglake_core::events_to_record_batch(events).unwrap();
         let mapped = siglake_core::map_carrier_batch(&carrier, &config).unwrap();
-        ice.append_to_table(&ice.index_table_ident("httplogs"), mapped, &[]).await.unwrap();
+        ice.append_to_table(&ice.index_table_ident("httplogs"), mapped, &[])
+            .await
+            .unwrap();
         all.extend(events.clone());
     }
-    let tail = vec![make(Some(200), Some(100)), make(Some(404), None), make(None, Some(8))];
+    let tail = vec![
+        make(Some(200), Some(100)),
+        make(Some(404), None),
+        make(None, Some(8)),
+    ];
     seal_index_buffer_segment(&wal_root, "httplogs", "avg-tail", &tail);
     all.extend(tail);
     let oracle_batch = siglake_core::map_carrier_batch(
-        &siglake_core::events_to_record_batch(&all).unwrap(), &config,
-    ).unwrap();
+        &siglake_core::events_to_record_batch(&all).unwrap(),
+        &config,
+    )
+    .unwrap();
     let oracle = session_context_with(None, None);
-    oracle.register_table("httplogs", Arc::new(datafusion::datasource::MemTable::try_new(
-        oracle_batch.schema(), vec![vec![oracle_batch]],
-    ).unwrap())).unwrap();
+    oracle
+        .register_table(
+            "httplogs",
+            Arc::new(
+                datafusion::datasource::MemTable::try_new(
+                    oracle_batch.schema(),
+                    vec![vec![oracle_batch]],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
     let mut peers = Vec::new();
     let mut handles = Vec::new();
     let mut counters = Vec::new();
@@ -2741,35 +2770,69 @@ async fn integer_avg_original_sql_uses_three_workers_and_exact_wal_states() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         peers.push(format!("http://{}", listener.local_addr().unwrap()));
         let app = router(AppState::new(ice.clone(), AuthConfig::open())).layer(
-            axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let counter = counter.clone();
-                async move {
-                    if request.uri().path() == "/api/v1/sql/shard" {
-                        counter.fetch_add(1, Ordering::SeqCst);
+            axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let counter = counter.clone();
+                    async move {
+                        if request.uri().path() == "/api/v1/sql/shard" {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                        }
+                        next.run(request).await
                     }
-                    next.run(request).await
-                }
-            }),
+                },
+            ),
         );
-        handles.push(tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }));
+        handles.push(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
     }
-    let (url, coordinator) = serve(AppState::new(ice, AuthConfig::open())
-        .with_coordinator(peers, None).with_wal_buffer_dir(Some(wal_root))).await;
+    let (url, coordinator) = serve(
+        AppState::new(ice, AuthConfig::open())
+            .with_coordinator(peers, None)
+            .with_wal_buffer_dir(Some(wal_root)),
+    )
+    .await;
     handles.push(coordinator);
     let sql = "SELECT status, avg(size) AS avg_size, count(*) AS n FROM \"httplogs\" GROUP BY status ORDER BY n DESC LIMIT 20";
-    let expected = batches_to_records(&oracle.sql(sql).await.unwrap().collect().await.unwrap(), None).unwrap().rows;
-    let response = reqwest::Client::new().post(format!("{url}/api/v1/sql/distributed"))
-        .json(&serde_json::json!({"query":sql, "default_order":false})).send().await.unwrap();
+    let expected = batches_to_records(
+        &oracle.sql(sql).await.unwrap().collect().await.unwrap(),
+        None,
+    )
+    .unwrap()
+    .rows;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/api/v1/sql/distributed"))
+        .json(&serde_json::json!({"query":sql, "default_order":false}))
+        .send()
+        .await
+        .unwrap();
     let status = response.status();
     let body: serde_json::Value = response.json().await.unwrap();
     // Stop owned listeners even if an assertion below fails.
-    for handle in handles { handle.abort(); let _ = handle.await; }
+    for handle in handles {
+        handle.abort();
+        let _ = handle.await;
+    }
     assert_eq!(status, reqwest::StatusCode::OK, "{body}");
-    assert_eq!(body["rows"], expected, "original order and all NULL-aware values: {body}");
+    assert_eq!(
+        body["rows"], expected,
+        "original order and all NULL-aware values: {body}"
+    );
     assert_eq!(body["rows"][0]["avg_size"], serde_json::json!(80.0));
     assert_eq!(body["rows"][0]["n"], serde_json::json!(7));
-    assert_eq!(body["stats"]["phases"]["distributed"]["mode"], "average_aggregate");
-    assert_eq!(shard_walls(&body), Some(3), "not a Local/tier1 answer: {body}");
-    assert!(counters.iter().all(|counter| counter.load(Ordering::SeqCst) == 1),
-        "each actual worker must receive exactly one shard request");
+    assert_eq!(
+        body["stats"]["phases"]["distributed"]["mode"],
+        "average_aggregate"
+    );
+    assert_eq!(
+        shard_walls(&body),
+        Some(3),
+        "not a Local/tier1 answer: {body}"
+    );
+    assert!(
+        counters
+            .iter()
+            .all(|counter| counter.load(Ordering::SeqCst) == 1),
+        "each actual worker must receive exactly one shard request"
+    );
 }

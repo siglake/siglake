@@ -10462,7 +10462,13 @@ async fn capture_buffered_shard_read(
 fn refused_buffer_partials(
     dist: &crate::coordinator::DistPlan,
     reason: &str,
-) -> Result<(Vec<arrow_array::RecordBatch>, Option<Arc<crate::wal_buffer::DecodedBuffer>>), ApiError> {
+) -> Result<
+    (
+        Vec<arrow_array::RecordBatch>,
+        Option<Arc<crate::wal_buffer::DecodedBuffer>>,
+    ),
+    ApiError,
+> {
     if matches!(dist, crate::coordinator::DistPlan::AverageAggregate(_)) {
         return Err(ApiError::pool_exhausted(format!(
             "distributed AVG requires complete WAL admission: {reason}"
@@ -10481,8 +10487,11 @@ fn prepare_buffer_partial_input(
         if masks == 0 && cast == 0 {
             return Some(0);
         }
-        let filter = if masks == 0 { 0 } else {
-            decoded.payload_bytes()
+        let filter = if masks == 0 {
+            0
+        } else {
+            decoded
+                .payload_bytes()
                 .checked_add((decoded.row_count() as u64).div_ceil(8))?
                 .checked_mul(masks.checked_add(1)?)?
         };
@@ -10503,7 +10512,10 @@ fn prepare_buffer_partial_input(
     };
     // Arrow allocations carry both decoded and workspace leases, including
     // children detached from a cancelled requester.
-    lease.attach(decoded.cloned_batches()).map(Some).map_err(ApiError::internal)
+    lease
+        .attach(decoded.cloned_batches())
+        .map(Some)
+        .map_err(ApiError::internal)
 }
 
 async fn compute_buffer_partials(
@@ -11509,17 +11521,26 @@ mod tests {
             Field::new("raw", DataType::Utf8, false),
         ]));
         let raw = "x".repeat(8192);
-        let batch = RecordBatch::try_new(schema, vec![
-            Arc::new(Int64Array::from(vec![Some(0), Some(100), None])),
-            Arc::new(StringArray::from(vec![raw.as_str(); 3])),
-        ]).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(0), Some(100), None])),
+                Arc::new(StringArray::from(vec![raw.as_str(); 3])),
+            ],
+        )
+        .unwrap();
         let ctx = SessionContext::new();
         ctx.register_batch("events", batch.clone()).unwrap();
-        let logical = ctx.state().create_logical_plan(
-            "SELECT avg(size) AS a, count(*) AS n FROM events"
-        ).await.unwrap();
+        let logical = ctx
+            .state()
+            .create_logical_plan("SELECT avg(size) AS a, count(*) AS n FROM events")
+            .await
+            .unwrap();
         let dist = crate::coordinator::classify(&logical);
-        assert!(matches!(&dist, crate::coordinator::DistPlan::AverageAggregate(_)));
+        assert!(matches!(
+            &dist,
+            crate::coordinator::DistPlan::AverageAggregate(_)
+        ));
         assert!(buffer_partial_plan_has_bounded_workspace(&logical, &dist));
         // An actual nonempty decoded tail with no spare workspace MUST refuse;
         // returning empty partials here would turn a complete AVG into a
@@ -11527,8 +11548,14 @@ mod tests {
         let low = crate::wal_buffer::decoded_buffer_for_test(vec![batch.clone()]);
         assert!(low.payload_bytes() > 27 * low.row_count() as u64);
         assert!(prepare_buffer_partial_input(&low, &dist, 0).is_err());
-        for stage in ["decode admission", "bounded plan", "filter masks",
-            "output bound", "output reservation", "output attachment"] {
+        for stage in [
+            "decode admission",
+            "bounded plan",
+            "filter masks",
+            "output bound",
+            "output reservation",
+            "output attachment",
+        ] {
             assert!(refused_buffer_partials(&dist, stage).is_err());
             assert!(refused_buffer_partials(&crate::coordinator::DistPlan::Local, stage).is_ok());
         }
@@ -11538,18 +11565,23 @@ mod tests {
         // incremental charge was not a full Arrow allocation bound.
         assert!(dist.partial_cast_workspace(1).unwrap() > 27);
         assert!(dist.partial_cast_workspace(usize::MAX).is_none());
-        let decoded = crate::wal_buffer::decoded_buffer_with_limit_for_test(
-            vec![batch], 64 * 1024 * 1024,
-        );
+        let decoded =
+            crate::wal_buffer::decoded_buffer_with_limit_for_test(vec![batch], 64 * 1024 * 1024);
         let used = decoded.memory_usage_for_test();
         let base = used();
-        let inputs = prepare_buffer_partial_input(&decoded, &dist, 0).unwrap().unwrap();
+        let inputs = prepare_buffer_partial_input(&decoded, &dist, 0)
+            .unwrap()
+            .unwrap();
         assert!(used() >= base + decoded.payload_bytes() + dist.partial_cast_workspace(3).unwrap());
         let detached_child = inputs[0].column(1).clone();
         let retained = used();
         drop(inputs);
         drop(decoded);
-        assert_eq!(used(), retained, "detached Arrow child must retain both leases");
+        assert_eq!(
+            used(),
+            retained,
+            "detached Arrow child must retain both leases"
+        );
         drop(detached_child);
         assert_eq!(used(), 0);
     }

@@ -966,7 +966,10 @@ pub(crate) fn decoded_buffer_for_test(batches: Vec<RecordBatch>) -> Arc<DecodedB
 }
 
 #[cfg(test)]
-pub(crate) fn decoded_buffer_with_limit_for_test(batches: Vec<RecordBatch>, limit: u64) -> Arc<DecodedBuffer> {
+pub(crate) fn decoded_buffer_with_limit_for_test(
+    batches: Vec<RecordBatch>,
+    limit: u64,
+) -> Arc<DecodedBuffer> {
     let payload = batches_payload_bytes(&batches);
     let budget = BufferMemoryBudget::new(limit);
     let reservation = budget
