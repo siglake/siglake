@@ -6401,6 +6401,7 @@ dependencies = [
  "chrono",
  "flate2",
  "jsonwebtoken",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",

@@ -72,6 +72,9 @@ tokio-metrics = { workspace = true, optional = true }
 flate2 = { version = "1", optional = true }
 tempfile = { version = "3", optional = true }
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 proptest = { workspace = true }
 
