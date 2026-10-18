@@ -1185,6 +1185,68 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod allocator_memory_readout_tests {
     const MIB: usize = 1024 * 1024;
 
+    // These assertions observe and purge process-global jemalloc arenas. Other
+    // CLI tests can free resident pages between snapshots, so run each body in
+    // a fresh exact-test process instead of weakening either memory assertion.
+    fn isolated_allocator_test(name: &str) -> bool {
+        const CHILD: &str = "SIGLAKE_ALLOCATOR_READOUT_EXACT_TEST_CHILD";
+        if let Ok(selected) = std::env::var(CHILD) {
+            assert_eq!(selected, name, "unexpected isolated allocator test");
+            return false;
+        }
+        let stdout = tempfile::NamedTempFile::new().expect("allocator child stdout");
+        let stderr = tempfile::NamedTempFile::new().expect("allocator child stderr");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(CHILD, name)
+            .stdout(stdout.reopen().unwrap())
+            .stderr(stderr.reopen().unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    #[cfg(unix)]
+                    // SAFETY: the child started a fresh process group whose ID
+                    // is its live owned PID; no foreign process group is used.
+                    unsafe {
+                        libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+                    }
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let mut child = OwnedChild(command.spawn().expect("spawn isolated allocator test"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().expect("poll allocator child") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "isolated allocator test timed out: {name}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let out = std::fs::read_to_string(stdout.path()).unwrap();
+        let err = std::fs::read_to_string(stderr.path()).unwrap();
+        assert!(
+            status.success(),
+            "isolated allocator test {name} failed: {status}\nstdout:\n{out}\nstderr:\n{err}"
+        );
+        assert!(
+            out.contains("test result: ok. 1 passed; 0 failed;"),
+            "exact allocator child did not execute one test: {out}\n{err}"
+        );
+        true
+    }
+
     #[test]
     #[ignore = "allocator churn probe must run alone"]
     fn jemalloc_readout_survives_concurrent_allocator_churn() {
@@ -1205,6 +1267,11 @@ mod allocator_memory_readout_tests {
 
     #[test]
     fn jemalloc_readout_tracks_a_touched_large_allocation() {
+        if isolated_allocator_test(
+            "allocator_memory_readout_tests::jemalloc_readout_tracks_a_touched_large_allocation",
+        ) {
+            return;
+        }
         let before = siglake_core::allocator_memory_readout()
             .expect("siglake-cli tests use jemalloc as the global allocator");
         assert!(before.resident_bytes > 0);
@@ -1230,6 +1297,11 @@ mod allocator_memory_readout_tests {
 
     #[test]
     fn jemalloc_purge_returns_freed_dirty_pages() {
+        if isolated_allocator_test(
+            "allocator_memory_readout_tests::jemalloc_purge_returns_freed_dirty_pages",
+        ) {
+            return;
+        }
         // One huge extent can be unmapped as soon as it is freed. The drain
         // leaves many medium Arrow buffers, which occupy ordinary dirty
         // extents and exercise the retention this handoff purge addresses.
