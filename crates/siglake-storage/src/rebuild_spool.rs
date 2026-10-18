@@ -192,7 +192,8 @@ mod tests {
                 .await
                 .unwrap();
             writer.close().await.unwrap();
-            let reader = PuffinReader::new(output.to_input_file());
+            let input = output.to_input_file();
+            let reader = PuffinReader::new(input.clone());
             let metadata = reader.file_metadata().await.unwrap();
             assert_eq!(metadata.blobs().len(), 1);
             assert_eq!(reader.blob(&metadata.blobs()[0]).await.unwrap().data(), raw);
@@ -203,7 +204,7 @@ mod tests {
             writer.add(blob(raw.to_vec()), codec).await.unwrap();
             writer.close().await.unwrap();
             assert_eq!(
-                output.to_input_file().read().await.unwrap(),
+                input.read().await.unwrap(),
                 ordinary.to_input_file().read().await.unwrap()
             );
         }
@@ -320,10 +321,8 @@ mod tests {
             .await
             .unwrap();
         assert!(writer.close().await.is_err());
-        assert!(output.to_input_file().metadata().await.unwrap().size <= 7);
-        assert!(PuffinReader::new(output.to_input_file())
-            .file_metadata()
-            .await
-            .is_err());
+        let input = output.to_input_file();
+        assert!(input.metadata().await.unwrap().size <= 7);
+        assert!(PuffinReader::new(input).file_metadata().await.is_err());
     }
 }
