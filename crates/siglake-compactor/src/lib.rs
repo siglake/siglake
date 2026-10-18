@@ -9857,176 +9857,6 @@ mod combined_memory_regression_tests {
         (cursor.remaining() == 0 && field_dense).then_some(n_rows)
     }
 
-    #[cfg(test)]
-    mod streaming_v1_coverage_tests {
-        use super::streaming_v1_field_coverage;
-
-        fn production_oracle(bytes: &[u8]) -> Option<u32> {
-            let index = siglake_index::InvertedIndex::from_bytes(bytes)?;
-            let rows = index.matching_rows_all(&["field"]);
-            (rows.len() as u64 == u64::from(index.n_rows())
-                && rows.iter().enumerate().all(|(i, row)| *row as usize == i))
-            .then_some(index.n_rows())
-        }
-
-        fn varint(bytes: &mut Vec<u8>, mut value: u64) {
-            loop {
-                let low = (value & 0x7f) as u8;
-                value >>= 7;
-                bytes.push(low | if value == 0 { 0 } else { 0x80 });
-                if value == 0 {
-                    break;
-                }
-            }
-        }
-
-        fn blob(rows: u64, terms: &[(&[u8], &[u64])]) -> Vec<u8> {
-            let mut bytes = b"KIDX\x01".to_vec();
-            varint(&mut bytes, rows);
-            varint(&mut bytes, terms.len() as u64);
-            for (term, deltas) in terms {
-                varint(&mut bytes, term.len() as u64);
-                bytes.extend_from_slice(term);
-                varint(&mut bytes, deltas.len() as u64);
-                for delta in *deltas {
-                    varint(&mut bytes, *delta);
-                }
-            }
-            bytes
-        }
-
-        #[test]
-        fn streaming_v1_coverage_matches_small_production_indexes() {
-            for count in 0..=6 {
-                for mask in 0..(1 << count) {
-                    let rows: Vec<_> = (0..count)
-                        .map(|i| {
-                            if mask & (1 << i) == 0 {
-                                "field alpha zulu"
-                            } else {
-                                "other"
-                            }
-                        })
-                        .collect();
-                    let bytes = siglake_index::InvertedIndex::from_rows(rows).to_bytes();
-                    assert_eq!(
-                        streaming_v1_field_coverage(&bytes),
-                        production_oracle(&bytes)
-                    );
-                }
-            }
-            let empty_term = blob(1, &[(b"", &[0]), (b"field", &[0])]);
-            assert_eq!(streaming_v1_field_coverage(&empty_term), Some(1));
-            assert_eq!(
-                streaming_v1_field_coverage(&empty_term),
-                production_oracle(&empty_term)
-            );
-        }
-
-        #[test]
-        fn streaming_v1_coverage_matches_all_small_truncations_and_mutations() {
-            let good =
-                siglake_index::InvertedIndex::from_rows(["field alpha", "field zulu"]).to_bytes();
-            for cut in 0..good.len() {
-                assert_eq!(streaming_v1_field_coverage(&good[..cut]), None);
-                assert_eq!(
-                    streaming_v1_field_coverage(&good[..cut]),
-                    production_oracle(&good[..cut])
-                );
-            }
-            for offset in 0..good.len() {
-                for byte in [0, 1, 0x7f, 0x80, 0xff] {
-                    let mut changed = good.clone();
-                    changed[offset] = byte;
-                    assert_eq!(
-                        streaming_v1_field_coverage(&changed),
-                        production_oracle(&changed),
-                        "offset={offset} byte={byte}"
-                    );
-                }
-            }
-        }
-
-        #[test]
-        fn streaming_v1_coverage_rejects_corrupt_nonfield_and_field_structures() {
-            let bad = [
-                blob(1u64 << 32, &[]),
-                blob(3, &[(b"field", &[0, 1, 1]), (b"zulu", &[0, 0])]),
-                blob(3, &[(b"field", &[0, 1, 1]), (b"\xff", &[0])]),
-                blob(3, &[(b"field", &[0, 1, 1]), (b"zulu", &[3])]),
-                blob(3, &[(b"field", &[0, 1, 1]), (b"zulu", &[])]),
-                blob(3, &[(b"field", &[0, 1, 1]), (b"alpha", &[0])]),
-                blob(3, &[(b"field", &[0, 1, 1]), (b"field", &[0])]),
-                blob(3, &[(b"field", &[1, 1])]),
-                blob(3, &[(b"field", &[0, 1u64 << 32])]),
-                blob(
-                    u64::from(u32::MAX),
-                    &[(b"field", &[1, u64::from(u32::MAX)])],
-                ),
-                blob(0, &[(b"field", &[0])]),
-            ];
-            for bytes in bad {
-                assert_eq!(streaming_v1_field_coverage(&bytes), None);
-                assert_eq!(
-                    streaming_v1_field_coverage(&bytes),
-                    production_oracle(&bytes)
-                );
-            }
-            let mut trailing = blob(1, &[(b"field", &[0])]);
-            trailing.push(0);
-            assert_eq!(streaming_v1_field_coverage(&trailing), None);
-            assert_eq!(
-                streaming_v1_field_coverage(&trailing),
-                production_oracle(&trailing)
-            );
-        }
-
-        #[test]
-        fn streaming_v1_coverage_preserves_varint_and_count_refusals() {
-            for suffix in [
-                vec![0xff; 11],
-                vec![0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2],
-            ] {
-                let mut bytes = b"KIDX\x01".to_vec();
-                bytes.extend(suffix);
-                assert_eq!(
-                    streaming_v1_field_coverage(&bytes),
-                    production_oracle(&bytes)
-                );
-                assert_eq!(streaming_v1_field_coverage(&bytes), None);
-            }
-            let mut impossible_terms = b"KIDX\x01\x03".to_vec();
-            varint(&mut impossible_terms, u64::from(u32::MAX));
-            assert_eq!(streaming_v1_field_coverage(&impossible_terms), None);
-            assert_eq!(
-                streaming_v1_field_coverage(&impossible_terms),
-                production_oracle(&impossible_terms)
-            );
-        }
-
-        #[test]
-        fn streaming_v1_coverage_large_dense_domain_uses_only_borrowed_cursor() {
-            // Input bytes are the existing Puffin allocation. The verifier's
-            // cursor and previous term borrow that input; no n_rows-sized output.
-            let rows = 1_000_000u64;
-            let mut bytes = b"KIDX\x01".to_vec();
-            varint(&mut bytes, rows);
-            varint(&mut bytes, 2);
-            for term in [b"field".as_slice(), b"zulu".as_slice()] {
-                varint(&mut bytes, term.len() as u64);
-                bytes.extend_from_slice(term);
-                varint(&mut bytes, rows);
-                bytes.push(0);
-                bytes.resize(bytes.len() + rows as usize - 1, 1);
-            }
-            assert_eq!(streaming_v1_field_coverage(&bytes), Some(rows as u32));
-            assert!(
-                std::mem::size_of::<super::V1CoverageCursor<'_>>()
-                    <= 4 * std::mem::size_of::<usize>()
-            );
-        }
-    }
-
     /// A successful rewrite is insufficient: rebuild errors are deliberately
     /// non-fatal. Prove the intended index mode was committed for every rewrite
     /// output, then open its physical blob and validate the row domain.
@@ -10287,6 +10117,176 @@ mod combined_memory_regression_tests {
             }
         }
         assert!(seen.into_iter().all(|present| present));
+    }
+
+    #[cfg(test)]
+    mod streaming_v1_coverage_tests {
+        use super::streaming_v1_field_coverage;
+
+        fn production_oracle(bytes: &[u8]) -> Option<u32> {
+            let index = siglake_index::InvertedIndex::from_bytes(bytes)?;
+            let rows = index.matching_rows_all(&["field"]);
+            (rows.len() as u64 == u64::from(index.n_rows())
+                && rows.iter().enumerate().all(|(i, row)| *row as usize == i))
+            .then_some(index.n_rows())
+        }
+
+        fn varint(bytes: &mut Vec<u8>, mut value: u64) {
+            loop {
+                let low = (value & 0x7f) as u8;
+                value >>= 7;
+                bytes.push(low | if value == 0 { 0 } else { 0x80 });
+                if value == 0 {
+                    break;
+                }
+            }
+        }
+
+        fn blob(rows: u64, terms: &[(&[u8], &[u64])]) -> Vec<u8> {
+            let mut bytes = b"KIDX\x01".to_vec();
+            varint(&mut bytes, rows);
+            varint(&mut bytes, terms.len() as u64);
+            for (term, deltas) in terms {
+                varint(&mut bytes, term.len() as u64);
+                bytes.extend_from_slice(term);
+                varint(&mut bytes, deltas.len() as u64);
+                for delta in *deltas {
+                    varint(&mut bytes, *delta);
+                }
+            }
+            bytes
+        }
+
+        #[test]
+        fn streaming_v1_coverage_matches_small_production_indexes() {
+            for count in 0..=6 {
+                for mask in 0..(1 << count) {
+                    let rows: Vec<_> = (0..count)
+                        .map(|i| {
+                            if mask & (1 << i) == 0 {
+                                "field alpha zulu"
+                            } else {
+                                "other"
+                            }
+                        })
+                        .collect();
+                    let bytes = siglake_index::InvertedIndex::from_rows(rows).to_bytes();
+                    assert_eq!(
+                        streaming_v1_field_coverage(&bytes),
+                        production_oracle(&bytes)
+                    );
+                }
+            }
+            let empty_term = blob(1, &[(b"", &[0]), (b"field", &[0])]);
+            assert_eq!(streaming_v1_field_coverage(&empty_term), Some(1));
+            assert_eq!(
+                streaming_v1_field_coverage(&empty_term),
+                production_oracle(&empty_term)
+            );
+        }
+
+        #[test]
+        fn streaming_v1_coverage_matches_all_small_truncations_and_mutations() {
+            let good =
+                siglake_index::InvertedIndex::from_rows(["field alpha", "field zulu"]).to_bytes();
+            for cut in 0..good.len() {
+                assert_eq!(streaming_v1_field_coverage(&good[..cut]), None);
+                assert_eq!(
+                    streaming_v1_field_coverage(&good[..cut]),
+                    production_oracle(&good[..cut])
+                );
+            }
+            for offset in 0..good.len() {
+                for byte in [0, 1, 0x7f, 0x80, 0xff] {
+                    let mut changed = good.clone();
+                    changed[offset] = byte;
+                    assert_eq!(
+                        streaming_v1_field_coverage(&changed),
+                        production_oracle(&changed),
+                        "offset={offset} byte={byte}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn streaming_v1_coverage_rejects_corrupt_nonfield_and_field_structures() {
+            let bad = [
+                blob(1u64 << 32, &[]),
+                blob(3, &[(b"field", &[0, 1, 1]), (b"zulu", &[0, 0])]),
+                blob(3, &[(b"field", &[0, 1, 1]), (b"\xff", &[0])]),
+                blob(3, &[(b"field", &[0, 1, 1]), (b"zulu", &[3])]),
+                blob(3, &[(b"field", &[0, 1, 1]), (b"zulu", &[])]),
+                blob(3, &[(b"field", &[0, 1, 1]), (b"alpha", &[0])]),
+                blob(3, &[(b"field", &[0, 1, 1]), (b"field", &[0])]),
+                blob(3, &[(b"field", &[1, 1])]),
+                blob(3, &[(b"field", &[0, 1u64 << 32])]),
+                blob(
+                    u64::from(u32::MAX),
+                    &[(b"field", &[1, u64::from(u32::MAX)])],
+                ),
+                blob(0, &[(b"field", &[0])]),
+            ];
+            for bytes in bad {
+                assert_eq!(streaming_v1_field_coverage(&bytes), None);
+                assert_eq!(
+                    streaming_v1_field_coverage(&bytes),
+                    production_oracle(&bytes)
+                );
+            }
+            let mut trailing = blob(1, &[(b"field", &[0])]);
+            trailing.push(0);
+            assert_eq!(streaming_v1_field_coverage(&trailing), None);
+            assert_eq!(
+                streaming_v1_field_coverage(&trailing),
+                production_oracle(&trailing)
+            );
+        }
+
+        #[test]
+        fn streaming_v1_coverage_preserves_varint_and_count_refusals() {
+            for suffix in [
+                vec![0xff; 11],
+                vec![0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2],
+            ] {
+                let mut bytes = b"KIDX\x01".to_vec();
+                bytes.extend(suffix);
+                assert_eq!(
+                    streaming_v1_field_coverage(&bytes),
+                    production_oracle(&bytes)
+                );
+                assert_eq!(streaming_v1_field_coverage(&bytes), None);
+            }
+            let mut impossible_terms = b"KIDX\x01\x03".to_vec();
+            varint(&mut impossible_terms, u64::from(u32::MAX));
+            assert_eq!(streaming_v1_field_coverage(&impossible_terms), None);
+            assert_eq!(
+                streaming_v1_field_coverage(&impossible_terms),
+                production_oracle(&impossible_terms)
+            );
+        }
+
+        #[test]
+        fn streaming_v1_coverage_large_dense_domain_uses_only_borrowed_cursor() {
+            // Input bytes are the existing Puffin allocation. The verifier's
+            // cursor and previous term borrow that input; no n_rows-sized output.
+            let rows = 1_000_000u64;
+            let mut bytes = b"KIDX\x01".to_vec();
+            varint(&mut bytes, rows);
+            varint(&mut bytes, 2);
+            for term in [b"field".as_slice(), b"zulu".as_slice()] {
+                varint(&mut bytes, term.len() as u64);
+                bytes.extend_from_slice(term);
+                varint(&mut bytes, rows);
+                bytes.push(0);
+                bytes.resize(bytes.len() + rows as usize - 1, 1);
+            }
+            assert_eq!(streaming_v1_field_coverage(&bytes), Some(rows as u32));
+            assert!(
+                std::mem::size_of::<super::V1CoverageCursor<'_>>()
+                    <= 4 * std::mem::size_of::<usize>()
+            );
+        }
     }
 }
 
