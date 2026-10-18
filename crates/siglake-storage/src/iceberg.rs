@@ -12569,19 +12569,17 @@ async fn parquet_footer_has_index(path: &str, file_io: &FileIO, column: &str) ->
         .is_some()
 }
 
-async fn build_puffin_index_blobs_for_file(
+async fn build_spilled_puffin_index_for_column(
     table: &Table,
     data_file: &DataFile,
-    specs: &[InvertedIndexSpec],
-) -> Result<Vec<PuffinSidecarBlobSpec>> {
+    spec: &InvertedIndexSpec,
+) -> Result<(siglake_index::spill::SpilledIndex, usize)> {
+    use crate::rebuild_spool::{INDEX_MEMORY_BYTES, INDEX_SCRATCH_BYTES};
     use futures::StreamExt;
     use iceberg::arrow::ArrowFileReader;
     use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
     use parquet::arrow::ProjectionMask;
 
-    if specs.is_empty() {
-        return Ok(Vec::new());
-    }
     let input = table
         .file_io()
         .new_input(data_file.file_path())
@@ -12601,19 +12599,18 @@ async fn build_puffin_index_blobs_for_file(
         .map(|rg| rg.num_rows() as usize)
         .max()
         .unwrap_or(0);
-    let mut builders: Vec<(InvertedIndexSpec, siglake_index::IndexBuilder)> = specs
-        .iter()
-        .map(|spec| {
-            (
-                spec.clone(),
-                siglake_index::IndexBuilder::with_tokenizer(spec.tokenizer),
-            )
-        })
-        .collect();
     let projection = ProjectionMask::columns(
         metadata.file_metadata().schema_descr(),
-        specs.iter().map(|spec| spec.column.as_str()),
+        [spec.column.as_str()],
     );
+    // One column at a time bounds both the number of builders and decoder
+    // projections. Batch/row-group geometry and physical row order are unchanged.
+    let mut index = siglake_index::spill::SpillingIndexBuilder::new(
+        spec.tokenizer,
+        INDEX_MEMORY_BYTES,
+        INDEX_SCRATCH_BYTES,
+    )
+    .context("create bounded v1 index builder")?;
     let mut reader = builder
         .with_projection(projection)
         .with_batch_size(MERGE_BATCH_ROWS)
@@ -12621,35 +12618,34 @@ async fn build_puffin_index_blobs_for_file(
         .context("build parquet reader for index rebuild")?;
     while let Some(batch) = reader.next().await {
         let batch = batch.context("decode parquet batch for index rebuild")?;
-        for (spec, builder) in &mut builders {
-            let Ok(idx) = batch.schema().index_of(spec.column.as_str()) else {
-                continue;
-            };
-            let Some(col) = batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-            else {
-                continue;
-            };
-            for value in col.iter() {
-                builder.push_row(value.unwrap_or(""));
-            }
+        let Ok(column) = batch.schema().index_of(spec.column.as_str()) else {
+            continue;
+        };
+        let Some(column) = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+        else {
+            continue;
+        };
+        for value in column.iter() {
+            index
+                .push_row(value.unwrap_or(""))
+                .context("spill v1 index row")?;
         }
     }
-    Ok(builders
-        .into_iter()
-        .filter_map(|(spec, builder)| {
-            let index = builder.build();
-            (index.n_terms() > 0).then_some(PuffinSidecarBlobSpec {
-                data_file_path: data_file.file_path().to_string(),
-                column: spec.column,
-                tokenizer: spec.tokenizer,
-                row_group_size,
-                bytes: index.to_bytes(),
-            })
-        })
-        .collect())
+    // Do not overlap the Parquet decoder's retained pages with the final merge
+    // and serialization. Spilling remains synchronous bounded disk I/O; this
+    // is not a promise of preemption or a bound on Parquet/allocator residency.
+    drop(reader);
+    let index = index.finish().context("finish spilled v1 index")?;
+    if index.n_terms() > 0 {
+        anyhow::ensure!(
+            u64::from(index.n_rows()) == data_file.record_count(),
+            "rebuilt v1 index row domain differs from Parquet"
+        );
+    }
+    Ok((index, row_group_size))
 }
 
 /// Write one Puffin statistics file holding the segmented (`seg2`) sidecars a
@@ -18733,6 +18729,17 @@ impl IcebergContext {
                 anyhow::anyhow!("snapshot {snapshot_id} not present on committed table")
             })?;
         let statistics = write_puffin_sidecar(table, snapshot, blobs).await?;
+        self.commit_puffin_statistics(table, statistics, snapshot_id, covered_files)
+            .await
+    }
+
+    async fn commit_puffin_statistics(
+        &self,
+        table: &Table,
+        statistics: StatisticsFile,
+        snapshot_id: i64,
+        covered_files: BTreeSet<String>,
+    ) -> Result<bool> {
         let statistics_path = statistics.statistics_path.clone();
         let observation = Arc::new(FirstStatisticsRegistrationObservation::default());
         let tx = Transaction::new(table);
@@ -18780,7 +18787,31 @@ impl IcebergContext {
             return Ok(0);
         }
         let existing = existing_puffin_index_columns(table.metadata());
-        let mut blobs = Vec::new();
+        use crate::rebuild_spool::{compress_v1, file_chunks, PUFFIN_SCRATCH_BYTES};
+        use futures::TryStreamExt;
+        let snapshot = table
+            .metadata()
+            .current_snapshot()
+            .filter(|snapshot| snapshot.snapshot_id() == snapshot_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("snapshot {snapshot_id} not present on committed table")
+            })?;
+        // Stage the whole container locally so the original pre-upload
+        // first-statistics guard remains in force. Only small blob metadata is
+        // retained across columns/files, never their serialized payloads.
+        let stage = tempfile::NamedTempFile::new().context("create rebuilt Puffin spool")?;
+        let local_io = FileIO::new_with_fs();
+        let local_output = local_io.new_output(
+            stage
+                .path()
+                .to_str()
+                .context("Puffin spool path is not UTF-8")?,
+        )?;
+        let mut writer = PuffinWriter::new(&local_output, HashMap::new(), false)
+            .await?
+            .with_max_size(PUFFIN_SCRATCH_BYTES);
+        let mut blob_metadata = Vec::new();
+        let mut covered_files = BTreeSet::new();
         let mut rebuilt_files = 0usize;
         let mut rebuilt_bytes = 0u64;
         let started = Instant::now();
@@ -18801,26 +18832,127 @@ impl IcebergContext {
                 continue;
             }
             tracing::info!(
-                selected_inputs = 1,
-                selected_rows = data_file.record_count(),
-                selected_bytes = data_file.file_size_in_bytes(),
-                selected_columns = missing.len(),
-                path = "range_streamed",
+                selected_inputs = 1, selected_rows = data_file.record_count(),
+                selected_bytes = data_file.file_size_in_bytes(), selected_columns = missing.len(),
+                path = "range_streamed", postings = "disk_spilled_v1",
                 cgroup_memory_limit_bytes = ?cgroup_memory_limit_bytes(),
                 "inverted-index rebuild dispatch"
             );
-            let file_blobs = build_puffin_index_blobs_for_file(&table, data_file, &missing).await?;
-            if !file_blobs.is_empty() {
+            let mut rebuilt_file = false;
+            for spec in missing {
+                let (index, row_group_size) =
+                    build_spilled_puffin_index_for_column(&table, data_file, &spec).await?;
+                if index.n_terms() == 0 {
+                    continue;
+                }
+                let level = match SIGLAKE_PUFFIN_INVERTED_CODEC {
+                    PuffinCompressionCodec::Zstd(level) => level,
+                    _ => anyhow::bail!("spilled v1 rebuild requires the registered Zstd codec"),
+                };
+                tracing::debug!(
+                    column = %spec.column,
+                    rows = index.n_rows(), terms = index.n_terms(), raw_bytes = index.raw_len(),
+                    "spilled v1 rebuild encoding complete"
+                );
+                let compressed = compress_v1(index.reopen_reader()?, index.raw_len(), level)?;
+                drop(index);
+                let properties = HashMap::from([
+                    ("data_file".to_string(), data_file.file_path().to_string()),
+                    ("column".to_string(), spec.column.clone()),
+                    (
+                        "tokenizer".to_string(),
+                        tokenizer_name(spec.tokenizer).to_string(),
+                    ),
+                    ("row_group_size".to_string(), row_group_size.to_string()),
+                    ("format".to_string(), "v1".to_string()),
+                ]);
+                let field_id = table
+                    .metadata()
+                    .current_schema()
+                    .field_id_by_name(spec.column.as_str())
+                    .unwrap_or_default();
+                writer
+                    .add_compressed_stream(
+                        PuffinBlob::builder()
+                            .r#type(SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE.to_string())
+                            .fields(vec![field_id])
+                            .snapshot_id(snapshot_id)
+                            .sequence_number(snapshot.sequence_number())
+                            .data(Vec::new())
+                            .properties(properties.clone())
+                            .build(),
+                        SIGLAKE_PUFFIN_INVERTED_CODEC,
+                        compressed.as_file().metadata()?.len(),
+                        file_chunks(compressed.reopen()?),
+                    )
+                    .await
+                    .context("stream rebuilt v1 blob into Puffin spool")?;
+                blob_metadata.push(StatisticsBlobMetadata {
+                    r#type: SIGLAKE_PUFFIN_INVERTED_BLOB_TYPE.to_string(),
+                    snapshot_id,
+                    sequence_number: snapshot.sequence_number(),
+                    fields: vec![field_id],
+                    properties,
+                });
+                rebuilt_file = true;
+            }
+            if rebuilt_file {
+                covered_files.insert(data_file.file_path().to_string());
                 rebuilt_files += 1;
                 rebuilt_bytes += data_file.file_size_in_bytes();
-                blobs.extend(file_blobs);
             }
         }
-        if blobs.is_empty() {
+        if blob_metadata.is_empty() {
             return Ok(0);
         }
+        writer
+            .close()
+            .await
+            .context("finish rebuilt Puffin spool")?;
+        if table
+            .metadata()
+            .statistics_for_snapshot(snapshot_id)
+            .is_some()
+        {
+            record_registration_deferral(table.identifier(), snapshot_id, &covered_files, None);
+            return Ok(0);
+        }
+        let statistics_path = next_puffin_sidecar_path(&table)?;
+        let output = table.file_io().new_output(&statistics_path)?;
+        let staged_length = stage.as_file().metadata()?.len();
+        let mut upload = output.writer().await?;
+        let chunks = file_chunks(stage.reopen()?);
+        futures::pin_mut!(chunks);
+        let mut uploaded = 0u64;
+        while let Some(chunk) = chunks.try_next().await? {
+            uploaded = uploaded
+                .checked_add(chunk.len() as u64)
+                .context("Puffin upload length overflow")?;
+            anyhow::ensure!(uploaded <= staged_length, "Puffin spool grew during upload");
+            upload.write(chunk).await?;
+        }
+        anyhow::ensure!(
+            uploaded == staged_length,
+            "Puffin spool truncated during upload"
+        );
+        upload.close().await?;
+        let input = output.to_input_file();
+        let actual_size = input.metadata().await?.size;
+        anyhow::ensure!(
+            actual_size == staged_length,
+            "rebuilt Puffin object size differs from spool"
+        );
+        let footer_size = PuffinReader::new(input).footer_size_in_bytes().await?;
+        let statistics = StatisticsFile {
+            snapshot_id,
+            statistics_path,
+            file_size_in_bytes: i64::try_from(actual_size)?,
+            file_footer_size_in_bytes: i64::try_from(footer_size)?,
+            key_metadata: None,
+            blob_metadata,
+        };
         if !self
-            .register_puffin_sidecar_for_snapshot(&table, blobs, snapshot_id)
+            .commit_puffin_statistics(&table, statistics, snapshot_id, covered_files)
             .await?
         {
             return Ok(0);

@@ -3699,3 +3699,100 @@ async fn time_ab_shape(
         segmented,
     )
 }
+
+/// The disk-spilled rebuild must publish the exact existing KIDX v1 bytes,
+/// including empty-row ordinals, and retain the ordinary first-statistics rule.
+#[tokio::test]
+async fn spilled_rebuild_preserves_v1_bytes_and_registration() {
+    use iceberg::puffin::{CompressionCodec, PuffinReader};
+
+    let temp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(&temp.path().join("warehouse"))
+        .await
+        .unwrap()
+        .with_inverted_index(true)
+        .with_table_cache_ttl(std::time::Duration::ZERO)
+        .with_tuning(IcebergTuning {
+            index_rebuild: Some(true),
+            ..Default::default()
+        });
+    let events = (0..8192)
+        .map(|row| {
+            let raw = if row % 31 == 0 {
+                String::new()
+            } else {
+                format!(
+                    "shared SHARED token{row:06} group{:03} unicode_ß",
+                    row % 127
+                )
+            };
+            event_at(row, &raw)
+        })
+        .collect::<Vec<_>>();
+    for chunk in events.chunks(4096) {
+        ice.append_events(chunk).await.unwrap();
+    }
+    let ident = ice.events_table_ident().clone();
+    let before = ice.live_data_files(&ident).await.unwrap();
+    assert_eq!(before.len(), 2);
+    let bloom = ice.events_bloom_columns();
+    let bloom_refs = bloom.iter().map(String::as_str).collect::<Vec<_>>();
+    ice.recluster_files_with(
+        &ident,
+        before,
+        &bloom_refs,
+        &ReclusterMergeOptions {
+            force_streaming: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let files = ice.live_data_files(&ident).await.unwrap();
+    assert_eq!(files.len(), 1);
+    let table = ice.catalog().load_table(&ident).await.unwrap();
+    let snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
+    let stats = table
+        .metadata()
+        .statistics_for_snapshot(snapshot_id)
+        .unwrap();
+    assert_eq!(stats.blob_metadata.len(), 1);
+    let reader = PuffinReader::new(table.file_io().new_input(&stats.statistics_path).unwrap());
+    let metadata = reader.file_metadata().await.unwrap();
+    assert_eq!(metadata.blobs().len(), 1);
+    let blob_meta = &metadata.blobs()[0];
+    assert_eq!(
+        blob_meta.compression_codec(),
+        CompressionCodec::zstd_default()
+    );
+    assert_eq!(blob_meta.properties().get("format").unwrap(), "v1");
+    assert_eq!(
+        blob_meta.properties().get("data_file").unwrap(),
+        files[0].file_path()
+    );
+    let blob = reader.blob(blob_meta).await.unwrap();
+    let expected =
+        siglake_index::InvertedIndex::from_rows(events.iter().map(|event| event.raw.as_str()));
+    assert_eq!(blob.data(), expected.to_bytes());
+    assert_eq!(
+        siglake_index::InvertedIndex::from_bytes(blob.data())
+            .unwrap()
+            .n_rows(),
+        8192
+    );
+    let original_stats = stats.clone();
+    assert_eq!(
+        ice.rebuild_inverted_indexes_for_files(&ident, &files)
+            .await
+            .unwrap(),
+        0
+    );
+    let after = ice.catalog().load_table(&ident).await.unwrap();
+    assert_eq!(
+        after
+            .metadata()
+            .statistics_for_snapshot(snapshot_id)
+            .unwrap(),
+        &original_stats
+    );
+}

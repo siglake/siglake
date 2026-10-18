@@ -32,6 +32,7 @@ typetag = "0.2"
 
 [dependencies]
 tempfile = "3"
+zstd = { workspace = true }
 siglake-core = { workspace = true }
 siglake-bloom = { workspace = true }
 siglake-index = { workspace = true }

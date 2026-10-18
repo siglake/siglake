@@ -20,11 +20,11 @@ use std::collections::{HashMap, HashSet};
 use bytes::Bytes;
 
 use super::validate_puffin_compression;
-use crate::Result;
 use crate::compression::CompressionCodec;
 use crate::io::{FileWrite, OutputFile};
 use crate::puffin::blob::Blob;
 use crate::puffin::metadata::{BlobMetadata, FileMetadata, Flag};
+use crate::{Error, ErrorKind, Result};
 
 /// Puffin writer
 pub struct PuffinWriter {
@@ -35,6 +35,9 @@ pub struct PuffinWriter {
     properties: HashMap<String, String>,
     footer_compression_codec: CompressionCodec,
     flags: HashSet<Flag>,
+    // A failed or cancelled streamed blob must never acquire a valid footer.
+    incomplete_stream: bool,
+    max_size: Option<u64>,
 }
 
 impl PuffinWriter {
@@ -60,11 +63,21 @@ impl PuffinWriter {
             properties,
             footer_compression_codec,
             flags,
+            incomplete_stream: false,
+            max_size: None,
         })
+    }
+
+    /// Limit the complete file, including its header and footer. Writes that
+    /// would exceed this size fail before those bytes are submitted.
+    pub fn with_max_size(mut self, max_size: u64) -> Self {
+        self.max_size = Some(max_size);
+        self
     }
 
     /// Adds blob to Puffin file
     pub async fn add(&mut self, blob: Blob, compression_codec: CompressionCodec) -> Result<()> {
+        self.require_complete_stream()?;
         validate_puffin_compression(compression_codec)?;
 
         self.write_header_once().await?;
@@ -87,8 +100,83 @@ impl PuffinWriter {
         Ok(())
     }
 
+    /// Write an already compressed blob without retaining its payload in memory.
+    ///
+    /// `blob.data` must be empty; the stream supplies exactly `compressed_length`
+    /// bytes encoded with `compression_codec`. The caller is responsible for
+    /// producing that encoding and bounding each chunk. Metadata is published
+    /// only after the stream ends at the declared length. On an error or future
+    /// cancellation this writer cannot be reused or closed with a valid footer.
+    pub async fn add_compressed_stream<S>(
+        &mut self,
+        blob: Blob,
+        compression_codec: CompressionCodec,
+        compressed_length: u64,
+        stream: S,
+    ) -> Result<()>
+    where
+        S: futures::TryStream<Ok = Bytes, Error = Error>,
+    {
+        use futures::TryStreamExt;
+
+        self.require_complete_stream()?;
+        validate_puffin_compression(compression_codec)?;
+        if !blob.data.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "streamed Puffin blob must not also contain in-memory data",
+            ));
+        }
+        self.incomplete_stream = true;
+        self.write_header_once().await?;
+        let offset = self.num_bytes_written;
+        let mut length = 0u64;
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.try_next().await? {
+            length = length.checked_add(chunk.len() as u64).ok_or_else(|| {
+                Error::new(ErrorKind::DataInvalid, "streamed Puffin length overflow")
+            })?;
+            if length > compressed_length {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "streamed Puffin blob exceeds declared length",
+                ));
+            }
+            self.write(chunk).await?;
+        }
+        if length != compressed_length {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "streamed Puffin blob is shorter than declared length",
+            ));
+        }
+        self.written_blobs_metadata.push(BlobMetadata {
+            r#type: blob.r#type,
+            fields: blob.fields,
+            snapshot_id: blob.snapshot_id,
+            sequence_number: blob.sequence_number,
+            offset,
+            length,
+            compression_codec,
+            properties: blob.properties,
+        });
+        self.incomplete_stream = false;
+        Ok(())
+    }
+
+    fn require_complete_stream(&self) -> Result<()> {
+        if self.incomplete_stream {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Puffin writer contains an incomplete streamed blob",
+            ));
+        }
+        Ok(())
+    }
+
     /// Finalizes the Puffin file
     pub async fn close(mut self) -> Result<()> {
+        self.require_complete_stream()?;
         self.write_header_once().await?;
         self.write_footer().await?;
         self.writer.close().await?;
@@ -96,9 +184,18 @@ impl PuffinWriter {
     }
 
     async fn write(&mut self, bytes: Bytes) -> Result<()> {
-        let length = bytes.len();
+        let next_length = self
+            .num_bytes_written
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Puffin file length overflow"))?;
+        if self.max_size.is_some_and(|limit| next_length > limit) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Puffin file size limit exceeded",
+            ));
+        }
         self.writer.write(bytes).await?;
-        self.num_bytes_written += length as u64;
+        self.num_bytes_written = next_length;
         Ok(())
     }
 
