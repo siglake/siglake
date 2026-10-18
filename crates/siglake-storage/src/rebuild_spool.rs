@@ -325,4 +325,37 @@ mod tests {
         assert!(input.metadata().await.unwrap().size <= 7);
         assert!(PuffinReader::new(input).file_metadata().await.is_err());
     }
+
+    #[tokio::test]
+    async fn malformed_puffin_footer_extents_return_errors() {
+        use iceberg::puffin::PuffinReader;
+        let temp = tempfile::tempdir().unwrap();
+        for length in 0..20 {
+            let name = format!("short-{length}.puffin");
+            let mut bytes = vec![0u8; length];
+            let prefix = length.min(4);
+            bytes[..prefix].copy_from_slice(&b"PFA1"[..prefix]);
+            std::fs::write(temp.path().join(&name), bytes).unwrap();
+            let reader = PuffinReader::new(test_output(&temp, &name).to_input_file());
+            assert!(reader.file_metadata().await.is_err(), "length {length}");
+            assert!(
+                reader.footer_size_in_bytes().await.is_err(),
+                "length {length}"
+            );
+        }
+        for (length, declared) in [(20usize, 1u32), (24, 5), (64, u32::MAX)] {
+            let name = format!("extent-{length}.puffin");
+            let mut bytes = vec![0u8; length];
+            bytes[..4].copy_from_slice(b"PFA1");
+            bytes[length - 12..length - 8].copy_from_slice(&declared.to_le_bytes());
+            bytes[length - 4..].copy_from_slice(b"PFA1");
+            std::fs::write(temp.path().join(&name), bytes).unwrap();
+            let reader = PuffinReader::new(test_output(&temp, &name).to_input_file());
+            assert!(reader.file_metadata().await.is_err(), "declared {declared}");
+            assert!(
+                reader.footer_size_in_bytes().await.is_err(),
+                "declared {declared}"
+            );
+        }
+    }
 }

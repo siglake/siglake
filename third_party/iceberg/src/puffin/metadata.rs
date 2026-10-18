@@ -199,6 +199,18 @@ impl FileMetadata {
         file_read: &dyn FileRead,
         input_file_length: u64,
     ) -> Result<u32> {
+        // Keep the file header and footer magic separate even for an empty
+        // payload. Validate before subtraction or interpreting declared sizes.
+        let minimum_length = u64::from(FileMetadata::FOOTER_STRUCT_LENGTH)
+            + 2 * u64::from(FileMetadata::MAGIC_LENGTH);
+        let available_payload = input_file_length
+            .checked_sub(minimum_length)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Puffin file is shorter than its header and footer",
+                )
+            })?;
         let start = input_file_length - FileMetadata::FOOTER_STRUCT_LENGTH as u64;
         let end = start + FileMetadata::FOOTER_STRUCT_PAYLOAD_LENGTH_LENGTH as u64;
         let outcome = file_read.read_with_outcome(start..end).await?;
@@ -206,9 +218,22 @@ impl FileMetadata {
             record_object_store_reads(ObjectStoreReadPhase::Footer, 1, outcome.bytes.len() as u64);
         }
         let footer_payload_length_bytes = outcome.bytes;
-        let mut buf = [0; 4];
-        buf.copy_from_slice(&footer_payload_length_bytes);
+        let buf: [u8; 4] = footer_payload_length_bytes
+            .as_ref()
+            .try_into()
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Puffin footer length read is truncated",
+                )
+            })?;
         let footer_payload_length = u32::from_le_bytes(buf);
+        if u64::from(footer_payload_length) > available_payload {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Puffin footer payload exceeds the file extent",
+            ));
+        }
         Ok(footer_payload_length)
     }
 
@@ -225,6 +250,12 @@ impl FileMetadata {
         let outcome = file_read.read_with_outcome(start..end).await?;
         if outcome.fetched {
             record_object_store_reads(ObjectStoreReadPhase::Footer, 1, outcome.bytes.len() as u64);
+        }
+        if outcome.bytes.len() as u64 != footer_length {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Puffin footer read does not match its declared length",
+            ));
         }
         Ok(outcome.bytes)
     }
