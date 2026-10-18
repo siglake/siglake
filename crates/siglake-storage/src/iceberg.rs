@@ -22110,6 +22110,13 @@ impl IcebergContext {
         // (FileIO clone + path) — capturing `&Table`/`&DataFile` in a
         // `buffered` stream trips rustc's higher-ranked-lifetime `Send`
         // limitation for every spawn up the compactor call chain.
+        let declared_rows = files.iter().try_fold(0usize, |total, file| {
+            total
+                .checked_add(usize::try_from(file.record_count())?)
+                .context("timestamp spool total row count overflow")
+        })?;
+        let timestamp_spool_bytes = crate::timestamp_spool::spool_budget_bytes(declared_rows)?;
+        tracing::info!(timestamp_spool_bytes, inputs = files.len(), cursor_bytes_per_input = crate::timestamp_spool::CURSOR_BYTES, "page-bounded timestamp scratch budget; TMPDIR must be disk-backed for memory isolation");
         let plan_futs: Vec<_> = files
             .iter()
             .map(|f| {
@@ -22117,26 +22124,37 @@ impl IcebergContext {
                     table.file_io().clone(),
                     f.file_path().to_string(),
                     ts_name.clone(),
+                    descending,
+                    f.record_count(),
                 )
             })
             .collect();
         let mut stages = crate::merge::MergeStageNanos::default();
         let t_plan_input = std::time::Instant::now();
-        let plan_inputs: Vec<(ArrowReaderMetadata, Vec<i64>)> = futures::stream::iter(plan_futs)
-            .buffered(merge_fetch_concurrency())
-            .try_collect()
-            .await?;
+        let plan_inputs: Vec<(ArrowReaderMetadata, crate::timestamp_spool::TimestampSpool)> =
+            futures::stream::iter(plan_futs)
+                .buffered(merge_fetch_concurrency())
+                .try_collect()
+                .await?;
         stages.input += t_plan_input.elapsed().as_nanos() as u64;
 
-        // Phase 2 — retain projected timestamps and only O(fan-in) planner
-        // cursors. A bin with identical timestamp sequences can have one run
-        // per row; materializing that plan and all chunk copies is unbounded.
+        // Phase 2 — private fixed-width timestamp spools and bounded forward
+        // cursors. Neither full timestamp columns nor a whole-bin plan stay
+        // resident. Census and execution reopen independent cursor offsets.
         let t_plan = std::time::Instant::now();
-        let (metas, timestamps): (Vec<ArrowReaderMetadata>, Vec<Vec<i64>>) =
-            plan_inputs.into_iter().unzip();
-        let ts_slices: Vec<&[i64]> = timestamps.iter().map(Vec::as_slice).collect();
-        let row_counts: Vec<usize> = timestamps.iter().map(Vec::len).collect();
+        let (metas, timestamps): (
+            Vec<ArrowReaderMetadata>,
+            Vec<crate::timestamp_spool::TimestampSpool>,
+        ) = plan_inputs.into_iter().unzip();
+        let row_counts: Vec<usize> = timestamps
+            .iter()
+            .map(crate::timestamp_spool::TimestampSpool::rows)
+            .collect();
         let total_rows: usize = row_counts.iter().sum();
+        anyhow::ensure!(
+            total_rows == declared_rows,
+            "timestamp spool rows differ from input file records"
+        );
         let uncompressed_bytes: u64 = metas
             .iter()
             .flat_map(|meta| meta.metadata().row_groups())
@@ -22160,9 +22178,13 @@ impl IcebergContext {
         // chunking is tunable, run structure is what the data decides.
         let mut run_count = 0usize;
         let census = page_bounded_copy_census(
-            crate::merge::MergeRuns::new(&ts_slices, descending).inspect(|_| run_count += 1),
+            crate::timestamp_spool::SpoolMergeRuns::new(&timestamps, descending)?.inspect(|run| {
+                if run.is_ok() {
+                    run_count += 1;
+                }
+            }),
             &metas,
-        );
+        )?;
         stages.assemble += t_plan.elapsed().as_nanos() as u64;
         metrics::counter!("siglake_compactor_merge_plan_runs_total").increment(run_count as u64);
         metrics::counter!("siglake_compactor_merge_rowgroups_total")
@@ -22221,16 +22243,17 @@ impl IcebergContext {
             memory_limit_bytes,
         );
         // Generate a chunk only when its resident prefetch slot is available.
-        // Fetch tasks take owned arguments; the cursor borrows only projected
-        // timestamps, never any task's decoded batches. No whole-bin chunks,
+        // Fetch tasks take owned arguments; scratch cursors own independent
+        // files, never any task's decoded batches. No whole-bin chunks,
         // fetch plans, or fetch-argument vectors are retained.
         type FetchArgs = (String, ArrowReaderMetadata, usize, usize, usize);
-        let mut pending_chunks = crate::merge::MergeChunks::new(
-            crate::merge::MergeRuns::new(&ts_slices, descending),
+        let mut pending_chunks = crate::timestamp_spool::SpoolMergeChunks::new(
+            crate::timestamp_spool::SpoolMergeRuns::new(&timestamps, descending)?,
             chunk_rows,
         )
         .enumerate()
-        .map(|(ci, chunk)| {
+        .map(|(ci, chunk)| -> Result<_> {
+            let chunk = chunk?;
             let plan = plan_chunk_fetches(&chunk);
             let args: Vec<FetchArgs> = plan
                 .fetches
@@ -22245,7 +22268,7 @@ impl IcebergContext {
                     )
                 })
                 .collect();
-            (ci, chunk, plan, args)
+            Ok((ci, chunk, plan, args))
         });
         let file_io = table.file_io().clone();
         // SPAWNED, not `stream::buffered`. A `buffered` stream only advances its
@@ -22262,7 +22285,7 @@ impl IcebergContext {
             let file_io = file_io.clone();
             move |ci: usize, args: Vec<FetchArgs>| {
                 let file_io = file_io.clone();
-                tokio::spawn(async move {
+                MergeFetchGuard(tokio::spawn(async move {
                     let t_input = std::time::Instant::now();
                     let futs: Vec<_> = args
                         .into_iter()
@@ -22275,7 +22298,7 @@ impl IcebergContext {
                         .try_collect()
                         .await?;
                     Ok::<_, anyhow::Error>((ci, raw, t_input.elapsed().as_nanos() as u64))
-                })
+                }))
             }
         };
         // A slot remains occupied after its handle is popped: the decoded
@@ -22286,7 +22309,7 @@ impl IcebergContext {
         let mut inflight: std::collections::VecDeque<_> = std::collections::VecDeque::new();
         while prefetch_window.available() > 0 {
             let t_chunk_plan = std::time::Instant::now();
-            let Some((ci, chunk, plan, args)) = pending_chunks.next() else {
+            let Some((ci, chunk, plan, args)) = pending_chunks.next().transpose()? else {
                 break;
             };
             stages.assemble += t_chunk_plan.elapsed().as_nanos() as u64;
@@ -22495,7 +22518,7 @@ impl IcebergContext {
             prefetch_window.released();
             while prefetch_window.available() > 0 {
                 let t_chunk_plan = std::time::Instant::now();
-                let Some((nci, chunk, plan, nargs)) = pending_chunks.next() else {
+                let Some((nci, chunk, plan, nargs)) = pending_chunks.next().transpose()? else {
                     break;
                 };
                 stages.assemble += t_chunk_plan.elapsed().as_nanos() as u64;
@@ -22505,11 +22528,9 @@ impl IcebergContext {
         }
 
         // All fetch slots have completed and no output row needs the planner
-        // again. Release its borrowed cursor first, then the projected keys
-        // and cached metadata before final row-group/index encoding in close.
-        // Otherwise roughly eight bytes per input row overlap finalization.
+        // again. Close cursor file descriptions and remove private timestamp
+        // spools before final row-group/index encoding in close.
         drop(pending_chunks);
-        drop(ts_slices);
         drop(timestamps);
         drop(metas);
         drop(row_counts);
@@ -33915,6 +33936,25 @@ struct ChunkFetchPlan {
     fetches: Vec<(usize, usize, usize)>,
 }
 
+// New fallible scratch reads must not detach prefetched decoders when a
+// census/execution error unwinds the merge. Abort requests cancellation; it
+// does not synchronously await termination. Completed handles abort harmlessly.
+struct MergeFetchGuard<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for MergeFetchGuard<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+impl<T> std::future::Future for MergeFetchGuard<T> {
+    type Output = std::result::Result<T, tokio::task::JoinError>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::future::Future::poll(std::pin::Pin::new(&mut self.0), cx)
+    }
+}
+
 /// Slots occupied by page-bounded chunk fetches, including the decoded chunk
 /// currently being assembled and written.
 ///
@@ -34009,9 +34049,9 @@ struct CopyCensus {
 /// upper bound on the opportunity, and reporting it as such is the point —
 /// otherwise F-3 gets built against an assumption.
 fn page_bounded_copy_census(
-    plan: impl Iterator<Item = crate::merge::MergeRun>,
+    plan: impl Iterator<Item = Result<crate::merge::MergeRun>>,
     metas: &[parquet::arrow::arrow_reader::ArrowReaderMetadata],
-) -> CopyCensus {
+) -> Result<CopyCensus> {
     // Per input: each row group as `(start_row, rows)`.
     let boundaries: Vec<Vec<(usize, usize)>> = metas
         .iter()
@@ -34039,18 +34079,20 @@ fn copy_census_from_boundaries(
     plan: &[crate::merge::MergeRun],
     boundaries: &[Vec<(usize, usize)>],
 ) -> CopyCensus {
-    copy_census_from_runs(plan.iter().copied(), boundaries)
+    copy_census_from_runs(plan.iter().copied().map(Ok), boundaries)
+        .expect("in-memory runs cannot fail")
 }
 
 fn copy_census_from_runs(
-    plan: impl Iterator<Item = crate::merge::MergeRun>,
+    plan: impl Iterator<Item = Result<crate::merge::MergeRun>>,
     boundaries: &[Vec<(usize, usize)>],
-) -> CopyCensus {
+) -> Result<CopyCensus> {
     let mut census = CopyCensus {
         total_row_groups: boundaries.iter().map(|b| b.len()).sum(),
         ..CopyCensus::default()
     };
     for run in plan {
+        let run = run?;
         let Some(groups) = boundaries.get(run.input_index) else {
             continue;
         };
@@ -34062,7 +34104,7 @@ fn copy_census_from_runs(
             }
         }
     }
-    census
+    Ok(census)
 }
 
 /// Page-bounded merge, phase 1, one input: load the Parquet metadata with the
@@ -34073,7 +34115,12 @@ async fn page_bounded_plan_input(
     file_io: iceberg::io::FileIO,
     path: String,
     ts_name: String,
-) -> Result<(parquet::arrow::arrow_reader::ArrowReaderMetadata, Vec<i64>)> {
+    descending: bool,
+    declared_rows: u64,
+) -> Result<(
+    parquet::arrow::arrow_reader::ArrowReaderMetadata,
+    crate::timestamp_spool::TimestampSpool,
+)> {
     use futures::StreamExt;
     use iceberg::arrow::ArrowFileReader;
     use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -34104,7 +34151,13 @@ async fn page_bounded_plan_input(
         .with_batch_size(65_536)
         .build()
         .context("build timestamp plan stream")?;
-    let mut ts: Vec<i64> = Vec::new();
+    let expected_rows = usize::try_from(meta.metadata().file_metadata().num_rows())
+        .context("negative or oversized timestamp metadata row count")?;
+    anyhow::ensure!(
+        u64::try_from(expected_rows)? == declared_rows,
+        "timestamp Parquet row count differs from declared input file"
+    );
+    let mut ts = crate::timestamp_spool::TimestampSpool::new(expected_rows, descending)?;
     while let Some(rb) = stream.next().await {
         let rb = rb.context("decode timestamp plan batch")?;
         let arr = siglake_core::column_nanos(rb.column(0))
@@ -34113,9 +34166,9 @@ async fn page_bounded_plan_input(
             arrow_array::Array::null_count(&arr) == 0,
             "page-bounded merge requires non-null timestamps"
         );
-        ts.extend_from_slice(arr.values());
+        ts.push(arr.values())?;
     }
-    Ok((meta, ts))
+    Ok((meta, ts.finish()?))
 }
 
 /// Page-bounded merge, phase 3, one input's chunk slice: re-open the input
@@ -38805,5 +38858,103 @@ mod side_publication_retry_tests {
         )
         .await;
         assert!(!op.exists(&group_count_rebuild_rel_path(7)).await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod timestamp_spool_integration_tests {
+    use super::*;
+    use crate::timestamp_spool::{SpoolMergeChunks, SpoolMergeRuns, TimestampSpool};
+
+    fn spool(values: &[i64]) -> TimestampSpool {
+        let mut spool = TimestampSpool::new(values.len(), false).unwrap();
+        spool.push(values).unwrap();
+        spool.finish().unwrap()
+    }
+
+    #[test]
+    fn timestamp_spool_census_preserves_uncut_cross_page_runs() {
+        let inputs = [vec![1; 20_000], vec![2; 17_000]];
+        let spools: Vec<_> = inputs.iter().map(|v| spool(v)).collect();
+        let boundaries = [vec![(0, 10_000), (10_000, 10_000)], vec![(0, 17_000)]];
+        let actual =
+            copy_census_from_runs(SpoolMergeRuns::new(&spools, false).unwrap(), &boundaries)
+                .unwrap();
+        let expected = CopyCensus {
+            total_row_groups: 3,
+            copyable_row_groups: 3,
+            copyable_rows: 37_000,
+        };
+        assert_eq!(actual, expected);
+        let chunks = SpoolMergeChunks::new(SpoolMergeRuns::new(&spools, false).unwrap(), 257)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.iter().map(|r| r.row_count).sum::<usize>() <= 257));
+        assert_eq!(
+            chunks.iter().flatten().map(|r| r.row_count).sum::<usize>(),
+            37_000
+        );
+    }
+
+    #[test]
+    fn timestamp_spool_census_propagates_error_without_partial_success() {
+        let plan = vec![
+            Ok(crate::merge::MergeRun {
+                input_index: 0,
+                start_row: 0,
+                row_count: 3,
+            }),
+            Err(anyhow::anyhow!("scratch read refused")),
+        ];
+        assert!(copy_census_from_runs(plan.into_iter(), &[vec![(0, 3)]]).is_err());
+    }
+
+    #[test]
+    fn timestamp_spool_chunk_fetch_ranges_match_slice_planner() {
+        let inputs = [vec![1, 2, 2, 7, 9], vec![1, 2, 5, 7, 10], vec![0, 3, 6, 8]];
+        let spools: Vec<_> = inputs.iter().map(|v| spool(v)).collect();
+        let slices: Vec<_> = inputs.iter().map(Vec::as_slice).collect();
+        let expected: Vec<_> =
+            crate::merge::MergeChunks::new(crate::merge::MergeRuns::new(&slices, false), 4)
+                .collect();
+        let actual = SpoolMergeChunks::new(SpoolMergeRuns::new(&spools, false).unwrap(), 4)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        for (actual, expected) in actual.iter().zip(&expected) {
+            let a = plan_chunk_fetches(actual);
+            let e = plan_chunk_fetches(expected);
+            assert_eq!(a.fetches, e.fetches);
+            assert_eq!(a.ordinal_of, e.ordinal_of);
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn timestamp_spool_error_cleanup_aborts_prefetched_decoder() {
+        struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = dropped.clone();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let fetch = MergeFetchGuard(tokio::spawn(async move {
+            let _dropped = Dropped(signal);
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        started.await.unwrap();
+        drop(fetch);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

@@ -18,6 +18,7 @@ pub mod merge;
 mod query_provider;
 pub mod schema_version;
 pub mod subscribe;
+mod timestamp_spool;
 pub mod wal_ledger;
 
 pub use query_provider::{

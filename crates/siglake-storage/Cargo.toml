@@ -23,7 +23,6 @@ proptest = { workspace = true }
 # OpenDAL 0.57's HttpClient accepts its Reqwest 0.13 type, while the workspace
 # application client remains on Reqwest 0.12.
 opendal_reqwest = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
-tempfile = "3"
 tokio = { workspace = true }
 # #1730 — the fenced-out table-cache WARN is the only place the table name
 # appears, so a test captures it through the same fmt + EnvFilter stack the
@@ -32,6 +31,7 @@ tracing-subscriber = { workspace = true }
 typetag = "0.2"
 
 [dependencies]
+tempfile = "3"
 siglake-core = { workspace = true }
 siglake-bloom = { workspace = true }
 siglake-index = { workspace = true }
