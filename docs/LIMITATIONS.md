@@ -1848,12 +1848,25 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   operations and 862,609,408 bytes at peak in a system-allocator test binary.
   A9's pre-merge resident/active difference suggests allocator retention, but
   does not establish dirty-page attribution or the cause of its 1GiB kill.
-  The constrained compactor now requests an all-arena purge before merge work,
-  with fallible before/after observations. The shipped-allocator unit test only
-  exercises reclamation of freed medium buffers; it does not bound live input,
-  writer or encoder residency. A fresh canonical field remains required.
-  It then proved every exact
-  timestamp, field, NULL, duplicate and omission result. It is not the full
+  The constrained compactor requests unused-page reclamation after acquiring
+  its decoded-work permit, before both merge and WAL-drain allocations. The
+  permit remains held during reclamation and by outstanding blocking readers.
+  The existing positive jemalloc detection uses an all-arena purge with
+  fallible before/after observations. Linux GNU processes can also trim the
+  glibc heap; that attempt does not identify the process-global allocator, and
+  a zero return means no pages were released. Other unsupported allocators or
+  platforms remain observable no-ops. No allocator, decay policy, workload or
+  memory limit is changed. These operations can return unused pages, but
+  cannot reduce live input, writer, encoder or cache residency.
+  The later full-size local run completed the spilled v1 rebuild, then
+  OOM-killed immediately after WAL admission. Its RSS had already exceeded the
+  unchanged 1 GiB assertion before that handoff; retained samples do not
+  distinguish live allocations from freed allocator pages. Reclamation at
+  both entries addresses a concrete lifecycle gap but is not proof that this
+  kill, the full local fixture, or the canonical field is resolved. Fresh
+  complete qualification remains required.
+  The earlier small regression proved every exact timestamp, field, NULL,
+  duplicate and omission result. It is not the full
   shipped field workload: fresh 1Gi qualification on the retained canonical
   field remains required before claiming the OOM is resolved. One oversized
   WAL segment also still admits alone. Explicit `SIGLAKE_MERGE_CHUNK_ROWS`

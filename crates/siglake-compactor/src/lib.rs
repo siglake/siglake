@@ -131,6 +131,22 @@ struct DecodedWorkLease {
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+// Reclaim only after exclusive decoded-work ownership has transferred, before
+// the new owner can allocate input buffers. The callback is also used by the
+// ownership tests; it must not release or replace the acquired permit.
+fn decoded_work_lease_after_reclaim(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    owner: &'static str,
+    reclaim: impl FnOnce(&'static str),
+) -> Arc<DecodedWorkLease> {
+    if matches!(owner, "drain" | "recluster") {
+        reclaim(owner);
+    }
+    Arc::new(DecodedWorkLease {
+        _permit: Some(permit),
+    })
+}
+
 #[cfg(test)]
 struct SegmentReadHold {
     remaining: std::sync::atomic::AtomicUsize,
@@ -646,14 +662,14 @@ fn log_compactor_commit_complete(segments: usize) {
     );
 }
 
-/// Reclaim the previous drain's dirty jemalloc pages before a constrained
-/// process starts allocating merge input and writer buffers. The caller owns
-/// the packaged decoded-work semaphore, so no drain allocation can race the
-/// handoff. Failure is observable but does not make maintenance unavailable.
-fn purge_allocator_at_recluster_handoff() {
+/// Request unused pages back before the next constrained decoded operation.
+/// The caller owns the packaged decoded-work semaphore during reclamation.
+/// This cannot release live buffers or establish an overall memory bound;
+/// failure is observable but does not make drain or maintenance unavailable.
+fn reclaim_allocator_at_decoded_handoff(owner: &'static str) {
     let started = std::time::Instant::now();
-    match siglake_core::purge_allocator_dirty_pages() {
-        Ok(Some(readout)) => {
+    match siglake_core::reclaim_allocator_free_pages() {
+        Ok(siglake_core::AllocatorFreePageReclaim::Jemalloc(readout)) => {
             let elapsed = started.elapsed();
             let allocator_resident_reclaimed_bytes = readout
                 .before
@@ -669,6 +685,8 @@ fn purge_allocator_at_recluster_handoff() {
             metrics::histogram!("siglake_compactor_allocator_purge_duration_seconds")
                 .record(elapsed.as_secs_f64());
             tracing::info!(
+                owner,
+                allocator_backend = "jemalloc",
                 allocator_allocated_before_bytes = readout.before.allocated_bytes,
                 allocator_allocated_after_bytes = readout.after.allocated_bytes,
                 allocator_active_before_bytes = readout.before.active_bytes,
@@ -680,18 +698,32 @@ fn purge_allocator_at_recluster_handoff() {
                 cgroup_memory_after_bytes = ?readout.after.cgroup_memory_current_bytes,
                 cgroup_reclaimed_bytes = ?cgroup_reclaimed_bytes,
                 elapsed_seconds = elapsed.as_secs_f64(),
-                "purged allocator dirty pages at drain-to-recluster handoff"
+                "purged allocator dirty pages at decoded-work handoff"
             );
         }
-        Ok(None) => {
+        Ok(siglake_core::AllocatorFreePageReclaim::GlibcHeap { released_pages }) => {
+            metrics::counter!("siglake_compactor_allocator_purges_total", "result" => "success")
+                .increment(1);
+            metrics::histogram!("siglake_compactor_allocator_purge_duration_seconds")
+                .record(started.elapsed().as_secs_f64());
+            tracing::info!(
+                owner,
+                allocator_backend = "glibc_heap",
+                released_pages,
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                "requested glibc free-page trim at decoded-work handoff; global allocator unidentified"
+            );
+        }
+        Ok(siglake_core::AllocatorFreePageReclaim::Unsupported) => {
             tracing::debug!(
-                "allocator purge skipped because jemalloc is not the process-global allocator"
+                owner,
+                "allocator reclamation unsupported at decoded-work handoff"
             );
         }
         Err(error) => {
             metrics::counter!("siglake_compactor_allocator_purges_total", "result" => "error")
                 .increment(1);
-            tracing::warn!(%error, "could not purge allocator dirty pages before re-clustering");
+            tracing::warn!(owner, %error, "could not reclaim allocator free pages at decoded-work handoff");
         }
     }
 }
@@ -706,7 +738,7 @@ mod allocator_readout_tests {
             "the compactor crate test binary uses the system allocator: {readout:?}"
         );
         super::log_compactor_commit_complete(1);
-        super::purge_allocator_at_recluster_handoff();
+        super::reclaim_allocator_at_decoded_handoff("recluster");
     }
 }
 
@@ -1093,12 +1125,7 @@ impl Compactor {
             "owner" => owner
         )
         .record(started.elapsed().as_secs_f64());
-        if owner == "recluster" {
-            purge_allocator_at_recluster_handoff();
-        }
-        Arc::new(DecodedWorkLease {
-            _permit: Some(permit),
-        })
+        decoded_work_lease_after_reclaim(permit, owner, reclaim_allocator_at_decoded_handoff)
     }
 
     /// Take the decoded-work slot without parking the maintenance loop.
@@ -1116,9 +1143,11 @@ impl Compactor {
             "owner" => owner
         )
         .record(0.0);
-        Some(Arc::new(DecodedWorkLease {
-            _permit: Some(permit),
-        }))
+        Some(decoded_work_lease_after_reclaim(
+            permit,
+            owner,
+            reclaim_allocator_at_decoded_handoff,
+        ))
     }
 
     /// Pin how many consecutive failed reads a local segment gets before the
@@ -13437,5 +13466,42 @@ mod delete_task_stall_tests {
             claim_before,
             "a create-only claim write that loses must not refresh the claim's age"
         );
+    }
+}
+
+#[cfg(test)]
+mod decoded_work_reclaim_tests {
+    use super::*;
+
+    #[test]
+    fn both_handoffs_reclaim_with_exclusive_ownership_and_keep_live_clones() {
+        for owner in ["drain", "recluster"] {
+            let gate = Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = gate.clone().try_acquire_owned().unwrap();
+            let called = std::cell::Cell::new(false);
+            let lease = decoded_work_lease_after_reclaim(permit, owner, |observed| {
+                assert_eq!(observed, owner);
+                assert!(gate.clone().try_acquire_owned().is_err());
+                called.set(true);
+            });
+            assert!(called.get());
+            let blocking_reader = lease.clone();
+            drop(lease);
+            assert!(gate.clone().try_acquire_owned().is_err());
+            drop(blocking_reader);
+            assert!(gate.clone().try_acquire_owned().is_ok());
+        }
+    }
+
+    #[test]
+    fn non_work_owner_keeps_lease_without_reclaiming() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().try_acquire_owned().unwrap();
+        let lease = decoded_work_lease_after_reclaim(permit, "test", |_| {
+            panic!("non-work owner must not trigger allocator reclamation");
+        });
+        assert!(gate.clone().try_acquire_owned().is_err());
+        drop(lease);
+        assert!(gate.clone().try_acquire_owned().is_ok());
     }
 }
