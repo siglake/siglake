@@ -70,10 +70,17 @@ fn isolated(mode: &str) {
         .take(65_537)
         .read_to_string(&mut errors)
         .unwrap();
-    // Prefix libtest summaries so whole-workspace parsers do not count
-    // the isolated child again as an additional top-level test suite.
+    // Whole-workspace parsers search for libtest summaries even inside a line.
+    // On success emit only the body observations/marker, never nested summaries.
+    // Failed or timed-out children retain the bounded diagnostic prefix.
     for line in output.lines().chain(errors.lines()) {
-        eprintln!("isolated_reclaim_child[{mode}] {line}");
+        if timed_out
+            || !status.success()
+            || line.contains("before_rss=")
+            || line.starts_with("reclaim_child_completed mode=")
+        {
+            eprintln!("isolated_reclaim_child[{mode}] {line}");
+        }
     }
     assert!(
         output.len() <= 65_536 && errors.len() <= 65_536,
