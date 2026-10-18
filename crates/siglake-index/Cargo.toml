@@ -9,6 +9,7 @@ description = "Per-file inverted index (term → row-ordinal postings) for exact
 siglake-bloom = { workspace = true }
 crc32fast = { workspace = true }
 zstd = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
