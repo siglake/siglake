@@ -8,7 +8,7 @@
       "external_id": 196,
       "exit_code": 0,
       "source_sha": "89d739ecae4d2b82100223f0ded62f90efb18b04",
-      "results": "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196",
+      "results": "retained-evidence/source-89d739ecae4d/results/run-196",
       "initial_group_sum_and_count": 6000,
       "initial_peers": 2,
       "scale_samples": [
@@ -141,7 +141,7 @@
       "restart_count": 0,
       "previous_log": "not requested because actual restart_count0",
       "conditional_refusals": [],
-      "current_log": "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/compactor-evidence/siglake-compactor-85f9f649d-q7m4g-current.stdout",
+      "current_log": "retained-evidence/source-89d739ecae4d/results/run-196/compactor-evidence/siglake-compactor-85f9f649d-q7m4g-current.stdout",
       "cluster_deletion_logged": true,
       "unit_pid0": true
     },
@@ -149,7 +149,7 @@
       "external_id": 197,
       "exit_code": 0,
       "source_sha": "89d739ecae4d2b82100223f0ded62f90efb18b04",
-      "results": "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197",
+      "results": "retained-evidence/source-89d739ecae4d/results/run-197",
       "initial_group_sum_and_count": 6000,
       "initial_peers": 2,
       "scale_samples": [
@@ -431,43 +431,43 @@
           "text": "2026-10-17T19:10:19.512582114Z 2026-10-17T19:10:19.512533Z ERROR siglake_storage::iceberg: refusing side-aggregate publication because the warehouse did not verify conditional writes error=warehouse store did not reject a stale If-Match overwrite; refusing an unsafe conditional mutation table=siglake.events"
         }
       ],
-      "current_log": "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/compactor-evidence/siglake-compactor-6cfcd57b94-cvtgb-current.stdout",
+      "current_log": "retained-evidence/source-89d739ecae4d/results/run-197/compactor-evidence/siglake-compactor-6cfcd57b94-cvtgb-current.stdout",
       "cluster_deletion_logged": true,
       "unit_pid0": true
     }
   },
   "files": {
-    "/home/todd/workspace/loglake-manager/var/external/196.log": "d4cee5b014ffdb6a72150f2556b75be2da3cf932c217034885fe0f99559b70a1",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/membership.log": "c1d6bfcda74c6fe6f1efbdfa24ff4f5b80346c9b8c8cc25487e175d6a9b7bb2f",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/scale-2-4-2.json": "9aa34b90020a19b1ec3167f81d90d28ed4df1424a5e5ccced38028e7fc0660dc",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/compactor-evidence/siglake-compactor-85f9f649d-q7m4g-metrics.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/compactor-evidence/siglake-compactor-85f9f649d-q7m4g-current.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/compactor-evidence/pods.stdout": "ddcfde982b7e4a04f649790d9487b7f0dcc8f6ff352344c7da42e5f5b1d98967",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/compactor-evidence/targets.tsv": "e46af9b789c3fc789a56438b740168ebebecf3ba80426c89b4ed30a6c6a498ed",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/compactor-evidence/deployment.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/compactor-evidence/commands.tsv": "ae8d803b76de5be47b170a01a27f2b09599bed2f151cd8cb83dcc1121542d7a6",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/compactor-evidence/capture.json": "1101ce7b985e81cdf775b655fd7bd17ea566fb499343cb5097c2153e7067f664",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/compactor-evidence/siglake-compactor-85f9f649d-q7m4g-metrics.stdout": "e85c1439653a12aa6e276037d7bb8647a1b893ca6805705f6b5329e9a82080bd",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/compactor-evidence/pods.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/compactor-evidence/siglake-compactor-85f9f649d-q7m4g-current.stdout": "76d1736b460a4c6c2187ff9d6904ef6ae4a4fc712cea4f1f1d165fcdfb50113f",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/compactor-evidence/deployment.stdout": "269378cba495536746fd60ec957b0caa61f90771a42ad24b37624f261f30a7cd",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-196/compactor-evidence/targets.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "/home/todd/workspace/loglake-manager/var/external/197.log": "3933dc2c3e93c0829903e6822329eb2fd64cd4cf6421a48121301c7770afca96",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/membership.log": "b1923d61421a531cd029f5aff8837b6c4a8856662a1879b030890bcfa386a061",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/scale-2-4-2.json": "5b001771dc77d779f2629dcf53cde3f8682c638fd6a25964e717e6867ff5ec3c",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/compactor-evidence/siglake-compactor-6cfcd57b94-cvtgb-current.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/compactor-evidence/siglake-compactor-6cfcd57b94-cvtgb-metrics.stdout": "2b9b07a253a05898c282446fffe024f80b14499bd51c9ab6d0deefdd60ace928",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/compactor-evidence/pods.stdout": "4a00d1d4d013e080826cdb3fc071d7e27b7aeedcf1f77a3f0bc1c242cab228ab",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/compactor-evidence/targets.tsv": "e3923acd589522159d301565a86c871d23acf4c1a0a4dc79ece1769d26022b19",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/compactor-evidence/deployment.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/compactor-evidence/commands.tsv": "418cf13bf766969c8580bff18da9bd3805a28014c62440a47996f34c518bf94f",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/compactor-evidence/siglake-compactor-6cfcd57b94-cvtgb-current.stdout": "05881008f919cab3ca3858fdeed34f4b7b84b7248219f1ef2ce54a071321dc6d",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/compactor-evidence/siglake-compactor-6cfcd57b94-cvtgb-metrics.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/compactor-evidence/capture.json": "d5d28b02ae846af46473a74405d0c0a99fdeaa17d965be86634ddd30a8ad17bb",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/compactor-evidence/pods.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/compactor-evidence/deployment.stdout": "46d003d7ce6129aa57fbea6eeed75c0da4424d2a112f4484c86b5eea170a385c",
-    "/home/todd/workspace/.lm/siglake/snapshots/89d739ecae4d/results/run-197/compactor-evidence/targets.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "/home/todd/workspace/loglake-manager/var/investigations/20261016-release-continuation/object-store-196-197-assessment-site/task6523-readback.json": "e66478849b2a229557454d1f9fd17967a26dccaaa3dad52e6c76c2a545dc5fd1"
+    "retained-evidence/external/196.log": "d4cee5b014ffdb6a72150f2556b75be2da3cf932c217034885fe0f99559b70a1",
+    "retained-evidence/source-89d739ecae4d/results/run-196/membership.log": "c1d6bfcda74c6fe6f1efbdfa24ff4f5b80346c9b8c8cc25487e175d6a9b7bb2f",
+    "retained-evidence/source-89d739ecae4d/results/run-196/scale-2-4-2.json": "9aa34b90020a19b1ec3167f81d90d28ed4df1424a5e5ccced38028e7fc0660dc",
+    "retained-evidence/source-89d739ecae4d/results/run-196/compactor-evidence/siglake-compactor-85f9f649d-q7m4g-metrics.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "retained-evidence/source-89d739ecae4d/results/run-196/compactor-evidence/siglake-compactor-85f9f649d-q7m4g-current.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "retained-evidence/source-89d739ecae4d/results/run-196/compactor-evidence/pods.stdout": "ddcfde982b7e4a04f649790d9487b7f0dcc8f6ff352344c7da42e5f5b1d98967",
+    "retained-evidence/source-89d739ecae4d/results/run-196/compactor-evidence/targets.tsv": "e46af9b789c3fc789a56438b740168ebebecf3ba80426c89b4ed30a6c6a498ed",
+    "retained-evidence/source-89d739ecae4d/results/run-196/compactor-evidence/deployment.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "retained-evidence/source-89d739ecae4d/results/run-196/compactor-evidence/commands.tsv": "ae8d803b76de5be47b170a01a27f2b09599bed2f151cd8cb83dcc1121542d7a6",
+    "retained-evidence/source-89d739ecae4d/results/run-196/compactor-evidence/capture.json": "1101ce7b985e81cdf775b655fd7bd17ea566fb499343cb5097c2153e7067f664",
+    "retained-evidence/source-89d739ecae4d/results/run-196/compactor-evidence/siglake-compactor-85f9f649d-q7m4g-metrics.stdout": "e85c1439653a12aa6e276037d7bb8647a1b893ca6805705f6b5329e9a82080bd",
+    "retained-evidence/source-89d739ecae4d/results/run-196/compactor-evidence/pods.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "retained-evidence/source-89d739ecae4d/results/run-196/compactor-evidence/siglake-compactor-85f9f649d-q7m4g-current.stdout": "76d1736b460a4c6c2187ff9d6904ef6ae4a4fc712cea4f1f1d165fcdfb50113f",
+    "retained-evidence/source-89d739ecae4d/results/run-196/compactor-evidence/deployment.stdout": "269378cba495536746fd60ec957b0caa61f90771a42ad24b37624f261f30a7cd",
+    "retained-evidence/source-89d739ecae4d/results/run-196/compactor-evidence/targets.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "retained-evidence/external/197.log": "3933dc2c3e93c0829903e6822329eb2fd64cd4cf6421a48121301c7770afca96",
+    "retained-evidence/source-89d739ecae4d/results/run-197/membership.log": "b1923d61421a531cd029f5aff8837b6c4a8856662a1879b030890bcfa386a061",
+    "retained-evidence/source-89d739ecae4d/results/run-197/scale-2-4-2.json": "5b001771dc77d779f2629dcf53cde3f8682c638fd6a25964e717e6867ff5ec3c",
+    "retained-evidence/source-89d739ecae4d/results/run-197/compactor-evidence/siglake-compactor-6cfcd57b94-cvtgb-current.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "retained-evidence/source-89d739ecae4d/results/run-197/compactor-evidence/siglake-compactor-6cfcd57b94-cvtgb-metrics.stdout": "2b9b07a253a05898c282446fffe024f80b14499bd51c9ab6d0deefdd60ace928",
+    "retained-evidence/source-89d739ecae4d/results/run-197/compactor-evidence/pods.stdout": "4a00d1d4d013e080826cdb3fc071d7e27b7aeedcf1f77a3f0bc1c242cab228ab",
+    "retained-evidence/source-89d739ecae4d/results/run-197/compactor-evidence/targets.tsv": "e3923acd589522159d301565a86c871d23acf4c1a0a4dc79ece1769d26022b19",
+    "retained-evidence/source-89d739ecae4d/results/run-197/compactor-evidence/deployment.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "retained-evidence/source-89d739ecae4d/results/run-197/compactor-evidence/commands.tsv": "418cf13bf766969c8580bff18da9bd3805a28014c62440a47996f34c518bf94f",
+    "retained-evidence/source-89d739ecae4d/results/run-197/compactor-evidence/siglake-compactor-6cfcd57b94-cvtgb-current.stdout": "05881008f919cab3ca3858fdeed34f4b7b84b7248219f1ef2ce54a071321dc6d",
+    "retained-evidence/source-89d739ecae4d/results/run-197/compactor-evidence/siglake-compactor-6cfcd57b94-cvtgb-metrics.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "retained-evidence/source-89d739ecae4d/results/run-197/compactor-evidence/capture.json": "d5d28b02ae846af46473a74405d0c0a99fdeaa17d965be86634ddd30a8ad17bb",
+    "retained-evidence/source-89d739ecae4d/results/run-197/compactor-evidence/pods.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "retained-evidence/source-89d739ecae4d/results/run-197/compactor-evidence/deployment.stdout": "46d003d7ce6129aa57fbea6eeed75c0da4424d2a112f4484c86b5eea170a385c",
+    "retained-evidence/source-89d739ecae4d/results/run-197/compactor-evidence/targets.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "retained-evidence/release-continuation/object-store-196-197-assessment-site/task6523-readback.json": "e66478849b2a229557454d1f9fd17967a26dccaaa3dad52e6c76c2a545dc5fd1"
   },
   "recommendations": [
     "Execution evidence now satisfies the original matched-source local pair and required Garage refusal collection: MinIO196 and Garage197 differ only object_store; both actual0,6000 initial exact fan-out and retained2\u21924\u21922 checks.",
@@ -475,5 +475,9 @@
     "Garage197 exit0 does not contradict expected conditional-write refusal: query/topology checks succeeded while guarded side-aggregate/fold operations refused. Garage remains unsupported; MinIO default unchanged, reserved support-scope decision untouched.",
     "Preserve193/194 capture-gap report and all earlier actual failed attempts as historical evidence; do not relabel old passes or claim generic Garage safety."
   ],
-  "scope": "Read-only retained evidence inspection and full result-file hash binding. No repeated runtime, build, task mutation, public edit or support waiver. Collector current log is complete for captured pod with0restarts; no previous-log content invented."
+  "scope": "Read-only retained evidence inspection and full result-file hash binding. No repeated runtime, build, task mutation, public edit or support waiver. Collector current log is complete for captured pod with0restarts; no previous-log content invented.",
+  "publication_path_normalization": {
+    "original_receipt_sha256": "ec2cd24f229f68ade5d38a669ab663821a5f99d95a18af0be357119e5484b414",
+    "scope": "Only local artifact paths were replaced by stable retained-evidence labels. Labels identify privately retained inputs, not files bundled with this public report. Original outcomes and all input content hashes are unchanged."
+  }
 }

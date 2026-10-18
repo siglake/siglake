@@ -11,7 +11,8 @@
 
 - Page-bounded compaction now generates merge runs and fetch plans only for
   admitted chunks, avoiding whole-bin plan copies on heavily interleaved inputs.
-  Timestamp columns remain resident; packaged memory qualification is separate.
+  Timestamp keys stream to private disk spools and use bounded per-input cursors;
+  packaged memory qualification remains separate.
 
 - A re-cluster in the packaged 1Gi compactor now uses the page-bounded executor
   for small continuation bins when its effective timestamp merge key has a

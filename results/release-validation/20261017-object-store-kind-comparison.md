@@ -38,8 +38,11 @@ binds all 31 retained inputs, per-arm source and results, exact scale samples,
 complete collector inventories, quoted log lines, cleanup and inactive process
 checks. Original manager logs are `var/external/196.log` and `197.log`; captured
 results are under snapshot `89d739ecae4d/results/run-196/` and `run-197/`.
-The receipt SHA-256 is
-`ec2cd24f229f68ade5d38a669ab663821a5f99d95a18af0be357119e5484b414`.
+The published receipt uses stable artifact labels for privately retained inputs;
+these labels are not download links. Its SHA-256 is
+`c199e04c766f239ac97bce9ef79f07a3c088495e0e97ec3ba2750b6f596a564e`. The original independent receipt, before path
+normalization, remains retained with SHA-256
+`ec2cd24f229f68ade5d38a669ab663821a5f99d95a18af0be357119e5484b414`; outcomes and input content hashes are unchanged.
 
 This completes the matched local execution and refusal-collection portion of
 #6523. Publishing this report is the remaining reporting step; it does not
