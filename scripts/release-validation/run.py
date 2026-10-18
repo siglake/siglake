@@ -22,9 +22,9 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 DURATIONS = {'smoke': 120, '24h': 86400, '72h': 259200}
-SUPPORTED_VERSIONS = ('v0.1.0', 'v0.2.0', 'v0.2.1')
-PROVENANCE_VERSIONS = frozenset({'v0.2.1'})
-QUERY_AUDIT_AGGREGATE_VERSIONS = frozenset({'v0.2.1'})
+SUPPORTED_VERSIONS = ('v0.1.0', 'v0.2.0', 'v0.2.1', 'v0.3.0')
+PROVENANCE_VERSIONS = frozenset({'v0.2.1', 'v0.3.0'})
+QUERY_AUDIT_AGGREGATE_VERSIONS = frozenset({'v0.2.1', 'v0.3.0'})
 PRODUCT_REPOSITORIES = {
     'engine': 'siglake/siglake',
     'operator': 'siglake/siglake-operator',

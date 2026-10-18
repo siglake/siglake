@@ -18,8 +18,8 @@ each dependency, and no swap. It is a single-host validation configuration, not
 a claim to test stock Helm defaults.
 
 ```sh
-python3 scripts/release-validation/run.py --version v0.2.1 --profile smoke \
-  --out "$HOME/siglake-validation/v0.2.1-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
+python3 scripts/release-validation/run.py --version v0.3.0 --profile smoke \
+  --out "$HOME/siglake-validation/v0.3.0-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
 Use `sg docker -c '...'` if your current session lacks the Docker group. Supported

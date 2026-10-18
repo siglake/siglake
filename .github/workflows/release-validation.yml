@@ -8,9 +8,9 @@ on:
         options: [smoke, 24h, 72h]
         default: smoke
       version:
-        description: Published version, or both
+        description: Published version (both runs all supported versions)
         type: choice
-        options: [both, v0.1.0, v0.2.0, v0.2.1]
+        options: [both, v0.1.0, v0.2.0, v0.2.1, v0.3.0]
         default: both
 permissions:
   contents: read
@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: [v0.1.0, v0.2.0, v0.2.1]
+        version: [v0.1.0, v0.2.0, v0.2.1, v0.3.0]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,7 +48,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        version: [v0.1.0, v0.2.0, v0.2.1]
+        version: [v0.1.0, v0.2.0, v0.2.1, v0.3.0]
     steps:
       - uses: actions/checkout@v4
         with:

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0
+
 - WAL drains release decoded input batches before sorting and encoding their
   combined append, and move single batches without a concatenation copy.
   Page-bounded merges release exhausted timestamp planning state before final
