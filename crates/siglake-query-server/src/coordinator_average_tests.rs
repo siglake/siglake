@@ -74,6 +74,52 @@ fn rows(batches: &[RecordBatch]) -> serde_json::Value {
 const ORIGINAL: &str = "SELECT status, avg(size) AS avg_size, count(*) AS n FROM \"httplogs\" GROUP BY status ORDER BY n DESC LIMIT 20";
 
 #[tokio::test]
+async fn average_worker_sql_preserves_partial_column_order() {
+    let ctx = context(vec![input(&[
+        (Some(200), Some(10)),
+        (Some(200), None),
+        (None, Some(20)),
+    ])]);
+    for sql in [
+        ORIGINAL,
+        "SELECT status, size, avg(size) AS a FROM httplogs GROUP BY status, size",
+        "SELECT avg(size) AS a, count(*) AS n FROM httplogs",
+    ] {
+        let plan = average_plan(&ctx, sql).await;
+        let batches = ctx
+            .sql(&plan.worker_sql)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        plan.validate_states(&batches).unwrap();
+        for batch in &batches {
+            let actual = batch.schema();
+            let fields = |schema: &Schema| {
+                schema
+                    .fields()
+                    .iter()
+                    .map(|f| (f.name().clone(), f.data_type().clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                fields(&actual),
+                fields(&plan.partial_schema),
+                "{}",
+                plan.worker_sql
+            );
+        }
+        if !plan.keys.is_empty() {
+            let mut order: Vec<_> = (0..batches[0].num_columns()).collect();
+            order.swap(0, plan.keys.len());
+            let reordered = batches[0].project(&order).unwrap();
+            assert!(plan.validate_schema(&[reordered]).is_err());
+        }
+    }
+}
+
+#[tokio::test]
 async fn unequal_worker_populations_nulls_and_original_schema_are_exact() {
     let inputs = vec![
         input(&[

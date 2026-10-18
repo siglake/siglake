@@ -867,6 +867,20 @@ fn classify_average(
         .ok()?
         .build()
         .ok()?;
+    // The bare Aggregate unparser emits aggregate expressions before group
+    // keys, unlike its logical schema (keys first). Make the transport order
+    // explicit so remote, local-failover and WAL workers share these indexes.
+    let columns = worker
+        .schema()
+        .columns()
+        .into_iter()
+        .map(Expr::Column)
+        .collect::<Vec<_>>();
+    let worker = LogicalPlanBuilder::from(worker)
+        .project(columns)
+        .ok()?
+        .build()
+        .ok()?;
     let worker_sql = datafusion::sql::unparser::plan_to_sql(&worker)
         .ok()?
         .to_string();
