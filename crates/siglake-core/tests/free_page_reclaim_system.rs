@@ -3,6 +3,7 @@
 #![cfg(all(target_os = "linux", target_env = "gnu"))]
 
 use siglake_core::{reclaim_allocator_free_pages, AllocatorFreePageReclaim};
+use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -30,15 +31,50 @@ fn isolated(mode: &str) {
             ])
             .env(CHILD_MODE, mode)
             .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
+            let mut output = String::new();
+            child
+                .0
+                .stdout
+                .take()
+                .unwrap()
+                .take(65_537)
+                .read_to_string(&mut output)
+                .unwrap();
+            let mut errors = String::new();
+            child
+                .0
+                .stderr
+                .take()
+                .unwrap()
+                .take(65_537)
+                .read_to_string(&mut errors)
+                .unwrap();
+            assert!(
+                output.len() <= 65_536 && errors.len() <= 65_536,
+                "child output bound"
+            );
+            // Prefix libtest summaries so whole-workspace parsers do not count
+            // the isolated child again as an additional top-level test suite.
+            for line in output.lines().chain(errors.lines()) {
+                eprintln!("isolated_reclaim_child[{mode}] {line}");
+            }
             assert!(status.success(), "isolated {mode} exited {status}");
+            assert!(
+                output.contains("test result: ok. 1 passed; 0 failed;"),
+                "exact child test did not pass"
+            );
+            assert!(
+                output.contains(&format!("reclaim_child_completed mode={mode}")),
+                "child body did not complete"
+            );
             break;
         }
         assert!(Instant::now() < deadline, "isolated {mode} timed out");
@@ -114,4 +150,5 @@ fn system_allocator_child() {
         );
     }
     std::hint::black_box(&chunks);
+    println!("reclaim_child_completed mode={mode}");
 }
