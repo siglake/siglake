@@ -35112,6 +35112,14 @@ mod streaming_recluster_tests {
             .merge_file_slice_streaming(&table, &files, BLOOM_FILTER_COLUMNS, true, 1, None)
             .await
             .unwrap();
+        // tracing-core's sole-dispatch fast path initializes a new callsite
+        // from the first hitting thread's current subscriber. A concurrent
+        // merge without our scoped subscriber can otherwise cache `never`
+        // for the DEBUG plan event before this future reaches it. Keep a
+        // second registered (but never installed) dispatcher alive throughout
+        // capture so first-hit interest considers the registered subscribers.
+        // This does not install a global subscriber or change log assertions.
+        let _interest_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing::Dispatch::new(
             tracing_subscriber::fmt()
