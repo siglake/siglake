@@ -124,6 +124,56 @@ for expected in 'Caused by:' '  could not execute process `/tmp/query_server` (n
   fi
 done
 
+# A rustc killed by a signal is retried once; a tree that does not compile is
+# not. The two look alike in a build log -- both end in `error:` lines and a
+# red cargo exit -- so each spelling of a dead compiler and each spelling of an
+# ordinary failure is held against the matcher here.
+crash_log="$check_dir/crash.log"
+cat >"$crash_log" <<'EOF'
+   Compiling siglake-storage v0.3.0 (/work/crates/siglake-storage)
+error: rustc interrupted by SIGSEGV, printing backtrace
+note: rustc unexpectedly overflowed its stack! this is a bug
+error: could not compile `siglake-storage` (lib test)
+EOF
+if ! test_build_compiler_crashed "$crash_log"; then
+  echo "FAIL rustc's own signal report was not reported as a compiler crash" >&2
+  exit 1
+fi
+
+cat >"$crash_log" <<'EOF'
+error: could not compile `siglake-storage` (lib test)
+
+Caused by:
+  process didn't exit successfully: `/home/u/.rustup/bin/rustc --crate-name siglake_storage --test` (signal: 11, SIGSEGV: invalid memory reference)
+EOF
+if ! test_build_compiler_crashed "$crash_log"; then
+  echo "FAIL cargo's signal wait-status was not reported as a compiler crash" >&2
+  exit 1
+fi
+
+cat >"$crash_log" <<'EOF'
+error[E0308]: mismatched types
+ --> crates/siglake-storage/src/iceberg.rs:1:1
+error: could not compile `siglake-storage` (lib test) due to 1 previous error
+EOF
+if test_build_compiler_crashed "$crash_log"; then
+  echo "FAIL an ordinary compile error was reported as a compiler crash" >&2
+  exit 1
+fi
+
+# The renderer indents the source it quotes, so a crate that writes this text
+# in a string literal cannot buy itself a retry.
+cat >"$crash_log" <<'EOF'
+error[E0599]: no method named `signal`
+   |
+13 |     let note = "error: rustc interrupted by SIGSEGV, printing backtrace";
+   |                 ^^^^^
+EOF
+if test_build_compiler_crashed "$crash_log"; then
+  echo "FAIL a quoted diagnostic was reported as a compiler crash" >&2
+  exit 1
+fi
+
 log_root="$check_dir/ci-local"
 mkdir -p "$log_root/older" "$log_root/newer"
 printf 'Compiling old (/work/old/crates/core)\n' >"$log_root/older/test.log"
@@ -185,4 +235,4 @@ if attribution=$(find_concurrent_test_run \
   exit 1
 fi
 
-echo "ok (source refresh, replacement, never-executed summary, physical, caller-named, stale and self-pointer attribution fixtures)"
+echo "ok (source refresh, replacement, never-executed summary, compiler-crash, physical, caller-named, stale and self-pointer attribution fixtures)"
