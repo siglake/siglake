@@ -2617,6 +2617,8 @@ pub struct BoundedSegmentReader {
     identity: FileIdentity,
     physical_bytes: u64,
     uncompressed_bytes: u64,
+    lifecycle_paths: Vec<PathBuf>,
+    expected_owner: Option<String>,
 }
 
 impl BoundedSegmentReader {
@@ -2634,7 +2636,126 @@ impl BoundedSegmentReader {
             identity: file_identity(&metadata),
             physical_bytes,
             uncompressed_bytes,
+            lifecycle_paths: Vec::new(),
+            expected_owner: None,
         })
+    }
+
+    /// Open one already-selected basename across its bounded WAL lifecycle.
+    /// Only a missing path permits relocation; corrupt or unreadable input is
+    /// never bypassed. No directory listing, new segment, or snapshot change is
+    /// introduced. Strict `open`/`read_segment_bounded` callers are unchanged.
+    pub fn open_in_lifecycle(path: &Path, owner: Option<&str>) -> Result<Self> {
+        // Relocation requires the device/inode identity used on Unix. Keep the
+        // existing strict-path behavior where that identity is unavailable.
+        if !cfg!(unix) {
+            return Self::open(path);
+        }
+        let parent = path.parent().context("WAL member has no parent")?;
+        let stage = parent.file_name().and_then(|s| s.to_str());
+        anyhow::ensure!(
+            matches!(stage, Some(SEALED_DIR | PROCESSING_DIR | COMMITTED_DIR)),
+            "selected WAL member is outside the immutable lifecycle"
+        );
+        let root = parent.parent().context("WAL member has no root")?;
+        let name = path.file_name().context("WAL member has no basename")?;
+        let paths: Vec<PathBuf> = [SEALED_DIR, PROCESSING_DIR, COMMITTED_DIR]
+            .into_iter()
+            .map(|stage| root.join(stage).join(name))
+            .collect();
+        // One extra pass covers a reverse processing→sealed retry while the
+        // first pass is probing. Work is bounded, regardless of drain churn.
+        let mut last_missing = None;
+        for candidate in
+            std::iter::once(path).chain(paths.iter().map(PathBuf::as_path).cycle().take(6))
+        {
+            match Self::open(candidate) {
+                Ok(mut reader) => {
+                    reader.expected_owner = owner.map(str::to_owned);
+                    // Framed members carry their checksum/owner in the bytes.
+                    // Legacy sidecar-based readers retain strict path behavior.
+                    let mut header = [0u8; WAL_FRAME_HEADER_LEN];
+                    let mut file = reader.file.lock().expect("bounded WAL reader poisoned");
+                    file.seek(std::io::SeekFrom::Start(0))?;
+                    let read = reader.physical_bytes.min(header.len() as u64) as usize;
+                    file.read_exact(&mut header[..read])?;
+                    if let Some(owner) = owner {
+                        anyhow::ensure!(
+                            !matches!(
+                                classify_segment_owner_bytes(&header[..read], owner),
+                                WalOwner::Stale(_)
+                            ),
+                            "selected WAL member belongs to a different table"
+                        );
+                    }
+                    let framed = is_framed(&header[..read]);
+                    drop(file);
+                    if framed {
+                        reader.lifecycle_paths = paths.clone();
+                    } else {
+                        anyhow::ensure!(
+                            candidate == path,
+                            "legacy WAL member moved before admission"
+                        );
+                    }
+                    return Ok(reader);
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    last_missing = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_missing.expect("at least one path was attempted"))
+    }
+
+    /// A basename observed in two lifecycle directories must still identify
+    /// the same admitted file before the query can deduplicate it.
+    pub fn same_file(&self, other: &Self) -> bool {
+        #[cfg(not(unix))]
+        {
+            let _ = other;
+            false
+        }
+        #[cfg(unix)]
+        {
+            self.identity == other.identity && self.physical_bytes == other.physical_bytes
+        }
+    }
+
+    fn verify_selected_path(&self) -> Result<()> {
+        for path in std::iter::once(self.path.as_path()).chain(
+            self.lifecycle_paths
+                .iter()
+                .map(PathBuf::as_path)
+                .cycle()
+                .take(6),
+        ) {
+            match fs::metadata(path) {
+                Ok(metadata) => {
+                    anyhow::ensure!(
+                        file_identity(&metadata) == self.identity
+                            && metadata.len() == self.physical_bytes,
+                        "selected WAL segment {} was replaced or resized after admission",
+                        path.display()
+                    );
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("restat selected WAL segment {}", path.display()))
+                }
+            }
+        }
+        anyhow::bail!(
+            "selected WAL segment {} disappeared from its admitted lifecycle",
+            self.path.display()
+        )
     }
 
     pub fn physical_bytes(&self) -> u64 {
@@ -2653,16 +2774,7 @@ impl BoundedSegmentReader {
                 self.uncompressed_bytes
             );
         }
-        let path_metadata = fs::metadata(&self.path)
-            .with_context(|| format!("restat selected WAL segment {}", self.path.display()))?;
-        if file_identity(&path_metadata) != self.identity
-            || path_metadata.len() != self.physical_bytes
-        {
-            bail!(
-                "selected WAL segment {} was replaced or resized after admission",
-                self.path.display()
-            );
-        }
+        self.verify_selected_path()?;
 
         let mut file = self.file.lock().expect("bounded WAL reader poisoned");
         let descriptor_metadata = file
@@ -2695,14 +2807,14 @@ impl BoundedSegmentReader {
         {
             bail!("WAL segment {} grew after admission", self.path.display());
         }
-        let final_path_metadata = fs::metadata(&self.path)
-            .with_context(|| format!("finish selected WAL segment {}", self.path.display()))?;
-        if file_identity(&final_path_metadata) != self.identity
-            || final_path_metadata.len() != self.physical_bytes
-        {
-            bail!(
-                "selected WAL segment {} changed while being read",
-                self.path.display()
+        self.verify_selected_path()?;
+        if let Some(owner) = &self.expected_owner {
+            anyhow::ensure!(
+                !matches!(
+                    classify_segment_owner_bytes(&bytes, owner),
+                    WalOwner::Stale(_)
+                ),
+                "selected WAL member belongs to a different table"
             );
         }
         decode_segment_bounded_bytes(&self.path, &bytes, self.uncompressed_bytes)
@@ -4317,6 +4429,56 @@ mod crc_integrity_tests {
         assert!(
             reader.read(u64::MAX).is_err(),
             "same-size path replacement must not pass descriptor admission"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_reader_refuses_replacement_growth_and_unowned_paths() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_one_segment(tmp.path());
+        let reader = BoundedSegmentReader::open_in_lifecycle(&path, None).unwrap();
+        let moved = claim_segment(&path).unwrap();
+        let replacement = moved.with_extension("replacement");
+        fs::write(&replacement, fs::read(&moved).unwrap()).unwrap();
+        fs::rename(replacement, moved).unwrap();
+        assert!(
+            reader.read(u64::MAX).is_err(),
+            "same-size replacement is not relocation"
+        );
+
+        let path = write_one_segment(tmp.path());
+        let reader = BoundedSegmentReader::open_in_lifecycle(&path, None).unwrap();
+        let moved = claim_segment(&path).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(moved)
+            .unwrap()
+            .write_all(b"growth")
+            .unwrap();
+        assert!(reader.read(u64::MAX).is_err());
+
+        let path = write_one_segment(tmp.path());
+        let outside = tmp.path().join("outside.arrow");
+        fs::rename(path, &outside).unwrap();
+        assert!(BoundedSegmentReader::open_in_lifecycle(&outside, None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_reader_keeps_frame_integrity_after_relocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_one_segment(tmp.path());
+        let reader = BoundedSegmentReader::open_in_lifecycle(&path, None).unwrap();
+        let moved = claim_segment(&path).unwrap();
+        let mut bytes = fs::read(&moved).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(moved, bytes).unwrap();
+        assert!(
+            reader.read(u64::MAX).is_err(),
+            "same-inode corruption must still fail CRC/decode"
         );
     }
 
