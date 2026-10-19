@@ -1,18 +1,22 @@
 # Things deliberately not yet done
 
-The engineering record of what Siglake 0.1.0 leaves out on purpose, why, and
+The engineering record of what Siglake leaves out on purpose, why, and
 what would change it — one entry per decision, kept current with the code. It
 moved here from the README on 2026-09-15; the docs site's
 [Limitations](https://docs.siglake.dev/about/limitations/) page is the
 user-facing summary of the same list. The mechanisms named below are described
 in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-- **The Iceberg 0.10.1 / Arrow 58 / DataFusion 53.1 / OpenDAL 0.57 stack has
-  no matched AWS performance comparison yet.** Its strict local gate passed in
-  run #136 at `bfc1fe5`, but the retained AWS candidate and pre-adoption round
-  differ in query memory, peer count and storage layout. The pre-registered
-  identities, launch contract, tolerances and pending verdict are in the
-  [slice 8 performance ledger](../bench/fork-rebase/README.md#slice-8-ledger--performance-acceptance-pre-registered).
+- **The dependency rebase has matched historical performance evidence with
+  explicit limits.** The October 11 pre-adoption/current comparison kept all
+  21 median ratios below 2x, but four original absolute latency goals failed.
+  Intervening fixes and missing older provenance prevent a dependency-only
+  causal claim. Current typed/cancellation and exact aggregate checks are
+  recorded separately in the [stack qualification report](../results/release-validation/20261019-stack-field-qualification.md).
+- **The clipped-text 10 ms / 25 ms goals remain unmet.** The retained run
+  measured about 386 ms for the keyword query and 27 ms for the last-25 query,
+  while exact results and policy checks passed. This performance work is
+  tracked for 0.4.0; it is not a speed claim for 0.3.0.
 - **The persistent ingest lane cap has no timed reclamation.** Once
   `ingester.maxLanes` admits a `(tenant, index)` lane, an empty queue does not
   release its slot; only process shutdown drains the map. A novel key past the
@@ -1632,7 +1636,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   extractor cannot address the synthesized `aws.cloudwatch.log_stream` path.
   Auto-promotion does not promote the parent object as a `Utf8` column.
   Leaving it off is still the shipped answer — qualifying the bounds is not a
-  decision to turn it on.
+  decision to turn it on. The mature-table rewrite, contention/freshness and
+  complete S3 cost qualification remains open for 0.4.0. A successful young-table
+  experiment or small attachment control does not establish those properties.
+  Setting the threshold to zero stops new automatic declarations; it does not
+  undo columns or stop backfill for promotions already declared explicitly or
+  automatically.
 - **Promoted columns written before 0.3.0 lose their speedup until the files
   are rewritten.** Through 0.2.1 the promotion extractor retried a literal
   dotted key only at the top level while `attr_get` retried it at every level,

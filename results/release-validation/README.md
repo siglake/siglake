@@ -8,6 +8,13 @@ Raw metrics and logs live in the run's durable artifact directory; they are not
 benchmark leaderboard inputs. Preserve failed attempts and subsequent reruns.
 The public operations docs are the release-wide coverage ledger.
 
+## October 19, 2026
+
+The [stack and field qualification report](20261019-stack-field-qualification.md)
+separates current typed/cancellation and exact aggregate checks, retained
+matched rebase observations, scoped memory evidence and unchanged failed goals.
+It is distinct from validation of a subsequently published public image.
+
 ## October 4, 2026
 
 The public v0.2.1 24-hour and 72-hour attempts both failed and do not qualify
