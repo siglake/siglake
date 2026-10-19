@@ -704,13 +704,36 @@ fn select_buffer_segments(
         .increment(pruned as u64);
     metrics::counter!("siglake_query_wal_buffer_segments_kept_total").increment(paths.len() as u64);
 
+    open_selected_buffer_segments(paths, owner, compressed_max)
+}
+
+fn open_selected_buffer_segments(
+    paths: Vec<PathBuf>,
+    owner: Option<&str>,
+    compressed_max: u64,
+) -> Result<SelectedBufferSegments> {
     let mut names = Vec::with_capacity(paths.len());
-    let mut readers = Vec::with_capacity(paths.len());
+    let mut readers: Vec<siglake_wal::BoundedSegmentReader> = Vec::with_capacity(paths.len());
+    let mut unique_paths = Vec::with_capacity(paths.len());
+    let mut seen: HashMap<String, usize> = HashMap::new();
     let mut compressed_bytes = 0u64;
     let mut decode_charge_bytes = 0u64;
     for path in &paths {
-        let reader = siglake_wal::BoundedSegmentReader::open(path)
+        let reader = siglake_wal::BoundedSegmentReader::open_in_lifecycle(path, owner)
             .with_context(|| format!("open selected WAL segment {}", path.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("selected WAL segment has no UTF-8 basename")?;
+        if let Some(&index) = seen.get(name) {
+            anyhow::ensure!(
+                readers[index].same_file(&reader),
+                "ambiguous selected WAL basename {name}"
+            );
+            continue;
+        }
+        seen.insert(name.to_string(), readers.len());
+        unique_paths.push(path.clone());
         let physical = reader.physical_bytes();
         compressed_bytes = compressed_bytes.saturating_add(physical);
         if compressed_max > 0 && compressed_bytes > compressed_max {
@@ -728,15 +751,11 @@ fn select_buffer_segments(
             .saturating_add(physical)
             .saturating_add(ipc.saturating_mul(2));
         readers.push(reader);
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .context("selected WAL segment has no UTF-8 basename")?;
         names.push(name.to_string());
     }
     names.sort_unstable();
     Ok(SelectedBufferSegments {
-        paths,
+        paths: unique_paths,
         readers,
         names,
         compressed_bytes,
@@ -3171,6 +3190,125 @@ mod tests {
             select_buffer_segments(tmp.path(), &HashSet::new(), None, None, u64::MAX).unwrap();
         std::fs::remove_file(&selected.paths[0]).unwrap();
         assert!(read_selected_buffer_batches(&selected).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_lifecycle_rename_before_open_and_before_decode_keeps_exact_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sealed_segment(tmp.path(), 2);
+        let (paths, _, _) =
+            list_uncommitted_segments_bounded(tmp.path(), &HashSet::new(), None, None, 0).unwrap();
+        let processing = siglake_wal::claim_segment(&paths[0]).unwrap();
+        // A new seal is deliberately outside the generation already selected.
+        write_sealed_segment(tmp.path(), 3);
+        let selected = open_selected_buffer_segments(paths, None, u64::MAX).unwrap();
+        let charge = selected.decode_charge_bytes;
+        siglake_wal::finish_segment(&processing).unwrap();
+        let batches = read_selected_buffer_batches(&selected).unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        assert_eq!(selected.names.len(), 1);
+        assert!(decoded_payload_bytes(&batches) <= charge);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_lifecycle_double_listing_is_charged_and_decoded_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sealed_segment(tmp.path(), 2);
+        let (mut paths, _, _) =
+            list_uncommitted_segments_bounded(tmp.path(), &HashSet::new(), None, None, 0).unwrap();
+        let processing = siglake_wal::claim_segment(&paths[0]).unwrap();
+        let single = open_selected_buffer_segments(paths.clone(), None, u64::MAX).unwrap();
+        // A non-atomic directory walk can observe the same basename at both
+        // sides of a rename. It still denotes one immutable segment.
+        paths.push(processing);
+        let selected = open_selected_buffer_segments(paths, None, u64::MAX).unwrap();
+        assert_eq!(selected.names.len(), 1);
+        assert_eq!(selected.compressed_bytes, single.compressed_bytes);
+        assert_eq!(selected.decode_charge_bytes, single.decode_charge_bytes);
+        assert_eq!(
+            read_selected_buffer_batches(&selected)
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_lifecycle_conflicting_basename_refuses_instead_of_deduplicating() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sealed_segment(tmp.path(), 2);
+        let (mut paths, _, _) =
+            list_uncommitted_segments_bounded(tmp.path(), &HashSet::new(), None, None, 0).unwrap();
+        let processing = siglake_wal::claim_segment(&paths[0]).unwrap();
+        std::fs::copy(&processing, &paths[0]).unwrap();
+        paths.push(processing);
+        assert!(open_selected_buffer_segments(paths, None, u64::MAX).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_lifecycle_missing_or_corrupt_member_is_not_omitted() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sealed_segment(tmp.path(), 2);
+        let (paths, _, _) =
+            list_uncommitted_segments_bounded(tmp.path(), &HashSet::new(), None, None, 0).unwrap();
+        let processing = siglake_wal::claim_segment(&paths[0]).unwrap();
+        let bytes = std::fs::read(&processing).unwrap();
+        std::fs::remove_file(&processing).unwrap();
+        assert!(open_selected_buffer_segments(paths.clone(), None, u64::MAX).is_err());
+        std::fs::write(&processing, b"corrupt member").unwrap();
+        assert!(open_selected_buffer_segments(paths.clone(), None, u64::MAX).is_err());
+        std::fs::write(&processing, &bytes).unwrap();
+        let selected = open_selected_buffer_segments(paths, None, u64::MAX).unwrap();
+        std::fs::remove_file(processing).unwrap();
+        assert!(read_selected_buffer_batches(&selected).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_lifecycle_preserves_consumed_exclusion_and_rejects_foreign_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owned = "00000000-0000-0000-0000-000000000001";
+        let foreign = "00000000-0000-0000-0000-000000000002";
+        let mut writer =
+            WalWriter::with_thresholds(tmp.path(), "owned", 10_000, Duration::from_secs(60))
+                .unwrap();
+        writer
+            .bind_table_uuid(Some(owned.parse().unwrap()))
+            .unwrap();
+        writer.append_events(&[Event::now("owned row")]).unwrap();
+        let sealed = writer.seal().unwrap().unwrap().path;
+        let consumed = HashSet::from([sealed.file_name().unwrap().to_str().unwrap().to_string()]);
+        assert!(
+            select_buffer_segments(tmp.path(), &consumed, None, Some(owned), u64::MAX)
+                .unwrap()
+                .names
+                .is_empty()
+        );
+        siglake_wal::claim_segment(&sealed).unwrap();
+        assert!(
+            select_buffer_segments(tmp.path(), &consumed, None, Some(owned), u64::MAX)
+                .unwrap()
+                .names
+                .is_empty()
+        );
+        assert!(
+            open_selected_buffer_segments(vec![sealed.clone()], Some(foreign), u64::MAX).is_err()
+        );
+        let selected = open_selected_buffer_segments(vec![sealed], Some(owned), u64::MAX).unwrap();
+        assert_eq!(
+            read_selected_buffer_batches(&selected)
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            1
+        );
     }
 
     #[test]
