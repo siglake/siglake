@@ -1130,10 +1130,33 @@ if [ "$WITH_HEAVY" = 1 ]; then
     # conditional-write tests, the six Postgres suites) compile before they
     # run, so the same dead compiler can land in this job. It is named and not
     # replayed: a retry is two image builds and another compose cycle, ~20 min,
-    # which is not what a transient rustc is worth. A rustc that died INSIDE
-    # `docker build` prints through buildkit's step prefixes and is not matched
-    # — that build has its own container and its own cache, and nothing here
-    # could tell it apart from a Dockerfile that does not build.
+    # which is not what a transient rustc is worth.
+    #
+    # A rustc that died INSIDE the image build above is NOT matched, and task
+    # #6954 settled why: under `-q` there is nothing in this log to match. The
+    # buildx `--quiet` flag maps to progressui's QuietMode, QuietMode returns
+    # newDiscardDisplay(), and that display's done() is a no-op — so
+    # trace.printErrorLogs, the `------ > [builder N/M] RUN …:` block that
+    # carries the failing step's own output, is never reached (buildkit
+    # util/progress/progressui/display.go). The step log holding
+    # `error: rustc interrupted by SIGSEGV` is discarded with it, and what
+    # survives is the solve error alone: `ERROR: failed to solve: process
+    # "/bin/sh -c …" did not complete successfully: exit code: N`. Adding
+    # buildkit's `#<n> <elapsed> ` prefix to the matcher would catch nothing
+    # from this build. (Under the legacy builder `-q` buffers and flushes the
+    # whole build on failure, unprefixed, which the existing anchor already
+    # matches; this box runs buildkit, so that is not the path taken.)
+    #
+    # The exit code does carry the signal (139 for SIGSEGV, 137 for an
+    # OOM-kill) and could be matched instead, but no run here has ever
+    # produced one: across the retained docker.logs under
+    # loglake-manager/var/external, every `phase image-build` is rc=0 and
+    # every buildkit step in them is CACHED or DONE, so there is no real
+    # output to write a fixture against. The compose-up build inside
+    # scripts/up.sh does print plain progress into this same log and would
+    # show a prefixed line, but it has never failed here either. A crash in
+    # either container has its own cache and its own memory limit; relabelling
+    # it would not retry it, so the label waits on captured output.
     if [ "$dk_ok" = 0 ] && cargo_compiler_crashed "$dlog"; then
       docker_status="FAIL (rustc killed by a signal; not retried, the job rebuilds two images${image_sizes:+; $image_sizes})"
       echo "  the compiler crashed in a host-side cargo step; see $dlog" >&2
