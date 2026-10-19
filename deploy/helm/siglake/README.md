@@ -552,6 +552,8 @@ metric would read double.
 `app.kubernetes.io/component` onto the series, which the operator's
 autoscaling PromQL selects on.
 
+The chart ships a `PrometheusRule` with 39 alerts.
+
 Set `prometheusRule.enabled=true` for alerts on the failure modes
 Siglake has hit or pins with a deterministic loss regression: silent-loss counters (abandoned mirror
 registrations, CRC mismatches, refused writes, lost group-count

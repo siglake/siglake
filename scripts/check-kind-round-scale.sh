@@ -28,7 +28,7 @@ SELF=scripts/check-kind-round-scale.sh
 ROUND_SCRIPT=scripts/kind-round.sh
 # The shipping documents that quote the evidence file by name, relative to the
 # doc root passed to check_round_script.
-DOC_FILES=(README.md deploy/kind/README.md)
+DOC_FILES=(deploy/kind/README.md)
 
 # `scale-<n>-<n>-<n>.json` anywhere in the tree. Every occurrence must be the
 # name the constants produce. This file is exempt: like scripts/check-public-

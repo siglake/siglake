@@ -52,7 +52,7 @@ quantiles stay as one sample per compactor â€” percentiles cannot be averaged â€
 while the rebuild counters add the same table across compactors and retain a
 separate line for every other table (#5231).
 
-It also holds the README to the PrometheusRule: the "No built-in UI" bullet
+It also holds the Helm chart README to the PrometheusRule: the monitoring section
 states how many alerts the rule ships, and that number is counted from the
 template source here so it cannot drift as alerts are added.
 
@@ -208,7 +208,7 @@ PREREGISTER_LOOP = re.compile(r"\bfor\s+\w+\s+in\s+\w+\.series\b")
 COUNTER_MACRO = "metrics::counter!("
 STR_ARG = re.compile(r'^"([^"]*)"$')
 
-README = pathlib.Path("README.md")
+README = pathlib.Path("deploy/helm/siglake/README.md")
 RULE_TEMPLATE = pathlib.Path("deploy/helm/siglake/templates/prometheusrule.yaml")
 PROMETHEUS_RULE_TESTS = pathlib.Path(
     "deploy/helm/siglake/tests/prometheusrule.test.yaml"
@@ -219,7 +219,7 @@ PROMETHEUS_RULE_TESTS = pathlib.Path(
 # `query.warmIntervalSecs > 0` conditional, so no single render sees every
 # alert. The README's number is what an operator reading the file finds.
 ALERT_LINE = re.compile(r"^\s*-\s+alert:\s*\S", re.M)
-# The sentence in README's "No built-in UI" bullet. Anchored on the exact
+# The sentence in the Helm chart README. Anchored on the exact
 # phrasing on purpose: if the wording changes the check must FAIL and be
 # re-pointed, not silently stop guarding.
 README_ALERT_COUNT = re.compile(r"`PrometheusRule` with (\d+) alerts")
@@ -3033,7 +3033,7 @@ def check_alert_count(template: str, readme: str) -> list[str]:
     if not claimed:
         problems.append(
             f"{README}: no sentence matching /{README_ALERT_COUNT.pattern}/; "
-            f"the alert count in the 'No built-in UI' bullet is unguarded"
+            f"the chart documentation must state its alert count"
         )
     for c in claimed:
         if c != n:
