@@ -362,6 +362,7 @@ pub const COMPACTOR_ALERTED_COUNTERS: &[AlertedCounter] = &[
             &[("stage", "expire")],
             &[("stage", "drain")],
             &[("stage", "agg_fold")],
+            &[("stage", "aggregate_maintenance")],
             &[("stage", "agg_short_repair")],
             &[("stage", "inline_coverage_census")],
             &[("stage", "recluster")],

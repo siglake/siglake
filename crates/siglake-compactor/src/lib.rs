@@ -981,6 +981,8 @@ pub struct Compactor {
     /// processes retain the concurrent scheduler; the packaged process removes
     /// the source scheduler's potential overlap.
     decoded_work_gate: Option<Arc<tokio::sync::Semaphore>>,
+    #[cfg(test)]
+    aggregate_maintenance_hold_for_test: Option<Arc<tokio::sync::Notify>>,
     /// See [`Self::with_poison_attempts`]; `None` reads the environment.
     poison_attempts: Option<u32>,
     /// #3143: consecutive read failures charged to each local segment, by file
@@ -1056,6 +1058,8 @@ impl Compactor {
             drain_cycle_budget: None,
             decoded_work_gate: serialize_drain_and_recluster_from(cgroup_memory_limit_bytes())
                 .then(|| Arc::new(tokio::sync::Semaphore::new(1))),
+            #[cfg(test)]
+            aggregate_maintenance_hold_for_test: None,
             poison_attempts: None,
             segment_read_failures: Default::default(),
             verified_owner_for_test: None,
@@ -2637,6 +2641,77 @@ impl Compactor {
         }
     }
 
+    fn aggregate_maintenance_due(&self) -> bool {
+        #[cfg(test)]
+        if self.aggregate_maintenance_hold_for_test.is_some() {
+            return true;
+        }
+        agg_fold_due()
+    }
+
+    /// Keep fold, deficit census and inline census ordered under one maintenance
+    /// lease. The deficit census may itself fold many outstanding deltas; it is
+    /// not cheap enough to put on a concurrent writer's drain critical path.
+    async fn run_aggregate_maintenance_once(
+        &self,
+        min_backlog: usize,
+        drain_watchdog: Option<Duration>,
+    ) {
+        #[cfg(test)]
+        if let Some(entered) = self.aggregate_maintenance_hold_for_test.as_ref() {
+            entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+        let _fold_guard = StageTimer(
+            "siglake_compactor_agg_fold_duration_seconds",
+            std::time::Instant::now(),
+        );
+        if bounded(drain_watchdog, self.run_agg_fold_once(min_backlog))
+            .await
+            .is_none()
+        {
+            tracing::error!("group-count delta fold exceeded the watchdog ceiling");
+            metrics::counter!("siglake_compactor_watchdog_trips_total",
+                        "stage" => "agg_fold")
+            .increment(1);
+        }
+        // The deficit census (#3000), inside the fold's lease and on its
+        // own much slower interval. It runs AFTER the fold so it reads
+        // the freshly folded base: the fold is what turns an outstanding
+        // delta into coverage, and a census in front of it would read
+        // every just-committed table as short.
+        if let Some(interval) = agg_short_scan_interval() {
+            if agg_short_scan_due(interval) {
+                let budget = if agg_short_repair_enabled() {
+                    agg_short_repair_max_tables()
+                } else {
+                    0
+                };
+                self.run_agg_short_repair_once(budget, drain_watchdog).await;
+            }
+        }
+        // The inline object's coverage census (#4674), on the same
+        // lease and its own interval. Separate from the census above
+        // because it measures a different thing: that one is an
+        // aggregate with a provable chain and too few rows, this one is
+        // an object with the rows and no chain to prove them through.
+        // After the fold for the same reason too — the fold is what
+        // turns an outstanding delta into coverage.
+        if inline_coverage_scan_interval().is_some_and(inline_coverage_scan_due)
+            && bounded(drain_watchdog, self.run_inline_coverage_census_once())
+                .await
+                .is_none()
+        {
+            // Safe to cut: the census writes nothing anywhere. What a
+            // cut costs is the gauges it had not reached yet, which
+            // keep their previous reading until the next pass.
+            tracing::error!("inline-coverage census exceeded the watchdog ceiling");
+            metrics::counter!("siglake_compactor_watchdog_trips_total",
+                        "stage" => "inline_coverage_census")
+            .increment(1);
+        }
+    }
+
     /// Every namespace whose aggregate artifacts this compactor maintains: the
     /// base one plus each `tenant_*` namespace the catalog reports.
     ///
@@ -4086,6 +4161,19 @@ impl Compactor {
     }
 
     pub async fn run_loop(self: std::sync::Arc<Self>, poll_interval: Duration) -> Result<()> {
+        let concurrent = std::env::var("SIGLAKE_COMPACTOR_CONCURRENT_RECLUSTER")
+            .ok()
+            .as_deref()
+            == Some("1");
+        self.run_loop_with_concurrency(poll_interval, concurrent)
+            .await
+    }
+
+    async fn run_loop_with_concurrency(
+        self: Arc<Self>,
+        poll_interval: Duration,
+        concurrent: bool,
+    ) -> Result<()> {
         preregister_inline_coverage_census_metrics();
         // Maintenance (re-clustering, snapshot expiry) runs on its own cadence,
         // only while ingest is idle, so it never contends with the commit hot
@@ -4136,10 +4224,7 @@ impl Compactor {
         // ingest is idle, so compaction makes steady progress under a sustained
         // baseline write rate (logging is bursty but never fully idle). Default off
         // preserves drain-priority. See docs/DESIGN_continuous_compaction_and_ingest.md.
-        let concurrent = std::env::var("SIGLAKE_COMPACTOR_CONCURRENT_RECLUSTER")
-            .ok()
-            .as_deref()
-            == Some("1");
+
         // A.2 concurrent scheduler (#63, second half): recluster passes run on
         // a SPAWNED task so the drain keeps cycling while a multi-minute merge
         // executes — freshness no longer waits on maintenance at all. The
@@ -4150,6 +4235,10 @@ impl Compactor {
         // optimistic concurrency (the same argument — proven cross-process in
         // the fleet round — applies in-process). One pass in flight at a time.
         let mut recluster_task: Option<tokio::task::JoinHandle<Result<usize>>> = None;
+        // JoinSet owns cancellation when the loop is dropped. Never detach
+        // census work or admit a second pass while the first is still running.
+        // Constrained processes retain the original sequential memory behavior.
+        let mut aggregate_tasks = tokio::task::JoinSet::new();
         let mut task_throttled = false;
         // Per-bin heartbeat from the in-flight re-clustering pass, so the
         // watchdog below can tell SLOW from WEDGED. See its comment.
@@ -4171,11 +4260,14 @@ impl Compactor {
         let idle_backoff_base = drain_idle_backoff_base(poll_interval);
         let mut idle_backoff = idle_backoff_base;
         loop {
-            // Bounds EVERYTHING below, including the `continue`s and the sleep, so
-            // `iteration - cycle - maintenance` is the loop's own overhead rather
-            // than a residual to be guessed at. Three attributions in a row put the
-            // unexplained time in the wrong place (fetch: 4.8%, not 35%; sleep:
-            // 5.2%, not 60%) because the outermost unit was never measured.
+            while let Some(result) = aggregate_tasks.try_join_next() {
+                if let Err(error) = result {
+                    tracing::error!(?error, "aggregate maintenance task failed");
+                }
+            }
+            // Includes every loop continue and sleep. Background re-clustering
+            // and aggregate maintenance have their own overlapping wall spans;
+            // subtracting those spans from this timer is not loop overhead.
             let _iter_guard = StageTimer(
                 "siglake_compactor_loop_iteration_duration_seconds",
                 std::time::Instant::now(),
@@ -4347,57 +4439,27 @@ impl Compactor {
             // rewriting the base (26.5MB on that table), while an idle cycle
             // takes whatever is there. A heavy ingest gets a few large folds
             // instead of either none at all or one every minute.
-            if self.role.maintains() && agg_fold_due() && self.maintenance_lease("agg_fold").await {
+            if aggregate_tasks.is_empty()
+                && self.role.maintains()
+                && self.aggregate_maintenance_due()
+                && self.maintenance_lease("agg_fold").await
+            {
                 let idle = !draining && self.pending_sealed_total() == 0;
                 let min_backlog = if idle { 1 } else { agg_fold_busy_backlog() };
-                let _fold_guard = StageTimer(
-                    "siglake_compactor_agg_fold_duration_seconds",
-                    std::time::Instant::now(),
-                );
-                if bounded(drain_watchdog, self.run_agg_fold_once(min_backlog))
-                    .await
-                    .is_none()
-                {
-                    tracing::error!("group-count delta fold exceeded the watchdog ceiling");
-                    metrics::counter!("siglake_compactor_watchdog_trips_total",
-                        "stage" => "agg_fold")
-                    .increment(1);
-                }
-                // The deficit census (#3000), inside the fold's lease and on its
-                // own much slower interval. It runs AFTER the fold so it reads
-                // the freshly folded base: the fold is what turns an outstanding
-                // delta into coverage, and a census in front of it would read
-                // every just-committed table as short.
-                if let Some(interval) = agg_short_scan_interval() {
-                    if agg_short_scan_due(interval) {
-                        let budget = if agg_short_repair_enabled() {
-                            agg_short_repair_max_tables()
-                        } else {
-                            0
-                        };
-                        self.run_agg_short_repair_once(budget, drain_watchdog).await;
-                    }
-                }
-                // The inline object's coverage census (#4674), on the same
-                // lease and its own interval. Separate from the census above
-                // because it measures a different thing: that one is an
-                // aggregate with a provable chain and too few rows, this one is
-                // an object with the rows and no chain to prove them through.
-                // After the fold for the same reason too — the fold is what
-                // turns an outstanding delta into coverage.
-                if inline_coverage_scan_interval().is_some_and(inline_coverage_scan_due)
-                    && bounded(drain_watchdog, self.run_inline_coverage_census_once())
-                        .await
-                        .is_none()
-                {
-                    // Safe to cut: the census writes nothing anywhere. What a
-                    // cut costs is the gauges it had not reached yet, which
-                    // keep their previous reading until the next pass.
-                    tracing::error!("inline-coverage census exceeded the watchdog ceiling");
-                    metrics::counter!("siglake_compactor_watchdog_trips_total",
-                        "stage" => "inline_coverage_census")
-                    .increment(1);
-                }
+                let me = Arc::clone(&self);
+                // Preserve the old anti-starvation placement, but do not make
+                // concurrent ingest await a potentially expensive census. The
+                // lease is the existing TTL election, not a task-owned lock.
+                dispatch_aggregate_maintenance(
+                    &mut aggregate_tasks,
+                    concurrent && self.decoded_work_gate.is_none(),
+                    async move {
+                        if bounded(drain_watchdog, me.run_aggregate_maintenance_once(min_backlog, drain_watchdog)).await.is_none() {
+                            tracing::error!("aggregate maintenance exceeded the watchdog ceiling");
+                            metrics::counter!("siglake_compactor_watchdog_trips_total", "stage" => "aggregate_maintenance").increment(1);
+                        }
+                    },
+                ).await;
             }
             let mut throttled = false;
             if backlog_gate > 0 && self.pending_sealed_total() > backlog_gate {
@@ -5487,6 +5549,25 @@ fn emit_delete_task_observation(report: &DeleteTaskObservationReport) {
             metrics::gauge!("siglake_compactor_delete_tasks_nonterminal", "state" => *state)
                 .set(*value as f64);
         }
+    }
+}
+
+/// Submit at most one maintenance pass. Await on the original sequential path;
+/// otherwise the owned task permits the next WAL cycle to proceed during IO.
+/// Abort is cooperative at async yields; synchronous CPU still has the process
+/// resource/watchdog bounds, just as it did on the sequential path.
+async fn dispatch_aggregate_maintenance<F>(
+    tasks: &mut tokio::task::JoinSet<()>,
+    background: bool,
+    work: F,
+) where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    assert!(tasks.is_empty(), "aggregate maintenance already running");
+    if background {
+        tasks.spawn(work);
+    } else {
+        work.await;
     }
 }
 
@@ -8505,6 +8586,121 @@ mod agg_fold_tests {
             }
         }
         out
+    }
+
+    #[tokio::test]
+    async fn aggregate_maintenance_actual_loop_drains_during_census_and_owns_cancellation() {
+        struct AbortLoop(tokio::task::AbortHandle);
+        impl Drop for AbortLoop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        for constrained in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let wal = tmp.path().join("wal");
+            let ice = Arc::new(
+                IcebergContext::open(&tmp.path().join("warehouse"))
+                    .await
+                    .unwrap(),
+            );
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let mut compactor =
+                Compactor::new(&wal, ice.clone()).with_serial_decoded_work_for_test(constrained);
+            compactor.aggregate_maintenance_hold_for_test = Some(entered.clone());
+            let compactor = Arc::new(compactor);
+            let weak = Arc::downgrade(&compactor);
+            let task =
+                tokio::spawn(compactor.run_loop_with_concurrency(Duration::from_millis(10), true));
+            let _abort_on_unwind = AbortLoop(task.abort_handle());
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .unwrap();
+            let mut writer = siglake_wal::WalWriter::with_thresholds(
+                &wal,
+                "maintenance",
+                1,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+            writer
+                .append_events(&[Event::now("maintenance must not block this row")])
+                .unwrap();
+            drop(writer);
+            if constrained {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(
+                    siglake_wal::list_sealed(&wal).unwrap().len(),
+                    1,
+                    "constrained process preserves serial memory scheduling"
+                );
+            } else {
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    loop {
+                        if siglake_wal::list_sealed(&wal).unwrap().is_empty()
+                            && std::fs::read_dir(wal.join(siglake_wal::PROCESSING_DIR))
+                                .map(|entries| entries.count() == 0)
+                                .unwrap_or(true)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("actual run_loop must drain while census IO remains pending");
+                let ctx = datafusion::prelude::SessionContext::new();
+                ice.register_with_datafusion(&ctx).await.unwrap();
+                let batches = ctx
+                    .sql("SELECT raw FROM events")
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+            }
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while weak.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("dropping run_loop must cancel its pending census and release Arc ownership");
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_maintenance_sequential_path_and_watchdog_stay_bounded() {
+        let mut tasks = tokio::task::JoinSet::new();
+        let blocked = dispatch_aggregate_maintenance(&mut tasks, false, std::future::pending());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), blocked)
+                .await
+                .is_err(),
+            "sequential mode must still await maintenance"
+        );
+        assert!(tasks.is_empty());
+        dispatch_aggregate_maintenance(&mut tasks, true, async {
+            assert!(bounded(
+                Some(Duration::from_millis(20)),
+                std::future::pending::<()>()
+            )
+            .await
+            .is_none());
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), tasks.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            tasks.is_empty(),
+            "a bounded pass frees the next maintenance slot"
+        );
     }
 
     #[tokio::test]

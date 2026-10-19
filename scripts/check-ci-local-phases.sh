@@ -20,6 +20,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/ci-local-phases.sh
 
+# Synthetic phase timestamps must not tick with wall time between assignments.
+# Unsetting removes Bash's special SECONDS behavior; the separately spawned
+# real-block driver below still has its normal elapsed clock.
+unset SECONDS
+
 work=$(mktemp -d "${TMPDIR:-/tmp}/siglake-ci-local-phases.XXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 
