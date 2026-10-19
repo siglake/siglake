@@ -69,19 +69,18 @@ where
             r"repeatable\ read",
         )
         .append_pair("options[statement_timeout]", "30000");
-    let isolation_probe = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect(uri.as_str())
-        .await?;
-    let actual_isolation: String = sqlx::query_scalar("SHOW default_transaction_isolation")
-        .fetch_one(&isolation_probe)
-        .await?;
-    isolation_probe.close().await;
-    ensure!(actual_isolation == "repeatable read");
-    let outcome = timeout(
-        Duration::from_secs(90),
-        case(admin.clone(), uri.into(), schema.clone()),
-    )
+    let outcome = timeout(Duration::from_secs(90), async {
+        let isolation_probe = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(uri.as_str())
+            .await?;
+        let actual_isolation: String = sqlx::query_scalar("SHOW default_transaction_isolation")
+            .fetch_one(&isolation_probe)
+            .await?;
+        isolation_probe.close().await;
+        ensure!(actual_isolation == "repeatable read");
+        case(admin.clone(), uri.into(), schema.clone()).await
+    })
     .await
     .context("bounded PostgreSQL initialization case")
     .and_then(|x| x);
