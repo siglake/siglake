@@ -4,6 +4,14 @@
 
 ## 0.3.0
 
+- Auto-promotion remains disabled by default. Remaining optional qualification is
+  deferred to 0.4.0: the latest matched young-table run measured freshness p95
+  of 117.8402 s with promotion versus 21.1050 s without it (5.5835×, above the
+  unchanged 1.25× limit). Eventual exact physical coverage passed, but the
+  required attributed promotion log was missing and the original reader
+  reported `not_assessed`. This release does not claim successful young-table
+  or mature-table cost qualification; see [limitations](docs/LIMITATIONS.md).
+
 - Concurrent PostgreSQL catalog initialization serializes physical table creation
   in one transaction. Failed or cancelled initialization releases the advisory
   lock; SQLite initialization is unchanged.

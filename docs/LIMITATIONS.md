@@ -1636,9 +1636,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   extractor cannot address the synthesized `aws.cloudwatch.log_stream` path.
   Auto-promotion does not promote the parent object as a `Utf8` column.
   Leaving it off is still the shipped answer — qualifying the bounds is not a
-  decision to turn it on. The mature-table rewrite, contention/freshness and
-  complete S3 cost qualification remains open for 0.4.0. A successful young-table
-  experiment or small attachment control does not establish those properties.
+  decision to turn it on. Remaining optional young-table qualification, as well
+  as mature-table rewrite, contention/freshness and complete S3 cost work, is
+  deferred to 0.4.0. The latest matched young-table run measured freshness p95
+  of 117.8402 s with promotion versus 21.1050 s without it: 5.5835× against the
+  unchanged 1.25× limit. Eventual physical candidate coverage was exact, but
+  the required attributed promotion log was missing, so the original reader
+  reported `not_assessed`. These adverse results remain failures; no successful
+  young-table or mature-table cost qualification is claimed. A small attachment
+  control does not establish those properties either.
   Setting the threshold to zero stops new automatic declarations; it does not
   undo columns or stop backfill for promotions already declared explicitly or
   automatically.
