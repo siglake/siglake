@@ -158,7 +158,7 @@ async fn postgres_failed_ddl_rolls_back_tables_and_releases_lock() -> Result<()>
     in_postgres(|admin, uri, schema| async move {
         // A conflicting type makes the second DDL fail after the first succeeds.
         sqlx::query(&format!(
-            "CREATE TYPE {schema}.iceberg_namespace_properties AS (value integer)"
+            "CREATE TYPE {schema}.iceberg_namespace_properties AS ENUM ('occupied')"
         ))
         .execute(&admin)
         .await?;
