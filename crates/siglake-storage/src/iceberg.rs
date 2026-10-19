@@ -18263,24 +18263,47 @@ impl IcebergContext {
         let promoted = self.promoted_for_table(&table);
         let file_extractor_version =
             file_extractor_version.map(|_| siglake_core::promotion_extractor_version(&promoted));
-        let (batch, bloom_owned): (RecordBatch, Vec<String>) = if promoted.is_empty() {
-            (batch, bloom_columns.iter().map(|s| s.to_string()).collect())
-        } else if file_extractor_version.is_none() {
-            // The mixed-writer regression supplies a physically stale promoted
-            // column. Recomputing it here would erase the state under test.
-            (batch, bloom_columns.iter().map(|s| s.to_string()).collect())
-        } else {
-            let batch = siglake_core::repromote_attributes(&batch, &promoted)
-                .map_err(|e| anyhow::anyhow!("promote batch for {table_ident}: {e}"))?;
-            let mut blooms: Vec<String> = bloom_columns.iter().map(|s| s.to_string()).collect();
-            for c in &promoted {
-                if c.ty == siglake_core::PromotedType::Utf8 && !blooms.iter().any(|b| b == &c.name)
-                {
-                    blooms.push(c.name.clone());
+        let (batch, bloom_owned, work_guard): (RecordBatch, Vec<String>, Option<AppendWorkGuard>) =
+            if promoted.is_empty() || file_extractor_version.is_none() {
+                // The mixed-writer regression supplies a physically stale promoted
+                // column. Recomputing it here would erase the state under test.
+                (
+                    batch,
+                    bloom_columns.iter().map(|s| s.to_string()).collect(),
+                    work_guard,
+                )
+            } else {
+                let mut blooms: Vec<String> = bloom_columns.iter().map(|s| s.to_string()).collect();
+                for c in &promoted {
+                    if c.ty == siglake_core::PromotedType::Utf8
+                        && !blooms.iter().any(|b| b == &c.name)
+                    {
+                        blooms.push(c.name.clone());
+                    }
                 }
-            }
-            (batch, blooms)
-        };
+                // Extraction parses every row's residual JSON. Running it inside
+                // this async future prevents sibling drain futures from advancing
+                // their IO while a promoted batch is being prepared. The blocking
+                // child owns both decoded input and its admission lease, including
+                // detached completion after the append future is cancelled.
+                let input = OwnedAppendWork {
+                    value: batch,
+                    guard: work_guard,
+                };
+                let extracted = tokio::task::spawn_blocking(move || {
+                    if let Some(guard) = &input.guard {
+                        guard.blocking_child_started();
+                    }
+                    let result = siglake_core::repromote_attributes(&input.value, &promoted);
+                    input.replace(result)
+                })
+                .await
+                .context("joining promotion extraction")?;
+                let OwnedAppendWork { value, guard } = extracted;
+                let batch =
+                    value.map_err(|e| anyhow::anyhow!("promote batch for {table_ident}: {e}"))?;
+                (batch, blooms, guard)
+            };
         let bloom_columns: Vec<&str> = bloom_owned.iter().map(String::as_str).collect();
         let bloom_columns = bloom_columns.as_slice();
 

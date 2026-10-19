@@ -1015,6 +1015,9 @@ pub struct Compactor {
     /// batches while allowing every admitted commit to finish normally.
     #[cfg(test)]
     fs_dispatch_batch_cap_for_test: Option<usize>,
+    /// Pin filesystem admission without changing process-global configuration.
+    #[cfg(test)]
+    fs_decoded_budget_for_test: Option<u64>,
     /// Pin the catalog fetch/decode budget without changing process state.
     #[cfg(test)]
     catalog_decoded_budget_for_test: Option<u64>,
@@ -1063,6 +1066,8 @@ impl Compactor {
             append_aggregate_hold_for_test: None,
             #[cfg(test)]
             fs_dispatch_batch_cap_for_test: None,
+            #[cfg(test)]
+            fs_decoded_budget_for_test: None,
             #[cfg(test)]
             catalog_decoded_budget_for_test: None,
         };
@@ -3698,6 +3703,17 @@ impl Compactor {
             siglake_storage::memory_limit_for_sizing(),
             drain_inflight_budget_bytes(),
         );
+        #[cfg(test)]
+        let decoded_byte_budget = self
+            .fs_decoded_budget_for_test
+            .unwrap_or(decoded_byte_budget);
+        // A claim must leave room for the other configured workers. Selecting
+        // each claim against the whole shared budget made a decoded-byte-sized
+        // batch monopolize admission, silently serializing parallel drains.
+        // Admission below still checks the unchanged aggregate budget. Selection
+        // admits one oversized segment for progress; a segment larger than the
+        // aggregate budget therefore still runs alone.
+        let batch_decoded_budget = (decoded_byte_budget / workers.max(1) as u64).max(1);
         let mut inflight_decoded_bytes = 0u64;
         let mut queue: Vec<PathBuf> = sealed;
         let mut offset = 0usize;
@@ -3766,7 +3782,7 @@ impl Compactor {
                     offset = 0;
                 }
                 let selected = self
-                    .select_sealed_for_cycle(&queue[offset..], decoded_byte_budget)
+                    .select_sealed_for_cycle(&queue[offset..], batch_decoded_budget)
                     .context("selecting sealed segments for cycle")?;
                 if selected.paths.is_empty() {
                     break;
@@ -8871,6 +8887,104 @@ mod backpressure_gate_tests {
 }
 
 #[cfg(test)]
+mod decoded_parallel_admission_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn another_worker_commits_while_first_decoded_batch_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let mut writer = siglake_wal::WalWriter::with_thresholds(
+            &wal,
+            "parallel-budget",
+            1,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let mut sealed = Vec::new();
+        for i in 0..4 {
+            let row = siglake_core::Event::now(format!("row-{i}:{}", "payload".repeat(1024)));
+            sealed.push(writer.append_events(&[row]).unwrap().unwrap().path);
+        }
+        drop(writer);
+        let decoded: Vec<u64> = sealed
+            .iter()
+            .map(|p| segment_uncompressed_bytes(p).unwrap())
+            .collect();
+        let budget = 2 * decoded.iter().copied().max().unwrap();
+        assert!(decoded.iter().sum::<u64>() > budget);
+
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        let hold = SegmentReadHold::once();
+        // Release even if the assertion times out, so an adverse control cannot
+        // leave a blocking reader behind when Tokio shuts down.
+        struct Release(Arc<SegmentReadHold>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+        let release = Release(hold.clone());
+        let mut compactor = Compactor::new(&wal, ice.clone())
+            .with_drain_concurrency(2)
+            .with_fs_batch_limits(0, 0)
+            .with_fs_dispatch_batch_cap_for_test(2)
+            .with_segment_read_hold_for_test(hold.clone());
+        compactor.fs_decoded_budget_for_test = Some(budget);
+        let compactor = Arc::new(compactor);
+        let task = {
+            let compactor = compactor.clone();
+            tokio::spawn(async move { compactor.run_once().await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), hold.entered.notified())
+            .await
+            .expect("first reader reached its deterministic hold");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let rows: u64 = ice
+                    .live_data_files(ice.events_table_ident())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|f| f.record_count())
+                    .sum();
+                if rows == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the second admitted batch must commit before the first is released");
+        assert!(!task.is_finished());
+        drop(release);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            2
+        );
+        assert_eq!(list_sealed(&wal).unwrap().len(), 2);
+        assert_eq!(compactor.run_once().await.unwrap(), 2);
+        let rows: u64 = ice
+            .live_data_files(ice.events_table_ident())
+            .await
+            .unwrap()
+            .iter()
+            .map(|f| f.record_count())
+            .sum();
+        assert_eq!(rows, 4);
+        assert!(list_sealed(&wal).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
 mod combined_memory_regression_tests {
     use super::*;
     use arrow_array::{Array, Int64Array, StringArray};
@@ -9308,13 +9422,36 @@ mod combined_memory_regression_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_append_retains_the_slot_until_aggregate_child_terminates() {
+        cancelled_append_keeps_blocking_child_owned(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_append_retains_the_slot_until_promotion_child_terminates() {
+        cancelled_append_keeps_blocking_child_owned(true).await;
+    }
+
+    async fn cancelled_append_keeps_blocking_child_owned(promoted: bool) {
         let tmp = tempfile::tempdir().unwrap();
         let wal = tmp.path().join("wal");
         let ice = Arc::new(
             IcebergContext::open(&tmp.path().join("warehouse"))
                 .await
-                .unwrap(),
+                .unwrap()
+                .with_promoted_columns(if promoted {
+                    vec![siglake_core::PromotedColumn {
+                        attr_key: "file".into(),
+                        carrier: Default::default(),
+                        attr_get_path: Vec::new(),
+                        name: "promoted_file".into(),
+                        ty: siglake_core::PromotedType::Int64,
+                    }]
+                } else {
+                    Vec::new()
+                }),
         );
+        if promoted {
+            ice.ensure_promoted_columns().await.unwrap();
+        }
         let source = event(2, 9);
         let mut writer =
             WalWriter::with_thresholds(&wal, "aggregate-cancel", 1, Duration::from_secs(60))
@@ -9338,7 +9475,7 @@ mod combined_memory_regression_tests {
         };
         tokio::time::timeout(Duration::from_secs(10), hold.entered.notified())
             .await
-            .expect("append aggregate child reached its deterministic hold");
+            .expect("append blocking child reached its deterministic hold");
         drain.abort();
         assert!(drain.await.unwrap_err().is_cancelled());
         compactor.quarantine_processing_orphans();
@@ -9350,13 +9487,13 @@ mod combined_memory_regression_tests {
         tokio::task::yield_now().await;
         assert!(
             !merge.is_finished(),
-            "the live aggregate child must retain decoded-work exclusion after parent cancellation"
+            "the live blocking child must retain decoded-work exclusion after parent cancellation"
         );
         hold.release();
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(10), merge)
                 .await
-                .expect("recluster acquired the slot after the aggregate child terminated")
+                .expect("recluster acquired the slot after the blocking child terminated")
                 .unwrap()
                 .unwrap(),
             0
