@@ -18061,6 +18061,17 @@ async fn shard_scoped(
     let scan_header = axum::http::HeaderValue::from_bytes(&encoded_scan)
         .map_err(|error| ApiError::internal(anyhow::Error::new(error)))?;
     resp.headers_mut().insert("x-siglake-scan", scan_header);
+    let totals = crate::coordinator::ShardScanStats {
+        rows_scanned: runtime.leaf_output_rows,
+        bytes_scanned: runtime.bytes_scanned,
+        spill_bytes: runtime.spilled_bytes,
+    };
+    let encoded_totals = serde_json::to_vec(&totals).map_err(ApiError::internal)?;
+    resp.headers_mut().insert(
+        "x-siglake-scan-stats",
+        axum::http::HeaderValue::from_bytes(&encoded_totals)
+            .map_err(|error| ApiError::internal(anyhow::Error::new(error)))?,
+    );
     Ok(resp)
 }
 
@@ -18694,6 +18705,9 @@ async fn distributed_inner(
                 // buffer partial, each shard's wall (fan-out is concurrent,
                 // so the max is the fan-out cost), and the merge.
                 body.stats = Some(crate::format::ScanStats {
+                    rows_scanned: coord_stats.totals.rows_scanned,
+                    bytes_scanned: coord_stats.totals.bytes_scanned,
+                    spill_bytes: coord_stats.totals.spill_bytes,
                     phases: Some(Box::new(crate::format::PhaseStats {
                         plan_micros: coord_stats.plan_micros,
                         buffer_delta_micros,

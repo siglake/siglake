@@ -1056,6 +1056,14 @@ if [ "$WITH_HEAVY" = 1 ]; then
           cargo test -p siglake-query-server --test jobs_postgres_ownership -- \
             --ignored --nocapture --test-threads=1 >>"$dlog" 2>&1 || pg_rc=$?
         ci_local_phase_end "$dlog" "$pg_rc" || dk_ok=0
+        ci_local_phase_begin sql-catalog-initialization-postgres
+        pg_rc=0
+        # Fresh schemas; observe concurrent startup waiting on the physical DDL
+        # lock, plus cancellation/error release. No production catalog mutation.
+        SIGLAKE_TEST_JOBS_POSTGRES_URI="postgres://siglake:siglake@localhost:$SIGLAKE_PG_HOST_PORT/siglake" \
+          cargo test -p siglake-storage --test sql_catalog_initialization -- \
+            --ignored --nocapture --test-threads=1 >>"$dlog" 2>&1 || pg_rc=$?
+        ci_local_phase_end "$dlog" "$pg_rc" || dk_ok=0
         ci_local_phase_begin local-commit-mark-postgres
         pg_rc=0
         # Same argument for the local drain's mirror-reclamation mark (#4913,

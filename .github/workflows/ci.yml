@@ -1011,6 +1011,8 @@ jobs:
           scripts/ci-local-conditional-write-agreement.sh "$conditional_log" "$conditional_probe_rc"
           cargo test -p siglake-query-server --test jobs_postgres_ownership -- \
             --ignored --nocapture --test-threads=1
+          cargo test -p siglake-storage --test sql_catalog_initialization -- \
+            --ignored --nocapture --test-threads=1
           cargo test -p siglake-storage --lib local_commit_mark_postgres -- \
             --ignored --nocapture
           cargo test -p siglake-storage --lib wal_ledger_postgres -- \

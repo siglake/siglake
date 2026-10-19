@@ -29,7 +29,7 @@ use iceberg::{
     Runtime, TableCommit, TableCreation, TableIdent,
 };
 use sqlx::any::{AnyPoolOptions, AnyQueryResult, AnyRow, install_default_drivers};
-use sqlx::{Any, AnyPool, Row, Transaction};
+use sqlx::{Any, AnyConnection, AnyPool, Connection, Row, Transaction};
 
 use crate::error::{
     from_sqlx_error, namespace_already_exists_err, namespace_insert_error, no_such_namespace_err,
@@ -289,6 +289,43 @@ impl SqlCatalog {
             .await
             .map_err(from_sqlx_error)?;
 
+        {
+            let mut connection = pool.acquire().await.map_err(from_sqlx_error)?;
+            if connection.backend_name() == "PostgreSQL" {
+                let mut transaction = connection.begin().await.map_err(from_sqlx_error)?;
+                // IF NOT EXISTS alone can race in PostgreSQL's pg_type catalog.
+                // All logical catalogs share these two physical tables, so use
+                // one database-wide key ("ICEBERG\x01"), not the catalog name.
+                // Transaction ownership also releases the lock on error/cancel.
+                // A fresh statement snapshot after waiting must see the prior
+                // initializer's commit, even if the server defaults to RR.
+                sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(from_sqlx_error)?;
+                sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+                    .bind(0x4943_4542_4552_4701_i64)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(from_sqlx_error)?;
+                Self::initialize_tables(&mut transaction).await?;
+                transaction.commit().await.map_err(from_sqlx_error)?;
+            } else {
+                Self::initialize_tables(&mut connection).await?;
+            }
+        }
+
+        Ok(SqlCatalog {
+            name: config.name.to_owned(),
+            connection: pool,
+            warehouse_location: config.warehouse_location,
+            fileio,
+            sql_bind_style: config.sql_bind_style,
+            runtime,
+        })
+    }
+
+    async fn initialize_tables(connection: &mut AnyConnection) -> Result<()> {
         sqlx::query(&format!(
             "CREATE TABLE IF NOT EXISTS {CATALOG_TABLE_NAME} (
                 {CATALOG_FIELD_CATALOG_NAME} VARCHAR(255) NOT NULL,
@@ -299,7 +336,7 @@ impl SqlCatalog {
                 {CATALOG_FIELD_RECORD_TYPE} VARCHAR(5),
                 PRIMARY KEY ({CATALOG_FIELD_CATALOG_NAME}, {CATALOG_FIELD_TABLE_NAMESPACE}, {CATALOG_FIELD_TABLE_NAME}))"
         ))
-        .execute(&pool)
+        .execute(&mut *connection)
         .await
         .map_err(from_sqlx_error)?;
 
@@ -311,18 +348,10 @@ impl SqlCatalog {
                 {NAMESPACE_FIELD_PROPERTY_VALUE} VARCHAR(1000),
                 PRIMARY KEY ({CATALOG_FIELD_CATALOG_NAME}, {NAMESPACE_FIELD_NAME}, {NAMESPACE_FIELD_PROPERTY_KEY}))"
         ))
-        .execute(&pool)
+        .execute(&mut *connection)
         .await
         .map_err(from_sqlx_error)?;
-
-        Ok(SqlCatalog {
-            name: config.name.to_owned(),
-            connection: pool,
-            warehouse_location: config.warehouse_location,
-            fileio,
-            sql_bind_style: config.sql_bind_style,
-            runtime,
-        })
+        Ok(())
     }
 
     /// SQLX Any does not implement PostgresSQL bindings, so we have to do this.
