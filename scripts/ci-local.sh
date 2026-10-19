@@ -65,6 +65,15 @@
 # names, README alert count) is its own `dashboard` line, so a box without helm
 # still runs it instead of skipping it along with the renders.
 #
+# A rustc the kernel killed is not a tree that does not compile, and the gate
+# says which one it got (#6942, #6947). Every cargo job's log is read for it;
+# `test`, `clippy`, `profiling` and `fork-tests` retry once, `generated`
+# already replays for its own reason, and `docker`, `operator-cluster` and
+# `external-readers` are named but never replayed — a retry there is two image
+# builds, a kind cluster or three external engines. A crash that survives the
+# retry, or one in a job that has none, is still a FAIL line and still a
+# nonzero exit; it only says what it was.
+#
 # Exits nonzero if any job would fail.
 
 set -uo pipefail
@@ -445,7 +454,7 @@ while :; do
     # Only the `--no-run` build is read for this. The pass below runs test
     # binaries, and a test binary killed by a signal is a test failure this
     # gate must keep reporting as one.
-    if test_build_compiler_crashed "$test_pass_log"; then
+    if cargo_compiler_crashed "$test_pass_log"; then
       test_compiler_crash=1
       printf '\nCOMPILER CRASHED: rustc was killed by a signal during the test build\n' \
         >>"$test_pass_log"
@@ -530,10 +539,22 @@ fi
 
 # --- clippy ------------------------------------------------------------------
 job_started=$SECONDS
-if cargo clippy --workspace --all-targets -- -D warnings >"$LOG_DIR/clippy.log" 2>&1; then
-  report clippy ok
+# Retried once on a dead compiler, for the same reason the test job is: a rustc
+# the kernel killed says nothing about the tree. This is the cheapest cargo job
+# in the gate to repeat — the crashed attempt leaves every unit it did finish
+# in the shared target dir, so the replay compiles only what the dead compiler
+# never produced, tens of seconds warm. A second crash is red.
+clippy_rc=0
+cargo_job_with_crash_retry "$LOG_DIR/clippy.log" "$LOG_DIR/clippy-attempt" "" \
+  cargo clippy --workspace --all-targets -- -D warnings || clippy_rc=$?
+if [ "$cargo_job_compiler_crashed" = 1 ]; then
+  report clippy "$(cargo_job_status FAIL 'rustc killed by a signal')"
+  echo "  the compiler crashed during the clippy build; see $LOG_DIR/clippy.log" >&2
+elif [ "$clippy_rc" -eq 0 ]; then
+  report clippy "$(cargo_job_status ok)"
 else
-  report clippy FAIL; grep -E '^error' "$LOG_DIR/clippy.log" | head -5 | sed 's/^/  /' >&2
+  report clippy "$(cargo_job_status FAIL)"
+  grep -E '^error' "$cargo_job_attempt_log" | head -5 | sed 's/^/  /' >&2
 fi
 
 # --- profiling ---------------------------------------------------------------
@@ -549,12 +570,27 @@ job_started=$SECONDS
 # Two extra dependency builds, since each RUSTFLAGS change invalidates the
 # graph; they cache separately after the first run. That is the price of the
 # gate building what the diagnostic image ships.
-if scripts/check-profiling-feature.sh >"$LOG_DIR/profiling.log" 2>&1; then
-  report profiling "ok ($(awk '/^test result: ok\./ {s+=$4} END {print s+0}' \
-    "$LOG_DIR/profiling.log") tests, both cfgs)"
+#
+# Retried once on a dead compiler, like clippy: the script compiles one crate
+# and its dependency graph twice, which is under a minute warm, and a crash
+# leaves both configurations' dependencies cached for the replay. Its log mixes
+# compiling with running siglake-core's tests, so the matcher's rustc
+# restriction is what keeps a test binary killed by a signal red — see
+# cargo_compiler_crashed. The counts and the excerpt are read from the LAST
+# attempt's log, not the job log, which now holds every attempt.
+profiling_rc=0
+cargo_job_with_crash_retry "$LOG_DIR/profiling.log" "$LOG_DIR/profiling-attempt" "" \
+  scripts/check-profiling-feature.sh || profiling_rc=$?
+if [ "$cargo_job_compiler_crashed" = 1 ]; then
+  report profiling "$(cargo_job_status FAIL 'rustc killed by a signal')"
+  echo "  the compiler crashed during the profiling build; see $LOG_DIR/profiling.log" >&2
+elif [ "$profiling_rc" -eq 0 ]; then
+  report profiling "$(cargo_job_status ok \
+    "$(awk '/^test result: ok\./ {s+=$4} END {print s+0}' \
+      "$cargo_job_attempt_log") tests, both cfgs")"
 else
-  report profiling FAIL
-  grep -E '^(error|test result: FAILED)' "$LOG_DIR/profiling.log" | head -5 | sed 's/^/  /' >&2
+  report profiling "$(cargo_job_status FAIL)"
+  grep -E '^(error|test result: FAILED)' "$cargo_job_attempt_log" | head -5 | sed 's/^/  /' >&2
 fi
 
 # --- helm --------------------------------------------------------------------
@@ -736,8 +772,19 @@ run_generators() {
 }
 
 run_generators_with_retry
+# This job's retry is unconditional, so a dead compiler (#6942) is already
+# replayed once; only the report had no word for one. The crash is read from
+# the final attempt alone — see ci-local-generated-guard.sh — so a first
+# attempt the retry cleared does not colour a green line, and a stale artifact
+# on the second attempt is not blamed on the compiler.
+generated_last_attempt="$LOG_DIR/generated-attempt-$generated_attempts.log"
+tail -c "+$((generated_attempt_offset + 1))" "$glog" >"$generated_last_attempt"
 if [ "${#gen_why[@]}" -eq 0 ]; then
   report generated ok
+elif cargo_compiler_crashed "$generated_last_attempt"; then
+  report generated "FAIL (rustc killed by a signal on generator attempt $generated_attempts)"
+  echo "  the compiler crashed while regenerating; see $glog" >&2
+  printf '  %s\n' "${gen_why[@]}" >&2
 else
   report generated FAIL; printf '  %s\n' "${gen_why[@]}" >&2
 fi
@@ -793,13 +840,25 @@ job_started=$SECONDS
 # The doctest arm, likewise, with a failing example instead:
 #   printf '\n/// d\n///\n/// ```\n/// assert_eq!(1, 2);\n/// ```\npub fn f() {}\n' \
 #     >>"$d/src/lib.rs"
-if scripts/check-fork-tests.sh >"$LOG_DIR/fork-tests.log" 2>&1; then
-  report fork-tests \
-    "ok ($(awk '/^ok +[0-9]+ forks, / {sub(/^ok +[0-9]+ forks, /, ""); print; exit}' \
-      "$LOG_DIR/fork-tests.log"))"
+#
+# Retried once on a dead compiler: ~9 s warm is the cheapest replay in the gate,
+# and even the cold ~75 s is well under the cost of a red line that says nothing
+# about the forks. The fork's cargo output reaches this log through
+# `sed "s/^/  [$fork] /"`, so the matcher is given that prefix; without it the
+# anchors would miss every crash this job can have.
+fork_tests_rc=0
+cargo_job_with_crash_retry "$LOG_DIR/fork-tests.log" "$LOG_DIR/fork-tests-attempt" \
+  '  \[[a-z0-9-]+\] ' scripts/check-fork-tests.sh || fork_tests_rc=$?
+if [ "$cargo_job_compiler_crashed" = 1 ]; then
+  report fork-tests "$(cargo_job_status FAIL 'rustc killed by a signal')"
+  echo "  the compiler crashed during the fork build; see $LOG_DIR/fork-tests.log" >&2
+elif [ "$fork_tests_rc" -eq 0 ]; then
+  report fork-tests "$(cargo_job_status ok \
+    "$(awk '/^ok +[0-9]+ forks, / {sub(/^ok +[0-9]+ forks, /, ""); print; exit}' \
+      "$cargo_job_attempt_log")")"
 else
-  report fork-tests FAIL
-  grep -E '^(FAIL|  \[[a-z-]+\] error)' "$LOG_DIR/fork-tests.log" | head -5 | sed 's/^/  /' >&2
+  report fork-tests "$(cargo_job_status FAIL)"
+  grep -E '^(FAIL|  \[[a-z-]+\] error)' "$cargo_job_attempt_log" | head -5 | sed 's/^/  /' >&2
 fi
 
 # --- heavy jobs --------------------------------------------------------------
@@ -834,6 +893,13 @@ if [ "$WITH_HEAVY" = 1 ]; then
       kind delete cluster --name siglake-ci-local --kubeconfig "$KUBECONFIG" >>"$olog" 2>&1
       if [ "$test_rc" -eq 0 ] && [ "$passed" -ge 4 ] && [ "$failed" -eq 0 ]; then
         report operator-cluster "ok ($passed tests)"
+      elif [ "$test_rc" -ne 0 ] && cargo_compiler_crashed "$olog"; then
+        # Named, not replayed: the cluster is deleted above, so a retry means
+        # another `kind create` and its 120 s wait for a fault the next run
+        # would meet anyway. The matcher's rustc restriction keeps an
+        # #[ignore]d test the kernel killed red.
+        report operator-cluster "FAIL (rustc killed by a signal; not retried, the cluster is torn down)"
+        echo "  the compiler crashed building the operator's cluster tests; see $olog" >&2
       else
         report operator-cluster "FAIL ($passed passed, $failed failed)"
         if [ "$passed" -lt 4 ] && [ "$failed" -eq 0 ]; then
@@ -1059,7 +1125,20 @@ if [ "$WITH_HEAVY" = 1 ]; then
       ci_local_phase_end "$dlog" "$down_rc" || dk_ok=0
     fi
     ci_local_phases_report "$dlog" "$((SECONDS - job_started))"
-    report docker "$(docker_job_status "$dk_ok" "$preflight_ok" "$image_sizes")"
+    docker_status=$(docker_job_status "$dk_ok" "$preflight_ok" "$image_sizes")
+    # The host-side cargo steps here (s3_mirror_pagination, the live
+    # conditional-write tests, the six Postgres suites) compile before they
+    # run, so the same dead compiler can land in this job. It is named and not
+    # replayed: a retry is two image builds and another compose cycle, ~20 min,
+    # which is not what a transient rustc is worth. A rustc that died INSIDE
+    # `docker build` prints through buildkit's step prefixes and is not matched
+    # — that build has its own container and its own cache, and nothing here
+    # could tell it apart from a Dockerfile that does not build.
+    if [ "$dk_ok" = 0 ] && cargo_compiler_crashed "$dlog"; then
+      docker_status="FAIL (rustc killed by a signal; not retried, the job rebuilds two images${image_sizes:+; $image_sizes})"
+      echo "  the compiler crashed in a host-side cargo step; see $dlog" >&2
+    fi
+    report docker "$docker_status"
     if [ "$preflight_ok" = 0 ]; then
       sed 's/^/  /' "$dlog" >&2
     fi
@@ -1082,6 +1161,13 @@ if [ "$WITH_HEAVY" = 1 ]; then
   scripts/check-external-timestamp-contract.sh \
     ${xopts[@]+"${xopts[@]}"} >"$xlog" 2>&1 || xrc=$?
   xstatus=$(external_readers_status "$STRICT" "$xlog" "$xrc")
+  # The checker builds siglake-cli before it reaches an engine, and a dead
+  # compiler there reads as `checker exited N with no FAIL line to attribute it
+  # to`. Named rather than replayed: the retry would re-run Spark, DuckDB and
+  # PyIceberg over the fixture warehouse, which is the job's whole cost.
+  if [ "$xrc" -ne 0 ] && cargo_compiler_crashed "$xlog"; then
+    xstatus="FAIL (rustc killed by a signal building the fixture binary; not retried)"
+  fi
   report external-readers "$xstatus"
   if [[ "$xstatus" == FAIL* ]]; then
     tail -20 "$xlog" | sed 's/^/  /' >&2

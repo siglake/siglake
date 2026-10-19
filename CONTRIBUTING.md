@@ -44,6 +44,17 @@ than the first few. Two runs that share a target directory neither wait on nor
 overwrite each other. Run directories the script named are pruned after a week;
 one you named is never touched.
 
+A rustc the kernel kills is not a tree that does not compile, and the gate says
+which one it got. `test`, `clippy`, `profiling` and `fork-tests` replay the job
+once, keeping each attempt's output in `<job>-attempt-<n>.log` beside the job
+log; `generated` already replays for its own reason; `docker`,
+`operator-cluster` and `external-readers` name the crash and do not replay,
+since a retry there is two image builds, a kind cluster or three external
+readers. A crash that survives the replay is red and exits nonzero like any
+other failure — the line reads `rustc killed by a signal` rather than blaming
+your change. A test binary or build script killed by a signal is your change,
+and stays red.
+
 The three you will reach for most, individually:
 
 ```sh
