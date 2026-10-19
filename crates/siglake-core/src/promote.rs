@@ -15,7 +15,12 @@
 //! ships off. Its bounds, cost and evidence:
 //! `docs/DESIGN_auto_promotion_qualification.md`.
 
-use std::sync::Arc;
+use std::{borrow::Cow, cell::OnceCell, sync::Arc};
+
+mod borrowed;
+#[cfg(test)]
+#[path = "promote/borrowed_tests.rs"]
+mod borrowed_tests;
 
 use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
@@ -331,6 +336,54 @@ fn promoted_value(
     Some(value)
 }
 
+// Strings remain borrowed until Arrow copies them. Scalar Values share the
+// exact existing coercion helpers; object/array/composed output stays owned.
+enum Extracted<'a> {
+    Text(&'a str),
+    Json(Cow<'a, serde_json::Value>),
+}
+
+struct RowAttributes<'a> {
+    input: Option<&'a str>,
+    borrowed: Option<borrowed::Object<'a>>,
+    owned: OnceCell<Option<serde_json::Map<String, serde_json::Value>>>,
+}
+
+impl<'a> RowAttributes<'a> {
+    fn new<const BORROWED: bool>(input: Option<&'a str>, direct_attributes: bool) -> Self {
+        Self {
+            input,
+            borrowed: if BORROWED && direct_attributes {
+                input.and_then(|s| serde_json::from_str(s).ok())
+            } else {
+                None
+            },
+            owned: OnceCell::new(),
+        }
+    }
+
+    fn extract(&self, column: &PromotedColumn) -> Option<Extracted<'_>> {
+        if column.attr_get_path.is_empty() {
+            if let Some(object) = &self.borrowed {
+                match object.lookup(&column.attr_key)? {
+                    borrowed::Node::String(s) => return Some(Extracted::Text(s)),
+                    borrowed::Node::Scalar(value) => {
+                        return Some(Extracted::Json(Cow::Borrowed(value)));
+                    }
+                    // Canonical JSON text must come from the original Map/Value
+                    // representation, including its ordering and duplicates.
+                    borrowed::Node::Array(_) | borrowed::Node::Object(_) => {}
+                }
+            }
+        }
+        let map = self
+            .owned
+            .get_or_init(|| self.input.and_then(|s| serde_json::from_str(s).ok()))
+            .as_ref()?;
+        promoted_value(map, column).map(|v| Extracted::Json(Cow::Owned(v)))
+    }
+}
+
 /// Field id of the `index`-th promoted column. The 8 core columns own ids 1..=8.
 ///
 /// A `experimental-schema-rollback-probe` build declares one more column ahead
@@ -372,6 +425,15 @@ pub(crate) fn promoted_field(col: &PromotedColumn, index: usize) -> Field {
 /// `siglake-query-server/tests/promoted_object_parity.rs`. The declared-mapping
 /// `Text` builder deliberately differs: see [`json_scalar_as_string`].
 pub fn promote_attributes(batch: &RecordBatch, promoted: &[PromotedColumn]) -> Result<RecordBatch> {
+    promote_attributes_impl::<true>(batch, promoted)
+}
+
+// The false specialization retains the original owned parsing/extraction path
+// for differential tests; both paths use the same Arrow builders and schema.
+fn promote_attributes_impl<const BORROWED: bool>(
+    batch: &RecordBatch,
+    promoted: &[PromotedColumn],
+) -> Result<RecordBatch> {
     if promoted.is_empty() {
         return Ok(batch.clone());
     }
@@ -389,6 +451,9 @@ pub fn promote_attributes(batch: &RecordBatch, promoted: &[PromotedColumn]) -> R
         .column_by_name("raw")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>());
     let needs_attributes = promoted.iter().any(|c| c.carrier.is_attributes());
+    let needs_direct_attributes = promoted
+        .iter()
+        .any(|c| c.carrier.is_attributes() && c.attr_get_path.is_empty());
 
     // One typed builder per promoted column.
     enum B {
@@ -408,33 +473,52 @@ pub fn promote_attributes(batch: &RecordBatch, promoted: &[PromotedColumn]) -> R
         .collect();
 
     for row in 0..n {
-        // Parse this row's attributes JSON once; extract every promoted key from it.
-        let parsed: Option<serde_json::Map<String, serde_json::Value>> = attrs
-            .filter(|_| needs_attributes)
-            .filter(|a| !a.is_null(row))
-            .and_then(|a| serde_json::from_str(a.value(row)).ok());
+        // Parse one borrowed tree for direct attributes. Complex/composed output
+        // lazily parses the original owned map once as a semantic fallback.
+        let parsed = RowAttributes::new::<BORROWED>(
+            attrs
+                .filter(|_| needs_attributes)
+                .filter(|a| !a.is_null(row))
+                .map(|a| a.value(row)),
+            needs_direct_attributes,
+        );
         for (col, b) in promoted.iter().zip(builders.iter_mut()) {
             let v = match col.carrier {
-                PromotionCarrier::Attributes => {
-                    parsed.as_ref().and_then(|m| promoted_value(m, col))
-                }
+                PromotionCarrier::Attributes => parsed.extract(col),
                 PromotionCarrier::Raw => raw.filter(|a| !a.is_null(row)).and_then(|a| {
                     let mut value = crate::json_attr_lookup(a.value(row), &col.attr_key)?;
                     for key in &col.attr_get_path {
                         value = crate::json_attr_lookup(&value, key)?;
                     }
-                    Some(serde_json::Value::String(value))
+                    Some(Extracted::Json(Cow::Owned(serde_json::Value::String(
+                        value,
+                    ))))
                 }),
             };
-            match b {
-                B::Utf8(bld) => match v.as_ref() {
-                    Some(serde_json::Value::String(s)) => bld.append_value(s),
-                    Some(serde_json::Value::Null) | None => bld.append_null(),
-                    Some(other) => bld.append_value(other.to_string()),
+            match v {
+                Some(Extracted::Text(s)) => match b {
+                    B::Utf8(bld) => bld.append_value(s),
+                    B::Int64(bld) => bld.append_option(s.parse().ok()),
+                    B::Float64(bld) => bld.append_option(s.parse().ok()),
+                    B::Boolean(bld) => bld.append_option(s.parse().ok()),
                 },
-                B::Int64(bld) => bld.append_option(v.as_ref().and_then(json_as_i64)),
-                B::Float64(bld) => bld.append_option(v.as_ref().and_then(json_as_f64)),
-                B::Boolean(bld) => bld.append_option(v.as_ref().and_then(json_as_bool)),
+                other => {
+                    let v = match &other {
+                        Some(Extracted::Json(v)) => Some(v.as_ref()),
+                        None => None,
+                        Some(Extracted::Text(_)) => unreachable!(),
+                    };
+                    match b {
+                        B::Utf8(bld) => match v {
+                            Some(serde_json::Value::String(s)) => bld.append_value(s),
+                            Some(serde_json::Value::Null) | None => bld.append_null(),
+                            Some(other) => bld.append_value(other.to_string()),
+                        },
+                        B::Int64(bld) => bld.append_option(v.and_then(json_as_i64)),
+                        B::Float64(bld) => bld.append_option(v.and_then(json_as_f64)),
+                        B::Boolean(bld) => bld.append_option(v.and_then(json_as_bool)),
+                    }
+                }
             }
         }
     }
