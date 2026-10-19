@@ -2716,10 +2716,15 @@ impl BoundedSegmentReader {
     /// A basename observed in two lifecycle directories must still identify
     /// the same admitted file before the query can deduplicate it.
     pub fn same_file(&self, other: &Self) -> bool {
-        if !cfg!(unix) && self.path != other.path {
-            return false;
+        #[cfg(not(unix))]
+        {
+            let _ = other;
+            false
         }
-        self.identity == other.identity && self.physical_bytes == other.physical_bytes
+        #[cfg(unix)]
+        {
+            self.identity == other.identity && self.physical_bytes == other.physical_bytes
+        }
     }
 
     fn verify_selected_path(&self) -> Result<()> {
