@@ -244,6 +244,113 @@ async fn distributed_query_over_http_matches_single_pod() {
     }
 }
 
+/// A rolling-upgrade peer returns valid Arrow data and the old detail header,
+/// but no measured totals. Reexecute only its slice once on the coordinator,
+/// with the identical immutable pin, rather than report invented zero counters.
+#[tokio::test]
+async fn legacy_worker_totals_fallback_preserves_pin_and_measured_rows() {
+    require_loopback!();
+    type Calls = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+    fn observed_app(state: AppState, calls: Calls, legacy: bool) -> axum::Router {
+        router(state).layer(axum::middleware::from_fn(
+            move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+                let calls = calls.clone();
+                async move {
+                    let shard = req.uri().path() == "/api/v1/sql/shard";
+                    if shard {
+                        let bytes =
+                            axum::body::to_bytes(std::mem::take(req.body_mut()), 1024 * 1024)
+                                .await
+                                .unwrap();
+                        calls
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::from_slice(&bytes).unwrap());
+                        *req.body_mut() = axum::body::Body::from(bytes);
+                    }
+                    let mut response = next.run(req).await;
+                    if shard && legacy && response.status().is_success() {
+                        assert!(response
+                            .headers_mut()
+                            .remove("x-siglake-scan-stats")
+                            .is_some());
+                    }
+                    response
+                }
+            },
+        ))
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = Arc::new(
+        IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap(),
+    );
+    for _ in 0..3 {
+        let events: Vec<_> = (0..25)
+            .map(|i| {
+                let mut event = Event::now(format!("row {i}"));
+                event.host = format!("h{}", i % 4);
+                event
+            })
+            .collect();
+        ice.append_events(&events).await.unwrap();
+    }
+    let old_calls = Calls::default();
+    let self_calls = Calls::default();
+    let old_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let old_url = format!("http://{}", old_listener.local_addr().unwrap());
+    let old_app = observed_app(
+        AppState::new(ice.clone(), AuthConfig::open()),
+        old_calls.clone(),
+        true,
+    );
+    let old_task = tokio::spawn(async move { axum::serve(old_listener, old_app).await.unwrap() });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = observed_app(
+        AppState::new(ice, AuthConfig::open()).with_coordinator(vec![url.clone(), old_url], None),
+        self_calls.clone(),
+        false,
+    );
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let response = reqwest::Client::new().post(format!("{url}/api/v1/sql/distributed"))
+        .json(&serde_json::json!({"query":"SELECT host, count(*) AS n FROM events WHERE raw LIKE '%row%' GROUP BY host"}))
+        .send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["rows"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["n"].as_u64().unwrap())
+            .sum::<u64>(),
+        75
+    );
+    assert_eq!(body["stats"]["rows_scanned"], 75, "{body}");
+    assert!(
+        body["stats"]["bytes_scanned"].as_u64().unwrap() > 0,
+        "{body}"
+    );
+    assert_eq!(body["stats"]["spill_bytes"], 0);
+    let old = old_calls.lock().unwrap();
+    let current = self_calls.lock().unwrap();
+    assert_eq!(old.len(), 1);
+    assert_eq!(current.len(), 2);
+    assert!(old[0]["pin"]["snapshot_id"].is_i64());
+    assert_eq!(
+        &old[0],
+        current
+            .iter()
+            .find(|req| req["shard"]["index"] == 1)
+            .unwrap()
+    );
+    task.abort();
+    old_task.abort();
+}
+
 /// Governance parity (#7): a worker enforces the mid-flight rows-scanned breaker
 /// on its own shard. Without this, a distributed query bypasses the per-pod row
 /// ceiling that single-pod execution enforces (AWS smoke round 62 finding).
