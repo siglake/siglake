@@ -80,6 +80,42 @@ fn decode_shard_scan_header(bytes: Option<&[u8]>) -> Result<Option<crate::format
     Ok(scan)
 }
 
+/// Measured worker execution totals, separate from planned/pruned file detail.
+/// Required on HTTP responses: missing totals must not masquerade as zero work.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ShardScanStats {
+    pub rows_scanned: u64,
+    pub bytes_scanned: u64,
+    pub spill_bytes: u64,
+}
+
+impl ShardScanStats {
+    fn absorb(&mut self, other: Self) -> Result<()> {
+        self.rows_scanned = self
+            .rows_scanned
+            .checked_add(other.rows_scanned)
+            .context("shard rows_scanned overflow")?;
+        self.bytes_scanned = self
+            .bytes_scanned
+            .checked_add(other.bytes_scanned)
+            .context("shard bytes_scanned overflow")?;
+        self.spill_bytes = self
+            .spill_bytes
+            .checked_add(other.spill_bytes)
+            .context("shard spill_bytes overflow")?;
+        Ok(())
+    }
+}
+
+fn decode_shard_scan_stats(bytes: Option<&[u8]>) -> Result<ShardScanStats> {
+    let bytes = bytes.context("shard response missing x-siglake-scan-stats")?;
+    anyhow::ensure!(
+        bytes.len() <= 256,
+        "shard x-siglake-scan-stats exceeds 256 bytes"
+    );
+    serde_json::from_slice(bytes).context("parse shard x-siglake-scan-stats")
+}
+
 /// Runs a query against one shard of the file set, returning its result
 /// batches. Implemented in-process ([`LocalShardRunner`]) for tests + the
 /// single-pod fallback, and over HTTP for cross-pod fan-out (part 2b).
@@ -97,6 +133,7 @@ pub trait ShardRunner: Send + Sync {
         Ok(ShardRun {
             batches: self.run(sql, shard).await?,
             scan: None,
+            totals: ShardScanStats::default(),
         })
     }
 }
@@ -105,6 +142,7 @@ pub trait ShardRunner: Send + Sync {
 /// it) the worker-side scan attribution for the response's `stats.scan`.
 pub struct ShardRun {
     pub batches: Vec<RecordBatch>,
+    pub totals: ShardScanStats,
     pub scan: Option<crate::format::ScanDetail>,
 }
 
@@ -314,9 +352,15 @@ impl ShardRunner for HttpShardRunner {
                 .get("x-siglake-scan")
                 .map(|header| header.as_bytes()),
         )?;
+        let totals = decode_shard_scan_stats(
+            resp.headers()
+                .get("x-siglake-scan-stats")
+                .map(|header| header.as_bytes()),
+        )?;
         let bytes = resp.bytes().await.context("read shard response")?;
         Ok(ShardRun {
             batches: crate::format::arrow_ipc_to_batches(&bytes)?,
+            totals,
             scan,
         })
     }
@@ -1183,6 +1227,7 @@ pub async fn coordinate_with_extra(
 /// response as [`crate::format::DistPhaseStats`].
 #[derive(Debug, Clone, Default)]
 pub struct CoordStats {
+    pub totals: ShardScanStats,
     pub mode: &'static str,
     pub plan_micros: u64,
     pub shard_wall_micros: Vec<u64>,
@@ -1246,6 +1291,7 @@ pub async fn coordinate_with_failover(
                 shard_wall_micros: vec![started.elapsed().as_micros() as u64],
                 merge_micros: 0,
                 scan: run.scan,
+                totals: run.totals,
             };
             return Ok((run.batches, stats));
         }
@@ -1286,9 +1332,11 @@ pub async fn coordinate_with_failover(
     let mut partials: Vec<RecordBatch> = Vec::new();
     let mut shard_wall_micros = Vec::with_capacity(shards);
     let mut scan: Option<crate::format::ScanDetail> = None;
+    let mut totals = ShardScanStats::default();
     let mut shard_missing_file_attribution = false;
     for (run, wall) in shard_runs {
         let mut run = run?;
+        totals.absorb(run.totals)?;
         if let DistPlan::AverageAggregate(average) = &dist {
             average.validate_schema(&run.batches)?;
             if average.keys.is_empty() {
@@ -1363,6 +1411,7 @@ pub async fn coordinate_with_failover(
         DistPlan::Local => unreachable!("handled above"),
     };
     let stats = CoordStats {
+        totals,
         mode,
         plan_micros,
         shard_wall_micros,
@@ -1587,6 +1636,49 @@ mod tests {
             shard_failure_is_retryable(&internal),
             "a worker that broke internally should still be retried"
         );
+    }
+
+    #[test]
+    fn shard_scan_totals_require_complete_measured_integers() {
+        let totals = ShardScanStats {
+            rows_scanned: 75,
+            bytes_scanned: 4096,
+            spill_bytes: 128,
+        };
+        assert_eq!(
+            decode_shard_scan_stats(Some(&serde_json::to_vec(&totals).unwrap())).unwrap(),
+            totals
+        );
+        assert!(decode_shard_scan_stats(None).is_err());
+        for invalid in [
+            "null",
+            "{}",
+            "{not-json}",
+            r#"{"rows_scanned":75,"bytes_scanned":4096}"#,
+            r#"{"rows_scanned":-1,"bytes_scanned":0,"spill_bytes":0}"#,
+            r#"{"rows_scanned":1.5,"bytes_scanned":0,"spill_bytes":0}"#,
+            r#"{"rows_scanned":18446744073709551616,"bytes_scanned":0,"spill_bytes":0}"#,
+        ] {
+            assert!(
+                decode_shard_scan_stats(Some(invalid.as_bytes())).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(decode_shard_scan_stats(Some(&[b' '; 257])).is_err());
+        for field in 0..3 {
+            let mut total = ShardScanStats {
+                rows_scanned: u64::MAX,
+                bytes_scanned: u64::MAX,
+                spill_bytes: u64::MAX,
+            };
+            let mut extra = ShardScanStats::default();
+            match field {
+                0 => extra.rows_scanned = 1,
+                1 => extra.bytes_scanned = 1,
+                _ => extra.spill_bytes = 1,
+            }
+            assert!(total.absorb(extra).is_err());
+        }
     }
 
     #[test]
@@ -1930,6 +2022,11 @@ mod tests {
                     cache_hit: index == 1,
                 };
                 Ok(ShardRun {
+                    totals: ShardScanStats {
+                        rows_scanned: (index as u64 + 1) * 50,
+                        bytes_scanned: (index as u64 + 1) * 1000,
+                        spill_bytes: (index as u64 + 1) * 10,
+                    },
                     batches: vec![RecordBatch::try_new(
                         self.schema.clone(),
                         vec![Arc::new(Int64Array::from(vec![1_i64]))],
@@ -1966,6 +2063,14 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(
+            stats.totals,
+            ShardScanStats {
+                rows_scanned: 150,
+                bytes_scanned: 3000,
+                spill_bytes: 30,
+            }
+        );
         let scan = stats.scan.unwrap();
         assert_eq!(scan.bytes_data, 450);
         assert_eq!(scan.bytes_data_requested, 300);

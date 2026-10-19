@@ -92,6 +92,9 @@ async fn distributed_query_over_http_matches_single_pod() {
         // single-pod / fan-out answer.
         "SELECT host, count(*) AS n FROM events GROUP BY host ORDER BY n DESC LIMIT 10",
         "SELECT host, count(*) AS n FROM events WHERE raw LIKE '%status=500%' GROUP BY host",
+        // Four output groups still scan all 75 source rows. This forces the
+        // real shard runtime -> HTTP -> coordinator -> Records counters path.
+        "SELECT host, count(*) AS n FROM events WHERE raw LIKE '%row%' GROUP BY host",
         "SELECT host FROM events WHERE host = 'host-2'",
     ] {
         let resp = client
@@ -109,6 +112,23 @@ async fn distributed_query_over_http_matches_single_pod() {
         let got = norm(&body["rows"]);
         let want = norm(&unsharded_rows(&ice, sql).await);
         assert_eq!(got, want, "distributed != single-pod for `{sql}`");
+        if sql.contains("LIKE '%row%'") {
+            assert_eq!(got.len(), 4);
+            assert_eq!(body["stats"]["rows_scanned"], 75, "{body}");
+            assert!(
+                body["stats"]["bytes_scanned"].as_u64().unwrap() > 0,
+                "{body}"
+            );
+            assert_eq!(body["stats"]["spill_bytes"], 0, "{body}");
+            assert_eq!(
+                body["stats"]["phases"]["distributed"]["shard_wall_micros"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+
         // #85: a coordinated query carries coordinator attribution — the
         // merge mode plus one wall per shard for a genuine fan-out, a single
         // wall for the whole-table `local` fallback, and zero walls for a
@@ -153,6 +173,14 @@ async fn distributed_query_over_http_matches_single_pod() {
                 resp.status()
             );
             let body: serde_json::Value = resp.json().await.unwrap();
+            if sql.contains("LIKE '%row%'") {
+                assert_eq!(body["stats"]["rows_scanned"], 75, "{path}: {body}");
+                assert!(
+                    body["stats"]["bytes_scanned"].as_u64().unwrap() > 0,
+                    "{path}: {body}"
+                );
+                assert_eq!(body["stats"]["spill_bytes"], 0, "{path}: {body}");
+            }
             assert_eq!(
                 norm(&body["rows"]),
                 want,
