@@ -4,6 +4,26 @@
 
 ## 0.3.0
 
+- Concurrent PostgreSQL catalog initialization serializes physical table creation
+  in one transaction. Failed or cancelled initialization releases the advisory
+  lock; SQLite initialization is unchanged.
+
+- Distributed SQL returns measured scan row, byte and spill totals from accepted
+  shard executions. An older worker without the new counters uses one measured
+  coordinator fallback with the same snapshot pin; malformed counters remain
+  errors. The fallback can repeat work already performed by the older worker.
+
+- Large v1 index rebuilds spill bounded sorted runs and stream compression and
+  Puffin output, avoiding a whole-file postings map and output buffer. Constrained
+  compactor handoffs reclaim allocator free pages before the next decoded phase.
+  See the [qualification report](results/release-validation/20261019-stack-field-qualification.md)
+  for tested memory geometry and limits.
+
+- Known performance limitation: the retained clipped-text keyword and last-25
+  queries measured about 386 ms and 27 ms, exceeding the 10 ms / 25 ms goals.
+  Exact results and policy checks passed; the remaining latency goals are tracked
+  for 0.4.0 and are not claimed as met by this release.
+
 - WAL drains release decoded input batches before sorting and encoding their
   combined append, and move single batches without a concatenation copy.
   Page-bounded merges release exhausted timestamp planning state before final
