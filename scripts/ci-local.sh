@@ -383,6 +383,9 @@ fi
 test_attempt=1
 test_contamination=0
 test_contaminated_twice=0
+test_compiler_crash=0
+test_compiler_crashed_twice=0
+test_retry_reason=
 test_attribution=
 while :; do
   test_pass_log="$LOG_DIR/test-pass-$test_attempt.log"
@@ -399,6 +402,7 @@ while :; do
   # Cargo's artifact lock ends with this build. Record inode and mtime as soon
   # as its JSON stream closes; there is necessarily a small window between the
   # build finishing and this stat pass, which `(never executed)` also covers.
+  test_compiler_crash=0
   if cargo test --workspace --no-run --message-format=json \
       >"$test_build_messages" 2>>"$test_pass_log"; then
     append_cargo_diagnostics "$test_build_messages" >>"$test_pass_log"
@@ -438,17 +442,34 @@ while :; do
     test_rc=$?
     append_cargo_diagnostics "$test_build_messages" >>"$test_pass_log"
     test_contamination=0
+    # Only the `--no-run` build is read for this. The pass below runs test
+    # binaries, and a test binary killed by a signal is a test failure this
+    # gate must keep reporting as one.
+    if test_build_compiler_crashed "$test_pass_log"; then
+      test_compiler_crash=1
+      printf '\nCOMPILER CRASHED: rustc was killed by a signal during the test build\n' \
+        >>"$test_pass_log"
+    fi
   fi
   cat "$test_pass_log" >>"$LOG_DIR/test.log"
 
-  if [ "$test_contamination" -eq 0 ]; then
+  if [ "$test_contamination" -eq 0 ] && [ "$test_compiler_crash" -eq 0 ]; then
     break
   elif [ "$test_attempt" -eq 1 ]; then
-    echo "  test CONTAMINATED: binaries relinked during the run by $test_attribution; retrying once" >&2
+    if [ "$test_contamination" -eq 1 ]; then
+      test_retry_reason=contamination
+      echo "  test CONTAMINATED: binaries relinked during the run by $test_attribution; retrying once" >&2
+    else
+      test_retry_reason="a compiler crash"
+      echo "  test COMPILER CRASHED: rustc was killed by a signal during the build; retrying once" >&2
+    fi
     print_test_failure_summary "$test_pass_log" | sed 's/^/  /' >&2
     test_attempt=2
-  else
+  elif [ "$test_contamination" -eq 1 ]; then
     test_contaminated_twice=1
+    break
+  else
+    test_compiler_crashed_twice=1
     break
   fi
 done
@@ -457,22 +478,36 @@ if [ "$test_refresh_failed" -eq 1 ]; then
   test_rc=1
 fi
 
+# A compiler crash is retried once, because a rustc the kernel killed says
+# nothing about the tree. Run #200's rustc took a SIGSEGV on a null read
+# (`segfault at 8` in the kernel log) inside the mono-item collector; its own
+# "overflowed its stack" note is a guess it makes whenever the backtrace is
+# cyclic, and that backtrace was about fifty frames deep. Twenty-one replays of
+# the identical rustc command, and a full `cargo test --workspace --no-run`,
+# compiled it. A second crash is red: by then something reproducible is wrong.
+#
+# Whatever the retry was for is named in every summary line below, so a run
+# that retried never reads like a run that did not.
 if [ "$test_contaminated_twice" -eq 1 ]; then
   contamination_red=1
-  report test "FAIL (contaminated twice by concurrent builds)"
-  echo "  test binaries relinked during both attempts; latest concurrent run: $test_attribution" >&2
+  report test "FAIL (contaminated by a concurrent build; retried after $test_retry_reason)"
+  echo "  test binaries relinked during the retry; latest concurrent run: $test_attribution" >&2
+  print_test_failure_summary "$test_pass_log" | sed 's/^/  /' >&2
+elif [ "$test_compiler_crashed_twice" -eq 1 ]; then
+  report test "FAIL (rustc killed by a signal; retried after $test_retry_reason)"
+  echo "  the compiler crashed during the test build; see $LOG_DIR/test.log" >&2
   print_test_failure_summary "$test_pass_log" | sed 's/^/  /' >&2
 elif [ "$test_rc" -eq 0 ]; then
   n=$(awk '/^test result: ok\./ {s+=$4} END {print s+0}' "$test_pass_log")
   if [ "$n" -lt 900 ]; then
     if [ "$test_attempt" -eq 2 ]; then
-      report test "FAIL (only $n tests after contamination retry)"
+      report test "FAIL (only $n tests; retried after $test_retry_reason)"
     else
       report test "FAIL"
     fi
     echo "  only $n tests ran; expected 900+" >&2
   elif [ "$test_attempt" -eq 2 ]; then
-    report test "ok ($n tests; retried after contamination)"
+    report test "ok ($n tests; retried after $test_retry_reason)"
   else
     report test "ok ($n tests)"
   fi
@@ -482,7 +517,7 @@ else
       "$test_pass_log"
   )
   if [ "$test_attempt" -eq 2 ]; then
-    report test "FAIL ($n tests across $binaries binaries after contamination retry)"
+    report test "FAIL ($n tests across $binaries binaries; retried after $test_retry_reason)"
   else
     report test "FAIL ($n tests across $binaries binaries)"
   fi

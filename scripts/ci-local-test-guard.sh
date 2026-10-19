@@ -85,6 +85,25 @@ test_pass_contaminated() {
   grep -Fq '(never executed)' "$test_log" || [ -s "$changed" ]
 }
 
+# A rustc the kernel killed, as opposed to a rustc that reported a diagnostic.
+# Run #200 (2026-10-19, task #6942) lost `cargo test --workspace --no-run` to
+# one of these while compiling siglake-storage's lib test, and the gate scored
+# a dead compiler the same as a tree that does not build.
+#
+# Two spellings, because the two processes print separately: rustc's own signal
+# handler writes `error: rustc interrupted by SIGSEGV` and a backtrace, and
+# cargo reports the child's wait status under `Caused by:` as
+# `(signal: 11, SIGSEGV: invalid memory reference)`. A build that produced
+# neither is a compile failure and must stay one, so both patterns are anchored
+# at the start of a line: a rendered diagnostic quoting this text out of some
+# source file is indented by the renderer and does not match.
+test_build_compiler_crashed() {
+  grep -Eq \
+    -e '^error: rustc interrupted by SIG[A-Z]+' \
+    -e "^[[:space:]]+process didn't exit successfully: .*\(signal: [0-9]+, SIG[A-Z]+" \
+    "$1"
+}
+
 print_test_failure_summary() {
   awk '
     /^test .* FAILED$/ || /^error/ || /^Caused by:/ || /^  (could not execute process|No such file or directory)/ { print }
