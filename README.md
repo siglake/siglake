@@ -7,6 +7,18 @@ in Apache Iceberg tables, and lets you explore it with SQL. Built in Rust on
 DataFusion, it separates ingestion, compaction, and querying so each can scale
 independently.
 
+**Designed for agents.** Siglake gives agents direct access to telemetry through
+SQL, a command-line client, and a [read-only MCP server](integrations/mcp/README.md).
+Tools such as Claude and Codex can discover schemas, estimate query costs, and
+work with structured results to investigate incidents and answer operational
+questions.
+
+**An open stream for your detection pipelines.** Siglake's write-ahead log (WAL)
+is also a supported integration point. External services can consume sealed
+Arrow batches through the [Rust consumer interface](docs/CONSUMING_SEGMENTS.md),
+with durable cursors and at-least-once delivery. Build your own detectors,
+alerting pipelines, or routers alongside Siglake's storage pipeline.
+
 [Documentation](https://docs.siglake.dev/) ·
 [Benchmarks](https://benchmarks.siglake.dev/) ·
 [Releases](https://github.com/siglake/siglake/releases) ·
@@ -14,8 +26,6 @@ independently.
 
 - **Use your existing collectors.** Ingest logs and traces over OTLP/HTTP or
   OTLP/gRPC, or send logs through the Elasticsearch-compatible bulk API.
-- **Query with your tools.** Use SQL over HTTP, the command-line client, or the
-  [read-only MCP server](integrations/mcp/README.md) for Claude and Codex.
 - **Keep your data open.** Read committed Iceberg snapshots directly with
   [DuckDB, Spark, Trino, and other compatible engines](https://docs.siglake.dev/guides/external-engines/).
 - **Run it on your infrastructure.** Start locally with Docker Compose, or
