@@ -64,8 +64,20 @@ where
         .append_pair("options[search_path]", &schema)
         .append_pair("application_name", &schema)
         // Prove the waiting initializer uses a fresh post-lock DDL snapshot.
-        .append_pair("options[default_transaction_isolation]", "repeatable read")
+        .append_pair(
+            "options[default_transaction_isolation]",
+            r"repeatable\ read",
+        )
         .append_pair("options[statement_timeout]", "30000");
+    let isolation_probe = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(uri.as_str())
+        .await?;
+    let actual_isolation: String = sqlx::query_scalar("SHOW default_transaction_isolation")
+        .fetch_one(&isolation_probe)
+        .await?;
+    isolation_probe.close().await;
+    ensure!(actual_isolation == "repeatable read");
     let outcome = timeout(
         Duration::from_secs(90),
         case(admin.clone(), uri.into(), schema.clone()),
