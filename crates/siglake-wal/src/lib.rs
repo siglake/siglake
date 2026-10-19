@@ -2723,9 +2723,13 @@ impl BoundedSegmentReader {
     }
 
     fn verify_selected_path(&self) -> Result<()> {
-        for path in std::iter::once(self.path.as_path())
-            .chain(self.lifecycle_paths.iter().map(PathBuf::as_path))
-        {
+        for path in std::iter::once(self.path.as_path()).chain(
+            self.lifecycle_paths
+                .iter()
+                .map(PathBuf::as_path)
+                .cycle()
+                .take(6),
+        ) {
             match fs::metadata(path) {
                 Ok(metadata) => {
                     anyhow::ensure!(
