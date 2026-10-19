@@ -29,11 +29,17 @@ confidence-threshold = 0.8
 # If no replacement exists, add { crate = "name@version", reason = "..." } to ignore below.
 yanked = "deny"
 ignore = [
-    "RUSTSEC-2024-0436", # paste is transitive through DataFusion/Parquet/utoipa; no safe upgrade exists.
-    "RUSTSEC-2026-0194", # quick-xml <0.41 is pinned by reqsign/object_store; upgrade with those dependencies.
-    "RUSTSEC-2026-0195", # quick-xml <0.41 is pinned by reqsign/object_store; upgrade with those dependencies.
-    "RUSTSEC-2023-0071", # rsa is transitive through reqsign, and no patched release exists.
-    "RUSTSEC-2025-0134", # rustls-pemfile is transitive through axum-server/object_store; migrate upstream.
+    # paste 1.0.15: unmaintained, no patched release. Reached through DataFusion
+    # 53.1.0 and parquet 58.4.0, utoipa-axum 0.2.0 and tikv-jemalloc-ctl 0.7.0.
+    "RUSTSEC-2024-0436",
+    # quick-xml 0.39.4: fixed in 0.41.0, pinned here by object_store 0.13.2 and
+    # OpenDAL 0.57 (opendal-core, opendal-service-s3). reqsign is already on
+    # quick-xml 0.41.0 and no longer holds these back.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # rustls-pemfile 2.2.0: unmaintained, no patched release. Sole parent is
+    # axum-server 0.7.3; object_store 0.13.2 no longer pulls it in.
+    "RUSTSEC-2025-0134",
 ]
 
 [bans]
