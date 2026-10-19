@@ -144,7 +144,7 @@ cat >"$crash_log" <<'EOF'
 error: could not compile `siglake-storage` (lib test)
 
 Caused by:
-  process didn't exit successfully: `/home/u/.rustup/bin/rustc --crate-name siglake_storage --test` (signal: 11, SIGSEGV: invalid memory reference)
+  process didn't exit successfully: `/usr/local/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name siglake_storage --test` (signal: 11, SIGSEGV: invalid memory reference)
 EOF
 if ! test_build_compiler_crashed "$crash_log"; then
   echo "FAIL cargo's signal wait-status was not reported as a compiler crash" >&2
