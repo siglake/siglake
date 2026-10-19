@@ -10,6 +10,15 @@ The public operations docs are the release-wide coverage ledger.
 
 ## October 19, 2026
 
+The public **v0.3.0 anonymous smoke passed** on the exact tagged source `f958aaa`.
+It verified both engine and operator image provenance, a fresh single-node
+installation, 400 exact committed events, component restarts, query-audit
+persistence and inline aggregate coverage. Artifact review and cleanup passed;
+no owned containers, networks or volumes remained. The workload ran for
+147.4 seconds, so this is a bounded smoke result, not a duration or performance
+qualification. See the [summary](v0.3.0-smoke-20261019T194920Z-fd5446f8/summary.json) and
+[raw-artifact hash manifest](v0.3.0-smoke-20261019T194920Z-fd5446f8/sha256.json).
+
 The [stack and field qualification report](20261019-stack-field-qualification.md)
 separates current typed/cancellation and exact aggregate checks, retained
 matched rebase observations, scoped memory evidence and unchanged failed goals.

@@ -1,0 +1,10 @@
+{
+  "summary.json": "a7eac6b3706b9790aa544d17ae213c2985433460ee702f88f5baf6bac5afb8c8",
+  "metrics.prom": "a2e2060e3f03a9d0c1da22e7219d9533adf2e8cd02009bceeacfdafc6c81d9e7",
+  "containers.log": "8a69bf1a46768747d6c36cc842c64e9b6002dd05b34e2aebf2a926978f00917f",
+  "compose.json": "4f4ed493f6c24edec6c6be901b90adca078d91cb9f44706d4ebfc81f7ef8714c",
+  "events.jsonl": "6dde362f426c094f3c9dd926300212d7c9da2bafe75a2d8bff9ab51212496236",
+  "harness.py": "a2d719c3bbfc9f6120f6920995cc526637532f1430f87d2da85b8f3dd2640b78",
+  "release-compose.yml": "f1ce418b59b5ee53a65a6023f23999d7ca05115e5f900ba104fb473dfacab432",
+  "resources.jsonl": "38546b568209ad4013aec14b2680b84387fa72b06509c0d62a2e796b7d5d3653"
+}
