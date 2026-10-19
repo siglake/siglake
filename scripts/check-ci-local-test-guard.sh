@@ -135,7 +135,7 @@ error: rustc interrupted by SIGSEGV, printing backtrace
 note: rustc unexpectedly overflowed its stack! this is a bug
 error: could not compile `siglake-storage` (lib test)
 EOF
-if ! test_build_compiler_crashed "$crash_log"; then
+if ! cargo_compiler_crashed "$crash_log"; then
   echo "FAIL rustc's own signal report was not reported as a compiler crash" >&2
   exit 1
 fi
@@ -146,8 +146,21 @@ error: could not compile `siglake-storage` (lib test)
 Caused by:
   process didn't exit successfully: `/usr/local/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name siglake_storage --test` (signal: 11, SIGSEGV: invalid memory reference)
 EOF
-if ! test_build_compiler_crashed "$crash_log"; then
+if ! cargo_compiler_crashed "$crash_log"; then
   echo "FAIL cargo's signal wait-status was not reported as a compiler crash" >&2
+  exit 1
+fi
+
+# The doctest arm of the fork-tests job compiles through rustdoc, which carries
+# the same signal handler and the same wait status.
+cat >"$crash_log" <<'EOF'
+error: doctest failed, to rerun pass `--doc`
+
+Caused by:
+  process didn't exit successfully: `/usr/local/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustdoc --edition=2021 --crate-type lib` (signal: 11, SIGSEGV: invalid memory reference)
+EOF
+if ! cargo_compiler_crashed "$crash_log"; then
+  echo "FAIL rustdoc's signal wait-status was not reported as a compiler crash" >&2
   exit 1
 fi
 
@@ -156,7 +169,7 @@ error[E0308]: mismatched types
  --> crates/siglake-storage/src/iceberg.rs:1:1
 error: could not compile `siglake-storage` (lib test) due to 1 previous error
 EOF
-if test_build_compiler_crashed "$crash_log"; then
+if cargo_compiler_crashed "$crash_log"; then
   echo "FAIL an ordinary compile error was reported as a compiler crash" >&2
   exit 1
 fi
@@ -169,8 +182,166 @@ error[E0599]: no method named `signal`
 13 |     let note = "error: rustc interrupted by SIGSEGV, printing backtrace";
    |                 ^^^^^
 EOF
-if test_build_compiler_crashed "$crash_log"; then
+if cargo_compiler_crashed "$crash_log"; then
   echo "FAIL a quoted diagnostic was reported as a compiler crash" >&2
+  exit 1
+fi
+
+# The jobs below the test job read logs that mix compiling with running, so the
+# two other processes that print this wait status have to stay red. A test
+# binary the kernel killed is the regression the profiling and docker jobs
+# exist to catch; a build script the kernel killed is a dependency that cannot
+# be built here.
+cat >"$crash_log" <<'EOF'
+   Compiling siglake-core v0.3.0 (/work/crates/siglake-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s)
+     Running unittests src/lib.rs (/work/target/debug/deps/siglake_core-9f2c1a7b)
+error: test failed, to rerun pass `-p siglake-core --lib`
+
+Caused by:
+  process didn't exit successfully: `/work/target/debug/deps/siglake_core-9f2c1a7b --nocapture` (signal: 11, SIGSEGV: invalid memory reference)
+EOF
+if cargo_compiler_crashed "$crash_log"; then
+  echo "FAIL a test binary killed by a signal was reported as a compiler crash" >&2
+  exit 1
+fi
+
+cat >"$crash_log" <<'EOF'
+error: failed to run custom build command for `ring v0.17.8`
+
+Caused by:
+  process didn't exit successfully: `/work/target/debug/build/ring-4a1f/build-script-build` (signal: 9, SIGKILL: kill)
+EOF
+if cargo_compiler_crashed "$crash_log"; then
+  echo "FAIL a build script killed by a signal was reported as a compiler crash" >&2
+  exit 1
+fi
+
+# check-fork-tests.sh prefixes each fork's cargo output with `  [<fork>] `, so
+# that job passes the prefix in. The anchors still hold: without the prefix the
+# same log matches nothing.
+fork_prefix='  \[[a-z0-9-]+\] '
+cat >"$crash_log" <<'EOF'
+FAIL iceberg: cargo test --lib exited 101 (12s)
+  [iceberg] error: could not compile `iceberg` (lib test)
+  [iceberg]
+  [iceberg] Caused by:
+  [iceberg]   process didn't exit successfully: `/usr/local/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name iceberg --test` (signal: 11, SIGSEGV: invalid memory reference)
+EOF
+if ! cargo_compiler_crashed "$crash_log" "$fork_prefix"; then
+  echo "FAIL a prefixed fork crash was not reported as a compiler crash" >&2
+  exit 1
+fi
+if cargo_compiler_crashed "$crash_log"; then
+  echo "FAIL prefixed output matched without the prefix the job passes in" >&2
+  exit 1
+fi
+cat >"$crash_log" <<'EOF'
+FAIL iceberg: cargo test --lib exited 101 (12s)
+  [iceberg] error[E0308]: mismatched types
+  [iceberg] error: could not compile `iceberg` (lib test) due to 1 previous error
+EOF
+if cargo_compiler_crashed "$crash_log" "$fork_prefix"; then
+  echo "FAIL a prefixed compile error was reported as a compiler crash" >&2
+  exit 1
+fi
+
+# The retry itself: one replay, no more, and only for a crash. Each attempt
+# keeps its own log and the job log keeps both, which is what a red line's
+# excerpt and the morning-after reader respectively need.
+crash_output=$(cat <<'EOF'
+error: could not compile `siglake-storage` (lib test)
+
+Caused by:
+  process didn't exit successfully: `/toolchains/stable/bin/rustc --crate-name siglake_storage --test` (signal: 11, SIGSEGV: invalid memory reference)
+EOF
+)
+retry_attempts=0
+# `<attempt that stops crashing, or 0 for never> <exit code>`: a stand-in cargo
+# job that writes a crash log until that attempt, then succeeds.
+crashing_job() {
+  local recovers_on=$1
+  retry_attempts=$((retry_attempts + 1))
+  if [ "$recovers_on" -ne 0 ] && [ "$retry_attempts" -ge "$recovers_on" ]; then
+    printf 'test result: ok. 7 passed; 0 failed\n'
+    return 0
+  fi
+  printf '%s\n' "$crash_output"
+  return 101
+}
+failing_job() {
+  retry_attempts=$((retry_attempts + 1))
+  printf 'error[E0308]: mismatched types\n'
+  return 101
+}
+passing_job() {
+  retry_attempts=$((retry_attempts + 1))
+  printf 'test result: ok. 7 passed; 0 failed\n'
+  return 0
+}
+
+job_log="$check_dir/job.log"
+stem="$check_dir/job-attempt"
+
+retry_attempts=0
+rc=0
+cargo_job_with_crash_retry "$job_log" "$stem" "" passing_job || rc=$?
+if [ "$rc" -ne 0 ] || [ "$retry_attempts" -ne 1 ] || [ "$cargo_job_attempts" -ne 1 ] \
+  || [ "$cargo_job_compiler_crashed" -ne 0 ]; then
+  echo "FAIL a job that passed was retried or misreported (rc $rc, $retry_attempts runs)" >&2
+  exit 1
+fi
+if [ "$(cargo_job_status ok)" != "ok" ] \
+  || [ "$(cargo_job_status ok '940 tests')" != "ok (940 tests)" ]; then
+  echo "FAIL an unretried status named a retry" >&2
+  exit 1
+fi
+
+retry_attempts=0
+rc=0
+cargo_job_with_crash_retry "$job_log" "$stem" "" failing_job || rc=$?
+if [ "$rc" -ne 101 ] || [ "$retry_attempts" -ne 1 ] || [ "$cargo_job_compiler_crashed" -ne 0 ]; then
+  echo "FAIL an ordinary compile failure was retried (rc $rc, $retry_attempts runs)" >&2
+  exit 1
+fi
+
+retry_attempts=0
+rc=0
+cargo_job_with_crash_retry "$job_log" "$stem" "" crashing_job 2 || rc=$?
+if [ "$rc" -ne 0 ] || [ "$retry_attempts" -ne 2 ] || [ "$cargo_job_attempts" -ne 2 ] \
+  || [ "$cargo_job_compiler_crashed" -ne 0 ]; then
+  echo "FAIL a crash the replay cleared was not reported green (rc $rc, $retry_attempts runs)" >&2
+  exit 1
+fi
+if [ "$(cargo_job_status ok)" != "ok (retried after a compiler crash)" ] \
+  || [ "$(cargo_job_status ok '940 tests')" \
+    != "ok (940 tests; retried after a compiler crash)" ]; then
+  echo "FAIL a recovered run did not name its retry: $(cargo_job_status ok '940 tests')" >&2
+  exit 1
+fi
+if [ "$cargo_job_attempt_log" != "$stem-2.log" ] \
+  || ! grep -Fq 'test result: ok.' "$stem-2.log" \
+  || ! grep -Fq 'SIGSEGV' "$stem-1.log"; then
+  echo "FAIL the retry did not preserve both attempt logs" >&2
+  exit 1
+fi
+if [ "$(grep -c '^===== attempt [12] =====$' "$job_log")" -ne 2 ] \
+  || ! grep -Fq 'COMPILER CRASHED' "$job_log"; then
+  echo "FAIL the job log did not keep both attempts and name the crash" >&2
+  exit 1
+fi
+
+retry_attempts=0
+rc=0
+cargo_job_with_crash_retry "$job_log" "$stem" "" crashing_job 0 || rc=$?
+if [ "$rc" -ne 101 ] || [ "$retry_attempts" -ne 2 ] || [ "$cargo_job_attempts" -ne 2 ] \
+  || [ "$cargo_job_compiler_crashed" -ne 1 ]; then
+  echo "FAIL an unrecovered crash was not exhausted after one retry (rc $rc, $retry_attempts runs)" >&2
+  exit 1
+fi
+if [ "$(cargo_job_status FAIL 'rustc killed by a signal')" \
+  != "FAIL (rustc killed by a signal; retried after a compiler crash)" ]; then
+  echo "FAIL an unrecovered crash did not report a specific FAIL status" >&2
   exit 1
 fi
 
@@ -235,4 +406,4 @@ if attribution=$(find_concurrent_test_run \
   exit 1
 fi
 
-echo "ok (source refresh, replacement, never-executed summary, compiler-crash, physical, caller-named, stale and self-pointer attribution fixtures)"
+echo "ok (source refresh, replacement, never-executed summary, compiler-crash, test-binary and build-script signals, prefixed fork output, crash retry, physical, caller-named, stale and self-pointer attribution fixtures)"

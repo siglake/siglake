@@ -97,11 +97,74 @@ test_pass_contaminated() {
 # neither is a compile failure and must stay one, so both patterns are anchored
 # at the start of a line: a rendered diagnostic quoting this text out of some
 # source file is indented by the renderer and does not match.
-test_build_compiler_crashed() {
+#
+# The wait-status spelling names the process cargo waited on, and only rustc
+# and rustdoc count as the compiler. A test binary or a build script the kernel
+# killed prints the identical line and is a real failure this gate must keep
+# reporting as one — which is what every job below the test job needs, because
+# their logs mix compiling with running: check-profiling-feature.sh runs
+# siglake-core's tests, the docker job runs six live suites.
+#
+# <line prefix regex> is whatever the job puts in front of cargo's own lines;
+# check-fork-tests.sh pipes each fork's output through `sed "s/^/  [$fork] /"`.
+# It is part of the anchor, not a relaxation of it.
+cargo_compiler_crashed() { # <log> [line prefix regex]
+  local log=$1 prefix=${2:-}
   grep -Eq \
-    -e '^error: rustc interrupted by SIG[A-Z]+' \
-    -e "^[[:space:]]+process didn't exit successfully: .*\(signal: [0-9]+, SIG[A-Z]+" \
-    "$1"
+    -e "^${prefix}error: rust(c|doc) interrupted by SIG[A-Z]+" \
+    -e "^${prefix}[[:space:]]+process didn't exit successfully: \`[^\` ]*rust(c|doc)([[:space:]][^\`]*)?\` \(signal: [0-9]+, SIG[A-Z]+" \
+    -- "$log"
+}
+
+# Run one of the gate's cargo jobs, retrying it once when the attempt's log says
+# the kernel killed the compiler. Each attempt keeps its own log under
+# <attempt log stem>-<n>.log and is appended to the job log under an
+# `===== attempt n =====` banner, so a retried job's evidence is the same shape
+# as the test job's and the excerpt printed by a red line can be taken from the
+# last attempt alone.
+#
+# Sets cargo_job_attempts, cargo_job_attempt_log and cargo_job_compiler_crashed
+# (1 only when the retry crashed too, which stays red); returns the last
+# attempt's exit code. Only a nonzero attempt is examined: a job that passed
+# did not lose a compiler.
+cargo_job_with_crash_retry() { # <job log> <attempt log stem> <line prefix regex> <command...>
+  local job_log=$1 stem=$2 prefix=$3 rc
+  shift 3
+  cargo_job_attempts=1
+  cargo_job_compiler_crashed=0
+  : >"$job_log"
+  while :; do
+    cargo_job_attempt_log="$stem-$cargo_job_attempts.log"
+    : >"$cargo_job_attempt_log"
+    if "$@" >"$cargo_job_attempt_log" 2>&1; then rc=0; else rc=$?; fi
+    {
+      printf '===== attempt %s =====\n' "$cargo_job_attempts"
+      cat "$cargo_job_attempt_log"
+    } >>"$job_log"
+    if [ "$rc" -eq 0 ] \
+      || ! cargo_compiler_crashed "$cargo_job_attempt_log" "$prefix"; then
+      break
+    fi
+    printf '\nCOMPILER CRASHED: rustc was killed by a signal during attempt %s\n' \
+      "$cargo_job_attempts" >>"$job_log"
+    if [ "$cargo_job_attempts" -ge 2 ]; then
+      cargo_job_compiler_crashed=1
+      break
+    fi
+    cargo_job_attempts=$((cargo_job_attempts + 1))
+  done
+  return "$rc"
+}
+
+# `<ok|FAIL> [detail]` -> the status string for report(), naming the retry
+# whenever there was one: a run that retried must not read like a run that did
+# not. Same wording as the test job's `retried after ...`.
+cargo_job_status() { # <ok|FAIL> [detail]
+  local base=$1 detail=${2:-}
+  if [ "${cargo_job_attempts:-1}" -gt 1 ]; then
+    detail="${detail:+$detail; }retried after a compiler crash"
+  fi
+  printf '%s%s\n' "$base" "${detail:+ ($detail)}"
 }
 
 print_test_failure_summary() {

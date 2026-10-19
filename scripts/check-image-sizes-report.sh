@@ -199,10 +199,15 @@ expect 'report of a red build that measured' \
   "$(report_line "$(docker_job_status 0 1 "$sizes")")"
 
 # --- the wiring, which is where this kind of defect actually lives -----------
+# The status is built, possibly re-worded for a compiler crash (#6947), and
+# then reported; the crash wording carries the measurement for the same reason
+# the verdict does — a red line is exactly when the sizes are worth reading.
 for wiring in \
   '. scripts/ci-local-image-sizes.sh' \
   'image_sizes=$(docker_image_sizes "$dlog")' \
-  'report docker "$(docker_job_status "$dk_ok" "$preflight_ok" "$image_sizes")"'; do
+  'docker_status=$(docker_job_status "$dk_ok" "$preflight_ok" "$image_sizes")' \
+  'not retried, the job rebuilds two images${image_sizes:+; $image_sizes})"' \
+  'report docker "$docker_status"'; do
   if ! grep -Fq "$wiring" scripts/ci-local.sh; then
     echo "FAIL: scripts/ci-local.sh no longer has: $wiring" >&2
     failures=$((failures + 1))
