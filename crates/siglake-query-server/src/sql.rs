@@ -1965,10 +1965,13 @@ fn attr_get_rewrite_target(
     let (first_key, outer_keys) = keys.split_first()?;
     let source = (carrier, first_key.clone(), outer_keys.to_vec());
     let (column, ty) = mapping.get(&source)?.clone();
+    // Mappings preserve exact physical names, including case and SQL syntax.
+    // Quote the injected leaf; retain the original qualifier identifiers.
+    let column = Ident::with_quote('"', column);
     let column = match qualifier {
-        None => SqlAstExpr::Identifier(column.as_str().into()),
+        None => SqlAstExpr::Identifier(column),
         Some(mut parts) => {
-            parts.push(column.as_str().into());
+            parts.push(column);
             SqlAstExpr::CompoundIdentifier(parts)
         }
     };
@@ -13431,6 +13434,58 @@ mod tests {
         maps
     }
 
+    #[tokio::test]
+    async fn attr_rewrite_quotes_exact_physical_identifiers() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        for name in ["Size Metric", "MixedCase", "select", "a\"b"] {
+            let ctx = SessionContext::new();
+            crate::udfs::register_udfs(&ctx);
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("attributes", DataType::Utf8, false),
+                    Field::new(name, DataType::Int64, false),
+                    Field::new("decoy", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(vec![r#"{"k":"9223372036854775807"}"#])),
+                    Arc::new(Int64Array::from(vec![i64::MAX])),
+                    Arc::new(Int64Array::from(vec![0])),
+                ],
+            )
+            .unwrap();
+            ctx.register_batch("events", batch).unwrap();
+            let maps = HashMap::from([(
+                "events".into(),
+                HashMap::from([(
+                    (
+                        siglake_core::PromotionCarrier::Attributes,
+                        "k".into(),
+                        Vec::new(),
+                    ),
+                    (name.into(), siglake_core::PromotedType::Int64),
+                )]),
+            )]);
+            for carrier in ["attributes", "e.attributes"] {
+                let sql = format!("SELECT CAST(attr_get({carrier}, 'k') AS BIGINT) AS value FROM events e WHERE attr_get({carrier}, 'k') = '9223372036854775807'");
+                let rewritten = rewrite_attr_get_to_columns(&sql, &maps).unwrap();
+                let expected = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+                let actual = ctx.sql(&rewritten).await.unwrap().collect().await.unwrap();
+                assert_eq!(actual, expected, "{name}: {rewritten}");
+                assert_eq!(actual.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                assert_eq!(
+                    actual[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    i64::MAX
+                );
+            }
+        }
+    }
+
     #[test]
     fn raw_carrier_rewrite_requires_exact_carrier_and_preserves_scope() {
         use siglake_core::{PromotedType, PromotionCarrier};
@@ -13453,9 +13508,9 @@ mod tests {
         )]);
         let result = rewrite_attr_get_to_columns("SELECT attr_get(e.raw, 'value'), attr_get(e.attributes, 'value'), attr_get(attr_get(e.raw, 'obj'), 'leaf') FROM events e", &maps).unwrap();
         assert!(
-            result.contains("e.raw_value")
-                && result.contains("e.attr_value")
-                && result.contains("e.raw_leaf"),
+            result.contains("e.\"raw_value\"")
+                && result.contains("e.\"attr_value\"")
+                && result.contains("e.\"raw_leaf\""),
             "{result}"
         );
         assert!(!result.contains("attr_get"), "{result}");
@@ -13532,7 +13587,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            rewritten.contains("metrics_size >= 9007199254740993"),
+            rewritten.contains("\"metrics_size\" >= 9007199254740993"),
             "{rewritten}"
         );
         assert!(!rewritten.contains("CAST"), "{rewritten}");
@@ -13543,7 +13598,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            projected.contains("CAST(metrics_size AS VARCHAR)"),
+            projected.contains("CAST(\"metrics_size\" AS VARCHAR)"),
             "{projected}"
         );
     }
@@ -13558,7 +13613,7 @@ mod tests {
         let rewritten =
             rewrite_attr_get_to_columns(sql, &attr_rewrite_maps(&[("events", "k", "event_k")]))
                 .expect("outer events attr_get rewrites");
-        assert!(rewritten.contains("SELECT event_k AS value FROM events"));
+        assert!(rewritten.contains("SELECT \"event_k\" AS value FROM events"));
         assert!(rewritten.contains("EXISTS (SELECT 1 FROM idx)"));
     }
 
@@ -13592,7 +13647,7 @@ mod tests {
         assert!(
             rewritten
                 .sql
-                .contains("SELECT event_k AS value FROM events"),
+                .contains("SELECT \"event_k\" AS value FROM events"),
             "{}",
             rewritten.sql
         );
@@ -13878,7 +13933,7 @@ mod tests {
         let rewritten =
             rewrite_attr_get_to_columns(sql, &attr_rewrite_maps(&[("events", "k", "event_k")]))
                 .expect("the gated events table rewrites");
-        assert!(rewritten.contains("e.event_k"), "{rewritten}");
+        assert!(rewritten.contains("e.\"event_k\""), "{rewritten}");
         assert!(
             rewritten.contains("attr_get(i.attributes, 'k')"),
             "ungated idx expression changed: {rewritten}"
@@ -13902,7 +13957,7 @@ mod tests {
             &maps,
         )
         .expect("the alias proves idx owns the qualified column");
-        assert!(aliased.contains("events.idx_k"), "{aliased}");
+        assert!(aliased.contains("events.\"idx_k\""), "{aliased}");
         assert!(!aliased.contains("event_k"), "alias shadow lost: {aliased}");
 
         assert!(
