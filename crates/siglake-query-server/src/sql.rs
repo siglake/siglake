@@ -13444,7 +13444,7 @@ mod tests {
             let batch = RecordBatch::try_new(
                 Arc::new(Schema::new(vec![
                     Field::new("attributes", DataType::Utf8, false),
-                    Field::new(name, DataType::Int64, false),
+                    Field::new(name, DataType::Int64, true),
                     Field::new("decoy", DataType::Int64, false),
                 ])),
                 vec![
